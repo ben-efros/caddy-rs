@@ -177,22 +177,42 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
                 },
             },
             '{' => {
-                chars.next();
-                tokens.push(Token {
-                    kind: TokenKind::LeftBrace,
-                    text: "{".to_string(),
-                    position,
-                });
-                column += 1;
+                if brace_is_standalone(&chars, '{') {
+                    chars.next();
+                    tokens.push(Token {
+                        kind: TokenKind::LeftBrace,
+                        text: "{".to_string(),
+                        position,
+                    });
+                    column += 1;
+                } else {
+                    match scan_word(&mut chars, position, &mut column) {
+                        Some(token) => tokens.push(token),
+                        None => {
+                            chars.next();
+                            column += 1;
+                        }
+                    }
+                }
             }
             '}' => {
-                chars.next();
-                tokens.push(Token {
-                    kind: TokenKind::RightBrace,
-                    text: "}".to_string(),
-                    position,
-                });
-                column += 1;
+                if brace_is_standalone(&chars, '}') {
+                    chars.next();
+                    tokens.push(Token {
+                        kind: TokenKind::RightBrace,
+                        text: "}".to_string(),
+                        position,
+                    });
+                    column += 1;
+                } else {
+                    match scan_word(&mut chars, position, &mut column) {
+                        Some(token) => tokens.push(token),
+                        None => {
+                            chars.next();
+                            column += 1;
+                        }
+                    }
+                }
             }
             '"' => {
                 let token = scan_quoted(&mut chars, position, &mut column)?;
@@ -215,11 +235,28 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
     Ok(tokens)
 }
 
+/// Caddy does not tokenize braces: a token is a whitespace-delimited run, and the parser decides
+/// that a token whose text is exactly `{` or `}` is structural. This mirrors that rule so that
+/// placeholder tokens such as `{block}`, `{args[0]}` and `{http.request.uri}` are single words and
+/// can be embedded in larger words (`prefix-{args[0]}`). `{}` remains a structural empty-block
+/// pair for backwards compatibility with the previous lexer.
+fn brace_is_standalone(chars: &Cursor<'_>, brace: char) -> bool {
+    match peek_ahead(chars, 1) {
+        None => true,
+        Some(next) if next.is_whitespace() => true,
+        Some('}') if brace == '{' => match peek_ahead(chars, 2) {
+            None => true,
+            Some(next) => next.is_whitespace(),
+        },
+        Some(_) => false,
+    }
+}
+
 /// Scan a bare word, applying Caddy's backslash rules.
 fn scan_word(cursor: &mut Cursor<'_>, position: Position, column: &mut usize) -> Option<Token> {
     let mut text = String::new();
     while let Some(&(_, ch)) = cursor.peek() {
-        if ch.is_whitespace() || matches!(ch, '{' | '}' | '"' | '`') {
+        if ch.is_whitespace() || matches!(ch, '"' | '`') {
             break;
         }
         if ch == '\\' {
@@ -835,5 +872,62 @@ mod tests {
     fn heredoc_body_may_contain_braces_and_quotes() {
         let tokens = texts("respond <<EOF\n{\"json\": true}\nEOF\n");
         assert!(tokens.contains(&(TokenKind::Quoted, "{\"json\": true}".to_string())));
+    }
+    #[test]
+    fn brace_delimited_placeholders_are_single_words() {
+        // Caddy does not tokenize braces; `{...}` runs are ordinary words.
+        let tokens = texts("header_up Host {host}\n");
+        assert!(
+            tokens.contains(&(TokenKind::Word, "{host}".to_string())),
+            "{tokens:?}"
+        );
+        let tokens = texts("respond {block}\n");
+        assert!(tokens.contains(&(TokenKind::Word, "{block}".to_string())));
+        let tokens = texts("respond {args[0]} {args[:]}\n");
+        assert!(tokens.contains(&(TokenKind::Word, "{args[0]}".to_string())));
+        assert!(tokens.contains(&(TokenKind::Word, "{args[:]}".to_string())));
+        // Placeholders may be embedded in a larger word.
+        let tokens = texts("root /srv/{args[0]}/www\n");
+        assert!(
+            tokens.contains(&(TokenKind::Word, "/srv/{args[0]}/www".to_string())),
+            "{tokens:?}"
+        );
+        let tokens = texts("header X-Test prefix-{http.request.host}\n");
+        assert!(tokens.contains(&(TokenKind::Word, "prefix-{http.request.host}".to_string())));
+    }
+
+    #[test]
+    fn structural_braces_are_still_recognised() {
+        let tokens = texts(":80 {\n respond ok\n}\n");
+        assert_eq!(
+            tokens
+                .iter()
+                .filter(|(k, _)| *k == TokenKind::LeftBrace)
+                .count(),
+            1
+        );
+        assert_eq!(
+            tokens
+                .iter()
+                .filter(|(k, _)| *k == TokenKind::RightBrace)
+                .count(),
+            1
+        );
+        // Empty block pair.
+        let tokens = texts(":80 {}\n");
+        assert_eq!(
+            tokens
+                .iter()
+                .filter(|(k, _)| *k == TokenKind::LeftBrace)
+                .count(),
+            1
+        );
+        assert_eq!(
+            tokens
+                .iter()
+                .filter(|(k, _)| *k == TokenKind::RightBrace)
+                .count(),
+            1
+        );
     }
 }
