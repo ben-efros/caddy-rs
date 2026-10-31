@@ -1,0 +1,7 @@
+example.com {
+	respond "main"
+}
+
+http://example.org {
+	respond "org"
+}

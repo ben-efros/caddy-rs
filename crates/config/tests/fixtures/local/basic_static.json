@@ -1,0 +1,44 @@
+{
+  "apps": {
+    "http": {
+      "servers": {
+        "srv0": {
+          "listen": [
+            ":8080"
+          ],
+          "routes": [
+            {
+              "handle": [
+                {
+                  "body": "hello",
+                  "handler": "static_response",
+                  "status_code": 200
+                }
+              ]
+            },
+            {
+              "handle": [
+                {
+                  "handler": "static_response",
+                  "headers": {
+                    "Location": [
+                      "/new"
+                    ]
+                  },
+                  "status_code": 301
+                }
+              ],
+              "match": [
+                {
+                  "path": [
+                    "/old"
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

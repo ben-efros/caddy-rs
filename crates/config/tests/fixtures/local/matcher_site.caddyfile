@@ -1,0 +1,4 @@
+:8081 {
+	@api path /api/*
+	reverse_proxy @api localhost:9000
+}

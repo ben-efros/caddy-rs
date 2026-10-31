@@ -1,0 +1,59 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/config",
+    "crates/http",
+    "crates/proxy",
+    "crates/tls",
+    "crates/admin",
+    "crates/server",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/example/caddy-rs"
+authors = ["caddy-rs contributors"]
+
+[workspace.dependencies]
+# Internal crates (path dependencies declared once).
+caddy-rs-core = { path = "crates/core" }
+caddy-rs-config = { path = "crates/config" }
+caddy-rs-http = { path = "crates/http" }
+caddy-rs-proxy = { path = "crates/proxy" }
+caddy-rs-tls = { path = "crates/tls" }
+caddy-rs-admin = { path = "crates/admin" }
+caddy-rs-server = { path = "crates/server" }
+anyhow = "1.0.104"
+async-trait = "0.1.92"
+bytes = "1.12.1"
+clap = { version = "4.6.7", default-features = false, features = [
+    "std", "derive", "help", "usage", "error-context", "suggestions",
+] }
+http = "1.5.0"
+http-body-util = "0.1.5"
+hyper = { version = "1.11.1", features = ["http1", "http2", "server", "client"] }
+hyper-util = { version = "0.1.21", features = [
+    "tokio", "server", "client", "client-legacy", "http1", "http2", "server-auto",
+] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.21"
+tokio = { version = "1.53.1", features = [
+    "rt-multi-thread", "macros", "net", "time", "sync", "io-util", "fs",
+] }
+tracing = "0.1.44"
+
+[patch.crates-io]
+# The sandbox that authored this repository has a read-only crates.io cache and cannot download
+# `httpdate` (a hyper dependency). The vendored crate implements exactly the surface hyper uses.
+# Delete this patch when building online; the vendored crate is version-compatible with 1.0.3.
+httpdate = { path = "vendor/httpdate" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

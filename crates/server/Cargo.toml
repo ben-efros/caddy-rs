@@ -1,0 +1,23 @@
+[package]
+name = "caddy-rs-server"
+description = "Listener management, runtime supervisor, hyper HTTP serving, and generation-aware reload."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+caddy-rs-admin = { workspace = true }
+caddy-rs-core = { workspace = true }
+caddy-rs-http = { workspace = true }
+caddy-rs-proxy = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

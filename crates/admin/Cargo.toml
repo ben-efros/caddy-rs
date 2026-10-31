@@ -1,0 +1,15 @@
+[package]
+name = "caddy-rs-admin"
+description = "Caddy-compatible admin API for runtime configuration and lifecycle."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+caddy-rs-core = { workspace = true }
+http = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }

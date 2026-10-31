@@ -1,0 +1,13 @@
+[package]
+name = "caddy-rs-config"
+description = "Caddyfile lexer, parser, and Caddy-JSON adapter."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+caddy-rs-core = { path = "../core" }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

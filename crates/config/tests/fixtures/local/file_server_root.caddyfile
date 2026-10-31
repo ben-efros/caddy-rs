@@ -1,0 +1,4 @@
+example.com {
+	root * /srv
+	file_server browse
+}

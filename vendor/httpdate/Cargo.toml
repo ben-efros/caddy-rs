@@ -1,0 +1,11 @@
+[package]
+name = "httpdate"
+version = "1.0.3"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/pyfisch/httpdate"
+description = "Vendored subset of httpdate used by hyper (offline build sandbox)."
+
+[lib]
+name = "httpdate"
+path = "src/lib.rs"

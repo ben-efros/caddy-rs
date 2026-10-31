@@ -1,0 +1,31 @@
+[package]
+name = "caddy-rs"
+description = "The caddy-rs command-line interface."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "caddy-rs"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+bytes = { workspace = true }
+caddy-rs-admin = { workspace = true }
+caddy-rs-config = { workspace = true }
+caddy-rs-core = { workspace = true }
+caddy-rs-server = { workspace = true }
+clap = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+libc = "0.2.189"
+serde_json = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.27.0"

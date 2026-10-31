@@ -1,0 +1,22 @@
+//! HTTP engine: matchers, handlers, route evaluation, and static file serving.
+//!
+//! The crate is transport-agnostic: it operates on [`types::Request`]/[`types::Response`] and is
+//! driven by `caddy-rs-server` over hyper connections. That keeps handler behaviour unit-testable
+//! without sockets, which matters for conformance work against Caddy.
+
+#![forbid(unsafe_code)]
+
+pub mod file_server;
+pub mod handlers;
+pub mod matchers;
+pub mod router;
+pub mod types;
+
+pub use handlers::{
+    EncodeHandler, HeadersHandler, RewriteHandler, StaticResponseHandler, SubrouteHandler,
+    VarsHandler,
+};
+pub use router::{CustomHandlerFactory, Route, Router, RouterBuilder};
+pub use types::{
+    Error, Handler, Matcher, Outcome, Request, Response, Result, SharedHandler, SharedMatcher,
+};

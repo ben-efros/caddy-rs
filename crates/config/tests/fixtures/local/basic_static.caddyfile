@@ -1,0 +1,4 @@
+:8080 {
+	respond "hello" 200
+	redir /old /new 301
+}

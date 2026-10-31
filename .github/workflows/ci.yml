@@ -1,0 +1,21 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          components: rustfmt
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Test
+        run: cargo test --workspace
+      - name: Build release
+        run: cargo build --workspace --release
