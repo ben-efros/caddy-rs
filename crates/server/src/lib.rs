@@ -9,10 +9,12 @@
 
 pub mod error;
 pub mod http;
+pub mod limits;
 pub mod listeners;
 pub mod runtime;
 
 pub use error::Error;
+pub use limits::{parse_caddy_duration, ServerLimits};
 pub use runtime::{RuntimeStatus, ServerRuntime};
 
 /// The default admin API listen address, matching Caddy.

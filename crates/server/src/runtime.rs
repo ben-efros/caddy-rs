@@ -12,11 +12,12 @@ use std::time::Duration;
 
 use caddy_rs_admin::AdminApi;
 use caddy_rs_core::{Generation, GenerationStore};
-use caddy_rs_http::{Router, RouterBuilder};
+use caddy_rs_http::RouterBuilder;
 use tokio::sync::watch;
 
 use crate::error::{Error, Result};
-use crate::listeners::{bind, bind_admin, ListenerHandle, SharedRouters};
+use crate::limits::ServerLimits;
+use crate::listeners::{bind, bind_admin, ListenerHandle, ListenerState, SharedListeners};
 
 /// Observable runtime state after an apply.
 #[derive(Debug, Clone, Default)]
@@ -40,7 +41,8 @@ impl RuntimeStatus {
 pub struct ServerRuntime {
     store: Arc<GenerationStore>,
     reload: Arc<tokio::sync::Notify>,
-    routers: SharedRouters,
+    /// Per-listen-address serving state (router + limits), shared with accept loops.
+    states: SharedListeners,
     listeners: BTreeMap<String, ListenerHandle>,
     admin: Option<ListenerHandle>,
     admin_api: AdminApi,
@@ -55,7 +57,7 @@ impl ServerRuntime {
         Self {
             store,
             reload,
-            routers: SharedRouters::new(RwLock::new(std::collections::HashMap::new())),
+            states: SharedListeners::new(RwLock::new(std::collections::HashMap::new())),
             listeners: BTreeMap::new(),
             admin: None,
             admin_api,
@@ -80,21 +82,21 @@ impl ServerRuntime {
             self.status = RuntimeStatus::default();
             return Ok(self.status.clone());
         };
-        let routers = self.build_routers(&generation)?;
+        let states = self.build_listener_states(&generation)?;
 
         {
             let mut shared = self
-                .routers
+                .states
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            *shared = routers.clone();
+            *shared = states.clone();
         }
 
         // Remove listeners whose address is no longer configured.
         let removed: Vec<String> = self
             .listeners
             .keys()
-            .filter(|listen| !routers.contains_key(*listen))
+            .filter(|listen| !states.contains_key(*listen))
             .cloned()
             .collect();
         for listen in removed {
@@ -105,11 +107,11 @@ impl ServerRuntime {
         }
 
         // Add newly configured listeners.
-        for listen in routers.keys() {
+        for listen in states.keys() {
             if self.listeners.contains_key(listen) {
                 continue;
             }
-            let handle = bind(listen, Arc::clone(&self.routers), Arc::clone(&self.store)).await?;
+            let handle = bind(listen, Arc::clone(&self.states), Arc::clone(&self.store)).await?;
             tracing::info!(listen, bound = %handle.bound, "listening");
             self.listeners.insert(listen.to_string(), handle);
         }
@@ -192,15 +194,21 @@ impl ServerRuntime {
         }
     }
 
-    fn build_routers(
+    /// Build the per-listen-address serving state for a generation.
+    ///
+    /// The same server object can own several listen addresses; each gets the same router and the
+    /// parsed [`ServerLimits`]. A malformed timeout or limit field fails the apply with the
+    /// offending JSON path, so an invalid server configuration is never served.
+    fn build_listener_states(
         &self,
         generation: &Generation,
-    ) -> Result<std::collections::HashMap<String, Arc<Router>>> {
-        let mut routers = std::collections::HashMap::new();
+    ) -> Result<std::collections::HashMap<String, Arc<ListenerState>>> {
+        let mut states = std::collections::HashMap::new();
         let Some(http) = generation.config().http() else {
-            return Ok(routers);
+            return Ok(states);
         };
         for (server_name, server) in &http.servers {
+            let limits = Arc::new(ServerLimits::from_http_server(server_name, server)?);
             // The router builder consumes the raw Caddy JSON route shape. The typed config model
             // preserves the handler/matcher objects verbatim, so re-serializing is lossless.
             let routes_value = serde_json::to_value(&server.routes).map_err(|error| {
@@ -219,9 +227,15 @@ impl ServerRuntime {
                 })?;
             let router = Arc::new(router);
             for listen in &server.listen {
-                routers.insert(listen.clone(), Arc::clone(&router));
+                states.insert(
+                    listen.clone(),
+                    Arc::new(ListenerState {
+                        router: Arc::clone(&router),
+                        limits: Arc::clone(&limits),
+                    }),
+                );
             }
         }
-        Ok(routers)
+        Ok(states)
     }
 }
