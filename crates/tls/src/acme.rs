@@ -1,0 +1,2146 @@
+//! ACME (RFC 8555) directory and account foundation.
+//!
+//! This module covers the parts of ACME account management that do not need a live TLS stack:
+//!
+//! * the directory document model (`newNonce`, `newAccount`, `newOrder`, `revokeCert`, `meta`);
+//! * ECDSA P-256 account keys: generation, PKCS#8 PEM load/save, public JWK and RFC 7638
+//!   thumbprint;
+//! * flattened JWS (ES256) signing, including external account binding (HS256);
+//! * account registration request/response types, status and problem-document handling;
+//! * a small client whose HTTP transport is the [`AcmeTransport`] trait, so tests drive it with a
+//!   scripted mock and production code plugs in a real HTTP implementation.
+//!
+//! The wire client for orders, authorizations, challenges and certificate download is the next
+//! task (T-TLS-041); it builds on [`AcmeClient`] and [`AccountKey`]. Account key material and the
+//! registered account record are persisted through [`AcmeStorage`], with `FileStorage` and
+//! `MemoryAcmeStorage` implementations available out of the box.
+//!
+//! Deliberate limitations (reported as divergences from Caddy v2.11.7):
+//!
+//! * only ECDSA P-256 / ES256 account keys are supported (Caddy/certmagic also accepts RSA and
+//!   other curves when `account_key` PEM is configured);
+//! * only PKCS#8 (`PRIVATE KEY`) PEM account keys are loaded; SEC1 `EC PRIVATE KEY` and PKCS#1
+//!   `RSA PRIVATE KEY` blocks are rejected with a located error;
+//! * ZeroSSL's automatic EAB credential provisioning is not implemented.
+
+use std::collections::BTreeMap;
+use std::fmt;
+use std::path::{Path, PathBuf};
+use std::sync::RwLock;
+
+use async_trait::async_trait;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::Engine as _;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use tokio::fs;
+use tokio::sync::Mutex;
+
+use crate::storage::FileStorage;
+use crate::{Error, Result};
+
+use ring::rand::SystemRandom;
+use ring::signature::{
+    EcdsaKeyPair, KeyPair, UnparsedPublicKey, ECDSA_P256_SHA256_FIXED,
+    ECDSA_P256_SHA256_FIXED_SIGNING,
+};
+
+/// IANA-registered ACME error namespace prefix.
+pub const ACME_ERROR_PREFIX: &str = "urn:ietf:params:acme:error:";
+
+/// Error type reported for an ACME `userActionRequired` problem document.
+pub const USER_ACTION_REQUIRED: &str = "urn:ietf:params:acme:error:userActionRequired";
+
+/// Errors raised while discovering a directory, managing an account key, or registering an
+/// account.
+#[derive(Debug, thiserror::Error)]
+pub enum AcmeError {
+    /// The directory document could not be decoded.
+    #[error("invalid ACME directory `{url}`: {reason}")]
+    InvalidDirectory {
+        /// Directory URL that was fetched.
+        url: String,
+        /// Decoding failure.
+        reason: String,
+    },
+
+    /// The directory document is missing an endpoint required by RFC 8555.
+    #[error("ACME directory `{url}` is missing required endpoint `{field}`")]
+    MissingDirectoryField {
+        /// Directory URL that was fetched.
+        url: String,
+        /// Missing JSON field.
+        field: &'static str,
+    },
+
+    /// The HTTP transport failed below the ACME layer.
+    #[error("ACME transport request to `{url}` failed: {reason}")]
+    Transport {
+        /// Request URL.
+        url: String,
+        /// Transport failure description.
+        reason: String,
+    },
+
+    /// The server returned an error without an ACME problem document.
+    #[error("ACME server returned HTTP {status} for `{url}`: {detail}")]
+    UnexpectedStatus {
+        /// Request URL.
+        url: String,
+        /// HTTP status.
+        status: u16,
+        /// Short body excerpt.
+        detail: String,
+    },
+
+    /// The server returned an RFC 7807 / RFC 8555 problem document.
+    #[error("ACME problem for `{url}` (HTTP {status}) {problem_type}: {detail}")]
+    Problem {
+        /// Request URL.
+        url: String,
+        /// HTTP status.
+        status: u16,
+        /// Problem type URI.
+        problem_type: String,
+        /// Human-readable detail (`"no detail"` when absent).
+        detail: String,
+        /// Full problem document.
+        problem: Problem,
+    },
+
+    /// The CA requires the terms of service to be accepted before an account is created.
+    #[error("ACME account registration requires accepting the terms of service at `{url}`")]
+    TermsOfServiceRequired {
+        /// Terms-of-service URL advertised by the directory `meta` section.
+        url: String,
+    },
+
+    /// Account key generation, parsing, or signing failed.
+    #[error("ACME account key error: {0}")]
+    AccountKey(String),
+
+    /// A response required by the protocol is missing a header.
+    #[error("ACME response for `{url}` is missing required header `{header}`")]
+    MissingHeader {
+        /// Request URL.
+        url: String,
+        /// Missing header name.
+        header: &'static str,
+    },
+
+    /// A response body could not be decoded or encoded.
+    #[error("ACME data for `{url}` is invalid: {reason}")]
+    Decode {
+        /// URL the data belongs to.
+        url: String,
+        /// Decoding failure.
+        reason: String,
+    },
+
+    /// JWS signing failed.
+    #[error("ACME JWS signing failed: {0}")]
+    Signing(String),
+
+    /// External account binding credentials are malformed.
+    #[error("ACME external account binding error: {0}")]
+    ExternalAccount(String),
+}
+
+impl AcmeError {
+    /// The ACME problem document carried by this error, if any.
+    pub fn problem(&self) -> Option<&Problem> {
+        match self {
+            Self::Problem { problem, .. } => Some(problem),
+            _ => None,
+        }
+    }
+
+    /// The problem type URI, if this error carries a problem document.
+    pub fn problem_type(&self) -> Option<&str> {
+        self.problem().map(|problem| problem.problem_type.as_str())
+    }
+
+    /// Whether the CA asked for operator action (for example a changed terms-of-service
+    /// agreement or account deactivation).
+    pub fn is_user_action_required(&self) -> bool {
+        self.problem_type() == Some(USER_ACTION_REQUIRED)
+    }
+
+    fn from_problem(url: &str, status: u16, problem: Problem) -> Self {
+        Self::Problem {
+            url: url.to_string(),
+            status,
+            problem_type: problem.problem_type.clone(),
+            detail: problem
+                .detail
+                .clone()
+                .unwrap_or_else(|| "no detail".to_string()),
+            problem,
+        }
+    }
+}
+
+/// ACME HTTP method used by a transport request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum HttpMethod {
+    /// `GET`
+    Get,
+    /// `HEAD`
+    Head,
+    /// `POST`
+    Post,
+}
+
+impl HttpMethod {
+    /// Uppercase wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Head => "HEAD",
+            Self::Post => "POST",
+        }
+    }
+}
+
+impl fmt::Display for HttpMethod {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// A transport-neutral HTTP request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpRequest {
+    /// HTTP method.
+    pub method: HttpMethod,
+    /// Absolute URL.
+    pub url: String,
+    /// Header name/value pairs (names keep their configured casing).
+    pub headers: Vec<(String, String)>,
+    /// Request body.
+    pub body: Vec<u8>,
+}
+
+impl HttpRequest {
+    /// A bare `GET` request.
+    pub fn get(url: impl Into<String>) -> Self {
+        Self {
+            method: HttpMethod::Get,
+            url: url.into(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        }
+    }
+
+    /// A bare `HEAD` request.
+    pub fn head(url: impl Into<String>) -> Self {
+        Self {
+            method: HttpMethod::Head,
+            url: url.into(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        }
+    }
+
+    /// A `POST` request with a flattened JWS body (`application/jose+json`).
+    pub fn post_jose(url: impl Into<String>, body: impl Into<Vec<u8>>) -> Self {
+        Self {
+            method: HttpMethod::Post,
+            url: url.into(),
+            headers: vec![("Content-Type".to_string(), JOSE_CONTENT_TYPE.to_string())],
+            body: body.into(),
+        }
+    }
+
+    /// Add a header.
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// Look up a header by case-insensitive name.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .rev()
+            .find(|(header, _)| header.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// Content type mandated by RFC 8555 for JWS request bodies.
+pub const JOSE_CONTENT_TYPE: &str = "application/jose+json";
+
+/// Content type of an ACME problem document.
+pub const PROBLEM_CONTENT_TYPE: &str = "application/problem+json";
+
+/// A transport-neutral HTTP response.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HttpResponse {
+    /// HTTP status code.
+    pub status: u16,
+    /// Header name/value pairs.
+    pub headers: Vec<(String, String)>,
+    /// Response body.
+    pub body: Vec<u8>,
+}
+
+impl HttpResponse {
+    /// An empty response with `status`.
+    pub fn new(status: u16) -> Self {
+        Self {
+            status,
+            headers: Vec::new(),
+            body: Vec::new(),
+        }
+    }
+
+    /// Add a header.
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// Set the body.
+    pub fn with_body(mut self, body: impl Into<Vec<u8>>) -> Self {
+        self.body = body.into();
+        self
+    }
+
+    /// A JSON response body with `Content-Type: application/json`.
+    pub fn with_json(status: u16, value: &serde_json::Value) -> Result<Self> {
+        let body = serde_json::to_vec(value).map_err(|error| AcmeError::Decode {
+            url: "response".to_string(),
+            reason: error.to_string(),
+        })?;
+        Ok(Self::new(status)
+            .with_header("Content-Type", "application/json")
+            .with_body(body))
+    }
+
+    /// A problem-document response body (`application/problem+json`).
+    pub fn with_problem(status: u16, value: &serde_json::Value) -> Result<Self> {
+        let body = serde_json::to_vec(value).map_err(|error| AcmeError::Decode {
+            url: "response".to_string(),
+            reason: error.to_string(),
+        })?;
+        Ok(Self::new(status)
+            .with_header("Content-Type", PROBLEM_CONTENT_TYPE)
+            .with_body(body))
+    }
+
+    /// Whether the status is in the 2xx range.
+    pub fn is_success(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
+
+    /// Look up a header by case-insensitive name (the last configured value wins).
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .rev()
+            .find(|(header, _)| header.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
+    /// The `Replay-Nonce` header, when present.
+    pub fn replay_nonce(&self) -> Option<&str> {
+        self.header("Replay-Nonce")
+    }
+
+    /// The `Location` header, when present.
+    pub fn location(&self) -> Option<&str> {
+        self.header("Location")
+    }
+
+    /// The response body decoded as UTF-8 (lossily) for diagnostics.
+    pub fn body_text(&self) -> String {
+        String::from_utf8_lossy(&self.body).to_string()
+    }
+
+    /// Decode the body as JSON, citing `url` on failure.
+    pub fn json<T: DeserializeOwned>(&self, url: &str) -> Result<T> {
+        serde_json::from_slice(&self.body).map_err(|error| {
+            AcmeError::Decode {
+                url: url.to_string(),
+                reason: error.to_string(),
+            }
+            .into()
+        })
+    }
+
+    /// Parse the body as an ACME problem document when it is one.
+    pub fn problem(&self) -> Option<Problem> {
+        let is_problem = self
+            .header("Content-Type")
+            .map(|content_type| content_type.starts_with(PROBLEM_CONTENT_TYPE))
+            .unwrap_or(false);
+        if !is_problem && self.status < 400 {
+            return None;
+        }
+        let problem: Problem = serde_json::from_slice(&self.body).ok()?;
+        if problem.problem_type.starts_with(ACME_ERROR_PREFIX) {
+            Some(problem)
+        } else {
+            None
+        }
+    }
+}
+
+/// Convert an error response into a located [`AcmeError`].
+fn response_error(url: &str, response: &HttpResponse) -> Error {
+    match response.problem() {
+        Some(problem) => AcmeError::from_problem(url, response.status, problem).into(),
+        None => {
+            let mut detail = response.body_text();
+            detail.truncate(500);
+            AcmeError::UnexpectedStatus {
+                url: url.to_string(),
+                status: response.status,
+                detail,
+            }
+            .into()
+        }
+    }
+}
+
+/// The ACME directory document (RFC 8555 §7.1.1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Directory {
+    /// `newNonce` endpoint.
+    #[serde(default)]
+    pub new_nonce: String,
+    /// `newAccount` endpoint.
+    #[serde(default)]
+    pub new_account: String,
+    /// `newOrder` endpoint.
+    #[serde(default)]
+    pub new_order: String,
+    /// `revokeCert` endpoint.
+    #[serde(default)]
+    pub revoke_cert: String,
+    /// Optional `keyChange` endpoint.
+    #[serde(default)]
+    pub key_change: Option<String>,
+    /// Optional `renewalInfo` (ARI) endpoint.
+    #[serde(default)]
+    pub renewal_info: Option<String>,
+    /// Optional directory metadata.
+    #[serde(default)]
+    pub meta: Option<DirectoryMeta>,
+}
+
+/// Optional directory metadata (RFC 8555 §7.1.1 and the ARI/profile extensions).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectoryMeta {
+    /// Terms-of-service URL.
+    #[serde(default)]
+    pub terms_of_service: Option<String>,
+    /// CA website URL.
+    #[serde(default)]
+    pub website: Option<String>,
+    /// CAA identities the CA recognises.
+    #[serde(default)]
+    pub caa_identities: Option<Vec<String>>,
+    /// Whether external account binding is mandatory.
+    #[serde(default)]
+    pub external_account_required: Option<bool>,
+    /// Optional ACME profile descriptions keyed by profile name.
+    #[serde(default)]
+    pub profiles: Option<BTreeMap<String, String>>,
+}
+
+impl Directory {
+    /// Parse and validate a directory document fetched from `url`.
+    pub fn parse(url: &str, body: &[u8]) -> Result<Self> {
+        let directory: Self =
+            serde_json::from_slice(body).map_err(|error| AcmeError::InvalidDirectory {
+                url: url.to_string(),
+                reason: error.to_string(),
+            })?;
+        directory.validate(url)?;
+        Ok(directory)
+    }
+
+    /// Validate that the endpoints RFC 8555 requires are present.
+    pub fn validate(&self, url: &str) -> Result<()> {
+        let required: [(&'static str, &str); 4] = [
+            ("newNonce", &self.new_nonce),
+            ("newAccount", &self.new_account),
+            ("newOrder", &self.new_order),
+            ("revokeCert", &self.revoke_cert),
+        ];
+        for (field, value) in required {
+            if value.trim().is_empty() {
+                return Err(AcmeError::MissingDirectoryField {
+                    url: url.to_string(),
+                    field,
+                }
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Terms-of-service URL, if the CA advertises one.
+    pub fn terms_of_service(&self) -> Option<&str> {
+        self.meta
+            .as_ref()
+            .and_then(|meta| meta.terms_of_service.as_deref())
+    }
+
+    /// Whether the CA requires external account binding.
+    pub fn external_account_required(&self) -> bool {
+        self.meta
+            .as_ref()
+            .and_then(|meta| meta.external_account_required)
+            .unwrap_or(false)
+    }
+}
+
+/// An RFC 7807 problem document as returned by an ACME server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Problem {
+    /// Problem type URI (for example `urn:ietf:params:acme:error:accountDoesNotExist`).
+    #[serde(rename = "type")]
+    pub problem_type: String,
+    /// Human-readable detail.
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// HTTP status suggested by the CA.
+    #[serde(default)]
+    pub status: Option<u16>,
+    /// Sub-problems (order authorization failures and similar).
+    #[serde(default)]
+    pub subproblems: Vec<Subproblem>,
+    /// Identifier the problem refers to, when provided.
+    #[serde(default)]
+    pub identifier: Option<serde_json::Value>,
+}
+
+/// One entry of a problem document's `subproblems`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Subproblem {
+    /// Problem type URI.
+    #[serde(rename = "type")]
+    pub problem_type: String,
+    /// Human-readable detail.
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// Identifier the sub-problem refers to.
+    #[serde(default)]
+    pub identifier: Option<serde_json::Value>,
+}
+
+/// A JSON Web Key for an ACME account (public key only).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Jwk {
+    /// Key type, always `EC` for this build.
+    pub kty: String,
+    /// Curve, always `P-256` for this build.
+    pub crv: String,
+    /// Base64url-encoded X coordinate.
+    pub x: String,
+    /// Base64url-encoded Y coordinate.
+    pub y: String,
+}
+
+impl Jwk {
+    /// Build the JWK for an uncompressed P-256 public key (`0x04 || X || Y`).
+    pub fn for_p256(public_key: &[u8]) -> Result<Self> {
+        if public_key.len() != 65 || public_key[0] != 0x04 {
+            return Err(AcmeError::AccountKey(format!(
+                "P-256 public key must be 65 bytes in uncompressed form, got {} bytes",
+                public_key.len()
+            ))
+            .into());
+        }
+        Ok(Self {
+            kty: "EC".to_string(),
+            crv: "P-256".to_string(),
+            x: URL_SAFE_NO_PAD.encode(&public_key[1..33]),
+            y: URL_SAFE_NO_PAD.encode(&public_key[33..65]),
+        })
+    }
+
+    /// The RFC 7638 SHA-256 thumbprint, base64url encoded.
+    ///
+    /// The canonical form for an EC JWK is `{"crv":...,"kty":...,"x":...,"y":...}` with members
+    /// in lexicographic order and no whitespace.
+    pub fn thumbprint(&self) -> Result<String> {
+        let canonical = format!(
+            "{{\"crv\":\"{}\",\"kty\":\"{}\",\"x\":\"{}\",\"y\":\"{}\"}}",
+            self.crv, self.kty, self.x, self.y
+        );
+        let digest = ring::digest::digest(&ring::digest::SHA256, canonical.as_bytes());
+        Ok(URL_SAFE_NO_PAD.encode(digest.as_ref()))
+    }
+
+    /// Canonical JSON encoding used for signatures and external account binding payloads.
+    pub fn to_canonical_json(&self) -> Result<Vec<u8>> {
+        serde_json::to_vec(self).map_err(|error| {
+            AcmeError::Decode {
+                url: "jwk".to_string(),
+                reason: error.to_string(),
+            }
+            .into()
+        })
+    }
+}
+
+const PEM_LABEL: &str = "PRIVATE KEY";
+
+/// Encode DER bytes as a PEM block.
+fn pem_encode(label: &str, der: &[u8]) -> String {
+    let encoded = STANDARD.encode(der);
+    let mut pem = String::with_capacity(encoded.len() + encoded.len() / 64 + 64);
+    pem.push_str("-----BEGIN ");
+    pem.push_str(label);
+    pem.push_str("-----\n");
+    for chunk in encoded.as_bytes().chunks(64) {
+        // `encoded` is ASCII base64, so the chunk is always valid UTF-8.
+        pem.push_str(std::str::from_utf8(chunk).unwrap_or_default());
+        pem.push('\n');
+    }
+    pem.push_str("-----END ");
+    pem.push_str(label);
+    pem.push_str("-----\n");
+    pem
+}
+
+/// Decode the first PEM block from `pem`, returning its label and DER bytes.
+fn pem_decode(pem: &str) -> Result<(String, Vec<u8>)> {
+    let mut label: Option<String> = None;
+    let mut body = String::new();
+    let mut done = false;
+    for line in pem.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("-----BEGIN ") {
+            let Some(begin_label) = rest.strip_suffix("-----") else {
+                continue;
+            };
+            label = Some(begin_label.to_string());
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("-----END ") {
+            let Some(end_label) = rest.strip_suffix("-----") else {
+                continue;
+            };
+            match label.as_deref() {
+                Some(begin_label) if begin_label == end_label => {
+                    done = true;
+                    break;
+                }
+                Some(begin_label) => {
+                    return Err(AcmeError::AccountKey(format!(
+                        "PEM block has mismatched labels `{begin_label}` and `{end_label}`"
+                    ))
+                    .into())
+                }
+                None => continue,
+            }
+        }
+        if label.is_some() {
+            body.extend(line.chars().filter(|character| !character.is_whitespace()));
+        }
+    }
+    let Some(label) = label else {
+        return Err(AcmeError::AccountKey("no PEM block found in account key".to_string()).into());
+    };
+    if !done {
+        return Err(
+            AcmeError::AccountKey(format!("PEM block `{label}` has no matching END line")).into(),
+        );
+    }
+    let der = STANDARD.decode(body.as_bytes()).map_err(|error| {
+        AcmeError::AccountKey(format!("PEM block `{label}` is not valid base64: {error}"))
+    })?;
+    Ok((label, der))
+}
+
+/// An ECDSA P-256 ACME account key.
+///
+/// Signing uses ES256 (ECDSA P-256 + SHA-256), the default account key type generated by Caddy's
+/// certmagic. Key material is kept in PKCS#8 PEM form so it can be persisted with
+/// [`AcmeStorage`].
+pub struct AccountKey {
+    pem: String,
+    public_key: Vec<u8>,
+    key_pair: EcdsaKeyPair,
+}
+
+impl fmt::Debug for AccountKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AccountKey")
+            .field("algorithm", &"ES256")
+            .field("public_key", &URL_SAFE_NO_PAD.encode(&self.public_key))
+            .finish_non_exhaustive()
+    }
+}
+
+impl AccountKey {
+    /// Generate a fresh ECDSA P-256 account key.
+    pub fn generate() -> Result<Self> {
+        let rng = SystemRandom::new();
+        let document = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
+            .map_err(|error| AcmeError::AccountKey(format!("generating P-256 key: {error}")))?;
+        Self::from_pkcs8(document.as_ref())
+    }
+
+    /// Parse a PKCS#8 DER-encoded ECDSA P-256 account key.
+    pub fn from_pkcs8(der: &[u8]) -> Result<Self> {
+        let rng = SystemRandom::new();
+        let key_pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, der, &rng)
+            .map_err(|error| {
+                AcmeError::AccountKey(format!(
+                    "only PKCS#8 ECDSA P-256 account keys are supported: {error}"
+                ))
+            })?;
+        let public_key = key_pair.public_key().as_ref().to_vec();
+        let pem = pem_encode(PEM_LABEL, der);
+        Ok(Self {
+            pem,
+            public_key,
+            key_pair,
+        })
+    }
+
+    /// Load an account key from PKCS#8 PEM (`-----BEGIN PRIVATE KEY-----`).
+    pub fn from_pkcs8_pem(pem: &str) -> Result<Self> {
+        let (label, der) = pem_decode(pem)?;
+        if label != PEM_LABEL {
+            return Err(AcmeError::AccountKey(format!(
+                "unsupported account key PEM label `{label}`; expected PKCS#8 `{PEM_LABEL}` with an ECDSA P-256 key"
+            ))
+            .into());
+        }
+        Self::from_pkcs8(&der)
+    }
+
+    /// The account key in PKCS#8 PEM form.
+    pub fn to_pkcs8_pem(&self) -> &str {
+        &self.pem
+    }
+
+    /// The uncompressed P-256 public key bytes (`0x04 || X || Y`).
+    pub fn public_key_bytes(&self) -> &[u8] {
+        &self.public_key
+    }
+
+    /// The public JWK for this account key.
+    pub fn public_jwk(&self) -> Result<Jwk> {
+        Jwk::for_p256(&self.public_key)
+    }
+
+    /// The RFC 7638 SHA-256 thumbprint, base64url encoded.
+    pub fn thumbprint(&self) -> Result<String> {
+        self.public_jwk()?.thumbprint()
+    }
+
+    /// Sign `message` with ES256, returning the 64-byte `r || s` signature.
+    pub fn sign_es256(&self, message: &[u8]) -> Result<[u8; 64]> {
+        let rng = SystemRandom::new();
+        let signature = self
+            .key_pair
+            .sign(&rng, message)
+            .map_err(|error| AcmeError::Signing(format!("ES256 signing failed: {error}")))?;
+        let bytes = signature.as_ref();
+        if bytes.len() != 64 {
+            return Err(AcmeError::Signing(format!(
+                "ES256 signature must be 64 bytes, got {}",
+                bytes.len()
+            ))
+            .into());
+        }
+        let mut fixed = [0_u8; 64];
+        fixed.copy_from_slice(bytes);
+        Ok(fixed)
+    }
+
+    /// Verify an ES256 signature with this key's public half (used by tests and diagnostics).
+    pub fn verify_es256(&self, message: &[u8], signature: &[u8]) -> bool {
+        UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, &self.public_key)
+            .verify(message, signature)
+            .is_ok()
+    }
+}
+
+#[derive(Serialize)]
+struct JwsHeader<'a> {
+    alg: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kid: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    jwk: Option<Jwk>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nonce: Option<&'a str>,
+    url: &'a str,
+}
+
+/// Sign an ACME request payload as a flattened JWS (RFC 7515 §7.2.2).
+///
+/// Exactly one of `kid` (existing account) or the account key's `jwk` (new account) is placed in
+/// the protected header. Returns the JSON body to POST as `application/jose+json`.
+pub fn sign_jws(
+    key: &AccountKey,
+    kid: Option<&str>,
+    nonce: Option<&str>,
+    url: &str,
+    payload: &[u8],
+) -> Result<String> {
+    let header = JwsHeader {
+        alg: "ES256",
+        kid,
+        jwk: if kid.is_none() {
+            Some(key.public_jwk()?)
+        } else {
+            None
+        },
+        nonce,
+        url,
+    };
+    let protected =
+        URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&header).map_err(|error| AcmeError::Decode {
+                url: url.to_string(),
+                reason: error.to_string(),
+            })?,
+        );
+    let encoded_payload = URL_SAFE_NO_PAD.encode(payload);
+    let signing_input = format!("{protected}.{encoded_payload}");
+    let signature = key.sign_es256(signing_input.as_bytes())?;
+    let body = serde_json::json!({
+        "protected": protected,
+        "payload": encoded_payload,
+        "signature": URL_SAFE_NO_PAD.encode(signature),
+    });
+    serde_json::to_string(&body).map_err(|error| {
+        AcmeError::Decode {
+            url: url.to_string(),
+            reason: error.to_string(),
+        }
+        .into()
+    })
+}
+
+/// External account binding credentials configured as `external_account` in Caddy's
+/// `tls.issuance.acme` JSON (`{"key_id": "...", "mac_key": "..."}`).
+///
+/// Both certmagic's `key_id`/`mac_key` member names and the `kid`/`hmac_key` spelling used by some
+/// ACME tooling are accepted when reading configuration; the certmagic spelling is emitted when
+/// serialising.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalAccount {
+    /// CA-assigned key identifier (`key_id` in Caddy JSON, `kid` in the EAB JWS header).
+    #[serde(rename = "key_id", alias = "kid")]
+    pub kid: String,
+    /// Base64url-encoded HMAC key (`mac_key` in Caddy JSON).
+    #[serde(rename = "mac_key", alias = "hmac_key")]
+    pub hmac_key: String,
+}
+
+impl ExternalAccount {
+    /// Build the `externalAccountBinding` JWS (HS256) for a new-account request.
+    pub fn binding(
+        &self,
+        account_key: &AccountKey,
+        new_account_url: &str,
+    ) -> Result<serde_json::Value> {
+        #[derive(Serialize)]
+        struct EabHeader<'a> {
+            alg: &'a str,
+            kid: &'a str,
+            url: &'a str,
+        }
+        let protected = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&EabHeader {
+                alg: "HS256",
+                kid: &self.kid,
+                url: new_account_url,
+            })
+            .map_err(|error| AcmeError::Decode {
+                url: new_account_url.to_string(),
+                reason: error.to_string(),
+            })?,
+        );
+        let payload = URL_SAFE_NO_PAD.encode(account_key.public_jwk()?.to_canonical_json()?);
+        let signing_input = format!("{protected}.{payload}");
+        let mac_key = URL_SAFE_NO_PAD
+            .decode(self.hmac_key.as_bytes())
+            .map_err(|error| {
+                AcmeError::ExternalAccount(format!("EAB hmac_key is not valid base64url: {error}"))
+            })?;
+        let hmac_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &mac_key);
+        let tag = ring::hmac::sign(&hmac_key, signing_input.as_bytes());
+        Ok(serde_json::json!({
+            "protected": protected,
+            "payload": payload,
+            "signature": URL_SAFE_NO_PAD.encode(tag.as_ref()),
+        }))
+    }
+}
+
+/// Status of an ACME account (RFC 8555 §7.1.2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AccountStatus {
+    /// Account is valid and can issue certificates.
+    #[default]
+    Valid,
+    /// Account was deactivated by its owner.
+    Deactivated,
+    /// Account was revoked by the CA.
+    Revoked,
+    /// A status added by a future ACME extension; surfaced instead of failing the parse.
+    #[serde(other)]
+    Unknown,
+}
+
+/// An account object returned by the CA (RFC 8555 §7.1.2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Account {
+    /// Account status.
+    #[serde(default)]
+    pub status: AccountStatus,
+    /// Contact URIs, normally `mailto:` addresses.
+    #[serde(default)]
+    pub contact: Vec<String>,
+    /// Orders URL for this account.
+    #[serde(default)]
+    pub orders: Option<String>,
+    /// Whether the terms of service were agreed to.
+    #[serde(default)]
+    pub terms_of_service_agreed: Option<bool>,
+    /// External account binding echo, when the CA returns one.
+    #[serde(default)]
+    pub external_account_binding: Option<serde_json::Value>,
+}
+
+/// The new-account request payload (RFC 8555 §7.3).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewAccountRequest {
+    /// Contact URIs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contact: Vec<String>,
+    /// Whether the caller agrees to the CA's terms of service.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub terms_of_service_agreed: bool,
+    /// Look up an existing account instead of creating one.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub only_return_existing: bool,
+    /// Signed external account binding JWS, when the CA requires EAB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_account_binding: Option<serde_json::Value>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Description of the account to register, before it is signed and sent.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AccountRegistration {
+    /// Contact URIs.
+    pub contact: Vec<String>,
+    /// Whether the caller agrees to the CA's terms of service.
+    pub terms_of_service_agreed: bool,
+    /// Look up an existing account instead of creating one.
+    pub only_return_existing: bool,
+    /// Optional external account binding credentials.
+    pub external_account: Option<ExternalAccount>,
+}
+
+impl AccountRegistration {
+    /// A registration for `email` that agrees to the terms of service.
+    pub fn for_email(email: impl AsRef<str>) -> Self {
+        Self {
+            contact: vec![format!("mailto:{}", email.as_ref())],
+            terms_of_service_agreed: true,
+            only_return_existing: false,
+            external_account: None,
+        }
+    }
+
+    /// Build the wire payload, signing the external account binding when configured.
+    pub fn to_wire_request(
+        &self,
+        account_key: &AccountKey,
+        new_account_url: &str,
+    ) -> Result<NewAccountRequest> {
+        let external_account_binding = match &self.external_account {
+            Some(external_account) => Some(external_account.binding(account_key, new_account_url)?),
+            None => None,
+        };
+        Ok(NewAccountRequest {
+            contact: self.contact.clone(),
+            terms_of_service_agreed: self.terms_of_service_agreed,
+            only_return_existing: self.only_return_existing,
+            external_account_binding,
+        })
+    }
+}
+
+/// The registered account record persisted through [`AcmeStorage`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredAccount {
+    /// Directory URL the account belongs to.
+    pub directory_url: String,
+    /// Account URL from the `Location` header (used as `kid` for signed requests).
+    pub account_url: String,
+    /// Contact URIs.
+    pub contact: Vec<String>,
+    /// Account status at registration time.
+    pub status: AccountStatus,
+    /// Whether the terms of service were agreed to.
+    pub terms_of_service_agreed: bool,
+    /// RFC 7638 thumbprint of the account key.
+    pub key_thumbprint: String,
+}
+
+/// HTTP transport used by [`AcmeClient`].
+///
+/// Production code plugs in a real HTTP client (the workspace has hyper); tests use a scripted
+/// mock. Keeping this at the HTTP-message level means the ACME protocol logic (JWS, nonces,
+/// problem documents) is exercised without network access.
+#[async_trait]
+pub trait AcmeTransport: Send + Sync {
+    /// Perform one HTTP request.
+    async fn request(&self, request: HttpRequest) -> Result<HttpResponse>;
+}
+
+/// An ACME client bound to one directory, one account key, and one transport.
+pub struct AcmeClient<T: AcmeTransport> {
+    transport: T,
+    directory_url: String,
+    directory: Directory,
+    account_key: AccountKey,
+    nonce: Mutex<Option<String>>,
+}
+
+impl<T: AcmeTransport> AcmeClient<T> {
+    /// Fetch `directory_url` and create a client for `account_key`.
+    pub async fn connect(
+        transport: T,
+        directory_url: impl Into<String>,
+        account_key: AccountKey,
+    ) -> Result<Self> {
+        let directory_url = directory_url.into();
+        let response = transport.request(HttpRequest::get(&directory_url)).await?;
+        if !response.is_success() {
+            return Err(response_error(&directory_url, &response));
+        }
+        let directory = Directory::parse(&directory_url, &response.body)?;
+        let nonce = response.replay_nonce().map(str::to_string);
+        Ok(Self {
+            transport,
+            directory_url,
+            directory,
+            account_key,
+            nonce: Mutex::new(nonce),
+        })
+    }
+
+    /// The discovered directory.
+    pub fn directory(&self) -> &Directory {
+        &self.directory
+    }
+
+    /// The directory URL this client was created for.
+    pub fn directory_url(&self) -> &str {
+        &self.directory_url
+    }
+
+    /// The account key used for signing.
+    pub fn account_key(&self) -> &AccountKey {
+        &self.account_key
+    }
+
+    /// Remember the `Replay-Nonce` from a response for the next request.
+    async fn record_nonce(&self, response: &HttpResponse) {
+        if let Some(nonce) = response.replay_nonce() {
+            *self.nonce.lock().await = Some(nonce.to_string());
+        }
+    }
+
+    /// Take a cached nonce or fetch a fresh one from the `newNonce` endpoint.
+    pub async fn next_nonce(&self) -> Result<String> {
+        if let Some(nonce) = self.nonce.lock().await.take() {
+            return Ok(nonce);
+        }
+        let url = self.directory.new_nonce.clone();
+        let request = HttpRequest::head(&url);
+        let response = self.transport.request(request).await?;
+        self.record_nonce(&response).await;
+        if !response.is_success() {
+            return Err(response_error(&url, &response));
+        }
+        response.replay_nonce().map(str::to_string).ok_or_else(|| {
+            AcmeError::MissingHeader {
+                url: url.clone(),
+                header: "Replay-Nonce",
+            }
+            .into()
+        })
+    }
+
+    /// Sign and POST `payload` to `url` as a flattened JWS.
+    ///
+    /// `kid` is the account URL for existing accounts, or `None` for `newAccount`, where the
+    /// public JWK is embedded in the protected header instead.
+    pub async fn post_signed(
+        &self,
+        url: &str,
+        kid: Option<&str>,
+        payload: &[u8],
+    ) -> Result<HttpResponse> {
+        let nonce = self.next_nonce().await?;
+        let body = sign_jws(&self.account_key, kid, Some(&nonce), url, payload)?;
+        let request = HttpRequest::post_jose(url, body.into_bytes());
+        let response = self.transport.request(request).await?;
+        self.record_nonce(&response).await;
+        Ok(response)
+    }
+
+    /// Register (or look up) an account and return the persisted record.
+    ///
+    /// When the directory advertises a terms-of-service URL and the registration does not agree
+    /// to it, this fails with [`AcmeError::TermsOfServiceRequired`] before any request is sent.
+    pub async fn register_account(
+        &self,
+        registration: &AccountRegistration,
+    ) -> Result<StoredAccount> {
+        let url = self.directory.new_account.clone();
+        if let Some(terms_url) = self.directory.terms_of_service() {
+            if !registration.terms_of_service_agreed && !registration.only_return_existing {
+                return Err(AcmeError::TermsOfServiceRequired {
+                    url: terms_url.to_string(),
+                }
+                .into());
+            }
+        }
+        if self.directory.external_account_required()
+            && registration.external_account.is_none()
+            && !registration.only_return_existing
+        {
+            return Err(AcmeError::ExternalAccount(format!(
+                "CA `{}` requires external account binding, but no `external_account` credentials are configured",
+                self.directory_url
+            ))
+            .into());
+        }
+
+        let request = registration.to_wire_request(&self.account_key, &url)?;
+        let payload = serde_json::to_vec(&request).map_err(|error| AcmeError::Decode {
+            url: url.clone(),
+            reason: error.to_string(),
+        })?;
+        let response = self.post_signed(&url, None, &payload).await?;
+        if !response.is_success() {
+            return Err(response_error(&url, &response));
+        }
+        let account: Account = response.json(&url)?;
+        let account_url = response
+            .location()
+            .ok_or_else(|| AcmeError::MissingHeader {
+                url: url.clone(),
+                header: "Location",
+            })?
+            .to_string();
+        let contact = if account.contact.is_empty() {
+            request.contact.clone()
+        } else {
+            account.contact.clone()
+        };
+        Ok(StoredAccount {
+            directory_url: self.directory_url.clone(),
+            account_url,
+            contact,
+            status: account.status,
+            terms_of_service_agreed: account
+                .terms_of_service_agreed
+                .unwrap_or(request.terms_of_service_agreed),
+            key_thumbprint: self.account_key.thumbprint()?,
+        })
+    }
+}
+
+/// Blob storage used for ACME account keys and account records.
+///
+/// This is intentionally separate from [`crate::storage::CertificateStorage`]: account material
+/// is raw PEM/JSON rather than a typed certificate record. [`FileStorage`] implements this trait,
+/// and [`MemoryAcmeStorage`] provides an in-memory backend for tests.
+#[async_trait]
+pub trait AcmeStorage: Send + Sync {
+    /// Backend name (for diagnostics and `list-modules`).
+    fn name(&self) -> &'static str;
+
+    /// Load a value by key.
+    async fn load(&self, key: &str) -> Result<Option<Vec<u8>>>;
+
+    /// Store a value under a key, replacing any previous value.
+    async fn store(&self, key: &str, value: &[u8]) -> Result<()>;
+
+    /// Delete a value; deleting a missing key succeeds.
+    async fn delete(&self, key: &str) -> Result<()>;
+}
+
+/// In-memory [`AcmeStorage`], used by tests and ephemeral deployments.
+#[derive(Debug, Default)]
+pub struct MemoryAcmeStorage {
+    values: RwLock<BTreeMap<String, Vec<u8>>>,
+}
+
+impl MemoryAcmeStorage {
+    /// Create empty storage.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait]
+impl AcmeStorage for MemoryAcmeStorage {
+    fn name(&self) -> &'static str {
+        "memory"
+    }
+
+    async fn load(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .values
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(key)
+            .cloned())
+    }
+
+    async fn store(&self, key: &str, value: &[u8]) -> Result<()> {
+        self.values
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key.to_string(), value.to_vec());
+        Ok(())
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.values
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(key);
+        Ok(())
+    }
+}
+
+fn storage_path(root: &Path, key: &str) -> Result<PathBuf> {
+    if key.is_empty() || key.contains("..") || key.starts_with('/') || key.contains('\0') {
+        return Err(Error::InvalidKey(key.to_string()));
+    }
+    Ok(root.join(key))
+}
+
+/// [`AcmeStorage`] over the filesystem certificate storage root.
+///
+/// Values live under `acme/...` inside the same root Caddy's `file_system` storage uses, so
+/// account material survives restarts without a second configured backend.
+#[async_trait]
+impl AcmeStorage for FileStorage {
+    fn name(&self) -> &'static str {
+        "file_system"
+    }
+
+    async fn load(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        let path = storage_path(self.root(), key)?;
+        match fs::read(&path).await {
+            Ok(value) => Ok(Some(value)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(Error::Io(error)),
+        }
+    }
+
+    async fn store(&self, key: &str, value: &[u8]) -> Result<()> {
+        let path = storage_path(self.root(), key)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        let temporary = path.with_extension("tmp");
+        fs::write(&temporary, value).await?;
+        fs::rename(&temporary, &path).await?;
+        Ok(())
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        let path = storage_path(self.root(), key)?;
+        match fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(Error::Io(error)),
+        }
+    }
+}
+
+/// Storage keys for one account under one CA directory.
+///
+/// The layout mirrors certmagic's account tree (`acme/<ca-directory>/users/<account>/account.key`
+/// and `account.json`), where the CA directory name is the directory URL without its scheme and
+/// with path separators replaced by `-`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountPaths {
+    /// Storage key of the PKCS#8 account key PEM.
+    pub account_key: String,
+    /// Storage key of the [`StoredAccount`] JSON record.
+    pub account: String,
+}
+
+/// Compute the storage keys for `directory_url` and `email`.
+pub fn account_paths(directory_url: &str, email: Option<&str>) -> Result<AccountPaths> {
+    let directory = sanitize_directory_url(directory_url)?;
+    let user = match email {
+        Some(email) if !email.trim().is_empty() => sanitize_segment(email),
+        _ => "default".to_string(),
+    };
+    Ok(AccountPaths {
+        account_key: format!("acme/{directory}/users/{user}/account.key"),
+        account: format!("acme/{directory}/users/{user}/account.json"),
+    })
+}
+
+fn sanitize_directory_url(directory_url: &str) -> Result<String> {
+    let trimmed = directory_url.trim();
+    let without_scheme = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .unwrap_or(trimmed);
+    if without_scheme.is_empty() {
+        return Err(
+            AcmeError::AccountKey(format!("invalid ACME directory URL `{directory_url}`")).into(),
+        );
+    }
+    let mut sanitized = String::with_capacity(without_scheme.len());
+    for (index, character) in without_scheme.chars().enumerate() {
+        if character == '/' {
+            // Trim a single trailing slash, as `.../directory/` and `.../directory` are the same.
+            if index + 1 == without_scheme.len() {
+                continue;
+            }
+            sanitized.push('-');
+        } else if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+            sanitized.push(character);
+        } else {
+            sanitized.push('-');
+        }
+    }
+    Ok(sanitized)
+}
+
+fn sanitize_segment(segment: &str) -> String {
+    let mut sanitized = String::with_capacity(segment.len());
+    for character in segment.trim().chars() {
+        if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_' | '@' | '+') {
+            sanitized.push(character);
+        } else {
+            sanitized.push('-');
+        }
+    }
+    if sanitized.is_empty() {
+        "default".to_string()
+    } else {
+        sanitized
+    }
+}
+
+/// Loads and persists ACME account keys and account records through an [`AcmeStorage`] backend.
+#[derive(Debug, Clone)]
+pub struct AccountStore<S: AcmeStorage> {
+    storage: S,
+    email: Option<String>,
+}
+
+impl<S: AcmeStorage> AccountStore<S> {
+    /// Create a store for `email` (or the `default` account when `None`).
+    pub fn new(storage: S, email: Option<String>) -> Self {
+        Self { storage, email }
+    }
+
+    /// The backing storage.
+    pub fn storage(&self) -> &S {
+        &self.storage
+    }
+
+    /// The configured account email.
+    pub fn email(&self) -> Option<&str> {
+        self.email.as_deref()
+    }
+
+    /// Compute the storage keys for `directory_url`.
+    pub fn paths(&self, directory_url: &str) -> Result<AccountPaths> {
+        account_paths(directory_url, self.email.as_deref())
+    }
+
+    /// Resolve the account key for `directory_url`.
+    ///
+    /// A non-empty `configured_pem` (Caddy's `tls.issuance.acme.account_key`) takes precedence
+    /// over storage, mirroring certmagic's behaviour: the configured key is loaded first and only
+    /// used to look up an existing account; it is never written back to storage. Without a
+    /// configured key, this loads the persisted key or generates and stores a new one.
+    pub async fn account_key(
+        &self,
+        directory_url: &str,
+        configured_pem: Option<&str>,
+    ) -> Result<(AccountKey, bool)> {
+        match configured_pem {
+            Some(pem) if !pem.trim().is_empty() => Ok((AccountKey::from_pkcs8_pem(pem)?, false)),
+            _ => self.load_or_create_account_key(directory_url).await,
+        }
+    }
+
+    /// Load the account key for `directory_url`, generating and storing one on first use.
+    ///
+    /// Returns the key and whether it was newly created.
+    pub async fn load_or_create_account_key(
+        &self,
+        directory_url: &str,
+    ) -> Result<(AccountKey, bool)> {
+        let paths = self.paths(directory_url)?;
+        match self.storage.load(&paths.account_key).await? {
+            Some(value) => {
+                let pem = String::from_utf8(value).map_err(|error| {
+                    AcmeError::AccountKey(format!(
+                        "stored account key `{}` is not UTF-8 PEM: {error}",
+                        paths.account_key
+                    ))
+                })?;
+                Ok((AccountKey::from_pkcs8_pem(&pem)?, false))
+            }
+            None => {
+                let key = AccountKey::generate()?;
+                self.storage
+                    .store(&paths.account_key, key.to_pkcs8_pem().as_bytes())
+                    .await?;
+                Ok((key, true))
+            }
+        }
+    }
+
+    /// Persist a registered account record.
+    pub async fn save_account(&self, account: &StoredAccount) -> Result<()> {
+        let paths = self.paths(&account.directory_url)?;
+        let value = serde_json::to_vec_pretty(account).map_err(|error| AcmeError::Decode {
+            url: paths.account.clone(),
+            reason: error.to_string(),
+        })?;
+        self.storage.store(&paths.account, &value).await
+    }
+
+    /// Load a previously persisted account record for `directory_url`.
+    pub async fn load_account(&self, directory_url: &str) -> Result<Option<StoredAccount>> {
+        let paths = self.paths(directory_url)?;
+        let Some(value) = self.storage.load(&paths.account).await? else {
+            return Ok(None);
+        };
+        let account = serde_json::from_slice(&value).map_err(|error| AcmeError::Decode {
+            url: paths.account.clone(),
+            reason: error.to_string(),
+        })?;
+        Ok(Some(account))
+    }
+
+    /// Delete the persisted account key and record for `directory_url`.
+    pub async fn delete_account(&self, directory_url: &str) -> Result<()> {
+        let paths = self.paths(directory_url)?;
+        self.storage.delete(&paths.account_key).await?;
+        self.storage.delete(&paths.account).await
+    }
+}
+
+impl<S: AcmeStorage> AccountStore<S> {
+    /// Register an account with `client` and persist the resulting record.
+    pub async fn register_account<T: AcmeTransport>(
+        &self,
+        client: &AcmeClient<T>,
+        registration: &AccountRegistration,
+    ) -> Result<StoredAccount> {
+        let account = client.register_account(registration).await?;
+        self.save_account(&account).await?;
+        Ok(account)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    // ---- mock transport -------------------------------------------------------------------
+
+    #[derive(Debug, Default)]
+    struct MockTransport {
+        script: std::sync::Mutex<std::collections::VecDeque<(HttpMethod, String, HttpResponse)>>,
+        requests: std::sync::Mutex<Vec<HttpRequest>>,
+    }
+
+    impl MockTransport {
+        fn new(script: Vec<(HttpMethod, &str, HttpResponse)>) -> Self {
+            Self {
+                script: std::sync::Mutex::new(
+                    script
+                        .into_iter()
+                        .map(|(method, url, response)| (method, url.to_string(), response))
+                        .collect(),
+                ),
+                requests: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn records(&self) -> Vec<HttpRequest> {
+            self.requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+
+        fn remaining(&self) -> usize {
+            self.script
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len()
+        }
+    }
+
+    #[async_trait]
+    impl AcmeTransport for Arc<MockTransport> {
+        async fn request(&self, request: HttpRequest) -> Result<HttpResponse> {
+            self.requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(request.clone());
+            let next = self
+                .script
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .pop_front()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "mock transport has no response for {} {}",
+                        request.method, request.url
+                    )
+                });
+            assert_eq!(
+                next.0, request.method,
+                "unexpected method for {}",
+                request.url
+            );
+            assert_eq!(next.1, request.url, "unexpected request URL");
+            Ok(next.2)
+        }
+    }
+
+    // ---- fixtures -------------------------------------------------------------------------
+
+    const DIRECTORY_URL: &str = "https://acme.test/directory";
+    const NEW_ACCOUNT_URL: &str = "https://acme.test/acme/new-account";
+
+    fn directory_json() -> serde_json::Value {
+        serde_json::json!({
+            "newNonce": "https://acme.test/acme/new-nonce",
+            "newAccount": NEW_ACCOUNT_URL,
+            "newOrder": "https://acme.test/acme/new-order",
+            "revokeCert": "https://acme.test/acme/revoke-cert",
+            "keyChange": "https://acme.test/acme/key-change",
+            "renewalInfo": "https://acme.test/acme/renewal-info",
+            "meta": {
+                "termsOfService": "https://acme.test/terms",
+                "website": "https://acme.test/",
+                "caaIdentities": ["acme.test"],
+                "externalAccountRequired": false,
+                "profiles": {"shortlived": "Short-lived certificates"}
+            }
+        })
+    }
+
+    fn directory_response() -> HttpResponse {
+        HttpResponse::with_json(200, &directory_json()).unwrap()
+    }
+
+    fn account_json() -> serde_json::Value {
+        serde_json::json!({
+            "status": "valid",
+            "contact": ["mailto:ops@example.com"],
+            "orders": "https://acme.test/acme/orders/1",
+            "termsOfServiceAgreed": true
+        })
+    }
+
+    fn account_created_response() -> HttpResponse {
+        HttpResponse::with_json(201, &account_json())
+            .unwrap()
+            .with_header("Location", "https://acme.test/acme/account/42")
+            .with_header("Replay-Nonce", "nonce-created")
+    }
+
+    fn decoded_jws(body: &[u8]) -> (serde_json::Value, Vec<u8>, Vec<u8>) {
+        let jws: serde_json::Value = serde_json::from_slice(body).unwrap();
+        let protected = jws["protected"].as_str().unwrap();
+        let payload = jws["payload"].as_str().unwrap();
+        let signature = jws["signature"].as_str().unwrap();
+        let header =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(protected.as_bytes()).unwrap()).unwrap();
+        let payload_bytes = URL_SAFE_NO_PAD.decode(payload.as_bytes()).unwrap();
+        let signature_bytes = URL_SAFE_NO_PAD.decode(signature.as_bytes()).unwrap();
+        (header, payload_bytes, signature_bytes)
+    }
+
+    // ---- directory ------------------------------------------------------------------------
+
+    #[test]
+    fn parses_directory_with_meta() {
+        let directory = Directory::parse(
+            DIRECTORY_URL,
+            &serde_json::to_vec(&directory_json()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(directory.new_nonce, "https://acme.test/acme/new-nonce");
+        assert_eq!(directory.new_account, NEW_ACCOUNT_URL);
+        assert_eq!(directory.new_order, "https://acme.test/acme/new-order");
+        assert_eq!(directory.revoke_cert, "https://acme.test/acme/revoke-cert");
+        assert_eq!(
+            directory.key_change.as_deref(),
+            Some("https://acme.test/acme/key-change")
+        );
+        assert_eq!(
+            directory.renewal_info.as_deref(),
+            Some("https://acme.test/acme/renewal-info")
+        );
+        assert_eq!(
+            directory.terms_of_service(),
+            Some("https://acme.test/terms")
+        );
+        assert!(!directory.external_account_required());
+        let meta = directory.meta.as_ref().unwrap();
+        assert_eq!(meta.website.as_deref(), Some("https://acme.test/"));
+        assert_eq!(
+            meta.caa_identities.as_deref(),
+            Some(&["acme.test".to_string()][..])
+        );
+        assert_eq!(
+            meta.profiles
+                .as_ref()
+                .and_then(|profiles| profiles.get("shortlived"))
+                .map(String::as_str),
+            Some("Short-lived certificates")
+        );
+    }
+
+    #[test]
+    fn rejects_directory_missing_required_endpoint() {
+        let mut value = directory_json();
+        value.as_object_mut().unwrap().remove("newOrder");
+        let error =
+            Directory::parse(DIRECTORY_URL, &serde_json::to_vec(&value).unwrap()).unwrap_err();
+        assert!(error.to_string().contains("newOrder"), "{error}");
+        assert!(error.to_string().contains(DIRECTORY_URL), "{error}");
+    }
+
+    #[test]
+    fn rejects_directory_that_is_not_json() {
+        let error = Directory::parse(DIRECTORY_URL, b"not json").unwrap_err();
+        assert!(
+            error.to_string().contains("invalid ACME directory"),
+            "{error}"
+        );
+    }
+
+    // ---- account keys ---------------------------------------------------------------------
+
+    #[test]
+    fn account_key_generates_and_round_trips_pkcs8_pem() {
+        let key = AccountKey::generate().unwrap();
+        let pem = key.to_pkcs8_pem();
+        assert!(pem.starts_with("-----BEGIN PRIVATE KEY-----\n"), "{pem}");
+        assert!(pem.contains("-----END PRIVATE KEY-----\n"), "{pem}");
+
+        let reloaded = AccountKey::from_pkcs8_pem(pem).unwrap();
+        assert_eq!(reloaded.public_key_bytes(), key.public_key_bytes());
+        assert_eq!(reloaded.thumbprint().unwrap(), key.thumbprint().unwrap());
+        assert_eq!(reloaded.public_jwk().unwrap(), key.public_jwk().unwrap());
+
+        let message = b"acme-jws-signing-input";
+        let signature = key.sign_es256(message).unwrap();
+        assert!(key.verify_es256(message, &signature));
+        assert!(reloaded.verify_es256(message, &signature));
+        assert!(!key.verify_es256(b"tampered", &signature));
+    }
+
+    #[test]
+    fn account_key_rejects_unsupported_pem_labels() {
+        let error = AccountKey::from_pkcs8_pem(
+            "-----BEGIN EC PRIVATE KEY-----\nAA==\n-----END EC PRIVATE KEY-----\n",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported account key PEM label"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("EC PRIVATE KEY"), "{error}");
+    }
+
+    #[test]
+    fn jwk_thumbprint_is_rfc7638_canonical() {
+        let key = AccountKey::generate().unwrap();
+        let jwk = key.public_jwk().unwrap();
+        let thumbprint = jwk.thumbprint().unwrap();
+        // Recompute over the canonical member order required by RFC 7638.
+        let canonical = format!(
+            "{{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"{}\",\"y\":\"{}\"}}",
+            jwk.x, jwk.y
+        );
+        let expected = URL_SAFE_NO_PAD.encode(ring::digest::digest(
+            &ring::digest::SHA256,
+            canonical.as_bytes(),
+        ));
+        assert_eq!(thumbprint, expected);
+        assert!(!thumbprint.contains('='));
+        assert!(!thumbprint.contains('+'));
+        assert!(!thumbprint.contains('/'));
+    }
+
+    // ---- account storage ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn account_paths_follow_certmagic_shape() {
+        let paths = account_paths(DIRECTORY_URL, Some("ops@example.com")).unwrap();
+        assert_eq!(
+            paths.account_key,
+            "acme/acme.test-directory/users/ops@example.com/account.key"
+        );
+        assert_eq!(
+            paths.account,
+            "acme/acme.test-directory/users/ops@example.com/account.json"
+        );
+        let default_paths =
+            account_paths("https://acme-v02.api.letsencrypt.org/directory", None).unwrap();
+        assert_eq!(
+            default_paths.account_key,
+            "acme/acme-v02.api.letsencrypt.org-directory/users/default/account.key"
+        );
+    }
+
+    #[tokio::test]
+    async fn account_key_persists_through_memory_storage() {
+        let storage = MemoryAcmeStorage::new();
+        let store = AccountStore::new(storage, Some("ops@example.com".to_string()));
+        let (first, created) = store
+            .load_or_create_account_key(DIRECTORY_URL)
+            .await
+            .unwrap();
+        assert!(created);
+
+        let (second, created_again) = store
+            .load_or_create_account_key(DIRECTORY_URL)
+            .await
+            .unwrap();
+        assert!(!created_again);
+        assert_eq!(first.thumbprint().unwrap(), second.thumbprint().unwrap());
+        assert_eq!(first.to_pkcs8_pem(), second.to_pkcs8_pem());
+        assert_eq!(
+            store.storage().name(),
+            "memory",
+            "storage backend must be reachable through the store"
+        );
+    }
+
+    #[tokio::test]
+    async fn account_record_persists_through_file_storage() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(directory.path());
+        let store = AccountStore::new(storage, Some("ops@example.com".to_string()));
+        let (key, created) = store
+            .load_or_create_account_key(DIRECTORY_URL)
+            .await
+            .unwrap();
+        assert!(created);
+        assert_eq!(store.storage().name(), "file_system");
+
+        let account = StoredAccount {
+            directory_url: DIRECTORY_URL.to_string(),
+            account_url: "https://acme.test/acme/account/42".to_string(),
+            contact: vec!["mailto:ops@example.com".to_string()],
+            status: AccountStatus::Valid,
+            terms_of_service_agreed: true,
+            key_thumbprint: key.thumbprint().unwrap(),
+        };
+        store.save_account(&account).await.unwrap();
+        let loaded = store.load_account(DIRECTORY_URL).await.unwrap().unwrap();
+        assert_eq!(loaded, account);
+
+        // And the key is still there after a fresh store over the same backend.
+        let (reloaded_key, created) = AccountStore::new(
+            FileStorage::new(directory.path()),
+            Some("ops@example.com".to_string()),
+        )
+        .load_or_create_account_key(DIRECTORY_URL)
+        .await
+        .unwrap();
+        assert!(!created);
+        assert_eq!(
+            reloaded_key.thumbprint().unwrap(),
+            key.thumbprint().unwrap()
+        );
+
+        store.delete_account(DIRECTORY_URL).await.unwrap();
+        assert!(store.load_account(DIRECTORY_URL).await.unwrap().is_none());
+        let (_, created) = store
+            .load_or_create_account_key(DIRECTORY_URL)
+            .await
+            .unwrap();
+        assert!(created, "deleted account key must be regenerated");
+    }
+
+    #[tokio::test]
+    async fn account_storage_refuses_traversal_keys() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(directory.path());
+        let error = storage.store("../escape", b"x").await.unwrap_err();
+        assert!(error.to_string().contains("../escape"), "{error}");
+    }
+
+    // ---- client: successful registration --------------------------------------------------
+
+    #[tokio::test]
+    async fn mock_transport_registers_account_and_persists_it() {
+        let mock = Arc::new(MockTransport::new(vec![
+            (HttpMethod::Get, DIRECTORY_URL, directory_response()),
+            (
+                HttpMethod::Head,
+                "https://acme.test/acme/new-nonce",
+                HttpResponse::new(200).with_header("Replay-Nonce", "nonce-1"),
+            ),
+            (
+                HttpMethod::Post,
+                NEW_ACCOUNT_URL,
+                account_created_response(),
+            ),
+        ]));
+        let key = AccountKey::generate().unwrap();
+        let client = AcmeClient::connect(mock.clone(), DIRECTORY_URL, key)
+            .await
+            .unwrap();
+        assert_eq!(client.directory().new_account, NEW_ACCOUNT_URL);
+        assert_eq!(client.directory_url(), DIRECTORY_URL);
+
+        let store = AccountStore::new(
+            MemoryAcmeStorage::new(),
+            Some("ops@example.com".to_string()),
+        );
+        let registration = AccountRegistration::for_email("ops@example.com");
+        let account = store
+            .register_account(&client, &registration)
+            .await
+            .unwrap();
+
+        assert_eq!(account.account_url, "https://acme.test/acme/account/42");
+        assert_eq!(account.status, AccountStatus::Valid);
+        assert_eq!(account.contact, vec!["mailto:ops@example.com".to_string()]);
+        assert!(account.terms_of_service_agreed);
+        assert_eq!(account.directory_url, DIRECTORY_URL);
+        assert_eq!(
+            account.key_thumbprint,
+            client.account_key().thumbprint().unwrap()
+        );
+        assert_eq!(
+            store.load_account(DIRECTORY_URL).await.unwrap(),
+            Some(account.clone())
+        );
+
+        let requests = mock.records();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].method, HttpMethod::Get);
+        assert_eq!(requests[1].method, HttpMethod::Head);
+        assert_eq!(requests[1].url, "https://acme.test/acme/new-nonce");
+
+        let post = &requests[2];
+        assert_eq!(post.method, HttpMethod::Post);
+        assert_eq!(post.url, NEW_ACCOUNT_URL);
+        assert_eq!(post.header("Content-Type"), Some(JOSE_CONTENT_TYPE));
+
+        let (header, payload, signature) = decoded_jws(&post.body);
+        assert_eq!(header["alg"], "ES256");
+        assert_eq!(header["nonce"], "nonce-1");
+        assert_eq!(header["url"], NEW_ACCOUNT_URL);
+        assert_eq!(
+            header["jwk"],
+            serde_json::to_value(key_jwk(&client)).unwrap()
+        );
+        assert!(
+            header.get("kid").is_none(),
+            "newAccount must use jwk, not kid"
+        );
+
+        let signing_input = {
+            let jws: serde_json::Value = serde_json::from_slice(&post.body).unwrap();
+            format!(
+                "{}.{}",
+                jws["protected"].as_str().unwrap(),
+                jws["payload"].as_str().unwrap()
+            )
+        };
+        assert!(client
+            .account_key()
+            .verify_es256(signing_input.as_bytes(), &signature));
+
+        let payload: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(
+            payload["contact"],
+            serde_json::json!(["mailto:ops@example.com"])
+        );
+        assert_eq!(payload["termsOfServiceAgreed"], true);
+        assert!(
+            payload.get("onlyReturnExisting").is_none(),
+            "false flags must not be serialized"
+        );
+        assert_eq!(mock.remaining(), 0);
+    }
+
+    fn key_jwk(client: &AcmeClient<Arc<MockTransport>>) -> Jwk {
+        client.account_key().public_jwk().unwrap()
+    }
+
+    // ---- client: error handling ----------------------------------------------------------
+
+    #[tokio::test]
+    async fn mock_transport_surfaces_problem_document() {
+        let mock = Arc::new(MockTransport::new(vec![
+            (HttpMethod::Get, DIRECTORY_URL, directory_response()),
+            (
+                HttpMethod::Head,
+                "https://acme.test/acme/new-nonce",
+                HttpResponse::new(200).with_header("Replay-Nonce", "nonce-1"),
+            ),
+            (
+                HttpMethod::Post,
+                NEW_ACCOUNT_URL,
+                HttpResponse::with_problem(
+                    400,
+                    &serde_json::json!({
+                        "type": "urn:ietf:params:acme:error:accountDoesNotExist",
+                        "detail": "No account exists with the provided key",
+                        "status": 400
+                    }),
+                )
+                .unwrap(),
+            ),
+        ]));
+        let client = AcmeClient::connect(mock, DIRECTORY_URL, AccountKey::generate().unwrap())
+            .await
+            .unwrap();
+        let mut registration = AccountRegistration::for_email("ops@example.com");
+        registration.only_return_existing = true;
+        registration.terms_of_service_agreed = false;
+        let error = client.register_account(&registration).await.unwrap_err();
+        let Error::Acme(acme_error) = error else {
+            panic!("expected AcmeError, got {error:?}");
+        };
+        assert_eq!(
+            acme_error.problem_type(),
+            Some("urn:ietf:params:acme:error:accountDoesNotExist")
+        );
+        let AcmeError::Problem {
+            status,
+            problem,
+            url,
+            ..
+        } = acme_error.as_ref()
+        else {
+            panic!("expected problem document, got {acme_error:?}");
+        };
+        assert_eq!(*status, 400);
+        assert_eq!(*url, NEW_ACCOUNT_URL);
+        assert_eq!(
+            problem.detail.as_deref(),
+            Some("No account exists with the provided key")
+        );
+        assert!(!acme_error.is_user_action_required());
+    }
+
+    #[tokio::test]
+    async fn user_action_required_problem_is_flagged() {
+        let mock = Arc::new(MockTransport::new(vec![
+            (HttpMethod::Get, DIRECTORY_URL, directory_response()),
+            (
+                HttpMethod::Head,
+                "https://acme.test/acme/new-nonce",
+                HttpResponse::new(200).with_header("Replay-Nonce", "nonce-1"),
+            ),
+            (
+                HttpMethod::Post,
+                NEW_ACCOUNT_URL,
+                HttpResponse::with_problem(
+                    403,
+                    &serde_json::json!({
+                        "type": USER_ACTION_REQUIRED,
+                        "detail": "The terms of service have changed; visit the CA website",
+                        "status": 403,
+                        "instance": "https://acme.test/terms"
+                    }),
+                )
+                .unwrap(),
+            ),
+        ]));
+        let client = AcmeClient::connect(mock, DIRECTORY_URL, AccountKey::generate().unwrap())
+            .await
+            .unwrap();
+        let error = client
+            .register_account(&AccountRegistration::for_email("ops@example.com"))
+            .await
+            .unwrap_err();
+        let Error::Acme(acme_error) = error else {
+            panic!("expected AcmeError, got {error:?}");
+        };
+        assert!(acme_error.is_user_action_required());
+        assert!(acme_error.to_string().contains("userActionRequired"));
+    }
+
+    #[tokio::test]
+    async fn terms_of_service_must_be_accepted_before_any_request() {
+        let mock = Arc::new(MockTransport::new(vec![(
+            HttpMethod::Get,
+            DIRECTORY_URL,
+            directory_response(),
+        )]));
+        let client =
+            AcmeClient::connect(mock.clone(), DIRECTORY_URL, AccountKey::generate().unwrap())
+                .await
+                .unwrap();
+        let mut registration = AccountRegistration::for_email("ops@example.com");
+        registration.terms_of_service_agreed = false;
+        let error = client.register_account(&registration).await.unwrap_err();
+        let Error::Acme(acme_error) = error else {
+            panic!("expected AcmeError, got {error:?}");
+        };
+        let AcmeError::TermsOfServiceRequired { url } = acme_error.as_ref() else {
+            panic!("expected TermsOfServiceRequired, got {acme_error:?}");
+        };
+        assert_eq!(url, "https://acme.test/terms");
+        assert_eq!(
+            mock.records().len(),
+            1,
+            "no POST may be sent when the terms are not accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_account_binding_is_signed_with_hs256() {
+        let key = AccountKey::generate().unwrap();
+        let mac_key = b"a-shared-eab-secret";
+        let external_account = ExternalAccount {
+            kid: "eab-kid-1".to_string(),
+            hmac_key: URL_SAFE_NO_PAD.encode(mac_key),
+        };
+        let registration = AccountRegistration {
+            contact: vec!["mailto:ops@example.com".to_string()],
+            terms_of_service_agreed: true,
+            only_return_existing: false,
+            external_account: Some(external_account),
+        };
+        let request = registration.to_wire_request(&key, NEW_ACCOUNT_URL).unwrap();
+        let binding = request.external_account_binding.as_ref().unwrap();
+        let protected = binding["protected"].as_str().unwrap();
+        let payload = binding["payload"].as_str().unwrap();
+        let signature = binding["signature"].as_str().unwrap();
+
+        let header: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(protected).unwrap()).unwrap();
+        assert_eq!(header["alg"], "HS256");
+        assert_eq!(header["kid"], "eab-kid-1");
+        assert_eq!(header["url"], NEW_ACCOUNT_URL);
+
+        let payload_bytes = URL_SAFE_NO_PAD.decode(payload).unwrap();
+        let payload_jwk: Jwk = serde_json::from_slice(&payload_bytes).unwrap();
+        assert_eq!(payload_jwk, key.public_jwk().unwrap());
+
+        let key_ring = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, mac_key);
+        let verified = ring::hmac::verify(
+            &key_ring,
+            format!("{protected}.{payload}").as_bytes(),
+            &URL_SAFE_NO_PAD.decode(signature).unwrap(),
+        );
+        assert!(
+            verified.is_ok(),
+            "EAB signature must verify with the MAC key"
+        );
+    }
+
+    #[test]
+    fn parses_account_statuses_and_rejects_unknown_fields_silently() {
+        for (value, expected) in [
+            ("valid", AccountStatus::Valid),
+            ("deactivated", AccountStatus::Deactivated),
+            ("revoked", AccountStatus::Revoked),
+            ("future-status", AccountStatus::Unknown),
+        ] {
+            let account: Account =
+                serde_json::from_value(serde_json::json!({"status": value})).unwrap();
+            assert_eq!(account.status, expected, "status `{value}`");
+        }
+        // The default is the ACME initial status.
+        assert_eq!(AccountStatus::default(), AccountStatus::Valid);
+    }
+
+    #[tokio::test]
+    async fn configured_account_key_takes_precedence_over_storage() {
+        let configured = AccountKey::generate().unwrap();
+        let store = AccountStore::new(
+            MemoryAcmeStorage::new(),
+            Some("ops@example.com".to_string()),
+        );
+        let (resolved, created) = store
+            .account_key(DIRECTORY_URL, Some(configured.to_pkcs8_pem()))
+            .await
+            .unwrap();
+        assert!(!created);
+        assert_eq!(
+            resolved.thumbprint().unwrap(),
+            configured.thumbprint().unwrap()
+        );
+        // A configured key is not persisted: no storage write should have happened.
+        assert!(store
+            .storage()
+            .load(&store.paths(DIRECTORY_URL).unwrap().account_key)
+            .await
+            .unwrap()
+            .is_none());
+
+        // Without a configured key the store generates and persists one.
+        let (generated, created) = store.account_key(DIRECTORY_URL, None).await.unwrap();
+        assert!(created);
+        assert!(store
+            .storage()
+            .load(&store.paths(DIRECTORY_URL).unwrap().account_key)
+            .await
+            .unwrap()
+            .is_some());
+        assert_ne!(
+            generated.thumbprint().unwrap(),
+            configured.thumbprint().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn only_return_existing_wire_request_omits_terms() {
+        let key = AccountKey::generate().unwrap();
+        let registration = AccountRegistration {
+            contact: Vec::new(),
+            terms_of_service_agreed: false,
+            only_return_existing: true,
+            external_account: None,
+        };
+        let request = registration.to_wire_request(&key, NEW_ACCOUNT_URL).unwrap();
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value, serde_json::json!({"onlyReturnExisting": true}));
+    }
+}

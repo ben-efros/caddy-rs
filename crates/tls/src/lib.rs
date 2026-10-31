@@ -6,10 +6,17 @@
 
 #![forbid(unsafe_code)]
 
+pub mod acme;
 pub mod certificate;
 pub mod issuer;
 pub mod storage;
 
+pub use acme::{
+    account_paths, Account, AccountKey, AccountPaths, AccountRegistration, AccountStatus,
+    AccountStore, AcmeClient, AcmeError, AcmeStorage, AcmeTransport, Directory, DirectoryMeta,
+    ExternalAccount, HttpMethod, HttpRequest, HttpResponse, Jwk, MemoryAcmeStorage,
+    NewAccountRequest, Problem, StoredAccount,
+};
 pub use certificate::{renewal_queue, Certificate, CertificateCache, RenewalItem};
 pub use issuer::{
     within_renewal_window, AcmeIssuer, AcmeIssuerConfig, CertificateIssuer, InternalIssuer,
@@ -32,6 +39,13 @@ pub enum Error {
     #[error("certificate issuer error: {0}")]
     Issuer(String),
 
+    /// ACME directory/account errors (problem documents, terms of service, account keys).
+    ///
+    /// Boxed to keep [`Error`] small: ACME problem documents carry several strings and are rare
+    /// compared with the success path.
+    #[error("ACME error: {0}")]
+    Acme(Box<AcmeError>),
+
     /// A storage key that would escape the storage root.
     #[error("invalid certificate storage key `{0}`")]
     InvalidKey(String),
@@ -48,6 +62,12 @@ pub enum Error {
     /// I/O errors.
     #[error("certificate I/O error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+impl From<AcmeError> for Error {
+    fn from(error: AcmeError) -> Self {
+        Self::Acme(Box::new(error))
+    }
 }
 
 /// Result alias for the TLS crate.

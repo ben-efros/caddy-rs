@@ -15,5 +15,10 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 
+# ACME (RFC 8555) account/JWS foundation: ES256 signing, SHA-256, HMAC and base64url.
+# Both crates are present in the offline registry cache used by this workspace.
+base64 = "0.22.1"
+ring = "0.17.14"
+
 [dev-dependencies]
 tempfile = "3.27.0"
