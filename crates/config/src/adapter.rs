@@ -1667,23 +1667,28 @@ struct ParsedUpstream {
 }
 
 fn parse_upstream(target: &str) -> Result<ParsedUpstream, String> {
-    // Network-specific shorthand: `unix+h2c//path` means a Unix-socket upstream whose transport
-    // speaks h2c, and Caddy normalises it to a `unix/...` dial plus an h2c transport.
-    if let Some(rest) = target.strip_prefix("unix+h2c//") {
-        return Ok(ParsedUpstream {
-            dial: format!("unix//{rest}"),
-            https: false,
-            h2c: true,
-        });
-    }
-    // Network addresses like `unix//path/to/socket` are passed through verbatim; Caddy's dial
-    // string keeps the network prefix.
-    if target.starts_with("unix//") {
-        return Ok(ParsedUpstream {
-            dial: target.to_string(),
-            https: false,
-            h2c: false,
-        });
+    // Network addresses (`network/host`, no scheme) are parsed by Caddy's SplitNetworkAddress:
+    // everything before the first `/` is the network and the rest is the host verbatim. Unix
+    // networks (`unix`, `unixgram`, `unixpacket`, `unix+h2c`) never get a default port appended,
+    // and `unix+h2c` is normalised to a `unix/...` dial plus an h2c transport.
+    if !target.contains("://") {
+        if let Some((network, host)) = target.split_once('/') {
+            let network = network.trim().to_ascii_lowercase();
+            if network == "unix+h2c" {
+                return Ok(ParsedUpstream {
+                    dial: format!("unix/{host}"),
+                    https: false,
+                    h2c: true,
+                });
+            }
+            if network.starts_with("unix") {
+                return Ok(ParsedUpstream {
+                    dial: format!("{network}/{host}"),
+                    https: false,
+                    h2c: false,
+                });
+            }
+        }
     }
     let (scheme, rest) = match target.split_once("://") {
         Some((scheme, rest)) => (Some(scheme), rest),

@@ -4,7 +4,7 @@
 //! must produce semantically identical JSON (object key order is not significant).
 
 use caddy_rs_config::adapt;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 fn fixture(name: &str) -> (String, Value) {
     let path = format!(
@@ -136,4 +136,47 @@ fn internal_name_shared_with_hostless_key_is_rejected_loudly() {
         message.contains("internal name `localhost`") && message.contains("not supported"),
         "unexpected error: {message}"
     );
+}
+
+#[test]
+fn reverse_proxy_h2c_shorthand_matches_caddy() {
+    // `unix+h2c//run/app.sock` adapts to a `unix//...` dial plus an h2c transport.
+    assert_adapts_like_caddy("reverse_proxy_h2c_shorthand.caddyfiletest");
+}
+
+#[test]
+fn unix_upstream_dials_are_verbatim_without_default_ports() {
+    // Caddy parses network addresses with SplitNetworkAddress: everything before the first `/`
+    // is the network, the rest is the host verbatim, and unix networks never get a default port
+    // appended. `unix+h2c` becomes a `unix/...` dial plus an h2c transport.
+    for (target, expected_dial, expected_h2c) in [
+        ("unix//run/app.sock", "unix//run/app.sock", false),
+        ("unix/run/app.sock", "unix/run/app.sock", false),
+        ("unix+h2c//run/app.sock", "unix//run/app.sock", true),
+        ("unix+h2c/run/app.sock", "unix/run/app.sock", true),
+    ] {
+        let caddyfile = format!(":8080 {{\n\treverse_proxy {target}\n}}\n");
+        let adapted = adapt(&caddyfile).unwrap_or_else(|error| panic!("adapt `{target}`: {error}"));
+        let handler = &adapted.config["apps"]["http"]["servers"]["srv0"]["routes"][0]["handle"][0];
+        let dial = handler["upstreams"][0]["dial"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no dial string for `{target}`"));
+        assert_eq!(dial, expected_dial, "dial for `{target}`");
+        assert!(
+            !dial.ends_with(":80"),
+            "unix dial for `{target}` must not get a default port: {dial}"
+        );
+        if expected_h2c {
+            assert_eq!(
+                handler["transport"]["versions"],
+                json!(["h2c", "2"]),
+                "h2c transport for `{target}`"
+            );
+        } else {
+            assert!(
+                handler.get("transport").is_none(),
+                "unexpected transport for `{target}`"
+            );
+        }
+    }
 }
