@@ -10,7 +10,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
-use crate::config::{Config, HttpApp, Route, TlsApp};
+use crate::config::{
+    AutomationPolicy, BaseLog, CertificatesConfig, Config, HttpApp, Logging, ModuleRef, Route,
+    StorageConfig, TlsApp, TlsAutomation,
+};
 use crate::error::{Error, Result};
 use crate::listen::ListenAddr;
 use crate::module::{ModuleKind, ModuleRegistry};
@@ -55,8 +58,12 @@ pub fn validate_config(config: &Config, registry: &ModuleRegistry) -> Result<Val
         }
     }
 
+    if let Some(logging) = &config.logging {
+        validate_logging(logging, registry)?;
+    }
+
     if let Some(storage) = &config.storage {
-        validate_storage(storage, registry)?;
+        validate_storage(storage, registry, "storage")?;
     }
 
     match &config.apps {
@@ -84,19 +91,93 @@ pub fn validate_config(config: &Config, registry: &ModuleRegistry) -> Result<Val
     Ok(validator.report)
 }
 
-fn validate_storage(storage: &Value, registry: &ModuleRegistry) -> Result<()> {
-    let object = storage
-        .as_object()
-        .ok_or_else(|| Error::invalid("storage", "storage must be an object"))?;
-    let module = object
-        .get("module")
-        .and_then(Value::as_str)
-        .ok_or_else(|| Error::invalid("storage.module", "storage object must name a `module`"))?;
+/// Validate the `logging` section: every configured writer, encoder and core must be a module this
+/// build knows. Unknown fields are preserved by the model; Caddy ignores unknown JSON fields here,
+/// so validation only checks module references and required module names.
+fn validate_logging(logging: &Logging, registry: &ModuleRegistry) -> Result<()> {
+    if let Some(sink) = &logging.sink {
+        validate_base_log(&sink.base, registry, "logging.sink")?;
+    }
+    for (name, log) in &logging.logs {
+        validate_base_log(&log.base, registry, &format!("logging.logs.{name}"))?;
+    }
+    Ok(())
+}
+
+fn validate_base_log(base: &BaseLog, registry: &ModuleRegistry, path: &str) -> Result<()> {
+    if let Some(writer) = &base.writer {
+        let writer_path = format!("{path}.writer.output");
+        let name = require_module_name(
+            writer.output.as_deref(),
+            &writer_path,
+            "log writer",
+            "output",
+        )?;
+        if registry.resolve_log_writer(name).is_none() {
+            return Err(Error::UnknownModule {
+                kind: "log writer",
+                name: name.to_string(),
+                path: writer_path,
+            });
+        }
+    }
+    if let Some(encoder) = &base.encoder {
+        let encoder_path = format!("{path}.encoder.format");
+        let name = require_module_name(
+            encoder.format.as_deref(),
+            &encoder_path,
+            "log encoder",
+            "format",
+        )?;
+        if registry.resolve_log_encoder(name).is_none() {
+            return Err(Error::UnknownModule {
+                kind: "log encoder",
+                name: name.to_string(),
+                path: encoder_path,
+            });
+        }
+    }
+    if let Some(core) = &base.core {
+        let core_path = format!("{path}.core.module");
+        let name = require_module_name(core.module.as_deref(), &core_path, "log core", "module")?;
+        if registry.resolve_log_core(name).is_none() {
+            return Err(Error::UnknownModule {
+                kind: "log core",
+                name: name.to_string(),
+                path: core_path,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// A module object must name its module; absent names get a located error rather than a serde error
+/// so the message points at the exact JSON path.
+fn require_module_name<'a>(
+    value: Option<&'a str>,
+    path: &str,
+    kind: &str,
+    field: &str,
+) -> Result<&'a str> {
+    value.ok_or_else(|| {
+        Error::invalid(
+            path,
+            format!("{kind} object must name a module with field `{field}`"),
+        )
+    })
+}
+
+fn validate_storage(storage: &StorageConfig, registry: &ModuleRegistry, path: &str) -> Result<()> {
+    let module_path = format!("{path}.module");
+    let module = storage
+        .module
+        .as_deref()
+        .ok_or_else(|| Error::invalid(&module_path, "storage object must name a `module`"))?;
     if registry.get_by_key(ModuleKind::Storage, module).is_none() {
         return Err(Error::UnknownModule {
             kind: "storage",
             name: module.to_string(),
-            path: "storage.module".to_string(),
+            path: module_path,
         });
     }
     Ok(())
@@ -293,78 +374,150 @@ impl Validator<'_> {
     }
 
     fn tls(&mut self, tls: &TlsApp) -> Result<()> {
-        if let Some(automation) = &tls.automation {
-            let Some(automation) = automation.as_object() else {
-                return Err(Error::invalid(
-                    "apps.tls.automation",
-                    "automation must be an object",
-                ));
-            };
-            if let Some(policies) = automation.get("policies") {
-                let Some(policies) = policies.as_array() else {
-                    return Err(Error::invalid(
-                        "apps.tls.automation.policies",
-                        "policies must be an array",
-                    ));
-                };
-                for (index, policy) in policies.iter().enumerate() {
-                    let path = format!("apps.tls.automation.policies[{index}]");
-                    self.tls_policy(policy, &path)?;
-                }
-            }
+        if let Some(certificates) = &tls.certificates {
+            self.certificates(certificates, "apps.tls.certificates")?;
         }
-        Ok(())
-    }
-
-    fn tls_policy(&mut self, policy: &Value, path: &str) -> Result<()> {
-        let object = policy
-            .as_object()
-            .ok_or_else(|| Error::invalid(path, "TLS automation policy must be an object"))?;
-        self.report.tls_policies += 1;
-        if let Some(issuers) = object.get("issuers") {
-            let issuers = issuers.as_array().ok_or_else(|| {
-                Error::invalid(format!("{path}.issuers"), "issuers must be an array")
-            })?;
-            for (index, issuer) in issuers.iter().enumerate() {
-                let issuer_path = format!("{path}.issuers[{index}]");
-                let issuer_object = issuer
-                    .as_object()
-                    .ok_or_else(|| Error::invalid(&issuer_path, "issuer must be an object"))?;
-                let module = issuer_object
-                    .get("module")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        Error::invalid(
-                            format!("{issuer_path}.module"),
-                            "issuer must name a `module`",
-                        )
-                    })?;
+        if let Some(automation) = &tls.automation {
+            self.automation(automation)?;
+        }
+        if let Some(session_tickets) = &tls.session_tickets {
+            if let Some(key_source) = &session_tickets.key_source {
+                let path = "apps.tls.session_tickets.key_source.provider";
+                let provider = require_module_name(
+                    key_source.provider.as_deref(),
+                    path,
+                    "session ticket key provider",
+                    "provider",
+                )?;
                 if self
                     .registry
-                    .get_by_key(ModuleKind::TlsIssuer, module)
+                    .get_by_key(ModuleKind::StekProvider, provider)
                     .is_none()
                 {
                     return Err(Error::UnknownModule {
-                        kind: "TLS issuer",
-                        name: module.to_string(),
-                        path: format!("{issuer_path}.module"),
+                        kind: "session ticket key provider",
+                        name: provider.to_string(),
+                        path: path.to_string(),
                     });
                 }
-                self.validate_dns_provider(issuer_object, &issuer_path)?;
+            }
+        }
+        if let Some(dns) = &tls.dns {
+            let path = "apps.tls.dns.name";
+            let name = require_module_name(dns.name.as_deref(), path, "DNS provider", "name")?;
+            if self
+                .registry
+                .get_by_key(ModuleKind::DnsProvider, name)
+                .is_none()
+            {
+                return Err(Error::UnknownModule {
+                    kind: "DNS provider",
+                    name: name.to_string(),
+                    path: path.to_string(),
+                });
             }
         }
         Ok(())
     }
 
-    fn validate_dns_provider(
-        &self,
-        issuer: &serde_json::Map<String, Value>,
-        path: &str,
-    ) -> Result<()> {
+    fn certificates(&mut self, certificates: &CertificatesConfig, path: &str) -> Result<()> {
+        if certificates.load_files.is_some() {
+            self.certificate_loader("load_files", &format!("{path}.load_files"))?;
+        }
+        if certificates.load_pem.is_some() {
+            self.certificate_loader("load_pem", &format!("{path}.load_pem"))?;
+        }
+        if certificates.automate.is_some() {
+            self.certificate_loader("automate", &format!("{path}.automate"))?;
+        }
+        // Remaining keys are other certificate-loader modules (load_folders, load_storage, and any
+        // future loader); the model preserves them, validation resolves them.
+        for key in certificates.extra.keys() {
+            self.certificate_loader(key, &format!("{path}.{key}"))?;
+        }
+        Ok(())
+    }
+
+    fn certificate_loader(&self, name: &str, path: &str) -> Result<()> {
+        if self
+            .registry
+            .get_by_key(ModuleKind::TlsCertificateLoader, name)
+            .is_none()
+        {
+            return Err(Error::UnknownModule {
+                kind: "TLS certificate loader",
+                name: name.to_string(),
+                path: path.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn automation(&mut self, automation: &TlsAutomation) -> Result<()> {
+        for (index, policy) in automation.policies.iter().enumerate() {
+            self.tls_policy(policy, &format!("apps.tls.automation.policies[{index}]"))?;
+        }
+        if let Some(on_demand) = &automation.on_demand {
+            if let Some(permission) = &on_demand.permission {
+                let path = "apps.tls.automation.on_demand.permission.module";
+                let module = require_module_name(
+                    permission.module.as_deref(),
+                    path,
+                    "TLS on-demand permission",
+                    "module",
+                )?;
+                if self
+                    .registry
+                    .get_by_key(ModuleKind::TlsPermission, module)
+                    .is_none()
+                {
+                    return Err(Error::UnknownModule {
+                        kind: "TLS on-demand permission",
+                        name: module.to_string(),
+                        path: path.to_string(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn tls_policy(&mut self, policy: &AutomationPolicy, path: &str) -> Result<()> {
+        self.report.tls_policies += 1;
+        for (index, issuer) in policy.issuers.iter().enumerate() {
+            let issuer_path = format!("{path}.issuers[{index}]");
+            let module_path = format!("{issuer_path}.module");
+            let module = require_module_name(
+                issuer.module.as_deref(),
+                &module_path,
+                "TLS issuer",
+                "module",
+            )?;
+            if self
+                .registry
+                .get_by_key(ModuleKind::TlsIssuer, module)
+                .is_none()
+            {
+                return Err(Error::UnknownModule {
+                    kind: "TLS issuer",
+                    name: module.to_string(),
+                    path: module_path,
+                });
+            }
+            self.validate_dns_provider(issuer, &issuer_path)?;
+        }
+        if let Some(storage) = &policy.storage {
+            validate_storage(storage, self.registry, &format!("{path}.storage"))?;
+        }
+        Ok(())
+    }
+
+    fn validate_dns_provider(&self, issuer: &ModuleRef, path: &str) -> Result<()> {
         let provider = issuer
+            .extra
             .get("challenges")
-            .and_then(|c| c.get("dns"))
-            .and_then(|d| d.get("provider"))
+            .and_then(|challenges| challenges.get("dns"))
+            .and_then(|dns| dns.get("provider"))
             .and_then(Value::as_str);
         if let Some(provider) = provider {
             if self
@@ -507,5 +660,256 @@ mod tests {
         );
         let error = validate_config(&config, &registry()).expect_err("no upstreams");
         assert!(error.to_string().contains("at least one upstream"));
+    }
+
+    fn config_from(value: serde_json::Value) -> Config {
+        Config::from_value(value).expect("configuration model decodes")
+    }
+
+    fn tls_config(tls: serde_json::Value) -> Config {
+        config_from(serde_json::json!({"apps": {"tls": tls}}))
+    }
+
+    #[test]
+    fn validates_typed_logging_storage_and_tls_modules() {
+        let config = config_from(serde_json::json!({
+            "logging": {
+                "sink": {
+                    "writer": {"output": "stdout"},
+                    "encoder": {"format": "console"}
+                },
+                "logs": {
+                    "default": {
+                        "level": "INFO",
+                        "writer": {"output": "file", "filename": "/var/log/caddy.log"},
+                        "encoder": {"format": "json"},
+                        "core": {"module": "mock"}
+                    }
+                },
+                "unknown_preserved_field": true
+            },
+            "storage": {"module": "file_system", "root": "/data"},
+            "apps": {"tls": {
+                "certificates": {
+                    "load_files": [{"certificate": "c.pem", "key": "k.pem"}],
+                    "load_pem": [{"certificate": "c", "key": "k"}],
+                    "automate": ["example.com"],
+                    "load_storage": {"pairs": []}
+                },
+                "automation": {
+                    "policies": [{
+                        "subjects": ["example.com"],
+                        "issuers": [
+                            {"module": "acme", "challenges": {"dns": {"provider": "cloudflare"}}},
+                            {"module": "internal"}
+                        ],
+                        "storage": {"module": "file_system", "root": "/tls"}
+                    }],
+                    "on_demand": {"permission": {"module": "http", "endpoint": "https://example.com/ask"}}
+                },
+                "session_tickets": {"key_source": {"provider": "standard"}},
+                "dns": {"name": "cloudflare"}
+            }}
+        }));
+        let report = validate_config(&config, &registry()).expect("typed settings validate");
+        assert_eq!(report.tls_policies, 1);
+    }
+
+    #[test]
+    fn rejects_unknown_log_writer_with_located_error() {
+        let config = config_from(serde_json::json!({
+            "logging": {"logs": {"default": {"writer": {"output": "syslog"}}}}
+        }));
+        let error = validate_config(&config, &registry()).expect_err("unknown writer");
+        let message = error.to_string();
+        assert!(
+            message.contains("unknown log writer module `syslog`"),
+            "{message}"
+        );
+        assert!(
+            message.contains("logging.logs.default.writer.output"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_log_encoder_with_located_error() {
+        let config = config_from(serde_json::json!({
+            "logging": {"sink": {"encoder": {"format": "xml"}}}
+        }));
+        let error = validate_config(&config, &registry()).expect_err("unknown encoder");
+        let message = error.to_string();
+        assert!(
+            message.contains("unknown log encoder module `xml`"),
+            "{message}"
+        );
+        assert!(message.contains("logging.sink.encoder.format"), "{message}");
+    }
+
+    #[test]
+    fn rejects_unknown_log_core_with_located_error() {
+        let config = config_from(serde_json::json!({
+            "logging": {"logs": {"default": {"core": {"module": "bogus"}}}}
+        }));
+        let error = validate_config(&config, &registry()).expect_err("unknown core");
+        let message = error.to_string();
+        assert!(
+            message.contains("unknown log core module `bogus`"),
+            "{message}"
+        );
+        assert!(
+            message.contains("logging.logs.default.core.module"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn rejects_log_module_without_required_name() {
+        let config = config_from(serde_json::json!({
+            "logging": {"logs": {"default": {"writer": {}}}}
+        }));
+        let error = validate_config(&config, &registry()).expect_err("missing writer name");
+        assert!(error
+            .to_string()
+            .contains("logging.logs.default.writer.output"));
+    }
+
+    #[test]
+    fn rejects_unknown_storage_module_with_located_error() {
+        let config = config_from(serde_json::json!({"storage": {"module": "redis"}}));
+        let error = validate_config(&config, &registry()).expect_err("unknown storage");
+        let message = error.to_string();
+        assert!(
+            message.contains("unknown storage module `redis`"),
+            "{message}"
+        );
+        assert!(message.contains("storage.module"), "{message}");
+    }
+
+    #[test]
+    fn rejects_storage_without_module() {
+        let config = config_from(serde_json::json!({"storage": {"root": "/data"}}));
+        let error = validate_config(&config, &registry()).expect_err("missing storage module");
+        assert!(error.to_string().contains("storage.module"), "{error}");
+        assert!(
+            error.to_string().contains("must name a `module`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_certificate_loader_with_located_error() {
+        let config = tls_config(serde_json::json!({
+            "certificates": {"load_bogus": []}
+        }));
+        let error = validate_config(&config, &registry()).expect_err("unknown loader");
+        let message = error.to_string();
+        assert!(
+            message.contains("unknown TLS certificate loader module `load_bogus`"),
+            "{message}"
+        );
+        assert!(
+            message.contains("apps.tls.certificates.load_bogus"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_tls_issuer_with_policy_path() {
+        let config = tls_config(serde_json::json!({
+            "automation": {"policies": [{"issuers": [{"module": "letsencrypt"}]}]}
+        }));
+        let error = validate_config(&config, &registry()).expect_err("unknown issuer");
+        let message = error.to_string();
+        assert!(
+            message.contains("unknown TLS issuer module `letsencrypt`"),
+            "{message}"
+        );
+        assert!(
+            message.contains("apps.tls.automation.policies[0].issuers[0].module"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_dns_provider_in_issuer_challenges() {
+        let config = tls_config(serde_json::json!({
+            "automation": {"policies": [{
+                "issuers": [{"module": "acme", "challenges": {"dns": {"provider": "route53"}}}]
+            }]}
+        }));
+        let error = validate_config(&config, &registry()).expect_err("unknown DNS provider");
+        let message = error.to_string();
+        assert!(
+            message.contains("unknown DNS provider module `route53`"),
+            "{message}"
+        );
+        assert!(
+            message.contains("policies[0].issuers[0].challenges.dns.provider"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_tls_default_dns_provider() {
+        let config = tls_config(serde_json::json!({"dns": {"name": "route53"}}));
+        let error = validate_config(&config, &registry()).expect_err("unknown tls dns");
+        let message = error.to_string();
+        assert!(
+            message.contains("unknown DNS provider module `route53`"),
+            "{message}"
+        );
+        assert!(message.contains("apps.tls.dns.name"), "{message}");
+    }
+
+    #[test]
+    fn rejects_unknown_session_ticket_key_provider() {
+        let config = tls_config(serde_json::json!({
+            "session_tickets": {"key_source": {"provider": "vault"}}
+        }));
+        let error = validate_config(&config, &registry()).expect_err("unknown STEK provider");
+        let message = error.to_string();
+        assert!(
+            message.contains("unknown session ticket key provider module `vault`"),
+            "{message}"
+        );
+        assert!(
+            message.contains("apps.tls.session_tickets.key_source.provider"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_on_demand_permission_module() {
+        let config = tls_config(serde_json::json!({
+            "automation": {"on_demand": {"permission": {"module": "dns"}}}
+        }));
+        let error = validate_config(&config, &registry()).expect_err("unknown permission");
+        let message = error.to_string();
+        assert!(
+            message.contains("unknown TLS on-demand permission module `dns`"),
+            "{message}"
+        );
+        assert!(
+            message.contains("apps.tls.automation.on_demand.permission.module"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_policy_storage_module() {
+        let config = tls_config(serde_json::json!({
+            "automation": {"policies": [{"storage": {"module": "redis"}}]}
+        }));
+        let error = validate_config(&config, &registry()).expect_err("unknown policy storage");
+        let message = error.to_string();
+        assert!(
+            message.contains("unknown storage module `redis`"),
+            "{message}"
+        );
+        assert!(
+            message.contains("apps.tls.automation.policies[0].storage.module"),
+            "{message}"
+        );
     }
 }
