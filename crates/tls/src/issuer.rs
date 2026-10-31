@@ -46,8 +46,14 @@ pub trait CertificateIssuer: Send + Sync {
 pub struct AcmeIssuerConfig {
     /// ACME directory URL (default: Let's Encrypt production).
     pub ca: String,
+    /// Test directory URL used for retries after a primary-CA failure (Caddy's `test_ca`).
+    pub test_ca: Option<String>,
     /// ACME account email.
     pub email: Option<String>,
+    /// PEM-encoded existing account private key (Caddy's `account_key` placeholder).
+    pub account_key_pem: Option<String>,
+    /// CA-provided external account binding credentials (Caddy's `external_account`).
+    pub external_account: Option<crate::acme::ExternalAccount>,
     /// Preferred certificate chains.
     pub preferred_chains: Vec<String>,
     /// DNS challenge provider module name, if any.
@@ -60,7 +66,10 @@ impl Default for AcmeIssuerConfig {
     fn default() -> Self {
         Self {
             ca: "https://acme-v02.api.letsencrypt.org/directory".to_string(),
+            test_ca: None,
             email: None,
+            account_key_pem: None,
+            external_account: None,
             preferred_chains: Vec::new(),
             dns_provider: None,
             renewal_window: None,
@@ -78,10 +87,26 @@ impl AcmeIssuerConfig {
         if let Some(ca) = object.get("ca").and_then(serde_json::Value::as_str) {
             config.ca = ca.to_string();
         }
+        config.test_ca = object
+            .get("test_ca")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
         config.email = object
             .get("email")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
+        config.account_key_pem = object
+            .get("account_key")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        config.external_account = object
+            .get("external_account")
+            .map(|value| {
+                serde_json::from_value(value.clone()).map_err(|error| {
+                    Error::Issuer(format!("invalid `external_account` config: {error}"))
+                })
+            })
+            .transpose()?;
         config.preferred_chains = object
             .get("preferred_chains")
             .and_then(|chains| chains.get("smallest"))
@@ -180,6 +205,56 @@ mod tests {
         );
         assert_eq!(config.email.as_deref(), Some("ops@example.com"));
         assert_eq!(config.dns_provider.as_deref(), Some("cloudflare"));
+    }
+
+    #[test]
+    fn parses_acme_account_and_eab_config() {
+        let config = AcmeIssuerConfig::from_json(&serde_json::json!({
+            "module": "acme",
+            "ca": "https://acme.example/directory",
+            "test_ca": "https://acme.example/test/directory",
+            "email": "ops@example.com",
+            "account_key": "-----BEGIN PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----\n",
+            "external_account": {"key_id": "kid-1", "mac_key": "c2VjcmV0"}
+        }))
+        .unwrap();
+        assert_eq!(
+            config.test_ca.as_deref(),
+            Some("https://acme.example/test/directory")
+        );
+        assert_eq!(
+            config.account_key_pem.as_deref(),
+            Some("-----BEGIN PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----\n")
+        );
+        let eab = config.external_account.unwrap();
+        assert_eq!(eab.kid, "kid-1");
+        assert_eq!(eab.hmac_key, "c2VjcmV0");
+    }
+
+    #[test]
+    fn accepts_alternate_external_account_member_names() {
+        let config = AcmeIssuerConfig::from_json(&serde_json::json!({
+            "module": "acme",
+            "external_account": {"kid": "kid-2", "hmac_key": "bWFj"}
+        }))
+        .unwrap();
+        let eab = config.external_account.unwrap();
+        assert_eq!(eab.kid, "kid-2");
+        assert_eq!(eab.hmac_key, "bWFj");
+        assert_eq!(
+            serde_json::to_value(&eab).unwrap(),
+            serde_json::json!({"key_id": "kid-2", "mac_key": "bWFj"})
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_external_account_config() {
+        let error = AcmeIssuerConfig::from_json(&serde_json::json!({
+            "module": "acme",
+            "external_account": {"key_id": "kid-1"}
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("external_account"), "{error}");
     }
 
     #[test]
