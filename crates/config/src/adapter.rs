@@ -1449,6 +1449,8 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
     let mut request_headers = Map::new();
     let mut response_headers = Map::new();
     let mut retry_match: Vec<Value> = Vec::new();
+    let mut health_active: Option<Map<String, Value>> = None;
+    let mut health_passive: Option<Map<String, Value>> = None;
 
     for item in &directive.block {
         match item.name.as_str() {
@@ -1523,6 +1525,154 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
                     matcher_from_directives(&item.block)?
                 };
                 retry_match.push(matcher);
+            }
+            "health_uri" => {
+                let uri = single_argument(item, "health_uri")?;
+                health_active_map(&mut health_active).insert("uri".to_string(), json!(uri));
+            }
+            "health_headers" => {
+                if !item.args.is_empty() {
+                    return Err(adapter_error(
+                        item.position,
+                        "`health_headers` does not take inline arguments",
+                    ));
+                }
+                // Caddy accumulates repeated fields into one list and keeps a header written
+                // without values as a single empty string.
+                let mut headers = Map::new();
+                for header in &item.block {
+                    // This build's lexer tokenises a bare `{...}` at the start of a value as a
+                    // block; a block cannot be a health-header value in Caddy's Caddyfile, so
+                    // report it instead of silently dropping the placeholder.
+                    if !header.block.is_empty() {
+                        return Err(adapter_error(
+                            header.position,
+                            "unquoted `{...}` placeholder in a `health_headers` value is not \
+                             supported by this build; quote the value",
+                        ));
+                    }
+                    let mut values: Vec<Value> =
+                        header.args.iter().map(|value| json!(value)).collect();
+                    if values.is_empty() {
+                        values.push(json!(""));
+                    }
+                    match headers.get_mut(&header.name) {
+                        Some(Value::Array(existing)) => existing.extend(values),
+                        _ => {
+                            headers.insert(header.name.clone(), Value::Array(values));
+                        }
+                    }
+                }
+                let active = health_active_map(&mut health_active);
+                if !headers.is_empty() {
+                    active.insert("headers".to_string(), Value::Object(headers));
+                }
+            }
+            "health_method" => {
+                let method = single_argument(item, "health_method")?;
+                health_active_map(&mut health_active).insert("method".to_string(), json!(method));
+            }
+            "health_request_body" => {
+                let body = single_argument(item, "health_request_body")?;
+                health_active_map(&mut health_active).insert("body".to_string(), json!(body));
+            }
+            "health_interval" => {
+                let value = single_argument(item, "health_interval")?;
+                let nanos = parse_duration(value)
+                    .map_err(|message| adapter_error(item.position, message))?;
+                health_active_map(&mut health_active).insert("interval".to_string(), json!(nanos));
+            }
+            "health_timeout" => {
+                let value = single_argument(item, "health_timeout")?;
+                let nanos = parse_duration(value)
+                    .map_err(|message| adapter_error(item.position, message))?;
+                health_active_map(&mut health_active).insert("timeout".to_string(), json!(nanos));
+            }
+            "health_status" => {
+                let value = single_argument(item, "health_status")?;
+                let status = parse_health_status(value)
+                    .map_err(|message| adapter_error(item.position, message))?;
+                health_active_map(&mut health_active)
+                    .insert("expect_status".to_string(), json!(status));
+            }
+            "health_body" => {
+                let body = single_argument(item, "health_body")?;
+                health_active_map(&mut health_active)
+                    .insert("expect_body".to_string(), json!(body));
+            }
+            "health_follow_redirects" => {
+                if !item.args.is_empty() {
+                    return Err(adapter_error(
+                        item.position,
+                        "`health_follow_redirects` does not take arguments",
+                    ));
+                }
+                health_active_map(&mut health_active)
+                    .insert("follow_redirects".to_string(), json!(true));
+            }
+            "health_passes" => {
+                let value = single_argument(item, "health_passes")?;
+                let passes =
+                    parse_count(value).map_err(|message| adapter_error(item.position, message))?;
+                health_active_map(&mut health_active).insert("passes".to_string(), json!(passes));
+            }
+            "health_fails" => {
+                let value = single_argument(item, "health_fails")?;
+                let fails =
+                    parse_count(value).map_err(|message| adapter_error(item.position, message))?;
+                health_active_map(&mut health_active).insert("fails".to_string(), json!(fails));
+            }
+            "max_fails" => {
+                let value = single_argument(item, "max_fails")?;
+                let max_fails =
+                    parse_count(value).map_err(|message| adapter_error(item.position, message))?;
+                health_passive_map(&mut health_passive)
+                    .insert("max_fails".to_string(), json!(max_fails));
+            }
+            "fail_duration" => {
+                let value = single_argument(item, "fail_duration")?;
+                let nanos = parse_duration(value)
+                    .map_err(|message| adapter_error(item.position, message))?;
+                health_passive_map(&mut health_passive)
+                    .insert("fail_duration".to_string(), json!(nanos));
+            }
+            "unhealthy_request_count" => {
+                let value = single_argument(item, "unhealthy_request_count")?;
+                let count =
+                    parse_count(value).map_err(|message| adapter_error(item.position, message))?;
+                health_passive_map(&mut health_passive)
+                    .insert("unhealthy_request_count".to_string(), json!(count));
+            }
+            "unhealthy_latency" => {
+                let value = single_argument(item, "unhealthy_latency")?;
+                let nanos = parse_duration(value)
+                    .map_err(|message| adapter_error(item.position, message))?;
+                health_passive_map(&mut health_passive)
+                    .insert("unhealthy_latency".to_string(), json!(nanos));
+            }
+            "unhealthy_status" => {
+                if item.args.is_empty() {
+                    return Err(adapter_error(
+                        item.position,
+                        "`unhealthy_status` requires at least one status code",
+                    ));
+                }
+                let mut statuses = Vec::new();
+                for value in &item.args {
+                    statuses.push(
+                        parse_health_status(value)
+                            .map_err(|message| adapter_error(item.position, message))?,
+                    );
+                }
+                let passive = health_passive_map(&mut health_passive);
+                match passive.get_mut("unhealthy_status") {
+                    Some(Value::Array(existing)) => {
+                        existing.extend(statuses.into_iter().map(|status| json!(status)));
+                    }
+                    _ => {
+                        passive.insert("unhealthy_status".to_string(), json!(statuses));
+                    }
+                }
             }
             "header_up" => {
                 if item.args.len() < 2 {
@@ -1657,7 +1807,53 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
         }
         object.insert("transport".to_string(), Value::Object(transport));
     }
+    if health_active.is_some() || health_passive.is_some() {
+        let mut health_checks = Map::new();
+        if let Some(active) = health_active {
+            health_checks.insert("active".to_string(), Value::Object(active));
+        }
+        if let Some(passive) = health_passive {
+            health_checks.insert("passive".to_string(), Value::Object(passive));
+        }
+        object.insert("health_checks".to_string(), Value::Object(health_checks));
+    }
     Ok(Value::Object(object))
+}
+
+fn health_active_map(slot: &mut Option<Map<String, Value>>) -> &mut Map<String, Value> {
+    slot.get_or_insert_with(Map::new)
+}
+
+fn health_passive_map(slot: &mut Option<Map<String, Value>>) -> &mut Map<String, Value> {
+    slot.get_or_insert_with(Map::new)
+}
+
+fn single_argument<'a>(directive: &'a Directive, option: &str) -> caddy_rs_core::Result<&'a str> {
+    match directive.args.as_slice() {
+        [value] => Ok(value),
+        _ => Err(adapter_error(
+            directive.position,
+            format!("`{option}` requires exactly one value"),
+        )),
+    }
+}
+
+/// Caddy's health status parsing: `2xx`/`5xx` are status classes written as single digits.
+fn parse_health_status(value: &str) -> Result<u16, String> {
+    let value = if value.len() == 3 && value.ends_with("xx") {
+        &value[..1]
+    } else {
+        value
+    };
+    value
+        .parse()
+        .map_err(|_| format!("invalid status value `{value}`"))
+}
+
+fn parse_count(value: &str) -> Result<u32, String> {
+    value
+        .parse()
+        .map_err(|_| format!("`{value}` is not a non-negative integer"))
 }
 
 struct ParsedUpstream {

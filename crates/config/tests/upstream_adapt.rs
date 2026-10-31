@@ -180,3 +180,87 @@ fn unix_upstream_dials_are_verbatim_without_default_ports() {
         }
     }
 }
+
+#[test]
+fn reverse_proxy_health_method_matches_caddy() {
+    assert_adapts_like_caddy("reverse_proxy_health_method.caddyfiletest");
+}
+
+#[test]
+fn reverse_proxy_health_path_query_matches_caddy() {
+    assert_adapts_like_caddy("reverse_proxy_health_path_query.caddyfiletest");
+}
+
+#[test]
+fn reverse_proxy_health_request_body_matches_caddy() {
+    assert_adapts_like_caddy("reverse_proxy_health_reqbody.caddyfiletest");
+}
+
+#[test]
+fn reverse_proxy_health_headers_values_match_caddy() {
+    // Mirrors Caddy's reverse_proxy_health_headers fixture, with the value that this build's
+    // lexer cannot tokenise unquoted (`{system.hostname}`) written quoted instead.
+    let caddyfile = ":8884\n\nreverse_proxy 127.0.0.1:65535 {\n\thealth_headers {\n\t\tHost example.com\n\t\tX-Header-Key 95ca39e3cbe7\n\t\tX-Header-Keys VbG4NZwWnipo 335Q9/MhqcNU3s2TO\n\t\tX-Empty-Value\n\t\tSame-Key 1\n\t\tSame-Key 2\n\t\tX-System-Hostname \"{system.hostname}\"\n\t}\n\thealth_uri /health\n}\n";
+    let adapted = adapt(caddyfile).unwrap_or_else(|error| panic!("adapt health_headers: {error}"));
+    let handler = &adapted.config["apps"]["http"]["servers"]["srv0"]["routes"][0]["handle"][0];
+    assert_eq!(
+        handler["health_checks"]["active"],
+        json!({
+            "uri": "/health",
+            "headers": {
+                "Host": ["example.com"],
+                "X-Header-Key": ["95ca39e3cbe7"],
+                "X-Header-Keys": ["VbG4NZwWnipo", "335Q9/MhqcNU3s2TO"],
+                "X-Empty-Value": [""],
+                "Same-Key": ["1", "2"],
+                "X-System-Hostname": ["{system.hostname}"],
+            }
+        })
+    );
+}
+
+#[test]
+fn unquoted_placeholder_health_header_is_rejected_loudly() {
+    // The lexer currently tokenises a bare `{...}` value as a block; the adapter must not drop
+    // the placeholder silently (DIV-0016).
+    let error = adapt(
+        ":8884\n\nreverse_proxy 127.0.0.1:65535 {\n\thealth_headers {\n\t\tX-System-Hostname {system.hostname}\n\t}\n\thealth_uri /health\n}\n",
+    )
+    .expect_err("unquoted placeholder health header must be rejected");
+    let message = error.to_string();
+    assert!(
+        message.contains("health_headers") && message.contains("quote the value"),
+        "unexpected error: {message}"
+    );
+}
+
+#[test]
+fn reverse_proxy_health_options_emit_caddy_health_checks_shape() {
+    let caddyfile = ":8884\n\nreverse_proxy 127.0.0.1:65535 {\n\thealth_uri /health?ready=1\n\thealth_interval 10s\n\thealth_timeout 2s\n\thealth_status 2xx\n\thealth_method HEAD\n\thealth_request_body \"ping\"\n\thealth_body ok\n\thealth_follow_redirects\n\thealth_passes 3\n\thealth_fails 2\n\tmax_fails 4\n\tfail_duration 30s\n\tunhealthy_status 502 5xx\n\tunhealthy_latency 1s\n\tunhealthy_request_count 8\n}\n";
+    let adapted = adapt(caddyfile).unwrap_or_else(|error| panic!("adapt health options: {error}"));
+    let handler = &adapted.config["apps"]["http"]["servers"]["srv0"]["routes"][0]["handle"][0];
+    assert_eq!(
+        handler["health_checks"],
+        json!({
+            "active": {
+                "uri": "/health?ready=1",
+                "interval": 10_000_000_000u64,
+                "timeout": 2_000_000_000u64,
+                "expect_status": 2,
+                "method": "HEAD",
+                "body": "ping",
+                "expect_body": "ok",
+                "follow_redirects": true,
+                "passes": 3,
+                "fails": 2,
+            },
+            "passive": {
+                "max_fails": 4,
+                "fail_duration": 30_000_000_000u64,
+                "unhealthy_status": [502, 5],
+                "unhealthy_latency": 1_000_000_000u64,
+                "unhealthy_request_count": 8,
+            }
+        })
+    );
+}
