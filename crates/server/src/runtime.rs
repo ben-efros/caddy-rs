@@ -4,6 +4,11 @@
 //! routers, updates the listener map, adds/removes listeners as addresses change, and rebinds the
 //! admin API if its address changed. Listeners are never torn down for an unchanged address, so a
 //! reload does not create a listening gap.
+//!
+//! When started by systemd with `LISTEN_FDS` (`LISTEN_PID` matching this process), inherited
+//! listening sockets are adopted instead of bound; see [`crate::activation`] for the mapping and
+//! mismatch policy. A reload never re-adopts descriptors: sockets are adopted on the first apply,
+//! and listeners added later bind normally.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -15,6 +20,7 @@ use caddy_rs_core::{Generation, GenerationStore};
 use caddy_rs_http::RouterBuilder;
 use tokio::sync::watch;
 
+use crate::activation::{plan_activation, ActivationError, ActivationPlan, SocketActivation};
 use crate::error::{Error, Result};
 use crate::limits::ServerLimits;
 use crate::listeners::{bind, bind_admin, ListenerHandle, ListenerState, SharedListeners};
@@ -47,6 +53,22 @@ pub struct ServerRuntime {
     admin: Option<ListenerHandle>,
     admin_api: AdminApi,
     status: RuntimeStatus,
+    /// Socket-activation resolution state; resolved once on the first apply.
+    activation: ActivationState,
+}
+
+/// How inherited systemd sockets are discovered for this runtime.
+enum ActivationState {
+    /// Read `LISTEN_PID`/`LISTEN_FDS`/`LISTEN_FDNAMES` on the first apply (the default).
+    Environment,
+    /// Descriptors injected by an embedder or test; consumed on the first apply.
+    Injected(Option<SocketActivation>),
+    /// Resolved mapping; entries are consumed as listeners adopt them.
+    Planned(ActivationPlan),
+    /// No socket activation for this runtime.
+    Inactive,
+    /// Resolution failed; every apply repeats the same located error.
+    Failed { path: String, message: String },
 }
 
 impl ServerRuntime {
@@ -62,7 +84,19 @@ impl ServerRuntime {
             admin: None,
             admin_api,
             status: RuntimeStatus::default(),
+            activation: ActivationState::Environment,
         }
+    }
+
+    /// Adopt the given inherited listening sockets instead of reading the process environment.
+    ///
+    /// Takes ownership of the descriptors (closing any that remain unclaimed when the runtime is
+    /// dropped) and must be called before the first [`ServerRuntime::apply`]; intended for
+    /// embedders and tests that need to inject systemd-style activation. If any inherited socket is
+    /// not claimed by a configured listener the first apply fails with a located error.
+    pub fn with_socket_activation(mut self, activation: SocketActivation) -> Self {
+        self.activation = ActivationState::Injected(Some(activation));
+        self
     }
 
     /// The generation store driving this runtime.
@@ -83,6 +117,10 @@ impl ServerRuntime {
             return Ok(self.status.clone());
         };
         let states = self.build_listener_states(&generation)?;
+        // Resolve systemd socket activation before mutating any runtime state: a mismatch
+        // (unclaimed inherited socket, malformed environment, non-listening fd) must fail the
+        // apply without disturbing the previous generation.
+        self.resolve_activation(&states)?;
 
         {
             let mut shared = self
@@ -111,9 +149,36 @@ impl ServerRuntime {
             if self.listeners.contains_key(listen) {
                 continue;
             }
-            let handle = bind(listen, Arc::clone(&self.states), Arc::clone(&self.store)).await?;
+            let inherited = match &mut self.activation {
+                ActivationState::Planned(plan) => plan.claim(listen),
+                _ => None,
+            };
+            if inherited.is_none() {
+                if let ActivationState::Planned(plan) = &self.activation {
+                    if plan.inherited() > 0 {
+                        tracing::info!(
+                            listen,
+                            "no inherited socket matched this listener; binding normally"
+                        );
+                    }
+                }
+            }
+            let handle = bind(
+                listen,
+                Arc::clone(&self.states),
+                Arc::clone(&self.store),
+                inherited,
+            )
+            .await?;
             tracing::info!(listen, bound = %handle.bound, "listening");
             self.listeners.insert(listen.to_string(), handle);
+        }
+
+        // Once every inherited socket has been adopted the remaining applies bind normally.
+        if let ActivationState::Planned(plan) = &self.activation {
+            if !plan.has_claims() {
+                self.activation = ActivationState::Inactive;
+            }
         }
 
         // Reconcile the admin listener.
@@ -192,6 +257,72 @@ impl ServerRuntime {
         for (_, handle) in listeners {
             handle.stop().await;
         }
+    }
+
+    /// Resolve the socket-activation state for the configured listeners, once.
+    fn resolve_activation(
+        &mut self,
+        states: &std::collections::HashMap<String, Arc<ListenerState>>,
+    ) -> Result<()> {
+        let state = std::mem::replace(&mut self.activation, ActivationState::Inactive);
+        match state {
+            ActivationState::Environment => match SocketActivation::from_env() {
+                Ok(Some(activation)) => self.plan_inherited_sockets(activation, states),
+                Ok(None) => Ok(()),
+                Err(error) => self.fail_activation(error),
+            },
+            ActivationState::Injected(Some(activation)) => {
+                self.plan_inherited_sockets(activation, states)
+            }
+            ActivationState::Injected(None) => Ok(()),
+            ActivationState::Planned(plan) => {
+                self.activation = ActivationState::Planned(plan);
+                Ok(())
+            }
+            ActivationState::Inactive => Ok(()),
+            ActivationState::Failed { path, message } => {
+                let error = Error::SocketActivation {
+                    path: path.clone(),
+                    message: message.clone(),
+                };
+                self.activation = ActivationState::Failed { path, message };
+                Err(error)
+            }
+        }
+    }
+
+    fn plan_inherited_sockets(
+        &mut self,
+        activation: SocketActivation,
+        states: &std::collections::HashMap<String, Arc<ListenerState>>,
+    ) -> Result<()> {
+        let listen_keys: Vec<String> = states.keys().cloned().collect();
+        match plan_activation(&listen_keys, activation) {
+            Ok(plan) => {
+                if plan.inherited() > 0 {
+                    tracing::info!(
+                        inherited = plan.inherited(),
+                        claimed = plan.claimed_listeners().count(),
+                        "resolved systemd socket activation"
+                    );
+                }
+                self.activation = ActivationState::Planned(plan);
+                Ok(())
+            }
+            Err(error) => self.fail_activation(error),
+        }
+    }
+
+    fn fail_activation(&mut self, error: ActivationError) -> Result<()> {
+        let located = Error::SocketActivation {
+            path: error.path().to_string(),
+            message: error.message().to_string(),
+        };
+        self.activation = ActivationState::Failed {
+            path: error.path().to_string(),
+            message: error.message().to_string(),
+        };
+        Err(located)
     }
 
     /// Build the per-listen-address serving state for a generation.

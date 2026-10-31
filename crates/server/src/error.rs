@@ -45,6 +45,18 @@ pub enum Error {
     #[error("invalid admin listen address `{0}`")]
     AdminAddress(String),
 
+    /// systemd socket activation is inconsistent.
+    ///
+    /// `path` names the offending environment value (for example `LISTEN_FDS[1]`), so the
+    /// operator can find the systemd unit/configuration mismatch.
+    #[error("socket activation: invalid `{path}`: {message}")]
+    SocketActivation {
+        /// Located activation path (`LISTEN_PID`, `LISTEN_FDS[2]`, ...).
+        path: String,
+        /// Diagnosis naming the offending value.
+        message: String,
+    },
+
     /// I/O errors.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

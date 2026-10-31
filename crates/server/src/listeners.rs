@@ -37,6 +37,7 @@ use caddy_rs_admin::{AdminApi, AdminRequest};
 use caddy_rs_core::{GenerationStore, ListenAddr, Network};
 use caddy_rs_http::Router;
 
+use crate::activation::{adopt_tcp, adopt_unix, InheritedSocket, LocalSocket};
 use crate::error::Error;
 use crate::http::serve_request_with_limits;
 use crate::limits::ServerLimits;
@@ -72,11 +73,16 @@ impl ListenerHandle {
     }
 }
 
-/// Bind the listener for a Caddy listen address.
+/// Bind the listener for a Caddy listen address, or adopt an inherited systemd socket.
+///
+/// When `inherited` is `Some`, the descriptor passed by systemd is adopted instead of binding a
+/// new socket. The caller must only pass a socket whose local address was matched against this
+/// configured listener by [`crate::activation::plan_activation`].
 pub(crate) async fn bind(
     configured: &str,
     listeners: SharedListeners,
     store: Arc<GenerationStore>,
+    inherited: Option<InheritedSocket>,
 ) -> Result<ListenerHandle, Error> {
     let address = ListenAddr::parse(configured).map_err(|reason| Error::Listen {
         listen: configured.to_string(),
@@ -84,9 +90,29 @@ pub(crate) async fn bind(
     })?;
     match address.network {
         Network::Tcp => {
-            let listener = TcpListener::bind(&address.address)
-                .await
-                .map_err(|error| Error::bind(configured, error))?;
+            let listener = match inherited {
+                Some(socket) => {
+                    if !matches!(socket.local(), LocalSocket::Tcp(_)) {
+                        return Err(Error::SocketActivation {
+                            path: format!("LISTEN_FDS[{}]", socket.index()),
+                            message: format!(
+                                "inherited {} cannot serve configured TCP listener `{configured}`",
+                                socket.local()
+                            ),
+                        });
+                    }
+                    tracing::info!(
+                        listen = configured,
+                        fd = socket.fd(),
+                        socket = %socket.local(),
+                        "adopting inherited systemd TCP socket"
+                    );
+                    adopt_tcp(socket, configured)?
+                }
+                None => TcpListener::bind(&address.address)
+                    .await
+                    .map_err(|error| Error::bind(configured, error))?,
+            };
             let socket_addr = listener
                 .local_addr()
                 .map_err(|error| Error::bind(configured, error))?;
@@ -102,11 +128,35 @@ pub(crate) async fn bind(
         }
         Network::Unix => {
             let path = address.address.clone();
-            if std::path::Path::new(&path).exists() {
-                std::fs::remove_file(&path).map_err(|error| Error::bind(configured, error))?;
-            }
-            let listener =
-                UnixListener::bind(&path).map_err(|error| Error::bind(configured, error))?;
+            let listener = match inherited {
+                Some(socket) => {
+                    if !matches!(socket.local(), LocalSocket::Unix(_)) {
+                        return Err(Error::SocketActivation {
+                            path: format!("LISTEN_FDS[{}]", socket.index()),
+                            message: format!(
+                                "inherited {} cannot serve configured Unix listener `{configured}`",
+                                socket.local()
+                            ),
+                        });
+                    }
+                    tracing::info!(
+                        listen = configured,
+                        fd = socket.fd(),
+                        socket = %socket.local(),
+                        "adopting inherited systemd Unix socket"
+                    );
+                    adopt_unix(socket, configured)?
+                }
+                None => {
+                    // Only a socket we bind ourselves may have a stale path to remove: an
+                    // inherited Unix socket is already bound and must not be unlinked.
+                    if std::path::Path::new(&path).exists() {
+                        std::fs::remove_file(&path)
+                            .map_err(|error| Error::bind(configured, error))?;
+                    }
+                    UnixListener::bind(&path).map_err(|error| Error::bind(configured, error))?
+                }
+            };
             let (shutdown, receiver) = watch::channel(false);
             let task = spawn_unix_accept_loop(
                 listener,
