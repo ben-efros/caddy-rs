@@ -20,5 +20,17 @@ tokio = { workspace = true }
 base64 = "0.22.1"
 ring = "0.17.14"
 
+# ACME order client: production HTTP(S) transport over hyper + rustls (ring provider).
+# All of these are already in the offline registry cache; feature sets deliberately avoid
+# aws-lc-rs, rustls-native-certs and webpki-roots (not cached in this workspace).
+bytes = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+httpdate = "1.0.3"
+rustls = { version = "0.23.45", default-features = false, features = ["std", "ring", "tls12", "logging"] }
+hyper-rustls = { version = "0.27.10", default-features = false, features = ["http1", "tls12", "logging", "ring"] }
+
 [dev-dependencies]
 tempfile = "3.27.0"
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }

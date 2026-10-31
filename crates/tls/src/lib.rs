@@ -1,8 +1,10 @@
 //! TLS subsystem foundations: certificate model and cache, Caddy-compatible certificate storage,
-//! issuer interface, DNS-01 provider interface, and renewal scheduling.
+//! issuer interface, DNS-01 provider interface, renewal scheduling, and the ACME (RFC 8555)
+//! account/order client.
 //!
-//! The rustls terminator and ACME wire client are intentionally not wired yet (M4/M5); this crate
-//! keeps the parts that do not need a live TLS stack testable and stable.
+//! The rustls terminator and the wiring of the ACME issuer into automatic HTTPS are intentionally
+//! not wired yet (M4/M5); this crate keeps the parts that do not need a live TLS stack testable
+//! and stable.
 
 #![forbid(unsafe_code)]
 
@@ -14,10 +16,14 @@ pub mod issuer;
 pub mod storage;
 
 pub use acme::{
-    account_paths, Account, AccountKey, AccountPaths, AccountRegistration, AccountStatus,
-    AccountStore, AcmeClient, AcmeError, AcmeStorage, AcmeTransport, Directory, DirectoryMeta,
-    ExternalAccount, HttpMethod, HttpRequest, HttpResponse, Jwk, MemoryAcmeStorage,
-    NewAccountRequest, Problem, StoredAccount,
+    account_paths, parse_pem_certificate_chain, parse_retry_after, retry_after, Account,
+    AccountKey, AccountPaths, AccountRegistration, AccountStatus, AccountStore, AcmeAccountClient,
+    AcmeClient, AcmeClock, AcmeError, AcmeStorage, AcmeTransport, Authorization,
+    AuthorizationFetch, AuthorizationStatus, CertificateRequest, Challenge, ChallengeFetch,
+    ChallengePolicy, ChallengeStatus, ChallengeType, Directory, DirectoryMeta, ExternalAccount,
+    HttpMethod, HttpRequest, HttpResponse, HyperTransport, Identifier, IssuedCertificate, Jwk,
+    MemoryAcmeStorage, NewAccountRequest, NewOrderRequest, Order, OrderFetch, OrderHandle,
+    OrderStatus, PollPolicy, Problem, StoredAccount, TokioClock,
 };
 pub use certificate::{renewal_queue, Certificate, CertificateCache, RenewalItem};
 pub use cloudflare::{
