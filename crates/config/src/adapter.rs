@@ -17,7 +17,7 @@ use caddy_rs_core::{AdaptedConfig, ConfigAdapter, Error as CoreError};
 use serde_json::{json, Map, Value};
 
 use crate::lexer::Position;
-use crate::parser::{self, AutoHttpsMode, Directive, SiteAddress, SiteBlock};
+use crate::parser::{self, AutoHttpsMode, Directive, SiteBlock};
 
 /// Canonical directive order, mirroring Caddy's default order for the supported subset.
 const DIRECTIVE_ORDER: &[&str] = &[
@@ -60,19 +60,27 @@ pub fn adapt(input: &str) -> caddy_rs_core::Result<AdaptedConfig> {
     let auto_https_off = matches!(options.auto_https, Some(AutoHttpsMode::Off));
     let mut warnings = options.warnings.clone();
 
+    // Each site block's route list is built once; a block may be served on several listeners.
+    let mut site_routes: Vec<Vec<Value>> = Vec::with_capacity(file.sites.len());
+    for site in &file.sites {
+        site_routes.push(build_site_routes(site, &mut warnings)?);
+    }
+
+    // Assign each site address to the server (listener) that serves it. Caddy groups site blocks
+    // per listener address; `bind` is not supported, so the listener is the wildcard address for
+    // the address's effective port.
     let mut seen_addresses: BTreeMap<String, Position> = BTreeMap::new();
     let mut servers: Vec<ServerBuilder> = Vec::new();
-
-    for site in &file.sites {
-        let site_routes = build_site_routes(site, &mut warnings)?;
-        for address in &site.addresses {
+    for (site_index, site) in file.sites.iter().enumerate() {
+        let mut addresses_by_listener: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for (address_index, address) in site.addresses.iter().enumerate() {
             let normalized = format!(
                 "{}://{}:{}",
                 address.scheme.as_deref().unwrap_or("auto"),
                 address.host,
                 address.effective_port(http_port, https_port)
             );
-            if let Some(previous) = seen_addresses.insert(normalized.clone(), site.position) {
+            if let Some(previous) = seen_addresses.insert(normalized, site.position) {
                 return Err(adapter_error(
                     site.position,
                     format!(
@@ -81,16 +89,15 @@ pub fn adapt(input: &str) -> caddy_rs_core::Result<AdaptedConfig> {
                     ),
                 ));
             }
-
             let port = address.effective_port(http_port, https_port);
-            let listen = listen_address(address, port);
+            let listen = listen_address(port);
             let https = address.is_https(http_port, https_port);
             let index = match servers.iter().position(|server| server.listen == listen) {
                 Some(index) => index,
                 None => {
                     servers.push(ServerBuilder {
-                        listen,
-                        routes: Vec::new(),
+                        listen: listen.clone(),
+                        blocks: Vec::new(),
                         https,
                         skip_auto_https: Vec::new(),
                     });
@@ -99,36 +106,91 @@ pub fn adapt(input: &str) -> caddy_rs_core::Result<AdaptedConfig> {
             };
             let server = &mut servers[index];
             server.https |= https;
-            if address.scheme.as_deref() == Some("http") && port != 80 && !address.host.is_empty() {
-                let host = address
-                    .host
-                    .trim_start_matches('[')
-                    .trim_end_matches(']')
-                    .to_string();
-                if !server.skip_auto_https.contains(&host) {
-                    server.skip_auto_https.push(host);
-                }
-            }
-            if address.host.is_empty() {
-                server.routes.extend(site_routes.clone());
-            } else {
+            if address.scheme.as_deref() == Some("http")
+                && port != http_port
+                && !address.host.is_empty()
+            {
                 let host = address.host.trim_start_matches('[').trim_end_matches(']');
-                let mut route = Map::new();
-                route.insert("match".to_string(), json!([{"host": [host]}]));
-                if !site_routes.is_empty() {
-                    route.insert(
-                        "handle".to_string(),
-                        json!([{"handler": "subroute", "routes": site_routes}]),
-                    );
+                if !server.skip_auto_https.iter().any(|skip| skip == host) {
+                    server.skip_auto_https.push(host.to_string());
                 }
-                route.insert("terminal".to_string(), json!(true));
-                server.routes.push(Value::Object(route));
             }
+            addresses_by_listener
+                .entry(listen)
+                .or_default()
+                .push(address_index);
+        }
+        for (listen, address_indices) in addresses_by_listener {
+            let server = servers
+                .iter_mut()
+                .find(|server| server.listen == listen)
+                .expect("listener was registered above");
+            server.blocks.push(SiteBlockPlan {
+                site_index,
+                address_indices,
+            });
         }
     }
 
+    // Caddy names servers ("srv0", ...) in sorted listener-address order.
+    servers.sort_by(|left, right| left.listen.cmp(&right.listen));
+
     let mut server_map = Map::new();
-    for (index, server) in servers.into_iter().enumerate() {
+    for (index, mut server) in servers.into_iter().enumerate() {
+        sort_site_blocks(&mut server.blocks, &file.sites);
+        let block_count = server.blocks.len();
+        let mut routes = Vec::new();
+        for block in &server.blocks {
+            let site = &file.sites[block.site_index];
+            let block_routes = site_routes[block.site_index].clone();
+            let catch_all = block
+                .address_indices
+                .iter()
+                .any(|address_index| site.addresses[*address_index].host.is_empty());
+            let mut hosts: Vec<String> = Vec::new();
+            if !catch_all {
+                for address_index in &block.address_indices {
+                    let host = site.addresses[*address_index]
+                        .host
+                        .trim_start_matches('[')
+                        .trim_end_matches(']');
+                    if !hosts.iter().any(|existing| existing == host) {
+                        hosts.push(host.to_string());
+                    }
+                }
+            }
+            let matchers = if hosts.is_empty() {
+                None
+            } else {
+                Some(json!([{"host": hosts}]))
+            };
+            // A site block with a hostless key has no host matcher (the hostless key already
+            // matches every host), and Caddy does not wrap the sole catch-all block of a server
+            // in a subroute unless one of its own routes carries a host matcher (issue #5124).
+            let wrap = !(matchers.is_none()
+                && block_count == 1
+                && !routes_have_host_matcher(&block_routes));
+            if wrap {
+                let mut route = Map::new();
+                if let Some(matchers) = matchers {
+                    route.insert("match".to_string(), matchers);
+                }
+                if !block_routes.is_empty() {
+                    route.insert(
+                        "handle".to_string(),
+                        json!([{"handler": "subroute", "routes": block_routes}]),
+                    );
+                }
+                route.insert("terminal".to_string(), json!(true));
+                if route.contains_key("match") || route.contains_key("handle") {
+                    routes.push(Value::Object(route));
+                }
+            } else {
+                routes.extend(block_routes);
+            }
+        }
+        let routes = consolidate_routes(routes);
+
         let mut object = Map::new();
         object.insert("listen".to_string(), json!([server.listen]));
         let mut automatic_https = Map::new();
@@ -156,108 +218,227 @@ pub fn adapt(input: &str) -> caddy_rs_core::Result<AdaptedConfig> {
         if server.https && auto_https_off {
             object.insert("tls_connection_policies".to_string(), json!([{}]));
         }
-        let routes = consolidate_host_routes(server.routes);
         object.insert("routes".to_string(), Value::Array(routes));
         server_map.insert(format!("srv{index}"), Value::Object(object));
     }
 
-    let config = json!({
-        "apps": {
-            "http": {
-                "servers": Value::Object(server_map),
-            }
-        }
-    });
+    let mut apps = Map::new();
+    apps.insert(
+        "http".to_string(),
+        json!({"servers": Value::Object(server_map)}),
+    );
+    if let Some(tls) = tls_app(&file.sites, http_port, auto_https_off)? {
+        apps.insert("tls".to_string(), tls);
+    }
 
-    Ok(AdaptedConfig { config, warnings })
+    Ok(AdaptedConfig {
+        config: json!({"apps": Value::Object(apps)}),
+        warnings,
+    })
 }
 
 struct ServerBuilder {
     listen: String,
-    routes: Vec<Value>,
+    blocks: Vec<SiteBlockPlan>,
     https: bool,
     skip_auto_https: Vec<String>,
 }
 
-fn listen_address(_address: &SiteAddress, port: u16) -> String {
+/// One site block as served by one listener: the block's routes plus which of its addresses are
+/// bound to that listener.
+struct SiteBlockPlan {
+    site_index: usize,
+    address_indices: Vec<usize>,
+}
+
+fn listen_address(port: u16) -> String {
     // Caddy site addresses name virtual hosts, not bind addresses; binding is controlled by the
     // `bind` directive. All sites therefore listen on the wildcard address for their port.
     format!(":{port}")
 }
 
-/// Consolidate routes that Caddy's adapter would merge: host-only routes with identical handling
-/// combine their host lists, and a host-only route is dropped when an equivalent catch-all route
-/// already exists (the catch-all covers it). This mirrors Caddy's site-block consolidation and is
-/// covered by `tls_automation_policies_9` in the conformance corpus.
-fn consolidate_host_routes(routes: Vec<Value>) -> Vec<Value> {
-    fn host_route(route: &Value) -> Option<(&Value, &Value)> {
-        let object = route.as_object()?;
-        let keys: Vec<&String> = object.keys().collect();
-        if keys.iter().any(|key| {
-            key.as_str() != "match" && key.as_str() != "handle" && key.as_str() != "terminal"
-        }) {
-            return None;
+/// Sort site blocks the way Caddy's `httptype.go` does: descending host specificity, catch-all
+/// blocks last, blocks with wildcard hosts after blocks with only concrete hosts.
+fn sort_site_blocks(blocks: &mut [SiteBlockPlan], sites: &[SiteBlock]) {
+    fn longest_host(block: &SiteBlockPlan, sites: &[SiteBlock]) -> (usize, bool) {
+        let site = &sites[block.site_index];
+        let mut longest = 0;
+        let mut wildcard = false;
+        for address_index in &block.address_indices {
+            let address = &site.addresses[*address_index];
+            if address.host.contains('*') || address.host.is_empty() {
+                wildcard = true;
+            }
+            longest = longest.max(specificity(&address.host));
         }
-        let matchers = object.get("match")?.as_array()?;
-        if matchers.len() != 1 {
-            return None;
-        }
-        let matcher = matchers[0].as_object()?;
-        if matcher.len() != 1 || matcher.get("host")?.as_array()?.is_empty() {
-            return None;
-        }
-        let handle = object.get("handle")?;
-        Some((handle, route))
+        (longest, wildcard)
     }
 
-    let mut output: Vec<Value> = Vec::new();
-    for route in routes {
-        let catch_all_handle = route.get("handle").cloned();
-        let Some((handle, _)) = host_route(&route) else {
-            // Catch-all or complex route: drop any host routes it makes redundant.
-            if route.get("match").is_none() {
-                if let Some(catch_all_handle) = catch_all_handle {
-                    output.retain(|existing| {
-                        host_route(existing)
-                            .map(|(existing_handle, _)| *existing_handle != catch_all_handle)
-                            .unwrap_or(true)
-                    });
-                }
-            }
-            output.push(route);
-            continue;
+    blocks.sort_by(|left, right| {
+        let (left_host, left_wildcard) = longest_host(left, sites);
+        let (right_host, right_wildcard) = longest_host(right, sites);
+        let left_before = if left_host == 0 {
+            false
+        } else if right_host == 0 {
+            true
+        } else if left_wildcard != right_wildcard {
+            right_wildcard && !left_wildcard
+        } else {
+            left_host > right_host
         };
-        let object = route.as_object().expect("host route is an object");
-        let hosts = object["match"][0]["host"].as_array().expect("checked");
-        // Merge into an existing host route with identical handling.
-        let mut merged = false;
-        for existing in &mut output {
-            let Some((existing_handle, _)) = host_route(existing) else {
-                continue;
-            };
-            if existing_handle == handle {
-                if let Some(existing_hosts) = existing
-                    .as_object_mut()
-                    .and_then(|object| object.get_mut("match"))
-                    .and_then(|matchers| matchers.get_mut(0))
-                    .and_then(|matcher| matcher.get_mut("host"))
-                    .and_then(Value::as_array_mut)
-                {
-                    for host in hosts {
-                        if !existing_hosts.contains(host) {
-                            existing_hosts.push(host.clone());
-                        }
-                    }
-                    merged = true;
-                    break;
+        let right_before = if right_host == 0 {
+            false
+        } else if left_host == 0 {
+            true
+        } else if left_wildcard != right_wildcard {
+            left_wildcard && !right_wildcard
+        } else {
+            right_host > left_host
+        };
+        if left_before {
+            std::cmp::Ordering::Less
+        } else if right_before {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    });
+}
+
+/// Caddy's address specificity: length with wildcards and placeholders removed.
+fn specificity(value: &str) -> usize {
+    let mut length = value.len() - value.matches('*').count();
+    let mut rest = value;
+    loop {
+        let Some(start) = rest.find('{') else {
+            return length;
+        };
+        let Some(relative_end) = rest[start..].find('}') else {
+            return length;
+        };
+        let end = start + relative_end + 1;
+        length -= end - start;
+        rest = &rest[end..];
+    }
+}
+
+fn routes_have_host_matcher(routes: &[Value]) -> bool {
+    routes.iter().any(|route| {
+        route
+            .get("match")
+            .and_then(Value::as_array)
+            .map(|matcher_sets| {
+                matcher_sets
+                    .iter()
+                    .any(|matcher_set| matcher_set.get("host").is_some())
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Caddy's `consolidateRoutes`: merge adjacent routes with identical matchers, terminal flag and
+/// group by concatenating their handler lists.
+fn consolidate_routes(routes: Vec<Value>) -> Vec<Value> {
+    let mut output: Vec<Value> = Vec::with_capacity(routes.len());
+    for route in routes {
+        if let Some(previous) = output.last_mut() {
+            if routes_are_mergeable(previous, &route) {
+                let mut handlers = previous
+                    .get("handle")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                if let Some(incoming) = route.get("handle").and_then(Value::as_array) {
+                    handlers.extend(incoming.iter().cloned());
                 }
+                previous["handle"] = Value::Array(handlers);
+                continue;
             }
         }
-        if !merged {
-            output.push(route);
-        }
+        output.push(route);
     }
     output
+}
+
+fn routes_are_mergeable(left: &Value, right: &Value) -> bool {
+    left.get("match") == right.get("match")
+        && left
+            .get("terminal")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            == right
+                .get("terminal")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        && left.get("group") == right.get("group")
+}
+
+/// Build the `apps.tls` section Caddy's adapter emits for automatic HTTPS.
+///
+/// Hostnames that share a site block with a hostless key never appear in a route matcher, so
+/// Caddy adds them to `certificates.automate` explicitly instead of relying on route-derived
+/// automatic HTTPS.
+fn tls_app(
+    sites: &[SiteBlock],
+    http_port: u16,
+    auto_https_off: bool,
+) -> caddy_rs_core::Result<Option<Value>> {
+    if auto_https_off {
+        return Ok(None);
+    }
+    let mut automate: Vec<String> = Vec::new();
+    for site in sites {
+        if !site.addresses.iter().any(|address| address.host.is_empty()) {
+            continue;
+        }
+        for address in &site.addresses {
+            if address.host.is_empty()
+                || address.scheme.as_deref() == Some("http")
+                || address.port == Some(http_port)
+            {
+                continue;
+            }
+            let host = address
+                .host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_string();
+            if !subject_qualifies_for_public_cert(&host) {
+                return Err(adapter_error(
+                    site.position,
+                    format!(
+                        "automatic HTTPS for internal name `{host}` shared with a hostless site \
+                         address is not supported by this build"
+                    ),
+                ));
+            }
+            if !automate.contains(&host) {
+                automate.push(host);
+            }
+        }
+    }
+    if automate.is_empty() {
+        return Ok(None);
+    }
+    automate.sort();
+    Ok(Some(json!({"certificates": {"automate": automate}})))
+}
+
+/// Approximation of `certmagic.SubjectQualifiesForPublicCert` for the names Caddy's adapter must
+/// list explicitly: internal names are not publicly issuable.
+fn subject_qualifies_for_public_cert(subject: &str) -> bool {
+    if subject.is_empty() {
+        return false;
+    }
+    if subject == "localhost"
+        || subject.ends_with(".localhost")
+        || subject.ends_with(".local")
+        || subject.ends_with(".internal")
+        || subject.ends_with(".home.arpa")
+    {
+        return false;
+    }
+    subject.parse::<std::net::IpAddr>().is_err()
 }
 
 fn build_site_routes(
@@ -472,8 +653,7 @@ fn build_routes(
     sort: bool,
     warnings: &mut Vec<String>,
 ) -> caddy_rs_core::Result<Vec<Value>> {
-    let mut plain: Vec<&Directive> = Vec::new();
-    let mut handled: Vec<&Directive> = Vec::new();
+    let mut ordered: Vec<&Directive> = Vec::new();
     for directive in directives {
         if directive.name.starts_with('@') {
             continue;
@@ -487,99 +667,151 @@ fn build_routes(
                 ),
             ));
         }
-        if matches!(directive.name.as_str(), "handle" | "handle_path" | "route") {
-            handled.push(directive);
-        } else {
-            plain.push(directive);
-        }
+        ordered.push(directive);
     }
 
     if sort {
-        plain.sort_by_key(|directive| {
+        ordered.sort_by_key(|directive| {
+            // Caddy normalises `handle_path` to `handle` before sorting so both share a slot.
+            let name = if directive.name == "handle_path" {
+                "handle"
+            } else {
+                directive.name.as_str()
+            };
             DIRECTIVE_ORDER
                 .iter()
-                .position(|name| *name == directive.name)
-                .unwrap_or(usize::MAX)
-        });
-        handled.sort_by_key(|directive| {
-            DIRECTIVE_ORDER
-                .iter()
-                .position(|name| *name == directive.name)
+                .position(|candidate| *candidate == name)
                 .unwrap_or(usize::MAX)
         });
     }
 
-    let mut routes = Vec::new();
+    // Caddy puts multiple mutually-exclusive `handle`/`handle_path` routes in one group.
+    let handle_count = ordered
+        .iter()
+        .filter(|directive| matches!(directive.name.as_str(), "handle" | "handle_path"))
+        .count();
 
-    // `route` blocks and `handle` blocks are routes in their own right.
-    let mut handle_routes = Vec::new();
-    for directive in &handled {
-        match directive.name.as_str() {
+    let mut entries: Vec<(&str, Value)> = Vec::new();
+    for directive in ordered {
+        let name = directive.name.as_str();
+        match name {
             "route" => {
                 let inner = build_routes(&directive.block, matchers, false, warnings)?;
                 if inner.is_empty() {
-                    routes.push(json!({"handle": [{"handler": "subroute"}]}));
+                    entries.push((name, json!({"handle": [{"handler": "subroute"}]})));
                 } else {
-                    routes.push(json!({
-                        "handle": [{"handler": "subroute", "routes": inner}]
-                    }));
+                    entries.push((
+                        name,
+                        json!({"handle": [{"handler": "subroute", "routes": inner}]}),
+                    ));
                 }
             }
             "handle" | "handle_path" => {
-                let route = build_handle_route(directive, matchers, warnings)?;
-                handle_routes.push(route);
+                let mut route = build_handle_route(directive, matchers, warnings)?;
+                if handle_count > 1 {
+                    route["group"] = json!("group1");
+                }
+                entries.push((name, route));
             }
-            _ => unreachable!("handled directive names are exhaustive"),
+            _ => {
+                let mut args = directive.args.clone();
+                let matcher = matcher_for_args(&mut args, matchers, directive.position)?;
+                let handlers = build_handlers(directive, &args, warnings)?;
+                if handlers.is_empty() {
+                    continue;
+                }
+                let route = match matcher {
+                    Some(matcher) => json!({
+                        "match": [matcher],
+                        "handle": handlers,
+                    }),
+                    None => json!({"handle": handlers}),
+                };
+                entries.push((name, route));
+            }
         }
     }
+
     if sort {
-        // Caddy sorts `handle` routes by matcher specificity: matched routes before the catch-all,
-        // and longer path patterns first. Group names are normalised by the conformance tooling
-        // (DIV-0022), but evaluation order is semantic and this matches it.
-        handle_routes.sort_by_key(|route| {
-            let pattern = route
-                .get("match")
-                .and_then(Value::as_array)
-                .and_then(|matchers| matchers.first())
-                .and_then(|matcher| matcher.get("path"))
-                .and_then(Value::as_array)
-                .and_then(|paths| paths.first())
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            if pattern.is_empty() {
-                i64::MAX
-            } else {
-                -(pattern.len() as i64)
+        entries.sort_by(|left, right| {
+            let left_position = directive_position(left.0);
+            let right_position = directive_position(right.0);
+            if left_position != right_position {
+                return left_position.cmp(&right_position);
             }
+            route_path_order(&left.1, &right.1)
         });
     }
-    if handle_routes.len() > 1 {
-        for route in &mut handle_routes {
-            route["group"] = json!("group1");
-        }
-    }
-    routes.extend(handle_routes);
 
-    let mut generic_handlers = Vec::new();
-    for directive in plain {
-        let mut args = directive.args.clone();
-        let matcher = matcher_for_args(&mut args, matchers, directive.position)?;
-        let handlers = build_handlers(directive, &args, warnings)?;
-        if handlers.is_empty() {
-            continue;
+    Ok(consolidate_routes(
+        entries.into_iter().map(|(_, route)| route).collect(),
+    ))
+}
+
+fn directive_position(name: &str) -> usize {
+    let name = if name == "handle_path" {
+        "handle"
+    } else {
+        name
+    };
+    DIRECTIVE_ORDER
+        .iter()
+        .position(|candidate| *candidate == name)
+        .unwrap_or(usize::MAX)
+}
+
+/// Caddy's `sortRoutes` sub-ordering for two routes of the same directive: more specific paths
+/// first, a trailing wildcard last among equal prefixes, then lexical order; routes with any
+/// matcher come before routes with none.
+fn route_path_order(left: &Value, right: &Value) -> std::cmp::Ordering {
+    fn less(left: &Value, right: &Value) -> bool {
+        let left_path = single_path(left);
+        let right_path = single_path(right);
+        let left_length = left_path.map(str::len).unwrap_or(0);
+        let right_length = right_path.map(str::len).unwrap_or(0);
+        if left_length > 0 && right_length > 0 {
+            let left_path = left_path.expect("length checked");
+            let right_path = right_path.expect("length checked");
+            let left_trimmed = left_path.trim_end_matches('*');
+            let right_trimmed = right_path.trim_end_matches('*');
+            if left_trimmed == right_trimmed {
+                return left_length < right_length;
+            }
+            if left_trimmed.len() == right_trimmed.len() {
+                return left_trimmed < right_trimmed;
+            }
+            return left_trimmed.len() > right_trimmed.len();
         }
-        match matcher {
-            Some(matcher) => routes.push(json!({
-                "match": [matcher],
-                "handle": handlers,
-            })),
-            None => generic_handlers.extend(handlers),
-        }
+        route_has_matchers(left) && !route_has_matchers(right)
     }
-    if !generic_handlers.is_empty() {
-        routes.push(json!({"handle": generic_handlers}));
+
+    if less(left, right) {
+        std::cmp::Ordering::Less
+    } else if less(right, left) {
+        std::cmp::Ordering::Greater
+    } else {
+        std::cmp::Ordering::Equal
     }
-    Ok(routes)
+}
+
+fn single_path(route: &Value) -> Option<&str> {
+    let matcher_sets = route.get("match")?.as_array()?;
+    if matcher_sets.len() != 1 {
+        return None;
+    }
+    let paths = matcher_sets[0].get("path")?.as_array()?;
+    if paths.len() != 1 {
+        return None;
+    }
+    paths[0].as_str()
+}
+
+fn route_has_matchers(route: &Value) -> bool {
+    route
+        .get("match")
+        .and_then(Value::as_array)
+        .map(|matcher_sets| !matcher_sets.is_empty())
+        .unwrap_or(false)
 }
 
 fn build_handle_route(
@@ -599,15 +831,16 @@ fn build_handle_route(
             ));
         };
         args.remove(0);
-        let (pattern, strip) = if let Some(base) = prefix.strip_suffix('*') {
-            (prefix.clone(), base.trim_end_matches('/').to_string())
+        // Caddy matches the literal path given and strips everything but the trailing wildcard:
+        // `/api/*` matches `/api/*` and strips `/api`; `/api` matches and strips `/api`.
+        let strip = if let Some(base) = prefix.strip_suffix("/*") {
+            base.to_string()
+        } else if let Some(base) = prefix.strip_suffix('*') {
+            base.to_string()
         } else {
-            (
-                format!("{prefix}*"),
-                prefix.trim_end_matches('/').to_string(),
-            )
+            prefix.clone()
         };
-        matcher = Some(json!({"path": [pattern]}));
+        matcher = Some(json!({"path": [prefix]}));
         strip_prefix = Some(strip);
     } else {
         matcher = matcher_for_args(&mut args, matchers, directive.position)?;
@@ -1441,6 +1674,15 @@ fn parse_upstream(target: &str) -> Result<ParsedUpstream, String> {
             dial: format!("unix//{rest}"),
             https: false,
             h2c: true,
+        });
+    }
+    // Network addresses like `unix//path/to/socket` are passed through verbatim; Caddy's dial
+    // string keeps the network prefix.
+    if target.starts_with("unix//") {
+        return Ok(ParsedUpstream {
+            dial: target.to_string(),
+            https: false,
+            h2c: false,
         });
     }
     let (scheme, rest) = match target.split_once("://") {
