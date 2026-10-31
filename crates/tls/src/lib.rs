@@ -8,6 +8,7 @@
 
 pub mod acme;
 pub mod certificate;
+pub mod cloudflare;
 pub mod dns;
 pub mod issuer;
 pub mod storage;
@@ -19,6 +20,10 @@ pub use acme::{
     NewAccountRequest, Problem, StoredAccount,
 };
 pub use certificate::{renewal_queue, Certificate, CertificateCache, RenewalItem};
+pub use cloudflare::{
+    resolve_env_placeholders, CloudflareConfig, CloudflareProvider, CLOUDFLARE_API_BASE,
+    CLOUDFLARE_MIN_TTL_SECONDS, CLOUDFLARE_PROVIDER_NAME,
+};
 pub use dns::{
     DnsChallengeConfig, DnsError, DnsProvider, InMemoryDnsProvider, PropagationTimeout, RecordId,
     TxtRecord,
