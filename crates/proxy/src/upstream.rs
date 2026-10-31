@@ -1,23 +1,49 @@
 //! Upstream server representation and dial parsing.
+//!
+//! Caddy "network addresses" support plain `host:port` TCP dials as well as Unix domain sockets.
+//! A Unix-socket dial is written with the `unix/` network prefix, either as `unix//run/app.sock`
+//! (the canonical Caddy form for an absolute path) or as `unix/run/app.sock` for a relative one.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+/// How an upstream is reached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Transport {
+    /// Plaintext HTTP over TCP to `address` (`host:port`).
+    Tcp {
+        /// `host:port` dial target.
+        address: String,
+    },
+    /// Plaintext HTTP over a Unix domain socket.
+    #[cfg(unix)]
+    Unix {
+        /// Filesystem path of the socket.
+        path: PathBuf,
+    },
+}
 
 /// A proxy upstream.
 #[derive(Debug)]
 pub struct Upstream {
-    /// Dial address (`host:port`).
+    /// Original dial value, for logs and error messages.
     pub dial: String,
     /// Whether this upstream TLS is required.
     pub tls: bool,
+    transport: Transport,
     healthy: AtomicBool,
     active_connections: AtomicUsize,
 }
 
 impl Upstream {
-    /// Construct an upstream.
+    /// Construct a TCP upstream from an already-validated `host:port` dial.
     pub fn new(dial: impl Into<String>, tls: bool) -> Self {
+        let dial = dial.into();
         Self {
-            dial: dial.into(),
+            transport: Transport::Tcp {
+                address: dial.clone(),
+            },
+            dial,
             tls,
             healthy: AtomicBool::new(true),
             active_connections: AtomicUsize::new(0),
@@ -25,6 +51,14 @@ impl Upstream {
     }
 
     /// Parse a Caddy `dial` value.
+    ///
+    /// Supported forms:
+    ///
+    /// * `host:port` — plain TCP.
+    /// * `unix//absolute/path.sock` and `unix/relative/path.sock` — Unix domain socket.
+    ///
+    /// Schemes, placeholders and malformed addresses are rejected by name so that unsupported
+    /// configuration never silently degrades into a wrong dial.
     pub fn parse_dial(dial: &str, tls: bool) -> Result<Self, String> {
         if dial.is_empty() {
             return Err("upstream dial address is empty".to_string());
@@ -34,18 +68,80 @@ impl Upstream {
                 "upstream `{dial}` uses placeholders, which are not implemented (HTTP-PLACEHOLDERS)"
             ));
         }
-        if dial.starts_with("unix/") {
+        if dial == "unix" || dial.starts_with("unix/") {
+            let path = dial.strip_prefix("unix/").unwrap_or_default();
+            if path.is_empty() {
+                return Err(format!(
+                    "unix socket upstream `{dial}` is missing a socket path"
+                ));
+            }
+            #[cfg(unix)]
+            {
+                return Ok(Self {
+                    dial: dial.to_string(),
+                    tls,
+                    transport: Transport::Unix {
+                        path: PathBuf::from(path),
+                    },
+                    healthy: AtomicBool::new(true),
+                    active_connections: AtomicUsize::new(0),
+                });
+            }
+            #[cfg(not(unix))]
+            {
+                return Err(format!(
+                    "unix socket upstream `{dial}` is not supported on this platform"
+                ));
+            }
+        }
+        if let Some((scheme, _)) = dial.split_once("://") {
             return Err(format!(
-                "unix socket upstream `{dial}` is not implemented yet (PROXY-UNIX)"
+                "upstream dial `{dial}` must not include a scheme (`{scheme}://`)"
             ));
         }
-        if dial.starts_with("http://") || dial.starts_with("https://") {
-            return Err(format!("upstream dial `{dial}` must not include a scheme"));
-        }
-        if !dial.contains(':') {
+        let Some((host, port)) = dial.rsplit_once(':') else {
             return Err(format!("upstream dial `{dial}` is missing a port"));
+        };
+        if host.is_empty() {
+            return Err(format!("upstream dial `{dial}` is missing a host"));
+        }
+        if port.parse::<u16>().is_err() {
+            return Err(format!(
+                "upstream dial `{dial}` has an invalid port `{port}` (a single numeric port is required)"
+            ));
         }
         Ok(Self::new(dial, tls))
+    }
+
+    /// How this upstream is reached.
+    pub fn transport(&self) -> &Transport {
+        &self.transport
+    }
+
+    /// Build the absolute URI hyper uses for a request to this upstream.
+    ///
+    /// TCP upstreams use `http://host:port`; Unix sockets are addressed through a synthetic
+    /// `unix://<hex-encoded socket path>` authority. The socket path is hex-encoded because a
+    /// URI authority cannot contain `/`; [`crate::client::UpstreamConnector`] decodes it again
+    /// before dialing.
+    pub fn url(&self, path_and_query: &str) -> String {
+        match &self.transport {
+            Transport::Tcp { address } => format!("http://{address}{path_and_query}"),
+            #[cfg(unix)]
+            Transport::Unix { path } => {
+                format!("unix://{}{path_and_query}", encode_unix_authority(path))
+            }
+        }
+    }
+
+    /// Host header used when a request does not carry one (health checks use `localhost` for Unix
+    /// sockets, matching Caddy).
+    pub fn fallback_host(&self) -> &str {
+        match &self.transport {
+            Transport::Tcp { address } => address,
+            #[cfg(unix)]
+            Transport::Unix { .. } => "localhost",
+        }
     }
 
     /// Health observed by active/passive checks.
@@ -83,6 +179,57 @@ impl Drop for ConnectionGuard<'_> {
     }
 }
 
+/// Hex-encode the socket path for use as a URI authority.
+#[cfg(unix)]
+fn encode_unix_authority(path: &std::path::Path) -> String {
+    use std::fmt::Write;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut encoded = String::with_capacity(path.as_os_str().as_bytes().len() * 2);
+    for byte in path.as_os_str().as_bytes() {
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+/// Decode a URI authority produced by [`encode_unix_authority`].
+#[cfg(unix)]
+pub(crate) fn decode_unix_authority(authority: &str) -> Result<PathBuf, String> {
+    use std::os::unix::ffi::OsStringExt;
+
+    if authority.is_empty() {
+        return Err("unix socket URI is missing an encoded path".to_string());
+    }
+    if authority.len() % 2 != 0 {
+        return Err(format!(
+            "unix socket URI authority `{authority}` has an odd number of hex digits"
+        ));
+    }
+    let mut bytes = Vec::with_capacity(authority.len() / 2);
+    let raw = authority.as_bytes();
+    let mut index = 0;
+    while index < raw.len() {
+        let high = hex_digit(raw[index])?;
+        let low = hex_digit(raw[index + 1])?;
+        bytes.push(high * 16 + low);
+        index += 2;
+    }
+    Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+}
+
+#[cfg(unix)]
+fn hex_digit(byte: u8) -> Result<u8, String> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        other => Err(format!(
+            "invalid hex digit `{}` in unix socket URI authority",
+            other as char
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,21 +238,80 @@ mod tests {
     fn parses_host_port_dial() {
         let upstream = Upstream::parse_dial("localhost:8096", false).unwrap();
         assert_eq!(upstream.dial, "localhost:8096");
+        assert_eq!(
+            upstream.url("/health?x=1"),
+            "http://localhost:8096/health?x=1"
+        );
+        assert_eq!(upstream.fallback_host(), "localhost:8096");
         assert!(upstream.is_healthy());
     }
 
     #[test]
-    fn rejects_scheme_and_missing_port() {
-        assert!(Upstream::parse_dial("http://localhost:8096", false).is_err());
-        assert!(Upstream::parse_dial("localhost", false).is_err());
+    fn parses_ipv6_dial() {
+        let upstream = Upstream::parse_dial("[::1]:8096", false).unwrap();
+        assert_eq!(upstream.fallback_host(), "[::1]:8096");
     }
 
     #[test]
-    fn reports_placeholders_and_unix_as_not_implemented() {
+    fn rejects_scheme_missing_port_and_bad_port() {
+        assert!(Upstream::parse_dial("http://localhost:8096", false).is_err());
+        assert!(Upstream::parse_dial("localhost", false).is_err());
+        let error = Upstream::parse_dial("localhost:http", false).unwrap_err();
+        assert!(error.contains("invalid port"), "{error}");
+        let error = Upstream::parse_dial(":8080", false).unwrap_err();
+        assert!(error.contains("missing a host"), "{error}");
+    }
+
+    #[test]
+    fn reports_placeholders_as_not_implemented() {
         let error = Upstream::parse_dial("{env.UPSTREAM}", false).unwrap_err();
         assert!(error.contains("placeholders"), "{error}");
-        let error = Upstream::parse_dial("unix//run/app.sock", false).unwrap_err();
-        assert!(error.contains("unix"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parses_unix_dial_forms() {
+        let canonical = Upstream::parse_dial("unix//run/app.sock", false).unwrap();
+        let relative = Upstream::parse_dial("unix/run/app.sock", false).unwrap();
+        assert_eq!(
+            canonical.transport(),
+            &Transport::Unix {
+                path: PathBuf::from("/run/app.sock")
+            }
+        );
+        assert_eq!(
+            relative.transport(),
+            &Transport::Unix {
+                path: PathBuf::from("run/app.sock")
+            }
+        );
+        assert_eq!(canonical.fallback_host(), "localhost");
+        let url = canonical.url("/health");
+        assert!(url.starts_with("unix://"), "{url}");
+        assert!(url.ends_with("/health"), "{url}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_authority_round_trips_socket_paths() {
+        for path in ["/run/app.sock", "/tmp/日本語.sock", "relative.sock"] {
+            let encoded = encode_unix_authority(std::path::Path::new(path));
+            assert!(
+                encoded.chars().all(|ch| ch.is_ascii_hexdigit()),
+                "{encoded}"
+            );
+            let decoded = decode_unix_authority(&encoded).unwrap();
+            assert_eq!(decoded, PathBuf::from(path));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_unix_dial_without_path() {
+        for dial in ["unix", "unix/"] {
+            let error = Upstream::parse_dial(dial, false).unwrap_err();
+            assert!(error.contains("missing a socket path"), "{error}");
+        }
     }
 
     #[test]

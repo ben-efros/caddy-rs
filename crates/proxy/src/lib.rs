@@ -7,9 +7,11 @@ pub mod balancer;
 pub mod client;
 pub mod handler;
 pub mod health;
+pub mod retry;
 pub mod upstream;
 
 pub use balancer::{from_policy, Balancer, First, LeastConnections, RoundRobin};
 pub use handler::{handler_factory, ReverseProxyHandler};
 pub use health::HealthCheck;
+pub use retry::RetryMatch;
 pub use upstream::Upstream;

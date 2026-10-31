@@ -123,6 +123,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tower-service",
 ]
 
 [[package]]

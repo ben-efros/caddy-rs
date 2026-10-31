@@ -46,12 +46,15 @@ impl Default for HealthCheck {
 
 impl HealthCheck {
     /// Perform one check. Returns whether the upstream is healthy.
+    ///
+    /// The check uses the same [`HttpClient`] transport as proxying, so TCP and Unix-socket
+    /// upstreams are both supported. Unix-socket checks use `localhost` as the Host, matching
+    /// Caddy's active health checker.
     pub async fn check_once(&self, client: &HttpClient, upstream: &Upstream) -> bool {
-        let url = format!("http://{}{}", upstream.dial, self.uri);
         let mut builder = hyper::Request::builder()
             .method(self.method.clone())
-            .uri(url)
-            .header(http::header::HOST, &upstream.dial);
+            .uri(upstream.url(&self.uri))
+            .header(http::header::HOST, upstream.fallback_host());
         for (name, value) in &self.headers {
             builder = builder.header(name, value);
         }
@@ -140,6 +143,52 @@ mod tests {
     async fn active_check_marks_unhealthy_on_error_status() {
         let dial = spawn_health_upstream(500).await;
         let upstream = Arc::new(Upstream::new(dial, false));
+        let check = HealthCheck::default();
+        let client = crate::client::build_client();
+        assert!(!check.check_once(&client, &upstream).await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn active_check_works_over_unix_socket() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("health.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let service = service_fn(move |_request| async move {
+                        Ok::<_, Infallible>(
+                            hyper::Response::builder()
+                                .status(200)
+                                .body(Full::new(Bytes::new()))
+                                .unwrap(),
+                        )
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+
+        let upstream =
+            Arc::new(Upstream::parse_dial(&format!("unix/{}", socket.display()), false).unwrap());
+        let check = HealthCheck::default();
+        let client = crate::client::build_client();
+        assert!(check.check_once(&client, &upstream).await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn active_check_fails_when_unix_socket_is_missing() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("missing.sock");
+        let upstream =
+            Arc::new(Upstream::parse_dial(&format!("unix/{}", socket.display()), false).unwrap());
         let check = HealthCheck::default();
         let client = crate::client::build_client();
         assert!(!check.check_once(&client, &upstream).await);

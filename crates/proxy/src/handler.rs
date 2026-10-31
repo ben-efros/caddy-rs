@@ -1,10 +1,24 @@
 //! The `reverse_proxy` handler.
+//!
+//! Header handling follows Caddy's `prepareRequest` / `addForwardedHeaders` semantics:
+//!
+//! * The client's `Host` header is forwarded unchanged (Caddy only rewrites it through `header_up`
+//!   operations or a transport-level host).
+//! * Hop-by-hop headers are stripped (including headers named by the `Connection` header).
+//! * `X-Forwarded-For`, `X-Forwarded-Proto` and `X-Forwarded-Host` are set from the connection.
+//!   Prior values are only trusted when the peer is in `trusted_proxies`.
+//! * `Via` is appended to the upstream response, matching Caddy.
+//!
+//! Upstreams may be `host:port` TCP dials or Unix sockets (`unix//path`); the shared
+//! [`crate::client::HttpClient`] selects the transport from the outbound URI.
 
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use bytes::Bytes;
+use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Version};
 use http_body_util::{BodyExt, Full};
 use serde_json::Value;
 
@@ -16,7 +30,22 @@ use caddy_rs_http::{
 use crate::balancer::{self, Balancer};
 use crate::client::{build_client, HttpClient};
 use crate::health::HealthCheck;
+use crate::retry::RetryMatch;
 use crate::upstream::Upstream;
+
+/// Headers Caddy strips in both directions (see `hopHeaders` in upstream `reverseproxy.go`).
+const HOP_BY_HOP_HEADERS: &[&str] = &[
+    "alt-svc",
+    "connection",
+    "proxy-connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
 
 fn invalid(path: &str, message: impl Into<String>) -> HttpError {
     HttpError::InvalidConfig {
@@ -37,6 +66,83 @@ enum ProxyError {
     Body(String),
 }
 
+impl ProxyError {
+    /// Whether this failure happened before any bytes of the request reached the upstream.
+    ///
+    /// A dial failure is always safe to retry, even for non-idempotent methods (Caddy's
+    /// `DialError` rule); other transport errors are only retried when `retry_match` opts in.
+    fn is_dial_error(&self) -> bool {
+        match self {
+            ProxyError::Client(error) => error.is_connect(),
+            _ => false,
+        }
+    }
+}
+
+/// One proxied upstream response, before conversion into the HTTP engine's [`Response`].
+struct ForwardedResponse {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: Bytes,
+}
+
+/// A CIDR or single-address trusted proxy range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IpNet {
+    address: IpAddr,
+    prefix: u8,
+}
+
+impl IpNet {
+    fn parse(text: &str) -> Result<Self, String> {
+        let (address_text, prefix_text) = match text.split_once('/') {
+            Some((address, prefix)) => (address, Some(prefix)),
+            None => (text, None),
+        };
+        let address: IpAddr = address_text
+            .parse()
+            .map_err(|_| format!("`{text}` is not an IP address or CIDR range"))?;
+        let maximum = match address {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        let prefix = match prefix_text {
+            Some(prefix) => prefix
+                .parse::<u8>()
+                .map_err(|_| format!("`{text}` has an invalid prefix length"))?,
+            None => maximum,
+        };
+        if prefix > maximum {
+            return Err(format!(
+                "`{text}` has a prefix length greater than {maximum}"
+            ));
+        }
+        Ok(Self { address, prefix })
+    }
+
+    fn contains(&self, address: IpAddr) -> bool {
+        match (self.address, address) {
+            (IpAddr::V4(network), IpAddr::V4(candidate)) => {
+                let mask = if self.prefix == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - u32::from(self.prefix))
+                };
+                (u32::from(network) & mask) == (u32::from(candidate) & mask)
+            }
+            (IpAddr::V6(network), IpAddr::V6(candidate)) => {
+                let mask = if self.prefix == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - u32::from(self.prefix))
+                };
+                (u128::from(network) & mask) == (u128::from(candidate) & mask)
+            }
+            _ => false,
+        }
+    }
+}
+
 /// Reverse proxy handler configuration and runtime.
 pub struct ReverseProxyHandler {
     client: HttpClient,
@@ -49,8 +155,9 @@ pub struct ReverseProxyHandler {
     retries: u32,
     try_duration: Duration,
     try_interval: Duration,
-    fail_duration: Duration,
     health_check: Option<Arc<HealthCheck>>,
+    retry_match: RetryMatch,
+    trusted_proxies: Vec<IpNet>,
 }
 
 impl ReverseProxyHandler {
@@ -118,12 +225,10 @@ impl ReverseProxyHandler {
             .and_then(Value::as_u64)
             .map(Duration::from_nanos)
             .unwrap_or(Duration::ZERO);
-
-        let fail_duration = object
-            .get("fail_duration")
-            .and_then(Value::as_u64)
-            .map(Duration::from_nanos)
-            .unwrap_or_else(|| Duration::from_secs(10));
+        let retry_match = RetryMatch::from_json(
+            load_balancing.and_then(|lb| lb.get("retry_match")),
+            &format!("{path}.load_balancing.retry_match"),
+        )?;
 
         let (
             request_headers_set,
@@ -131,6 +236,8 @@ impl ReverseProxyHandler {
             response_headers_add,
             response_headers_delete,
         ) = parse_headers(object.get("headers"), path)?;
+
+        let trusted_proxies = parse_trusted_proxies(object.get("trusted_proxies"), path)?;
 
         let health_check = parse_health_check(object, path)?;
 
@@ -145,8 +252,9 @@ impl ReverseProxyHandler {
             retries,
             try_duration,
             try_interval,
-            fail_duration,
             health_check,
+            retry_match,
+            trusted_proxies,
         })
     }
 
@@ -164,60 +272,25 @@ impl ReverseProxyHandler {
         &self,
         upstream: &Upstream,
         request: &Request,
-    ) -> Result<Response, ProxyError> {
+    ) -> Result<ForwardedResponse, ProxyError> {
         let path_and_query = request
             .uri
             .path_and_query()
             .map(|value| value.as_str())
             .unwrap_or("/");
-        let url = format!("http://{}{}", upstream.dial, path_and_query);
-        let mut headers = HeaderMap::new();
-        for (name, value) in &request.headers {
-            if is_hop_by_hop(name) || name == http::header::HOST {
-                continue;
-            }
-            headers.append(name.clone(), value.clone());
-        }
-        headers.insert(
-            http::header::HOST,
-            HeaderValue::from_str(&upstream.dial)
-                .map_err(|error| ProxyError::Request(error.to_string()))?,
-        );
-        if let Some(remote) = request.remote_addr {
-            let forwarded = headers
-                .get("x-forwarded-for")
-                .and_then(|value| value.to_str().ok())
-                .map(|existing| format!("{existing}, {}", remote.ip()))
-                .unwrap_or_else(|| remote.ip().to_string());
-            headers.insert(
-                "x-forwarded-for",
-                HeaderValue::from_str(&forwarded)
-                    .map_err(|error| ProxyError::Request(error.to_string()))?,
-            );
-        }
-        headers.insert(
-            "x-forwarded-proto",
-            HeaderValue::from_static(if request.tls { "https" } else { "http" }),
-        );
-        if let Some(host) = request.host() {
-            if let Ok(value) = HeaderValue::from_str(host) {
-                headers.insert("x-forwarded-host", value);
-            }
-        }
-        for (name, value) in &self.request_headers_set {
-            headers.insert(name.clone(), value.clone());
-        }
+        let url = upstream.url(path_and_query);
+        let headers = self.outbound_headers(request, upstream)?;
 
-        let outbound = hyper::Request::builder()
+        let mut outbound = hyper::Request::builder()
             .method(request.method.clone())
             .uri(url)
             .body(Full::new(request.body.clone()))
             .map_err(|error| ProxyError::Request(error.to_string()))?;
-        let mut outbound = outbound;
         *outbound.headers_mut() = headers;
 
         let response = self.client.request(outbound).await?;
         let status = response.status();
+        let version = response.version();
         let response_headers = response.headers().clone();
         let body = response
             .into_body()
@@ -225,18 +298,130 @@ impl ReverseProxyHandler {
             .await
             .map_err(|error| ProxyError::Body(error.to_string()))?
             .to_bytes();
-        let mut headers = HeaderMap::new();
-        for (name, value) in &response_headers {
-            if is_hop_by_hop(name) {
-                continue;
-            }
-            headers.append(name.clone(), value.clone());
-        }
-        Ok(Response {
+        Ok(ForwardedResponse {
             status,
-            headers,
+            headers: self.response_headers(&response_headers, version),
             body,
         })
+    }
+
+    /// Build the headers sent to the upstream, following Caddy's `prepareRequest`.
+    fn outbound_headers(
+        &self,
+        request: &Request,
+        upstream: &Upstream,
+    ) -> Result<HeaderMap, ProxyError> {
+        let mut headers = strip_hop_by_hop(&request.headers);
+
+        // Go's reverse proxy keeps `TE: trailers` so backends know trailers are supported.
+        if header_has_token(&request.headers, http::header::TE, "trailers") {
+            headers.insert(http::header::TE, HeaderValue::from_static("trailers"));
+        }
+
+        // Caddy forwards the client's Host header unchanged; the URI authority is only the dial
+        // target. A request without a Host falls back to the upstream address (or `localhost`
+        // for Unix sockets), matching what Go's transport does.
+        let host = request.host().unwrap_or_else(|| upstream.fallback_host());
+        headers.insert(
+            http::header::HOST,
+            HeaderValue::from_str(host).map_err(|error| ProxyError::Request(error.to_string()))?,
+        );
+
+        self.add_forwarded_headers(&mut headers, request, upstream)?;
+
+        // `header_up` operations are applied last and win over the implicit headers.
+        for (name, value) in &self.request_headers_set {
+            headers.insert(name.clone(), value.clone());
+        }
+        Ok(headers)
+    }
+
+    /// Set `X-Forwarded-*` headers from the connection, trusting prior values only for peers in
+    /// `trusted_proxies` (Caddy's `addForwardedHeaders`).
+    fn add_forwarded_headers(
+        &self,
+        headers: &mut HeaderMap,
+        request: &Request,
+        upstream: &Upstream,
+    ) -> Result<(), ProxyError> {
+        let Some(remote) = request.remote_addr.as_ref() else {
+            // Caddy treats a Unix-socket peer as remote address "@": it cannot be a trusted
+            // proxy, so forwarded headers sent by the client are stripped.
+            headers.remove("x-forwarded-for");
+            headers.remove("x-forwarded-proto");
+            headers.remove("x-forwarded-host");
+            return Ok(());
+        };
+        let client_ip = remote.ip();
+        let trusted = self
+            .trusted_proxies
+            .iter()
+            .any(|network| network.contains(client_ip));
+
+        let forwarded_for = joined_header_value(headers, "x-forwarded-for");
+        if trusted
+            && forwarded_for
+                .as_deref()
+                .is_some_and(|prior| !prior.is_empty())
+        {
+            let mut prior = forwarded_for.unwrap_or_default();
+            prior.push_str(", ");
+            prior.push_str(&client_ip.to_string());
+            headers.insert(
+                "x-forwarded-for",
+                HeaderValue::from_str(&prior)
+                    .map_err(|error| ProxyError::Request(error.to_string()))?,
+            );
+        } else {
+            headers.insert(
+                "x-forwarded-for",
+                HeaderValue::from_str(&client_ip.to_string())
+                    .map_err(|error| ProxyError::Request(error.to_string()))?,
+            );
+        }
+
+        // X-Forwarded-Proto: the trusted proxy's value wins, else the actual connection scheme.
+        let mut proto = if request.tls { "https" } else { "http" }.to_string();
+        if trusted {
+            if let Some(prior) = last_header_value(headers, "x-forwarded-proto") {
+                if !prior.is_empty() {
+                    proto = prior;
+                }
+            }
+        }
+        headers.insert(
+            "x-forwarded-proto",
+            HeaderValue::from_str(&proto)
+                .map_err(|error| ProxyError::Request(error.to_string()))?,
+        );
+
+        // X-Forwarded-Host: the trusted proxy's value wins, else the original Host.
+        let mut host = request
+            .host()
+            .unwrap_or_else(|| upstream.fallback_host())
+            .to_string();
+        if trusted {
+            if let Some(prior) = last_header_value(headers, "x-forwarded-host") {
+                if !prior.is_empty() {
+                    host = prior;
+                }
+            }
+        }
+        headers.insert(
+            "x-forwarded-host",
+            HeaderValue::from_str(&host).map_err(|error| ProxyError::Request(error.to_string()))?,
+        );
+        Ok(())
+    }
+
+    /// Strip hop-by-hop headers from an upstream response and add the `Via` header Caddy adds.
+    fn response_headers(&self, upstream_headers: &HeaderMap, version: Version) -> HeaderMap {
+        let mut headers = strip_hop_by_hop(upstream_headers);
+        headers.append(
+            http::header::VIA,
+            HeaderValue::from_static(via_value(version)),
+        );
+        headers
     }
 
     fn apply_response_headers(&self, response: &mut Response) {
@@ -251,12 +436,29 @@ impl ReverseProxyHandler {
         }
     }
 
-    fn schedule_recovery(&self, upstream: Arc<Upstream>) {
-        let fail_duration = self.fail_duration;
-        tokio::spawn(async move {
-            tokio::time::sleep(fail_duration).await;
-            upstream.set_healthy(true);
-        });
+    /// Whether another attempt is allowed after `attempts` retries have already been performed.
+    ///
+    /// Mirrors Caddy's `tryAgain`: retries stop when neither `lb_retries` nor `lb_try_duration`
+    /// is configured, when the retry budget is spent, or when the try duration has elapsed.
+    fn retry_allowed(&self, attempts: u32, deadline: Option<tokio::time::Instant>) -> bool {
+        if self.retries == 0 && self.try_duration.is_zero() {
+            return false;
+        }
+        if self.retries > 0 && attempts >= self.retries {
+            return false;
+        }
+        if let Some(deadline) = deadline {
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+        }
+        true
+    }
+
+    async fn wait_before_retry(&self) {
+        if !self.try_interval.is_zero() {
+            tokio::time::sleep(self.try_interval).await;
+        }
     }
 }
 
@@ -272,22 +474,44 @@ impl Handler for ReverseProxyHandler {
         } else {
             Some(tokio::time::Instant::now() + self.try_duration)
         };
+        // Number of retries already performed (Caddy's `retries` in `tryAgain`).
         let mut attempts: u32 = 0;
         loop {
             let Some(upstream) = self.balancer.select(&self.upstreams) else {
-                // No upstream has ever been tried: the pool is empty or all are marked down.
-                // After a failed attempt the gateway semantics are 502, matching Caddy's
-                // "upstream unavailable after retries" behaviour.
-                let (status, body) = if attempts == 0 {
-                    (StatusCode::SERVICE_UNAVAILABLE, "503 Service Unavailable")
-                } else {
-                    (StatusCode::BAD_GATEWAY, "502 Bad Gateway")
-                };
-                return Ok(Outcome::Respond(Response::text(status, body)));
+                // No upstream is available. Caddy retries this state (an upstream may recover)
+                // and surfaces 503 when the retry budget is spent.
+                if !self.retry_allowed(attempts, deadline) {
+                    return Ok(Outcome::Respond(Response::text(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "503 Service Unavailable",
+                    )));
+                }
+                attempts += 1;
+                self.wait_before_retry().await;
+                continue;
             };
             let _guard = upstream.connection_started();
             match self.forward(&upstream, &request).await {
-                Ok(mut response) => {
+                Ok(forwarded) => {
+                    let mut response = Response {
+                        status: forwarded.status,
+                        headers: forwarded.headers,
+                        body: forwarded.body,
+                    };
+                    if self.retry_match.matches_response(&request, &response) {
+                        if self.retry_allowed(attempts, deadline) {
+                            attempts += 1;
+                            self.wait_before_retry().await;
+                            continue;
+                        }
+                        // Caddy closes the matched response body and surfaces the upstream status
+                        // once the retry budget is spent (rather than a generic 502).
+                        return Ok(Outcome::Respond(Response {
+                            status: forwarded.status,
+                            headers: HeaderMap::new(),
+                            body: Bytes::new(),
+                        }));
+                    }
                     self.apply_response_headers(&mut response);
                     return Ok(Outcome::Respond(response));
                 }
@@ -296,38 +520,126 @@ impl Handler for ReverseProxyHandler {
                         "caddy-rs: reverse_proxy upstream `{}` failed: {error}",
                         upstream.dial
                     );
-                    upstream.set_healthy(false);
-                    self.schedule_recovery(Arc::clone(&upstream));
-                    attempts += 1;
-                    let past_deadline =
-                        deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline);
-                    if attempts > self.retries || past_deadline {
+                    let retryable =
+                        error.is_dial_error() || self.retry_match.matches_transport_error(&request);
+                    if !retryable || !self.retry_allowed(attempts, deadline) {
                         return Ok(Outcome::Respond(Response::text(
                             StatusCode::BAD_GATEWAY,
                             "502 Bad Gateway",
                         )));
                     }
-                    if !self.try_interval.is_zero() {
-                        tokio::time::sleep(self.try_interval).await;
-                    }
+                    attempts += 1;
+                    self.wait_before_retry().await;
                 }
             }
         }
     }
 }
 
+/// Build a fresh header map without hop-by-hop headers from `source`.
+///
+/// Headers named by tokens in `Connection` are dropped as well (RFC 7230 §6.1).
+fn strip_hop_by_hop(source: &HeaderMap) -> HeaderMap {
+    let mut connection_tokens: Vec<HeaderName> = Vec::new();
+    for value in source.get_all(http::header::CONNECTION) {
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        for token in value.split(',') {
+            let token = token.trim();
+            if token.is_empty() {
+                continue;
+            }
+            if let Ok(name) = token.parse::<HeaderName>() {
+                connection_tokens.push(name);
+            }
+        }
+    }
+
+    let mut headers = HeaderMap::with_capacity(source.len());
+    for (name, value) in source {
+        if is_hop_by_hop(name) || connection_tokens.contains(name) {
+            continue;
+        }
+        headers.append(name.clone(), value.clone());
+    }
+    headers
+}
+
+/// Whether a comma-separated header contains `token`, case-insensitively.
+fn header_has_token(headers: &HeaderMap, name: HeaderName, token: &str) -> bool {
+    headers.get_all(name).iter().any(|value| {
+        value.to_str().is_ok_and(|value| {
+            value
+                .split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case(token))
+        })
+    })
+}
+
+/// Join all values of a header with `, ` (Caddy's `allHeaderValues`).
+fn joined_header_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    let mut values = Vec::new();
+    for value in headers.get_all(name) {
+        values.push(value.to_str().unwrap_or_default());
+    }
+    if values.is_empty() {
+        return None;
+    }
+    Some(values.join(", "))
+}
+
+/// Last value of a header (Caddy's `lastHeaderValue`).
+fn last_header_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get_all(name)
+        .iter()
+        .next_back()
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+}
+
+/// The `Via` entry Caddy appends for a given upstream HTTP version.
+fn via_value(version: Version) -> &'static str {
+    match version {
+        Version::HTTP_09 => "0.9 Caddy",
+        Version::HTTP_10 => "1.0 Caddy",
+        Version::HTTP_2 => "2.0 Caddy",
+        Version::HTTP_3 => "3.0 Caddy",
+        _ => "1.1 Caddy",
+    }
+}
+
 fn is_hop_by_hop(name: &HeaderName) -> bool {
-    matches!(
-        name.as_str(),
-        "connection"
-            | "keep-alive"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-            | "te"
-            | "trailer"
-            | "transfer-encoding"
-            | "upgrade"
-    )
+    HOP_BY_HOP_HEADERS
+        .iter()
+        .any(|hop| name.as_str().eq_ignore_ascii_case(hop))
+}
+
+fn parse_trusted_proxies(value: Option<&Value>, path: &str) -> HttpResult<Vec<IpNet>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let entries = value.as_array().ok_or_else(|| {
+        invalid(
+            &format!("{path}.trusted_proxies"),
+            "`trusted_proxies` must be an array of IP addresses or CIDR ranges",
+        )
+    })?;
+    let mut networks = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let text = entry.as_str().ok_or_else(|| {
+            invalid(
+                &format!("{path}.trusted_proxies[{index}]"),
+                "trusted proxy entries must be strings",
+            )
+        })?;
+        networks
+            .push(IpNet::parse(text).map_err(|message| {
+                invalid(&format!("{path}.trusted_proxies[{index}]"), message)
+            })?);
+    }
+    Ok(networks)
 }
 
 fn parse_headers(
@@ -462,14 +774,75 @@ pub fn handler_factory() -> CustomHandlerFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
     use caddy_rs_http::Request;
     use http::Method;
     use hyper::service::service_fn;
     use hyper_util::rt::TokioIo;
     use std::convert::Infallible;
 
+    /// Upstream that echoes the interesting parts of the request it received.
     async fn spawn_echo_upstream() -> String {
+        spawn_upstream(
+            move |request: hyper::Request<hyper::body::Incoming>| async move {
+                let header = |name: &str| {
+                    request
+                        .headers()
+                        .get(name)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("missing")
+                        .to_string()
+                };
+                let body = format!(
+                    "path={}\nproto={}\nhost={}\nxff={}\nxfh={}\nconnection={}\nte={}",
+                    request.uri().path(),
+                    header("x-forwarded-proto"),
+                    header("host"),
+                    header("x-forwarded-for"),
+                    header("x-forwarded-host"),
+                    header("connection"),
+                    header("te"),
+                );
+                let response = hyper::Response::builder()
+                    .status(200)
+                    .header("x-upstream", "echo")
+                    .header("set-cookie", "a=1")
+                    .header("set-cookie", "b=2")
+                    .header("alt-svc", "h3=\":443\"")
+                    .header("connection", "x-hop")
+                    .header("x-hop", "drop-me");
+                Ok::<_, Infallible>(
+                    response
+                        .body(Full::new(Bytes::from(body)))
+                        .expect("response"),
+                )
+            },
+        )
+        .await
+    }
+
+    /// Upstream that always answers with a fixed status and body.
+    async fn spawn_status_upstream(status: u16, body: &'static str) -> String {
+        spawn_upstream(
+            move |_request: hyper::Request<hyper::body::Incoming>| async move {
+                Ok::<_, Infallible>(
+                    hyper::Response::builder()
+                        .status(status)
+                        .header("x-upstream", status.to_string())
+                        .body(Full::new(Bytes::from(body)))
+                        .expect("response"),
+                )
+            },
+        )
+        .await
+    }
+
+    async fn spawn_upstream<F, Fut>(serve: F) -> String
+    where
+        F: Fn(hyper::Request<hyper::body::Incoming>) -> Fut + Clone + Send + 'static,
+        Fut: std::future::Future<Output = Result<hyper::Response<Full<Bytes>>, Infallible>>
+            + Send
+            + 'static,
+    {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -477,34 +850,12 @@ mod tests {
                 let Ok((stream, _)) = listener.accept().await else {
                     break;
                 };
+                let serve = serve.clone();
                 tokio::spawn(async move {
-                    let service = service_fn(
-                        |request: hyper::Request<hyper::body::Incoming>| async move {
-                            let path = request.uri().path().to_string();
-                            let proto = request
-                                .headers()
-                                .get("x-forwarded-proto")
-                                .and_then(|value| value.to_str().ok())
-                                .unwrap_or("missing")
-                                .to_string();
-                            let host = request
-                                .headers()
-                                .get(http::header::HOST)
-                                .and_then(|value| value.to_str().ok())
-                                .unwrap_or("missing")
-                                .to_string();
-                            let body = format!("path={path};proto={proto};host={host}");
-                            Ok::<_, Infallible>(
-                                hyper::Response::builder()
-                                    .status(200)
-                                    .header("x-upstream", "echo")
-                                    .header("set-cookie", "a=1")
-                                    .header("set-cookie", "b=2")
-                                    .body(Full::new(Bytes::from(body)))
-                                    .unwrap(),
-                            )
-                        },
-                    );
+                    let service = service_fn(move |request| {
+                        let serve = serve.clone();
+                        async move { serve(request).await }
+                    });
                     let _ = hyper::server::conn::http1::Builder::new()
                         .serve_connection(TokioIo::new(stream), service)
                         .await;
@@ -514,40 +865,81 @@ mod tests {
         address.to_string()
     }
 
-    fn handler(dial: &str) -> ReverseProxyHandler {
-        ReverseProxyHandler::from_json(
-            &serde_json::json!({
-                "handler": "reverse_proxy",
-                "upstreams": [{"dial": dial}],
-                "headers": {
-                    "request": {"set": {"X-Added": ["yes"]}},
-                    "response": {"set": {"X-Proxy": ["caddy-rs"]}}
-                }
-            }),
-            "handler",
-        )
-        .unwrap()
+    /// Upstream that accepts a connection and closes it without responding (not a dial error).
+    async fn spawn_broken_upstream() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&connections);
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        (address.to_string(), connections)
     }
 
-    #[tokio::test]
-    async fn forwards_request_and_rewrites_headers() {
-        let dial = spawn_echo_upstream().await;
-        let handler = handler(&dial);
-        let mut request = Request::new(Method::GET, "/hello?x=1".parse().unwrap());
-        request.remote_addr = Some("203.0.113.7:5555".parse().unwrap());
+    fn build_handler(value: Value) -> ReverseProxyHandler {
+        ReverseProxyHandler::from_json(&value, "handler").unwrap()
+    }
+
+    fn handler(dial: &str) -> ReverseProxyHandler {
+        build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": dial}],
+            "headers": {
+                "request": {"set": {"X-Added": ["yes"]}},
+                "response": {"set": {"X-Proxy": ["caddy-rs"]}}
+            }
+        }))
+    }
+
+    fn get_request(path: &str, remote: Option<&str>) -> Request {
+        let mut request = Request::new(Method::GET, path.parse().unwrap());
+        request.remote_addr = remote.map(|remote| remote.parse().unwrap());
         request
             .headers
             .insert(http::header::HOST, "example.com".parse().unwrap());
+        request
+    }
+
+    fn body_text(response: &Response) -> String {
+        String::from_utf8(response.body.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn forwards_request_preserving_host_and_forwarded_headers() {
+        let dial = spawn_echo_upstream().await;
+        let handler = handler(&dial);
+        let mut request = get_request("/hello?x=1", Some("203.0.113.7:5555"));
+        request
+            .headers
+            .insert("x-forwarded-for", "198.51.100.9".parse().unwrap());
+        request
+            .headers
+            .insert("x-forwarded-proto", "https".parse().unwrap());
+        request
+            .headers
+            .insert("x-forwarded-host", "spoofed.example".parse().unwrap());
         let Outcome::Respond(response) = handler.handle(request).await.unwrap() else {
             panic!("expected proxied response");
         };
         assert_eq!(response.status, StatusCode::OK);
-        let body = String::from_utf8(response.body.to_vec()).unwrap();
+        let body = body_text(&response);
         assert!(body.contains("path=/hello"), "{body}");
         assert!(body.contains("proto=http"), "{body}");
-        assert!(body.contains(&format!("host={dial}")), "{body}");
+        // Caddy forwards the client Host unchanged rather than the dial address.
+        assert!(body.contains("host=example.com"), "{body}");
+        // Untrusted peers cannot inject X-Forwarded-* values.
+        assert!(body.contains("xff=203.0.113.7"), "{body}");
+        assert!(body.contains("xfh=example.com"), "{body}");
         assert_eq!(response.headers["x-proxy"], "caddy-rs");
         assert_eq!(response.headers["x-upstream"], "echo");
+        assert_eq!(response.headers[http::header::VIA], "1.1 Caddy");
         assert_eq!(
             response.headers.get_all("set-cookie").iter().count(),
             2,
@@ -556,22 +948,294 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trusted_proxy_values_are_retained() {
+        let dial = spawn_echo_upstream().await;
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": dial}],
+            "trusted_proxies": ["203.0.113.0/24"]
+        }));
+        let mut request = get_request("/", Some("203.0.113.7:5555"));
+        request
+            .headers
+            .insert("x-forwarded-for", "198.51.100.9".parse().unwrap());
+        request
+            .headers
+            .insert("x-forwarded-proto", "https".parse().unwrap());
+        request
+            .headers
+            .insert("x-forwarded-host", "prior.example".parse().unwrap());
+        let Outcome::Respond(response) = handler.handle(request).await.unwrap() else {
+            panic!("expected proxied response");
+        };
+        let body = body_text(&response);
+        assert!(body.contains("xff=198.51.100.9, 203.0.113.7"), "{body}");
+        assert!(body.contains("proto=https"), "{body}");
+        assert!(body.contains("xfh=prior.example"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn hop_by_hop_headers_are_stripped_and_via_is_added() {
+        let dial = spawn_echo_upstream().await;
+        let handler = handler(&dial);
+        let mut request = get_request("/", Some("203.0.113.7:5555"));
+        request
+            .headers
+            .insert(http::header::CONNECTION, "x-custom".parse().unwrap());
+        request
+            .headers
+            .insert("x-custom", "drop-me".parse().unwrap());
+        request
+            .headers
+            .insert(http::header::TE, "trailers".parse().unwrap());
+        let Outcome::Respond(response) = handler.handle(request).await.unwrap() else {
+            panic!("expected proxied response");
+        };
+        let body = body_text(&response);
+        assert!(body.contains("connection=missing"), "{body}");
+        assert!(body.contains("te=trailers"), "{body}");
+        // Hop-by-hop response headers (and headers named by Connection) are stripped.
+        assert!(!response.headers.contains_key("alt-svc"));
+        assert!(!response.headers.contains_key("connection"));
+        assert!(!response.headers.contains_key("x-hop"));
+        assert!(response.headers.contains_key("x-upstream"));
+    }
+
+    #[tokio::test]
+    async fn header_up_host_override_wins() {
+        let dial = spawn_echo_upstream().await;
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": dial}],
+            "headers": {"request": {"set": {"Host": ["override.example"]}}}
+        }));
+        let request = get_request("/", Some("203.0.113.7:5555"));
+        let Outcome::Respond(response) = handler.handle(request).await.unwrap() else {
+            panic!("expected proxied response");
+        };
+        assert!(body_text(&response).contains("host=override.example"));
+    }
+
+    #[tokio::test]
+    async fn response_matching_retry_match_retries_to_next_upstream() {
+        let bad = spawn_status_upstream(502, "bad").await;
+        let good = spawn_status_upstream(200, "good").await;
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": bad}, {"dial": good}],
+            "load_balancing": {
+                "retries": 1,
+                "retry_match": [{"status": [502, 503]}]
+            }
+        }));
+        let Outcome::Respond(response) = handler.handle(get_request("/", None)).await.unwrap()
+        else {
+            panic!("expected proxied response");
+        };
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(body_text(&response), "good");
+        assert_eq!(response.headers["x-upstream"], "200");
+    }
+
+    #[tokio::test]
+    async fn non_matching_response_passes_through() {
+        let upstream = spawn_status_upstream(500, "upstream-error").await;
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": upstream}],
+            "load_balancing": {
+                "retries": 2,
+                "retry_match": [{"status": [502, 503]}]
+            }
+        }));
+        let Outcome::Respond(response) = handler.handle(get_request("/", None)).await.unwrap()
+        else {
+            panic!("expected proxied response");
+        };
+        assert_eq!(response.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body_text(&response), "upstream-error");
+    }
+
+    #[tokio::test]
+    async fn retry_match_combines_request_and_response_matchers() {
+        let upstream = spawn_status_upstream(502, "retried").await;
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": upstream}],
+            "load_balancing": {
+                "retries": 1,
+                "retry_match": [{"status": [502], "method": ["POST"]}]
+            }
+        }));
+        // GET does not match the request matcher, so the 502 passes through with its body.
+        let Outcome::Respond(response) = handler.handle(get_request("/", None)).await.unwrap()
+        else {
+            panic!("expected proxied response");
+        };
+        assert_eq!(response.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body_text(&response), "retried");
+    }
+
+    #[tokio::test]
+    async fn exhausted_response_retry_preserves_upstream_status() {
+        let upstream = spawn_status_upstream(503, "unavailable").await;
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": upstream}],
+            "load_balancing": {
+                "retries": 1,
+                "retry_match": [{"status": [503]}]
+            }
+        }));
+        let Outcome::Respond(response) = handler.handle(get_request("/", None)).await.unwrap()
+        else {
+            panic!("expected proxied response");
+        };
+        // Caddy surfaces the upstream status, not a generic 502.
+        assert_eq!(response.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn request_only_retry_match_does_not_retry_responses() {
+        let upstream = spawn_status_upstream(200, "ok").await;
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": upstream}],
+            "load_balancing": {
+                "retries": 2,
+                "try_interval": 1_000_000,
+                "retry_match": [{"method": ["GET"]}]
+            }
+        }));
+        let Outcome::Respond(response) = handler.handle(get_request("/", None)).await.unwrap()
+        else {
+            panic!("expected proxied response");
+        };
+        // A request-only matcher set gates transport retries only (Caddy semantics); it must not
+        // turn every matching response into a retry.
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(body_text(&response), "ok");
+    }
+
+    #[tokio::test]
+    async fn post_transport_error_is_not_retried_by_default() {
+        let (dial, connections) = spawn_broken_upstream().await;
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": dial}],
+            "load_balancing": {"retries": 2, "try_interval": 1_000_000}
+        }));
+        let mut request = Request::new(Method::POST, "/".parse().unwrap());
+        request
+            .headers
+            .insert(http::header::HOST, "example.com".parse().unwrap());
+        let Outcome::Respond(response) = handler.handle(request).await.unwrap() else {
+            panic!("expected error response");
+        };
+        assert_eq!(response.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            connections.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "non-dial transport errors must not be retried for POST without retry_match"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_transport_error_is_retried_when_retry_match_matches() {
+        let (dial, connections) = spawn_broken_upstream().await;
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": dial}],
+            "load_balancing": {
+                "retries": 2,
+                "try_interval": 1_000_000,
+                "retry_match": [{"method": ["POST"]}]
+            }
+        }));
+        let mut request = Request::new(Method::POST, "/".parse().unwrap());
+        request
+            .headers
+            .insert(http::header::HOST, "example.com".parse().unwrap());
+        let Outcome::Respond(response) = handler.handle(request).await.unwrap() else {
+            panic!("expected error response");
+        };
+        assert_eq!(response.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            connections.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "matching retry_match should retry the transport error (1 attempt + 2 retries)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn proxies_over_unix_socket_upstream() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("upstream.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let service = service_fn(
+                        |request: hyper::Request<hyper::body::Incoming>| async move {
+                            let body = format!(
+                                "unix path={} host={}",
+                                request.uri().path(),
+                                request
+                                    .headers()
+                                    .get(http::header::HOST)
+                                    .and_then(|value| value.to_str().ok())
+                                    .unwrap_or("missing")
+                            );
+                            Ok::<_, Infallible>(
+                                hyper::Response::builder()
+                                    .status(200)
+                                    .header("x-transport", "unix")
+                                    .body(Full::new(Bytes::from(body)))
+                                    .expect("response"),
+                            )
+                        },
+                    );
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+
+        let dial = format!("unix/{}", socket.display());
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": dial}]
+        }));
+        let request = get_request("/over-unix?q=1", Some("203.0.113.7:5555"));
+        let Outcome::Respond(response) = handler.handle(request).await.unwrap() else {
+            panic!("expected proxied response");
+        };
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.headers["x-transport"], "unix");
+        let body = body_text(&response);
+        assert!(body.contains("unix path=/over-unix"), "{body}");
+        assert!(body.contains("host=example.com"), "{body}");
+    }
+
+    #[tokio::test]
     async fn unreachable_upstream_returns_502() {
         // Reserve a port by binding then dropping; the port is almost certainly closed afterwards.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dial = listener.local_addr().unwrap().to_string();
         drop(listener);
-        let handler = ReverseProxyHandler::from_json(
-            &serde_json::json!({
-                "handler": "reverse_proxy",
-                "upstreams": [{"dial": dial}],
-                "load_balancing": {"retries": 1, "try_interval": 1_000_000}
-            }),
-            "handler",
-        )
-        .unwrap();
-        let request = Request::new(Method::GET, "/".parse().unwrap());
-        let Outcome::Respond(response) = handler.handle(request).await.unwrap() else {
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": dial}],
+            "load_balancing": {"retries": 1, "try_interval": 1_000_000}
+        }));
+        let Outcome::Respond(response) = handler.handle(get_request("/", None)).await.unwrap()
+        else {
             panic!("expected error response");
         };
         assert_eq!(response.status, StatusCode::BAD_GATEWAY);
@@ -592,6 +1256,31 @@ mod tests {
         )
         .unwrap();
         assert!(declined.is_none());
+    }
+
+    #[test]
+    fn accepts_unix_dial_in_configuration() {
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": "unix//run/app.sock"}]
+        }));
+        assert_eq!(handler.upstreams().len(), 1);
+        assert_eq!(handler.upstreams()[0].dial, "unix//run/app.sock");
+    }
+
+    #[test]
+    fn rejects_invalid_trusted_proxies() {
+        let error = ReverseProxyHandler::from_json(
+            &serde_json::json!({
+                "handler": "reverse_proxy",
+                "upstreams": [{"dial": "localhost:8080"}],
+                "trusted_proxies": ["not-an-ip"]
+            }),
+            "handler",
+        )
+        .err()
+        .expect("invalid trusted_proxies must fail");
+        assert!(error.to_string().contains("trusted_proxies"), "{error}");
     }
 
     #[test]
@@ -622,5 +1311,39 @@ mod tests {
         .err()
         .expect("TLS upstream must be rejected");
         assert!(error.to_string().contains("TLS upstreams"));
+    }
+
+    #[test]
+    fn parses_trusted_proxy_cidr_ranges() {
+        let range = IpNet::parse("10.0.0.0/8").unwrap();
+        assert!(range.contains("10.1.2.3".parse().unwrap()));
+        assert!(!range.contains("11.1.2.3".parse().unwrap()));
+        let range = IpNet::parse("2001:db8::/32").unwrap();
+        assert!(range.contains("2001:db8::1".parse().unwrap()));
+        assert!(!range.contains("2001:db9::1".parse().unwrap()));
+        let single = IpNet::parse("192.0.2.10").unwrap();
+        assert!(single.contains("192.0.2.10".parse().unwrap()));
+        assert!(!single.contains("192.0.2.11".parse().unwrap()));
+        assert!(IpNet::parse("10.0.0.0/33").is_err());
+        assert!(IpNet::parse("10.0.0.0/9")
+            .unwrap()
+            .contains("10.100.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn hop_by_hop_strips_connection_tokens() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONNECTION,
+            "X-Hop, keep-alive".parse().unwrap(),
+        );
+        headers.insert("x-hop", "1".parse().unwrap());
+        headers.insert("keep-alive", "timeout=5".parse().unwrap());
+        headers.insert("x-keep", "yes".parse().unwrap());
+        let stripped = strip_hop_by_hop(&headers);
+        assert!(!stripped.contains_key("connection"));
+        assert!(!stripped.contains_key("x-hop"));
+        assert!(!stripped.contains_key("keep-alive"));
+        assert_eq!(stripped["x-keep"], "yes");
     }
 }
