@@ -23,6 +23,10 @@
 //!   `RSA PRIVATE KEY` blocks are rejected with a located error;
 //! * ZeroSSL's automatic EAB credential provisioning is not implemented.
 
+pub mod csr;
+pub mod order;
+pub mod transport;
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -144,6 +148,103 @@ pub enum AcmeError {
     /// External account binding credentials are malformed.
     #[error("ACME external account binding error: {0}")]
     ExternalAccount(String),
+
+    /// An ACME order reached the `invalid` state.
+    #[error("ACME order `{url}` is invalid: {detail}")]
+    InvalidOrder {
+        /// Order URL.
+        url: String,
+        /// Human-readable detail (from the order error object).
+        detail: String,
+        /// Order error problem document, when the CA provided one.
+        problem: Option<Problem>,
+    },
+
+    /// An ACME authorization reached the `invalid` state.
+    #[error("ACME authorization `{url}` is invalid: {detail}")]
+    InvalidAuthorization {
+        /// Authorization URL.
+        url: String,
+        /// Human-readable detail (from the failed challenge).
+        detail: String,
+        /// Authorization/challenge problem document, when the CA provided one.
+        problem: Option<Problem>,
+    },
+
+    /// An ACME challenge failed.
+    #[error("ACME challenge `{url}` ({challenge_type}) failed: {detail}")]
+    InvalidChallenge {
+        /// Challenge URL.
+        url: String,
+        /// Challenge type (`http-01`, `tls-alpn-01`, `dns-01`).
+        challenge_type: String,
+        /// Human-readable detail.
+        detail: String,
+        /// Challenge problem document, when the CA provided one.
+        problem: Option<Problem>,
+    },
+
+    /// An ACME order was in a state the flow did not expect.
+    #[error("ACME order `{url}` is `{status}`, expected {expected}")]
+    UnexpectedOrderStatus {
+        /// Order URL.
+        url: String,
+        /// Observed status.
+        status: String,
+        /// Expected status or statuses.
+        expected: String,
+    },
+
+    /// An ACME authorization was in a state the flow did not expect.
+    #[error("ACME authorization `{url}` is `{status}`, expected valid")]
+    UnexpectedAuthorizationStatus {
+        /// Authorization URL.
+        url: String,
+        /// Observed status.
+        status: String,
+    },
+
+    /// Polling an ACME resource exceeded the policy's attempt budget.
+    #[error("gave up polling `{url}` after {attempts} attempts")]
+    PollingTimeout {
+        /// Polled URL.
+        url: String,
+        /// Attempts made.
+        attempts: u32,
+    },
+
+    /// No challenge offered by the authorization is enabled in the policy.
+    #[error("authorization for `{identifier}` offers no enabled challenge (offered: {offered:?})")]
+    NoSupportedChallenge {
+        /// Identifier the authorization is for.
+        identifier: String,
+        /// Challenge types offered by the CA.
+        offered: Vec<String>,
+    },
+
+    /// Certificate signing request generation failed.
+    #[error("ACME certificate request error: {0}")]
+    CertificateRequest(String),
+
+    /// An order is not in a state that has a certificate URL.
+    #[error("ACME order `{url}` has no certificate URL (status `{status}`)")]
+    MissingCertificateUrl {
+        /// Order URL.
+        url: String,
+        /// Observed order status.
+        status: String,
+    },
+
+    /// The account record and the client belong to different directory URLs.
+    #[error(
+        "ACME account `{account_directory_url}` does not belong to directory `{directory_url}`"
+    )]
+    MismatchedAccountDirectory {
+        /// Directory URL recorded in the account.
+        account_directory_url: String,
+        /// Directory URL of the client.
+        directory_url: String,
+    },
 }
 
 impl AcmeError {
@@ -1099,9 +1200,26 @@ impl<T: AcmeTransport> AcmeClient<T> {
         kid: Option<&str>,
         payload: &[u8],
     ) -> Result<HttpResponse> {
+        self.post_signed_headers(url, kid, payload, &[]).await
+    }
+
+    /// Like [`Self::post_signed`], with additional request headers.
+    ///
+    /// The certificate-download endpoint needs `Accept: application/pem-certificate-chain`; the
+    /// `Content-Type` header is always `application/jose+json` for signed ACME requests.
+    pub async fn post_signed_headers(
+        &self,
+        url: &str,
+        kid: Option<&str>,
+        payload: &[u8],
+        headers: &[(String, String)],
+    ) -> Result<HttpResponse> {
         let nonce = self.next_nonce().await?;
         let body = sign_jws(&self.account_key, kid, Some(&nonce), url, payload)?;
-        let request = HttpRequest::post_jose(url, body.into_bytes());
+        let mut request = HttpRequest::post_jose(url, body.into_bytes());
+        for (name, value) in headers {
+            request = request.with_header(name.clone(), value.clone());
+        }
         let response = self.transport.request(request).await?;
         self.record_nonce(&response).await;
         Ok(response)
@@ -1468,6 +1586,15 @@ impl<S: AcmeStorage> AccountStore<S> {
         Ok(account)
     }
 }
+
+pub use csr::CertificateRequest;
+pub use order::{
+    parse_pem_certificate_chain, parse_retry_after, retry_after, AcmeAccountClient, AcmeClock,
+    Authorization, AuthorizationFetch, AuthorizationStatus, Challenge, ChallengeFetch,
+    ChallengePolicy, ChallengeStatus, ChallengeType, Identifier, IssuedCertificate,
+    NewOrderRequest, Order, OrderFetch, OrderHandle, OrderStatus, PollPolicy, TokioClock,
+};
+pub use transport::HyperTransport;
 
 #[cfg(test)]
 mod tests {
