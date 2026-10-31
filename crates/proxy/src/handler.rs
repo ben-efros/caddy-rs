@@ -60,10 +60,19 @@ impl ReverseProxyHandler {
             .as_object()
             .ok_or_else(|| invalid(path, "reverse_proxy handler must be an object"))?;
 
-        let transport_tls = object
-            .get("transport")
+        let transport = object.get("transport");
+        let transport_tls = transport
             .and_then(|transport| transport.get("tls"))
             .is_some();
+        if transport
+            .and_then(|transport| transport.get("versions"))
+            .is_some()
+        {
+            return Err(HttpError::NotImplemented {
+                feature: "HTTP/2 upstream transports (h2c/h2)",
+                tracking_id: "PROXY-H2-UPSTREAM",
+            });
+        }
         if transport_tls {
             return Err(HttpError::NotImplemented {
                 feature:
@@ -583,6 +592,21 @@ mod tests {
         )
         .unwrap();
         assert!(declined.is_none());
+    }
+
+    #[test]
+    fn rejects_http2_upstream_transport() {
+        let error = ReverseProxyHandler::from_json(
+            &serde_json::json!({
+                "handler": "reverse_proxy",
+                "upstreams": [{"dial": "localhost:8080"}],
+                "transport": {"protocol": "http", "versions": ["h2c", "2"]}
+            }),
+            "handler",
+        )
+        .err()
+        .expect("h2c upstream transport must be rejected");
+        assert!(error.to_string().contains("PROXY-H2-UPSTREAM"));
     }
 
     #[test]

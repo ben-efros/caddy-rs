@@ -12,7 +12,6 @@
 //! program repository.
 
 use std::collections::BTreeMap;
-use std::net::IpAddr;
 
 use caddy_rs_core::{AdaptedConfig, ConfigAdapter, Error as CoreError};
 use serde_json::{json, Map, Value};
@@ -93,24 +92,37 @@ pub fn adapt(input: &str) -> caddy_rs_core::Result<AdaptedConfig> {
                         listen,
                         routes: Vec::new(),
                         https,
+                        skip_auto_https: Vec::new(),
                     });
                     servers.len() - 1
                 }
             };
             let server = &mut servers[index];
             server.https |= https;
+            if address.scheme.as_deref() == Some("http") && port != 80 && !address.host.is_empty() {
+                let host = address
+                    .host
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .to_string();
+                if !server.skip_auto_https.contains(&host) {
+                    server.skip_auto_https.push(host);
+                }
+            }
             if address.host.is_empty() {
                 server.routes.extend(site_routes.clone());
             } else {
                 let host = address.host.trim_start_matches('[').trim_end_matches(']');
-                server.routes.push(json!({
-                    "match": [{"host": [host]}],
-                    "handle": [{
-                        "handler": "subroute",
-                        "routes": site_routes,
-                    }],
-                    "terminal": true,
-                }));
+                let mut route = Map::new();
+                route.insert("match".to_string(), json!([{"host": [host]}]));
+                if !site_routes.is_empty() {
+                    route.insert(
+                        "handle".to_string(),
+                        json!([{"handler": "subroute", "routes": site_routes}]),
+                    );
+                }
+                route.insert("terminal".to_string(), json!(true));
+                server.routes.push(Value::Object(route));
             }
         }
     }
@@ -119,23 +131,33 @@ pub fn adapt(input: &str) -> caddy_rs_core::Result<AdaptedConfig> {
     for (index, server) in servers.into_iter().enumerate() {
         let mut object = Map::new();
         object.insert("listen".to_string(), json!([server.listen]));
-        object.insert("routes".to_string(), Value::Array(server.routes));
-        if auto_https_off {
-            object.insert("automatic_https".to_string(), json!({"disable": true}));
-        } else if matches!(options.auto_https, Some(AutoHttpsMode::DisableRedirects)) {
+        let mut automatic_https = Map::new();
+        match options.auto_https {
+            Some(AutoHttpsMode::Off) => {
+                automatic_https.insert("disable".to_string(), json!(true));
+            }
+            Some(AutoHttpsMode::DisableRedirects) => {
+                automatic_https.insert("disable_redirects".to_string(), json!(true));
+            }
+            Some(AutoHttpsMode::IgnoreLoadedCerts) => {
+                automatic_https.insert("ignore_loaded_certificates".to_string(), json!(true));
+            }
+            None => {}
+        }
+        if !server.skip_auto_https.is_empty() {
+            automatic_https.insert("skip".to_string(), json!(server.skip_auto_https));
+        }
+        if !automatic_https.is_empty() {
             object.insert(
                 "automatic_https".to_string(),
-                json!({"disable_redirects": true}),
-            );
-        } else if matches!(options.auto_https, Some(AutoHttpsMode::IgnoreLoadedCerts)) {
-            object.insert(
-                "automatic_https".to_string(),
-                json!({"ignore_loaded_certs": true}),
+                Value::Object(automatic_https),
             );
         }
         if server.https && auto_https_off {
             object.insert("tls_connection_policies".to_string(), json!([{}]));
         }
+        let routes = consolidate_host_routes(server.routes);
+        object.insert("routes".to_string(), Value::Array(routes));
         server_map.insert(format!("srv{index}"), Value::Object(object));
     }
 
@@ -154,14 +176,88 @@ struct ServerBuilder {
     listen: String,
     routes: Vec<Value>,
     https: bool,
+    skip_auto_https: Vec<String>,
 }
 
-fn listen_address(address: &SiteAddress, port: u16) -> String {
-    if address.host.parse::<IpAddr>().is_ok() {
-        format!("{}:{}", address.host, port)
-    } else {
-        format!(":{port}")
+fn listen_address(_address: &SiteAddress, port: u16) -> String {
+    // Caddy site addresses name virtual hosts, not bind addresses; binding is controlled by the
+    // `bind` directive. All sites therefore listen on the wildcard address for their port.
+    format!(":{port}")
+}
+
+/// Consolidate routes that Caddy's adapter would merge: host-only routes with identical handling
+/// combine their host lists, and a host-only route is dropped when an equivalent catch-all route
+/// already exists (the catch-all covers it). This mirrors Caddy's site-block consolidation and is
+/// covered by `tls_automation_policies_9` in the conformance corpus.
+fn consolidate_host_routes(routes: Vec<Value>) -> Vec<Value> {
+    fn host_route(route: &Value) -> Option<(&Value, &Value)> {
+        let object = route.as_object()?;
+        let keys: Vec<&String> = object.keys().collect();
+        if keys.iter().any(|key| {
+            key.as_str() != "match" && key.as_str() != "handle" && key.as_str() != "terminal"
+        }) {
+            return None;
+        }
+        let matchers = object.get("match")?.as_array()?;
+        if matchers.len() != 1 {
+            return None;
+        }
+        let matcher = matchers[0].as_object()?;
+        if matcher.len() != 1 || matcher.get("host")?.as_array()?.is_empty() {
+            return None;
+        }
+        let handle = object.get("handle")?;
+        Some((handle, route))
     }
+
+    let mut output: Vec<Value> = Vec::new();
+    for route in routes {
+        let catch_all_handle = route.get("handle").cloned();
+        let Some((handle, _)) = host_route(&route) else {
+            // Catch-all or complex route: drop any host routes it makes redundant.
+            if route.get("match").is_none() {
+                if let Some(catch_all_handle) = catch_all_handle {
+                    output.retain(|existing| {
+                        host_route(existing)
+                            .map(|(existing_handle, _)| *existing_handle != catch_all_handle)
+                            .unwrap_or(true)
+                    });
+                }
+            }
+            output.push(route);
+            continue;
+        };
+        let object = route.as_object().expect("host route is an object");
+        let hosts = object["match"][0]["host"].as_array().expect("checked");
+        // Merge into an existing host route with identical handling.
+        let mut merged = false;
+        for existing in &mut output {
+            let Some((existing_handle, _)) = host_route(existing) else {
+                continue;
+            };
+            if existing_handle == handle {
+                if let Some(existing_hosts) = existing
+                    .as_object_mut()
+                    .and_then(|object| object.get_mut("match"))
+                    .and_then(|matchers| matchers.get_mut(0))
+                    .and_then(|matcher| matcher.get_mut("host"))
+                    .and_then(Value::as_array_mut)
+                {
+                    for host in hosts {
+                        if !existing_hosts.contains(host) {
+                            existing_hosts.push(host.clone());
+                        }
+                    }
+                    merged = true;
+                    break;
+                }
+            }
+        }
+        if !merged {
+            output.push(route);
+        }
+    }
+    output
 }
 
 fn build_site_routes(
@@ -184,11 +280,16 @@ fn collect_matchers(directives: &[Directive]) -> caddy_rs_core::Result<BTreeMap<
                 "matcher name after `@` must not be empty",
             ));
         }
-        let object = if directive.block.is_empty() {
+        let mut object = if directive.block.is_empty() {
             matcher_from_inline_args(&directive.args, directive.position)?
         } else {
             matcher_from_directives(&directive.block)?
         };
+        if let Some(regexp) = object.get_mut("path_regexp").and_then(Value::as_object_mut) {
+            regexp
+                .entry("name".to_string())
+                .or_insert_with(|| json!(name));
+        }
         matchers.insert(name.to_string(), object);
     }
     Ok(matchers)
@@ -416,9 +517,13 @@ fn build_routes(
         match directive.name.as_str() {
             "route" => {
                 let inner = build_routes(&directive.block, matchers, false, warnings)?;
-                routes.push(json!({
-                    "handle": [{"handler": "subroute", "routes": inner}]
-                }));
+                if inner.is_empty() {
+                    routes.push(json!({"handle": [{"handler": "subroute"}]}));
+                } else {
+                    routes.push(json!({
+                        "handle": [{"handler": "subroute", "routes": inner}]
+                    }));
+                }
             }
             "handle" | "handle_path" => {
                 let route = build_handle_route(directive, matchers, warnings)?;
@@ -426,6 +531,27 @@ fn build_routes(
             }
             _ => unreachable!("handled directive names are exhaustive"),
         }
+    }
+    if sort {
+        // Caddy sorts `handle` routes by matcher specificity: matched routes before the catch-all,
+        // and longer path patterns first. Group names are normalised by the conformance tooling
+        // (DIV-0022), but evaluation order is semantic and this matches it.
+        handle_routes.sort_by_key(|route| {
+            let pattern = route
+                .get("match")
+                .and_then(Value::as_array)
+                .and_then(|matchers| matchers.first())
+                .and_then(|matcher| matcher.get("path"))
+                .and_then(Value::as_array)
+                .and_then(|paths| paths.first())
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if pattern.is_empty() {
+                i64::MAX
+            } else {
+                -(pattern.len() as i64)
+            }
+        });
     }
     if handle_routes.len() > 1 {
         for route in &mut handle_routes {
@@ -451,7 +577,7 @@ fn build_routes(
         }
     }
     if !generic_handlers.is_empty() {
-        routes.insert(0, json!({"handle": generic_handlers}));
+        routes.push(json!({"handle": generic_handlers}));
     }
     Ok(routes)
 }
@@ -512,7 +638,7 @@ fn build_handlers(
     _warnings: &mut Vec<String>,
 ) -> caddy_rs_core::Result<Vec<Value>> {
     let handlers = match directive.name.as_str() {
-        "respond" => vec![respond_handler(args, directive.position)?],
+        "respond" => vec![respond_handler(directive, args)?],
         "redir" => vec![redirect_handler(args, directive.position)?],
         "file_server" => vec![file_server_handler(directive)?],
         "root" => vec![root_handler(args, directive.position)?],
@@ -530,33 +656,52 @@ fn build_handlers(
     Ok(handlers)
 }
 
-fn respond_handler(args: &[String], position: Position) -> caddy_rs_core::Result<Value> {
+fn respond_handler(directive: &Directive, args: &[String]) -> caddy_rs_core::Result<Value> {
+    let position = directive.position;
     let mut object = Map::new();
     object.insert("handler".to_string(), json!("static_response"));
-    match args {
-        // `respond 403` is a status-only response in Caddy, not a body.
-        [only] if is_status_code(only) => {
-            let code: u16 = only.parse().expect("checked by is_status_code");
-            object.insert("status_code".to_string(), json!(code));
-        }
-        [body, status, ..] => {
-            if !body.is_empty() {
-                object.insert("body".to_string(), json!(body));
+
+    // A `respond` block may override the body: `respond /path 200 { body "..." }`.
+    let mut block_body: Option<String> = None;
+    for item in &directive.block {
+        match item.name.as_str() {
+            "body" => {
+                let body = item.args.join(" ");
+                block_body = Some(body);
             }
-            let code: u16 = status.parse().map_err(|_| {
-                adapter_error(
-                    position,
-                    format!("`respond` status `{status}` is not a number"),
-                )
-            })?;
-            object.insert("status_code".to_string(), json!(code));
-        }
-        [body] => {
-            if !body.is_empty() {
-                object.insert("body".to_string(), json!(body));
+            other => {
+                return Err(adapter_error(
+                    item.position,
+                    format!("`respond` block option `{other}` is not supported by this build"),
+                ))
             }
         }
-        [] => {}
+    }
+
+    let (body, status) = if let Some(body) = block_body {
+        (Some(body), args.first().cloned())
+    } else {
+        match args {
+            // `respond 403` is a status-only response in Caddy, not a body.
+            [only] if is_status_code(only) => (None, Some(only.clone())),
+            [body, status, ..] => (Some(body.clone()), Some(status.clone())),
+            [body] => (Some(body.clone()), None),
+            [] => (None, None),
+        }
+    };
+    if let Some(body) = body {
+        if !body.is_empty() {
+            object.insert("body".to_string(), json!(qualify_placeholders(&body)));
+        }
+    }
+    if let Some(status) = status {
+        let code: u16 = status.parse().map_err(|_| {
+            adapter_error(
+                position,
+                format!("`respond` status `{status}` is not a number"),
+            )
+        })?;
+        object.insert("status_code".to_string(), json!(code));
     }
     Ok(Value::Object(object))
 }
@@ -582,7 +727,7 @@ fn redirect_handler(args: &[String], position: Position) -> caddy_rs_core::Resul
     };
     Ok(json!({
         "handler": "static_response",
-        "headers": {"Location": [location]},
+        "headers": {"Location": [qualify_placeholders(location)]},
         "status_code": code,
     }))
 }
@@ -619,6 +764,21 @@ fn header_handlers(directive: &Directive) -> caddy_rs_core::Result<Vec<Value>> {
                 "`header` requires a field name and value (or a block)",
             ));
         }
+        if directive.args.len() >= 3 && !directive.args[0].starts_with(['+', '-', '?', '>']) {
+            // `header <field> <search> <replacement>` is Caddy's regex replacement form.
+            let replace = json!({
+                "handler": "headers",
+                "response": {
+                    "replace": {
+                        directive.args[0].clone(): [{
+                            "search_regexp": qualify_placeholders(&directive.args[1]),
+                            "replace": qualify_placeholders(&directive.args[2]),
+                        }]
+                    }
+                }
+            });
+            return Ok(vec![replace]);
+        }
         entries.push((directive.args[0].clone(), directive.args[1..].to_vec()));
     } else {
         for item in &directive.block {
@@ -642,12 +802,28 @@ fn header_handlers(directive: &Directive) -> caddy_rs_core::Result<Vec<Value>> {
     for (raw_field, values) in entries {
         let field = raw_field.trim_end_matches(':').to_string();
         if let Some(name) = field.strip_prefix('+') {
-            adds.insert(name.to_string(), json!(values));
+            adds.insert(
+                name.to_string(),
+                json!(values
+                    .iter()
+                    .map(|value| qualify_placeholders(value))
+                    .collect::<Vec<_>>()),
+            );
         } else if let Some(name) = field.strip_prefix('-') {
             deletes.push(Value::String(name.to_string()));
         } else if let Some(name) = field.strip_prefix('?') {
-            sets.insert(name.to_string(), json!(values));
+            sets.insert(
+                name.to_string(),
+                json!(values
+                    .iter()
+                    .map(|value| qualify_placeholders(value))
+                    .collect::<Vec<_>>()),
+            );
         } else {
+            let values: Vec<String> = values
+                .iter()
+                .map(|value| qualify_placeholders(value))
+                .collect();
             sets.insert(field, json!(values));
         }
     }
@@ -669,20 +845,65 @@ fn header_handlers(directive: &Directive) -> caddy_rs_core::Result<Vec<Value>> {
 fn file_server_handler(directive: &Directive) -> caddy_rs_core::Result<Value> {
     let mut object = Map::new();
     object.insert("handler".to_string(), json!("file_server"));
-    let mut hide: Vec<Value> = vec![json!("./Caddyfile")];
-    let mut seen_hide = false;
+    let mut hide: Vec<Value> = Vec::new();
     let mut index_names: Vec<Value> = Vec::new();
 
-    let apply = |name: &str,
-                 values: &[String],
-                 object: &mut Map<String, Value>,
-                 hide: &mut Vec<Value>,
-                 seen_hide: &mut bool,
-                 index_names: &mut Vec<Value>|
-     -> caddy_rs_core::Result<()> {
+    fn apply_option(
+        directive: &Directive,
+        name: &str,
+        values: &[String],
+        block: &[Directive],
+        object: &mut Map<String, Value>,
+        hide: &mut Vec<Value>,
+        index_names: &mut Vec<Value>,
+    ) -> caddy_rs_core::Result<()> {
         match name {
             "browse" => {
-                object.insert("browse".to_string(), json!({}));
+                let mut browse = Map::new();
+                for option in block {
+                    match option.name.as_str() {
+                        "sort" => {
+                            if option.args.is_empty() {
+                                return Err(adapter_error(
+                                    option.position,
+                                    "`browse sort` requires one or more fields",
+                                ));
+                            }
+                            browse.insert("sort".to_string(), json!(option.args));
+                        }
+                        "file_limit" => {
+                            if option.args.len() != 1 {
+                                return Err(adapter_error(
+                                    option.position,
+                                    "`browse file_limit` requires exactly one integer",
+                                ));
+                            }
+                            let limit: u64 = option.args[0].parse().map_err(|_| {
+                                adapter_error(
+                                    option.position,
+                                    format!(
+                                        "`browse file_limit` value `{}` is not an integer",
+                                        option.args[0]
+                                    ),
+                                )
+                            })?;
+                            browse.insert("file_limit".to_string(), json!(limit));
+                        }
+                        other => {
+                            return Err(adapter_error(
+                                option.position,
+                                format!("`browse` option `{other}` is not supported by this build"),
+                            ))
+                        }
+                    }
+                }
+                if !values.is_empty() {
+                    return Err(adapter_error(
+                        directive.position,
+                        "`browse` does not take inline arguments",
+                    ));
+                }
+                object.insert("browse".to_string(), Value::Object(browse));
             }
             "pass_thru" => {
                 object.insert("pass_thru".to_string(), json!(true));
@@ -693,10 +914,6 @@ fn file_server_handler(directive: &Directive) -> caddy_rs_core::Result<Value> {
                         directive.position,
                         "`file_server hide` requires one or more paths",
                     ));
-                }
-                if !*seen_hide {
-                    hide.clear();
-                    *seen_hide = true;
                 }
                 hide.extend(values.iter().map(|value| json!(value)));
             }
@@ -753,7 +970,7 @@ fn file_server_handler(directive: &Directive) -> caddy_rs_core::Result<Value> {
             }
         }
         Ok(())
-    };
+    }
 
     // Options written directly after the directive name.
     let args = &directive.args;
@@ -780,31 +997,38 @@ fn file_server_handler(directive: &Directive) -> caddy_rs_core::Result<Value> {
                 index += 1;
             }
         }
-        apply(
+        apply_option(
+            directive,
             &name,
             &values,
+            &[],
             &mut object,
             &mut hide,
-            &mut seen_hide,
             &mut index_names,
         )?;
     }
 
     // Options written in a nested block.
     for item in &directive.block {
-        apply(
+        apply_option(
+            directive,
             &item.name,
             &item.args,
+            &item.block,
             &mut object,
             &mut hide,
-            &mut seen_hide,
             &mut index_names,
         )?;
     }
 
-    if !hide.is_empty() {
-        object.insert("hide".to_string(), Value::Array(hide));
+    // Caddy hides the config file itself by default, appended after any explicit hide entries.
+    if !hide
+        .iter()
+        .any(|value| value.as_str() == Some("./Caddyfile"))
+    {
+        hide.push(json!("./Caddyfile"));
     }
+    object.insert("hide".to_string(), Value::Array(hide));
     if !index_names.is_empty() {
         object.insert("index_names".to_string(), Value::Array(index_names));
     }
@@ -828,139 +1052,137 @@ fn is_file_server_option(value: &str) -> bool {
 fn encode_handler(directive: &Directive) -> caddy_rs_core::Result<Value> {
     let mut encodings = Map::new();
     let mut prefer = Vec::new();
-    if directive.block.is_empty() {
-        for name in &directive.args {
-            if !matches!(name.as_str(), "gzip" | "zstd") {
-                return Err(adapter_error(
-                    directive.position,
-                    format!("unsupported encoding `{name}`; expected gzip or zstd"),
-                ));
-            }
-            encodings.insert(name.clone(), json!({}));
-            prefer.push(json!(name));
+    for name in &directive.args {
+        if !matches!(name.as_str(), "gzip" | "zstd") {
+            return Err(adapter_error(
+                directive.position,
+                format!("unsupported encoding `{name}`; expected gzip or zstd"),
+            ));
         }
-        if prefer.is_empty() {
-            encodings.insert("zstd".to_string(), json!({}));
-            encodings.insert("gzip".to_string(), json!({}));
-            prefer.extend([json!("zstd"), json!("gzip")]);
-        }
-    } else {
-        let mut minimum_length = None;
-        let mut matches = Map::new();
-        for item in &directive.block {
-            match item.name.as_str() {
-                "gzip" => {
-                    let mut options = Map::new();
-                    if let Some(level) = item.args.first() {
-                        let level: u32 = level.parse().map_err(|_| {
-                            adapter_error(
-                                item.position,
-                                format!("gzip level `{level}` is not a number"),
-                            )
-                        })?;
-                        options.insert("level".to_string(), json!(level));
-                    }
-                    encodings.insert("gzip".to_string(), Value::Object(options));
-                    prefer.push(json!("gzip"));
-                }
-                "zstd" => {
-                    let mut options = Map::new();
-                    for option in &item.block {
-                        if option.name == "disable_checksum" {
-                            options.insert("checksum".to_string(), json!(false));
-                        } else {
-                            return Err(adapter_error(
-                                option.position,
-                                format!("unsupported zstd option `{}`", option.name),
-                            ));
-                        }
-                    }
-                    encodings.insert("zstd".to_string(), Value::Object(options));
-                    prefer.push(json!("zstd"));
-                }
-                "minimum_length" => {
-                    let Some(value) = item.args.first() else {
-                        return Err(adapter_error(
-                            item.position,
-                            "`minimum_length` requires a value",
-                        ));
-                    };
-                    minimum_length = Some(json!(parse_size(value)
-                        .map_err(|message| { adapter_error(item.position, message) })?));
-                }
-                "match" => {
-                    for matcher in &item.block {
-                        match matcher.name.as_str() {
-                            "status" => {
-                                let mut codes = Vec::new();
-                                for code in &matcher.args {
-                                    codes.push(parse_status_range(code).map_err(|message| {
-                                        adapter_error(matcher.position, message)
-                                    })?);
-                                }
-                                matches.insert("status_code".to_string(), json!(codes));
-                            }
-                            "header" => {
-                                let Some(field) = matcher.args.first() else {
-                                    return Err(adapter_error(
-                                        matcher.position,
-                                        "`match header` requires a field",
-                                    ));
-                                };
-                                let mut values = Vec::new();
-                                for value in matcher.args.iter().skip(1) {
-                                    values.push(json!(value));
-                                }
-                                let headers = matches
-                                    .entry("headers".to_string())
-                                    .or_insert_with(|| json!({}));
-                                if let Some(headers) = headers.as_object_mut() {
-                                    headers.insert(field.clone(), json!(values));
-                                }
-                            }
-                            other => {
-                                return Err(adapter_error(
-                                    matcher.position,
-                                    format!("unsupported encode match `{other}`"),
-                                ))
-                            }
-                        }
-                    }
-                }
-                other => {
-                    return Err(adapter_error(
-                        item.position,
-                        format!("unsupported `encode` option `{other}`"),
-                    ))
-                }
-            }
-        }
-        if encodings.is_empty() {
-            encodings.insert("zstd".to_string(), json!({}));
-            encodings.insert("gzip".to_string(), json!({}));
-            prefer.extend([json!("zstd"), json!("gzip")]);
-        }
-        if !matches.is_empty() {
-            // Keep for callers that build the handler object below.
-        }
-        let mut object = Map::new();
-        object.insert("handler".to_string(), json!("encode"));
-        object.insert("encodings".to_string(), Value::Object(encodings));
-        object.insert("prefer".to_string(), Value::Array(prefer));
-        if let Some(minimum_length) = minimum_length {
-            object.insert("minimum_length".to_string(), minimum_length);
-        }
-        if !matches.is_empty() {
-            object.insert("match".to_string(), Value::Object(matches));
-        }
-        return Ok(Value::Object(object));
+        encodings.insert(name.clone(), json!({}));
+        prefer.push(json!(name));
     }
 
-    Ok(json!({
-        "handler": "encode",
-        "encodings": Value::Object(encodings),
-        "prefer": prefer,
-    }))
+    let mut minimum_length = None;
+    let mut matches = Map::new();
+    for item in &directive.block {
+        match item.name.as_str() {
+            "gzip" => {
+                let mut options = Map::new();
+                if let Some(level) = item.args.first() {
+                    let level: u32 = level.parse().map_err(|_| {
+                        adapter_error(
+                            item.position,
+                            format!("gzip level `{level}` is not a number"),
+                        )
+                    })?;
+                    options.insert("level".to_string(), json!(level));
+                }
+                encodings.insert("gzip".to_string(), Value::Object(options));
+                if !prefer.iter().any(|value| value == "gzip") {
+                    prefer.push(json!("gzip"));
+                }
+            }
+            "zstd" => {
+                let mut options = Map::new();
+                for option in &item.block {
+                    if option.name == "disable_checksum" {
+                        options.insert("checksum".to_string(), json!(false));
+                    } else {
+                        return Err(adapter_error(
+                            option.position,
+                            format!("unsupported zstd option `{}`", option.name),
+                        ));
+                    }
+                }
+                encodings.insert("zstd".to_string(), Value::Object(options));
+                if !prefer.iter().any(|value| value == "zstd") {
+                    prefer.push(json!("zstd"));
+                }
+            }
+            "minimum_length" => {
+                let Some(value) = item.args.first() else {
+                    return Err(adapter_error(
+                        item.position,
+                        "`minimum_length` requires a value",
+                    ));
+                };
+                minimum_length = Some(json!(parse_size(value)
+                    .map_err(|message| { adapter_error(item.position, message) })?));
+            }
+            "match" => {
+                for matcher in &item.block {
+                    match matcher.name.as_str() {
+                        "status" => {
+                            let mut codes = Vec::new();
+                            for code in &matcher.args {
+                                codes.push(
+                                    parse_status_range(code).map_err(|message| {
+                                        adapter_error(matcher.position, message)
+                                    })?,
+                                );
+                            }
+                            matches.insert("status_code".to_string(), json!(codes));
+                        }
+                        "header" => {
+                            let Some(field) = matcher.args.first() else {
+                                return Err(adapter_error(
+                                    matcher.position,
+                                    "`match header` requires a field",
+                                ));
+                            };
+                            let values: Vec<Value> = matcher
+                                .args
+                                .iter()
+                                .skip(1)
+                                .map(|value| json!(value))
+                                .collect();
+                            let headers = matches
+                                .entry("headers".to_string())
+                                .or_insert_with(|| json!({}));
+                            if let Some(headers) = headers.as_object_mut() {
+                                match headers.get_mut(field) {
+                                    Some(Value::Array(existing)) => existing.extend(values),
+                                    _ => {
+                                        headers.insert(field.clone(), json!(values));
+                                    }
+                                }
+                            }
+                        }
+                        other => {
+                            return Err(adapter_error(
+                                matcher.position,
+                                format!("unsupported encode match `{other}`"),
+                            ))
+                        }
+                    }
+                }
+            }
+            other => {
+                return Err(adapter_error(
+                    item.position,
+                    format!("unsupported `encode` option `{other}`"),
+                ))
+            }
+        }
+    }
+
+    if encodings.is_empty() {
+        encodings.insert("zstd".to_string(), json!({}));
+        encodings.insert("gzip".to_string(), json!({}));
+        prefer.extend([json!("zstd"), json!("gzip")]);
+    }
+    let mut object = Map::new();
+    object.insert("handler".to_string(), json!("encode"));
+    object.insert("encodings".to_string(), Value::Object(encodings));
+    object.insert("prefer".to_string(), Value::Array(prefer));
+    if let Some(minimum_length) = minimum_length {
+        object.insert("minimum_length".to_string(), minimum_length);
+    }
+    if !matches.is_empty() {
+        object.insert("match".to_string(), Value::Object(matches));
+    }
+    Ok(Value::Object(object))
 }
 
 fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_core::Result<Value> {
@@ -972,6 +1194,7 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
     }
     let mut upstreams = Vec::new();
     let mut https_target = false;
+    let mut h2c_target = false;
     let mut extra_transport = Map::new();
     for target in args {
         let parsed = parse_upstream(target).map_err(|message| {
@@ -981,6 +1204,7 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
             )
         })?;
         https_target |= parsed.https;
+        h2c_target |= parsed.h2c;
         upstreams.push(json!({"dial": parsed.dial}));
     }
 
@@ -999,7 +1223,22 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
                 let Some(policy) = item.args.first() else {
                     return Err(adapter_error(item.position, "`lb_policy` requires a value"));
                 };
-                load_balancing.insert("selection_policy".to_string(), json!({"policy": policy}));
+                let mut selection = Map::new();
+                selection.insert("policy".to_string(), json!(policy));
+                if item.args.len() > 1 {
+                    let mut weights = Vec::new();
+                    for weight in item.args.iter().skip(1) {
+                        let weight: u64 = weight.parse().map_err(|_| {
+                            adapter_error(
+                                item.position,
+                                format!("`lb_policy` weight `{weight}` is not a number"),
+                            )
+                        })?;
+                        weights.push(json!(weight));
+                    }
+                    selection.insert("weights".to_string(), json!(weights));
+                }
+                load_balancing.insert("selection_policy".to_string(), Value::Object(selection));
             }
             "lb_retries" => {
                 let Some(retries) = item.args.first() else {
@@ -1061,7 +1300,7 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
                 }
                 request_headers.insert(
                     item.args[0].clone(),
-                    json!([rewrite_placeholder(&item.args[1..].join(" "))]),
+                    json!([qualify_placeholders(&item.args[1..].join(" "))]),
                 );
             }
             "header_down" => {
@@ -1073,7 +1312,7 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
                 }
                 response_headers.insert(
                     item.args[0].clone(),
-                    json!([rewrite_placeholder(&item.args[1..].join(" "))]),
+                    json!([qualify_placeholders(&item.args[1..].join(" "))]),
                 );
             }
             "request_buffers" => {
@@ -1164,23 +1403,25 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
         }
         object.insert("headers".to_string(), Value::Object(headers));
     }
-    if https_target {
+    if https_target || h2c_target || !extra_transport.is_empty() {
         let mut transport = Map::new();
         transport.insert("protocol".to_string(), json!("http"));
-        transport.insert(
-            "tls".to_string(),
-            Value::Object(
-                extra_transport
-                    .remove("tls")
-                    .and_then(|v| v.as_object().cloned())
-                    .unwrap_or_default(),
-            ),
-        );
-        object.insert("transport".to_string(), Value::Object(transport));
-    } else if !extra_transport.is_empty() {
-        let mut transport = Map::new();
-        transport.insert("protocol".to_string(), json!("http"));
-        transport.extend(extra_transport);
+        if https_target {
+            transport.insert(
+                "tls".to_string(),
+                Value::Object(
+                    extra_transport
+                        .remove("tls")
+                        .and_then(|v| v.as_object().cloned())
+                        .unwrap_or_default(),
+                ),
+            );
+        } else {
+            transport.extend(extra_transport);
+        }
+        if h2c_target {
+            transport.insert("versions".to_string(), json!(["h2c", "2"]));
+        }
         object.insert("transport".to_string(), Value::Object(transport));
     }
     Ok(Value::Object(object))
@@ -1189,9 +1430,19 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
 struct ParsedUpstream {
     dial: String,
     https: bool,
+    h2c: bool,
 }
 
 fn parse_upstream(target: &str) -> Result<ParsedUpstream, String> {
+    // Network-specific shorthand: `unix+h2c//path` means a Unix-socket upstream whose transport
+    // speaks h2c, and Caddy normalises it to a `unix/...` dial plus an h2c transport.
+    if let Some(rest) = target.strip_prefix("unix+h2c//") {
+        return Ok(ParsedUpstream {
+            dial: format!("unix//{rest}"),
+            https: false,
+            h2c: true,
+        });
+    }
     let (scheme, rest) = match target.split_once("://") {
         Some((scheme, rest)) => (Some(scheme), rest),
         None => (None, target),
@@ -1206,22 +1457,51 @@ fn parse_upstream(target: &str) -> Result<ParsedUpstream, String> {
     if authority.is_empty() {
         return Err("missing host".to_string());
     }
+    let default_port = if scheme == Some("https") { 443 } else { 80 };
+    let dial = if authority_has_port(authority) {
+        authority.to_string()
+    } else {
+        format!("{authority}:{default_port}")
+    };
     Ok(ParsedUpstream {
-        dial: authority.to_string(),
+        dial,
         https: scheme == Some("https"),
+        h2c: scheme == Some("h2c"),
     })
 }
 
-fn rewrite_placeholder(value: &str) -> String {
-    // Caddy expands short placeholders to fully qualified Caddy placeholders in adapted JSON.
+fn authority_has_port(authority: &str) -> bool {
+    if let Some(rest) = authority.strip_prefix('[') {
+        return rest
+            .split_once(']')
+            .map(|(_, tail)| tail.starts_with(':'))
+            .unwrap_or(false);
+    }
+    authority
+        .rsplit_once(':')
+        .map(|(_, port)| !port.is_empty() && port.chars().all(|ch| ch.is_ascii_digit()))
+        .unwrap_or(false)
+}
+
+/// Expand Caddy's shorthand placeholders to the fully qualified forms Caddy's adapter emits.
+///
+/// The runtime does not expand placeholders yet (DIV-0007); this keeps adapted JSON faithful to
+/// Caddy so the compatibility layer can be tested independently of placeholder support.
+fn qualify_placeholders(value: &str) -> String {
     let mut out = value.to_string();
     for (short, full) in [
+        ("{re.", "{http.regexp."),
+        ("{header.", "{http.request.header."),
+        ("{labels.", "{http.request.host.labels."),
+        ("{query.", "{http.request.uri.query."),
+        ("{path.", "{http.request.uri.path."),
         ("{host}", "{http.request.host}"),
         ("{uri}", "{http.request.uri}"),
         ("{path}", "{http.request.uri.path}"),
         ("{method}", "{http.request.method}"),
         ("{scheme}", "{http.request.scheme}"),
         ("{remote_host}", "{http.request.remote.host}"),
+        ("{remote_port}", "{http.request.remote.port}"),
         (
             "{upstream_hostport}",
             "{http.reverse_proxy.upstream.hostport}",

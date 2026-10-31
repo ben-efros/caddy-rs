@@ -1,8 +1,9 @@
 # caddy-rs (implementation repository)
 
 The Rust implementation of the caddy-rs program: a Caddy-compatible web server, reverse proxy,
-and configuration engine. **Status: M0/M1 skeleton** — the crates compile, 98 tests pass, and the
-Caddyfile adapter matches Caddy v2.11.7's golden output for a curated directive subset.
+and configuration engine. **Status: M0/M1 skeleton** — the crates compile, 100 tests pass, and the
+Caddyfile adapter matches Caddy v2.11.7's golden output for a curated directive subset (30 of the
+245 upstream adapter fixtures exactly; see the program repository's conformance report).
 
 See the program repository (`..`) for the plan, compatibility contract, divergence register, and
 work queue.

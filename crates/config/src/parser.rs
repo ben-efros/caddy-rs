@@ -131,6 +131,37 @@ pub fn parse(input: &str) -> Result<Caddyfile, ParseError> {
     Parser { tokens, cursor: 0 }.parse_file()
 }
 
+/// Directives that must never be parsed as a site address. Caddy produces a specific diagnostic
+/// for this confusion; the adapter rejects it explicitly.
+const KNOWN_DIRECTIVES: &[&str] = &[
+    "respond",
+    "redir",
+    "file_server",
+    "root",
+    "method",
+    "reverse_proxy",
+    "header",
+    "encode",
+    "route",
+    "handle",
+    "handle_path",
+    "tls",
+    "log",
+    "uri",
+    "rewrite",
+    "try_files",
+    "handle_response",
+    "map",
+    "invoke",
+    "acme_server",
+    "php_fastcgi",
+    "templates",
+    "request_body",
+    "basic_auth",
+    "forward_auth",
+    "rate_limit",
+];
+
 struct Parser {
     tokens: Vec<Token>,
     cursor: usize,
@@ -188,6 +219,18 @@ impl Parser {
                 ));
             }
             let addresses = parse_addresses(&raw_addresses, position)?;
+            if raw_addresses.len() == 1 {
+                let candidate = raw_addresses[0].trim_end_matches(',');
+                if KNOWN_DIRECTIVES.contains(&candidate) {
+                    return Err(ParseError::syntax(
+                        position,
+                        format!(
+                            "parsed `{candidate}` as a site address, but it is a known directive; \
+                             directives must appear in a site block"
+                        ),
+                    ));
+                }
+            }
             let directives = match self.peek().map(|t| t.kind) {
                 Some(TokenKind::LeftBrace) => {
                     self.cursor += 1;
@@ -411,10 +454,14 @@ fn read_global_options(directives: Vec<Directive>) -> Result<GlobalOptions, Pars
                 options.https_port = Some(global_port(&directive)?);
             }
             "email" | "acme_ca" | "acme_ca_root" | "acme_dns" | "local_certs" | "debug" => {
-                options.warnings.push(format!(
-                    "global option `{}` is parsed but not applied by this build (TLS automation is M5)",
-                    directive.name
-                ));
+                return Err(ParseError::syntax(
+                    directive.position,
+                    format!(
+                        "global option `{}` is not implemented by this build (tracked as T-CONF-011); \
+                         it is rejected rather than silently ignored",
+                        directive.name
+                    ),
+                ))
             }
             other => {
                 return Err(ParseError::syntax(

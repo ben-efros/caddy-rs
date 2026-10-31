@@ -102,11 +102,13 @@ impl ModuleRegistry {
         Self::default()
     }
 
-    /// Registry populated with the modules implemented by this build.
+    /// Registry populated with the modules this build knows about.
     ///
-    /// The set is intentionally honest: modules listed in the compatibility plan but not yet
-    /// implemented are **not** registered, so a configuration using them fails validation with
-    /// [`Error::UnknownModule`] instead of being silently accepted.
+    /// Most entries are implemented and executable. A small number are **reserved**: their
+    /// names are registered so configuration using them passes validation and then fails during
+    /// provisioning with a tracking id ([`Error::NotImplemented`]), rather than being rejected as
+    /// an unknown module. Reserved entries are marked `(planned, ...)` in their summary; the
+    /// documentation lists both sets explicitly (`docs/compatibility/MODULE-PARITY.md`).
     pub fn builtin() -> Self {
         let mut registry = Self::default();
         for module in BUILTIN_MODULES {

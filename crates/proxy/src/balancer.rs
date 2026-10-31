@@ -149,6 +149,14 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_policy_fails_by_name() {
+        let error = from_policy(Some("weighted_round_robin"))
+            .err()
+            .expect("not implemented");
+        assert!(error.contains("weighted_round_robin"), "{error}");
+    }
+
+    #[test]
     fn no_healthy_upstream_returns_none() {
         let pool = pool(2);
         pool.iter().for_each(|upstream| upstream.set_healthy(false));

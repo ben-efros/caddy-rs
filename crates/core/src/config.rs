@@ -230,7 +230,11 @@ pub struct AutoHttps {
     pub disable_redirects: bool,
 
     /// Ignore certificates already loaded from storage when deciding what to automate.
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(
+        rename = "ignore_loaded_certificates",
+        default,
+        skip_serializing_if = "is_false"
+    )]
     pub ignore_loaded_certs: bool,
 
     /// Hosts to skip automating.

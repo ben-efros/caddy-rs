@@ -10,15 +10,6 @@
             {
               "handle": [
                 {
-                  "body": "hello",
-                  "handler": "static_response",
-                  "status_code": 200
-                }
-              ]
-            },
-            {
-              "handle": [
-                {
                   "handler": "static_response",
                   "headers": {
                     "Location": [
@@ -33,6 +24,15 @@
                   "path": [
                     "/old"
                   ]
+                }
+              ]
+            },
+            {
+              "handle": [
+                {
+                  "body": "hello",
+                  "handler": "static_response",
+                  "status_code": 200
                 }
               ]
             }
