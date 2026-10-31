@@ -339,4 +339,32 @@ mod tests {
         let response = router.handle(request("/b", "host")).await.unwrap();
         assert_eq!(response.body, bytes::Bytes::from_static(b"fallback"));
     }
+
+    #[tokio::test]
+    async fn rewrite_then_static_response_sees_expanded_request() {
+        let router = RouterBuilder::new()
+            .build(&[json!({
+                "handle": [
+                    {"handler": "rewrite", "uri": "/new/{http.request.method}"},
+                    {"handler": "static_response", "body": "{http.request.method} {http.request.uri.path}"}
+                ]
+            })])
+            .unwrap();
+        let response = router.handle(request("/old", "example.com")).await.unwrap();
+        assert_eq!(response.body, bytes::Bytes::from_static(b"GET /new/GET"));
+    }
+
+    #[tokio::test]
+    async fn headers_values_expand_against_the_request() {
+        let router = RouterBuilder::new()
+            .build(&[json!({
+                "handle": [
+                    {"handler": "headers", "response": {"set": {"X-Path": ["{http.request.uri.path}"]}}},
+                    {"handler": "static_response", "body": "ok"}
+                ]
+            })])
+            .unwrap();
+        let response = router.handle(request("/x", "example.com")).await.unwrap();
+        assert_eq!(response.headers["x-path"], "/x");
+    }
 }

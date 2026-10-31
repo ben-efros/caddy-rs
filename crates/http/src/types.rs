@@ -102,6 +102,32 @@ impl Request {
     pub fn query(&self) -> Option<&str> {
         self.uri.query()
     }
+
+    /// A request-scoped placeholder replacer (T-ROUTE-030).
+    ///
+    /// This is the public expansion API for handlers and, later, the proxy / access-log layers.
+    /// Use [`crate::placeholders::Replacer::with_response_headers`] when the response headers are
+    /// also in scope (for `{http.response.header.*}`).
+    pub fn placeholders(&self) -> crate::placeholders::Replacer<'_> {
+        crate::placeholders::Replacer::new(self)
+    }
+
+    /// Expand placeholders with Caddy's `ReplaceKnown` semantics: unknown placeholders are left
+    /// verbatim, known-but-empty ones expand to nothing.
+    pub fn replace_known(&self, input: &str) -> String {
+        self.placeholders().replace_known(input)
+    }
+
+    /// Expand placeholders with Caddy's `ReplaceAll` semantics: unknown placeholders expand to
+    /// nothing.
+    pub fn replace_all(&self, input: &str) -> String {
+        self.placeholders().replace_all(input)
+    }
+
+    /// Look up one placeholder by name; `None` means the name is not in the supported subset.
+    pub fn get_placeholder(&self, name: &str) -> Option<String> {
+        self.placeholders().get(name)
+    }
 }
 
 /// An internal HTTP response.
