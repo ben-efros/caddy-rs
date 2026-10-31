@@ -1,4 +1,15 @@
 //! Built-in HTTP handlers for the supported Caddy module set.
+//!
+//! Handler values that Caddy expands through the request replacer are expanded here with the
+//! request-scoped [`crate::placeholders::Replacer`] (T-ROUTE-030/T-ROUTE-031):
+//!
+//! * `static_response` body and header names/values use `ReplaceKnown` semantics (unknown
+//!   placeholders stay visible), matching Caddy's `modules/caddyhttp/staticresp.go`.
+//! * `headers` request/response names and values use `ReplaceKnown` semantics, matching
+//!   `modules/caddyhttp/headers/headers.go`.
+//! * `rewrite` method, `uri` and `strip_path_prefix`, and `vars` keys/values use `ReplaceAll`
+//!   semantics (unknown placeholders expand to nothing), matching
+//!   `modules/caddyhttp/rewrite/rewrite.go` and `modules/caddyhttp/vars.go`.
 
 use std::sync::Arc;
 
@@ -18,6 +29,19 @@ fn invalid(path: &str, message: impl Into<String>) -> Error {
 
 /// Convert a JSON value (string or array of strings) into header values.
 pub fn header_values(value: &serde_json::Value, path: &str) -> Result<Vec<HeaderValue>> {
+    header_value_strings(value, path)?
+        .into_iter()
+        .map(|item| {
+            HeaderValue::from_str(&item)
+                .map_err(|error| invalid(path, format!("invalid header value `{item}`: {error}")))
+        })
+        .collect()
+}
+
+/// Convert a JSON value (string or array of strings) into raw header value strings.
+///
+/// Expansion happens per request, so values are kept as strings until the handler runs.
+fn header_value_strings(value: &serde_json::Value, path: &str) -> Result<Vec<String>> {
     let items: Vec<&str> = match value {
         serde_json::Value::String(value) => vec![value],
         serde_json::Value::Array(values) => values
@@ -35,26 +59,37 @@ pub fn header_values(value: &serde_json::Value, path: &str) -> Result<Vec<Header
             ))
         }
     };
-    items
-        .into_iter()
-        .map(|item| {
-            HeaderValue::from_str(item)
-                .map_err(|error| invalid(path, format!("invalid header value `{item}`: {error}")))
+    Ok(items.into_iter().map(str::to_string).collect())
+}
+
+fn expand_header_name(request: &Request, name: &str, path: &str) -> Result<HeaderName> {
+    let expanded = request.replace_known(name);
+    expanded
+        .parse::<HeaderName>()
+        .map_err(|error| invalid(path, format!("invalid header name `{expanded}`: {error}")))
+}
+
+fn expand_header_values(
+    request: &Request,
+    values: &[String],
+    path: &str,
+) -> Result<Vec<HeaderValue>> {
+    values
+        .iter()
+        .map(|value| {
+            let expanded = request.replace_known(value);
+            HeaderValue::from_str(&expanded).map_err(|error| {
+                invalid(path, format!("invalid header value `{expanded}`: {error}"))
+            })
         })
         .collect()
 }
 
-fn header_name(field: &str, path: &str) -> Result<HeaderName> {
-    field
-        .parse::<HeaderName>()
-        .map_err(|error| invalid(path, format!("invalid header name `{field}`: {error}")))
-}
-
-/// `static_response`: write a fixed response.
+/// `static_response`: write a fixed response, expanding placeholders in body and headers.
 pub struct StaticResponseHandler {
     status: StatusCode,
-    headers: Vec<(HeaderName, Vec<HeaderValue>)>,
-    body: Bytes,
+    headers: Vec<(String, Vec<String>)>,
+    body: String,
 }
 
 impl StaticResponseHandler {
@@ -89,15 +124,15 @@ impl StaticResponseHandler {
                 .ok_or_else(|| invalid(path, "`headers` must be an object"))?;
             for (field, value) in values {
                 headers.push((
-                    header_name(field, path)?,
-                    header_values(value, &format!("{path}.headers.{field}"))?,
+                    field.clone(),
+                    header_value_strings(value, &format!("{path}.headers.{field}"))?,
                 ));
             }
         }
         Ok(Self {
             status,
             headers,
-            body: Bytes::from(body),
+            body,
         })
     }
 }
@@ -108,15 +143,19 @@ impl Handler for StaticResponseHandler {
         "static_response"
     }
 
-    async fn handle(&self, _request: Request) -> Result<Outcome> {
+    async fn handle(&self, request: Request) -> Result<Outcome> {
+        let body = request.replace_known(&self.body);
         let mut response = Response {
             status: self.status,
             headers: http::HeaderMap::new(),
-            body: self.body.clone(),
+            body: Bytes::from(body),
         };
-        for (name, values) in &self.headers {
+        for (raw_name, values) in &self.headers {
+            let path = format!("static_response.headers.{raw_name}");
+            let name = expand_header_name(&request, raw_name, &path)?;
+            let values = expand_header_values(&request, values, &path)?;
             for value in values {
-                response.headers.append(name.clone(), value.clone());
+                response.headers.append(name.clone(), value);
             }
         }
         Ok(Outcome::Respond(response))
@@ -125,10 +164,10 @@ impl Handler for StaticResponseHandler {
 
 /// `headers`: stage response header mutations (and apply request header mutations).
 pub struct HeadersHandler {
-    request_set: Vec<(HeaderName, Vec<HeaderValue>)>,
-    response_set: Vec<(HeaderName, Vec<HeaderValue>)>,
-    response_add: Vec<(HeaderName, Vec<HeaderValue>)>,
-    response_delete: Vec<HeaderName>,
+    request_set: Vec<(String, Vec<String>)>,
+    response_set: Vec<(String, Vec<String>)>,
+    response_add: Vec<(String, Vec<String>)>,
+    response_delete: Vec<String>,
 }
 
 impl HeadersHandler {
@@ -171,9 +210,7 @@ impl HeadersHandler {
                             "expected a string",
                         )
                     })?;
-                    handler
-                        .response_delete
-                        .push(header_name(field, &response_path)?);
+                    handler.response_delete.push(field.to_string());
                 }
             }
         }
@@ -181,18 +218,15 @@ impl HeadersHandler {
     }
 }
 
-fn parse_header_map(
-    value: &serde_json::Value,
-    path: &str,
-) -> Result<Vec<(HeaderName, Vec<HeaderValue>)>> {
+fn parse_header_map(value: &serde_json::Value, path: &str) -> Result<Vec<(String, Vec<String>)>> {
     let object = value
         .as_object()
         .ok_or_else(|| invalid(path, "expected an object"))?;
     let mut output = Vec::new();
     for (field, value) in object {
         output.push((
-            header_name(field, path)?,
-            header_values(value, &format!("{path}.{field}"))?,
+            field.clone(),
+            header_value_strings(value, &format!("{path}.{field}"))?,
         ));
     }
     Ok(output)
@@ -201,7 +235,7 @@ fn parse_header_map(
 fn parse_header_operations(
     value: &serde_json::Value,
     path: &str,
-) -> Result<Vec<(HeaderName, Vec<HeaderValue>)>> {
+) -> Result<Vec<(String, Vec<String>)>> {
     let object = value
         .as_object()
         .ok_or_else(|| invalid(path, "expected an object"))?;
@@ -219,35 +253,41 @@ impl Handler for HeadersHandler {
     }
 
     async fn handle(&self, mut request: Request) -> Result<Outcome> {
-        for (name, values) in &self.request_set {
-            request.headers.remove(name);
+        for (raw_name, values) in &self.request_set {
+            let path = format!("headers.request.set.{raw_name}");
+            let name = expand_header_name(&request, raw_name, &path)?;
+            let values = expand_header_values(&request, values, &path)?;
+            request.headers.remove(&name);
             for value in values {
-                request.headers.append(name.clone(), value.clone());
+                request.headers.append(name.clone(), value);
             }
         }
-        for (name, values) in &self.response_set {
-            request.pending_response_headers.remove(name);
+        for (raw_name, values) in &self.response_set {
+            let path = format!("headers.response.set.{raw_name}");
+            let name = expand_header_name(&request, raw_name, &path)?;
+            let values = expand_header_values(&request, values, &path)?;
+            request.pending_response_headers.remove(&name);
             for value in values {
-                request
-                    .pending_response_headers
-                    .append(name.clone(), value.clone());
+                request.pending_response_headers.append(name.clone(), value);
             }
         }
-        for (name, values) in &self.response_add {
+        for (raw_name, values) in &self.response_add {
+            let path = format!("headers.response.add.{raw_name}");
+            let name = expand_header_name(&request, raw_name, &path)?;
+            let values = expand_header_values(&request, values, &path)?;
             for value in values {
-                request
-                    .pending_response_headers
-                    .append(name.clone(), value.clone());
+                request.pending_response_headers.append(name.clone(), value);
             }
         }
-        for name in &self.response_delete {
-            request.pending_response_headers.remove(name);
+        for raw_name in &self.response_delete {
+            let name = expand_header_name(&request, raw_name, "headers.response.delete")?;
+            request.pending_response_headers.remove(&name);
         }
         Ok(Outcome::Continue(request))
     }
 }
 
-/// `vars`: set request variables.
+/// `vars`: set request variables, expanding placeholders in names and values.
 pub struct VarsHandler {
     vars: Vec<(String, String)>,
 }
@@ -282,17 +322,25 @@ impl Handler for VarsHandler {
     }
 
     async fn handle(&self, mut request: Request) -> Result<Outcome> {
-        for (key, value) in &self.vars {
-            request.vars.insert(key.clone(), value.clone());
+        let vars: Vec<(String, String)> = self
+            .vars
+            .iter()
+            .map(|(key, value)| (request.replace_all(key), request.replace_all(value)))
+            .collect();
+        for (key, value) in vars {
+            request.vars.insert(key, value);
         }
         Ok(Outcome::Continue(request))
     }
 }
 
 /// `rewrite`: change the request URI, method, or path prefix.
+///
+/// Order of operations matches Caddy's `Rewrite.Rewrite`: method, then URI, then path prefix.
+/// Placeholders use `ReplaceAll` semantics, as Caddy does for these fields.
 pub struct RewriteHandler {
     uri: Option<String>,
-    method: Option<Method>,
+    method: Option<String>,
     strip_path_prefix: Option<String>,
 }
 
@@ -302,27 +350,84 @@ impl RewriteHandler {
         let object = value
             .as_object()
             .ok_or_else(|| invalid(path, "rewrite handler must be an object"))?;
-        let method = match object.get("method").and_then(serde_json::Value::as_str) {
-            Some(method) => Some(Method::from_bytes(method.as_bytes()).map_err(|_| {
-                invalid(
-                    &format!("{path}.method"),
-                    format!("invalid method `{method}`"),
-                )
-            })?),
-            None => None,
-        };
         Ok(Self {
             uri: object
                 .get("uri")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string),
-            method,
+            method: object
+                .get("method")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
             strip_path_prefix: object
                 .get("strip_path_prefix")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string),
         })
     }
+}
+
+/// Apply a rewritten `uri` template with Caddy's component-wise semantics: a configured URI that
+/// has no `?` preserves the current query string, and a URI with only `?query` preserves the
+/// current path. Fragments are dropped because they are never sent to a server.
+fn rewritten_uri(request: &Request, template: &str) -> Result<Uri> {
+    let expanded = request.replace_all(template);
+    let without_fragment = expanded.split('#').next().unwrap_or("");
+    let (path, query) = match without_fragment.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (without_fragment, None),
+    };
+
+    let mut new_path = request.uri.path().to_string();
+    let mut new_query = request.uri.query().map(str::to_string);
+    if !path.is_empty() {
+        new_path = path.to_string();
+    }
+    if let Some(query) = query {
+        new_query = if query.is_empty() {
+            None
+        } else {
+            Some(query.to_string())
+        };
+    }
+
+    let mut rebuilt = new_path;
+    if let Some(query) = &new_query {
+        rebuilt.push('?');
+        rebuilt.push_str(query);
+    }
+    rebuilt
+        .parse::<Uri>()
+        .map_err(|error| invalid("rewrite.uri", error.to_string()))
+}
+
+fn strip_path_prefix(request: &mut Request, prefix: &str) -> Result<()> {
+    if prefix.is_empty() {
+        return Ok(());
+    }
+    let mut prefix = prefix.to_string();
+    if !prefix.starts_with('/') {
+        prefix.insert(0, '/');
+    }
+    let Some(rest) = request.uri.path().strip_prefix(prefix.as_str()) else {
+        return Ok(());
+    };
+    let rest = if rest.is_empty() {
+        "/".to_string()
+    } else if rest.starts_with('/') {
+        rest.to_string()
+    } else {
+        // Caddy's `canonicalizePath` restores the leading slash after trimming.
+        format!("/{rest}")
+    };
+    let new_uri = match request.uri.query() {
+        Some(query) => format!("{rest}?{query}"),
+        None => rest,
+    };
+    request.uri = new_uri
+        .parse::<Uri>()
+        .map_err(|error| invalid("rewrite.strip_path_prefix", error.to_string()))?;
+    Ok(())
 }
 
 #[async_trait]
@@ -333,30 +438,18 @@ impl Handler for RewriteHandler {
 
     async fn handle(&self, mut request: Request) -> Result<Outcome> {
         if let Some(method) = &self.method {
-            request.method = method.clone();
-        }
-        if let Some(prefix) = &self.strip_path_prefix {
-            if let Some(rest) = request.uri.path().strip_prefix(prefix.as_str()) {
-                let rest = if rest.is_empty() { "/" } else { rest };
-                let new_uri = match request.uri.query() {
-                    Some(query) => format!("{rest}?{query}"),
-                    None => rest.to_string(),
-                };
-                request.uri = new_uri
-                    .parse::<Uri>()
-                    .map_err(|error| invalid("rewrite.strip_path_prefix", error.to_string()))?;
-            }
+            let expanded = request.replace_all(method).to_ascii_uppercase();
+            request.method = Method::from_bytes(expanded.as_bytes())
+                .map_err(|_| invalid("rewrite.method", format!("invalid method `{expanded}`")))?;
         }
         if let Some(uri) = &self.uri {
-            if uri.contains('{') {
-                return Err(Error::NotImplemented {
-                    feature: "placeholder expansion in rewrite URIs",
-                    tracking_id: "HTTP-PLACEHOLDERS",
-                });
+            if !uri.is_empty() {
+                request.uri = rewritten_uri(&request, uri)?;
             }
-            request.uri = uri
-                .parse::<Uri>()
-                .map_err(|error| invalid("rewrite.uri", error.to_string()))?;
+        }
+        if let Some(prefix) = &self.strip_path_prefix {
+            let expanded = request.replace_all(prefix);
+            strip_path_prefix(&mut request, &expanded)?;
         }
         Ok(Outcome::Continue(request))
     }
@@ -407,10 +500,22 @@ impl Handler for EncodeHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http::Uri;
+
+    fn test_request(method: Method, uri: &str) -> Request {
+        let mut request = Request::new(method, uri.parse::<Uri>().unwrap());
+        request.headers.insert(
+            http::header::HOST,
+            HeaderValue::from_static("example.com:8080"),
+        );
+        request
+    }
 
     fn request() -> Request {
-        Request::new(Method::GET, "/old/path?q=1".parse::<Uri>().unwrap())
+        let mut request = Request::new(Method::GET, "/old/path?q=1".parse::<Uri>().unwrap());
+        request
+            .headers
+            .insert(http::header::HOST, HeaderValue::from_static("example.com"));
+        request
     }
 
     #[tokio::test]
@@ -431,6 +536,57 @@ mod tests {
         assert_eq!(response.status, StatusCode::IM_A_TEAPOT);
         assert_eq!(response.body, Bytes::from_static(b"teapot"));
         assert_eq!(response.headers["x-test"], "yes");
+    }
+
+    #[tokio::test]
+    async fn static_response_expands_body_header_values_and_header_names() {
+        let handler = StaticResponseHandler::from_json(
+            &serde_json::json!({
+                "handler": "static_response",
+                "body": "{http.request.method} {http.request.uri.path} {http.request.host}",
+                "headers": {
+                    "X-Method-{http.request.method}": ["{http.request.method}"],
+                    "X-Query": ["q={http.request.uri.query}"],
+                    "X-Unknown": ["{not.a.placeholder}"]
+                }
+            }),
+            "handler",
+        )
+        .unwrap();
+        let request = test_request(Method::POST, "/some/path?q=1");
+        let Outcome::Respond(response) = handler.handle(request).await.unwrap() else {
+            panic!("expected response");
+        };
+        assert_eq!(
+            response.body,
+            Bytes::from_static(b"POST /some/path example.com")
+        );
+        assert_eq!(response.headers["x-method-post"], "POST");
+        assert_eq!(response.headers["x-query"], "q=q=1");
+        // ReplaceKnown keeps unknown placeholders visible instead of silently dropping them.
+        assert_eq!(response.headers["x-unknown"], "{not.a.placeholder}");
+    }
+
+    #[tokio::test]
+    async fn headers_handler_expands_request_and_response_values() {
+        let handler = HeadersHandler::from_json(
+            &serde_json::json!({
+                "handler": "headers",
+                "request": {"set": {"X-From": ["{http.request.method}"]}},
+                "response": {
+                    "set": {"X-Path": ["{http.request.uri.path}"]},
+                    "add": {"Vary": ["Accept"]}
+                }
+            }),
+            "handler",
+        )
+        .unwrap();
+        let Outcome::Continue(request) = handler.handle(request()).await.unwrap() else {
+            panic!("expected continue");
+        };
+        assert_eq!(request.headers["x-from"], "GET");
+        assert_eq!(request.pending_response_headers["x-path"], "/old/path");
+        assert_eq!(request.pending_response_headers["vary"], "Accept");
     }
 
     #[tokio::test]
@@ -465,6 +621,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rewrite_expands_uri_placeholders_and_preserves_query() {
+        let handler = RewriteHandler::from_json(
+            &serde_json::json!({"handler": "rewrite", "uri": "/new/{http.request.method}"}),
+            "handler",
+        )
+        .unwrap();
+        let Outcome::Continue(request) = handler.handle(request()).await.unwrap() else {
+            panic!("expected continue");
+        };
+        assert_eq!(request.uri.path(), "/new/GET");
+        // No `?` in the configured URI, so the original query string survives.
+        assert_eq!(request.uri.query(), Some("q=1"));
+    }
+
+    #[tokio::test]
+    async fn rewrite_uri_with_only_query_keeps_path() {
+        let handler = RewriteHandler::from_json(
+            &serde_json::json!({"handler": "rewrite", "uri": "?a=b"}),
+            "handler",
+        )
+        .unwrap();
+        let Outcome::Continue(request) = handler.handle(request()).await.unwrap() else {
+            panic!("expected continue");
+        };
+        assert_eq!(request.uri.path(), "/old/path");
+        assert_eq!(request.uri.query(), Some("a=b"));
+    }
+
+    #[tokio::test]
+    async fn rewrite_expands_strip_path_prefix_and_method() {
+        let mut request = request();
+        request
+            .vars
+            .insert("prefix".to_string(), "/old".to_string());
+        let handler = RewriteHandler::from_json(
+            &serde_json::json!({
+                "handler": "rewrite",
+                "method": "{http.request.method}",
+                "strip_path_prefix": "{http.vars.prefix}"
+            }),
+            "handler",
+        )
+        .unwrap();
+        let Outcome::Continue(request) = handler.handle(request).await.unwrap() else {
+            panic!("expected continue");
+        };
+        assert_eq!(request.method, Method::GET);
+        assert_eq!(request.uri.path(), "/path");
+        assert_eq!(request.uri.query(), Some("q=1"));
+    }
+
+    #[tokio::test]
+    async fn rewrite_unknown_placeholder_expands_to_empty() {
+        let handler = RewriteHandler::from_json(
+            &serde_json::json!({"handler": "rewrite", "uri": "/x/{not.a.placeholder}"}),
+            "handler",
+        )
+        .unwrap();
+        let Outcome::Continue(request) = handler.handle(request()).await.unwrap() else {
+            panic!("expected continue");
+        };
+        assert_eq!(request.uri.path(), "/x/");
+    }
+
+    #[tokio::test]
+    async fn rewrite_with_empty_uri_template_is_a_noop() {
+        let handler = RewriteHandler::from_json(
+            &serde_json::json!({"handler": "rewrite", "uri": "{http.vars.missing}"}),
+            "handler",
+        )
+        .unwrap();
+        let Outcome::Continue(request) = handler.handle(request()).await.unwrap() else {
+            panic!("expected continue");
+        };
+        assert_eq!(request.uri.path(), "/old/path");
+        assert_eq!(request.uri.query(), Some("q=1"));
+    }
+
+    #[tokio::test]
     async fn vars_handler_sets_request_variables() {
         let handler = VarsHandler::from_json(
             &serde_json::json!({"handler": "vars", "root": "/srv"}),
@@ -475,5 +710,24 @@ mod tests {
             panic!("expected continue");
         };
         assert_eq!(request.vars.get("root").map(String::as_str), Some("/srv"));
+    }
+
+    #[tokio::test]
+    async fn vars_handler_expands_keys_and_values() {
+        let handler = VarsHandler::from_json(
+            &serde_json::json!({
+                "handler": "vars",
+                "prefix-{http.request.method}": "/srv/{http.request.uri.path}"
+            }),
+            "handler",
+        )
+        .unwrap();
+        let Outcome::Continue(request) = handler.handle(request()).await.unwrap() else {
+            panic!("expected continue");
+        };
+        assert_eq!(
+            request.vars.get("prefix-GET").map(String::as_str),
+            Some("/srv//old/path")
+        );
     }
 }
