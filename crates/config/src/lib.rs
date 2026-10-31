@@ -11,4 +11,7 @@ pub mod lexer;
 pub mod parser;
 
 pub use adapter::{adapt, CaddyfileAdapter};
-pub use parser::{parse, Caddyfile, Directive, GlobalOptions, SiteAddress, SiteBlock};
+pub use parser::{
+    expand_env_vars, expand_env_vars_with, parse, Caddyfile, Directive, EnvExpansion,
+    GlobalOptions, SiteAddress, SiteBlock,
+};

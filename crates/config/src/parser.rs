@@ -4,6 +4,14 @@
 //! structurally common Caddyfile forms — braced site blocks, the single unbraced site permitted by
 //! Caddy, global options, named matchers, and nested directive blocks — and rejects the rest with
 //! a located error.
+//!
+//! Before lexing, the raw source is preprocessed exactly like Caddy's
+//! `caddyconfig/caddyfile/parse.go`: `{$ENV}` and `{$ENV:default}` placeholders are replaced
+//! (one level deep, with the process environment consulted for the name) on the raw bytes, so
+//! expansion works in site addresses, arguments, quoted strings and heredoc bodies alike.
+//! Caddy emits no diagnostic when a referenced variable is unset; this implementation substitutes
+//! the same empty string but also records a non-fatal warning in
+//! [`GlobalOptions::warnings`], which the adapter surfaces to callers (and the CLI prints).
 
 use crate::lexer::{lex, LexError, Position, Token, TokenKind};
 
@@ -25,7 +33,8 @@ pub struct GlobalOptions {
     pub http_port: Option<u16>,
     /// `https_port`.
     pub https_port: Option<u16>,
-    /// Non-fatal notes produced while reading options.
+    /// Non-fatal notes produced while preprocessing the Caddyfile (environment-placeholder
+    /// expansion) and while reading options. Adapters surface these to callers.
     pub warnings: Vec<String>,
 }
 
@@ -125,10 +134,107 @@ impl ParseError {
     }
 }
 
+/// Result of Caddyfile preprocessing: the source with environment placeholders substituted,
+/// plus any non-fatal diagnostics found while expanding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvExpansion {
+    /// Source text with `{$ENV}` / `{$ENV:default}` placeholders replaced.
+    pub source: String,
+    /// Non-fatal diagnostics, one per missing variable without a default.
+    pub warnings: Vec<String>,
+}
+
+/// Replace `{$ENV}` and `{$ENV:default}` placeholders in raw Caddyfile source using the process
+/// environment.
+///
+/// This is Caddy's preprocessing step (`replaceEnvVars` in
+/// `caddyconfig/caddyfile/parse.go`): it runs on the raw source *before* lexing, so values may
+/// contain any characters (including whitespace, braces, or newlines) and are lexed as if written
+/// literally. Expansion is one level deep: a value that itself looks like `{$OTHER}` is not
+/// expanded again.
+///
+/// Caddy has no escape sequence for this syntax: a backslash before `{$` does not prevent
+/// expansion (the backslash survives into the token text), and `\{$...}` therefore expands like
+/// `{$...}`. Malformed spans are left untouched: `{$}`, an unterminated `{$FOO`, and `{ $FOO}`
+/// (with a space before the `$`) are not placeholders. A value that literally contains `{$NAME}`
+/// can only be produced by an environment variable's own value (which is not re-expanded).
+pub fn expand_env_vars(input: &str) -> EnvExpansion {
+    expand_env_vars_with(input, |name| {
+        std::env::var_os(name).map(|value| value.to_string_lossy().into_owned())
+    })
+}
+
+/// Like [`expand_env_vars`], but resolves variable names with `lookup` instead of the process
+/// environment. Useful for embedding and for tests.
+pub fn expand_env_vars_with<F>(input: &str, lookup: F) -> EnvExpansion
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let mut source = input.to_string();
+    let mut warnings = Vec::new();
+    let mut offset = 0;
+    // Replacements may add or remove line breaks (an environment value can contain them). Keep
+    // the accumulated delta so warnings still point at the line in the caller's original source.
+    let mut newline_shift: i64 = 0;
+    loop {
+        let Some(relative_begin) = source[offset..].find("{$") else {
+            break;
+        };
+        let begin = offset + relative_begin;
+        let Some(relative_end) = source[begin + 2..].find('}') else {
+            // Unterminated placeholder: Caddy stops scanning the whole input here.
+            break;
+        };
+        let end = begin + 2 + relative_end;
+
+        let placeholder = source[begin + 2..end].to_string();
+        if placeholder.is_empty() {
+            // `{$}` is not a placeholder; skip past it without rewriting anything.
+            offset = end + 1;
+            continue;
+        }
+
+        let (name, default) = match placeholder.split_once(':') {
+            Some((name, default)) => (name, Some(default.to_string())),
+            None => (placeholder.as_str(), None),
+        };
+        let value = match lookup(name) {
+            Some(value) => value,
+            None => match default {
+                Some(default) => default,
+                None => {
+                    let current_line = source[..begin].matches('\n').count() as i64 + 1;
+                    let line = (current_line - newline_shift).max(1);
+                    warnings.push(format!(
+                        "Caddyfile line {line}: environment variable `{name}` is not set and \
+                         has no default; substituted an empty string"
+                    ));
+                    String::new()
+                }
+            },
+        };
+
+        let removed_newlines = source[begin..=end].matches('\n').count() as i64;
+        let inserted_newlines = value.matches('\n').count() as i64;
+        newline_shift += inserted_newlines - removed_newlines;
+        let value_len = value.len();
+        source.replace_range(begin..=end, &value);
+        // Continue after the replacement so that placeholder-looking environment values are not
+        // expanded recursively (Caddy's one-level-deep behaviour).
+        offset = begin + value_len;
+    }
+    EnvExpansion { source, warnings }
+}
+
 /// Parse a Caddyfile.
 pub fn parse(input: &str) -> Result<Caddyfile, ParseError> {
-    let tokens = lex(input)?;
-    Parser { tokens, cursor: 0 }.parse_file()
+    let expansion = expand_env_vars(input);
+    let tokens = lex(&expansion.source)?;
+    let mut file = Parser { tokens, cursor: 0 }.parse_file()?;
+    let mut warnings = expansion.warnings;
+    warnings.append(&mut file.options.warnings);
+    file.options.warnings = warnings;
+    Ok(file)
 }
 
 /// Directives that must never be parsed as a site address. Caddy produces a specific diagnostic
@@ -563,5 +669,153 @@ mod tests {
     fn rejects_invalid_port() {
         let error = parse(":70000 {\n respond ok\n}\n").expect_err("port");
         assert!(error.to_string().contains("70000"));
+    }
+
+    #[test]
+    fn heredoc_is_a_directive_argument() {
+        let file =
+            parse(":80 {\n respond <<EOF\n <html>\n   <body>hi</body>\n </html>\n EOF 200\n}\n")
+                .expect("parses");
+        let directive = &file.sites[0].directives[0];
+        assert_eq!(directive.name, "respond");
+        assert_eq!(
+            directive.args,
+            vec![
+                "<html>\n  <body>hi</body>\n</html>".to_string(),
+                "200".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn heredoc_is_a_directive_block_argument() {
+        let file = parse(
+            ":80 {\n reverse_proxy localhost:9000 {\n header_up X-Test <<EOF\n yes\n EOF\n }\n}\n",
+        )
+        .expect("parses");
+        let proxy = &file.sites[0].directives[0];
+        assert_eq!(proxy.block[0].name, "header_up");
+        assert_eq!(
+            proxy.block[0].args,
+            vec!["X-Test".to_string(), "yes".to_string()]
+        );
+    }
+
+    #[test]
+    fn heredoc_preserves_structure_after_closing_marker() {
+        let file =
+            parse(":80 {\n respond <<EOF\n {\"looks\": \"structural\"}\n EOF\n respond after\n}\n")
+                .expect("parses");
+        let directives = &file.sites[0].directives;
+        assert_eq!(directives.len(), 2);
+        assert_eq!(
+            directives[0].args[0],
+            "{\"looks\": \"structural\"}".to_string()
+        );
+        assert_eq!(directives[1].name, "respond");
+    }
+
+    #[test]
+    fn backslash_continuation_chains_arguments() {
+        let file = parse(":80 {\n respond hello \\\n world\n}\n").expect("parses");
+        assert_eq!(
+            file.sites[0].directives[0].args,
+            vec!["hello".to_string(), "world".to_string()]
+        );
+        assert_eq!(file.sites[0].directives.len(), 1);
+    }
+
+    #[test]
+    fn env_placeholders_expand_before_parsing() {
+        let expansion =
+            expand_env_vars_with("example.com {\n respond {$GREETING:hello}\n}\n", |name| {
+                (name == "GREETING").then(|| "hi there".to_string())
+            });
+        assert_eq!(expansion.source, "example.com {\n respond hi there\n}\n");
+        assert!(expansion.warnings.is_empty());
+
+        let expansion = expand_env_vars_with(":{$PORT}\nrespond {$MISSING}\n", |name| {
+            (name == "PORT").then(|| "8080".to_string())
+        });
+        assert_eq!(expansion.source, ":8080\nrespond \n");
+        assert_eq!(expansion.warnings.len(), 1);
+        assert!(
+            expansion.warnings[0].contains("`MISSING`"),
+            "{:?}",
+            expansion.warnings
+        );
+        assert!(
+            expansion.warnings[0].contains("Caddyfile line 2"),
+            "{:?}",
+            expansion.warnings
+        );
+    }
+
+    #[test]
+    fn env_defaults_nested_in_site_address() {
+        let file = parse(":{$PORT:8080} {\n respond ok\n}\n").expect("parses");
+        assert_eq!(file.sites[0].addresses[0].port, Some(8080));
+    }
+
+    #[test]
+    fn env_expansion_is_not_recursive() {
+        let expansion = expand_env_vars_with("{$A}", |name| match name {
+            "A" => Some("{$B}".to_string()),
+            "B" => Some("nope".to_string()),
+            _ => None,
+        });
+        assert_eq!(expansion.source, "{$B}");
+        assert!(expansion.warnings.is_empty());
+    }
+
+    #[test]
+    fn malformed_env_placeholders_are_left_untouched() {
+        for input in ["{$}", "{$FOO", "}{$", "{ $FOO}", "{$FOO:default"] {
+            let expansion = expand_env_vars_with(input, |_| None);
+            assert_eq!(expansion.source, input, "input {input:?}");
+            assert!(expansion.warnings.is_empty(), "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn env_escaping_matches_caddy_no_escape_sequence() {
+        // Caddy expands before lexing and has no escape for `{$`: the backslash survives.
+        let expansion = expand_env_vars_with(r"\{$FOO}", |name| {
+            (name == "FOO").then(|| "bar".to_string())
+        });
+        assert_eq!(expansion.source, r"\bar");
+    }
+
+    #[test]
+    fn env_placeholder_inside_heredoc_is_expanded() {
+        let expansion = expand_env_vars_with(
+            "respond <<EOF\nHello {$CADDY_RS_HEREDOC_TEST_NAME:world}\nEOF\n",
+            |_| None,
+        );
+        assert_eq!(expansion.source, "respond <<EOF\nHello world\nEOF\n");
+        let file =
+            parse(":80 {\n respond <<EOF\n Hello {$CADDY_RS_HEREDOC_TEST_NAME:world}\n EOF\n}\n")
+                .expect("parses");
+        assert_eq!(
+            file.sites[0].directives[0].args,
+            vec!["Hello world".to_string()]
+        );
+    }
+
+    #[test]
+    fn missing_env_var_warns_through_the_public_parse_result() {
+        let file = parse(":80 {\n respond {$CADDY_RS_UNSET_TEST_VAR}\n}\n").expect("parses");
+        assert_eq!(file.sites[0].directives[0].args, Vec::<String>::new());
+        assert_eq!(
+            file.options.warnings.len(),
+            1,
+            "{:?}",
+            file.options.warnings
+        );
+        assert!(
+            file.options.warnings[0].contains("CADDY_RS_UNSET_TEST_VAR"),
+            "{:?}",
+            file.options.warnings
+        );
     }
 }
