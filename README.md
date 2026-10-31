@@ -1,39 +1,48 @@
 # caddy-rs (implementation repository)
 
 The Rust implementation of the caddy-rs program: a Caddy-compatible web server, reverse proxy,
-and configuration engine. **Status: M0/M1 skeleton** — the crates compile, 100 tests pass, and the
-Caddyfile adapter matches Caddy v2.11.7's golden output for a curated directive subset (30 of the
-245 upstream adapter fixtures exactly; see the program repository's conformance report).
+and configuration engine. **Status: M1/M2 skeleton (post-agent sprint)** — the crates compile,
+**483 tests pass**, and the Caddyfile adapter matches Caddy v2.11.7's golden output for every
+fixture it supports: **49 of the 245 upstream adapter fixtures exactly, 0 mismatches** (100% of
+supported fixtures, 20% corpus coverage). See the program repository's conformance report.
 
 See the program repository (`..`) for the plan, compatibility contract, divergence register, and
 work queue.
 
 ## What works today
 
-- Caddy JSON configuration model with lossless round-tripping and located validation errors
-- Immutable configuration generations, atomic reload, in-flight draining
-- Module registry (handlers, matchers, storage, issuers, DNS providers) with honest membership
+- Caddy JSON configuration model with lossless round-tripping and located validation errors, typed
+  logging/storage/TLS-app models, and module-reference validation
+- Immutable configuration generations, atomic reload, in-flight draining; generation-scoped
+  supervisor that reuses unchanged listeners and rebinds changed ones
+- Module registry (handlers, matchers, logging/TLS config modules, storage, issuers, DNS providers)
+  with an honest executing/config-only/reserved distinction
 - Caddyfile lexer/parser/adapter: `respond`, `redir`, `file_server`, `root`, `method`,
-  `reverse_proxy` (basic options), `header` (simple forms), `encode`, `route`, `handle`,
-  `handle_path`; matchers `host`, `path`, `method`, `header`, `query`, `not`, `path_regexp`
-  (validation-only), named matchers, global options; exact parity with 6 upstream golden fixtures
-- HTTP/1.1 + cleartext HTTP/2 (h2c) serving over TCP and Unix sockets
-- Route evaluation with matcher sets, terminals, groups, subroutes, header middleware
+  `reverse_proxy` (unix upstreams, balancing, retries, health options), `header`, `encode`, `route`,
+  `handle`, `handle_path`; matchers `host`, `path`, `method`, `header`, `query`, `not`,
+  `path_regexp` (config-only); heredocs, line continuation, same-file snippets/imports with
+  arguments, named routes parsed; global options; 49 exact upstream golden fixtures
+- HTTP/1.1 + cleartext HTTP/2 (h2c) over TCP and Unix sockets; per-server timeouts, header/body
+  limits, connection caps and systemd socket activation
+- Route evaluation with matcher sets, terminals, groups, subroutes, header middleware and the
+  placeholder engine (request/vars/env/header placeholders in rewrite/respond/headers/vars)
 - Static file serving with traversal protection, index files, browse, pass_thru
-- Reverse proxy: round-robin/first/least-conn balancing, retries, passive health + active health
-  checks, forwarded headers, request/response header rewriting
-- Admin API: `GET /config/`, `GET /config/<path>`, `POST /load`, `POST /stop`; `/metrics` returns
-  an explicit 501 until the observability workstream lands
-- TLS foundations: certificate model/cache/SNI, pluggable storage (memory + filesystem), issuer
-  traits, renewal queue (ACME/internal issuance is M5 and fails loudly)
+- Reverse proxy: HTTP and Unix-socket upstreams, round-robin/first/least-conn balancing, retries
+  with retry_match, active + passive health checks, forwarded headers and trusted proxies,
+  request/response header rewriting
+- Admin API: `/config/` traversal, full `POST/PUT/PATCH/DELETE` partial updates with validation and
+  rollback, `/id/<id>`, `/load`, `/stop`, origin enforcement; `/metrics` still 501
+- TLS foundations: certificate model/cache/SNI, Caddy/CertMagic-compatible storage layout + DNS
+  provider trait, ACME directory/account/order/CSR/transport clients, Cloudflare DNS-01 provider
+  (mock-tested) — issuance still returns NotImplemented and is not wired to automatic HTTPS
 - CLI: `version`, `list-modules`, `adapt`, `validate`, `run`, `reload`, `stop`
 
 ## What does not work yet (registered, not hidden)
 
-TLS termination, ACME issuance, DNS-01, HTTP/3, dynamic upstreams, placeholder expansion, plugin
-loading, request body limits, compression, `/adapt` endpoint, `GET /id/<id>`, partial config
-patches, access logging, metrics. Each is tracked in the program plan; behaviour-level gaps are in
-the program repository's divergence register.
+TLS termination, automatic-HTTPS/ACME issuer wiring and challenge solvers, HTTP/3, response
+streaming, WebSocket proxying, TLS/h2c upstream transports, compression, request_body handler,
+file/glob imports and invoke JSON, access logging, metrics, and some admin preconditions. Each is
+tracked in the program plan; behaviour-level gaps are in the divergence register (51 entries).
 
 ## Workspace map
 
