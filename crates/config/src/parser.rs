@@ -230,7 +230,12 @@ where
 pub fn parse(input: &str) -> Result<Caddyfile, ParseError> {
     let expansion = expand_env_vars(input);
     let tokens = lex(&expansion.source)?;
-    let mut file = Parser { tokens, cursor: 0 }.parse_file()?;
+    let mut file = Parser {
+        tokens,
+        cursor: 0,
+        depth: 0,
+    }
+    .parse_file()?;
     let mut warnings = expansion.warnings;
     warnings.append(&mut file.options.warnings);
     file.options.warnings = warnings;
@@ -268,9 +273,26 @@ const KNOWN_DIRECTIVES: &[&str] = &[
     "rate_limit",
 ];
 
+/// Maximum number of nested braced blocks accepted by the parser.
+///
+/// Caddy itself has no such limit: Go grows goroutine stacks on demand, so arbitrarily deep
+/// nesting parses until memory runs out. Rust stacks have a fixed size, so unbounded
+/// recursive-descent parsing of hostile input aborts the process with an uncatchable stack
+/// overflow; that was a real defect (a ~2.5 KB Caddyfile with 400 nested blocks aborted
+/// `caddy-rs adapt` and would have been a DoS once `/adapt` is exposed). This bound converts that
+/// abort into a normal located parse error.
+///
+/// 128 is far above real Caddyfiles (the deepest fixture in the compatibility corpus nests three
+/// blocks) and leaves headroom on the smallest stacks the parser runs on: the whole suite also
+/// parses at this depth on a debug-build 2 MiB worker thread. This is a deliberate divergence from
+/// Caddy, registered by the compatibility owner (see `docs/compatibility/CADDYFILE.md`).
+pub const MAX_BLOCK_DEPTH: usize = 128;
+
 struct Parser {
     tokens: Vec<Token>,
     cursor: usize,
+    /// Number of braced blocks currently being parsed, including the site/global-options block.
+    depth: usize,
 }
 
 impl Parser {
@@ -339,8 +361,9 @@ impl Parser {
             }
             let directives = match self.peek().map(|t| t.kind) {
                 Some(TokenKind::LeftBrace) => {
+                    let opener = self.peek().map(|token| token.position).unwrap_or(position);
                     self.cursor += 1;
-                    self.parse_directives(position, true)?
+                    self.parse_directives(opener, true)?
                 }
                 _ => {
                     // Caddy allows a single site block without braces. Everything remaining in the
@@ -376,6 +399,21 @@ impl Parser {
         opener: Position,
         require_closing_brace: bool,
     ) -> Result<Vec<Directive>, ParseError> {
+        self.depth += 1;
+        if self.depth > MAX_BLOCK_DEPTH {
+            // Check before recursing any further: the error must not build more stack frames.
+            return Err(ParseError::syntax(
+                opener,
+                format!(
+                    concat!(
+                        "nested blocks exceed the maximum depth of {} ",
+                        "(caddy-rs bounds block nesting to prevent a stack-overflow abort; ",
+                        "Caddy has no such limit)"
+                    ),
+                    MAX_BLOCK_DEPTH
+                ),
+            ));
+        }
         let mut directives = Vec::new();
         loop {
             self.skip_newlines();
@@ -410,6 +448,7 @@ impl Parser {
                 }
             }
         }
+        self.depth -= 1;
         Ok(directives)
     }
 
@@ -443,8 +482,12 @@ impl Parser {
             }
         }
         let block = if matches!(self.peek().map(|t| t.kind), Some(TokenKind::LeftBrace)) {
+            let opener = self
+                .peek()
+                .map(|token| token.position)
+                .expect("peeked left brace");
             self.cursor += 1;
-            self.parse_directives(name_token.position, true)?
+            self.parse_directives(opener, true)?
         } else {
             if matches!(self.peek().map(|t| t.kind), Some(TokenKind::Newline)) {
                 self.cursor += 1;
@@ -817,5 +860,90 @@ mod tests {
             "{:?}",
             file.options.warnings
         );
+    }
+
+    /// A braced site block containing `depth` nested `route` blocks, i.e. `depth + 1` braced
+    /// blocks in total (the site block counts as nesting level 1).
+    fn nested_blocks(depth: usize) -> String {
+        let mut input = String::from(":80 {\n");
+        for _ in 0..depth {
+            input.push_str("\troute {\n");
+        }
+        input.push_str("\t\trespond ok\n");
+        for _ in 0..depth {
+            input.push_str("\t}\n");
+        }
+        input.push_str("}\n");
+        input
+    }
+
+    #[test]
+    fn parses_blocks_exactly_at_the_maximum_depth() {
+        let file = parse(&nested_blocks(MAX_BLOCK_DEPTH - 1)).expect("at the limit parses");
+
+        // Prove the deepest block was actually built rather than accepted and dropped: the site
+        // block is level 1 and the `route` chain adds MAX_BLOCK_DEPTH - 1 nested blocks.
+        let mut routes = 0;
+        let mut current = &file.sites[0].directives[0];
+        loop {
+            assert_eq!(current.name, "route");
+            routes += 1;
+            match current.block.first() {
+                Some(child) if child.name == "route" => current = child,
+                Some(child) => {
+                    assert_eq!(child.name, "respond");
+                    break;
+                }
+                None => break,
+            }
+        }
+        assert_eq!(routes, MAX_BLOCK_DEPTH - 1);
+    }
+
+    #[test]
+    fn rejects_one_block_past_the_maximum_depth_with_a_located_error() {
+        let error = parse(&nested_blocks(MAX_BLOCK_DEPTH)).expect_err("limit + 1 is rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("maximum depth of {MAX_BLOCK_DEPTH}")),
+            "error must name the limit: {message}"
+        );
+        assert!(
+            message.contains("Caddyfile line"),
+            "error must be located: {message}"
+        );
+        // The site block opens on line 1; nested `route` block k opens on line k + 1, so the
+        // offending (MAX_BLOCK_DEPTH + 1)-th block opens on line MAX_BLOCK_DEPTH + 1.
+        assert!(
+            message.contains(&format!("Caddyfile line {}", MAX_BLOCK_DEPTH + 1)),
+            "error must point at the offending `{{`: {message}"
+        );
+    }
+
+    #[test]
+    fn former_stack_overflow_reproducer_is_now_a_located_error() {
+        // The T-COMPAT-012 defect reproducer: a ~2.5 KB Caddyfile with 400 nested blocks used to
+        // abort the process with a stack overflow (SIGABRT, not a catchable panic).
+        let error = parse(&nested_blocks(400)).expect_err("deep nesting is bounded");
+        let message = error.to_string();
+        assert!(message.contains("Caddyfile line"), "{message}");
+        assert!(message.contains("maximum depth"), "{message}");
+    }
+
+    #[test]
+    fn sibling_site_blocks_do_not_accumulate_depth() {
+        // Block depth must reset when a block closes; otherwise the second site would be rejected
+        // even though it is no deeper than the first.
+        let mut input = nested_blocks(MAX_BLOCK_DEPTH - 1);
+        input.push_str(&nested_blocks(MAX_BLOCK_DEPTH - 1).replace(":80", ":8080"));
+        let file = parse(&input).expect("each sibling site reaches the limit independently");
+        assert_eq!(file.sites.len(), 2);
+    }
+
+    #[test]
+    fn depth_limit_is_exported_and_documented() {
+        // The constant is public so callers and docs can reference the bound rather than copying
+        // the number; 128 is the value the compatibility doc must advertise.
+        assert_eq!(MAX_BLOCK_DEPTH, 128);
     }
 }

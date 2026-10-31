@@ -342,9 +342,10 @@ const HANDWRITTEN_SEEDS: &[&str] = &[
 /// This suite's ~3.8k generated cases (seeded LCG, deterministic) found **no catchable panics or
 /// hangs** in the lexer, parser, or adapter, so this corpus currently records the malformed-input
 /// classes that must stay located errors (the classes that historically break hand-written
-/// Caddyfile lexers). The one known defect found is the *unbounded nesting depth* process abort
-/// documented on [`deep_nesting_within_the_safe_budget_is_handled`]; it cannot be recorded here
-/// because an abort cannot be caught inside the test process.
+/// Caddyfile lexers). The one defect this suite found — unbounded parser nesting, which aborted
+/// the process on a deeply nested Caddyfile — has been fixed by the parser's `MAX_BLOCK_DEPTH`
+/// bound; the former reproducer is asserted as a located error in
+/// `former_stack_overflow_reproducer_is_a_located_error`.
 ///
 /// Add entries here when a fuzz case finds a panic: copy the `input=...` value from the failure
 /// message, keep the smallest reproducer, and note the defect (this file is the executable
@@ -356,7 +357,7 @@ const REGRESSION_CORPUS: &[&str] = &[
     ":80 {\n\trespond \"unterminated\n}\n",
     // Unterminated backtick string must be a located lexical error.
     ":80 {\n\trespond `unterminated\n}\n",
-    // Heredocs are explicitly unsupported: located error, never silent mis-parse.
+    // Heredoc bodies (supported, T-CONF-003) must never be mis-lexed as structure or hang.
     ":80 {\n\trespond <<EOF\n\tbody\n\tEOF\n}\n",
     // Stray closing brace without a block.
     "}\n",
@@ -685,25 +686,36 @@ fn nested_blocks(depth: usize) -> String {
     input
 }
 
-/// Known gap found while validating this suite (the fix is a parser recursion-depth limit, which
-/// is outside this task's write scope; a report/DIV entry is raised by the compatibility owner):
-/// the recursive-descent parser has no nesting-depth limit, so a deeply nested Caddyfile aborts
-/// the process with a **stack overflow** instead of returning a located error. A process abort is
-/// not a panic and cannot be caught by `catch_unwind`, so this suite probes only a depth that is
-/// safely below the measured limit (debug build, 2 MiB worker stack: depth 256 passes, depth 400
-/// aborts) and records the out-of-process reproducer here instead.
-///
-/// Out-of-process reproducer (aborts with SIGABRT):
-///
-/// ```text
-/// python3 -c 'd=400; print(":80 {\n" + "\troute {\n"*d + "\t\trespond ok\n" + "\t}\n"*d + "}\n", end="")' > /tmp/deep.caddyfile
-/// caddy-rs adapt --config /tmp/deep.caddyfile
-/// ```
+/// Nesting-depth contract (T-COMPAT-012 defect, fixed by the parser `MAX_BLOCK_DEPTH` bound):
+/// the parser accepts at most 128 braced block levels including the site block and turns deeper
+/// nesting into a located parse error instead of recursing until the process aborts. The former
+/// reproducer — a ~2.5 KB Caddyfile with a site block plus 400 nested `route` blocks — used to
+/// abort with SIGABRT; it is now rejected cleanly in-process (second test below).
 #[test]
-fn deep_nesting_within_the_safe_budget_is_handled() {
-    for depth in [1usize, 4, 8, 16, 32, 64, 128] {
+fn nesting_depth_within_the_parser_budget_is_handled() {
+    // The site block counts as level 1. Depth 127 reaches exactly the parser's 128-level budget;
+    // every value here must be accepted.
+    for depth in [0usize, 1, 4, 8, 16, 32, 64, 96, 127] {
         check_str(&nested_blocks(depth));
     }
+}
+
+#[test]
+fn former_stack_overflow_reproducer_is_a_located_error() {
+    // Exact shape of the T-COMPAT-012 reproducer (previously an uncatchable stack-overflow
+    // abort). `adapt` must return a located parser error without recursing past the limit, so
+    // this is safe to run directly on the test thread — if the bound regresses, this test aborts
+    // the process instead of hanging in the watchdog.
+    let error = adapt(&nested_blocks(400)).expect_err("deep nesting must be rejected, not abort");
+    let message = error.to_string();
+    assert!(
+        message.contains("Caddyfile line"),
+        "error must be located: {message}"
+    );
+    assert!(
+        message.contains("maximum depth"),
+        "error must name the nesting limit: {message}"
+    );
 }
 
 #[test]
