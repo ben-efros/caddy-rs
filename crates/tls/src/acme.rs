@@ -180,7 +180,7 @@ impl AcmeError {
     }
 }
 
-/// ACME HTTP method used by a transport request.
+/// HTTP method used by a transport request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum HttpMethod {
@@ -190,6 +190,8 @@ pub enum HttpMethod {
     Head,
     /// `POST`
     Post,
+    /// `DELETE`
+    Delete,
 }
 
 impl HttpMethod {
@@ -199,6 +201,7 @@ impl HttpMethod {
             Self::Get => "GET",
             Self::Head => "HEAD",
             Self::Post => "POST",
+            Self::Delete => "DELETE",
         }
     }
 }
@@ -237,6 +240,16 @@ impl HttpRequest {
     pub fn head(url: impl Into<String>) -> Self {
         Self {
             method: HttpMethod::Head,
+            url: url.into(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        }
+    }
+
+    /// A bare `DELETE` request.
+    pub fn delete(url: impl Into<String>) -> Self {
+        Self {
+            method: HttpMethod::Delete,
             url: url.into(),
             headers: Vec::new(),
             body: Vec::new(),
@@ -1003,11 +1016,12 @@ pub struct StoredAccount {
     pub key_thumbprint: String,
 }
 
-/// HTTP transport used by [`AcmeClient`].
+/// Transport-neutral HTTP client used by [`AcmeClient`] and other HTTP-speaking clients in this
+/// crate (for example the Cloudflare DNS provider).
 ///
 /// Production code plugs in a real HTTP client (the workspace has hyper); tests use a scripted
-/// mock. Keeping this at the HTTP-message level means the ACME protocol logic (JWS, nonces,
-/// problem documents) is exercised without network access.
+/// mock. Keeping this at the HTTP-message level means protocol logic (JWS, nonces, problem
+/// documents, DNS provider request/response mapping) is exercised without network access.
 #[async_trait]
 pub trait AcmeTransport: Send + Sync {
     /// Perform one HTTP request.

@@ -15,8 +15,9 @@
 //! * [`InMemoryDnsProvider`] — an in-process provider used by tests (and useful for local
 //!   development); it performs no network I/O.
 //!
-//! Real provider modules (Cloudflare, Route53, ...) and the `dns.providers` module registry are
-//! tracked separately; this module only defines the interface they must implement.
+//! The Cloudflare implementation lives in [`crate::cloudflare`]. Other provider modules and the
+//! `dns.providers` module registry are tracked separately; this module only defines the interface
+//! they must implement.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::RwLock;
