@@ -25,6 +25,18 @@ pub enum ModuleKind {
     DnsProvider,
     /// Storage backend (`caddy.storage.*`).
     Storage,
+    /// TLS certificate loader (`tls.certificates.*`).
+    TlsCertificateLoader,
+    /// TLS session-ticket key provider (`tls.stek.*`).
+    StekProvider,
+    /// On-Demand TLS permission module (`tls.permission.*`).
+    TlsPermission,
+    /// Log encoder (`caddy.logging.encoders.*`).
+    LogEncoder,
+    /// Log writer (`caddy.logging.writers.*`).
+    LogWriter,
+    /// Log core (`caddy.logging.cores.*`).
+    LogCore,
     /// Application module (`apps.*`).
     App,
     /// Anything else.
@@ -40,6 +52,12 @@ impl ModuleKind {
             ModuleKind::TlsIssuer => "TLS issuer",
             ModuleKind::DnsProvider => "DNS provider",
             ModuleKind::Storage => "storage",
+            ModuleKind::TlsCertificateLoader => "TLS certificate loader",
+            ModuleKind::StekProvider => "session ticket key provider",
+            ModuleKind::TlsPermission => "TLS on-demand permission",
+            ModuleKind::LogEncoder => "log encoder",
+            ModuleKind::LogWriter => "log writer",
+            ModuleKind::LogCore => "log core",
             ModuleKind::App => "app",
             ModuleKind::Other => "module",
         }
@@ -53,6 +71,12 @@ impl ModuleKind {
             ModuleKind::TlsIssuer => "tls.issuance.",
             ModuleKind::DnsProvider => "dns.providers.",
             ModuleKind::Storage => "caddy.storage.",
+            ModuleKind::TlsCertificateLoader => "tls.certificates.",
+            ModuleKind::StekProvider => "tls.stek.",
+            ModuleKind::TlsPermission => "tls.permission.",
+            ModuleKind::LogEncoder => "caddy.logging.encoders.",
+            ModuleKind::LogWriter => "caddy.logging.writers.",
+            ModuleKind::LogCore => "caddy.logging.cores.",
             ModuleKind::App => "apps.",
             ModuleKind::Other => "",
         }
@@ -150,6 +174,36 @@ impl ModuleRegistry {
     /// Resolve an HTTP matcher object key.
     pub fn resolve_matcher(&self, json_key: &str) -> Option<&Module> {
         self.get_by_key(ModuleKind::HttpMatcher, json_key)
+    }
+
+    /// Resolve a log writer's `output` key (`caddy.logging.writers.*`).
+    pub fn resolve_log_writer(&self, json_key: &str) -> Option<&Module> {
+        self.get_by_key(ModuleKind::LogWriter, json_key)
+    }
+
+    /// Resolve a log encoder's `format` key (`caddy.logging.encoders.*`).
+    pub fn resolve_log_encoder(&self, json_key: &str) -> Option<&Module> {
+        self.get_by_key(ModuleKind::LogEncoder, json_key)
+    }
+
+    /// Resolve a log core's `module` key (`caddy.logging.cores.*`).
+    pub fn resolve_log_core(&self, json_key: &str) -> Option<&Module> {
+        self.get_by_key(ModuleKind::LogCore, json_key)
+    }
+
+    /// Resolve a TLS certificate loader key (`tls.certificates.*`).
+    pub fn resolve_certificate_loader(&self, json_key: &str) -> Option<&Module> {
+        self.get_by_key(ModuleKind::TlsCertificateLoader, json_key)
+    }
+
+    /// Resolve a session-ticket key provider key (`tls.stek.*`).
+    pub fn resolve_stek_provider(&self, json_key: &str) -> Option<&Module> {
+        self.get_by_key(ModuleKind::StekProvider, json_key)
+    }
+
+    /// Resolve an On-Demand TLS permission module key (`tls.permission.*`).
+    pub fn resolve_tls_permission(&self, json_key: &str) -> Option<&Module> {
+        self.get_by_key(ModuleKind::TlsPermission, json_key)
     }
 
     /// Whether a module id is registered.
@@ -294,6 +348,120 @@ pub const BUILTIN_MODULES: &[Module] = &[
         ModuleKind::DnsProvider,
         "Cloudflare DNS-01 provider (planned, M6)",
     ),
+    // TLS certificate loaders (configuration only; loading is part of the TLS workstream)
+    Module::new(
+        "tls.certificates.load_files",
+        "load_files",
+        ModuleKind::TlsCertificateLoader,
+        "Load certificate/key pairs from disk (config only)",
+    ),
+    Module::new(
+        "tls.certificates.load_pem",
+        "load_pem",
+        ModuleKind::TlsCertificateLoader,
+        "Load certificate/key pairs from PEM blocks (config only)",
+    ),
+    Module::new(
+        "tls.certificates.load_folders",
+        "load_folders",
+        ModuleKind::TlsCertificateLoader,
+        "Load certificates from folders (config only)",
+    ),
+    Module::new(
+        "tls.certificates.load_storage",
+        "load_storage",
+        ModuleKind::TlsCertificateLoader,
+        "Load certificate/key pairs from storage (config only)",
+    ),
+    Module::new(
+        "tls.certificates.automate",
+        "automate",
+        ModuleKind::TlsCertificateLoader,
+        "Automatically manage certificates for subjects (config only)",
+    ),
+    // TLS session ticket key providers
+    Module::new(
+        "tls.stek.standard",
+        "standard",
+        ModuleKind::StekProvider,
+        "Standard-library session ticket key provider (config only)",
+    ),
+    // On-Demand TLS permission modules
+    Module::new(
+        "tls.permission.http",
+        "http",
+        ModuleKind::TlsPermission,
+        "Ask an HTTP endpoint for On-Demand TLS permission (config only)",
+    ),
+    // Logging encoders
+    Module::new(
+        "caddy.logging.encoders.console",
+        "console",
+        ModuleKind::LogEncoder,
+        "Human-readable console log encoder (config only)",
+    ),
+    Module::new(
+        "caddy.logging.encoders.json",
+        "json",
+        ModuleKind::LogEncoder,
+        "Structured JSON log encoder (config only)",
+    ),
+    Module::new(
+        "caddy.logging.encoders.filter",
+        "filter",
+        ModuleKind::LogEncoder,
+        "Filtering log encoder wrapper (config only)",
+    ),
+    Module::new(
+        "caddy.logging.encoders.append",
+        "append",
+        ModuleKind::LogEncoder,
+        "Encoder that appends fields (config only)",
+    ),
+    Module::new(
+        "caddy.logging.encoders.journald",
+        "journald",
+        ModuleKind::LogEncoder,
+        "systemd journal log encoder (config only)",
+    ),
+    // Logging writers
+    Module::new(
+        "caddy.logging.writers.stdout",
+        "stdout",
+        ModuleKind::LogWriter,
+        "Write logs to standard output (config only)",
+    ),
+    Module::new(
+        "caddy.logging.writers.stderr",
+        "stderr",
+        ModuleKind::LogWriter,
+        "Write logs to standard error (config only)",
+    ),
+    Module::new(
+        "caddy.logging.writers.discard",
+        "discard",
+        ModuleKind::LogWriter,
+        "Discard logs (config only)",
+    ),
+    Module::new(
+        "caddy.logging.writers.file",
+        "file",
+        ModuleKind::LogWriter,
+        "Write logs to a file with rotation (config only)",
+    ),
+    Module::new(
+        "caddy.logging.writers.net",
+        "net",
+        ModuleKind::LogWriter,
+        "Write logs to a network socket (config only)",
+    ),
+    // Logging cores
+    Module::new(
+        "caddy.logging.cores.mock",
+        "mock",
+        ModuleKind::LogCore,
+        "Test log core (config only)",
+    ),
 ];
 
 #[cfg(test)]
@@ -314,6 +482,32 @@ mod tests {
         assert!(registry.resolve_handler("not_a_real_handler").is_none());
         assert!(registry.get("apps.http").is_none());
         assert!(registry.contains("http"));
+    }
+
+    #[test]
+    fn builtin_registry_covers_settings_modules() {
+        let registry = ModuleRegistry::builtin();
+        for (kind, key) in [
+            (ModuleKind::LogWriter, "stderr"),
+            (ModuleKind::LogWriter, "file"),
+            (ModuleKind::LogEncoder, "json"),
+            (ModuleKind::LogEncoder, "console"),
+            (ModuleKind::LogCore, "mock"),
+            (ModuleKind::TlsCertificateLoader, "load_files"),
+            (ModuleKind::TlsCertificateLoader, "load_pem"),
+            (ModuleKind::TlsCertificateLoader, "automate"),
+            (ModuleKind::StekProvider, "standard"),
+            (ModuleKind::TlsPermission, "http"),
+            (ModuleKind::Storage, "file_system"),
+            (ModuleKind::TlsIssuer, "acme"),
+            (ModuleKind::DnsProvider, "cloudflare"),
+        ] {
+            assert!(
+                registry.get_by_key(kind, key).is_some(),
+                "missing {kind:?} module `{key}`"
+            );
+        }
+        assert!(registry.resolve_log_encoder("xml").is_none());
     }
 
     #[test]
