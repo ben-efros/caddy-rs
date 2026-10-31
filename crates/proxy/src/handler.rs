@@ -29,7 +29,8 @@ use caddy_rs_http::{
 
 use crate::balancer::{self, Balancer};
 use crate::client::{build_client, HttpClient};
-use crate::health::HealthCheck;
+use crate::health::{HealthCheck, HealthCheckScheduler};
+use crate::passive::PassiveHealth;
 use crate::retry::RetryMatch;
 use crate::upstream::Upstream;
 
@@ -82,6 +83,8 @@ impl ProxyError {
 /// One proxied upstream response, before conversion into the HTTP engine's [`Response`].
 struct ForwardedResponse {
     status: StatusCode,
+    /// Time until the upstream sent its response headers (Caddy's roundtrip duration).
+    latency: Duration,
     headers: HeaderMap,
     body: Bytes,
 }
@@ -156,6 +159,7 @@ pub struct ReverseProxyHandler {
     try_duration: Duration,
     try_interval: Duration,
     health_check: Option<Arc<HealthCheck>>,
+    passive: Option<PassiveHealth>,
     retry_match: RetryMatch,
     trusted_proxies: Vec<IpNet>,
 }
@@ -239,7 +243,7 @@ impl ReverseProxyHandler {
 
         let trusted_proxies = parse_trusted_proxies(object.get("trusted_proxies"), path)?;
 
-        let health_check = parse_health_check(object, path)?;
+        let (health_check, passive) = parse_health_checks(object.get("health_checks"), path)?;
 
         Ok(Self {
             client: build_client(),
@@ -253,6 +257,7 @@ impl ReverseProxyHandler {
             try_duration,
             try_interval,
             health_check,
+            passive,
             retry_match,
             trusted_proxies,
         })
@@ -266,6 +271,26 @@ impl ReverseProxyHandler {
     /// Upstreams, for health-check scheduling.
     pub fn upstreams(&self) -> &[Arc<Upstream>] {
         &self.upstreams
+    }
+
+    /// Passive health-check state, when `health_checks.passive` is configured.
+    pub fn passive_health(&self) -> Option<&PassiveHealth> {
+        self.passive.as_ref()
+    }
+
+    /// Spawn the active-health-check scheduler for this handler's upstreams, when configured.
+    ///
+    /// The caller owns the returned handle and calls [`HealthCheckScheduler::shutdown`] when the
+    /// handler generation is torn down (for example on config reload). This keeps the proxy crate
+    /// free of runtime-lifetime concerns while making the scheduler drivable by the server crate.
+    pub fn spawn_health_checks(&self) -> Option<HealthCheckScheduler> {
+        self.health_check.as_ref().map(|check| {
+            HealthCheckScheduler::spawn(
+                Arc::clone(check),
+                self.upstreams.clone(),
+                self.client.clone(),
+            )
+        })
     }
 
     async fn forward(
@@ -288,7 +313,9 @@ impl ReverseProxyHandler {
             .map_err(|error| ProxyError::Request(error.to_string()))?;
         *outbound.headers_mut() = headers;
 
+        let started = std::time::Instant::now();
         let response = self.client.request(outbound).await?;
+        let latency = started.elapsed();
         let status = response.status();
         let version = response.version();
         let response_headers = response.headers().clone();
@@ -300,6 +327,7 @@ impl ReverseProxyHandler {
             .to_bytes();
         Ok(ForwardedResponse {
             status,
+            latency,
             headers: self.response_headers(&response_headers, version),
             body,
         })
@@ -477,7 +505,21 @@ impl Handler for ReverseProxyHandler {
         // Number of retries already performed (Caddy's `retries` in `tryAgain`).
         let mut attempts: u32 = 0;
         loop {
-            let Some(upstream) = self.balancer.select(&self.upstreams) else {
+            // Passive health checks remove temporarily unhealthy (or saturated) upstreams from
+            // selection until their failure window expires (Caddy's `Upstream.Available()`).
+            let now = std::time::Instant::now();
+            let candidates: Vec<Arc<Upstream>> = match &self.passive {
+                Some(passive) => self
+                    .upstreams
+                    .iter()
+                    .filter(|upstream| {
+                        passive.is_available(&upstream.dial, now, upstream.active_connections())
+                    })
+                    .cloned()
+                    .collect(),
+                None => self.upstreams.clone(),
+            };
+            let Some(upstream) = self.balancer.select(&candidates) else {
                 // No upstream is available. Caddy retries this state (an upstream may recover)
                 // and surfaces 503 when the retry budget is spent.
                 if !self.retry_allowed(attempts, deadline) {
@@ -493,6 +535,16 @@ impl Handler for ReverseProxyHandler {
             let _guard = upstream.connection_started();
             match self.forward(&upstream, &request).await {
                 Ok(forwarded) => {
+                    // Caddy applies passive response checks before deciding on retry_match, so an
+                    // unhealthy_status strike is recorded even when the response is retried.
+                    if let Some(passive) = &self.passive {
+                        passive.record_response(
+                            &upstream.dial,
+                            forwarded.status,
+                            forwarded.latency,
+                            std::time::Instant::now(),
+                        );
+                    }
                     let mut response = Response {
                         status: forwarded.status,
                         headers: forwarded.headers,
@@ -520,6 +572,9 @@ impl Handler for ReverseProxyHandler {
                         "caddy-rs: reverse_proxy upstream `{}` failed: {error}",
                         upstream.dial
                     );
+                    if let Some(passive) = &self.passive {
+                        passive.record_failure(&upstream.dial, std::time::Instant::now());
+                    }
                     let retryable =
                         error.is_dial_error() || self.retry_match.matches_transport_error(&request);
                     if !retryable || !self.retry_allowed(attempts, deadline) {
@@ -720,43 +775,34 @@ fn parse_header_map(value: &Value, path: &str) -> HttpResult<HeaderMap> {
     Ok(headers)
 }
 
-fn parse_health_check(
-    object: &serde_json::Map<String, Value>,
+/// Parse Caddy's `health_checks` object into active and passive configuration.
+///
+/// Caddy's JSON shape is `health_checks.active` / `health_checks.passive`. The pre-T-PROXY-021
+/// scaffold parsed top-level `health_uri`/`health_interval`/... keys; those are not Caddy fields.
+/// A stray top-level `fail_duration` (also not a Caddy handler field) is likewise ignored, as
+/// Caddy's JSON loader ignores unknown fields. Passive-health timing now lives under
+/// `health_checks.passive.fail_duration`.
+fn parse_health_checks(
+    value: Option<&Value>,
     path: &str,
-) -> HttpResult<Option<Arc<HealthCheck>>> {
-    let uri = object.get("health_uri").and_then(Value::as_str);
-    let interval = object
-        .get("health_interval")
-        .and_then(Value::as_u64)
-        .map(Duration::from_nanos);
-    if uri.is_none() && interval.is_none() {
-        return Ok(None);
-    }
-    let mut check = HealthCheck::default();
-    if let Some(uri) = uri {
-        check.uri = uri.to_string();
-    }
-    if let Some(interval) = interval {
-        check.interval = interval;
-    }
-    if let Some(timeout) = object.get("health_timeout").and_then(Value::as_u64) {
-        check.timeout = Duration::from_nanos(timeout);
-    }
-    if let Some(status) = object.get("health_status").and_then(Value::as_u64) {
-        check.expected_status =
-            Some(u16::try_from(status).map_err(|_| {
-                invalid(&format!("{path}.health_status"), "status must fit in u16")
-            })?);
-    }
-    if let Some(method) = object.get("health_method").and_then(Value::as_str) {
-        check.method = method.parse().map_err(|error| {
-            invalid(
-                &format!("{path}.health_method"),
-                format!("invalid method: {error}"),
-            )
-        })?;
-    }
-    Ok(Some(Arc::new(check)))
+) -> HttpResult<(Option<Arc<HealthCheck>>, Option<PassiveHealth>)> {
+    let Some(value) = value else {
+        return Ok((None, None));
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| invalid(path, "`health_checks` must be an object"))?;
+    let active = object
+        .get("active")
+        .map(|active| HealthCheck::from_json(active, &format!("{path}.active")))
+        .transpose()?
+        .flatten()
+        .map(Arc::new);
+    let passive = object
+        .get("passive")
+        .map(|passive| PassiveHealth::from_json(passive, &format!("{path}.passive")))
+        .transpose()?;
+    Ok((active, passive))
 }
 
 /// The handler factory installed in the HTTP router builder.
@@ -1345,5 +1391,196 @@ mod tests {
         assert!(!stripped.contains_key("x-hop"));
         assert!(!stripped.contains_key("keep-alive"));
         assert_eq!(stripped["x-keep"], "yes");
+    }
+
+    #[test]
+    fn parses_health_checks_active_and_passive_configuration() {
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": "localhost:8080"}],
+            "health_checks": {
+                "active": {
+                    "uri": "/healthz?probe=1",
+                    "method": "HEAD",
+                    "headers": {"X-Probe": ["yes"]},
+                    "body": "ping",
+                    "interval": 2_000_000_000u64,
+                    "timeout": 500_000_000u64,
+                    "passes": 2,
+                    "fails": 3,
+                    "expect_status": 204
+                },
+                "passive": {
+                    "fail_duration": 10_000_000_000u64,
+                    "max_fails": 4,
+                    "unhealthy_status": [502, 5],
+                    "unhealthy_latency": 1_000_000_000u64,
+                    "unhealthy_request_count": 8
+                }
+            }
+        }));
+        let active = handler.health_check().expect("active checks configured");
+        assert_eq!(active.uri, "/healthz?probe=1");
+        assert_eq!(active.method, http::Method::HEAD);
+        assert_eq!(active.passes, 2);
+        assert_eq!(active.fails, 3);
+        assert_eq!(active.expected_status, Some(204));
+        assert_eq!(
+            active.headers,
+            vec![("X-Probe".to_string(), "yes".to_string())]
+        );
+
+        let passive = handler
+            .passive_health()
+            .expect("passive checks configured")
+            .config();
+        assert_eq!(passive.fail_duration, Duration::from_secs(10));
+        assert_eq!(passive.max_fails, 4);
+        assert_eq!(passive.unhealthy_status, vec![502, 5]);
+        assert_eq!(passive.unhealthy_latency, Duration::from_secs(1));
+        assert_eq!(passive.unhealthy_request_count, 8);
+    }
+
+    #[test]
+    fn active_health_checks_without_uri_are_disabled() {
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": "localhost:8080"}],
+            "health_checks": {"active": {"interval": 1_000_000_000u64}}
+        }));
+        assert!(handler.health_check().is_none());
+        assert!(handler.spawn_health_checks().is_none());
+    }
+
+    #[test]
+    fn spawn_health_checks_is_exposed_for_the_runtime() {
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": "localhost:8080"}],
+            "health_checks": {"active": {"uri": "/health"}}
+        }));
+        assert!(handler.health_check().is_some());
+        // Creating the scheduler requires a Tokio runtime, so only assert the API is reachable in
+        // an async test below; here the synchronous accessor must at least be present.
+        assert!(handler.passive_health().is_none());
+    }
+
+    #[test]
+    fn legacy_top_level_health_keys_are_ignored() {
+        // Not Caddy JSON: health options belong under `health_checks`. Unknown handler fields are
+        // ignored, matching Caddy's JSON loader.
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": "localhost:8080"}],
+            "health_uri": "/health",
+            "health_interval": 1_000_000_000u64,
+            "fail_duration": 5_000_000_000u64
+        }));
+        assert!(handler.health_check().is_none());
+        assert!(handler.passive_health().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn spawn_health_checks_starts_and_stops_a_checker() {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_hits = Arc::clone(&hits);
+        let dial = spawn_upstream(move |_request| {
+            let hits = Arc::clone(&server_hits);
+            async move {
+                hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok::<_, Infallible>(
+                    hyper::Response::builder()
+                        .status(200)
+                        .body(Full::new(Bytes::new()))
+                        .expect("response"),
+                )
+            }
+        });
+        let dial = dial.await;
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": dial}],
+            "health_checks": {"active": {"uri": "/health", "interval": 1_000_000_000u64}}
+        }));
+        let scheduler = handler
+            .spawn_health_checks()
+            .expect("scheduler for configured active checks");
+        for _ in 0..100 {
+            if hits.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::advance(Duration::from_millis(100)).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            hits.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "scheduler should probe configured upstreams"
+        );
+        scheduler.shutdown().await;
+        let after_shutdown = hits.load(std::sync::atomic::Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(10)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            after_shutdown,
+            "shutdown must stop the health-check task"
+        );
+    }
+
+    #[tokio::test]
+    async fn passive_health_removes_failing_upstream_from_rotation() {
+        let bad = spawn_status_upstream(502, "bad").await;
+        let good = spawn_status_upstream(200, "good").await;
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": bad}, {"dial": good}],
+            "load_balancing": {"selection_policy": {"policy": "first"}},
+            "health_checks": {
+                "passive": {
+                    "fail_duration": 10_000_000_000u64,
+                    "max_fails": 1,
+                    "unhealthy_status": [502]
+                }
+            }
+        }));
+        // First request hits the first upstream, which fails its passive health check.
+        let Outcome::Respond(first) = handler.handle(get_request("/", None)).await.unwrap() else {
+            panic!("expected proxied response");
+        };
+        assert_eq!(first.status, StatusCode::BAD_GATEWAY);
+        let passive = handler.passive_health().expect("passive configured");
+        let bad_dial = handler.upstreams()[0].dial.clone();
+        assert!(!passive.is_healthy(&bad_dial, std::time::Instant::now()));
+        assert!(
+            !passive.is_available(&bad_dial, std::time::Instant::now(), 0),
+            "failing upstream must leave rotation"
+        );
+
+        // Subsequent requests skip it and reach the healthy upstream.
+        let Outcome::Respond(second) = handler.handle(get_request("/", None)).await.unwrap() else {
+            panic!("expected proxied response");
+        };
+        assert_eq!(second.status, StatusCode::OK);
+        assert_eq!(body_text(&second), "good");
+    }
+
+    #[tokio::test]
+    async fn passive_health_counts_transport_errors() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dial = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": dial.clone()}],
+            "health_checks": {"passive": {"fail_duration": 10_000_000_000u64, "max_fails": 1}}
+        }));
+        let Outcome::Respond(response) = handler.handle(get_request("/", None)).await.unwrap()
+        else {
+            panic!("expected error response");
+        };
+        assert_eq!(response.status, StatusCode::BAD_GATEWAY);
+        let passive = handler.passive_health().expect("passive configured");
+        assert_eq!(passive.failures(&dial, std::time::Instant::now()), 1);
+        assert!(!passive.is_healthy(&dial, std::time::Instant::now()));
     }
 }
