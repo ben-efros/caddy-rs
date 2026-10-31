@@ -282,7 +282,7 @@ pub const BUILTIN_MODULES: &[Module] = &[
         "http.handlers.encode",
         "encode",
         ModuleKind::HttpHandler,
-        "Response compression (accepted; compression planned)",
+        "Response compression (config only; runtime is a pass-through)",
     ),
     // HTTP matchers
     Module::new(
@@ -301,7 +301,7 @@ pub const BUILTIN_MODULES: &[Module] = &[
         "http.matchers.path_regexp",
         "path_regexp",
         ModuleKind::HttpMatcher,
-        "Match request path with a regular expression",
+        "Match request path with a regular expression (config only; runtime not implemented)",
     ),
     Module::new(
         "http.matchers.method",

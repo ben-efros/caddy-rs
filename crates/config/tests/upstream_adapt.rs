@@ -220,18 +220,10 @@ fn reverse_proxy_health_headers_values_match_caddy() {
 }
 
 #[test]
-fn unquoted_placeholder_health_header_is_rejected_loudly() {
-    // The lexer currently tokenises a bare `{...}` value as a block; the adapter must not drop
-    // the placeholder silently (DIV-0016).
-    let error = adapt(
-        ":8884\n\nreverse_proxy 127.0.0.1:65535 {\n\thealth_headers {\n\t\tX-System-Hostname {system.hostname}\n\t}\n\thealth_uri /health\n}\n",
-    )
-    .expect_err("unquoted placeholder health header must be rejected");
-    let message = error.to_string();
-    assert!(
-        message.contains("health_headers") && message.contains("quote the value"),
-        "unexpected error: {message}"
-    );
+fn reverse_proxy_health_headers_matches_caddy() {
+    // Unquoted `{system.hostname}` is a normal word now that the lexer only treats standalone
+    // braces as structural (Caddy parity).
+    assert_adapts_like_caddy("reverse_proxy_health_headers.caddyfiletest");
 }
 
 #[test]

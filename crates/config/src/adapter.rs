@@ -939,6 +939,25 @@ fn respond_handler(directive: &Directive, args: &[String]) -> caddy_rs_core::Res
     Ok(Value::Object(object))
 }
 
+/// Canonicalise a header field name the way Go's `textproto.CanonicalMIMEHeaderKey` does:
+/// upper-case the first letter and every letter after a hyphen, lower-case the rest.
+fn canonical_header_name(field: &str) -> String {
+    let mut output = String::with_capacity(field.len());
+    let mut upper = true;
+    for ch in field.chars() {
+        if ch == '-' {
+            output.push('-');
+            upper = true;
+        } else if upper {
+            output.extend(ch.to_uppercase());
+            upper = false;
+        } else {
+            output.extend(ch.to_lowercase());
+        }
+    }
+    output
+}
+
 fn is_status_code(value: &str) -> bool {
     value.len() == 3
         && value.chars().all(|ch| ch.is_ascii_digit())
@@ -1003,7 +1022,7 @@ fn header_handlers(directive: &Directive) -> caddy_rs_core::Result<Vec<Value>> {
                 "handler": "headers",
                 "response": {
                     "replace": {
-                        directive.args[0].clone(): [{
+                        canonical_header_name(&directive.args[0]): [{
                             "search_regexp": qualify_placeholders(&directive.args[1]),
                             "replace": qualify_placeholders(&directive.args[2]),
                         }]
@@ -1036,17 +1055,17 @@ fn header_handlers(directive: &Directive) -> caddy_rs_core::Result<Vec<Value>> {
         let field = raw_field.trim_end_matches(':').to_string();
         if let Some(name) = field.strip_prefix('+') {
             adds.insert(
-                name.to_string(),
+                canonical_header_name(name),
                 json!(values
                     .iter()
                     .map(|value| qualify_placeholders(value))
                     .collect::<Vec<_>>()),
             );
         } else if let Some(name) = field.strip_prefix('-') {
-            deletes.push(Value::String(name.to_string()));
+            deletes.push(Value::String(canonical_header_name(name)));
         } else if let Some(name) = field.strip_prefix('?') {
             sets.insert(
-                name.to_string(),
+                canonical_header_name(name),
                 json!(values
                     .iter()
                     .map(|value| qualify_placeholders(value))
@@ -1057,7 +1076,7 @@ fn header_handlers(directive: &Directive) -> caddy_rs_core::Result<Vec<Value>> {
                 .iter()
                 .map(|value| qualify_placeholders(value))
                 .collect();
-            sets.insert(field, json!(values));
+            sets.insert(canonical_header_name(&field), json!(values));
         }
     }
 
@@ -1430,15 +1449,17 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
     let mut h2c_target = false;
     let mut extra_transport = Map::new();
     for target in args {
-        let parsed = parse_upstream(target).map_err(|message| {
+        let parsed = parse_upstreams(target).map_err(|message| {
             adapter_error(
                 directive.position,
                 format!("upstream `{target}`: {message}"),
             )
         })?;
-        https_target |= parsed.https;
-        h2c_target |= parsed.h2c;
-        upstreams.push(json!({"dial": parsed.dial}));
+        for parsed in parsed {
+            https_target |= parsed.https;
+            h2c_target |= parsed.h2c;
+            upstreams.push(json!({"dial": qualify_placeholders(&parsed.dial)}));
+        }
     }
 
     let mut object = Map::new();
@@ -1682,7 +1703,7 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
                     ));
                 }
                 request_headers.insert(
-                    item.args[0].clone(),
+                    canonical_header_name(&item.args[0]),
                     json!([qualify_placeholders(&item.args[1..].join(" "))]),
                 );
             }
@@ -1694,7 +1715,7 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
                     ));
                 }
                 response_headers.insert(
-                    item.args[0].clone(),
+                    canonical_header_name(&item.args[0]),
                     json!([qualify_placeholders(&item.args[1..].join(" "))]),
                 );
             }
@@ -1862,7 +1883,16 @@ struct ParsedUpstream {
     h2c: bool,
 }
 
-fn parse_upstream(target: &str) -> Result<ParsedUpstream, String> {
+fn parse_upstreams(target: &str) -> Result<Vec<ParsedUpstream>, String> {
+    // Network-specific shorthand: `unix+h2c//path` means a Unix-socket upstream whose transport
+    // speaks h2c, and Caddy normalises it to a `unix/...` dial plus an h2c transport.
+    if let Some(rest) = target.strip_prefix("unix+h2c//") {
+        return Ok(vec![ParsedUpstream {
+            dial: format!("unix//{rest}"),
+            https: false,
+            h2c: true,
+        }]);
+    }
     // Network addresses (`network/host`, no scheme) are parsed by Caddy's SplitNetworkAddress:
     // everything before the first `/` is the network and the rest is the host verbatim. Unix
     // networks (`unix`, `unixgram`, `unixpacket`, `unix+h2c`) never get a default port appended,
@@ -1871,18 +1901,18 @@ fn parse_upstream(target: &str) -> Result<ParsedUpstream, String> {
         if let Some((network, host)) = target.split_once('/') {
             let network = network.trim().to_ascii_lowercase();
             if network == "unix+h2c" {
-                return Ok(ParsedUpstream {
+                return Ok(vec![ParsedUpstream {
                     dial: format!("unix/{host}"),
                     https: false,
                     h2c: true,
-                });
+                }]);
             }
             if network.starts_with("unix") {
-                return Ok(ParsedUpstream {
+                return Ok(vec![ParsedUpstream {
                     dial: format!("{network}/{host}"),
                     https: false,
                     h2c: false,
-                });
+                }]);
             }
         }
     }
@@ -1901,16 +1931,43 @@ fn parse_upstream(target: &str) -> Result<ParsedUpstream, String> {
         return Err("missing host".to_string());
     }
     let default_port = if scheme == Some("https") { 443 } else { 80 };
+    // Caddy expands `host:start-end` into one upstream per port, preserving order.
+    if let Some((host, ports)) = split_port_range(authority) {
+        let mut expanded = Vec::new();
+        for port in ports {
+            expanded.push(ParsedUpstream {
+                dial: format!("{host}:{port}"),
+                https: scheme == Some("https"),
+                h2c: scheme == Some("h2c"),
+            });
+        }
+        return Ok(expanded);
+    }
     let dial = if authority_has_port(authority) {
         authority.to_string()
     } else {
         format!("{authority}:{default_port}")
     };
-    Ok(ParsedUpstream {
+    Ok(vec![ParsedUpstream {
         dial,
         https: scheme == Some("https"),
         h2c: scheme == Some("h2c"),
-    })
+    }])
+}
+
+/// Split a `host:start-end` port range into the host and an inclusive list of ports.
+fn split_port_range(authority: &str) -> Option<(&str, Vec<u16>)> {
+    let (host, range) = authority.rsplit_once(':')?;
+    let (start, end) = range.split_once('-')?;
+    if start.is_empty() || end.is_empty() {
+        return None;
+    }
+    let start: u16 = start.parse().ok()?;
+    let end: u16 = end.parse().ok()?;
+    if end < start || end - start > 256 {
+        return None;
+    }
+    Some((host, (start..=end).collect()))
 }
 
 fn authority_has_port(authority: &str) -> bool {
