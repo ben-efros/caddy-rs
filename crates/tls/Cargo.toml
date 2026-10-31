@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+base64 = "0.22.1"
 caddy-rs-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
