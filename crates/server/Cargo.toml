@@ -17,6 +17,7 @@ http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
+libc = "0.2.189"
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
