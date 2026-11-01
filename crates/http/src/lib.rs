@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod auth;
 pub mod file_server;
 pub mod handlers;
 pub mod matchers;
@@ -13,6 +14,7 @@ pub mod placeholders;
 pub mod router;
 pub mod types;
 
+pub use auth::{BasicAuthHandler, ForwardAuthHandler};
 pub use handlers::{
     EncodeHandler, HeadersHandler, RewriteHandler, StaticResponseHandler, SubrouteHandler,
     VarsHandler,

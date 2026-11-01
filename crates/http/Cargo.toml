@@ -12,6 +12,9 @@ async-trait = { workspace = true }
 bytes = { workspace = true }
 caddy-rs-core = { workspace = true }
 http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
