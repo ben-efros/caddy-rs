@@ -57,6 +57,10 @@ pub enum Error {
         message: String,
     },
 
+    /// Server-side TLS configuration errors.
+    #[error("TLS error: {0}")]
+    Tls(#[from] caddy_rs_tls::Error),
+
     /// I/O errors.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

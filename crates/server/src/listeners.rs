@@ -4,6 +4,11 @@
 //! server's limits) from the shared generation map at connection time, so a reload that keeps
 //! the same listen address does not need to rebind (no listener gap, no `EADDRINUSE`).
 //!
+//! TLS listeners (decided by the runtime: server `tls_connection_policies` or the effective HTTPS
+//! port) terminate TLS with the rustls configuration prepared by `caddy_rs_tls`; the negotiated
+//! ALPN protocol is passed to the request context as the `tls.alpn` variable. Cleartext
+//! listeners are unchanged (HTTP/1.1 and h2c).
+//!
 //! The connection boundary applies the per-server limits from [`crate::limits`]:
 //!
 //! * `read_timeout`/`write_timeout` wrap the transport in a per-operation I/O timer,
@@ -32,14 +37,15 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use tokio_rustls::TlsAcceptor;
 
 use caddy_rs_admin::{AdminApi, AdminRequest};
-use caddy_rs_core::{GenerationStore, ListenAddr, Network};
+use caddy_rs_core::{Generation, GenerationStore, ListenAddr, Network};
 use caddy_rs_http::Router;
 
 use crate::activation::{adopt_tcp, adopt_unix, InheritedSocket, LocalSocket};
 use crate::error::Error;
-use crate::http::serve_request_with_limits;
+use crate::http::serve_request_with_limits_and_alpn;
 use crate::limits::ServerLimits;
 
 /// Router map shared with accept loops, keyed by configured listen address.
@@ -53,6 +59,8 @@ pub type SharedRouters = Arc<RwLock<HashMap<String, Arc<Router>>>>;
 pub(crate) struct ListenerState {
     pub(crate) router: Arc<Router>,
     pub(crate) limits: Arc<ServerLimits>,
+    /// TLS configuration when this listener terminates TLS; `None` for cleartext listeners.
+    pub(crate) tls: Option<Arc<rustls::ServerConfig>>,
 }
 
 /// Listener state shared with accept loops, keyed by configured listen address.
@@ -184,6 +192,8 @@ struct ConnectionContext {
     /// Router to serve, or `None` while the listener is being retired (responds 503).
     router: Option<Arc<Router>>,
     limits: Arc<ServerLimits>,
+    /// TLS configuration for this accepted connection, when the listener terminates TLS.
+    tls: Option<Arc<rustls::ServerConfig>>,
 }
 
 /// Look up the state of an accepted connection and acquire a connection slot.
@@ -204,10 +214,12 @@ fn admit_connection(
         Some(state) => ConnectionContext {
             router: Some(Arc::clone(&state.router)),
             limits: Arc::clone(&state.limits),
+            tls: state.tls.clone(),
         },
         None => ConnectionContext {
             router: None,
             limits: Arc::new(ServerLimits::default()),
+            tls: None,
         },
     };
     let permit = ConnectionPermit::try_acquire(Arc::clone(active), context.limits.max_connections)?;
@@ -275,31 +287,14 @@ fn spawn_tcp_accept_loop(
                     };
                     let generation = store.acquire();
                     let connection_shutdown = shutdown.clone();
-                    tokio::spawn(async move {
-                        let _generation = generation;
-                        let _permit = permit;
-                        let limits = Arc::clone(&context.limits);
-                        let service_limits = Arc::clone(&limits);
-                        let router = context.router;
-                        let activity = Arc::new(ConnectionActivity::default());
-                        let service_activity = Arc::clone(&activity);
-                        let service = service_fn(move |request: hyper::Request<Incoming>| {
-                            let router = router.clone();
-                            let limits = Arc::clone(&service_limits);
-                            let activity = Arc::clone(&service_activity);
-                            async move {
-                                let _in_flight = activity.begin();
-                                let response = match router {
-                                    Some(router) => {
-                                        serve_request_with_limits(&limits, router, request, Some(peer), false).await
-                                    }
-                                    None => error_response(),
-                                };
-                                Ok::<_, std::convert::Infallible>(response)
-                            }
-                        });
-                        serve_connection(stream, service, connection_shutdown, limits, activity).await;
-                    });
+                    tokio::spawn(serve_accepted(
+                        stream,
+                        Some(peer),
+                        context,
+                        permit,
+                        generation,
+                        connection_shutdown,
+                    ));
                 }
             }
         }
@@ -331,33 +326,110 @@ fn spawn_unix_accept_loop(
                     };
                     let generation = store.acquire();
                     let connection_shutdown = shutdown.clone();
-                    tokio::spawn(async move {
-                        let _generation = generation;
-                        let _permit = permit;
-                        let limits = Arc::clone(&context.limits);
-                        let service_limits = Arc::clone(&limits);
-                        let router = context.router;
-                        let activity = Arc::new(ConnectionActivity::default());
-                        let service_activity = Arc::clone(&activity);
-                        let service = service_fn(move |request: hyper::Request<Incoming>| {
-                            let router = router.clone();
-                            let limits = Arc::clone(&service_limits);
-                            let activity = Arc::clone(&service_activity);
-                            async move {
-                                let _in_flight = activity.begin();
-                                let response = match router {
-                                    Some(router) => {
-                                        serve_request_with_limits(&limits, router, request, None, false).await
-                                    }
-                                    None => error_response(),
-                                };
-                                Ok::<_, std::convert::Infallible>(response)
-                            }
-                        });
-                        serve_connection(stream, service, connection_shutdown, limits, activity).await;
-                    });
+                    tokio::spawn(serve_accepted(
+                        stream,
+                        None,
+                        context,
+                        permit,
+                        generation,
+                        connection_shutdown,
+                    ));
                 }
             }
+        }
+    })
+}
+
+/// Terminate TLS when the listener is a TLS listener, then serve the connection.
+async fn serve_accepted<I>(
+    stream: I,
+    peer: Option<SocketAddr>,
+    context: ConnectionContext,
+    permit: ConnectionPermit,
+    generation: Option<Arc<Generation>>,
+    shutdown: watch::Receiver<bool>,
+) where
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let _generation = generation;
+    let _permit = permit;
+    let limits = Arc::clone(&context.limits);
+    let activity = Arc::new(ConnectionActivity::default());
+    let router = context.router;
+    if let Some(tls) = context.tls {
+        let acceptor = TlsAcceptor::from(tls);
+        let tls_stream = match acceptor.accept(stream).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                // TLS handshake failures are client-side errors (wrong SNI, protocol mismatch);
+                // log at debug and drop the connection like Caddy does.
+                tracing::debug!(%error, "TLS handshake failed");
+                return;
+            }
+        };
+        let alpn = tls_stream
+            .get_ref()
+            .1
+            .alpn_protocol()
+            .map(|protocol| String::from_utf8_lossy(protocol).into_owned());
+        let service = connection_service(
+            router,
+            Arc::clone(&limits),
+            peer,
+            true,
+            alpn,
+            Arc::clone(&activity),
+        );
+        serve_connection(tls_stream, service, shutdown, limits, activity).await;
+    } else {
+        let service = connection_service(
+            router,
+            Arc::clone(&limits),
+            peer,
+            false,
+            None,
+            Arc::clone(&activity),
+        );
+        serve_connection(stream, service, shutdown, limits, activity).await;
+    }
+}
+
+fn connection_service(
+    router: Option<Arc<Router>>,
+    limits: Arc<ServerLimits>,
+    remote_addr: Option<SocketAddr>,
+    tls: bool,
+    alpn: Option<String>,
+    activity: Arc<ConnectionActivity>,
+) -> impl hyper::service::Service<
+    hyper::Request<Incoming>,
+    Response = hyper::Response<Full<Bytes>>,
+    Error = std::convert::Infallible,
+    Future: Send,
+> + Send
+       + 'static {
+    service_fn(move |request: hyper::Request<Incoming>| {
+        let router = router.clone();
+        let limits = Arc::clone(&limits);
+        let activity = Arc::clone(&activity);
+        let alpn = alpn.clone();
+        async move {
+            let _in_flight = activity.begin();
+            let response = match router {
+                Some(router) => {
+                    serve_request_with_limits_and_alpn(
+                        &limits,
+                        router,
+                        request,
+                        remote_addr,
+                        tls,
+                        alpn.as_deref(),
+                    )
+                    .await
+                }
+                None => error_response(),
+            };
+            Ok::<_, std::convert::Infallible>(response)
         }
     })
 }

@@ -1,6 +1,6 @@
 //! TLS subsystem foundations: certificate model and cache, Caddy-compatible certificate storage,
-//! issuer interface, DNS-01 provider interface, renewal scheduling, and the ACME (RFC 8555)
-//! account/order client.
+//! issuer interface, DNS-01 provider interface, renewal scheduling, the ACME (RFC 8555)
+//! account/order client, and the rustls server configuration (SNI resolver, ALPN, client auth).
 //!
 //! The rustls terminator and the wiring of the ACME issuer into automatic HTTPS are intentionally
 //! not wired yet (M4/M5); this crate keeps the parts that do not need a live TLS stack testable
@@ -14,6 +14,7 @@ pub mod cloudflare;
 pub mod dns;
 pub mod issuer;
 pub mod storage;
+pub mod tls_server;
 
 pub use acme::{
     account_paths, parse_pem_certificate_chain, parse_retry_after, retry_after, Account,
@@ -41,6 +42,11 @@ pub use issuer::{
 pub use storage::{
     caddy_certificate_storage_name, caddy_issuer_key, from_config, CertificateStorage, FileStorage,
     MemoryStorage, StoredCertificate,
+};
+pub use tls_server::{
+    build_server_config, certificates_from_pem, certificates_from_tls_app, listener_uses_tls,
+    resolver_from_config, CertificateResolver, ClientAuthMode, TlsCertificate, TlsServerOptions,
+    TlsVersions, DEFAULT_ALPN, DEFAULT_HTTPS_PORT,
 };
 
 /// Errors raised by the TLS layer.
@@ -81,6 +87,15 @@ pub enum Error {
     /// DNS-01 challenge provider errors.
     #[error(transparent)]
     Dns(#[from] dns::DnsError),
+
+    /// Server-side TLS configuration errors (certificate loading, connection policies).
+    #[error("TLS configuration at `{path}`: {message}")]
+    TlsConfig {
+        /// JSON path or component that failed.
+        path: String,
+        /// Diagnosis.
+        message: String,
+    },
 
     /// I/O errors.
     #[error("certificate I/O error: {0}")]

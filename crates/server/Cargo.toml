@@ -13,12 +13,15 @@ caddy-rs-admin = { workspace = true }
 caddy-rs-core = { workspace = true }
 caddy-rs-http = { workspace = true }
 caddy-rs-proxy = { workspace = true }
+caddy-rs-tls = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 libc = "0.2.189"
+rustls = { version = "0.23.45", default-features = false, features = ["std", "ring", "tls12", "logging"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
 tracing = { workspace = true }

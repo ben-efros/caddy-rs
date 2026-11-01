@@ -39,6 +39,25 @@ pub async fn serve_request_with_limits(
     remote_addr: Option<SocketAddr>,
     tls: bool,
 ) -> hyper::Response<Full<Bytes>> {
+    serve_request_with_limits_and_alpn(limits, router, request, remote_addr, tls, None).await
+}
+
+/// Like [`serve_request_with_limits`], also recording the negotiated TLS ALPN protocol in the
+/// request context.
+///
+/// The internal HTTP [`Request`] carries `tls` and per-request variables; the negotiated ALPN
+/// protocol is exposed to handlers as the `tls.alpn` variable (for example
+/// `{http.vars.tls.alpn}`), which is how this build forwards HTTP/2-vs-HTTP/1.1 information into
+/// the router. The Caddy `{http.request.tls.*}` placeholder family remains a documented gap
+/// (T-ROUTE-030).
+pub async fn serve_request_with_limits_and_alpn(
+    limits: &ServerLimits,
+    router: Arc<Router>,
+    request: hyper::Request<Incoming>,
+    remote_addr: Option<SocketAddr>,
+    tls: bool,
+    tls_alpn: Option<&str>,
+) -> hyper::Response<Full<Bytes>> {
     let (parts, body) = request.into_parts();
     let body = match read_body(body, limits.max_request_body_size).await {
         Ok(body) => body,
@@ -63,6 +82,11 @@ pub async fn serve_request_with_limits(
     internal.body = body;
     internal.remote_addr = remote_addr;
     internal.tls = tls;
+    if let Some(alpn) = tls_alpn {
+        internal
+            .vars
+            .insert("tls.alpn".to_string(), alpn.to_string());
+    }
 
     match router.handle(internal).await {
         Ok(response) => to_hyper(response),

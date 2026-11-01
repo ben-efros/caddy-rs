@@ -1104,7 +1104,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
-    use crate::acme::{AccountKey, AccountStatus, Directory, HttpMethod, HttpRequest};
+    use crate::acme::{AccountKey, AccountStatus, HttpMethod, HttpRequest};
 
     // ---- scripted transport ------------------------------------------------------------------
 
