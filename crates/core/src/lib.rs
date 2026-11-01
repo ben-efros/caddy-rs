@@ -8,9 +8,11 @@
 //! - [`module`]: the static module registry.
 //! - [`validate`]: located validation of handlers, matchers, listeners, and issuers.
 //! - [`generation`]: immutable configuration generations and atomic reload/drain.
+//! - [`lifecycle`]: async provisioning/start/stop/cleanup hooks for generation-owned resources.
 //! - [`adapter`]: the Caddyfile-to-JSON adapter interface.
 //!
-//! It has no HTTP, TLS, or filesystem dependencies beyond `tokio` time/sync for draining.
+//! It has no HTTP, TLS, or filesystem dependencies beyond `tokio` time/sync for draining and the
+//! async generation lifecycle.
 
 #![forbid(unsafe_code)]
 
@@ -18,6 +20,7 @@ pub mod adapter;
 pub mod config;
 pub mod error;
 pub mod generation;
+pub mod lifecycle;
 pub mod listen;
 pub mod module;
 pub mod validate;
@@ -31,7 +34,10 @@ pub use config::{
 };
 pub use error::{Error, Result};
 pub use generation::{
-    drain, DrainOutcome, Generation, GenerationStore, LifecycleState, LoadResult,
+    drain, DrainOutcome, Generation, GenerationStore, LifecycleState, LoadResult, StopResult,
+};
+pub use lifecycle::{
+    CancellationToken, GenerationHooks, GenerationResource, GenerationResources, ResourceLifecycle,
 };
 pub use listen::{ListenAddr, Network};
 pub use module::{Module, ModuleKind, ModuleRegistry};
