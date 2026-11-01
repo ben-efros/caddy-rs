@@ -16,7 +16,7 @@
 //! | `POST`/`PUT`/`PATCH`/`DELETE /id/<id>[/<path>]` | Partial update addressed by `@id` |
 //! | `POST /load` | Validate, provision, and atomically activate a configuration |
 //! | `POST /stop` | Deactivate the running configuration |
-//! | `GET /metrics` | 501 until the observability workstream lands |
+//! | `GET /metrics` | Prometheus text format (v0.0.4) rendered from the shared [`MetricsRegistry`]; empty until the runtime populates it |
 //!
 //! Partial updates follow upstream Caddy's semantics exactly (see `config_path`):
 //!
@@ -27,6 +27,19 @@
 //!   Caddy) and sets object keys; a trailing `...` expands an array payload into the destination
 //!   array.
 //! - `DELETE` removes an object key/array element (404 if missing).
+//!
+//! ## Observability primitives
+//!
+//! [`metrics`] implements a hand-written Prometheus text-format registry (counters, gauges,
+//! histograms, labelled series, deterministic rendering) and a typed layer for the Caddy HTTP
+//! series plus caddy-rs proxy/certificate extensions. `GET /metrics` renders the registry, and
+//! [`AdminApi::metrics`] hands the same registry to the server runtime for population.
+//!
+//! [`access_log`] models Caddy's structured access-log entry (request/TLS/upstream fields),
+//! with field selection, sampling and redaction primitives. Wiring the model to a log sink is a
+//! server-runtime follow-up.
+//!
+//! ## Partial updates
 //!
 //! The resulting *full* configuration is decoded, `@id`-indexed (duplicate ids are rejected with
 //! both locations), validated, and only then swapped in atomically. A rejected update leaves the
@@ -52,10 +65,16 @@
 //! - Origin policy derives implicit origins from a non-empty `admin.origins`; the shared core
 //!   model cannot distinguish `origins: null` (derive) from `origins: []` (allow none), so an
 //!   explicit empty list derives the defaults instead of blocking the endpoint.
+//! - Metrics and access logging are crate-level primitives (T-ADMIN-020/T-ADMIN-021): the
+//!   registry is exposed for the server runtime to populate, and the access-log record model is
+//!   not yet wired to a sink. `/metrics` renders whatever the registry currently holds, which is
+//!   empty until the runtime records something.
 
 #![forbid(unsafe_code)]
 
+pub mod access_log;
 mod config_path;
+pub mod metrics;
 mod origin;
 
 use std::sync::Arc;
@@ -66,6 +85,15 @@ use caddy_rs_core::{drain, Config, GenerationStore, LifecycleState};
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use serde_json::{json, Value};
 
+pub use access_log::{
+    AccessLogConfig, AccessLogEntry, AccessLogError, AccessLogField, AccessLogRequest,
+    AccessLogSampler, AccessLogTls, AccessLogUpstream, HeaderRedaction, HeaderTarget, LogLevel,
+    RedactionPolicy, SamplingConfig,
+};
+pub use metrics::{
+    HttpMetrics, MetricsError, MetricsRegistry, ProxyObservation, RequestObservation,
+    METRICS_CONTENT_TYPE,
+};
 pub use origin::{OriginPolicy, OriginViolation};
 
 use config_path::{index_config, navigate, Mutation};
@@ -142,6 +170,7 @@ pub struct AdminApi {
     drain_timeout: Duration,
     reload_notify: Option<Arc<tokio::sync::Notify>>,
     origin_policy: Option<OriginPolicy>,
+    metrics: MetricsRegistry,
 }
 
 impl AdminApi {
@@ -152,7 +181,22 @@ impl AdminApi {
             drain_timeout: Duration::from_secs(30),
             reload_notify: None,
             origin_policy: None,
+            metrics: MetricsRegistry::new(),
         }
+    }
+
+    /// Use a pre-populated metrics registry instead of a fresh one.
+    ///
+    /// The server runtime builds its instrumentation from this same registry (see
+    /// [`AdminApi::metrics`]), so `GET /metrics` renders exactly the series the runtime records.
+    pub fn with_metrics(mut self, metrics: MetricsRegistry) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// A cheap handle to the metrics registry for the server runtime to populate.
+    pub fn metrics(&self) -> MetricsRegistry {
+        self.metrics.clone()
     }
 
     /// Wake the runtime supervisor immediately after a successful load/stop instead of waiting
@@ -312,10 +356,17 @@ impl AdminApi {
                 }
                 self.unload()
             }
-            "/metrics" => AdminResponse::text(
-                StatusCode::NOT_IMPLEMENTED,
-                "metrics are tracked by the observability workstream (ADMIN-METRICS)",
-            ),
+            "/metrics" => {
+                if method != "GET" {
+                    return AdminResponse::empty(StatusCode::METHOD_NOT_ALLOWED);
+                }
+                let mut response = AdminResponse::text(StatusCode::OK, self.metrics.render());
+                response.headers.insert(
+                    http::header::CONTENT_TYPE,
+                    HeaderValue::from_static(METRICS_CONTENT_TYPE),
+                );
+                response
+            }
             "/healthz" => AdminResponse::json(
                 StatusCode::OK,
                 &json!({
@@ -651,7 +702,11 @@ mod tests {
         );
         assert_eq!(
             admin.handle(request("GET", "/metrics", "")).await.status,
-            StatusCode::NOT_IMPLEMENTED
+            StatusCode::OK
+        );
+        assert_eq!(
+            admin.handle(request("POST", "/metrics", "")).await.status,
+            StatusCode::METHOD_NOT_ALLOWED
         );
         // Caddy's route is `/config/`; the bare path is accepted for compatibility with the
         // previous caddy-rs behaviour.
@@ -1316,5 +1371,83 @@ mod tests {
             ))
             .await;
         assert_eq!(response.status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_renders_the_shared_registry() {
+        let admin = admin();
+        // The server runtime instruments this same registry; populate it the way it would.
+        let metrics = HttpMetrics::new(admin.metrics());
+        metrics
+            .request_finished(&RequestObservation::new(
+                "srv0",
+                "route0",
+                "GET",
+                200,
+                Duration::from_millis(5),
+            ))
+            .unwrap();
+        let guard = metrics.request_started("srv0", "route0").unwrap();
+
+        let response = admin.handle(request("GET", "/metrics", "")).await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            response
+                .headers
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some(METRICS_CONTENT_TYPE)
+        );
+        let body = body_string(&response);
+        assert!(
+            body.contains("# TYPE caddy_http_requests_total counter"),
+            "missing counter family: {body}"
+        );
+        assert!(
+            body.contains("caddy_http_requests_total{handler=\"route0\",server=\"srv0\"} 1"),
+            "missing counter series: {body}"
+        );
+        assert!(
+            body.contains("caddy_http_requests_in_flight{handler=\"route0\",server=\"srv0\"} 1"),
+            "missing in-flight gauge: {body}"
+        );
+        assert!(
+            body.contains("# TYPE caddy_http_request_duration_seconds histogram"),
+            "missing latency histogram: {body}"
+        );
+
+        // Deterministic: scraping twice yields byte-identical output.
+        let second = body_string(&admin.handle(request("GET", "/metrics", "")).await);
+        assert_eq!(body, second);
+
+        drop(guard);
+        let after = body_string(&admin.handle(request("GET", "/metrics", "")).await);
+        assert!(
+            after.contains("caddy_http_requests_in_flight{handler=\"route0\",server=\"srv0\"} 0")
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_registry_can_be_injected_before_population() {
+        let registry = MetricsRegistry::new();
+        let admin = admin().with_metrics(registry.clone());
+        let metrics = HttpMetrics::new(admin.metrics());
+        metrics
+            .proxy_request_finished(&ProxyObservation {
+                upstream: "10.0.0.5:8080",
+                method: "GET",
+                status: 200,
+                duration: Duration::from_millis(20),
+                success: true,
+            })
+            .unwrap();
+
+        // Both handles share one registry: the admin serves what the runtime recorded.
+        assert_eq!(admin.metrics().render(), registry.render());
+        let body = body_string(&admin.handle(request("GET", "/metrics", "")).await);
+        assert!(
+            body.contains("caddy_rs_proxy_requests_total{code=\"200\",method=\"GET\",upstream=\"10.0.0.5:8080\"} 1"),
+            "missing proxy series: {body}"
+        );
     }
 }
