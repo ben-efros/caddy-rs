@@ -66,6 +66,45 @@ pub enum Error {
         /// Plan task or divergence id tracking the gap.
         tracking_id: &'static str,
     },
+
+    /// A generation lifecycle hook (provision/start/stop/cleanup) failed.
+    ///
+    /// The message is located: it names the generation, the phase, and the resource that failed,
+    /// so a failed reload can be diagnosed without attaching a debugger. Any additional failures
+    /// from the same phase (a cleanup that continues after one resource errors, for example) are
+    /// appended to `message`.
+    #[error("generation {generation} {phase} failed at resource `{resource}`: {message}")]
+    Lifecycle {
+        /// Generation id whose lifecycle failed.
+        generation: u64,
+        /// Phase: `provision`, `start`, `stop`, or `cleanup`.
+        phase: &'static str,
+        /// Stable resource name reported by the resource's `name()`.
+        resource: String,
+        /// Failure diagnosis (plus any secondary failures).
+        message: String,
+    },
+
+    /// A generation lifecycle operation was cancelled before it completed.
+    ///
+    /// Cancellation is cooperative via [`crate::CancellationToken`]; resources already attached to
+    /// the generation are cleaned up exactly once before this error is returned.
+    #[error("generation {generation} {phase} was cancelled")]
+    LifecycleCancelled {
+        /// Generation id whose lifecycle was cancelled.
+        generation: u64,
+        /// Phase the operation was executing: `provision`, `start`, `stop`, or `cleanup`.
+        phase: &'static str,
+    },
+
+    /// A lifecycle phase was entered out of order (framework misuse, never user configuration).
+    #[error("generation {generation} lifecycle state error: {message}")]
+    LifecycleState {
+        /// Generation id whose lifecycle state was invalid.
+        generation: u64,
+        /// What was wrong.
+        message: String,
+    },
 }
 
 /// Result alias for this crate.
