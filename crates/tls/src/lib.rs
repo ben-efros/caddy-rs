@@ -13,6 +13,7 @@ pub mod certificate;
 pub mod cloudflare;
 pub mod dns;
 pub mod issuer;
+pub mod solver;
 pub mod storage;
 
 pub use acme::{
@@ -36,7 +37,12 @@ pub use dns::{
 };
 pub use issuer::{
     within_renewal_window, AcmeIssuer, AcmeIssuerConfig, CertificateIssuer, InternalIssuer,
-    IssuanceRequest,
+    IssuanceRequest, ProductionAcmeIssuer,
+};
+pub use solver::{
+    dns01_record_name, dns01_txt_value, key_authorization, ChallengeHandle, ChallengeSolver,
+    Dns01Solver, Http01Solver, Http01Token, Http01TokenStore, SolverRegistry, TlsAlpn01Solver,
+    DNS01_RECORD_PREFIX, HTTP01_PATH_PREFIX,
 };
 pub use storage::{
     caddy_certificate_storage_name, caddy_issuer_key, from_config, CertificateStorage, FileStorage,
