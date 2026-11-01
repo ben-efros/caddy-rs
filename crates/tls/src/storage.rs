@@ -36,7 +36,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -334,6 +334,29 @@ impl CertificateStorage for FileStorage {
     }
 }
 
+#[async_trait]
+impl<T: CertificateStorage + ?Sized> CertificateStorage for Arc<T> {
+    fn name(&self) -> &'static str {
+        (**self).name()
+    }
+
+    async fn load(&self, key: &str) -> Result<Option<StoredCertificate>> {
+        (**self).load(key).await
+    }
+
+    async fn store(&self, key: &str, certificate: &StoredCertificate) -> Result<()> {
+        (**self).store(key, certificate).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        (**self).delete(key).await
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        (**self).list(prefix).await
+    }
+}
+
 /// Metadata file written by CertMagic alongside `<name>.crt` / `<name>.key`.
 ///
 /// Only the fields this build needs are decoded; unknown fields (for example CertMagic's
@@ -512,17 +535,54 @@ fn private_key_pem(document: &str) -> Result<String> {
     ))
 }
 
-/// Decode a PEM certificate block and return its `notAfter` as Unix seconds.
-fn certificate_not_after_unix(pem: &str) -> Result<u64> {
-    let body: String = pem
+/// Decode the first PEM block with `label` into DER bytes.
+///
+/// Used by the ACME issuer to turn downloaded PEM chains and generated PKCS#8 keys into the DER
+/// representation held by [`crate::certificate::Certificate`].
+pub(crate) fn pem_block_der(pem: &str, label: &str) -> Result<Vec<u8>> {
+    let blocks = pem_blocks(pem, label)?;
+    let block = blocks
+        .first()
+        .ok_or_else(|| Error::Storage(format!("PEM document contains no `{label}` block")))?;
+    let body: String = block
         .lines()
         .filter(|line| !line.trim_start().starts_with("-----"))
         .collect::<Vec<_>>()
         .join("");
-    let der = base64::engine::general_purpose::STANDARD
+    base64::engine::general_purpose::STANDARD
         .decode(body.as_bytes())
-        .map_err(|error| Error::Storage(format!("invalid certificate PEM base64: {error}")))?;
-    not_after_unix_from_der(&der)
+        .map_err(|error| Error::Storage(format!("invalid PEM base64: {error}")))
+}
+
+/// Convert PEM certificate-chain blocks (leaf first) into DER.
+pub(crate) fn certificate_chain_der(chain_pem: &[String]) -> Result<Vec<Vec<u8>>> {
+    chain_pem
+        .iter()
+        .map(|block| pem_block_der(block, "CERTIFICATE"))
+        .collect()
+}
+
+/// Convert a PEM private key (PKCS#8, PKCS#1 or SEC1) into DER.
+pub(crate) fn private_key_der(pem: &str) -> Result<Vec<u8>> {
+    for label in ["PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY"] {
+        if !pem_blocks(pem, label)?.is_empty() {
+            return pem_block_der(pem, label);
+        }
+    }
+    Err(Error::Storage(
+        "private key PEM contains no private key block".to_string(),
+    ))
+}
+
+/// The leaf certificate's `(notBefore, notAfter)` as Unix seconds.
+pub(crate) fn certificate_validity_unix(pem: &str) -> Result<(u64, u64)> {
+    let der = pem_block_der(pem, "CERTIFICATE")?;
+    validity_unix_from_der(&der)
+}
+
+/// Decode a PEM certificate block and return its `notAfter` as Unix seconds.
+fn certificate_not_after_unix(pem: &str) -> Result<u64> {
+    Ok(certificate_validity_unix(pem)?.1)
 }
 
 /// Minimal DER reader for the small part of X.509 needed to read validity times.
@@ -598,8 +658,8 @@ const DER_UTC_TIME: u8 = 0x17;
 const DER_GENERALIZED_TIME: u8 = 0x18;
 const DER_CONTEXT_0: u8 = 0xa0;
 
-/// Extract `notAfter` (Unix seconds) from a DER-encoded X.509 certificate.
-fn not_after_unix_from_der(der: &[u8]) -> Result<u64> {
+/// Extract `(notBefore, notAfter)` (Unix seconds) from a DER-encoded X.509 certificate.
+fn validity_unix_from_der(der: &[u8]) -> Result<(u64, u64)> {
     let mut outer = DerReader::new(der);
     let certificate = outer.expect(DER_SEQUENCE, "Certificate")?;
     let mut certificate_reader = DerReader::new(certificate);
@@ -623,8 +683,10 @@ fn not_after_unix_from_der(der: &[u8]) -> Result<u64> {
     let mut validity = DerReader::new(validity);
     let not_before = validity.read_tlv()?;
     let not_after = validity.read_tlv()?;
-    parse_asn1_time(not_before.0, not_before.1)?;
-    parse_asn1_time(not_after.0, not_after.1)
+    Ok((
+        parse_asn1_time(not_before.0, not_before.1)?,
+        parse_asn1_time(not_after.0, not_after.1)?,
+    ))
 }
 
 /// Parse an ASN.1 `UTCTime` or `GeneralizedTime` value (`YYMMDDHHMMSSZ` / `YYYYMMDDHHMMSSZ`).

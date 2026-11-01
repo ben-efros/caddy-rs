@@ -30,7 +30,7 @@ pub mod transport;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -1129,6 +1129,20 @@ pub trait AcmeTransport: Send + Sync {
     async fn request(&self, request: HttpRequest) -> Result<HttpResponse>;
 }
 
+#[async_trait]
+impl<T: AcmeTransport + ?Sized> AcmeTransport for &T {
+    async fn request(&self, request: HttpRequest) -> Result<HttpResponse> {
+        (**self).request(request).await
+    }
+}
+
+#[async_trait]
+impl<T: AcmeTransport + ?Sized> AcmeTransport for Arc<T> {
+    async fn request(&self, request: HttpRequest) -> Result<HttpResponse> {
+        (**self).request(request).await
+    }
+}
+
 /// An ACME client bound to one directory, one account key, and one transport.
 pub struct AcmeClient<T: AcmeTransport> {
     transport: T,
@@ -1320,6 +1334,25 @@ pub trait AcmeStorage: Send + Sync {
 
     /// Delete a value; deleting a missing key succeeds.
     async fn delete(&self, key: &str) -> Result<()>;
+}
+
+#[async_trait]
+impl<T: AcmeStorage + ?Sized> AcmeStorage for Arc<T> {
+    fn name(&self) -> &'static str {
+        (**self).name()
+    }
+
+    async fn load(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        (**self).load(key).await
+    }
+
+    async fn store(&self, key: &str, value: &[u8]) -> Result<()> {
+        (**self).store(key, value).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        (**self).delete(key).await
+    }
 }
 
 /// In-memory [`AcmeStorage`], used by tests and ephemeral deployments.
