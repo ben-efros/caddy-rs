@@ -1,10 +1,10 @@
 # caddy-rs (implementation repository)
 
 The Rust implementation of the caddy-rs program: a Caddy-compatible web server, reverse proxy,
-and configuration engine. **Status: M1/M2 skeleton (post-agent sprint)** — the crates compile,
-**483 tests pass**, and the Caddyfile adapter matches Caddy v2.11.7's golden output for every
-fixture it supports: **49 of the 245 upstream adapter fixtures exactly, 0 mismatches** (100% of
-supported fixtures, 20% corpus coverage). See the program repository's conformance report.
+and configuration engine. **Status: M2/M4 (post-agent sprint)** — the crates compile,
+**628 tests pass**, HTTPS termination works, and the Caddyfile adapter matches Caddy v2.11.7's
+golden output for every fixture it supports: **62 of the 245 upstream adapter fixtures exactly, 0
+mismatches** (100% of supported fixtures, 25.3% corpus coverage). See the program repository's conformance report.
 
 See the program repository (`..`) for the plan, compatibility contract, divergence register, and
 work queue.
@@ -22,19 +22,25 @@ work queue.
   `handle`, `handle_path`; matchers `host`, `path`, `method`, `header`, `query`, `not`,
   `path_regexp` (config-only); heredocs, line continuation, same-file snippets/imports with
   arguments, named routes parsed; global options; 49 exact upstream golden fixtures
-- HTTP/1.1 + cleartext HTTP/2 (h2c) over TCP and Unix sockets; per-server timeouts, header/body
-  limits, connection caps and systemd socket activation
+- HTTP/1.1 + cleartext HTTP/2 (h2c) over TCP and Unix sockets; **HTTPS termination** via rustls with
+  SNI (exact/wildcard), ALPN h2/http1.1, TLS versions and client-auth request/require; per-server
+  timeouts, header/body limits, connection caps and systemd socket activation
 - Route evaluation with matcher sets, terminals, groups, subroutes, header middleware and the
   placeholder engine (request/vars/env/header placeholders in rewrite/respond/headers/vars)
 - Static file serving with traversal protection, index files, browse, pass_thru
-- Reverse proxy: HTTP and Unix-socket upstreams, round-robin/first/least-conn balancing, retries
-  with retry_match, active + passive health checks, forwarded headers and trusted proxies,
-  request/response header rewriting
+- Reverse proxy: HTTP, HTTPS (rustls with explicit/system trust, insecure opt-in, SNI) and
+  Unix-socket upstreams, round-robin/first/least-conn balancing, retries with retry_match, active +
+  passive health checks, forwarded headers and trusted proxies, request/response header rewriting
 - Admin API: `/config/` traversal, full `POST/PUT/PATCH/DELETE` partial updates with validation and
-  rollback, `/id/<id>`, `/load`, `/stop`, origin enforcement; `/metrics` still 501
-- TLS foundations: certificate model/cache/SNI, Caddy/CertMagic-compatible storage layout + DNS
-  provider trait, ACME directory/account/order/CSR/transport clients, Cloudflare DNS-01 provider
-  (mock-tested) — issuance still returns NotImplemented and is not wired to automatic HTTPS
+  rollback, `/id/<id>`, `/load`, `/stop`, origin enforcement, `/metrics` Prometheus text endpoint,
+  and access-log record/redaction primitives
+- TLS/ACME: certificate model/cache/SNI, Caddy/CertMagic storage layout, ACME directory/account/
+  order/CSR/transport clients, **full `AcmeIssuer` issuance with HTTP-01 and DNS-01 solvers**
+  (mock-tested), Cloudflare DNS-01 provider (mock-tested), Caddyfile `tls` directive + global ACME
+  options — automatic-HTTPS orchestration/redirects and TLS-ALPN-01 remain tracked
+- Middleware: placeholder engine, forward_auth and basic_auth/authentication handlers, request/
+  response header rewriting, static/file serving; async generation lifecycle hooks (provision →
+  start → stop → cleanup)
 - CLI: `version`, `list-modules`, `adapt`, `validate`, `run`, `reload`, `stop`
 
 ## What does not work yet (registered, not hidden)
