@@ -11,7 +11,7 @@
 //! Supported directives and matchers are listed in `docs/compatibility/CADDYFILE.md` in the
 //! program repository.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use caddy_rs_core::{AdaptedConfig, ConfigAdapter, Error as CoreError};
 use serde_json::{json, Map, Value};
@@ -57,8 +57,14 @@ pub fn adapt(input: &str) -> caddy_rs_core::Result<AdaptedConfig> {
     let options = &file.options;
     let http_port = options.http_port.unwrap_or(80);
     let https_port = options.https_port.unwrap_or(443);
-    let auto_https_off = matches!(options.auto_https, Some(AutoHttpsMode::Off));
     let mut warnings = options.warnings.clone();
+
+    // Parse each block's `tls` directive once; the adapter builds routes and the TLS app from it.
+    let site_tls: Vec<Option<SiteTls>> = file
+        .sites
+        .iter()
+        .map(parse_site_tls)
+        .collect::<caddy_rs_core::Result<_>>()?;
 
     // Each site block's route list is built once; a block may be served on several listeners.
     let mut site_routes: Vec<Vec<Value>> = Vec::with_capacity(file.sites.len());
@@ -135,9 +141,14 @@ pub fn adapt(input: &str) -> caddy_rs_core::Result<AdaptedConfig> {
     // Caddy names servers ("srv0", ...) in sorted listener-address order.
     servers.sort_by(|left, right| left.listen.cmp(&right.listen));
 
-    let mut server_map = Map::new();
-    for (index, mut server) in servers.into_iter().enumerate() {
+    // Caddy sorts the server blocks of each listener once, before building both routes and TLS.
+    for server in &mut servers {
         sort_site_blocks(&mut server.blocks, &file.sites);
+    }
+    let tls_plan = build_tls_plan(&file, &site_tls, &servers, http_port, https_port)?;
+
+    let mut server_map = Map::new();
+    for (index, server) in servers.into_iter().enumerate() {
         let block_count = server.blocks.len();
         let mut routes = Vec::new();
         for block in &server.blocks {
@@ -215,10 +226,17 @@ pub fn adapt(input: &str) -> caddy_rs_core::Result<AdaptedConfig> {
                 Value::Object(automatic_https),
             );
         }
-        if server.https && auto_https_off {
-            object.insert("tls_connection_policies".to_string(), json!([{}]));
+        if let Some(connection_policies) = tls_plan.connection_policies.get(index) {
+            if !connection_policies.is_empty() {
+                object.insert(
+                    "tls_connection_policies".to_string(),
+                    Value::Array(connection_policies.clone()),
+                );
+            }
         }
-        object.insert("routes".to_string(), Value::Array(routes));
+        if !routes.is_empty() {
+            object.insert("routes".to_string(), Value::Array(routes));
+        }
         server_map.insert(format!("srv{index}"), Value::Object(object));
     }
 
@@ -227,7 +245,7 @@ pub fn adapt(input: &str) -> caddy_rs_core::Result<AdaptedConfig> {
         "http".to_string(),
         json!({"servers": Value::Object(server_map)}),
     );
-    if let Some(tls) = tls_app(&file.sites, http_port, auto_https_off)? {
+    if let Some(tls) = tls_plan.app.clone() {
         apps.insert("tls".to_string(), tls);
     }
 
@@ -373,72 +391,942 @@ fn routes_are_mergeable(left: &Value, right: &Value) -> bool {
         && left.get("group") == right.get("group")
 }
 
-/// Build the `apps.tls` section Caddy's adapter emits for automatic HTTPS.
-///
-/// Hostnames that share a site block with a hostless key never appear in a route matcher, so
-/// Caddy adds them to `certificates.automate` explicitly instead of relying on route-derived
-/// automatic HTTPS.
-fn tls_app(
-    sites: &[SiteBlock],
-    http_port: u16,
-    auto_https_off: bool,
-) -> caddy_rs_core::Result<Option<Value>> {
-    if auto_https_off {
-        return Ok(None);
-    }
-    let mut automate: Vec<String> = Vec::new();
-    for site in sites {
-        if !site.addresses.iter().any(|address| address.host.is_empty()) {
-            continue;
-        }
-        for address in &site.addresses {
-            if address.host.is_empty()
-                || address.scheme.as_deref() == Some("http")
-                || address.port == Some(http_port)
-            {
-                continue;
-            }
-            let host = address
-                .host
-                .trim_start_matches('[')
-                .trim_end_matches(']')
-                .to_string();
-            if !subject_qualifies_for_public_cert(&host) {
-                return Err(adapter_error(
-                    site.position,
-                    format!(
-                        "automatic HTTPS for internal name `{host}` shared with a hostless site \
-                         address is not supported by this build"
-                    ),
-                ));
-            }
-            if !automate.contains(&host) {
-                automate.push(host);
-            }
-        }
-    }
-    if automate.is_empty() {
-        return Ok(None);
-    }
-    automate.sort();
-    Ok(Some(json!({"certificates": {"automate": automate}})))
+// ---------------------------------------------------------------------------
+// TLS app generation (Caddy's httpcaddyfile/tlsapp.go for the supported subset)
+// ---------------------------------------------------------------------------
+
+/// Parsed `tls` directive of one site block.
+#[derive(Clone, Debug, Default)]
+struct SiteTls {
+    /// `tls internal` or `tls <email>`.
+    issuer: Option<TlsIssuer>,
+    /// `tls <cert_file> <key_file>`.
+    cert_key: Option<(String, String)>,
+    /// `tls { on_demand }`.
+    on_demand: bool,
+    /// `tls { ca <endpoint> }`.
+    ca: Option<String>,
+    /// `tls { dns <provider> ... }`.
+    dns: Option<parser::DnsProvider>,
+    /// `tls { key_type <type> }`.
+    key_type: Option<String>,
 }
 
-/// Approximation of `certmagic.SubjectQualifiesForPublicCert` for the names Caddy's adapter must
-/// list explicitly: internal names are not publicly issuable.
-fn subject_qualifies_for_public_cert(subject: &str) -> bool {
-    if subject.is_empty() {
-        return false;
+#[derive(Clone, Debug)]
+enum TlsIssuer {
+    /// `tls internal`.
+    Internal,
+    /// `tls <email>`.
+    Email(String),
+}
+
+/// One Caddy automation policy, in the subset this adapter builds.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct AutomationPolicy {
+    subjects: Vec<String>,
+    issuers: Vec<Value>,
+    on_demand: bool,
+    key_type: Option<String>,
+    reuse_private_keys: bool,
+}
+
+impl AutomationPolicy {
+    fn encoded(&self) -> Value {
+        let mut object = Map::new();
+        if !self.subjects.is_empty() {
+            object.insert("subjects".to_string(), json!(self.subjects));
+        }
+        if !self.issuers.is_empty() {
+            object.insert("issuers".to_string(), Value::Array(self.issuers.clone()));
+        }
+        if self.on_demand {
+            object.insert("on_demand".to_string(), json!(true));
+        }
+        if let Some(key_type) = &self.key_type {
+            object.insert("key_type".to_string(), json!(key_type));
+        }
+        if self.reuse_private_keys {
+            object.insert("reuse_private_keys".to_string(), json!(true));
+        }
+        Value::Object(object)
     }
-    if subject == "localhost"
+}
+
+/// Zerossl's ACME endpoint, Caddy's second default issuer when an email is configured.
+const ZEROSSL_CA: &str = "https://acme.zerossl.com/v2/DV90";
+
+/// The TLS-app plan for one adapted Caddyfile: the `apps.tls` value plus the TLS connection
+/// policies each HTTP server needs.
+struct TlsPlan {
+    app: Option<Value>,
+    connection_policies: Vec<Vec<Value>>,
+}
+
+#[derive(Default)]
+struct ConnectionPolicyState {
+    entries: Vec<Value>,
+    has_catch_all: bool,
+    address_qualifies: bool,
+    auto_https_will_add: bool,
+}
+
+/// Parse the `tls` directive of a site block. Only the documented subset is implemented; other
+/// forms fail loudly.
+fn parse_site_tls(site: &SiteBlock) -> caddy_rs_core::Result<Option<SiteTls>> {
+    let mut found: Option<&Directive> = None;
+    for directive in &site.directives {
+        if directive.name != "tls" {
+            continue;
+        }
+        if found.is_some() {
+            return Err(adapter_error(
+                directive.position,
+                "multiple `tls` directives in one site block are not supported by this build",
+            ));
+        }
+        found = Some(directive);
+    }
+    let Some(directive) = found else {
+        return Ok(None);
+    };
+    let position = directive.position;
+    let mut config = SiteTls::default();
+    match directive.args.as_slice() {
+        [] => {}
+        [single] if single == "internal" => config.issuer = Some(TlsIssuer::Internal),
+        [single] if single == "force_automate" => {
+            return Err(adapter_error(
+                position,
+                "`tls force_automate` is not supported by this build",
+            ))
+        }
+        [single] if single.contains('@') => config.issuer = Some(TlsIssuer::Email(single.clone())),
+        [cert, key] => config.cert_key = Some((cert.clone(), key.clone())),
+        [_] => return Err(adapter_error(
+            position,
+            "single argument to `tls` must be 'internal', 'force_automate', or an email address",
+        )),
+        _ => {
+            return Err(adapter_error(
+                position,
+                "`tls` takes at most two arguments (certificate and key files)",
+            ))
+        }
+    }
+    if directive.args.is_empty() && directive.block.is_empty() {
+        return Err(adapter_error(
+            position,
+            "a naked `tls` directive is not allowed",
+        ));
+    }
+    for option in &directive.block {
+        match option.name.as_str() {
+            "on_demand" => {
+                if !option.args.is_empty() || !option.block.is_empty() {
+                    return Err(adapter_error(
+                        option.position,
+                        "`on_demand` does not take arguments",
+                    ));
+                }
+                config.on_demand = true;
+            }
+            "ca" => {
+                if option.args.len() != 1 || !option.block.is_empty() {
+                    return Err(adapter_error(
+                        option.position,
+                        "`ca` requires exactly one ACME CA endpoint",
+                    ));
+                }
+                config.ca = Some(option.args[0].clone());
+            }
+            "dns" => {
+                if !option.block.is_empty() {
+                    return Err(adapter_error(
+                        option.position,
+                        "`dns` does not support a block in this build",
+                    ));
+                }
+                let Some(name) = option.args.first() else {
+                    return Err(adapter_error(
+                        option.position,
+                        "`dns` requires a DNS provider name",
+                    ));
+                };
+                config.dns = Some(parser::DnsProvider {
+                    name: name.clone(),
+                    args: option.args[1..].to_vec(),
+                });
+            }
+            "key_type" => {
+                if option.args.len() != 1 || !option.block.is_empty() {
+                    return Err(adapter_error(
+                        option.position,
+                        "`key_type` requires exactly one key type",
+                    ));
+                }
+                config.key_type = Some(option.args[0].clone());
+            }
+            other => {
+                return Err(adapter_error(
+                    option.position,
+                    format!("`tls` option `{other}` is not supported by this build"),
+                ))
+            }
+        }
+    }
+    if matches!(config.issuer, Some(TlsIssuer::Internal))
+        && (config.ca.is_some() || config.dns.is_some())
+    {
+        return Err(adapter_error(
+            position,
+            "cannot create both ACME and internal certificate issuers",
+        ));
+    }
+    if config.cert_key.is_some() && (config.ca.is_some() || config.dns.is_some()) {
+        return Err(adapter_error(
+            position,
+            "cannot mix a certificate/key pair with ACME issuer options",
+        ));
+    }
+    Ok(Some(config))
+}
+
+/// `certmagic.DefaultIssuers`: the default ACME issuer, plus Zerossl when an email is set.
+fn default_issuers(email: &str) -> Vec<Value> {
+    let mut issuers = vec![json!({"module": "acme"})];
+    if !email.trim().is_empty() {
+        issuers.push(json!({
+            "module": "acme",
+            "ca": ZEROSSL_CA,
+            "email": email,
+        }));
+    }
+    issuers
+}
+
+/// Translate a DNS provider reference into Caddy's `dns.providers.<name>` module object.
+fn dns_provider_json(
+    provider: &parser::DnsProvider,
+    position: Position,
+) -> caddy_rs_core::Result<Value> {
+    let mut object = Map::new();
+    object.insert("name".to_string(), json!(provider.name));
+    match provider.name.as_str() {
+        // Caddy's test-only provider, kept so its upstream golden fixture can be matched.
+        "mock" => {
+            if provider.args.len() > 1 {
+                return Err(adapter_error(
+                    position,
+                    "dns provider `mock` takes at most one argument",
+                ));
+            }
+            if let Some(argument) = provider.args.first() {
+                object.insert("argument".to_string(), json!(argument));
+            }
+        }
+        "cloudflare" => {
+            if provider.args.len() != 1 {
+                return Err(adapter_error(
+                    position,
+                    "dns provider `cloudflare` requires an API token argument",
+                ));
+            }
+            object.insert("api_token".to_string(), json!(provider.args[0]));
+        }
+        other => {
+            return Err(adapter_error(
+                position,
+                format!(
+                    "dns provider `{other}` is not supported by this build; supported providers: cloudflare"
+                ),
+            ))
+        }
+    }
+    Ok(Value::Object(object))
+}
+
+/// Issuers Caddy creates for the implicit ACME shortcuts (`tls <email>`, `ca`, `dns`).
+fn implicit_acme_issuers(tls: &SiteTls, position: Position) -> caddy_rs_core::Result<Vec<Value>> {
+    let email = match &tls.issuer {
+        Some(TlsIssuer::Email(email)) => Some(email.clone()),
+        _ => None,
+    };
+    let mut bases: Vec<Map<String, Value>> = vec![Map::new()];
+    if tls.ca.is_none() {
+        if let Some(email) = &email {
+            if !email.trim().is_empty() {
+                let mut zerossl = Map::new();
+                zerossl.insert("ca".to_string(), json!(ZEROSSL_CA));
+                zerossl.insert("email".to_string(), json!(email));
+                bases.push(zerossl);
+            }
+        }
+    }
+    let provider = match &tls.dns {
+        Some(provider) => Some(dns_provider_json(provider, position)?),
+        None => None,
+    };
+    let mut issuers = Vec::with_capacity(bases.len());
+    for mut base in bases {
+        base.insert("module".to_string(), json!("acme"));
+        if let Some(email) = &email {
+            base.entry("email".to_string())
+                .or_insert_with(|| json!(email));
+        }
+        if let Some(ca) = &tls.ca {
+            base.insert("ca".to_string(), json!(ca));
+        }
+        if let Some(provider) = &provider {
+            base.insert(
+                "challenges".to_string(),
+                json!({"dns": {"provider": provider}}),
+            );
+        }
+        issuers.push(Value::Object(base));
+    }
+    Ok(issuers)
+}
+
+/// `newBaseAutomationPolicy`: a policy populated from global options, or `None` when there are
+/// no global automation options and `always` is false.
+fn base_automation_policy(
+    options: &parser::GlobalOptions,
+    always: bool,
+) -> Option<AutomationPolicy> {
+    // Caddy's `newBaseAutomationPolicy` does NOT treat a bare global email as an automation
+    // default; only `acme_ca`, `acme_ca_root` and `acme_dns` make the catch-all policy non-nil.
+    let has_global_acme_defaults =
+        options.acme_ca.is_some() || options.acme_ca_root.is_some() || options.acme_dns.is_some();
+    if !options.local_certs && !has_global_acme_defaults {
+        return always.then(AutomationPolicy::default);
+    }
+    let mut policy = AutomationPolicy::default();
+    if options.local_certs {
+        policy.issuers = vec![json!({"module": "internal"})];
+    }
+    Some(policy)
+}
+
+fn has_global_acme_defaults(options: &parser::GlobalOptions) -> bool {
+    options.email.is_some()
+        || options.acme_ca.is_some()
+        || options.acme_ca_root.is_some()
+        || options.acme_dns.is_some()
+}
+
+/// `fillInGlobalACMEDefaults` for an already-encoded issuer object.
+fn fill_global_acme_defaults(issuer: &mut Value, options: &parser::GlobalOptions) {
+    if issuer.get("module").and_then(Value::as_str) != Some("acme") {
+        return;
+    }
+    let Some(object) = issuer.as_object_mut() else {
+        return;
+    };
+    if let Some(email) = &options.email {
+        object
+            .entry("email".to_string())
+            .or_insert_with(|| json!(email));
+    }
+    if let Some(ca) = &options.acme_ca {
+        object.entry("ca".to_string()).or_insert_with(|| json!(ca));
+    }
+    if let Some(root) = &options.acme_ca_root {
+        let roots = object
+            .entry("trusted_roots_pem_files".to_string())
+            .or_insert_with(|| json!([]));
+        if let Some(roots) = roots.as_array_mut() {
+            if !roots.iter().any(|value| value.as_str() == Some(root)) {
+                roots.push(json!(root));
+            }
+        }
+    }
+    if let Some(global_dns) = &options.acme_dns {
+        let challenges = object
+            .entry("challenges".to_string())
+            .or_insert_with(|| json!({}));
+        if let Some(challenges) = challenges.as_object_mut() {
+            let dns = challenges
+                .entry("dns".to_string())
+                .or_insert_with(|| json!({}));
+            if let Some(dns) = dns.as_object_mut() {
+                if dns.get("provider").is_none() {
+                    if let Ok(provider) =
+                        dns_provider_json(global_dns, Position { line: 0, column: 0 })
+                    {
+                        dns.insert("provider".to_string(), provider);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Caddy's host specificity for a block: hosts from its keys (empty when a key has no host).
+fn hosts_from_keys(addresses: &[&parser::SiteAddress]) -> Vec<String> {
+    let mut hosts: Vec<String> = Vec::new();
+    for address in addresses {
+        if address.host.is_empty() {
+            return Vec::new();
+        }
+        let host = address
+            .host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_string();
+        if !hosts.contains(&host) {
+            hosts.push(host);
+        }
+    }
+    hosts
+}
+
+/// `hostsFromKeysNotHTTP`: hosts that are served with certificates.
+fn hosts_not_http(addresses: &[&parser::SiteAddress], http_port: u16) -> Vec<String> {
+    let mut hosts: Vec<String> = Vec::new();
+    for address in addresses {
+        if address.host.is_empty()
+            || address.scheme.as_deref() == Some("http")
+            || address.port == Some(http_port)
+        {
+            continue;
+        }
+        let host = address
+            .host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_string();
+        if !hosts.contains(&host) {
+            hosts.push(host);
+        }
+    }
+    hosts
+}
+
+fn subject_is_internal(subject: &str) -> bool {
+    subject == "localhost"
         || subject.ends_with(".localhost")
         || subject.ends_with(".local")
         || subject.ends_with(".internal")
         || subject.ends_with(".home.arpa")
-    {
+        || subject.parse::<std::net::IpAddr>().is_ok()
+}
+
+/// `certmagic.SubjectQualifiesForPublicCert` (with Caddy's on-demand wildcard allowance).
+fn subject_qualifies_for_public_cert(policy: &AutomationPolicy, subject: &str) -> bool {
+    if subject.is_empty() || subject_is_internal(subject) {
         return false;
     }
-    subject.parse::<std::net::IpAddr>().is_err()
+    subject.matches("*.").count() < 2 || policy.on_demand
+}
+
+fn automation_policy_has_all_public_names(policy: &AutomationPolicy) -> bool {
+    policy
+        .subjects
+        .iter()
+        .all(|subject| subject_qualifies_for_public_cert(policy, subject))
+}
+
+/// Glob matching with `*` matching any run of characters, as `certmagic.MatchWildcard` does for
+/// configured subject patterns (a wildcard covers any number of labels).
+fn wildcard_matches(name: &str, pattern: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    fn matches(name: &[u8], pattern: &[u8]) -> bool {
+        match pattern.first() {
+            None => name.is_empty(),
+            Some(b'*') => {
+                if matches(name, &pattern[1..]) {
+                    return true;
+                }
+                !name.is_empty() && matches(&name[1..], pattern)
+            }
+            Some(expected) => name.first() == Some(expected) && matches(&name[1..], &pattern[1..]),
+        }
+    }
+    matches(name.as_bytes(), pattern.as_bytes())
+}
+
+/// `automationPolicyIsSubset`: every subject of `policy` is covered by `other`.
+fn automation_policy_is_subset(policy: &AutomationPolicy, other: &AutomationPolicy) -> bool {
+    if other.subjects.is_empty() {
+        return true;
+    }
+    if policy.subjects.is_empty() {
+        return false;
+    }
+    policy.subjects.iter().all(|subject| {
+        other
+            .subjects
+            .iter()
+            .any(|candidate| wildcard_matches(subject, candidate))
+    })
+}
+
+fn automation_policy_shadows(index: usize, policies: &[AutomationPolicy]) -> Option<usize> {
+    (index + 1..policies.len())
+        .find(|candidate| automation_policy_is_subset(&policies[index], &policies[*candidate]))
+}
+
+fn automation_policy_implicit_class(policy: &AutomationPolicy) -> &'static str {
+    if policy.subjects.is_empty() {
+        return "catch-all";
+    }
+    let mut has_public = false;
+    let mut has_internal = false;
+    for subject in &policy.subjects {
+        if subject_qualifies_for_public_cert(policy, subject) {
+            has_public = true;
+        } else {
+            has_internal = true;
+        }
+    }
+    match (has_public, has_internal) {
+        (true, true) => "mixed",
+        (true, false) => "public",
+        _ => "internal",
+    }
+}
+
+fn automation_policy_uses_default_internal_issuer(policy: &AutomationPolicy) -> bool {
+    if policy.issuers.is_empty() {
+        return automation_policy_implicit_class(policy) == "internal";
+    }
+    policy.issuers == vec![json!({"module": "internal"})]
+}
+
+fn automation_policies_have_same_issuers(
+    left: &AutomationPolicy,
+    right: &AutomationPolicy,
+) -> bool {
+    if left.issuers == right.issuers {
+        if !left.issuers.is_empty() {
+            return true;
+        }
+        let left_class = automation_policy_implicit_class(left);
+        let right_class = automation_policy_implicit_class(right);
+        return left_class == "catch-all"
+            || right_class == "catch-all"
+            || left_class == right_class;
+    }
+    automation_policy_uses_default_internal_issuer(left)
+        && automation_policy_uses_default_internal_issuer(right)
+}
+
+fn automation_policy_is_empty(policy: &AutomationPolicy) -> bool {
+    policy.issuers.is_empty()
+        && !policy.on_demand
+        && policy.key_type.is_none()
+        && !policy.reuse_private_keys
+}
+
+fn automation_policies_can_combine(left: &AutomationPolicy, right: &AutomationPolicy) -> bool {
+    automation_policies_have_same_issuers(left, right)
+        && left.on_demand == right.on_demand
+        && left.key_type == right.key_type
+        && left.reuse_private_keys == right.reuse_private_keys
+}
+
+/// Caddy's `consolidateAutomationPolicies`: sort most-specific first, drop redundant empty
+/// policies, then merge policies that are identical apart from their subjects.
+fn consolidate_automation_policies(mut policies: Vec<AutomationPolicy>) -> Vec<AutomationPolicy> {
+    policies.sort_by(|left, right| {
+        let left_before = if automation_policy_is_subset(left, right) {
+            true
+        } else if automation_policy_is_subset(right, left) {
+            false
+        } else {
+            left.subjects.len() > right.subjects.len()
+        };
+        let right_before = if automation_policy_is_subset(right, left) {
+            true
+        } else if automation_policy_is_subset(left, right) {
+            false
+        } else {
+            right.subjects.len() > left.subjects.len()
+        };
+        if left_before {
+            std::cmp::Ordering::Less
+        } else if right_before {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    });
+
+    let original_len = policies.len();
+    let mut empty_count = 0usize;
+    let mut index = 0usize;
+    while index < policies.len() {
+        if automation_policy_is_empty(&policies[index]) {
+            empty_count += 1;
+            let shadow = automation_policy_shadows(index, &policies);
+            let mut empty_policy = AutomationPolicy::default();
+            empty_policy.subjects = policies[index].subjects.clone();
+            if let Some(shadow) = shadow {
+                empty_policy.subjects = policies[shadow].subjects.clone();
+            }
+            if index == policies.len() - 1
+                || shadow.is_some_and(|shadow| policies[shadow] == empty_policy)
+            {
+                policies.remove(index);
+                continue;
+            }
+        }
+        index += 1;
+    }
+    if empty_count == original_len {
+        return Vec::new();
+    }
+
+    let mut index: isize = 0;
+    'outer: while (index as usize) < policies.len() {
+        let mut inner = (index + 1) as usize;
+        while inner < policies.len() {
+            if policies[index as usize] == policies[inner] {
+                policies.remove(inner);
+                continue 'outer;
+            }
+            if automation_policies_can_combine(&policies[index as usize], &policies[inner]) {
+                if !policies[index as usize].subjects.is_empty()
+                    && policies[inner].subjects.is_empty()
+                {
+                    if automation_policy_shadows(index as usize, &policies)
+                        .is_some_and(|shadow| shadow >= inner)
+                    {
+                        policies.remove(index as usize);
+                        continue 'outer;
+                    }
+                } else {
+                    for subject in policies[inner].subjects.clone() {
+                        if !policies[index as usize].subjects.contains(&subject) {
+                            policies[index as usize].subjects.push(subject);
+                        }
+                    }
+                    policies.remove(inner);
+                    continue;
+                }
+            }
+            inner += 1;
+        }
+        index += 1;
+    }
+    policies
+}
+
+/// A simplified `consolidateConnPolicies`: connection policies in this subset differ only by
+/// their matchers and certificate-selection tags.
+fn consolidate_connection_policies(mut policies: Vec<Value>) -> Vec<Value> {
+    // Catch-all policies (no matcher) must come last, as Caddy sorts them.
+    policies.sort_by_key(|policy| usize::from(policy.get("match").is_none()));
+    loop {
+        let mut removed = false;
+        let mut left = 0;
+        while left < policies.len() {
+            let mut right = left + 1;
+            while right < policies.len() {
+                if policies[left] == policies[right] {
+                    policies.remove(right);
+                    removed = true;
+                    continue;
+                }
+                if policies[left].get("match") == policies[right].get("match") {
+                    let tags = policies[right]
+                        .get("certificate_selection")
+                        .and_then(|selection| selection.get("any_tag"))
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    if let Some(selection) = policies[left]
+                        .pointer_mut("/certificate_selection/any_tag")
+                        .and_then(Value::as_array_mut)
+                    {
+                        for tag in tags {
+                            if !selection.contains(&tag) {
+                                selection.push(tag);
+                            }
+                        }
+                    }
+                    policies.remove(right);
+                    removed = true;
+                    continue;
+                }
+                right += 1;
+            }
+            left += 1;
+        }
+        if !removed {
+            return policies;
+        }
+    }
+}
+
+/// Build `apps.tls` and the per-server TLS connection policies from the parsed Caddyfile,
+/// mirroring Caddy's `buildTLSApp`/`serversFromPairings` for the supported subset.
+fn build_tls_plan(
+    file: &parser::Caddyfile,
+    site_tls: &[Option<SiteTls>],
+    servers: &[ServerBuilder],
+    http_port: u16,
+    https_port: u16,
+) -> caddy_rs_core::Result<TlsPlan> {
+    let options = &file.options;
+    let auto_https_off = matches!(options.auto_https, Some(AutoHttpsMode::Off));
+
+    // Hosts that share a server block with a hostless key are not route-matcher hosts, so Caddy
+    // adds them to `certificates.automate` explicitly.
+    let mut shared_hosts: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    if !auto_https_off {
+        for server in servers {
+            for block in &server.blocks {
+                let site = &file.sites[block.site_index];
+                let has_hostless = block
+                    .address_indices
+                    .iter()
+                    .any(|index| site.addresses[*index].host.is_empty());
+                if !has_hostless {
+                    continue;
+                }
+                for index in &block.address_indices {
+                    let address = &site.addresses[*index];
+                    if address.host.is_empty()
+                        || address.scheme.as_deref() == Some("http")
+                        || address.port == Some(http_port)
+                    {
+                        continue;
+                    }
+                    let host = address.host.trim_start_matches('[').trim_end_matches(']');
+                    shared_hosts.insert(host.to_string());
+                }
+            }
+        }
+    }
+
+    let mut policies: Vec<AutomationPolicy> = Vec::new();
+    let mut catch_all_base = base_automation_policy(options, false);
+    if let Some(base) = &catch_all_base {
+        policies.push(base.clone());
+    }
+    let mut load_files: Vec<Value> = Vec::new();
+    let mut cert_tags: BTreeMap<String, String> = BTreeMap::new();
+    let mut connection_states: Vec<ConnectionPolicyState> = servers
+        .iter()
+        .map(|_| ConnectionPolicyState {
+            auto_https_will_add: !auto_https_off,
+            ..ConnectionPolicyState::default()
+        })
+        .collect();
+
+    for (server_index, server) in servers.iter().enumerate() {
+        let listen_port = server
+            .listen
+            .strip_prefix(':')
+            .and_then(|port| port.parse::<u16>().ok());
+        if listen_port == Some(http_port) {
+            continue;
+        }
+        for block in &server.blocks {
+            let site = &file.sites[block.site_index];
+            let addresses: Vec<&parser::SiteAddress> = block
+                .address_indices
+                .iter()
+                .map(|index| &site.addresses[*index])
+                .collect();
+            if addresses
+                .iter()
+                .all(|address| address.scheme.as_deref() == Some("http"))
+            {
+                continue;
+            }
+            let tls = site_tls[block.site_index].clone();
+            let hosts = hosts_from_keys(&addresses);
+            let mut policy =
+                base_automation_policy(options, true).expect("always returns a policy");
+            if hosts.is_empty() {
+                if let Some(base) = &catch_all_base {
+                    policy = base.clone();
+                }
+            }
+            if let Some(tls) = &tls {
+                policy.on_demand |= tls.on_demand;
+                if tls.key_type.is_some() {
+                    policy.key_type = tls.key_type.clone();
+                }
+                if tls.cert_key.is_none() {
+                    if matches!(tls.issuer, Some(TlsIssuer::Internal)) {
+                        policy.issuers = vec![json!({"module": "internal"})];
+                    } else if tls.issuer.is_some() || tls.ca.is_some() || tls.dns.is_some() {
+                        policy.issuers = implicit_acme_issuers(tls, site.position)?;
+                    }
+                }
+            }
+            if hosts.is_empty() && catch_all_base.is_none() {
+                catch_all_base = Some(policy.clone());
+            }
+            let mut subjects = hosts_not_http(&addresses, http_port);
+            subjects.sort();
+            policy.subjects = subjects;
+
+            if policy.issuers.is_empty() {
+                let mut external = Vec::new();
+                let mut internal = Vec::new();
+                for subject in &policy.subjects {
+                    if subject_qualifies_for_public_cert(&policy, subject) {
+                        external.push(subject.clone());
+                    } else {
+                        internal.push(subject.clone());
+                    }
+                }
+                if !external.is_empty() && !internal.is_empty() {
+                    policy.subjects = external;
+                    let mut internal_policy = policy.clone();
+                    internal_policy.subjects = internal;
+                    internal_policy.issuers = vec![json!({"module": "internal"})];
+                    policies.push(internal_policy);
+                }
+            }
+            policies.push(policy);
+
+            // Connection policies contributed by this block's `tls` directive.
+            let state = &mut connection_states[server_index];
+            if let Some(tls) = &tls {
+                let mut connection_policy = Map::new();
+                if !hosts.is_empty() {
+                    let mut sni = hosts.clone();
+                    sni.sort();
+                    connection_policy.insert("match".to_string(), json!({"sni": sni}));
+                }
+                if let Some((cert, key)) = &tls.cert_key {
+                    let tag = match cert_tags.get(cert) {
+                        Some(tag) => tag.clone(),
+                        None => {
+                            let tag = format!("cert{}", cert_tags.len());
+                            cert_tags.insert(cert.clone(), tag.clone());
+                            load_files.push(json!({
+                                "certificate": cert,
+                                "key": key,
+                                "tags": [tag],
+                            }));
+                            tag
+                        }
+                    };
+                    connection_policy.insert(
+                        "certificate_selection".to_string(),
+                        json!({"any_tag": [tag]}),
+                    );
+                }
+                if connection_policy.contains_key("certificate_selection") {
+                    if hosts.is_empty() {
+                        state.has_catch_all = true;
+                    }
+                    state.entries.push(Value::Object(connection_policy));
+                }
+            }
+
+            // Auto-HTTPS bookkeeping for this server.
+            for address in &addresses {
+                let explicit_port = address.port;
+                let host = address.host.trim_start_matches('[').trim_end_matches(']');
+                let has_tls_enabled = tls.is_some()
+                    || (!address.host.is_empty()
+                        && !server.skip_auto_https.iter().any(|skip| skip == host));
+                if address.scheme.as_deref() == Some("https")
+                    || (address.scheme.as_deref() != Some("http")
+                        && explicit_port != Some(http_port)
+                        && has_tls_enabled)
+                {
+                    state.address_qualifies = true;
+                }
+                state.auto_https_will_add = state.auto_https_will_add
+                    && (explicit_port == Some(https_port)
+                        || (explicit_port != Some(http_port) && !address.host.is_empty()));
+            }
+        }
+    }
+
+    // Automate loader: hosts shared with a hostless key always need explicit management.
+    let mut automate: Vec<String> = shared_hosts.iter().cloned().collect();
+    automate.sort();
+    let mut internal_subjects: Vec<String> = shared_hosts
+        .iter()
+        .filter(|host| !subject_qualifies_for_public_cert(&AutomationPolicy::default(), host))
+        .cloned()
+        .collect();
+    internal_subjects.sort();
+    if !internal_subjects.is_empty() {
+        policies.push(AutomationPolicy {
+            subjects: internal_subjects,
+            issuers: vec![json!({"module": "internal"})],
+            ..AutomationPolicy::default()
+        });
+    }
+
+    // Global ACME defaults apply to every policy that has no issuers and only public names.
+    if has_global_acme_defaults(options) {
+        for policy in &mut policies {
+            if policy.issuers.is_empty() && automation_policy_has_all_public_names(policy) {
+                policy.issuers = default_issuers(options.email.as_deref().unwrap_or(""));
+                if options.acme_ca.is_some() {
+                    policy.issuers = vec![json!({"module": "acme"})];
+                }
+            }
+        }
+    }
+    for policy in &mut policies {
+        for issuer in &mut policy.issuers {
+            fill_global_acme_defaults(issuer, options);
+        }
+    }
+
+    let policies = consolidate_automation_policies(policies);
+    let mut seen_subjects: BTreeSet<&str> = BTreeSet::new();
+    for policy in &policies {
+        for subject in &policy.subjects {
+            if !seen_subjects.insert(subject.as_str()) {
+                return Err(adapter_error(
+                    Position { line: 0, column: 0 },
+                    format!(
+                        "hostname appears in more than one automation policy, making certificate \
+                         management ambiguous: {subject}"
+                    ),
+                ));
+            }
+        }
+    }
+
+    let mut tls_object = Map::new();
+    if !policies.is_empty() {
+        let encoded: Vec<Value> = policies.iter().map(AutomationPolicy::encoded).collect();
+        tls_object.insert("automation".to_string(), json!({"policies": encoded}));
+    }
+    if !automate.is_empty() || !load_files.is_empty() {
+        let mut certificates = Map::new();
+        if !automate.is_empty() {
+            certificates.insert("automate".to_string(), json!(automate));
+        }
+        if !load_files.is_empty() {
+            certificates.insert("load_files".to_string(), Value::Array(load_files));
+        }
+        tls_object.insert("certificates".to_string(), Value::Object(certificates));
+    }
+
+    let mut connection_policies = Vec::with_capacity(servers.len());
+    for (index, state) in connection_states.into_iter().enumerate() {
+        let mut entries = state.entries;
+        if state.address_qualifies
+            && !state.has_catch_all
+            && (!entries.is_empty() || !state.auto_https_will_add)
+        {
+            entries.push(json!({}));
+        }
+        let _ = index;
+        connection_policies.push(consolidate_connection_policies(entries));
+    }
+
+    Ok(TlsPlan {
+        app: (!tls_object.is_empty()).then_some(Value::Object(tls_object)),
+        connection_policies,
+    })
 }
 
 fn build_site_routes(
@@ -446,7 +1334,7 @@ fn build_site_routes(
     warnings: &mut Vec<String>,
 ) -> caddy_rs_core::Result<Vec<Value>> {
     let matchers = collect_matchers(&site.directives)?;
-    build_routes(&site.directives, &matchers, true, warnings)
+    build_routes(&site.directives, &matchers, true, true, warnings)
 }
 
 fn collect_matchers(directives: &[Directive]) -> caddy_rs_core::Result<BTreeMap<String, Value>> {
@@ -651,12 +1539,23 @@ fn build_routes(
     directives: &[Directive],
     matchers: &BTreeMap<String, Value>,
     sort: bool,
+    top_level: bool,
     warnings: &mut Vec<String>,
 ) -> caddy_rs_core::Result<Vec<Value>> {
     let mut ordered: Vec<&Directive> = Vec::new();
     for directive in directives {
         if directive.name.starts_with('@') {
             continue;
+        }
+        if directive.name == "tls" {
+            if top_level {
+                // Handled by the TLS app builder, not as an HTTP handler.
+                continue;
+            }
+            return Err(adapter_error(
+                directive.position,
+                "directive `tls` can only be used directly in a site block",
+            ));
         }
         if !DIRECTIVE_ORDER.contains(&directive.name.as_str()) {
             return Err(adapter_error(
@@ -696,7 +1595,7 @@ fn build_routes(
         let name = directive.name.as_str();
         match name {
             "route" => {
-                let inner = build_routes(&directive.block, matchers, false, warnings)?;
+                let inner = build_routes(&directive.block, matchers, false, false, warnings)?;
                 if inner.is_empty() {
                     entries.push((name, json!({"handle": [{"handler": "subroute"}]})));
                 } else {
@@ -852,7 +1751,13 @@ fn build_handle_route(
             "handle": [{"handler": "rewrite", "strip_path_prefix": prefix}]
         }));
     }
-    inner.extend(build_routes(&directive.block, matchers, true, warnings)?);
+    inner.extend(build_routes(
+        &directive.block,
+        matchers,
+        true,
+        false,
+        warnings,
+    )?);
 
     let mut route = Map::new();
     route.insert(

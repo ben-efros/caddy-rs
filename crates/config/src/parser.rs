@@ -52,9 +52,29 @@ pub struct GlobalOptions {
     pub http_port: Option<u16>,
     /// `https_port`.
     pub https_port: Option<u16>,
+    /// Default ACME account email from `email`.
+    pub email: Option<String>,
+    /// Default ACME CA endpoint from `acme_ca`.
+    pub acme_ca: Option<String>,
+    /// PEM bundle of trusted roots for the ACME CA from `acme_ca_root`.
+    pub acme_ca_root: Option<String>,
+    /// Global DNS-challenge provider from `acme_dns`.
+    pub acme_dns: Option<DnsProvider>,
+    /// Use Caddy's internal CA for certificates (`local_certs`).
+    pub local_certs: bool,
     /// Non-fatal notes produced while preprocessing the Caddyfile (environment-placeholder
     /// expansion) and while reading options. Adapters surface these to callers.
     pub warnings: Vec<String>,
+}
+
+/// A DNS-challenge provider referenced by `acme_dns` or `tls { dns ... }`:
+/// the module name plus the arguments written after it on the Caddyfile line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsProvider {
+    /// Provider module name, e.g. `cloudflare`.
+    pub name: String,
+    /// Remaining arguments on the line (provider-specific).
+    pub args: Vec<String>,
 }
 
 /// `auto_https` modes.
@@ -1336,16 +1356,43 @@ fn read_global_options(directives: Vec<Directive>) -> Result<GlobalOptions, Pars
             "https_port" => {
                 options.https_port = Some(global_port(&directive)?);
             }
-            "email" | "acme_ca" | "acme_ca_root" | "acme_dns" | "local_certs" | "debug" => {
-                return Err(ParseError::syntax(
-                    directive.position,
-                    format!(
-                        "global option `{}` is not implemented by this build (tracked as T-CONF-011); \
-                         it is rejected rather than silently ignored",
-                        directive.name
-                    ),
-                ))
+            "email" => options.email = Some(global_string(&directive, "email")?),
+            "acme_ca" => options.acme_ca = Some(global_string(&directive, "acme_ca")?),
+            "acme_ca_root" => {
+                options.acme_ca_root = Some(global_string(&directive, "acme_ca_root")?)
             }
+            "acme_dns" => {
+                if !directive.block.is_empty() {
+                    return Err(ParseError::syntax(
+                        directive.position,
+                        "global option `acme_dns` does not support a block in this build",
+                    ));
+                }
+                let Some(name) = directive.args.first() else {
+                    return Err(ParseError::syntax(
+                        directive.position,
+                        "global option `acme_dns` requires a DNS provider name",
+                    ));
+                };
+                options.acme_dns = Some(DnsProvider {
+                    name: name.clone(),
+                    args: directive.args[1..].to_vec(),
+                });
+            }
+            "local_certs" => {
+                if !directive.args.is_empty() || !directive.block.is_empty() {
+                    return Err(ParseError::syntax(
+                        directive.position,
+                        "global option `local_certs` does not take arguments",
+                    ));
+                }
+                options.local_certs = true;
+            }
+            "debug" => return Err(ParseError::syntax(
+                directive.position,
+                "global option `debug` is not implemented by this build (tracked as T-CONF-011); \
+                     it is rejected rather than silently ignored",
+            )),
             other => {
                 return Err(ParseError::syntax(
                     directive.position,
@@ -1355,6 +1402,22 @@ fn read_global_options(directives: Vec<Directive>) -> Result<GlobalOptions, Pars
         }
     }
     Ok(options)
+}
+
+fn global_string(directive: &Directive, option: &str) -> Result<String, ParseError> {
+    if !directive.block.is_empty() {
+        return Err(ParseError::syntax(
+            directive.position,
+            format!("global option `{option}` does not support a block in this build"),
+        ));
+    }
+    if directive.args.len() != 1 {
+        return Err(ParseError::syntax(
+            directive.position,
+            format!("global option `{option}` requires exactly one argument"),
+        ));
+    }
+    Ok(directive.args[0].clone())
 }
 
 fn global_port(directive: &Directive) -> Result<u16, ParseError> {
