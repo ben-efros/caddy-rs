@@ -120,16 +120,26 @@ impl Upstream {
 
     /// Build the absolute URI hyper uses for a request to this upstream.
     ///
-    /// TCP upstreams use `http://host:port`; Unix sockets are addressed through a synthetic
-    /// `unix://<hex-encoded socket path>` authority. The socket path is hex-encoded because a
-    /// URI authority cannot contain `/`; [`crate::client::UpstreamConnector`] decodes it again
-    /// before dialing.
+    /// The scheme selects both the network transport and whether TLS is applied:
+    ///
+    /// * `http://host:port` — plain TCP.
+    /// * `https://host:port` — TCP + TLS (`transport.tls` configured).
+    /// * `unix://<hex-encoded socket path>` — plain Unix socket.
+    /// * `unixs://<hex-encoded socket path>` — Unix socket + TLS.
+    ///
+    /// The socket path is hex-encoded because a URI authority cannot contain `/`;
+    /// [`crate::client::UpstreamConnector`] decodes it again before dialing.
     pub fn url(&self, path_and_query: &str) -> String {
-        match &self.transport {
-            Transport::Tcp { address } => format!("http://{address}{path_and_query}"),
+        match (&self.transport, self.tls) {
+            (Transport::Tcp { address }, false) => format!("http://{address}{path_and_query}"),
+            (Transport::Tcp { address }, true) => format!("https://{address}{path_and_query}"),
             #[cfg(unix)]
-            Transport::Unix { path } => {
+            (Transport::Unix { path }, false) => {
                 format!("unix://{}{path_and_query}", encode_unix_authority(path))
+            }
+            #[cfg(unix)]
+            (Transport::Unix { path }, true) => {
+                format!("unixs://{}{path_and_query}", encode_unix_authority(path))
             }
         }
     }
