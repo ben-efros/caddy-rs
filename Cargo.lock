@@ -149,14 +149,17 @@ dependencies = [
  "caddy-rs-core",
  "caddy-rs-http",
  "caddy-rs-proxy",
+ "caddy-rs-tls",
  "http",
  "http-body-util",
  "hyper",
  "hyper-util",
  "libc",
+ "rustls",
  "serde_json",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "tracing",
 ]
 

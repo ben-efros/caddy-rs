@@ -2,8 +2,9 @@
 //! reload.
 //!
 //! Scope of this milestone: HTTP/1.1 and cleartext HTTP/2 (h2c) over TCP and Unix sockets, static
-//! responses, file serving, routing, and reverse proxying. TLS termination (M4) and HTTP/3 (M9)
-//! are explicit gaps, not silent fallbacks.
+//! responses, file serving, routing, reverse proxying, and TLS termination for listeners that
+//! configure it (`tls_connection_policies` or the effective HTTPS port). Automatic HTTPS
+//! (ACME issuance and redirects) and HTTP/3 are explicit gaps, not silent fallbacks.
 //!
 //! The crate denies unsafe code. The single exception is [`activation`], which must adopt file
 //! descriptors passed by systemd (`FromRawFd` is `unsafe`) to implement socket activation; that

@@ -18,6 +18,10 @@ use std::time::Duration;
 use caddy_rs_admin::AdminApi;
 use caddy_rs_core::{Generation, GenerationStore};
 use caddy_rs_http::RouterBuilder;
+use caddy_rs_tls::{
+    build_server_config, listener_uses_tls, resolver_from_config, CertificateResolver,
+    TlsServerOptions, DEFAULT_HTTPS_PORT,
+};
 use tokio::sync::watch;
 
 use crate::activation::{plan_activation, ActivationError, ActivationPlan, SocketActivation};
@@ -40,6 +44,23 @@ impl RuntimeStatus {
     /// Find the actual bound address for a configured listen string.
     pub fn listener_address(&self, configured: &str) -> Option<&str> {
         self.listeners.get(configured).map(String::as_str)
+    }
+}
+
+/// Whether a server's `strict_sni_host` setting asks for strict SNI enforcement.
+///
+/// Caddy accepts either a boolean or an object with `enabled`; both spellings are recognised so a
+/// configuration that depends on strict SNI fails loudly instead of being served with the default
+/// certificate.
+fn strict_sni_host_enabled(value: Option<&serde_json::Value>) -> bool {
+    match value {
+        None => false,
+        Some(serde_json::Value::Bool(enabled)) => *enabled,
+        Some(serde_json::Value::Object(object)) => object
+            .get("enabled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true),
+        Some(_) => true,
     }
 }
 
@@ -338,8 +359,23 @@ impl ServerRuntime {
         let Some(http) = generation.config().http() else {
             return Ok(states);
         };
+        // TLS listener policy: a listener terminates TLS when its HTTP server declares connection
+        // policies or when its port is the effective HTTPS port. Certificates come from
+        // `apps.tls.certificates`; a TLS listener without certificates fails this apply loudly.
+        let https_port = http.https_port.unwrap_or(DEFAULT_HTTPS_PORT);
+        let resolver: Option<Arc<CertificateResolver>> =
+            resolver_from_config(generation.config())?.map(Arc::new);
         for (server_name, server) in &http.servers {
             let limits = Arc::new(ServerLimits::from_http_server(server_name, server)?);
+            let policies = server.tls_connection_policies.as_deref();
+            let has_connection_policies = policies.is_some_and(|policies| !policies.is_empty());
+            if strict_sni_host_enabled(server.strict_sni_host.as_ref()) {
+                return Err(Error::NotImplemented {
+                    feature: "`strict_sni_host` TLS handshake rejection",
+                    tracking_id: "TLS-STRICT-SNI",
+                });
+            }
+            let tls_options = TlsServerOptions::from_connection_policies(policies)?;
             // The router builder consumes the raw Caddy JSON route shape. The typed config model
             // preserves the handler/matcher objects verbatim, so re-serializing is lossless.
             let routes_value = serde_json::to_value(&server.routes).map_err(|error| {
@@ -358,11 +394,27 @@ impl ServerRuntime {
                 })?;
             let router = Arc::new(router);
             for listen in &server.listen {
+                let terminates_tls =
+                    listener_uses_tls(listen, https_port, has_connection_policies)?;
+                let tls = if terminates_tls {
+                    let resolver = resolver.as_ref().ok_or_else(|| {
+                        Error::Config(caddy_rs_core::Error::invalid(
+                            "apps.tls.certificates",
+                            format!(
+                                "listener `{listen}` for server `{server_name}` terminates TLS                                  (HTTPS port {https_port} or `tls_connection_policies`) but no                                  certificates are configured; set `apps.tls.certificates.load_pem`                                  or `load_files`"
+                            ),
+                        ))
+                    })?;
+                    Some(build_server_config(Arc::clone(resolver), &tls_options)?)
+                } else {
+                    None
+                };
                 states.insert(
                     listen.clone(),
                     Arc::new(ListenerState {
                         router: Arc::clone(&router),
                         limits: Arc::clone(&limits),
+                        tls,
                     }),
                 );
             }
