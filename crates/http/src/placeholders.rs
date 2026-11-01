@@ -42,6 +42,7 @@
 //! | `{http.request.cookie.NAME}` | First cookie value with that name (case-insensitive) |
 //! | `{http.request.host.labels.N}` | `N`th host label (0-based, from the right, lowercased) |
 //! | `{http.vars.NAME}` | Request variable set by the `vars` handler |
+//! | `{http.auth.user.NAME}` | Authenticated user metadata (`id` = username), set by `basic_auth` |
 //! | `{vars.NAME}` | Alias for `{http.vars.NAME}`; Caddy's Caddyfile adapter rewrites this form |
 //! | `{env.NAME}` | Environment variable, empty when unset |
 //! | `{http.response.header.NAME}` | Response header values, only when a replacer is built with [`Replacer::with_response_headers`] |
@@ -171,6 +172,12 @@ impl<'a> Replacer<'a> {
                     // Caddyfile shorthand: the adapter rewrites `{vars.x}` to `{http.vars.x}`
                     // before the JSON reaches Caddy, so accepting both is compatible.
                     return Some(self.request.vars.get(name).cloned().unwrap_or_default());
+                }
+                if let Some(rest) = name.strip_prefix("http.auth.user.") {
+                    // Set by the `basic_auth`/`authentication` handler after a successful login;
+                    // matches Caddy's `repl.Set("http.auth.user.*", ...)`.
+                    let key = format!("http.auth.user.{rest}");
+                    return Some(self.request.vars.get(&key).cloned().unwrap_or_default());
                 }
                 if let Some(name) = name.strip_prefix("http.response.header.") {
                     let headers = self.response_headers?;
@@ -678,6 +685,7 @@ mod tests {
         assert_eq!(replacer.get("http.vars.root").as_deref(), Some("/srv"));
         assert_eq!(replacer.get("vars.root").as_deref(), Some("/srv"));
         assert_eq!(replacer.get("http.vars.missing").as_deref(), Some(""));
+        assert_eq!(replacer.get("http.auth.user.id").as_deref(), Some(""));
         // `env.NAME` is always known, even when unset.
         assert_eq!(
             replacer

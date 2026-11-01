@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use crate::auth::{BasicAuthHandler, ForwardAuthHandler};
 use crate::file_server::FileServerHandler;
 use crate::handlers::{
     EncodeHandler, HeadersHandler, RewriteHandler, StaticResponseHandler, SubrouteHandler,
@@ -215,6 +216,8 @@ impl RouterBuilder {
             "rewrite" => Arc::new(RewriteHandler::from_json(value, path)?),
             "encode" => Arc::new(EncodeHandler),
             "file_server" => Arc::new(FileServerHandler::from_json(value, path)?),
+            "forward_auth" => Arc::new(ForwardAuthHandler::from_json(value, path)?),
+            "authentication" | "basic_auth" => Arc::new(BasicAuthHandler::from_json(value, path)?),
             "subroute" => {
                 let routes = object
                     .get("routes")
@@ -352,6 +355,64 @@ mod tests {
             .unwrap();
         let response = router.handle(request("/old", "example.com")).await.unwrap();
         assert_eq!(response.body, bytes::Bytes::from_static(b"GET /new/GET"));
+    }
+
+    #[tokio::test]
+    async fn basic_auth_route_challenges_and_then_authenticates() {
+        let router = RouterBuilder::new()
+            .build(&[json!({
+                "handle": [
+                    {
+                        "handler": "basic_auth",
+                        "hash": {"algorithm": "plaintext"},
+                        "realm": "test",
+                        "accounts": [{"username": "alice", "password": "s3cret"}]
+                    },
+                    {"handler": "static_response", "body": "welcome"}
+                ]
+            })])
+            .unwrap();
+
+        // No credentials -> 401 challenge from the authentication handler.
+        let response = router.handle(request("/", "example.com")).await.unwrap();
+        assert_eq!(response.status, http::StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers[http::header::WWW_AUTHENTICATE],
+            "Basic realm=\"test\""
+        );
+
+        // Valid credentials -> chain continues to static_response.
+        let mut authenticated = request("/", "example.com");
+        authenticated.headers.insert(
+            http::header::AUTHORIZATION,
+            "Basic YWxpY2U6czNjcmV0".parse().unwrap(),
+        );
+        let response = router.handle(authenticated).await.unwrap();
+        assert_eq!(response.status, http::StatusCode::OK);
+        assert_eq!(response.body, bytes::Bytes::from_static(b"welcome"));
+    }
+
+    #[tokio::test]
+    async fn router_builds_forward_auth_handler() {
+        let router = RouterBuilder::new()
+            .build(&[json!({
+                "handle": [{
+                    "handler": "forward_auth",
+                    "upstreams": [{"dial": "127.0.0.1:1"}],
+                    "uri": "/authz",
+                    "copy_headers": ["Remote-User"]
+                }]
+            })])
+            .unwrap();
+        // With no auth server listening the handler fails loudly rather than allowing the request.
+        let error = router
+            .handle(request("/protected", "example.com"))
+            .await
+            .expect_err("auth upstream is unreachable");
+        assert!(
+            error.to_string().contains("forward_auth upstream"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

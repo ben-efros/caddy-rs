@@ -255,6 +255,24 @@ pub const BUILTIN_MODULES: &[Module] = &[
         "Proxy requests to upstream servers",
     ),
     Module::new(
+        "http.handlers.forward_auth",
+        "forward_auth",
+        ModuleKind::HttpHandler,
+        "Authentication gate via a subrequest to an auth service (caddy-rs handler; upstream          adapts forward_auth to reverse_proxy)",
+    ),
+    Module::new(
+        "http.handlers.authentication",
+        "authentication",
+        ModuleKind::HttpHandler,
+        "Authentication middleware with the HTTP Basic provider (bcrypt/argon2id verification          not implemented)",
+    ),
+    Module::new(
+        "http.handlers.basic_auth",
+        "basic_auth",
+        ModuleKind::HttpHandler,
+        "HTTP Basic authentication (caddy-rs shorthand for the authentication handler)",
+    ),
+    Module::new(
         "http.handlers.rewrite",
         "rewrite",
         ModuleKind::HttpHandler,
@@ -501,6 +519,9 @@ mod tests {
             (ModuleKind::Storage, "file_system"),
             (ModuleKind::TlsIssuer, "acme"),
             (ModuleKind::DnsProvider, "cloudflare"),
+            (ModuleKind::HttpHandler, "forward_auth"),
+            (ModuleKind::HttpHandler, "authentication"),
+            (ModuleKind::HttpHandler, "basic_auth"),
         ] {
             assert!(
                 registry.get_by_key(kind, key).is_some(),
