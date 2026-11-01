@@ -125,16 +125,19 @@ fn all_curated_upstream_fixtures_match_caddy() {
 }
 
 #[test]
-fn internal_name_shared_with_hostless_key_is_rejected_loudly() {
-    // Caddy would emit an internal automation policy for this; caddy-rs does not implement that
-    // path yet, so it rejects the configuration with a located error (DIV-0016) rather than
-    // silently omitting the policy.
-    let error = adapt(":443, localhost {\n\trespond \"hi\"\n}\n")
-        .expect_err("internal name shared with a hostless key must be rejected");
-    let message = error.to_string();
-    assert!(
-        message.contains("internal name `localhost`") && message.contains("not supported"),
-        "unexpected error: {message}"
+fn internal_name_shared_with_hostless_key_gets_internal_policy() {
+    // A hostname on a block with a hostless key is not a route-matcher host, so Caddy manages its
+    // certificate explicitly and uses the internal issuer for non-public names.
+    let adapted = adapt(":443, localhost {\n\trespond \"hi\"\n}\n")
+        .expect("internal name shared with a hostless key adapts");
+    let tls = &adapted.config["apps"]["tls"];
+    assert_eq!(tls["certificates"]["automate"], json!(["localhost"]));
+    assert_eq!(
+        tls["automation"]["policies"],
+        json!([{
+            "subjects": ["localhost"],
+            "issuers": [{"module": "internal"}],
+        }])
     );
 }
 
@@ -254,5 +257,75 @@ fn reverse_proxy_health_options_emit_caddy_health_checks_shape() {
                 "unhealthy_request_count": 8,
             }
         })
+    );
+}
+
+#[test]
+fn tls_internal_and_email_policies_match_caddy() {
+    // `tls internal`, `tls <email>` and global `local_certs` automation policies.
+    assert_adapts_like_caddy("tls_automation_policies_3.caddyfiletest");
+}
+
+#[test]
+fn tls_on_demand_and_local_certs_policies_match_caddy() {
+    // `tls { on_demand }` with global `local_certs`; policy consolidation/order.
+    assert_adapts_like_caddy("tls_automation_policies_1.caddyfiletest");
+}
+
+#[test]
+fn tls_global_email_policies_match_caddy() {
+    // Global `email` populates the default ACME issuers of the automation policies.
+    assert_adapts_like_caddy("tls_automation_policies_4.caddyfiletest");
+    assert_adapts_like_caddy("tls_automation_policies_global_email_localhost.caddyfiletest");
+}
+
+#[test]
+fn tls_ca_and_on_demand_policies_match_caddy() {
+    // `tls { ca ... }` (implicit ACME issuer) and a catch-all on-demand block.
+    assert_adapts_like_caddy("tls_automation_policies_6.caddyfiletest");
+    assert_adapts_like_caddy("tls_automation_policies_5.caddyfiletest");
+}
+
+#[test]
+fn tls_certificate_files_and_connection_policies_match_caddy() {
+    // `tls <cert> <key>` emits certificates.load_files plus a certificate-selection connection
+    // policy, including Caddy's SNI shields for wildcard certificates.
+    assert_adapts_like_caddy("tls_automation_policies_10.caddyfiletest");
+    assert_adapts_like_caddy("tls_automation_wildcard_shadowing.caddyfiletest");
+    assert_adapts_like_caddy("tls_conn_policy_consolidate.caddyfiletest");
+}
+
+#[test]
+fn tls_catch_all_site_enables_connection_policy() {
+    // A `tls` directive on a catch-all non-standard port site emits an empty server connection
+    // policy plus the internal automation policy.
+    assert_adapts_like_caddy("enable_tls_for_catch_all_site.caddyfiletest");
+}
+
+#[test]
+fn global_acme_dns_maps_to_issuer_dns_challenge() {
+    assert_adapts_like_caddy("acme_dns_configured.caddyfiletest");
+}
+
+#[test]
+fn unsupported_tls_options_are_rejected_loudly() {
+    let error =
+        adapt("example.com {\n\ttls {\n\t\tclient_auth {\n\t\t\tmode require\n\t\t}\n\t}\n}\n")
+            .expect_err("unsupported tls subdirective must be rejected");
+    let message = error.to_string();
+    assert!(
+        message.contains("`tls` option `client_auth`") && message.contains("not supported"),
+        "unexpected error: {message}"
+    );
+}
+
+#[test]
+fn tls_inside_a_route_block_is_rejected_loudly() {
+    let error = adapt("example.com {\n\troute {\n\t\ttls internal\n\t}\n}\n")
+        .expect_err("tls inside a route block must be rejected");
+    let message = error.to_string();
+    assert!(
+        message.contains("`tls`") && message.contains("site block"),
+        "unexpected error: {message}"
     );
 }
