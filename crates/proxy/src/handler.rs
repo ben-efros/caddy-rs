@@ -28,10 +28,11 @@ use caddy_rs_http::{
 };
 
 use crate::balancer::{self, Balancer};
-use crate::client::{build_client, HttpClient};
+use crate::client::{build_client_with_tls, HttpClient};
 use crate::health::{HealthCheck, HealthCheckScheduler};
 use crate::passive::PassiveHealth;
 use crate::retry::RetryMatch;
+use crate::tls::UpstreamTls;
 use crate::upstream::Upstream;
 
 /// Headers Caddy strips in both directions (see `hopHeaders` in upstream `reverseproxy.go`).
@@ -171,26 +172,10 @@ impl ReverseProxyHandler {
             .as_object()
             .ok_or_else(|| invalid(path, "reverse_proxy handler must be an object"))?;
 
-        let transport = object.get("transport");
-        let transport_tls = transport
-            .and_then(|transport| transport.get("tls"))
-            .is_some();
-        if transport
-            .and_then(|transport| transport.get("versions"))
-            .is_some()
-        {
-            return Err(HttpError::NotImplemented {
-                feature: "HTTP/2 upstream transports (h2c/h2)",
-                tracking_id: "PROXY-H2-UPSTREAM",
-            });
-        }
-        if transport_tls {
-            return Err(HttpError::NotImplemented {
-                feature:
-                    "TLS upstreams (rustls client trust configuration unavailable in this build)",
-                tracking_id: "TLS-UPSTREAM",
-            });
-        }
+        // `transport.tls` enables TLS for every upstream of the handler (Caddy's transport is
+        // per-handler, not per-upstream). The client configuration is built here so trust-store
+        // failures surface as located config errors instead of per-request transport errors.
+        let tls = parse_transport(object.get("transport"), path)?;
 
         let upstreams_value = object
             .get("upstreams")
@@ -203,9 +188,12 @@ impl ReverseProxyHandler {
                 .get("dial")
                 .and_then(Value::as_str)
                 .ok_or_else(|| invalid(&upstream_path, "upstream requires a `dial` string"))?;
-            let parsed = Upstream::parse_dial(dial, false)
+            let parsed = Upstream::parse_dial(dial, tls.is_some())
                 .map_err(|message| invalid(&upstream_path, message))?;
             upstreams.push(Arc::new(parsed));
+        }
+        if let Some(tls) = &tls {
+            validate_unix_tls(&upstreams, tls, path)?;
         }
 
         let load_balancing = object.get("load_balancing");
@@ -246,7 +234,7 @@ impl ReverseProxyHandler {
         let (health_check, passive) = parse_health_checks(object.get("health_checks"), path)?;
 
         Ok(Self {
-            client: build_client(),
+            client: build_client_with_tls(tls),
             upstreams,
             balancer,
             request_headers_set,
@@ -271,6 +259,12 @@ impl ReverseProxyHandler {
     /// Upstreams, for health-check scheduling.
     pub fn upstreams(&self) -> &[Arc<Upstream>] {
         &self.upstreams
+    }
+
+    /// The outbound client (TLS-aware), exposed for crate-level health-check tests.
+    #[cfg(test)]
+    pub(crate) fn client(&self) -> &HttpClient {
+        &self.client
     }
 
     /// Passive health-check state, when `health_checks.passive` is configured.
@@ -773,6 +767,157 @@ fn parse_header_map(value: &Value, path: &str) -> HttpResult<HeaderMap> {
         }
     }
     Ok(headers)
+}
+
+/// Parse `transport` (Caddy `http` transport only) and build the TLS client configuration when
+/// `transport.tls` is configured.
+///
+/// TLS is enabled by the mere presence of the `tls` object, even `{}` (Caddy semantics). Options
+/// this build cannot honour fail loudly instead of silently changing transport behaviour.
+fn parse_transport(value: Option<&Value>, path: &str) -> HttpResult<Option<Arc<UpstreamTls>>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let transport_path = format!("{path}.transport");
+    let object = value
+        .as_object()
+        .ok_or_else(|| invalid(&transport_path, "`transport` must be an object"))?;
+
+    if let Some(protocol) = object.get("protocol").and_then(Value::as_str) {
+        if protocol != "http" {
+            return Err(HttpError::NotImplemented {
+                feature: "non-HTTP upstream transports (for example FastCGI)",
+                tracking_id: "PROXY-TRANSPORT-PROTOCOL",
+            });
+        }
+    }
+
+    if let Some(versions) = object.get("versions") {
+        let versions = versions.as_array().ok_or_else(|| {
+            invalid(
+                &format!("{transport_path}.versions"),
+                "`versions` must be an array of strings",
+            )
+        })?;
+        for version in versions {
+            let Some(version) = version.as_str() else {
+                return Err(invalid(
+                    &format!("{transport_path}.versions"),
+                    "`versions` entries must be strings",
+                ));
+            };
+            if !matches!(version, "1" | "1.1") {
+                return Err(HttpError::NotImplemented {
+                    feature: "HTTP/2 upstream transports (h2c/h2)",
+                    tracking_id: "PROXY-H2-UPSTREAM",
+                });
+            }
+        }
+    }
+
+    // Real Caddy transport knobs that this build does not implement: reject rather than ignore.
+    const UNSUPPORTED_TRANSPORT_OPTIONS: &[(&str, &str, &str)] = &[
+        (
+            "keep_alive",
+            "PROXY-TRANSPORT-KEEPALIVE",
+            "HTTP transport keep-alive tuning",
+        ),
+        (
+            "dial_timeout",
+            "PROXY-TRANSPORT-DIAL-TIMEOUT",
+            "HTTP transport dial timeout",
+        ),
+        (
+            "dial_fallback_delay",
+            "PROXY-TRANSPORT-FALLBACK-DELAY",
+            "HTTP transport dial fallback delay",
+        ),
+        (
+            "response_header_timeout",
+            "PROXY-TRANSPORT-RESPONSE-TIMEOUT",
+            "HTTP transport response header timeout",
+        ),
+        (
+            "read_buffer_size",
+            "PROXY-TRANSPORT-BUFFERS",
+            "HTTP transport read buffer sizing",
+        ),
+        (
+            "write_buffer_size",
+            "PROXY-TRANSPORT-BUFFERS",
+            "HTTP transport write buffer sizing",
+        ),
+        (
+            "max_response_header_size",
+            "PROXY-TRANSPORT-BUFFERS",
+            "HTTP transport response header size limits",
+        ),
+        (
+            "local_address",
+            "PROXY-TRANSPORT-LOCAL-ADDRESS",
+            "HTTP transport local address binding",
+        ),
+        (
+            "resolver",
+            "PROXY-TRANSPORT-RESOLVER",
+            "HTTP transport custom DNS resolvers",
+        ),
+        (
+            "compression",
+            "PROXY-TRANSPORT-COMPRESSION",
+            "HTTP transport compression",
+        ),
+        (
+            "max_conns_per_host",
+            "PROXY-TRANSPORT-MAX-CONNS",
+            "HTTP transport connection limits",
+        ),
+        (
+            "proxy_protocol",
+            "PROXY-TRANSPORT-PROXY-PROTOCOL",
+            "PROXY protocol to upstreams",
+        ),
+    ];
+    for (field, tracking_id, feature) in UNSUPPORTED_TRANSPORT_OPTIONS {
+        if object.get(*field).is_some() {
+            return Err(HttpError::NotImplemented {
+                feature,
+                tracking_id,
+            });
+        }
+    }
+
+    let tls = object
+        .get("tls")
+        .map(|tls| UpstreamTls::from_json(tls, &format!("{transport_path}.tls")))
+        .transpose()?
+        .map(Arc::new);
+    Ok(tls)
+}
+
+/// A Unix-socket upstream with TLS has no dial host for SNI/verification, so it must configure
+/// either `server_name` or `insecure_skip_verify`. Fail at config load instead of at handshake
+/// time (Caddy fails the first request with "either ServerName or InsecureSkipVerify must be
+/// specified").
+fn validate_unix_tls(upstreams: &[Arc<Upstream>], tls: &UpstreamTls, path: &str) -> HttpResult<()> {
+    if tls.insecure_skip_verify() || tls.server_name().is_some() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    if upstreams.iter().any(|upstream| {
+        matches!(
+            upstream.transport(),
+            crate::upstream::Transport::Unix { .. }
+        )
+    }) {
+        return Err(invalid(
+            &format!("{path}.transport.tls"),
+            "a Unix-socket upstream with `transport.tls` requires `server_name` (or \
+             `insecure_skip_verify`) because the socket has no host name for SNI/verification",
+        ));
+    }
+    let _ = (upstreams, path);
+    Ok(())
 }
 
 /// Parse Caddy's `health_checks` object into active and passive configuration.
@@ -1344,19 +1489,390 @@ mod tests {
         assert!(error.to_string().contains("PROXY-H2-UPSTREAM"));
     }
 
+    // ---- TLS upstream tests -------------------------------------------------------------
+
+    const TLS_CERT_PEM: &str = include_str!("../testdata/tls/localhost-cert.pem");
+    const TLS_KEY_PEM: &str = include_str!("../testdata/tls/localhost-key.pem");
+    const TLS_UNRELATED_CERT_PEM: &str = include_str!("../testdata/tls/unrelated-cert.pem");
+
+    fn tls_acceptor() -> tokio_rustls::TlsAcceptor {
+        let certificates = crate::tls::parse_pem_certificates(TLS_CERT_PEM.as_bytes()).unwrap();
+        let key = crate::tls::parse_pem_private_key(TLS_KEY_PEM.as_bytes()).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(certificates, key)
+            .unwrap();
+        tokio_rustls::TlsAcceptor::from(Arc::new(config))
+    }
+
+    /// Spawn a TLS upstream over TCP; `respond` decides the response for each request.
+    async fn spawn_tls_upstream<F, Fut>(respond: F) -> String
+    where
+        F: Fn(hyper::Request<hyper::body::Incoming>) -> Fut + Clone + Send + 'static,
+        Fut: std::future::Future<Output = Result<hyper::Response<Full<Bytes>>, Infallible>>
+            + Send
+            + 'static,
+    {
+        let acceptor = tls_acceptor();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let acceptor = acceptor.clone();
+                let respond = respond.clone();
+                tokio::spawn(async move {
+                    let Ok(tls) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let service = service_fn(move |request| {
+                        let respond = respond.clone();
+                        async move { respond(request).await }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(tls), service)
+                        .await;
+                });
+            }
+        });
+        address.to_string()
+    }
+
+    async fn spawn_tls_echo_upstream(status: u16) -> String {
+        spawn_tls_upstream(
+            move |request: hyper::Request<hyper::body::Incoming>| async move {
+                let body = format!(
+                    "tls path={} host={}",
+                    request.uri().path(),
+                    request
+                        .headers()
+                        .get(http::header::HOST)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("missing")
+                );
+                Ok::<_, Infallible>(
+                    hyper::Response::builder()
+                        .status(status)
+                        .header("x-transport", "tls")
+                        .body(Full::new(Bytes::from(body)))
+                        .expect("response"),
+                )
+            },
+        )
+        .await
+    }
+
+    fn write_tls_root(directory: &tempfile::TempDir, pem: &str) -> String {
+        let path = directory.path().join("root-ca.pem");
+        std::fs::write(&path, pem).unwrap();
+        path.display().to_string()
+    }
+
+    #[tokio::test]
+    async fn proxies_over_tls_upstream_with_explicit_root() {
+        let dial = spawn_tls_echo_upstream(200).await;
+        let directory = tempfile::tempdir().unwrap();
+        let root = write_tls_root(&directory, TLS_CERT_PEM);
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": dial}],
+            "transport": {
+                "protocol": "http",
+                "tls": {"root_ca_pem_files": [root], "server_name": "localhost"}
+            }
+        }));
+        let Outcome::Respond(response) = handler
+            .handle(get_request("/tls?x=1", Some("203.0.113.7:5555")))
+            .await
+            .unwrap()
+        else {
+            panic!("expected proxied response");
+        };
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.headers["x-transport"], "tls");
+        let body = body_text(&response);
+        assert!(body.contains("tls path=/tls"), "{body}");
+        assert!(body.contains("host=example.com"), "{body}");
+        assert_eq!(response.headers[http::header::VIA], "1.1 Caddy");
+    }
+
+    #[tokio::test]
+    async fn untrusted_tls_certificate_is_rejected() {
+        let dial = spawn_tls_echo_upstream(200).await;
+        let directory = tempfile::tempdir().unwrap();
+        // Trust a different self-signed certificate, so the upstream certificate cannot chain.
+        let root = write_tls_root(&directory, TLS_UNRELATED_CERT_PEM);
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": dial}],
+            "transport": {
+                "protocol": "http",
+                "tls": {"root_ca_pem_files": [root], "server_name": "localhost"}
+            }
+        }));
+        let Outcome::Respond(response) = handler.handle(get_request("/", None)).await.unwrap()
+        else {
+            panic!("expected proxy error response");
+        };
+        assert_eq!(response.status, StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn self_signed_upstream_is_not_trusted_by_default_platform_roots() {
+        // The fixture is a self-signed certificate that no platform trust store contains. When a
+        // platform bundle exists, the default trust policy must reject it; without any loadable
+        // bundle the handler fails loudly at config time (both are acceptable loud outcomes).
+        let dial = spawn_tls_echo_upstream(200).await;
+        let handler = match ReverseProxyHandler::from_json(
+            &serde_json::json!({
+                "handler": "reverse_proxy",
+                "upstreams": [{"dial": dial}],
+                "transport": {"protocol": "http", "tls": {}}
+            }),
+            "handler",
+        ) {
+            Ok(handler) => handler,
+            Err(error) => {
+                let error = error.to_string();
+                assert!(
+                    error.contains("no TLS trust roots"),
+                    "expected either a trust failure or a loud missing-roots error: {error}"
+                );
+                return;
+            }
+        };
+        let Outcome::Respond(response) = handler.handle(get_request("/", None)).await.unwrap()
+        else {
+            panic!("expected proxy error response");
+        };
+        assert_eq!(response.status, StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn insecure_skip_verify_allows_self_signed_upstream() {
+        let dial = spawn_tls_echo_upstream(200).await;
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": dial}],
+            "transport": {
+                "protocol": "http",
+                "tls": {"insecure_skip_verify": true, "server_name": "localhost"}
+            }
+        }));
+        let Outcome::Respond(response) = handler.handle(get_request("/", None)).await.unwrap()
+        else {
+            panic!("expected proxied response");
+        };
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.headers["x-transport"], "tls");
+    }
+
+    #[tokio::test]
+    async fn insecure_skip_verify_absent_rejects_self_signed_upstream() {
+        // Root trust points at the unrelated certificate on purpose: only explicit
+        // `insecure_skip_verify: true` may bypass verification.
+        let dial = spawn_tls_echo_upstream(200).await;
+        let directory = tempfile::tempdir().unwrap();
+        let root = write_tls_root(&directory, TLS_UNRELATED_CERT_PEM);
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": dial}],
+            "transport": {
+                "protocol": "http",
+                "tls": {"root_ca_pem_files": [root], "server_name": "localhost"}
+            }
+        }));
+        let Outcome::Respond(response) = handler.handle(get_request("/", None)).await.unwrap()
+        else {
+            panic!("expected proxy error response");
+        };
+        assert_eq!(response.status, StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn health_check_over_tls_upstream() {
+        let healthy = spawn_tls_echo_upstream(200).await;
+        let directory = tempfile::tempdir().unwrap();
+        let root = write_tls_root(&directory, TLS_CERT_PEM);
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": healthy}],
+            "transport": {
+                "protocol": "http",
+                "tls": {"root_ca_pem_files": [root], "server_name": "localhost"}
+            },
+            "health_checks": {"active": {"uri": "/health"}}
+        }));
+        let check = handler.health_check().expect("active checks configured");
+        assert!(
+            check
+                .check_once(handler.client(), &handler.upstreams()[0])
+                .await,
+            "active health check should complete over TLS"
+        );
+
+        let failing = spawn_tls_echo_upstream(500).await;
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": failing}],
+            "transport": {
+                "protocol": "http",
+                "tls": {"insecure_skip_verify": true, "server_name": "localhost"}
+            },
+            "health_checks": {"active": {"uri": "/health"}}
+        }));
+        let check = handler.health_check().expect("active checks configured");
+        assert!(
+            !check
+                .check_once(handler.client(), &handler.upstreams()[0])
+                .await,
+            "failing TLS upstream must fail the probe"
+        );
+    }
+
     #[test]
-    fn rejects_tls_upstream_transport() {
+    fn unix_socket_tls_upstream_requires_server_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = write_tls_root(&directory, TLS_CERT_PEM);
         let error = ReverseProxyHandler::from_json(
             &serde_json::json!({
                 "handler": "reverse_proxy",
-                "upstreams": [{"dial": "localhost:8443"}],
-                "transport": {"protocol": "http", "tls": {}}
+                "upstreams": [{"dial": "unix//tmp/upstream.sock"}],
+                "transport": {
+                    "protocol": "http",
+                    "tls": {"root_ca_pem_files": [root]}
+                }
             }),
             "handler",
         )
         .err()
-        .expect("TLS upstream must be rejected");
-        assert!(error.to_string().contains("TLS upstreams"));
+        .expect("Unix socket TLS without server_name must fail at config load");
+        assert!(error.to_string().contains("server_name"), "{error}");
+
+        // With an explicit server name the configuration is accepted.
+        let root = write_tls_root(&directory, TLS_CERT_PEM);
+        ReverseProxyHandler::from_json(
+            &serde_json::json!({
+                "handler": "reverse_proxy",
+                "upstreams": [{"dial": "unix//tmp/upstream.sock"}],
+                "transport": {
+                    "protocol": "http",
+                    "tls": {"root_ca_pem_files": [root], "server_name": "localhost"}
+                }
+            }),
+            "handler",
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn proxies_over_tls_unix_socket_upstream() {
+        let acceptor = tls_acceptor();
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("tls-upstream.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(tls) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let service = service_fn(
+                        |request: hyper::Request<hyper::body::Incoming>| async move {
+                            let body = format!("unix-tls path={}", request.uri().path());
+                            Ok::<_, Infallible>(
+                                hyper::Response::builder()
+                                    .status(200)
+                                    .header("x-transport", "unix-tls")
+                                    .body(Full::new(Bytes::from(body)))
+                                    .expect("response"),
+                            )
+                        },
+                    );
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(tls), service)
+                        .await;
+                });
+            }
+        });
+
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = write_tls_root(&root_dir, TLS_CERT_PEM);
+        let dial = format!("unix/{}", socket.display());
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": dial}],
+            "transport": {
+                "protocol": "http",
+                "tls": {"root_ca_pem_files": [root], "server_name": "localhost"}
+            }
+        }));
+        let Outcome::Respond(response) = handler
+            .handle(get_request("/over-unix-tls", Some("203.0.113.7:5555")))
+            .await
+            .unwrap()
+        else {
+            panic!("expected proxied response");
+        };
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.headers["x-transport"], "unix-tls");
+        assert!(body_text(&response).contains("unix-tls path=/over-unix-tls"));
+    }
+
+    #[test]
+    fn h1_only_transport_versions_are_accepted_with_tls() {
+        ReverseProxyHandler::from_json(
+            &serde_json::json!({
+                "handler": "reverse_proxy",
+                "upstreams": [{"dial": "localhost:8443"}],
+                "transport": {
+                    "protocol": "http",
+                    "versions": ["1.1"],
+                    "tls": {"insecure_skip_verify": true}
+                }
+            }),
+            "handler",
+        )
+        .unwrap();
+        let error = ReverseProxyHandler::from_json(
+            &serde_json::json!({
+                "handler": "reverse_proxy",
+                "upstreams": [{"dial": "localhost:8443"}],
+                "transport": {"protocol": "http", "versions": ["2"], "tls": {}}
+            }),
+            "handler",
+        )
+        .err()
+        .expect("h2 upstream transport must stay unsupported");
+        assert!(error.to_string().contains("PROXY-H2-UPSTREAM"), "{error}");
+    }
+
+    #[test]
+    fn unsupported_transport_options_fail_loudly() {
+        let error = ReverseProxyHandler::from_json(
+            &serde_json::json!({
+                "handler": "reverse_proxy",
+                "upstreams": [{"dial": "localhost:8443"}],
+                "transport": {"protocol": "http", "keep_alive": {"enabled": false}}
+            }),
+            "handler",
+        )
+        .err()
+        .expect("unsupported transport option must fail");
+        assert!(
+            error.to_string().contains("PROXY-TRANSPORT-KEEPALIVE"),
+            "{error}"
+        );
     }
 
     #[test]

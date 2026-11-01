@@ -119,16 +119,19 @@ name = "caddy-rs-proxy"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "bytes",
  "caddy-rs-http",
  "http",
  "http-body-util",
  "hyper",
  "hyper-util",
+ "rustls",
  "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "tower-service",
 ]
 

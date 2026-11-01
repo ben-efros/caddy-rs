@@ -9,15 +9,22 @@ repository.workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+base64 = "0.22.1"
 bytes = { workspace = true }
 caddy-rs-http = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
+rustls = { version = "0.23.45", default-features = false, features = [
+    "std", "ring", "tls12", "logging",
+] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-rustls = { version = "0.26.6", default-features = false, features = [
+    "ring", "tls12", "logging",
+] }
 tower-service = "0.3.3"
 
 [dev-dependencies]
