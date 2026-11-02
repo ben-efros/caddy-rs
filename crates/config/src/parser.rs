@@ -28,6 +28,7 @@
 //! named route fails loudly in the adapter.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
 use crate::lexer::{lex, LexError, Position, Token, TokenKind};
 
@@ -133,6 +134,16 @@ impl SiteAddress {
             _ => self.effective_port(http_port, https_port) != http_port,
         }
     }
+}
+
+/// Make a path absolute without requiring it to exist (Caddy's `FastAbs`).
+fn absolute_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(path))
+        .unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// One directive (or matcher definition, `@name`).
@@ -278,9 +289,15 @@ where
 
 /// Parse a Caddyfile.
 pub fn parse(input: &str) -> Result<Caddyfile, ParseError> {
+    parse_with_source(input, None)
+}
+
+/// Parse a Caddyfile whose source path is known, so `import <file>`/`import <glob>` resolve
+/// relative to the Caddyfile's directory (Caddy's adapter filename option).
+pub fn parse_with_source(input: &str, source: Option<&Path>) -> Result<Caddyfile, ParseError> {
     let expansion = expand_env_vars(input);
     let tokens = lex(&expansion.source)?;
-    let parser = Parser::new(tokens);
+    let parser = Parser::new(tokens, source.map(Path::to_path_buf));
     let mut file = parser.parse_file()?;
     let mut warnings = expansion.warnings;
     warnings.append(&mut file.options.warnings);
@@ -393,30 +410,24 @@ impl ImportGraph {
     }
 }
 
-/// Node name for the token currently being parsed, given the snippet it came from.
-fn import_node_name(snippet: Option<&str>) -> String {
-    match snippet {
-        Some(name) => format!("Caddyfile:{name}"),
-        None => "Caddyfile".to_string(),
-    }
-}
-
 struct Parser {
     tokens: Vec<Token>,
     /// Snippet context of each token (the snippet definition the token came from, if any). Kept
     /// aligned with `tokens` across splices; used only for import-cycle diagnostics.
     contexts: Vec<Option<String>>,
     cursor: usize,
-    snippets: BTreeMap<String, Vec<Token>>,
+    snippets: BTreeMap<String, (Vec<Token>, String)>,
     named_routes: Vec<NamedRoute>,
     import_graph: ImportGraph,
     warnings: Vec<String>,
     /// Number of braced blocks currently being parsed, including the site/global-options block.
     depth: usize,
+    /// Path of the Caddyfile being parsed, used to resolve file/glob imports.
+    source: Option<PathBuf>,
 }
 
 impl Parser {
-    fn new(tokens: Vec<Token>) -> Self {
+    fn new(tokens: Vec<Token>, source: Option<PathBuf>) -> Self {
         let contexts = vec![None; tokens.len()];
         Self {
             tokens,
@@ -427,6 +438,15 @@ impl Parser {
             import_graph: ImportGraph::default(),
             warnings: Vec::new(),
             depth: 0,
+            source,
+        }
+    }
+
+    /// Import-graph node name for the top-level Caddyfile.
+    fn root_node(&self) -> String {
+        match &self.source {
+            Some(source) => absolute_path(source).display().to_string(),
+            None => "Caddyfile".to_string(),
         }
     }
 
@@ -645,7 +665,13 @@ impl Parser {
                 format!("redeclaration of previously declared snippet {name}"),
             ));
         }
-        self.snippets.insert(name.to_string(), tokens);
+        let node = self
+            .contexts
+            .get(self.cursor)
+            .and_then(|context| context.clone())
+            .unwrap_or_else(|| self.root_node());
+        self.snippets
+            .insert(name.to_string(), (tokens, format!("{node}:{name}")));
         Ok(())
     }
 
@@ -811,7 +837,6 @@ impl Parser {
     fn expand_import(&mut self) -> Result<(), ParseError> {
         let import_index = self.cursor;
         let import_position = self.tokens[import_index].position;
-        let import_context = self.current_context();
         self.cursor += 1;
 
         // The import target and any replacement arguments must be on the directive's line.
@@ -848,40 +873,185 @@ impl Parser {
         let mapping = build_block_mapping(&block_tokens, import_position)?;
         let block_tokens = trim_newlines(block_tokens);
 
-        let Some(imported) = self.snippets.get(&pattern).cloned() else {
-            return Err(ParseError::syntax(
-                import_position,
-                format!(
-                    "File to import not found: {pattern}; file and glob imports are not supported \
-                     by this build yet, only snippets defined in this Caddyfile can be imported"
-                ),
-            ));
-        };
+        let parent_context = self.current_context();
+        let parent_node = parent_context.clone().unwrap_or_else(|| self.root_node());
 
-        // Cycle detection, matching Caddy's import graph and diagnostic.
-        let from = import_node_name(import_context.as_deref());
-        let to = format!("Caddyfile:{pattern}");
-        self.import_graph.add_node(&from);
-        self.import_graph.add_node(&to);
-        if let Err(message) = self.import_graph.add_edge(&from, &to) {
-            return Err(ParseError::syntax(import_position, message));
+        // Snippets are a simple, non-recursive replacement.
+        if let Some((imported, snippet_node)) = self.snippets.get(&pattern).cloned() {
+            self.import_graph.add_node(&parent_node);
+            self.import_graph.add_node(&snippet_node);
+            if let Err(message) = self.import_graph.add_edge(&parent_node, &snippet_node) {
+                return Err(ParseError::syntax(import_position, message));
+            }
+
+            let (tokens, contexts) = self.substitute_import(
+                &imported,
+                &args,
+                &block_tokens,
+                &mapping,
+                parent_context.as_deref(),
+                &snippet_node,
+            );
+            self.splice(import_index, end, tokens, contexts);
+            self.cursor = import_index;
+            return Ok(());
         }
 
-        let (tokens, contexts) = self.substitute_import(
-            &imported,
-            &args,
-            &block_tokens,
-            &mapping,
-            import_context.as_deref(),
-            &pattern,
-        );
-        self.splice(import_index, end, tokens, contexts);
+        // Otherwise this is a file or glob import, resolved relative to the Caddyfile.
+        let files = self.resolve_import_files(&pattern, import_position)?;
+        let mut imported_tokens = Vec::new();
+        let mut imported_contexts = Vec::new();
+        for file in &files {
+            let node = absolute_path(file).display().to_string();
+            self.import_graph.add_node(&parent_node);
+            self.import_graph.add_node(&node);
+            if let Err(message) = self.import_graph.add_edge(&parent_node, &node) {
+                return Err(ParseError::syntax(import_position, message));
+            }
+            if file.is_dir() {
+                return Err(ParseError::syntax(
+                    import_position,
+                    format!("Could not import {}: is a directory", file.display()),
+                ));
+            }
+            let bytes = std::fs::read(file).map_err(|error| {
+                ParseError::syntax(
+                    import_position,
+                    format!("Could not import {}: {error}", file.display()),
+                )
+            })?;
+            let text = String::from_utf8(bytes).map_err(|_| {
+                ParseError::syntax(
+                    import_position,
+                    format!(
+                        "Could not read tokens while importing {}: not valid UTF-8",
+                        file.display()
+                    ),
+                )
+            })?;
+            if text.trim().is_empty() {
+                self.warnings
+                    .push(format!("Import file is empty: {}", file.display()));
+                continue;
+            }
+            let expanded = expand_env_vars(&text);
+            self.warnings.extend(expanded.warnings);
+            let tokens = lex(&expanded.source).map_err(|error| {
+                ParseError::syntax(
+                    import_position,
+                    format!(
+                        "Could not read tokens while importing {}: {}",
+                        file.display(),
+                        error.message
+                    ),
+                )
+            })?;
+            let (tokens, contexts) = self.substitute_import(
+                &tokens,
+                &args,
+                &block_tokens,
+                &mapping,
+                parent_context.as_deref(),
+                &node,
+            );
+            imported_tokens.extend(tokens);
+            imported_contexts.extend(contexts);
+        }
+        self.splice(import_index, end, imported_tokens, imported_contexts);
         self.cursor = import_index;
         Ok(())
     }
 
-    /// Apply argument/block substitution to imported snippet tokens and tag them with their
-    /// snippet context for import-cycle diagnostics.
+    /// Resolve `import <file>`/`<glob>` to existing files relative to the Caddyfile.
+    fn resolve_import_files(
+        &mut self,
+        pattern: &str,
+        position: Position,
+    ) -> Result<Vec<PathBuf>, ParseError> {
+        let raw = Path::new(pattern);
+        let resolved = if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            match &self.source {
+                Some(source) => absolute_path(source)
+                    .parent()
+                    .map(|parent| parent.join(raw))
+                    .unwrap_or_else(|| raw.to_path_buf()),
+                None => raw.to_path_buf(),
+            }
+        };
+        let has_glob = pattern.contains('*')
+            || pattern.contains('?')
+            || (pattern.contains('[') && pattern.contains(']'));
+        if !has_glob {
+            if resolved.is_file() {
+                return Ok(vec![resolved]);
+            }
+            if resolved.is_dir() {
+                return Err(ParseError::syntax(
+                    position,
+                    format!("Could not import {pattern}: is a directory"),
+                ));
+            }
+            return Err(ParseError::syntax(
+                position,
+                format!(
+                    "File to import not found: {pattern} (this requires the Caddyfile's source \
+                     directory for file/glob imports; adapting stdin has no source path)"
+                ),
+            ));
+        }
+
+        let resolved_text = resolved.display().to_string();
+        if resolved_text.matches('*').count() > 1
+            || resolved_text.matches('?').count() > 1
+            || (resolved_text.contains('[') && resolved_text.contains(']'))
+        {
+            return Err(ParseError::syntax(
+                position,
+                format!(
+                    "Glob pattern may only contain one wildcard (*), but has others: {resolved_text}"
+                ),
+            ));
+        }
+        let parent = resolved.parent().unwrap_or_else(|| Path::new("."));
+        let file_pattern = resolved
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let skip_dotfiles = file_pattern.starts_with('*');
+        let mut matches = Vec::new();
+        let entries = std::fs::read_dir(parent).map_err(|error| {
+            ParseError::syntax(
+                position,
+                format!("Failed to use import pattern {pattern}: {error}"),
+            )
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                ParseError::syntax(
+                    position,
+                    format!("Failed to use import pattern {pattern}: {error}"),
+                )
+            })?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if skip_dotfiles && name.starts_with('.') {
+                continue;
+            }
+            if glob_match(&name, &file_pattern) {
+                matches.push(entry.path());
+            }
+        }
+        matches.sort();
+        if matches.is_empty() {
+            self.warnings
+                .push(format!("No files matching import glob pattern: {pattern}"));
+        }
+        Ok(matches)
+    }
+
+    /// Apply argument/block substitution to imported tokens and tag them with the import-graph
+    /// node they belong to.
     fn substitute_import(
         &mut self,
         imported: &[Token],
@@ -889,17 +1059,15 @@ impl Parser {
         block_tokens: &[Token],
         mapping: &BTreeMap<String, Vec<Token>>,
         import_context: Option<&str>,
-        snippet_name: &str,
+        node: &str,
     ) -> (Vec<Token>, Vec<Option<String>>) {
-        let snippet_context = Some(snippet_name.to_string());
+        let snippet_context = Some(node.to_string());
         let imported_context = import_context.map(str::to_string);
         let mut out_tokens: Vec<Token> = Vec::new();
         let mut out_contexts: Vec<Option<String>> = Vec::new();
         let mut index = 0;
         while index < imported.len() {
             let token = &imported[index];
-            // Snippet definitions inside imported content are copied verbatim so their bodies are
-            // not argument-replaced (Caddy's `maybeSnippet` logic).
             if at_line_start(&out_tokens)
                 && is_snippet_name(&token.text)
                 && matches!(
@@ -972,6 +1140,22 @@ impl Parser {
         }
         (out_tokens, out_contexts)
     }
+}
+
+/// Simple single-wildcard glob matching used for file imports (`*` matches any run, `?` one
+/// character).
+fn glob_match(name: &str, pattern: &str) -> bool {
+    fn matches(name: &[u8], pattern: &[u8]) -> bool {
+        match pattern.first() {
+            None => name.is_empty(),
+            Some(b'*') => {
+                matches(name, &pattern[1..]) || (!name.is_empty() && matches(&name[1..], pattern))
+            }
+            Some(b'?') => !name.is_empty() && matches(&name[1..], &pattern[1..]),
+            Some(expected) => name.first() == Some(expected) && matches(&name[1..], &pattern[1..]),
+        }
+    }
+    matches(name.as_bytes(), pattern.as_bytes())
 }
 
 fn at_line_start(tokens: &[Token]) -> bool {
@@ -1784,16 +1968,86 @@ mod tests {
     }
 
     #[test]
-    fn file_imports_are_rejected_loudly() {
+    fn file_imports_without_a_source_path_stay_loud() {
         let error = parse(":80 {\n import ./snippets/common.caddy\n}\n").expect_err("file import");
         assert!(
-            error.to_string().contains("not supported by this build"),
+            error.to_string().contains("File to import not found"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn file_imports_resolve_relative_to_the_source_path() {
+        let directory = std::env::temp_dir().join(format!(
+            "caddy-rs-import-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(directory.join("parts")).expect("create temp dir");
+        std::fs::write(
+            directory.join("parts/respond.conf"),
+            "respond \"from {args[0]}\"\n",
+        )
+        .expect("write import file");
+        std::fs::create_dir_all(directory.join("parts/glob")).expect("create glob dir");
+        std::fs::write(directory.join("parts/glob/one.conf"), "header X-One one\n")
+            .expect("write import file");
+        std::fs::write(directory.join("parts/glob/two.conf"), "header X-Two two\n")
+            .expect("write import file");
+        let caddyfile = ":80 {\n import parts/respond.conf hello\n import parts/glob/*.conf\n}\n";
+        let file = parse_with_source(caddyfile, Some(&directory.join("Caddyfile")))
+            .expect("file and glob imports parse");
+        let names: Vec<&str> = file.sites[0]
+            .directives
+            .iter()
+            .map(|directive| directive.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["respond", "header", "header"]);
+        assert_eq!(file.sites[0].directives[0].args, vec!["from hello"]);
+        std::fs::remove_dir_all(&directory).expect("clean temp dir");
+    }
+
+    #[test]
+    fn missing_file_import_is_located() {
+        let error = parse_with_source(
+            ":80 {\n import nope.conf\n}\n",
+            Some(Path::new("/tmp/Caddyfile")),
+        )
+        .expect_err("missing import file");
         assert!(
-            error.to_string().contains("./snippets/common.caddy"),
+            error
+                .to_string()
+                .contains("File to import not found: nope.conf"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn file_import_cycles_are_rejected() {
+        let directory = std::env::temp_dir().join(format!(
+            "caddy-rs-import-cycle-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).expect("create temp dir");
+        std::fs::write(directory.join("a.conf"), "import b.conf\n").expect("write a");
+        std::fs::write(directory.join("b.conf"), "import a.conf\n").expect("write b");
+        let error = parse_with_source(
+            "import a.conf\n:80 {\n respond ok\n}\n",
+            Some(&directory.join("Caddyfile")),
+        )
+        .expect_err("cycle");
+        assert!(
+            error.to_string().contains("a cycle of imports exists"),
+            "{error}"
+        );
+        std::fs::remove_dir_all(&directory).expect("clean temp dir");
     }
 
     #[test]

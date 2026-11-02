@@ -117,3 +117,29 @@ fn adapt_surfaces_unsupported_directive_as_error() {
     assert!(stderr.contains("some_unknown_directive"), "{stderr}");
     assert!(stderr.contains("docs/compatibility"), "{stderr}");
 }
+
+#[test]
+fn adapt_resolves_file_imports_relative_to_the_config_path() {
+    let directory = tempfile::tempdir().unwrap();
+    let snippets = directory.path().join("snippets");
+    std::fs::create_dir_all(&snippets).unwrap();
+    std::fs::write(snippets.join("respond.conf"), "respond \"imported\"\n").unwrap();
+    let config = directory.path().join("Caddyfile");
+    std::fs::write(&config, ":80 {\n\timport snippets/respond.conf\n}\n").unwrap();
+    // Run from a different working directory to prove imports are relative to the config path.
+    let output = Command::new(binary())
+        .args(["adapt", "--config", config.to_str().unwrap()])
+        .current_dir(std::env::temp_dir())
+        .output()
+        .expect("run caddy-rs");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("adapted JSON");
+    assert_eq!(
+        value["apps"]["http"]["servers"]["srv0"]["routes"][0]["handle"][0]["body"],
+        "imported"
+    );
+}

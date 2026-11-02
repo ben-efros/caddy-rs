@@ -2,9 +2,9 @@
 //!
 //! The golden cases are upstream Caddy v2.11.7 fixtures from
 //! `caddytest/integration/caddyfile_adapt/`, so the expected JSON is what Caddy itself emits.
-//! Fixtures that encode adapter features which are still unsupported (file imports, `log`,
-//! `invoke` JSON emission, Caddy's header-name canonicalisation) are covered at the parser level in
-//! `crates/config/src/parser.rs` or asserted to fail loudly here.
+//! File/glob imports and named-route/`invoke` JSON are emitted by the adapter; fixtures that use
+//! unsupported directives (`log`, TLS client auth, ...) are covered at the parser level or
+//! asserted to fail loudly here.
 
 use caddy_rs_config::{adapt, parse};
 use serde_json::Value;
@@ -180,20 +180,43 @@ fn import_cycle_error_through_adapt() {
 }
 
 #[test]
-fn file_imports_fail_loudly_through_adapt() {
+fn file_imports_without_a_source_path_fail_loudly() {
     let error = adapt_error(":80 {\n import /etc/caddy/snippets.caddy\n}\n");
     assert!(
         error.contains("File to import not found: /etc/caddy/snippets.caddy"),
         "{error}"
     );
-    assert!(error.contains("not supported by this build"), "{error}");
+}
+
+#[test]
+fn file_imports_resolve_through_the_adapter_source_path() {
+    let directory = std::env::temp_dir().join(format!(
+        "caddy-rs-adapter-import-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&directory).expect("create temp dir");
+    std::fs::write(
+        directory.join("respond.conf"),
+        "respond \"imported {args[0]}\"\n",
+    )
+    .expect("write import file");
+    let caddyfile = ":80 {\n import respond.conf hi\n}\n";
+    let adapted = caddy_rs_config::adapt_with_source(caddyfile, Some(&directory.join("Caddyfile")))
+        .expect("adapts with source path");
+    assert_eq!(
+        adapted.config["apps"]["http"]["servers"]["srv0"]["routes"][0]["handle"][0]["body"],
+        Value::String("imported hi".to_string())
+    );
+    std::fs::remove_dir_all(&directory).expect("clean temp dir");
 }
 
 #[test]
 fn named_routes_do_not_leak_into_the_adapted_config() {
-    // The parser records named routes; the adapter does not emit them. A Caddyfile that defines
-    // named routes but never invokes them produces the same config Caddy would (named routes are
-    // only attached to servers that invoke them), and invoking one fails loudly (tested above).
+    // Named routes are only attached to servers that invoke them, exactly like Caddy.
     let file = parse("&(unused) {\n respond nope\n}\n:80 {\n respond ok\n}\n").expect("parses");
     assert_eq!(file.named_routes.len(), 1);
     assert_eq!(file.named_routes[0].name, "unused");
