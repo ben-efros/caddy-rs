@@ -4,7 +4,11 @@
 //!
 //! * `http://host:port/...` is dialed over TCP by hyper-util's [`HttpConnector`].
 //! * `https://host:port/...` is dialed over TCP and wrapped in TLS (when the handler configures
-//!   `transport.tls`); the server name comes from [`crate::tls::UpstreamTls`].
+//!   `transport.tls`); the server name comes from [`crate::tls::UpstreamTls`]. ALPN selects
+//!   HTTP/2 or HTTP/1.1 (see [`UpstreamConnector::with_transport`]).
+//! * Cleartext upstreams configured with `transport.versions: ["h2c", ...]` use HTTP/2 prior
+//!   knowledge on the plain TCP/Unix connection (`h2c`): the connector reports an
+//!   already-negotiated HTTP/2 connection so hyper's legacy client speaks h2 without an upgrade.
 //! * `unix://<hex-encoded-socket-path>/...` is dialed over a Unix domain socket. The socket path
 //!   is carried in the URI authority (hex-encoded, because an authority cannot contain `/`) so
 //!   that hyper's connection pool keys each socket separately and the connector itself stays
@@ -35,27 +39,40 @@ pub type ClientBody = Full<Bytes>;
 /// The outbound client type.
 pub type HttpClient = Client<UpstreamConnector, ClientBody>;
 
-/// Connector supporting TCP, Unix-socket, and TLS upstreams.
+/// Connector supporting TCP, Unix-socket, TLS, HTTP/2-ALPN and cleartext-h2c upstreams.
 #[derive(Clone, Debug)]
 pub struct UpstreamConnector {
     tcp: HttpConnector,
     tls: Option<Arc<UpstreamTls>>,
+    /// Speak HTTP/2 with prior knowledge (no upgrade) on cleartext connections (`h2c`).
+    h2c: bool,
 }
 
 impl UpstreamConnector {
-    /// Create a plaintext-only connector with tokio-backed TCP dialing.
+    /// Create a plaintext-only HTTP/1.1 connector with tokio-backed TCP dialing.
     pub fn new() -> Self {
         Self {
             tcp: tcp_connector(),
             tls: None,
+            h2c: false,
         }
     }
 
     /// Create a connector that enables TLS for `https://`/`unixs://` URIs.
     pub fn with_tls(tls: Option<Arc<UpstreamTls>>) -> Self {
+        Self::with_transport(tls, false)
+    }
+
+    /// Create a connector for a configured `transport`.
+    ///
+    /// * `tls` — client configuration for `https://`/`unixs://` URIs; ALPN protocols are taken
+    ///   from the [`UpstreamTls`] value itself.
+    /// * `h2c` — use HTTP/2 prior knowledge on cleartext `http://`/`unix://` connections.
+    pub fn with_transport(tls: Option<Arc<UpstreamTls>>, h2c: bool) -> Self {
         Self {
             tcp: tcp_connector(),
             tls,
+            h2c,
         }
     }
 }
@@ -87,6 +104,7 @@ impl Service<Uri> for UpstreamConnector {
     fn call(&mut self, uri: Uri) -> Self::Future {
         let mut tcp = self.tcp.clone();
         let tls = self.tls.clone();
+        let h2c = self.h2c;
         Box::pin(async move {
             match uri.scheme_str() {
                 Some("unix") => {
@@ -94,7 +112,7 @@ impl Service<Uri> for UpstreamConnector {
                     {
                         let path = unix_socket_path(&uri)?;
                         let stream = tokio::net::UnixStream::connect(&path).await?;
-                        Ok(TokioIo::new(UpstreamStream::Unix(stream)))
+                        Ok(TokioIo::new(UpstreamStream::plain(stream, h2c)))
                     }
                     #[cfg(not(unix))]
                     {
@@ -115,7 +133,7 @@ impl Service<Uri> for UpstreamConnector {
                         })?;
                         let stream = tokio::net::UnixStream::connect(&path).await?;
                         let stream = connect_tls(&tls, server_name, stream).await?;
-                        Ok(TokioIo::new(UpstreamStream::UnixTls(Box::new(stream))))
+                        Ok(TokioIo::new(UpstreamStream::tls(stream)))
                     }
                     #[cfg(not(unix))]
                     {
@@ -133,11 +151,11 @@ impl Service<Uri> for UpstreamConnector {
                         .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
                     let stream = tcp.call(uri).await.map_err(io::Error::other)?.into_inner();
                     let stream = connect_tls(&tls, server_name, stream).await?;
-                    Ok(TokioIo::new(UpstreamStream::Tls(Box::new(stream))))
+                    Ok(TokioIo::new(UpstreamStream::tls(stream)))
                 }
                 _ => {
                     let stream = tcp.call(uri).await.map_err(io::Error::other)?.into_inner();
-                    Ok(TokioIo::new(UpstreamStream::Tcp(stream)))
+                    Ok(TokioIo::new(UpstreamStream::plain(stream, h2c)))
                 }
             }
         })
@@ -187,32 +205,131 @@ where
     }
 }
 
-/// Either transport hyper may drive for an upstream connection.
+/// Transport hyper may drive for an upstream connection.
+///
+/// The connection reports HTTP/2 as already negotiated when ALPN selected `h2` (TLS) or when the
+/// transport is configured for h2c prior knowledge. hyper-util's legacy client then speaks HTTP/2
+/// on this connection instead of HTTP/1.1.
 #[derive(Debug)]
-pub enum UpstreamStream {
-    /// TCP connection to a `host:port` upstream.
+pub struct UpstreamStream {
+    io: StreamIo,
+    /// Cleartext HTTP/2 prior knowledge (h2c): no ALPN to inspect.
+    prior_knowledge_h2: bool,
+}
+
+#[derive(Debug)]
+enum StreamIo {
     Tcp(tokio::net::TcpStream),
-    /// Unix domain socket connection.
     #[cfg(unix)]
     Unix(tokio::net::UnixStream),
-    /// TLS connection over TCP.
     Tls(Box<TlsStream<tokio::net::TcpStream>>),
-    /// TLS connection over a Unix domain socket.
     #[cfg(unix)]
     UnixTls(Box<TlsStream<tokio::net::UnixStream>>),
 }
 
+impl UpstreamStream {
+    fn plain<S>(stream: S, prior_knowledge_h2: bool) -> Self
+    where
+        S: Into<PlainIo>,
+    {
+        Self {
+            io: stream.into().into(),
+            prior_knowledge_h2,
+        }
+    }
+
+    fn tls<S>(stream: TlsStream<S>) -> Self
+    where
+        TlsStream<S>: Into<TlsIo>,
+    {
+        Self {
+            io: stream.into().into(),
+            prior_knowledge_h2: false,
+        }
+    }
+
+    /// Whether HTTP/2 was negotiated (ALPN `h2` or h2c prior knowledge).
+    fn is_http2(&self) -> bool {
+        if self.prior_knowledge_h2 {
+            return true;
+        }
+        match &self.io {
+            StreamIo::Tls(stream) => stream.get_ref().1.alpn_protocol() == Some(b"h2"),
+            #[cfg(unix)]
+            StreamIo::UnixTls(stream) => stream.get_ref().1.alpn_protocol() == Some(b"h2"),
+            StreamIo::Tcp(_) => false,
+            #[cfg(unix)]
+            StreamIo::Unix(_) => false,
+        }
+    }
+}
+
+/// Helper so [`UpstreamStream::plain`] works for TCP and Unix streams.
+enum PlainIo {
+    Tcp(tokio::net::TcpStream),
+    #[cfg(unix)]
+    Unix(tokio::net::UnixStream),
+}
+
+impl From<tokio::net::TcpStream> for PlainIo {
+    fn from(stream: tokio::net::TcpStream) -> Self {
+        Self::Tcp(stream)
+    }
+}
+
+#[cfg(unix)]
+impl From<tokio::net::UnixStream> for PlainIo {
+    fn from(stream: tokio::net::UnixStream) -> Self {
+        Self::Unix(stream)
+    }
+}
+
+impl From<PlainIo> for StreamIo {
+    fn from(io: PlainIo) -> Self {
+        match io {
+            PlainIo::Tcp(stream) => Self::Tcp(stream),
+            #[cfg(unix)]
+            PlainIo::Unix(stream) => Self::Unix(stream),
+        }
+    }
+}
+
+/// Helper so [`UpstreamStream::tls`] works for TCP and Unix TLS streams.
+enum TlsIo {
+    Tcp(Box<TlsStream<tokio::net::TcpStream>>),
+    #[cfg(unix)]
+    Unix(Box<TlsStream<tokio::net::UnixStream>>),
+}
+
+impl From<TlsStream<tokio::net::TcpStream>> for TlsIo {
+    fn from(stream: TlsStream<tokio::net::TcpStream>) -> Self {
+        Self::Tcp(Box::new(stream))
+    }
+}
+
+#[cfg(unix)]
+impl From<TlsStream<tokio::net::UnixStream>> for TlsIo {
+    fn from(stream: TlsStream<tokio::net::UnixStream>) -> Self {
+        Self::Unix(Box::new(stream))
+    }
+}
+
+impl From<TlsIo> for StreamIo {
+    fn from(io: TlsIo) -> Self {
+        match io {
+            TlsIo::Tcp(stream) => Self::Tls(stream),
+            #[cfg(unix)]
+            TlsIo::Unix(stream) => Self::UnixTls(stream),
+        }
+    }
+}
+
 impl Connection for UpstreamStream {
     fn connected(&self) -> Connected {
-        match self {
-            UpstreamStream::Tcp(stream) => stream.connected(),
-            #[cfg(unix)]
-            UpstreamStream::Unix(stream) => stream.connected(),
-            // TLS connections are HTTP/1.1-only (ALPN advertises only http/1.1), so the default
-            // empty connection metadata is correct.
-            UpstreamStream::Tls(_) => Connected::new(),
-            #[cfg(unix)]
-            UpstreamStream::UnixTls(_) => Connected::new(),
+        if self.is_http2() {
+            Connected::new().negotiated_h2()
+        } else {
+            Connected::new()
         }
     }
 }
@@ -223,13 +340,13 @@ impl tokio::io::AsyncRead for UpstreamStream {
         cx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            UpstreamStream::Tcp(stream) => Pin::new(stream).poll_read(cx, buf),
+        match &mut self.get_mut().io {
+            StreamIo::Tcp(stream) => Pin::new(stream).poll_read(cx, buf),
             #[cfg(unix)]
-            UpstreamStream::Unix(stream) => Pin::new(stream).poll_read(cx, buf),
-            UpstreamStream::Tls(stream) => Pin::new(stream.as_mut()).poll_read(cx, buf),
+            StreamIo::Unix(stream) => Pin::new(stream).poll_read(cx, buf),
+            StreamIo::Tls(stream) => Pin::new(stream.as_mut()).poll_read(cx, buf),
             #[cfg(unix)]
-            UpstreamStream::UnixTls(stream) => Pin::new(stream.as_mut()).poll_read(cx, buf),
+            StreamIo::UnixTls(stream) => Pin::new(stream.as_mut()).poll_read(cx, buf),
         }
     }
 }
@@ -240,47 +357,55 @@ impl tokio::io::AsyncWrite for UpstreamStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        match self.get_mut() {
-            UpstreamStream::Tcp(stream) => Pin::new(stream).poll_write(cx, buf),
+        match &mut self.get_mut().io {
+            StreamIo::Tcp(stream) => Pin::new(stream).poll_write(cx, buf),
             #[cfg(unix)]
-            UpstreamStream::Unix(stream) => Pin::new(stream).poll_write(cx, buf),
-            UpstreamStream::Tls(stream) => Pin::new(stream.as_mut()).poll_write(cx, buf),
+            StreamIo::Unix(stream) => Pin::new(stream).poll_write(cx, buf),
+            StreamIo::Tls(stream) => Pin::new(stream.as_mut()).poll_write(cx, buf),
             #[cfg(unix)]
-            UpstreamStream::UnixTls(stream) => Pin::new(stream.as_mut()).poll_write(cx, buf),
+            StreamIo::UnixTls(stream) => Pin::new(stream.as_mut()).poll_write(cx, buf),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            UpstreamStream::Tcp(stream) => Pin::new(stream).poll_flush(cx),
+        match &mut self.get_mut().io {
+            StreamIo::Tcp(stream) => Pin::new(stream).poll_flush(cx),
             #[cfg(unix)]
-            UpstreamStream::Unix(stream) => Pin::new(stream).poll_flush(cx),
-            UpstreamStream::Tls(stream) => Pin::new(stream.as_mut()).poll_flush(cx),
+            StreamIo::Unix(stream) => Pin::new(stream).poll_flush(cx),
+            StreamIo::Tls(stream) => Pin::new(stream.as_mut()).poll_flush(cx),
             #[cfg(unix)]
-            UpstreamStream::UnixTls(stream) => Pin::new(stream.as_mut()).poll_flush(cx),
+            StreamIo::UnixTls(stream) => Pin::new(stream.as_mut()).poll_flush(cx),
         }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            UpstreamStream::Tcp(stream) => Pin::new(stream).poll_shutdown(cx),
+        match &mut self.get_mut().io {
+            StreamIo::Tcp(stream) => Pin::new(stream).poll_shutdown(cx),
             #[cfg(unix)]
-            UpstreamStream::Unix(stream) => Pin::new(stream).poll_shutdown(cx),
-            UpstreamStream::Tls(stream) => Pin::new(stream.as_mut()).poll_shutdown(cx),
+            StreamIo::Unix(stream) => Pin::new(stream).poll_shutdown(cx),
+            StreamIo::Tls(stream) => Pin::new(stream.as_mut()).poll_shutdown(cx),
             #[cfg(unix)]
-            UpstreamStream::UnixTls(stream) => Pin::new(stream.as_mut()).poll_shutdown(cx),
+            StreamIo::UnixTls(stream) => Pin::new(stream.as_mut()).poll_shutdown(cx),
         }
     }
 }
 
-/// Build the plaintext client used by the reverse proxy and active health checks.
+/// Build the plaintext HTTP/1.1 client used by tests and health checks.
 pub fn build_client() -> HttpClient {
     build_client_with_tls(None)
 }
 
 /// Build the outbound client, enabling TLS when `transport.tls` is configured.
 pub fn build_client_with_tls(tls: Option<Arc<UpstreamTls>>) -> HttpClient {
-    Client::builder(TokioExecutor::new()).build(UpstreamConnector::with_tls(tls))
+    build_client_with_transport(tls, false)
+}
+
+/// Build the outbound client for a configured `transport` (TLS and/or h2c).
+///
+/// The connector's ALPN/HTTP/2 decision is per connection, so the same client serves all
+/// upstreams and active health checks of the handler.
+pub fn build_client_with_transport(tls: Option<Arc<UpstreamTls>>, h2c: bool) -> HttpClient {
+    Client::builder(TokioExecutor::new()).build(UpstreamConnector::with_transport(tls, h2c))
 }
 
 #[cfg(test)]
@@ -291,7 +416,8 @@ mod tests {
 
     #[test]
     fn uri_scheme_selects_transport() {
-        // The connector is stateless; only the URI scheme decides between TCP, Unix and TLS.
+        // The connector is stateless; the URI scheme decides TCP/Unix/TLS, and ALPN/h2c decides
+        // HTTP/1.1 vs HTTP/2.
         let unix = Uri::from_static("unix://2f72756e2f6170702e736f636b/health");
         assert_eq!(unix.scheme_str(), Some("unix"));
         let unix_tls = Uri::from_static("unixs://2f72756e2f6170702e736f636b/health");
