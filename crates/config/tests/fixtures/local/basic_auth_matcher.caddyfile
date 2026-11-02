@@ -1,0 +1,5 @@
+:8084 {
+	basic_auth /private/* {
+		dave $2a$14$abcdefghijklmnopqrstuv
+	}
+}

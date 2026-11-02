@@ -1,0 +1,42 @@
+{
+  "apps": {
+    "http": {
+      "servers": {
+        "srv0": {
+          "listen": [
+            ":8084"
+          ],
+          "routes": [
+            {
+              "handle": [
+                {
+                  "handler": "authentication",
+                  "providers": {
+                    "http_basic": {
+                      "accounts": [
+                        {
+                          "password": "$2a$14$abcdefghijklmnopqrstuv",
+                          "username": "dave"
+                        }
+                      ],
+                      "hash": {
+                        "algorithm": "bcrypt"
+                      }
+                    }
+                  }
+                }
+              ],
+              "match": [
+                {
+                  "path": [
+                    "/private/*"
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

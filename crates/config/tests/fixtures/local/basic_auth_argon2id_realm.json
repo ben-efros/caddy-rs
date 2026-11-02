@@ -1,0 +1,36 @@
+{
+  "apps": {
+    "http": {
+      "servers": {
+        "srv0": {
+          "listen": [
+            ":8083"
+          ],
+          "routes": [
+            {
+              "handle": [
+                {
+                  "handler": "authentication",
+                  "providers": {
+                    "http_basic": {
+                      "accounts": [
+                        {
+                          "password": "$argon2id$v=19$m=65536,t=3,p=2$c29tZXNhbHQ$cmVzdWx0",
+                          "username": "carol"
+                        }
+                      ],
+                      "hash": {
+                        "algorithm": "argon2id"
+                      },
+                      "realm": "Auth realm"
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

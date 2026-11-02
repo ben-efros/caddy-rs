@@ -1,0 +1,6 @@
+:8082 {
+	basic_auth {
+		alice $2a$14$abcdefghijklmnopqrstuv
+		bob $2b$14$zyxwvutsrqponmlkjihgfe
+	}
+}

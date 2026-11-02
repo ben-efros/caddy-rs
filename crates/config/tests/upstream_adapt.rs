@@ -329,3 +329,40 @@ fn tls_inside_a_route_block_is_rejected_loudly() {
         "unexpected error: {message}"
     );
 }
+
+#[test]
+fn forward_auth_authelia_matches_caddy() {
+    // `forward_auth` adapts to Caddy's canonical reverse_proxy expansion: rewrite to the auth
+    // service, forward the original method/URI, and copy response headers on 2xx.
+    assert_adapts_like_caddy("forward_auth_authelia.caddyfiletest");
+}
+
+#[test]
+fn forward_auth_copy_headers_matches_caddy() {
+    assert_adapts_like_caddy("forward_auth_copy_headers_strip.caddyfiletest");
+    assert_adapts_like_caddy("forward_auth_rename_headers.caddyfiletest");
+}
+
+#[test]
+fn forward_auth_duplicate_uri_is_rejected_like_caddy() {
+    let error = adapt(
+        "localhost:9080 {\n\tforward_auth :9091 {\n\t\turi /first\n\t\turi /second\n\t\tcopy_headers Remote-User\n\t}\n\n\trespond \"ok\" 200\n}\n",
+    )
+    .expect_err("duplicate forward_auth uri must be rejected");
+    let message = error.to_string();
+    assert!(
+        message.contains("cannot re-declare uri: /second"),
+        "unexpected error: {message}"
+    );
+}
+
+#[test]
+fn basic_auth_rejects_unknown_hash_algorithm_loudly() {
+    let error = adapt(":8085 {\n\tbasic_auth sha256 {\n\t\talice hash\n\t}\n}\n")
+        .expect_err("unknown hash algorithm must be rejected");
+    let message = error.to_string();
+    assert!(
+        message.contains("unrecognized hash algorithm: sha256"),
+        "unexpected error: {message}"
+    );
+}
