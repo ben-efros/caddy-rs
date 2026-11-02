@@ -57,12 +57,30 @@ pub struct UpstreamTls {
     handshake_timeout: Option<Duration>,
 }
 
+/// ALPN protocol identifier for HTTP/1.1.
+const ALPN_HTTP11: &[u8] = b"http/1.1";
+/// ALPN protocol identifier for HTTP/2 (RFC 7540).
+const ALPN_H2: &[u8] = b"h2";
+
 impl UpstreamTls {
     /// Parse a `transport.tls` object and build the rustls client configuration.
     ///
     /// Loading roots happens here so a missing/unreadable trust store fails at config load time
     /// (located error) rather than on the first proxied request.
     pub fn from_json(value: &Value, path: &str) -> HttpResult<Self> {
+        Self::from_json_with_alpn(value, path, &[ALPN_HTTP11])
+    }
+
+    /// Parse `transport.tls` and advertise the given ALPN protocols.
+    ///
+    /// The handler derives these from `transport.versions`: Caddy/Go offer `["h2","http/1.1"]`
+    /// when HTTP/2 is enabled for TLS upstreams (HTTP/1.1 remains a fallback), and
+    /// `["http/1.1"]` when only HTTP/1.1 is configured.
+    pub fn from_json_with_alpn(
+        value: &Value,
+        path: &str,
+        alpn_protocols: &[&[u8]],
+    ) -> HttpResult<Self> {
         let object = value
             .as_object()
             .ok_or_else(|| invalid(path, "`transport.tls` must be an object"))?;
@@ -129,8 +147,10 @@ impl UpstreamTls {
             };
             builder.with_root_certificates(roots).with_no_client_auth()
         };
-        // HTTP/1.1-only client, so that is the only protocol worth advertising.
-        client_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        client_config.alpn_protocols = alpn_protocols
+            .iter()
+            .map(|protocol| protocol.to_vec())
+            .collect();
 
         Ok(Self {
             client_config: Arc::new(client_config),
@@ -158,6 +178,39 @@ impl UpstreamTls {
     /// The explicitly configured `server_name`, if any.
     pub fn server_name(&self) -> Option<&str> {
         self.server_name.as_deref()
+    }
+
+    /// ALPN protocols this client offers.
+    pub fn alpn_protocols(&self) -> &[Vec<u8>] {
+        &self.client_config.alpn_protocols
+    }
+
+    /// A clone that offers HTTP/2 and HTTP/1.1 via ALPN (Caddy's TLS-upstream HTTP/2 default).
+    pub fn with_http2_alpn(&self) -> Self {
+        self.with_alpn(&[ALPN_H2, ALPN_HTTP11])
+    }
+
+    /// A clone that offers HTTP/1.1 only.
+    ///
+    /// Used for protocol-upgrade (WebSocket) requests when the main transport prefers HTTP/2:
+    /// Caddy disables ALPN h2 for upgradable connections because HTTP/1.1 upgrades cannot be
+    /// carried over HTTP/2.
+    pub fn h1_only(&self) -> Self {
+        self.with_alpn(&[ALPN_HTTP11])
+    }
+
+    fn with_alpn(&self, alpn_protocols: &[&[u8]]) -> Self {
+        let mut client_config = (*self.client_config).clone();
+        client_config.alpn_protocols = alpn_protocols
+            .iter()
+            .map(|protocol| protocol.to_vec())
+            .collect();
+        Self {
+            client_config: Arc::new(client_config),
+            server_name: self.server_name.clone(),
+            insecure_skip_verify: self.insecure_skip_verify,
+            handshake_timeout: self.handshake_timeout,
+        }
     }
 
     /// The server name (SNI + verification name) for a connection whose URI host is `uri_host`.

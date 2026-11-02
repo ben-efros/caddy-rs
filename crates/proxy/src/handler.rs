@@ -31,7 +31,7 @@ use caddy_rs_http::{
 };
 
 use crate::balancer::{self, Balancer};
-use crate::client::{build_client_with_tls, HttpClient};
+use crate::client::{build_client_with_transport, HttpClient};
 use crate::forward_auth::{HandleResponse, HandleResponseResult, RequestRewrite};
 use crate::health::{HealthCheck, HealthCheckScheduler};
 use crate::passive::PassiveHealth;
@@ -209,6 +209,10 @@ impl IpNet {
 /// Reverse proxy handler configuration and runtime.
 pub struct ReverseProxyHandler {
     client: HttpClient,
+    /// HTTP/1.1-only companion client used for protocol-upgrade (WebSocket) requests when the
+    /// configured upstream transport prefers HTTP/2 (ALPN h2 or h2c). HTTP/1.1 upgrades cannot be
+    /// carried over HTTP/2, and Caddy likewise disables ALPN h2 for upgradable connections.
+    upgrade_client: Option<HttpClient>,
     upstreams: Vec<Arc<Upstream>>,
     balancer: Box<dyn Balancer>,
     request_header_ops: HeaderOps,
@@ -236,10 +240,11 @@ impl ReverseProxyHandler {
         // ignoring them could skip security-relevant behaviour (see T-PROXY-037).
         audit_unsupported_handler_fields(object, path)?;
 
-        // `transport.tls` enables TLS for every upstream of the handler (Caddy's transport is
-        // per-handler, not per-upstream). The client configuration is built here so trust-store
-        // failures surface as located config errors instead of per-request transport errors.
-        let tls = parse_transport(object.get("transport"), path)?;
+        // `transport` applies to every upstream of the handler (Caddy's transport is per-handler,
+        // not per-upstream). TLS trust and HTTP version configuration are built here so invalid
+        // configuration surfaces as located errors instead of per-request transport failures.
+        let transport = parse_transport(object.get("transport"), path)?;
+        let tls = transport.tls.clone();
 
         let upstreams_value = object
             .get("upstreams")
@@ -304,6 +309,8 @@ impl ReverseProxyHandler {
             &format!("{path}.load_balancing.retry_match"),
         )?;
 
+        let (client, upgrade_client) = build_transport_clients(&transport);
+
         let header_config = parse_headers(object.get("headers"), path)?;
 
         let rewrite = RequestRewrite::from_json(object.get("rewrite"), &format!("{path}.rewrite"))?;
@@ -322,7 +329,8 @@ impl ReverseProxyHandler {
         )?;
 
         Ok(Self {
-            client: build_client_with_tls(tls),
+            client,
+            upgrade_client,
             upstreams,
             balancer,
             request_header_ops: header_config.request,
@@ -421,7 +429,7 @@ impl ReverseProxyHandler {
         *outbound.headers_mut() = headers;
 
         let started = std::time::Instant::now();
-        let mut response = self.client.request(outbound).await?;
+        let mut response = self.upstream_client(request).request(outbound).await?;
         let latency = started.elapsed();
         let status = response.status();
         let version = response.version();
@@ -497,6 +505,20 @@ impl ReverseProxyHandler {
             headers: forwarded.headers,
             body,
         })
+    }
+
+    /// The client used for this request.
+    ///
+    /// Protocol-upgrade (WebSocket) requests go through the HTTP/1.1-only companion client when
+    /// the main upstream transport prefers HTTP/2: HTTP/1.1 upgrades cannot be expressed over
+    /// HTTP/2, and Caddy likewise disables ALPN h2 for upgradable connections.
+    fn upstream_client(&self, request: &Request) -> &HttpClient {
+        match &self.upgrade_client {
+            Some(upgrade) if caddy_rs_http::requested_upgrade_type(&request.headers).is_some() => {
+                upgrade
+            }
+            _ => &self.client,
+        }
     }
 
     /// Build the headers sent to the upstream, following Caddy's `prepareRequest`.
@@ -1233,9 +1255,45 @@ fn parse_headers(value: Option<&Value>, path: &str) -> HttpResult<HeaderConfig> 
 ///
 /// TLS is enabled by the mere presence of the `tls` object, even `{}` (Caddy semantics). Options
 /// this build cannot honour fail loudly instead of silently changing transport behaviour.
-fn parse_transport(value: Option<&Value>, path: &str) -> HttpResult<Option<Arc<UpstreamTls>>> {
+/// Parsed `transport` section for Caddy's HTTP upstream transport.
+#[derive(Debug, Clone, Default)]
+struct TransportConfig {
+    /// TLS client configuration when `transport.tls` is present.
+    tls: Option<Arc<UpstreamTls>>,
+    /// Cleartext HTTP/2 with prior knowledge (Caddy `versions` containing `h2c`, no TLS).
+    h2c: bool,
+    /// TLS ALPN offers HTTP/2 (Caddy `versions` containing `2` or `h2c`).
+    alpn_h2: bool,
+}
+
+/// Build the main client and, when the transport prefers HTTP/2, the h1-only companion used for
+/// protocol upgrades.
+fn build_transport_clients(transport: &TransportConfig) -> (HttpClient, Option<HttpClient>) {
+    let client = build_client_with_transport(transport.tls.clone(), transport.h2c);
+    let upgrade_client = if transport.alpn_h2 || transport.h2c {
+        let h1_tls = transport.tls.as_ref().map(|tls| Arc::new(tls.h1_only()));
+        Some(build_client_with_transport(h1_tls, false))
+    } else {
+        None
+    };
+    (client, upgrade_client)
+}
+
+/// Parse `transport` (Caddy's `http` transport) into TLS and HTTP-version configuration.
+///
+/// HTTP version semantics (matching Caddy v2.11.7 / Go's `http.Transport`):
+///
+/// * `versions` defaults to Caddy's `["1.1", "2"]`.
+/// * Allowed values are `1.1`, `2`, `h2c`, `3`; anything else is a located error and `3` is a
+///   loud `NotImplemented` (HTTP/3 upstreams).
+/// * TLS upstreams: HTTP/2 is offered via ALPN (`["h2","http/1.1"]`) when `2` or `h2c` is listed,
+///   because Go's transport always keeps the HTTP/1.1 fallback. With neither listed, only
+///   `http/1.1` is offered.
+/// * Cleartext upstreams: `2` alone does not enable HTTP/2 (Go's plaintext transport stays
+///   HTTP/1.1); `h2c` opts into HTTP/2 prior knowledge.
+fn parse_transport(value: Option<&Value>, path: &str) -> HttpResult<TransportConfig> {
     let Some(value) = value else {
-        return Ok(None);
+        return Ok(TransportConfig::default());
     };
     let transport_path = format!("{path}.transport");
     let object = value
@@ -1251,25 +1309,45 @@ fn parse_transport(value: Option<&Value>, path: &str) -> HttpResult<Option<Arc<U
         }
     }
 
-    if let Some(versions) = object.get("versions") {
-        let versions = versions.as_array().ok_or_else(|| {
-            invalid(
-                &format!("{transport_path}.versions"),
-                "`versions` must be an array of strings",
-            )
-        })?;
-        for version in versions {
-            let Some(version) = version.as_str() else {
+    // Caddy defaults `versions` to ["1.1", "2"] when unset.
+    let versions: Vec<String> = match object.get("versions") {
+        None | Some(Value::Null) => vec!["1.1".to_string(), "2".to_string()],
+        Some(versions) => {
+            let versions = versions.as_array().ok_or_else(|| {
+                invalid(
+                    &format!("{transport_path}.versions"),
+                    "`versions` must be an array of strings",
+                )
+            })?;
+            versions
+                .iter()
+                .map(|version| {
+                    version.as_str().map(str::to_string).ok_or_else(|| {
+                        invalid(
+                            &format!("{transport_path}.versions"),
+                            "`versions` entries must be strings",
+                        )
+                    })
+                })
+                .collect::<HttpResult<Vec<_>>>()?
+        }
+    };
+    for version in &versions {
+        match version.as_str() {
+            "1.1" | "2" | "h2c" => {}
+            "3" => {
+                return Err(HttpError::NotImplemented {
+                    feature: "HTTP/3 upstream transports",
+                    tracking_id: "PROXY-H3-UPSTREAM",
+                })
+            }
+            other => {
                 return Err(invalid(
                     &format!("{transport_path}.versions"),
-                    "`versions` entries must be strings",
-                ));
-            };
-            if !matches!(version, "1" | "1.1") {
-                return Err(HttpError::NotImplemented {
-                    feature: "HTTP/2 upstream transports (h2c/h2)",
-                    tracking_id: "PROXY-H2-UPSTREAM",
-                });
+                    format!(
+                        "unsupported HTTP version: {other}, supported versions: 1.1, 2, h2c, 3"
+                    ),
+                ))
             }
         }
     }
@@ -1346,12 +1424,31 @@ fn parse_transport(value: Option<&Value>, path: &str) -> HttpResult<Option<Arc<U
         }
     }
 
-    let tls = object
-        .get("tls")
-        .map(|tls| UpstreamTls::from_json(tls, &format!("{transport_path}.tls")))
-        .transpose()?
-        .map(Arc::new);
-    Ok(tls)
+    let tls_present = object.get("tls").is_some();
+    let tls = match object.get("tls") {
+        Some(tls) => {
+            let alpn_h2 = versions
+                .iter()
+                .any(|version| version == "2" || version == "h2c");
+            let alpn: &[&[u8]] = if alpn_h2 {
+                &[b"h2", b"http/1.1"]
+            } else {
+                &[b"http/1.1"]
+            };
+            Some(Arc::new(UpstreamTls::from_json_with_alpn(
+                tls,
+                &format!("{transport_path}.tls"),
+                alpn,
+            )?))
+        }
+        None => None,
+    };
+    let alpn_h2 = tls_present
+        && versions
+            .iter()
+            .any(|version| version == "2" || version == "h2c");
+    let h2c = !tls_present && versions.iter().any(|version| version == "h2c");
+    Ok(TransportConfig { tls, h2c, alpn_h2 })
 }
 
 /// A Unix-socket upstream with TLS has no dial host for SNI/verification, so it must configure
@@ -1934,18 +2031,76 @@ mod tests {
     }
 
     #[test]
-    fn rejects_http2_upstream_transport() {
+    fn accepts_h2_and_h2c_transport_versions() {
+        // Caddy's H2C transport output: cleartext HTTP/2 prior knowledge.
+        build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": "localhost:8080"}],
+            "transport": {"protocol": "http", "versions": ["h2c", "2"]}
+        }));
+        // TLS upstream with HTTP/2 via ALPN.
+        build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": "localhost:8443"}],
+            "transport": {
+                "protocol": "http",
+                "versions": ["2"],
+                "tls": {"insecure_skip_verify": true}
+            }
+        }));
+        // Default versions (absent) match Caddy's ["1.1","2"].
+        build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": "localhost:8443"}],
+            "transport": {"protocol": "http", "tls": {"insecure_skip_verify": true}}
+        }));
+    }
+
+    #[test]
+    fn rejects_unsupported_http_versions() {
         let error = ReverseProxyHandler::from_json(
             &serde_json::json!({
                 "handler": "reverse_proxy",
                 "upstreams": [{"dial": "localhost:8080"}],
-                "transport": {"protocol": "http", "versions": ["h2c", "2"]}
+                "transport": {"protocol": "http", "versions": ["1.0"]}
             }),
             "handler",
         )
         .err()
-        .expect("h2c upstream transport must be rejected");
-        assert!(error.to_string().contains("PROXY-H2-UPSTREAM"));
+        .expect("unknown HTTP version must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("unsupported HTTP version: 1.0"),
+            "{message}"
+        );
+        assert!(
+            message.contains("supported versions: 1.1, 2, h2c, 3"),
+            "{message}"
+        );
+
+        let error = ReverseProxyHandler::from_json(
+            &serde_json::json!({
+                "handler": "reverse_proxy",
+                "upstreams": [{"dial": "localhost:8080"}],
+                "transport": {"protocol": "http", "versions": ["3"]}
+            }),
+            "handler",
+        )
+        .err()
+        .expect("HTTP/3 upstream transport must fail loudly");
+        assert!(error.to_string().contains("PROXY-H3-UPSTREAM"), "{error}");
+
+        let error = ReverseProxyHandler::from_json(
+            &serde_json::json!({
+                "handler": "reverse_proxy",
+                "upstreams": [{"dial": "localhost:8080"}],
+                "transport": {"protocol": "http", "versions": [2]}
+            }),
+            "handler",
+        )
+        .err()
+        .expect("non-string versions must be rejected");
+        assert!(error.to_string().contains("must be strings"), "{error}");
     }
 
     // ---- TLS upstream tests -------------------------------------------------------------
@@ -2303,7 +2458,8 @@ mod tests {
             "handler",
         )
         .unwrap();
-        let error = ReverseProxyHandler::from_json(
+        // HTTP/2 versions are accepted; ALPN h2 negotiation is covered by the h2 tests.
+        ReverseProxyHandler::from_json(
             &serde_json::json!({
                 "handler": "reverse_proxy",
                 "upstreams": [{"dial": "localhost:8443"}],
@@ -2311,9 +2467,7 @@ mod tests {
             }),
             "handler",
         )
-        .err()
-        .expect("h2 upstream transport must stay unsupported");
-        assert!(error.to_string().contains("PROXY-H2-UPSTREAM"), "{error}");
+        .unwrap();
     }
 
     #[test]
@@ -3592,5 +3746,503 @@ mod upgrade_tests {
         // Dropping the tunnel closes the upstream connection; the raw upstream echoes until EOF and
         // then returns, which is the observable close propagation for this test.
         drop(tunnel);
+    }
+}
+
+#[cfg(test)]
+mod h2_tests {
+    //! HTTP/2 / h2c upstream transport tests: ALPN negotiation, h1 fallback, prior knowledge,
+    //! streaming, health checks and the h1-only companion used for protocol upgrades.
+
+    use super::*;
+    use bytes::Bytes;
+    use caddy_rs_http::body::{BodyError, StreamingBody};
+    use http::{Method, StatusCode, Version};
+    use http_body_util::BodyExt;
+    use hyper::service::service_fn;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto;
+    use std::convert::Infallible;
+    use std::sync::{Arc, Mutex};
+    use tokio_rustls::TlsAcceptor;
+
+    const CERT: &str = include_str!("../testdata/tls/localhost-cert.pem");
+    const KEY: &str = include_str!("../testdata/tls/localhost-key.pem");
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Seen {
+        Http1,
+        Http2,
+    }
+
+    type SeenList = Arc<Mutex<Vec<Seen>>>;
+
+    fn tls_acceptor(alpn: Vec<Vec<u8>>) -> TlsAcceptor {
+        let certificates = crate::tls::parse_pem_certificates(CERT.as_bytes()).unwrap();
+        let key = crate::tls::parse_pem_private_key(KEY.as_bytes()).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(certificates, key)
+            .unwrap();
+        config.alpn_protocols = alpn;
+        TlsAcceptor::from(Arc::new(config))
+    }
+
+    fn record_version(request: &hyper::Request<hyper::body::Incoming>, seen: &SeenList) -> Seen {
+        let version = if request.version() == Version::HTTP_2 {
+            Seen::Http2
+        } else {
+            Seen::Http1
+        };
+        seen.lock().unwrap().push(version);
+        version
+    }
+
+    fn version_response(
+        request: &hyper::Request<hyper::body::Incoming>,
+        seen: &SeenList,
+    ) -> hyper::Response<Full<Bytes>> {
+        let _ = record_version(request, seen);
+        let body = format!(
+            "version={:?} path={} authority={} host={}",
+            request.version(),
+            request.uri().path(),
+            request
+                .uri()
+                .authority()
+                .map(|authority| authority.as_str())
+                .unwrap_or("missing"),
+            request
+                .headers()
+                .get(http::header::HOST)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("missing"),
+        );
+        hyper::Response::builder()
+            .status(200)
+            .header("x-server-version", format!("{:?}", request.version()))
+            .body(Full::new(Bytes::from(body)))
+            .unwrap()
+    }
+
+    /// TLS upstream that serves h1 or h2 depending on the negotiated ALPN protocol and records
+    /// every request's HTTP version.
+    async fn spawn_tls_versioned_upstream(alpn: Vec<Vec<u8>>, seen: SeenList) -> String {
+        let acceptor = tls_acceptor(alpn);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let acceptor = acceptor.clone();
+                let seen = Arc::clone(&seen);
+                tokio::spawn(async move {
+                    let Ok(tls) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let service = service_fn(move |request| {
+                        let seen = Arc::clone(&seen);
+                        async move { Ok::<_, Infallible>(version_response(&request, &seen)) }
+                    });
+                    let _ = auto::Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(tls), service)
+                        .await;
+                });
+            }
+        });
+        address.to_string()
+    }
+
+    /// Cleartext upstream that auto-detects HTTP/1.1 vs HTTP/2 prior-knowledge connections.
+    async fn spawn_plain_versioned_upstream(seen: SeenList) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let seen = Arc::clone(&seen);
+                tokio::spawn(async move {
+                    let service = service_fn(move |request| {
+                        let seen = Arc::clone(&seen);
+                        async move { Ok::<_, Infallible>(version_response(&request, &seen)) }
+                    });
+                    let _ = auto::Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        address.to_string()
+    }
+
+    /// Cleartext upstream over a Unix socket (auto-detects h1/h2 prior knowledge).
+    #[cfg(unix)]
+    async fn spawn_unix_versioned_upstream(socket: std::path::PathBuf, seen: SeenList) -> () {
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let seen = Arc::clone(&seen);
+                tokio::spawn(async move {
+                    let service = service_fn(move |request| {
+                        let seen = Arc::clone(&seen);
+                        async move { Ok::<_, Infallible>(version_response(&request, &seen)) }
+                    });
+                    let _ = auto::Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+    }
+
+    /// TLS HTTP/2 upstream with a channel-fed streaming body (for streaming tests).
+    async fn spawn_tls_h2_channel_upstream() -> (
+        String,
+        tokio::sync::mpsc::Sender<std::result::Result<Bytes, BodyError>>,
+    ) {
+        let acceptor = tls_acceptor(vec![b"h2".to_vec()]);
+        let (sender, receiver) = tokio::sync::mpsc::channel(8);
+        let receiver = Arc::new(Mutex::new(Some(receiver)));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(tls) = acceptor.accept(stream).await else {
+                return;
+            };
+            let service = service_fn(move |_request| {
+                let receiver = Arc::clone(&receiver);
+                async move {
+                    let receiver = receiver
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take()
+                        .expect("one streaming request per test upstream");
+                    Ok::<_, Infallible>(
+                        hyper::Response::builder()
+                            .status(200)
+                            .header("content-type", "text/event-stream")
+                            .body(StreamingBody::from_chunks(receiver))
+                            .expect("streaming response"),
+                    )
+                }
+            });
+            let _ = auto::Builder::new(TokioExecutor::new())
+                .serve_connection(TokioIo::new(tls), service)
+                .await;
+        });
+        (address.to_string(), sender)
+    }
+
+    fn write_root(directory: &tempfile::TempDir) -> String {
+        let path = directory.path().join("root-ca.pem");
+        std::fs::write(&path, CERT).unwrap();
+        path.display().to_string()
+    }
+
+    fn build(value: Value) -> ReverseProxyHandler {
+        ReverseProxyHandler::from_json(&value, "handler").expect("handler builds")
+    }
+
+    fn tls_handler(
+        dial: &str,
+        root: &str,
+        versions: Option<&[&str]>,
+        health_check: bool,
+    ) -> ReverseProxyHandler {
+        let mut transport = serde_json::json!({
+            "protocol": "http",
+            "tls": {"root_ca_pem_files": [root], "server_name": "localhost"}
+        });
+        if let Some(versions) = versions {
+            transport["versions"] = serde_json::json!(versions);
+        }
+        let mut config = serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": dial}],
+            "transport": transport
+        });
+        if health_check {
+            config["health_checks"] = serde_json::json!({"active": {"uri": "/health"}});
+        }
+        build(config)
+    }
+
+    fn plain_handler(dial: &str, versions: &[&str]) -> ReverseProxyHandler {
+        build(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": dial}],
+            "transport": {"protocol": "http", "versions": versions}
+        }))
+    }
+
+    fn get(path: &str) -> Request {
+        let mut request = Request::new(Method::GET, path.parse().unwrap());
+        request.remote_addr = Some("203.0.113.7:5555".parse().unwrap());
+        request
+            .headers
+            .insert(http::header::HOST, "example.com".parse().unwrap());
+        request
+    }
+
+    fn body_string(response: &Response) -> String {
+        String::from_utf8(response.body.to_vec()).unwrap()
+    }
+
+    async fn respond(handler: &ReverseProxyHandler, path: &str) -> Response {
+        let Outcome::Respond(response) = handler.handle(get(path)).await.unwrap() else {
+            panic!("expected proxied response");
+        };
+        response
+    }
+
+    #[tokio::test]
+    async fn tls_h2_upstream_selected_via_alpn() {
+        let seen: SeenList = Arc::new(Mutex::new(Vec::new()));
+        let dial = spawn_tls_versioned_upstream(vec![b"h2".to_vec()], Arc::clone(&seen)).await;
+        let directory = tempfile::tempdir().unwrap();
+        let root = write_root(&directory);
+        let handler = tls_handler(&dial, &root, Some(&["2"]), false);
+
+        let response = respond(&handler, "/over-h2").await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert!(body_string(&response).contains("version=HTTP/2.0"));
+        assert_eq!(response.headers["x-server-version"], "HTTP/2.0");
+        assert_eq!(*seen.lock().unwrap(), vec![Seen::Http2]);
+        assert_eq!(response.headers[http::header::VIA], "2.0 Caddy");
+    }
+
+    #[tokio::test]
+    async fn tls_mixed_versions_fall_back_to_http1() {
+        // The client offers h2+http/1.1; this upstream only speaks http/1.1.
+        let seen: SeenList = Arc::new(Mutex::new(Vec::new()));
+        let dial =
+            spawn_tls_versioned_upstream(vec![b"http/1.1".to_vec()], Arc::clone(&seen)).await;
+        let directory = tempfile::tempdir().unwrap();
+        let root = write_root(&directory);
+        let handler = tls_handler(&dial, &root, Some(&["1.1", "2"]), false);
+
+        let response = respond(&handler, "/fallback").await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert!(body_string(&response).contains("version=HTTP/1.1"));
+        assert_eq!(*seen.lock().unwrap(), vec![Seen::Http1]);
+        assert_eq!(response.headers[http::header::VIA], "1.1 Caddy");
+    }
+
+    #[tokio::test]
+    async fn tls_default_versions_negotiate_h2() {
+        // Caddy's default versions are ["1.1","2"] even when the field is absent; TLS ALPN
+        // therefore offers h2 first and the server selects it.
+        let seen: SeenList = Arc::new(Mutex::new(Vec::new()));
+        let dial = spawn_tls_versioned_upstream(
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            Arc::clone(&seen),
+        )
+        .await;
+        let directory = tempfile::tempdir().unwrap();
+        let root = write_root(&directory);
+        let handler = tls_handler(&dial, &root, None, false);
+
+        let response = respond(&handler, "/defaults").await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(*seen.lock().unwrap(), vec![Seen::Http2]);
+    }
+
+    #[tokio::test]
+    async fn h2c_prior_knowledge_upstream() {
+        let seen: SeenList = Arc::new(Mutex::new(Vec::new()));
+        let dial = spawn_plain_versioned_upstream(Arc::clone(&seen)).await;
+        let handler = plain_handler(&dial, &["h2c"]);
+
+        let response = respond(&handler, "/cleartext-h2").await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert!(body_string(&response).contains("version=HTTP/2.0"));
+        assert_eq!(*seen.lock().unwrap(), vec![Seen::Http2]);
+    }
+
+    #[tokio::test]
+    async fn h2c_pair_versions_from_caddy_h2c_transport() {
+        // Caddy's `http.transport.h2c` transport enables versions ["h2c","2"].
+        let seen: SeenList = Arc::new(Mutex::new(Vec::new()));
+        let dial = spawn_plain_versioned_upstream(Arc::clone(&seen)).await;
+        let handler = plain_handler(&dial, &["h2c", "2"]);
+
+        let response = respond(&handler, "/cleartext-h2-pair").await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(*seen.lock().unwrap(), vec![Seen::Http2]);
+    }
+
+    #[tokio::test]
+    async fn plaintext_version_two_without_h2c_stays_http1() {
+        // Go's plaintext transport is HTTP/1.1 even when "2" is listed; h2c requires "h2c".
+        let seen: SeenList = Arc::new(Mutex::new(Vec::new()));
+        let dial = spawn_plain_versioned_upstream(Arc::clone(&seen)).await;
+        let handler = plain_handler(&dial, &["2"]);
+
+        let response = respond(&handler, "/plain-h1").await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(*seen.lock().unwrap(), vec![Seen::Http1]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn h2c_prior_knowledge_over_unix_socket() {
+        let seen: SeenList = Arc::new(Mutex::new(Vec::new()));
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("h2c.sock");
+        spawn_unix_versioned_upstream(socket.clone(), Arc::clone(&seen)).await;
+        let dial = format!("unix/{}", socket.display());
+        let handler = plain_handler(&dial, &["h2c"]);
+
+        let response = respond(&handler, "/unix-h2c").await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert!(body_string(&response).contains("version=HTTP/2.0"));
+        assert_eq!(*seen.lock().unwrap(), vec![Seen::Http2]);
+    }
+
+    #[tokio::test]
+    async fn h2_authority_is_the_upstream_dial_and_host_header_is_forwarded() {
+        // Documented divergence: Caddy forwards the original Host as the HTTP/2 `:authority`
+        // pseudo-header (Go's transport derives it from req.Host). caddy-rs builds the outbound
+        // URI from the upstream dial address, so `:authority` is the dial while the original Host
+        // header is still forwarded as a regular header field.
+        let seen: SeenList = Arc::new(Mutex::new(Vec::new()));
+        let dial = spawn_tls_versioned_upstream(vec![b"h2".to_vec()], Arc::clone(&seen)).await;
+        let directory = tempfile::tempdir().unwrap();
+        let root = write_root(&directory);
+        let handler = tls_handler(&dial, &root, Some(&["2"]), false);
+
+        let response = respond(&handler, "/authority").await;
+        let body = body_string(&response);
+        assert!(body.contains("version=HTTP/2.0"), "{body}");
+        assert!(body.contains(&format!("authority={dial}")), "{body}");
+        assert!(body.contains("host=example.com"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn streaming_response_over_h2() {
+        let (dial, sender) = spawn_tls_h2_channel_upstream().await;
+        let directory = tempfile::tempdir().unwrap();
+        let root = write_root(&directory);
+        let handler = tls_handler(&dial, &root, Some(&["2"]), false);
+
+        let outcome = handler.handle_streaming(get("/h2-stream")).await.unwrap();
+        let StreamingOutcome::Respond(response) = outcome else {
+            panic!("expected a proxied response");
+        };
+        assert_eq!(response.status, StatusCode::OK);
+        assert!(response.is_streaming(), "response body must stream over h2");
+        let mut body = match response.body {
+            Body::Stream(stream) => stream,
+            Body::Bytes(_) => panic!("expected a streaming body"),
+        };
+
+        sender
+            .send(Ok(Bytes::from_static(b"data: first\n\n")))
+            .await
+            .unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(2), body.frame())
+            .await
+            .expect("first frame timeout")
+            .expect("first frame")
+            .expect("data");
+        assert_eq!(
+            first.into_data().unwrap(),
+            Bytes::from_static(b"data: first\n\n")
+        );
+        assert!(!sender.is_closed(), "h2 stream must not be buffered");
+
+        sender
+            .send(Ok(Bytes::from_static(b"data: second\n\n")))
+            .await
+            .unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(2), body.frame())
+            .await
+            .expect("second frame timeout")
+            .expect("second frame")
+            .expect("data");
+        assert_eq!(
+            second.into_data().unwrap(),
+            Bytes::from_static(b"data: second\n\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn health_check_over_h2_upstream() {
+        let seen: SeenList = Arc::new(Mutex::new(Vec::new()));
+        let dial = spawn_tls_versioned_upstream(vec![b"h2".to_vec()], Arc::clone(&seen)).await;
+        let directory = tempfile::tempdir().unwrap();
+        let root = write_root(&directory);
+        let handler = tls_handler(&dial, &root, Some(&["2"]), true);
+
+        let check = handler
+            .health_check()
+            .expect("active health check configured");
+        assert!(
+            check
+                .check_once(handler.client(), &handler.upstreams()[0])
+                .await,
+            "health check should succeed over HTTP/2"
+        );
+        assert_eq!(*seen.lock().unwrap(), vec![Seen::Http2]);
+    }
+
+    #[tokio::test]
+    async fn upgrade_requests_use_h1_companion_when_http2_enabled() {
+        // Server supports both; the main client negotiates h2, but an upgrade request must use
+        // HTTP/1.1 (protocol upgrades cannot be carried over HTTP/2).
+        let seen: SeenList = Arc::new(Mutex::new(Vec::new()));
+        let dial = spawn_tls_versioned_upstream(
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            Arc::clone(&seen),
+        )
+        .await;
+        let directory = tempfile::tempdir().unwrap();
+        let root = write_root(&directory);
+        let handler = tls_handler(&dial, &root, Some(&["2"]), false);
+
+        // Normal request: h2.
+        assert_eq!(respond(&handler, "/normal").await.status, StatusCode::OK);
+
+        // Upgrade request: server sees an HTTP/1.1 connection because the companion client
+        // advertises only http/1.1. The server answers 200 (no real upgrade), which the proxy
+        // passes through.
+        let mut upgrade = get("/upgrade");
+        upgrade
+            .headers
+            .insert(http::header::CONNECTION, "Upgrade".parse().unwrap());
+        upgrade
+            .headers
+            .insert(http::header::UPGRADE, "websocket".parse().unwrap());
+        upgrade.headers.insert(
+            "sec-websocket-key",
+            "dGhlIHNhbXBsZSBub25jZQ==".parse().unwrap(),
+        );
+        upgrade
+            .headers
+            .insert("sec-websocket-version", "13".parse().unwrap());
+        let Outcome::Respond(response) = handler.handle(upgrade).await.unwrap() else {
+            panic!("expected proxied response");
+        };
+        assert_eq!(response.status, StatusCode::OK);
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![Seen::Http2, Seen::Http1],
+            "upgrade request must use the h1-only companion client"
+        );
     }
 }
