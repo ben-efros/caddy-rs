@@ -19,8 +19,9 @@
 //!   or the effective HTTPS port) plus `apps.tls.certificates.automate`, minus
 //!   `automatic_https.skip`/`skip_certs`; servers with `automatic_https.disable` are manual.
 //! * **policies**: `apps.tls.automation.policies` in order, matched by subject (empty subjects =
-//!   catch-all, `*` wildcards supported). The first `acme` issuer in a policy becomes an
-//!   [`crate::issuer::AcmeIssuerConfig`]; `internal` issuers are a tracked stub.
+//!   catch-all, `*` wildcards supported). The first issuer in a policy becomes either an ACME
+//!   issuer ([`crate::issuer::AcmeIssuerConfig`]) or Caddy's local internal CA
+//!   ([`crate::internal_ca::InternalIssuer`]).
 //! * **redirects**: HTTPS subjects of servers that do not disable redirects, plus a catch-all
 //!   marker when an HTTPS server has a route without a host matcher.
 //! * **HTTP listener requirement**: when redirects or managed subjects exist and the configuration
@@ -29,14 +30,21 @@
 //! # Provisioning
 //!
 //! [`AutomaticHttpsProvisioner`] loads already-valid certificates from [`CertificateStorage`],
-//! then obtains every missing subject through the existing [`AcmeIssuer`] (HTTP-01 via the shared
-//! [`Http01TokenStore`], or the configured DNS-01 provider), adding the results to a
-//! [`CertificateResolver`]. The transport is injectable, so tests (and embedders) drive the whole
-//! path against a local fake ACME CA without network access.
+//! then obtains every missing subject through the policy's issuer: ACME ([`AcmeIssuer`], HTTP-01
+//! via the shared [`Http01TokenStore`], or the configured DNS-01 provider) or the local internal
+//! CA ([`InternalIssuer`], material persisted under Caddy's `pki/authorities/<ca-id>/` layout and
+//! leaves under `certificates/<ca-id>/`). Results are added to a [`CertificateResolver`].
+//!
+//! For `tls internal` sites the provisioner exposes the local CA certificates through
+//! [`AutomaticHttpsProvisioner::ca_certificates`] so a server can serve or install trust later;
+//! trust installation itself is not done here (see the divergence register). The transport is
+//! injectable, so tests (and embedders) drive the ACME path against a local fake CA without
+//! network access.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
@@ -46,6 +54,7 @@ use caddy_rs_core::listen::{ListenAddr, Network};
 
 use crate::acme::{AcmeClock, AcmeStorage, AcmeTransport, PollPolicy, TokioClock};
 use crate::certificate::Certificate;
+use crate::internal_ca::{CaCertificates, CaStorage, InternalIssuer, DEFAULT_CA_ID};
 use crate::issuer::{AcmeIssuer, AcmeIssuerConfig, CertificateIssuer, IssuanceRequest};
 use crate::solver::Http01TokenStore;
 use crate::solver::{Http01Solver, TlsAlpn01Solver};
@@ -53,6 +62,7 @@ use crate::storage::{CertificateStorage, FileStorage, StoredCertificate};
 use crate::tls_alpn::TlsAlpn01TokenStore;
 use crate::tls_server::{CertificateResolver, TlsCertificate};
 use crate::{Error, Result};
+use tokio::sync::Mutex as AsyncMutex;
 
 /// Caddy's default HTTP port for automatic HTTPS redirects/challenges.
 pub const DEFAULT_HTTP_PORT: u16 = 80;
@@ -73,7 +83,7 @@ pub struct AutomaticHttpsPolicy {
 pub enum AutomaticHttpsIssuer {
     /// Use an ACME issuer with this configuration.
     Acme(Box<AcmeIssuerConfig>),
-    /// Caddy's internal CA (`tls internal`); tracked by T-TLS-050 and not implemented yet.
+    /// Caddy's internal/local CA (`tls internal`, `local_certs`).
     Internal,
 }
 
@@ -328,9 +338,14 @@ fn parse_policy(policy: &AutomationPolicy, index: usize) -> Result<AutomaticHttp
                 break;
             }
             Some("internal") => {
-                return Err(Error::Issuer(format!(
-                    "{issuer_path}: the internal CA issuer is not implemented (T-TLS-050)"
-                )))
+                if !module.extra.is_empty() {
+                    return Err(Error::NotImplemented {
+                        feature: "internal CA issuer options in automation policies (T-TLS-031)",
+                        tracking_id: "T-TLS-031",
+                    });
+                }
+                issuer = Some(AutomaticHttpsIssuer::Internal);
+                break;
             }
             Some(other) => {
                 return Err(Error::Issuer(format!(
@@ -433,6 +448,17 @@ pub struct AutomaticHttpsProvisioner {
     tls_alpn01_tokens: Arc<TlsAlpn01TokenStore>,
     clock: Arc<dyn AcmeClock>,
     poll_policy: PollPolicy,
+    /// Optional injected CA blob storage; when absent the internal CA is rooted at `root`
+    /// (`InternalIssuer::from_data_directory`).
+    internal_ca_storage: Option<Arc<dyn CaStorage>>,
+    /// CA identifier used by the internal issuer (`local`, matching Caddy's default).
+    internal_ca_name: String,
+    /// Whether this provisioner has provisioned subjects from the internal CA.
+    internal_ca_used: AtomicBool,
+    /// Lazily constructed internal CA issuer (CA material loaded once per provisioner).
+    internal_issuer: AsyncMutex<Option<Arc<InternalIssuer>>>,
+    /// Snapshots of local CA certificates for trust installation/diagnostics.
+    ca_certificates: StdMutex<BTreeMap<String, CaCertificates>>,
 }
 
 impl std::fmt::Debug for AutomaticHttpsProvisioner {
@@ -440,6 +466,8 @@ impl std::fmt::Debug for AutomaticHttpsProvisioner {
         formatter
             .debug_struct("AutomaticHttpsProvisioner")
             .field("root", &self.root)
+            .field("internal_ca_name", &self.internal_ca_name)
+            .field("internal_ca_storage", &self.internal_ca_storage.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -461,7 +489,92 @@ impl AutomaticHttpsProvisioner {
             tls_alpn01_tokens: Arc::new(TlsAlpn01TokenStore::new()),
             clock: Arc::new(TokioClock),
             poll_policy: PollPolicy::default(),
+            internal_ca_storage: None,
+            internal_ca_name: DEFAULT_CA_ID.to_string(),
+            internal_ca_used: AtomicBool::new(false),
+            internal_issuer: AsyncMutex::new(None),
+            ca_certificates: StdMutex::new(BTreeMap::new()),
         }
+    }
+
+    /// Inject the blob storage used for internal CA material.
+    ///
+    /// Without this, the internal CA persists under `<data-dir>/pki/authorities/<ca-id>/` via
+    /// [`InternalIssuer::from_data_directory`]. Leaf certificates always use the provisioner's
+    /// data directory (`CertificateStorage`), matching the ACME path.
+    pub fn with_internal_ca_storage(mut self, storage: Arc<dyn CaStorage>) -> Self {
+        self.internal_ca_storage = Some(storage);
+        self
+    }
+
+    /// Set the internal CA identifier used in the Caddy storage layout (default `local`).
+    pub fn with_internal_ca_name(mut self, name: impl Into<String>) -> Self {
+        self.internal_ca_name = name.into();
+        self
+    }
+
+    /// Local CA certificates recorded during this provisioner's lifetime.
+    ///
+    /// Empty until a generation with an internal-CA policy has been provisioned (or
+    /// [`Self::ca_certificates`] was called after such a provision). The entries are root +
+    /// intermediate chains suitable for trust installation by a server/CLI layer.
+    pub fn recorded_ca_certificates(&self) -> Vec<CaCertificates> {
+        self.ca_certificates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// Local CA certificates for trust installation, loading/recording them on first use.
+    ///
+    /// Returns an empty vector when no internal-CA policy has been provisioned. This is the
+    /// accessor a server/CLI uses to install the local root (`root_pem`/`root_der`); trust
+    /// installation and `/pki` endpoints are follow-up work.
+    pub async fn ca_certificates(&self) -> Result<Vec<CaCertificates>> {
+        if self.internal_ca_used.load(Ordering::Acquire)
+            && self
+                .ca_certificates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty()
+        {
+            let issuer = self.internal_issuer().await?;
+            self.record_ca_certificates(&issuer).await?;
+        }
+        Ok(self.recorded_ca_certificates())
+    }
+
+    async fn internal_issuer(&self) -> Result<Arc<InternalIssuer>> {
+        let mut guard = self.internal_issuer.lock().await;
+        if let Some(issuer) = guard.as_ref() {
+            return Ok(Arc::clone(issuer));
+        }
+        let issuer = match &self.internal_ca_storage {
+            Some(storage) => {
+                InternalIssuer::new(Arc::clone(storage), Box::new(FileStorage::new(&self.root)))
+            }
+            None => InternalIssuer::from_data_directory(&self.root),
+        }
+        .with_name(self.internal_ca_name.clone());
+        let issuer = Arc::new(issuer);
+        *guard = Some(Arc::clone(&issuer));
+        Ok(issuer)
+    }
+
+    async fn record_ca_certificates(&self, issuer: &InternalIssuer) -> Result<()> {
+        let certificates = issuer.ca_certificates().await.map_err(|error| {
+            Error::Issuer(format!(
+                "automatic HTTPS: cannot initialize the internal CA `{}`: {error}",
+                issuer.name
+            ))
+        })?;
+        self.ca_certificates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(issuer.name.clone(), certificates);
+        Ok(())
     }
 
     /// The TLS-ALPN-01 challenge-certificate store shared with every issuer this provisioner
@@ -513,6 +626,19 @@ impl AutomaticHttpsProvisioner {
             resolver.insert(TlsCertificate::from_stored(&stored)?)?;
         }
 
+        // Internal-CA policies load (or generate) the local CA before any subject is examined, so
+        // a restart that reuses persisted leaves still exposes the CA certificates for trust
+        // installation and CA errors surface before partial provisioning.
+        if plan
+            .policies
+            .iter()
+            .any(|policy| matches!(policy.issuer, AutomaticHttpsIssuer::Internal))
+        {
+            self.internal_ca_used.store(true, Ordering::Release);
+            let issuer = self.internal_issuer().await?;
+            self.record_ca_certificates(&issuer).await?;
+        }
+
         let account_storage: Arc<dyn AcmeStorage> = Arc::new(FileStorage::new(&self.root));
         let mut issued = Vec::new();
         for subject in &plan.subjects {
@@ -529,40 +655,51 @@ impl AutomaticHttpsProvisioner {
                     "automatic HTTPS: on-demand TLS for `{subject}` is not implemented (T-TLS-028)"
                 )));
             }
-            let config = match &policy.issuer {
+            let certificate = match &policy.issuer {
                 AutomaticHttpsIssuer::Internal => {
-                    return Err(Error::Issuer(format!(
-                    "automatic HTTPS: subject `{subject}` uses Caddy's internal CA, which is not \
-                         implemented (T-TLS-050)"
-                )))
+                    let issuer = self.internal_issuer().await?;
+                    issuer
+                        .obtain(&IssuanceRequest {
+                            domains: vec![subject.clone()],
+                            internal: true,
+                        })
+                        .await
+                        .map_err(|error| {
+                            Error::Issuer(format!(
+                                "automatic HTTPS: cannot obtain a local-CA certificate for \
+                                 `{subject}`: {error}"
+                            ))
+                        })?
                 }
-                AutomaticHttpsIssuer::Acme(config) => config.as_ref().clone(),
+                AutomaticHttpsIssuer::Acme(config) => {
+                    let issuer = AcmeIssuer::new(
+                        config.as_ref().clone(),
+                        Arc::clone(&self.transport),
+                        Arc::clone(&account_storage),
+                        Box::new(FileStorage::new(&self.root)),
+                    )
+                    .with_solver(Arc::new(Http01Solver::new(Arc::clone(
+                        &self.challenge_tokens,
+                    ))))
+                    .with_solver(Arc::new(TlsAlpn01Solver::new(Arc::clone(
+                        &self.tls_alpn01_tokens,
+                    ))))
+                    .with_clock(Arc::clone(&self.clock))
+                    .with_poll_policy(self.poll_policy.clone());
+                    issuer
+                        .obtain(&IssuanceRequest {
+                            domains: vec![subject.clone()],
+                            internal: false,
+                        })
+                        .await
+                        .map_err(|error| {
+                            Error::Issuer(format!(
+                                "automatic HTTPS: cannot obtain a certificate for `{subject}`: \
+                                 {error}"
+                            ))
+                        })?
+                }
             };
-            let issuer = AcmeIssuer::new(
-                config,
-                Arc::clone(&self.transport),
-                Arc::clone(&account_storage),
-                Box::new(FileStorage::new(&self.root)),
-            )
-            .with_solver(Arc::new(Http01Solver::new(Arc::clone(
-                &self.challenge_tokens,
-            ))))
-            .with_solver(Arc::new(TlsAlpn01Solver::new(Arc::clone(
-                &self.tls_alpn01_tokens,
-            ))))
-            .with_clock(Arc::clone(&self.clock))
-            .with_poll_policy(self.poll_policy.clone());
-            let certificate = issuer
-                .obtain(&IssuanceRequest {
-                    domains: vec![subject.clone()],
-                    internal: false,
-                })
-                .await
-                .map_err(|error| {
-                    Error::Issuer(format!(
-                        "automatic HTTPS: cannot obtain a certificate for `{subject}`: {error}"
-                    ))
-                })?;
             resolver.insert(TlsCertificate::from_cache_certificate(&certificate)?)?;
             issued.push(certificate);
         }
@@ -607,7 +744,7 @@ pub fn subjects_by_policy(plan: &AutomaticHttpsPlan) -> BTreeMap<String, Option<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acme::{HttpMethod, HttpRequest, HttpResponse};
+    use crate::acme::{HttpMethod, HttpRequest, HttpResponse, MemoryAcmeStorage};
     use crate::solver::Http01TokenStore;
     use async_trait::async_trait;
     use serde_json::json;
@@ -637,6 +774,124 @@ mod tests {
                 }
             }
         }))
+    }
+
+    fn internal_config() -> Config {
+        config(json!({
+            "apps": {
+                "tls": {"automation": {"policies": [
+                    {"subjects": ["*.internal.example"], "issuers": [{"module": "internal"}]}
+                ]}},
+                "http": {"servers": {"srv0": {
+                    "listen": ["127.0.0.1:0"],
+                    "tls_connection_policies": [{}],
+                    "routes": [{"match": [{"host": ["app.internal.example"]}],
+                                "handle": [{"handler": "static_response", "body": "ok"}]}]
+                }}}
+            }
+        }))
+    }
+
+    fn acme_and_internal_config() -> Config {
+        config(json!({
+            "apps": {
+                "tls": {"automation": {"policies": [
+                    {"subjects": ["acme.example"], "issuers": [
+                        {"module": "acme", "ca": "https://acme.test/directory"}
+                    ]},
+                    {"subjects": ["*.internal.example"], "issuers": [{"module": "internal"}]}
+                ]}},
+                "http": {"servers": {"srv0": {
+                    "listen": ["127.0.0.1:0"],
+                    "tls_connection_policies": [{}],
+                    "routes": [{"match": [{"host": ["acme.example", "app.internal.example"]}],
+                                "handle": [{"handler": "static_response", "body": "ok"}]}]
+                }}}
+            }
+        }))
+    }
+
+    /// A transport that fails the test if the ACME path is used at all.
+    #[derive(Clone, Default, Debug)]
+    struct NoopTransport {
+        calls: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait]
+    impl AcmeTransport for NoopTransport {
+        async fn request(&self, _request: HttpRequest) -> Result<HttpResponse> {
+            *self.calls.lock().unwrap() += 1;
+            Err(Error::Issuer(
+                "ACME transport must not be used for internal-CA policies".to_string(),
+            ))
+        }
+    }
+
+    /// CA storage that always fails, for loud-failure tests.
+    struct FailingCaStorage;
+
+    #[async_trait]
+    impl CaStorage for FailingCaStorage {
+        fn name(&self) -> &'static str {
+            "failing"
+        }
+
+        async fn load(&self, _key: &str) -> Result<Option<Vec<u8>>> {
+            Err(Error::Issuer("ca storage exploded".to_string()))
+        }
+
+        async fn store(&self, _key: &str, _value: &[u8]) -> Result<()> {
+            Err(Error::Issuer("ca storage exploded".to_string()))
+        }
+    }
+
+    /// Perform a real rustls handshake trusting only `root_der`, proving the leaf chains to the
+    /// exposed local root (with the intermediate in the served chain).
+    async fn assert_serves_verified_chain(
+        resolver: Arc<CertificateResolver>,
+        root_der: Vec<u8>,
+        server_name: &str,
+    ) {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let server_config = crate::tls_server::build_server_config(
+            resolver,
+            &crate::tls_server::TlsServerOptions::default(),
+        )
+        .expect("server config builds");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            if let Ok(mut stream) = acceptor.accept(stream).await {
+                let _ = stream.write_all(b"ok").await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(rustls::pki_types::CertificateDer::from(root_der))
+            .expect("exposed local root is a valid trust anchor");
+        let client = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
+        let tcp = tokio::net::TcpStream::connect(address).await.unwrap();
+        let name = rustls::pki_types::ServerName::try_from(server_name.to_string()).unwrap();
+        let stream = connector
+            .connect(name, tcp)
+            .await
+            .expect("chain verifies against the exposed internal CA root");
+        assert_eq!(
+            stream.get_ref().1.peer_certificates().unwrap().len(),
+            2,
+            "served chain is leaf + intermediate"
+        );
     }
 
     #[test]
@@ -707,12 +962,30 @@ mod tests {
     }
 
     #[test]
-    fn plan_rejects_unimplemented_issuers_and_on_demand() {
+    fn plan_accepts_internal_issuers_and_rejects_unknown_or_on_demand() {
         let mut value = serde_json::to_value(https_config()).unwrap();
         value["apps"]["tls"]["automation"]["policies"][0]["issuers"] =
             json!([{"module": "internal"}]);
+        let selected = plan(&Config::from_value(value.clone()).unwrap())
+            .unwrap()
+            .expect("internal policy yields a plan");
+        assert!(matches!(
+            selected.policy_for("www.example.com").unwrap().issuer,
+            AutomaticHttpsIssuer::Internal
+        ));
+
+        value["apps"]["tls"]["automation"]["policies"][0]["issuers"] = json!([{"module": "bogus"}]);
         let error = plan(&Config::from_value(value.clone()).unwrap()).unwrap_err();
-        assert!(error.to_string().contains("internal CA"), "{error}");
+        assert!(error.to_string().contains("not implemented"), "{error}");
+
+        value["apps"]["tls"]["automation"]["policies"][0]["issuers"] =
+            json!([{"module": "internal", "name": "custom"}]);
+        let error = plan(&Config::from_value(value.clone()).unwrap()).unwrap_err();
+        assert!(
+            error.to_string().contains("internal CA issuer options"),
+            "{error}"
+        );
+
         value["apps"]["tls"]["automation"]["policies"][0]["issuers"] = json!([]);
         value["apps"]["tls"]["automation"]["policies"][0]["on_demand"] = json!(true);
         let error = plan(&Config::from_value(value).unwrap()).unwrap_err();
@@ -855,30 +1128,180 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provisioner_defensively_reports_internal_issuer_as_not_implemented() {
+    async fn internal_policy_provisions_local_leaf_and_exposes_trust_root() {
         let directory = tempfile::tempdir().unwrap();
-        let plan = AutomaticHttpsPlan {
-            http_port: 80,
-            https_port: 443,
-            subjects: vec!["example.com".to_string()],
-            redirect_hosts: Vec::new(),
-            redirect_all: false,
-            redirects_enabled: false,
-            needs_http_listener: false,
-            policies: vec![AutomaticHttpsPolicy {
-                subjects: vec!["example.com".to_string()],
-                issuer: AutomaticHttpsIssuer::Internal,
-                on_demand: false,
-            }],
-        };
+        let plan = plan(&internal_config()).unwrap().unwrap();
+        let transport = NoopTransport::default();
         let provisioner = AutomaticHttpsProvisioner::new(
-            Arc::new(FakeAcme::default()),
+            Arc::new(transport.clone()),
             directory.path(),
             Arc::new(Http01TokenStore::new()),
         );
+        let result = provisioner.provision(&plan, None).await.unwrap();
+
+        assert_eq!(result.issued.len(), 1);
+        assert_eq!(result.issued[0].issuer, "local");
+        assert_eq!(
+            result.issued[0].cert_chain_der.len(),
+            2,
+            "leaf plus intermediate"
+        );
+        assert!(result.resolver.covers("app.internal.example"));
+        assert_eq!(
+            *transport.calls.lock().unwrap(),
+            0,
+            "internal policies must not touch the ACME transport"
+        );
+
+        let ca = provisioner.ca_certificates().await.unwrap();
+        assert_eq!(ca.len(), 1);
+        assert!(!ca[0].root_der.is_empty());
+        assert!(ca[0].root_pem.starts_with("-----BEGIN CERTIFICATE-----"));
+        assert!(ca[0].chain_pem.contains("-----END CERTIFICATE-----"));
+        assert_serves_verified_chain(
+            Arc::clone(&result.resolver),
+            ca[0].root_der.clone(),
+            "app.internal.example",
+        )
+        .await;
+
+        let keys = FileStorage::new(directory.path()).list("").await.unwrap();
+        assert_eq!(keys.len(), 1, "one persisted internal leaf: {keys:?}");
+        assert!(keys[0].starts_with("local/"), "{keys:?}");
+    }
+
+    #[tokio::test]
+    async fn restart_reuses_the_internal_ca_and_persisted_leaf() {
+        let directory = tempfile::tempdir().unwrap();
+        let plan = plan(&internal_config()).unwrap().unwrap();
+        let first = AutomaticHttpsProvisioner::new(
+            Arc::new(NoopTransport::default()),
+            directory.path(),
+            Arc::new(Http01TokenStore::new()),
+        );
+        let first_result = first.provision(&plan, None).await.unwrap();
+        assert_eq!(first_result.issued.len(), 1);
+        let first_ca = first.ca_certificates().await.unwrap();
+        let first_keys = FileStorage::new(directory.path()).list("").await.unwrap();
+        assert_eq!(first_ca.len(), 1);
+
+        // A fresh provisioner over the same data directory behaves like a process restart.
+        let second = AutomaticHttpsProvisioner::new(
+            Arc::new(NoopTransport::default()),
+            directory.path(),
+            Arc::new(Http01TokenStore::new()),
+        );
+        let second_result = second.provision(&plan, None).await.unwrap();
+        assert!(
+            second_result.issued.is_empty(),
+            "persisted leaf must be reused instead of reissued"
+        );
+        assert!(second_result.resolver.covers("app.internal.example"));
+        let second_ca = second.ca_certificates().await.unwrap();
+        assert_eq!(second_ca.len(), 1);
+        assert_eq!(
+            second_ca[0].root_der, first_ca[0].root_der,
+            "the persisted CA root must be reused"
+        );
+        assert_eq!(
+            FileStorage::new(directory.path()).list("").await.unwrap(),
+            first_keys,
+            "no additional certificate files after restart"
+        );
+        assert_serves_verified_chain(
+            Arc::clone(&second_result.resolver),
+            second_ca[0].root_der.clone(),
+            "app.internal.example",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn injectable_ca_storage_and_ca_name_are_used() {
+        let directory = tempfile::tempdir().unwrap();
+        let plan = plan(&internal_config()).unwrap().unwrap();
+        let ca_storage = Arc::new(MemoryAcmeStorage::new());
+        let provisioner = AutomaticHttpsProvisioner::new(
+            Arc::new(NoopTransport::default()),
+            directory.path(),
+            Arc::new(Http01TokenStore::new()),
+        )
+        .with_internal_ca_storage(ca_storage.clone())
+        .with_internal_ca_name("custom");
+        let result = provisioner.provision(&plan, None).await.unwrap();
+        assert_eq!(result.issued.len(), 1);
+        assert!(result.resolver.covers("app.internal.example"));
+
+        let keys = FileStorage::new(directory.path()).list("").await.unwrap();
+        assert!(
+            keys.iter().any(|key| key.starts_with("custom/")),
+            "leaves use the configured CA id: {keys:?}"
+        );
+        let root = CaStorage::load(ca_storage.as_ref(), "pki/authorities/custom/root.crt")
+            .await
+            .unwrap()
+            .expect("root certificate persisted in the injected CA storage");
+        assert!(String::from_utf8_lossy(&root).contains("BEGIN CERTIFICATE"));
+        let ca = provisioner.ca_certificates().await.unwrap();
+        assert_eq!(ca.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn internal_and_acme_policies_coexist() {
+        let directory = tempfile::tempdir().unwrap();
+        let plan = plan(&acme_and_internal_config()).unwrap().unwrap();
+        let transport = Arc::new(FakeAcme::default());
+        let provisioner = AutomaticHttpsProvisioner::new(
+            transport.clone(),
+            directory.path(),
+            Arc::new(Http01TokenStore::new()),
+        );
+        let result = provisioner.provision(&plan, None).await.unwrap();
+        assert_eq!(result.issued.len(), 2, "one ACME and one internal leaf");
+        assert!(result.resolver.covers("acme.example"));
+        assert!(result.resolver.covers("app.internal.example"));
+        assert!(
+            !transport.inner.requests.lock().unwrap().is_empty(),
+            "ACME policy uses the ACME transport"
+        );
+        let ca = provisioner.ca_certificates().await.unwrap();
+        assert_eq!(
+            ca.len(),
+            1,
+            "only the internal policy records CA certificates"
+        );
+        let keys = FileStorage::new(directory.path()).list("").await.unwrap();
+        assert!(
+            keys.iter().any(|key| key.starts_with("local/")),
+            "internal leaf stored under the local CA id: {keys:?}"
+        );
+        assert!(
+            keys.iter().any(|key| key.contains("acme.test")),
+            "ACME leaf stored under the ACME issuer key: {keys:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_ca_failures_are_loud() {
+        let directory = tempfile::tempdir().unwrap();
+        let plan = plan(&internal_config()).unwrap().unwrap();
+        let provisioner = AutomaticHttpsProvisioner::new(
+            Arc::new(NoopTransport::default()),
+            directory.path(),
+            Arc::new(Http01TokenStore::new()),
+        )
+        .with_internal_ca_storage(Arc::new(FailingCaStorage));
         let error = provisioner.provision(&plan, None).await.unwrap_err();
-        assert!(error.to_string().contains("internal CA"), "{error}");
-        assert!(error.to_string().contains("T-TLS-050"), "{error}");
+        let message = error.to_string();
+        assert!(
+            message.contains("cannot initialize the internal CA"),
+            "{message}"
+        );
+        assert!(message.contains("ca storage exploded"), "{message}");
+        assert!(
+            provisioner.ca_certificates().await.is_err()
+                || provisioner.recorded_ca_certificates().is_empty()
+        );
     }
 
     #[tokio::test]
