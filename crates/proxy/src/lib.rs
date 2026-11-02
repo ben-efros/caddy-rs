@@ -5,10 +5,12 @@
 
 pub mod balancer;
 pub mod client;
+pub mod forward_auth;
 pub mod handler;
 pub mod health;
 pub mod passive;
 pub mod retry;
+pub mod template;
 pub mod tls;
 pub mod upstream;
 

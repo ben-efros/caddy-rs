@@ -33,6 +33,8 @@ pub struct Upstream {
     transport: Transport,
     healthy: AtomicBool,
     active_connections: AtomicUsize,
+    /// Caddy `upstreams[].max_requests`: maximum simultaneous requests (`None` = unlimited).
+    max_requests: Option<usize>,
 }
 
 impl Upstream {
@@ -47,6 +49,7 @@ impl Upstream {
             tls,
             healthy: AtomicBool::new(true),
             active_connections: AtomicUsize::new(0),
+            max_requests: None,
         }
     }
 
@@ -85,6 +88,7 @@ impl Upstream {
                     },
                     healthy: AtomicBool::new(true),
                     active_connections: AtomicUsize::new(0),
+                    max_requests: None,
                 });
             }
             #[cfg(not(unix))]
@@ -152,6 +156,23 @@ impl Upstream {
             #[cfg(unix)]
             Transport::Unix { .. } => "localhost",
         }
+    }
+
+    /// Caddy `upstreams[].max_requests`, when configured.
+    pub fn max_requests(&self) -> Option<usize> {
+        self.max_requests
+    }
+
+    /// Configure the maximum simultaneous request count (builder style).
+    pub fn with_max_requests(mut self, max_requests: Option<usize>) -> Self {
+        self.max_requests = max_requests;
+        self
+    }
+
+    /// Caddy `Upstream.Full()`: the configured simultaneous-request limit is reached.
+    pub fn is_full(&self) -> bool {
+        self.max_requests
+            .is_some_and(|max| self.active_connections() >= max)
     }
 
     /// Health observed by active/passive checks.
