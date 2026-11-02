@@ -43,7 +43,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use crate::access_log::{
-    AccessLogConfig, AccessLogEntry, AccessLogError, AccessLogSampler, SamplingConfig,
+    AccessLogConfig, AccessLogEntry, AccessLogError, AccessLogSampler, LogLevel, SamplingConfig,
 };
 
 /// Default [`BufWriter`] capacity for an access-log sink (32 KiB).
@@ -97,6 +97,10 @@ pub struct AccessLogSinkConfig {
     /// Capacity of the write buffer in bytes.
     #[serde(default = "default_buffer_bytes")]
     pub buffer_bytes: usize,
+    /// Minimum entry level to emit (Caddy's `logging.logs.<name>.level`). Entries below it are
+    /// counted as [`AccessLogSinkStats::filtered_out`] and never encoded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<LogLevel>,
 }
 
 fn default_buffer_bytes() -> usize {
@@ -110,6 +114,7 @@ impl Default for AccessLogSinkConfig {
             filename: None,
             encoder: AccessLogConfig::default(),
             buffer_bytes: DEFAULT_ACCESS_LOG_BUFFER_BYTES,
+            level: None,
         }
     }
 }
@@ -122,6 +127,12 @@ impl AccessLogSinkConfig {
             filename: Some(path.into()),
             ..Self::default()
         }
+    }
+
+    /// Set the minimum emitted level (Caddy's `logging.logs.<name>.level`).
+    pub fn with_level(mut self, level: LogLevel) -> Self {
+        self.level = Some(level);
+        self
     }
 
     /// Validate the sink configuration, returning the first located problem.
@@ -158,6 +169,8 @@ pub enum EmitOutcome {
     Written,
     /// The sampling policy suppressed the entry; nothing was encoded or written.
     SampledOut,
+    /// The configured minimum level filtered the entry out; nothing was encoded or written.
+    FilteredOut,
 }
 
 /// A snapshot of sink activity, useful for diagnostics and tests.
@@ -167,6 +180,8 @@ pub struct AccessLogSinkStats {
     pub written: u64,
     /// Entries suppressed by sampling.
     pub sampled_out: u64,
+    /// Entries suppressed by the configured minimum level.
+    pub filtered_out: u64,
     /// Encoded bytes accepted by the destination.
     pub bytes_written: u64,
     /// Write/flush failures observed (each also returned to the caller).
@@ -266,10 +281,12 @@ struct SinkState {
 struct SinkInner {
     encoder: AccessLogEncoder,
     sampler: Option<Mutex<AccessLogSampler>>,
+    min_level: Option<LogLevel>,
     state: Mutex<SinkState>,
     closed: AtomicBool,
     written: AtomicU64,
     sampled_out: AtomicU64,
+    filtered_out: AtomicU64,
     bytes_written: AtomicU64,
     write_errors: AtomicU64,
     flushes: AtomicU64,
@@ -342,10 +359,12 @@ impl AccessLogSink {
             inner: Arc::new(SinkInner {
                 encoder,
                 sampler,
+                min_level: config.level,
                 state: Mutex::new(SinkState { target }),
                 closed: AtomicBool::new(false),
                 written: AtomicU64::new(0),
                 sampled_out: AtomicU64::new(0),
+                filtered_out: AtomicU64::new(0),
                 bytes_written: AtomicU64::new(0),
                 write_errors: AtomicU64::new(0),
                 flushes: AtomicU64::new(0),
@@ -378,6 +397,7 @@ impl AccessLogSink {
             inner: Arc::new(SinkInner {
                 encoder,
                 sampler,
+                min_level: sink_config.level,
                 state: Mutex::new(SinkState {
                     target: SinkTarget::Custom(BufWriter::with_capacity(
                         sink_config.buffer_bytes,
@@ -387,6 +407,7 @@ impl AccessLogSink {
                 closed: AtomicBool::new(false),
                 written: AtomicU64::new(0),
                 sampled_out: AtomicU64::new(0),
+                filtered_out: AtomicU64::new(0),
                 bytes_written: AtomicU64::new(0),
                 write_errors: AtomicU64::new(0),
                 flushes: AtomicU64::new(0),
@@ -423,6 +444,7 @@ impl AccessLogSink {
         AccessLogSinkStats {
             written: self.inner.written.load(Ordering::Relaxed),
             sampled_out: self.inner.sampled_out.load(Ordering::Relaxed),
+            filtered_out: self.inner.filtered_out.load(Ordering::Relaxed),
             bytes_written: self.inner.bytes_written.load(Ordering::Relaxed),
             write_errors: self.inner.write_errors.load(Ordering::Relaxed),
             flushes: self.inner.flushes.load(Ordering::Relaxed),
@@ -439,6 +461,12 @@ impl AccessLogSink {
                 "sink",
                 "cannot emit an access log entry after close",
             ));
+        }
+        if let Some(min_level) = self.inner.min_level {
+            if entry.level < min_level {
+                self.inner.filtered_out.fetch_add(1, Ordering::Relaxed);
+                return Ok(EmitOutcome::FilteredOut);
+            }
         }
         if let Some(sampler) = &self.inner.sampler {
             let should_log = sampler
@@ -947,6 +975,28 @@ mod tests {
     }
 
     // -- configuration serialization -------------------------------------------------------
+
+    #[test]
+    fn minimum_level_filters_entries_before_encoding() {
+        let sink = AccessLogSink::from_config(&AccessLogSinkConfig {
+            output: AccessLogOutput::Discard,
+            level: Some(LogLevel::Warn),
+            ..AccessLogSinkConfig::default()
+        })
+        .expect("sink");
+        assert_eq!(
+            sink.emit(&entry("info", 200)).expect("emit"),
+            EmitOutcome::FilteredOut
+        );
+        assert_eq!(
+            sink.emit(&entry("error", 500)).expect("emit"),
+            EmitOutcome::Written
+        );
+        let stats = sink.stats();
+        assert_eq!(stats.filtered_out, 1);
+        assert_eq!(stats.written, 1);
+        assert_eq!(stats.sampled_out, 0);
+    }
 
     #[test]
     fn sink_handle_is_send_sync_for_runtime_wiring() {

@@ -46,6 +46,12 @@
 //! to [`HttpMetrics`], plus [`CertificateMetrics`] hooks for the TLS renewal work. The server
 //! runtime stores one recorder and clones it per task; see the module docs for the wiring recipe.
 //!
+//! [`logging_config`] maps Caddy's `logging.logs[]` JSON (writer, encoder, level, sampling,
+//! include/exclude and the supported encoder filter subset) to validated
+//! [`AccessLogSinkConfig`] targets and builds the corresponding sinks. Unsupported writers,
+//! encoders and filters fail loudly with located errors and a tracking id instead of being
+//! silently ignored.
+//!
 //! ## Partial updates
 //!
 //! The resulting *full* configuration is decoded, `@id`-indexed (duplicate ids are rejected with
@@ -72,10 +78,12 @@
 //! - Origin policy derives implicit origins from a non-empty `admin.origins`; the shared core
 //!   model cannot distinguish `origins: null` (derive) from `origins: []` (allow none), so an
 //!   explicit empty list derives the defaults instead of blocking the endpoint.
-//! - Metrics rendering and the access-log record model/sink are crate-level primitives
-//!   (T-ADMIN-020/021/022): `/metrics` renders whatever the runtime records through the
-//!   [`recorder`] API, and the server runtime decides when to construct an [`AccessLogSink`],
-//!   emit entries and close it on shutdown. Both are empty/inert until the runtime wires them.
+//! - Metrics rendering, the access-log record/sink model and the Caddy `logging` -> sink mapping
+//!   are crate-level primitives (T-ADMIN-020/021/022/025): `/metrics` renders whatever the
+//!   runtime records through the [`recorder`] API, and [`logging_config`] turns the active
+//!   generation's `logging.logs[]` into ready [`AccessLogSink`] targets. The server runtime still
+//!   decides when to build the sinks, emit entries and close them on reload/shutdown. Until it
+//!   does, `/metrics` stays empty and access-log output is inert.
 //! - Access-log file rotation (`roll_*` writer options) is not implemented; files are opened in
 //!   append mode and rotated externally. See [`sink`] for details.
 
@@ -83,6 +91,7 @@
 
 pub mod access_log;
 mod config_path;
+pub mod logging_config;
 pub mod metrics;
 mod origin;
 pub mod recorder;
@@ -99,7 +108,10 @@ use serde_json::{json, Value};
 pub use access_log::{
     AccessLogConfig, AccessLogEntry, AccessLogError, AccessLogField, AccessLogRequest,
     AccessLogSampler, AccessLogTls, AccessLogUpstream, HeaderRedaction, HeaderTarget, LogLevel,
-    RedactionPolicy, SamplingConfig,
+    RedactionPolicy, SamplingConfig, ACCESS_LOG_LOGGER,
+};
+pub use logging_config::{
+    AccessLogTarget, BuiltAccessLogSink, LoggingConfig, LoggingConfigError, LOGGING_TRACKING_ID,
 };
 pub use metrics::{
     HttpMetrics, MetricsError, MetricsRegistry, ProxyObservation, RequestObservation,
@@ -226,6 +238,18 @@ impl AdminApi {
         MetricsRequestRecorder::shared(Arc::new(crate::metrics::HttpMetrics::new(
             self.metrics.clone(),
         )))
+    }
+
+    /// Map the *active generation's* `logging` configuration to access-log targets.
+    ///
+    /// The server runtime calls this when a configuration becomes active (or after `/load`); the
+    /// returned [`LoggingConfig`] builds one sink per Caddy log that accepts `http.log.access`.
+    /// With no active generation the Caddy default logging configuration is assumed.
+    pub fn access_log_config(&self) -> Result<LoggingConfig, LoggingConfigError> {
+        match self.store.current() {
+            Some(generation) => LoggingConfig::from_config(generation.config()),
+            None => LoggingConfig::from_config(&Config::default()),
+        }
     }
 
     /// A certificate-metrics handle backed by this admin API's metrics registry.
@@ -726,6 +750,35 @@ mod tests {
         let response = admin.handle(request("GET", "/config/", "")).await;
         assert_eq!(response.status, StatusCode::OK);
         assert_eq!(response.body, Bytes::from_static(b"{}"));
+    }
+
+    #[tokio::test]
+    async fn access_log_config_maps_the_active_generation_logging_section() {
+        let admin = admin();
+        let config = json!({
+            "logging": {"logs": {"default": {
+                "writer": {"output": "discard"},
+                "level": "warn"
+            }}},
+            "apps": {"http": {"servers": {"srv0": {"listen": [":8080"], "routes": []}}}}
+        });
+        assert_eq!(
+            load(&admin, &config.to_string()).await.status,
+            StatusCode::OK
+        );
+        let mapping = admin.access_log_config().expect("map logging");
+        assert_eq!(mapping.targets().len(), 1);
+        assert_eq!(mapping.targets()[0].name(), "default");
+        assert_eq!(
+            mapping.targets()[0].sink_config().level,
+            Some(LogLevel::Warn)
+        );
+
+        // No active generation: Caddy's implicit default log (stderr, INFO) is assumed.
+        admin.handle(request("POST", "/stop", "")).await;
+        let mapping = admin.access_log_config().expect("defaults");
+        assert_eq!(mapping.targets().len(), 1);
+        assert_eq!(mapping.targets()[0].name(), "default");
     }
 
     #[tokio::test]
