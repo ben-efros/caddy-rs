@@ -82,9 +82,9 @@ pub use tls_alpn::{
 };
 pub use tls_server::{
     build_server_config, build_server_config_with_cert_resolver, certificates_from_pem,
-    certificates_from_tls_app, listener_uses_tls, resolver_from_config, CertificateResolver,
-    ClientAuthMode, TlsCertificate, TlsServerOptions, TlsVersions, DEFAULT_ALPN,
-    DEFAULT_HTTPS_PORT,
+    certificates_from_tls_app, listener_uses_tls, resolver_from_config, CertificatePolicy,
+    CertificateResolver, ClientAuthMode, TaggedCertificateSelector, TlsCertificate, TlsResolver,
+    TlsServerOptions, TlsVersions, DEFAULT_ALPN, DEFAULT_HTTPS_PORT,
 };
 
 /// Errors raised by the TLS layer.
@@ -118,6 +118,18 @@ pub enum Error {
     NotImplemented {
         /// Capability.
         feature: &'static str,
+        /// Tracking task.
+        tracking_id: &'static str,
+    },
+
+    /// A recognised-but-unimplemented capability whose description is built dynamically (for
+    /// example a named configuration field). Located so the operator can find the offending JSON.
+    #[error("not implemented at `{path}`: {feature} ({tracking_id})")]
+    Unsupported {
+        /// JSON path of the offending configuration value.
+        path: String,
+        /// Capability description.
+        feature: String,
         /// Tracking task.
         tracking_id: &'static str,
     },
