@@ -21,7 +21,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
@@ -33,6 +33,7 @@ use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::watch;
@@ -121,18 +122,7 @@ pub(crate) async fn bind(
                     );
                     adopt_tcp(socket, configured)?
                 }
-                None => {
-                    // Hostless Caddy addresses (`:443`, `:80`, `:0`) bind the wildcard address;
-                    // `tokio::net::TcpListener::bind(&str)` cannot resolve a bare `:port`.
-                    let socket = address.socket_addr().ok_or_else(|| Error::Listen {
-                        listen: configured.to_string(),
-                        reason: "expected `host:port`; a hostless address needs a numeric port"
-                            .to_string(),
-                    })?;
-                    TcpListener::bind(socket)
-                        .await
-                        .map_err(|error| Error::bind(configured, error))?
-                }
+                None => bind_configured_tcp(configured, &address).await?,
             };
             let socket_addr = listener
                 .local_addr()
@@ -198,6 +188,78 @@ pub(crate) async fn bind(
             tracking_id: "HTTP3-UDP",
         }),
     }
+}
+
+/// Bind a TCP listener for a configured Caddy listen address.
+///
+/// Hostless Caddy addresses (`:443`, `:80`, `:0`) mean "all interfaces, both address families":
+/// Go's `net.Listen("tcp", ":port")` creates a dual-stack IPv6 wildcard when the platform
+/// supports IPv6. Binding `0.0.0.0` would silently serve IPv4 only, so hostless addresses
+/// explicitly request a dual-stack wildcard (ignoring the OS `bindv6only` default; Caddy does the
+/// same) and fall back to an IPv4 wildcard only when IPv6 sockets are unavailable.
+///
+/// Explicit wildcard literals (`0.0.0.0:port`, `[::]:port`) keep their family; IP literals and
+/// hostnames behave exactly as Caddy's resolved bind.
+async fn bind_configured_tcp(configured: &str, address: &ListenAddr) -> Result<TcpListener, Error> {
+    if address.host().is_empty() {
+        let port = address.port().ok_or_else(|| Error::Listen {
+            listen: configured.to_string(),
+            reason: "expected `host:port`; a hostless address needs a numeric port".to_string(),
+        })?;
+        match wildcard_dual_stack_listener(port) {
+            Ok(listener) => return Ok(listener),
+            Err(error) if ipv6_wildcard_unavailable(&error) => {
+                tracing::debug!(
+                    listen = configured,
+                    %error,
+                    "IPv6 wildcard listener unavailable; binding the IPv4 wildcard"
+                );
+            }
+            Err(error) => return Err(Error::bind(configured, error)),
+        }
+        let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)))
+            .map_err(|error| Error::bind(configured, error))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| Error::bind(configured, error))?;
+        return TcpListener::from_std(listener).map_err(|error| Error::bind(configured, error));
+    }
+    match address.socket_addr() {
+        // IP literal: bind exactly that address/family.
+        Some(socket_addr) => TcpListener::bind(socket_addr)
+            .await
+            .map_err(|error| Error::bind(configured, error)),
+        // Hostname: resolve and bind like Caddy's `net.Listen("tcp", "host:port")`. Bind the
+        // address without a `tcp/`/`udp/` network prefix (the prefix is already parsed above).
+        None => TcpListener::bind(&address.address)
+            .await
+            .map_err(|error| Error::bind(configured, error)),
+    }
+}
+
+/// A dual-stack (`IPv6` wildcard with `IPV6_V6ONLY=0`) listening socket for a hostless address.
+fn wildcard_dual_stack_listener(port: u16) -> io::Result<TcpListener> {
+    let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+    // Caddy (Go) forces IPV6_V6ONLY=0 for `:port`; do not depend on the host's bindv6only default.
+    socket.set_only_v6(false)?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)).into())?;
+    // Caddy (Go) uses the system `somaxconn` backlog for `:port` wildcard listeners.
+    socket.listen(libc::SOMAXCONN)?;
+    socket.set_nonblocking(true)?;
+    TcpListener::from_std(socket.into())
+}
+
+/// Whether a failed wildcard bind means the platform has no usable IPv6 sockets (fall back to
+/// IPv4 rather than failing the configuration).
+fn ipv6_wildcard_unavailable(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::AddrNotAvailable | io::ErrorKind::Unsupported | io::ErrorKind::InvalidInput
+    ) || matches!(
+        error.raw_os_error(),
+        Some(code) if code == libc::EAFNOSUPPORT || code == libc::EPROTONOSUPPORT
+    )
 }
 
 /// State captured for one accepted connection.
@@ -669,9 +731,17 @@ fn error_response() -> hyper::Response<Body> {
 
 /// Bind the admin API listener.
 pub(crate) async fn bind_admin(configured: &str, api: AdminApi) -> Result<ListenerHandle, Error> {
-    let listener = TcpListener::bind(configured)
-        .await
-        .map_err(|error| Error::bind(configured, error))?;
+    let address = ListenAddr::parse(configured).map_err(|reason| Error::Listen {
+        listen: configured.to_string(),
+        reason,
+    })?;
+    if address.network != Network::Tcp {
+        return Err(Error::NotImplemented {
+            feature: "admin API on non-TCP listeners",
+            tracking_id: "ADMIN-LISTEN",
+        });
+    }
+    let listener = bind_configured_tcp(configured, &address).await?;
     let socket_addr = listener
         .local_addr()
         .map_err(|error| Error::bind(configured, error))?;

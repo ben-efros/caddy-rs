@@ -821,6 +821,24 @@ fn config(
     auto_https_disable: bool,
     storage_root: &str,
 ) -> Config {
+    config_with_admin(
+        listen,
+        http_port,
+        disable_redirects,
+        auto_https_disable,
+        storage_root,
+        serde_json::json!({"disabled": true}),
+    )
+}
+
+fn config_with_admin(
+    listen: &str,
+    http_port: Option<u16>,
+    disable_redirects: bool,
+    auto_https_disable: bool,
+    storage_root: &str,
+    admin: serde_json::Value,
+) -> Config {
     let mut server = serde_json::json!({
         "listen": [listen],
         "tls_connection_policies": [{}],
@@ -844,7 +862,7 @@ fn config(
         http["http_port"] = serde_json::json!(http_port);
     }
     Config::from_value(serde_json::json!({
-        "admin": {"disabled": true},
+        "admin": admin,
         "storage": {"module": "file_system", "root": storage_root},
         "apps": {
             "tls": {"automation": {"policies": [{
@@ -987,6 +1005,28 @@ async fn apply(
         .listener_address(":0")
         .expect("derived HTTP listener bound");
     (runtime, https, http, directory)
+}
+
+/// A fixed loopback port that is currently free (released immediately before use).
+fn free_loopback_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("reserve a port")
+        .local_addr()
+        .expect("local addr")
+        .port()
+}
+
+/// Send `POST <path>` over a fresh connection and return the status code.
+async fn post_plain(address: SocketAddr, path: &str) -> u16 {
+    let mut stream = TcpStream::connect(address).await.expect("connect for POST");
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write POST");
+    read_response(&mut stream).await.0
 }
 
 /// Pre-bind the TLS listener and hand it to the runtime as a systemd-style inherited socket.
@@ -1453,4 +1493,68 @@ async fn tls_alpn_probe_failure_keeps_previous_generation() {
     assert_eq!(status, 200);
     assert_eq!(body, "old");
     runtime.shutdown().await;
+}
+
+/// `POST /stop` must terminate the supervisor loop even when the active generation is an
+/// automatic-HTTPS generation (two-phase apply, DERIVED HTTP challenge listener, certificate
+/// provisioning). The real-Caddy-oracle finding was that the process kept running after a 200
+/// response because nothing watched the store for the "configuration removed" state.
+#[tokio::test]
+async fn admin_stop_ends_runtime_loop_with_automatic_https() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().to_string_lossy().to_string();
+    let admin_port = free_loopback_port();
+    let store = Arc::new(GenerationStore::with_builtin_registry());
+    store
+        .load(config_with_admin(
+            "127.0.0.1:0",
+            Some(0),
+            false,
+            false,
+            &root,
+            serde_json::json!({"listen": format!("127.0.0.1:{admin_port}")}),
+        ))
+        .expect("automatic-HTTPS config validates");
+    let runtime = ServerRuntime::new(Arc::clone(&store))
+        .with_acme_transport(Arc::new(FakeCa::new(false)))
+        .with_data_root(directory.path());
+
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let running = tokio::spawn(async move { runtime.run(shutdown_rx).await });
+
+    // Wait for the two-phase apply to finish and the admin listener to accept connections.
+    let admin = SocketAddr::from(([127, 0, 0, 1], admin_port));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "admin API did not start; store generation: {:?}",
+            store.current().map(|generation| generation.id())
+        );
+        if TcpStream::connect(admin).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(post_plain(admin, "/stop").await, 200);
+
+    let joined = tokio::time::timeout(Duration::from_secs(15), running)
+        .await
+        .expect("runtime loop must exit after /stop with automatic HTTPS");
+    joined
+        .expect("runtime task")
+        .expect("runtime run returns Ok");
+    assert!(
+        store.current().is_none(),
+        "the stop must unload the automatic-HTTPS generation"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while TcpStream::connect(admin).await.is_ok() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "admin listener must close after /stop"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }

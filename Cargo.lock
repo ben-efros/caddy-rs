@@ -162,6 +162,7 @@ dependencies = [
  "ring",
  "rustls",
  "serde_json",
+ "socket2",
  "tempfile",
  "thiserror",
  "tokio",
