@@ -49,6 +49,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Default access logger name, matching Caddy's `http.log.access`.
 pub const DEFAULT_ACCESS_LOGGER: &str = "http.log.access";
+/// Caddy logger name that receives structured HTTP access entries.
+pub const ACCESS_LOG_LOGGER: &str = DEFAULT_ACCESS_LOGGER;
 /// Default access log message, matching Caddy's `logRequest`.
 pub const DEFAULT_ACCESS_MESSAGE: &str = "handled request";
 /// Replacement value for redacted fields, matching Caddy.
