@@ -293,10 +293,17 @@ pub fn adapt_with_source(
     }
 
     let mut apps = Map::new();
-    apps.insert(
-        "http".to_string(),
-        json!({"servers": Value::Object(server_map)}),
-    );
+    // Caddy's caddyhttp.App carries the global HTTP/HTTPS ports (used for automatic-HTTPS
+    // redirects and ACME challenge ports); they are emitted only when explicitly configured.
+    let mut http_app = Map::new();
+    if let Some(port) = options.http_port {
+        http_app.insert("http_port".to_string(), json!(port));
+    }
+    if let Some(port) = options.https_port {
+        http_app.insert("https_port".to_string(), json!(port));
+    }
+    http_app.insert("servers".to_string(), Value::Object(server_map));
+    apps.insert("http".to_string(), Value::Object(http_app));
     if let Some(tls) = tls_plan.app.clone() {
         apps.insert("tls".to_string(), tls);
     }
