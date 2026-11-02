@@ -52,6 +52,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
+use ring::digest::{digest, SHA1_FOR_LEGACY_USE_ONLY};
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 use serde::{Deserialize, Serialize};
@@ -546,6 +547,7 @@ impl InternalIssuer {
                 let not_after = not_before + self.lifetimes.root;
                 let subject = subject_name(&root_common_name(&self.display_name, now)?);
                 let spki = subject_public_key_info(&key.public_key);
+                let subject_key_id = key_identifier(&key.public_key);
                 let der = create_certificate(
                     &CertSpec {
                         serial: &random_serial()?,
@@ -559,6 +561,8 @@ impl InternalIssuer {
                         key_usage_bits: &[5, 6], // keyCertSign, cRLSign
                         server_auth: false,
                         san: &[],
+                        subject_key_id: Some(&subject_key_id),
+                        authority_key_id: None,
                     },
                     &key.pair,
                 )?;
@@ -690,6 +694,8 @@ impl InternalIssuer {
         }
         let subject = subject_name(&format!("{} - ECC Intermediate", self.display_name));
         let spki = subject_public_key_info(&key.public_key);
+        let subject_key_id = key_identifier(&key.public_key);
+        let issuer_key_id = issuer_key_identifier(&root.2);
         let der = create_certificate(
             &CertSpec {
                 serial: &random_serial()?,
@@ -703,6 +709,8 @@ impl InternalIssuer {
                 key_usage_bits: &[5, 6],
                 server_auth: false,
                 san: &[],
+                subject_key_id: Some(&subject_key_id),
+                authority_key_id: Some(&issuer_key_id),
             },
             &root.3,
         )?;
@@ -750,6 +758,8 @@ impl InternalIssuer {
         let not_after = not_before + self.lifetimes.leaf;
 
         let spki = subject_public_key_info(&key.public_key);
+        let subject_key_id = key_identifier(&key.public_key);
+        let issuer_key_id = issuer_key_identifier(&ca.intermediate);
         let der = create_certificate(
             &CertSpec {
                 serial: &random_serial()?,
@@ -763,6 +773,8 @@ impl InternalIssuer {
                 key_usage_bits: &[0], // digitalSignature
                 server_auth: true,
                 san: domains,
+                subject_key_id: Some(&subject_key_id),
+                authority_key_id: Some(&issuer_key_id),
             },
             &ca.intermediate_key,
         )?;
@@ -907,6 +919,27 @@ struct CertSpec<'a> {
     key_usage_bits: &'a [u8],
     server_auth: bool,
     san: &'a [String],
+    /// SubjectKeyIdentifier to emit (SHA-1 of this certificate's public key).
+    subject_key_id: Option<&'a [u8]>,
+    /// AuthorityKeyIdentifier keyIdentifier to emit (the issuing CA's subject key identifier).
+    authority_key_id: Option<&'a [u8]>,
+}
+
+/// RFC 5280 (4.2.1.2) method 1 subject key identifier: SHA-1 over the contents of the
+/// subjectPublicKey BIT STRING (the uncompressed EC point, excluding tag/length/unused-bits).
+fn key_identifier(public_key: &[u8]) -> Vec<u8> {
+    digest(&SHA1_FOR_LEGACY_USE_ONLY, public_key)
+        .as_ref()
+        .to_vec()
+}
+
+/// The key identifier an issuer certificate advertises: its own SKI, or the RFC 5280 method 1
+/// value derived from its public key for CA material persisted before SKI support was added.
+fn issuer_key_identifier(issuer: &ParsedCertificate) -> Vec<u8> {
+    issuer
+        .subject_key_identifier
+        .clone()
+        .unwrap_or_else(|| key_identifier(&issuer.public_key))
 }
 
 fn create_certificate(spec: &CertSpec<'_>, signer: &EcdsaKeyPair) -> Result<Vec<u8>> {
@@ -959,6 +992,25 @@ fn extensions(spec: &CertSpec<'_>) -> Vec<u8> {
         true,
         &key_usage(spec.key_usage_bits),
     ));
+    // subjectKeyIdentifier (RFC 5280 4.2.1.2): KeyIdentifier is an OCTET STRING; the extension
+    // value wraps that DER. Non-critical, matching Caddy/smallstep and strict verifiers.
+    if let Some(subject_key_id) = spec.subject_key_id {
+        extensions.push(extension(
+            OID_SUBJECT_KEY_IDENTIFIER,
+            false,
+            &der_tlv(0x04, subject_key_id),
+        ));
+    }
+    // authorityKeyIdentifier (RFC 5280 4.2.1.1): SEQUENCE { keyIdentifier [0] IMPLICIT OCTET
+    // STRING }. Non-critical. Emitted for intermediate and leaf certificates so strict clients can
+    // link the chain by key id (root is self-signed and has no AKI).
+    if let Some(authority_key_id) = spec.authority_key_id {
+        extensions.push(extension(
+            OID_AUTHORITY_KEY_IDENTIFIER,
+            false,
+            &der_sequence(&[der_tlv(0x80, authority_key_id)]),
+        ));
+    }
     // extendedKeyUsage: serverAuth for leaves
     if spec.server_auth {
         extensions.push(extension(
@@ -1035,6 +1087,8 @@ const OID_BASIC_CONSTRAINTS: &[u64] = &[2, 5, 29, 19];
 const OID_KEY_USAGE: &[u64] = &[2, 5, 29, 15];
 const OID_SUBJECT_ALT_NAME: &[u64] = &[2, 5, 29, 17];
 const OID_EXTENDED_KEY_USAGE: &[u64] = &[2, 5, 29, 37];
+const OID_SUBJECT_KEY_IDENTIFIER: &[u64] = &[2, 5, 29, 14];
+const OID_AUTHORITY_KEY_IDENTIFIER: &[u64] = &[2, 5, 29, 35];
 const OID_SERVER_AUTH: &[u64] = &[1, 3, 6, 1, 5, 5, 7, 3, 1];
 
 fn subject_public_key_info(public_key: &[u8]) -> Vec<u8> {
@@ -1235,6 +1289,10 @@ struct ParsedCertificate {
     public_key: Vec<u8>,
     not_before: SystemTime,
     not_after: SystemTime,
+    /// `subjectKeyIdentifier` extension value (RFC 5280 method 1: SHA-1 of the public key).
+    subject_key_identifier: Option<Vec<u8>>,
+    /// `authorityKeyIdentifier.keyIdentifier` extension value, when present.
+    authority_key_identifier: Option<Vec<u8>>,
 }
 
 struct DerReader<'a> {
@@ -1249,6 +1307,10 @@ impl<'a> DerReader<'a> {
 
     fn position(&self) -> usize {
         self.offset
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.offset)
     }
 
     fn read_tlv(&mut self) -> Result<(u8, &'a [u8])> {
@@ -1337,6 +1399,20 @@ fn parse_certificate(der: &[u8]) -> Result<ParsedCertificate> {
     let spki = tbs_reader.expect(0x30, "subjectPublicKeyInfo")?;
     let public_key = parse_spki_public_key(spki)?;
 
+    // Optional trailing TBSCertificate fields: issuerUniqueID [1], subjectUniqueID [2] and
+    // extensions [3]. Only the extensions matter here (SKI/AKI are needed to chain and renew CA
+    // certificates and to prove key-id linkage in tests).
+    let mut subject_key_identifier = None;
+    let mut authority_key_identifier = None;
+    while tbs_reader.remaining() > 0 {
+        let (tag, value) = tbs_reader.read_tlv()?;
+        if tag == 0xA3 {
+            let (subject, authority) = parse_key_identifiers(value)?;
+            subject_key_identifier = subject;
+            authority_key_identifier = authority;
+        }
+    }
+
     let mut validity_reader = DerReader::new(validity);
     let not_before = validity_reader.read_tlv()?;
     let not_after = validity_reader.read_tlv()?;
@@ -1345,6 +1421,8 @@ fn parse_certificate(der: &[u8]) -> Result<ParsedCertificate> {
         public_key,
         not_before: UNIX_EPOCH + Duration::from_secs(parse_asn1_time(not_before.0, not_before.1)?),
         not_after: UNIX_EPOCH + Duration::from_secs(parse_asn1_time(not_after.0, not_after.1)?),
+        subject_key_identifier,
+        authority_key_identifier,
     })
 }
 
@@ -1359,6 +1437,63 @@ fn parse_spki_public_key(spki: &[u8]) -> Result<Vec<u8>> {
         ));
     }
     Ok(bit_string[1..].to_vec())
+}
+
+/// Extract `subjectKeyIdentifier` and `authorityKeyIdentifier.keyIdentifier` from an
+/// `Extensions` [3] EXPLICIT value.
+fn parse_key_identifiers(explicit_extensions: &[u8]) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
+    // DER OID contents: 2.5.29.14 (subjectKeyIdentifier) and 2.5.29.35
+    // (authorityKeyIdentifier).
+    const SUBJECT_KEY_IDENTIFIER_OID: &[u8] = &[0x55, 0x1d, 0x0e];
+    const AUTHORITY_KEY_IDENTIFIER_OID: &[u8] = &[0x55, 0x1d, 0x23];
+
+    let mut reader = DerReader::new(explicit_extensions);
+    let extensions = reader.expect(0x30, "Extensions")?;
+    let mut extensions = DerReader::new(extensions);
+    let mut subject_key_identifier = None;
+    let mut authority_key_identifier = None;
+    while extensions.remaining() > 0 {
+        let extension = extensions.expect(0x30, "Extension")?;
+        let mut extension = DerReader::new(extension);
+        let (oid_tag, oid) = extension.read_tlv()?;
+        if oid_tag != 0x06 {
+            return Err(Error::Issuer(
+                "invalid X.509 extension: extension ID is not an OBJECT IDENTIFIER".to_string(),
+            ));
+        }
+        let (mut value_tag, mut value) = extension.read_tlv()?;
+        if value_tag == 0x01 {
+            // critical BOOLEAN
+            (value_tag, value) = extension.read_tlv()?;
+        }
+        if value_tag != 0x04 {
+            return Err(Error::Issuer(
+                "invalid X.509 extension: extnValue is not an OCTET STRING".to_string(),
+            ));
+        }
+        if oid == SUBJECT_KEY_IDENTIFIER_OID {
+            let mut value_reader = DerReader::new(value);
+            let (tag, key_identifier) = value_reader.read_tlv()?;
+            if tag != 0x04 {
+                return Err(Error::Issuer(
+                    "invalid subjectKeyIdentifier: value is not an OCTET STRING".to_string(),
+                ));
+            }
+            subject_key_identifier = Some(key_identifier.to_vec());
+        } else if oid == AUTHORITY_KEY_IDENTIFIER_OID {
+            let mut value_reader = DerReader::new(value);
+            let sequence = value_reader.expect(0x30, "AuthorityKeyIdentifier")?;
+            let mut sequence_reader = DerReader::new(sequence);
+            while sequence_reader.remaining() > 0 {
+                let (tag, key_identifier) = sequence_reader.read_tlv()?;
+                if tag == 0x80 {
+                    authority_key_identifier = Some(key_identifier.to_vec());
+                    break;
+                }
+            }
+        }
+    }
+    Ok((subject_key_identifier, authority_key_identifier))
 }
 
 fn parse_asn1_time(tag: u8, value: &[u8]) -> Result<u64> {
@@ -2021,5 +2156,158 @@ mod tests {
                 .join("certificates/local/perms.example/perms.example.crt")
                 .is_file());
         }
+    }
+
+    // ---- SKI / AKI (strict client compatibility; acceptance finding F1) -------------------
+
+    /// Whether the extension `oid` is marked critical (`None` when the extension is absent).
+    fn extension_criticality(der: &[u8], oid: &[u64]) -> Option<bool> {
+        fn oid_content(oid: &[u64]) -> Vec<u8> {
+            let encoded = der_oid(oid);
+            let mut reader = DerReader::new(&encoded);
+            let (_, content) = reader.read_tlv().expect("encoded OID");
+            content.to_vec()
+        }
+        let expected = oid_content(oid);
+        let mut outer = DerReader::new(der);
+        let certificate = outer.expect(0x30, "Certificate").ok()?;
+        let mut certificate = DerReader::new(certificate);
+        let tbs = certificate.expect(0x30, "TBSCertificate").ok()?;
+        let mut tbs = DerReader::new(tbs);
+        while tbs.remaining() > 0 {
+            let (tag, value) = tbs.read_tlv().ok()?;
+            if tag != 0xa3 {
+                continue;
+            }
+            let mut explicit = DerReader::new(value);
+            let extensions = explicit.expect(0x30, "Extensions").ok()?;
+            let mut extensions = DerReader::new(extensions);
+            while extensions.remaining() > 0 {
+                let extension = extensions.expect(0x30, "Extension").ok()?;
+                let mut extension = DerReader::new(extension);
+                let (oid_tag, oid_value) = extension.read_tlv().ok()?;
+                if oid_tag != 0x06 || oid_value != expected.as_slice() {
+                    continue;
+                }
+                let (tag, value) = extension.read_tlv().ok()?;
+                return Some(tag == 0x01 && value != [0x00]);
+            }
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn internal_ca_certificates_have_linked_ski_and_aki_extensions() {
+        let clock = Arc::new(ManualClock::new(at(Duration::ZERO)));
+        let (issuer, ca_storage, certificate_storage) = memory_issuer(clock.clone()).await;
+        let certificate = issuer
+            .obtain(&issuance(&["strict.example"]))
+            .await
+            .expect("internal issuance");
+        let ca = issuer.ca_certificates().await.expect("CA certificates");
+        let root = parse_certificate(&ca.root_der).expect("root parses");
+        let intermediate = parse_certificate(&ca.intermediate_der).expect("intermediate parses");
+        let leaf = parse_certificate(&certificate.cert_chain_der[0]).expect("leaf parses");
+
+        // SKI on all three certificates, RFC 5280 method 1 (SHA-1 over the public key BIT STRING).
+        let root_ski = root
+            .subject_key_identifier
+            .clone()
+            .expect("root certificate must carry a subjectKeyIdentifier");
+        let intermediate_ski = intermediate
+            .subject_key_identifier
+            .clone()
+            .expect("intermediate certificate must carry a subjectKeyIdentifier");
+        let leaf_ski = leaf
+            .subject_key_identifier
+            .clone()
+            .expect("leaf certificate must carry a subjectKeyIdentifier");
+        assert_eq!(root_ski.len(), 20);
+        assert_eq!(root_ski, key_identifier(&root.public_key));
+        assert_eq!(intermediate_ski, key_identifier(&intermediate.public_key));
+        assert_eq!(leaf_ski, key_identifier(&leaf.public_key));
+
+        // Key-id linkage: root SKI == intermediate AKI, intermediate SKI == leaf AKI.
+        assert_eq!(
+            intermediate.authority_key_identifier.as_deref(),
+            Some(root_ski.as_slice()),
+            "intermediate AKI must equal the root SKI"
+        );
+        assert_eq!(
+            leaf.authority_key_identifier.as_deref(),
+            Some(intermediate_ski.as_slice()),
+            "leaf AKI must equal the intermediate SKI"
+        );
+        assert_ne!(root_ski, intermediate_ski);
+        assert_ne!(intermediate_ski, leaf_ski);
+
+        // A self-signed root has no AKI; SKI/AKI extensions are non-critical.
+        assert!(root.authority_key_identifier.is_none());
+        for (der, oid) in [
+            (&ca.root_der, OID_SUBJECT_KEY_IDENTIFIER),
+            (&ca.intermediate_der, OID_SUBJECT_KEY_IDENTIFIER),
+            (&ca.intermediate_der, OID_AUTHORITY_KEY_IDENTIFIER),
+            (&certificate.cert_chain_der[0], OID_SUBJECT_KEY_IDENTIFIER),
+            (&certificate.cert_chain_der[0], OID_AUTHORITY_KEY_IDENTIFIER),
+        ] {
+            assert_eq!(
+                extension_criticality(der, oid),
+                Some(false),
+                "extension {oid:?} must be present and non-critical"
+            );
+        }
+        assert_eq!(
+            extension_criticality(&ca.root_der, OID_AUTHORITY_KEY_IDENTIFIER),
+            None
+        );
+
+        // Existing extensions/SANs are preserved and the chain still verifies through webpki.
+        verify_leaf(
+            &ca.root_der,
+            &certificate.cert_chain_der[0],
+            &ca.intermediate_der,
+            &dns_name("strict.example"),
+            at(Duration::ZERO),
+        )
+        .expect("webpki verifies the SKI/AKI-bearing chain");
+
+        // Reissue/renewal from a restarted issuer (persisted CA loaded, not regenerated) keeps the
+        // same key-id linkage: renewals must stay strict-client compatible too.
+        let restarted = InternalIssuer::new(
+            ca_storage.clone() as Arc<dyn CaStorage>,
+            Box::new(certificate_storage.clone()),
+        )
+        .with_clock(clock);
+        let renewed = restarted
+            .obtain(&issuance(&["strict.example"]))
+            .await
+            .expect("renewal issuance");
+        let ca_after_restart = restarted.ca_certificates().await.expect("CA certificates");
+        let root_after_restart =
+            parse_certificate(&ca_after_restart.root_der).expect("root parses");
+        let intermediate_after_restart =
+            parse_certificate(&ca_after_restart.intermediate_der).expect("intermediate parses");
+        let leaf_after_restart =
+            parse_certificate(&renewed.cert_chain_der[0]).expect("leaf parses");
+        assert_eq!(
+            intermediate_after_restart
+                .authority_key_identifier
+                .as_deref(),
+            root_after_restart.subject_key_identifier.as_deref(),
+            "reloaded intermediate AKI must still equal the root SKI"
+        );
+        assert_eq!(
+            leaf_after_restart.authority_key_identifier.as_deref(),
+            intermediate_after_restart.subject_key_identifier.as_deref(),
+            "renewed leaf AKI must equal the intermediate SKI"
+        );
+        verify_leaf(
+            &ca_after_restart.root_der,
+            &renewed.cert_chain_der[0],
+            &ca_after_restart.intermediate_der,
+            &dns_name("strict.example"),
+            at(Duration::ZERO),
+        )
+        .expect("webpki verifies a renewed chain");
     }
 }
