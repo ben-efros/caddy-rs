@@ -30,9 +30,11 @@ use caddy_rs_http::{
 
 use crate::balancer::{self, Balancer};
 use crate::client::{build_client_with_tls, HttpClient};
+use crate::forward_auth::{HandleResponse, HandleResponseResult, RequestRewrite};
 use crate::health::{HealthCheck, HealthCheckScheduler};
 use crate::passive::PassiveHealth;
 use crate::retry::RetryMatch;
+use crate::template::{HeaderOps, TemplateContext};
 use crate::tls::UpstreamTls;
 use crate::upstream::Upstream;
 
@@ -177,10 +179,10 @@ pub struct ReverseProxyHandler {
     client: HttpClient,
     upstreams: Vec<Arc<Upstream>>,
     balancer: Box<dyn Balancer>,
-    request_headers_set: HeaderMap,
-    response_headers_set: HeaderMap,
-    response_headers_add: HeaderMap,
-    response_headers_delete: Vec<HeaderName>,
+    request_header_ops: HeaderOps,
+    response_header_ops: HeaderOps,
+    rewrite: Option<RequestRewrite>,
+    handle_response: HandleResponse,
     retries: u32,
     try_duration: Duration,
     try_interval: Duration,
@@ -198,6 +200,10 @@ impl ReverseProxyHandler {
             .as_object()
             .ok_or_else(|| invalid(path, "reverse_proxy handler must be an object"))?;
 
+        // Fail closed on handler fields Caddy implements but this build does not: silently
+        // ignoring them could skip security-relevant behaviour (see T-PROXY-037).
+        audit_unsupported_handler_fields(object, path)?;
+
         // `transport.tls` enables TLS for every upstream of the handler (Caddy's transport is
         // per-handler, not per-upstream). The client configuration is built here so trust-store
         // failures surface as located config errors instead of per-request transport errors.
@@ -214,8 +220,26 @@ impl ReverseProxyHandler {
                 .get("dial")
                 .and_then(Value::as_str)
                 .ok_or_else(|| invalid(&upstream_path, "upstream requires a `dial` string"))?;
+            let max_requests = match upstream.get("max_requests") {
+                None | Some(Value::Null) => None,
+                Some(value) => {
+                    let max = value.as_u64().ok_or_else(|| {
+                        invalid(
+                            &format!("{upstream_path}.max_requests"),
+                            "`max_requests` must be a non-negative integer",
+                        )
+                    })?;
+                    Some(usize::try_from(max).map_err(|_| {
+                        invalid(
+                            &format!("{upstream_path}.max_requests"),
+                            "`max_requests` is too large for this platform",
+                        )
+                    })?)
+                }
+            };
             let parsed = Upstream::parse_dial(dial, tls.is_some())
-                .map_err(|message| invalid(&upstream_path, message))?;
+                .map_err(|message| invalid(&upstream_path, message))?
+                .with_max_requests(max_requests);
             upstreams.push(Arc::new(parsed));
         }
         if let Some(tls) = &tls {
@@ -248,12 +272,13 @@ impl ReverseProxyHandler {
             &format!("{path}.load_balancing.retry_match"),
         )?;
 
-        let (
-            request_headers_set,
-            response_headers_set,
-            response_headers_add,
-            response_headers_delete,
-        ) = parse_headers(object.get("headers"), path)?;
+        let header_config = parse_headers(object.get("headers"), path)?;
+
+        let rewrite = RequestRewrite::from_json(object.get("rewrite"), &format!("{path}.rewrite"))?;
+        let handle_response = HandleResponse::from_json(
+            object.get("handle_response"),
+            &format!("{path}.handle_response"),
+        )?;
 
         let trusted_proxies = parse_trusted_proxies(object.get("trusted_proxies"), path)?;
 
@@ -268,10 +293,10 @@ impl ReverseProxyHandler {
             client: build_client_with_tls(tls),
             upstreams,
             balancer,
-            request_headers_set,
-            response_headers_set,
-            response_headers_add,
-            response_headers_delete,
+            request_header_ops: header_config.request,
+            response_header_ops: header_config.response,
+            rewrite,
+            handle_response,
             retries,
             try_duration,
             try_interval,
@@ -335,18 +360,31 @@ impl ReverseProxyHandler {
         upstream: &Upstream,
         request: &Request,
     ) -> Result<ForwardedStreamingResponse, ProxyError> {
-        let path_and_query = request
-            .uri
-            .path_and_query()
-            .map(|value| value.as_str())
-            .unwrap_or("/");
-        let url = upstream.url(path_and_query);
+        // `forward_auth` (and any configured `rewrite`) changes only the auth sub-request: the
+        // original request is untouched so later handlers still see the client's method/URI/body.
+        let (method, path_and_query) = match &self.rewrite {
+            Some(rewrite) => rewrite.prepare(request),
+            None => (
+                request.method.clone(),
+                request
+                    .uri
+                    .path_and_query()
+                    .map(|value| value.as_str())
+                    .unwrap_or("/")
+                    .to_string(),
+            ),
+        };
+        let body = match &self.rewrite {
+            Some(rewrite) if rewrite.drops_body() => Bytes::new(),
+            _ => request.body.clone(),
+        };
+        let url = upstream.url(&path_and_query);
         let headers = self.outbound_headers(request, upstream)?;
 
         let mut outbound = hyper::Request::builder()
-            .method(request.method.clone())
+            .method(method)
             .uri(url)
-            .body(Full::new(request.body.clone()))
+            .body(Full::new(body))
             .map_err(|error| ProxyError::Request(error.to_string()))?;
         *outbound.headers_mut() = headers;
 
@@ -413,10 +451,16 @@ impl ReverseProxyHandler {
 
         self.add_forwarded_headers(&mut headers, request, upstream)?;
 
-        // `header_up` operations are applied last and win over the implicit headers.
-        for (name, value) in &self.request_headers_set {
-            headers.insert(name.clone(), value.clone());
-        }
+        // `header_up` operations are applied last and win over the implicit headers. Values are
+        // templates: canonical `forward_auth` relies on `{http.request.method}` / `{http.request.uri}`
+        // carrying the *original* request values to the auth service.
+        let context = TemplateContext {
+            request,
+            response_status: None,
+            response_headers: None,
+            vars: Some(&request.vars),
+        };
+        self.request_header_ops.apply(&mut headers, &context);
         Ok(headers)
     }
 
@@ -508,21 +552,43 @@ impl ReverseProxyHandler {
         headers
     }
 
-    fn apply_response_headers(&self, response: &mut Response) {
-        self.apply_response_headers_to(&mut response.headers);
+    /// Apply the configured `headers.response` operations to a response header map (buffered and
+    /// streaming responses share the same semantics).
+    fn apply_response_headers_to(
+        &self,
+        headers: &mut HeaderMap,
+        request: &Request,
+        status: StatusCode,
+        upstream_headers: &HeaderMap,
+    ) {
+        let snapshot = request.clone();
+        let context = TemplateContext {
+            request: &snapshot,
+            response_status: Some(status),
+            response_headers: Some(upstream_headers),
+            vars: Some(&snapshot.vars),
+        };
+        self.response_header_ops.apply(headers, &context);
     }
 
-    /// Apply the configured `headers.response` operations to any response header map (buffered or
-    /// streaming responses share the same semantics).
-    fn apply_response_headers_to(&self, headers: &mut HeaderMap) {
-        for (name, value) in &self.response_headers_set {
-            headers.insert(name.clone(), value.clone());
+    /// Caddy's `Upstream.Available()`: not actively unhealthy, below the passive failure
+    /// threshold, and below the simultaneous-request limit.
+    ///
+    /// Caddy copies `health_checks.passive.unhealthy_request_count` into `MaxRequests` only for
+    /// upstreams without an explicit `max_requests`; an explicit `max_requests` wins.
+    fn upstream_available(&self, upstream: &Upstream, now: std::time::Instant) -> bool {
+        if upstream.is_full() {
+            return false;
         }
-        for (name, value) in &self.response_headers_add {
-            headers.append(name.clone(), value.clone());
-        }
-        for name in &self.response_headers_delete {
-            headers.remove(name);
+        match &self.passive {
+            None => true,
+            Some(passive) => {
+                if upstream.max_requests().is_some() {
+                    passive.is_healthy(&upstream.dial, now)
+                } else {
+                    passive.is_available(&upstream.dial, now, upstream.active_connections())
+                }
+            }
         }
     }
 
@@ -550,6 +616,57 @@ impl ReverseProxyHandler {
             tokio::time::sleep(self.try_interval).await;
         }
     }
+}
+
+/// Reject `reverse_proxy` handler fields that Caddy implements but caddy-rs does not.
+///
+/// Unknown fields that Caddy also ignores are harmless (both loaders ignore them), but a field
+/// with runtime meaning must never be silently dropped: that is exactly how an authentication gate
+/// could appear configured while doing nothing. Each rejection names the field and the tracking
+/// task.
+fn audit_unsupported_handler_fields(
+    object: &serde_json::Map<String, Value>,
+    path: &str,
+) -> HttpResult<()> {
+    const UNSUPPORTED: &[(&str, &str)] = &[
+        (
+            "circuit_breaker",
+            "reverse_proxy `circuit_breaker` (circuit breakers are not implemented)",
+        ),
+        (
+            "dynamic_upstreams",
+            "reverse_proxy `dynamic_upstreams` (dynamic upstream discovery is not implemented)",
+        ),
+        (
+            "proxy_status_name",
+            "reverse_proxy `proxy_status_name` (Proxy-Status headers are not implemented)",
+        ),
+        (
+            "stream_timeout",
+            "reverse_proxy `stream_timeout` (proxied stream timeouts are not implemented)",
+        ),
+        (
+            "stream_buffer_size",
+            "reverse_proxy `stream_buffer_size` (stream buffer sizing is not implemented)",
+        ),
+        (
+            "stream_close_delay",
+            "reverse_proxy `stream_close_delay` (stream close delays are not implemented)",
+        ),
+    ];
+    for (field, feature) in UNSUPPORTED {
+        if object.get(*field).is_some() {
+            let _ = path;
+            return Err(HttpError::NotImplemented {
+                feature,
+                tracking_id: "T-PROXY-037",
+            });
+        }
+    }
+    // `request_buffers`/`response_buffers` are accepted and inert while response streaming is
+    // always on (DIV-0009); `verbose_logs` only affects logging, so ignoring it cannot change
+    // request handling.
+    Ok(())
 }
 
 /// Parse Caddy's `reverse_proxy.flush_interval` (`caddy.Duration`, integer nanoseconds in JSON).
@@ -591,17 +708,12 @@ impl Handler for ReverseProxyHandler {
             // Passive health checks remove temporarily unhealthy (or saturated) upstreams from
             // selection until their failure window expires (Caddy's `Upstream.Available()`).
             let now = std::time::Instant::now();
-            let candidates: Vec<Arc<Upstream>> = match &self.passive {
-                Some(passive) => self
-                    .upstreams
-                    .iter()
-                    .filter(|upstream| {
-                        passive.is_available(&upstream.dial, now, upstream.active_connections())
-                    })
-                    .cloned()
-                    .collect(),
-                None => self.upstreams.clone(),
-            };
+            let candidates: Vec<Arc<Upstream>> = self
+                .upstreams
+                .iter()
+                .filter(|upstream| self.upstream_available(upstream, now))
+                .cloned()
+                .collect();
             let Some(upstream) = self.balancer.select(&candidates) else {
                 // No upstream is available. Caddy retries this state (an upstream may recover)
                 // and surfaces 503 when the retry budget is spent.
@@ -647,7 +759,33 @@ impl Handler for ReverseProxyHandler {
                             body: Bytes::new(),
                         }));
                     }
-                    self.apply_response_headers(&mut response);
+                    // Caddy evaluates `handle_response` after `retry_match`; a matching 2xx
+                    // forward-auth response continues the handler chain (gate passed), while a
+                    // non-matching 401/403 falls through to the normal response below.
+                    if self.handle_response.is_configured() {
+                        if let Some(result) = self.handle_response.evaluate(
+                            &request,
+                            response.status,
+                            &response.headers,
+                        ) {
+                            return Ok(match result {
+                                HandleResponseResult::Continue(request) => {
+                                    Outcome::Continue(request)
+                                }
+                                HandleResponseResult::Respond(response) => {
+                                    Outcome::Respond(response)
+                                }
+                            });
+                        }
+                    }
+                    let status = response.status;
+                    let upstream_headers = response.headers.clone();
+                    self.apply_response_headers_to(
+                        &mut response.headers,
+                        &request,
+                        status,
+                        &upstream_headers,
+                    );
                     return Ok(Outcome::Respond(response));
                 }
                 Err(error) => {
@@ -688,17 +826,12 @@ impl Handler for ReverseProxyHandler {
         let mut attempts: u32 = 0;
         loop {
             let now = std::time::Instant::now();
-            let candidates: Vec<Arc<Upstream>> = match &self.passive {
-                Some(passive) => self
-                    .upstreams
-                    .iter()
-                    .filter(|upstream| {
-                        passive.is_available(&upstream.dial, now, upstream.active_connections())
-                    })
-                    .cloned()
-                    .collect(),
-                None => self.upstreams.clone(),
-            };
+            let candidates: Vec<Arc<Upstream>> = self
+                .upstreams
+                .iter()
+                .filter(|upstream| self.upstream_available(upstream, now))
+                .cloned()
+                .collect();
             let Some(upstream) = self.balancer.select(&candidates) else {
                 if !self.retry_allowed(attempts, deadline) {
                     return Ok(StreamingOutcome::Respond(StreamingResponse::from_buffered(
@@ -744,12 +877,43 @@ impl Handler for ReverseProxyHandler {
                             },
                         )));
                     }
+                    // A matching response handler either continues the chain with the auth headers
+                    // copied onto the original request (2xx gate) or terminates with a synthetic
+                    // response; otherwise the upstream response is streamed through unchanged.
+                    if self.handle_response.is_configured() {
+                        if let Some(result) = self.handle_response.evaluate(
+                            &request,
+                            forwarded.status,
+                            &forwarded.headers,
+                        ) {
+                            return Ok(match result {
+                                HandleResponseResult::Continue(request) => {
+                                    // Cancel the auth response body: the chain continues and the
+                                    // auth body is never sent to the client.
+                                    drop(forwarded);
+                                    StreamingOutcome::Continue(request)
+                                }
+                                HandleResponseResult::Respond(response) => {
+                                    StreamingOutcome::Respond(StreamingResponse::from_buffered(
+                                        response,
+                                    ))
+                                }
+                            });
+                        }
+                    }
                     let mut response = StreamingResponse::new(
                         forwarded.status,
                         forwarded.headers,
                         Body::from_stream(forwarded.body),
                     );
-                    self.apply_response_headers_to(&mut response.headers);
+                    let status = response.status;
+                    let upstream_headers = response.headers.clone();
+                    self.apply_response_headers_to(
+                        &mut response.headers,
+                        &request,
+                        status,
+                        &upstream_headers,
+                    );
                     return Ok(StreamingOutcome::Respond(response));
                 }
                 Err(error) => {
@@ -881,82 +1045,40 @@ fn parse_trusted_proxies(value: Option<&Value>, path: &str) -> HttpResult<Vec<Ip
     Ok(networks)
 }
 
-fn parse_headers(
-    value: Option<&Value>,
-    path: &str,
-) -> HttpResult<(HeaderMap, HeaderMap, HeaderMap, Vec<HeaderName>)> {
-    let mut request_set = HeaderMap::new();
-    let mut response_set = HeaderMap::new();
-    let mut response_add = HeaderMap::new();
-    let mut response_delete = Vec::new();
+/// Parsed `reverse_proxy.headers`: request operations (applied before sending upstream) and
+/// response operations (applied to the proxied response).
+struct HeaderConfig {
+    request: HeaderOps,
+    response: HeaderOps,
+}
+
+/// Parse Caddy's embedded `headers` handler.
+///
+/// Only request/response `add`/`set`/`delete` are implemented. Caddy's `replace` operations
+/// require a regex engine that is unavailable offline, and `deferred`/`require` change *when*
+/// response operations apply; all are rejected loudly by [`HeaderOps::from_json`] (T-PROXY-037)
+/// rather than silently misapplying security headers.
+fn parse_headers(value: Option<&Value>, path: &str) -> HttpResult<HeaderConfig> {
     let Some(value) = value else {
-        return Ok((request_set, response_set, response_add, response_delete));
+        return Ok(HeaderConfig {
+            request: HeaderOps::default(),
+            response: HeaderOps::default(),
+        });
     };
     let object = value
         .as_object()
         .ok_or_else(|| invalid(path, "`headers` must be an object"))?;
-    if let Some(request) = object.get("request") {
-        if let Some(set) = request.get("set") {
-            request_set = parse_header_map(set, &format!("{path}.headers.request.set"))?;
-        }
-    }
-    if let Some(response) = object.get("response") {
-        if let Some(set) = response.get("set") {
-            response_set = parse_header_map(set, &format!("{path}.headers.response.set"))?;
-        }
-        if let Some(add) = response.get("add") {
-            response_add = parse_header_map(add, &format!("{path}.headers.response.add"))?;
-        }
-        if let Some(delete) = response.get("delete").and_then(Value::as_array) {
-            for (index, name) in delete.iter().enumerate() {
-                let name = name.as_str().ok_or_else(|| {
-                    invalid(
-                        &format!("{path}.headers.response.delete[{index}]"),
-                        "expected a header name",
-                    )
-                })?;
-                response_delete.push(name.parse().map_err(|error| {
-                    invalid(
-                        &format!("{path}.headers.response.delete[{index}]"),
-                        format!("{error}"),
-                    )
-                })?);
-            }
-        }
-    }
-    Ok((request_set, response_set, response_add, response_delete))
-}
-
-fn parse_header_map(value: &Value, path: &str) -> HttpResult<HeaderMap> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| invalid(path, "expected an object"))?;
-    let mut headers = HeaderMap::new();
-    for (field, value) in object {
-        let name: HeaderName = field
-            .parse()
-            .map_err(|error| invalid(path, format!("invalid header name `{field}`: {error}")))?;
-        let values: Vec<&str> = match value {
-            Value::String(value) => vec![value],
-            Value::Array(values) => values
-                .iter()
-                .map(|value| {
-                    value
-                        .as_str()
-                        .ok_or_else(|| invalid(path, "header values must be strings"))
-                })
-                .collect::<HttpResult<_>>()?,
-            _ => return Err(invalid(path, "header value must be a string or array")),
-        };
-        for value in values {
-            headers.append(
-                name.clone(),
-                HeaderValue::from_str(value)
-                    .map_err(|error| invalid(path, format!("invalid header value: {error}")))?,
-            );
-        }
-    }
-    Ok(headers)
+    let request = object
+        .get("request")
+        .map(|request| HeaderOps::from_json(request, &format!("{path}.headers.request")))
+        .transpose()?
+        .unwrap_or_default();
+    let response = object
+        .get("response")
+        .map(|response| HeaderOps::from_json(response, &format!("{path}.headers.response")))
+        .transpose()?
+        .unwrap_or_default();
+    Ok(HeaderConfig { request, response })
 }
 
 /// Parse `transport` (Caddy `http` transport only) and build the TLS client configuration when
@@ -2658,5 +2780,407 @@ mod tests {
             .expect("router buffers");
         producer.await.unwrap();
         assert_eq!(response.body, Bytes::from_static(b"buffered-body"));
+    }
+
+    // ---- Canonical `forward_auth` execution (T-PROXY-037) ---------------------------------
+
+    #[derive(Debug, Clone, Default)]
+    struct RecordedRequest {
+        method: String,
+        uri: String,
+        headers: http::HeaderMap,
+        body: bytes::Bytes,
+    }
+
+    fn canonical_forward_auth_handler(auth_dial: &str, copy_headers: &[&str]) -> Value {
+        let mut routes = vec![serde_json::json!({"handle": [{"handler": "vars"}]})];
+        for header in copy_headers {
+            let placeholder = format!("{{http.reverse_proxy.header.{header}}}");
+            routes.push(serde_json::json!({
+                "handle": [{"handler": "headers", "request": {"delete": [header]}}]
+            }));
+            let mut set = serde_json::Map::new();
+            set.insert(header.to_string(), serde_json::json!([placeholder]));
+            let mut vars = serde_json::Map::new();
+            vars.insert(placeholder.clone(), serde_json::json!([""]));
+            routes.push(serde_json::json!({
+                "handle": [{"handler": "headers", "request": {"set": Value::Object(set)}}],
+                "match": [{"not": [{"vars": Value::Object(vars)}]}]
+            }));
+        }
+        serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": auth_dial}],
+            "rewrite": {"method": "GET", "uri": "/api/authz/forward-auth"},
+            "headers": {"request": {"set": {
+                "X-Forwarded-Method": ["{http.request.method}"],
+                "X-Forwarded-Uri": ["{http.request.uri}"]
+            }}},
+            "handle_response": [{"match": {"status_code": [2]}, "routes": routes}]
+        })
+    }
+
+    /// Spawn an upstream that records requests and answers with a fixed status/body/headers.
+    async fn spawn_recording_upstream(
+        status: u16,
+        response_body: &'static str,
+        response_headers: Vec<(&'static str, &'static str)>,
+        recorded: Arc<std::sync::Mutex<Vec<RecordedRequest>>>,
+    ) -> String {
+        spawn_upstream(move |request: hyper::Request<hyper::body::Incoming>| {
+            let recorded = Arc::clone(&recorded);
+            let response_headers = response_headers.clone();
+            async move {
+                let (parts, body_incoming) = request.into_parts();
+                let request_body = body_incoming
+                    .collect()
+                    .await
+                    .map(|collected| collected.to_bytes())
+                    .unwrap_or_default();
+                recorded.lock().unwrap().push(RecordedRequest {
+                    method: parts.method.to_string(),
+                    uri: parts
+                        .uri
+                        .path_and_query()
+                        .map(|value| value.as_str().to_string())
+                        .unwrap_or_default(),
+                    headers: parts.headers,
+                    body: request_body,
+                });
+                let mut builder = hyper::Response::builder().status(status);
+                for (name, value) in &response_headers {
+                    builder = builder.header(*name, *value);
+                }
+                Ok::<_, Infallible>(
+                    builder
+                        .body(Full::new(Bytes::from_static(response_body.as_bytes())))
+                        .expect("response"),
+                )
+            }
+        })
+        .await
+    }
+
+    /// Upstream that echoes the request method, URI, body and selected headers.
+    async fn spawn_header_echo_upstream() -> String {
+        spawn_upstream(
+            move |request: hyper::Request<hyper::body::Incoming>| async move {
+                let (parts, body_incoming) = request.into_parts();
+                let body = body_incoming
+                    .collect()
+                    .await
+                    .map(|collected| collected.to_bytes())
+                    .unwrap_or_default();
+                let header = |name: &str| {
+                    parts
+                        .headers
+                        .get(name)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("missing")
+                        .to_string()
+                };
+                let text = format!(
+                    "method={}\nuri={}\nbody={}\nremote-user={}\nremote-email={}\nx-forwarded-method={}\nx-forwarded-uri={}\nauthorization={}",
+                    parts.method,
+                    parts
+                        .uri
+                        .path_and_query()
+                        .map(|value| value.as_str())
+                        .unwrap_or("/"),
+                    String::from_utf8_lossy(&body),
+                    header("remote-user"),
+                    header("remote-email"),
+                    header("x-forwarded-method"),
+                    header("x-forwarded-uri"),
+                    header("authorization"),
+                );
+                Ok::<_, Infallible>(
+                    hyper::Response::builder()
+                        .status(200)
+                        .body(Full::new(Bytes::from(text)))
+                        .expect("response"),
+                )
+            },
+        )
+        .await
+    }
+
+    fn build_chain_router(handlers: Vec<Value>) -> caddy_rs_http::Router {
+        let routes = vec![serde_json::json!({"handle": handlers})];
+        caddy_rs_http::RouterBuilder::new()
+            .with_custom_handler(handler_factory())
+            .build(&routes)
+            .expect("router builds")
+    }
+
+    fn post_request(uri: &str, body: &'static str) -> Request {
+        let mut request = Request::new(Method::POST, uri.parse().unwrap());
+        request.remote_addr = Some("203.0.113.7:5555".parse().unwrap());
+        request.body = Bytes::from_static(body.as_bytes());
+        request
+            .headers
+            .insert(http::header::HOST, "example.com".parse().unwrap());
+        request
+    }
+
+    #[tokio::test]
+    async fn forward_auth_2xx_gate_passes_and_copies_headers() {
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let auth = spawn_recording_upstream(
+            200,
+            "",
+            vec![
+                ("Remote-User", "alice"),
+                ("Remote-Email", "alice@example.com"),
+            ],
+            Arc::clone(&recorded),
+        )
+        .await;
+        let backend = spawn_header_echo_upstream().await;
+        let router = build_chain_router(vec![
+            canonical_forward_auth_handler(&auth, &["Remote-User", "Remote-Email"]),
+            serde_json::json!({"handler": "reverse_proxy", "upstreams": [{"dial": backend}]}),
+        ]);
+        let mut request = post_request("/protected?x=1", "hello");
+        request
+            .headers
+            .insert("remote-user", "attacker".parse().unwrap());
+
+        let response = router.handle(request).await.unwrap();
+        assert_eq!(response.status, StatusCode::OK);
+        let body = body_text(&response);
+        // The backend sees the ORIGINAL request, now authorized by the auth service...
+        assert!(body.contains("method=POST"), "{body}");
+        assert!(body.contains("uri=/protected?x=1"), "{body}");
+        assert!(body.contains("body=hello"), "{body}");
+        // ...with auth-provided headers replacing any client-supplied value.
+        assert!(body.contains("remote-user=alice"), "{body}");
+        assert!(body.contains("remote-email=alice@example.com"), "{body}");
+        // The forwarded-auth headers went to the auth service only.
+        assert!(body.contains("x-forwarded-method=missing"), "{body}");
+
+        // The auth sub-request was rewritten and carried the original method/URI.
+        let recorded = recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "exactly one auth sub-request");
+        let auth_request = &recorded[0];
+        assert_eq!(auth_request.method, "GET");
+        assert_eq!(auth_request.uri, "/api/authz/forward-auth?x=1");
+        assert_eq!(auth_request.headers["x-forwarded-method"], "POST");
+        assert_eq!(auth_request.headers["x-forwarded-uri"], "/protected?x=1");
+        assert!(
+            auth_request.body.is_empty(),
+            "rewritten GET drops the request body"
+        );
+        assert_eq!(auth_request.headers[http::header::HOST], "example.com");
+    }
+
+    #[tokio::test]
+    async fn forward_auth_2xx_omitting_header_removes_client_supplied_value() {
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let auth = spawn_recording_upstream(200, "", Vec::new(), Arc::clone(&recorded)).await;
+        let backend = spawn_header_echo_upstream().await;
+        let router = build_chain_router(vec![
+            canonical_forward_auth_handler(&auth, &["Remote-User"]),
+            serde_json::json!({"handler": "reverse_proxy", "upstreams": [{"dial": backend}]}),
+        ]);
+        let mut request = post_request("/protected", "");
+        request
+            .headers
+            .insert("remote-user", "attacker".parse().unwrap());
+
+        let response = router.handle(request).await.unwrap();
+        assert_eq!(response.status, StatusCode::OK);
+        let body = body_text(&response);
+        assert!(
+            body.contains("remote-user=missing"),
+            "client-injected authorization headers must be deleted when the auth service omits them: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_auth_401_and_403_pass_through_without_hitting_backend() {
+        for status in [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN] {
+            let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let auth = spawn_recording_upstream(
+                status.as_u16(),
+                "denied",
+                vec![("WWW-Authenticate", "Basic")],
+                Arc::clone(&recorded),
+            )
+            .await;
+            let backend_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counters = Arc::clone(&backend_hits);
+            let backend = spawn_upstream(move |_request| {
+                let counters = Arc::clone(&counters);
+                async move {
+                    counters.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok::<_, Infallible>(
+                        hyper::Response::builder()
+                            .status(200)
+                            .body(Full::new(Bytes::new()))
+                            .expect("response"),
+                    )
+                }
+            })
+            .await;
+            let router = build_chain_router(vec![
+                canonical_forward_auth_handler(&auth, &["Remote-User"]),
+                serde_json::json!({"handler": "reverse_proxy", "upstreams": [{"dial": backend}]}),
+            ]);
+            let response = router.handle(post_request("/protected", "")).await.unwrap();
+            assert_eq!(
+                response.status, status,
+                "auth challenge must be passed through as {status}"
+            );
+            assert_eq!(body_text(&response), "denied");
+            assert_eq!(response.headers["www-authenticate"], "Basic");
+            assert_eq!(
+                backend_hits.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "a failed auth check must not reach the backend"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn forward_auth_streaming_path_continues_on_2xx() {
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let auth = spawn_recording_upstream(
+            200,
+            "",
+            vec![("Remote-User", "alice")],
+            Arc::clone(&recorded),
+        )
+        .await;
+        let backend = spawn_header_echo_upstream().await;
+        let router = build_chain_router(vec![
+            canonical_forward_auth_handler(&auth, &["Remote-User"]),
+            serde_json::json!({"handler": "reverse_proxy", "upstreams": [{"dial": backend}]}),
+        ]);
+        let streamed = router
+            .handle_streaming(post_request("/protected", "hello"))
+            .await
+            .unwrap();
+        let response = streamed.into_buffered().await.unwrap();
+        assert_eq!(response.status, StatusCode::OK);
+        let body = body_text(&response);
+        assert!(body.contains("remote-user=alice"), "{body}");
+        assert!(body.contains("uri=/protected"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn forward_auth_streaming_401_terminates_chain() {
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let auth = spawn_recording_upstream(
+            401,
+            "denied",
+            vec![("WWW-Authenticate", "Basic")],
+            Arc::clone(&recorded),
+        )
+        .await;
+        let handler = build_handler(canonical_forward_auth_handler(&auth, &["Remote-User"]));
+        let outcome = handler
+            .handle_streaming(post_request("/protected", ""))
+            .await
+            .unwrap();
+        let StreamingOutcome::Respond(response) = outcome else {
+            panic!("401 must terminate the handler chain, not continue it");
+        };
+        let response = response.into_buffered().await.unwrap();
+        assert_eq!(response.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body_text(&response), "denied");
+    }
+
+    #[tokio::test]
+    async fn top_level_request_header_delete_is_applied() {
+        let upstream = spawn_header_echo_upstream().await;
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": upstream}],
+            "headers": {"request": {"delete": ["Authorization"]}}
+        }));
+        let mut request = post_request("/", "");
+        request.headers.insert(
+            http::header::AUTHORIZATION,
+            "Bearer client".parse().unwrap(),
+        );
+        let Outcome::Respond(response) = handler.handle(request).await.unwrap() else {
+            panic!("expected proxied response");
+        };
+        assert!(
+            body_text(&response).contains("authorization=missing"),
+            "headers.request.delete must strip the header before proxying"
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_security_relevant_handler_fields() {
+        for (field, value) in [
+            ("circuit_breaker", serde_json::json!({"type": "x"})),
+            ("dynamic_upstreams", serde_json::json!({"source": "x"})),
+            ("proxy_status_name", serde_json::json!("caddy")),
+            ("stream_timeout", serde_json::json!(1000)),
+            ("stream_buffer_size", serde_json::json!(1024)),
+            ("stream_close_delay", serde_json::json!(10)),
+        ] {
+            let mut config = serde_json::json!({
+                "handler": "reverse_proxy",
+                "upstreams": [{"dial": "localhost:8080"}]
+            });
+            config[field] = value;
+            let error = ReverseProxyHandler::from_json(&config, "handler")
+                .err()
+                .expect("unsupported handler field must be rejected");
+            let message = error.to_string();
+            assert!(
+                message.contains(field),
+                "error must name `{field}`: {message}"
+            );
+            assert!(message.contains("T-PROXY-037"), "{message}");
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_header_and_rewrite_and_handle_response_forms() {
+        let unsupported_header_ops = serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": "localhost:8080"}],
+            "headers": {"request": {"replace": {"X": [{"search": "a", "replace": "b"}]}}}
+        });
+        let error = ReverseProxyHandler::from_json(&unsupported_header_ops, "handler")
+            .err()
+            .expect("header replace must be rejected");
+        assert!(error.to_string().contains("T-PROXY-037"), "{error}");
+
+        let unsupported_rewrite = serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": "localhost:8080"}],
+            "rewrite": {"strip_path_prefix": "/api"}
+        });
+        let error = ReverseProxyHandler::from_json(&unsupported_rewrite, "handler")
+            .err()
+            .expect("unsupported rewrite must be rejected");
+        assert!(error.to_string().contains("T-PROXY-037"), "{error}");
+
+        let unsupported_handle_response = serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": "localhost:8080"}],
+            "handle_response": [{"routes": [{"handle": [{"handler": "file_server"}]}]}]
+        });
+        let error = ReverseProxyHandler::from_json(&unsupported_handle_response, "handler")
+            .err()
+            .expect("unsupported handle_response must be rejected");
+        assert!(error.to_string().contains("T-PROXY-037"), "{error}");
+    }
+
+    #[test]
+    fn accepts_upstream_max_requests_and_unknown_harmless_fields() {
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": "localhost:8080", "max_requests": 7}],
+            "some_field_caddy_also_ignores": true
+        }));
+        assert_eq!(handler.upstreams()[0].max_requests(), Some(7));
+        assert!(!handler.upstreams()[0].is_full());
     }
 }

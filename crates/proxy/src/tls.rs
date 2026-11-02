@@ -696,8 +696,7 @@ mod tests {
             &serde_json::json!({"root_ca_pem_files": [empty.display().to_string()]}),
             "transport.tls",
         )
-        .err()
-        .expect("empty trust store must fail");
+        .expect_err("empty trust store must fail");
         assert!(
             error.to_string().contains("no CERTIFICATE blocks"),
             "{error}"
