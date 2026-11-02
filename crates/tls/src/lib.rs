@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod acme;
+pub mod automatic_https;
 pub mod certificate;
 pub mod cloudflare;
 pub mod dns;
@@ -27,6 +28,10 @@ pub use acme::{
     HttpMethod, HttpRequest, HttpResponse, HyperTransport, Identifier, IssuedCertificate, Jwk,
     MemoryAcmeStorage, NewAccountRequest, NewOrderRequest, Order, OrderFetch, OrderHandle,
     OrderStatus, PollPolicy, Problem, StoredAccount, TokioClock,
+};
+pub use automatic_https::{
+    plan as plan_automatic_https, AutomaticHttpsIssuer, AutomaticHttpsPlan, AutomaticHttpsPolicy,
+    AutomaticHttpsProvisioner, ProvisionedCertificates, DEFAULT_HTTP_PORT,
 };
 pub use certificate::{renewal_queue, Certificate, CertificateCache, RenewalItem};
 pub use cloudflare::{

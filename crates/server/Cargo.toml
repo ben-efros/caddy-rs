@@ -25,3 +25,9 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
 tracing = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+base64 = "0.22.1"
+ring = "0.17.14"
+tempfile = "3.27.0"

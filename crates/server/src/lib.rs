@@ -13,6 +13,7 @@
 #![deny(unsafe_code)]
 
 pub mod activation;
+pub(crate) mod auto_https;
 pub mod error;
 pub mod http;
 pub mod limits;

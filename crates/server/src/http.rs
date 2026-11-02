@@ -14,6 +14,7 @@ use hyper::body::Incoming;
 
 use caddy_rs_http::{Request, Response, Router};
 
+use crate::auto_https::AutomaticHttpsServing;
 use crate::limits::ServerLimits;
 
 /// Serve one hyper request through a router with the server's default limits.
@@ -58,6 +59,27 @@ pub async fn serve_request_with_limits_and_alpn(
     tls: bool,
     tls_alpn: Option<&str>,
 ) -> hyper::Response<Full<Bytes>> {
+    serve_request_with_automatic(limits, router, request, remote_addr, tls, tls_alpn, None).await
+}
+
+/// Like [`serve_request_with_limits_and_alpn`], with automatic-HTTPS pre-routing: ACME HTTP-01
+/// challenge responses and HTTP→HTTPS redirects are handled before the router runs.
+pub(crate) async fn serve_request_with_automatic(
+    limits: &ServerLimits,
+    router: Arc<Router>,
+    request: hyper::Request<Incoming>,
+    remote_addr: Option<SocketAddr>,
+    tls: bool,
+    tls_alpn: Option<&str>,
+    automatic: Option<Arc<AutomaticHttpsServing>>,
+) -> hyper::Response<Full<Bytes>> {
+    if !tls {
+        if let Some(automatic) = &automatic {
+            if let Some(response) = automatic.pre_router_response(&request) {
+                return response;
+            }
+        }
+    }
     let (parts, body) = request.into_parts();
     let body = match read_body(body, limits.max_request_body_size).await {
         Ok(body) => body,

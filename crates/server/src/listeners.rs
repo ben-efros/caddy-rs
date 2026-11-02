@@ -44,8 +44,9 @@ use caddy_rs_core::{Generation, GenerationStore, ListenAddr, Network};
 use caddy_rs_http::Router;
 
 use crate::activation::{adopt_tcp, adopt_unix, InheritedSocket, LocalSocket};
+use crate::auto_https::AutomaticHttpsServing;
 use crate::error::Error;
-use crate::http::serve_request_with_limits_and_alpn;
+use crate::http::serve_request_with_automatic;
 use crate::limits::ServerLimits;
 
 /// Router map shared with accept loops, keyed by configured listen address.
@@ -61,6 +62,9 @@ pub(crate) struct ListenerState {
     pub(crate) limits: Arc<ServerLimits>,
     /// TLS configuration when this listener terminates TLS; `None` for cleartext listeners.
     pub(crate) tls: Option<Arc<rustls::ServerConfig>>,
+    /// Automatic-HTTPS pre-routing (challenge responses, HTTP→HTTPS redirects) for cleartext
+    /// listeners; `None` when automatic HTTPS is not active for this generation.
+    pub(crate) automatic: Option<Arc<AutomaticHttpsServing>>,
 }
 
 /// Listener state shared with accept loops, keyed by configured listen address.
@@ -117,9 +121,18 @@ pub(crate) async fn bind(
                     );
                     adopt_tcp(socket, configured)?
                 }
-                None => TcpListener::bind(&address.address)
-                    .await
-                    .map_err(|error| Error::bind(configured, error))?,
+                None => {
+                    // Hostless Caddy addresses (`:443`, `:80`, `:0`) bind the wildcard address;
+                    // `tokio::net::TcpListener::bind(&str)` cannot resolve a bare `:port`.
+                    let socket = address.socket_addr().ok_or_else(|| Error::Listen {
+                        listen: configured.to_string(),
+                        reason: "expected `host:port`; a hostless address needs a numeric port"
+                            .to_string(),
+                    })?;
+                    TcpListener::bind(socket)
+                        .await
+                        .map_err(|error| Error::bind(configured, error))?
+                }
             };
             let socket_addr = listener
                 .local_addr()
@@ -194,6 +207,8 @@ struct ConnectionContext {
     limits: Arc<ServerLimits>,
     /// TLS configuration for this accepted connection, when the listener terminates TLS.
     tls: Option<Arc<rustls::ServerConfig>>,
+    /// Automatic-HTTPS pre-routing for cleartext connections.
+    automatic: Option<Arc<AutomaticHttpsServing>>,
 }
 
 /// Look up the state of an accepted connection and acquire a connection slot.
@@ -215,11 +230,13 @@ fn admit_connection(
             router: Some(Arc::clone(&state.router)),
             limits: Arc::clone(&state.limits),
             tls: state.tls.clone(),
+            automatic: state.automatic.clone(),
         },
         None => ConnectionContext {
             router: None,
             limits: Arc::new(ServerLimits::default()),
             tls: None,
+            automatic: None,
         },
     };
     let permit = ConnectionPermit::try_acquire(Arc::clone(active), context.limits.max_connections)?;
@@ -356,6 +373,7 @@ async fn serve_accepted<I>(
     let limits = Arc::clone(&context.limits);
     let activity = Arc::new(ConnectionActivity::default());
     let router = context.router;
+    let automatic = context.automatic;
     if let Some(tls) = context.tls {
         let acceptor = TlsAcceptor::from(tls);
         let tls_stream = match acceptor.accept(stream).await {
@@ -378,6 +396,7 @@ async fn serve_accepted<I>(
             peer,
             true,
             alpn,
+            automatic,
             Arc::clone(&activity),
         );
         serve_connection(tls_stream, service, shutdown, limits, activity).await;
@@ -388,6 +407,7 @@ async fn serve_accepted<I>(
             peer,
             false,
             None,
+            automatic,
             Arc::clone(&activity),
         );
         serve_connection(stream, service, shutdown, limits, activity).await;
@@ -400,6 +420,7 @@ fn connection_service(
     remote_addr: Option<SocketAddr>,
     tls: bool,
     alpn: Option<String>,
+    automatic: Option<Arc<AutomaticHttpsServing>>,
     activity: Arc<ConnectionActivity>,
 ) -> impl hyper::service::Service<
     hyper::Request<Incoming>,
@@ -413,17 +434,19 @@ fn connection_service(
         let limits = Arc::clone(&limits);
         let activity = Arc::clone(&activity);
         let alpn = alpn.clone();
+        let automatic = automatic.clone();
         async move {
             let _in_flight = activity.begin();
             let response = match router {
                 Some(router) => {
-                    serve_request_with_limits_and_alpn(
+                    serve_request_with_automatic(
                         &limits,
                         router,
                         request,
                         remote_addr,
                         tls,
                         alpn.as_deref(),
+                        automatic,
                     )
                     .await
                 }
