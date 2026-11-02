@@ -1,0 +1,42 @@
+{
+  "apps": {
+    "http": {
+      "http_port": 8080,
+      "https_port": 8443,
+      "servers": {
+        "srv0": {
+          "listen": [
+            ":8443"
+          ],
+          "routes": [
+            {
+              "match": [
+                {
+                  "host": [
+                    "localhost"
+                  ]
+                }
+              ],
+              "handle": [
+                {
+                  "handler": "subroute",
+                  "routes": [
+                    {
+                      "handle": [
+                        {
+                          "body": "ok",
+                          "handler": "static_response"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ],
+              "terminal": true
+            }
+          ]
+        }
+      }
+    }
+  }
+}

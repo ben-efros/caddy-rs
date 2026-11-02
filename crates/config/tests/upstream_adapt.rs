@@ -468,3 +468,54 @@ fn dynamic_upstreams_fail_with_a_construct_specific_error() {
         );
     }
 }
+
+#[test]
+fn global_ports_are_emitted_into_apps_http_like_caddy() {
+    // The expected values below were confirmed against `caddy adapt` v2.11.7 (release oracle):
+    // caddyhttp.App carries http_port/https_port only when the global options set them.
+    let both =
+        adapt("{\n\thttp_port 8080\n\thttps_port 8443\n}\n\nlocalhost {\n\trespond \"ok\"\n}\n")
+            .expect("adapt both ports");
+    assert_eq!(both.config["apps"]["http"]["http_port"], json!(8080));
+    assert_eq!(both.config["apps"]["http"]["https_port"], json!(8443));
+
+    let https_only = adapt("{\n\thttps_port 8443\n}\n\nlocalhost {\n\trespond \"ok\"\n}\n")
+        .expect("adapt https port");
+    assert_eq!(https_only.config["apps"]["http"]["https_port"], json!(8443));
+    assert!(https_only.config["apps"]["http"].get("http_port").is_none());
+
+    let http_only = adapt("{\n\thttp_port 8080\n}\n\nlocalhost:8080 {\n\trespond \"ok\"\n}\n")
+        .expect("adapt http port");
+    assert_eq!(http_only.config["apps"]["http"]["http_port"], json!(8080));
+    assert!(http_only.config["apps"]["http"].get("https_port").is_none());
+
+    let none = adapt("localhost {\n\trespond \"ok\"\n}\n").expect("adapt defaults");
+    assert!(none.config["apps"]["http"].get("http_port").is_none());
+    assert!(none.config["apps"]["http"].get("https_port").is_none());
+}
+
+#[test]
+fn tls_cert_key_emits_caddys_connection_policies() {
+    // Verified byte-identical to `caddy adapt` v2.11.7 for this Caddyfile: tag-qualified
+    // certificate selection plus an SNI matcher, followed by Caddy's catch-all policy.
+    let adapted = adapt("https://localhost:8443 {\n\ttls cert.pem key.pem\n\trespond \"ok\"\n}\n")
+        .expect("adapt tls cert/key");
+    assert_eq!(
+        adapted.config["apps"]["tls"]["certificates"]["load_files"],
+        json!([{
+            "certificate": "cert.pem",
+            "key": "key.pem",
+            "tags": ["cert0"],
+        }])
+    );
+    assert_eq!(
+        adapted.config["apps"]["http"]["servers"]["srv0"]["tls_connection_policies"],
+        json!([
+            {
+                "certificate_selection": {"any_tag": ["cert0"]},
+                "match": {"sni": ["localhost"]},
+            },
+            {},
+        ])
+    );
+}

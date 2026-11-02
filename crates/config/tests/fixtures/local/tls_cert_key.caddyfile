@@ -1,0 +1,4 @@
+https://localhost:8443 {
+	tls caddy-rs/crates/proxy/testdata/tls/localhost-cert.pem caddy-rs/crates/proxy/testdata/tls/localhost-key.pem
+	respond "tls adapted ok"
+}
