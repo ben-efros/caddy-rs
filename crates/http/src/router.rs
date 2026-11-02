@@ -18,7 +18,7 @@ use crate::handlers::{
 };
 use crate::matchers::build_matcher_set;
 use crate::types::{
-    Error, Request, Response, Result, SharedHandler, SharedMatcher, StreamingOutcome,
+    Error, Outcome, Request, Response, Result, SharedHandler, SharedMatcher, StreamingOutcome,
 };
 
 /// A custom handler factory, used by crates outside this one (for example `caddy-rs-proxy`) to
@@ -79,7 +79,27 @@ impl Router {
     /// Handlers that have not opted into streaming still produce buffered responses; see
     /// [`crate::types::Handler::handle_streaming`] and the server integration contract in
     /// [`crate::body`].
+    ///
+    /// When no route produces a response, this returns `404 Not Found` (the top-level engine
+    /// behaviour). Nested routers that must pass control back to their caller use
+    /// [`Router::handle_streaming_outcome`], which reports that case as
+    /// [`StreamingOutcome::Continue`] — this is what makes an empty `subroute` a no-op.
     pub async fn handle_streaming(&self, request: Request) -> Result<StreamingResponse> {
+        match self.handle_streaming_outcome(request).await? {
+            StreamingOutcome::Continue(_) => {
+                Ok(StreamingResponse::from_buffered(Response::not_found()))
+            }
+            StreamingOutcome::Respond(response) => Ok(response),
+        }
+    }
+
+    /// Evaluate a request through the route tree and report whether a route handled it.
+    ///
+    /// [`StreamingOutcome::Continue`] means every matching route ran its handlers without
+    /// producing a response (or no route matched); the caller decides what to do next. This is the
+    /// contract Caddy's `RouteList.Compile(next)` implements, and it is what lets a `subroute`
+    /// with no routes behave as a no-op that passes control on.
+    pub async fn handle_streaming_outcome(&self, request: Request) -> Result<StreamingOutcome> {
         let mut matched_groups: HashSet<&str> = HashSet::new();
         let mut current = request;
         for route in &self.routes {
@@ -103,17 +123,30 @@ impl Router {
                     StreamingOutcome::Continue(next) => current = next,
                     StreamingOutcome::Respond(mut response) => {
                         apply_pending_headers(&mut response.headers, &staged);
-                        return Ok(response);
+                        return Ok(StreamingOutcome::Respond(response));
                     }
                 }
             }
             if route.terminal {
                 let mut response = StreamingResponse::from_buffered(Response::ok());
                 apply_pending_headers(&mut response.headers, &current);
-                return Ok(response);
+                return Ok(StreamingOutcome::Respond(response));
             }
         }
-        Ok(StreamingResponse::from_buffered(Response::not_found()))
+        Ok(StreamingOutcome::Continue(current))
+    }
+
+    /// Buffered counterpart of [`Router::handle_streaming_outcome`].
+    ///
+    /// Streaming responses are collected; use the streaming variant when the caller must preserve
+    /// streaming bodies.
+    pub async fn handle_outcome(&self, request: Request) -> Result<Outcome> {
+        match self.handle_streaming_outcome(request).await? {
+            StreamingOutcome::Continue(request) => Ok(Outcome::Continue(request)),
+            StreamingOutcome::Respond(response) => {
+                Ok(Outcome::Respond(response.into_buffered().await?))
+            }
+        }
     }
 }
 
@@ -236,13 +269,20 @@ impl RouterBuilder {
             "forward_auth" => Arc::new(ForwardAuthHandler::from_json(value, path)?),
             "authentication" | "basic_auth" => Arc::new(BasicAuthHandler::from_json(value, path)?),
             "subroute" => {
-                let routes = object
-                    .get("routes")
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| Error::InvalidConfig {
-                        path: format!("{path}.routes"),
-                        message: "subroute requires a `routes` array".to_string(),
-                    })?;
+                // Caddy's `subroute.routes` is optional (`json:"routes,omitempty"`): absent,
+                // `null` and an empty array all mean "no routes", which compiles to a no-op that
+                // passes control to the next handler (core validation accepts these forms too).
+                let routes: &[Value] = match object.get("routes") {
+                    None | Some(Value::Null) => &[],
+                    Some(Value::Array(routes)) => routes,
+                    Some(_) => {
+                        return Err(Error::InvalidConfig {
+                            path: format!("{path}.routes"),
+                            message: "subroute handler field `routes` must be an array of routes"
+                                .to_string(),
+                        })
+                    }
+                };
                 let inner = self.build(routes)?;
                 Arc::new(SubrouteHandler::new(inner))
             }
@@ -358,6 +398,129 @@ mod tests {
         assert_eq!(response.body, bytes::Bytes::from_static(b"a"));
         let response = router.handle(request("/b", "host")).await.unwrap();
         assert_eq!(response.body, bytes::Bytes::from_static(b"fallback"));
+    }
+
+    async fn build_router_for_servers(routes: serde_json::Value) -> Router {
+        let config = caddy_rs_core::Config::from_value(serde_json::json!({
+            "apps": {"http": {"servers": {"srv0": {
+                "listen": [":80"],
+                "routes": routes
+            }}}}
+        }))
+        .expect("config model decodes");
+        let value = config.to_value().expect("config serializes");
+        let routes = value["apps"]["http"]["servers"]["srv0"]["routes"]
+            .as_array()
+            .expect("routes array");
+        RouterBuilder::new()
+            .build(routes)
+            .expect("adapted routes must construct")
+    }
+
+    #[tokio::test]
+    async fn empty_subroute_is_a_valid_noop() {
+        // Caddy's `subroute.routes` is optional; absent, null and empty array all behave as a
+        // no-op that continues the outer handler chain.
+        for subroute in [
+            json!({"handler": "subroute"}),
+            json!({"handler": "subroute", "routes": null}),
+            json!({"handler": "subroute", "routes": []}),
+        ] {
+            let router = RouterBuilder::new()
+                .build(&[json!({
+                    "handle": [
+                        subroute.clone(),
+                        {"handler": "static_response", "body": "after-subroute"}
+                    ]
+                })])
+                .unwrap_or_else(|error| {
+                    panic!("empty subroute `{subroute}` must construct: {error}")
+                });
+            let response = router
+                .handle(request("/", "example.com"))
+                .await
+                .expect("serves");
+            assert_eq!(
+                response.body,
+                bytes::Bytes::from_static(b"after-subroute"),
+                "empty subroute `{subroute}` must pass control to the next handler"
+            );
+
+            // A lone empty subroute also constructs and serves without an error.
+            let router = RouterBuilder::new()
+                .build(&[json!({"handle": [subroute]})])
+                .expect("lone empty subroute constructs");
+            assert!(router.handle(request("/", "example.com")).await.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn subroute_without_matching_inner_route_continues_outer_chain() {
+        // Caddy compiles nested routes with the outer chain as the fallback, so an inner
+        // non-match is not a 404: the next outer route runs.
+        let router = RouterBuilder::new()
+            .build(&[
+                json!({
+                    "handle": [{
+                        "handler": "subroute",
+                        "routes": [{
+                            "match": [{"path": ["/inner"]}],
+                            "handle": [{"handler": "static_response", "body": "inner"}]
+                        }]
+                    }]
+                }),
+                json!({"handle": [{"handler": "static_response", "body": "outer"}]}),
+            ])
+            .unwrap();
+        let response = router
+            .handle(request("/other", "example.com"))
+            .await
+            .unwrap();
+        assert_eq!(response.body, bytes::Bytes::from_static(b"outer"));
+        let response = router
+            .handle(request("/inner", "example.com"))
+            .await
+            .unwrap();
+        assert_eq!(response.body, bytes::Bytes::from_static(b"inner"));
+    }
+
+    #[tokio::test]
+    async fn subroute_non_array_routes_is_a_located_error() {
+        for routes in [json!({}), json!("not-an-array"), json!(42)] {
+            let error = match RouterBuilder::new()
+                .build(&[json!({"handle": [{"handler": "subroute", "routes": routes}]})])
+            {
+                Ok(_) => panic!("non-array routes must be rejected"),
+                Err(error) => error,
+            };
+            let Error::InvalidConfig { path, message } = error else {
+                panic!("expected located InvalidConfig, got {error}");
+            };
+            assert!(path.contains("handle[0].routes"), "path was {path}");
+            assert!(
+                message.contains("must be an array"),
+                "message was {message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn oracle_matchers_in_route_adapted_json_constructs_and_serves() {
+        // Exact adapted JSON from Caddy's `matchers_in_route.caddyfiletest` fixture: a route whose
+        // only handler is a subroute with no `routes` key. Core validation accepts it; router
+        // construction and serving must not fail.
+        let router = build_router_for_servers(json!([{
+            "handle": [{"handler": "subroute"}]
+        }]))
+        .await;
+        let response = router
+            .handle(request("/", "example.com"))
+            .await
+            .expect("route with empty subroute must serve without an error");
+        // The route must construct and dispatch (no construction failure, no 500). caddy-rs'
+        // top-level no-response policy is 404, while Caddy's emptyHandler answers 200 with an
+        // empty body; that difference is registered separately from this construction fix.
+        assert_eq!(response.status, http::StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

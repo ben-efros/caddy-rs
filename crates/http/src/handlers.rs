@@ -18,7 +18,7 @@ use bytes::Bytes;
 use http::{HeaderName, HeaderValue, Method, StatusCode, Uri};
 
 use crate::router::Router;
-use crate::types::{Error, Handler, Outcome, Request, Response, Result};
+use crate::types::{Error, Handler, Outcome, Request, Response, Result, StreamingOutcome};
 
 fn invalid(path: &str, message: impl Into<String>) -> Error {
     Error::InvalidConfig {
@@ -518,8 +518,16 @@ impl Handler for SubrouteHandler {
     }
 
     async fn handle(&self, request: Request) -> Result<Outcome> {
-        let response = self.router.handle(request).await?;
-        Ok(Outcome::Respond(response))
+        // Caddy compiles a subroute's routes with the *outer* handler chain as their continuation
+        // (`RouteList.Compile(next)`), so an empty or non-matching subroute is a no-op that passes
+        // control on instead of responding. `handle_outcome` exposes exactly that distinction.
+        self.router.handle_outcome(request).await
+    }
+
+    async fn handle_streaming(&self, request: Request) -> Result<StreamingOutcome> {
+        // Preserve streamed inner responses (for example a reverse_proxy inside a subroute)
+        // instead of collecting them at the subroute boundary.
+        self.router.handle_streaming_outcome(request).await
     }
 }
 
