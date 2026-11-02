@@ -461,11 +461,29 @@ impl ServerRuntime {
         self.admin.as_ref().and_then(|handle| handle.socket_addr)
     }
 
-    /// Serve until `shutdown` becomes true, reconciling configuration as it changes.
+    /// Serve until `shutdown` becomes true or the configuration is stopped, reconciling
+    /// configuration as it changes.
+    ///
+    /// Caddy's `POST /stop` unloads the configuration *and exits the process*; the same is true
+    /// for any external [`GenerationStore::stop`] call. The supervisor therefore ends its loop
+    /// once a configuration that was active has been removed from the store (after stopping the
+    /// listeners and the admin endpoint), for every adapter and for automatic-HTTPS generations.
+    /// Without this, `run` would idle forever with no listeners and the CLI process would never
+    /// exit, which was the real-Caddy-oracle `admin-stop#stop` finding.
     pub async fn run(mut self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
+        let mut seen_active_generation = self.store.current().is_some();
         loop {
+            seen_active_generation |= self.store.current().is_some();
             if let Err(error) = self.apply().await {
                 eprintln!("caddy-rs: cannot apply configuration: {error}");
+            }
+            // `apply` with no active generation stops every listener and the admin endpoint; the
+            // store is the source of truth for "the server was told to stop".
+            if seen_active_generation && self.store.current().is_none() {
+                tracing::info!(
+                    "configuration stopped; ending the server runtime loop (Caddy /stop semantics)"
+                );
+                break;
             }
             tokio::select! {
                 changed = shutdown.changed() => {

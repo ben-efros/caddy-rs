@@ -21,6 +21,7 @@ hyper-util = { workspace = true }
 libc = "0.2.189"
 rustls = { version = "0.23.45", default-features = false, features = ["std", "ring", "tls12", "logging"] }
 serde_json = { workspace = true }
+socket2 = "0.6.5"
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
