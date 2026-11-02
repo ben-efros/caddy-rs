@@ -26,6 +26,9 @@ const DIRECTIVE_ORDER: &[&str] = &[
     "redir",
     "respond",
     "route",
+    "basicauth",
+    "basic_auth",
+    "forward_auth",
     "encode",
     "handle",
     "handle_path",
@@ -1784,6 +1787,8 @@ fn build_handlers(
         "header" => header_handlers(directive)?,
         "encode" => vec![encode_handler(directive)?],
         "reverse_proxy" => vec![reverse_proxy_handler(directive, args)?],
+        "basicauth" | "basic_auth" => vec![basic_auth_handler(directive, args)?],
+        "forward_auth" => vec![forward_auth_handler(directive, args)?],
         other => {
             return Err(adapter_error(
                 directive.position,
@@ -1792,6 +1797,232 @@ fn build_handlers(
         }
     };
     Ok(handlers)
+}
+
+/// Caddy's `basic_auth` directive: emit the canonical `authentication` handler with the
+/// HTTP Basic provider (`providers.http_basic`).
+fn basic_auth_handler(directive: &Directive, args: &[String]) -> caddy_rs_core::Result<Value> {
+    let mut hash_name = "bcrypt".to_string();
+    let mut realm: Option<String> = None;
+    match args {
+        [] => {}
+        [hash] => hash_name = hash.clone(),
+        [hash, configured_realm] => {
+            hash_name = hash.clone();
+            realm = Some(configured_realm.clone());
+        }
+        _ => {
+            return Err(adapter_error(
+                directive.position,
+                "`basic_auth` takes at most a hash algorithm and a realm",
+            ))
+        }
+    }
+    if hash_name != "bcrypt" && hash_name != "argon2id" {
+        return Err(adapter_error(
+            directive.position,
+            format!("unrecognized hash algorithm: {hash_name}"),
+        ));
+    }
+
+    let mut accounts = Vec::new();
+    for account in &directive.block {
+        if !account.block.is_empty() || account.args.len() != 1 {
+            return Err(adapter_error(
+                account.position,
+                "username and password cannot be empty or missing",
+            ));
+        }
+        let username = account.name.as_str();
+        let password = account.args[0].as_str();
+        if username.is_empty() || password.is_empty() {
+            return Err(adapter_error(
+                account.position,
+                "username and password cannot be empty or missing",
+            ));
+        }
+        accounts.push(json!({"username": username, "password": password}));
+    }
+
+    let mut provider = Map::new();
+    provider.insert("hash".to_string(), json!({"algorithm": hash_name}));
+    if !accounts.is_empty() {
+        provider.insert("accounts".to_string(), Value::Array(accounts));
+    }
+    if let Some(realm) = realm {
+        provider.insert("realm".to_string(), json!(realm));
+    }
+    Ok(json!({
+        "handler": "authentication",
+        "providers": {"http_basic": Value::Object(provider)},
+    }))
+}
+
+/// Caddy's `forward_auth` directive: adapt to Caddy's canonical expansion, a `reverse_proxy`
+/// handler that rewrites the request to the auth service, forwards the original method/URI, and
+/// copies configured response headers back onto the request on a 2xx response.
+fn forward_auth_handler(directive: &Directive, args: &[String]) -> caddy_rs_core::Result<Value> {
+    let mut uri: Option<String> = None;
+    let mut headers_to_copy: BTreeMap<String, String> = BTreeMap::new();
+    let mut trusted_proxies: Vec<Value> = Vec::new();
+    let mut passthrough: Vec<Directive> = Vec::new();
+    for item in &directive.block {
+        match item.name.as_str() {
+            "uri" => {
+                if item.args.len() != 1 || !item.block.is_empty() {
+                    return Err(adapter_error(
+                        item.position,
+                        "`forward_auth` option `uri` requires exactly one argument",
+                    ));
+                }
+                if uri.is_some() {
+                    return Err(adapter_error(
+                        item.position,
+                        format!("cannot re-declare uri: {}", item.args[0]),
+                    ));
+                }
+                uri = Some(item.args[0].clone());
+            }
+            "copy_headers" => {
+                let mut fields = item.args.clone();
+                for nested in &item.block {
+                    if !nested.args.is_empty() || !nested.block.is_empty() {
+                        return Err(adapter_error(
+                            nested.position,
+                            "unexpected arguments in a `copy_headers` block",
+                        ));
+                    }
+                    fields.push(nested.name.clone());
+                }
+                if fields.is_empty() {
+                    return Err(adapter_error(
+                        item.position,
+                        "`copy_headers` requires at least one header field",
+                    ));
+                }
+                for field in fields {
+                    match field.split_once('>') {
+                        Some((from, to)) => {
+                            headers_to_copy.insert(from.to_string(), to.to_string());
+                        }
+                        None => {
+                            headers_to_copy.insert(field.clone(), field);
+                        }
+                    }
+                }
+            }
+            "trusted_proxies" => {
+                for argument in &item.args {
+                    if argument == "private_ranges" {
+                        return Err(adapter_error(
+                            item.position,
+                            "`trusted_proxies private_ranges` is not supported by this build",
+                        ));
+                    }
+                    trusted_proxies.push(json!(argument));
+                }
+            }
+            _ => passthrough.push(item.clone()),
+        }
+    }
+    let Some(uri) = uri else {
+        return Err(adapter_error(
+            directive.position,
+            "the 'uri' subdirective is required",
+        ));
+    };
+
+    // The rest of the block uses reverse_proxy syntax.
+    let synthetic = Directive {
+        name: "reverse_proxy".to_string(),
+        args: Vec::new(),
+        block: passthrough,
+        position: directive.position,
+    };
+    let base = reverse_proxy_handler(&synthetic, args)?;
+    let mut object = base.as_object().cloned().unwrap_or_default();
+    object.insert("rewrite".to_string(), json!({"method": "GET", "uri": uri}));
+    if !trusted_proxies.is_empty() {
+        object.insert("trusted_proxies".to_string(), Value::Array(trusted_proxies));
+    }
+
+    // Preserve the original method and URI for the auth service before the rewrite.
+    let headers = object
+        .entry("headers".to_string())
+        .or_insert_with(|| json!({}));
+    if let Some(headers) = headers.as_object_mut() {
+        let request = headers
+            .entry("request".to_string())
+            .or_insert_with(|| json!({}));
+        if let Some(request) = request.as_object_mut() {
+            let set = request
+                .entry("set".to_string())
+                .or_insert_with(|| json!({}));
+            if let Some(set) = set.as_object_mut() {
+                set.entry("X-Forwarded-Method".to_string())
+                    .or_insert_with(|| json!(["{http.request.method}"]));
+                set.entry("X-Forwarded-Uri".to_string())
+                    .or_insert_with(|| json!(["{http.request.uri}"]));
+            }
+        }
+    }
+
+    // On a 2xx auth response, copy the configured headers back onto the original request. The
+    // delete-then-conditional-set pattern prevents a client from injecting a header the auth
+    // service did not return.
+    let mut copy_routes: Vec<Value> = vec![json!({"handle": [{"handler": "vars"}]})];
+    for (from, to) in &headers_to_copy {
+        let to = canonical_header_key(to);
+        let placeholder = format!(
+            "{{http.reverse_proxy.header.{}}}",
+            canonical_header_key(from)
+        );
+        copy_routes.push(json!({
+            "handle": [{"handler": "headers", "request": {"delete": [to]}}],
+        }));
+        let mut set = Map::new();
+        set.insert(to.clone(), json!([placeholder.clone()]));
+        let mut vars = Map::new();
+        vars.insert(placeholder, json!([""]));
+        copy_routes.push(json!({
+            "handle": [{
+                "handler": "headers",
+                "request": {"set": Value::Object(set)},
+            }],
+            "match": [{"not": [{"vars": Value::Object(vars)}]}],
+        }));
+    }
+    object.insert(
+        "handle_response".to_string(),
+        json!([{"match": {"status_code": [2]}, "routes": copy_routes}]),
+    );
+    Ok(Value::Object(object))
+}
+
+/// `http.CanonicalHeaderKey`: capitalize the first letter and letters after `-`, lowercase the
+/// rest; return the value unchanged when it is not a valid header token.
+fn canonical_header_key(value: &str) -> String {
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return value.to_string();
+    }
+    let mut canonical = String::with_capacity(value.len());
+    let mut uppercase_next = true;
+    for character in value.chars() {
+        if uppercase_next {
+            canonical.extend(character.to_uppercase());
+            uppercase_next = false;
+        } else {
+            canonical.extend(character.to_lowercase());
+        }
+        if character == '-' {
+            uppercase_next = true;
+        }
+    }
+    canonical
 }
 
 fn respond_handler(directive: &Directive, args: &[String]) -> caddy_rs_core::Result<Value> {

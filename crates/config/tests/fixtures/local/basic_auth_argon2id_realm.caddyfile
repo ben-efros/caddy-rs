@@ -1,0 +1,5 @@
+:8083 {
+	basic_auth argon2id "Auth realm" {
+		carol $argon2id$v=19$m=65536,t=3,p=2$c29tZXNhbHQ$cmVzdWx0
+	}
+}
