@@ -138,13 +138,28 @@ impl CloudflareConfig {
         }
     }
 
+    /// Provider settings understood by the Cloudflare v4 client.
+    ///
+    /// Anything else in the module object is rejected by [`CloudflareConfig::from_settings`]:
+    /// silently ignoring a provider option could change which account/zone is updated.
+    pub const SUPPORTED_SETTINGS: &'static [&'static str] = &["api_token", "email", "api_key"];
+
     /// Parse Cloudflare provider settings from the Caddy `dns.providers.cloudflare` module object
     /// (the contents of `challenges.dns.provider` after `name` is removed).
     ///
     /// Exactly one authentication method is required: `api_token`, or `email` + `api_key`.
     /// String values may contain `{env.NAME}`, `{$NAME}`, `{env.NAME:default}` and
     /// `{$NAME:default}` placeholders, resolved against the process environment.
+    /// Unknown option keys fail loudly (T-TLS-063) instead of being ignored.
     pub fn from_settings(settings: &Map<String, Value>) -> DnsResult<Self> {
+        for key in settings.keys() {
+            if !Self::SUPPORTED_SETTINGS.contains(&key.as_str()) {
+                return Err(DnsError::UnsupportedOption {
+                    provider: CLOUDFLARE_PROVIDER_NAME.to_string(),
+                    option: key.clone(),
+                });
+            }
+        }
         let api_token = optional_string(settings, "api_token")?;
         let email = optional_string(settings, "email")?;
         let api_key = optional_string(settings, "api_key")?;
@@ -1275,6 +1290,28 @@ mod tests {
         let settings = json!({ "email": "me@example.com", "api_key": "global-key" });
         let config = CloudflareConfig::from_settings(settings.as_object().unwrap()).unwrap();
         assert_eq!(config.auth_description(), "legacy email/API key (redacted)");
+    }
+
+    #[test]
+    fn config_rejects_unknown_provider_options_loudly() {
+        for settings in [
+            json!({"api_token": "token", "api_token2": "other"}),
+            json!({"api_token": "token", "zone": "example.com"}),
+            json!({"email": "me@example.com", "api_key": "key", "api_base": "x"}),
+        ] {
+            let error = CloudflareConfig::from_settings(settings.as_object().unwrap())
+                .expect_err("unknown option must be rejected");
+            let message = error.to_string();
+            assert!(
+                message.contains("is not supported by this build"),
+                "{message}"
+            );
+            assert!(message.contains("T-TLS-063"), "{message}");
+            assert!(
+                matches!(error, DnsError::UnsupportedOption { .. }),
+                "{error:?}"
+            );
+        }
     }
 
     #[test]

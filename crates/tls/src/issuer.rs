@@ -25,9 +25,9 @@
 //! * `test_ca` fallback (retry on a staging CA after a production failure) is not implemented.
 //! * Challenge cleanup errors are not surfaced (there is no logger in this crate); cleanup is
 //!   best effort, matching certmagic's log-and-continue cleanup behaviour.
-//! * DNS-01 uses the [`DnsProvider`] attached by the caller; provider settings from
-//!   `challenges.dns.provider` are parsed but the module registry (provider construction) is not
-//!   wired here.
+//! * DNS-01 provider modules are constructed from `challenges.dns.provider` configuration by
+//!   [`AcmeIssuer::with_configured_dns_solver`] (currently Cloudflare); a caller can still attach
+//!   its own [`DnsProvider`] with [`AcmeIssuer::with_dns01_solver`].
 
 use std::fmt;
 use std::path::PathBuf;
@@ -42,7 +42,7 @@ use crate::acme::{
     IssuedCertificate, NewOrderRequest, OrderStatus, PollPolicy, TokioClock,
 };
 use crate::certificate::Certificate;
-use crate::dns::DnsProvider;
+use crate::dns::{DnsChallengeConfig, DnsProvider};
 use crate::solver::{
     key_authorization, ChallengeHandle, ChallengeSolver, Dns01Solver, Http01Solver,
     Http01TokenStore, SolverRegistry, TlsAlpn01Solver,
@@ -100,6 +100,10 @@ pub struct AcmeIssuerConfig {
     pub preferred_chains: Vec<String>,
     /// DNS challenge provider module name, if any.
     pub dns_provider: Option<String>,
+    /// Full `challenges.dns` configuration (provider settings, TTL, propagation options), when a
+    /// DNS challenge provider is configured. Used by [`AcmeIssuer::with_configured_dns_solver`]
+    /// to construct the provider from configuration alone.
+    pub dns_challenge: Option<DnsChallengeConfig>,
     /// Whether Caddy's `challenges.http.disabled` is set.
     pub http_challenge_disabled: bool,
     /// Whether Caddy's `challenges.tls-alpn.disabled` is set.
@@ -118,6 +122,7 @@ impl Default for AcmeIssuerConfig {
             external_account: None,
             preferred_chains: Vec::new(),
             dns_provider: None,
+            dns_challenge: None,
             http_challenge_disabled: false,
             tls_alpn_challenge_disabled: false,
             renewal_window: None,
@@ -169,16 +174,15 @@ impl AcmeIssuerConfig {
             .unwrap_or_default();
         if let Some(challenges) = object.get("challenges") {
             if let Some(dns) = challenges.get("dns") {
-                // Caddy serialises the provider as an inline module object
-                // ({"name":"cloudflare", "api_token": ...}); older configurations use a string.
-                config.dns_provider = dns
-                    .get("provider")
-                    .and_then(|provider| {
-                        provider
-                            .as_str()
-                            .or_else(|| provider.get("name").and_then(serde_json::Value::as_str))
-                    })
-                    .map(str::to_string);
+                // Parse Caddy's complete `challenges.dns` object: the provider is an inline module
+                // object ({"name":"cloudflare", "api_token": ...}) or a legacy string, and the
+                // challenge-level settings (ttl, propagation_delay/timeout, resolvers,
+                // override_domain) drive the solver this issuer builds.
+                let challenge = DnsChallengeConfig::from_caddy_json(dns).map_err(|error| {
+                    Error::Issuer(format!("invalid `challenges.dns` configuration: {error}"))
+                })?;
+                config.dns_provider = Some(challenge.provider.clone());
+                config.dns_challenge = Some(challenge);
             }
             config.http_challenge_disabled = challenges
                 .get("http")
@@ -269,6 +273,21 @@ impl<T: AcmeTransport> AcmeIssuer<T> {
             Dns01Solver::new(provider).with_propagation(timeout, delay),
         ));
         self
+    }
+
+    /// Attach the DNS-01 solver described by this issuer's `challenges.dns` configuration.
+    ///
+    /// This is how automatic HTTPS selects DNS-01 from configuration alone: the provider module
+    /// (`cloudflare`) is constructed from its settings and paired with authoritative propagation
+    /// checks (DNS-over-HTTPS) using the same HTTP transport. Unknown providers or provider
+    /// options fail loudly (T-TLS-063). Callers that already have a [`DnsProvider`] instance can
+    /// use [`AcmeIssuer::with_dns01_solver`] instead.
+    pub fn with_configured_dns_solver(mut self, transport: Arc<dyn AcmeTransport>) -> Result<Self> {
+        if let Some(challenge) = &self.config.dns_challenge {
+            let solver = crate::dns_providers::build_dns01_solver(challenge, transport)?;
+            self.solvers.insert(Arc::new(solver));
+        }
+        Ok(self)
     }
 
     /// Attach an arbitrary challenge solver (replacing one for the same challenge type).
@@ -1041,6 +1060,56 @@ mod tests {
             error.to_string().contains("not configured"),
             "unexpected error: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn configured_dns_solver_is_attached_from_configuration_alone() {
+        let transport: Arc<dyn AcmeTransport> = Arc::new(TestTransport::new());
+        let config = AcmeIssuerConfig::from_json(&serde_json::json!({
+            "module": "acme",
+            "ca": DIRECTORY_URL,
+            "challenges": {
+                "dns": {
+                    "provider": {"name": "cloudflare", "api_token": "token"},
+                    "propagation_timeout": 5_000_000_000_i64
+                }
+            }
+        }))
+        .unwrap();
+        let issuer = AcmeIssuer::new(
+            config,
+            Arc::clone(&transport),
+            Arc::new(MemoryAcmeStorage::new()),
+            Box::new(MemoryStorage::new()),
+        )
+        .with_configured_dns_solver(Arc::clone(&transport))
+        .expect("configured DNS solver builds");
+        assert!(
+            issuer.solvers().contains(ChallengeType::Dns01),
+            "config alone must attach a DNS-01 solver"
+        );
+        assert_eq!(issuer.config.dns_provider.as_deref(), Some("cloudflare"));
+    }
+
+    #[tokio::test]
+    async fn configured_dns_solver_rejects_unknown_provider_loudly() {
+        let transport: Arc<dyn AcmeTransport> = Arc::new(TestTransport::new());
+        let config = AcmeIssuerConfig::from_json(&serde_json::json!({
+            "module": "acme",
+            "challenges": {"dns": {"provider": {"name": "route53"}}}
+        }))
+        .unwrap();
+        let error = AcmeIssuer::new(
+            config,
+            Arc::clone(&transport),
+            Arc::new(MemoryAcmeStorage::new()),
+            Box::new(MemoryStorage::new()),
+        )
+        .with_configured_dns_solver(transport)
+        .expect_err("unknown DNS provider must be rejected");
+        let message = error.to_string();
+        assert!(message.contains("route53"), "{message}");
+        assert!(message.contains("T-TLS-063"), "{message}");
     }
 
     // ---- end-to-end HTTP-01 issuance -----------------------------------------------------

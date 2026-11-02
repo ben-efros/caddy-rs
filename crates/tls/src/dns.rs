@@ -133,6 +133,27 @@ pub enum DnsError {
         message: String,
     },
 
+    /// A configured DNS provider module is not implemented by this build.
+    #[error(
+        "DNS challenge provider `{provider}` is not implemented by this build (tracking T-TLS-063)"
+    )]
+    UnsupportedProvider {
+        /// Provider module name from `challenges.dns.provider.name`.
+        provider: String,
+    },
+
+    /// A configured DNS provider option is not implemented by this build.
+    #[error(
+        "DNS challenge provider `{provider}` option `{option}` is not supported by this build \
+         (tracking T-TLS-063)"
+    )]
+    UnsupportedOption {
+        /// Provider module name.
+        provider: String,
+        /// Unsupported provider setting key.
+        option: String,
+    },
+
     /// The provider does not support an operation or challenge type.
     #[error("DNS provider `{provider}` does not support {operation}")]
     Unsupported {
