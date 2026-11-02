@@ -194,7 +194,7 @@ pub fn plan(config: &Config) -> Result<Option<AutomaticHttpsPlan>> {
     if !policies.iter().any(|policy| policy.subjects.is_empty()) {
         policies.push(AutomaticHttpsPolicy {
             subjects: Vec::new(),
-            issuer: AutomaticHttpsIssuer::Acme(Box::new(AcmeIssuerConfig::default())),
+            issuer: AutomaticHttpsIssuer::Acme(Box::default()),
             on_demand: false,
         });
     }
@@ -203,7 +203,7 @@ pub fn plan(config: &Config) -> Result<Option<AutomaticHttpsPlan>> {
     let mut redirect_hosts: Vec<String> = Vec::new();
     let mut redirect_all = false;
     let mut has_manual_disable = false;
-    for (_server_name, server) in &http.servers {
+    for server in http.servers.values() {
         let auto_https = server.automatic_https.clone().unwrap_or_default();
         let policies_present = server
             .tls_connection_policies
@@ -251,10 +251,8 @@ pub fn plan(config: &Config) -> Result<Option<AutomaticHttpsPlan>> {
             if !subjects.contains(&host) {
                 subjects.push(host.clone());
             }
-            if !auto_https.disable_redirects {
-                if !redirect_hosts.contains(&host) {
-                    redirect_hosts.push(host);
-                }
+            if !auto_https.disable_redirects && !redirect_hosts.contains(&host) {
+                redirect_hosts.push(host);
             }
         }
         if catch_all && !auto_https.disable_redirects {
@@ -272,7 +270,7 @@ pub fn plan(config: &Config) -> Result<Option<AutomaticHttpsPlan>> {
     // address).
     if let Some(tls) = tls {
         for subject in tls_automate(tls).map(Vec::as_slice).unwrap_or(&[]) {
-            let subject = normalize_host(&subject);
+            let subject = normalize_host(subject);
             if subject.is_empty()
                 || skip_patterns
                     .iter()
@@ -352,8 +350,12 @@ fn parse_policy(policy: &AutomationPolicy, index: usize) -> Result<AutomaticHttp
             "{path}.on_demand: on-demand TLS is not implemented (T-TLS-028)"
         )));
     }
+    // Only the first issuer of a policy is honoured: Caddy tries the configured issuers in
+    // order as a fallback chain, while this build supports one per policy. Choosing the first
+    // issuer keeps the common single-issuer configuration exact and never silently skips a
+    // configured issuer.
     let mut issuer = None;
-    for (issuer_index, module) in policy.issuers.iter().enumerate() {
+    if let Some((issuer_index, module)) = policy.issuers.iter().enumerate().next() {
         let issuer_path = format!("{path}.issuers[{issuer_index}]");
         match module.module.as_deref() {
             Some("acme") => {
@@ -362,7 +364,6 @@ fn parse_policy(policy: &AutomationPolicy, index: usize) -> Result<AutomaticHttp
                 })?;
                 let config = AcmeIssuerConfig::from_json(&value)?;
                 issuer = Some(AutomaticHttpsIssuer::Acme(Box::new(config)));
-                break;
             }
             Some("internal") => {
                 if !module.extra.is_empty() {
@@ -372,7 +373,6 @@ fn parse_policy(policy: &AutomationPolicy, index: usize) -> Result<AutomaticHttp
                     });
                 }
                 issuer = Some(AutomaticHttpsIssuer::Internal);
-                break;
             }
             Some(other) => {
                 return Err(Error::Issuer(format!(
@@ -388,7 +388,7 @@ fn parse_policy(policy: &AutomationPolicy, index: usize) -> Result<AutomaticHttp
     }
     let issuer = issuer.unwrap_or_else(|| {
         // Caddy's default issuers are the ACME issuers; this build defaults to Let's Encrypt.
-        AutomaticHttpsIssuer::Acme(Box::new(AcmeIssuerConfig::default()))
+        AutomaticHttpsIssuer::Acme(Box::default())
     });
     Ok(AutomaticHttpsPolicy {
         subjects: policy.subjects.clone(),
