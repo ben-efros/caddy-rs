@@ -521,6 +521,30 @@ impl CertificateResolver {
             .clone()
     }
 
+    /// Whether a certificate is loaded for `server_name` (exact or one-label wildcard).
+    ///
+    /// Unlike [`Self::select`], this does not fall back to the default certificate; it is used by
+    /// automatic HTTPS to decide whether a subject still needs to be obtained.
+    pub fn covers(&self, server_name: &str) -> bool {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let name = normalize_server_name(server_name);
+        if state.certificates.contains_key(&name) {
+            return true;
+        }
+        if let Some((_, rest)) = name.split_once('.') {
+            if !rest.is_empty()
+                && rest.contains('.')
+                && state.certificates.contains_key(&format!("*.{rest}"))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Select the certificate for `server_name` (exact, then one-label wildcard, then default).
     pub fn select(&self, server_name: Option<&str>) -> Option<Arc<CertifiedKey>> {
         let state = self

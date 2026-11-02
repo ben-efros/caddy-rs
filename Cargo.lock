@@ -144,6 +144,8 @@ dependencies = [
 name = "caddy-rs-server"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "base64",
  "bytes",
  "caddy-rs-admin",
  "caddy-rs-core",
@@ -155,8 +157,10 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "ring",
  "rustls",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-rustls",

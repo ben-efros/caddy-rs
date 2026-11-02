@@ -19,12 +19,14 @@ use caddy_rs_admin::AdminApi;
 use caddy_rs_core::{Generation, GenerationStore};
 use caddy_rs_http::RouterBuilder;
 use caddy_rs_tls::{
-    build_server_config, listener_uses_tls, resolver_from_config, CertificateResolver,
+    build_server_config, listener_uses_tls, plan_automatic_https, resolver_from_config,
+    AcmeTransport, AutomaticHttpsProvisioner, CertificateResolver, HyperTransport,
     TlsServerOptions, DEFAULT_HTTPS_PORT,
 };
 use tokio::sync::watch;
 
 use crate::activation::{plan_activation, ActivationError, ActivationPlan, SocketActivation};
+use crate::auto_https::{PreparedAutomaticHttps, RedirectPolicy};
 use crate::error::{Error, Result};
 use crate::limits::ServerLimits;
 use crate::listeners::{bind, bind_admin, ListenerHandle, ListenerState, SharedListeners};
@@ -45,6 +47,20 @@ impl RuntimeStatus {
     pub fn listener_address(&self, configured: &str) -> Option<&str> {
         self.listeners.get(configured).map(String::as_str)
     }
+}
+
+/// A TLS listener without any certificate must fail the apply rather than serve cleartext or
+/// complete no handshakes.
+fn missing_certificates_error(listen: &str, server_name: &str, https_port: u16) -> Error {
+    Error::Config(caddy_rs_core::Error::invalid(
+        "apps.tls.certificates",
+        format!(
+            "listener `{listen}` for server `{server_name}` terminates TLS (HTTPS port \
+             {https_port} or `tls_connection_policies`) but no certificates are configured; set \
+             `apps.tls.certificates.load_pem`/`load_files` or enable automatic HTTPS with \
+             `apps.tls.automation`"
+        ),
+    ))
 }
 
 /// Whether a server's `strict_sni_host` setting asks for strict SNI enforcement.
@@ -68,6 +84,14 @@ fn strict_sni_host_enabled(value: Option<&serde_json::Value>) -> bool {
 pub struct ServerRuntime {
     store: Arc<GenerationStore>,
     reload: Arc<tokio::sync::Notify>,
+    /// Injected ACME transport for automatic HTTPS (tests and embedders); production builds a
+    /// [`HyperTransport`] when certificates must be obtained.
+    acme_transport: Option<Arc<dyn AcmeTransport>>,
+    /// Caddy data directory override for account/certificate storage (defaults to the configured
+    /// `storage` root, then `.caddy-rs`).
+    data_root: Option<std::path::PathBuf>,
+    /// HTTP-01 tokens shared between the ACME issuer and the HTTP listeners.
+    challenge_tokens: Arc<caddy_rs_tls::Http01TokenStore>,
     /// Per-listen-address serving state (router + limits), shared with accept loops.
     states: SharedListeners,
     listeners: BTreeMap<String, ListenerHandle>,
@@ -100,6 +124,9 @@ impl ServerRuntime {
         Self {
             store,
             reload,
+            acme_transport: None,
+            data_root: None,
+            challenge_tokens: Arc::new(caddy_rs_tls::Http01TokenStore::new()),
             states: SharedListeners::new(RwLock::new(std::collections::HashMap::new())),
             listeners: BTreeMap::new(),
             admin: None,
@@ -120,6 +147,26 @@ impl ServerRuntime {
         self
     }
 
+    /// Inject the ACME HTTP transport used for automatic-HTTPS certificate acquisition.
+    ///
+    /// Tests inject a fake local CA; production leaves this unset so a [`HyperTransport`] (platform
+    /// trust store) is created only when certificates actually need to be obtained.
+    pub fn with_acme_transport(mut self, transport: Arc<dyn AcmeTransport>) -> Self {
+        self.acme_transport = Some(transport);
+        self
+    }
+
+    /// Override the Caddy data directory used for account and certificate storage.
+    pub fn with_data_root(mut self, root: impl Into<std::path::PathBuf>) -> Self {
+        self.data_root = Some(root.into());
+        self
+    }
+
+    /// The HTTP-01 token store shared with the ACME issuer (tests seed tokens directly).
+    pub fn challenge_tokens(&self) -> Arc<caddy_rs_tls::Http01TokenStore> {
+        Arc::clone(&self.challenge_tokens)
+    }
+
     /// The generation store driving this runtime.
     pub fn store(&self) -> &Arc<GenerationStore> {
         &self.store
@@ -137,7 +184,10 @@ impl ServerRuntime {
             self.status = RuntimeStatus::default();
             return Ok(self.status.clone());
         };
-        let states = self.build_listener_states(&generation)?;
+        // Automatic HTTPS (certificate acquisition) runs before listener state is replaced: a
+        // failure here aborts the apply and leaves the previous generation's listeners serving.
+        let prepared = self.prepare_automatic_https(&generation).await?;
+        let states = self.build_listener_states(&generation, prepared.as_ref())?;
         // Resolve systemd socket activation before mutating any runtime state: a mismatch
         // (unclaimed inherited socket, malformed environment, non-listening fd) must fail the
         // apply without disturbing the previous generation.
@@ -351,9 +401,52 @@ impl ServerRuntime {
     /// The same server object can own several listen addresses; each gets the same router and the
     /// parsed [`ServerLimits`]. A malformed timeout or limit field fails the apply with the
     /// offending JSON path, so an invalid server configuration is never served.
+    /// Provision automatic-HTTPS certificates for `generation` (if automation is configured).
+    async fn prepare_automatic_https(
+        &self,
+        generation: &Generation,
+    ) -> Result<Option<PreparedAutomaticHttps>> {
+        let config = generation.config();
+        let Some(plan) = plan_automatic_https(config)? else {
+            return Ok(None);
+        };
+        let root = self
+            .data_root
+            .clone()
+            .or_else(|| {
+                config
+                    .storage()
+                    .and_then(|storage| storage.root())
+                    .map(std::path::PathBuf::from)
+            })
+            .unwrap_or_else(|| std::path::PathBuf::from(".caddy-rs"));
+        let transport: Arc<dyn AcmeTransport> = match &self.acme_transport {
+            Some(transport) => Arc::clone(transport),
+            None => Arc::new(HyperTransport::new()?),
+        };
+        let base_resolver = resolver_from_config(config)?;
+        let provisioner =
+            AutomaticHttpsProvisioner::new(transport, root, Arc::clone(&self.challenge_tokens));
+        let provisioned = provisioner.provision(&plan, base_resolver).await?;
+        let redirect = plan.redirects_enabled.then(|| RedirectPolicy {
+            hosts: plan.redirect_hosts.clone(),
+            redirect_all: plan.redirect_all,
+            https_port: plan.https_port,
+        });
+        Ok(Some(PreparedAutomaticHttps {
+            resolver: provisioned.resolver,
+            serving: Arc::new(crate::auto_https::AutomaticHttpsServing {
+                tokens: Arc::clone(&self.challenge_tokens),
+                redirect,
+            }),
+            plan,
+        }))
+    }
+
     fn build_listener_states(
         &self,
         generation: &Generation,
+        prepared: Option<&PreparedAutomaticHttps>,
     ) -> Result<std::collections::HashMap<String, Arc<ListenerState>>> {
         let mut states = std::collections::HashMap::new();
         let Some(http) = generation.config().http() else {
@@ -363,8 +456,12 @@ impl ServerRuntime {
         // policies or when its port is the effective HTTPS port. Certificates come from
         // `apps.tls.certificates`; a TLS listener without certificates fails this apply loudly.
         let https_port = http.https_port.unwrap_or(DEFAULT_HTTPS_PORT);
-        let resolver: Option<Arc<CertificateResolver>> =
-            resolver_from_config(generation.config())?.map(Arc::new);
+        let resolver: Option<Arc<CertificateResolver>> = match prepared {
+            Some(prepared) => Some(Arc::clone(&prepared.resolver)),
+            None => resolver_from_config(generation.config())?.map(Arc::new),
+        };
+        let http_port = http.http_port.unwrap_or(caddy_rs_tls::DEFAULT_HTTP_PORT);
+        let automatic_serving = prepared.map(|prepared| Arc::clone(&prepared.serving));
         for (server_name, server) in &http.servers {
             let limits = Arc::new(ServerLimits::from_http_server(server_name, server)?);
             let policies = server.tls_connection_policies.as_deref();
@@ -397,15 +494,23 @@ impl ServerRuntime {
                 let terminates_tls =
                     listener_uses_tls(listen, https_port, has_connection_policies)?;
                 let tls = if terminates_tls {
-                    let resolver = resolver.as_ref().ok_or_else(|| {
-                        Error::Config(caddy_rs_core::Error::invalid(
-                            "apps.tls.certificates",
-                            format!(
-                                "listener `{listen}` for server `{server_name}` terminates TLS                                  (HTTPS port {https_port} or `tls_connection_policies`) but no                                  certificates are configured; set `apps.tls.certificates.load_pem`                                  or `load_files`"
-                            ),
-                        ))
+                    let resolver = resolver.as_ref().filter(|resolver| !resolver.is_empty());
+                    let resolver = resolver.ok_or_else(|| {
+                        missing_certificates_error(listen, server_name, https_port)
                     })?;
                     Some(build_server_config(Arc::clone(resolver), &tls_options)?)
+                } else {
+                    None
+                };
+                let automatic = if !terminates_tls {
+                    let listener_port = caddy_rs_core::ListenAddr::parse(listen)
+                        .ok()
+                        .and_then(|address| address.port());
+                    if listener_port == Some(http_port) {
+                        automatic_serving.clone()
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 };
@@ -415,8 +520,32 @@ impl ServerRuntime {
                         router: Arc::clone(&router),
                         limits: Arc::clone(&limits),
                         tls,
+                        automatic,
                     }),
                 );
+            }
+        }
+        if let Some(prepared) = prepared {
+            if let Some(listen) = prepared.plan.http_listener() {
+                if !states.contains_key(&listen) {
+                    // Challenge/redirect-only HTTP listener derived from the HTTPS site: no
+                    // configured routes; the automatic pre-routing answers before the router.
+                    let router = Arc::new(
+                        RouterBuilder::new()
+                            .with_custom_handler(caddy_rs_proxy::handler_factory())
+                            .build(&[])
+                            .map_err(Error::Http)?,
+                    );
+                    states.insert(
+                        listen,
+                        Arc::new(ListenerState {
+                            router,
+                            limits: Arc::new(ServerLimits::default()),
+                            tls: None,
+                            automatic: Some(Arc::clone(&prepared.serving)),
+                        }),
+                    );
+                }
             }
         }
         Ok(states)
