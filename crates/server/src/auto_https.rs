@@ -17,8 +17,8 @@ use bytes::Bytes;
 
 use caddy_rs_http::Body;
 use caddy_rs_tls::{
-    AutomaticHttpsPlan, CertificateResolver, Http01TokenStore, TlsAlpn01TokenStore,
-    HTTP01_PATH_PREFIX,
+    AutomaticHttpsPlan, AutomaticHttpsRenewals, CertificateResolver, Http01TokenStore,
+    TlsAlpn01TokenStore, HTTP01_PATH_PREFIX,
 };
 
 /// Redirect policy for one generation's HTTP listeners.
@@ -52,8 +52,11 @@ impl RedirectPolicy {
 }
 
 /// Everything the supervisor prepared for one generation's automatic HTTPS: the certificate
-/// resolver for TLS listeners, the policy plan, and the pre-routing state for HTTP listeners.
-#[derive(Debug, Clone)]
+/// resolver for TLS listeners, the policy plan, the pre-routing state for HTTP listeners and the
+/// generation's renewal scheduler.
+///
+/// Not `Clone`: the renewal scheduler has generation-scoped ownership and must not be duplicated.
+#[derive(Debug)]
 pub(crate) struct PreparedAutomaticHttps {
     /// Resolver containing manual plus automatically obtained certificates.
     pub(crate) resolver: Arc<CertificateResolver>,
@@ -64,6 +67,11 @@ pub(crate) struct PreparedAutomaticHttps {
     /// TLS-ALPN-01 challenge-certificate store shared with the issuer that ran this apply. TLS
     /// listeners wrap their resolver with it so `acme-tls/1` handshakes are answered.
     pub(crate) tls_alpn01_tokens: Arc<TlsAlpn01TokenStore>,
+    /// Generation-scoped certificate renewal scheduler returned by provisioning.
+    ///
+    /// The runtime owns this value for the generation's lifetime: keeping it alive keeps renewing
+    /// certificates into the resolver above; dropping it (or stopping it) aborts the scheduler.
+    pub(crate) renewals: Option<AutomaticHttpsRenewals>,
 }
 
 /// Per-generation automatic-HTTPS serving state for cleartext listeners.
