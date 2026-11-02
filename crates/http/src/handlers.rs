@@ -517,6 +517,10 @@ impl Handler for SubrouteHandler {
         "subroute"
     }
 
+    fn requires_buffered_request_body(&self) -> bool {
+        self.router.requires_buffered_request_body()
+    }
+
     async fn handle(&self, request: Request) -> Result<Outcome> {
         // Caddy compiles a subroute's routes with the *outer* handler chain as their continuation
         // (`RouteList.Compile(next)`), so an empty or non-matching subroute is a no-op that passes

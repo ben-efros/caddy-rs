@@ -25,8 +25,9 @@
 //! Gaps (reported with T-ADMIN-024): proxy upstream observations need a recorder handle inside
 //! `caddy-rs-proxy` (not reachable from this crate); certificate metrics are recorded as a snapshot
 //! at generation apply time (ongoing renewal outcomes are picked up on the next apply, which the
-//! supervisor performs every poll interval); streaming response sizes/`bytes_read` are only known
-//! when the body reports an exact size.
+//! supervisor performs every poll interval); streaming response sizes are only known when the
+//! response body reports an exact size, and request `bytes_read`/`request_size` uses the declared
+//! `Content-Length` (0 for chunked/licence-unknown bodies).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -186,6 +187,12 @@ pub(crate) struct RequestSnapshot {
     remote: Option<SocketAddr>,
     tls: Option<TlsLogInfo>,
     timestamp: SystemTime,
+    /// Declared request body size (`Content-Length`), 0 when the body is chunked/unknown.
+    ///
+    /// caddy-rs streams request bodies for handlers that do not need them buffered, so the exact
+    /// bytes-read count is not known at logging time; the declared size is the compatible
+    /// approximation Caddy reports for `request_size`/`bytes_read` when a length was declared.
+    content_length: u64,
 }
 
 impl RequestSnapshot {
@@ -212,12 +219,19 @@ impl RequestSnapshot {
             .path_and_query()
             .map(|value| value.as_str().to_string())
             .unwrap_or_else(|| "/".to_string());
+        let content_length = request
+            .headers()
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(0);
         Self {
             method: request.method().as_str().to_string(),
             host,
             uri,
             proto: proto_name(request.version()),
             headers: request.headers().clone(),
+            content_length,
             remote,
             tls: tls.cloned(),
             timestamp: SystemTime::now(),
@@ -236,12 +250,16 @@ impl RequestSnapshot {
             .with_headers(&self.headers);
         request.proto = self.proto.clone();
         request.tls = self.tls.as_ref().map(TlsLogInfo::to_access_tls);
-        AccessLogEntry::new(request)
+        let mut entry = AccessLogEntry::new(request)
             .with_timestamp(self.timestamp)
             .with_status(status)
             .with_duration(duration)
             .with_size(size)
-            .with_response_headers(response_headers)
+            .with_response_headers(response_headers);
+        // Caddy's `bytes_read` is the request body bytes read; for streamed or unread bodies
+        // caddy-rs reports the declared Content-Length (0 when unknown/chunked).
+        entry.bytes_read = self.content_length;
+        entry
     }
 }
 
@@ -288,8 +306,9 @@ pub(crate) fn observe_request(
     response_headers: &HeaderMap,
 ) {
     let duration = started.elapsed();
-    // Request-body accounting is not surfaced across the router boundary yet (T-PROXY-039).
-    let request_size = 0;
+    // Request-body accounting: declared Content-Length when present (streaming/unread bodies are
+    // not counted); see `RequestSnapshot::content_length` and the T-PROXY-039 notes.
+    let request_size = snapshot.map_or(0, |snapshot| snapshot.content_length);
     if let Err(error) = recorder.request_finished(&RequestObservation {
         server: server_name,
         handler: "",

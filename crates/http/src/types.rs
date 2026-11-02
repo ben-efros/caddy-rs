@@ -9,7 +9,7 @@ use bytes::Bytes;
 use http::{HeaderMap, Method, StatusCode, Uri};
 use thiserror::Error;
 
-use crate::body::{BodyError, StreamingResponse};
+use crate::body::{BodyError, RequestBody, StreamingResponse};
 use crate::upgrade::UpgradedResponse;
 
 /// Errors raised while building or executing handlers.
@@ -56,7 +56,7 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// An internal HTTP request, decoupled from hyper so handlers are testable without sockets.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Request {
     /// Request method.
     pub method: Method,
@@ -64,8 +64,19 @@ pub struct Request {
     pub uri: Uri,
     /// Request headers.
     pub headers: HeaderMap,
-    /// Request body.
+    /// Buffered request body.
+    ///
+    /// This is the compatibility accessor used by handlers and tests that need the complete body.
+    /// It is empty when the body is streamed (see [`Request::has_streaming_body`]) or after
+    /// [`Request::take_body`]/[`Request::collect_body`] consumed the stream.
     pub body: Bytes,
+    /// Streaming request body source, when the server did not buffer it.
+    ///
+    /// Stored behind a `Mutex` so `Request` stays `Sync` (async handler futures hold `&Request`
+    /// across awaits). The body is single-owner and taken out through [`Request::take_body`].
+    /// Cloned requests do not carry the streaming body; clones are only used for response-side
+    /// bookkeeping.
+    body_stream: Option<std::sync::Mutex<RequestBody>>,
     /// Peer address, when known.
     pub remote_addr: Option<SocketAddr>,
     /// Whether the connection is TLS.
@@ -84,10 +95,76 @@ impl Request {
             uri,
             headers: HeaderMap::new(),
             body: Bytes::new(),
+            body_stream: None,
             remote_addr: None,
             tls: false,
             vars: BTreeMap::new(),
             pending_response_headers: HeaderMap::new(),
+        }
+    }
+
+    /// Attach a streaming request body (server adapter; buffered bodies should use
+    /// [`Request::body`] directly).
+    pub fn with_streaming_body(mut self, body: RequestBody) -> Self {
+        self.body_stream = Some(std::sync::Mutex::new(body));
+        self.body = Bytes::new();
+        self
+    }
+
+    /// Whether the request body is streamed rather than buffered.
+    pub fn has_streaming_body(&self) -> bool {
+        self.body_stream.is_some()
+    }
+
+    /// Take the request body for explicit consumption (buffered bodies are moved out too).
+    ///
+    /// This is the streaming handler API: a handler that consumes the body calls this once and
+    /// then reads frames with [`RequestBody::next_frame`] or collects with
+    /// [`RequestBody::collect`]. Handlers that only need the buffered bytes can keep reading
+    /// [`Request::body`].
+    pub fn take_body(&mut self) -> RequestBody {
+        match self.body_stream.take() {
+            Some(body) => body
+                .into_inner()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            None => RequestBody::buffered(std::mem::take(&mut self.body)),
+        }
+    }
+
+    /// Collect the request body into bytes (streaming produces no request-size changes beyond the
+    /// limit check) and also store it in [`Request::body`] for later compatibility access.
+    ///
+    /// This is the replacement for handlers that previously assumed `request.body` was always
+    /// populated when the server started streaming bodies.
+    pub async fn collect_body(
+        &mut self,
+        limit: Option<u64>,
+    ) -> std::result::Result<Bytes, BodyError> {
+        if let Some(stream) = self.body_stream.take() {
+            let stream = stream
+                .into_inner()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let bytes = stream.collect(limit).await?;
+            self.body = bytes.clone();
+            Ok(bytes)
+        } else if let Some(limit) = limit {
+            if self.body.len() as u64 > limit {
+                return Err(BodyError::TooLarge { limit });
+            }
+            Ok(self.body.clone())
+        } else {
+            Ok(self.body.clone())
+        }
+    }
+
+    /// Request body size when known: buffered length, or a stream's exact size hint.
+    pub fn body_size_hint(&self) -> Option<u64> {
+        match &self.body_stream {
+            Some(body) => body
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .exact_size(),
+            None => Some(self.body.len() as u64),
         }
     }
 
@@ -209,6 +286,24 @@ impl Response {
     }
 }
 
+impl Clone for Request {
+    fn clone(&self) -> Self {
+        // Streaming bodies are single-owner and cannot be cloned; clones are used for response
+        // bookkeeping (for example staged response headers), which never needs the request body.
+        Self {
+            method: self.method.clone(),
+            uri: self.uri.clone(),
+            headers: self.headers.clone(),
+            body: self.body.clone(),
+            body_stream: None,
+            remote_addr: self.remote_addr,
+            tls: self.tls,
+            vars: self.vars.clone(),
+            pending_response_headers: self.pending_response_headers.clone(),
+        }
+    }
+}
+
 /// What a handler does with a request.
 #[derive(Debug)]
 pub enum Outcome {
@@ -254,6 +349,17 @@ pub trait Handler: Send + Sync {
     /// Process a request with the buffered compatibility API.
     async fn handle(&self, request: Request) -> Result<Outcome>;
 
+    /// Whether this handler consumes the request body and therefore requires it to be buffered
+    /// before dispatch.
+    ///
+    /// The server buffers request bodies for routers that contain such a handler (today that is
+    /// `reverse_proxy`; streaming request bodies through the proxy is the T-PROXY-004 follow-up).
+    /// The router derives the same flag from the configuration JSON so external crates do not have
+    /// to override this (see [`crate::RouterBuilder`]).
+    fn requires_buffered_request_body(&self) -> bool {
+        false
+    }
+
     /// Process a request on the streaming path.
     ///
     /// The default implementation delegates to [`Handler::handle`] and wraps a buffered response,
@@ -284,3 +390,76 @@ pub type SharedHandler = Arc<dyn Handler>;
 
 /// Convenience alias for a shared matcher.
 pub type SharedMatcher = Arc<dyn Matcher>;
+
+#[cfg(test)]
+mod request_body_tests {
+    use super::*;
+    use crate::body::StreamingBody;
+    use tokio::sync::mpsc;
+
+    fn request_with_streaming_body(
+        receiver: mpsc::Receiver<std::result::Result<Bytes, BodyError>>,
+    ) -> Request {
+        let mut request = Request::new(Method::POST, "/upload".parse().unwrap());
+        request = request
+            .with_streaming_body(RequestBody::streaming(StreamingBody::from_chunks(receiver)));
+        assert!(request.has_streaming_body());
+        assert!(request.body.is_empty());
+        request
+    }
+
+    #[tokio::test]
+    async fn collect_body_buffers_a_stream_for_compatibility_handlers() {
+        let (sender, receiver) = mpsc::channel(4);
+        let mut request = request_with_streaming_body(receiver);
+        sender.send(Ok(Bytes::from_static(b"abc"))).await.unwrap();
+        sender.send(Ok(Bytes::from_static(b"defg"))).await.unwrap();
+        drop(sender);
+
+        let body = request.collect_body(None).await.expect("collect body");
+        assert_eq!(body, Bytes::from_static(b"abcdefg"));
+        assert_eq!(request.body, Bytes::from_static(b"abcdefg"));
+        assert!(!request.has_streaming_body());
+        // A second collect returns the buffered bytes without replaying the stream.
+        assert_eq!(
+            request.collect_body(None).await.expect("collect again"),
+            Bytes::from_static(b"abcdefg")
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_body_enforces_the_limit_while_streaming() {
+        let (sender, receiver) = mpsc::channel(4);
+        let mut request = request_with_streaming_body(receiver);
+        sender.send(Ok(Bytes::from_static(b"1234"))).await.unwrap();
+        sender.send(Ok(Bytes::from_static(b"56"))).await.unwrap();
+        drop(sender);
+        let error = request.collect_body(Some(5)).await.expect_err("too large");
+        assert!(matches!(error, BodyError::TooLarge { limit: 5 }), "{error}");
+    }
+
+    #[tokio::test]
+    async fn take_body_returns_buffered_bytes_or_the_stream() {
+        // Buffered request: take_body moves the bytes out and leaves the compatibility field empty.
+        let mut buffered = Request::new(Method::POST, "/".parse().unwrap());
+        buffered.body = Bytes::from_static(b"buffered");
+        let body = buffered.take_body();
+        assert_eq!(
+            body.collect(None).await.expect("collect"),
+            Bytes::from_static(b"buffered")
+        );
+        assert!(buffered.body.is_empty());
+
+        // Streaming request: take_body hands over the stream.
+        let (sender, receiver) = mpsc::channel(4);
+        let mut streamed = request_with_streaming_body(receiver);
+        sender.send(Ok(Bytes::from_static(b"wire"))).await.unwrap();
+        drop(sender);
+        let body = streamed.take_body();
+        assert_eq!(
+            body.collect(None).await.expect("collect"),
+            Bytes::from_static(b"wire")
+        );
+        assert!(!streamed.has_streaming_body());
+    }
+}

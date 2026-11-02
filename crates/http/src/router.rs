@@ -40,6 +40,13 @@ pub struct Route {
 }
 
 impl Route {
+    /// Whether any handler in this route needs a buffered request body.
+    fn requires_buffered_request_body(&self) -> bool {
+        self.handlers
+            .iter()
+            .any(|handler| handler.requires_buffered_request_body())
+    }
+
     fn matches(&self, request: &Request) -> bool {
         self.matcher_sets.is_empty()
             || self
@@ -49,9 +56,35 @@ impl Route {
     }
 }
 
+/// Handler modules that consume the request body on their buffered path.
+///
+/// Until request streaming through the reverse proxy lands (T-PROXY-004 follow-up), these handlers
+/// need the full body, so the server buffers request bodies for any router whose configuration
+/// contains one. Adding a handler here is the extension point for future body-consuming modules.
+const BODY_BUFFERING_HANDLERS: &[&str] = &["reverse_proxy"];
+
+/// Whether this configuration subtree contains a handler that needs a buffered request body.
+fn requests_buffered_request_body(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            if map
+                .get("handler")
+                .and_then(Value::as_str)
+                .is_some_and(|name| BODY_BUFFERING_HANDLERS.contains(&name))
+            {
+                return true;
+            }
+            map.values().any(requests_buffered_request_body)
+        }
+        Value::Array(items) => items.iter().any(requests_buffered_request_body),
+        _ => false,
+    }
+}
+
 /// An ordered route list.
 pub struct Router {
     routes: Vec<Route>,
+    requires_buffered_request_body: bool,
 }
 
 impl Router {
@@ -63,6 +96,16 @@ impl Router {
     /// Whether the router has no routes.
     pub fn is_empty(&self) -> bool {
         self.routes.is_empty()
+    }
+
+    /// Whether any handler in this route tree consumes the request body on its buffered path.
+    ///
+    /// The server buffers `hyper::body::Incoming` before dispatch when this is true, preserving
+    /// the compatibility behaviour of body-consuming handlers (today: `reverse_proxy`, until
+    /// request streaming through the proxy lands as T-PROXY-004). Routers without such handlers
+    /// receive a streaming request body and never buffer it.
+    pub fn requires_buffered_request_body(&self) -> bool {
+        self.requires_buffered_request_body
     }
 
     /// Evaluate a request through the route tree, returning a buffered response.
@@ -210,6 +253,7 @@ impl RouterBuilder {
     pub fn build(&self, routes: &[Value]) -> Result<Router> {
         Ok(Router {
             routes: self.build_routes(routes, "routes")?,
+            requires_buffered_request_body: routes.iter().any(requests_buffered_request_body),
         })
     }
 
@@ -655,6 +699,188 @@ mod tests {
         );
     }
 
+    // ---- streaming request bodies (T-PROXY-039 sub-wave: http/server model) -------------
+
+    use crate::body::RequestBody;
+    use std::sync::Mutex;
+
+    /// Records request-body chunk sizes delivered on the streaming path and buffered lengths on
+    /// the compatibility path.
+    struct RequestBodyRecorder {
+        streaming_chunks: Arc<Mutex<Vec<usize>>>,
+        buffered_lengths: Arc<Mutex<Vec<usize>>>,
+    }
+
+    #[async_trait]
+    impl Handler for RequestBodyRecorder {
+        fn name(&self) -> &'static str {
+            "request_body_recorder"
+        }
+
+        async fn handle(&self, request: Request) -> Result<Outcome> {
+            self.buffered_lengths
+                .lock()
+                .expect("lock")
+                .push(request.body.len());
+            Ok(Outcome::Respond(Response::text(
+                http::StatusCode::OK,
+                "buffered",
+            )))
+        }
+
+        async fn handle_streaming(&self, mut request: Request) -> Result<StreamingOutcome> {
+            assert!(
+                request.has_streaming_body(),
+                "server handed a streamed body"
+            );
+            assert!(
+                request.body.is_empty(),
+                "streaming path must not populate the buffered compatibility accessor"
+            );
+            let mut body = request.take_body();
+            while let Some(frame) = body.next_frame().await {
+                let frame = frame?;
+                if let Ok(data) = frame.into_data() {
+                    self.streaming_chunks.lock().expect("lock").push(data.len());
+                }
+            }
+            Ok(StreamingOutcome::Respond(StreamingResponse::from_buffered(
+                Response::text(http::StatusCode::OK, "streamed"),
+            )))
+        }
+    }
+
+    /// A handler factory for the streaming body tests: `request_body_recorder` plus a stub for the
+    /// body-buffering `reverse_proxy` module so the router-level flag can be exercised without the
+    /// proxy crate.
+    fn streaming_factory(recorder: Arc<RequestBodyRecorder>) -> CustomHandlerFactory {
+        Arc::new(move |value: &Value, _path: &str| {
+            match value.get("handler").and_then(Value::as_str) {
+                Some("request_body_recorder") => Ok(Some(Arc::new(RequestBodyRecorder {
+                    streaming_chunks: Arc::clone(&recorder.streaming_chunks),
+                    buffered_lengths: Arc::clone(&recorder.buffered_lengths),
+                }) as SharedHandler)),
+                Some("reverse_proxy") => Ok(Some(
+                    Arc::new(ChunkHandler { frames: Vec::new() }) as SharedHandler
+                )),
+                _ => Ok(None),
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn streaming_request_body_reaches_the_handler_chunk_by_chunk() {
+        let recorder = Arc::new(RequestBodyRecorder {
+            streaming_chunks: Arc::new(Mutex::new(Vec::new())),
+            buffered_lengths: Arc::new(Mutex::new(Vec::new())),
+        });
+        let router = RouterBuilder::new()
+            .with_custom_handler(streaming_factory(Arc::clone(&recorder)))
+            .build(&[json!({"handle": [{"handler": "request_body_recorder"}]})])
+            .unwrap();
+        assert!(!router.requires_buffered_request_body());
+
+        let (sender, receiver) = mpsc::channel(4);
+        let mut request = Request::new(Method::POST, "/upload".parse().unwrap());
+        request = request
+            .with_streaming_body(RequestBody::streaming(StreamingBody::from_chunks(receiver)));
+        sender.send(Ok(Bytes::from_static(b"abc"))).await.unwrap();
+        sender.send(Ok(Bytes::from_static(b"defg"))).await.unwrap();
+        sender.send(Ok(Bytes::from_static(b"hi"))).await.unwrap();
+        drop(sender);
+
+        let response = router
+            .handle_streaming(request)
+            .await
+            .expect("streaming request handled");
+        let response = response.into_buffered().await.expect("buffered response");
+        assert_eq!(response.body, Bytes::from_static(b"streamed"));
+        assert_eq!(
+            *recorder.streaming_chunks.lock().expect("lock"),
+            vec![3, 4, 2]
+        );
+        assert!(
+            recorder.buffered_lengths.lock().expect("lock").is_empty(),
+            "the streaming path must not run the buffered handler"
+        );
+    }
+
+    #[tokio::test]
+    async fn router_detects_body_buffering_handlers_including_nested_routes() {
+        let recorder = Arc::new(RequestBodyRecorder {
+            streaming_chunks: Arc::new(Mutex::new(Vec::new())),
+            buffered_lengths: Arc::new(Mutex::new(Vec::new())),
+        });
+        let builder =
+            || RouterBuilder::new().with_custom_handler(streaming_factory(Arc::clone(&recorder)));
+
+        let static_router = builder()
+            .build(&[json!({"handle": [{"handler": "static_response", "body": "x"}]})])
+            .unwrap();
+        assert!(!static_router.requires_buffered_request_body());
+
+        let recorder_router = builder()
+            .build(&[json!({"handle": [{"handler": "request_body_recorder"}]})])
+            .unwrap();
+        assert!(!recorder_router.requires_buffered_request_body());
+
+        let proxy_router = builder()
+            .build(&[json!({"handle": [{"handler": "reverse_proxy", "upstreams": [{"dial": "localhost:9"}]}]})])
+            .unwrap();
+        assert!(proxy_router.requires_buffered_request_body());
+
+        // Nested subroute/handle_response configurations are detected too: the proxy handler only
+        // appears inside the subroute's route JSON.
+        let nested_router = builder()
+            .build(&[json!({
+                "handle": [
+                    {"handler": "subroute", "routes": [
+                        {"handle": [{"handler": "reverse_proxy", "upstreams": [{"dial": "localhost:9"}]}]}
+                    ]}
+                ]
+            })])
+            .unwrap();
+        assert!(nested_router.requires_buffered_request_body());
+    }
+
+    /// Buffered-only handler: records `request.body` through the default `handle_streaming`
+    /// delegation, proving the compatibility path still carries full bodies.
+    struct BufferedBodyHandler;
+
+    #[async_trait]
+    impl Handler for BufferedBodyHandler {
+        fn name(&self) -> &'static str {
+            "buffered_body_handler"
+        }
+
+        async fn handle(&self, request: Request) -> Result<Outcome> {
+            Ok(Outcome::Respond(Response::text(
+                http::StatusCode::OK,
+                format!("body={}", String::from_utf8_lossy(&request.body)),
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn buffered_compatibility_path_still_sees_the_full_request_body() {
+        let factory: CustomHandlerFactory = Arc::new(|value: &Value, _path: &str| {
+            match value.get("handler").and_then(Value::as_str) {
+                Some("buffered_body_handler") => {
+                    Ok(Some(Arc::new(BufferedBodyHandler) as SharedHandler))
+                }
+                _ => Ok(None),
+            }
+        });
+        let router = RouterBuilder::new()
+            .with_custom_handler(factory)
+            .build(&[json!({"handle": [{"handler": "buffered_body_handler"}]})])
+            .unwrap();
+        let mut request = Request::new(Method::POST, "/".parse().unwrap());
+        request.body = Bytes::from_static(b"buffered body");
+        let response = router.handle(request).await.expect("buffered request");
+        assert_eq!(response.body, Bytes::from_static(b"body=buffered body"));
+    }
+
     #[tokio::test]
     async fn static_response_sets_caddy_content_type_through_router() {
         let router = RouterBuilder::new()
@@ -762,6 +988,7 @@ mod tests {
 
     fn router_with_handlers(handlers: Vec<SharedHandler>) -> Router {
         Router {
+            requires_buffered_request_body: false,
             routes: vec![Route {
                 matcher_sets: Vec::new(),
                 handlers,

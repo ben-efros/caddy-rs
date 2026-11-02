@@ -11,6 +11,8 @@
 //!   [`http_body::Body`] so hyper can consume it directly; `into_bytes()` collects it for the
 //!   legacy buffered path. [`ResponseBody`] and [`RequestBody`] are aliases that document the two
 //!   directions it serves.
+//! * [`RequestBody`] — the request-side body: buffered bytes or a streaming source, with an
+//!   optional byte limit and chunk-preserving [`RequestBody::next_frame`] consumption.
 //! * [`StreamingBody`] — a chunk stream with an error terminus. Construct it from bytes, from a
 //!   chunk channel (tests, adapters), from raw frames (data + trailers), or from any hyper body
 //!   ([`StreamingBody::from_hyper`], the proxy path).
@@ -52,9 +54,10 @@
 //!    too late for a new status);
 //! 5. drop the body future on client disconnect so the upstream request is cancelled.
 //!
-//! Request-body streaming is not wired yet: `Request.body` remains `Bytes`, and the server still
-//! collects `hyper::body::Incoming` before dispatch. [`RequestBody`] is the type that path will
-//! carry once the server and handler traits are extended; see the report for T-PROXY-004.
+//! Request bodies: the server hands [`RequestBody`] to the router without collecting it unless the
+//! router contains a body-buffering handler (`reverse_proxy` today; proxy request streaming is the
+//! T-PROXY-004 follow-up, whose contract is documented in the task report). `Request.body` remains
+//! the buffered compatibility accessor for handlers/tests that need full bodies.
 
 use std::error::Error as StdError;
 use std::fmt;
@@ -87,6 +90,17 @@ pub enum BodyError {
     /// An I/O error occurred while producing or consuming the body.
     #[error("body I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// The body exceeded its configured byte limit while being streamed.
+    ///
+    /// The server maps this to `413 Request Entity Too Large` when the error is observed before
+    /// response headers are sent; handlers that consume the body on the streaming path must map it
+    /// themselves (the limit is enforced lazily, like Caddy's request-body limits).
+    #[error("request body exceeds the configured limit of {limit} bytes")]
+    TooLarge {
+        /// Configured limit in bytes.
+        limit: u64,
+    },
 }
 
 impl BodyError {
@@ -273,8 +287,6 @@ pub enum Body {
 
 /// Response body type alias for clarity in signatures.
 pub type ResponseBody = Body;
-/// Request body type alias for clarity in signatures (request streaming is follow-up wiring).
-pub type RequestBody = Body;
 
 impl Body {
     /// An empty buffered body.
@@ -358,6 +370,260 @@ impl HttpBody for Body {
             Body::Bytes(bytes) => SizeHint::with_exact(bytes.len() as u64),
             Body::Stream(stream) => stream.size_hint(),
         }
+    }
+}
+
+/// The request body handed to handlers and the router.
+///
+/// The server passes a streaming body through without collecting it (unless the router contains a
+/// handler that requires a buffered body — see
+/// [`Router::requires_buffered_request_body`](crate::Router::requires_buffered_request_body)).
+/// Handlers have two compatibility accessors:
+///
+/// * [`Request::body`](crate::Request::body) remains the buffered bytes for the compatibility path
+///   (empty when the body is streamed or already taken), and
+/// * [`RequestBody::collect`](RequestBody::collect) / [`RequestBody::next_frame`] consume or read
+///   the streaming source.
+///
+/// `RequestBody` implements [`http_body::Body`] with `Data = Bytes` and [`BodyError`] so a handler
+/// can hand it directly to a hyper client (the reverse-proxy request-streaming follow-up,
+/// T-PROXY-004).
+#[derive(Debug)]
+pub struct RequestBody {
+    inner: RequestBodyInner,
+    /// Optional byte limit, enforced lazily as frames are consumed.
+    limit: Option<u64>,
+    /// Bytes delivered so far (for the limit).
+    read: u64,
+}
+
+#[derive(Debug)]
+enum RequestBodyInner {
+    Buffered(Option<Bytes>),
+    Streaming(Option<StreamingBody>),
+    Consumed,
+}
+
+impl RequestBody {
+    /// An empty request body.
+    pub fn empty() -> Self {
+        Self::buffered(Bytes::new())
+    }
+
+    /// A fully buffered request body.
+    pub fn buffered(bytes: impl Into<Bytes>) -> Self {
+        Self {
+            inner: RequestBodyInner::Buffered(Some(bytes.into())),
+            limit: None,
+            read: 0,
+        }
+    }
+
+    /// A streaming request body.
+    pub fn streaming(stream: StreamingBody) -> Self {
+        Self {
+            inner: RequestBodyInner::Streaming(Some(stream)),
+            limit: None,
+            read: 0,
+        }
+    }
+
+    /// Wrap the body in a byte limit. Buffered bodies over the limit fail immediately; streaming
+    /// bodies fail with [`BodyError::TooLarge`] as soon as a frame crosses the limit.
+    pub fn with_limit(mut self, limit: Option<u64>) -> Self {
+        self.limit = limit;
+        self
+    }
+
+    /// Whether the body is streamed (not fully buffered).
+    pub fn is_streaming(&self) -> bool {
+        matches!(self.inner, RequestBodyInner::Streaming(_))
+    }
+
+    /// Whether the body has already been consumed.
+    pub fn is_consumed(&self) -> bool {
+        matches!(self.inner, RequestBodyInner::Consumed)
+    }
+
+    /// Exact size when known: buffered bodies always; streams only when their source reports one.
+    pub fn exact_size(&self) -> Option<u64> {
+        match &self.inner {
+            RequestBodyInner::Buffered(Some(bytes)) => Some(bytes.len() as u64),
+            RequestBodyInner::Buffered(None) => Some(0),
+            RequestBodyInner::Streaming(Some(stream)) => stream.size_hint().exact(),
+            RequestBodyInner::Streaming(None) | RequestBodyInner::Consumed => None,
+        }
+    }
+
+    /// Borrow the buffered bytes when the body was not streamed (compatibility accessor).
+    pub fn as_buffered(&self) -> Option<&Bytes> {
+        match &self.inner {
+            RequestBodyInner::Buffered(Some(bytes)) => Some(bytes),
+            _ => None,
+        }
+    }
+
+    /// Collect the body into bytes with an optional byte limit.
+    pub async fn collect(self, limit: Option<u64>) -> Result<Bytes, BodyError> {
+        match self.inner {
+            RequestBodyInner::Buffered(Some(bytes)) => {
+                if let Some(limit) = limit.or(self.limit) {
+                    if bytes.len() as u64 > limit {
+                        return Err(BodyError::TooLarge { limit });
+                    }
+                }
+                Ok(bytes)
+            }
+            RequestBodyInner::Buffered(None) => Ok(Bytes::new()),
+            RequestBodyInner::Streaming(Some(mut stream)) => {
+                let effective_limit = limit.or(self.limit);
+                let mut collected = bytes::BytesMut::new();
+                let mut read = self.read;
+                loop {
+                    let frame =
+                        std::future::poll_fn(|cx| Pin::new(&mut stream).poll_frame(cx)).await;
+                    let Some(frame) = frame else { break };
+                    let frame = frame?;
+                    let Ok(data) = frame.into_data() else {
+                        continue;
+                    };
+                    read = read.checked_add(data.len() as u64).unwrap_or(u64::MAX);
+                    if let Some(limit) = effective_limit {
+                        if read > limit {
+                            return Err(BodyError::TooLarge { limit });
+                        }
+                    }
+                    collected.extend_from_slice(&data);
+                }
+                Ok(collected.freeze())
+            }
+            RequestBodyInner::Streaming(None) | RequestBodyInner::Consumed => {
+                Err(BodyError::Consumed)
+            }
+        }
+    }
+
+    /// Take the streaming body, if this request body is streamed.
+    pub fn into_streaming(self) -> Option<StreamingBody> {
+        match self.inner {
+            RequestBodyInner::Streaming(stream) => stream,
+            _ => None,
+        }
+    }
+
+    /// Read the next frame from the body.
+    ///
+    /// Buffered bodies yield exactly one data frame, then `None`. Streamed bodies preserve their
+    /// chunk boundaries. A `TooLarge` error terminates the body.
+    pub async fn next_frame(&mut self) -> Option<Result<Frame<Bytes>, BodyError>> {
+        match &mut self.inner {
+            RequestBodyInner::Buffered(slot) => match slot.take() {
+                Some(bytes) if bytes.is_empty() => None,
+                Some(bytes) => {
+                    if let Some(limit) = self.limit {
+                        if bytes.len() as u64 > limit {
+                            return Some(Err(BodyError::TooLarge { limit }));
+                        }
+                    }
+                    Some(Ok(Frame::data(bytes)))
+                }
+                None => None,
+            },
+            RequestBodyInner::Streaming(slot) => match slot {
+                Some(stream) => {
+                    let frame =
+                        std::future::poll_fn(|cx| Pin::new(&mut *stream).poll_frame(cx)).await;
+                    match frame {
+                        Some(Ok(frame)) => match frame.into_data() {
+                            Ok(data) => {
+                                if let Some(limit) = self.limit {
+                                    let read = self
+                                        .read
+                                        .checked_add(data.len() as u64)
+                                        .unwrap_or(u64::MAX);
+                                    self.read = read;
+                                    if read > limit {
+                                        return Some(Err(BodyError::TooLarge { limit }));
+                                    }
+                                }
+                                Some(Ok(Frame::data(data)))
+                            }
+                            Err(frame) => Some(Ok(frame)),
+                        },
+                        Some(Err(error)) => Some(Err(error)),
+                        None => {
+                            // End of stream: mark the body consumed so a later `collect` is a
+                            // loud error instead of replaying an already-drained stream as empty.
+                            *slot = None;
+                            None
+                        }
+                    }
+                }
+                None => None,
+            },
+            RequestBodyInner::Consumed => Some(Err(BodyError::Consumed)),
+        }
+    }
+}
+
+impl HttpBody for RequestBody {
+    type Data = Bytes;
+    type Error = BodyError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
+        let this = self.get_mut();
+        match &mut this.inner {
+            RequestBodyInner::Buffered(slot) => match slot.take() {
+                Some(bytes) if bytes.is_empty() => Poll::Ready(None),
+                Some(bytes) => {
+                    if let Some(limit) = this.limit {
+                        if bytes.len() as u64 > limit {
+                            return Poll::Ready(Some(Err(BodyError::TooLarge { limit })));
+                        }
+                    }
+                    Poll::Ready(Some(Ok(Frame::data(bytes))))
+                }
+                None => Poll::Ready(None),
+            },
+            RequestBodyInner::Streaming(slot) => match slot {
+                Some(stream) => match Pin::new(stream).poll_frame(cx) {
+                    Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                        Ok(data) => {
+                            if let Some(limit) = this.limit {
+                                let read =
+                                    this.read.checked_add(data.len() as u64).unwrap_or(u64::MAX);
+                                this.read = read;
+                                if read > limit {
+                                    return Poll::Ready(Some(Err(BodyError::TooLarge { limit })));
+                                }
+                            }
+                            Poll::Ready(Some(Ok(Frame::data(data))))
+                        }
+                        Err(frame) => Poll::Ready(Some(Ok(frame))),
+                    },
+                    other => other,
+                },
+                None => Poll::Ready(None),
+            },
+            RequestBodyInner::Consumed => Poll::Ready(Some(Err(BodyError::Consumed))),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        match &self.inner {
+            RequestBodyInner::Buffered(slot) => slot.as_ref().is_none_or(Bytes::is_empty),
+            RequestBodyInner::Streaming(Some(stream)) => stream.is_end_stream(),
+            RequestBodyInner::Streaming(None) | RequestBodyInner::Consumed => true,
+        }
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.exact_size()
+            .map(SizeHint::with_exact)
+            .unwrap_or_else(SizeHint::default)
     }
 }
 
@@ -678,5 +944,105 @@ mod tests {
 
         drop(sender);
         assert_eq!(next_data(&mut body).await, None);
+    }
+
+    // ---- request bodies (T-PROXY-039 sub-wave: http/server streaming model) ---------------
+
+    #[tokio::test]
+    async fn request_body_buffered_and_streaming_collectors() {
+        // Buffered bodies collect without a stream and enforce the limit eagerly.
+        let body = RequestBody::buffered(Bytes::from_static(b"hello"));
+        assert!(!body.is_streaming());
+        assert_eq!(body.exact_size(), Some(5));
+        assert_eq!(
+            body.collect(None).await.expect("collect"),
+            Bytes::from_static(b"hello")
+        );
+        let body = RequestBody::buffered(Bytes::from_static(b"hello"));
+        let error = body.collect(Some(4)).await.expect_err("over limit");
+        assert!(matches!(error, BodyError::TooLarge { limit: 4 }), "{error}");
+
+        // Streaming bodies preserve chunk boundaries through `next_frame`.
+        let (sender, receiver) = mpsc::channel(4);
+        let mut body = RequestBody::streaming(StreamingBody::from_chunks(receiver));
+        assert!(body.is_streaming());
+        sender.send(Ok(Bytes::from_static(b"aa"))).await.unwrap();
+        sender.send(Ok(Bytes::from_static(b"bbb"))).await.unwrap();
+        sender.send(Ok(Bytes::from_static(b"c"))).await.unwrap();
+        drop(sender);
+        let mut chunks = Vec::new();
+        while let Some(frame) = body.next_frame().await {
+            let frame = frame.expect("frame");
+            chunks.push(frame.into_data().expect("data frame"));
+        }
+        assert_eq!(
+            chunks,
+            vec![
+                Bytes::from_static(b"aa"),
+                Bytes::from_static(b"bbb"),
+                Bytes::from_static(b"c")
+            ]
+        );
+
+        // A consumed streaming body cannot be replayed (no silent empty body).
+        let (sender, receiver) = mpsc::channel(4);
+        let mut body = RequestBody::streaming(StreamingBody::from_chunks(receiver));
+        sender.send(Ok(Bytes::from_static(b"x"))).await.unwrap();
+        drop(sender);
+        let _ = body.next_frame().await.expect("first frame");
+        let _ = body.next_frame().await;
+        let error = body.collect(None).await.expect_err("consumed");
+        assert!(matches!(error, BodyError::Consumed), "{error}");
+    }
+
+    #[tokio::test]
+    async fn request_body_limit_is_enforced_while_streaming() {
+        let (sender, receiver) = mpsc::channel(4);
+        let mut body =
+            RequestBody::streaming(StreamingBody::from_chunks(receiver)).with_limit(Some(5));
+        sender.send(Ok(Bytes::from_static(b"1234"))).await.unwrap();
+        sender.send(Ok(Bytes::from_static(b"56"))).await.unwrap();
+        drop(sender);
+        let first = body
+            .next_frame()
+            .await
+            .expect("first frame")
+            .expect("ok frame");
+        assert_eq!(
+            first.into_data().expect("data"),
+            Bytes::from_static(b"1234")
+        );
+        let error = body
+            .next_frame()
+            .await
+            .expect("second frame")
+            .expect_err("limit crossed");
+        assert!(matches!(error, BodyError::TooLarge { limit: 5 }), "{error}");
+
+        // Buffered bodies over the limit fail before yielding data.
+        let mut body = RequestBody::buffered(Bytes::from_static(b"123456")).with_limit(Some(5));
+        let error = body
+            .next_frame()
+            .await
+            .expect("frame")
+            .expect_err("too large");
+        assert!(matches!(error, BodyError::TooLarge { limit: 5 }), "{error}");
+
+        // RequestBody is a normal `http_body::Body` for upstream forwarding.
+        let (sender, receiver) = mpsc::channel(4);
+        let body = RequestBody::streaming(StreamingBody::from_chunks(receiver));
+        sender.send(Ok(Bytes::from_static(b"data"))).await.unwrap();
+        drop(sender);
+        let collected = http_body_util::BodyExt::collect(body)
+            .await
+            .expect("http-body collect");
+        assert_eq!(
+            http_body_util::BodyExt::collect(Body::from_bytes(Bytes::new()))
+                .await
+                .expect("empty")
+                .to_bytes(),
+            Bytes::new()
+        );
+        assert_eq!(collected.to_bytes(), Bytes::from_static(b"data"));
     }
 }

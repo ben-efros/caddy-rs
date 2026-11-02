@@ -3,6 +3,21 @@
 //! This module also enforces the per-server request-body limit (caddy-rs hardening extension,
 //! see [`crate::limits`]) and converts body-read failures into HTTP status codes.
 //!
+//! ## Request-body streaming
+//!
+//! Request bodies are passed to the engine as `caddy_rs_http::RequestBody`, which can be buffered
+//! bytes or a stream. The server streams `hyper::body::Incoming` without collecting it when:
+//!
+//! * the router contains no handler that needs a buffered body (`reverse_proxy` today; request
+//!   streaming through the proxy is the T-PROXY-004 follow-up), and
+//! * a valid `Content-Length` was declared (the load-time limit check is enough) or no
+//!   `max_request_body_size` is configured.
+//!
+//! A chunked body with a configured limit keeps the bounded buffered path so the limit can be
+//! enforced before dispatch (`413`), preserving T-HTTP-013 semantics. On the streaming path the
+//! limit is enforced lazily by `RequestBody::with_limit` as the body is read, and handlers that
+//! never read the body leave it unread (Caddy's lazy limit semantics).
+//!
 //! Response bodies are handed to hyper as [`caddy_rs_http::Body`], which can be either a buffered
 //! `Bytes` value or a streamed body. The router's streaming entry point
 //! ([`Router::handle_streaming`]) is used so handlers that can stream (the reverse proxy today)
@@ -28,7 +43,10 @@ use http_body_util::{BodyExt, LengthLimitError, Limited};
 use hyper::body::Incoming;
 use hyper::upgrade::OnUpgrade;
 
-use caddy_rs_http::{Body, Request, Response, ResponseOutcome, Router, StreamingResponse, Tunnel};
+use caddy_rs_http::{
+    Body, Request, RequestBody, Response, ResponseOutcome, Router, StreamingBody,
+    StreamingResponse, Tunnel,
+};
 
 use crate::auto_https::AutomaticHttpsServing;
 use crate::limits::ServerLimits;
@@ -174,12 +192,19 @@ pub(crate) async fn serve_request_with_automatic_upgradable(
         ));
     }
     let (parts, body) = request.into_parts();
-    let body = match read_body(body, limits.max_request_body_size).await {
-        Ok(body) => body,
-        Err(BodyReadError::TooLarge { limit }) => {
+    let path = parts.uri.path().to_string();
+    let limit = limits.max_request_body_size;
+    // A declared body over the limit is rejected before any body bytes are read, for both the
+    // buffered and streaming paths. Chunked/unknown-length streams are limited lazily as they are
+    // consumed (see `RequestBody::with_limit`); handlers that never read the body leave it
+    // unread, which matches Caddy's lazy request-body limit semantics.
+    let declared_length = declared_content_length(&parts.headers);
+    if let (Some(limit), Some(declared)) = (limit, declared_length) {
+        if declared > limit {
             tracing::debug!(
                 limit,
-                path = parts.uri.path(),
+                declared,
+                path = %path,
                 "request body exceeds max_request_body_size"
             );
             return ServedResponse::Response(status_response(
@@ -187,19 +212,55 @@ pub(crate) async fn serve_request_with_automatic_upgradable(
                 "413 Request Entity Too Large",
             ));
         }
-        Err(BodyReadError::Read(error)) => {
-            eprintln!("caddy-rs: cannot read request body: {error}");
-            return ServedResponse::Response(status_response(
-                StatusCode::BAD_REQUEST,
-                "400 Bad Request",
-            ));
-        }
-    };
+    }
+
     let mut internal = Request::new(parts.method, parts.uri);
     internal.headers = parts.headers;
-    internal.body = body;
     internal.remote_addr = remote_addr;
     internal.tls = tls;
+    // Streamed dispatch is used when:
+    // * no handler in the route tree needs the buffered body (today only `reverse_proxy` does, and
+    //   proxy request-body streaming is the T-PROXY-004 follow-up), and
+    // * either a valid Content-Length was declared (hyper reads exactly that many bytes, so the
+    //   declared-vs-limit check above is sufficient) or no body limit is configured.
+    // A chunked body with a configured limit keeps the buffered path so the limit can still be
+    // enforced *before* the handler runs (413 pre-dispatch, preserving T-HTTP-013 semantics);
+    // buffering is bounded by the configured limit.
+    let can_stream =
+        !router.requires_buffered_request_body() && (declared_length.is_some() || limit.is_none());
+    if !can_stream {
+        // Compatibility/bounded path: handlers that consume the full body today (the reverse
+        // proxy; T-PROXY-004 follow-up streams through it) and chunked bodies with a configured
+        // limit are buffered, enforcing the limit while reading exactly as before.
+        let body = match read_body(body, limit).await {
+            Ok(body) => body,
+            Err(BodyReadError::TooLarge { limit }) => {
+                tracing::debug!(
+                    limit,
+                    path = %path,
+                    "request body exceeds max_request_body_size"
+                );
+                return ServedResponse::Response(status_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "413 Request Entity Too Large",
+                ));
+            }
+            Err(BodyReadError::Read(error)) => {
+                eprintln!("caddy-rs: cannot read request body: {error}");
+                return ServedResponse::Response(status_response(
+                    StatusCode::BAD_REQUEST,
+                    "400 Bad Request",
+                ));
+            }
+        };
+        internal.body = body;
+    } else {
+        // Streaming path: the engine receives hyper's `Incoming` as a chunk stream and the server
+        // never collects it. The limit is applied lazily by `RequestBody::with_limit`, and the
+        // request size is the declared Content-Length when present (0 when chunked/unknown).
+        let body = RequestBody::streaming(StreamingBody::from_hyper(body)).with_limit(limit);
+        internal = internal.with_streaming_body(body);
+    }
     if let Some(alpn) = tls_alpn {
         internal
             .vars
@@ -248,6 +309,14 @@ pub(crate) async fn serve_request_with_automatic_upgradable(
             ))
         }
     }
+}
+
+/// Declared request body size (`Content-Length`), when present and valid.
+pub(crate) fn declared_content_length(headers: &http::HeaderMap) -> Option<u64> {
+    headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
 }
 
 /// Failure while consuming a request body.
@@ -332,3 +401,33 @@ fn status_response(status: StatusCode, body: &'static str) -> hyper::Response<Bo
 
 /// Type used for `service_fn` closures.
 pub type ServiceResult = Result<hyper::Response<Body>, Infallible>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http::HeaderValue;
+
+    #[test]
+    fn declared_content_length_parses_valid_headers_only() {
+        let mut headers = http::HeaderMap::new();
+        assert_eq!(declared_content_length(&headers), None);
+
+        headers.insert(
+            http::header::CONTENT_LENGTH,
+            HeaderValue::from_static("1024"),
+        );
+        assert_eq!(declared_content_length(&headers), Some(1024));
+
+        headers.insert(
+            http::header::CONTENT_LENGTH,
+            HeaderValue::from_static("  42 "),
+        );
+        assert_eq!(declared_content_length(&headers), Some(42));
+
+        headers.insert(
+            http::header::CONTENT_LENGTH,
+            HeaderValue::from_static("not-a-number"),
+        );
+        assert_eq!(declared_content_length(&headers), None);
+    }
+}
