@@ -35,10 +35,10 @@
 //! * `size_hint` is only exact for byte bodies; streamed bodies are chunked unless the source
 //!   reports an exact size.
 //!
-//! ## Server integration contract (follow-up)
+//! ## Server integration contract (implemented by `caddy-rs-server`)
 //!
-//! The server crate currently calls [`Router::handle`](crate::Router::handle), which buffers
-//! streaming responses for compatibility. To stream end to end it must:
+//! The server crate calls [`Router::handle_streaming`](crate::Router::handle_streaming) and hands
+//! the returned [`Body`] to hyper without buffering (T-PROXY-038). The contract it implements is:
 //!
 //! 1. call `Router::handle_streaming(request)` and build a `hyper::Response` whose body is the
 //!    returned [`Body`] (hyper accepts any `http_body::Body<Data = Bytes>` whose error is

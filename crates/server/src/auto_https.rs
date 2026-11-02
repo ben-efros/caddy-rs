@@ -14,8 +14,8 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http_body_util::Full;
 
+use caddy_rs_http::Body;
 use caddy_rs_tls::{AutomaticHttpsPlan, CertificateResolver, Http01TokenStore, HTTP01_PATH_PREFIX};
 
 /// Redirect policy for one generation's HTTP listeners.
@@ -74,7 +74,7 @@ impl AutomaticHttpsServing {
     pub(crate) fn pre_router_response(
         &self,
         request: &hyper::Request<hyper::body::Incoming>,
-    ) -> Option<hyper::Response<Full<Bytes>>> {
+    ) -> Option<hyper::Response<Body>> {
         let path = request.uri().path();
         if let Some(token) = path.strip_prefix(HTTP01_PATH_PREFIX) {
             let token = token.trim_end_matches('/');
@@ -112,17 +112,17 @@ impl AutomaticHttpsServing {
                 .status(308)
                 .header(hyper::header::LOCATION, location)
                 .header(hyper::header::CONTENT_LENGTH, "0")
-                .body(Full::new(Bytes::new()))
+                .body(Body::from_bytes(Bytes::new()))
                 .expect("static redirect response is valid"),
         )
     }
 }
 
-fn text_response(status: u16, body: &str) -> hyper::Response<Full<Bytes>> {
+fn text_response(status: u16, body: &str) -> hyper::Response<Body> {
     hyper::Response::builder()
         .status(status)
         .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
-        .body(Full::new(Bytes::from(body.to_string())))
+        .body(Body::from_bytes(Bytes::from(body.to_string())))
         .expect("static response is valid")
 }
 

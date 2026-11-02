@@ -29,7 +29,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
@@ -41,7 +41,7 @@ use tokio_rustls::TlsAcceptor;
 
 use caddy_rs_admin::{AdminApi, AdminRequest};
 use caddy_rs_core::{Generation, GenerationStore, ListenAddr, Network};
-use caddy_rs_http::Router;
+use caddy_rs_http::{Body, Router};
 
 use crate::activation::{adopt_tcp, adopt_unix, InheritedSocket, LocalSocket};
 use crate::auto_https::AutomaticHttpsServing;
@@ -424,7 +424,7 @@ fn connection_service(
     activity: Arc<ConnectionActivity>,
 ) -> impl hyper::service::Service<
     hyper::Request<Incoming>,
-    Response = hyper::Response<Full<Bytes>>,
+    Response = hyper::Response<Body>,
     Error = std::convert::Infallible,
     Future: Send,
 > + Send
@@ -468,7 +468,7 @@ async fn serve_connection<I, S>(
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     S: hyper::service::Service<
             hyper::Request<Incoming>,
-            Response = hyper::Response<Full<Bytes>>,
+            Response = hyper::Response<Body>,
             Error = std::convert::Infallible,
         > + Send
         + 'static,
@@ -657,11 +657,13 @@ impl<I: AsyncWrite + Unpin> AsyncWrite for TimedIo<I> {
     }
 }
 
-fn error_response() -> hyper::Response<Full<Bytes>> {
+fn error_response() -> hyper::Response<Body> {
     hyper::Response::builder()
         .status(503)
         .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
-        .body(Full::new(Bytes::from_static(b"503 Service Unavailable")))
+        .body(Body::from_bytes(Bytes::from_static(
+            b"503 Service Unavailable",
+        )))
         .expect("static response is valid")
 }
 
@@ -714,7 +716,7 @@ pub(crate) async fn bind_admin(configured: &str, api: AdminApi) -> Result<Listen
                                 }
                                 Ok::<_, std::convert::Infallible>(
                                     builder
-                                        .body(Full::new(response.body))
+                                        .body(Body::from_bytes(response.body))
                                         .expect("admin response is valid"),
                                 )
                             }
