@@ -2,10 +2,10 @@
 
 The Rust implementation of the caddy-rs program: a Caddy-compatible web server, reverse proxy,
 and configuration engine. **Status: M2/M4 (post-agent sprint)** — the crates compile,
-**842 tests pass**, HTTPS termination, automatic-HTTPS issuance (fake-CA tested), renewal hot-swap,
+**972 tests pass**, HTTPS termination, automatic-HTTPS issuance (fake-CA tested), renewal hot-swap,
 streaming, forward_auth and TLS-ALPN-01 work end to end, and the Caddyfile adapter matches Caddy
-v2.11.7's golden output for every fixture it supports: **80 of the 245 upstream adapter fixtures
-exactly, 0 mismatches** (100% of supported fixtures, 32.7% corpus coverage). A real Caddy v2.11.7
+v2.11.7's golden output for every fixture it supports: **81 of the 245 upstream adapter fixtures
+exactly, 0 mismatches** (100% of supported fixtures, 33.1% corpus coverage). A real Caddy v2.11.7
 binary oracle is acquired and run by the program repository. See the program repository's conformance report.
 
 See the program repository (`..`) for the plan, compatibility contract, divergence register, and
@@ -37,7 +37,9 @@ work queue.
   Unix-socket upstreams, round-robin/first/least-conn balancing, retries with retry_match, active +
   passive health checks, forwarded headers and trusted proxies, request/response header rewriting,
   streaming responses (no full-body buffering; mid-stream errors and client cancellation handled),
-  canonical forward_auth execution (rewrite/handle_response, header copy, 401/403 pass-through)
+  **WebSocket/Upgrade passthrough** (h1, cleartext+TLS), **HTTP/2 and h2c upstreams**
+  (`transport.versions`), canonical forward_auth execution (rewrite/handle_response, header copy,
+  401/403 pass-through); request bodies stream through HTTP/server (proxy forwarding follow-up)
 - Admin API: `/config/` traversal, full `POST/PUT/PATCH/DELETE` partial updates with validation and
   rollback, `/id/<id>`, `/load`, `/stop` (exits the process for all adapters), origin enforcement,
   `/metrics` Prometheus text endpoint, access-log record/redaction/sampling/sink primitives and
@@ -47,10 +49,14 @@ work queue.
   Cloudflare DNS-01 provider (mock-tested), Caddy-compatible internal CA (`tls internal`), Caddyfile
   `tls` directive/global ACME options, automatic-HTTPS driver and renewal schedulers
 - Middleware/engine: placeholder engine, forward_auth and basic_auth/authentication handlers,
-  streaming body engine, request/response header rewriting, static/file serving, vars/invoke/named
-  routes, file/glob imports, async generation lifecycle hooks (provision → start → stop → cleanup)
+  streaming response/request body engine, request/response header rewriting, static/file serving,
+  vars/invoke/named routes, file/glob imports, async generation lifecycle hooks
+- PKI/observability: read-only `/pki` endpoints + `pki list/export/trust` CLI, Prometheus metrics
+  and Caddy `logging.logs[]`-configured access-log emission at runtime
+- Acceptance: local acceptance harness (forward_auth/Authelia, streaming, WebSocket, TLS, internal
+  CA auto-HTTPS, admin) and Pebble real-ACME acceptance (HTTP-01/TLS-ALPN-01, account reuse)
 - Compatibility: real Caddy v2.11.7 oracle acquisition (no Docker), adapt/validate/runtime probes,
-  drift triage and nightly workflow; 70 registered divergences with tracking tasks
+  drift triage and nightly workflow; 76 registered divergences with tracking tasks
 - CLI: `version`, `list-modules`, `adapt`, `validate`, `run`, `reload`, `stop`
 
 ## What does not work yet (registered, not hidden)
