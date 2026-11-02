@@ -389,3 +389,238 @@ fn run_json_adapter_admin_stop_exits_process() {
         "JSON-adapter run should exit successfully after /stop, got {status:?}"
     );
 }
+
+// ---- PKI / trust commands (read-only local CA material) --------------------------------------
+//
+// The fixtures live in the admin crate (`crates/admin/tests/fixtures/pki/authorities/...`); they
+// are read-only test data generated for this task (root + intermediate certificates for `local`
+// and `staging` CAs in Caddy's data-directory layout).
+
+use std::path::PathBuf;
+
+fn pki_fixture_data_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../admin/tests/fixtures")
+}
+
+fn run_pki(args: &[&str]) -> (i32, String, String) {
+    let output = Command::new(binary())
+        .args(args)
+        .output()
+        .expect("run caddy-rs pki");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
+fn assert_pem_count(pem: &str, count: usize) {
+    assert_eq!(
+        pem.matches("-----BEGIN CERTIFICATE-----").count(),
+        count,
+        "PEM block count in:\n{pem}"
+    );
+    assert_eq!(
+        pem.matches("-----END CERTIFICATE-----").count(),
+        count,
+        "PEM end-block count in:\n{pem}"
+    );
+}
+
+#[test]
+fn pki_list_reports_provisioned_cas_and_json_shape() {
+    let data_dir = pki_fixture_data_dir();
+    let (code, stdout, stderr) =
+        run_pki(&["pki", "list", "--data-dir", data_dir.to_str().unwrap()]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("ID"), "{stdout}");
+    assert!(stdout.contains("local"), "{stdout}");
+    assert!(stdout.contains("staging"), "{stdout}");
+    assert!(stdout.contains("caddy-rs test root"), "{stdout}");
+    assert!(stdout.contains("caddy-rs test intermediate"), "{stdout}");
+
+    let (code, stdout, stderr) = run_pki(&[
+        "pki",
+        "list",
+        "--json",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("list JSON");
+    let authorities = value["authorities"].as_array().expect("authorities array");
+    assert_eq!(authorities.len(), 2);
+    assert_eq!(authorities[0]["id"], "local");
+    assert_eq!(authorities[0]["root_common_name"], "caddy-rs test root");
+    assert_eq!(
+        authorities[0]["intermediate_common_name"],
+        "caddy-rs test intermediate"
+    );
+    assert!(authorities[0]["directory"]
+        .as_str()
+        .unwrap()
+        .ends_with("authorities/local"));
+    assert!(authorities[0]["root_not_after"].is_string());
+    assert!(authorities[0]["has_intermediate"].as_bool().unwrap());
+
+    // `$CADDY_RS_DATA_DIR` is respected when --data-dir is absent.
+    let output = Command::new(binary())
+        .args(["pki", "list"])
+        .env("CADDY_RS_DATA_DIR", &data_dir)
+        .output()
+        .expect("run with env data dir");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("local"), "{stdout}");
+    assert!(stdout.contains("staging"), "{stdout}");
+
+    // An empty/missing data dir lists nothing but is not an error.
+    let empty = tempfile::tempdir().unwrap();
+    let (code, stdout, stderr) =
+        run_pki(&["pki", "list", "--data-dir", empty.path().to_str().unwrap()]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        stdout.contains("no local certificate authorities"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn pki_export_writes_root_intermediate_and_chain_pem() {
+    let data_dir = pki_fixture_data_dir();
+    let data_dir = data_dir.to_str().unwrap();
+    let root_expected =
+        std::fs::read_to_string(pki_fixture_data_dir().join("pki/authorities/local/root.crt"))
+            .expect("root fixture");
+    let intermediate_expected = std::fs::read_to_string(
+        pki_fixture_data_dir().join("pki/authorities/local/intermediate.crt"),
+    )
+    .expect("intermediate fixture");
+
+    let (code, stdout, stderr) = run_pki(&["pki", "export", "local", "--data-dir", data_dir]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_pem_count(&stdout, 1);
+    assert_eq!(
+        stdout.trim(),
+        root_expected.trim(),
+        "default export is the root"
+    );
+
+    let (code, stdout, _) = run_pki(&["pki", "export", "local", "--root", "--data-dir", data_dir]);
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), root_expected.trim());
+
+    let (code, stdout, _) = run_pki(&[
+        "pki",
+        "export",
+        "local",
+        "--intermediate",
+        "--data-dir",
+        data_dir,
+    ]);
+    assert_eq!(code, 0);
+    assert_pem_count(&stdout, 1);
+    assert_eq!(stdout.trim(), intermediate_expected.trim());
+
+    // Caddy chain order: intermediate(s) first, root last.
+    let (code, stdout, _) = run_pki(&["pki", "export", "local", "--chain", "--data-dir", data_dir]);
+    assert_eq!(code, 0);
+    assert_pem_count(&stdout, 2);
+    assert!(
+        stdout.trim().starts_with(intermediate_expected.trim()),
+        "{stdout}"
+    );
+    assert!(stdout.trim().ends_with(root_expected.trim()), "{stdout}");
+
+    // Unknown CA is a loud, located error with nothing on stdout.
+    let (code, stdout, stderr) =
+        run_pki(&["pki", "export", "does-not-exist", "--data-dir", data_dir]);
+    assert_ne!(code, 0);
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(
+        stderr.contains("no certificate authority configured with id `does-not-exist`"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("must be provisioned"), "{stderr}");
+
+    // `--root` and `--chain` conflict at the argument-parsing level.
+    let (code, _stdout, stderr) = run_pki(&[
+        "pki",
+        "export",
+        "local",
+        "--root",
+        "--chain",
+        "--data-dir",
+        data_dir,
+    ]);
+    assert_ne!(code, 0);
+    assert!(stderr.contains("cannot be used with"), "{stderr}");
+}
+
+#[test]
+fn trust_dry_run_prints_instructions_and_changes_nothing() {
+    let data_dir = pki_fixture_data_dir();
+    let (code, stdout, stderr) = run_pki(&[
+        "trust",
+        "--dry-run",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("CA id: local"), "{stdout}");
+    assert!(stdout.contains("root certificate:"), "{stdout}");
+    assert!(
+        stdout.contains("pki/authorities/local/root.crt"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("caddy-rs test root"), "{stdout}");
+    assert!(stdout.contains("no changes made (--dry-run)"), "{stdout}");
+    assert!(stdout.contains("to install manually, run:"), "{stdout}");
+    if cfg!(target_os = "linux") {
+        assert!(
+            stdout.contains("update-ca-certificates"),
+            "Linux instructions must name update-ca-certificates:\n{stdout}"
+        );
+    }
+
+    // A non-default CA can be inspected too.
+    let (code, stdout, _) = run_pki(&[
+        "trust",
+        "--dry-run",
+        "--ca",
+        "staging",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("CA id: staging"), "{stdout}");
+    assert!(stdout.contains("caddy-rs staging root"), "{stdout}");
+}
+
+#[test]
+fn trust_fails_loudly_before_touching_the_os_when_the_ca_is_missing() {
+    let data_dir = pki_fixture_data_dir();
+    let (code, stdout, stderr) = run_pki(&[
+        "trust",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+        "--ca",
+        "does-not-exist",
+    ]);
+    assert_ne!(code, 0, "trust must fail for an unknown CA");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(
+        stderr.contains("no certificate authority configured with id `does-not-exist`"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("must be provisioned"), "{stderr}");
+
+    // A missing data directory fails at CA lookup, before any installation step could run.
+    let empty = tempfile::tempdir().unwrap();
+    let (code, _stdout, stderr) = run_pki(&["trust", "--data-dir", empty.path().to_str().unwrap()]);
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("no certificate authority configured with id `local`"),
+        "{stderr}"
+    );
+}

@@ -17,6 +17,9 @@
 //! | `POST /load` | Validate, provision, and atomically activate a configuration |
 //! | `POST /stop` | Deactivate the running configuration |
 //! | `GET /metrics` | Prometheus text format (v0.0.4) rendered from the shared [`MetricsRegistry`]; empty until the runtime populates it |
+//! | `GET /pki/ca/<id>` | Caddy-compatible metadata for a provisioned local CA (`caInfo` JSON) |
+//! | `GET /pki/ca/<id>/certificates` | PEM certificate chain: intermediate(s) then root |
+//! | `GET /pki/ca/<id>/certificates/<name>` | One PEM file from the CA directory (`root.crt`/`intermediate.crt`, caddy-rs extension) |
 //!
 //! Partial updates follow upstream Caddy's semantics exactly (see `config_path`):
 //!
@@ -45,6 +48,11 @@
 //! handle, no-op implementation, RAII in-flight guards) that forwards request/proxy observations
 //! to [`HttpMetrics`], plus [`CertificateMetrics`] hooks for the TLS renewal work. The server
 //! runtime stores one recorder and clones it per task; see the module docs for the wiring recipe.
+//!
+//! [`pki`] exposes the local certificate authority material that the server's automatic HTTPS
+//! persisted under `<data-dir>/pki/authorities/<id>/` through read-only admin endpoints. It never
+//! provisions or repairs a CA: a missing CA is a located 404 (Caddy lazily provisions the default
+//! `local` CA on `/pki` reads; this build deliberately does not).
 //!
 //! [`logging_config`] maps Caddy's `logging.logs[]` JSON (writer, encoder, level, sampling,
 //! include/exclude and the supported encoder filter subset) to validated
@@ -78,6 +86,11 @@
 //! - Origin policy derives implicit origins from a non-empty `admin.origins`; the shared core
 //!   model cannot distinguish `origins: null` (derive) from `origins: []` (allow none), so an
 //!   explicit empty list derives the defaults instead of blocking the endpoint.
+//! - `/pki` is read-only: it serves the local CA material persisted under
+//!   `<data-dir>/pki/authorities/<id>/` but never provisions, repairs or trusts anything. Caddy
+//!   lazily provisions the default `local` CA on a `/pki` read; this build returns `404` instead
+//!   and the CA must already exist (for example from automatic HTTPS). Caddy's CA `name` field is
+//!   reported as the id because `apps.pki` is not modelled by this build. See [`pki`].
 //! - Metrics rendering, the access-log record/sink model and the Caddy `logging` -> sink mapping
 //!   are crate-level primitives (T-ADMIN-020/021/022/025): `/metrics` renders whatever the
 //!   runtime records through the [`recorder`] API, and [`logging_config`] turns the active
@@ -94,9 +107,11 @@ mod config_path;
 pub mod logging_config;
 pub mod metrics;
 mod origin;
+pub mod pki;
 pub mod recorder;
 pub mod sink;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -118,6 +133,10 @@ pub use metrics::{
     METRICS_CONTENT_TYPE,
 };
 pub use origin::{OriginPolicy, OriginViolation};
+pub use pki::{
+    authorities_directory, resolve_data_dir, CaMaterial, CaSummary, CertificateInfo, PkiError,
+    PkiStore, AUTHORITIES_DIRECTORY, DATA_DIR_ENV, DEFAULT_CA_ID, DEFAULT_DATA_DIR,
+};
 pub use recorder::{
     noop_recorder, CertificateMetrics, MetricsRequestRecorder, NoopRequestRecorder,
     ProxyRequestGuard, RequestGuard, RequestRecorder, SharedRequestRecorder,
@@ -188,6 +207,21 @@ impl AdminResponse {
         response
     }
 
+    /// Response with an explicit content type (PEM chains and certificate files).
+    pub fn with_content_type(
+        status: StatusCode,
+        content_type: &'static str,
+        body: impl Into<Bytes>,
+    ) -> Self {
+        let mut response = Self::empty(status);
+        response.headers.insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static(content_type),
+        );
+        response.body = body.into();
+        response
+    }
+
     /// Caddy-compatible `APIError` body: `{"error":"<message>"}` with JSON content type.
     pub fn api_error(status: StatusCode, message: impl AsRef<str>) -> Self {
         Self::json(status, &json!({ "error": message.as_ref() }))
@@ -202,6 +236,8 @@ pub struct AdminApi {
     reload_notify: Option<Arc<tokio::sync::Notify>>,
     origin_policy: Option<OriginPolicy>,
     metrics: MetricsRegistry,
+    /// Caddy data directory containing `pki/authorities` (admin `/pki` endpoints).
+    data_dir: Option<PathBuf>,
 }
 
 impl AdminApi {
@@ -213,6 +249,7 @@ impl AdminApi {
             reload_notify: None,
             origin_policy: None,
             metrics: MetricsRegistry::new(),
+            data_dir: None,
         }
     }
 
@@ -228,6 +265,32 @@ impl AdminApi {
     /// A cheap handle to the metrics registry for the server runtime to populate.
     pub fn metrics(&self) -> MetricsRegistry {
         self.metrics.clone()
+    }
+
+    /// Pin the Caddy data directory used by the read-only `/pki` endpoints.
+    ///
+    /// The server runtime should pass its effective data root (the same directory whose
+    /// `pki/authorities/<id>/` holds the internal CA). Without an override the resolution order is
+    /// `CADDY_RS_DATA_DIR`, then the active generation's `storage.root`, then `.caddy-rs` (the
+    /// server runtime's default).
+    pub fn with_data_dir(mut self, data_dir: impl Into<PathBuf>) -> Self {
+        self.data_dir = Some(data_dir.into());
+        self
+    }
+
+    /// The PKI store for the effective data directory.
+    fn pki_store(&self) -> PkiStore {
+        let config_storage_root = self.store.current().and_then(|generation| {
+            generation
+                .config()
+                .storage()
+                .and_then(|storage| storage.root())
+                .map(PathBuf::from)
+        });
+        PkiStore::new(pki::resolve_data_dir(
+            self.data_dir.clone(),
+            config_storage_root,
+        ))
     }
 
     /// A shared request recorder backed by this admin API's metrics registry.
@@ -377,6 +440,10 @@ impl AdminApi {
             return self.handle_id(rest, request);
         }
 
+        if path == "/pki" || path.starts_with("/pki/") {
+            return self.handle_pki(path, request).await;
+        }
+
         match path {
             "/id" | "/id/" => AdminResponse::api_error(
                 StatusCode::BAD_REQUEST,
@@ -441,6 +508,50 @@ impl AdminApi {
             _ => AdminResponse::text(
                 StatusCode::NOT_FOUND,
                 format!("admin endpoint `{path}` is not implemented"),
+            ),
+        }
+    }
+
+    /// Handle Caddy's read-only `/pki` endpoints.
+    ///
+    /// The local CA material is read from the data directory on every request (no caching), never
+    /// created or repaired. Origin enforcement and the shared request handling already apply
+    /// because this runs inside [`AdminApi::handle`].
+    async fn handle_pki(&self, path: &str, request: &AdminRequest) -> AdminResponse {
+        if request.method != Method::GET {
+            return AdminResponse::api_error(
+                StatusCode::METHOD_NOT_ALLOWED,
+                format!("method not allowed: {}", request.method),
+            );
+        }
+        let Some(rest) = path.strip_prefix("/pki/") else {
+            return AdminResponse::api_error(
+                StatusCode::NOT_FOUND,
+                format!("resource not found: {path}"),
+            );
+        };
+        let store = self.pki_store();
+        let segments: Vec<&str> = rest.split('/').collect();
+        match segments.as_slice() {
+            ["ca", id] if !id.is_empty() => match store.load(id).await {
+                Ok(ca) => AdminResponse::json(StatusCode::OK, &ca.info_json()),
+                Err(error) => pki_error_response(&error, id),
+            },
+            ["ca", id, "certificates"] if !id.is_empty() => match store.load(id).await {
+                Ok(ca) => AdminResponse::with_content_type(
+                    StatusCode::OK,
+                    "application/pem-certificate-chain",
+                    ca.chain_pem(),
+                ),
+                Err(error) => pki_error_response(&error, id),
+            },
+            ["ca", id, "certificates", name] if !id.is_empty() => match store.load(id).await {
+                Ok(ca) => pki_certificate_response(&ca, name, id, path),
+                Err(error) => pki_error_response(&error, id),
+            },
+            _ => AdminResponse::api_error(
+                StatusCode::NOT_FOUND,
+                format!("resource not found: {path}"),
             ),
         }
     }
@@ -610,6 +721,55 @@ impl AdminApi {
         }
         self.notify_reload();
         AdminResponse::empty(StatusCode::OK)
+    }
+}
+
+/// One certificate file from a CA directory (caddy-rs extension endpoint).
+fn pki_certificate_response(ca: &CaMaterial, name: &str, id: &str, path: &str) -> AdminResponse {
+    let pem = match name {
+        "root.crt" | "root.pem" => Some(ca.root_pem().to_string()),
+        "intermediate.crt" | "intermediate.pem" => {
+            let intermediate = ca.intermediate_pem();
+            if intermediate.is_empty() {
+                None
+            } else {
+                Some(intermediate)
+            }
+        }
+        _ => {
+            return AdminResponse::api_error(
+                StatusCode::NOT_FOUND,
+                format!("resource not found: {path}"),
+            )
+        }
+    };
+    match pem {
+        Some(pem) => {
+            AdminResponse::with_content_type(StatusCode::OK, "application/x-pem-file", pem)
+        }
+        None => AdminResponse::api_error(
+            StatusCode::NOT_FOUND,
+            format!("CA `{id}` has no intermediate certificate"),
+        ),
+    }
+}
+
+/// Map a [`PkiError`] to a Caddy-compatible API error response.
+fn pki_error_response(error: &PkiError, id: &str) -> AdminResponse {
+    match error {
+        PkiError::NotFound { .. } => AdminResponse::api_error(
+            StatusCode::NOT_FOUND,
+            // Caddy's exact message for an unconfigured CA id. Caddy would lazy-provision the
+            // default `local` CA here; this build is read-only and deliberately does not.
+            format!("no certificate authority configured with id: {id}"),
+        ),
+        PkiError::InvalidCaId { .. } => {
+            AdminResponse::api_error(StatusCode::BAD_REQUEST, error.to_string())
+        }
+        _ => AdminResponse::api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to get root and intermediate cert for CA {id}: {error}"),
+        ),
     }
 }
 
@@ -1560,6 +1720,242 @@ mod tests {
         assert!(
             after.contains("caddy_http_requests_in_flight{handler=\"route0\",server=\"srv0\"} 0")
         );
+    }
+
+    // -- PKI endpoints --------------------------------------------------------------------
+
+    fn pki_fixture_data_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+    }
+
+    fn pki_admin() -> AdminApi {
+        AdminApi::new(Arc::new(GenerationStore::with_builtin_registry()))
+            .with_data_dir(pki_fixture_data_dir())
+    }
+
+    #[tokio::test]
+    async fn pki_ca_metadata_chain_and_certificate_files() {
+        let admin = pki_admin();
+
+        let response = admin.handle(request("GET", "/pki/ca/local", "")).await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            response
+                .headers
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+        let info: Value = serde_json::from_slice(&response.body).expect("caInfo JSON");
+        assert_eq!(info["id"], "local");
+        assert_eq!(info["name"], "local");
+        assert_eq!(info["root_common_name"], "caddy-rs test root");
+        assert_eq!(
+            info["intermediate_common_name"],
+            "caddy-rs test intermediate"
+        );
+        let root_pem = info["root_certificate"].as_str().expect("root PEM");
+        assert!(
+            root_pem.starts_with("-----BEGIN CERTIFICATE-----"),
+            "{root_pem}"
+        );
+        assert!(root_pem.ends_with("-----END CERTIFICATE-----\n"));
+        let intermediate_pem = info["intermediate_certificate"]
+            .as_str()
+            .expect("intermediate PEM");
+        assert!(intermediate_pem.contains("BEGIN CERTIFICATE"));
+
+        // Caddy's /certificates: intermediate chain first, root last.
+        let response = admin
+            .handle(request("GET", "/pki/ca/local/certificates", ""))
+            .await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            response
+                .headers
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/pem-certificate-chain")
+        );
+        let chain = body_string(&response);
+        assert_eq!(chain.matches("BEGIN CERTIFICATE").count(), 2);
+        assert!(chain.starts_with(intermediate_pem));
+        assert!(chain.ends_with(root_pem));
+
+        // caddy-rs extension: individual PEM files by Caddy file name.
+        for (name, expected) in [
+            ("root.crt", root_pem),
+            ("root.pem", root_pem),
+            ("intermediate.crt", intermediate_pem),
+            ("intermediate.pem", intermediate_pem),
+        ] {
+            let response = admin
+                .handle(request(
+                    "GET",
+                    &format!("/pki/ca/local/certificates/{name}"),
+                    "",
+                ))
+                .await;
+            assert_eq!(response.status, StatusCode::OK, "{name}");
+            assert_eq!(
+                response
+                    .headers
+                    .get(http::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("application/x-pem-file"),
+                "{name}"
+            );
+            assert_eq!(body_string(&response), expected, "{name}");
+        }
+
+        let response = admin
+            .handle(request("GET", "/pki/ca/local/certificates/root.key", ""))
+            .await;
+        assert_eq!(response.status, StatusCode::NOT_FOUND);
+
+        // A second CA is listed and readable independently.
+        let response = admin.handle(request("GET", "/pki/ca/staging", "")).await;
+        assert_eq!(response.status, StatusCode::OK);
+        let info: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(info["root_common_name"], "caddy-rs staging root");
+    }
+
+    #[tokio::test]
+    async fn pki_unknown_ca_and_malformed_paths_are_located() {
+        let admin = pki_admin();
+
+        let response = admin.handle(request("GET", "/pki/ca/nope", "")).await;
+        assert_eq!(response.status, StatusCode::NOT_FOUND);
+        let error: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(
+            error["error"],
+            "no certificate authority configured with id: nope"
+        );
+
+        for path in ["/pki", "/pki/", "/pki/ca/", "/pki/ca/local/nope"] {
+            assert_eq!(
+                admin.handle(request("GET", path, "")).await.status,
+                StatusCode::NOT_FOUND,
+                "{path}"
+            );
+        }
+
+        // Path traversal / invalid id is rejected as a located 400.
+        let response = admin.handle(request("GET", "/pki/ca/..", "")).await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        let error: Value = serde_json::from_slice(&response.body).unwrap();
+        assert!(
+            error["error"].as_str().unwrap().contains("invalid CA id"),
+            "{error}"
+        );
+
+        // The PKI surface is read-only.
+        for (method, path) in [
+            ("POST", "/pki/ca/local"),
+            ("PUT", "/pki/ca/local/certificates"),
+            ("DELETE", "/pki/ca/local"),
+        ] {
+            let response = admin.handle(request(method, path, "")).await;
+            assert_eq!(
+                response.status,
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method} {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pki_incomplete_and_malformed_cas_report_500_with_location() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let ca_dir = directory.path().join("pki/authorities/incomplete");
+        std::fs::create_dir_all(&ca_dir).unwrap();
+        let admin = AdminApi::new(Arc::new(GenerationStore::with_builtin_registry()))
+            .with_data_dir(directory.path());
+
+        let response = admin.handle(request("GET", "/pki/ca/incomplete", "")).await;
+        assert_eq!(response.status, StatusCode::INTERNAL_SERVER_ERROR);
+        let error: Value = serde_json::from_slice(&response.body).unwrap();
+        let message = error["error"].as_str().unwrap();
+        assert!(
+            message.contains("failed to get root and intermediate cert"),
+            "{message}"
+        );
+        assert!(message.contains("root.crt"), "{message}");
+
+        std::fs::write(ca_dir.join("root.crt"), b"garbage").unwrap();
+        let response = admin.handle(request("GET", "/pki/ca/incomplete", "")).await;
+        assert_eq!(response.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body_string(&response).contains("invalid PEM"));
+    }
+
+    #[tokio::test]
+    async fn pki_data_dir_falls_back_to_the_active_storage_root_and_override_wins() {
+        let store = Arc::new(GenerationStore::with_builtin_registry());
+        let fixture = pki_fixture_data_dir();
+        let config = json!({
+            "admin": {"listen": "127.0.0.1:0"},
+            "storage": {"module": "file_system", "root": fixture.to_string_lossy()},
+            "apps": {"http": {"servers": {"srv0": {"listen": [":8080"], "routes": []}}}}
+        });
+        assert_eq!(
+            load(&AdminApi::new(Arc::clone(&store)), &config.to_string())
+                .await
+                .status,
+            StatusCode::OK
+        );
+
+        // No explicit data dir: the active generation's `storage.root` is used.
+        let admin = AdminApi::new(Arc::clone(&store));
+        assert_eq!(
+            admin
+                .handle(request("GET", "/pki/ca/local", ""))
+                .await
+                .status,
+            StatusCode::OK
+        );
+
+        // An explicit data dir wins over the configuration.
+        let empty = tempfile::tempdir().unwrap();
+        let admin = admin.with_data_dir(empty.path());
+        assert_eq!(
+            admin
+                .handle(request("GET", "/pki/ca/local", ""))
+                .await
+                .status,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn pki_endpoints_are_behind_admin_origin_enforcement() {
+        let store = Arc::new(GenerationStore::with_builtin_registry());
+        let config = json!({
+            "admin": {
+                "listen": "127.0.0.1:0",
+                "enforce_origin": true,
+                "origins": ["https://allowed.example"]
+            },
+            "apps": {"http": {"servers": {"srv0": {"listen": [":8080"], "routes": []}}}}
+        });
+        let admin = AdminApi::new(Arc::clone(&store)).with_data_dir(pki_fixture_data_dir());
+        assert_eq!(
+            load(&admin, &config.to_string()).await.status,
+            StatusCode::OK
+        );
+
+        let response = admin.handle(request("GET", "/pki/ca/local", "")).await;
+        assert_eq!(
+            response.status,
+            StatusCode::FORBIDDEN,
+            "origin enforcement applies"
+        );
+        let response = admin
+            .handle(with_origin(
+                request("GET", "/pki/ca/local", ""),
+                "https://allowed.example",
+            ))
+            .await;
+        assert_eq!(response.status, StatusCode::OK);
     }
 
     #[tokio::test]
