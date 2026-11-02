@@ -13,6 +13,7 @@ pub mod certificate;
 pub mod cloudflare;
 pub mod dns;
 pub mod issuer;
+pub mod renewal;
 pub mod solver;
 pub mod storage;
 pub mod tls_server;
@@ -39,6 +40,11 @@ pub use dns::{
 pub use issuer::{
     within_renewal_window, AcmeIssuer, AcmeIssuerConfig, CertificateIssuer, InternalIssuer,
     IssuanceRequest, ProductionAcmeIssuer,
+};
+pub use renewal::{
+    CertificatePublisher, ManualClock, RenewalClock, RenewalOutcome, RenewalPolicy,
+    RenewalScheduler, RenewalSchedulerHandle, SharedCertificateStore, SystemClock,
+    DEFAULT_BACKOFF_BASE, DEFAULT_BACKOFF_MAX, DEFAULT_RENEWAL_JITTER, RENEWAL_REMAINING_FRACTION,
 };
 pub use solver::{
     dns01_record_name, dns01_txt_value, key_authorization, ChallengeHandle, ChallengeSolver,
