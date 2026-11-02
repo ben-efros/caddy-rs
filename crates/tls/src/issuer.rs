@@ -576,27 +576,11 @@ fn normalize_domains(domains: &[String]) -> Result<Vec<String>> {
     Ok(normalized)
 }
 
-/// Internal CA issuer. Wire implementation is tracked by M5.
-#[derive(Debug, Clone, Default)]
-pub struct InternalIssuer {
-    /// CA name.
-    pub name: String,
-}
-
-#[async_trait]
-impl CertificateIssuer for InternalIssuer {
-    fn name(&self) -> &'static str {
-        "internal"
-    }
-
-    async fn obtain(&self, request: &IssuanceRequest) -> Result<Certificate> {
-        let _ = request;
-        Err(Error::NotImplemented {
-            feature: "internal CA certificate issuance",
-            tracking_id: "TLS-INTERNAL-CA",
-        })
-    }
-}
+/// Internal/local CA issuer (`tls internal` / `local_certs`).
+///
+/// The implementation lives in [`crate::internal_ca`]; this re-export keeps the historical
+/// `crate::issuer::InternalIssuer` path working.
+pub use crate::internal_ca::InternalIssuer;
 
 /// Expiry/renewal helper used by the scheduler: returns whether `now` is inside the renewal
 /// window, where the window is `renewal_window` before expiry (Caddy's default is a fixed
@@ -1024,18 +1008,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn internal_issuer_is_a_tracked_not_implemented() {
+    async fn unconfigured_internal_issuer_fails_loudly() {
         let error = InternalIssuer::default()
             .obtain(&issuance_request())
             .await
             .unwrap_err();
         assert!(
-            matches!(
-                &error,
-                Error::NotImplemented { tracking_id, .. }
-                    if *tracking_id == "TLS-INTERNAL-CA"
-            ),
-            "unexpected error: {error:?}"
+            error.to_string().contains("not configured"),
+            "unexpected error: {error}"
         );
     }
 
