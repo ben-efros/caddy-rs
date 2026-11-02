@@ -137,6 +137,33 @@ impl StaticResponseHandler {
     }
 }
 
+/// Caddy's implicit `Content-Type` for a `static_response` body.
+///
+/// Mirrors `modules/caddyhttp/staticresp.go`: a body that (after trimming whitespace) is at least
+/// three bytes long, starts/ends with `{`/`}` or `[`/`]`, and is valid JSON is served as
+/// `application/json`; every other non-empty body is `text/plain; charset=utf-8`.
+fn implicit_content_type(body: &str) -> &'static str {
+    let trimmed = body.trim();
+    if trimmed.len() > 2 {
+        let bytes = trimmed.as_bytes();
+        let braced = bytes[0] == b'{' && bytes[bytes.len() - 1] == b'}';
+        let bracketed = bytes[0] == b'[' && bytes[bytes.len() - 1] == b']';
+        if (braced || bracketed) && serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
+            return "application/json";
+        }
+    }
+    "text/plain; charset=utf-8"
+}
+
+/// Caddy only fills in an implicit `Content-Type` when the configured headers left it absent or
+/// empty (`w.Header().Get("Content-Type") == ""`); an explicit non-empty value always wins.
+fn implicit_content_type_is_unset(headers: &http::HeaderMap) -> bool {
+    match headers.get(http::header::CONTENT_TYPE) {
+        None => true,
+        Some(value) => value.is_empty(),
+    }
+}
+
 #[async_trait]
 impl Handler for StaticResponseHandler {
     fn name(&self) -> &'static str {
@@ -145,6 +172,13 @@ impl Handler for StaticResponseHandler {
 
     async fn handle(&self, request: Request) -> Result<Outcome> {
         let body = request.replace_known(&self.body);
+        // Caddy sets the implicit Content-Type from the *expanded* body, on GET and HEAD alike;
+        // the body itself is discarded by the transport for HEAD, never the headers.
+        let implicit_type = if body.is_empty() {
+            None
+        } else {
+            Some(implicit_content_type(&body))
+        };
         let mut response = Response {
             status: self.status,
             headers: http::HeaderMap::new(),
@@ -156,6 +190,14 @@ impl Handler for StaticResponseHandler {
             let values = expand_header_values(&request, values, &path)?;
             for value in values {
                 response.headers.append(name.clone(), value);
+            }
+        }
+        if let Some(content_type) = implicit_type {
+            if implicit_content_type_is_unset(&response.headers) {
+                response.headers.insert(
+                    http::header::CONTENT_TYPE,
+                    HeaderValue::from_static(content_type),
+                );
             }
         }
         Ok(Outcome::Respond(response))
@@ -710,6 +752,138 @@ mod tests {
             panic!("expected continue");
         };
         assert_eq!(request.vars.get("root").map(String::as_str), Some("/srv"));
+    }
+
+    async fn static_response(body: serde_json::Value) -> Response {
+        let handler = StaticResponseHandler::from_json(&body, "handler").unwrap();
+        let Outcome::Respond(response) = handler.handle(request()).await.unwrap() else {
+            panic!("expected response");
+        };
+        response
+    }
+
+    fn content_type(response: &Response) -> Option<&str> {
+        response
+            .headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+    }
+
+    #[tokio::test]
+    async fn static_response_string_body_gets_caddy_text_content_type() {
+        // Real Caddy's staticresp.go: every non-empty non-JSON string body is
+        // `text/plain; charset=utf-8`.
+        let response = static_response(serde_json::json!({
+            "handler": "static_response",
+            "body": "hello oracle"
+        }))
+        .await;
+        assert_eq!(content_type(&response), Some("text/plain; charset=utf-8"));
+        assert_eq!(response.body, Bytes::from_static(b"hello oracle"));
+    }
+
+    #[tokio::test]
+    async fn static_response_json_body_gets_json_content_type() {
+        for body in ["{\"a\":1}", "[1,2,3]", "  {\"nested\":true}\n"] {
+            let response = static_response(serde_json::json!({
+                "handler": "static_response",
+                "body": body
+            }))
+            .await;
+            assert_eq!(
+                content_type(&response),
+                Some("application/json"),
+                "body {body:?}"
+            );
+        }
+        // Caddy requires more than two trimmed bytes regardless of validity: `{}` is text.
+        for body in ["{}", "[]", "{not json}", "[trailing", "  ", "   \n\t"] {
+            let response = static_response(serde_json::json!({
+                "handler": "static_response",
+                "body": body
+            }))
+            .await;
+            assert_eq!(
+                content_type(&response),
+                Some("text/plain; charset=utf-8"),
+                "body {body:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn static_response_explicit_content_type_wins() {
+        let response = static_response(serde_json::json!({
+            "handler": "static_response",
+            "body": "hello",
+            "headers": {"Content-Type": ["application/x-custom"]}
+        }))
+        .await;
+        assert_eq!(content_type(&response), Some("application/x-custom"));
+
+        // Caddy treats an empty configured value as "not set" (Header.Get == "") and replaces it
+        // with the implicit type.
+        let response = static_response(serde_json::json!({
+            "handler": "static_response",
+            "body": "hello",
+            "headers": {"Content-Type": [""]}
+        }))
+        .await;
+        assert_eq!(content_type(&response), Some("text/plain; charset=utf-8"));
+    }
+
+    #[tokio::test]
+    async fn static_response_empty_body_has_no_content_type() {
+        // Caddy only sets the implicit Content-Type when the expanded body is non-empty, and it
+        // explicitly clears Content-Type afterwards so Go cannot sniff one.
+        let response = static_response(serde_json::json!({
+            "handler": "static_response",
+            "body": ""
+        }))
+        .await;
+        assert_eq!(content_type(&response), None);
+        assert!(response.body.is_empty());
+
+        // A placeholder that expands to an empty string behaves like an empty body.
+        let handler = StaticResponseHandler::from_json(
+            &serde_json::json!({
+                "handler": "static_response",
+                "body": "{http.request.uri.query}"
+            }),
+            "handler",
+        )
+        .unwrap();
+        let no_query = Request::new(Method::GET, "/no-query".parse::<Uri>().unwrap());
+        let Outcome::Respond(response) = handler.handle(no_query).await.unwrap() else {
+            panic!("expected response");
+        };
+        assert_eq!(content_type(&response), None);
+        assert!(response.body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn static_response_content_type_uses_expanded_body_and_ignores_method() {
+        // The implicit type is computed from the expanded body (Caddy computes it before writing
+        // the body and independently of HEAD/GET).
+        let handler = StaticResponseHandler::from_json(
+            &serde_json::json!({
+                "handler": "static_response",
+                "body": "{http.request.method}"
+            }),
+            "handler",
+        )
+        .unwrap();
+        let request = Request::new(Method::GET, "/".parse::<Uri>().unwrap());
+        let Outcome::Respond(response) = handler.handle(request).await.unwrap() else {
+            panic!("expected response");
+        };
+        assert_eq!(content_type(&response), Some("text/plain; charset=utf-8"));
+
+        let head = Request::new(Method::HEAD, "/".parse::<Uri>().unwrap());
+        let Outcome::Respond(response) = handler.handle(head).await.unwrap() else {
+            panic!("expected response");
+        };
+        assert_eq!(content_type(&response), Some("text/plain; charset=utf-8"));
     }
 
     #[tokio::test]

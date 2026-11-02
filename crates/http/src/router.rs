@@ -433,6 +433,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn static_response_sets_caddy_content_type_through_router() {
+        let router = RouterBuilder::new()
+            .build(&[json!({
+                "handle": [{"handler": "static_response", "body": "hello oracle"}]
+            })])
+            .unwrap();
+        let response = router.handle(request("/", "example.com")).await.unwrap();
+        assert_eq!(
+            response.headers[http::header::CONTENT_TYPE],
+            "text/plain; charset=utf-8"
+        );
+
+        let router = RouterBuilder::new()
+            .build(&[json!({
+                "handle": [{"handler": "static_response", "body": "{\"a\":1}"}]
+            })])
+            .unwrap();
+        let response = router.handle(request("/", "example.com")).await.unwrap();
+        assert_eq!(
+            response.headers[http::header::CONTENT_TYPE],
+            "application/json"
+        );
+    }
+
+    #[tokio::test]
+    async fn headers_handler_content_type_overrides_static_response_default() {
+        let router = RouterBuilder::new()
+            .build(&[json!({
+                "handle": [
+                    {"handler": "headers", "response": {"set": {"Content-Type": ["application/x-custom"]}}},
+                    {"handler": "static_response", "body": "hello"}
+                ]
+            })])
+            .unwrap();
+        let response = router.handle(request("/", "example.com")).await.unwrap();
+        assert_eq!(
+            response.headers[http::header::CONTENT_TYPE],
+            "application/x-custom"
+        );
+    }
+
+    #[tokio::test]
     async fn headers_values_expand_against_the_request() {
         let router = RouterBuilder::new()
             .build(&[json!({
