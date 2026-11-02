@@ -33,7 +33,7 @@ pub use acme::{
 };
 pub use automatic_https::{
     plan as plan_automatic_https, AutomaticHttpsIssuer, AutomaticHttpsPlan, AutomaticHttpsPolicy,
-    AutomaticHttpsProvisioner, ProvisionedCertificates, DEFAULT_HTTP_PORT,
+    AutomaticHttpsProvisioner, AutomaticHttpsRenewals, ProvisionedCertificates, DEFAULT_HTTP_PORT,
 };
 pub use certificate::{renewal_queue, Certificate, CertificateCache, RenewalItem};
 pub use cloudflare::{

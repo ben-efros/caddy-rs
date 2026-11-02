@@ -40,6 +40,28 @@
 //! trust installation itself is not done here (see the divergence register). The transport is
 //! injectable, so tests (and embedders) drive the ACME path against a local fake CA without
 //! network access.
+//!
+//! # Renewal
+//!
+//! After provisioning, [`AutomaticHttpsProvisioner::provision`] starts a generation-scoped
+//! [`RenewalScheduler`] for the managed certificates (issuer-issued *and* reused from storage)
+//! unless disabled with [`AutomaticHttpsProvisioner::with_renewal_scheduler`]. The scheduler is
+//! wired to the returned [`CertificateResolver`] through a [`SharedCertificateStore`] publisher:
+//!
+//! * each due certificate is renewed through the automation policy's ACME or internal issuer
+//!   (see the private renewal issuer router), persisted with [`CertificateStorage`] and only then
+//!   swapped in;
+//! * the publisher replaces the resolver's `Arc<CertifiedKey>` atomically, so a handshake already
+//!   in flight keeps the certificate it resolved and new handshakes see the renewed one;
+//! * failed renewals keep the old certificate serving and retry with exponential backoff;
+//! * the scheduler lives in [`ProvisionedCertificates::renewals`]. It is owned by the generation:
+//!   stop it with [`AutomaticHttpsRenewals::stop`]/[`AutomaticHttpsRenewals::abort`] (or simply
+//!   drop it) when the generation is retired. Dropping aborts the background task so reloads cannot
+//!   leak schedulers.
+//!
+//! Server adoption of this lifecycle (keeping `ProvisionedCertificates::renewals` alongside the
+//! generation's listeners and stopping it on drain) is a follow-up wiring step. ARI-driven renewal
+//! and on-demand TLS are not implemented.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -47,15 +69,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use serde_json::Value;
 
 use caddy_rs_core::config::{AutomationPolicy, Config, TlsApp};
 use caddy_rs_core::listen::{ListenAddr, Network};
 
 use crate::acme::{AcmeClock, AcmeStorage, AcmeTransport, PollPolicy, TokioClock};
-use crate::certificate::Certificate;
+use crate::certificate::{Certificate, RenewalItem};
 use crate::internal_ca::{CaCertificates, CaStorage, InternalIssuer, DEFAULT_CA_ID};
 use crate::issuer::{AcmeIssuer, AcmeIssuerConfig, CertificateIssuer, IssuanceRequest};
+use crate::renewal::{
+    CertificatePublisher, RenewalClock, RenewalOutcome, RenewalPolicy, RenewalScheduler,
+    RenewalSchedulerHandle, SharedCertificateStore, SystemClock,
+};
 use crate::solver::Http01TokenStore;
 use crate::solver::{Http01Solver, TlsAlpn01Solver};
 use crate::storage::{CertificateStorage, FileStorage, StoredCertificate};
@@ -438,6 +465,145 @@ pub struct ProvisionedCertificates {
     pub resolver: Arc<CertificateResolver>,
     /// Certificates obtained through the issuer during this pass.
     pub issued: Vec<Certificate>,
+    /// Generation-scoped renewal scheduler for the managed certificates.
+    ///
+    /// `None` when no managed certificates exist. The scheduler is started by default; dropping
+    /// this value stops it, so the owning generation must keep it alive for renewals to run (see
+    /// the server-wiring notes in the module docs).
+    pub renewals: Option<AutomaticHttpsRenewals>,
+}
+
+/// A started (or startable) renewal scheduler plus the shared store it renews into.
+///
+/// The scheduler publishes renewed certificates through a [`CertificatePublisher`] attached to the
+/// [`CertificateResolver`] returned by [`AutomaticHttpsProvisioner::provision`], so a renewal
+/// hot-swaps the rustls configuration atomically: in-flight handshakes keep the `Arc` they already
+/// resolved and new handshakes use the renewed certificate.
+///
+/// Lifecycle: [`AutomaticHttpsRenewals::stop`]/[`AutomaticHttpsRenewals::abort`] stop the
+/// background task explicitly; dropping the value also aborts it, which prevents leaked scheduler
+/// tasks when a generation is retired without an explicit stop.
+pub struct AutomaticHttpsRenewals {
+    scheduler: Arc<RenewalScheduler>,
+    store: Arc<SharedCertificateStore>,
+    handle: StdMutex<Option<RenewalSchedulerHandle>>,
+}
+
+impl std::fmt::Debug for AutomaticHttpsRenewals {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AutomaticHttpsRenewals")
+            .field("running", &self.is_running())
+            .field("certificates", &self.store.len())
+            .finish()
+    }
+}
+
+impl AutomaticHttpsRenewals {
+    fn new(scheduler: Arc<RenewalScheduler>, store: Arc<SharedCertificateStore>) -> Self {
+        Self {
+            scheduler,
+            store,
+            handle: StdMutex::new(None),
+        }
+    }
+
+    /// The underlying scheduler (also usable via [`Self::run_once`] for deterministic tests).
+    pub fn scheduler(&self) -> &Arc<RenewalScheduler> {
+        &self.scheduler
+    }
+
+    /// The shared certificate store updated after each renewal.
+    pub fn store(&self) -> &Arc<SharedCertificateStore> {
+        &self.store
+    }
+
+    /// Whether the background renewal task is currently running.
+    pub fn is_running(&self) -> bool {
+        self.handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+    }
+
+    /// Whether the background renewal task has finished (never started or stopped/aborted).
+    pub fn is_finished(&self) -> bool {
+        self.handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|handle| handle.is_finished())
+            .unwrap_or(true)
+    }
+
+    /// Start the background task if it is not already running.
+    ///
+    /// Returns whether the task was started by this call.
+    pub fn start(&self) -> bool {
+        let mut handle = self
+            .handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if handle.is_some() || self.scheduler.is_stopped() {
+            return false;
+        }
+        *handle = Some(self.scheduler.start());
+        true
+    }
+
+    /// Stop the background task and wait for it to finish (idempotent).
+    pub async fn stop(&self) {
+        let handle = self
+            .handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(handle) = handle {
+            handle.stop().await;
+        }
+    }
+
+    /// Ask the background task to stop without waiting (idempotent).
+    pub fn abort(&self) {
+        let handle = self
+            .handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(handle) = handle {
+            handle.abort();
+        }
+    }
+
+    /// Renew every certificate that is due at `now` (deterministic tests and embedders with their
+    /// own timer loop).
+    pub async fn run_once(&self, now: SystemTime) -> Vec<RenewalOutcome> {
+        self.scheduler.run_once(now).await
+    }
+
+    /// Earliest time the scheduler has work, taking failed-renewal backoff into account.
+    pub fn next_renewal(&self, now: SystemTime) -> Option<RenewalItem> {
+        self.scheduler.next_renewal(now)
+    }
+
+    /// Recent renewal outcomes (most recent last).
+    pub fn history(&self) -> Vec<RenewalOutcome> {
+        self.scheduler.history()
+    }
+
+    /// Certificates currently tracked for renewal.
+    pub fn managed_certificates(&self) -> Vec<Arc<Certificate>> {
+        self.store.certificates()
+    }
+}
+
+impl Drop for AutomaticHttpsRenewals {
+    fn drop(&mut self) {
+        // Generation-scoped lifecycle: a generation that goes away without an explicit stop must
+        // not leave its renewal task running.
+        self.abort();
+    }
 }
 
 /// Obtains missing certificates through the ACME issuer and loads persisted ones from storage.
@@ -455,10 +621,19 @@ pub struct AutomaticHttpsProvisioner {
     internal_ca_name: String,
     /// Whether this provisioner has provisioned subjects from the internal CA.
     internal_ca_used: AtomicBool,
-    /// Lazily constructed internal CA issuer (CA material loaded once per provisioner).
-    internal_issuer: AsyncMutex<Option<Arc<InternalIssuer>>>,
+    /// Lazily constructed internal CA issuer (CA material loaded once per provisioner); shared
+    /// with the renewal issuers so CA state and clock stay consistent.
+    internal_issuer: Arc<AsyncMutex<Option<Arc<InternalIssuer>>>>,
     /// Snapshots of local CA certificates for trust installation/diagnostics.
     ca_certificates: StdMutex<BTreeMap<String, CaCertificates>>,
+    /// Clock used by the renewal scheduler (system clock in production, manual in tests).
+    renewal_clock: Arc<dyn RenewalClock>,
+    /// Renewal policy (window, jitter, backoff) used by generation schedulers.
+    renewal_policy: RenewalPolicy,
+    /// Whether provisioning starts the generation's renewal scheduler by default.
+    renewal_scheduler_enabled: bool,
+    /// Clock used for internal CA validity windows (tests share a manual clock with renewals).
+    internal_ca_clock: Arc<dyn RenewalClock>,
 }
 
 impl std::fmt::Debug for AutomaticHttpsProvisioner {
@@ -492,8 +667,12 @@ impl AutomaticHttpsProvisioner {
             internal_ca_storage: None,
             internal_ca_name: DEFAULT_CA_ID.to_string(),
             internal_ca_used: AtomicBool::new(false),
-            internal_issuer: AsyncMutex::new(None),
+            internal_issuer: Arc::new(AsyncMutex::new(None)),
             ca_certificates: StdMutex::new(BTreeMap::new()),
+            renewal_clock: Arc::new(SystemClock),
+            renewal_policy: RenewalPolicy::default(),
+            renewal_scheduler_enabled: true,
+            internal_ca_clock: Arc::new(SystemClock),
         }
     }
 
@@ -510,6 +689,38 @@ impl AutomaticHttpsProvisioner {
     /// Set the internal CA identifier used in the Caddy storage layout (default `local`).
     pub fn with_internal_ca_name(mut self, name: impl Into<String>) -> Self {
         self.internal_ca_name = name.into();
+        self
+    }
+
+    /// Override the clock used for certificate validity of internal-CA leaves.
+    ///
+    /// Tests share a [`ManualClock`](crate::renewal::ManualClock) between this and
+    /// [`Self::with_renewal_clock`] so internal leaf renewal is deterministic.
+    pub fn with_internal_ca_clock(mut self, clock: Arc<dyn RenewalClock>) -> Self {
+        self.internal_ca_clock = clock;
+        self
+    }
+
+    /// Override the renewal scheduler clock (production uses [`SystemClock`]; tests use
+    /// [`ManualClock`](crate::renewal::ManualClock)).
+    pub fn with_renewal_clock(mut self, clock: Arc<dyn RenewalClock>) -> Self {
+        self.renewal_clock = clock;
+        self
+    }
+
+    /// Override the renewal policy (renewal window, jitter, exponential backoff).
+    pub fn with_renewal_policy(mut self, policy: RenewalPolicy) -> Self {
+        self.renewal_policy = policy;
+        self
+    }
+
+    /// Enable/disable automatically starting the renewal scheduler after provisioning.
+    ///
+    /// Disabling is intended for embedders that drive [`AutomaticHttpsRenewals::run_once`] with
+    /// their own timer loop and for deterministic tests; a scheduler is still returned so those
+    /// callers can start it later with [`AutomaticHttpsRenewals::start`].
+    pub fn with_renewal_scheduler(mut self, enabled: bool) -> Self {
+        self.renewal_scheduler_enabled = enabled;
         self
     }
 
@@ -547,20 +758,14 @@ impl AutomaticHttpsProvisioner {
     }
 
     async fn internal_issuer(&self) -> Result<Arc<InternalIssuer>> {
-        let mut guard = self.internal_issuer.lock().await;
-        if let Some(issuer) = guard.as_ref() {
-            return Ok(Arc::clone(issuer));
-        }
-        let issuer = match &self.internal_ca_storage {
-            Some(storage) => {
-                InternalIssuer::new(Arc::clone(storage), Box::new(FileStorage::new(&self.root)))
-            }
-            None => InternalIssuer::from_data_directory(&self.root),
-        }
-        .with_name(self.internal_ca_name.clone());
-        let issuer = Arc::new(issuer);
-        *guard = Some(Arc::clone(&issuer));
-        Ok(issuer)
+        cached_internal_issuer(
+            &self.internal_issuer,
+            &self.internal_ca_storage,
+            &self.root,
+            &self.internal_ca_name,
+            &self.internal_ca_clock,
+        )
+        .await
     }
 
     async fn record_ca_certificates(&self, issuer: &InternalIssuer) -> Result<()> {
@@ -605,6 +810,12 @@ impl AutomaticHttpsProvisioner {
     }
 
     /// Load persisted, still-valid certificates and obtain every missing planned subject.
+    ///
+    /// After provisioning, a generation-scoped [`RenewalScheduler`] is started (unless disabled
+    /// with [`Self::with_renewal_scheduler`]) for every managed certificate; it renews due
+    /// certificates through the policy's ACME or internal issuer and hot-swaps them into the
+    /// returned resolver. Drop/stop [`ProvisionedCertificates::renewals`] when the generation is
+    /// retired.
     pub async fn provision(
         &self,
         plan: &AutomaticHttpsPlan,
@@ -616,12 +827,24 @@ impl AutomaticHttpsProvisioner {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+        let mut managed: Vec<Certificate> = Vec::new();
         for key in storage.list("").await? {
             let Some(stored) = CertificateStorage::load(&storage, &key).await? else {
                 continue;
             };
             if stored.not_after_unix <= now {
                 continue;
+            }
+            let issuer_label = key.split('/').next().unwrap_or("loaded").to_string();
+            if let Ok(certificate) = stored_to_certificate(&stored, &issuer_label) {
+                if plan.subjects.iter().any(|subject| {
+                    certificate
+                        .domains
+                        .iter()
+                        .any(|domain| host_matches(domain, subject))
+                }) {
+                    managed.push(certificate);
+                }
             }
             resolver.insert(TlsCertificate::from_stored(&stored)?)?;
         }
@@ -639,7 +862,6 @@ impl AutomaticHttpsProvisioner {
             self.record_ca_certificates(&issuer).await?;
         }
 
-        let account_storage: Arc<dyn AcmeStorage> = Arc::new(FileStorage::new(&self.root));
         let mut issued = Vec::new();
         for subject in &plan.subjects {
             if resolver.covers(subject) {
@@ -655,58 +877,251 @@ impl AutomaticHttpsProvisioner {
                     "automatic HTTPS: on-demand TLS for `{subject}` is not implemented (T-TLS-028)"
                 )));
             }
-            let certificate = match &policy.issuer {
-                AutomaticHttpsIssuer::Internal => {
-                    let issuer = self.internal_issuer().await?;
-                    issuer
-                        .obtain(&IssuanceRequest {
-                            domains: vec![subject.clone()],
-                            internal: true,
-                        })
-                        .await
-                        .map_err(|error| {
-                            Error::Issuer(format!(
-                                "automatic HTTPS: cannot obtain a local-CA certificate for \
-                                 `{subject}`: {error}"
-                            ))
-                        })?
-                }
-                AutomaticHttpsIssuer::Acme(config) => {
-                    let issuer = AcmeIssuer::new(
-                        config.as_ref().clone(),
-                        Arc::clone(&self.transport),
-                        Arc::clone(&account_storage),
-                        Box::new(FileStorage::new(&self.root)),
-                    )
-                    .with_solver(Arc::new(Http01Solver::new(Arc::clone(
-                        &self.challenge_tokens,
-                    ))))
-                    .with_solver(Arc::new(TlsAlpn01Solver::new(Arc::clone(
-                        &self.tls_alpn01_tokens,
-                    ))))
-                    .with_clock(Arc::clone(&self.clock))
-                    .with_poll_policy(self.poll_policy.clone());
-                    issuer
-                        .obtain(&IssuanceRequest {
-                            domains: vec![subject.clone()],
-                            internal: false,
-                        })
-                        .await
-                        .map_err(|error| {
-                            Error::Issuer(format!(
-                                "automatic HTTPS: cannot obtain a certificate for `{subject}`: \
-                                 {error}"
-                            ))
-                        })?
-                }
-            };
+            let certificate = self.obtain_subject(plan, subject).await?;
             resolver.insert(TlsCertificate::from_cache_certificate(&certificate)?)?;
+            managed.push(certificate.clone());
             issued.push(certificate);
         }
+
+        let resolver = Arc::new(resolver);
+        let renewals = self.start_renewals(plan, Arc::clone(&resolver), managed)?;
         Ok(ProvisionedCertificates {
-            resolver: Arc::new(resolver),
+            resolver,
             issued,
+            renewals,
         })
+    }
+
+    async fn obtain_subject(
+        &self,
+        plan: &AutomaticHttpsPlan,
+        subject: &str,
+    ) -> Result<Certificate> {
+        let policy = plan.policy_for(subject).ok_or_else(|| {
+            Error::Issuer(format!(
+                "automatic HTTPS: no automation policy matches subject `{subject}`"
+            ))
+        })?;
+        match &policy.issuer {
+            AutomaticHttpsIssuer::Internal => {
+                let issuer = self.internal_issuer().await?;
+                issuer
+                    .obtain(&IssuanceRequest {
+                        domains: vec![subject.to_string()],
+                        internal: true,
+                    })
+                    .await
+                    .map_err(|error| {
+                        Error::Issuer(format!(
+                            "automatic HTTPS: cannot obtain a local-CA certificate for \
+                             `{subject}`: {error}"
+                        ))
+                    })
+            }
+            AutomaticHttpsIssuer::Acme(config) => obtain_acme_certificate(
+                config,
+                &[subject.to_string()],
+                &self.transport,
+                self.root.clone(),
+                &self.challenge_tokens,
+                &self.tls_alpn01_tokens,
+                &self.clock,
+                &self.poll_policy,
+            )
+            .await
+            .map_err(|error| {
+                Error::Issuer(format!(
+                    "automatic HTTPS: cannot obtain a certificate for `{subject}`: {error}"
+                ))
+            }),
+        }
+    }
+
+    fn start_renewals(
+        &self,
+        plan: &AutomaticHttpsPlan,
+        resolver: Arc<CertificateResolver>,
+        managed: Vec<Certificate>,
+    ) -> Result<Option<AutomaticHttpsRenewals>> {
+        if managed.is_empty() {
+            return Ok(None);
+        }
+        let mut unique: Vec<Certificate> = Vec::new();
+        for certificate in managed {
+            if !unique.iter().any(|existing| {
+                existing.domains == certificate.domains
+                    && existing.not_before == certificate.not_before
+                    && existing.not_after == certificate.not_after
+            }) {
+                unique.push(certificate);
+            }
+        }
+        if unique.is_empty() {
+            return Ok(None);
+        }
+        let publisher: Arc<dyn CertificatePublisher> = resolver;
+        let store = Arc::new(SharedCertificateStore::with_publisher(publisher));
+        for certificate in &unique {
+            store.insert(certificate.clone())?;
+        }
+        let issuer: Arc<dyn CertificateIssuer> = Arc::new(RenewalIssuer {
+            plan: plan.clone(),
+            transport: Arc::clone(&self.transport),
+            root: self.root.clone(),
+            challenge_tokens: Arc::clone(&self.challenge_tokens),
+            tls_alpn01_tokens: Arc::clone(&self.tls_alpn01_tokens),
+            acme_clock: Arc::clone(&self.clock),
+            poll_policy: self.poll_policy.clone(),
+            internal_ca_storage: self.internal_ca_storage.clone(),
+            internal_ca_name: self.internal_ca_name.clone(),
+            internal_ca_clock: Arc::clone(&self.internal_ca_clock),
+            internal_issuer: Arc::clone(&self.internal_issuer),
+        });
+        let storage: Arc<dyn CertificateStorage> = Arc::new(FileStorage::new(&self.root));
+        let scheduler = Arc::new(
+            RenewalScheduler::new(
+                issuer,
+                storage,
+                Arc::clone(&store),
+                Arc::clone(&self.renewal_clock),
+            )
+            .with_policy(self.renewal_policy.clone()),
+        );
+        let renewals = AutomaticHttpsRenewals::new(scheduler, store);
+        if self.renewal_scheduler_enabled {
+            renewals.start();
+        }
+        Ok(Some(renewals))
+    }
+}
+
+/// Construct (once) and cache the internal CA issuer shared by provisioning and renewal.
+async fn cached_internal_issuer(
+    cache: &Arc<AsyncMutex<Option<Arc<InternalIssuer>>>>,
+    storage: &Option<Arc<dyn CaStorage>>,
+    root: &std::path::Path,
+    name: &str,
+    clock: &Arc<dyn RenewalClock>,
+) -> Result<Arc<InternalIssuer>> {
+    let mut guard = cache.lock().await;
+    if let Some(issuer) = guard.as_ref() {
+        return Ok(Arc::clone(issuer));
+    }
+    let issuer = match storage {
+        Some(storage) => InternalIssuer::new(Arc::clone(storage), Box::new(FileStorage::new(root))),
+        None => InternalIssuer::from_data_directory(root),
+    }
+    .with_name(name.to_string())
+    .with_clock(Arc::clone(clock));
+    let issuer = Arc::new(issuer);
+    *guard = Some(Arc::clone(&issuer));
+    Ok(issuer)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn obtain_acme_certificate(
+    config: &AcmeIssuerConfig,
+    domains: &[String],
+    transport: &Arc<dyn AcmeTransport>,
+    root: PathBuf,
+    challenge_tokens: &Arc<Http01TokenStore>,
+    tls_alpn01_tokens: &Arc<TlsAlpn01TokenStore>,
+    clock: &Arc<dyn AcmeClock>,
+    poll_policy: &PollPolicy,
+) -> Result<Certificate> {
+    let account_storage: Arc<dyn AcmeStorage> = Arc::new(FileStorage::new(&root));
+    let issuer = AcmeIssuer::new(
+        config.clone(),
+        Arc::clone(transport),
+        account_storage,
+        Box::new(FileStorage::new(&root)),
+    )
+    .with_solver(Arc::new(Http01Solver::new(Arc::clone(challenge_tokens))))
+    .with_solver(Arc::new(TlsAlpn01Solver::new(Arc::clone(
+        tls_alpn01_tokens,
+    ))))
+    .with_clock(Arc::clone(clock))
+    .with_poll_policy(poll_policy.clone());
+    issuer
+        .obtain(&IssuanceRequest {
+            domains: domains.to_vec(),
+            internal: false,
+        })
+        .await
+}
+
+/// Renewal issuer router: picks the ACME or internal issuer per certificate policy.
+struct RenewalIssuer {
+    plan: AutomaticHttpsPlan,
+    transport: Arc<dyn AcmeTransport>,
+    root: PathBuf,
+    challenge_tokens: Arc<Http01TokenStore>,
+    tls_alpn01_tokens: Arc<TlsAlpn01TokenStore>,
+    acme_clock: Arc<dyn AcmeClock>,
+    poll_policy: PollPolicy,
+    internal_ca_storage: Option<Arc<dyn CaStorage>>,
+    internal_ca_name: String,
+    internal_ca_clock: Arc<dyn RenewalClock>,
+    internal_issuer: Arc<AsyncMutex<Option<Arc<InternalIssuer>>>>,
+}
+
+impl RenewalIssuer {
+    async fn internal_issuer(&self) -> Result<Arc<InternalIssuer>> {
+        cached_internal_issuer(
+            &self.internal_issuer,
+            &self.internal_ca_storage,
+            &self.root,
+            &self.internal_ca_name,
+            &self.internal_ca_clock,
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl CertificateIssuer for RenewalIssuer {
+    fn name(&self) -> &'static str {
+        "automatic_https"
+    }
+
+    async fn obtain(&self, request: &IssuanceRequest) -> Result<Certificate> {
+        let subject = request.domains.first().ok_or_else(|| {
+            Error::Issuer("automatic HTTPS renewal request has no domains".to_string())
+        })?;
+        let policy = self.plan.policy_for(subject).ok_or_else(|| {
+            Error::Issuer(format!(
+                "automatic HTTPS: no automation policy matches subject `{subject}`"
+            ))
+        })?;
+        if policy.on_demand {
+            return Err(Error::Issuer(format!(
+                "automatic HTTPS: on-demand TLS for `{subject}` is not implemented (T-TLS-028)"
+            )));
+        }
+        match &policy.issuer {
+            AutomaticHttpsIssuer::Internal => {
+                let issuer = self.internal_issuer().await?;
+                issuer
+                    .obtain(&IssuanceRequest {
+                        domains: request.domains.clone(),
+                        internal: true,
+                    })
+                    .await
+            }
+            AutomaticHttpsIssuer::Acme(config) => {
+                obtain_acme_certificate(
+                    config,
+                    &request.domains,
+                    &self.transport,
+                    self.root.clone(),
+                    &self.challenge_tokens,
+                    &self.tls_alpn01_tokens,
+                    &self.acme_clock,
+                    &self.poll_policy,
+                )
+                .await
+            }
+        }
     }
 }
 
@@ -745,10 +1160,12 @@ pub fn subjects_by_policy(plan: &AutomaticHttpsPlan) -> BTreeMap<String, Option<
 mod tests {
     use super::*;
     use crate::acme::{HttpMethod, HttpRequest, HttpResponse, MemoryAcmeStorage};
+    use crate::renewal::ManualClock;
     use crate::solver::Http01TokenStore;
     use async_trait::async_trait;
     use serde_json::json;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     fn config(value: Value) -> Config {
         Config::from_value(value).expect("config decodes")
@@ -1007,6 +1424,8 @@ mod tests {
         requests: Mutex<Vec<HttpRequest>>,
         challenge_acked: Mutex<bool>,
         finalize_seen: Mutex<bool>,
+        fail_new_order: Mutex<bool>,
+        renewed_certificate: Mutex<bool>,
     }
 
     #[derive(Clone, Default, Debug)]
@@ -1016,6 +1435,18 @@ mod tests {
 
     const CERT_PEM: &str = include_str!("../testdata/https/example.com.pem");
     const CERT_KEY_PEM: &str = include_str!("../testdata/https/example.com.key");
+    /// Later-validity certificate returned for renewals.
+    const RENEWED_CERT_PEM: &str = include_str!("../testdata/renewal/renewed-example.com.pem");
+
+    impl FakeAcme {
+        fn set_fail_new_order(&self, fail: bool) {
+            *self.inner.fail_new_order.lock().unwrap() = fail;
+        }
+
+        fn set_renewed_certificate(&self, renewed: bool) {
+            *self.inner.renewed_certificate.lock().unwrap() = renewed;
+        }
+    }
 
     fn response(status: u16, body: Value) -> HttpResponse {
         HttpResponse::with_json(status, &body)
@@ -1038,6 +1469,18 @@ mod tests {
             } else if url.ends_with("/new-account") {
                 json!({"status": "valid", "contact": ["mailto:ops@example.com"]})
             } else if url.ends_with("/new-order") {
+                if *self.inner.fail_new_order.lock().unwrap() {
+                    return Ok(HttpResponse::with_problem(
+                        400,
+                        &json!({
+                            "type": "urn:ietf:params:acme:error:serverInternal",
+                            "detail": "fake CA is configured to fail newOrder",
+                            "status": 400
+                        }),
+                    )
+                    .unwrap()
+                    .with_header("Replay-Nonce", "nonce"));
+                }
                 json!({"status": "pending",
                        "authorizations": ["https://acme.test/authz/1"],
                        "finalize": "https://acme.test/finalize/1"})
@@ -1066,10 +1509,12 @@ mod tests {
                            "finalize": "https://acme.test/finalize/1"})
                 }
             } else if url.ends_with("/cert/1") {
+                let renewed = *self.inner.renewed_certificate.lock().unwrap();
+                let pem = if renewed { RENEWED_CERT_PEM } else { CERT_PEM };
                 return Ok(HttpResponse::new(200)
                     .with_header("Content-Type", "application/pem-certificate-chain")
                     .with_header("Replay-Nonce", "nonce")
-                    .with_body(CERT_PEM));
+                    .with_body(pem));
             } else {
                 return Err(Error::Issuer(format!("unexpected fake ACME request {url}")));
             };
@@ -1335,5 +1780,294 @@ mod tests {
         let result = provisioner.provision(&plan, None).await.unwrap();
         assert!(result.issued.is_empty());
         assert!(result.resolver.covers("example.com"));
+    }
+    // ---- renewal wiring ------------------------------------------------------------------
+
+    fn acme_renewal_config() -> Config {
+        config(json!({
+            "apps": {
+                "tls": {"automation": {"policies": [
+                    {"subjects": ["example.com"], "issuers": [
+                        {"module": "acme", "ca": "https://acme.test/directory"}
+                    ]}
+                ]}},
+                "http": {"servers": {"srv0": {
+                    "listen": ["127.0.0.1:0"],
+                    "tls_connection_policies": [{}],
+                    "routes": [{"match": [{"host": ["example.com"]}],
+                                "handle": [{"handler": "static_response", "body": "ok"}]}]
+                }}}
+            }
+        }))
+    }
+
+    fn renewal_start() -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(1_800_000_000)
+    }
+
+    fn renewal_test_policy() -> RenewalPolicy {
+        RenewalPolicy::new()
+            .with_jitter(Duration::ZERO)
+            .with_backoff(Duration::from_secs(10), Duration::from_secs(300))
+    }
+
+    /// The policy's default due time: two thirds through the certificate's lifetime.
+    fn renewal_due(certificate: &Certificate) -> SystemTime {
+        let lifetime = certificate
+            .not_after
+            .duration_since(certificate.not_before)
+            .unwrap_or_default();
+        certificate.not_before + lifetime.mul_f64(2.0 / 3.0)
+    }
+
+    fn leaf_der(pem: &str) -> Vec<u8> {
+        crate::tls_server::certificates_from_pem(pem).expect("fixture PEM parses")[0]
+            .as_ref()
+            .to_vec()
+    }
+
+    #[tokio::test]
+    async fn renewal_renews_due_acme_certificate_and_hot_swaps_resolver() {
+        let directory = tempfile::tempdir().unwrap();
+        let plan = plan(&acme_renewal_config()).unwrap().unwrap();
+        let clock = Arc::new(ManualClock::new(renewal_start()));
+        let fake = Arc::new(FakeAcme::default());
+        let provisioner = AutomaticHttpsProvisioner::new(
+            fake.clone(),
+            directory.path(),
+            Arc::new(Http01TokenStore::new()),
+        )
+        .with_renewal_clock(clock.clone())
+        .with_renewal_policy(renewal_test_policy())
+        .with_renewal_scheduler(false);
+        let result = provisioner.provision(&plan, None).await.unwrap();
+        assert_eq!(result.issued.len(), 1);
+        let renewals = result.renewals.expect("renewal scheduler returned");
+        assert!(
+            !renewals.is_running(),
+            "background task is disabled for deterministic tests"
+        );
+        assert_eq!(renewals.managed_certificates().len(), 1);
+
+        let old_certificate = result.issued[0].clone();
+        let old_leaf = leaf_der(CERT_PEM);
+        let new_leaf = leaf_der(RENEWED_CERT_PEM);
+        let before = result
+            .resolver
+            .select(Some("example.com"))
+            .expect("certificate resolved");
+        assert_eq!(before.cert[0].as_ref(), old_leaf.as_slice());
+
+        clock.set(renewal_due(&old_certificate) + Duration::from_secs(1));
+        fake.set_renewed_certificate(true);
+        let outcomes = renewals.run_once(clock.now()).await;
+        assert_eq!(outcomes.len(), 1);
+        assert!(
+            outcomes[0].is_renewed(),
+            "expected a successful renewal: {outcomes:?}"
+        );
+
+        let after = result
+            .resolver
+            .select(Some("example.com"))
+            .expect("renewed certificate resolved");
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "resolver must hot-swap to a new CertifiedKey"
+        );
+        assert_eq!(
+            before.cert[0].as_ref(),
+            old_leaf.as_slice(),
+            "an in-flight handshake keeps the certificate it resolved"
+        );
+        assert_eq!(
+            after.cert[0].as_ref(),
+            new_leaf.as_slice(),
+            "new handshakes see the renewed certificate"
+        );
+        let managed = renewals.managed_certificates();
+        assert_eq!(managed.len(), 1);
+        assert!(managed[0].not_after > old_certificate.not_after);
+        assert!(
+            renewals.next_renewal(clock.now()).unwrap().due_at > clock.now(),
+            "the renewed certificate is not due immediately"
+        );
+        assert!(renewals.history().iter().any(RenewalOutcome::is_renewed));
+    }
+
+    #[tokio::test]
+    async fn failed_renewal_keeps_certificate_and_backs_off() {
+        let directory = tempfile::tempdir().unwrap();
+        let plan = plan(&acme_renewal_config()).unwrap().unwrap();
+        let clock = Arc::new(ManualClock::new(renewal_start()));
+        let fake = Arc::new(FakeAcme::default());
+        let provisioner = AutomaticHttpsProvisioner::new(
+            fake.clone(),
+            directory.path(),
+            Arc::new(Http01TokenStore::new()),
+        )
+        .with_renewal_clock(clock.clone())
+        .with_renewal_policy(renewal_test_policy())
+        .with_renewal_scheduler(false);
+        let result = provisioner.provision(&plan, None).await.unwrap();
+        let renewals = result.renewals.expect("renewal scheduler");
+        let old_certificate = result.issued[0].clone();
+        let old_not_after = old_certificate.not_after;
+        let before = result.resolver.select(Some("example.com")).unwrap();
+
+        clock.set(renewal_due(&old_certificate) + Duration::from_secs(1));
+        let now = clock.now();
+        fake.set_fail_new_order(true);
+        let outcomes = renewals.run_once(now).await;
+        let RenewalOutcome::Failed { retry_at, .. } = &outcomes[0] else {
+            panic!("expected a failed renewal: {outcomes:?}");
+        };
+        let retry_at = *retry_at;
+        assert!(retry_at > now, "failure schedules a backoff retry");
+        let after_failure = result.resolver.select(Some("example.com")).unwrap();
+        assert!(
+            Arc::ptr_eq(&before, &after_failure),
+            "a failed renewal keeps the old certificate installed"
+        );
+        assert_eq!(renewals.managed_certificates()[0].not_after, old_not_after);
+
+        // Before the retry time, the certificate is not due again.
+        let outcomes = renewals.run_once(now + Duration::from_secs(1)).await;
+        assert!(
+            outcomes.is_empty(),
+            "backoff suppresses retries until retry_at: {outcomes:?}"
+        );
+        assert_eq!(
+            renewals
+                .next_renewal(now + Duration::from_secs(1))
+                .unwrap()
+                .due_at,
+            retry_at,
+            "the scheduler reports the backoff retry time"
+        );
+
+        // The next attempt at the retry time fails again and backs off further.
+        clock.set(retry_at);
+        let outcomes = renewals.run_once(retry_at).await;
+        let RenewalOutcome::Failed {
+            retry_at: retry_again_at,
+            ..
+        } = &outcomes[0]
+        else {
+            panic!("expected a second failed renewal: {outcomes:?}");
+        };
+        let first_delay = retry_at.duration_since(now).unwrap();
+        let second_delay = retry_again_at.duration_since(retry_at).unwrap();
+        assert!(
+            second_delay > first_delay,
+            "exponential backoff: {first_delay:?} then {second_delay:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_lifecycle_starts_stops_and_does_not_leak_across_generations() {
+        let directory = tempfile::tempdir().unwrap();
+        let plan = plan(&acme_renewal_config()).unwrap().unwrap();
+        let fake = Arc::new(FakeAcme::default());
+        let provisioner = AutomaticHttpsProvisioner::new(
+            fake,
+            directory.path(),
+            Arc::new(Http01TokenStore::new()),
+        );
+        let first = provisioner.provision(&plan, None).await.unwrap();
+        let first_renewals = first.renewals.expect("first generation scheduler");
+        assert!(first_renewals.is_running());
+        assert_eq!(first_renewals.store().len(), 1);
+
+        // A new generation over the same provisioner gets its own scheduler and reuses certs.
+        let second = provisioner.provision(&plan, None).await.unwrap();
+        assert!(second.issued.is_empty(), "certificate is reused");
+        let second_renewals = second.renewals.expect("second generation scheduler");
+        assert!(second_renewals.is_running());
+
+        first_renewals.stop().await;
+        assert!(!first_renewals.is_running());
+        assert!(first_renewals.is_finished());
+        assert!(first_renewals.scheduler().is_stopped());
+        second_renewals.stop().await;
+        assert!(!second_renewals.is_running());
+        assert!(second_renewals.scheduler().is_stopped());
+
+        // Dropping a generation without an explicit stop aborts its scheduler (no leak).
+        let third = provisioner.provision(&plan, None).await.unwrap();
+        let third_renewals = third.renewals.expect("third generation scheduler");
+        assert!(third_renewals.is_running());
+        let scheduler = Arc::clone(third_renewals.scheduler());
+        drop(third_renewals);
+        assert!(scheduler.is_stopped(), "drop aborts the scheduler task");
+    }
+
+    #[tokio::test]
+    async fn scheduler_can_be_started_explicitly_when_disabled() {
+        let directory = tempfile::tempdir().unwrap();
+        let plan = plan(&acme_renewal_config()).unwrap().unwrap();
+        let provisioner = AutomaticHttpsProvisioner::new(
+            Arc::new(FakeAcme::default()),
+            directory.path(),
+            Arc::new(Http01TokenStore::new()),
+        )
+        .with_renewal_scheduler(false);
+        let result = provisioner.provision(&plan, None).await.unwrap();
+        let renewals = result.renewals.expect("scheduler returned");
+        assert!(!renewals.is_running());
+        assert!(renewals.start());
+        assert!(renewals.is_running());
+        assert!(!renewals.start(), "starting twice is a no-op");
+        renewals.stop().await;
+        assert!(!renewals.is_running());
+    }
+
+    #[tokio::test]
+    async fn internal_leaf_renews_with_manual_clock() {
+        let directory = tempfile::tempdir().unwrap();
+        let plan = plan(&internal_config()).unwrap().unwrap();
+        let clock = Arc::new(ManualClock::new(renewal_start()));
+        let provisioner = AutomaticHttpsProvisioner::new(
+            Arc::new(NoopTransport::default()),
+            directory.path(),
+            Arc::new(Http01TokenStore::new()),
+        )
+        .with_renewal_clock(clock.clone())
+        .with_internal_ca_clock(clock.clone())
+        .with_renewal_policy(renewal_test_policy())
+        .with_renewal_scheduler(false);
+        let result = provisioner.provision(&plan, None).await.unwrap();
+        let old_certificate = result.issued[0].clone();
+        assert_eq!(old_certificate.issuer, "local");
+        let renewals = result.renewals.expect("renewal scheduler");
+        let ca_before = provisioner.ca_certificates().await.unwrap();
+
+        clock.set(renewal_due(&old_certificate) + Duration::from_secs(1));
+        let before = result
+            .resolver
+            .select(Some("app.internal.example"))
+            .expect("internal leaf resolves");
+        let outcomes = renewals.run_once(clock.now()).await;
+        assert!(
+            outcomes[0].is_renewed(),
+            "expected internal leaf renewal: {outcomes:?}"
+        );
+        let after = result
+            .resolver
+            .select(Some("app.internal.example"))
+            .expect("renewed internal leaf resolves");
+        assert!(!Arc::ptr_eq(&before, &after));
+        let managed = renewals.managed_certificates();
+        assert_eq!(managed.len(), 1);
+        assert_eq!(managed[0].issuer, "local");
+        assert!(
+            managed[0].not_after > old_certificate.not_after,
+            "renewed internal leaf has a later expiry"
+        );
+        let ca_after = provisioner.ca_certificates().await.unwrap();
+        assert_eq!(
+            ca_after[0].root_der, ca_before[0].root_der,
+            "internal leaf renewal reuses the local CA"
+        );
     }
 }
