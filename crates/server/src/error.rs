@@ -64,6 +64,19 @@ pub enum Error {
     /// I/O errors.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// Observability (access-log / metrics) configuration is invalid.
+    ///
+    /// The message carries the located JSON path from [`caddy_rs_admin::LoggingConfigError`] and,
+    /// for recognised-but-unsupported Caddy features, the tracking id.
+    #[error("observability configuration: {0}")]
+    Observability(String),
+}
+
+impl From<caddy_rs_admin::LoggingConfigError> for Error {
+    fn from(error: caddy_rs_admin::LoggingConfigError) -> Self {
+        Self::Observability(error.to_string())
+    }
 }
 
 impl Error {

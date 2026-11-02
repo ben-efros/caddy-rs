@@ -15,7 +15,9 @@ use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use caddy_rs_admin::AdminApi;
+use caddy_rs_admin::{
+    AdminApi, CertificateMetrics, LoggingConfig, MetricsRegistry, SharedRequestRecorder,
+};
 use caddy_rs_core::{Generation, GenerationStore};
 use caddy_rs_http::RouterBuilder;
 use caddy_rs_tls::{
@@ -31,6 +33,7 @@ use crate::auto_https::{PreparedAutomaticHttps, RedirectPolicy};
 use crate::error::{Error, Result};
 use crate::limits::ServerLimits;
 use crate::listeners::{bind, bind_admin, ListenerHandle, ListenerState, SharedListeners};
+use crate::observability::{record_certificate_metrics, AccessLogRuntime};
 
 /// Observable runtime state after an apply.
 #[derive(Debug, Clone, Default)]
@@ -159,6 +162,17 @@ pub struct ServerRuntime {
     /// the previous generation's scheduler after a successful reload and stops every scheduler on
     /// shutdown (`/stop`, no active generation, or process shutdown).
     renewals: BTreeMap<u64, AutomaticHttpsRenewals>,
+    /// Shared metrics recorder handed to every listener; renders through the admin `/metrics`
+    /// endpoint because it shares the admin API's registry.
+    recorder: SharedRequestRecorder,
+    /// Certificate expiry/renewal metrics handle (same registry).
+    certificate_metrics: CertificateMetrics,
+    /// Access-log sinks for the active generation (`None` when access logging is not configured).
+    access_log: Option<Arc<AccessLogRuntime>>,
+    /// Generation id the current access-log sinks were built for.
+    access_log_generation: Option<u64>,
+    /// Number of renewal-scheduler history entries already exported as metrics, per generation.
+    renewal_metrics_seen: BTreeMap<u64, usize>,
 }
 
 /// How inherited systemd sockets are discovered for this runtime.
@@ -180,6 +194,8 @@ impl ServerRuntime {
     pub fn new(store: Arc<GenerationStore>) -> Self {
         let reload = Arc::new(tokio::sync::Notify::new());
         let admin_api = AdminApi::new(Arc::clone(&store)).with_reload_notify(Arc::clone(&reload));
+        let recorder = admin_api.request_recorder();
+        let certificate_metrics = admin_api.certificate_metrics();
         Self {
             store,
             reload,
@@ -193,6 +209,11 @@ impl ServerRuntime {
             status: RuntimeStatus::default(),
             activation: ActivationState::Environment,
             renewals: BTreeMap::new(),
+            recorder,
+            certificate_metrics,
+            access_log: None,
+            access_log_generation: None,
+            renewal_metrics_seen: BTreeMap::new(),
         }
     }
 
@@ -237,6 +258,73 @@ impl ServerRuntime {
         &self.status
     }
 
+    /// A handle to the metrics registry rendered by the admin `/metrics` endpoint.
+    pub fn metrics(&self) -> MetricsRegistry {
+        self.admin_api.metrics()
+    }
+
+    /// A clone of the shared request recorder used by every listener.
+    pub fn request_recorder(&self) -> SharedRequestRecorder {
+        Arc::clone(&self.recorder)
+    }
+
+    /// Number of access-log sinks built for the active generation (0 when access logging is off).
+    pub fn access_log_sink_count(&self) -> usize {
+        self.access_log
+            .as_ref()
+            .map_or(0, |access| access.sink_count())
+    }
+
+    /// Build and install the access-log sinks for one generation (flushing the old ones).
+    fn access_log_for(&self, generation: &Generation) -> Result<Option<Arc<AccessLogRuntime>>> {
+        if self.access_log_generation == Some(generation.id()) {
+            return Ok(self.access_log.clone());
+        }
+        let config = generation.config();
+        if config.logging.is_none() {
+            // Access logging is opt-in: the implicit Caddy default sink is not opened for a
+            // configuration that does not mention logging at all.
+            return Ok(None);
+        }
+        let logging = LoggingConfig::from_config(config)?;
+        Ok(AccessLogRuntime::build(Some(&logging))?)
+    }
+
+    /// Swap in the generation's access-log sinks, flushing (and logically closing) the old ones.
+    ///
+    /// The old sinks are closed when their last `Arc` drops; listener states hold references, so an
+    /// in-flight request that started under the old generation still emits its entry, then closes.
+    fn install_access_log(&mut self, generation_id: u64, access: Option<Arc<AccessLogRuntime>>) {
+        if self.access_log_generation == Some(generation_id) {
+            return;
+        }
+        if let Some(old) = self.access_log.take() {
+            old.flush();
+            drop(old);
+        }
+        self.access_log = access;
+        self.access_log_generation = Some(generation_id);
+    }
+
+    /// Export certificate expiry gauges and new renewal outcomes for the active generation.
+    fn record_certificate_metrics(&mut self, generation: &Generation) {
+        let Some(renewals) = self.renewals.get(&generation.id()) else {
+            return;
+        };
+        let mut seen = self
+            .renewal_metrics_seen
+            .get(&generation.id())
+            .copied()
+            .unwrap_or(0);
+        record_certificate_metrics(
+            &self.certificate_metrics,
+            renewals,
+            std::time::SystemTime::now(),
+            &mut seen,
+        );
+        self.renewal_metrics_seen.insert(generation.id(), seen);
+    }
+
     /// Reconcile listeners and routers with the active generation.
     ///
     /// When automatic HTTPS is active the apply is two-phase because ACME challenges require live
@@ -258,12 +346,20 @@ impl ServerRuntime {
             self.status = RuntimeStatus::default();
             return Ok(self.status.clone());
         };
+        // Access-log sinks belong to the active generation: build them before touching listeners
+        // so an invalid logging configuration fails the apply loudly and leaves the previous
+        // generation serving.
+        let access_log = self.access_log_for(&generation)?;
+        let access = match &access_log {
+            Some(access) => Arc::clone(access),
+            None => AccessLogRuntime::disabled(),
+        };
         let pending = self.prepare_automatic_https(&generation)?;
         let mut newly_bound: Vec<String> = Vec::new();
 
         // Without automatic HTTPS there is nothing to provision: the original single-phase path.
         let Some(pending) = pending else {
-            let states = self.build_listener_states(&generation, None)?;
+            let states = self.build_listener_states(&generation, None, &access)?;
             self.resolve_activation(&states)?;
             self.publish_states(&states);
             if let Err(error) = self.start_new_listeners(&states, &mut newly_bound).await {
@@ -275,6 +371,8 @@ impl ServerRuntime {
             // A generation without automatic HTTPS has no renewal schedulers; retire any left by
             // an earlier automatic-HTTPS generation before publishing the new status.
             self.retire_stale_renewals(generation.id()).await;
+            self.install_access_log(generation.id(), access_log);
+            self.record_certificate_metrics(&generation);
             return Ok(self.finish_apply(&generation));
         };
         // Snapshot for rollback: a failed provisioning pass must leave the previous generation's
@@ -286,7 +384,7 @@ impl ServerRuntime {
             .clone();
 
         // Phase 1: challenge-capable states, then start the listeners before provisioning.
-        let bootstrap = self.build_bootstrap_states(&generation, &pending)?;
+        let bootstrap = self.build_bootstrap_states(&generation, &pending, &access)?;
         self.resolve_activation(&bootstrap)?;
         self.publish_states(&bootstrap);
         if let Err(error) = self.start_new_listeners(&bootstrap, &mut newly_bound).await {
@@ -320,7 +418,7 @@ impl ServerRuntime {
             http_listener: plan.http_listener(),
             bootstrap: false,
         };
-        let states = match self.build_listener_states(&generation, Some(&context)) {
+        let states = match self.build_listener_states(&generation, Some(&context), &access) {
             Ok(states) => states,
             Err(error) => {
                 self.rollback_states(&previous_states, &newly_bound).await;
@@ -342,6 +440,8 @@ impl ServerRuntime {
             self.renewals.insert(generation.id(), renewals);
         }
         self.retire_stale_renewals(generation.id()).await;
+        self.install_access_log(generation.id(), access_log);
+        self.record_certificate_metrics(&generation);
         Ok(self.finish_apply(&generation))
     }
 
@@ -358,6 +458,7 @@ impl ServerRuntime {
             .collect();
         for generation in stale {
             if let Some(renewals) = self.renewals.remove(&generation) {
+                self.renewal_metrics_seen.remove(&generation);
                 tracing::info!(
                     generation,
                     "stopping certificate renewal scheduler for retired generation"
@@ -590,6 +691,12 @@ impl ServerRuntime {
             tracing::info!(generation, "stopping certificate renewal scheduler");
             renewals.stop().await;
         }
+        self.renewal_metrics_seen.clear();
+        if let Some(access) = self.access_log.take() {
+            access.flush();
+            access.close();
+        }
+        self.access_log_generation = None;
     }
 
     /// Resolve the socket-activation state for the configured listeners, once.
@@ -722,6 +829,7 @@ impl ServerRuntime {
         &self,
         generation: &Generation,
         pending: &PendingAutomaticHttps,
+        access_log: &Arc<AccessLogRuntime>,
     ) -> Result<std::collections::HashMap<String, Arc<ListenerState>>> {
         let context = AutomaticHttpsContext {
             resolver: resolver_from_config(generation.config())?.map(Arc::new),
@@ -730,7 +838,7 @@ impl ServerRuntime {
             http_listener: pending.plan.http_listener(),
             bootstrap: true,
         };
-        self.build_listener_states(generation, Some(&context))
+        self.build_listener_states(generation, Some(&context), access_log)
     }
 
     /// Build the per-listen-address serving state for a generation.
@@ -747,6 +855,7 @@ impl ServerRuntime {
         &self,
         generation: &Generation,
         automatic: Option<&AutomaticHttpsContext<'_>>,
+        access_log: &Arc<AccessLogRuntime>,
     ) -> Result<std::collections::HashMap<String, Arc<ListenerState>>> {
         let mut states = std::collections::HashMap::new();
         let Some(http) = generation.config().http() else {
@@ -852,6 +961,9 @@ impl ServerRuntime {
                         limits: Arc::clone(&limits),
                         tls,
                         automatic: automatic_serving,
+                        server_name: server_name.clone(),
+                        recorder: Arc::clone(&self.recorder),
+                        access_log: Arc::clone(access_log),
                     }),
                 );
             }
@@ -874,6 +986,9 @@ impl ServerRuntime {
                             limits: Arc::new(ServerLimits::default()),
                             tls: None,
                             automatic: Some(Arc::clone(context.serving)),
+                            server_name: String::new(),
+                            recorder: Arc::clone(&self.recorder),
+                            access_log: Arc::clone(access_log),
                         }),
                     );
                 }

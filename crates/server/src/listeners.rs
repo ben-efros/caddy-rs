@@ -40,7 +40,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 
-use caddy_rs_admin::{AdminApi, AdminRequest};
+use caddy_rs_admin::{AdminApi, AdminRequest, SharedRequestRecorder};
 use caddy_rs_core::{Generation, GenerationStore, ListenAddr, Network};
 use caddy_rs_http::{Body, Router};
 
@@ -49,6 +49,9 @@ use crate::auto_https::AutomaticHttpsServing;
 use crate::error::Error;
 use crate::http::{serve_request_with_automatic_upgradable, ServedResponse};
 use crate::limits::ServerLimits;
+use crate::observability::{
+    body_len, observe_request, request_started, AccessLogRuntime, RequestSnapshot, TlsLogInfo,
+};
 
 /// Router map shared with accept loops, keyed by configured listen address.
 ///
@@ -66,6 +69,13 @@ pub(crate) struct ListenerState {
     /// Automatic-HTTPS pre-routing (challenge responses, HTTP→HTTPS redirects) for cleartext
     /// listeners; `None` when automatic HTTPS is not active for this generation.
     pub(crate) automatic: Option<Arc<AutomaticHttpsServing>>,
+    /// Name of the configured HTTP server (`apps.http.servers.<name>`), used as the metrics
+    /// `server` label and in access-log diagnostics. Empty for the derived challenge listener.
+    pub(crate) server_name: String,
+    /// Shared request recorder (metrics) — the same handle the admin `/metrics` endpoint renders.
+    pub(crate) recorder: SharedRequestRecorder,
+    /// Access-log sinks for this generation.
+    pub(crate) access_log: Arc<AccessLogRuntime>,
 }
 
 /// Listener state shared with accept loops, keyed by configured listen address.
@@ -271,6 +281,12 @@ struct ConnectionContext {
     tls: Option<Arc<rustls::ServerConfig>>,
     /// Automatic-HTTPS pre-routing for cleartext connections.
     automatic: Option<Arc<AutomaticHttpsServing>>,
+    /// Configured HTTP server name for metrics/access-log labels.
+    server_name: String,
+    /// Shared metrics recorder.
+    recorder: SharedRequestRecorder,
+    /// Access-log sinks for the connection's generation.
+    access_log: Arc<AccessLogRuntime>,
 }
 
 /// Look up the state of an accepted connection and acquire a connection slot.
@@ -293,12 +309,18 @@ fn admit_connection(
             limits: Arc::clone(&state.limits),
             tls: state.tls.clone(),
             automatic: state.automatic.clone(),
+            server_name: state.server_name.clone(),
+            recorder: Arc::clone(&state.recorder),
+            access_log: Arc::clone(&state.access_log),
         },
         None => ConnectionContext {
             router: None,
             limits: Arc::new(ServerLimits::default()),
             tls: None,
             automatic: None,
+            server_name: String::new(),
+            recorder: caddy_rs_admin::noop_recorder(),
+            access_log: AccessLogRuntime::disabled(),
         },
     };
     let permit = ConnectionPermit::try_acquire(Arc::clone(active), context.limits.max_connections)?;
@@ -439,6 +461,9 @@ async fn serve_accepted<I>(
     let activity = Arc::new(ConnectionActivity::default());
     let router = context.router;
     let automatic = context.automatic;
+    let server_name = context.server_name;
+    let recorder = context.recorder;
+    let access_log = context.access_log;
     if let Some(tls) = context.tls {
         let acceptor = TlsAcceptor::from(tls);
         let tls_stream = match acceptor.accept(stream).await {
@@ -450,17 +475,34 @@ async fn serve_accepted<I>(
                 return;
             }
         };
-        let alpn = tls_stream
-            .get_ref()
-            .1
+        let connection = tls_stream.get_ref().1;
+        let alpn = connection
             .alpn_protocol()
             .map(|protocol| String::from_utf8_lossy(protocol).into_owned());
+        let tls_info = TlsLogInfo {
+            resumed: matches!(
+                connection.handshake_kind(),
+                Some(rustls::HandshakeKind::Resumed)
+            ),
+            version: connection.protocol_version().map(u16::from).unwrap_or(0),
+            cipher_suite: connection
+                .negotiated_cipher_suite()
+                .map(|suite| u16::from(suite.suite()))
+                .unwrap_or(0),
+            proto: alpn.clone().unwrap_or_default(),
+            server_name: connection.server_name().unwrap_or("").to_string(),
+            ech: false,
+        };
         let service = connection_service(
             router,
             Arc::clone(&limits),
             peer,
             true,
             alpn,
+            Some(tls_info),
+            server_name,
+            recorder,
+            access_log,
             automatic,
             Arc::clone(&activity),
             Arc::clone(&permit),
@@ -475,6 +517,10 @@ async fn serve_accepted<I>(
             peer,
             false,
             None,
+            None,
+            server_name,
+            recorder,
+            access_log,
             automatic,
             Arc::clone(&activity),
             Arc::clone(&permit),
@@ -492,6 +538,10 @@ fn connection_service(
     remote_addr: Option<SocketAddr>,
     tls: bool,
     alpn: Option<String>,
+    tls_info: Option<TlsLogInfo>,
+    server_name: String,
+    recorder: SharedRequestRecorder,
+    access_log: Arc<AccessLogRuntime>,
     automatic: Option<Arc<AutomaticHttpsServing>>,
     activity: Arc<ConnectionActivity>,
     permit: Arc<ConnectionPermit>,
@@ -509,13 +559,38 @@ fn connection_service(
         let limits = Arc::clone(&limits);
         let activity = Arc::clone(&activity);
         let alpn = alpn.clone();
+        let tls_info = tls_info.clone();
+        let server_name = server_name.clone();
+        let recorder = Arc::clone(&recorder);
+        let access_log = Arc::clone(&access_log);
         let automatic = automatic.clone();
         let permit = Arc::clone(&permit);
         let generation = generation.clone();
         let shutdown = shutdown.clone();
         async move {
             let _in_flight = activity.begin();
+            let started = std::time::Instant::now();
+            let method = request.method().as_str().to_string();
+            // Capture the access-log fields before the request is consumed. Only done when a sink
+            // is configured, so the common no-logging path pays nothing.
+            let snapshot = access_log
+                .is_enabled()
+                .then(|| RequestSnapshot::capture(&request, remote_addr, tls_info.as_ref()));
+            let _request_guard = request_started(&recorder, &server_name);
+
             let Some(router) = router else {
+                let headers = http::HeaderMap::new();
+                observe_request(
+                    &recorder,
+                    &access_log,
+                    &server_name,
+                    &method,
+                    snapshot.as_ref(),
+                    started,
+                    503,
+                    0,
+                    &headers,
+                );
                 return Ok::<_, std::convert::Infallible>(error_response());
             };
             // Take the client-side upgrade future before the request is consumed. Only requests
@@ -533,6 +608,29 @@ fn connection_service(
                 on_upgrade,
             )
             .await;
+
+            let (status, response_size, response_headers) = match &served {
+                ServedResponse::Response(response) => (
+                    response.status().as_u16(),
+                    body_len(response.body()),
+                    response.headers().clone(),
+                ),
+                ServedResponse::Upgraded { response, .. } => {
+                    (response.status().as_u16(), 0, response.headers().clone())
+                }
+            };
+            observe_request(
+                &recorder,
+                &access_log,
+                &server_name,
+                &method,
+                snapshot.as_ref(),
+                started,
+                status,
+                response_size,
+                &response_headers,
+            );
+
             match served {
                 ServedResponse::Response(response) => Ok::<_, std::convert::Infallible>(response),
                 ServedResponse::Upgraded {

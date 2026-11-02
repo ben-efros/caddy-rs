@@ -1123,6 +1123,18 @@ async fn fake_acme_issues_certificate_and_site_serves_https() {
     assert_eq!(body, "hello https");
     assert_eq!(fake.domains(), vec!["example.com".to_string()]);
 
+    // T-ADMIN-024: the automatic-HTTPS certificate is exported to the certificate metrics wired
+    // into the same registry the admin /metrics endpoint renders.
+    let metrics = runtime.metrics().render();
+    assert!(
+        metrics.contains("caddy_rs_tls_certificate_expiration_seconds"),
+        "certificate expiry metric missing:\n{metrics}"
+    );
+    assert!(
+        metrics.contains("subject=\"example.com\""),
+        "certificate metric must be labelled with the subject:\n{metrics}"
+    );
+
     // The issued certificate is persisted in Caddy's storage layout.
     let storage = FileStorage::new(directory.path());
     let keys = storage.list("").await.expect("storage list");
