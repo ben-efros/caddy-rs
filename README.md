@@ -1,5 +1,7 @@
 # caddy-rs (implementation repository)
 
+Hosted at <https://github.com/ben-efros/caddy-rs>.
+
 The Rust implementation of the caddy-rs program: a Caddy-compatible web server, reverse proxy,
 and configuration engine. **Status: M2/M4 (post-agent sprint)** — the crates compile,
 **972 tests pass**, HTTPS termination, automatic-HTTPS issuance (fake-CA tested), renewal hot-swap,
