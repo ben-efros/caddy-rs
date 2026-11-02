@@ -13,8 +13,10 @@ pub mod automatic_https;
 pub mod certificate;
 pub mod cloudflare;
 pub mod dns;
+pub mod dns_providers;
 pub mod internal_ca;
 pub mod issuer;
+pub mod propagation;
 pub mod renewal;
 pub mod solver;
 pub mod storage;
@@ -44,6 +46,9 @@ pub use dns::{
     DnsChallengeConfig, DnsError, DnsProvider, InMemoryDnsProvider, PropagationTimeout, RecordId,
     TxtRecord,
 };
+pub use dns_providers::{
+    build_dns01_solver, build_dns_provider, DNS_PROVIDER_TRACKING_ID, SUPPORTED_DNS_PROVIDERS,
+};
 pub use internal_ca::{
     ca_storage_keys, CaCertificates, CaLifetimes, CaStorage, CaStorageKeys, LocalCa,
     DEFAULT_BACKDATE, DEFAULT_CA_DISPLAY_NAME, DEFAULT_CA_ID, DEFAULT_INTERMEDIATE_LIFETIME,
@@ -52,6 +57,9 @@ pub use internal_ca::{
 pub use issuer::{
     within_renewal_window, AcmeIssuer, AcmeIssuerConfig, CertificateIssuer, InternalIssuer,
     IssuanceRequest, ProductionAcmeIssuer,
+};
+pub use propagation::{
+    txt_data_matches, DohPropagationChecker, PropagationChecker, CLOUDFLARE_DOH_ENDPOINT,
 };
 pub use renewal::{
     CertificatePublisher, ManualClock, RenewalClock, RenewalOutcome, RenewalPolicy,

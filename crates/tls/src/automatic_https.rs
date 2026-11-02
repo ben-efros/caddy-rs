@@ -1019,7 +1019,7 @@ async fn cached_internal_issuer(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn obtain_acme_certificate(
+pub(crate) async fn obtain_acme_certificate(
     config: &AcmeIssuerConfig,
     domains: &[String],
     transport: &Arc<dyn AcmeTransport>,
@@ -1040,6 +1040,8 @@ async fn obtain_acme_certificate(
     .with_solver(Arc::new(TlsAlpn01Solver::new(Arc::clone(
         tls_alpn01_tokens,
     ))))
+    // Configuration alone selects DNS-01 when `challenges.dns` names a provider.
+    .with_configured_dns_solver(Arc::clone(transport))?
     .with_clock(Arc::clone(clock))
     .with_poll_policy(poll_policy.clone());
     issuer
@@ -1376,6 +1378,40 @@ mod tests {
         assert!(plan
             .redirect_hosts
             .contains(&"extra.example.com".to_string()));
+    }
+
+    #[test]
+    fn plan_preserves_dns_challenge_configuration_for_the_issuer() {
+        let mut value = serde_json::to_value(https_config()).unwrap();
+        value["apps"]["tls"]["automation"]["policies"][0]["issuers"][0]["challenges"] = json!({"dns": {
+            "provider": {"name": "cloudflare", "api_token": "config-token"},
+            "propagation_timeout": 5_000_000_000_i64
+        }});
+        let plan = plan(&Config::from_value(value).unwrap())
+            .unwrap()
+            .expect("DNS challenge policy yields a plan");
+        match &plan.policy_for("www.example.com").unwrap().issuer {
+            AutomaticHttpsIssuer::Acme(config) => {
+                assert_eq!(config.dns_provider.as_deref(), Some("cloudflare"));
+                let challenge = config
+                    .dns_challenge
+                    .as_ref()
+                    .expect("challenges.dns configuration retained in the plan");
+                assert_eq!(challenge.provider, "cloudflare");
+                assert_eq!(
+                    challenge
+                        .settings
+                        .get("api_token")
+                        .and_then(serde_json::Value::as_str),
+                    Some("config-token")
+                );
+                assert_eq!(
+                    challenge.propagation_timeout_duration(),
+                    Some(std::time::Duration::from_secs(5))
+                );
+            }
+            other => panic!("unexpected issuer: {other:?}"),
+        }
     }
 
     #[test]

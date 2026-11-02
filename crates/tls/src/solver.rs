@@ -28,6 +28,7 @@ use ring::digest;
 
 use crate::acme::{Challenge, ChallengeType};
 use crate::dns::{DnsError, DnsProvider, TxtRecord};
+use crate::propagation::PropagationChecker;
 use crate::{Error, Result};
 
 /// Path prefix the ACME HTTP-01 challenge is served under (RFC 8555 §8.3).
@@ -262,27 +263,97 @@ impl ChallengeSolver for Http01Solver {
     }
 }
 
+/// How [`Dns01Solver`] waits for the challenge TXT record to become visible.
+enum PropagationWait {
+    /// Ask the provider's own `list TXT` API (default; works with the in-memory/test providers).
+    Provider {
+        /// Overall timeout.
+        timeout: Duration,
+    },
+    /// Poll an authoritative checker (production: DNS-over-HTTPS).
+    Checker {
+        /// Authoritative visibility checker.
+        checker: Arc<dyn PropagationChecker>,
+        /// Overall timeout.
+        timeout: Duration,
+        /// Delay between checks.
+        interval: Duration,
+    },
+    /// Do not wait at all (Caddy's `propagation_timeout: -1`).
+    Disabled,
+}
+
 /// DNS-01 solver: creates TXT records through a [`DnsProvider`] and waits for propagation.
 pub struct Dns01Solver {
     provider: Arc<dyn DnsProvider>,
-    propagation_timeout: Duration,
+    propagation: PropagationWait,
     propagation_delay: Duration,
+    /// Caddy's `challenges.dns.override_domain`: publish the TXT record under this domain instead
+    /// of the certificate domain.
+    record_domain_override: Option<String>,
 }
 
 impl Dns01Solver {
     /// Create a solver using Caddy's default propagation timeout (2 minutes) and no delay.
+    ///
+    /// By default visibility is checked through the provider's TXT list API; use
+    /// [`Dns01Solver::with_checker`] to poll authoritative DNS instead, or
+    /// [`Dns01Solver::without_propagation_wait`] to skip the wait.
     pub fn new(provider: Arc<dyn DnsProvider>) -> Self {
         Self {
             provider,
-            propagation_timeout: crate::dns::DEFAULT_PROPAGATION_TIMEOUT,
+            propagation: PropagationWait::Provider {
+                timeout: crate::dns::DEFAULT_PROPAGATION_TIMEOUT,
+            },
             propagation_delay: Duration::ZERO,
+            record_domain_override: None,
         }
     }
 
-    /// Set the propagation wait: delay before the first check and overall timeout.
+    /// Publish the challenge TXT record under `domain` instead of the certificate domain
+    /// (Caddy's `challenges.dns.override_domain`).
+    pub fn with_record_domain_override(mut self, domain: impl Into<String>) -> Self {
+        self.record_domain_override = Some(domain.into());
+        self
+    }
+
+    /// Set the provider-polling propagation wait: delay before the first check and overall
+    /// timeout (no authoritative checker).
     pub fn with_propagation(mut self, timeout: Duration, delay: Duration) -> Self {
-        self.propagation_timeout = timeout;
+        self.propagation = PropagationWait::Provider { timeout };
         self.propagation_delay = delay;
+        self
+    }
+
+    /// Set the delay before the first propagation check.
+    pub fn with_propagation_delay(mut self, delay: Duration) -> Self {
+        self.propagation_delay = delay;
+        self
+    }
+
+    /// Poll an authoritative [`PropagationChecker`] until the TXT record is visible.
+    ///
+    /// The record is deleted (cleanup on failure) if the checker never reports it within
+    /// `timeout`.
+    pub fn with_checker(
+        mut self,
+        checker: Arc<dyn PropagationChecker>,
+        timeout: Duration,
+        interval: Duration,
+    ) -> Self {
+        self.propagation = PropagationWait::Checker {
+            checker,
+            timeout,
+            interval,
+        };
+        self
+    }
+
+    /// Skip the propagation wait entirely (Caddy's `propagation_timeout: -1`).
+    ///
+    /// The TXT record is created and removed as usual; no visibility check is performed.
+    pub fn without_propagation_wait(mut self) -> Self {
+        self.propagation = PropagationWait::Disabled;
         self
     }
 
@@ -291,20 +362,54 @@ impl Dns01Solver {
         &self.provider
     }
 
-    /// Propagation timeout.
+    /// The configured propagation timeout (`Duration::ZERO` when the wait is disabled).
     pub fn propagation_timeout(&self) -> Duration {
-        self.propagation_timeout
+        match &self.propagation {
+            PropagationWait::Provider { timeout } => *timeout,
+            PropagationWait::Checker { timeout, .. } => *timeout,
+            PropagationWait::Disabled => Duration::ZERO,
+        }
     }
 }
 
 impl fmt::Debug for Dns01Solver {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let propagation = match &self.propagation {
+            PropagationWait::Provider { .. } => "provider",
+            PropagationWait::Checker { .. } => "dns-over-https",
+            PropagationWait::Disabled => "disabled",
+        };
         formatter
             .debug_struct("Dns01Solver")
             .field("provider", &self.provider.name())
-            .field("propagation_timeout", &self.propagation_timeout)
+            .field("propagation", &propagation)
+            .field("propagation_timeout", &self.propagation_timeout())
             .field("propagation_delay", &self.propagation_delay)
             .finish()
+    }
+}
+
+/// Poll `checker` until `value` is visible at `fqdn`, or the timeout expires.
+async fn wait_for_checker(
+    checker: &dyn PropagationChecker,
+    fqdn: &str,
+    value: &str,
+    timeout: Duration,
+    interval: Duration,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if checker.txt_record_visible(fqdn, value).await? {
+            return Ok(());
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(Error::Dns(DnsError::PropagationTimeout {
+                fqdn: fqdn.to_string(),
+                timeout,
+            }));
+        }
+        tokio::time::sleep(interval.min(deadline - now)).await;
     }
 }
 
@@ -326,20 +431,40 @@ impl ChallengeSolver for Dns01Solver {
                 challenge.challenge_type
             )));
         }
+        let domain = self.record_domain_override.as_deref().unwrap_or(domain);
         let fqdn = dns01_record_name(domain);
         let value = dns01_txt_value(key_authorization);
         let record = self.provider.create_txt(&fqdn, &value).await?;
         if !self.propagation_delay.is_zero() {
             tokio::time::sleep(self.propagation_delay).await;
         }
-        if let Err(error) = self
-            .provider
-            .wait_for_propagation(&record, self.propagation_timeout)
-            .await
-        {
+        let visible = match &self.propagation {
+            PropagationWait::Disabled => Ok(()),
+            PropagationWait::Provider { timeout } => self
+                .provider
+                .wait_for_propagation(&record, *timeout)
+                .await
+                .map(|_| ())
+                .map_err(Error::from),
+            PropagationWait::Checker {
+                checker,
+                timeout,
+                interval,
+            } => {
+                wait_for_checker(
+                    checker.as_ref(),
+                    &record.fqdn,
+                    &record.value,
+                    *timeout,
+                    *interval,
+                )
+                .await
+            }
+        };
+        if let Err(error) = visible {
             // Do not leave a stale challenge record behind when propagation fails.
             let _ = self.provider.delete_txt(&record).await;
-            return Err(error.into());
+            return Err(error);
         }
         Ok(ChallengeHandle::Dns01 { record })
     }
@@ -617,6 +742,147 @@ mod tests {
             other => panic!("unexpected handle {other:?}"),
         };
         provider.delete_txt(&record).await.unwrap();
+        solver.withdraw(&handle).await.unwrap();
+    }
+
+    struct MockPropagationChecker {
+        calls: std::sync::atomic::AtomicUsize,
+        visible_after_calls: usize,
+        fail: bool,
+    }
+
+    impl MockPropagationChecker {
+        fn new(visible_after_calls: usize, fail: bool) -> Arc<Self> {
+            Arc::new(Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                visible_after_calls,
+                fail,
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl PropagationChecker for MockPropagationChecker {
+        async fn txt_record_visible(&self, _fqdn: &str, _value: &str) -> Result<bool> {
+            let calls = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if self.fail {
+                return Err(Error::Dns(DnsError::Provider {
+                    provider: "mock-doh".to_string(),
+                    message: "propagation lookup failed".to_string(),
+                }));
+            }
+            Ok(calls > self.visible_after_calls)
+        }
+    }
+
+    #[tokio::test]
+    async fn dns01_solver_with_checker_polls_until_visible() {
+        let provider = dns_provider();
+        let checker = MockPropagationChecker::new(2, false);
+        let solver = Dns01Solver::new(provider.clone() as Arc<dyn DnsProvider>).with_checker(
+            checker.clone(),
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+        );
+        let handle = solver
+            .present(
+                "example.com",
+                &challenge("dns-01", "token-1"),
+                "token-1.thumbprint-abc",
+            )
+            .await
+            .unwrap();
+        assert_eq!(checker.calls(), 3, "two invisible polls, then visible");
+        assert_eq!(provider.records().len(), 1);
+        solver.withdraw(&handle).await.unwrap();
+        assert!(provider.records().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dns01_solver_checker_timeout_cleans_up() {
+        let provider = dns_provider();
+        let checker = MockPropagationChecker::new(usize::MAX, false);
+        let solver = Dns01Solver::new(provider.clone() as Arc<dyn DnsProvider>).with_checker(
+            checker.clone(),
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+        );
+        let error = solver
+            .present(
+                "example.com",
+                &challenge("dns-01", "token-1"),
+                "token-1.thumbprint-abc",
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::Dns(DnsError::PropagationTimeout { .. })),
+            "unexpected error: {error:?}"
+        );
+        assert!(checker.calls() >= 1);
+        assert!(
+            provider.records().is_empty(),
+            "timed-out checker must delete the record"
+        );
+    }
+
+    #[tokio::test]
+    async fn dns01_solver_checker_error_cleans_up() {
+        let provider = dns_provider();
+        let checker = MockPropagationChecker::new(0, true);
+        let solver = Dns01Solver::new(provider.clone() as Arc<dyn DnsProvider>).with_checker(
+            checker,
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+        );
+        let error = solver
+            .present(
+                "example.com",
+                &challenge("dns-01", "token-1"),
+                "token-1.thumbprint-abc",
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("propagation lookup failed"),
+            "{error}"
+        );
+        assert!(
+            provider.records().is_empty(),
+            "checker error must delete the record"
+        );
+    }
+
+    #[tokio::test]
+    async fn dns01_solver_without_propagation_wait_skips_checks() {
+        let provider = dns_provider();
+        provider.set_visible(false);
+        let checker = MockPropagationChecker::new(0, true);
+        let solver = Dns01Solver::new(provider.clone() as Arc<dyn DnsProvider>)
+            .with_checker(
+                checker.clone(),
+                Duration::from_secs(5),
+                Duration::from_millis(10),
+            )
+            .without_propagation_wait();
+        let handle = solver
+            .present(
+                "example.com",
+                &challenge("dns-01", "token-1"),
+                "token-1.thumbprint-abc",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            checker.calls(),
+            0,
+            "disabled wait must not query the checker"
+        );
+        assert_eq!(provider.records().len(), 1);
         solver.withdraw(&handle).await.unwrap();
     }
 
