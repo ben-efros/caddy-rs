@@ -18,6 +18,7 @@ pub mod error;
 pub mod http;
 pub mod limits;
 pub mod listeners;
+mod observability;
 pub mod runtime;
 
 pub use activation::{
