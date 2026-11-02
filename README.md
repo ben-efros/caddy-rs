@@ -2,9 +2,11 @@
 
 The Rust implementation of the caddy-rs program: a Caddy-compatible web server, reverse proxy,
 and configuration engine. **Status: M2/M4 (post-agent sprint)** — the crates compile,
-**628 tests pass**, HTTPS termination works, and the Caddyfile adapter matches Caddy v2.11.7's
-golden output for every fixture it supports: **62 of the 245 upstream adapter fixtures exactly, 0
-mismatches** (100% of supported fixtures, 25.3% corpus coverage). See the program repository's conformance report.
+**842 tests pass**, HTTPS termination, automatic-HTTPS issuance (fake-CA tested), renewal hot-swap,
+streaming, forward_auth and TLS-ALPN-01 work end to end, and the Caddyfile adapter matches Caddy
+v2.11.7's golden output for every fixture it supports: **80 of the 245 upstream adapter fixtures
+exactly, 0 mismatches** (100% of supported fixtures, 32.7% corpus coverage). A real Caddy v2.11.7
+binary oracle is acquired and run by the program repository. See the program repository's conformance report.
 
 See the program repository (`..`) for the plan, compatibility contract, divergence register, and
 work queue.
@@ -23,24 +25,32 @@ work queue.
   `path_regexp` (config-only); heredocs, line continuation, same-file snippets/imports with
   arguments, named routes parsed; global options; 49 exact upstream golden fixtures
 - HTTP/1.1 + cleartext HTTP/2 (h2c) over TCP and Unix sockets; **HTTPS termination** via rustls with
-  SNI (exact/wildcard), ALPN h2/http1.1, TLS versions and client-auth request/require; per-server
+  SNI (exact/wildcard), ALPN h2/http1.1, TLS versions and client-auth request/require;
+  **automatic HTTPS** for explicit `apps.tls` automation: ACME issuance (HTTP-01, DNS-01,
+  TLS-ALPN-01) and internal CA, challenge listeners, 308 redirects, two-phase apply with rollback,
+  generation-scoped renewal with resolver hot-swap; dual-stack wildcard listeners; per-server
   timeouts, header/body limits, connection caps and systemd socket activation
 - Route evaluation with matcher sets, terminals, groups, subroutes, header middleware and the
   placeholder engine (request/vars/env/header placeholders in rewrite/respond/headers/vars)
 - Static file serving with traversal protection, index files, browse, pass_thru
 - Reverse proxy: HTTP, HTTPS (rustls with explicit/system trust, insecure opt-in, SNI) and
   Unix-socket upstreams, round-robin/first/least-conn balancing, retries with retry_match, active +
-  passive health checks, forwarded headers and trusted proxies, request/response header rewriting
+  passive health checks, forwarded headers and trusted proxies, request/response header rewriting,
+  streaming responses (no full-body buffering; mid-stream errors and client cancellation handled),
+  canonical forward_auth execution (rewrite/handle_response, header copy, 401/403 pass-through)
 - Admin API: `/config/` traversal, full `POST/PUT/PATCH/DELETE` partial updates with validation and
-  rollback, `/id/<id>`, `/load`, `/stop`, origin enforcement, `/metrics` Prometheus text endpoint,
-  and access-log record/redaction primitives
+  rollback, `/id/<id>`, `/load`, `/stop` (exits the process for all adapters), origin enforcement,
+  `/metrics` Prometheus text endpoint, access-log record/redaction/sampling/sink primitives and
+  Caddy `logging.logs[]` mapping
 - TLS/ACME: certificate model/cache/SNI, Caddy/CertMagic storage layout, ACME directory/account/
-  order/CSR/transport clients, **full `AcmeIssuer` issuance with HTTP-01 and DNS-01 solvers**
-  (mock-tested), Cloudflare DNS-01 provider (mock-tested), Caddyfile `tls` directive + global ACME
-  options — automatic-HTTPS orchestration/redirects and TLS-ALPN-01 remain tracked
-- Middleware: placeholder engine, forward_auth and basic_auth/authentication handlers, request/
-  response header rewriting, static/file serving; async generation lifecycle hooks (provision →
-  start → stop → cleanup)
+  order/CSR/transport clients, `AcmeIssuer` issuance with HTTP-01/DNS-01/TLS-ALPN-01 solvers,
+  Cloudflare DNS-01 provider (mock-tested), Caddy-compatible internal CA (`tls internal`), Caddyfile
+  `tls` directive/global ACME options, automatic-HTTPS driver and renewal schedulers
+- Middleware/engine: placeholder engine, forward_auth and basic_auth/authentication handlers,
+  streaming body engine, request/response header rewriting, static/file serving, vars/invoke/named
+  routes, file/glob imports, async generation lifecycle hooks (provision → start → stop → cleanup)
+- Compatibility: real Caddy v2.11.7 oracle acquisition (no Docker), adapt/validate/runtime probes,
+  drift triage and nightly workflow; 70 registered divergences with tracking tasks
 - CLI: `version`, `list-modules`, `adapt`, `validate`, `run`, `reload`, `stop`
 
 ## What does not work yet (registered, not hidden)
