@@ -16,8 +16,7 @@ use clap::{Parser, Subcommand};
 use http_body_util::{BodyExt, Full};
 
 use caddy_rs_admin::AdminResponse;
-use caddy_rs_config::CaddyfileAdapter;
-use caddy_rs_core::{Config, ConfigAdapter, GenerationStore, ModuleRegistry, VERSION};
+use caddy_rs_core::{Config, GenerationStore, ModuleRegistry, VERSION};
 use caddy_rs_server::ServerRuntime;
 
 #[derive(Debug, Parser)]
@@ -249,9 +248,12 @@ fn adapt(config: &Path, adapter: Option<&str>) -> anyhow::Result<caddy_rs_core::
     let input = std::fs::read(config)
         .with_context(|| format!("cannot read config `{}`", config.display()))?;
     match infer_adapter(config, adapter).as_deref() {
-        Some("caddyfile") => CaddyfileAdapter
-            .adapt(&input)
-            .with_context(|| format!("cannot adapt `{}`", config.display())),
+        Some("caddyfile") => {
+            let text = std::str::from_utf8(&input)
+                .with_context(|| format!("`{}` is not valid UTF-8", config.display()))?;
+            caddy_rs_config::adapt_with_source(text, Some(config))
+                .with_context(|| format!("cannot adapt `{}`", config.display()))
+        }
         Some("json") | None => {
             let value: serde_json::Value = serde_json::from_slice(&input)
                 .with_context(|| format!("`{}` is not valid JSON", config.display()))?;

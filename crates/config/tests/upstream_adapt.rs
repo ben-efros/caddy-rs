@@ -3,8 +3,9 @@
 //! Each fixture is split into a Caddyfile and the JSON Caddy v2.11.7 emits for it. The adapter
 //! must produce semantically identical JSON (object key order is not significant).
 
-use caddy_rs_config::adapt;
+use caddy_rs_config::{adapt, adapt_with_source};
 use serde_json::{json, Value};
+use std::path::Path;
 
 fn fixture(name: &str) -> (String, Value) {
     let path = format!(
@@ -364,5 +365,53 @@ fn basic_auth_rejects_unknown_hash_algorithm_loudly() {
     assert!(
         message.contains("unrecognized hash algorithm: sha256"),
         "unexpected error: {message}"
+    );
+}
+
+#[test]
+fn invoke_named_routes_match_caddy() {
+    // `&(name)` definitions become per-server `named_routes`; `invoke` emits the invoke handler.
+    assert_adapts_like_caddy("invoke_named_routes.caddyfiletest");
+    assert_adapts_like_caddy("invoke_nested_named_routes.caddyfiletest");
+    assert_adapts_like_caddy("import_inside_named_route.caddyfiletest");
+    assert_adapts_like_caddy("import_inside_named_route_args.caddyfiletest");
+    assert_adapts_like_caddy("import_inside_named_route_block.caddyfiletest");
+    assert_adapts_like_caddy("import_inside_named_route_nested.caddyfiletest");
+}
+
+#[test]
+fn vars_routes_sort_least_specific_first_like_caddy() {
+    // Caddy reverses matcher specificity for `vars` so later matching routes win.
+    assert_adapts_like_caddy("sort_vars_in_reverse.caddyfiletest");
+}
+
+/// File-import fixtures need the Caddyfile's source path so `import testdata/...` resolves the
+/// same way as in Caddy's test working directory.
+fn assert_adapts_file_fixture_like_caddy(name: &str) {
+    let path = format!(
+        "{}/tests/fixtures/upstream-imports/{name}",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let raw = std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {path}: {error}"));
+    let (caddyfile, expected) = raw
+        .split_once("----------")
+        .unwrap_or_else(|| panic!("fixture {name} has no `----------` separator"));
+    let caddyfile = format!("{}\n", caddyfile.trim());
+    let expected: Value = serde_json::from_str(expected.trim())
+        .unwrap_or_else(|error| panic!("fixture {name} expected JSON: {error}"));
+    let adapted = adapt_with_source(&caddyfile, Some(Path::new(&path)))
+        .unwrap_or_else(|error| panic!("adapt {name}: {error}"));
+    let mut actual = adapted.config;
+    let mut expected = expected;
+    normalize_groups(&mut actual);
+    normalize_groups(&mut expected);
+    assert_eq!(actual, expected, "adapted JSON differs for {name}");
+}
+
+#[test]
+fn file_imports_match_caddy() {
+    assert_adapts_file_fixture_like_caddy("import_args_file.caddyfiletest");
+    assert_adapts_file_fixture_like_caddy(
+        "import_block_snippet_non_replaced_block_from_separate_file.caddyfiletest",
     );
 }

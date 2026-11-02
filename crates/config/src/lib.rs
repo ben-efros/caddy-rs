@@ -10,8 +10,8 @@ pub mod adapter;
 pub mod lexer;
 pub mod parser;
 
-pub use adapter::{adapt, CaddyfileAdapter};
+pub use adapter::{adapt, adapt_with_source, CaddyfileAdapter};
 pub use parser::{
-    expand_env_vars, expand_env_vars_with, parse, Caddyfile, Directive, EnvExpansion,
-    GlobalOptions, NamedRoute, SiteAddress, SiteBlock,
+    expand_env_vars, expand_env_vars_with, parse, parse_with_source, Caddyfile, Directive,
+    EnvExpansion, GlobalOptions, NamedRoute, SiteAddress, SiteBlock,
 };

@@ -21,18 +21,20 @@ use crate::parser::{self, AutoHttpsMode, Directive, SiteBlock};
 
 /// Canonical directive order, mirroring Caddy's default order for the supported subset.
 const DIRECTIVE_ORDER: &[&str] = &[
+    "vars",
     "root",
     "header",
     "redir",
-    "respond",
-    "route",
+    "method",
     "basicauth",
     "basic_auth",
     "forward_auth",
     "encode",
+    "invoke",
     "handle",
     "handle_path",
-    "method",
+    "route",
+    "respond",
     "reverse_proxy",
     "file_server",
 ];
@@ -56,7 +58,15 @@ impl ConfigAdapter for CaddyfileAdapter {
 
 /// Adapt a Caddyfile string to Caddy JSON.
 pub fn adapt(input: &str) -> caddy_rs_core::Result<AdaptedConfig> {
-    let file = parser::parse(input).map_err(parse_error)?;
+    adapt_with_source(input, None)
+}
+
+/// Adapt a Caddyfile string to Caddy JSON, resolving file/glob imports relative to `source`.
+pub fn adapt_with_source(
+    input: &str,
+    source: Option<&std::path::Path>,
+) -> caddy_rs_core::Result<AdaptedConfig> {
+    let file = parser::parse_with_source(input, source).map_err(parse_error)?;
     let options = &file.options;
     let http_port = options.http_port.unwrap_or(80);
     let https_port = options.https_port.unwrap_or(443);
@@ -68,6 +78,17 @@ pub fn adapt(input: &str) -> caddy_rs_core::Result<AdaptedConfig> {
         .iter()
         .map(parse_site_tls)
         .collect::<caddy_rs_core::Result<_>>()?;
+
+    // Named-route definitions are emitted as `named_routes` on each server that invokes them,
+    // transitively (Caddy's `extractNamedRoutes`/`namedRouteInvokes`).
+    let mut named_route_json: BTreeMap<String, Value> = BTreeMap::new();
+    let mut named_route_invokes: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for named in &file.named_routes {
+        named_route_json.insert(named.name.clone(), build_named_route(named, &mut warnings)?);
+        let mut invokes = Vec::new();
+        collect_invoke_names(&named.directives, &mut invokes);
+        named_route_invokes.insert(named.name.clone(), invokes);
+    }
 
     // Each site block's route list is built once; a block may be served on several listeners.
     let mut site_routes: Vec<Vec<Value>> = Vec::with_capacity(file.sites.len());
@@ -205,6 +226,31 @@ pub fn adapt(input: &str) -> caddy_rs_core::Result<AdaptedConfig> {
         }
         let routes = consolidate_routes(routes);
 
+        // Named routes reachable from this server's site blocks, transitively.
+        let mut attached: Vec<String> = Vec::new();
+        for block in &server.blocks {
+            collect_invoke_names(&file.sites[block.site_index].directives, &mut attached);
+        }
+        let mut attached_index = 0;
+        while attached_index < attached.len() {
+            if let Some(invokes) = named_route_invokes.get(&attached[attached_index]) {
+                for name in invokes {
+                    if !attached.contains(name) {
+                        attached.push(name.clone());
+                    }
+                }
+            }
+            attached_index += 1;
+        }
+        let attached: BTreeMap<String, Value> = attached
+            .into_iter()
+            .filter_map(|name| {
+                named_route_json
+                    .get(&name)
+                    .map(|route| (name.clone(), route.clone()))
+            })
+            .collect();
+
         let mut object = Map::new();
         object.insert("listen".to_string(), json!([server.listen]));
         let mut automatic_https = Map::new();
@@ -239,6 +285,9 @@ pub fn adapt(input: &str) -> caddy_rs_core::Result<AdaptedConfig> {
         }
         if !routes.is_empty() {
             object.insert("routes".to_string(), Value::Array(routes));
+        }
+        if !attached.is_empty() {
+            object.insert("named_routes".to_string(), json!(attached));
         }
         server_map.insert(format!("srv{index}"), Value::Object(object));
     }
@@ -1598,15 +1647,26 @@ fn build_routes(
         let name = directive.name.as_str();
         match name {
             "route" => {
-                let inner = build_routes(&directive.block, matchers, false, false, warnings)?;
-                if inner.is_empty() {
-                    entries.push((name, json!({"handle": [{"handler": "subroute"}]})));
-                } else {
-                    entries.push((
-                        name,
-                        json!({"handle": [{"handler": "subroute", "routes": inner}]}),
+                let mut route_args = directive.args.clone();
+                let matcher = matcher_for_args(&mut route_args, matchers, directive.position)?;
+                if !route_args.is_empty() {
+                    return Err(adapter_error(
+                        directive.position,
+                        "unexpected arguments to `route` (only an optional matcher is accepted)",
                     ));
                 }
+                let inner = build_routes(&directive.block, matchers, false, false, warnings)?;
+                let subroute = if inner.is_empty() {
+                    json!({"handler": "subroute"})
+                } else {
+                    json!({"handler": "subroute", "routes": inner})
+                };
+                let mut route = Map::new();
+                route.insert("handle".to_string(), json!([subroute]));
+                if let Some(matcher) = matcher {
+                    route.insert("match".to_string(), json!([matcher]));
+                }
+                entries.push((name, Value::Object(route)));
             }
             "handle" | "handle_path" => {
                 let mut route = build_handle_route(directive, matchers, warnings)?;
@@ -1641,7 +1701,13 @@ fn build_routes(
             if left_position != right_position {
                 return left_position.cmp(&right_position);
             }
-            route_path_order(&left.1, &right.1)
+            // `vars` is sorted least-specific first so the last matching route wins (Caddy's
+            // `sortRoutes` reverse special case).
+            if left.0 == "vars" {
+                route_path_order(&right.1, &left.1)
+            } else {
+                route_path_order(&left.1, &right.1)
+            }
         });
     }
 
@@ -1789,6 +1855,8 @@ fn build_handlers(
         "reverse_proxy" => vec![reverse_proxy_handler(directive, args)?],
         "basicauth" | "basic_auth" => vec![basic_auth_handler(directive, args)?],
         "forward_auth" => vec![forward_auth_handler(directive, args)?],
+        "invoke" => vec![invoke_handler(args, directive.position)?],
+        "vars" => vec![vars_handler(directive, args)?],
         other => {
             return Err(adapter_error(
                 directive.position,
@@ -2023,6 +2091,96 @@ fn canonical_header_key(value: &str) -> String {
         }
     }
     canonical
+}
+
+/// Caddy's `invoke` directive: a handler that runs a named route attached to the server.
+fn invoke_handler(args: &[String], position: Position) -> caddy_rs_core::Result<Value> {
+    match args {
+        [name] => Ok(json!({"handler": "invoke", "name": name})),
+        _ => Err(adapter_error(
+            position,
+            "`invoke` requires exactly one named-route name",
+        )),
+    }
+}
+
+/// Caddy's `vars` directive: set request variables, with Caddy's scalar conversion of unquoted
+/// values (numbers, booleans, otherwise strings).
+fn vars_handler(directive: &Directive, args: &[String]) -> caddy_rs_core::Result<Value> {
+    let mut object = Map::new();
+    object.insert("handler".to_string(), json!("vars"));
+    if !args.is_empty() {
+        let [name, value] = args else {
+            return Err(adapter_error(
+                directive.position,
+                "`vars` requires a name and a value",
+            ));
+        };
+        object.insert(name.clone(), scalar_json(value));
+    }
+    for item in &directive.block {
+        if !item.block.is_empty() || item.args.len() != 1 {
+            return Err(adapter_error(
+                item.position,
+                "`vars` block entries require a name and a value",
+            ));
+        }
+        object.insert(item.name.clone(), scalar_json(&item.args[0]));
+    }
+    Ok(Value::Object(object))
+}
+
+/// `caddyfile.Dispenser.ScalarVal` for a token whose quotedness is no longer tracked.
+fn scalar_json(text: &str) -> Value {
+    if let Ok(value) = text.parse::<i64>() {
+        return json!(value);
+    }
+    if let Ok(value) = text.parse::<f64>() {
+        return json!(value);
+    }
+    if text == "true" {
+        return json!(true);
+    }
+    if text == "false" {
+        return json!(false);
+    }
+    json!(text)
+}
+
+/// Names invoked by a directive list, recursively.
+fn collect_invoke_names(directives: &[Directive], out: &mut Vec<String>) {
+    for directive in directives {
+        if directive.name == "invoke" {
+            if let Some(name) = directive.args.first() {
+                if !out.contains(name) {
+                    out.push(name.clone());
+                }
+            }
+        }
+        collect_invoke_names(&directive.block, out);
+    }
+}
+
+/// Build the JSON route for a `&(name) { ... }` definition, following Caddy's
+/// `extractNamedRoutes` simplification for a single matcher-less route.
+fn build_named_route(
+    named: &parser::NamedRoute,
+    warnings: &mut Vec<String>,
+) -> caddy_rs_core::Result<Value> {
+    let matchers = collect_matchers(&named.directives)?;
+    let routes = build_routes(&named.directives, &matchers, true, true, warnings)?;
+    if routes.len() == 1 && routes[0].get("match").is_none() {
+        // Caddy keeps only the first handler of a single matcher-less route here.
+        let first_handler = routes[0]
+            .get("handle")
+            .and_then(Value::as_array)
+            .and_then(|handlers| handlers.first())
+            .cloned()
+            .unwrap_or_else(|| json!({"handler": "subroute"}));
+        Ok(json!({"handle": [first_handler]}))
+    } else {
+        Ok(json!({"handle": [{"handler": "subroute", "routes": routes}]}))
+    }
 }
 
 fn respond_handler(directive: &Directive, args: &[String]) -> caddy_rs_core::Result<Value> {
