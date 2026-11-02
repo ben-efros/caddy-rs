@@ -76,20 +76,15 @@ impl ClientAuthMode {
 }
 
 /// TLS protocol versions a listener may negotiate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum TlsVersions {
     /// TLS 1.2 and TLS 1.3 (rustls safe defaults, matching Caddy's defaults).
+    #[default]
     Default,
     /// TLS 1.2 only.
     Tls12Only,
     /// TLS 1.3 only.
     Tls13Only,
-}
-
-impl Default for TlsVersions {
-    fn default() -> Self {
-        Self::Default
-    }
 }
 
 const TLS12_AND_13: &[&SupportedProtocolVersion] =
