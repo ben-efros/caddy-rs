@@ -29,6 +29,10 @@
 //!
 //! # Provisioning
 //!
+//! Issuers configured with `trusted_roots_pem_files` (emitted from Caddy's `acme_ca_root`) get a
+//! transport that trusts exactly those PEM roots for the CA HTTPS connection; unreadable/empty
+//! files fail the generation loudly and explicit roots never fall back to the platform bundle.
+//!
 //! [`AutomaticHttpsProvisioner`] loads already-valid certificates from [`CertificateStorage`],
 //! then obtains every missing subject through the policy's issuer: ACME ([`AcmeIssuer`], HTTP-01
 //! via the shared [`Http01TokenStore`], or the configured DNS-01 provider) or the local internal
@@ -1018,6 +1022,28 @@ async fn cached_internal_issuer(
     Ok(issuer)
 }
 
+/// Build the transport for one ACME issuer configuration.
+///
+/// Caddy's `trusted_roots_pem_files` (emitted from `acme_ca_root`) replaces the platform trust
+/// store for the ACME CA connection; the roots are read eagerly so a bad path fails the
+/// generation instead of silently falling back to platform roots. Without explicit roots the
+/// provisioner's transport is used unchanged (production: the platform bundle).
+fn acme_transport_for_config(
+    config: &AcmeIssuerConfig,
+    transport: &Arc<dyn AcmeTransport>,
+) -> Result<Arc<dyn AcmeTransport>> {
+    if !config.has_trusted_roots() {
+        return Ok(Arc::clone(transport));
+    }
+    let roots = config.read_trusted_roots()?;
+    transport.with_trusted_roots(roots).map_err(|error| {
+        Error::Issuer(format!(
+            "automatic HTTPS: cannot apply trusted roots for ACME CA `{}`: {error}",
+            config.ca
+        ))
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn obtain_acme_certificate(
     config: &AcmeIssuerConfig,
@@ -1029,10 +1055,11 @@ pub(crate) async fn obtain_acme_certificate(
     clock: &Arc<dyn AcmeClock>,
     poll_policy: &PollPolicy,
 ) -> Result<Certificate> {
+    let transport = acme_transport_for_config(config, transport)?;
     let account_storage: Arc<dyn AcmeStorage> = Arc::new(FileStorage::new(&root));
     let issuer = AcmeIssuer::new(
         config.clone(),
-        Arc::clone(transport),
+        Arc::clone(&transport),
         account_storage,
         Box::new(FileStorage::new(&root)),
     )
@@ -1041,7 +1068,7 @@ pub(crate) async fn obtain_acme_certificate(
         tls_alpn01_tokens,
     ))))
     // Configuration alone selects DNS-01 when `challenges.dns` names a provider.
-    .with_configured_dns_solver(Arc::clone(transport))?
+    .with_configured_dns_solver(Arc::clone(&transport))?
     .with_clock(Arc::clone(clock))
     .with_poll_policy(poll_policy.clone());
     issuer
@@ -1161,13 +1188,26 @@ pub fn subjects_by_policy(plan: &AutomaticHttpsPlan) -> BTreeMap<String, Option<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acme::{HttpMethod, HttpRequest, HttpResponse, MemoryAcmeStorage};
+    use crate::acme::transport::parse_pem_certificates;
+    use crate::acme::{
+        AcmeTransport, HttpMethod, HttpRequest, HttpResponse, HyperTransport, MemoryAcmeStorage,
+    };
     use crate::renewal::ManualClock;
     use crate::solver::Http01TokenStore;
     use async_trait::async_trait;
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine as _;
+    use bytes::Bytes;
+    use http_body_util::{BodyExt, Full};
+    use hyper::service::service_fn;
+    use hyper::{Response as HyperResponse, StatusCode};
+    use hyper_util::rt::TokioIo;
     use serde_json::json;
+    use std::path::PathBuf;
     use std::sync::Mutex;
     use std::time::Duration;
+    use tokio::net::TcpListener;
+    use tokio_rustls::TlsAcceptor;
 
     fn config(value: Value) -> Config {
         Config::from_value(value).expect("config decodes")
@@ -1345,6 +1385,24 @@ mod tests {
     }
 
     #[test]
+    fn plan_retains_trusted_roots_for_acme_issuer() {
+        let mut value = serde_json::to_value(https_config()).unwrap();
+        value["apps"]["tls"]["automation"]["policies"][0]["issuers"][0]
+            ["trusted_roots_pem_files"] = json!(["/etc/ssl/private/test-ca.pem"]);
+        let plan = plan(&Config::from_value(value).unwrap()).unwrap().unwrap();
+        match &plan.policy_for("www.example.com").unwrap().issuer {
+            AutomaticHttpsIssuer::Acme(config) => {
+                assert!(config.has_trusted_roots());
+                assert_eq!(
+                    config.trusted_roots_pem_files,
+                    vec![PathBuf::from("/etc/ssl/private/test-ca.pem")]
+                );
+            }
+            other => panic!("unexpected issuer: {other:?}"),
+        }
+    }
+
+    #[test]
     fn plan_respects_disable_redirects_and_skip() {
         let mut value = serde_json::to_value(https_config()).unwrap();
         value["apps"]["http"]["servers"]["srv0"]["automatic_https"] =
@@ -1462,6 +1520,7 @@ mod tests {
         finalize_seen: Mutex<bool>,
         fail_new_order: Mutex<bool>,
         renewed_certificate: Mutex<bool>,
+        base_url: Mutex<String>,
     }
 
     #[derive(Clone, Default, Debug)]
@@ -1482,6 +1541,11 @@ mod tests {
         fn set_renewed_certificate(&self, renewed: bool) {
             *self.inner.renewed_certificate.lock().unwrap() = renewed;
         }
+
+        /// Point the fake CA's advertised URLs at a local server (used by the real-TLS test).
+        fn set_base_url(&self, base_url: impl Into<String>) {
+            *self.inner.base_url.lock().unwrap() = base_url.into();
+        }
     }
 
     fn response(status: u16, body: Value) -> HttpResponse {
@@ -1495,12 +1559,20 @@ mod tests {
         async fn request(&self, request: HttpRequest) -> Result<HttpResponse> {
             self.inner.requests.lock().unwrap().push(request.clone());
             let url = request.url.clone();
+            let base = {
+                let configured = self.inner.base_url.lock().unwrap().clone();
+                if configured.is_empty() {
+                    "https://acme.test".to_string()
+                } else {
+                    configured
+                }
+            };
             let body = if request.method == HttpMethod::Get && url.ends_with("/directory") {
                 json!({
-                    "newNonce": "https://acme.test/new-nonce",
-                    "newAccount": "https://acme.test/new-account",
-                    "newOrder": "https://acme.test/new-order",
-                    "revokeCert": "https://acme.test/revoke"
+                    "newNonce": format!("{base}/new-nonce"),
+                    "newAccount": format!("{base}/new-account"),
+                    "newOrder": format!("{base}/new-order"),
+                    "revokeCert": format!("{base}/revoke")
                 })
             } else if url.ends_with("/new-account") {
                 json!({"status": "valid", "contact": ["mailto:ops@example.com"]})
@@ -1518,31 +1590,31 @@ mod tests {
                     .with_header("Replay-Nonce", "nonce"));
                 }
                 json!({"status": "pending",
-                       "authorizations": ["https://acme.test/authz/1"],
-                       "finalize": "https://acme.test/finalize/1"})
+                       "authorizations": [format!("{base}/authz/1")],
+                       "finalize": format!("{base}/finalize/1")})
             } else if url.ends_with("/authz/1") {
                 let acked = *self.inner.challenge_acked.lock().unwrap();
                 if acked {
                     json!({"status": "valid", "identifier": {"type": "dns", "value": "example.com"}, "challenges": []})
                 } else {
                     json!({"status": "pending", "identifier": {"type": "dns", "value": "example.com"},
-                           "challenges": [{"type": "http-01", "url": "https://acme.test/challenge/1", "token": "tok", "status": "pending"}]})
+                           "challenges": [{"type": "http-01", "url": format!("{base}/challenge/1"), "token": "tok", "status": "pending"}]})
                 }
             } else if url.ends_with("/challenge/1") {
                 *self.inner.challenge_acked.lock().unwrap() = true;
-                json!({"type": "http-01", "url": "https://acme.test/challenge/1", "token": "tok", "status": "processing"})
+                json!({"type": "http-01", "url": format!("{base}/challenge/1"), "token": "tok", "status": "processing"})
             } else if url.ends_with("/finalize/1") {
                 *self.inner.finalize_seen.lock().unwrap() = true;
                 json!({"status": "processing"})
             } else if url.ends_with("/order/1") {
                 if *self.inner.finalize_seen.lock().unwrap() {
-                    json!({"status": "valid", "certificate": "https://acme.test/cert/1",
-                           "authorizations": ["https://acme.test/authz/1"],
-                           "finalize": "https://acme.test/finalize/1"})
+                    json!({"status": "valid", "certificate": format!("{base}/cert/1"),
+                           "authorizations": [format!("{base}/authz/1")],
+                           "finalize": format!("{base}/finalize/1")})
                 } else {
                     json!({"status": "ready",
-                           "authorizations": ["https://acme.test/authz/1"],
-                           "finalize": "https://acme.test/finalize/1"})
+                           "authorizations": [format!("{base}/authz/1")],
+                           "finalize": format!("{base}/finalize/1")})
                 }
             } else if url.ends_with("/cert/1") {
                 let renewed = *self.inner.renewed_certificate.lock().unwrap();
@@ -1561,10 +1633,10 @@ mod tests {
                 200
             };
             if url.ends_with("/new-account") {
-                response = response.with_header("Location", "https://acme.test/account/1");
+                response = response.with_header("Location", format!("{base}/account/1"));
             }
             if url.ends_with("/new-order") {
-                response = response.with_header("Location", "https://acme.test/order/1");
+                response = response.with_header("Location", format!("{base}/order/1"));
             }
             Ok(response)
         }
@@ -2104,6 +2176,320 @@ mod tests {
         assert_eq!(
             ca_after[0].root_der, ca_before[0].root_der,
             "internal leaf renewal reuses the local CA"
+        );
+    }
+
+    // ---- native trusted roots over real TLS ------------------------------------------------
+
+    const ACME_TLS_CERT_PEM: &str = include_str!("../testdata/acme/localhost-cert.pem");
+    const ACME_TLS_KEY_PEM: &str = include_str!("../testdata/acme/localhost-key.pem");
+    const UNRELATED_ACME_ROOT_PEM: &str = include_str!("../testdata/acme/unrelated-cert.pem");
+
+    fn pem_block_der(pem: &str, label: &str) -> Vec<u8> {
+        let begin = format!("-----BEGIN {label}-----");
+        let end = format!("-----END {label}-----");
+        let mut inside = false;
+        let mut base64 = String::new();
+        for line in pem.lines() {
+            let line = line.trim();
+            if line == begin {
+                inside = true;
+            } else if line == end {
+                inside = false;
+            } else if inside {
+                base64.push_str(line);
+            }
+        }
+        STANDARD.decode(base64.as_bytes()).unwrap()
+    }
+
+    /// Serve the scripted fake ACME CA over real HTTPS on 127.0.0.1, with its advertised URLs
+    /// pointing back at the local server. Returns the bound port.
+    fn spawn_tls_acme_server(fake: FakeAcme) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        fake.set_base_url(format!("https://127.0.0.1:{port}"));
+        let listener = TcpListener::from_std(listener).unwrap();
+        let certificates = parse_pem_certificates(ACME_TLS_CERT_PEM.as_bytes()).unwrap();
+        let key = pem_block_der(ACME_TLS_KEY_PEM, "PRIVATE KEY");
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                certificates,
+                rustls::pki_types::PrivatePkcs8KeyDer::from(key).into(),
+            )
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let acceptor = acceptor.clone();
+                let fake = fake.clone();
+                tokio::spawn(async move {
+                    let Ok(stream) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let service =
+                        service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
+                            let fake = fake.clone();
+                            async move {
+                                let (parts, body) = request.into_parts();
+                                let body = body
+                                    .collect()
+                                    .await
+                                    .map(|collected| collected.to_bytes().to_vec())
+                                    .unwrap_or_default();
+                                let path = parts
+                                    .uri
+                                    .path_and_query()
+                                    .map(|path| path.as_str())
+                                    .unwrap_or("/");
+                                let url = format!("https://127.0.0.1:{port}{path}");
+                                let method = match parts.method {
+                                    hyper::Method::GET => HttpMethod::Get,
+                                    hyper::Method::HEAD => HttpMethod::Head,
+                                    hyper::Method::POST => HttpMethod::Post,
+                                    hyper::Method::DELETE => HttpMethod::Delete,
+                                    _ => HttpMethod::Post,
+                                };
+                                let headers = parts
+                                    .headers
+                                    .iter()
+                                    .map(|(name, value)| {
+                                        (
+                                            name.to_string(),
+                                            value.to_str().unwrap_or_default().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                let request = HttpRequest {
+                                    method,
+                                    url,
+                                    headers,
+                                    body,
+                                };
+                                let response = match fake.request(request).await {
+                                    Ok(response) => response,
+                                    Err(error) => {
+                                        return Ok::<_, std::convert::Infallible>(
+                                            HyperResponse::builder()
+                                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                .body(Full::new(Bytes::from(error.to_string())))
+                                                .unwrap(),
+                                        );
+                                    }
+                                };
+                                let mut builder = HyperResponse::builder().status(
+                                    StatusCode::from_u16(response.status)
+                                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                                );
+                                for (name, value) in &response.headers {
+                                    builder = builder.header(name.as_str(), value.as_str());
+                                }
+                                Ok::<_, std::convert::Infallible>(
+                                    builder.body(Full::new(Bytes::from(response.body))).unwrap(),
+                                )
+                            }
+                        });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        port
+    }
+
+    fn local_acme_config(port: u16, trusted_roots: Option<PathBuf>) -> Config {
+        let mut value = serde_json::to_value(https_config()).unwrap();
+        value["apps"]["tls"]["automation"]["policies"][0]["issuers"][0]["ca"] =
+            json!(format!("https://127.0.0.1:{port}/directory"));
+        if let Some(root) = trusted_roots {
+            value["apps"]["tls"]["automation"]["policies"][0]["issuers"][0]
+                ["trusted_roots_pem_files"] = json!([root]);
+        }
+        Config::from_value(value).unwrap()
+    }
+
+    #[tokio::test]
+    async fn provisioner_honors_configured_trusted_roots_over_real_tls() {
+        let fake = FakeAcme::default();
+        let port = spawn_tls_acme_server(fake.clone());
+        let directory = tempfile::tempdir().unwrap();
+        let root_file = directory.path().join("acme-ca.pem");
+        std::fs::write(&root_file, ACME_TLS_CERT_PEM).unwrap();
+        let mut plan = plan(&local_acme_config(port, Some(root_file)))
+            .unwrap()
+            .expect("plan exists");
+        plan.subjects = vec!["www.example.com".to_string()];
+        // Start from a transport that trusts only an unrelated root: success is only possible if
+        // the configured trusted_roots_pem_files replace that store.
+        let base: Arc<dyn AcmeTransport> = Arc::new(
+            HyperTransport::with_root_certificates(
+                parse_pem_certificates(UNRELATED_ACME_ROOT_PEM.as_bytes()).unwrap(),
+            )
+            .unwrap(),
+        );
+        let provisioner = AutomaticHttpsProvisioner::new(
+            base,
+            directory.path(),
+            Arc::new(Http01TokenStore::new()),
+        )
+        .with_renewal_scheduler(false);
+        let result = provisioner
+            .provision(&plan, None)
+            .await
+            .expect("real-TLS ACME issuance with configured trusted roots");
+        assert_eq!(result.issued.len(), 1);
+        assert!(result.resolver.covers("www.example.com"));
+        let requests = fake.inner.requests.lock().unwrap();
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.url.ends_with("/directory")),
+            "the ACME client must have fetched the directory over real TLS"
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.url.contains("/new-order")),
+            "the ACME order flow must have run over real TLS"
+        );
+    }
+
+    #[tokio::test]
+    async fn renewal_uses_configured_trusted_roots_over_real_tls() {
+        let fake = FakeAcme::default();
+        let port = spawn_tls_acme_server(fake.clone());
+        let directory = tempfile::tempdir().unwrap();
+        let root_file = directory.path().join("acme-ca.pem");
+        std::fs::write(&root_file, ACME_TLS_CERT_PEM).unwrap();
+        let mut plan = plan(&local_acme_config(port, Some(root_file)))
+            .unwrap()
+            .expect("plan exists");
+        plan.subjects = vec!["www.example.com".to_string()];
+        let clock = Arc::new(ManualClock::new(renewal_start()));
+        let base: Arc<dyn AcmeTransport> = Arc::new(
+            HyperTransport::with_root_certificates(
+                parse_pem_certificates(UNRELATED_ACME_ROOT_PEM.as_bytes()).unwrap(),
+            )
+            .unwrap(),
+        );
+        let provisioner = AutomaticHttpsProvisioner::new(
+            base,
+            directory.path(),
+            Arc::new(Http01TokenStore::new()),
+        )
+        .with_renewal_clock(clock.clone())
+        .with_renewal_policy(renewal_test_policy())
+        .with_renewal_scheduler(false);
+        let result = provisioner
+            .provision(&plan, None)
+            .await
+            .expect("initial issuance with configured trusted roots");
+        let issued = result.issued[0].clone();
+        let renewals = result.renewals.expect("renewal scheduler");
+        fake.set_renewed_certificate(true);
+        clock.set(renewal_due(&issued) + Duration::from_secs(1));
+        let outcomes = renewals.run_once(clock.now()).await;
+        assert!(
+            outcomes[0].is_renewed(),
+            "renewal must use the configured roots: {outcomes:?}"
+        );
+        let managed = renewals.managed_certificates();
+        assert_eq!(managed.len(), 1);
+        assert!(managed[0].not_after > issued.not_after);
+    }
+
+    #[tokio::test]
+    async fn provisioner_rejects_acme_tls_without_configured_trusted_roots() {
+        let fake = FakeAcme::default();
+        let port = spawn_tls_acme_server(fake.clone());
+        let directory = tempfile::tempdir().unwrap();
+        let mut plan = plan(&local_acme_config(port, None)).unwrap().unwrap();
+        plan.subjects = vec!["www.example.com".to_string()];
+        let base: Arc<dyn AcmeTransport> = Arc::new(
+            HyperTransport::with_root_certificates(
+                parse_pem_certificates(UNRELATED_ACME_ROOT_PEM.as_bytes()).unwrap(),
+            )
+            .unwrap(),
+        );
+        let provisioner = AutomaticHttpsProvisioner::new(
+            base,
+            directory.path(),
+            Arc::new(Http01TokenStore::new()),
+        )
+        .with_renewal_scheduler(false);
+        let error = provisioner.provision(&plan, None).await.unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("invalid peer certificate") || message.contains("UnknownIssuer"),
+            "expected a TLS trust failure without configured roots, got: {message}"
+        );
+        assert!(
+            fake.inner.requests.lock().unwrap().is_empty(),
+            "no ACME request may reach an untrusted CA"
+        );
+    }
+
+    #[tokio::test]
+    async fn provisioner_fails_loudly_when_transport_cannot_reconfigure_trust() {
+        let directory = tempfile::tempdir().unwrap();
+        let root_file = directory.path().join("ca.pem");
+        std::fs::write(&root_file, ACME_TLS_CERT_PEM).unwrap();
+        let mut plan = plan(&local_acme_config(18443, Some(root_file)))
+            .unwrap()
+            .unwrap();
+        plan.subjects = vec!["www.example.com".to_string()];
+        // A scripted test transport has no TLS stack to reconfigure; it must error rather than
+        // silently keep trusting the platform store.
+        let fake = Arc::new(FakeAcme::default());
+        let provisioner = AutomaticHttpsProvisioner::new(
+            fake.clone(),
+            directory.path(),
+            Arc::new(Http01TokenStore::new()),
+        )
+        .with_renewal_scheduler(false);
+        let error = provisioner.provision(&plan, None).await.unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("does not support explicit trusted roots"),
+            "expected a loud transport error, got: {message}"
+        );
+        assert!(fake.inner.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn provisioner_fails_loudly_for_missing_trusted_root_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing-ca.pem");
+        let mut plan = plan(&local_acme_config(18443, Some(missing.clone())))
+            .unwrap()
+            .unwrap();
+        plan.subjects = vec!["www.example.com".to_string()];
+        let fake = Arc::new(FakeAcme::default());
+        let provisioner = AutomaticHttpsProvisioner::new(
+            fake.clone(),
+            directory.path(),
+            Arc::new(Http01TokenStore::new()),
+        )
+        .with_renewal_scheduler(false);
+        let error = provisioner.provision(&plan, None).await.unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains(missing.to_string_lossy().as_ref()),
+            "error must name the bad trusted-roots path: {message}"
+        );
+        assert!(message.contains("cannot read"), "{message}");
+        assert!(
+            fake.inner.requests.lock().unwrap().is_empty(),
+            "no ACME request may be attempted when explicit roots cannot be loaded"
         );
     }
 }

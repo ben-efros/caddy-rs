@@ -24,14 +24,15 @@ pub mod tls_alpn;
 pub mod tls_server;
 
 pub use acme::{
-    account_paths, parse_pem_certificate_chain, parse_retry_after, retry_after, Account,
-    AccountKey, AccountPaths, AccountRegistration, AccountStatus, AccountStore, AcmeAccountClient,
-    AcmeClient, AcmeClock, AcmeError, AcmeStorage, AcmeTransport, Authorization,
-    AuthorizationFetch, AuthorizationStatus, CertificateRequest, Challenge, ChallengeFetch,
-    ChallengePolicy, ChallengeStatus, ChallengeType, Directory, DirectoryMeta, ExternalAccount,
-    HttpMethod, HttpRequest, HttpResponse, HyperTransport, Identifier, IssuedCertificate, Jwk,
-    MemoryAcmeStorage, NewAccountRequest, NewOrderRequest, Order, OrderFetch, OrderHandle,
-    OrderStatus, PollPolicy, Problem, StoredAccount, TokioClock,
+    account_paths, parse_pem_certificate_chain, parse_retry_after,
+    read_root_certificates_pem_files, retry_after, Account, AccountKey, AccountPaths,
+    AccountRegistration, AccountStatus, AccountStore, AcmeAccountClient, AcmeClient, AcmeClock,
+    AcmeError, AcmeStorage, AcmeTransport, Authorization, AuthorizationFetch, AuthorizationStatus,
+    CertificateRequest, Challenge, ChallengeFetch, ChallengePolicy, ChallengeStatus, ChallengeType,
+    Directory, DirectoryMeta, ExternalAccount, HttpMethod, HttpRequest, HttpResponse,
+    HyperTransport, Identifier, IssuedCertificate, Jwk, MemoryAcmeStorage, NewAccountRequest,
+    NewOrderRequest, Order, OrderFetch, OrderHandle, OrderStatus, PollPolicy, Problem,
+    StoredAccount, TokioClock,
 };
 pub use automatic_https::{
     plan as plan_automatic_https, AutomaticHttpsIssuer, AutomaticHttpsPlan, AutomaticHttpsPolicy,

@@ -35,6 +35,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use rustls::pki_types::CertificateDer;
 
 use crate::acme::{
     AccountRegistration, AcmeAccountClient, AcmeClient, AcmeClock, AcmeStorage, AcmeTransport,
@@ -96,6 +97,10 @@ pub struct AcmeIssuerConfig {
     pub account_key_pem: Option<String>,
     /// CA-provided external account binding credentials (Caddy's `external_account`).
     pub external_account: Option<crate::acme::ExternalAccount>,
+    /// PEM bundle files used to verify the ACME CA's HTTPS certificate (Caddy's
+    /// `trusted_roots_pem_files`, emitted from `acme_ca_root`). When non-empty these roots
+    /// **replace** the platform trust store for ACME connections, matching certmagic.
+    pub trusted_roots_pem_files: Vec<PathBuf>,
     /// Preferred certificate chains.
     pub preferred_chains: Vec<String>,
     /// DNS challenge provider module name, if any.
@@ -120,6 +125,7 @@ impl Default for AcmeIssuerConfig {
             email: None,
             account_key_pem: None,
             external_account: None,
+            trusted_roots_pem_files: Vec::new(),
             preferred_chains: Vec::new(),
             dns_provider: None,
             dns_challenge: None,
@@ -160,6 +166,8 @@ impl AcmeIssuerConfig {
                 })
             })
             .transpose()?;
+        config.trusted_roots_pem_files =
+            parse_trusted_roots_pem_files(object.get("trusted_roots_pem_files"))?;
         config.preferred_chains = object
             .get("preferred_chains")
             .and_then(|chains| chains.get("smallest"))
@@ -197,6 +205,57 @@ impl AcmeIssuerConfig {
         }
         Ok(config)
     }
+
+    /// Whether explicit ACME trust roots were configured.
+    pub fn has_trusted_roots(&self) -> bool {
+        !self.trusted_roots_pem_files.is_empty()
+    }
+
+    /// Read the configured trusted roots into DER certificates.
+    ///
+    /// Returns an empty vector when no explicit roots are configured. With explicit roots every
+    /// file must exist and contain at least one certificate: errors are located and there is no
+    /// silent fallback to the platform trust store.
+    pub fn read_trusted_roots(&self) -> Result<Vec<CertificateDer<'static>>> {
+        if self.trusted_roots_pem_files.is_empty() {
+            return Ok(Vec::new());
+        }
+        crate::acme::read_root_certificates_pem_files(&self.trusted_roots_pem_files).map_err(
+            |error| {
+                Error::Issuer(format!(
+                    "invalid trusted roots for ACME CA `{}`: {error}",
+                    self.ca
+                ))
+            },
+        )
+    }
+}
+
+/// Parse Caddy's `trusted_roots_pem_files` JSON array into paths.
+fn parse_trusted_roots_pem_files(value: Option<&serde_json::Value>) -> Result<Vec<PathBuf>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let array = value.as_array().ok_or_else(|| {
+        Error::Issuer(
+            "invalid `trusted_roots_pem_files`: expected an array of PEM file paths".to_string(),
+        )
+    })?;
+    let mut paths = Vec::with_capacity(array.len());
+    for (index, entry) in array.iter().enumerate() {
+        let path = entry.as_str().ok_or_else(|| {
+            Error::Issuer(format!(
+                "invalid `trusted_roots_pem_files[{index}]`: expected a string path"
+            ))
+        })?;
+        if path.trim().is_empty() {
+            return Err(Error::Issuer(format!(
+                "invalid `trusted_roots_pem_files[{index}]`: path is empty"
+            )));
+        }
+        paths.push(PathBuf::from(path));
+    }
+    Ok(paths)
 }
 
 /// The ACME issuer: account management, order flow, challenge solving and certificate storage.
@@ -229,6 +288,10 @@ impl<T: AcmeTransport> AcmeIssuer<T> {
     /// [`AcmeIssuer::http01_token_store`]) and a TLS-ALPN-01 solver (see
     /// [`AcmeIssuer::tls_alpn01_token_store`]). Attach DNS-01 with
     /// [`AcmeIssuer::with_dns01_solver`].
+    ///
+    /// This constructor takes the transport as given; `config.trusted_roots_pem_files` is not
+    /// applied here. Use [`AcmeIssuer::from_config`] for production wiring or pass a transport
+    /// built with explicit roots (automatic HTTPS does this per issuer policy).
     pub fn new(
         config: AcmeIssuerConfig,
         transport: T,
@@ -527,11 +590,18 @@ impl<T: AcmeTransport> AcmeIssuer<T> {
 }
 
 impl AcmeIssuer<HyperTransport> {
-    /// Production wiring: use the platform trust store for the ACME transport and Caddy's
-    /// data-directory `<root>` for account material and certificate storage.
+    /// Production wiring using Caddy's data-directory `<root>` for account material and
+    /// certificate storage.
+    ///
+    /// The transport trusts the CA's configured `trusted_roots_pem_files` when present (replacing
+    /// the platform bundle, matching certmagic) and otherwise uses the platform trust store.
     pub fn from_config(config: AcmeIssuerConfig, root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
-        let transport = HyperTransport::new()?;
+        let transport = if config.has_trusted_roots() {
+            HyperTransport::with_root_certificates_pem_files(&config.trusted_roots_pem_files)?
+        } else {
+            HyperTransport::new()?
+        };
         let account_storage: Arc<dyn AcmeStorage> =
             Arc::new(crate::storage::FileStorage::new(&root));
         let certificate_storage: Box<dyn CertificateStorage> =
@@ -1763,5 +1833,94 @@ mod tests {
         // The error-propagations tests above assert `Error::Acme`; this keeps the type referenced.
         let error: Error = AcmeError::AccountKey("test".to_string()).into();
         assert!(matches!(error, Error::Acme(_)));
+    }
+
+    #[test]
+    fn parses_trusted_roots_pem_files_from_issuer_json() {
+        let config = AcmeIssuerConfig::from_json(&serde_json::json!({
+            "module": "acme",
+            "ca": "https://ca.test/directory",
+            "trusted_roots_pem_files": ["/etc/ssl/private/ca.pem", "relative/ca.pem"]
+        }))
+        .unwrap();
+        assert!(config.has_trusted_roots());
+        assert_eq!(
+            config.trusted_roots_pem_files,
+            vec![
+                PathBuf::from("/etc/ssl/private/ca.pem"),
+                PathBuf::from("relative/ca.pem")
+            ]
+        );
+
+        let default = AcmeIssuerConfig::from_json(&serde_json::json!({"module": "acme"})).unwrap();
+        assert!(!default.has_trusted_roots());
+        assert!(default.read_trusted_roots().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rejects_malformed_trusted_roots_config() {
+        let error = AcmeIssuerConfig::from_json(&serde_json::json!({
+            "trusted_roots_pem_files": "/etc/ca.pem"
+        }))
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("expected an array of PEM file paths"),
+            "{error}"
+        );
+
+        let error = AcmeIssuerConfig::from_json(&serde_json::json!({
+            "trusted_roots_pem_files": [42]
+        }))
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("expected a string path"),
+            "{error}"
+        );
+
+        let error = AcmeIssuerConfig::from_json(&serde_json::json!({
+            "trusted_roots_pem_files": [""]
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("path is empty"), "{error}");
+    }
+
+    #[test]
+    fn reading_missing_trusted_roots_fails_without_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("does-not-exist.pem");
+        let config = AcmeIssuerConfig {
+            ca: "https://ca.test/directory".to_string(),
+            trusted_roots_pem_files: vec![missing.clone()],
+            ..AcmeIssuerConfig::default()
+        };
+        let error = config.read_trusted_roots().unwrap_err().to_string();
+        assert!(
+            error.contains(missing.to_string_lossy().as_ref()),
+            "error must name the configured path: {error}"
+        );
+        assert!(error.contains("cannot read"), "{error}");
+        assert!(
+            error.contains("https://ca.test/directory"),
+            "error must name the ACME CA: {error}"
+        );
+    }
+
+    #[test]
+    fn reads_trusted_roots_from_pem_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let root_file = directory.path().join("root.pem");
+        std::fs::write(
+            &root_file,
+            include_str!("../testdata/acme/localhost-cert.pem"),
+        )
+        .unwrap();
+        let config = AcmeIssuerConfig {
+            trusted_roots_pem_files: vec![root_file],
+            ..AcmeIssuerConfig::default()
+        };
+        let roots = config.read_trusted_roots().unwrap();
+        assert_eq!(roots.len(), 1);
     }
 }
