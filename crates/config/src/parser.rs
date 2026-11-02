@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use crate::lexer::{lex, LexError, Position, Token, TokenKind};
 
 /// A parsed Caddyfile.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Caddyfile {
     /// Global options block, if present.
     pub options: GlobalOptions,
@@ -45,7 +45,7 @@ pub struct Caddyfile {
 }
 
 /// Global options supported by the adapter.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct GlobalOptions {
     /// Automatic HTTPS mode from `auto_https`.
     pub auto_https: Option<AutoHttpsMode>,
@@ -63,6 +63,8 @@ pub struct GlobalOptions {
     pub acme_dns: Option<DnsProvider>,
     /// Use Caddy's internal CA for certificates (`local_certs`).
     pub local_certs: bool,
+    /// Certificate authorities defined by the global `pki` option (`apps.pki` in JSON).
+    pub pki: Option<PkiOptions>,
     /// Non-fatal notes produced while preprocessing the Caddyfile (environment-placeholder
     /// expansion) and while reading options. Adapters surface these to callers.
     pub warnings: Vec<String>,
@@ -76,6 +78,53 @@ pub struct DnsProvider {
     pub name: String,
     /// Remaining arguments on the line (provider-specific).
     pub args: Vec<String>,
+}
+
+/// Certificate authorities defined by the global `pki` option.
+///
+/// Mirrors Caddy's `pki` global option (`caddyconfig/httpcaddyfile/pkiapp.go`): one or more `ca`
+/// blocks, each keyed by an ID (`local` when unspecified). Caddy's Caddyfile syntax does not offer
+/// `install_trust`; it is available in the JSON model only (`skip_install_trust` is a separate
+/// global option that this build rejects loudly).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PkiOptions {
+    /// Certificate authorities in source order; an ID repeated later replaces the earlier CA,
+    /// matching Caddy's map assignment.
+    pub certificate_authorities: Vec<PkiCertificateAuthority>,
+}
+
+/// One `ca` block of the global `pki` option.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PkiCertificateAuthority {
+    /// Config-facing ID (the `ca [<id>]` argument; `local` when omitted).
+    pub id: String,
+    /// User-facing name (`name`).
+    pub name: Option<String>,
+    /// Root certificate Common Name (`root_cn`).
+    pub root_common_name: Option<String>,
+    /// Intermediate certificate Common Name (`intermediate_cn`).
+    pub intermediate_common_name: Option<String>,
+    /// Intermediate lifetime in nanoseconds (`intermediate_lifetime`).
+    pub intermediate_lifetime_ns: Option<i64>,
+    /// Renewal maintenance interval in nanoseconds (`maintenance_interval`).
+    pub maintenance_interval_ns: Option<i64>,
+    /// Renewal window ratio in (0, 1] (`renewal_window_ratio`).
+    pub renewal_window_ratio: Option<f64>,
+    /// Explicit root certificate/key (`root { ... }`).
+    pub root: Option<PkiKeyPairConfig>,
+    /// Explicit intermediate certificate/key (`intermediate { ... }`).
+    pub intermediate: Option<PkiKeyPairConfig>,
+}
+
+/// Explicit certificate/key pair of a PKI CA (`root` / `intermediate` block).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PkiKeyPairConfig {
+    /// Certificate path or inline value (`cert`).
+    pub certificate: Option<String>,
+    /// Private key path or inline value (`key`).
+    pub private_key: Option<String>,
+    /// Format (`format`); Caddy supports `pem_file`.
+    pub format: Option<String>,
 }
 
 /// `auto_https` modes.
@@ -1563,6 +1612,9 @@ fn read_global_options(directives: Vec<Directive>) -> Result<GlobalOptions, Pars
                     args: directive.args[1..].to_vec(),
                 });
             }
+            "pki" => {
+                options.pki = Some(parse_pki_option(&directive)?);
+            }
             "local_certs" => {
                 if !directive.args.is_empty() || !directive.block.is_empty() {
                     return Err(ParseError::syntax(
@@ -1586,6 +1638,206 @@ fn read_global_options(directives: Vec<Directive>) -> Result<GlobalOptions, Pars
         }
     }
     Ok(options)
+}
+
+/// Parse the global `pki { ca [<id>] { ... } }` option into [`PkiOptions`].
+///
+/// Mirrors Caddy's `parsePKIApp`: every `ca` block becomes a certificate authority, defaulting to
+/// the `local` ID; repeated IDs replace earlier definitions (Caddy assigns into a map).
+fn parse_pki_option(directive: &Directive) -> Result<PkiOptions, ParseError> {
+    if !directive.args.is_empty() {
+        return Err(ParseError::syntax(
+            directive.position,
+            "global option `pki` does not take arguments; write `pki { ca [<id>] { ... } }`",
+        ));
+    }
+    let mut authorities: Vec<PkiCertificateAuthority> = Vec::new();
+    for item in &directive.block {
+        if item.name != "ca" {
+            return Err(ParseError::syntax(
+                item.position,
+                format!("unrecognized pki option `{}`", item.name),
+            ));
+        }
+        if item.args.len() > 1 {
+            return Err(ParseError::syntax(
+                item.position,
+                "`pki ca` takes at most one certificate authority ID",
+            ));
+        }
+        let id = item
+            .args
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "local".to_string());
+        if id.trim().is_empty() {
+            return Err(ParseError::syntax(
+                item.position,
+                "certificate authority ID must not be empty (use `local` for the default CA)",
+            ));
+        }
+        let mut authority = PkiCertificateAuthority {
+            id: id.clone(),
+            ..PkiCertificateAuthority::default()
+        };
+        for option in &item.block {
+            let single = |option: &Directive| -> Result<String, ParseError> {
+                single_argument(option, &format!("`pki ca {}`", option.name))
+            };
+            match option.name.as_str() {
+                "name" => authority.name = Some(single(option)?),
+                "root_cn" => authority.root_common_name = Some(single(option)?),
+                "intermediate_cn" => authority.intermediate_common_name = Some(single(option)?),
+                "intermediate_lifetime" => {
+                    authority.intermediate_lifetime_ns = Some(duration_argument(option)?)
+                }
+                "maintenance_interval" => {
+                    authority.maintenance_interval_ns = Some(duration_argument(option)?)
+                }
+                "renewal_window_ratio" => {
+                    let value = single(option)?;
+                    let ratio = value.parse::<f64>().map_err(|_| {
+                        ParseError::syntax(
+                            option.position,
+                            format!(
+                                "renewal_window_ratio must be a number in (0, 1], got `{value}`"
+                            ),
+                        )
+                    })?;
+                    if !ratio.is_finite() || ratio <= 0.0 || ratio > 1.0 {
+                        return Err(ParseError::syntax(
+                            option.position,
+                            format!(
+                                "renewal_window_ratio must be a number in (0, 1], got `{value}`"
+                            ),
+                        ));
+                    }
+                    authority.renewal_window_ratio = Some(ratio);
+                }
+                "root" => authority.root = Some(parse_pki_key_pair(option, "root")?),
+                "intermediate" => {
+                    authority.intermediate = Some(parse_pki_key_pair(option, "intermediate")?)
+                }
+                other => {
+                    return Err(ParseError::syntax(
+                        option.position,
+                        format!("unrecognized pki ca option `{other}`"),
+                    ))
+                }
+            }
+        }
+        authorities.retain(|existing| existing.id != id);
+        authorities.push(authority);
+    }
+    Ok(PkiOptions {
+        certificate_authorities: authorities,
+    })
+}
+
+/// Parse a `root { cert/key/format }` or `intermediate { ... }` block of a PKI CA.
+fn parse_pki_key_pair(directive: &Directive, kind: &str) -> Result<PkiKeyPairConfig, ParseError> {
+    if !directive.args.is_empty() {
+        return Err(ParseError::syntax(
+            directive.position,
+            format!("`pki ca {kind}` does not take arguments; use a block"),
+        ));
+    }
+    let mut pair = PkiKeyPairConfig::default();
+    for option in &directive.block {
+        let value = single_argument(option, &format!("`pki ca {kind} {}`", option.name))?;
+        match option.name.as_str() {
+            "cert" => pair.certificate = Some(value),
+            "key" => pair.private_key = Some(value),
+            "format" => pair.format = Some(value),
+            other => {
+                return Err(ParseError::syntax(
+                    option.position,
+                    format!("unrecognized pki ca {kind} option `{other}`"),
+                ))
+            }
+        }
+    }
+    Ok(pair)
+}
+
+/// Require exactly one argument on `directive` (and no block); used by `pki` sub-options.
+fn single_argument(directive: &Directive, context: &str) -> Result<String, ParseError> {
+    if directive.args.len() != 1 || !directive.block.is_empty() {
+        return Err(ParseError::syntax(
+            directive.position,
+            format!("{context} requires exactly one argument"),
+        ));
+    }
+    Ok(directive.args[0].clone())
+}
+
+/// Require one duration argument and parse it into nanoseconds.
+fn duration_argument(directive: &Directive) -> Result<i64, ParseError> {
+    let value = single_argument(directive, &format!("`{}`", directive.name))?;
+    let nanoseconds = parse_duration_ns(&value).map_err(|reason| {
+        ParseError::syntax(
+            directive.position,
+            format!("invalid duration `{value}`: {reason}"),
+        )
+    })?;
+    if nanoseconds <= 0 {
+        return Err(ParseError::syntax(
+            directive.position,
+            format!(
+                "`{}` must be a positive duration, got `{value}`",
+                directive.name
+            ),
+        ));
+    }
+    Ok(nanoseconds)
+}
+
+/// Parse Caddy duration syntax into nanoseconds: a sequence of number/unit components such as
+/// `24h`, `1h30m` or `1.5h`. Units: `ns`, `us`/`µs`, `ms`, `s`, `m`, `h`, `d`.
+pub(crate) fn parse_duration_ns(value: &str) -> Result<i64, String> {
+    let mut rest = value.trim();
+    if rest.is_empty() {
+        return Err("empty duration".to_string());
+    }
+    let mut total = 0.0_f64;
+    let mut components = 0_usize;
+    while !rest.is_empty() {
+        let number_end = rest
+            .find(|character: char| !(character.is_ascii_digit() || character == '.'))
+            .unwrap_or(rest.len());
+        if number_end == 0 {
+            return Err(format!("expected a number at `{rest}`"));
+        }
+        let number: f64 = rest[..number_end]
+            .parse()
+            .map_err(|_| format!("invalid number `{}`", &rest[..number_end]))?;
+        rest = &rest[number_end..];
+        let unit_end = rest
+            .find(|character: char| character.is_ascii_digit() || character == '.')
+            .unwrap_or(rest.len());
+        let unit = &rest[..unit_end];
+        rest = &rest[unit_end..];
+        let multiplier = match unit {
+            "ns" => 1.0,
+            "us" | "µs" | "μs" => 1_000.0,
+            "ms" => 1_000_000.0,
+            "s" => 1_000_000_000.0,
+            "m" => 60_000_000_000.0,
+            "h" => 3_600_000_000_000.0,
+            "d" => 86_400_000_000_000.0,
+            "" => return Err("missing duration unit".to_string()),
+            other => return Err(format!("unknown duration unit `{other}`")),
+        };
+        total += number * multiplier;
+        components += 1;
+    }
+    if components == 0 {
+        return Err("empty duration".to_string());
+    }
+    if !total.is_finite() || total > i64::MAX as f64 || total < 0.0 {
+        return Err("duration is out of range".to_string());
+    }
+    Ok(total.round() as i64)
 }
 
 fn global_string(directive: &Directive, option: &str) -> Result<String, ParseError> {
