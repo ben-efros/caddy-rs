@@ -12,7 +12,10 @@
 //!   from the existing [`CertificateCache`], from [`CertificateStorage`], and from typed
 //!   `apps.tls.certificates` configuration;
 //! * [`TlsServerOptions`] derives ALPN, TLS versions and client-auth mode from Caddy's
-//!   `tls_connection_policies` JSON;
+//!   `tls_connection_policies` JSON and keeps every policy's `match.sni` /
+//!   `certificate_selection.any_tag` for per-connection certificate selection (evaluated by
+//!   [`ConnectionPolicyResolver`] after the ClientHello, in policy order, with `{}` as the
+//!   catch-all fallback);
 //! * [`build_server_config`] assembles the rustls [`ServerConfig`] with the `ring` provider.
 //!
 //! Listener policy (documented for the server supervisor, see [`listener_uses_tls`]): a TCP
@@ -115,6 +118,49 @@ pub struct TlsServerOptions {
     /// [`ClientAuthMode::Require`]. Configuration-driven CA pools are not modelled yet; embedders
     /// that need client auth supply the bundle explicitly.
     pub client_auth_roots_pem: Option<String>,
+    /// Per-connection certificate selection policies, in configuration order.
+    ///
+    /// Caddy evaluates `tls_connection_policies` per ClientHello: the first policy whose
+    /// `match` constraints accept the connection applies, including its
+    /// `certificate_selection`. The empty catch-all policy (`{}`) matches every connection and
+    /// therefore falls back to normal SNI selection.
+    pub certificate_policies: Vec<CertificatePolicy>,
+}
+
+/// Certificate selection rules from one `tls_connection_policies` entry.
+///
+/// Only the fields the rustls terminator can honour are represented: SNI matching (`match.sni`)
+/// and tag-based selection (`certificate_selection.any_tag`). Other selection criteria are
+/// rejected loudly by [`TlsServerOptions::from_connection_policies`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CertificatePolicy {
+    /// SNI patterns from `match.sni`. Left-most-label wildcards (`*.example.com`) are supported;
+    /// `None` matches every SNI (including connections without SNI).
+    pub sni: Option<Vec<String>>,
+    /// Tags from `certificate_selection.any_tag`; a certificate matches when it carries at least
+    /// one of these tags. `None` (or an empty list) means "no tag filtering".
+    pub any_tag: Option<Vec<String>>,
+}
+
+impl CertificatePolicy {
+    /// Whether this policy's `match` constraints accept `server_name`.
+    pub fn matches_server_name(&self, server_name: Option<&str>) -> bool {
+        let Some(patterns) = &self.sni else {
+            return true;
+        };
+        let Some(server_name) = server_name else {
+            return false;
+        };
+        let server_name = normalize_server_name(server_name);
+        patterns
+            .iter()
+            .any(|pattern| server_name_matches(pattern, &server_name))
+    }
+
+    /// The tags this policy filters on, if any.
+    pub fn tags(&self) -> Option<&[String]> {
+        self.any_tag.as_deref().filter(|tags| !tags.is_empty())
+    }
 }
 
 impl Default for TlsServerOptions {
@@ -127,6 +173,7 @@ impl Default for TlsServerOptions {
             versions: TlsVersions::Default,
             client_auth: ClientAuthMode::None,
             client_auth_roots_pem: None,
+            certificate_policies: Vec::new(),
         }
     }
 }
@@ -253,26 +300,159 @@ impl TlsServerOptions {
                     })?;
             options.client_auth = ClientAuthMode::parse(mode)?;
         }
-        // Every remaining field changes TLS behaviour; fail loudly rather than approximating.
-        for field in policy.keys() {
-            if !matches!(
-                field.as_str(),
-                "alpn" | "protocols" | "client_authentication"
-            ) {
-                return Err(Error::NotImplemented {
-                    feature: "TLS connection policy field (`tls_connection_policies[0]`)",
+        // Parse every connection policy: the first one supplied the listener-wide options above,
+        // and each policy contributes per-connection certificate selection. Caddy evaluates the
+        // policies in order after the ClientHello (SNI is available) and the first matching policy
+        // applies, including its certificate selection.
+        let mut certificate_policies = Vec::with_capacity(policies.len());
+        for (index, value) in policies.iter().enumerate() {
+            certificate_policies.push(parse_connection_policy(value, index)?);
+        }
+        options.certificate_policies = certificate_policies;
+        Ok(options)
+    }
+}
+
+/// Parse one `tls_connection_policies[i]` entry into per-connection certificate selection rules.
+///
+/// Fields that configure the rustls `ServerConfig` (`alpn`, `protocols`, `client_authentication`)
+/// are only honoured on the first policy (rustls has one configuration per listener); seeing them
+/// on a later policy fails loudly instead of silently applying the first policy's value.
+fn parse_connection_policy(value: &Value, index: usize) -> Result<CertificatePolicy> {
+    let path = format!("tls_connection_policies[{index}]");
+    let Some(object) = value.as_object() else {
+        return Err(Error::TlsConfig {
+            path,
+            message: "connection policy must be an object".to_string(),
+        });
+    };
+    let mut policy = CertificatePolicy::default();
+    for field in object.keys() {
+        match field.as_str() {
+            "match" => {
+                let match_object =
+                    object
+                        .get("match")
+                        .and_then(Value::as_object)
+                        .ok_or_else(|| Error::TlsConfig {
+                            path: format!("{path}.match"),
+                            message: "`match` must be an object".to_string(),
+                        })?;
+                for key in match_object.keys() {
+                    if key != "sni" {
+                        return Err(Error::Unsupported {
+                            path: format!("{path}.match.{key}"),
+                            feature: format!("TLS connection policy match field `{key}`"),
+                            tracking_id: "TLS-CONN-MATCH",
+                        });
+                    }
+                }
+                if let Some(sni) = match_object.get("sni") {
+                    let patterns = sni.as_array().ok_or_else(|| Error::TlsConfig {
+                        path: format!("{path}.match.sni"),
+                        message: "`match.sni` must be an array of server names".to_string(),
+                    })?;
+                    if patterns.is_empty() {
+                        return Err(Error::TlsConfig {
+                            path: format!("{path}.match.sni"),
+                            message: "`match.sni` must contain at least one server name"
+                                .to_string(),
+                        });
+                    }
+                    let mut sni_patterns = Vec::with_capacity(patterns.len());
+                    for (pattern_index, pattern) in patterns.iter().enumerate() {
+                        let pattern = pattern.as_str().ok_or_else(|| Error::TlsConfig {
+                            path: format!("{path}.match.sni[{pattern_index}]"),
+                            message: "SNI pattern must be a string".to_string(),
+                        })?;
+                        if pattern.trim().is_empty() {
+                            return Err(Error::TlsConfig {
+                                path: format!("{path}.match.sni[{pattern_index}]"),
+                                message: "SNI pattern must not be empty".to_string(),
+                            });
+                        }
+                        if !pattern.trim().is_ascii() {
+                            return Err(Error::Unsupported {
+                                path: format!("{path}.match.sni[{pattern_index}]"),
+                                feature: "internationalized (IDN) `match.sni` patterns; configure the ASCII/punycode form"
+                                    .to_string(),
+                                tracking_id: "TLS-CONN-MATCH",
+                            });
+                        }
+                        sni_patterns.push(pattern.trim().to_string());
+                    }
+                    policy.sni = Some(sni_patterns);
+                }
+            }
+            "certificate_selection" => {
+                let selection = object
+                    .get("certificate_selection")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| Error::TlsConfig {
+                        path: format!("{path}.certificate_selection"),
+                        message: "`certificate_selection` must be an object".to_string(),
+                    })?;
+                for key in selection.keys() {
+                    if key != "any_tag" {
+                        return Err(Error::Unsupported {
+                            path: format!("{path}.certificate_selection.{key}"),
+                            feature: format!("certificate selection criterion `{key}`"),
+                            tracking_id: "TLS-CERT-SELECTION",
+                        });
+                    }
+                }
+                if let Some(tags) = selection.get("any_tag") {
+                    let tags = tags.as_array().ok_or_else(|| Error::TlsConfig {
+                        path: format!("{path}.certificate_selection.any_tag"),
+                        message: "`any_tag` must be an array of tags".to_string(),
+                    })?;
+                    let mut any_tags = Vec::with_capacity(tags.len());
+                    for (tag_index, tag) in tags.iter().enumerate() {
+                        let tag = tag.as_str().ok_or_else(|| Error::TlsConfig {
+                            path: format!("{path}.certificate_selection.any_tag[{tag_index}]"),
+                            message: "tag must be a string".to_string(),
+                        })?;
+                        if tag.trim().is_empty() {
+                            return Err(Error::TlsConfig {
+                                path: format!("{path}.certificate_selection.any_tag[{tag_index}]"),
+                                message: "tag must not be empty".to_string(),
+                            });
+                        }
+                        any_tags.push(tag.trim().to_string());
+                    }
+                    if !any_tags.is_empty() {
+                        policy.any_tag = Some(any_tags);
+                    }
+                }
+            }
+            "alpn" | "protocols" | "client_authentication" => {
+                if index != 0 {
+                    return Err(Error::Unsupported {
+                        path: format!("{path}.{field}"),
+                        feature: format!(
+                            "per-connection policy field `{field}` (only the first policy's listener-wide options are applied)"
+                        ),
+                        tracking_id: "TLS-CONN-POLICY",
+                    });
+                }
+            }
+            other => {
+                return Err(Error::Unsupported {
+                    path: path.clone(),
+                    feature: format!("TLS connection policy field `{other}`"),
                     tracking_id: "TLS-CONN-POLICY",
                 });
             }
         }
-        Ok(options)
     }
+    Ok(policy)
 }
 
 /// A certificate chain and private key ready for rustls, with the names it covers.
 #[derive(Debug)]
 pub struct TlsCertificate {
     names: Vec<String>,
+    tags: Vec<String>,
     chain: Vec<CertificateDer<'static>>,
     private_key: PrivateKeyDer<'static>,
 }
@@ -290,6 +470,7 @@ impl TlsCertificate {
         let names = certificate_names(chain[0].as_ref())?;
         Ok(Self {
             names,
+            tags: Vec::new(),
             chain,
             private_key,
         })
@@ -315,6 +496,7 @@ impl TlsCertificate {
         }
         Ok(Self {
             names,
+            tags: Vec::new(),
             chain: chain_der.into_iter().map(CertificateDer::from).collect(),
             private_key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(private_key_der)),
         })
@@ -335,6 +517,7 @@ impl TlsCertificate {
         };
         Ok(Self {
             names,
+            tags: Vec::new(),
             chain: chain_der.into_iter().map(CertificateDer::from).collect(),
             private_key,
         })
@@ -364,6 +547,17 @@ impl TlsCertificate {
     /// Names this certificate covers (as configured/parsed, not lowercased).
     pub fn names(&self) -> &[String] {
         &self.names
+    }
+
+    /// Tags carried by this certificate (`apps.tls.certificates.load_*.tags`).
+    pub fn tags(&self) -> &[String] {
+        &self.tags
+    }
+
+    /// Attach the configured tags (used by connection-policy `certificate_selection.any_tag`).
+    pub fn with_tags(mut self, tags: Vec<String>) -> Self {
+        self.tags = tags;
+        self
     }
 
     /// The DER certificate chain, leaf first.
@@ -398,6 +592,17 @@ struct ResolverState {
     certificates: BTreeMap<String, Arc<CertifiedKey>>,
     default: Option<Arc<CertifiedKey>>,
     names: Vec<String>,
+    /// Distinct tagged certificates, in insertion order, for `certificate_selection.any_tag`.
+    tagged: Vec<TaggedCertificate>,
+}
+
+#[derive(Debug)]
+struct TaggedCertificate {
+    /// Tags as configured (case-sensitive; compared exactly like Caddy's `HasTag`).
+    tags: Vec<String>,
+    /// Normalized names the certificate covers (lowercase, no trailing dot).
+    names: Vec<String>,
+    certified: Arc<CertifiedKey>,
 }
 
 impl ResolverState {
@@ -405,6 +610,17 @@ impl ResolverState {
         let certified = Arc::new(certificate.certified_key()?);
         if self.default.is_none() {
             self.default = Some(Arc::clone(&certified));
+        }
+        if !certificate.tags().is_empty() {
+            self.tagged.push(TaggedCertificate {
+                tags: certificate.tags().to_vec(),
+                names: certificate
+                    .names()
+                    .iter()
+                    .map(|name| normalize_server_name(name))
+                    .collect(),
+                certified: Arc::clone(&certified),
+            });
         }
         for name in certificate.names() {
             let key = normalize_server_name(name);
@@ -589,6 +805,140 @@ impl ResolvesServerCert for CertificateResolver {
     }
 }
 
+/// Tag-filtered certificate selection used by connection-policy `certificate_selection.any_tag`.
+pub trait TaggedCertificateSelector: Send + Sync {
+    /// Select a certificate carrying at least one of `any_tags`.
+    ///
+    /// Matching order within the tagged subset: exact SNI, one-label wildcard, then the first
+    /// tagged certificate as the subset default. `None` means the tagged subset is empty (Caddy
+    /// fails the handshake in that case rather than falling back to an untagged certificate).
+    fn select_with_tags(
+        &self,
+        server_name: Option<&str>,
+        any_tags: &[String],
+    ) -> Option<Arc<CertifiedKey>>;
+}
+
+impl TaggedCertificateSelector for CertificateResolver {
+    fn select_with_tags(
+        &self,
+        server_name: Option<&str>,
+        any_tags: &[String],
+    ) -> Option<Arc<CertifiedKey>> {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let candidates: Vec<&TaggedCertificate> = state
+            .tagged
+            .iter()
+            .filter(|candidate| {
+                candidate
+                    .tags
+                    .iter()
+                    .any(|tag| any_tags.iter().any(|wanted| wanted == tag))
+            })
+            .collect();
+        let first = candidates.first()?;
+        let Some(server_name) = server_name else {
+            return Some(Arc::clone(&first.certified));
+        };
+        let name = normalize_server_name(server_name);
+        if let Some(candidate) = candidates
+            .iter()
+            .find(|candidate| candidate.names.iter().any(|candidate| candidate == &name))
+        {
+            return Some(Arc::clone(&candidate.certified));
+        }
+        if let Some((_, rest)) = name.split_once('.') {
+            if !rest.is_empty() && rest.contains('.') {
+                let wildcard = format!("*.{rest}");
+                if let Some(candidate) = candidates
+                    .iter()
+                    .find(|candidate| candidate.names.iter().any(|name| name == &wildcard))
+                {
+                    return Some(Arc::clone(&candidate.certified));
+                }
+            }
+        }
+        // Caddy's certmagic default selector falls back to the first viable candidate.
+        Some(Arc::clone(&first.certified))
+    }
+}
+
+/// A certificate resolver that can expose tag-filtered selection to connection policies.
+///
+/// `build_server_config_with_cert_resolver` wraps this in a
+/// [`ConnectionPolicyResolver`] when the listener has `certificate_selection.any_tag` policies.
+/// The two resolvers supplied by this crate implement it: [`CertificateResolver`] exposes its
+/// tagged certificates directly, and [`crate::tls_alpn::AcmeTlsAlpnResolver`] forwards to its
+/// fallback resolver.
+pub trait TlsResolver: ResolvesServerCert {
+    /// The tag selector for this resolver, if it can select by certificate tags.
+    fn tag_selector(&self) -> Option<&dyn TaggedCertificateSelector>;
+}
+
+impl TlsResolver for CertificateResolver {
+    fn tag_selector(&self) -> Option<&dyn TaggedCertificateSelector> {
+        Some(self)
+    }
+}
+
+/// Adapter from [`TlsResolver`] to rustls' [`ResolvesServerCert`] for the no-policy path.
+#[derive(Debug)]
+struct TlsResolverAdapter(Arc<dyn TlsResolver>);
+
+impl ResolvesServerCert for TlsResolverAdapter {
+    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        self.0.resolve(client_hello)
+    }
+}
+
+/// Resolver that applies per-connection `tls_connection_policies` certificate selection.
+#[derive(Debug)]
+struct ConnectionPolicyResolver {
+    fallback: Arc<dyn TlsResolver>,
+    policies: Vec<CertificatePolicy>,
+}
+
+impl ResolvesServerCert for ConnectionPolicyResolver {
+    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        // ACME TLS-ALPN-01 challenge handshakes must never be filtered by connection policies; the
+        // fallback resolver's overlay answers them (it advertises `acme-tls/1` itself).
+        let offers_acme_tls = client_hello
+            .alpn()
+            .map(|protocols| {
+                protocols
+                    .into_iter()
+                    .any(|protocol| protocol == crate::tls_alpn::ACME_TLS_ALPN_PROTOCOL)
+            })
+            .unwrap_or(false);
+        if offers_acme_tls {
+            return self.fallback.resolve(client_hello);
+        }
+        let server_name = client_hello.server_name();
+        for policy in &self.policies {
+            if !policy.matches_server_name(server_name) {
+                continue;
+            }
+            let Some(tags) = policy.tags() else {
+                // First matching policy without a tag filter: normal SNI selection.
+                return self.fallback.resolve(client_hello);
+            };
+            // A connection policy matched and requires one of these tags. Caddy's custom selector
+            // fails the handshake when no tagged certificate is viable, so do not fall through to
+            // later policies here.
+            return self
+                .fallback
+                .tag_selector()
+                .and_then(|selector| selector.select_with_tags(server_name, tags));
+        }
+        // No policy's match constraints accepted the connection (for example an unknown SNI with
+        // no catch-all policy): keep the historical permissive default-certificate behaviour.
+        self.fallback.resolve(client_hello)
+    }
+}
+
 /// Build a rustls server configuration from a [`CertificateResolver`] and options.
 pub fn build_server_config(
     resolver: Arc<CertificateResolver>,
@@ -597,14 +947,39 @@ pub fn build_server_config(
     build_server_config_with_cert_resolver(resolver, options)
 }
 
-/// Build a rustls server configuration from any certificate resolver.
+/// Build a rustls server configuration from a certificate resolver.
 ///
 /// Use this with [`crate::tls_alpn::AcmeTlsAlpnResolver`] to combine normal SNI selection with
 /// ACME TLS-ALPN-01 challenge certificates.
+///
+/// When the listener's `tls_connection_policies` contain per-connection certificate selection
+/// rules, the supplied resolver is wrapped in a policy resolver that selects the certificate after
+/// the ClientHello (SNI is available), matching Caddy's policy order. Tag-based selection requires
+/// a resolver that implements [`TlsResolver`]; both resolvers provided by this crate do, including
+/// the ACME TLS-ALPN overlay (which forwards to its fallback).
 pub fn build_server_config_with_cert_resolver(
-    resolver: Arc<dyn ResolvesServerCert>,
+    resolver: Arc<dyn TlsResolver>,
     options: &TlsServerOptions,
 ) -> Result<Arc<ServerConfig>> {
+    let resolver: Arc<dyn ResolvesServerCert> = if options.certificate_policies.is_empty() {
+        Arc::new(TlsResolverAdapter(resolver))
+    } else {
+        // Tag filtering needs a tag-aware resolver; fail loudly rather than ignoring the policy.
+        let requires_tags = options
+            .certificate_policies
+            .iter()
+            .any(|policy| policy.tags().is_some());
+        if requires_tags && resolver.tag_selector().is_none() {
+            return Err(Error::NotImplemented {
+                feature: "certificate_selection.any_tag with a resolver that cannot select by certificate tag",
+                tracking_id: "TLS-CERT-SELECTION",
+            });
+        }
+        Arc::new(ConnectionPolicyResolver {
+            fallback: resolver,
+            policies: options.certificate_policies.clone(),
+        })
+    };
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let builder = ServerConfig::builder_with_provider(Arc::clone(&provider))
         .with_protocol_versions(options.versions.rustls_versions())
@@ -683,12 +1058,11 @@ pub fn certificates_from_tls_app(tls: &TlsApp) -> Result<Vec<TlsCertificate>> {
                 path: format!("{path}.key"),
                 message: format!("cannot read `{}`: {error}", pair.key),
             })?;
-        let certificate =
-            TlsCertificate::from_pem(&certificate_pem, &private_key_pem).map_err(|error| {
-                Error::TlsConfig {
-                    path: path.clone(),
-                    message: error.to_string(),
-                }
+        let certificate = TlsCertificate::from_pem(&certificate_pem, &private_key_pem)
+            .map(|certificate| certificate.with_tags(pair.tags.clone()))
+            .map_err(|error| Error::TlsConfig {
+                path: path.clone(),
+                message: error.to_string(),
             })?;
         certificates.push(certificate);
     }
@@ -696,13 +1070,15 @@ pub fn certificates_from_tls_app(tls: &TlsApp) -> Result<Vec<TlsCertificate>> {
 }
 
 fn load_pem_pair(pair: &CertKeyPemPair, path: &str) -> Result<TlsCertificate> {
-    TlsCertificate::from_pem(&pair.certificate, &pair.key).map_err(|error| match error {
-        Error::TlsConfig { message, .. } => Error::TlsConfig {
-            path: path.to_string(),
-            message,
-        },
-        other => other,
-    })
+    TlsCertificate::from_pem(&pair.certificate, &pair.key)
+        .map(|certificate| certificate.with_tags(pair.tags.clone()))
+        .map_err(|error| match error {
+            Error::TlsConfig { message, .. } => Error::TlsConfig {
+                path: path.to_string(),
+                message,
+            },
+            other => other,
+        })
 }
 
 /// Listener policy: whether a configured TCP listener terminates TLS.
@@ -851,6 +1227,23 @@ fn root_store_from_pem(pem: &str) -> Result<RootCertStore> {
         });
     }
     Ok(roots)
+}
+
+/// Match one SNI pattern against a normalized server name.
+///
+/// Exact names compare case-insensitively. Left-most-label wildcards (`*.example.com`) match
+/// exactly one additional label, mirroring Caddy's `MatchServerName` semantics.
+fn server_name_matches(pattern: &str, normalized_server_name: &str) -> bool {
+    let pattern = normalize_server_name(pattern);
+    if pattern == "*" || pattern == normalized_server_name {
+        return true;
+    }
+    match pattern.strip_prefix("*.") {
+        Some(suffix) => normalized_server_name
+            .split_once('.')
+            .is_some_and(|(label, rest)| !label.is_empty() && rest == suffix),
+        None => false,
+    }
 }
 
 fn normalize_server_name(name: &str) -> String {
@@ -1413,5 +1806,360 @@ mod tests {
         assert!(error.to_string().contains("certificates"), "{error}");
         let error = CertificateResolver::from_certificates([certificate]).unwrap_err();
         assert!(error.to_string().contains("certificates"), "{error}");
+    }
+
+    // ---- connection-policy SNI matching and certificate_selection tags -------------------
+
+    /// Test-only verifier that accepts any server certificate. Used to inspect which certificate
+    /// the connection policy selected when the name does not match the certificate.
+    #[derive(Debug)]
+    struct AcceptAnyCertificate(Arc<rustls::crypto::CryptoProvider>);
+
+    impl rustls::client::danger::ServerCertVerifier for AcceptAnyCertificate {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error>
+        {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            certificate: &CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+        {
+            rustls::crypto::verify_tls12_signature(
+                message,
+                certificate,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            certificate: &CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+        {
+            rustls::crypto::verify_tls13_signature(
+                message,
+                certificate,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            self.0.signature_verification_algorithms.supported_schemes()
+        }
+    }
+
+    /// Run a real rustls handshake against `server_config` and return the leaf certificate DER the
+    /// client received.
+    async fn handshake_peer_certificate(
+        server_config: Arc<ServerConfig>,
+        server_name: &str,
+    ) -> Vec<u8> {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(stream).await.expect("server TLS handshake");
+            let _ = tls.write_all(b"ok").await;
+            let _ = tls.shutdown().await;
+        });
+
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut client = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyCertificate(provider)))
+            .with_no_client_auth();
+        client.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let server_name = rustls::pki_types::ServerName::try_from(server_name.to_string()).unwrap();
+        let tls = connector
+            .connect(server_name, stream)
+            .await
+            .expect("client TLS handshake");
+        let certificate = tls.get_ref().1.peer_certificates().unwrap()[0]
+            .as_ref()
+            .to_vec();
+        server.await.unwrap();
+        certificate
+    }
+
+    #[test]
+    fn parses_adapted_cert_key_connection_policies() {
+        // shape emitted by the Caddyfile adapter for `tls <cert> <key>`:
+        // a tag-selecting policy matched by SNI plus an empty catch-all fallback.
+        let options = TlsServerOptions::from_connection_policies(Some(&[
+            serde_json::json!({
+                "match": {"sni": ["localhost"]},
+                "certificate_selection": {"any_tag": ["cert0"]}
+            }),
+            serde_json::json!({}),
+        ]))
+        .expect("adapted cert/key policies parse");
+
+        assert_eq!(options.certificate_policies.len(), 2);
+        assert_eq!(
+            options.certificate_policies[0].sni,
+            Some(vec!["localhost".to_string()])
+        );
+        assert_eq!(
+            options.certificate_policies[0].any_tag,
+            Some(vec!["cert0".to_string()])
+        );
+        assert!(options.certificate_policies[1].sni.is_none());
+        assert!(options.certificate_policies[1].any_tag.is_none());
+        // Listener-wide options still come from the first policy; absent fields are defaults.
+        assert_eq!(options.alpn, TlsServerOptions::default().alpn);
+
+        let any_name = CertificatePolicy {
+            sni: Some(vec!["*".to_string()]),
+            any_tag: None,
+        };
+        assert!(any_name.matches_server_name(Some("example.com")));
+        assert!(any_name.matches_server_name(Some("a.b.example.com")));
+
+        let wildcard = CertificatePolicy {
+            sni: Some(vec!["*.example.com".to_string()]),
+            any_tag: None,
+        };
+        assert!(wildcard.matches_server_name(Some("api.example.com")));
+        assert!(!wildcard.matches_server_name(Some("example.com")));
+        assert!(!wildcard.matches_server_name(Some("a.b.example.com")));
+        assert!(!wildcard.matches_server_name(None));
+        let catch_all = CertificatePolicy::default();
+        assert!(catch_all.matches_server_name(Some("anything.example")));
+        assert!(catch_all.matches_server_name(None));
+    }
+
+    #[test]
+    fn rejects_unsupported_connection_policy_match_and_selection_fields() {
+        let error = TlsServerOptions::from_connection_policies(Some(&[serde_json::json!({
+            "match": {"remote_ip": ["192.0.2.1"]}
+        })]))
+        .unwrap_err();
+        assert!(error.to_string().contains("TLS-CONN-MATCH"), "{error}");
+        assert!(error.to_string().contains("remote_ip"), "{error}");
+
+        for criterion in [
+            "serial_number",
+            "subject_organization",
+            "all_tags",
+            "public_key_algorithm",
+        ] {
+            let error = TlsServerOptions::from_connection_policies(Some(&[serde_json::json!({
+                "certificate_selection": {criterion: ["x"]}
+            })]))
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("TLS-CERT-SELECTION"),
+                "{criterion}: {error}"
+            );
+        }
+
+        // IDN patterns are not silently ignored: this build does not implement IDNA conversion.
+        let error = TlsServerOptions::from_connection_policies(Some(&[serde_json::json!({
+            "match": {"sni": ["bücher.example"]}
+        })]))
+        .unwrap_err();
+        assert!(error.to_string().contains("IDN"), "{error}");
+
+        // Listener-wide fields are only honoured on the first policy; a later policy that tries to
+        // change them fails loudly instead of silently using the first policy's values.
+        let error = TlsServerOptions::from_connection_policies(Some(&[
+            serde_json::json!({"certificate_selection": {"any_tag": ["a"]}}),
+            serde_json::json!({"alpn": ["http/1.1"]}),
+        ]))
+        .unwrap_err();
+        assert!(error.to_string().contains("TLS-CONN-POLICY"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn certificate_selection_any_tag_filters_by_tag_before_sni() {
+        // The default certificate is `other.example`; the example.com certificate is untagged.
+        // A policy for SNI example.com requesting tag `cert0` must pick the tagged certificate,
+        // proving tag filtering is applied rather than plain SNI selection.
+        let resolver = Arc::new(
+            CertificateResolver::from_certificates([
+                other().with_tags(vec!["cert0".to_string()]),
+                example(),
+            ])
+            .expect("resolver builds"),
+        );
+        let policies = [
+            serde_json::json!({
+                "match": {"sni": ["example.com"]},
+                "certificate_selection": {"any_tag": ["cert0"]}
+            }),
+            serde_json::json!({}),
+        ];
+        let options =
+            TlsServerOptions::from_connection_policies(Some(&policies)).expect("policies parse");
+        let config = build_server_config(Arc::clone(&resolver), &options).expect("config builds");
+        let served = handshake_peer_certificate(config, "example.com").await;
+        assert_eq!(
+            served,
+            certificate_der(&other()),
+            "tag policy must select the tagged certificate even when SNI matches another cert"
+        );
+
+        // Without policies the same resolver serves the normal SNI-selected certificate.
+        let plain = build_server_config(resolver, &TlsServerOptions::default()).expect("config");
+        let served = handshake_peer_certificate(plain, "example.com").await;
+        assert_eq!(served, certificate_der(&example()));
+    }
+
+    #[tokio::test]
+    async fn certificate_selection_policies_evaluate_in_order_with_catch_all_fallback() {
+        let resolver = Arc::new(
+            CertificateResolver::from_certificates([
+                example().with_tags(vec!["cert0".to_string()]),
+                other().with_tags(vec!["cert1".to_string()]),
+            ])
+            .expect("resolver builds"),
+        );
+        let policies = [
+            serde_json::json!({
+                "match": {"sni": ["example.com", "www.example.com"]},
+                "certificate_selection": {"any_tag": ["cert0"]}
+            }),
+            serde_json::json!({
+                "match": {"sni": ["other.example"]},
+                "certificate_selection": {"any_tag": ["cert1"]}
+            }),
+            serde_json::json!({}),
+        ];
+        let options =
+            TlsServerOptions::from_connection_policies(Some(&policies)).expect("policies parse");
+        let config = build_server_config(Arc::clone(&resolver), &options).expect("config builds");
+
+        assert_eq!(
+            handshake_peer_certificate(Arc::clone(&config), "example.com").await,
+            certificate_der(&example())
+        );
+        assert_eq!(
+            handshake_peer_certificate(Arc::clone(&config), "www.example.com").await,
+            certificate_der(&example())
+        );
+        assert_eq!(
+            handshake_peer_certificate(Arc::clone(&config), "other.example").await,
+            certificate_der(&other())
+        );
+        // Unknown SNI matches only the empty catch-all policy: normal SNI selection (default
+        // certificate, which is the first inserted one).
+        assert_eq!(
+            handshake_peer_certificate(config, "unknown.example").await,
+            certificate_der(&example())
+        );
+    }
+
+    #[tokio::test]
+    async fn no_tagged_candidate_fails_the_handshake() {
+        let resolver =
+            Arc::new(CertificateResolver::from_certificates([example()]).expect("resolver builds"));
+        let policies = [serde_json::json!({
+            "match": {"sni": ["example.com"]},
+            "certificate_selection": {"any_tag": ["missing-tag"]}
+        })];
+        let options =
+            TlsServerOptions::from_connection_policies(Some(&policies)).expect("policies parse");
+        let config = build_server_config(resolver, &options).expect("config builds");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(config);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            acceptor.accept(stream).await
+        });
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut client = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyCertificate(provider)))
+            .with_no_client_auth();
+        client.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let server_name = rustls::pki_types::ServerName::try_from("example.com").unwrap();
+        assert!(
+            connector.connect(server_name, stream).await.is_err(),
+            "a policy whose tag set matches no certificate must fail the handshake"
+        );
+        assert!(server.await.unwrap().is_err());
+    }
+
+    #[test]
+    fn load_files_tags_are_loaded_into_certificates() {
+        let directory = tempfile::tempdir().unwrap();
+        let certificate_path = directory.path().join("example.pem");
+        let key_path = directory.path().join("example.key");
+        std::fs::write(&certificate_path, EXAMPLE_CERT).unwrap();
+        std::fs::write(&key_path, EXAMPLE_KEY).unwrap();
+        let config = Config::from_value(serde_json::json!({
+            "apps": {"tls": {"certificates": {"load_files": [{
+                "certificate": certificate_path.to_string_lossy(),
+                "key": key_path.to_string_lossy(),
+                "tags": ["cert0", "shared"]
+            }]}}}
+        }))
+        .expect("config decodes");
+        let certificates = certificates_from_tls_app(config.tls().unwrap()).unwrap();
+        assert_eq!(certificates.len(), 1);
+        assert_eq!(certificates[0].tags(), &["cert0", "shared"]);
+        let resolver = CertificateResolver::from_certificates(certificates).unwrap();
+        assert!(
+            resolver
+                .select_with_tags(Some("example.com"), &["shared".to_string()])
+                .is_some(),
+            "tags from load_files must be selectable"
+        );
+        assert!(resolver
+            .select_with_tags(Some("example.com"), &["missing".to_string()])
+            .is_none());
+    }
+
+    #[test]
+    fn build_server_config_with_custom_resolver_supports_tag_policies() {
+        // The ACME TLS-ALPN overlay forwards tag selection to its fallback resolver, so the
+        // auto-HTTPS listener path supports connection-policy tag selection too.
+        let resolver = Arc::new(
+            CertificateResolver::from_certificates(
+                [example().with_tags(vec!["cert0".to_string()])],
+            )
+            .expect("resolver builds"),
+        );
+        let tokens = Arc::new(crate::tls_alpn::TlsAlpn01TokenStore::new());
+        let overlay = Arc::new(crate::tls_alpn::AcmeTlsAlpnResolver::new(
+            Arc::clone(&resolver),
+            tokens,
+        ));
+        let policies = [serde_json::json!({
+            "match": {"sni": ["example.com"]},
+            "certificate_selection": {"any_tag": ["cert0"]}
+        })];
+        let options =
+            TlsServerOptions::from_connection_policies(Some(&policies)).expect("policies parse");
+        build_server_config_with_cert_resolver(overlay, &options)
+            .expect("ACME overlay with tag-aware fallback builds");
     }
 }

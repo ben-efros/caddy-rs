@@ -311,6 +311,12 @@ impl AcmeTlsAlpnResolver {
     }
 }
 
+impl crate::tls_server::TlsResolver for AcmeTlsAlpnResolver {
+    fn tag_selector(&self) -> Option<&dyn crate::tls_server::TaggedCertificateSelector> {
+        crate::tls_server::TlsResolver::tag_selector(&*self.fallback)
+    }
+}
+
 impl ResolvesServerCert for AcmeTlsAlpnResolver {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         let offers_acme_tls = client_hello
