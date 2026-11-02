@@ -81,15 +81,14 @@ impl Router {
     /// [`crate::types::Handler::handle_streaming`] and the server integration contract in
     /// [`crate::body`].
     ///
-    /// When no route produces a response, this returns `404 Not Found` (the top-level engine
-    /// behaviour). Nested routers that must pass control back to their caller use
-    /// [`Router::handle_streaming_outcome`], which reports that case as
-    /// [`StreamingOutcome::Continue`] — this is what makes an empty `subroute` a no-op.
+    /// When no route produces a response, this returns Caddy's top-level "empty handler"
+    /// response: `200 OK` with an empty body (Caddy's `emptyHandler`). Nested routers that must
+    /// pass control back to their caller use [`Router::handle_streaming_outcome`], which reports
+    /// that case as [`StreamingOutcome::Continue`] — this is what makes an empty `subroute` a
+    /// no-op.
     pub async fn handle_streaming(&self, request: Request) -> Result<StreamingResponse> {
         match self.handle_streaming_outcome(request).await? {
-            StreamingOutcome::Continue(_) => {
-                Ok(StreamingResponse::from_buffered(Response::not_found()))
-            }
+            StreamingOutcome::Continue(_) => Ok(StreamingResponse::from_buffered(Response::ok())),
             StreamingOutcome::Respond(response) => Ok(response),
             StreamingOutcome::Upgrade(_) => Err(Error::UpgradeNotRepresentable {
                 context: "Router::handle_streaming",
@@ -102,11 +101,12 @@ impl Router {
     ///
     /// This is the entry point the server connection layer uses: it returns either a normal
     /// (possibly streaming) response or an [`UpgradedResponse`] carrying the raw tunnel. An
-    /// unmatched request still becomes `404 Not Found`, matching the top-level engine behaviour.
+    /// unmatched request becomes Caddy's top-level "empty handler" response (`200 OK`, empty
+    /// body), matching Caddy's `emptyHandler`.
     pub async fn handle_upgradable(&self, request: Request) -> Result<ResponseOutcome> {
         match self.handle_streaming_outcome(request).await? {
             StreamingOutcome::Continue(_) => Ok(ResponseOutcome::Response(
-                StreamingResponse::from_buffered(Response::not_found()),
+                StreamingResponse::from_buffered(Response::ok()),
             )),
             StreamingOutcome::Respond(response) => Ok(ResponseOutcome::Response(response)),
             StreamingOutcome::Upgrade(response) => Ok(ResponseOutcome::Upgrade(response)),
@@ -363,7 +363,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unmatched_requests_get_404() {
+    async fn unmatched_requests_get_caddy_empty_200() {
+        // Real Caddy's top-level `emptyHandler` answers unmatched requests with `200 OK`, an empty
+        // body and `Content-Length: 0` (verified against Caddy v2.11.7, see DIV-0068).
         let router = RouterBuilder::new()
             .build(&[json!({
                 "match": [{"host": ["example.com"]}],
@@ -371,7 +373,38 @@ mod tests {
             })])
             .unwrap();
         let response = router.handle(request("/", "other.com")).await.unwrap();
+        assert_eq!(response.status, http::StatusCode::OK);
+        assert!(response.body.is_empty());
+        assert!(response.headers.is_empty());
+
+        // The streaming/upgradable entry points the server uses share the same termination.
+        let response = router
+            .handle_upgradable(request("/", "other.com"))
+            .await
+            .unwrap();
+        let ResponseOutcome::Response(response) = response else {
+            panic!("unmatched request must not be an upgrade");
+        };
+        assert_eq!(response.status, http::StatusCode::OK);
+        assert!(response.into_buffered().await.unwrap().body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn explicit_handler_404_is_preserved() {
+        // Only the implicit termination changes; a handler that explicitly answers 404 must keep
+        // doing so with its body/headers.
+        let router = RouterBuilder::new()
+            .build(&[json!({
+                "handle": [{"handler": "static_response", "status_code": 404, "body": "nope"}]
+            })])
+            .unwrap();
+        let response = router.handle(request("/", "host")).await.unwrap();
         assert_eq!(response.status, http::StatusCode::NOT_FOUND);
+        assert_eq!(response.body, bytes::Bytes::from_static(b"nope"));
+        assert_eq!(
+            response.headers.get(http::header::CONTENT_TYPE).unwrap(),
+            "text/plain; charset=utf-8"
+        );
     }
 
     #[tokio::test]
@@ -544,10 +577,10 @@ mod tests {
             .handle(request("/", "example.com"))
             .await
             .expect("route with empty subroute must serve without an error");
-        // The route must construct and dispatch (no construction failure, no 500). caddy-rs'
-        // top-level no-response policy is 404, while Caddy's emptyHandler answers 200 with an
-        // empty body; that difference is registered separately from this construction fix.
-        assert_eq!(response.status, http::StatusCode::NOT_FOUND);
+        // The route must construct and dispatch without an error, and the top-level no-response
+        // policy matches Caddy's emptyHandler: 200 OK with an empty body.
+        assert_eq!(response.status, http::StatusCode::OK);
+        assert!(response.body.is_empty());
     }
 
     #[tokio::test]
