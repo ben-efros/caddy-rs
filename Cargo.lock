@@ -110,6 +110,7 @@ dependencies = [
  "bytes",
  "caddy-rs-core",
  "http",
+ "http-body",
  "http-body-util",
  "hyper",
  "hyper-util",

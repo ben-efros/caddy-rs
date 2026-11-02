@@ -9,6 +9,8 @@ use bytes::Bytes;
 use http::{HeaderMap, Method, StatusCode, Uri};
 use thiserror::Error;
 
+use crate::body::{BodyError, StreamingResponse};
+
 /// Errors raised while building or executing handlers.
 #[derive(Debug, Error)]
 pub enum Error {
@@ -33,6 +35,10 @@ pub enum Error {
     /// I/O failure while serving a request.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// Failure while consuming a streaming response body (buffered compatibility path).
+    #[error(transparent)]
+    Body(#[from] BodyError),
 }
 
 /// Result alias for the HTTP crate.
@@ -201,14 +207,42 @@ pub enum Outcome {
     Respond(Response),
 }
 
+/// What a streaming-capable handler does with a request.
+///
+/// The `Continue` variant is large because it carries the whole request; boxing it would add an
+/// allocation on every request, so the same trade-off as [`Outcome`] is kept.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+pub enum StreamingOutcome {
+    /// Continue to the next handler with the (possibly modified) request.
+    Continue(Request),
+    /// Write this (possibly streaming) response and stop the chain.
+    Respond(StreamingResponse),
+}
+
 /// An HTTP handler.
 #[async_trait]
 pub trait Handler: Send + Sync {
     /// Stable module key for logs and tests.
     fn name(&self) -> &'static str;
 
-    /// Process a request.
+    /// Process a request with the buffered compatibility API.
     async fn handle(&self, request: Request) -> Result<Outcome>;
+
+    /// Process a request on the streaming path.
+    ///
+    /// The default implementation delegates to [`Handler::handle`] and wraps a buffered response,
+    /// so existing handlers keep working unchanged. Handlers that can stream (for example
+    /// `reverse_proxy`) override this method; see [`crate::body`] for the server integration
+    /// contract.
+    async fn handle_streaming(&self, request: Request) -> Result<StreamingOutcome> {
+        Ok(match self.handle(request).await? {
+            Outcome::Continue(request) => StreamingOutcome::Continue(request),
+            Outcome::Respond(response) => {
+                StreamingOutcome::Respond(StreamingResponse::from_buffered(response))
+            }
+        })
+    }
 }
 
 /// A request matcher.
