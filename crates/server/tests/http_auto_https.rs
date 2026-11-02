@@ -8,6 +8,8 @@
 //! rustls handshake.
 
 use std::net::SocketAddr;
+use std::os::fd::IntoRawFd;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -15,13 +17,16 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use ring::rand::SystemRandom;
 use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, SignatureScheme};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
 
 use caddy_rs_core::{Config, GenerationStore};
-use caddy_rs_server::ServerRuntime;
+use caddy_rs_server::{ServerRuntime, SocketActivation};
 use caddy_rs_tls::{
     AcmeTransport, CertificateStorage, FileStorage, HttpMethod, HttpRequest, HttpResponse,
 };
@@ -36,6 +41,7 @@ const ACCOUNT: &str = "https://acme.test/account/1";
 const ORDER: &str = "https://acme.test/order/1";
 const AUTHZ: &str = "https://acme.test/authz/1";
 const CHALLENGE: &str = "https://acme.test/challenge/1";
+const TLS_ALPN_CHALLENGE: &str = "https://acme.test/challenge/tls-alpn/1";
 const FINALIZE: &str = "https://acme.test/finalize/1";
 const CERTIFICATE: &str = "https://acme.test/cert/1";
 
@@ -48,6 +54,16 @@ struct CaState {
     challenge_acked: bool,
     cert_pem: Option<String>,
     fail_new_order: bool,
+    /// Which challenge type the issuer selected ("http-01" or "tls-alpn-01").
+    selected_challenge: Option<String>,
+    /// When set, `tls-alpn-01` acknowledgements probe this TLS listener like a real ACME CA.
+    tls_alpn_probe: Option<SocketAddr>,
+    /// Challenge certificate captured by the TLS-ALPN-01 probe.
+    tls_alpn_certificate: Option<Vec<u8>>,
+    /// Number of successful TLS-ALPN-01 probes.
+    tls_alpn_validations: usize,
+    /// Probe failure detail, when the CA could not validate TLS-ALPN-01.
+    probe_failure: Option<String>,
 }
 
 /// A local fake ACME CA. Enough RFC 8555 to drive `AcmeIssuer`; it signs the finalize CSR with
@@ -85,6 +101,29 @@ impl FakeCa {
 
     fn set_fail_new_order(&self, fail: bool) {
         self.state.lock().unwrap().fail_new_order = fail;
+    }
+
+    /// Configure the CA to validate `tls-alpn-01` challenges by connecting to this TLS listener
+    /// with ALPN `acme-tls/1` (a real RFC 8737 validation).
+    fn with_tls_alpn_probe(self, address: SocketAddr) -> Self {
+        self.state.lock().unwrap().tls_alpn_probe = Some(address);
+        self
+    }
+
+    fn selected_challenge(&self) -> Option<String> {
+        self.state.lock().unwrap().selected_challenge.clone()
+    }
+
+    fn tls_alpn_validations(&self) -> usize {
+        self.state.lock().unwrap().tls_alpn_validations
+    }
+
+    fn tls_alpn_certificate(&self) -> Option<Vec<u8>> {
+        self.state.lock().unwrap().tls_alpn_certificate.clone()
+    }
+
+    fn probe_failure(&self) -> Option<String> {
+        self.state.lock().unwrap().probe_failure.clone()
     }
 }
 
@@ -204,22 +243,92 @@ impl AcmeTransport for FakeCa {
                 serde_json::json!({
                     "status": status,
                     "identifier": {"type": "dns", "value": state.domains.first().cloned().unwrap_or_default()},
-                    "challenges": [{
-                        "type": "http-01",
-                        "url": CHALLENGE,
-                        "token": "token-1",
-                        "status": challenge_status
-                    }]
+                    "challenges": [
+                        {
+                            "type": "http-01",
+                            "url": CHALLENGE,
+                            "token": "token-1",
+                            "status": challenge_status
+                        },
+                        {
+                            "type": "tls-alpn-01",
+                            "url": TLS_ALPN_CHALLENGE,
+                            "token": "token-1",
+                            "status": challenge_status
+                        }
+                    ]
                 }),
             ));
         }
-        if url == CHALLENGE {
-            self.state.lock().unwrap().challenge_acked = true;
+        if url == CHALLENGE || url == TLS_ALPN_CHALLENGE {
+            let challenge_type = if url == CHALLENGE {
+                "http-01"
+            } else {
+                "tls-alpn-01"
+            };
+            let (probe, domain) = {
+                let mut state = self.state.lock().unwrap();
+                state.selected_challenge = Some(challenge_type.to_string());
+                (state.tls_alpn_probe, state.domains.first().cloned())
+            };
+            if challenge_type == "tls-alpn-01" {
+                let Some(address) = probe else {
+                    let detail = "fake CA has no TLS-ALPN-01 probe configured".to_string();
+                    self.state.lock().unwrap().probe_failure = Some(detail.clone());
+                    return Ok(HttpResponse::with_problem(
+                        400,
+                        &serde_json::json!({
+                            "type": "urn:ietf:params:acme:error:connection",
+                            "detail": detail,
+                            "status": 400
+                        }),
+                    )
+                    .unwrap()
+                    .with_header("Replay-Nonce", "nonce-1"));
+                };
+                let domain = domain.unwrap_or_default();
+                match tls_alpn_probe(address, &domain).await {
+                    Ok(certificate) => {
+                        if let Err(error) = verify_tls_alpn_certificate(&certificate, &domain) {
+                            self.state.lock().unwrap().probe_failure = Some(error.clone());
+                            return Ok(HttpResponse::with_problem(
+                                400,
+                                &serde_json::json!({
+                                    "type": "urn:ietf:params:acme:error:connection",
+                                    "detail": error,
+                                    "status": 400
+                                }),
+                            )
+                            .unwrap()
+                            .with_header("Replay-Nonce", "nonce-1"));
+                        }
+                        let mut state = self.state.lock().unwrap();
+                        state.tls_alpn_certificate = Some(certificate);
+                        state.tls_alpn_validations += 1;
+                        state.challenge_acked = true;
+                    }
+                    Err(error) => {
+                        self.state.lock().unwrap().probe_failure = Some(error.clone());
+                        return Ok(HttpResponse::with_problem(
+                            400,
+                            &serde_json::json!({
+                                "type": "urn:ietf:params:acme:error:connection",
+                                "detail": error,
+                                "status": 400
+                            }),
+                        )
+                        .unwrap()
+                        .with_header("Replay-Nonce", "nonce-1"));
+                    }
+                }
+            } else {
+                self.state.lock().unwrap().challenge_acked = true;
+            }
             return Ok(json_response(
                 200,
                 serde_json::json!({
-                    "type": "http-01",
-                    "url": CHALLENGE,
+                    "type": challenge_type,
+                    "url": url,
                     "token": "token-1",
                     "status": "processing"
                 }),
@@ -284,6 +393,226 @@ impl AcmeTransport for FakeCa {
             request.method, url
         )))
     }
+}
+
+// ---- TLS-ALPN-01 CA validation ---------------------------------------------------------------
+
+/// Test-only verifier that accepts the CA's own self-signed challenge certificate. A real ACME
+/// CA does not chain-validate this certificate either; it only inspects the acmeIdentifier
+/// extension.
+#[derive(Debug)]
+struct AcceptAnyCertificate {
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl ServerCertVerifier for AcceptAnyCertificate {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_challenge_signature(message, certificate, signature)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_challenge_signature(message, certificate, signature)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Verify a handshake signature using the challenge certificate's P-256 public key.
+///
+/// `rustls::crypto::verify_tls13_signature` parses the certificate with webpki, which rejects the
+/// challenge certificate's critical `id-pe-acmeIdentifier` extension; a real ACME CA ignores
+/// normal path validation, so the test verifier extracts the SubjectPublicKeyInfo itself and
+/// verifies the ECDSA signature with ring.
+fn verify_challenge_signature(
+    message: &[u8],
+    certificate: &CertificateDer<'_>,
+    signature: &DigitallySignedStruct,
+) -> Result<HandshakeSignatureValid, rustls::Error> {
+    use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_ASN1};
+    if signature.scheme != SignatureScheme::ECDSA_NISTP256_SHA256 {
+        return Err(rustls::Error::General(
+            "unsupported challenge certificate signature scheme".to_string(),
+        ));
+    }
+    let public_key = certificate_public_key(certificate.as_ref());
+    UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, public_key)
+        .verify(message, signature.signature())
+        .map(|()| HandshakeSignatureValid::assertion())
+        .map_err(|_| rustls::Error::InvalidCertificate(rustls::CertificateError::BadSignature))
+}
+
+fn certificate_public_key(der: &[u8]) -> Vec<u8> {
+    let outer = read_tlv(der);
+    let parts = children_with_offsets(outer.content);
+    let tbs = parts.first().expect("tbs certificate");
+    let fields = children_with_offsets(tbs.content);
+    let mut index = 0;
+    if fields.first().is_some_and(|field| field.tag == 0xA0) {
+        index += 1; // explicit version
+    }
+    // serial, signature algorithm, issuer, validity, subject, subjectPublicKeyInfo
+    let spki = fields.get(index + 5).expect("subjectPublicKeyInfo");
+    let spki_fields = children_with_offsets(spki.content);
+    let key_bits = spki_fields.get(1).expect("subjectPublicKey BIT STRING");
+    // BIT STRING content is `unused-bits-byte || key bytes`; it is not itself DER-encoded.
+    key_bits
+        .content
+        .get(1..)
+        .expect("public key bits after the unused-bits byte")
+        .to_vec()
+}
+
+/// Connect like an ACME CA: ALPN `acme-tls/1`, accept the self-signed challenge certificate and
+/// return its DER encoding.
+async fn tls_alpn_probe(address: SocketAddr, domain: &str) -> Result<Vec<u8>, String> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier = Arc::new(AcceptAnyCertificate {
+        provider: Arc::clone(&provider),
+    });
+    let mut config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|error| format!("client protocol versions: {error}"))?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"acme-tls/1".to_vec()];
+    let connector = TlsConnector::from(Arc::new(config));
+    let stream = TcpStream::connect(address)
+        .await
+        .map_err(|error| format!("connect to TLS listener {address}: {error}"))?;
+    let server_name = ServerName::try_from(domain.to_string())
+        .map_err(|error| format!("invalid challenge domain {domain:?}: {error}"))?;
+    let tls = connector
+        .connect(server_name, stream)
+        .await
+        .map_err(|error| format!("acme-tls/1 handshake failed: {error}"))?;
+    let (_, session) = tls.get_ref();
+    if session.alpn_protocol() != Some(b"acme-tls/1".as_slice()) {
+        return Err(format!(
+            "server did not negotiate acme-tls/1; got {:?}",
+            session.alpn_protocol()
+        ));
+    }
+    let certificates = session
+        .peer_certificates()
+        .ok_or_else(|| "acme-tls/1 server presented no certificate".to_string())?;
+    let certificate = certificates
+        .first()
+        .ok_or_else(|| "acme-tls/1 server presented no certificate".to_string())?;
+    Ok(certificate.as_ref().to_vec())
+}
+
+fn der_content<'a>(certificate: &'a [u8], tlv: &Tlv<'a>) -> &'a [u8] {
+    // `Tlv` slices created by `children_with_offsets` already point at their content.
+    let _ = certificate;
+    tlv.content
+}
+
+/// Verify RFC 8737 challenge evidence: a subjectAltName dNSName for `domain` plus the critical
+/// `id-pe-acmeIdentifier` extension wrapping a 32-byte SHA-256 digest.
+fn verify_tls_alpn_certificate(certificate_der: &[u8], domain: &str) -> Result<(), String> {
+    const SAN_OID: &[u8] = &[0x55, 0x1D, 0x11];
+    const ACME_IDENTIFIER_OID_DER: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x1F];
+
+    let outer = read_tlv(certificate_der);
+    if outer.tag != 0x30 {
+        return Err("challenge certificate is not a DER SEQUENCE".to_string());
+    }
+    let parts = children_with_offsets(outer.content);
+    if parts.len() < 3 {
+        return Err("challenge certificate is truncated".to_string());
+    }
+    let tbs = &parts[0];
+    let fields = children_with_offsets(tbs.content);
+    let mut index = 0;
+    if fields.first().is_some_and(|field| field.tag == 0xA0) {
+        index += 1; // explicit version
+    }
+    // serial, signature algorithm, issuer, validity, subject, subjectPublicKeyInfo, [3] extensions
+    let extensions = fields
+        .get(index + 6)
+        .filter(|field| field.tag == 0xA3)
+        .ok_or_else(|| "challenge certificate has no extensions".to_string())?;
+    let extension_sequence = read_tlv(extensions.content);
+    if extension_sequence.tag != 0x30 {
+        return Err("challenge certificate extensions are malformed".to_string());
+    }
+
+    let mut saw_subject_alt_name = false;
+    let mut saw_identifier = false;
+    for extension in children_with_offsets(extension_sequence.content) {
+        let extension_fields = children_with_offsets(extension.content);
+        let Some(oid) = extension_fields.first() else {
+            continue;
+        };
+        if oid.tag != 0x06 {
+            continue;
+        }
+        let oid_content = der_content(extension.content, oid);
+        if oid_content == SAN_OID {
+            let Some(value) = extension_fields.get(1) else {
+                continue;
+            };
+            let names = read_tlv(value.content);
+            for name in children_with_offsets(names.content) {
+                if name.tag == 0x82 && der_content(names.content, &name) == domain.as_bytes() {
+                    saw_subject_alt_name = true;
+                }
+            }
+        } else if oid_content == ACME_IDENTIFIER_OID_DER {
+            let Some(critical) = extension_fields.get(1).filter(|field| field.tag == 0x01) else {
+                return Err("acmeIdentifier extension is not marked critical".to_string());
+            };
+            if der_content(extension.content, critical) != [0xFF] {
+                return Err("acmeIdentifier extension critical flag is false".to_string());
+            }
+            let Some(value) = extension_fields.get(2).filter(|field| field.tag == 0x04) else {
+                return Err("acmeIdentifier extension has no value".to_string());
+            };
+            let digest = read_tlv(value.content);
+            if digest.tag != 0x04 || digest.content.len() != 32 {
+                return Err(format!(
+                    "acmeIdentifier must wrap a 32-byte OCTET STRING, got {} bytes",
+                    digest.content.len()
+                ));
+            }
+            saw_identifier = true;
+        }
+    }
+    if !saw_subject_alt_name {
+        return Err(format!(
+            "challenge certificate SAN does not contain {domain:?}"
+        ));
+    }
+    if !saw_identifier {
+        return Err("challenge certificate has no id-pe-acmeIdentifier extension".to_string());
+    }
+    Ok(())
 }
 
 // ---- minimal X.509 issuance from the finalize CSR --------------------------------------------
@@ -529,29 +858,45 @@ fn config(
 }
 
 fn client_config() -> Arc<rustls::ClientConfig> {
+    client_config_with_alpn(&[])
+}
+
+fn client_config_with_alpn(alpn: &[&[u8]]) -> Arc<rustls::ClientConfig> {
     let mut roots = rustls::RootCertStore::empty();
     for certificate in caddy_rs_tls::certificates_from_pem(CA_PEM).expect("CA parses") {
         roots.add(certificate).expect("CA is a valid root");
     }
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    Arc::new(
-        rustls::ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .expect("safe protocol versions")
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-    )
+    let mut config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("safe protocol versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = alpn.iter().map(|protocol| protocol.to_vec()).collect();
+    Arc::new(config)
 }
 
 async fn tls_connect(address: SocketAddr, server_name: &str) -> TlsStream<TcpStream> {
-    let connector = TlsConnector::from(client_config());
-    let stream = TcpStream::connect(address).await.expect("TCP connect");
+    tls_connect_result(address, server_name, client_config())
+        .await
+        .expect("TLS handshake")
+}
+
+async fn tls_connect_result(
+    address: SocketAddr,
+    server_name: &str,
+    config: Arc<rustls::ClientConfig>,
+) -> Result<TlsStream<TcpStream>, String> {
+    let connector = TlsConnector::from(config);
+    let stream = TcpStream::connect(address)
+        .await
+        .map_err(|error| format!("TCP connect: {error}"))?;
     let server_name = rustls::pki_types::ServerName::try_from(server_name.to_string())
-        .expect("valid server name");
+        .map_err(|error| format!("invalid server name: {error}"))?;
     connector
         .connect(server_name, stream)
         .await
-        .expect("TLS handshake")
+        .map_err(|error| format!("TLS handshake failed: {error}"))
 }
 
 async fn read_response<S>(stream: &mut S) -> (u16, Vec<(String, String)>, String)
@@ -642,6 +987,77 @@ async fn apply(
         .listener_address(":0")
         .expect("derived HTTP listener bound");
     (runtime, https, http, directory)
+}
+
+/// Pre-bind the TLS listener and hand it to the runtime as a systemd-style inherited socket.
+///
+/// This gives the CA probe a deterministic address without a reserve/drop race, and exercises the
+/// normal inherited-socket binding path used in production.
+fn prebound_listener() -> (SocketAddr, SocketActivation) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("pre-bind TLS listener");
+    let address = listener.local_addr().expect("pre-bound address");
+    let activation = SocketActivation::from_raw_descriptors(vec![(
+        listener.into_raw_fd(),
+        Some("https".to_string()),
+    )])
+    .expect("valid inherited descriptor");
+    (address, activation)
+}
+
+/// A fixed port number that is currently free, for tests that need a connection to fail (probing a
+/// closed port). The port is released immediately, so a refused connection is deterministic.
+fn closed_port() -> u16 {
+    static NEXT: AtomicU16 = AtomicU16::new(23_000);
+    for _ in 0..100 {
+        let port = NEXT.fetch_add(1, Ordering::Relaxed);
+        if let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+            drop(listener);
+            return port;
+        }
+    }
+    panic!("no free fixed port");
+}
+
+/// Automatic-HTTPS config with a fixed TLS listen address and optional ACME challenge options
+/// (for example `{"http": {"disabled": true}}` to force TLS-ALPN-01).
+fn tls_alpn_config(
+    listen: &str,
+    http_port: Option<u16>,
+    challenges: Option<serde_json::Value>,
+    storage_root: &str,
+) -> Config {
+    let mut issuer = serde_json::json!({
+        "module": "acme",
+        "ca": DIRECTORY,
+        "email": "ops@example.com"
+    });
+    if let Some(challenges) = challenges {
+        issuer["challenges"] = challenges;
+    }
+    let mut http = serde_json::json!({"servers": {"srv0": {
+        "listen": [listen],
+        "tls_connection_policies": [{}],
+        "automatic_https": {"disable_redirects": true},
+        "routes": [{
+            "match": [{"host": ["example.com"]}],
+            "handle": [{"handler": "static_response", "body": "hello https"}]
+        }]
+    }}});
+    if let Some(http_port) = http_port {
+        http["http_port"] = serde_json::json!(http_port);
+    }
+    Config::from_value(serde_json::json!({
+        "admin": {"disabled": true},
+        "storage": {"module": "file_system", "root": storage_root},
+        "apps": {
+            "tls": {"automation": {"policies": [{
+                "subjects": ["example.com"],
+                "issuers": [issuer]
+            }]}},
+            "http": http
+        }
+    }))
+    .expect("TLS-ALPN test config decodes")
 }
 
 // ---- tests -----------------------------------------------------------------------------------
@@ -821,5 +1237,220 @@ async fn cleartext_static_regression() {
     let (status, _, body) = plain_get(address, "example.com", "/").await;
     assert_eq!(status, 200);
     assert_eq!(body, "plain");
+    runtime.shutdown().await;
+}
+
+// ---- TLS-ALPN-01 server integration ----------------------------------------------------------
+
+#[tokio::test]
+async fn tls_alpn01_challenge_validates_and_issues_certificate() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().to_string_lossy().to_string();
+    let (address, activation) = prebound_listener();
+    let listen = address.to_string();
+    let store = Arc::new(GenerationStore::with_builtin_registry());
+    store
+        .load(tls_alpn_config(
+            &listen,
+            Some(0),
+            Some(serde_json::json!({"http": {"disabled": true}})),
+            &root,
+        ))
+        .expect("config validates");
+    let fake = Arc::new(FakeCa::new(false).with_tls_alpn_probe(address));
+    let mut runtime = ServerRuntime::new(Arc::clone(&store))
+        .with_acme_transport(fake.clone())
+        .with_data_root(directory.path())
+        .with_socket_activation(activation);
+    runtime
+        .apply()
+        .await
+        .expect("TLS-ALPN-01 issuance through the live listener must succeed");
+
+    // The CA selected TLS-ALPN-01 (HTTP-01 was disabled) and validated it over `acme-tls/1`.
+    assert_eq!(
+        fake.selected_challenge().as_deref(),
+        Some("tls-alpn-01"),
+        "TLS-ALPN-01 must be selected when HTTP-01 is disabled"
+    );
+    assert_eq!(
+        fake.tls_alpn_validations(),
+        1,
+        "the CA must perform exactly one acme-tls/1 validation"
+    );
+    let challenge_certificate = fake
+        .tls_alpn_certificate()
+        .expect("the CA captured the challenge certificate");
+    verify_tls_alpn_certificate(&challenge_certificate, "example.com")
+        .expect("challenge certificate carries valid RFC 8737 evidence");
+
+    // The issued certificate is now served for normal clients at the same listener.
+    let address = runtime
+        .listener_address(&listen)
+        .expect("TLS listener bound");
+    let mut stream = tls_connect(address, "example.com").await;
+    let (status, _, body) = http_get(&mut stream, "example.com", "/").await;
+    assert_eq!(status, 200);
+    assert_eq!(body, "hello https");
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn normal_tls_clients_are_unaffected_by_tls_alpn_overlay() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().to_string_lossy().to_string();
+    let (address, activation) = prebound_listener();
+    let listen = address.to_string();
+    let store = Arc::new(GenerationStore::with_builtin_registry());
+    store
+        .load(tls_alpn_config(
+            &listen,
+            Some(0),
+            Some(serde_json::json!({"http": {"disabled": true}})),
+            &root,
+        ))
+        .expect("config validates");
+    let fake = Arc::new(FakeCa::new(false).with_tls_alpn_probe(address));
+    let mut runtime = ServerRuntime::new(Arc::clone(&store))
+        .with_acme_transport(fake.clone())
+        .with_data_root(directory.path())
+        .with_socket_activation(activation);
+    runtime.apply().await.expect("apply");
+    let address = runtime
+        .listener_address(&listen)
+        .expect("TLS listener bound");
+
+    // A normal client (no ALPN) still gets the issued certificate and the route.
+    let mut normal = tls_connect(address, "example.com").await;
+    let (status, _, body) = http_get(&mut normal, "example.com", "/").await;
+    assert_eq!(status, 200);
+    assert_eq!(body, "hello https");
+    let (_, session) = normal.get_ref();
+    let served_certificate = session
+        .peer_certificates()
+        .and_then(|certificates| certificates.first())
+        .expect("issued certificate")
+        .as_ref()
+        .to_vec();
+    let challenge_certificate = fake.tls_alpn_certificate().expect("challenge certificate");
+    assert_ne!(
+        served_certificate, challenge_certificate,
+        "normal handshakes must not be served the challenge certificate"
+    );
+
+    // Unknown SNI completes/would complete with the default cert but the client rejects the name
+    // mismatch; either way the handshake does not succeed for the client.
+    let unknown_sni = tls_connect_result(address, "unknown.example", client_config()).await;
+    assert!(
+        unknown_sni.is_err(),
+        "a client must not accept the default certificate for an unknown SNI"
+    );
+
+    // An ALPN the server does not support is rejected cleanly instead of being served as HTTP.
+    let unsupported_alpn = tls_connect_result(
+        address,
+        "example.com",
+        client_config_with_alpn(&[b"bogus/1"]),
+    )
+    .await;
+    assert!(
+        unsupported_alpn.is_err(),
+        "unknown ALPN must fail the handshake, not fall back to a normal protocol"
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn http01_is_preferred_when_both_challenges_are_available() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().to_string_lossy().to_string();
+    let (address, activation) = prebound_listener();
+    let listen = address.to_string();
+    let store = Arc::new(GenerationStore::with_builtin_registry());
+    // No `challenges` options: HTTP-01 and TLS-ALPN-01 are both enabled.
+    store
+        .load(tls_alpn_config(&listen, Some(0), None, &root))
+        .expect("config validates");
+    let fake = Arc::new(FakeCa::new(false).with_tls_alpn_probe(address));
+    let mut runtime = ServerRuntime::new(Arc::clone(&store))
+        .with_acme_transport(fake.clone())
+        .with_data_root(directory.path())
+        .with_socket_activation(activation);
+    runtime.apply().await.expect("apply");
+    assert_eq!(
+        fake.selected_challenge().as_deref(),
+        Some("http-01"),
+        "Caddy prefers HTTP-01 when both challenges are available"
+    );
+    assert_eq!(
+        fake.tls_alpn_validations(),
+        0,
+        "TLS-ALPN-01 must not be used when HTTP-01 succeeds"
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn tls_alpn_probe_failure_keeps_previous_generation() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().to_string_lossy().to_string();
+    let store = Arc::new(GenerationStore::with_builtin_registry());
+    // First generation: cleartext static response.
+    store
+        .load(
+            Config::from_value(serde_json::json!({
+                "admin": {"disabled": true},
+                "apps": {"http": {"servers": {"srv0": {
+                    "listen": ["127.0.0.1:0"],
+                    "routes": [{"handle": [{"handler": "static_response", "body": "old"}]}]
+                }}}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    // The CA's TLS-ALPN probe points at a port where nothing listens, so validation fails once the
+    // second (automatic-HTTPS) generation is applied.
+    let closed_port = closed_port();
+    let fake = Arc::new(
+        FakeCa::new(false).with_tls_alpn_probe(SocketAddr::from(([127, 0, 0, 1], closed_port))),
+    );
+    let mut runtime = ServerRuntime::new(Arc::clone(&store))
+        .with_acme_transport(fake.clone())
+        .with_data_root(directory.path());
+    runtime.apply().await.expect("first apply");
+    let old_address = runtime.listener_address("127.0.0.1:0").unwrap();
+    let old_generation = runtime.status().generation_id;
+
+    // Second generation: automatic HTTPS whose TLS-ALPN-01 validation cannot connect. The TLS
+    // listener is pre-bound and injected, so the failed apply does not race for a port.
+    let (address, activation) = prebound_listener();
+    let listen = address.to_string();
+    runtime = runtime.with_socket_activation(activation);
+    store
+        .load(tls_alpn_config(
+            &listen,
+            Some(0),
+            Some(serde_json::json!({"http": {"disabled": true}})),
+            &root,
+        ))
+        .expect("second config validates");
+    let error = runtime
+        .apply()
+        .await
+        .expect_err("TLS-ALPN-01 probe failure must fail the apply");
+    assert!(
+        error.to_string().contains("automatic HTTPS"),
+        "error must name automatic HTTPS: {error}"
+    );
+    assert!(
+        fake.probe_failure().is_some(),
+        "the CA must record the failed TLS-ALPN-01 probe"
+    );
+
+    // The old generation and its cleartext listener are untouched by the failed apply.
+    assert_eq!(runtime.status().generation_id, old_generation);
+    let (status, _, body) = plain_get(old_address, "example.com", "/").await;
+    assert_eq!(status, 200);
+    assert_eq!(body, "old");
     runtime.shutdown().await;
 }

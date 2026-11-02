@@ -16,7 +16,10 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use caddy_rs_http::Body;
-use caddy_rs_tls::{AutomaticHttpsPlan, CertificateResolver, Http01TokenStore, HTTP01_PATH_PREFIX};
+use caddy_rs_tls::{
+    AutomaticHttpsPlan, CertificateResolver, Http01TokenStore, TlsAlpn01TokenStore,
+    HTTP01_PATH_PREFIX,
+};
 
 /// Redirect policy for one generation's HTTP listeners.
 #[derive(Debug, Clone)]
@@ -58,6 +61,9 @@ pub(crate) struct PreparedAutomaticHttps {
     pub(crate) plan: AutomaticHttpsPlan,
     /// Pre-routing state for cleartext listeners.
     pub(crate) serving: Arc<AutomaticHttpsServing>,
+    /// TLS-ALPN-01 challenge-certificate store shared with the issuer that ran this apply. TLS
+    /// listeners wrap their resolver with it so `acme-tls/1` handshakes are answered.
+    pub(crate) tls_alpn01_tokens: Arc<TlsAlpn01TokenStore>,
 }
 
 /// Per-generation automatic-HTTPS serving state for cleartext listeners.

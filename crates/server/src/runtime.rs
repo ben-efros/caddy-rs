@@ -19,9 +19,10 @@ use caddy_rs_admin::AdminApi;
 use caddy_rs_core::{Generation, GenerationStore};
 use caddy_rs_http::RouterBuilder;
 use caddy_rs_tls::{
-    build_server_config, listener_uses_tls, plan_automatic_https, resolver_from_config,
-    AcmeTransport, AutomaticHttpsProvisioner, CertificateResolver, HyperTransport,
-    TlsServerOptions, DEFAULT_HTTPS_PORT,
+    build_server_config, build_server_config_with_cert_resolver, listener_uses_tls,
+    plan_automatic_https, resolver_from_config, AcmeTlsAlpnResolver, AcmeTransport,
+    AutomaticHttpsPlan, AutomaticHttpsProvisioner, CertificateResolver, HyperTransport,
+    TlsAlpn01TokenStore, TlsServerOptions, DEFAULT_HTTPS_PORT,
 };
 use tokio::sync::watch;
 
@@ -78,6 +79,56 @@ fn strict_sni_host_enabled(value: Option<&serde_json::Value>) -> bool {
             .unwrap_or(true),
         Some(_) => true,
     }
+}
+
+/// Automatic-HTTPS work split across two apply phases.
+///
+/// Listeners must already be accepting connections before the ACME CA can validate an HTTP-01 or
+/// TLS-ALPN-01 challenge, but the final TLS configuration needs the certificate that provisioning
+/// obtains. The runtime therefore creates the issuer (and captures its TLS-ALPN token store) first,
+/// binds challenge-capable listeners, provisions, and only then installs the final resolver.
+struct PendingAutomaticHttps {
+    plan: AutomaticHttpsPlan,
+    provisioner: AutomaticHttpsProvisioner,
+    base_resolver: Option<CertificateResolver>,
+    serving: Arc<crate::auto_https::AutomaticHttpsServing>,
+    /// Shared challenge-certificate store handed to the TLS listeners in both phases.
+    tls_alpn01_tokens: Arc<TlsAlpn01TokenStore>,
+}
+
+impl PendingAutomaticHttps {
+    /// Run certificate acquisition. The CA connects back to the listeners bound in the bootstrap
+    /// phase, so this must only be called after they are accepting connections.
+    async fn provision(self) -> Result<PreparedAutomaticHttps> {
+        let tokens = Arc::clone(&self.tls_alpn01_tokens);
+        let plan = self.plan;
+        let provisioned = self
+            .provisioner
+            .provision(&plan, self.base_resolver)
+            .await?;
+        Ok(PreparedAutomaticHttps {
+            resolver: provisioned.resolver,
+            plan,
+            serving: self.serving,
+            tls_alpn01_tokens: tokens,
+        })
+    }
+}
+
+/// TLS material for one listener-state build.
+struct AutomaticHttpsContext<'a> {
+    /// Resolver for normal SNI. During the bootstrap phase this is the manual (configured)
+    /// resolver or an empty resolver; in the final phase it is the provisioned resolver.
+    resolver: Option<Arc<CertificateResolver>>,
+    /// TLS-ALPN-01 challenge certificates to overlay on `acme-tls/1` handshakes.
+    tokens: &'a Arc<TlsAlpn01TokenStore>,
+    /// Pre-routing state for cleartext listeners (HTTP-01, redirects).
+    serving: &'a Arc<crate::auto_https::AutomaticHttpsServing>,
+    /// Derived HTTP listener address from the plan, when the configuration needs one.
+    http_listener: Option<String>,
+    /// Whether this is the pre-provisioning build (allows a missing certificate resolver so the
+    /// listener can start and answer acme-tls/1 challenges).
+    bootstrap: bool,
 }
 
 /// Owns listeners and drives configuration generations.
@@ -178,45 +229,115 @@ impl ServerRuntime {
     }
 
     /// Reconcile listeners and routers with the active generation.
+    ///
+    /// When automatic HTTPS is active the apply is two-phase because ACME challenges require live
+    /// listeners:
+    ///
+    /// 1. derive the automation plan and create the issuer/provisioner (no network);
+    /// 2. build and publish "bootstrap" listener states whose TLS listeners advertise `acme-tls/1`
+    ///    with the challenge-certificate resolver overlay, and whose cleartext listeners answer
+    ///    HTTP-01 and redirects;
+    /// 3. bind/start every configured listener;
+    /// 4. provision certificates (the CA connects back to the now-running listeners);
+    /// 5. rebuild the states with the provisioned resolver and publish them.
+    ///
+    /// A failure after step 2 restores the previous generation's states and stops newly bound
+    /// listeners, so a failed issuance keeps the old generation serving.
     pub async fn apply(&mut self) -> Result<RuntimeStatus> {
         let Some(generation) = self.store.current() else {
             self.stop_all().await;
             self.status = RuntimeStatus::default();
             return Ok(self.status.clone());
         };
-        // Automatic HTTPS (certificate acquisition) runs before listener state is replaced: a
-        // failure here aborts the apply and leaves the previous generation's listeners serving.
-        let prepared = self.prepare_automatic_https(&generation).await?;
-        let states = self.build_listener_states(&generation, prepared.as_ref())?;
-        // Resolve systemd socket activation before mutating any runtime state: a mismatch
-        // (unclaimed inherited socket, malformed environment, non-listening fd) must fail the
-        // apply without disturbing the previous generation.
-        self.resolve_activation(&states)?;
+        let pending = self.prepare_automatic_https(&generation)?;
+        let mut newly_bound: Vec<String> = Vec::new();
 
-        {
-            let mut shared = self
-                .states
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            *shared = states.clone();
-        }
-
-        // Remove listeners whose address is no longer configured.
-        let removed: Vec<String> = self
-            .listeners
-            .keys()
-            .filter(|listen| !states.contains_key(*listen))
-            .cloned()
-            .collect();
-        for listen in removed {
-            if let Some(handle) = self.listeners.remove(&listen) {
-                tracing::info!(%listen, "closing listener");
-                handle.stop().await;
+        // Without automatic HTTPS there is nothing to provision: the original single-phase path.
+        let Some(pending) = pending else {
+            let states = self.build_listener_states(&generation, None)?;
+            self.resolve_activation(&states)?;
+            self.publish_states(&states);
+            if let Err(error) = self.start_new_listeners(&states, &mut newly_bound).await {
+                self.stop_listener_keys(&newly_bound).await;
+                return Err(error);
             }
+            self.remove_unconfigured_listeners(&states).await;
+            self.reconcile_admin(&generation).await?;
+            return Ok(self.finish_apply(&generation));
+        };
+        // Snapshot for rollback: a failed provisioning pass must leave the previous generation's
+        // listener states untouched.
+        let previous_states = self
+            .states
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+
+        // Phase 1: challenge-capable states, then start the listeners before provisioning.
+        let bootstrap = self.build_bootstrap_states(&generation, &pending)?;
+        self.resolve_activation(&bootstrap)?;
+        self.publish_states(&bootstrap);
+        if let Err(error) = self.start_new_listeners(&bootstrap, &mut newly_bound).await {
+            self.rollback_states(&previous_states, &newly_bound).await;
+            return Err(error);
         }
 
-        // Add newly configured listeners.
-        for listen in states.keys() {
+        // Phase 2: provision certificates; the CA can now reach the listeners for HTTP-01 /
+        // TLS-ALPN-01 validation.
+        let prepared = match pending.provision().await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.rollback_states(&previous_states, &newly_bound).await;
+                return Err(error);
+            }
+        };
+
+        // Phase 3: install the final states (provisioned resolver, `acme-tls/1` retained so
+        // renewals can answer challenges on the same listeners).
+        let context = AutomaticHttpsContext {
+            resolver: Some(Arc::clone(&prepared.resolver)),
+            tokens: &prepared.tls_alpn01_tokens,
+            serving: &prepared.serving,
+            http_listener: prepared.plan.http_listener(),
+            bootstrap: false,
+        };
+        let states = match self.build_listener_states(&generation, Some(&context)) {
+            Ok(states) => states,
+            Err(error) => {
+                self.rollback_states(&previous_states, &newly_bound).await;
+                return Err(error);
+            }
+        };
+        self.publish_states(&states);
+        if let Err(error) = self.start_new_listeners(&states, &mut newly_bound).await {
+            self.rollback_states(&previous_states, &newly_bound).await;
+            return Err(error);
+        }
+        self.remove_unconfigured_listeners(&states).await;
+        self.reconcile_admin(&generation).await?;
+        Ok(self.finish_apply(&generation))
+    }
+
+    /// Replace the shared listener-state map.
+    fn publish_states(&self, states: &std::collections::HashMap<String, Arc<ListenerState>>) {
+        let mut shared = self
+            .states
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *shared = states.clone();
+    }
+
+    /// Bind and start every configured listener that is not running yet.
+    ///
+    /// Listen addresses are processed in sorted order so socket-activation claims are deterministic.
+    async fn start_new_listeners(
+        &mut self,
+        states: &std::collections::HashMap<String, Arc<ListenerState>>,
+        newly_bound: &mut Vec<String>,
+    ) -> Result<()> {
+        let mut listens: Vec<&String> = states.keys().collect();
+        listens.sort();
+        for listen in listens {
             if self.listeners.contains_key(listen) {
                 continue;
             }
@@ -242,17 +363,58 @@ impl ServerRuntime {
             )
             .await?;
             tracing::info!(listen, bound = %handle.bound, "listening");
-            self.listeners.insert(listen.to_string(), handle);
+            self.listeners.insert(listen.clone(), handle);
+            newly_bound.push(listen.clone());
         }
-
         // Once every inherited socket has been adopted the remaining applies bind normally.
         if let ActivationState::Planned(plan) = &self.activation {
             if !plan.has_claims() {
                 self.activation = ActivationState::Inactive;
             }
         }
+        Ok(())
+    }
 
-        // Reconcile the admin listener.
+    /// Stop listeners whose address is no longer configured.
+    async fn remove_unconfigured_listeners(
+        &mut self,
+        states: &std::collections::HashMap<String, Arc<ListenerState>>,
+    ) {
+        let removed: Vec<String> = self
+            .listeners
+            .keys()
+            .filter(|listen| !states.contains_key(*listen))
+            .cloned()
+            .collect();
+        for listen in removed {
+            if let Some(handle) = self.listeners.remove(&listen) {
+                tracing::info!(%listen, "closing listener");
+                handle.stop().await;
+            }
+        }
+    }
+
+    /// Stop the listeners bound during the current (failed) apply.
+    async fn stop_listener_keys(&mut self, keys: &[String]) {
+        for key in keys {
+            if let Some(handle) = self.listeners.remove(key) {
+                handle.stop().await;
+            }
+        }
+    }
+
+    /// Restore the previous generation's listener states and stop listeners added by this apply.
+    async fn rollback_states(
+        &mut self,
+        previous: &std::collections::HashMap<String, Arc<ListenerState>>,
+        newly_bound: &[String],
+    ) {
+        self.publish_states(previous);
+        self.stop_listener_keys(newly_bound).await;
+    }
+
+    /// Reconcile the admin listener with the active generation.
+    async fn reconcile_admin(&mut self, generation: &Generation) -> Result<()> {
         let admin_config = generation.config().admin.clone().unwrap_or_default();
         let desired_admin = if admin_config.disabled {
             None
@@ -270,7 +432,11 @@ impl ServerRuntime {
                 self.admin = Some(handle);
             }
         }
+        Ok(())
+    }
 
+    /// Record the applied generation in the observable status.
+    fn finish_apply(&mut self, generation: &Generation) -> RuntimeStatus {
         self.status = RuntimeStatus {
             generation_id: Some(generation.id()),
             listeners: self
@@ -280,7 +446,7 @@ impl ServerRuntime {
                 .collect(),
             admin: self.admin.as_ref().map(|handle| handle.bound.clone()),
         };
-        Ok(self.status.clone())
+        self.status.clone()
     }
 
     /// The actual bound address for a configured listen string.
@@ -402,10 +568,15 @@ impl ServerRuntime {
     /// parsed [`ServerLimits`]. A malformed timeout or limit field fails the apply with the
     /// offending JSON path, so an invalid server configuration is never served.
     /// Provision automatic-HTTPS certificates for `generation` (if automation is configured).
-    async fn prepare_automatic_https(
+    /// Derive the automatic-HTTPS plan and build the provisioner without doing any network work.
+    ///
+    /// The returned issuer's TLS-ALPN-01 token store is captured here: the bootstrap listener
+    /// states must already share it before provisioning runs, otherwise `acme-tls/1` handshakes
+    /// cannot be answered while the CA validates the order.
+    fn prepare_automatic_https(
         &self,
         generation: &Generation,
-    ) -> Result<Option<PreparedAutomaticHttps>> {
+    ) -> Result<Option<PendingAutomaticHttps>> {
         let config = generation.config();
         let Some(plan) = plan_automatic_https(config)? else {
             return Ok(None);
@@ -427,26 +598,59 @@ impl ServerRuntime {
         let base_resolver = resolver_from_config(config)?;
         let provisioner =
             AutomaticHttpsProvisioner::new(transport, root, Arc::clone(&self.challenge_tokens));
-        let provisioned = provisioner.provision(&plan, base_resolver).await?;
+        let tls_alpn01_tokens = Arc::clone(provisioner.tls_alpn01_token_store());
         let redirect = plan.redirects_enabled.then(|| RedirectPolicy {
             hosts: plan.redirect_hosts.clone(),
             redirect_all: plan.redirect_all,
             https_port: plan.https_port,
         });
-        Ok(Some(PreparedAutomaticHttps {
-            resolver: provisioned.resolver,
+        Ok(Some(PendingAutomaticHttps {
+            plan,
+            provisioner,
+            base_resolver,
             serving: Arc::new(crate::auto_https::AutomaticHttpsServing {
                 tokens: Arc::clone(&self.challenge_tokens),
                 redirect,
             }),
-            plan,
+            tls_alpn01_tokens,
         }))
     }
 
+    /// Build the pre-provisioning listener states.
+    ///
+    /// TLS listeners use the manual (configured) certificates as their normal fallback and the
+    /// issuer's TLS-ALPN token store as the `acme-tls/1` overlay, so they can answer challenge
+    /// handshakes even though no certificate has been obtained yet. Cleartext listeners get the
+    /// HTTP-01/redirect pre-routing from the plan.
+    fn build_bootstrap_states(
+        &self,
+        generation: &Generation,
+        pending: &PendingAutomaticHttps,
+    ) -> Result<std::collections::HashMap<String, Arc<ListenerState>>> {
+        let context = AutomaticHttpsContext {
+            resolver: resolver_from_config(generation.config())?.map(Arc::new),
+            tokens: &pending.tls_alpn01_tokens,
+            serving: &pending.serving,
+            http_listener: pending.plan.http_listener(),
+            bootstrap: true,
+        };
+        self.build_listener_states(generation, Some(&context))
+    }
+
+    /// Build the per-listen-address serving state for a generation.
+    ///
+    /// The same server object can own several listen addresses; each gets the same router and the
+    /// parsed [`ServerLimits`]. A malformed timeout or limit field fails the apply with the
+    /// offending JSON path, so an invalid server configuration is never served.
+    ///
+    /// When `automatic` is present, TLS listeners additionally advertise `acme-tls/1` and wrap
+    /// their resolver with [`AcmeTlsAlpnResolver`]; challenge certificates are only selected for
+    /// handshakes that offer that ALPN, and every other handshake uses the normal resolver (and
+    /// therefore normal SNI behaviour).
     fn build_listener_states(
         &self,
         generation: &Generation,
-        prepared: Option<&PreparedAutomaticHttps>,
+        automatic: Option<&AutomaticHttpsContext<'_>>,
     ) -> Result<std::collections::HashMap<String, Arc<ListenerState>>> {
         let mut states = std::collections::HashMap::new();
         let Some(http) = generation.config().http() else {
@@ -454,14 +658,15 @@ impl ServerRuntime {
         };
         // TLS listener policy: a listener terminates TLS when its HTTP server declares connection
         // policies or when its port is the effective HTTPS port. Certificates come from
-        // `apps.tls.certificates`; a TLS listener without certificates fails this apply loudly.
+        // `apps.tls.certificates` (manual) or automatic HTTPS; a TLS listener without certificates
+        // fails this apply loudly once provisioning has had its chance.
         let https_port = http.https_port.unwrap_or(DEFAULT_HTTPS_PORT);
-        let resolver: Option<Arc<CertificateResolver>> = match prepared {
-            Some(prepared) => Some(Arc::clone(&prepared.resolver)),
-            None => resolver_from_config(generation.config())?.map(Arc::new),
+        let manual_resolver: Option<Arc<CertificateResolver>> = if automatic.is_none() {
+            resolver_from_config(generation.config())?.map(Arc::new)
+        } else {
+            None
         };
         let http_port = http.http_port.unwrap_or(caddy_rs_tls::DEFAULT_HTTP_PORT);
-        let automatic_serving = prepared.map(|prepared| Arc::clone(&prepared.serving));
         for (server_name, server) in &http.servers {
             let limits = Arc::new(ServerLimits::from_http_server(server_name, server)?);
             let policies = server.tls_connection_policies.as_deref();
@@ -494,22 +699,52 @@ impl ServerRuntime {
                 let terminates_tls =
                     listener_uses_tls(listen, https_port, has_connection_policies)?;
                 let tls = if terminates_tls {
-                    let resolver = resolver.as_ref().filter(|resolver| !resolver.is_empty());
-                    let resolver = resolver.ok_or_else(|| {
-                        missing_certificates_error(listen, server_name, https_port)
-                    })?;
-                    Some(build_server_config(Arc::clone(resolver), &tls_options)?)
+                    match automatic {
+                        Some(context) => {
+                            // TLS-ALPN-01 overlay: advertise `acme-tls/1` and resolve challenge
+                            // certificates only for that ALPN. During the bootstrap phase an empty
+                            // fallback resolver is allowed (normal handshakes fail until the
+                            // certificate exists, exactly like Caddy while issuance is in flight).
+                            let fallback: Arc<CertificateResolver> = match &context.resolver {
+                                Some(resolver) if !resolver.is_empty() => Arc::clone(resolver),
+                                _ if context.bootstrap => Arc::new(CertificateResolver::default()),
+                                _ => {
+                                    return Err(missing_certificates_error(
+                                        listen,
+                                        server_name,
+                                        https_port,
+                                    ))
+                                }
+                            };
+                            let overlay = Arc::new(AcmeTlsAlpnResolver::new(
+                                fallback,
+                                Arc::clone(context.tokens),
+                            ));
+                            let options = tls_options.clone().with_acme_tls_alpn();
+                            Some(build_server_config_with_cert_resolver(overlay, &options)?)
+                        }
+                        None => {
+                            let resolver = manual_resolver
+                                .as_ref()
+                                .filter(|resolver| !resolver.is_empty())
+                                .ok_or_else(|| {
+                                    missing_certificates_error(listen, server_name, https_port)
+                                })?;
+                            Some(build_server_config(Arc::clone(resolver), &tls_options)?)
+                        }
+                    }
                 } else {
                     None
                 };
-                let automatic = if !terminates_tls {
+                let automatic_serving = if !terminates_tls {
                     let listener_port = caddy_rs_core::ListenAddr::parse(listen)
                         .ok()
                         .and_then(|address| address.port());
-                    if listener_port == Some(http_port) {
-                        automatic_serving.clone()
-                    } else {
-                        None
+                    match automatic {
+                        Some(context) if listener_port == Some(http_port) => {
+                            Some(Arc::clone(context.serving))
+                        }
+                        _ => None,
                     }
                 } else {
                     None
@@ -520,14 +755,14 @@ impl ServerRuntime {
                         router: Arc::clone(&router),
                         limits: Arc::clone(&limits),
                         tls,
-                        automatic,
+                        automatic: automatic_serving,
                     }),
                 );
             }
         }
-        if let Some(prepared) = prepared {
-            if let Some(listen) = prepared.plan.http_listener() {
-                if !states.contains_key(&listen) {
+        if let Some(context) = automatic {
+            if let Some(listen) = &context.http_listener {
+                if !states.contains_key(listen) {
                     // Challenge/redirect-only HTTP listener derived from the HTTPS site: no
                     // configured routes; the automatic pre-routing answers before the router.
                     let router = Arc::new(
@@ -537,12 +772,12 @@ impl ServerRuntime {
                             .map_err(Error::Http)?,
                     );
                     states.insert(
-                        listen,
+                        listen.clone(),
                         Arc::new(ListenerState {
                             router,
                             limits: Arc::new(ServerLimits::default()),
                             tls: None,
-                            automatic: Some(Arc::clone(&prepared.serving)),
+                            automatic: Some(Arc::clone(context.serving)),
                         }),
                     );
                 }
