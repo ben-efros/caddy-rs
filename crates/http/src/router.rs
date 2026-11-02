@@ -10,13 +10,16 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::auth::{BasicAuthHandler, ForwardAuthHandler};
+use crate::body::StreamingResponse;
 use crate::file_server::FileServerHandler;
 use crate::handlers::{
     EncodeHandler, HeadersHandler, RewriteHandler, StaticResponseHandler, SubrouteHandler,
     VarsHandler,
 };
 use crate::matchers::build_matcher_set;
-use crate::types::{Error, Outcome, Request, Response, Result, SharedHandler, SharedMatcher};
+use crate::types::{
+    Error, Request, Response, Result, SharedHandler, SharedMatcher, StreamingOutcome,
+};
 
 /// A custom handler factory, used by crates outside this one (for example `caddy-rs-proxy`) to
 /// contribute handler modules without creating a dependency cycle.
@@ -61,8 +64,22 @@ impl Router {
         self.routes.is_empty()
     }
 
-    /// Evaluate a request through the route tree.
+    /// Evaluate a request through the route tree, returning a buffered response.
+    ///
+    /// This is the compatibility API used by the server until it adopts the streaming path: a
+    /// streaming handler response is collected into [`Response::body`]. Use
+    /// [`Router::handle_streaming`] to keep streamed bodies unbuffered.
     pub async fn handle(&self, request: Request) -> Result<Response> {
+        let response = self.handle_streaming(request).await?;
+        response.into_buffered().await.map_err(Error::from)
+    }
+
+    /// Evaluate a request through the route tree, preserving streaming response bodies.
+    ///
+    /// Handlers that have not opted into streaming still produce buffered responses; see
+    /// [`crate::types::Handler::handle_streaming`] and the server integration contract in
+    /// [`crate::body`].
+    pub async fn handle_streaming(&self, request: Request) -> Result<StreamingResponse> {
         let mut matched_groups: HashSet<&str> = HashSet::new();
         let mut current = request;
         for route in &self.routes {
@@ -82,27 +99,27 @@ impl Router {
                 // A handler consumes the request. Keep the pre-handler request so staged response
                 // headers survive into a response produced by a later handler.
                 let staged = current.clone();
-                match handler.handle(current).await? {
-                    Outcome::Continue(next) => current = next,
-                    Outcome::Respond(mut response) => {
-                        apply_pending_headers(&mut response, &staged);
+                match handler.handle_streaming(current).await? {
+                    StreamingOutcome::Continue(next) => current = next,
+                    StreamingOutcome::Respond(mut response) => {
+                        apply_pending_headers(&mut response.headers, &staged);
                         return Ok(response);
                     }
                 }
             }
             if route.terminal {
-                let mut response = Response::ok();
-                apply_pending_headers(&mut response, &current);
+                let mut response = StreamingResponse::from_buffered(Response::ok());
+                apply_pending_headers(&mut response.headers, &current);
                 return Ok(response);
             }
         }
-        Ok(Response::not_found())
+        Ok(StreamingResponse::from_buffered(Response::not_found()))
     }
 }
 
-fn apply_pending_headers(response: &mut Response, request: &Request) {
+fn apply_pending_headers(headers: &mut http::HeaderMap, request: &Request) {
     for (name, value) in &request.pending_response_headers {
-        response.headers.insert(name.clone(), value.clone());
+        headers.insert(name.clone(), value.clone());
     }
 }
 
@@ -427,5 +444,195 @@ mod tests {
             .unwrap();
         let response = router.handle(request("/x", "example.com")).await.unwrap();
         assert_eq!(response.headers["x-path"], "/x");
+    }
+
+    // ---- streaming handler/router path ------------------------------------------------
+
+    use crate::body::{Body, BodyError, StreamingBody, StreamingResponse};
+    use crate::types::{Handler, Outcome, SharedHandler, StreamingOutcome};
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use http::HeaderMap;
+    use http_body_util::BodyExt;
+    use tokio::sync::mpsc;
+
+    /// Handler that serves a buffered response on the legacy path and a chunked stream on the
+    /// streaming path.
+    struct ChunkHandler {
+        frames: Vec<std::result::Result<Bytes, BodyError>>,
+    }
+
+    #[async_trait]
+    impl Handler for ChunkHandler {
+        fn name(&self) -> &'static str {
+            "test_chunk_handler"
+        }
+
+        async fn handle(&self, _request: Request) -> Result<Outcome> {
+            Ok(Outcome::Respond(Response::text(
+                http::StatusCode::OK,
+                "buffered",
+            )))
+        }
+
+        async fn handle_streaming(&self, _request: Request) -> Result<StreamingOutcome> {
+            let (sender, receiver) = mpsc::channel(self.frames.len().max(1));
+            for frame in &self.frames {
+                // `BodyError` is deliberately not `Clone` (it boxes a source error); the test
+                // handler only uses the cancellation variant.
+                let frame = match frame {
+                    Ok(bytes) => Ok(bytes.clone()),
+                    Err(_) => Err(BodyError::Cancelled),
+                };
+                sender.send(frame).await.expect("test channel has capacity");
+            }
+            drop(sender);
+            Ok(StreamingOutcome::Respond(StreamingResponse::new(
+                http::StatusCode::OK,
+                HeaderMap::new(),
+                Body::from_stream(StreamingBody::from_chunks(receiver)),
+            )))
+        }
+    }
+
+    fn router_with_handlers(handlers: Vec<SharedHandler>) -> Router {
+        Router {
+            routes: vec![Route {
+                matcher_sets: Vec::new(),
+                handlers,
+                terminal: false,
+                group: None,
+            }],
+        }
+    }
+
+    async fn body_frames(body: &mut StreamingBody) -> Vec<Bytes> {
+        let mut frames = Vec::new();
+        while let Some(frame) = body.frame().await {
+            match frame {
+                Ok(frame) => {
+                    if let Ok(data) = frame.into_data() {
+                        frames.push(data);
+                    }
+                }
+                Err(error) => panic!("unexpected body error: {error}"),
+            }
+        }
+        frames
+    }
+
+    #[tokio::test]
+    async fn streaming_handler_response_is_preserved_on_streaming_path() {
+        let router = router_with_handlers(vec![Arc::new(ChunkHandler {
+            frames: vec![Ok(Bytes::from_static(b"a")), Ok(Bytes::from_static(b"bc"))],
+        })]);
+        let mut response = router
+            .handle_streaming(request("/stream", "example.com"))
+            .await
+            .unwrap();
+        assert!(response.is_streaming());
+        assert_eq!(response.status, http::StatusCode::OK);
+        match &mut response.body {
+            Body::Stream(stream) => {
+                assert_eq!(
+                    body_frames(stream).await,
+                    [Bytes::from_static(b"a"), Bytes::from_static(b"bc")]
+                );
+            }
+            Body::Bytes(_) => panic!("expected a streaming body"),
+        }
+    }
+
+    #[tokio::test]
+    async fn buffered_handle_collects_streaming_responses_for_compatibility() {
+        let router = router_with_handlers(vec![Arc::new(ChunkHandler {
+            frames: vec![
+                Ok(Bytes::from_static(b"one")),
+                Ok(Bytes::from_static(b"two")),
+            ],
+        })]);
+        let response = router
+            .handle(request("/stream", "example.com"))
+            .await
+            .unwrap();
+        assert_eq!(response.status, http::StatusCode::OK);
+        assert_eq!(response.body, Bytes::from_static(b"onetwo"));
+    }
+
+    #[tokio::test]
+    async fn mid_stream_errors_surface_after_headers_on_streaming_path() {
+        let router = router_with_handlers(vec![Arc::new(ChunkHandler {
+            frames: vec![
+                Ok(Bytes::from_static(b"partial")),
+                Err(BodyError::Cancelled),
+            ],
+        })]);
+        let mut response = router
+            .handle_streaming(request("/stream", "example.com"))
+            .await
+            .expect("headers are sent before the body fails");
+        assert_eq!(response.status, http::StatusCode::OK);
+        let Body::Stream(stream) = &mut response.body else {
+            panic!("expected a streaming body");
+        };
+        let first = stream.frame().await.expect("first frame").expect("data");
+        assert_eq!(first.into_data().unwrap(), Bytes::from_static(b"partial"));
+        let error = stream
+            .frame()
+            .await
+            .expect("error frame")
+            .expect_err("mid-stream error must surface");
+        assert!(matches!(error, BodyError::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn buffered_handle_reports_mid_stream_errors() {
+        let router = router_with_handlers(vec![Arc::new(ChunkHandler {
+            frames: vec![
+                Ok(Bytes::from_static(b"partial")),
+                Err(BodyError::Cancelled),
+            ],
+        })]);
+        let error = router
+            .handle(request("/stream", "example.com"))
+            .await
+            .expect_err("buffered compatibility path cannot represent a mid-stream error");
+        assert!(
+            matches!(error, Error::Body(BodyError::Cancelled)),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_handlers_convert_to_streaming_by_default() {
+        let router = RouterBuilder::new()
+            .build(&[json!({
+                "handle": [{"handler": "static_response", "body": "hello"}]
+            })])
+            .unwrap();
+        let response = router
+            .handle_streaming(request("/", "example.com"))
+            .await
+            .unwrap();
+        assert!(!response.is_streaming());
+        assert_eq!(response.body.exact_size(), Some(5));
+        assert_eq!(response.into_buffered().await.unwrap().body, "hello");
+    }
+
+    #[tokio::test]
+    async fn pending_response_headers_apply_to_streaming_responses() {
+        let router = RouterBuilder::new()
+            .build(&[json!({
+                "handle": [
+                    {"handler": "headers", "response": {"set": {"X-Staged": ["yes"]}}},
+                    {"handler": "static_response", "body": "ok"}
+                ]
+            })])
+            .unwrap();
+        let response = router
+            .handle_streaming(request("/", "example.com"))
+            .await
+            .unwrap();
+        assert_eq!(response.headers["x-staged"], "yes");
     }
 }

@@ -19,12 +19,13 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Version};
-use http_body_util::{BodyExt, Full};
+use http_body_util::Full;
 use serde_json::Value;
 
 use caddy_rs_http::{
+    body::{Body, StreamingBody, StreamingResponse},
     CustomHandlerFactory, Error as HttpError, Handler, Outcome, Request, Response,
-    Result as HttpResult,
+    Result as HttpResult, StreamingOutcome,
 };
 
 use crate::balancer::{self, Balancer};
@@ -88,6 +89,30 @@ struct ForwardedResponse {
     latency: Duration,
     headers: HeaderMap,
     body: Bytes,
+}
+
+/// One proxied upstream response whose body is still streaming.
+struct ForwardedStreamingResponse {
+    status: StatusCode,
+    /// Time until the upstream sent its response headers (Caddy's roundtrip duration).
+    latency: Duration,
+    headers: HeaderMap,
+    body: StreamingBody,
+}
+
+/// How often Caddy flushes a proxied response body (`reverse_proxy.flush_interval`).
+///
+/// Caddy's sentinel `-1` (the default) means "flush immediately after every write". The streaming
+/// path in caddy-rs always flushes each chunk as soon as it arrives (equivalent to `-1`); a
+/// positive interval is accepted for configuration compatibility but does not coalesce chunks yet.
+/// See DIV-0060.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FlushInterval {
+    /// Flush after every frame (Caddy's `-1` default).
+    #[default]
+    Immediate,
+    /// A positive flush interval from configuration (accepted; streaming flushes immediately).
+    Interval(Duration),
 }
 
 /// A CIDR or single-address trusted proxy range.
@@ -163,6 +188,7 @@ pub struct ReverseProxyHandler {
     passive: Option<PassiveHealth>,
     retry_match: RetryMatch,
     trusted_proxies: Vec<IpNet>,
+    flush_interval: FlushInterval,
 }
 
 impl ReverseProxyHandler {
@@ -233,6 +259,11 @@ impl ReverseProxyHandler {
 
         let (health_check, passive) = parse_health_checks(object.get("health_checks"), path)?;
 
+        let flush_interval = parse_flush_interval(
+            object.get("flush_interval"),
+            &format!("{path}.flush_interval"),
+        )?;
+
         Ok(Self {
             client: build_client_with_tls(tls),
             upstreams,
@@ -248,6 +279,7 @@ impl ReverseProxyHandler {
             passive,
             retry_match,
             trusted_proxies,
+            flush_interval,
         })
     }
 
@@ -259,6 +291,11 @@ impl ReverseProxyHandler {
     /// Upstreams, for health-check scheduling.
     pub fn upstreams(&self) -> &[Arc<Upstream>] {
         &self.upstreams
+    }
+
+    /// Configured response-body flush policy (`reverse_proxy.flush_interval`).
+    pub fn flush_interval(&self) -> FlushInterval {
+        self.flush_interval
     }
 
     /// The outbound client (TLS-aware), exposed for crate-level health-check tests.
@@ -287,11 +324,17 @@ impl ReverseProxyHandler {
         })
     }
 
-    async fn forward(
+    /// Send the upstream request and return the response with its body still streaming.
+    ///
+    /// No body bytes are read here: only the response head is awaited. The returned
+    /// [`StreamingBody`] bridges the hyper upstream body, preserves chunk boundaries and
+    /// terminates with an error if the upstream fails mid-stream. Dropping it cancels the
+    /// upstream transfer.
+    async fn forward_streaming(
         &self,
         upstream: &Upstream,
         request: &Request,
-    ) -> Result<ForwardedResponse, ProxyError> {
+    ) -> Result<ForwardedStreamingResponse, ProxyError> {
         let path_and_query = request
             .uri
             .path_and_query()
@@ -313,16 +356,35 @@ impl ReverseProxyHandler {
         let status = response.status();
         let version = response.version();
         let response_headers = response.headers().clone();
-        let body = response
-            .into_body()
-            .collect()
-            .await
-            .map_err(|error| ProxyError::Body(error.to_string()))?
-            .to_bytes();
-        Ok(ForwardedResponse {
+        let body = StreamingBody::from_hyper(response.into_body());
+        Ok(ForwardedStreamingResponse {
             status,
             latency,
             headers: self.response_headers(&response_headers, version),
+            body,
+        })
+    }
+
+    /// Send the upstream request and buffer the whole response body.
+    ///
+    /// This is the legacy `Handler::handle` path: the server does not consume streaming bodies
+    /// yet, so the buffered API must keep returning a complete [`Response`]. The streaming path
+    /// ([`Handler::handle_streaming`]) uses [`Self::forward_streaming`] directly.
+    async fn forward(
+        &self,
+        upstream: &Upstream,
+        request: &Request,
+    ) -> Result<ForwardedResponse, ProxyError> {
+        let forwarded = self.forward_streaming(upstream, request).await?;
+        let body = forwarded
+            .body
+            .into_bytes()
+            .await
+            .map_err(|error| ProxyError::Body(error.to_string()))?;
+        Ok(ForwardedResponse {
+            status: forwarded.status,
+            latency: forwarded.latency,
+            headers: forwarded.headers,
             body,
         })
     }
@@ -447,14 +509,20 @@ impl ReverseProxyHandler {
     }
 
     fn apply_response_headers(&self, response: &mut Response) {
+        self.apply_response_headers_to(&mut response.headers);
+    }
+
+    /// Apply the configured `headers.response` operations to any response header map (buffered or
+    /// streaming responses share the same semantics).
+    fn apply_response_headers_to(&self, headers: &mut HeaderMap) {
         for (name, value) in &self.response_headers_set {
-            response.headers.insert(name.clone(), value.clone());
+            headers.insert(name.clone(), value.clone());
         }
         for (name, value) in &self.response_headers_add {
-            response.headers.append(name.clone(), value.clone());
+            headers.append(name.clone(), value.clone());
         }
         for name in &self.response_headers_delete {
-            response.headers.remove(name);
+            headers.remove(name);
         }
     }
 
@@ -482,6 +550,27 @@ impl ReverseProxyHandler {
             tokio::time::sleep(self.try_interval).await;
         }
     }
+}
+
+/// Parse Caddy's `reverse_proxy.flush_interval` (`caddy.Duration`, integer nanoseconds in JSON).
+///
+/// Caddy's sentinel `-1` means "flush immediately after every write" and is the default. The
+/// streaming implementation flushes each frame immediately, so an explicit positive interval is
+/// accepted for compatibility but does not coalesce frames yet (DIV-0060).
+fn parse_flush_interval(value: Option<&Value>, path: &str) -> HttpResult<FlushInterval> {
+    let Some(value) = value else {
+        return Ok(FlushInterval::Immediate);
+    };
+    let Some(nanos) = value.as_i64() else {
+        return Err(invalid(
+            path,
+            "flush_interval must be an integer number of nanoseconds (Caddy JSON duration); -1 means immediate",
+        ));
+    };
+    if nanos < 0 {
+        return Ok(FlushInterval::Immediate);
+    }
+    Ok(FlushInterval::Interval(Duration::from_nanos(nanos as u64)))
 }
 
 #[async_trait]
@@ -575,6 +664,107 @@ impl Handler for ReverseProxyHandler {
                         return Ok(Outcome::Respond(Response::text(
                             StatusCode::BAD_GATEWAY,
                             "502 Bad Gateway",
+                        )));
+                    }
+                    attempts += 1;
+                    self.wait_before_retry().await;
+                }
+            }
+        }
+    }
+
+    /// Streaming variant of [`Handler::handle`]: response headers are returned immediately and the
+    /// upstream body is streamed frame by frame (no full-body buffering).
+    ///
+    /// Retry, load-balancing, passive health-check and response-header behaviour matches the
+    /// buffered path; the only difference is that the body is not collected. A retried response
+    /// drops its upstream body, cancelling the upstream transfer.
+    async fn handle_streaming(&self, request: Request) -> HttpResult<StreamingOutcome> {
+        let deadline = if self.try_duration.is_zero() {
+            None
+        } else {
+            Some(tokio::time::Instant::now() + self.try_duration)
+        };
+        let mut attempts: u32 = 0;
+        loop {
+            let now = std::time::Instant::now();
+            let candidates: Vec<Arc<Upstream>> = match &self.passive {
+                Some(passive) => self
+                    .upstreams
+                    .iter()
+                    .filter(|upstream| {
+                        passive.is_available(&upstream.dial, now, upstream.active_connections())
+                    })
+                    .cloned()
+                    .collect(),
+                None => self.upstreams.clone(),
+            };
+            let Some(upstream) = self.balancer.select(&candidates) else {
+                if !self.retry_allowed(attempts, deadline) {
+                    return Ok(StreamingOutcome::Respond(StreamingResponse::from_buffered(
+                        Response::text(StatusCode::SERVICE_UNAVAILABLE, "503 Service Unavailable"),
+                    )));
+                }
+                attempts += 1;
+                self.wait_before_retry().await;
+                continue;
+            };
+            let _guard = upstream.connection_started();
+            match self.forward_streaming(&upstream, &request).await {
+                Ok(forwarded) => {
+                    if let Some(passive) = &self.passive {
+                        passive.record_response(
+                            &upstream.dial,
+                            forwarded.status,
+                            forwarded.latency,
+                            std::time::Instant::now(),
+                        );
+                    }
+                    // `retry_match` only inspects the request and the response status, so a
+                    // bodyless probe response is enough to evaluate it; the stream is untouched.
+                    let probe = Response {
+                        status: forwarded.status,
+                        headers: forwarded.headers.clone(),
+                        body: Bytes::new(),
+                    };
+                    if self.retry_match.matches_response(&request, &probe) {
+                        if self.retry_allowed(attempts, deadline) {
+                            attempts += 1;
+                            // Drop the upstream body before retrying so the old upstream request
+                            // is cancelled instead of leaked.
+                            drop(forwarded);
+                            self.wait_before_retry().await;
+                            continue;
+                        }
+                        return Ok(StreamingOutcome::Respond(StreamingResponse::from_buffered(
+                            Response {
+                                status: forwarded.status,
+                                headers: HeaderMap::new(),
+                                body: Bytes::new(),
+                            },
+                        )));
+                    }
+                    let mut response = StreamingResponse::new(
+                        forwarded.status,
+                        forwarded.headers,
+                        Body::from_stream(forwarded.body),
+                    );
+                    self.apply_response_headers_to(&mut response.headers);
+                    return Ok(StreamingOutcome::Respond(response));
+                }
+                Err(error) => {
+                    eprintln!(
+                        "caddy-rs: reverse_proxy upstream `{}` failed: {error}",
+                        upstream.dial
+                    );
+                    if let Some(passive) = &self.passive {
+                        passive.record_failure(&upstream.dial, std::time::Instant::now());
+                    }
+                    let retryable =
+                        error.is_dial_error() || self.retry_match.matches_transport_error(&request);
+                    if !retryable || !self.retry_allowed(attempts, deadline) {
+                        return Ok(StreamingOutcome::Respond(StreamingResponse::from_buffered(
+                            Response::text(StatusCode::BAD_GATEWAY, "502 Bad Gateway"),
                         )));
                     }
                     attempts += 1;
@@ -2098,5 +2288,375 @@ mod tests {
         let passive = handler.passive_health().expect("passive configured");
         assert_eq!(passive.failures(&dial, std::time::Instant::now()), 1);
         assert!(!passive.is_healthy(&dial, std::time::Instant::now()));
+    }
+
+    // ---- streaming response path -----------------------------------------------------
+
+    use caddy_rs_http::body::BodyError as HttpBodyError;
+    use http_body_util::BodyExt;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    /// Upstream serving a channel-fed streaming body, so tests control chunk timing and failures.
+    async fn spawn_channel_upstream(
+        status: u16,
+        headers: &'static [(&'static str, &'static str)],
+    ) -> (
+        String,
+        mpsc::Sender<std::result::Result<Bytes, HttpBodyError>>,
+    ) {
+        let (sender, receiver) = mpsc::channel(8);
+        let receiver = Arc::new(std::sync::Mutex::new(Some(receiver)));
+        let address = spawn_body_upstream(move |_request| {
+            let receiver = Arc::clone(&receiver);
+            async move {
+                let receiver = receiver
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take()
+                    .expect("one streaming request per test upstream");
+                let mut builder = hyper::Response::builder().status(status);
+                for (name, value) in headers {
+                    builder = builder.header(*name, *value);
+                }
+                Ok(builder
+                    .body(StreamingBody::from_chunks(receiver))
+                    .expect("streaming response"))
+            }
+        })
+        .await;
+        (address, sender)
+    }
+
+    async fn spawn_body_upstream<F, Fut>(serve: F) -> String
+    where
+        F: Fn(hyper::Request<hyper::body::Incoming>) -> Fut + Clone + Send + 'static,
+        Fut: std::future::Future<Output = Result<hyper::Response<StreamingBody>, Infallible>>
+            + Send
+            + 'static,
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let serve = serve.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |request| {
+                        let serve = serve.clone();
+                        async move { serve(request).await }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        address.to_string()
+    }
+
+    fn streaming_body(outcome: StreamingOutcome) -> StreamingBody {
+        let StreamingOutcome::Respond(response) = outcome else {
+            panic!("expected a proxied response");
+        };
+        match response.body {
+            Body::Stream(stream) => stream,
+            Body::Bytes(_) => panic!("expected a streaming body"),
+        }
+    }
+
+    #[tokio::test]
+    async fn streams_first_byte_before_upstream_finishes() {
+        let (dial, sender) =
+            spawn_channel_upstream(200, &[("content-type", "text/event-stream")]).await;
+        let handler = handler(&dial);
+        let started = std::time::Instant::now();
+        let outcome = handler
+            .handle_streaming(get_request("/events", None))
+            .await
+            .unwrap();
+        let StreamingOutcome::Respond(response) = outcome else {
+            panic!("expected a proxied response");
+        };
+        assert_eq!(response.status, 200);
+        assert!(response.is_streaming(), "response body must stream");
+        // Headers arrive before any upstream body byte.
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "response headers must not wait for the upstream body"
+        );
+        let mut body = match response.body {
+            Body::Stream(stream) => stream,
+            Body::Bytes(_) => panic!("expected a streaming body"),
+        };
+
+        sender
+            .send(Ok(Bytes::from_static(b"data: first\n\n")))
+            .await
+            .expect("send first chunk");
+        let first = tokio::time::timeout(Duration::from_secs(2), body.frame())
+            .await
+            .expect("first frame timeout")
+            .expect("first frame")
+            .expect("data");
+        assert_eq!(
+            first.into_data().unwrap(),
+            Bytes::from_static(b"data: first\n\n")
+        );
+        // The upstream body is still open: the downstream already saw bytes, so the proxy did not
+        // buffer the full response.
+        assert!(!sender.is_closed());
+
+        sender
+            .send(Ok(Bytes::from_static(b"data: second\n\n")))
+            .await
+            .expect("send second chunk");
+        let second = tokio::time::timeout(Duration::from_secs(2), body.frame())
+            .await
+            .expect("second frame timeout")
+            .expect("second frame")
+            .expect("data");
+        assert_eq!(
+            second.into_data().unwrap(),
+            Bytes::from_static(b"data: second\n\n")
+        );
+
+        drop(sender);
+        assert!(tokio::time::timeout(Duration::from_secs(2), body.frame())
+            .await
+            .expect("end timeout")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn preserves_status_headers_and_content_length() {
+        let (dial, sender) = spawn_channel_upstream(
+            201,
+            &[
+                ("content-type", "application/octet-stream"),
+                ("content-length", "10"),
+                ("x-upstream", "yes"),
+                ("connection", "x-hop"),
+                ("x-hop", "drop-me"),
+            ],
+        )
+        .await;
+        let handler = handler(&dial);
+        let StreamingOutcome::Respond(response) = handler
+            .handle_streaming(get_request("/blob", None))
+            .await
+            .unwrap()
+        else {
+            panic!("expected a proxied response");
+        };
+        assert_eq!(response.status, StatusCode::CREATED);
+        assert_eq!(response.headers["content-type"], "application/octet-stream");
+        assert_eq!(response.headers["content-length"], "10");
+        assert_eq!(response.headers["x-upstream"], "yes");
+        // Caddy adds Via and strips hop-by-hop headers on the streaming path too.
+        assert!(response.headers.contains_key(http::header::VIA));
+        assert!(response.headers.get("x-hop").is_none());
+
+        let mut body = match response.body {
+            Body::Stream(stream) => stream,
+            Body::Bytes(_) => panic!("expected a streaming body"),
+        };
+        sender.send(Ok(Bytes::from_static(b"01234"))).await.unwrap();
+        sender.send(Ok(Bytes::from_static(b"56789"))).await.unwrap();
+        drop(sender);
+        let mut received = Vec::new();
+        while let Some(frame) = body.frame().await {
+            received.extend_from_slice(frame.unwrap().into_data().unwrap().as_ref());
+        }
+        assert_eq!(received, b"0123456789");
+    }
+
+    #[tokio::test]
+    async fn mid_stream_error_after_headers_is_surfaced() {
+        let (dial, sender) = spawn_channel_upstream(200, &[]).await;
+        let handler = handler(&dial);
+        let outcome = handler
+            .handle_streaming(get_request("/broken", None))
+            .await
+            .unwrap();
+        let mut body = streaming_body(outcome);
+
+        sender
+            .send(Ok(Bytes::from_static(b"partial")))
+            .await
+            .unwrap();
+        let first = body.frame().await.expect("first frame").expect("data");
+        assert_eq!(first.into_data().unwrap(), Bytes::from_static(b"partial"));
+
+        sender
+            .send(Err(HttpBodyError::upstream(std::io::Error::other(
+                "upstream died mid-stream",
+            ))))
+            .await
+            .unwrap();
+        let error = body
+            .frame()
+            .await
+            .expect("error frame")
+            .expect_err("mid-stream error must surface after headers");
+        // hyper surfaces a mid-body upstream failure as a connection read error; the exact
+        // upstream message is not retransmitted by HTTP/1.1, but the error must be a body error.
+        assert!(
+            matches!(error, HttpBodyError::Upstream(_)),
+            "expected an upstream body error, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_the_response_body_cancels_the_upstream() {
+        let (dial, sender) = spawn_channel_upstream(200, &[]).await;
+        let handler = handler(&dial);
+        let outcome = handler
+            .handle_streaming(get_request("/cancel", None))
+            .await
+            .unwrap();
+        let mut body = streaming_body(outcome);
+        sender.send(Ok(Bytes::from_static(b"first"))).await.unwrap();
+        let first = body.frame().await.expect("first frame").expect("data");
+        assert_eq!(first.into_data().unwrap(), Bytes::from_static(b"first"));
+
+        // A client disconnect is modelled by dropping the response body; the upstream transfer
+        // (and its channel receiver) must be cancelled instead of draining to completion. The
+        // upstream learns about the disconnect on its next write, so keep feeding chunks until the
+        // channel reports that the consumer is gone.
+        drop(body);
+        let cancelled = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if sender.send(Ok(Bytes::from_static(b"x"))).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            cancelled.is_ok(),
+            "upstream body was still alive after the downstream body was dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_handle_still_buffers_a_streaming_upstream() {
+        let (dial, sender) = spawn_channel_upstream(200, &[]).await;
+        let handler = handler(&dial);
+        let producer = tokio::spawn(async move {
+            sender.send(Ok(Bytes::from_static(b"full"))).await.unwrap();
+            sender.send(Ok(Bytes::from_static(b"body"))).await.unwrap();
+        });
+        let Outcome::Respond(response) = handler
+            .handle(get_request("/buffered", None))
+            .await
+            .unwrap()
+        else {
+            panic!("expected a proxied response");
+        };
+        producer.await.unwrap();
+        assert_eq!(response.body, Bytes::from_static(b"fullbody"));
+        assert_eq!(response.status, 200);
+    }
+
+    #[test]
+    fn flush_interval_is_parsed_like_caddy() {
+        let base = serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": "127.0.0.1:1"}]
+        });
+        let implicit = build_handler(base.clone());
+        assert_eq!(implicit.flush_interval(), FlushInterval::Immediate);
+
+        let mut negative = base.clone();
+        negative["flush_interval"] = serde_json::json!(-1);
+        assert_eq!(
+            build_handler(negative).flush_interval(),
+            FlushInterval::Immediate
+        );
+
+        let mut interval = base.clone();
+        interval["flush_interval"] = serde_json::json!(100_000_000_i64);
+        assert_eq!(
+            build_handler(interval).flush_interval(),
+            FlushInterval::Interval(Duration::from_millis(100))
+        );
+
+        let mut invalid = base;
+        invalid["flush_interval"] = serde_json::json!("soon");
+        let error = match ReverseProxyHandler::from_json(&invalid, "handler") {
+            Ok(_) => panic!("string flush_interval must fail loudly"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("flush_interval"),
+            "error must locate flush_interval: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn router_streaming_path_proxies_without_buffering() {
+        let (dial, sender) = spawn_channel_upstream(200, &[]).await;
+        let routes = serde_json::json!([{
+            "handle": [{"handler": "reverse_proxy", "upstreams": [{"dial": dial}]}]
+        }]);
+        let router = caddy_rs_http::RouterBuilder::new()
+            .with_custom_handler(handler_factory())
+            .build(routes.as_array().unwrap())
+            .expect("router builds");
+        let response = router
+            .handle_streaming(get_request("/routed", None))
+            .await
+            .expect("router streams");
+        assert!(
+            response.is_streaming(),
+            "proxy body must reach the router as a stream"
+        );
+        let Body::Stream(mut body) = response.body else {
+            panic!("expected a streaming body");
+        };
+
+        sender
+            .send(Ok(Bytes::from_static(b"routed-first")))
+            .await
+            .expect("send first");
+        let frame = tokio::time::timeout(Duration::from_secs(2), body.frame())
+            .await
+            .expect("first frame timeout")
+            .expect("first frame")
+            .expect("data");
+        assert_eq!(
+            frame.into_data().unwrap(),
+            Bytes::from_static(b"routed-first")
+        );
+        assert!(!sender.is_closed(), "router must not buffer the proxy body");
+    }
+
+    #[tokio::test]
+    async fn router_buffered_path_collects_proxy_streams() {
+        let (dial, sender) = spawn_channel_upstream(200, &[]).await;
+        let routes = serde_json::json!([{
+            "handle": [{"handler": "reverse_proxy", "upstreams": [{"dial": dial}]}]
+        }]);
+        let router = caddy_rs_http::RouterBuilder::new()
+            .with_custom_handler(handler_factory())
+            .build(routes.as_array().unwrap())
+            .expect("router builds");
+        let producer = tokio::spawn(async move {
+            sender
+                .send(Ok(Bytes::from_static(b"buffered")))
+                .await
+                .unwrap();
+            sender.send(Ok(Bytes::from_static(b"-body"))).await.unwrap();
+        });
+        let response = router
+            .handle(get_request("/routed", None))
+            .await
+            .expect("router buffers");
+        producer.await.unwrap();
+        assert_eq!(response.body, Bytes::from_static(b"buffered-body"));
     }
 }
