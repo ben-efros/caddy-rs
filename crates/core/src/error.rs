@@ -54,6 +54,23 @@ pub enum Error {
         source: serde_json::Error,
     },
 
+    /// A recognised Caddy configuration construct that this build intentionally does not
+    /// implement.
+    ///
+    /// Unlike [`Error::Invalid`], this is not a malformed configuration: Caddy accepts it, and
+    /// caddy-rs rejects it loudly (DIV-0016) with a tracking task instead of silently
+    /// approximating its behaviour. The message must stay recognisable to the compatibility
+    /// tooling's "unsupported" class, hence the "not supported by this build" wording.
+    #[error("configuration at `{path}` is not supported by this build: {feature} ({tracking_id})")]
+    Unsupported {
+        /// JSON path of the unsupported construct.
+        path: String,
+        /// Human-readable construct name, e.g. ``reverse_proxy `dynamic_upstreams```.
+        feature: &'static str,
+        /// Plan task id that tracks implementing this construct.
+        tracking_id: &'static str,
+    },
+
     /// Two modules were registered with the same id.
     #[error("module registry: module id `{0}` is already registered")]
     DuplicateModule(&'static str),
@@ -116,6 +133,19 @@ impl Error {
         Self::Invalid {
             path: path.into(),
             message: message.into(),
+        }
+    }
+
+    /// Convenience constructor for a located "recognised but unsupported" error.
+    pub fn unsupported(
+        path: impl Into<String>,
+        feature: &'static str,
+        tracking_id: &'static str,
+    ) -> Self {
+        Self::Unsupported {
+            path: path.into(),
+            feature,
+            tracking_id,
         }
     }
 }
