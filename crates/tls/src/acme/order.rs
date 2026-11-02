@@ -14,7 +14,7 @@
 //! is driven through the [`AcmeClock`] trait so tests record the delays instead of sleeping.
 //!
 //! Challenge solving itself (serving `/.well-known/acme-challenge/...`, the TLS-ALPN certificate,
-//! DNS TXT records) is the solver tasks T-TLS-042/T-TLS-043/T-TLS-044; this module only selects
+//! DNS TXT records) is handled by the solver tasks T-TLS-042/T-TLS-043/T-TLS-044; this module only selects
 //! and acknowledges the challenge.
 
 use std::fmt;

@@ -47,9 +47,10 @@ use caddy_rs_core::listen::{ListenAddr, Network};
 use crate::acme::{AcmeClock, AcmeStorage, AcmeTransport, PollPolicy, TokioClock};
 use crate::certificate::Certificate;
 use crate::issuer::{AcmeIssuer, AcmeIssuerConfig, CertificateIssuer, IssuanceRequest};
-use crate::solver::Http01Solver;
 use crate::solver::Http01TokenStore;
+use crate::solver::{Http01Solver, TlsAlpn01Solver};
 use crate::storage::{CertificateStorage, FileStorage, StoredCertificate};
+use crate::tls_alpn::TlsAlpn01TokenStore;
 use crate::tls_server::{CertificateResolver, TlsCertificate};
 use crate::{Error, Result};
 
@@ -429,6 +430,7 @@ pub struct AutomaticHttpsProvisioner {
     transport: Arc<dyn AcmeTransport>,
     root: PathBuf,
     challenge_tokens: Arc<Http01TokenStore>,
+    tls_alpn01_tokens: Arc<TlsAlpn01TokenStore>,
     clock: Arc<dyn AcmeClock>,
     poll_policy: PollPolicy,
 }
@@ -456,9 +458,20 @@ impl AutomaticHttpsProvisioner {
             transport,
             root: root.into(),
             challenge_tokens,
+            tls_alpn01_tokens: Arc::new(TlsAlpn01TokenStore::new()),
             clock: Arc::new(TokioClock),
             poll_policy: PollPolicy::default(),
         }
+    }
+
+    /// The TLS-ALPN-01 challenge-certificate store shared with every issuer this provisioner
+    /// builds.
+    ///
+    /// The server's TLS listeners must use it (with [`crate::tls_alpn::AcmeTlsAlpnResolver`] and
+    /// [`crate::tls_server::TlsServerOptions::with_acme_tls_alpn`]) so `acme-tls/1` handshakes are
+    /// answered while an order is validated.
+    pub fn tls_alpn01_token_store(&self) -> &Arc<TlsAlpn01TokenStore> {
+        &self.tls_alpn01_tokens
     }
 
     /// Override the polling clock (tests use a no-sleep clock).
@@ -533,6 +546,9 @@ impl AutomaticHttpsProvisioner {
             )
             .with_solver(Arc::new(Http01Solver::new(Arc::clone(
                 &self.challenge_tokens,
+            ))))
+            .with_solver(Arc::new(TlsAlpn01Solver::new(Arc::clone(
+                &self.tls_alpn01_tokens,
             ))))
             .with_clock(Arc::clone(&self.clock))
             .with_poll_policy(self.poll_policy.clone());

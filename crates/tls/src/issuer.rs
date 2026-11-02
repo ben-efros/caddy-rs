@@ -18,7 +18,9 @@
 //!
 //! Deliberate limitations (reported as divergences from Caddy v2.11.7/certmagic):
 //!
-//! * TLS-ALPN-01 is a tracked stub (T-TLS-043); HTTP-01 and DNS-01 are implemented.
+//! * TLS-ALPN-01 generates the challenge certificate and publishes it in a domain-keyed store
+//!   ([`AcmeIssuer::tls_alpn01_token_store`]); the TLS listener must serve it over the
+//!   `acme-tls/1` ALPN protocol (server wiring is a follow-up, see [`crate::tls_alpn`]).
 //! * `preferred_chains` is not applied: the chain is downloaded in CA preference order.
 //! * `test_ca` fallback (retry on a staging CA after a production failure) is not implemented.
 //! * Challenge cleanup errors are not surfaced (there is no logger in this crate); cleanup is
@@ -49,6 +51,7 @@ use crate::storage::{
     caddy_certificate_storage_name, caddy_issuer_key, certificate_chain_der,
     certificate_validity_unix, private_key_der, CertificateStorage, StoredCertificate,
 };
+use crate::tls_alpn::TlsAlpn01TokenStore;
 use crate::{Error, Result};
 
 /// Request to issue a certificate.
@@ -206,6 +209,7 @@ pub struct AcmeIssuer<T: AcmeTransport> {
     certificate_storage: Box<dyn CertificateStorage>,
     solvers: SolverRegistry,
     http01_tokens: Arc<Http01TokenStore>,
+    tls_alpn01_tokens: Arc<TlsAlpn01TokenStore>,
     clock: Arc<dyn AcmeClock>,
     poll_policy: PollPolicy,
     challenge_policy: Option<ChallengePolicy>,
@@ -218,7 +222,8 @@ impl<T: AcmeTransport> AcmeIssuer<T> {
     /// Create an issuer.
     ///
     /// The issuer starts with an HTTP-01 solver (backed by its own [`Http01TokenStore`], see
-    /// [`AcmeIssuer::http01_token_store`]) and the TLS-ALPN-01 stub. Attach DNS-01 with
+    /// [`AcmeIssuer::http01_token_store`]) and a TLS-ALPN-01 solver (see
+    /// [`AcmeIssuer::tls_alpn01_token_store`]). Attach DNS-01 with
     /// [`AcmeIssuer::with_dns01_solver`].
     pub fn new(
         config: AcmeIssuerConfig,
@@ -227,9 +232,12 @@ impl<T: AcmeTransport> AcmeIssuer<T> {
         certificate_storage: Box<dyn CertificateStorage>,
     ) -> Self {
         let http01_tokens = Arc::new(Http01TokenStore::new());
+        let tls_alpn01_tokens = Arc::new(TlsAlpn01TokenStore::new());
         let mut solvers = SolverRegistry::new();
         solvers.insert(Arc::new(Http01Solver::new(Arc::clone(&http01_tokens))));
-        solvers.insert(Arc::new(TlsAlpn01Solver));
+        solvers.insert(Arc::new(TlsAlpn01Solver::new(Arc::clone(
+            &tls_alpn01_tokens,
+        ))));
         Self {
             config,
             transport,
@@ -237,6 +245,7 @@ impl<T: AcmeTransport> AcmeIssuer<T> {
             certificate_storage,
             solvers,
             http01_tokens,
+            tls_alpn01_tokens,
             clock: Arc::new(TokioClock),
             poll_policy: PollPolicy::default(),
             challenge_policy: None,
@@ -290,6 +299,12 @@ impl<T: AcmeTransport> AcmeIssuer<T> {
     /// The HTTP-01 token store, for the HTTP server to answer validation requests.
     pub fn http01_token_store(&self) -> &Arc<Http01TokenStore> {
         &self.http01_tokens
+    }
+
+    /// The TLS-ALPN-01 challenge-certificate store, for the TLS listener to answer `acme-tls/1`
+    /// handshakes (see [`crate::tls_alpn::AcmeTlsAlpnResolver`]).
+    pub fn tls_alpn01_token_store(&self) -> &Arc<TlsAlpn01TokenStore> {
+        &self.tls_alpn01_tokens
     }
 
     /// The registered challenge solvers.
@@ -616,8 +631,8 @@ pub fn within_renewal_window(
 mod tests {
     use super::*;
     use crate::acme::{
-        account_paths, AcmeError, ChallengeStatus, HttpMethod, HttpRequest, HttpResponse,
-        MemoryAcmeStorage, StoredAccount,
+        account_paths, AcmeError, Challenge, ChallengeStatus, HttpMethod, HttpRequest,
+        HttpResponse, MemoryAcmeStorage, StoredAccount,
     };
     use crate::dns::{DnsProvider, InMemoryDnsProvider};
     use crate::solver::dns01_txt_value;
@@ -915,6 +930,15 @@ mod tests {
         }
     }
 
+    fn tls_alpn01_config() -> AcmeIssuerConfig {
+        AcmeIssuerConfig {
+            ca: DIRECTORY_URL.to_string(),
+            email: Some("ops@example.com".to_string()),
+            http_challenge_disabled: true,
+            ..AcmeIssuerConfig::default()
+        }
+    }
+
     fn issuer_with(
         transport: TestTransport,
         config: AcmeIssuerConfig,
@@ -1157,6 +1181,142 @@ mod tests {
         assert_eq!(transport.remaining(), 0);
     }
 
+    // ---- end-to-end TLS-ALPN-01 issuance --------------------------------------------------
+
+    #[tokio::test]
+    async fn tls_alpn01_issuance_succeeds_when_http01_is_disabled() {
+        let transport = TestTransport::new();
+        let account_storage = Arc::new(MemoryAcmeStorage::new());
+        let certificate_storage = Arc::new(MemoryStorage::new());
+        let issuer = issuer_with(
+            transport.clone(),
+            tls_alpn01_config(),
+            Arc::clone(&account_storage),
+            &certificate_storage,
+        );
+        let tokens = Arc::clone(issuer.tls_alpn01_token_store());
+        assert_eq!(
+            issuer.challenge_policy().ordered_types(),
+            vec![ChallengeType::TlsAlpn01],
+            "HTTP-01 disabled means only TLS-ALPN-01 may be selected"
+        );
+
+        script_account_and_order(&transport, &["tls-alpn-01"]);
+        let tokens_for_check = Arc::clone(&tokens);
+        let served = Arc::new(AtomicBool::new(false));
+        let served_clone = Arc::clone(&served);
+        transport.expect_with(
+            HttpMethod::Post,
+            CHALLENGE_URL,
+            with_nonce(
+                json_response(200, challenge_document("tls-alpn-01")),
+                "nonce-4",
+            ),
+            move |_request| {
+                let challenge = tokens_for_check
+                    .lookup("example.com")
+                    .expect("challenge certificate must exist when the challenge is acknowledged");
+                assert!(
+                    challenge.key_authorization().starts_with("token-1."),
+                    "unexpected key authorization `{}`",
+                    challenge.key_authorization()
+                );
+                served_clone.store(true, Ordering::SeqCst);
+            },
+        );
+        transport.expect(
+            HttpMethod::Post,
+            AUTHZ_URL,
+            with_nonce(
+                json_response(200, authorization_document("valid", &["tls-alpn-01"])),
+                "nonce-5",
+            ),
+        );
+        transport.expect(
+            HttpMethod::Post,
+            ORDER_URL,
+            with_nonce(json_response(200, order_document("ready")), "nonce-6"),
+        );
+        transport.expect(
+            HttpMethod::Post,
+            FINALIZE_URL,
+            with_nonce(json_response(200, order_document("processing")), "nonce-7"),
+        );
+        transport.expect(
+            HttpMethod::Post,
+            ORDER_URL,
+            with_nonce(json_response(200, valid_order_document()), "nonce-8"),
+        );
+        transport.expect(
+            HttpMethod::Post,
+            CERTIFICATE_URL,
+            with_nonce(pem_response(), "nonce-9"),
+        );
+
+        let certificate = issuer.obtain(&issuance_request()).await.unwrap();
+        assert!(
+            served.load(Ordering::SeqCst),
+            "TLS-ALPN solver was never used"
+        );
+        assert!(
+            tokens.is_empty(),
+            "challenge certificate must be withdrawn after issuance"
+        );
+        assert_eq!(certificate.domains, vec!["example.com".to_string()]);
+        assert_eq!(transport.remaining(), 0);
+    }
+
+    #[tokio::test]
+    async fn tls_alpn01_challenge_is_withdrawn_when_validation_fails() {
+        let transport = TestTransport::new();
+        let account_storage = Arc::new(MemoryAcmeStorage::new());
+        let certificate_storage = Arc::new(MemoryStorage::new());
+        let issuer = issuer_with(
+            transport.clone(),
+            tls_alpn01_config(),
+            Arc::clone(&account_storage),
+            &certificate_storage,
+        );
+        let tokens = Arc::clone(issuer.tls_alpn01_token_store());
+
+        script_account_and_order(&transport, &["tls-alpn-01"]);
+        let tokens_for_check = Arc::clone(&tokens);
+        transport.expect_with(
+            HttpMethod::Post,
+            CHALLENGE_URL,
+            with_nonce(
+                json_response(200, challenge_document("tls-alpn-01")),
+                "nonce-4",
+            ),
+            move |_request| {
+                assert!(
+                    tokens_for_check.lookup("example.com").is_some(),
+                    "challenge certificate must be present before validation"
+                );
+            },
+        );
+        // The CA rejects the authorization: issuance fails, evidence must be withdrawn.
+        transport.expect(
+            HttpMethod::Post,
+            AUTHZ_URL,
+            with_nonce(
+                problem_response(400, "unauthorized", "validation failed"),
+                "nonce-5",
+            ),
+        );
+
+        let error = issuer.obtain(&issuance_request()).await.unwrap_err();
+        assert!(
+            error.to_string().contains("validation failed")
+                || error.to_string().contains("problem"),
+            "expected a loud CA error, got: {error}"
+        );
+        assert!(
+            tokens.is_empty(),
+            "challenge certificate must be cleaned up when issuance fails"
+        );
+    }
+
     #[tokio::test]
     async fn second_issuance_reuses_the_stored_account() {
         let transport = TestTransport::new();
@@ -1251,7 +1411,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tls_alpn_selection_without_http_is_a_tracked_stub() {
+    async fn tls_alpn_selection_without_http_uses_the_real_solver() {
         let transport = TestTransport::new();
         let account_storage = Arc::new(MemoryAcmeStorage::new());
         let certificate_storage = Arc::new(MemoryStorage::new());
@@ -1260,23 +1420,30 @@ mod tests {
             http_challenge_disabled: true,
             ..AcmeIssuerConfig::default()
         };
-        let issuer = issuer_with(
-            transport.clone(),
-            config,
-            account_storage,
-            &certificate_storage,
+        let issuer = issuer_with(transport, config, account_storage, &certificate_storage);
+        assert_eq!(
+            issuer.challenge_policy().ordered_types(),
+            vec![ChallengeType::TlsAlpn01]
         );
-        script_account_and_order(&transport, &["tls-alpn-01"]);
-
-        let error = issuer.obtain(&issuance_request()).await.unwrap_err();
-        assert!(
-            matches!(
-                &error,
-                Error::NotImplemented { tracking_id, .. } if *tracking_id == "T-TLS-043"
-            ),
-            "unexpected error: {error:?}"
-        );
-        assert_eq!(transport.requests().len(), 4);
+        let tokens = Arc::clone(issuer.tls_alpn01_token_store());
+        let solver = issuer
+            .solvers()
+            .get(ChallengeType::TlsAlpn01)
+            .expect("TLS-ALPN-01 solver is registered");
+        let challenge: Challenge = serde_json::from_value(json!({
+            "type": "tls-alpn-01",
+            "url": CHALLENGE_URL,
+            "token": "token-1",
+            "status": "pending"
+        }))
+        .unwrap();
+        let handle = solver
+            .present("example.com", &challenge, "token-1.thumbprint")
+            .await
+            .unwrap();
+        assert!(tokens.lookup("example.com").is_some());
+        solver.withdraw(&handle).await.unwrap();
+        assert!(tokens.is_empty());
     }
 
     // ---- end-to-end DNS-01 issuance ------------------------------------------------------
