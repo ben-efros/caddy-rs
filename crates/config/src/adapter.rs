@@ -300,6 +300,9 @@ pub fn adapt_with_source(
     if let Some(tls) = tls_plan.app.clone() {
         apps.insert("tls".to_string(), tls);
     }
+    if let Some(pki) = pki_app_json(options) {
+        apps.insert("pki".to_string(), pki);
+    }
 
     Ok(AdaptedConfig {
         config: json!({"apps": Value::Object(apps)}),
@@ -462,6 +465,33 @@ struct SiteTls {
     dns: Option<parser::DnsProvider>,
     /// `tls { key_type <type> }`.
     key_type: Option<String>,
+    /// `tls { issuer internal { ... } }` options (in addition to the `tls internal` shorthand).
+    internal: Option<InternalIssuerOptions>,
+}
+
+/// Options of `tls { issuer internal { ... } }` (Caddy's `tls.issuance.internal`).
+#[derive(Clone, Debug, Default)]
+struct InternalIssuerOptions {
+    /// Certificate authority ID (`ca`); defaults to `local`.
+    ca: Option<String>,
+    /// Certificate lifetime in nanoseconds (`lifetime`).
+    lifetime_ns: Option<i64>,
+    /// Sign with the root certificate directly (`sign_with_root`).
+    sign_with_root: bool,
+}
+
+impl SiteTls {
+    /// The internal-issuer options requested by this site, from either the `tls internal`
+    /// shorthand or an explicit `issuer internal` block.
+    fn internal_options(&self) -> Option<InternalIssuerOptions> {
+        if let Some(internal) = &self.internal {
+            return Some(internal.clone());
+        }
+        if matches!(self.issuer, Some(TlsIssuer::Internal)) {
+            return Some(InternalIssuerOptions::default());
+        }
+        None
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -520,6 +550,77 @@ struct ConnectionPolicyState {
     has_catch_all: bool,
     address_qualifies: bool,
     auto_https_will_add: bool,
+}
+
+/// Encode the internal issuer module object (`tls.issuance.internal`).
+fn internal_issuer_json(internal: &InternalIssuerOptions) -> Value {
+    let mut object = Map::new();
+    object.insert("module".to_string(), json!("internal"));
+    if let Some(ca) = &internal.ca {
+        object.insert("ca".to_string(), json!(ca));
+    }
+    if let Some(lifetime) = internal.lifetime_ns {
+        object.insert("lifetime".to_string(), json!(lifetime));
+    }
+    if internal.sign_with_root {
+        object.insert("sign_with_root".to_string(), json!(true));
+    }
+    Value::Object(object)
+}
+
+/// Encode the PKI app from the global `pki` option, or `None` when no CA was configured.
+///
+/// Caddy emits `apps.pki` only when the option defines at least one CA; `tls internal` without any
+/// `pki` configuration relies on the default `local` CA provisioned implicitly by the PKI app.
+fn pki_app_json(options: &parser::GlobalOptions) -> Option<Value> {
+    let pki = options.pki.as_ref()?;
+    if pki.certificate_authorities.is_empty() {
+        return None;
+    }
+    let mut authorities = Map::new();
+    for authority in &pki.certificate_authorities {
+        let mut object = Map::new();
+        if let Some(name) = &authority.name {
+            object.insert("name".to_string(), json!(name));
+        }
+        if let Some(name) = &authority.root_common_name {
+            object.insert("root_common_name".to_string(), json!(name));
+        }
+        if let Some(name) = &authority.intermediate_common_name {
+            object.insert("intermediate_common_name".to_string(), json!(name));
+        }
+        if let Some(lifetime) = authority.intermediate_lifetime_ns {
+            object.insert("intermediate_lifetime".to_string(), json!(lifetime));
+        }
+        if let Some(interval) = authority.maintenance_interval_ns {
+            object.insert("maintenance_interval".to_string(), json!(interval));
+        }
+        if let Some(ratio) = authority.renewal_window_ratio {
+            object.insert("renewal_window_ratio".to_string(), json!(ratio));
+        }
+        if let Some(root) = &authority.root {
+            object.insert("root".to_string(), pki_key_pair_json(root));
+        }
+        if let Some(intermediate) = &authority.intermediate {
+            object.insert("intermediate".to_string(), pki_key_pair_json(intermediate));
+        }
+        authorities.insert(authority.id.clone(), Value::Object(object));
+    }
+    Some(json!({"certificate_authorities": Value::Object(authorities)}))
+}
+
+fn pki_key_pair_json(pair: &parser::PkiKeyPairConfig) -> Value {
+    let mut object = Map::new();
+    if let Some(certificate) = &pair.certificate {
+        object.insert("certificate".to_string(), json!(certificate));
+    }
+    if let Some(private_key) = &pair.private_key {
+        object.insert("private_key".to_string(), json!(private_key));
+    }
+    if let Some(format) = &pair.format {
+        object.insert("format".to_string(), json!(format));
+    }
+    Value::Object(object)
 }
 
 /// Parse the `tls` directive of a site block. Only the documented subset is implemented; other
@@ -618,6 +719,85 @@ fn parse_site_tls(site: &SiteBlock) -> caddy_rs_core::Result<Option<SiteTls>> {
                 }
                 config.key_type = Some(option.args[0].clone());
             }
+            "issuer" => {
+                if option.args.as_slice() != ["internal"] {
+                    return Err(adapter_error(
+                        option.position,
+                        "`tls` option `issuer` only supports `internal`; ACME issuer \
+                         configuration is not supported by this build",
+                    ));
+                }
+                if config.issuer.is_some() {
+                    return Err(adapter_error(
+                        option.position,
+                        "cannot specify both `tls internal` and a `tls { issuer ... }` block",
+                    ));
+                }
+                let mut internal = InternalIssuerOptions::default();
+                for sub in &option.block {
+                    match sub.name.as_str() {
+                        "ca" => {
+                            if sub.args.len() != 1 || !sub.block.is_empty() {
+                                return Err(adapter_error(
+                                    sub.position,
+                                    "`issuer internal ca` requires exactly one CA ID",
+                                ));
+                            }
+                            if sub.args[0].trim().is_empty() {
+                                return Err(adapter_error(
+                                    sub.position,
+                                    "`issuer internal ca` requires a non-empty CA ID",
+                                ));
+                            }
+                            internal.ca = Some(sub.args[0].clone());
+                        }
+                        "lifetime" => {
+                            if sub.args.len() != 1 || !sub.block.is_empty() {
+                                return Err(adapter_error(
+                                    sub.position,
+                                    "`issuer internal lifetime` requires exactly one duration",
+                                ));
+                            }
+                            let nanoseconds = crate::parser::parse_duration_ns(&sub.args[0])
+                                .map_err(|reason| {
+                                    adapter_error(
+                                        sub.position,
+                                        format!(
+                                            "invalid `issuer internal lifetime` \
+                                             `{}`: {reason}",
+                                            sub.args[0]
+                                        ),
+                                    )
+                                })?;
+                            if nanoseconds <= 0 {
+                                return Err(adapter_error(
+                                    sub.position,
+                                    "`issuer internal lifetime` must be positive",
+                                ));
+                            }
+                            internal.lifetime_ns = Some(nanoseconds);
+                        }
+                        "sign_with_root" => {
+                            if !sub.args.is_empty() || !sub.block.is_empty() {
+                                return Err(adapter_error(
+                                    sub.position,
+                                    "`issuer internal sign_with_root` does not take arguments",
+                                ));
+                            }
+                            internal.sign_with_root = true;
+                        }
+                        other => {
+                            return Err(adapter_error(
+                                sub.position,
+                                format!(
+                                "`issuer internal` option `{other}` is not supported by this build"
+                            ),
+                            ))
+                        }
+                    }
+                }
+                config.internal = Some(internal);
+            }
             other => {
                 return Err(adapter_error(
                     option.position,
@@ -626,9 +806,7 @@ fn parse_site_tls(site: &SiteBlock) -> caddy_rs_core::Result<Option<SiteTls>> {
             }
         }
     }
-    if matches!(config.issuer, Some(TlsIssuer::Internal))
-        && (config.ca.is_some() || config.dns.is_some())
-    {
+    if config.internal_options().is_some() && (config.ca.is_some() || config.dns.is_some()) {
         return Err(adapter_error(
             position,
             "cannot create both ACME and internal certificate issuers",
@@ -1205,8 +1383,8 @@ fn build_tls_plan(
                     policy.key_type = tls.key_type.clone();
                 }
                 if tls.cert_key.is_none() {
-                    if matches!(tls.issuer, Some(TlsIssuer::Internal)) {
-                        policy.issuers = vec![json!({"module": "internal"})];
+                    if let Some(internal) = tls.internal_options() {
+                        policy.issuers = vec![internal_issuer_json(&internal)];
                     } else if tls.issuer.is_some() || tls.ca.is_some() || tls.dns.is_some() {
                         policy.issuers = implicit_acme_issuers(tls, site.position)?;
                     }

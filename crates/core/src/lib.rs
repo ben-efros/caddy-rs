@@ -28,9 +28,9 @@ pub mod validate;
 pub use adapter::{AdaptedConfig, ConfigAdapter};
 pub use config::{
     AdminConfig, Apps, AutoHttps, AutomationPolicy, BaseLog, CertKeyFilePair, CertKeyPemPair,
-    CertificatesConfig, Config, CustomLog, HttpApp, HttpServer, LogEncoder, LogSampling, LogWriter,
-    Logging, ModuleRef, NamedModuleRef, OnDemandConfig, ProviderModuleRef, Route,
-    SessionTicketService, SinkLog, StorageConfig, TlsApp, TlsAutomation,
+    CertificateAuthority, CertificatesConfig, Config, CustomLog, HttpApp, HttpServer, LogEncoder,
+    LogSampling, LogWriter, Logging, ModuleRef, NamedModuleRef, OnDemandConfig, PkiApp, PkiKeyPair,
+    ProviderModuleRef, Route, SessionTicketService, SinkLog, StorageConfig, TlsApp, TlsAutomation,
 };
 pub use error::{Error, Result};
 pub use generation::{

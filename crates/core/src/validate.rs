@@ -12,8 +12,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::Value;
 
 use crate::config::{
-    AutomationPolicy, BaseLog, CertificatesConfig, Config, HttpApp, Logging, ModuleRef, Route,
-    StorageConfig, TlsApp, TlsAutomation,
+    AutomationPolicy, BaseLog, CertificateAuthority, CertificatesConfig, Config, HttpApp, Logging,
+    ModuleRef, PkiApp, PkiKeyPair, Route, StorageConfig, TlsApp, TlsAutomation,
 };
 use crate::error::{Error, Result};
 use crate::listen::ListenAddr;
@@ -39,6 +39,7 @@ pub fn validate_config(config: &Config, registry: &ModuleRegistry) -> Result<Val
     let mut validator = Validator {
         registry,
         ids: BTreeSet::new(),
+        pki_ca_ids: None,
         report: ValidationReport::default(),
     };
 
@@ -75,10 +76,14 @@ pub fn validate_config(config: &Config, registry: &ModuleRegistry) -> Result<Val
                 return Err(Error::invalid(
                     "apps",
                     format!(
-                        "unknown app module(s): {}; this build supports `http` and `tls`",
+                        "unknown app module(s): {}; this build supports `http`, `tls` and `pki`",
                         apps_unknown.join(", ")
                     ),
                 ));
+            }
+            // Validate PKI before TLS: internal issuers reference CA IDs that the PKI app defines.
+            if let Some(pki) = &apps.pki {
+                validator.pki(pki)?;
             }
             if let Some(http) = &apps.http {
                 validator.http(http)?;
@@ -187,6 +192,8 @@ fn validate_storage(storage: &StorageConfig, registry: &ModuleRegistry, path: &s
 struct Validator<'a> {
     registry: &'a ModuleRegistry,
     ids: BTreeSet<String>,
+    /// CA IDs from `apps.pki`; `None` means the implicit default `local` CA is available.
+    pki_ca_ids: Option<BTreeSet<String>>,
     report: ValidationReport,
 }
 
@@ -387,6 +394,121 @@ impl Validator<'_> {
         Ok(())
     }
 
+    fn pki(&mut self, pki: &PkiApp) -> Result<()> {
+        if !pki.extra.is_empty() {
+            let fields: Vec<&str> = pki.extra.keys().map(String::as_str).collect();
+            return Err(Error::invalid(
+                "apps.pki",
+                format!("unknown PKI app field(s): {}", fields.join(", ")),
+            ));
+        }
+        let Some(authorities) = &pki.certificate_authorities else {
+            return Ok(());
+        };
+        let mut ids = BTreeSet::new();
+        for (id, authority) in authorities {
+            self.certificate_authority(id, authority)?;
+            ids.insert(id.clone());
+        }
+        // An empty `certificate_authorities` map behaves like an absent app: Caddy provisions the
+        // default `local` CA implicitly, so the set stays `None` in that case.
+        self.pki_ca_ids = if ids.is_empty() { None } else { Some(ids) };
+        Ok(())
+    }
+
+    fn certificate_authority(&self, id: &str, authority: &CertificateAuthority) -> Result<()> {
+        let path = format!("apps.pki.certificate_authorities.{id}");
+        if id.trim().is_empty() {
+            return Err(Error::invalid(
+                &path,
+                "certificate authority ID must not be empty (use `local` for the default CA)",
+            ));
+        }
+        if let Some(declared) = &authority.id {
+            if declared != id {
+                return Err(Error::invalid(
+                    format!("{path}.id"),
+                    format!(
+                        "certificate authority `id` field `{declared}` does not match its certificate_authorities key `{id}`"
+                    ),
+                ));
+            }
+        }
+        if !authority.extra.is_empty() {
+            let fields: Vec<&str> = authority.extra.keys().map(String::as_str).collect();
+            return Err(Error::invalid(
+                &path,
+                format!(
+                    "unknown certificate authority field(s): {}",
+                    fields.join(", ")
+                ),
+            ));
+        }
+        for (field, value) in [
+            ("intermediate_lifetime", authority.intermediate_lifetime),
+            ("maintenance_interval", authority.maintenance_interval),
+        ] {
+            if let Some(value) = value {
+                if value <= 0 {
+                    return Err(Error::invalid(
+                        format!("{path}.{field}"),
+                        format!("`{field}` must be a positive duration in nanoseconds"),
+                    ));
+                }
+            }
+        }
+        if let Some(ratio) = authority.renewal_window_ratio {
+            if !ratio.is_finite() || ratio <= 0.0 || ratio > 1.0 {
+                return Err(Error::invalid(
+                    format!("{path}.renewal_window_ratio"),
+                    format!("`renewal_window_ratio` must be a number in (0, 1], got {ratio}"),
+                ));
+            }
+        }
+        if let Some(root) = &authority.root {
+            self.pki_key_pair(root, &format!("{path}.root"))?;
+        }
+        if let Some(intermediate) = &authority.intermediate {
+            self.pki_key_pair(intermediate, &format!("{path}.intermediate"))?;
+        }
+        if let Some(storage) = &authority.storage {
+            validate_storage(storage, self.registry, &format!("{path}.storage"))?;
+        }
+        Ok(())
+    }
+
+    fn pki_key_pair(&self, pair: &PkiKeyPair, path: &str) -> Result<()> {
+        if !pair.extra.is_empty() {
+            let fields: Vec<&str> = pair.extra.keys().map(String::as_str).collect();
+            return Err(Error::invalid(
+                path,
+                format!("unknown key-pair field(s): {}", fields.join(", ")),
+            ));
+        }
+        for (field, value) in [
+            ("certificate", &pair.certificate),
+            ("private_key", &pair.private_key),
+        ] {
+            if let Some(value) = value {
+                if value.trim().is_empty() {
+                    return Err(Error::invalid(
+                        format!("{path}.{field}"),
+                        format!("`{field}` must not be empty"),
+                    ));
+                }
+            }
+        }
+        if let Some(format) = &pair.format {
+            if format != "pem_file" {
+                return Err(Error::invalid(
+                    format!("{path}.format"),
+                    format!("unsupported key-pair format `{format}`; only `pem_file` is supported"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn tls(&mut self, tls: &TlsApp) -> Result<()> {
         if let Some(certificates) = &tls.certificates {
             self.certificates(certificates, "apps.tls.certificates")?;
@@ -518,10 +640,49 @@ impl Validator<'_> {
                     path: module_path,
                 });
             }
+            if module == "internal" {
+                self.internal_issuer_ca(issuer, &issuer_path)?;
+            }
             self.validate_dns_provider(issuer, &issuer_path)?;
         }
         if let Some(storage) = &policy.storage {
             validate_storage(storage, self.registry, &format!("{path}.storage"))?;
+        }
+        Ok(())
+    }
+
+    /// An internal issuer must reference a CA that the PKI app defines, or the implicit default
+    /// `local` CA. Caddy accepts this at adaptation time but fails provisioning with
+    /// "no certificate authority configured with id: ..."; this build rejects it at validation
+    /// (the oracle fixture `tls_internal_options` is the regression case, DIV-0070).
+    fn internal_issuer_ca(&self, issuer: &ModuleRef, path: &str) -> Result<()> {
+        let ca_path = format!("{path}.ca");
+        let ca_id =
+            match issuer.extra.get("ca") {
+                None => "local".to_string(),
+                Some(Value::String(value)) if !value.trim().is_empty() => value.clone(),
+                Some(Value::String(_)) => return Err(Error::invalid(
+                    &ca_path,
+                    "certificate authority ID must not be empty (use `local` for the default CA)",
+                )),
+                Some(_) => {
+                    return Err(Error::invalid(
+                        &ca_path,
+                        "`ca` must be a string certificate authority ID",
+                    ))
+                }
+            };
+        let configured = match &self.pki_ca_ids {
+            Some(ids) => ids.contains(&ca_id),
+            None => ca_id == "local",
+        };
+        if !configured {
+            return Err(Error::invalid(
+                &ca_path,
+                format!(
+                    "no certificate authority configured with id: {ca_id}; configure it in `apps.pki.certificate_authorities` or use the default `local` CA"
+                ),
+            ));
         }
         Ok(())
     }
@@ -1056,6 +1217,236 @@ mod tests {
         assert!(
             message.contains("apps.tls.automation.policies[0].storage.module"),
             "{message}"
+        );
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // apps.pki and internal issuer CA validation (DIV-0070)
+    // ------------------------------------------------------------------------------------------
+
+    fn validate_json(value: serde_json::Value) -> Result<ValidationReport> {
+        let config = Config::from_value(value).expect("decodes");
+        validate_config(&config, &registry())
+    }
+
+    #[test]
+    fn accepts_pki_ca_referenced_by_internal_issuer() {
+        let report = validate_json(serde_json::json!({
+            "apps": {
+                "pki": {
+                    "certificate_authorities": {
+                        "foo": {
+                            "name": "Foo CA",
+                            "root_common_name": "Foo Root",
+                            "intermediate_common_name": "Foo Intermediate",
+                            "intermediate_lifetime": 86_400_000_000_000_i64,
+                            "install_trust": false,
+                            "renewal_window_ratio": 0.2
+                        }
+                    }
+                },
+                "tls": {
+                    "automation": {
+                        "policies": [{
+                            "issuers": [{"module": "internal", "ca": "foo", "lifetime": 86_400_000_000_000_i64}]
+                        }]
+                    }
+                }
+            }
+        }))
+        .expect("configured internal CA must validate");
+        assert_eq!(report.tls_policies, 1);
+    }
+
+    #[test]
+    fn rejects_internal_issuer_with_missing_ca_id() {
+        // Oracle fixture `tls_internal_options`: Caddy's validator fails with
+        // "no certificate authority configured with id: foo"; we reject at validation too.
+        let error = validate_json(serde_json::json!({
+            "apps": {
+                "tls": {
+                    "automation": {
+                        "policies": [{
+                            "issuers": [{"module": "internal", "ca": "foo"}]
+                        }]
+                    }
+                }
+            }
+        }))
+        .expect_err("missing internal CA must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("no certificate authority configured with id: foo"),
+            "{message}"
+        );
+        assert!(
+            message.contains("apps.tls.automation.policies[0].issuers[0].ca"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn accepts_implicit_local_ca_for_internal_issuer() {
+        // No apps.pki at all: Caddy provisions the default `local` CA implicitly.
+        validate_json(serde_json::json!({
+            "apps": {"tls": {"automation": {"policies": [{"issuers": [{"module": "internal"}]}]}}}
+        }))
+        .expect("implicit local CA must be accepted");
+
+        // Explicit `ca: local` without apps.pki is the same CA.
+        validate_json(serde_json::json!({
+            "apps": {"tls": {"automation": {"policies": [{"issuers": [{"module": "internal", "ca": "local"}]}]}}}
+        }))
+        .expect("explicit local CA must be accepted");
+
+        // An empty certificate_authorities map also provisions the default CA.
+        validate_json(serde_json::json!({
+            "apps": {
+                "pki": {"certificate_authorities": {}},
+                "tls": {"automation": {"policies": [{"issuers": [{"module": "internal"}]}]}}
+            }
+        }))
+        .expect("empty pki app must accept the implicit local CA");
+    }
+
+    #[test]
+    fn rejects_implicit_local_ca_when_pki_defines_other_cas() {
+        // Once apps.pki defines CAs, Caddy no longer provisions the default local CA.
+        let error = validate_json(serde_json::json!({
+            "apps": {
+                "pki": {"certificate_authorities": {"foo": {"name": "Foo"}}},
+                "tls": {"automation": {"policies": [{"issuers": [{"module": "internal"}]}]}}
+            }
+        }))
+        .expect_err("local CA is not implicitly provisioned when apps.pki is non-empty");
+        assert!(
+            error
+                .to_string()
+                .contains("no certificate authority configured with id: local"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn accepts_pki_key_pairs_and_storage() {
+        validate_json(serde_json::json!({
+            "apps": {
+                "pki": {
+                    "certificate_authorities": {
+                        "local": {
+                            "install_trust": false,
+                            "root": {
+                                "certificate": "/path/cert.pem",
+                                "private_key": "/path/key.pem",
+                                "format": "pem_file"
+                            },
+                            "intermediate": {
+                                "certificate": "/path/inter.pem",
+                                "private_key": "/path/inter.key"
+                            },
+                            "storage": {"module": "file_system", "root": "/data"}
+                        }
+                    }
+                },
+                "tls": {"automation": {"policies": [{"issuers": [{"module": "internal"}]}]}}
+            }
+        }))
+        .expect("explicit local CA with key pairs and storage validates");
+    }
+
+    #[test]
+    fn rejects_unknown_pki_and_ca_fields_loudly() {
+        let error = validate_json(serde_json::json!({
+            "apps": {"pki": {"certificate_authorities": {}, "future_pki_field": true}}
+        }))
+        .expect_err("unknown pki app field");
+        assert!(
+            error
+                .to_string()
+                .contains("unknown PKI app field(s): future_pki_field"),
+            "{error}"
+        );
+
+        let error = validate_json(serde_json::json!({
+            "apps": {"pki": {"certificate_authorities": {
+                "local": {"future_ca_field": 1}
+            }}}
+        }))
+        .expect_err("unknown CA field");
+        assert!(
+            error
+                .to_string()
+                .contains("unknown certificate authority field(s): future_ca_field"),
+            "{error}"
+        );
+
+        let error = validate_json(serde_json::json!({
+            "apps": {"pki": {"certificate_authorities": {
+                "local": {"root": {"future_key_pair_field": true}}
+            }}}
+        }))
+        .expect_err("unknown key-pair field");
+        assert!(
+            error
+                .to_string()
+                .contains("unknown key-pair field(s): future_key_pair_field"),
+            "{error}"
+        );
+
+        let error = validate_json(serde_json::json!({
+            "apps": {"pki": {"certificate_authorities": {
+                "local": {"root": {"certificate": "/c", "format": "pkcs12"}}
+            }}}
+        }))
+        .expect_err("unsupported key-pair format");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported key-pair format `pkcs12`"),
+            "{error}"
+        );
+
+        let error = validate_json(serde_json::json!({
+            "apps": {"pki": {"certificate_authorities": {
+                "local": {"storage": {"module": "bogus_storage"}}
+            }}}
+        }))
+        .expect_err("unknown storage module");
+        assert!(error.to_string().contains("bogus_storage"), "{error}");
+    }
+
+    #[test]
+    fn rejects_invalid_ca_identifiers_and_numbers() {
+        for value in [
+            serde_json::json!({"apps": {"pki": {"certificate_authorities": {"": {}}}}}),
+            serde_json::json!({"apps": {"pki": {"certificate_authorities": {
+                "local": {"id": "other"}
+            }}}}),
+            serde_json::json!({"apps": {"pki": {"certificate_authorities": {
+                "local": {"intermediate_lifetime": -1}
+            }}}}),
+            serde_json::json!({"apps": {"pki": {"certificate_authorities": {
+                "local": {"renewal_window_ratio": 1.5}
+            }}}}),
+            serde_json::json!({"apps": {"pki": {"certificate_authorities": {
+                "local": {"root": {"certificate": ""}}
+            }}}}),
+        ] {
+            assert!(validate_json(value.clone()).is_err(), "must reject {value}");
+        }
+    }
+
+    #[test]
+    fn rejects_internal_issuer_with_non_string_ca() {
+        let error = validate_json(serde_json::json!({
+            "apps": {"tls": {"automation": {"policies": [{
+                "issuers": [{"module": "internal", "ca": 42}]
+            }]}}}
+        }))
+        .expect_err("non-string ca");
+        assert!(
+            error.to_string().contains("`ca` must be a string"),
+            "{error}"
         );
     }
 }

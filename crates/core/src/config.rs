@@ -91,6 +91,11 @@ impl Config {
     pub fn tls(&self) -> Option<&TlsApp> {
         self.apps.as_ref().and_then(|apps| apps.tls.as_ref())
     }
+
+    /// The PKI app, if configured.
+    pub fn pki(&self) -> Option<&PkiApp> {
+        self.apps.as_ref().and_then(|apps| apps.pki.as_ref())
+    }
 }
 
 /// Admin API configuration.
@@ -147,7 +152,112 @@ pub struct Apps {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<TlsApp>,
 
+    /// PKI app (`apps.pki`): certificate authorities used by internal issuers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pki: Option<PkiApp>,
+
     /// Apps this build does not model; preserved and rejected by validation unless registered.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+/// PKI app configuration (`apps.pki`, Caddy module `pki`).
+///
+/// Caddy's PKI app manages certificate authorities that internal issuers use. The default CA ID
+/// is `local`; when the app is absent (or defines no CAs) Caddy provisions that default CA
+/// implicitly, which is why `tls internal` works without any `apps.pki` configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PkiApp {
+    /// Certificate authorities keyed by their config-facing ID (`certificate_authorities`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate_authorities: Option<BTreeMap<String, CertificateAuthority>>,
+
+    /// Unknown PKI-app fields, preserved for round-tripping and rejected by validation.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+impl Default for PkiApp {
+    fn default() -> Self {
+        Self {
+            certificate_authorities: None,
+            extra: BTreeMap::new(),
+        }
+    }
+}
+
+/// One certificate authority in `apps.pki.certificate_authorities`.
+///
+/// Field names follow Caddy's `caddypki.CA` JSON encoding. The config-facing ID is the map key;
+/// Caddy ignores an `id` field in JSON, but it is accepted here for configuration generators and
+/// must match the key when present.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CertificateAuthority {
+    /// Unique config-facing ID. Duplicated map key, accepted for generators that emit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+
+    /// User-facing name of the certificate authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+
+    /// Common Name of the root certificate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_common_name: Option<String>,
+
+    /// Common Name of the intermediate certificates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intermediate_common_name: Option<String>,
+
+    /// Lifetime of the intermediate certificates, in nanoseconds (Caddy `Duration`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intermediate_lifetime: Option<i64>,
+
+    /// How often to check whether CA certificates need renewal, in nanoseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance_interval: Option<i64>,
+
+    /// Fraction of a certificate's lifetime after which renewal is attempted (0.0–1.0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renewal_window_ratio: Option<f64>,
+
+    /// Whether Caddy installs the root certificate into system trust stores (`install_trust`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_trust: Option<bool>,
+
+    /// Root certificate/key to use; generated when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<PkiKeyPair>,
+
+    /// Intermediate certificate/key to use; generated when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intermediate: Option<PkiKeyPair>,
+
+    /// Storage backend for this CA, overriding the global storage configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<StorageConfig>,
+
+    /// Unknown CA fields, preserved for round-tripping and rejected by validation.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+/// A certificate/key pair (`root` / `intermediate` in a PKI CA).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PkiKeyPair {
+    /// Path to (or inline value of) the certificate PEM; format-dependent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate: Option<String>,
+
+    /// Path to (or inline value of) the private key; format-dependent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_key: Option<String>,
+
+    /// Format of the certificate and key. Caddy supports `pem_file` (the default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+
+    /// Unknown key-pair fields, preserved for round-tripping and rejected by validation.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
 }
@@ -1054,5 +1164,49 @@ mod tests {
             config.to_value().unwrap(),
             serde_json::json!({"admin": {"disabled": true}})
         );
+    }
+
+    #[test]
+    fn round_trips_typed_pki_app_without_losing_fields() {
+        let json = serde_json::json!({
+            "apps": {
+                "pki": {
+                    "certificate_authorities": {
+                        "local": {
+                            "name": "Local",
+                            "root_common_name": "Root CN",
+                            "intermediate_common_name": "Intermediate CN",
+                            "intermediate_lifetime": 86_400_000_000_000_i64,
+                            "maintenance_interval": 600_000_000_000_i64,
+                            "renewal_window_ratio": 0.2,
+                            "install_trust": false,
+                            "root": {
+                                "certificate": "/path/cert.pem",
+                                "private_key": "/path/key.pem",
+                                "format": "pem_file"
+                            },
+                            "intermediate": {"certificate": "/path/inter.pem"},
+                            "storage": {"module": "file_system", "root": "/data"}
+                        }
+                    }
+                }
+            }
+        });
+        let config = Config::from_value(json.clone()).expect("typed pki model decodes");
+        let pki = config.pki().expect("pki app present");
+        let authorities = pki
+            .certificate_authorities
+            .as_ref()
+            .expect("certificate authorities");
+        let local = authorities.get("local").expect("local CA");
+        assert_eq!(local.name.as_deref(), Some("Local"));
+        assert_eq!(local.intermediate_lifetime, Some(86_400_000_000_000));
+        assert_eq!(local.renewal_window_ratio, Some(0.2));
+        assert_eq!(local.install_trust, Some(false));
+        assert_eq!(
+            local.root.as_ref().and_then(|root| root.format.as_deref()),
+            Some("pem_file")
+        );
+        assert_eq!(config.to_value().expect("serializes"), json);
     }
 }
