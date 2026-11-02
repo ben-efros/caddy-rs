@@ -36,8 +36,15 @@
 //! [`AdminApi::metrics`] hands the same registry to the server runtime for population.
 //!
 //! [`access_log`] models Caddy's structured access-log entry (request/TLS/upstream fields),
-//! with field selection, sampling and redaction primitives. Wiring the model to a log sink is a
-//! server-runtime follow-up.
+//! with field selection, sampling and redaction primitives. [`sink`] turns those records into
+//! bytes: a validated [`AccessLogEncoder`] (redaction + field selection), a cloneable
+//! [`AccessLogSink`] writing to stderr/stdout/a file/discard with buffering, explicit
+//! flush/close and located errors, and sampling applied at emission.
+//!
+//! [`recorder`] is the runtime seam for metrics: a [`RequestRecorder`] observer API (shared
+//! handle, no-op implementation, RAII in-flight guards) that forwards request/proxy observations
+//! to [`HttpMetrics`], plus [`CertificateMetrics`] hooks for the TLS renewal work. The server
+//! runtime stores one recorder and clones it per task; see the module docs for the wiring recipe.
 //!
 //! ## Partial updates
 //!
@@ -65,10 +72,12 @@
 //! - Origin policy derives implicit origins from a non-empty `admin.origins`; the shared core
 //!   model cannot distinguish `origins: null` (derive) from `origins: []` (allow none), so an
 //!   explicit empty list derives the defaults instead of blocking the endpoint.
-//! - Metrics and access logging are crate-level primitives (T-ADMIN-020/T-ADMIN-021): the
-//!   registry is exposed for the server runtime to populate, and the access-log record model is
-//!   not yet wired to a sink. `/metrics` renders whatever the registry currently holds, which is
-//!   empty until the runtime records something.
+//! - Metrics rendering and the access-log record model/sink are crate-level primitives
+//!   (T-ADMIN-020/021/022): `/metrics` renders whatever the runtime records through the
+//!   [`recorder`] API, and the server runtime decides when to construct an [`AccessLogSink`],
+//!   emit entries and close it on shutdown. Both are empty/inert until the runtime wires them.
+//! - Access-log file rotation (`roll_*` writer options) is not implemented; files are opened in
+//!   append mode and rotated externally. See [`sink`] for details.
 
 #![forbid(unsafe_code)]
 
@@ -76,6 +85,8 @@ pub mod access_log;
 mod config_path;
 pub mod metrics;
 mod origin;
+pub mod recorder;
+pub mod sink;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -95,6 +106,14 @@ pub use metrics::{
     METRICS_CONTENT_TYPE,
 };
 pub use origin::{OriginPolicy, OriginViolation};
+pub use recorder::{
+    noop_recorder, CertificateMetrics, MetricsRequestRecorder, NoopRequestRecorder,
+    ProxyRequestGuard, RequestGuard, RequestRecorder, SharedRequestRecorder,
+};
+pub use sink::{
+    AccessLogEncoder, AccessLogOutput, AccessLogSink, AccessLogSinkConfig, AccessLogSinkStats,
+    EmitOutcome, DEFAULT_ACCESS_LOG_BUFFER_BYTES,
+};
 
 use config_path::{index_config, navigate, Mutation};
 
@@ -197,6 +216,26 @@ impl AdminApi {
     /// A cheap handle to the metrics registry for the server runtime to populate.
     pub fn metrics(&self) -> MetricsRegistry {
         self.metrics.clone()
+    }
+
+    /// A shared request recorder backed by this admin API's metrics registry.
+    ///
+    /// The server runtime stores this handle and calls it for request/proxy lifecycle events; the
+    /// same registry is rendered by `GET /metrics`. See [`recorder`] for the full wiring recipe.
+    pub fn request_recorder(&self) -> SharedRequestRecorder {
+        MetricsRequestRecorder::shared(Arc::new(crate::metrics::HttpMetrics::new(
+            self.metrics.clone(),
+        )))
+    }
+
+    /// A certificate-metrics handle backed by this admin API's metrics registry.
+    ///
+    /// Intended for the TLS certificate/renewal work; the gauge/counter series are rendered by the
+    /// same `GET /metrics` endpoint.
+    pub fn certificate_metrics(&self) -> CertificateMetrics {
+        CertificateMetrics::new(Arc::new(crate::metrics::HttpMetrics::new(
+            self.metrics.clone(),
+        )))
     }
 
     /// Wake the runtime supervisor immediately after a successful load/stop instead of waiting
@@ -687,6 +726,49 @@ mod tests {
         let response = admin.handle(request("GET", "/config/", "")).await;
         assert_eq!(response.status, StatusCode::OK);
         assert_eq!(response.body, Bytes::from_static(b"{}"));
+    }
+
+    #[tokio::test]
+    async fn runtime_recorder_and_certificate_metrics_feed_the_metrics_endpoint() {
+        let admin = admin();
+        load(&admin, &valid_config()).await;
+
+        // The server runtime records through the shared handle; `/metrics` renders the same
+        // registry, so a recorded request must be visible on the endpoint.
+        let recorder = admin.request_recorder();
+        let guard = recorder.request_started("srv0", "route0").expect("start");
+        recorder
+            .request_finished(&RequestObservation::new(
+                "srv0",
+                "route0",
+                "GET",
+                200,
+                Duration::from_millis(5),
+            ))
+            .expect("finish");
+        drop(guard);
+        admin
+            .certificate_metrics()
+            .certificate_expiry("acme", "example.com", 3_600.0)
+            .expect("certificate expiry");
+
+        let response = admin.handle(request("GET", "/metrics", "")).await;
+        assert_eq!(response.status, StatusCode::OK);
+        let body = body_string(&response);
+        assert!(
+            body.contains("caddy_http_requests_total{handler=\"route0\",server=\"srv0\"} 1"),
+            "metrics body:\n{body}"
+        );
+        assert!(
+            body.contains("caddy_http_requests_in_flight{handler=\"route0\",server=\"srv0\"} 0"),
+            "metrics body:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "caddy_rs_tls_certificate_expiration_seconds{issuer=\"acme\",subject=\"example.com\"} 3600"
+            ),
+            "metrics body:\n{body}"
+        );
     }
 
     #[tokio::test]
