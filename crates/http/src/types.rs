@@ -10,6 +10,7 @@ use http::{HeaderMap, Method, StatusCode, Uri};
 use thiserror::Error;
 
 use crate::body::{BodyError, StreamingResponse};
+use crate::upgrade::UpgradedResponse;
 
 /// Errors raised while building or executing handlers.
 #[derive(Debug, Error)]
@@ -39,6 +40,16 @@ pub enum Error {
     /// Failure while consuming a streaming response body (buffered compatibility path).
     #[error(transparent)]
     Body(#[from] BodyError),
+
+    /// An upgraded (101 + tunnel) response reached a router path that cannot carry a tunnel.
+    ///
+    /// The buffered and streaming-only APIs cannot represent a raw connection; callers that need
+    /// HTTP Upgrade support must use `Router::handle_upgradable`.
+    #[error("upgraded response cannot be represented on `{context}`")]
+    UpgradeNotRepresentable {
+        /// Router API that received the upgraded response.
+        context: &'static str,
+    },
 }
 
 /// Result alias for the HTTP crate.
@@ -218,6 +229,20 @@ pub enum StreamingOutcome {
     Continue(Request),
     /// Write this (possibly streaming) response and stop the chain.
     Respond(StreamingResponse),
+    /// Switch protocols (HTTP/1.1 `101 Switching Protocols`) and hand the tunnel to the server.
+    ///
+    /// Only the upgrade-aware router path (`Router::handle_upgradable`) can carry this outcome;
+    /// the buffered/streaming-only paths return [`Error::UpgradeNotRepresentable`].
+    Upgrade(UpgradedResponse),
+}
+
+/// The result of an upgrade-aware router evaluation: a normal response or a protocol switch.
+#[derive(Debug)]
+pub enum ResponseOutcome {
+    /// A normal (possibly streaming) response.
+    Response(StreamingResponse),
+    /// A protocol switch carrying the upgraded upstream tunnel.
+    Upgrade(UpgradedResponse),
 }
 
 /// An HTTP handler.

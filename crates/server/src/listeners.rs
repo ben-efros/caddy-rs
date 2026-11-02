@@ -47,7 +47,7 @@ use caddy_rs_http::{Body, Router};
 use crate::activation::{adopt_tcp, adopt_unix, InheritedSocket, LocalSocket};
 use crate::auto_https::AutomaticHttpsServing;
 use crate::error::Error;
-use crate::http::serve_request_with_automatic;
+use crate::http::{serve_request_with_automatic_upgradable, ServedResponse};
 use crate::limits::ServerLimits;
 
 /// Router map shared with accept loops, keyed by configured listen address.
@@ -430,8 +430,11 @@ async fn serve_accepted<I>(
 ) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let _generation = generation;
-    let _permit = permit;
+    // The permit and generation guard are held by the connection service so an HTTP Upgrade tunnel
+    // can take ownership of them once the connection is handed off. For normal connections the
+    // service is dropped when the connection ends, releasing both.
+    let permit = Arc::new(permit);
+    let generation = generation;
     let limits = Arc::clone(&context.limits);
     let activity = Arc::new(ConnectionActivity::default());
     let router = context.router;
@@ -460,6 +463,9 @@ async fn serve_accepted<I>(
             alpn,
             automatic,
             Arc::clone(&activity),
+            Arc::clone(&permit),
+            generation.clone(),
+            shutdown.clone(),
         );
         serve_connection(tls_stream, service, shutdown, limits, activity).await;
     } else {
@@ -471,11 +477,15 @@ async fn serve_accepted<I>(
             None,
             automatic,
             Arc::clone(&activity),
+            Arc::clone(&permit),
+            generation.clone(),
+            shutdown.clone(),
         );
         serve_connection(stream, service, shutdown, limits, activity).await;
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn connection_service(
     router: Option<Arc<Router>>,
     limits: Arc<ServerLimits>,
@@ -484,6 +494,9 @@ fn connection_service(
     alpn: Option<String>,
     automatic: Option<Arc<AutomaticHttpsServing>>,
     activity: Arc<ConnectionActivity>,
+    permit: Arc<ConnectionPermit>,
+    generation: Option<Arc<Generation>>,
+    shutdown: watch::Receiver<bool>,
 ) -> impl hyper::service::Service<
     hyper::Request<Incoming>,
     Response = hyper::Response<Body>,
@@ -491,32 +504,98 @@ fn connection_service(
     Future: Send,
 > + Send
        + 'static {
-    service_fn(move |request: hyper::Request<Incoming>| {
+    service_fn(move |mut request: hyper::Request<Incoming>| {
         let router = router.clone();
         let limits = Arc::clone(&limits);
         let activity = Arc::clone(&activity);
         let alpn = alpn.clone();
         let automatic = automatic.clone();
+        let permit = Arc::clone(&permit);
+        let generation = generation.clone();
+        let shutdown = shutdown.clone();
         async move {
             let _in_flight = activity.begin();
-            let response = match router {
-                Some(router) => {
-                    serve_request_with_automatic(
-                        &limits,
-                        router,
-                        request,
-                        remote_addr,
-                        tls,
-                        alpn.as_deref(),
-                        automatic,
-                    )
-                    .await
-                }
-                None => error_response(),
+            let Some(router) = router else {
+                return Ok::<_, std::convert::Infallible>(error_response());
             };
-            Ok::<_, std::convert::Infallible>(response)
+            // Take the client-side upgrade future before the request is consumed. Only requests
+            // that actually negotiate an upgrade get one; the router decides whether to switch.
+            let on_upgrade = caddy_rs_http::requested_upgrade_type(request.headers())
+                .map(|_| hyper::upgrade::on(&mut request));
+            let served = serve_request_with_automatic_upgradable(
+                &limits,
+                router,
+                request,
+                remote_addr,
+                tls,
+                alpn.as_deref(),
+                automatic,
+                on_upgrade,
+            )
+            .await;
+            match served {
+                ServedResponse::Response(response) => Ok::<_, std::convert::Infallible>(response),
+                ServedResponse::Upgraded {
+                    response,
+                    tunnel,
+                    on_upgrade,
+                } => {
+                    spawn_upgraded_tunnel(on_upgrade, tunnel, shutdown, permit, generation);
+                    Ok::<_, std::convert::Infallible>(response)
+                }
+            }
         }
     })
+}
+
+/// Tunnel an upgraded client connection to the upgraded upstream connection.
+///
+/// The task owns the connection permit and the generation guard for the lifetime of the tunnel, so
+/// connection limits and generation draining stay correct after hyper hands the socket off. A
+/// shutdown signal, EOF from either side, or a copy error ends the task and drops both streams,
+/// which closes the corresponding sockets.
+fn spawn_upgraded_tunnel(
+    on_upgrade: hyper::upgrade::OnUpgrade,
+    tunnel: caddy_rs_http::Tunnel,
+    mut shutdown: watch::Receiver<bool>,
+    permit: Arc<ConnectionPermit>,
+    generation: Option<Arc<Generation>>,
+) {
+    tokio::spawn(async move {
+        let _permit = permit;
+        let _generation = generation;
+        if *shutdown.borrow() {
+            return;
+        }
+        let client = match on_upgrade.await {
+            Ok(upgraded) => upgraded,
+            Err(error) => {
+                tracing::debug!(%error, "client upgrade did not complete");
+                return;
+            }
+        };
+        // `TokioIo` adapts hyper's upgraded I/O to tokio's AsyncRead/AsyncWrite traits.
+        let mut client = TokioIo::new(client);
+        let mut upstream = tunnel.into_inner();
+        let copy = tokio::io::copy_bidirectional(&mut client, &mut upstream);
+        tokio::pin!(copy);
+        tokio::select! {
+            result = &mut copy => {
+                match result {
+                    Ok((to_client, to_upstream)) => tracing::debug!(
+                        to_client,
+                        to_upstream,
+                        "upgraded connection closed"
+                    ),
+                    Err(error) => tracing::debug!(%error, "upgraded connection copy failed"),
+                }
+            }
+            _ = shutdown.changed() => {
+                tracing::debug!("closing upgraded connection on shutdown");
+            }
+        }
+        // Dropping `client` and `upstream` closes both sides of the tunnel.
+    });
 }
 
 /// Serve one connection with the server's limits and graceful-shutdown/idle handling.
@@ -549,7 +628,7 @@ async fn serve_connection<I, S>(
     }
 
     let io = TimedIo::new(io, limits.read_timeout, limits.write_timeout);
-    let connection = builder.serve_connection(TokioIo::new(io), service);
+    let connection = builder.serve_connection_with_upgrades(TokioIo::new(io), service);
     tokio::pin!(connection);
     let idle = idle_after(activity, limits.idle_timeout);
     tokio::pin!(idle);

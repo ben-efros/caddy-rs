@@ -23,14 +23,34 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http::StatusCode;
+use http::{Method, StatusCode, Version};
 use http_body_util::{BodyExt, LengthLimitError, Limited};
 use hyper::body::Incoming;
+use hyper::upgrade::OnUpgrade;
 
-use caddy_rs_http::{Body, Request, Response, Router, StreamingResponse};
+use caddy_rs_http::{Body, Request, Response, ResponseOutcome, Router, StreamingResponse, Tunnel};
 
 use crate::auto_https::AutomaticHttpsServing;
 use crate::limits::ServerLimits;
+
+/// One served request at the hyper connection boundary.
+///
+/// Most requests produce a normal (possibly streaming) response. A protocol switch additionally
+/// hands the server the upgraded upstream tunnel plus the pending client-side upgrade future; the
+/// connection layer spawns the bidirectional copy and writes the 101 response.
+pub(crate) enum ServedResponse {
+    /// A normal (possibly streaming) response.
+    Response(hyper::Response<Body>),
+    /// A protocol switch: write `response`, then tunnel the client and `tunnel` together.
+    Upgraded {
+        /// The `101 Switching Protocols` response to write to the client.
+        response: hyper::Response<Body>,
+        /// The upgraded upstream connection.
+        tunnel: Tunnel,
+        /// The pending client-side upgrade.
+        on_upgrade: OnUpgrade,
+    },
+}
 
 /// Serve one hyper request through a router with the server's default limits.
 pub async fn serve_request(
@@ -83,8 +103,10 @@ pub async fn serve_request_with_limits_and_alpn(
 /// Like [`serve_request_with_limits_and_alpn`], with automatic-HTTPS pre-routing: ACME HTTP-01
 /// challenge responses and HTTP→HTTPS redirects are handled before the router runs.
 ///
-/// Pre-routing responses stay fully buffered (they are small static bodies) and are returned
-/// before any request-body handling, preserving the automatic-HTTPS ordering.
+/// Pre-routing responses stay fully buffered (they are small static bodies). This entry point does
+/// not carry a client upgrade future; an upstream protocol switch is reported as `502` because a
+/// tunnel cannot be established without the connection layer. The server listener uses
+/// [`serve_request_with_automatic_upgradable`] instead.
 pub(crate) async fn serve_request_with_automatic(
     limits: &ServerLimits,
     router: Arc<Router>,
@@ -94,12 +116,62 @@ pub(crate) async fn serve_request_with_automatic(
     tls_alpn: Option<&str>,
     automatic: Option<Arc<AutomaticHttpsServing>>,
 ) -> hyper::Response<Body> {
+    match serve_request_with_automatic_upgradable(
+        limits,
+        router,
+        request,
+        remote_addr,
+        tls,
+        tls_alpn,
+        automatic,
+        None,
+    )
+    .await
+    {
+        ServedResponse::Response(response) => response,
+        ServedResponse::Upgraded { .. } => {
+            // `on_upgrade` is None here, so the upgradable function never returns this variant.
+            status_response(
+                StatusCode::BAD_GATEWAY,
+                "502 Bad Gateway: protocol upgrade requires the connection layer",
+            )
+        }
+    }
+}
+
+/// Serve one request, preserving protocol upgrades when `on_upgrade` is supplied.
+///
+/// `on_upgrade` must have been obtained from the request (via `hyper::upgrade::on(&mut request)`)
+/// before the request is consumed. When the router returns an
+/// [`ResponseOutcome::Upgrade`](caddy_rs_http::ResponseOutcome::Upgrade) and `on_upgrade` is
+/// available, the caller receives [`ServedResponse::Upgraded`] and must write the response and run
+/// the tunnel copy. HTTP/2 extended CONNECT (WebSocket over HTTP/2) is rejected with `501`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn serve_request_with_automatic_upgradable(
+    limits: &ServerLimits,
+    router: Arc<Router>,
+    request: hyper::Request<Incoming>,
+    remote_addr: Option<SocketAddr>,
+    tls: bool,
+    tls_alpn: Option<&str>,
+    automatic: Option<Arc<AutomaticHttpsServing>>,
+    on_upgrade: Option<OnUpgrade>,
+) -> ServedResponse {
     if !tls {
         if let Some(automatic) = &automatic {
             if let Some(response) = automatic.pre_router_response(&request) {
-                return response;
+                return ServedResponse::Response(response);
             }
         }
+    }
+    // HTTP/2 extended CONNECT (RFC 8441) is not implemented: hyper's auto connection does not
+    // expose it, so reject loudly rather than mis-serving a WebSocket-ish request as CONNECT.
+    if request.version() == Version::HTTP_2 && request.method() == Method::CONNECT {
+        tracing::debug!("rejecting HTTP/2 extended CONNECT: WebSocket over HTTP/2 is unsupported");
+        return ServedResponse::Response(status_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "501 Not Implemented: HTTP/2 extended CONNECT (WebSocket over HTTP/2) is unsupported",
+        ));
     }
     let (parts, body) = request.into_parts();
     let body = match read_body(body, limits.max_request_body_size).await {
@@ -110,14 +182,17 @@ pub(crate) async fn serve_request_with_automatic(
                 path = parts.uri.path(),
                 "request body exceeds max_request_body_size"
             );
-            return status_response(
+            return ServedResponse::Response(status_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "413 Request Entity Too Large",
-            );
+            ));
         }
         Err(BodyReadError::Read(error)) => {
             eprintln!("caddy-rs: cannot read request body: {error}");
-            return status_response(StatusCode::BAD_REQUEST, "400 Bad Request");
+            return ServedResponse::Response(status_response(
+                StatusCode::BAD_REQUEST,
+                "400 Bad Request",
+            ));
         }
     };
     let mut internal = Request::new(parts.method, parts.uri);
@@ -131,14 +206,46 @@ pub(crate) async fn serve_request_with_automatic(
             .insert("tls.alpn".to_string(), alpn.to_string());
     }
 
-    match router.handle_streaming(internal).await {
-        Ok(response) => to_hyper_streaming(response),
+    match router.handle_upgradable(internal).await {
+        Ok(ResponseOutcome::Response(response)) => {
+            ServedResponse::Response(to_hyper_streaming(response))
+        }
+        Ok(ResponseOutcome::Upgrade(upgraded)) => {
+            let Some(on_upgrade) = on_upgrade else {
+                eprintln!(
+                    "caddy-rs: upstream switched protocols but the client connection cannot \
+                     upgrade; serving 502"
+                );
+                return ServedResponse::Response(status_response(
+                    StatusCode::BAD_GATEWAY,
+                    "502 Bad Gateway: client connection cannot be upgraded",
+                ));
+            };
+            // A 101 response has no body; hyper completes the client handshake when the response
+            // carries the upgrade headers and status.
+            let mut builder = hyper::Response::builder().status(upgraded.status);
+            for (name, value) in &upgraded.headers {
+                builder = builder.header(name, value);
+            }
+            let response = builder.body(Body::empty()).unwrap_or_else(|error| {
+                eprintln!("caddy-rs: cannot build upgrade response: {error}");
+                status_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "500 Internal Server Error",
+                )
+            });
+            ServedResponse::Upgraded {
+                response,
+                tunnel: upgraded.tunnel,
+                on_upgrade,
+            }
+        }
         Err(error) => {
             eprintln!("caddy-rs: handler error: {error}");
-            status_response(
+            ServedResponse::Response(status_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "500 Internal Server Error",
-            )
+            ))
         }
     }
 }

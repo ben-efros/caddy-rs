@@ -14,6 +14,7 @@ pub mod matchers;
 pub mod placeholders;
 pub mod router;
 pub mod types;
+pub mod upgrade;
 
 pub use auth::{BasicAuthHandler, ForwardAuthHandler};
 pub use body::{Body, BodyError, RequestBody, ResponseBody, StreamingBody, StreamingResponse};
@@ -24,6 +25,7 @@ pub use handlers::{
 pub use placeholders::{Replacer, UnknownPlaceholders};
 pub use router::{CustomHandlerFactory, Route, Router, RouterBuilder};
 pub use types::{
-    Error, Handler, Matcher, Outcome, Request, Response, Result, SharedHandler, SharedMatcher,
-    StreamingOutcome,
+    Error, Handler, Matcher, Outcome, Request, Response, ResponseOutcome, Result, SharedHandler,
+    SharedMatcher, StreamingOutcome,
 };
+pub use upgrade::{requested_upgrade_type, Tunnel, TunnelStream, UpgradedResponse};
