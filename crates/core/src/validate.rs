@@ -4,7 +4,8 @@
 //! It walks every handler and matcher reference, so an unsupported module fails at validation
 //! time with a located error instead of at request time. It also enforces the structural
 //! invariants this implementation relies on: unique route ids, unique listeners, and well-formed
-//! reverse-proxy upstreams.
+//! reverse-proxy upstreams. Constructs Caddy accepts but this build does not implement are
+//! rejected with [`Error::Unsupported`] and a tracking task, never silently accepted.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -285,26 +286,39 @@ impl Validator<'_> {
         self.report.handlers += 1;
 
         match module.json_key {
-            "subroute" => {
-                let nested = object
-                    .get("routes")
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| {
-                        Error::invalid(
-                            format!("{path}.routes"),
-                            "subroute handler requires an array field `routes`",
-                        )
-                    })?;
-                let decoded: Vec<Route> = serde_json::from_value(Value::Array(nested.clone()))
-                    .map_err(|source| {
-                        Error::invalid(
-                            format!("{path}.routes"),
-                            format!("cannot decode nested routes: {source}"),
-                        )
-                    })?;
-                self.routes(&decoded, &format!("{path}.routes"))?;
-            }
+            "subroute" => match object.get("routes") {
+                // Caddy's `subroute.routes` is optional (`json:"routes,omitempty"`); a subroute
+                // with no routes is valid and behaves as a no-op that passes control on.
+                None | Some(Value::Null) => {}
+                Some(Value::Array(nested)) => {
+                    let decoded: Vec<Route> = serde_json::from_value(Value::Array(nested.clone()))
+                        .map_err(|source| {
+                            Error::invalid(
+                                format!("{path}.routes"),
+                                format!("cannot decode nested routes: {source}"),
+                            )
+                        })?;
+                    self.routes(&decoded, &format!("{path}.routes"))?;
+                }
+                Some(_) => {
+                    return Err(Error::invalid(
+                        format!("{path}.routes"),
+                        "subroute handler field `routes` must be an array of routes",
+                    ))
+                }
+            },
             "reverse_proxy" => {
+                // Caddy supports dynamically discovered upstreams (`dynamic_upstreams` with
+                // `source`, `refresh`, `grace_period`, ...). caddy-rs does not implement the
+                // discovery modules, so reject the construct as tracked-unsupported instead of
+                // reporting a misleading "missing upstreams" structural error.
+                if object.get("dynamic_upstreams").is_some() {
+                    return Err(Error::unsupported(
+                        format!("{path}.dynamic_upstreams"),
+                        "reverse_proxy `dynamic_upstreams` (dynamic upstream discovery)",
+                        "T-PROXY-036",
+                    ));
+                }
                 let upstreams = object
                     .get("upstreams")
                     .and_then(Value::as_array)
@@ -650,6 +664,138 @@ mod tests {
         );
         let error = validate_config(&config, &registry()).expect_err("nested unknown handler");
         assert!(error.to_string().contains("bogus_nested"));
+    }
+
+    #[test]
+    fn accepts_subroute_handler_without_routes() {
+        // Caddy's `subroute.routes` is optional; the adapter itself emits `{"handler":"subroute"}`
+        // for empty nested blocks, so validation must accept it.
+        let config = minimal_http_config(serde_json::json!({"handler": "subroute"}), None);
+        let report = validate_config(&config, &registry()).expect("empty subroute is valid");
+        assert_eq!(report.servers, 1);
+        assert_eq!(report.routes, 1);
+        assert_eq!(report.handlers, 1);
+
+        // `null` is decoded as an absent list by Caddy too.
+        let config = minimal_http_config(
+            serde_json::json!({"handler": "subroute", "routes": null}),
+            None,
+        );
+        validate_config(&config, &registry()).expect("null subroute routes is valid");
+
+        // An explicitly empty list is valid as well.
+        let config = minimal_http_config(
+            serde_json::json!({"handler": "subroute", "routes": []}),
+            None,
+        );
+        validate_config(&config, &registry()).expect("empty subroute routes is valid");
+    }
+
+    #[test]
+    fn rejects_subroute_with_non_array_routes() {
+        for routes in [
+            serde_json::json!("not-an-array"),
+            serde_json::json!({"handle": []}),
+            serde_json::json!(42),
+        ] {
+            let config = minimal_http_config(
+                serde_json::json!({"handler": "subroute", "routes": routes}),
+                None,
+            );
+            let error = validate_config(&config, &registry()).expect_err("bad routes type");
+            let message = error.to_string();
+            assert!(message.contains("subroute"), "{message}");
+            assert!(message.contains("routes"), "{message}");
+            assert!(message.contains("array of routes"), "{message}");
+            assert!(message.contains("handle[0].routes"), "{message}");
+        }
+    }
+
+    #[test]
+    fn rejects_reverse_proxy_with_dynamic_upstreams_as_tracked_unsupported() {
+        // Shape produced by Caddy's adapter for `reverse_proxy { dynamic srv { ... } }`, including
+        // the nested `grace_period` field.
+        let config = minimal_http_config(
+            serde_json::json!({
+                "handler": "reverse_proxy",
+                "dynamic_upstreams": {
+                    "source": "srv",
+                    "name": "foo",
+                    "refresh": 300_000_000_000_i64,
+                    "grace_period": 5_000_000_000_i64
+                }
+            }),
+            None,
+        );
+        let error = validate_config(&config, &registry()).expect_err("dynamic upstreams");
+        let message = error.to_string();
+        assert!(message.contains("dynamic_upstreams"), "{message}");
+        assert!(message.contains("dynamic upstream discovery"), "{message}");
+        assert!(message.contains("T-PROXY-036"), "{message}");
+        assert!(message.contains("not supported by this build"), "{message}");
+        assert!(message.contains("handle[0].dynamic_upstreams"), "{message}");
+        assert!(matches!(error, Error::Unsupported { .. }), "{error:?}");
+
+        // Even together with a normal `upstreams` list the construct is unsupported, so it must
+        // not be silently accepted.
+        let config = minimal_http_config(
+            serde_json::json!({
+                "handler": "reverse_proxy",
+                "upstreams": [{"dial": "localhost:8080"}],
+                "dynamic_upstreams": {"source": "a"}
+            }),
+            None,
+        );
+        let error = validate_config(&config, &registry()).expect_err("dynamic upstreams");
+        assert!(error.to_string().contains("T-PROXY-036"), "{error}");
+    }
+
+    #[test]
+    fn keeps_structural_reverse_proxy_validation() {
+        // Missing `upstreams` remains a structural error when no dynamic upstreams are declared.
+        let config = minimal_http_config(serde_json::json!({"handler": "reverse_proxy"}), None);
+        let error = validate_config(&config, &registry()).expect_err("missing upstreams");
+        assert!(
+            error
+                .to_string()
+                .contains("requires an array field `upstreams`"),
+            "{error}"
+        );
+
+        // Empty upstreams are still rejected.
+        let config = minimal_http_config(
+            serde_json::json!({"handler": "reverse_proxy", "upstreams": []}),
+            None,
+        );
+        let error = validate_config(&config, &registry()).expect_err("empty upstreams");
+        assert!(
+            error.to_string().contains("at least one upstream"),
+            "{error}"
+        );
+
+        // Non-array upstreams are still rejected.
+        let config = minimal_http_config(
+            serde_json::json!({"handler": "reverse_proxy", "upstreams": "localhost:8080"}),
+            None,
+        );
+        let error = validate_config(&config, &registry()).expect_err("bad upstreams type");
+        assert!(
+            error
+                .to_string()
+                .contains("requires an array field `upstreams`"),
+            "{error}"
+        );
+
+        // A normal handler with valid upstreams still validates.
+        let config = minimal_http_config(
+            serde_json::json!({
+                "handler": "reverse_proxy",
+                "upstreams": [{"dial": "localhost:8080"}]
+            }),
+            None,
+        );
+        let report = validate_config(&config, &registry()).expect("valid reverse_proxy");
+        assert_eq!(report.handlers, 1);
     }
 
     #[test]
