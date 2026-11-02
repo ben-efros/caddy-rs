@@ -1558,3 +1558,171 @@ async fn admin_stop_ends_runtime_loop_with_automatic_https() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
+
+// ---- generation-scoped renewal scheduler lifecycle -------------------------------------------
+
+#[tokio::test]
+async fn renewal_scheduler_survives_reloads_and_previous_generation_is_stopped() {
+    let (mut runtime, https, _http, directory) = apply(false).await;
+    let first_generation = runtime.status().generation_id.expect("generation active");
+    assert_eq!(
+        runtime.renewal_scheduler_count(),
+        1,
+        "one generation-scoped renewal scheduler after automatic-HTTPS apply"
+    );
+    assert!(
+        runtime
+            .renewal_scheduler(first_generation)
+            .expect("generation owns a scheduler")
+            .is_running(),
+        "the scheduler must be kept alive by the runtime"
+    );
+    assert!(runtime.has_running_renewal_schedulers());
+
+    let store = Arc::clone(runtime.store());
+    let root = directory.path().to_string_lossy().to_string();
+
+    // Reload: the previous generation's scheduler must be stopped and dropped, not accumulated.
+    store
+        .load(config("127.0.0.1:0", Some(0), false, false, &root))
+        .expect("second generation validates");
+    runtime.apply().await.expect("reload applies");
+    let second_generation = runtime
+        .status()
+        .generation_id
+        .expect("second generation active");
+    assert_ne!(first_generation, second_generation);
+    assert_eq!(
+        runtime.renewal_scheduler_count(),
+        1,
+        "the retired generation's scheduler must be stopped and removed"
+    );
+    assert!(
+        runtime.renewal_scheduler(first_generation).is_none(),
+        "the previous generation must not keep renewal ownership"
+    );
+    assert!(
+        runtime
+            .renewal_scheduler(second_generation)
+            .expect("new generation owns a scheduler")
+            .is_running(),
+        "the new generation's scheduler must be running"
+    );
+
+    // The listener (and the issued certificate) keep serving across the reload.
+    let mut stream = tls_connect(https, "example.com").await;
+    let (status, _, body) = http_get(&mut stream, "example.com", "/").await;
+    assert_eq!(status, 200);
+    assert_eq!(body, "hello https");
+
+    // Repeated reloads do not accumulate schedulers.
+    for _ in 0..3 {
+        store
+            .load(config("127.0.0.1:0", Some(0), false, false, &root))
+            .expect("reload generation validates");
+        runtime.apply().await.expect("reload applies");
+        assert_eq!(
+            runtime.renewal_scheduler_count(),
+            1,
+            "repeated reloads must not accumulate renewal schedulers"
+        );
+    }
+    assert!(runtime.has_running_renewal_schedulers());
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn stopping_the_configuration_stops_all_renewal_schedulers() {
+    let (mut runtime, _https, _http, _directory) = apply(false).await;
+    assert_eq!(runtime.renewal_scheduler_count(), 1);
+    assert!(runtime.has_running_renewal_schedulers());
+
+    // `POST /stop` (and any external store stop) removes the active generation; the supervisor then
+    // runs the no-generation apply path, which must stop every scheduler.
+    runtime.store().stop();
+    runtime
+        .apply()
+        .await
+        .expect("apply without an active generation stops the runtime resources");
+    assert_eq!(runtime.renewal_scheduler_count(), 0);
+    assert!(
+        !runtime.has_running_renewal_schedulers(),
+        "no renewal scheduler may outlive the stopped configuration"
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn failed_apply_aborts_the_new_scheduler_and_keeps_the_previous_one() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().to_string_lossy().to_string();
+    let store = Arc::new(GenerationStore::with_builtin_registry());
+    store
+        .load(config("127.0.0.1:0", Some(0), false, false, &root))
+        .expect("first generation validates");
+    let fake = Arc::new(FakeCa::new(false));
+    let mut runtime = ServerRuntime::new(Arc::clone(&store))
+        .with_acme_transport(fake.clone())
+        .with_data_root(directory.path());
+    runtime.apply().await.expect("first automatic-HTTPS apply");
+    let old_generation = runtime
+        .status()
+        .generation_id
+        .expect("first generation active");
+    assert_eq!(runtime.renewal_scheduler_count(), 1);
+    assert!(runtime
+        .renewal_scheduler(old_generation)
+        .expect("first generation scheduler")
+        .is_running());
+
+    // Remove the persisted certificate so the reload must issue again, then make the fake CA fail
+    // newOrder: provisioning (and the renewal scheduler it would start) fails, while the previous
+    // generation's in-memory certificate and scheduler keep running.
+    let storage = FileStorage::new(directory.path());
+    for key in storage.list("").await.expect("storage list") {
+        storage
+            .delete(&key)
+            .await
+            .expect("delete persisted certificate");
+    }
+    store
+        .load(config("127.0.0.1:0", Some(0), false, false, &root))
+        .expect("second generation validates");
+    let failed_generation = store.current().expect("second generation loaded").id();
+    fake.set_fail_new_order(true);
+    let error = runtime
+        .apply()
+        .await
+        .expect_err("failed issuance must fail the apply");
+    assert!(
+        error.to_string().contains("automatic HTTPS"),
+        "error must name automatic HTTPS: {error}"
+    );
+
+    // The newly started scheduler was aborted with the dropped PreparedAutomaticHttps; the previous
+    // generation's scheduler is still owned and running.
+    assert_eq!(
+        runtime.renewal_scheduler_count(),
+        1,
+        "a failed apply must not leave a scheduler for the failed generation"
+    );
+    assert!(
+        runtime.renewal_scheduler(failed_generation).is_none(),
+        "the failed generation must not own a renewal scheduler"
+    );
+    assert_eq!(runtime.status().generation_id, Some(old_generation));
+    assert!(runtime
+        .renewal_scheduler(old_generation)
+        .expect("previous scheduler retained")
+        .is_running());
+
+    // The previous generation's listener and certificate keep serving.
+    let old_listener = runtime
+        .listener_address("127.0.0.1:0")
+        .expect("old TLS listener still bound");
+    let mut stream = tls_connect(old_listener, "example.com").await;
+    let (status, _, body) = http_get(&mut stream, "example.com", "/").await;
+    assert_eq!(status, 200);
+    assert_eq!(body, "hello https");
+    runtime.shutdown().await;
+}

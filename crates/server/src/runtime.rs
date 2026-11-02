@@ -21,8 +21,8 @@ use caddy_rs_http::RouterBuilder;
 use caddy_rs_tls::{
     build_server_config, build_server_config_with_cert_resolver, listener_uses_tls,
     plan_automatic_https, resolver_from_config, AcmeTlsAlpnResolver, AcmeTransport,
-    AutomaticHttpsPlan, AutomaticHttpsProvisioner, CertificateResolver, HyperTransport,
-    TlsAlpn01TokenStore, TlsServerOptions, DEFAULT_HTTPS_PORT,
+    AutomaticHttpsPlan, AutomaticHttpsProvisioner, AutomaticHttpsRenewals, CertificateResolver,
+    HyperTransport, TlsAlpn01TokenStore, TlsServerOptions, DEFAULT_HTTPS_PORT,
 };
 use tokio::sync::watch;
 
@@ -111,6 +111,7 @@ impl PendingAutomaticHttps {
             plan,
             serving: self.serving,
             tls_alpn01_tokens: tokens,
+            renewals: provisioned.renewals,
         })
     }
 }
@@ -151,6 +152,13 @@ pub struct ServerRuntime {
     status: RuntimeStatus,
     /// Socket-activation resolution state; resolved once on the first apply.
     activation: ActivationState,
+    /// Generation-scoped certificate renewal schedulers.
+    ///
+    /// Each successfully applied generation that manages certificates owns one scheduler, keyed by
+    /// generation id. Keeping the value alive keeps renewals running; the runtime stops and drops
+    /// the previous generation's scheduler after a successful reload and stops every scheduler on
+    /// shutdown (`/stop`, no active generation, or process shutdown).
+    renewals: BTreeMap<u64, AutomaticHttpsRenewals>,
 }
 
 /// How inherited systemd sockets are discovered for this runtime.
@@ -184,6 +192,7 @@ impl ServerRuntime {
             admin_api,
             status: RuntimeStatus::default(),
             activation: ActivationState::Environment,
+            renewals: BTreeMap::new(),
         }
     }
 
@@ -263,6 +272,9 @@ impl ServerRuntime {
             }
             self.remove_unconfigured_listeners(&states).await;
             self.reconcile_admin(&generation).await?;
+            // A generation without automatic HTTPS has no renewal schedulers; retire any left by
+            // an earlier automatic-HTTPS generation before publishing the new status.
+            self.retire_stale_renewals(generation.id()).await;
             return Ok(self.finish_apply(&generation));
         };
         // Snapshot for rollback: a failed provisioning pass must leave the previous generation's
@@ -294,11 +306,18 @@ impl ServerRuntime {
 
         // Phase 3: install the final states (provisioned resolver, `acme-tls/1` retained so
         // renewals can answer challenges on the same listeners).
+        let PreparedAutomaticHttps {
+            resolver,
+            plan,
+            serving,
+            tls_alpn01_tokens,
+            renewals,
+        } = prepared;
         let context = AutomaticHttpsContext {
-            resolver: Some(Arc::clone(&prepared.resolver)),
-            tokens: &prepared.tls_alpn01_tokens,
-            serving: &prepared.serving,
-            http_listener: prepared.plan.http_listener(),
+            resolver: Some(Arc::clone(&resolver)),
+            tokens: &tls_alpn01_tokens,
+            serving: &serving,
+            http_listener: plan.http_listener(),
             bootstrap: false,
         };
         let states = match self.build_listener_states(&generation, Some(&context)) {
@@ -315,7 +334,61 @@ impl ServerRuntime {
         }
         self.remove_unconfigured_listeners(&states).await;
         self.reconcile_admin(&generation).await?;
+
+        // Adopt the new generation's renewal scheduler only after every fallible step succeeded: a
+        // failure above drops `renewals`, which aborts the just-started scheduler and leaves the
+        // previous generation's scheduler untouched.
+        if let Some(renewals) = renewals {
+            self.renewals.insert(generation.id(), renewals);
+        }
+        self.retire_stale_renewals(generation.id()).await;
         Ok(self.finish_apply(&generation))
+    }
+
+    /// Stop and drop the renewal schedulers owned by generations other than `active_generation`.
+    ///
+    /// Called after a successful atomic swap and when a configuration without automatic HTTPS
+    /// replaces one that had it, so a retired generation never keeps a renewal task alive.
+    async fn retire_stale_renewals(&mut self, active_generation: u64) {
+        let stale: Vec<u64> = self
+            .renewals
+            .keys()
+            .copied()
+            .filter(|generation| *generation != active_generation)
+            .collect();
+        for generation in stale {
+            if let Some(renewals) = self.renewals.remove(&generation) {
+                tracing::info!(
+                    generation,
+                    "stopping certificate renewal scheduler for retired generation"
+                );
+                renewals.stop().await;
+            }
+        }
+    }
+
+    /// Generation ids that currently own a certificate renewal scheduler.
+    pub fn renewal_scheduler_generations(&self) -> Vec<u64> {
+        self.renewals.keys().copied().collect()
+    }
+
+    /// Number of generation-scoped certificate renewal schedulers owned by the runtime.
+    pub fn renewal_scheduler_count(&self) -> usize {
+        self.renewals.len()
+    }
+
+    /// The renewal scheduler owned by one generation, when it manages certificates.
+    ///
+    /// This is the handle the generation keeps alive; it is returned for diagnostics and tests.
+    pub fn renewal_scheduler(&self, generation_id: u64) -> Option<&AutomaticHttpsRenewals> {
+        self.renewals.get(&generation_id)
+    }
+
+    /// Whether any owned renewal scheduler's background task is currently running.
+    pub fn has_running_renewal_schedulers(&self) -> bool {
+        self.renewals
+            .values()
+            .any(caddy_rs_tls::AutomaticHttpsRenewals::is_running)
     }
 
     /// Replace the shared listener-state map.
@@ -511,6 +584,11 @@ impl ServerRuntime {
         let listeners = std::mem::take(&mut self.listeners);
         for (_, handle) in listeners {
             handle.stop().await;
+        }
+        let renewals = std::mem::take(&mut self.renewals);
+        for (generation, renewals) in renewals {
+            tracing::info!(generation, "stopping certificate renewal scheduler");
+            renewals.stop().await;
         }
     }
 
