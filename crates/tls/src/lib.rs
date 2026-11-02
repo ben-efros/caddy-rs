@@ -17,6 +17,7 @@ pub mod issuer;
 pub mod renewal;
 pub mod solver;
 pub mod storage;
+pub mod tls_alpn;
 pub mod tls_server;
 
 pub use acme::{
@@ -60,10 +61,15 @@ pub use storage::{
     caddy_certificate_storage_name, caddy_issuer_key, from_config, CertificateStorage, FileStorage,
     MemoryStorage, StoredCertificate,
 };
+pub use tls_alpn::{
+    AcmeTlsAlpnResolver, TlsAlpn01Challenge, TlsAlpn01TokenStore, ACME_IDENTIFIER_OID,
+    ACME_TLS_ALPN_PROTOCOL,
+};
 pub use tls_server::{
-    build_server_config, certificates_from_pem, certificates_from_tls_app, listener_uses_tls,
-    resolver_from_config, CertificateResolver, ClientAuthMode, TlsCertificate, TlsServerOptions,
-    TlsVersions, DEFAULT_ALPN, DEFAULT_HTTPS_PORT,
+    build_server_config, build_server_config_with_cert_resolver, certificates_from_pem,
+    certificates_from_tls_app, listener_uses_tls, resolver_from_config, CertificateResolver,
+    ClientAuthMode, TlsCertificate, TlsServerOptions, TlsVersions, DEFAULT_ALPN,
+    DEFAULT_HTTPS_PORT,
 };
 
 /// Errors raised by the TLS layer.

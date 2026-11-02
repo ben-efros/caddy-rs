@@ -137,6 +137,25 @@ impl Default for TlsServerOptions {
 }
 
 impl TlsServerOptions {
+    /// Include the ACME TLS-ALPN-01 protocol (`acme-tls/1`) in the server's ALPN list.
+    ///
+    /// Required when the listener should be able to answer `acme-tls/1` challenge handshakes; the
+    /// resolver overlay is [`crate::tls_alpn::AcmeTlsAlpnResolver`].
+    pub fn with_acme_tls_alpn(mut self) -> Self {
+        if !self.supports_acme_tls_alpn() {
+            self.alpn
+                .push(crate::tls_alpn::ACME_TLS_ALPN_PROTOCOL.to_vec());
+        }
+        self
+    }
+
+    /// Whether `acme-tls/1` is in the ALPN list.
+    pub fn supports_acme_tls_alpn(&self) -> bool {
+        self.alpn
+            .iter()
+            .any(|protocol| protocol.as_slice() == crate::tls_alpn::ACME_TLS_ALPN_PROTOCOL)
+    }
+
     /// Derive options from the first server `tls_connection_policies` entry.
     ///
     /// Absent or empty policies mean Caddy's defaults (ALPN `h2`/`http/1.1`, TLS 1.2+1.3, no
@@ -575,9 +594,20 @@ impl ResolvesServerCert for CertificateResolver {
     }
 }
 
-/// Build a rustls server configuration from a resolver and options.
+/// Build a rustls server configuration from a [`CertificateResolver`] and options.
 pub fn build_server_config(
     resolver: Arc<CertificateResolver>,
+    options: &TlsServerOptions,
+) -> Result<Arc<ServerConfig>> {
+    build_server_config_with_cert_resolver(resolver, options)
+}
+
+/// Build a rustls server configuration from any certificate resolver.
+///
+/// Use this with [`crate::tls_alpn::AcmeTlsAlpnResolver`] to combine normal SNI selection with
+/// ACME TLS-ALPN-01 challenge certificates.
+pub fn build_server_config_with_cert_resolver(
+    resolver: Arc<dyn ResolvesServerCert>,
     options: &TlsServerOptions,
 ) -> Result<Arc<ServerConfig>> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());

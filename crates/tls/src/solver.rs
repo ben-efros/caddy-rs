@@ -1,4 +1,4 @@
-//! ACME challenge solvers: HTTP-01, DNS-01 and the TLS-ALPN-01 placeholder.
+//! ACME challenge solvers: HTTP-01, DNS-01 and TLS-ALPN-01.
 //!
 //! RFC 8555 requires the ACME client to prove control of each identifier in an order. The issuer
 //! (see [`crate::issuer::AcmeIssuer`]) selects a challenge per authorization, asks a
@@ -12,9 +12,9 @@
 //!   [`DnsProvider`] abstraction, waits for propagation via
 //!   [`DnsProvider::wait_for_propagation`], and deletes the record on withdrawal (or immediately
 //!   if propagation fails).
-//! * [`TlsAlpn01Solver`] is a tracked stub: TLS-ALPN-01 needs a live TLS listener carrying a
-//!   self-signed certificate with the `acme-tls/1` ALPN protocol, which is the end-to-end TLS
-//!   serving work (T-TLS-043). Selecting it returns a located [`Error::NotImplemented`].
+//! * [`TlsAlpn01Solver`] generates the RFC 8737 self-signed challenge certificate (see
+//!   [`crate::tls_alpn`]) and publishes it in a domain-keyed [`crate::tls_alpn::TlsAlpn01TokenStore`]
+//!   for the TLS listener to serve over the `acme-tls/1` ALPN protocol.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -49,8 +49,11 @@ pub enum ChallengeHandle {
         /// The record that was created.
         record: TxtRecord,
     },
-    /// TLS-ALPN-01 evidence (not implemented yet).
-    TlsAlpn01,
+    /// A TLS-ALPN-01 challenge certificate registered for a domain.
+    TlsAlpn01 {
+        /// Normalised identifier the challenge certificate is for.
+        domain: String,
+    },
 }
 
 /// Installs and removes the evidence for one ACME challenge type.
@@ -356,37 +359,7 @@ impl ChallengeSolver for Dns01Solver {
     }
 }
 
-/// TLS-ALPN-01 solver placeholder.
-///
-/// TLS-ALPN-01 requires a live TLS listener presenting a self-signed certificate with the
-/// `acme-tls/1` ALPN protocol; that belongs to the end-to-end TLS serving work (T-TLS-043). The
-/// stub keeps challenge selection honest: choosing it fails with a tracked
-/// [`Error::NotImplemented`] instead of silently hanging validation.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct TlsAlpn01Solver;
-
-#[async_trait]
-impl ChallengeSolver for TlsAlpn01Solver {
-    fn challenge_type(&self) -> ChallengeType {
-        ChallengeType::TlsAlpn01
-    }
-
-    async fn present(
-        &self,
-        _domain: &str,
-        _challenge: &Challenge,
-        _key_authorization: &str,
-    ) -> Result<ChallengeHandle> {
-        Err(Error::NotImplemented {
-            feature: "TLS-ALPN-01 challenge solver (live TLS listener with acme-tls/1 ALPN)",
-            tracking_id: "T-TLS-043",
-        })
-    }
-
-    async fn withdraw(&self, _handle: &ChallengeHandle) -> Result<()> {
-        Ok(())
-    }
-}
+pub use crate::tls_alpn::TlsAlpn01Solver;
 
 /// Solvers available to an issuer, keyed by challenge type.
 #[derive(Default)]
@@ -648,24 +621,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tls_alpn_solver_is_a_tracked_stub() {
-        let solver = TlsAlpn01Solver;
+    async fn tls_alpn_solver_registers_and_withdraws_a_challenge_certificate() {
+        let tokens = Arc::new(crate::tls_alpn::TlsAlpn01TokenStore::new());
+        let solver = TlsAlpn01Solver::new(Arc::clone(&tokens));
         assert_eq!(solver.challenge_type(), ChallengeType::TlsAlpn01);
-        let error = solver
+        let handle = solver
             .present(
                 "example.com",
                 &challenge("tls-alpn-01", "token-1"),
                 "token-1.thumbprint",
             )
             .await
+            .unwrap();
+        assert!(matches!(handle, ChallengeHandle::TlsAlpn01 { .. }));
+        assert!(tokens.lookup("example.com").is_some());
+        solver.withdraw(&handle).await.unwrap();
+        assert!(tokens.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tls_alpn_solver_rejects_other_challenge_types() {
+        let tokens = Arc::new(crate::tls_alpn::TlsAlpn01TokenStore::new());
+        let solver = TlsAlpn01Solver::new(tokens);
+        let error = solver
+            .present(
+                "example.com",
+                &challenge("http-01", "token-1"),
+                "token-1.thumbprint",
+            )
+            .await
             .unwrap_err();
-        assert!(
-            matches!(
-                &error,
-                Error::NotImplemented { tracking_id, .. } if *tracking_id == "T-TLS-043"
-            ),
-            "unexpected error: {error:?}"
-        );
+        assert!(error.to_string().contains("TLS-ALPN-01"), "{error}");
     }
 
     #[test]
@@ -674,7 +660,9 @@ mod tests {
         assert!(registry.is_empty());
         let tokens = Arc::new(Http01TokenStore::new());
         registry.insert(Arc::new(Http01Solver::new(Arc::clone(&tokens))));
-        registry.insert(Arc::new(TlsAlpn01Solver));
+        registry.insert(Arc::new(TlsAlpn01Solver::new(Arc::new(
+            crate::tls_alpn::TlsAlpn01TokenStore::new(),
+        ))));
         registry.insert(Arc::new(Http01Solver::new(tokens)));
         assert_eq!(registry.len(), 2);
         assert!(registry.contains(ChallengeType::Http01));
