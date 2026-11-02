@@ -22,10 +22,12 @@ use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Version};
 use http_body_util::Full;
 use serde_json::Value;
 
+use hyper_util::rt::TokioIo;
+
 use caddy_rs_http::{
     body::{Body, StreamingBody, StreamingResponse},
-    CustomHandlerFactory, Error as HttpError, Handler, Outcome, Request, Response,
-    Result as HttpResult, StreamingOutcome,
+    requested_upgrade_type, CustomHandlerFactory, Error as HttpError, Handler, Outcome, Request,
+    Response, Result as HttpResult, StreamingOutcome, Tunnel, UpgradedResponse,
 };
 
 use crate::balancer::{self, Balancer};
@@ -69,6 +71,15 @@ enum ProxyError {
     Client(#[from] hyper_util::client::legacy::Error),
     #[error("cannot read upstream response body: {0}")]
     Body(String),
+    /// The upstream answered 101 but the upgrade handshake could not be completed.
+    #[error("upstream protocol upgrade failed: {0}")]
+    Upgrade(String),
+    /// The upstream switched protocols, but the buffered handler path cannot carry a tunnel.
+    #[error(
+        "upstream switched protocols but the buffered reverse_proxy path cannot tunnel \
+         (T-PROXY-032)"
+    )]
+    UpgradeNotSupported,
 }
 
 impl ProxyError {
@@ -81,6 +92,11 @@ impl ProxyError {
             ProxyError::Client(error) => error.is_connect(),
             _ => false,
         }
+    }
+
+    /// Whether this is the "upgrade needs the streaming path" error.
+    fn is_upgrade_not_supported(&self) -> bool {
+        matches!(self, ProxyError::UpgradeNotSupported)
     }
 }
 
@@ -100,6 +116,22 @@ struct ForwardedStreamingResponse {
     latency: Duration,
     headers: HeaderMap,
     body: StreamingBody,
+}
+
+/// One proxied upstream response that switched protocols (`101 Switching Protocols`).
+struct ForwardedUpgrade {
+    status: StatusCode,
+    /// Time until the upstream sent its response headers (Caddy's roundtrip duration).
+    latency: Duration,
+    headers: HeaderMap,
+    /// The upgraded upstream connection.
+    tunnel: Tunnel,
+}
+
+/// A forwarded upstream response: a normal (streaming) response or a protocol switch.
+enum Forwarded {
+    Streaming(ForwardedStreamingResponse),
+    Upgrade(ForwardedUpgrade),
 }
 
 /// How often Caddy flushes a proxied response body (`reverse_proxy.flush_interval`).
@@ -359,7 +391,7 @@ impl ReverseProxyHandler {
         &self,
         upstream: &Upstream,
         request: &Request,
-    ) -> Result<ForwardedStreamingResponse, ProxyError> {
+    ) -> Result<Forwarded, ProxyError> {
         // `forward_auth` (and any configured `rewrite`) changes only the auth sub-request: the
         // original request is untouched so later handlers still see the client's method/URI/body.
         let (method, path_and_query) = match &self.rewrite {
@@ -389,18 +421,55 @@ impl ReverseProxyHandler {
         *outbound.headers_mut() = headers;
 
         let started = std::time::Instant::now();
-        let response = self.client.request(outbound).await?;
+        let mut response = self.client.request(outbound).await?;
         let latency = started.elapsed();
         let status = response.status();
         let version = response.version();
         let response_headers = response.headers().clone();
+
+        if status == StatusCode::SWITCHING_PROTOCOLS {
+            // RFC 7230 §6.7 / Caddy's handleUpgradeResponse: the protocol the upstream selected
+            // must be exactly the one the client requested (case-insensitive printable ASCII).
+            let requested = requested_upgrade_type(&request.headers).ok_or_else(|| {
+                ProxyError::Upgrade(
+                    "upstream switched protocols but the client did not request an upgrade"
+                        .to_string(),
+                )
+            })?;
+            let selected = response_headers
+                .get(http::header::UPGRADE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .unwrap_or("");
+            if selected.is_empty()
+                || !selected.bytes().all(|byte| byte.is_ascii_graphic())
+                || !selected.eq_ignore_ascii_case(&requested)
+            {
+                return Err(ProxyError::Upgrade(format!(
+                    "upstream selected unexpected protocol {selected:?}; client requested                      {requested:?}"
+                )));
+            }
+
+            // Take the upgraded client-side connection before consuming the response.
+            let on_upgrade = hyper::upgrade::on(&mut response);
+            let upgraded = on_upgrade
+                .await
+                .map_err(|error| ProxyError::Upgrade(error.to_string()))?;
+            return Ok(Forwarded::Upgrade(ForwardedUpgrade {
+                status,
+                latency,
+                headers: upgrade_response_headers(&response_headers),
+                tunnel: Tunnel::new(TokioIo::new(upgraded)),
+            }));
+        }
+
         let body = StreamingBody::from_hyper(response.into_body());
-        Ok(ForwardedStreamingResponse {
+        Ok(Forwarded::Streaming(ForwardedStreamingResponse {
             status,
             latency,
             headers: self.response_headers(&response_headers, version),
             body,
-        })
+        }))
     }
 
     /// Send the upstream request and buffer the whole response body.
@@ -413,7 +482,10 @@ impl ReverseProxyHandler {
         upstream: &Upstream,
         request: &Request,
     ) -> Result<ForwardedResponse, ProxyError> {
-        let forwarded = self.forward_streaming(upstream, request).await?;
+        let forwarded = match self.forward_streaming(upstream, request).await? {
+            Forwarded::Streaming(forwarded) => forwarded,
+            Forwarded::Upgrade(_) => return Err(ProxyError::UpgradeNotSupported),
+        };
         let body = forwarded
             .body
             .into_bytes()
@@ -450,6 +522,21 @@ impl ReverseProxyHandler {
         );
 
         self.add_forwarded_headers(&mut headers, request, upstream)?;
+
+        // After stripping hop-by-hop headers (which include `Connection` and `Upgrade`), add the
+        // upgrade negotiation back so WebSocket-style handshakes reach the upstream. Caddy does
+        // this after hop-by-hop removal and before `header_up` operations.
+        if let Some(upgrade_type) = requested_upgrade_type(&request.headers) {
+            headers.insert(
+                http::header::CONNECTION,
+                HeaderValue::from_static("Upgrade"),
+            );
+            headers.insert(
+                http::header::UPGRADE,
+                HeaderValue::from_str(&upgrade_type)
+                    .map_err(|error| ProxyError::Request(error.to_string()))?,
+            );
+        }
 
         // `header_up` operations are applied last and win over the implicit headers. Values are
         // templates: canonical `forward_auth` relies on `{http.request.method}` / `{http.request.uri}`
@@ -788,6 +875,13 @@ impl Handler for ReverseProxyHandler {
                     );
                     return Ok(Outcome::Respond(response));
                 }
+                Err(error) if error.is_upgrade_not_supported() => {
+                    // The upstream upgraded, but this path returns a complete buffered Response and
+                    // cannot carry a raw tunnel. Fail loudly instead of returning a broken 101.
+                    return Err(HttpError::UpgradeNotRepresentable {
+                        context: "reverse_proxy buffered Handler::handle",
+                    });
+                }
                 Err(error) => {
                     eprintln!(
                         "caddy-rs: reverse_proxy upstream `{}` failed: {error}",
@@ -844,7 +938,40 @@ impl Handler for ReverseProxyHandler {
             };
             let _guard = upstream.connection_started();
             match self.forward_streaming(&upstream, &request).await {
-                Ok(forwarded) => {
+                Ok(Forwarded::Upgrade(forwarded)) => {
+                    if let Some(passive) = &self.passive {
+                        passive.record_response(
+                            &upstream.dial,
+                            forwarded.status,
+                            forwarded.latency,
+                            std::time::Instant::now(),
+                        );
+                    }
+                    // A configured retry match may still ask for another attempt; the tunnel is
+                    // dropped (which closes the upstream) before retrying. Once the retry budget is
+                    // spent the successful upgrade is served as-is.
+                    let probe = Response {
+                        status: forwarded.status,
+                        headers: forwarded.headers.clone(),
+                        body: Bytes::new(),
+                    };
+                    if self.retry_match.matches_response(&request, &probe)
+                        && self.retry_allowed(attempts, deadline)
+                    {
+                        attempts += 1;
+                        drop(forwarded);
+                        self.wait_before_retry().await;
+                        continue;
+                    }
+                    // `forward_auth`/`handle_response` rules match normal responses; a protocol
+                    // switch is passed through untouched.
+                    return Ok(StreamingOutcome::Upgrade(UpgradedResponse::new(
+                        forwarded.status,
+                        forwarded.headers,
+                        forwarded.tunnel,
+                    )));
+                }
+                Ok(Forwarded::Streaming(forwarded)) => {
                     if let Some(passive) = &self.passive {
                         passive.record_response(
                             &upstream.dial,
@@ -937,6 +1064,26 @@ impl Handler for ReverseProxyHandler {
             }
         }
     }
+}
+
+/// Build the client-facing headers for a `101 Switching Protocols` response.
+///
+/// Hop-by-hop headers are stripped as for normal responses, then the upgrade negotiation pair is
+/// restored canonically (`Upgrade: <protocol>` and `Connection: Upgrade`). Other hop-by-hop
+/// headers (keep-alive, transfer-encoding, ...) stay stripped. Caddy likewise does not apply
+/// `header.response` operations to 101 responses.
+fn upgrade_response_headers(upstream_headers: &HeaderMap) -> HeaderMap {
+    let upgrade = upstream_headers
+        .get(http::header::UPGRADE)
+        .cloned()
+        .unwrap_or_else(|| HeaderValue::from_static("upgrade"));
+    let mut headers = strip_hop_by_hop(upstream_headers);
+    headers.insert(http::header::UPGRADE, upgrade);
+    headers.insert(
+        http::header::CONNECTION,
+        HeaderValue::from_static("Upgrade"),
+    );
+    headers
 }
 
 /// Build a fresh header map without hop-by-hop headers from `source`.
@@ -3182,5 +3329,268 @@ mod tests {
         }));
         assert_eq!(handler.upstreams()[0].max_requests(), Some(7));
         assert!(!handler.upstreams()[0].is_full());
+    }
+}
+
+#[cfg(test)]
+mod upgrade_tests {
+    use super::*;
+    use caddy_rs_http::{Tunnel, UpgradedResponse};
+    use http::Method;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    fn handler(dial: &str) -> ReverseProxyHandler {
+        ReverseProxyHandler::from_json(
+            &serde_json::json!({
+                "handler": "reverse_proxy",
+                "upstreams": [{"dial": dial}],
+                "headers": {
+                    "request": {"set": {"X-Added": ["yes"]}},
+                    "response": {"set": {"X-Proxy": ["caddy-rs"]}}
+                }
+            }),
+            "handler",
+        )
+        .expect("handler builds")
+    }
+
+    /// Read an HTTP/1 request head (through the blank line) from a raw upstream connection.
+    async fn read_http_head(stream: &mut TcpStream) -> String {
+        let mut head = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            match stream.read(&mut byte).await {
+                Ok(0) => break,
+                Ok(_) => head.push(byte[0]),
+                Err(_) => break,
+            }
+        }
+        String::from_utf8_lossy(&head).into_owned()
+    }
+
+    fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+        head.lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(key, _)| key.trim().eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.trim())
+    }
+
+    /// A raw WebSocket-style upstream:
+    /// * normal requests get `200 plain`;
+    /// * upgrade requests get `101` and then raw bytes are echoed back (after an initial greeting).
+    async fn spawn_upgrade_echo_upstream() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let head = read_http_head(&mut stream).await;
+                    if header_value(&head, "upgrade").is_none() {
+                        let response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\
+                                        Connection: close\r\n\r\nplain";
+                        let _ = stream.write_all(response.as_bytes()).await;
+                        return;
+                    }
+                    let upgrade = header_value(&head, "upgrade").unwrap_or("missing");
+                    let connection = header_value(&head, "connection").unwrap_or("missing");
+                    let added = header_value(&head, "x-added").unwrap_or("missing");
+                    let response = format!(
+                        "HTTP/1.1 101 Switching Protocols\r\n\
+                         Connection: Upgrade\r\n\
+                         Upgrade: {upgrade}\r\n\
+                         Sec-WebSocket-Accept: test-accept\r\n\
+                         X-Seen-Connection: {connection}\r\n\
+                         X-Seen-Upgrade: {upgrade}\r\n\
+                         X-Seen-X-Added: {added}\r\n\
+                         Keep-Alive: timeout=5\r\n\
+                         Transfer-Encoding: chunked\r\n\
+                         \r\n"
+                    );
+                    if stream.write_all(response.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    if stream.write_all(b"greeting").await.is_err() {
+                        return;
+                    }
+                    let mut buffer = [0_u8; 1024];
+                    loop {
+                        match stream.read(&mut buffer).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(read) => {
+                                if stream.write_all(&buffer[..read]).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        address.to_string()
+    }
+
+    fn upgrade_request(path: &str) -> Request {
+        let mut request = Request::new(Method::GET, path.parse().unwrap());
+        request
+            .headers
+            .insert(http::header::HOST, "example.com".parse().unwrap());
+        request.headers.insert(
+            http::header::CONNECTION,
+            "keep-alive, Upgrade".parse().unwrap(),
+        );
+        request
+            .headers
+            .insert(http::header::UPGRADE, "websocket".parse().unwrap());
+        request.headers.insert(
+            "sec-websocket-key",
+            "dGhlIHNhbXBsZSBub25jZQ==".parse().unwrap(),
+        );
+        request
+            .headers
+            .insert("sec-websocket-version", "13".parse().unwrap());
+        request
+    }
+
+    #[tokio::test]
+    async fn upgrade_is_returned_as_a_tunnel_with_preserved_handshake_headers() {
+        let dial = spawn_upgrade_echo_upstream().await;
+        let handler = handler(&dial);
+        let outcome = handler
+            .handle_streaming(upgrade_request("/ws"))
+            .await
+            .expect("upgrade handshake");
+        let StreamingOutcome::Upgrade(UpgradedResponse {
+            status,
+            headers,
+            tunnel,
+        }) = outcome
+        else {
+            panic!("expected an upgraded outcome");
+        };
+        assert_eq!(status, StatusCode::SWITCHING_PROTOCOLS);
+        assert_eq!(headers[http::header::UPGRADE], "websocket");
+        assert_eq!(headers[http::header::CONNECTION], "Upgrade");
+        assert_eq!(headers["sec-websocket-accept"], "test-accept");
+        // The proxy reconstructed the upgrade negotiation for the upstream.
+        assert_eq!(headers["x-seen-connection"], "Upgrade");
+        assert_eq!(headers["x-seen-upgrade"], "websocket");
+        // `header_up` operations still apply to upgrade requests.
+        assert_eq!(headers["x-seen-x-added"], "yes");
+        // Hop-by-hop response headers are stripped.
+        assert!(headers.get("keep-alive").is_none());
+        assert!(headers.get("transfer-encoding").is_none());
+
+        let mut tunnel = tunnel;
+        let mut buffer = [0_u8; 8];
+        tunnel
+            .as_pinned_mut()
+            .read_exact(&mut buffer)
+            .await
+            .expect("upstream greeting");
+        assert_eq!(&buffer, b"greeting");
+        tunnel
+            .as_pinned_mut()
+            .write_all(b"ping")
+            .await
+            .expect("write through tunnel");
+        let mut echo = [0_u8; 4];
+        tunnel
+            .as_pinned_mut()
+            .read_exact(&mut echo)
+            .await
+            .expect("echo through tunnel");
+        assert_eq!(&echo, b"ping");
+    }
+
+    #[tokio::test]
+    async fn upgrade_with_unexpected_protocol_is_502() {
+        // Upstream answers 101 with a different protocol than the client requested.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let _head = read_http_head(&mut stream).await;
+            let response = "HTTP/1.1 101 Switching Protocols\r\n\
+                            Connection: Upgrade\r\n\
+                            Upgrade: h2c\r\n\r\n";
+            let _ = stream.write_all(response.as_bytes()).await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        });
+        let handler = handler(&address.to_string());
+        let outcome = handler
+            .handle_streaming(upgrade_request("/ws"))
+            .await
+            .expect("a failed upgrade is a response");
+        let StreamingOutcome::Respond(response) = outcome else {
+            panic!("expected a 502 response, got an upgrade");
+        };
+        assert_eq!(response.status, StatusCode::BAD_GATEWAY);
+        let body = response.body.into_bytes().await.expect("502 body");
+        assert_eq!(body, Bytes::from_static(b"502 Bad Gateway"));
+    }
+
+    #[tokio::test]
+    async fn buffered_handler_rejects_upgrade_loudly() {
+        let dial = spawn_upgrade_echo_upstream().await;
+        let handler = handler(&dial);
+        let error = handler
+            .handle(upgrade_request("/ws"))
+            .await
+            .expect_err("buffered path cannot carry a tunnel");
+        assert!(
+            matches!(error, HttpError::UpgradeNotRepresentable { .. }),
+            "expected UpgradeNotRepresentable, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_upgrade_requests_still_proxy_normally() {
+        let dial = spawn_upgrade_echo_upstream().await;
+        let handler = handler(&dial);
+        let mut request = Request::new(Method::GET, "/plain".parse().unwrap());
+        request
+            .headers
+            .insert(http::header::HOST, "example.com".parse().unwrap());
+        let outcome = handler
+            .handle_streaming(request)
+            .await
+            .expect("normal response");
+        let StreamingOutcome::Respond(response) = outcome else {
+            panic!("expected a normal response");
+        };
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            response.body.into_bytes().await.unwrap(),
+            Bytes::from_static(b"plain")
+        );
+    }
+
+    #[tokio::test]
+    async fn tunnel_drop_closes_the_upstream_connection() {
+        let dial = spawn_upgrade_echo_upstream().await;
+        let handler = handler(&dial);
+        let outcome = handler
+            .handle_streaming(upgrade_request("/ws"))
+            .await
+            .expect("upgrade handshake");
+        let StreamingOutcome::Upgrade(UpgradedResponse { tunnel, .. }) = outcome else {
+            panic!("expected an upgraded outcome");
+        };
+        let mut tunnel: Tunnel = tunnel;
+        let mut greeting = [0_u8; 8];
+        tunnel
+            .as_pinned_mut()
+            .read_exact(&mut greeting)
+            .await
+            .expect("greeting");
+        // Dropping the tunnel closes the upstream connection; the raw upstream echoes until EOF and
+        // then returns, which is the observable close propagation for this test.
+        drop(tunnel);
     }
 }

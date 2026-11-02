@@ -18,7 +18,8 @@ use crate::handlers::{
 };
 use crate::matchers::build_matcher_set;
 use crate::types::{
-    Error, Outcome, Request, Response, Result, SharedHandler, SharedMatcher, StreamingOutcome,
+    Error, Outcome, Request, Response, ResponseOutcome, Result, SharedHandler, SharedMatcher,
+    StreamingOutcome,
 };
 
 /// A custom handler factory, used by crates outside this one (for example `caddy-rs-proxy`) to
@@ -90,6 +91,25 @@ impl Router {
                 Ok(StreamingResponse::from_buffered(Response::not_found()))
             }
             StreamingOutcome::Respond(response) => Ok(response),
+            StreamingOutcome::Upgrade(_) => Err(Error::UpgradeNotRepresentable {
+                context: "Router::handle_streaming",
+            }),
+        }
+    }
+
+    /// Evaluate a request through the route tree, preserving both streamed bodies and protocol
+    /// upgrades.
+    ///
+    /// This is the entry point the server connection layer uses: it returns either a normal
+    /// (possibly streaming) response or an [`UpgradedResponse`] carrying the raw tunnel. An
+    /// unmatched request still becomes `404 Not Found`, matching the top-level engine behaviour.
+    pub async fn handle_upgradable(&self, request: Request) -> Result<ResponseOutcome> {
+        match self.handle_streaming_outcome(request).await? {
+            StreamingOutcome::Continue(_) => Ok(ResponseOutcome::Response(
+                StreamingResponse::from_buffered(Response::not_found()),
+            )),
+            StreamingOutcome::Respond(response) => Ok(ResponseOutcome::Response(response)),
+            StreamingOutcome::Upgrade(response) => Ok(ResponseOutcome::Upgrade(response)),
         }
     }
 
@@ -125,6 +145,10 @@ impl Router {
                         apply_pending_headers(&mut response.headers, &staged);
                         return Ok(StreamingOutcome::Respond(response));
                     }
+                    StreamingOutcome::Upgrade(mut response) => {
+                        apply_pending_headers(&mut response.headers, &staged);
+                        return Ok(StreamingOutcome::Upgrade(response));
+                    }
                 }
             }
             if route.terminal {
@@ -146,6 +170,9 @@ impl Router {
             StreamingOutcome::Respond(response) => {
                 Ok(Outcome::Respond(response.into_buffered().await?))
             }
+            StreamingOutcome::Upgrade(_) => Err(Error::UpgradeNotRepresentable {
+                context: "Router::handle_outcome",
+            }),
         }
     }
 }
@@ -839,5 +866,88 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.headers["x-staged"], "yes");
+    }
+
+    // ---- upgrade-aware router path -------------------------------------------------------
+
+    use crate::upgrade::{Tunnel, UpgradedResponse};
+
+    /// Handler that always switches protocols on the streaming path.
+    struct UpgradeHandler;
+
+    #[async_trait]
+    impl Handler for UpgradeHandler {
+        fn name(&self) -> &'static str {
+            "test_upgrade_handler"
+        }
+
+        async fn handle(&self, request: Request) -> Result<Outcome> {
+            Ok(Outcome::Continue(request))
+        }
+
+        async fn handle_streaming(&self, _request: Request) -> Result<StreamingOutcome> {
+            let (stream, _other) = tokio::io::duplex(8);
+            let mut headers = http::HeaderMap::new();
+            headers.insert(
+                http::header::UPGRADE,
+                http::HeaderValue::from_static("websocket"),
+            );
+            headers.insert(
+                http::header::CONNECTION,
+                http::HeaderValue::from_static("Upgrade"),
+            );
+            Ok(StreamingOutcome::Upgrade(UpgradedResponse::new(
+                http::StatusCode::SWITCHING_PROTOCOLS,
+                headers,
+                Tunnel::new(stream),
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn upgradable_router_path_returns_tunnel_with_staged_headers() {
+        let headers_handler = Arc::new(
+            HeadersHandler::from_json(
+                &json!({
+                    "handler": "headers",
+                    "response": {"set": {"X-Staged": ["yes"]}}
+                }),
+                "handle[0]",
+            )
+            .expect("headers handler builds"),
+        );
+        let router = router_with_handlers(vec![headers_handler, Arc::new(UpgradeHandler)]);
+        let outcome = router
+            .handle_upgradable(request("/ws", "example.com"))
+            .await
+            .expect("upgrade-aware routing");
+        let crate::types::ResponseOutcome::Upgrade(response) = outcome else {
+            panic!("expected an upgraded response");
+        };
+        assert_eq!(response.status, http::StatusCode::SWITCHING_PROTOCOLS);
+        assert_eq!(response.headers[http::header::UPGRADE], "websocket");
+        assert_eq!(response.headers["x-staged"], "yes");
+    }
+
+    #[tokio::test]
+    async fn streaming_and_buffered_router_paths_reject_upgrades_loudly() {
+        let router = router_with_handlers(vec![Arc::new(UpgradeHandler)]);
+        let streaming_error = router
+            .handle_streaming(request("/ws", "example.com"))
+            .await
+            .expect_err("streaming-only path cannot carry a tunnel");
+        assert!(
+            matches!(streaming_error, Error::UpgradeNotRepresentable { context }
+                if context == "Router::handle_streaming"),
+            "{streaming_error}"
+        );
+        let buffered_error = router
+            .handle(request("/ws", "example.com"))
+            .await
+            .expect_err("buffered path cannot carry a tunnel");
+        assert!(
+            matches!(buffered_error, Error::UpgradeNotRepresentable { .. }),
+            "{buffered_error}"
+        );
     }
 }
