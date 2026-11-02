@@ -415,3 +415,56 @@ fn file_imports_match_caddy() {
         "import_block_snippet_non_replaced_block_from_separate_file.caddyfiletest",
     );
 }
+
+#[test]
+fn header_forms_match_caddy() {
+    // `header -Field` one-arg delete, defer, ?field require, response match and `>` deferred
+    // set/replace forms all emit Caddy's headers handler JSON.
+    assert_adapts_like_caddy("header.caddyfiletest");
+}
+
+#[test]
+fn file_server_precompressed_and_status_match_caddy() {
+    // Empty `precompressed` defaults to br,zstd,gzip (module map + order); `status` is a
+    // WeakString that may hold a placeholder.
+    assert_adapts_like_caddy("file_server_precompressed.caddyfiletest");
+    assert_adapts_like_caddy("file_server_status.caddyfiletest");
+}
+
+#[test]
+fn matcher_syntax_and_inline_not_match_caddy() {
+    // Inline `not <matcher>`, vars/vars_regexp, header null matchers, query merging, inline
+    // expression matchers and private_ranges expansion.
+    assert_adapts_like_caddy("matcher_syntax.caddyfiletest");
+    assert_adapts_like_caddy("sort_directives_with_any_matcher_first.caddyfiletest");
+}
+
+#[test]
+fn named_matchers_defined_inside_route_match_caddy() {
+    assert_adapts_like_caddy("root_directive_permutations.caddyfiletest");
+}
+
+#[test]
+fn dynamic_upstreams_fail_with_a_construct_specific_error() {
+    for name in [
+        "reverse_proxy_dynamic_upstreams.caddyfiletest",
+        "reverse_proxy_dynamic_upstreams_grace_period.caddyfiletest",
+    ] {
+        let path = format!(
+            "{}/tests/fixtures/unsupported/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let raw =
+            std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {path}: {error}"));
+        let (caddyfile, _) = raw
+            .split_once("----------")
+            .unwrap_or_else(|| panic!("fixture {name} has no `----------` separator"));
+        let error = adapt(&caddyfile).expect_err("dynamic upstreams must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("dynamic upstreams are not supported")
+                && message.contains("T-PROXY-036"),
+            "unexpected error for {name}: {message}"
+        );
+    }
+}

@@ -1411,6 +1411,20 @@ fn collect_matchers(directives: &[Directive]) -> caddy_rs_core::Result<BTreeMap<
                 .entry("name".to_string())
                 .or_insert_with(|| json!(name));
         }
+        if let Some(regexp) = object.get_mut("vars_regexp").and_then(Value::as_object_mut) {
+            for value in regexp.values_mut() {
+                if let Some(value) = value.as_object_mut() {
+                    value
+                        .entry("name".to_string())
+                        .or_insert_with(|| json!(name));
+                }
+            }
+        }
+        if let Some(expression) = object.get_mut("expression").and_then(Value::as_object_mut) {
+            expression
+                .entry("name".to_string())
+                .or_insert_with(|| json!(name));
+        }
         matchers.insert(name.to_string(), object);
     }
     Ok(matchers)
@@ -1423,6 +1437,24 @@ fn matcher_from_inline_args(args: &[String], position: Position) -> caddy_rs_cor
             "named matcher needs a matcher on the same line or a block",
         ));
     };
+    const KNOWN_MATCHERS: &[&str] = &[
+        "host",
+        "path",
+        "method",
+        "header",
+        "path_regexp",
+        "query",
+        "not",
+        "remote_ip",
+        "client_ip",
+        "vars",
+        "vars_regexp",
+    ];
+    if args.len() == 1 && !KNOWN_MATCHERS.contains(&name.as_str()) {
+        // Caddy treats a lone quoted argument that is not a known matcher name as an inline
+        // CEL expression matcher (`path('/foo*') && method('GET')`).
+        return Ok(json!({"expression": {"expr": name}}));
+    }
     matcher_from_directive(name, &args[1..], position)
 }
 
@@ -1430,13 +1462,11 @@ fn matcher_from_directives(directives: &[Directive]) -> caddy_rs_core::Result<Va
     let mut object = Map::new();
     for directive in directives {
         if directive.name == "not" {
-            if directive.block.is_empty() {
-                return Err(adapter_error(
-                    directive.position,
-                    "matcher `not` must be used with a block",
-                ));
-            }
-            let inner = matcher_from_directives(&directive.block)?;
+            let inner = if directive.block.is_empty() {
+                matcher_from_inline_args(&directive.args, directive.position)?
+            } else {
+                matcher_from_directives(&directive.block)?
+            };
             merge_matcher(&mut object, json!({"not": [inner]}), directive.position)?;
             continue;
         }
@@ -1468,7 +1498,29 @@ fn matcher_from_directive(
                     "matcher `header` requires a field name",
                 ));
             };
-            let value = args.get(1).cloned().unwrap_or_else(|| "*".to_string());
+            if let Some(field) = field.strip_prefix('!') {
+                if field.is_empty() {
+                    return Err(adapter_error(
+                        position,
+                        "malformed header matcher: must have field name following ! character",
+                    ));
+                }
+                if args.len() > 1 {
+                    return Err(adapter_error(
+                        position,
+                        "malformed header matcher: null matching headers cannot have a field value",
+                    ));
+                }
+                let mut header = Map::new();
+                header.insert(field.to_string(), Value::Null);
+                return Ok(json!({"header": Value::Object(header)}));
+            }
+            let Some(value) = args.get(1) else {
+                return Err(adapter_error(
+                    position,
+                    "malformed header matcher: expected both field and value",
+                ));
+            };
             Ok(json!({"header": {field: [value]}}))
         }
         "path_regexp" => {
@@ -1490,21 +1542,91 @@ fn matcher_from_directive(
             Ok(json!({"path_regexp": Value::Object(object)}))
         }
         "query" => {
+            if args.is_empty() {
+                return Err(adapter_error(
+                    position,
+                    "matcher `query` requires at least one key=value pair",
+                ));
+            }
+            let mut query: Map<String, Value> = Map::new();
+            for pair in args {
+                let Some((key, value)) = pair.split_once('=') else {
+                    return Err(adapter_error(
+                        position,
+                        format!(
+                            "malformed query matcher token: {pair}; must be in param=val format"
+                        ),
+                    ));
+                };
+                match query.get_mut(key) {
+                    Some(Value::Array(values)) => values.push(json!(value)),
+                    _ => {
+                        query.insert(key.to_string(), json!([value]));
+                    }
+                }
+            }
+            Ok(json!({"query": Value::Object(query)}))
+        }
+        "vars" => {
             if args.len() < 2 {
                 return Err(adapter_error(
                     position,
-                    "matcher `query` requires a key and value",
+                    "matcher `vars` requires a name and a value",
                 ));
             }
-            Ok(json!({"query": {args[0].clone(): [args[1].clone()]}}))
+            Ok(json!({"vars": {args[0].clone(): [args[1].clone()]}}))
+        }
+        "vars_regexp" => {
+            let (regexp_name, field, pattern) = match args {
+                [field, pattern] => (None, field, pattern),
+                [name, field, pattern, ..] => (Some(name.clone()), field, pattern),
+                _ => {
+                    return Err(adapter_error(
+                        position,
+                        "matcher `vars_regexp` requires [name] field and pattern",
+                    ))
+                }
+            };
+            let mut value = Map::new();
+            value.insert("pattern".to_string(), json!(pattern));
+            if let Some(name) = regexp_name {
+                value.insert("name".to_string(), json!(name));
+            }
+            Ok(json!({"vars_regexp": {field.clone(): Value::Object(value)}}))
         }
         "not" => {
-            // A `not` block is represented by the parser as a nested directive list, which the
-            // caller handles via `matcher_from_directives`; inline `not` has no arguments.
-            Err(adapter_error(
-                position,
-                "matcher `not` must be used with a block",
-            ))
+            // Inline form: `not <matcher> [args...]`.
+            if args.is_empty() {
+                return Err(adapter_error(position, "matcher `not` requires a matcher"));
+            }
+            let inner = matcher_from_directive(&args[0], &args[1..], position)?;
+            Ok(json!({"not": [inner]}))
+        }
+        "remote_ip" | "client_ip" => {
+            if args.is_empty() {
+                return Err(adapter_error(
+                    position,
+                    format!("matcher `{name}` requires at least one range"),
+                ));
+            }
+            let mut ranges = Vec::new();
+            for range in args {
+                if range == "private_ranges" {
+                    for private in [
+                        "192.168.0.0/16",
+                        "172.16.0.0/12",
+                        "10.0.0.0/8",
+                        "127.0.0.1/8",
+                        "fd00::/8",
+                        "::1",
+                    ] {
+                        ranges.push(json!(private));
+                    }
+                } else {
+                    ranges.push(json!(range));
+                }
+            }
+            Ok(json!({ name: {"ranges": ranges} }))
         }
         other => Err(adapter_error(
             position,
@@ -1655,7 +1777,11 @@ fn build_routes(
                         "unexpected arguments to `route` (only an optional matcher is accepted)",
                     ));
                 }
-                let inner = build_routes(&directive.block, matchers, false, false, warnings)?;
+                // Matchers defined inside the block are scoped to it (Caddy segment scope).
+                let mut inner_matchers = matchers.clone();
+                inner_matchers.extend(collect_matchers(&directive.block)?);
+                let inner =
+                    build_routes(&directive.block, &inner_matchers, false, false, warnings)?;
                 let subroute = if inner.is_empty() {
                     json!({"handler": "subroute"})
                 } else {
@@ -1677,7 +1803,13 @@ fn build_routes(
             }
             _ => {
                 let mut args = directive.args.clone();
-                let matcher = matcher_for_args(&mut args, matchers, directive.position)?;
+                // `root` is ambiguous: a single argument is always the root path, never a path
+                // matcher (Caddy's parseRoot uses the argument count to disambiguate).
+                let matcher = if name == "root" && args.len() == 1 {
+                    None
+                } else {
+                    matcher_for_args(&mut args, matchers, directive.position)?
+                };
                 let handlers = build_handlers(directive, &args, warnings)?;
                 if handlers.is_empty() {
                     continue;
@@ -1820,9 +1952,11 @@ fn build_handle_route(
             "handle": [{"handler": "rewrite", "strip_path_prefix": prefix}]
         }));
     }
+    let mut inner_matchers = matchers.clone();
+    inner_matchers.extend(collect_matchers(&directive.block)?);
     inner.extend(build_routes(
         &directive.block,
-        matchers,
+        &inner_matchers,
         true,
         false,
         warnings,
@@ -1850,7 +1984,7 @@ fn build_handlers(
         "file_server" => vec![file_server_handler(directive)?],
         "root" => vec![root_handler(args, directive.position)?],
         "method" => vec![method_handler(args, directive.position)?],
-        "header" => header_handlers(directive)?,
+        "header" => header_handlers(directive, args)?,
         "encode" => vec![encode_handler(directive)?],
         "reverse_proxy" => vec![reverse_proxy_handler(directive, args)?],
         "basicauth" | "basic_auth" => vec![basic_auth_handler(directive, args)?],
@@ -2295,97 +2429,288 @@ fn method_handler(args: &[String], position: Position) -> caddy_rs_core::Result<
     Ok(json!({"handler": "rewrite", "method": method}))
 }
 
-fn header_handlers(directive: &Directive) -> caddy_rs_core::Result<Vec<Value>> {
-    // Supported forms:
-    //   header <Field> <value>       -> response.set
-    //   header +<Field> <value>      -> response.add
-    //   header -<Field>              -> response.delete
-    //   header ?<Field> <value>      -> response.require + set
-    let mut handlers = Vec::new();
-    let mut entries: Vec<(String, Vec<String>)> = Vec::new();
-    if directive.block.is_empty() {
-        if directive.args.len() < 2 {
+/// Response-header operations being accumulated from one `header` directive.
+#[derive(Default)]
+struct HeaderOpsPlan {
+    add: BTreeMap<String, Vec<String>>,
+    set: BTreeMap<String, Vec<String>>,
+    delete: Vec<String>,
+    replace: BTreeMap<String, Vec<(String, String)>>,
+    require: Option<Map<String, Value>>,
+    deferred: bool,
+}
+
+impl HeaderOpsPlan {
+    fn is_empty(&self) -> bool {
+        self.add.is_empty()
+            && self.set.is_empty()
+            && self.delete.is_empty()
+            && self.replace.is_empty()
+            && self.require.is_none()
+    }
+
+    /// Caddy's `applyHeaderOp`.
+    fn apply(&mut self, field: &str, value: &str, replacement: Option<&str>) {
+        let field = field.trim_end_matches(':');
+        if let Some(name) = field.strip_prefix('+') {
+            self.add
+                .entry(canonical_header_name(name))
+                .or_default()
+                .push(qualify_placeholders(value));
+        } else if let Some(name) = field.strip_prefix('-') {
+            self.delete.push(canonical_header_name(name));
+            self.deferred = true;
+        } else if let Some(name) = field.strip_prefix('?') {
+            let require = self.require.get_or_insert_with(Map::new);
+            let headers = require
+                .entry("headers".to_string())
+                .or_insert_with(|| json!({}));
+            if let Some(headers) = headers.as_object_mut() {
+                headers.insert(canonical_header_name(name), Value::Null);
+            }
+            self.set.insert(
+                canonical_header_name(name),
+                vec![qualify_placeholders(value)],
+            );
+        } else if let Some(replacement) = replacement {
+            if field.starts_with('>') {
+                self.deferred = true;
+            }
+            let name = field.trim_start_matches(['+', '-', '?', '>']);
+            self.replace
+                .entry(canonical_header_name(name))
+                .or_default()
+                .push((
+                    qualify_placeholders(value),
+                    qualify_placeholders(replacement),
+                ));
+        } else if let Some(name) = field.strip_prefix('>') {
+            self.set.insert(
+                canonical_header_name(name),
+                vec![qualify_placeholders(value)],
+            );
+            self.deferred = true;
+        } else {
+            self.set.insert(
+                canonical_header_name(field),
+                vec![qualify_placeholders(value)],
+            );
+        }
+    }
+
+    fn response(&self) -> Map<String, Value> {
+        let mut response = Map::new();
+        if !self.add.is_empty() {
+            response.insert("add".to_string(), json!(self.add));
+        }
+        if !self.set.is_empty() {
+            response.insert("set".to_string(), json!(self.set));
+        }
+        if !self.delete.is_empty() {
+            response.insert("delete".to_string(), json!(self.delete));
+        }
+        if !self.replace.is_empty() {
+            let replace: Map<String, Value> = self
+                .replace
+                .iter()
+                .map(|(field, replacements)| {
+                    let replacements: Vec<Value> = replacements
+                        .iter()
+                        .map(|(search, replacement)| {
+                            json!({"search_regexp": search, "replace": replacement})
+                        })
+                        .collect();
+                    (field.clone(), Value::Array(replacements))
+                })
+                .collect();
+            response.insert("replace".to_string(), Value::Object(replace));
+        }
+        if let Some(require) = &self.require {
+            response.insert("require".to_string(), Value::Object(require.clone()));
+        }
+        if self.deferred {
+            response.insert("deferred".to_string(), json!(true));
+        }
+        response
+    }
+
+    fn encode(&self) -> Option<Value> {
+        if self.is_empty() {
+            return None;
+        }
+        Some(json!({"handler": "headers", "response": self.response()}))
+    }
+}
+
+fn header_handlers(directive: &Directive, args: &[String]) -> caddy_rs_core::Result<Vec<Value>> {
+    // Caddy builds two handlers: one for ordinary operations and one for `?` (conditional set)
+    // operations, because those need a response matcher.
+    let mut handler = HeaderOpsPlan::default();
+    let mut require_handler = HeaderOpsPlan::default();
+
+    let has_inline = !args.is_empty();
+    if has_inline {
+        if args.len() > 3 {
             return Err(adapter_error(
                 directive.position,
-                "`header` requires a field name and value (or a block)",
+                "`header` takes at most a field, value and replacement",
             ));
         }
-        if directive.args.len() >= 3 && !directive.args[0].starts_with(['+', '-', '?', '>']) {
-            // `header <field> <search> <replacement>` is Caddy's regex replacement form.
-            let replace = json!({
-                "handler": "headers",
-                "response": {
-                    "replace": {
-                        canonical_header_name(&directive.args[0]): [{
-                            "search_regexp": qualify_placeholders(&directive.args[1]),
-                            "replace": qualify_placeholders(&directive.args[2]),
-                        }]
+        handler.apply(
+            &args[0],
+            args.get(1).map(String::as_str).unwrap_or(""),
+            args.get(2).map(String::as_str),
+        );
+    }
+
+    for item in &directive.block {
+        match item.name.as_str() {
+            "defer" => {
+                if !item.args.is_empty() {
+                    return Err(adapter_error(
+                        item.position,
+                        "`header` option `defer` does not take arguments",
+                    ));
+                }
+                if has_inline {
+                    return Err(adapter_error(
+                        item.position,
+                        "cannot specify headers in both arguments and block",
+                    ));
+                }
+                handler.deferred = true;
+            }
+            "match" => {
+                if has_inline {
+                    return Err(adapter_error(
+                        item.position,
+                        "cannot specify headers in both arguments and block",
+                    ));
+                }
+                let matcher = response_matcher(item)?;
+                let require = handler.require.get_or_insert_with(Map::new);
+                merge_response_matcher(require, matcher);
+            }
+            _ => {
+                if has_inline {
+                    return Err(adapter_error(
+                        item.position,
+                        "cannot specify headers in both arguments and block",
+                    ));
+                }
+                let field = item.name.as_str();
+                let target = if field.starts_with('?') {
+                    &mut require_handler
+                } else {
+                    &mut handler
+                };
+                target.apply(
+                    field,
+                    item.args.first().map(String::as_str).unwrap_or(""),
+                    item.args.get(1).map(String::as_str),
+                );
+            }
+        }
+    }
+
+    let mut handlers = Vec::new();
+    if let Some(handler) = handler.encode() {
+        handlers.push(handler);
+    }
+    if let Some(handler) = require_handler.encode() {
+        handlers.push(handler);
+    }
+    Ok(handlers)
+}
+
+/// Parse Caddy's response matcher used by `header { match ... }`.
+fn response_matcher(item: &Directive) -> caddy_rs_core::Result<Map<String, Value>> {
+    let mut matcher = Map::new();
+    if item.block.is_empty() {
+        if item.args.is_empty() {
+            return Err(adapter_error(
+                item.position,
+                "`match` requires a response matcher",
+            ));
+        }
+        add_response_matcher_part(&mut matcher, &item.args[0], &item.args[1..], item.position)?;
+    } else {
+        for part in &item.block {
+            add_response_matcher_part(&mut matcher, &part.name, &part.args, part.position)?;
+        }
+    }
+    Ok(matcher)
+}
+
+fn add_response_matcher_part(
+    matcher: &mut Map<String, Value>,
+    name: &str,
+    args: &[String],
+    position: Position,
+) -> caddy_rs_core::Result<()> {
+    match name {
+        "status" => {
+            if args.is_empty() {
+                return Err(adapter_error(position, "`match status` requires a code"));
+            }
+            let mut codes = Vec::new();
+            for code in args {
+                codes.push(
+                    parse_status_range(code).map_err(|message| adapter_error(position, message))?,
+                );
+            }
+            let entry = matcher
+                .entry("status_code".to_string())
+                .or_insert_with(|| json!([]));
+            if let Some(entry) = entry.as_array_mut() {
+                entry.extend(codes.into_iter().map(|code| json!(code)));
+            }
+        }
+        "header" => {
+            let Some(field) = args.first() else {
+                return Err(adapter_error(
+                    position,
+                    "`match header` requires a field name",
+                ));
+            };
+            let values: Vec<Value> = args.iter().skip(1).map(|value| json!(value)).collect();
+            let headers = matcher
+                .entry("headers".to_string())
+                .or_insert_with(|| json!({}));
+            if let Some(headers) = headers.as_object_mut() {
+                headers.insert(field.clone(), Value::Array(values));
+            }
+        }
+        other => {
+            return Err(adapter_error(
+                position,
+                format!("response matcher `{other}` is not supported by this build"),
+            ))
+        }
+    }
+    Ok(())
+}
+
+fn merge_response_matcher(target: &mut Map<String, Value>, source: Map<String, Value>) {
+    for (key, value) in source {
+        match target.get_mut(&key) {
+            Some(Value::Array(existing)) => {
+                if let Value::Array(incoming) = value {
+                    existing.extend(incoming);
+                }
+            }
+            Some(Value::Object(existing)) => {
+                if let Value::Object(incoming) = value {
+                    for (field, value) in incoming {
+                        existing.insert(field, value);
                     }
                 }
-            });
-            return Ok(vec![replace]);
-        }
-        entries.push((directive.args[0].clone(), directive.args[1..].to_vec()));
-    } else {
-        for item in &directive.block {
-            if matches!(item.name.as_str(), "defer" | "match") {
-                return Err(adapter_error(
-                    item.position,
-                    "`header` block options `defer`/`match` are not supported by this build",
-                ));
             }
-            if item.args.is_empty() {
-                entries.push((item.name.clone(), Vec::new()));
-            } else {
-                entries.push((item.name.clone(), vec![item.args.join(" ")]));
+            _ => {
+                target.insert(key, value);
             }
         }
     }
-
-    let mut sets = Map::new();
-    let mut adds = Map::new();
-    let mut deletes = Vec::new();
-    for (raw_field, values) in entries {
-        let field = raw_field.trim_end_matches(':').to_string();
-        if let Some(name) = field.strip_prefix('+') {
-            adds.insert(
-                canonical_header_name(name),
-                json!(values
-                    .iter()
-                    .map(|value| qualify_placeholders(value))
-                    .collect::<Vec<_>>()),
-            );
-        } else if let Some(name) = field.strip_prefix('-') {
-            deletes.push(Value::String(canonical_header_name(name)));
-        } else if let Some(name) = field.strip_prefix('?') {
-            sets.insert(
-                canonical_header_name(name),
-                json!(values
-                    .iter()
-                    .map(|value| qualify_placeholders(value))
-                    .collect::<Vec<_>>()),
-            );
-        } else {
-            let values: Vec<String> = values
-                .iter()
-                .map(|value| qualify_placeholders(value))
-                .collect();
-            sets.insert(canonical_header_name(&field), json!(values));
-        }
-    }
-
-    let mut response = Map::new();
-    if !sets.is_empty() {
-        response.insert("set".to_string(), Value::Object(sets));
-    }
-    if !adds.is_empty() {
-        response.insert("add".to_string(), Value::Object(adds));
-    }
-    if !deletes.is_empty() {
-        response.insert("delete".to_string(), Value::Array(deletes));
-    }
-    handlers.push(json!({"handler": "headers", "response": response}));
-    Ok(handlers)
 }
 
 fn file_server_handler(directive: &Directive) -> caddy_rs_core::Result<Value> {
@@ -2488,25 +2813,43 @@ fn file_server_handler(directive: &Directive) -> caddy_rs_core::Result<Value> {
                         "`file_server status` requires a code",
                     ));
                 };
-                let code: u16 = status.parse().map_err(|_| {
-                    adapter_error(
-                        directive.position,
-                        format!("`file_server status` value `{status}` is not a number"),
-                    )
-                })?;
-                object.insert("status_code".to_string(), json!(code));
+                // Caddy's status is a WeakString: numeric codes are emitted as numbers, anything
+                // else (e.g. placeholders such as `{env.CUSTOM_STATUS}`) as a string.
+                let value = match status.parse::<u16>() {
+                    Ok(code) => json!(code),
+                    Err(_) => json!(status),
+                };
+                object.insert("status_code".to_string(), value);
             }
             "disable_canonical_uris" => {
                 object.insert("canonical_uris".to_string(), json!(false));
             }
             "precompressed" => {
-                if values.is_empty() {
-                    return Err(adapter_error(
-                        directive.position,
-                        "`file_server precompressed` requires at least one format",
-                    ));
+                // Caddy defaults an empty format list to br, zstd, gzip and emits a module map
+                // plus the preference order.
+                let formats: Vec<String> = if values.is_empty() {
+                    ["br", "zstd", "gzip"]
+                        .iter()
+                        .map(|format| (*format).to_string())
+                        .collect()
+                } else {
+                    values.to_vec()
+                };
+                let mut precompressed = Map::new();
+                for format in &formats {
+                    if !matches!(format.as_str(), "br" | "zstd" | "gzip") {
+                        return Err(adapter_error(
+                            directive.position,
+                            format!(
+                                "`file_server precompressed` format `{format}` is not supported \
+                                 by this build; expected br, zstd or gzip"
+                            ),
+                        ));
+                    }
+                    precompressed.insert(format.clone(), json!({}));
                 }
-                object.insert("precompressed".to_string(), json!({"order": values}));
+                object.insert("precompressed".to_string(), Value::Object(precompressed));
+                object.insert("precompressed_order".to_string(), json!(formats));
             }
             other => {
                 return Err(adapter_error(
@@ -2733,6 +3076,13 @@ fn encode_handler(directive: &Directive) -> caddy_rs_core::Result<Value> {
 
 fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_core::Result<Value> {
     if args.is_empty() {
+        if let Some(dynamic) = directive.block.iter().find(|item| item.name == "dynamic") {
+            return Err(adapter_error(
+                dynamic.position,
+                "`reverse_proxy` dynamic upstreams are not supported by this build \
+                 (tracked as T-PROXY-036); use static upstreams",
+            ));
+        }
         return Err(adapter_error(
             directive.position,
             "`reverse_proxy` requires at least one upstream",
