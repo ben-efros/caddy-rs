@@ -35,6 +35,7 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
+use rustls::pki_types::CertificateDer;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
@@ -1127,6 +1128,24 @@ pub struct StoredAccount {
 pub trait AcmeTransport: Send + Sync {
     /// Perform one HTTP request.
     async fn request(&self, request: HttpRequest) -> Result<HttpResponse>;
+
+    /// Return an equivalent transport that trusts exactly `roots` for HTTPS connections.
+    ///
+    /// This backs Caddy's `trusted_roots_pem_files` / `acme_ca_root` options. Configured roots
+    /// **replace** the platform trust store, matching certmagic (which starts from an empty
+    /// `x509.CertPool` and appends the configured files). Implementations that cannot
+    /// reconfigure trust (for example scripted test transports) must return a located error
+    /// instead of silently falling back to platform roots.
+    fn with_trusted_roots(
+        &self,
+        _roots: Vec<CertificateDer<'static>>,
+    ) -> Result<Arc<dyn AcmeTransport>> {
+        Err(AcmeError::Transport {
+            url: "https://".to_string(),
+            reason: "this ACME transport does not support explicit trusted roots; use HyperTransport for a CA configured with trusted_roots_pem_files".to_string(),
+        }
+        .into())
+    }
 }
 
 #[async_trait]
@@ -1134,12 +1153,26 @@ impl<T: AcmeTransport + ?Sized> AcmeTransport for &T {
     async fn request(&self, request: HttpRequest) -> Result<HttpResponse> {
         (**self).request(request).await
     }
+
+    fn with_trusted_roots(
+        &self,
+        roots: Vec<CertificateDer<'static>>,
+    ) -> Result<Arc<dyn AcmeTransport>> {
+        (**self).with_trusted_roots(roots)
+    }
 }
 
 #[async_trait]
 impl<T: AcmeTransport + ?Sized> AcmeTransport for Arc<T> {
     async fn request(&self, request: HttpRequest) -> Result<HttpResponse> {
         (**self).request(request).await
+    }
+
+    fn with_trusted_roots(
+        &self,
+        roots: Vec<CertificateDer<'static>>,
+    ) -> Result<Arc<dyn AcmeTransport>> {
+        (**self).with_trusted_roots(roots)
     }
 }
 
@@ -1641,7 +1674,7 @@ pub use order::{
     ChallengePolicy, ChallengeStatus, ChallengeType, Identifier, IssuedCertificate,
     NewOrderRequest, Order, OrderFetch, OrderHandle, OrderStatus, PollPolicy, TokioClock,
 };
-pub use transport::HyperTransport;
+pub use transport::{read_root_certificates_pem_files, HyperTransport};
 
 #[cfg(test)]
 mod tests {

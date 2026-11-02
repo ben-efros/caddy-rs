@@ -14,7 +14,7 @@
 //! certificates from disk but never contacts the network.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -107,6 +107,13 @@ impl HyperTransport {
         Self::with_root_certificates(read_root_certificates_pem_file(path)?)
     }
 
+    /// Create a transport from several PEM bundle files (Caddy's `trusted_roots_pem_files`).
+    ///
+    /// The configured roots replace the platform trust store entirely, matching certmagic.
+    pub fn with_root_certificates_pem_files(paths: &[PathBuf]) -> Result<Self> {
+        Self::with_root_certificates(read_root_certificates_pem_files(paths)?)
+    }
+
     /// Override the `User-Agent` header sent with every request.
     pub fn with_user_agent(mut self, user_agent: impl Into<String>) -> Self {
         self.user_agent = user_agent.into();
@@ -183,6 +190,15 @@ impl AcmeTransport for HyperTransport {
             body,
         })
     }
+
+    fn with_trusted_roots(
+        &self,
+        roots: Vec<CertificateDer<'static>>,
+    ) -> Result<Arc<dyn AcmeTransport>> {
+        let mut transport = HyperTransport::with_root_certificates(roots)?;
+        transport.user_agent = self.user_agent.clone();
+        Ok(Arc::new(transport))
+    }
 }
 
 /// Load trust roots from the platform CA bundle.
@@ -243,6 +259,38 @@ pub fn read_root_certificates_pem_file(
         }
         .into()
     })
+}
+
+/// Read and parse several PEM bundle files into one trust-root set.
+///
+/// Used by Caddy's `trusted_roots_pem_files` / `acme_ca_root`. Every path is read and parsed
+/// eagerly: a missing, unreadable, empty or malformed file is a located error, never a reason to
+/// fall back to the platform bundle. Calling this with no paths is also an error; callers that
+/// want platform roots must ask for them explicitly.
+pub fn read_root_certificates_pem_files(paths: &[PathBuf]) -> Result<Vec<CertificateDer<'static>>> {
+    if paths.is_empty() {
+        return Err(AcmeError::Transport {
+            url: "https://".to_string(),
+            reason: "no trusted root PEM files configured for the ACME HTTP transport".to_string(),
+        }
+        .into());
+    }
+    let mut roots = Vec::new();
+    for path in paths {
+        let certificates = read_root_certificates_pem_file(path)?;
+        if certificates.is_empty() {
+            return Err(AcmeError::Transport {
+                url: "https://".to_string(),
+                reason: format!(
+                    "trusted roots file `{}` contains no CERTIFICATE blocks",
+                    path.display()
+                ),
+            }
+            .into());
+        }
+        roots.extend(certificates);
+    }
+    Ok(roots)
 }
 
 /// Parse all `CERTIFICATE` blocks in a PEM document into DER certificates.
@@ -679,5 +727,117 @@ mod tests {
         let error = transport_error("https://ca.test/dir", "boom");
         assert!(error.to_string().contains("https://ca.test/dir"));
         assert!(error.to_string().contains("boom"));
+    }
+
+    #[test]
+    fn reads_multiple_trust_root_pem_files_and_rejects_bad_inputs() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.pem");
+        let second = directory.path().join("second.pem");
+        std::fs::write(&first, TEST_CERT_PEM).unwrap();
+        std::fs::write(&second, UNRELATED_CERT_PEM).unwrap();
+        let roots = read_root_certificates_pem_files(&[first, second]).unwrap();
+        assert_eq!(roots.len(), 2);
+
+        let error = read_root_certificates_pem_files(&[])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no trusted root PEM files"), "{error}");
+
+        let missing = directory.path().join("missing.pem");
+        let error = read_root_certificates_pem_files(&[missing.clone()])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(missing.to_string_lossy().as_ref()),
+            "error should name the missing file: {error}"
+        );
+        assert!(error.contains("cannot read"), "{error}");
+
+        let empty = directory.path().join("empty.pem");
+        std::fs::write(&empty, b"").unwrap();
+        let error = read_root_certificates_pem_files(&[empty])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no CERTIFICATE blocks"), "{error}");
+
+        let invalid = directory.path().join("invalid.pem");
+        std::fs::write(&invalid, b"not a pem").unwrap();
+        let error = read_root_certificates_pem_files(&[invalid])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no CERTIFICATE blocks"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn transport_built_from_pem_root_files_verifies_local_tls_server() {
+        let replies = Replies::default();
+        let recorder = Recorder::default();
+        let (port, _roots, _server_errors) = spawn_https_server(replies.clone(), recorder);
+        replay(
+            &replies,
+            ScriptedReply {
+                status: 200,
+                headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+                body: b"{\"rooted\":true}".to_vec(),
+            },
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let root_file = directory.path().join("root.pem");
+        std::fs::write(&root_file, TEST_CERT_PEM).unwrap();
+        let transport = HyperTransport::with_root_certificates_pem_files(&[root_file])
+            .expect("rooted transport");
+        let url = format!("https://127.0.0.1:{port}/secure");
+        let response = transport.request(HttpRequest::get(&url)).await.unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"{\"rooted\":true}");
+    }
+
+    #[tokio::test]
+    async fn with_trusted_roots_replaces_existing_platform_roots() {
+        let replies = Replies::default();
+        let recorder = Recorder::default();
+        let (port, server_roots, _server_errors) = spawn_https_server(replies.clone(), recorder);
+        replay(
+            &replies,
+            ScriptedReply {
+                status: 200,
+                headers: Vec::new(),
+                body: b"{\"secure\":true}".to_vec(),
+            },
+        );
+        // Start from an unrelated root: only the explicit roots can make the request succeed.
+        let base = HyperTransport::with_root_certificates(
+            parse_pem_certificates(UNRELATED_CERT_PEM.as_bytes()).unwrap(),
+        )
+        .unwrap();
+        let rooted = base
+            .with_trusted_roots(server_roots)
+            .expect("transport supports explicit roots");
+        let url = format!("https://127.0.0.1:{port}/secure");
+        let response = rooted.request(HttpRequest::get(&url)).await.unwrap();
+        assert_eq!(response.status, 200);
+    }
+
+    #[test]
+    fn transport_without_root_support_fails_loudly() {
+        struct UnconfigurableTransport;
+
+        #[async_trait]
+        impl AcmeTransport for UnconfigurableTransport {
+            async fn request(&self, _request: HttpRequest) -> Result<HttpResponse> {
+                Err(Error::Issuer("unused test transport".to_string()))
+            }
+        }
+
+        let roots = parse_pem_certificates(TEST_CERT_PEM.as_bytes()).unwrap();
+        let error = match UnconfigurableTransport.with_trusted_roots(roots) {
+            Ok(_) => panic!("transport unexpectedly accepted explicit trusted roots"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("does not support explicit trusted roots"),
+            "expected a loud unsupported-transport error, got: {error}"
+        );
     }
 }
