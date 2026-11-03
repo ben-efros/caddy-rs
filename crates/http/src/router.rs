@@ -55,12 +55,25 @@ impl Route {
             .any(|handler| handler.consumes_request_body())
     }
 
-    fn matches(&self, request: &Request) -> bool {
-        self.matcher_sets.is_empty()
-            || self
-                .matcher_sets
-                .iter()
-                .any(|set| set.iter().all(|matcher| matcher.matches(request)))
+    fn matches(&self, request: &mut Request) -> bool {
+        if self.matcher_sets.is_empty() {
+            return true;
+        }
+        for set in &self.matcher_sets {
+            let mut matched = true;
+            for matcher in set {
+                // `matches_mut` publishes matcher placeholders (for example
+                // `{http.matchers.file.relative}`) on a successful match.
+                if !matcher.matches_mut(request) {
+                    matched = false;
+                    break;
+                }
+            }
+            if matched {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -220,7 +233,7 @@ impl Router {
                     continue;
                 }
             }
-            if !route.matches(&current) {
+            if !route.matches(&mut current) {
                 continue;
             }
             if let Some(group) = &route.group {
