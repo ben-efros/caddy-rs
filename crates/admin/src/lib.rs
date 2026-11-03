@@ -70,21 +70,28 @@
 //!
 //! Documented simplifications:
 //!
-//! - Malformed bodies and traversal errors return `400` with a located message. Upstream Caddy
-//!   only wraps *some* errors in `APIError`, so several equivalent failures surface as `500`.
+//! - JSON response bodies (including errors) are terminated with a newline like Caddy's
+//!   `json.Encoder`, so bodies and ETag hashes match byte-for-byte.
+//! - A mutation that leaves the configuration unchanged is short-circuited: `200 OK` with an empty
+//!   body and no new generation. `Cache-Control: must-revalidate` forces the reload, exactly like
+//!   Caddy. `POST /load` with an identical config follows the same rule.
+//! - Malformed JSON request bodies on config mutations return `500` with a
+//!   `decoding request body: ...` message (Caddy returns these as plain, non-`APIError` errors).
+//!   Config traversal errors (`invalid traversal path`, array index problems) also return `500`;
+//!   a missing *leaf* config key reads as JSON `null` with `200`, matching Caddy
+//!   (`GET /config/<missing>` is no longer a 404).
 //! - ETags and `If-Match` are implemented with Caddy's strong-ETag format
 //!   (`"<config path> <xxhash64 hex>"`, same xxhash64 algorithm) and its 400/412 semantics.
-//!   Differences from Caddy v2.11.7: the "config unchanged" short-circuit is not implemented, so
-//!   every accepted update still creates a generation and `Cache-Control: must-revalidate` is
-//!   accepted but has no observable effect; Caddy ignores `If-None-Match` entirely, while
+//!   Differences from Caddy v2.11.7: Caddy ignores `If-None-Match` entirely, while
 //!   caddy-rs serves `304` on a matching config read and `412` on a conditional write
 //!   (documented extension); no `Last-Modified` is sent (Caddy sends none either). The ETag hash
 //!   is over caddy-rs's serialized JSON, so it can differ from Caddy's for a semantically equal
 //!   config if key order/formatting differs between the two serializers.
 //! - `GET /reverse_proxy/upstreams` reports the configured upstream addresses, de-duplicated and
-//!   sorted, in Caddy's `[{address,num_requests,fails}]` shape. Live proxy counters and health are
-//!   not exposed to this crate yet, so `num_requests`/`fails` are always `0`; dynamic upstream
-//!   sources are not modelled.
+//!   sorted, in Caddy's `[{address,num_requests,fails}]` shape. Live counters require the server
+//!   runtime to register an [`UpstreamStatusSource`] via
+//!   [`AdminApi::with_upstream_status_source`]; until then `num_requests`/`fails` are `0`.
+//!   Dynamic upstream sources are not modelled.
 //! - `POST /adapt` follows Caddy's `Content-Type`-selected adapter semantics; the additional
 //!   `{config, adapter, wrap}` JSON request form (with `wrap:false` returning the raw adapted JSON)
 //!   is a caddy-rs extension. Adapter warnings are rendered as Caddy-shaped
@@ -97,8 +104,7 @@
 //!   (Caddy's `net/url` decodes `URL.Path` before dispatch). The server crate passes the raw
 //!   request path, so `@id` values and object keys containing reserved characters need literal
 //!   segments.
-//! - `GET /config/<missing>` reports a located `404`; Caddy renders a missing path as `null` with
-//!   `200`. `GET /id/<id>` returns `404` for unknown ids as required by the admin contract.
+//! - `GET /id/<id>` returns `404` for unknown ids as required by the admin contract.
 //! - Origin policy derives implicit origins from a non-empty `admin.origins`; the shared core
 //!   model cannot distinguish `origins: null` (derive) from `origins: []` (allow none), so an
 //!   explicit empty list derives the defaults instead of blocking the endpoint.
@@ -211,10 +217,14 @@ impl AdminResponse {
     }
 
     /// JSON response.
+    ///
+    /// Caddy's admin API encodes JSON with `json.Encoder`, which terminates every document with a
+    /// newline; responses and ETag hashes include it so bodies match byte-for-byte.
     pub fn json(status: StatusCode, value: &Value) -> Self {
-        let body = serde_json::to_vec(value).unwrap_or_else(|error| {
+        let mut body = serde_json::to_vec(value).unwrap_or_else(|error| {
             format!("{{\"error\":\"serialization: {error}\"}}").into_bytes()
         });
+        body.push(b'\n');
         let mut response = Self::empty(status);
         response.headers.insert(
             http::header::CONTENT_TYPE,
@@ -247,6 +257,104 @@ impl AdminResponse {
 
 /// FNV-1a 64 fallback is not used: ETag hashing must match Caddy's xxhash64 so optimistic
 /// concurrency headers are stable across implementations of the same config document.
+
+/// The exact bytes Caddy's `json.Encoder` writes for a config document (compact JSON + newline).
+/// ETag hashes are computed over these bytes.
+fn config_json_body(value: &Value) -> Vec<u8> {
+    let mut body = serde_json::to_vec(value).unwrap_or_else(|_| b"null".to_vec());
+    body.push(b'\n');
+    body
+}
+
+/// Caddy's force-reload signal: `Cache-Control: must-revalidate` (exact header value compare).
+fn force_reload(request: &AdminRequest) -> bool {
+    request
+        .headers
+        .get(http::header::CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok())
+        == Some("must-revalidate")
+}
+
+/// Read a config path with Caddy's traversal semantics.
+///
+/// * a missing object key at the terminal segment reads as `null` (Caddy encodes `v[part]`);
+/// * traversing *through* a missing key, a scalar, or a non-canonical/out-of-range array index is
+///   a plain error (Caddy returns HTTP 500 for these, not a 404).
+fn read_config_value(current: &Value, parts: &[&str]) -> std::result::Result<Value, String> {
+    let mut ptr = current;
+    for (index, part) in parts.iter().enumerate() {
+        let last = index + 1 == parts.len();
+        match ptr {
+            Value::Object(object) => {
+                if last {
+                    return Ok(object.get(*part).cloned().unwrap_or(Value::Null));
+                }
+                match object.get(*part) {
+                    Some(Value::Null) | None => {
+                        return Err(format!(
+                            "invalid traversal path at: {}",
+                            parts[..=index].join("/")
+                        ))
+                    }
+                    Some(value) => ptr = value,
+                }
+            }
+            Value::Array(items) => {
+                let canonical = part
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|parsed| *part == parsed.to_string());
+                let Some(array_index) = canonical else {
+                    return Err(format!(
+                        "[/{}] invalid array index '{}'",
+                        parts[..=index].join("/"),
+                        part
+                    ));
+                };
+                let Some(value) = items.get(array_index) else {
+                    return Err(format!(
+                        "[/{}] array index out of bounds: {}",
+                        parts[..=index].join("/"),
+                        part
+                    ));
+                };
+                if last {
+                    return Ok(value.clone());
+                }
+                ptr = value;
+            }
+            _ => {
+                return Err(format!(
+                    "invalid traversal path at: {}",
+                    parts[..=index].join("/")
+                ))
+            }
+        }
+    }
+    Ok(ptr.clone())
+}
+
+/// Runtime upstream status for one reverse-proxy address, in Caddy's `/reverse_proxy/upstreams`
+/// shape (`num_requests`/`fails` counters).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UpstreamStatus {
+    /// Upstream dial address (`host:port`).
+    pub address: String,
+    /// Requests handled by this upstream since it was configured.
+    pub num_requests: u64,
+    /// Failed requests for this upstream since it was configured.
+    pub fails: u64,
+}
+
+/// Source of live reverse-proxy upstream counters, supplied by the server runtime.
+///
+/// The admin crate does not own the proxy pools, so live counters are only available when the
+/// server registers a source with [`AdminApi::with_upstream_status_source`]. Without one,
+/// `GET /reverse_proxy/upstreams` reports the configured addresses with zero counters.
+pub trait UpstreamStatusSource: Send + Sync + std::fmt::Debug {
+    /// Current per-address counters (configured addresses should be included even at zero).
+    fn upstream_status(&self) -> Vec<UpstreamStatus>;
+}
 
 /// 64-bit xxHash (seed 0), the algorithm Caddy uses for config ETags (`admin.go: etagHasher`).
 ///
@@ -387,6 +495,8 @@ pub struct AdminApi {
     metrics: MetricsRegistry,
     /// Caddy data directory containing `pki/authorities` (admin `/pki` endpoints).
     data_dir: Option<PathBuf>,
+    /// Optional live reverse-proxy upstream counters supplied by the server runtime.
+    upstream_status_source: Option<Arc<dyn UpstreamStatusSource>>,
 }
 
 impl AdminApi {
@@ -399,6 +509,7 @@ impl AdminApi {
             origin_policy: None,
             metrics: MetricsRegistry::new(),
             data_dir: None,
+            upstream_status_source: None,
         }
     }
 
@@ -424,6 +535,15 @@ impl AdminApi {
     /// server runtime's default).
     pub fn with_data_dir(mut self, data_dir: impl Into<PathBuf>) -> Self {
         self.data_dir = Some(data_dir.into());
+        self
+    }
+
+    /// Register the runtime source of live `/reverse_proxy/upstreams` counters.
+    ///
+    /// The server runtime owns the proxy pools; until it supplies this source the endpoint reports
+    /// configured upstreams with `num_requests: 0`/`fails: 0` (documented divergence).
+    pub fn with_upstream_status_source(mut self, source: Arc<dyn UpstreamStatusSource>) -> Self {
+        self.upstream_status_source = Some(source);
         self
     }
 
@@ -572,12 +692,11 @@ impl AdminApi {
             }
             let current = self.current_config_value();
             let parts = config_path::split_path(pointer);
-            return match navigate(&current, &parts) {
-                Some(value) => self.config_read_response(path, value, request),
-                None => AdminResponse::text(
-                    StatusCode::NOT_FOUND,
-                    format!("config path `{pointer}` not found"),
-                ),
+            return match read_config_value(&current, &parts) {
+                Ok(value) => self.config_read_response(path, &value, request),
+                Err(message) => {
+                    AdminResponse::api_error(StatusCode::INTERNAL_SERVER_ERROR, message)
+                }
             };
         }
 
@@ -623,6 +742,15 @@ impl AdminApi {
                         )
                     }
                 }
+                // Caddy's `Load` short-circuits an identical config unless the client forces a
+                // reload with `Cache-Control: must-revalidate`.
+                if !force_reload(request) {
+                    if let Ok(value) = config.to_value() {
+                        if self.config_unchanged(&value) {
+                            return self.unchanged_config();
+                        }
+                    }
+                }
                 self.commit(config)
             }
             "/stop" => {
@@ -652,10 +780,7 @@ impl AdminApi {
                     "lifecycle": self.store.current().map(|generation| generation.state().as_str()),
                 }),
             ),
-            _ => AdminResponse::text(
-                StatusCode::NOT_FOUND,
-                format!("admin endpoint `{path}` is not implemented"),
-            ),
+            _ => AdminResponse::text(StatusCode::NOT_FOUND, "404 page not found\n"),
         }
     }
 
@@ -668,6 +793,17 @@ impl AdminApi {
         } else {
             value
         }
+    }
+
+    /// Whether `updated` is identical to the active configuration (Caddy's `errSameConfig` check).
+    fn config_unchanged(&self, updated: &Value) -> bool {
+        let current = self.current_config_value();
+        !current.is_null() && *updated == current
+    }
+
+    /// Caddy's no-op update response: `200 OK` with an empty body and no new generation.
+    fn unchanged_config(&self) -> AdminResponse {
+        AdminResponse::empty(StatusCode::OK)
     }
 
     /// The `(etag path, document)` pair for a config path used by ETags and preconditions.
@@ -696,9 +832,7 @@ impl AdminApi {
         value: &Value,
         request: &AdminRequest,
     ) -> AdminResponse {
-        let body = serde_json::to_vec(value).unwrap_or_else(|error| {
-            format!("{{\"error\":\"serialization: {error}\"}}").into_bytes()
-        });
+        let body = config_json_body(value);
         let etag = config_etag(etag_path, &body);
         if if_none_match_matches(&request.headers, &etag) {
             let mut response = AdminResponse::empty(StatusCode::NOT_MODIFIED);
@@ -746,7 +880,7 @@ impl AdminApi {
                 )
             };
             let (_, value) = self.etag_document(parts[0]).ok_or_else(mismatch)?;
-            let body = serde_json::to_vec(&value).unwrap_or_default();
+            let body = config_json_body(&value);
             let current_hash = format!("{:016x}", xxh64(&body));
             if current_hash != parts[1] {
                 return Err(mismatch());
@@ -761,7 +895,7 @@ impl AdminApi {
                 )
             };
             let (etag_path, value) = self.etag_document(path).ok_or_else(mismatch)?;
-            let body = serde_json::to_vec(&value).unwrap_or_default();
+            let body = config_json_body(&value);
             let etag = config_etag(&etag_path, &body);
             if if_none_match_matches(&request.headers, &etag) {
                 return Err(mismatch());
@@ -851,12 +985,13 @@ impl AdminApi {
         result
     }
 
-    /// `GET /reverse_proxy/upstreams`: Caddy's upstream-status shape for the configured upstreams.
+    /// `GET /reverse_proxy/upstreams`: Caddy's upstream-status shape for the proxy pools.
     ///
-    /// The proxy runtime does not expose live counters/health to this crate, so every entry reports
-    /// `num_requests: 0` and `fails: 0` (documented divergence). Dynamic upstream sources are not
-    /// modelled. Addresses are de-duplicated like Caddy's global host pool and sorted for
-    /// deterministic output.
+    /// Configured static upstream addresses are always listed. When the server registers an
+    /// [`UpstreamStatusSource`] (see [`AdminApi::with_upstream_status_source`]) its live
+    /// `num_requests`/`fails` counters and any dynamic/in-flight addresses are merged in;
+    /// otherwise counters report 0 (documented residual until the server hooks the proxy pools).
+    /// Addresses are de-duplicated like Caddy's global host pool and sorted for determinism.
     fn handle_reverse_proxy_upstreams(&self, request: &AdminRequest) -> AdminResponse {
         if request.method != Method::GET {
             return AdminResponse::api_error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
@@ -864,9 +999,33 @@ impl AdminApi {
         let config = self.current_config_or_empty();
         let mut addresses = BTreeSet::new();
         collect_reverse_proxy_upstreams(&config, &mut addresses);
-        let upstreams: Vec<Value> = addresses
+        let mut statuses: std::collections::BTreeMap<String, UpstreamStatus> = addresses
             .into_iter()
-            .map(|address| json!({"address": address, "num_requests": 0, "fails": 0}))
+            .map(|address| {
+                (
+                    address.clone(),
+                    UpstreamStatus {
+                        address,
+                        num_requests: 0,
+                        fails: 0,
+                    },
+                )
+            })
+            .collect();
+        if let Some(source) = &self.upstream_status_source {
+            for entry in source.upstream_status() {
+                statuses.insert(entry.address.clone(), entry);
+            }
+        }
+        let upstreams: Vec<Value> = statuses
+            .into_values()
+            .map(|status| {
+                json!({
+                    "address": status.address,
+                    "num_requests": status.num_requests,
+                    "fails": status.fails,
+                })
+            })
             .collect();
         AdminResponse::json(StatusCode::OK, &Value::Array(upstreams))
     }
@@ -944,10 +1103,12 @@ impl AdminApi {
             match serde_json::from_slice::<Value>(&request.body) {
                 Ok(value) => Some(value),
                 Err(error) => {
+                    // Caddy returns this as a plain (non-APIError) error, which the admin
+                    // middleware renders as HTTP 500.
                     return AdminResponse::api_error(
-                        StatusCode::BAD_REQUEST,
+                        StatusCode::INTERNAL_SERVER_ERROR,
                         format!("decoding request body: {error}"),
-                    )
+                    );
                 }
             }
         };
@@ -978,6 +1139,12 @@ impl AdminApi {
             // `DELETE /config/` removes the wrapper key; Caddy then runs a nil config, which
             // stops all apps. Model that as unloading the generation.
             return self.unload();
+        }
+
+        // Caddy compares the mutated raw config with the active one and skips the reload (200,
+        // empty body, no new generation) unless `Cache-Control: must-revalidate` forces it.
+        if !force_reload(request) && self.config_unchanged(&updated) {
+            return self.unchanged_config();
         }
 
         if let Err(message) = index_config(&updated) {
@@ -1043,13 +1210,12 @@ impl AdminApi {
         };
 
         if request.method == Method::GET {
-            if let Some(value) = navigate(&current, &parts) {
-                return self.config_read_response(&expanded_path, value, request);
-            }
-            return AdminResponse::text(
-                StatusCode::NOT_FOUND,
-                format!("config path `{rest}` not found"),
-            );
+            return match read_config_value(&current, &parts) {
+                Ok(value) => self.config_read_response(&expanded_path, &value, request),
+                Err(message) => {
+                    AdminResponse::api_error(StatusCode::INTERNAL_SERVER_ERROR, message)
+                }
+            };
         }
 
         let mut rewritten = request.clone();
@@ -1316,10 +1482,19 @@ mod tests {
             json!(":8080")
         );
 
+        // Caddy renders a missing leaf key as JSON `null` with 200 (traversal errors are 500).
         let response = admin
             .handle(request("GET", "/config/apps/missing", ""))
             .await;
-        assert_eq!(response.status, StatusCode::NOT_FOUND);
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, Bytes::from_static(b"null\n"));
+        assert!(response.headers.contains_key(http::header::ETAG));
+        // Traversing *through* a missing key is a located 500, like Caddy's plain traversal error.
+        let response = admin
+            .handle(request("GET", "/config/apps/missing/deeper", ""))
+            .await;
+        assert_eq!(response.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body_string(&response).contains("invalid traversal path"));
     }
 
     fn etag_of(response: &AdminResponse) -> String {
@@ -1448,7 +1623,7 @@ mod tests {
         assert_eq!(response.status, StatusCode::PRECONDITION_FAILED);
         assert_eq!(
             body_string(&response),
-            "{\"error\":\"If-Match header did not match current config hash\"}"
+            "{\"error\":\"If-Match header did not match current config hash\"}\n"
         );
         assert_eq!(config_etag_for_path(&admin, "/config/").await, updated_etag);
 
@@ -1536,6 +1711,159 @@ mod tests {
             "\"/config/ 0000000000000000\"",
         );
         assert_eq!(admin.handle(conditional).await.status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn unchanged_updates_are_short_circuited_without_a_new_generation() {
+        let admin = admin();
+        load(&admin, &valid_config()).await;
+        let generation_before = admin.store().current().expect("active").id();
+
+        // PATCH with the same value: 200, empty body, no new generation.
+        let response = admin
+            .handle(json_request(
+                "PATCH",
+                "/config/apps/http/servers/srv0/listen/0",
+                json!(":8080"),
+            ))
+            .await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert!(response.body.is_empty(), "Caddy returns an empty body");
+        assert_eq!(
+            admin.store().current().expect("active").id(),
+            generation_before,
+            "unchanged config must not create a generation"
+        );
+
+        // POST /load with the same document: also a no-op.
+        let response = load(&admin, &valid_config()).await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert!(response.body.is_empty());
+        assert_eq!(
+            admin.store().current().expect("active").id(),
+            generation_before
+        );
+
+        // POST /config/ with the same document: also a no-op.
+        let response = admin
+            .handle(json_request("POST", "/config/", &valid_config()))
+            .await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            admin.store().current().expect("active").id(),
+            generation_before
+        );
+
+        // `Cache-Control: must-revalidate` forces the reload even when unchanged.
+        let mut forced = json_request(
+            "PATCH",
+            "/config/apps/http/servers/srv0/listen/0",
+            json!(":8080"),
+        );
+        forced.headers.insert(
+            http::header::CACHE_CONTROL,
+            HeaderValue::from_static("must-revalidate"),
+        );
+        let response = admin.handle(forced).await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert!(response.body.is_empty());
+        assert_ne!(
+            admin.store().current().expect("active").id(),
+            generation_before,
+            "must-revalidate must force a new generation"
+        );
+
+        // A real change still creates a generation.
+        let generation_now = admin.store().current().expect("active").id();
+        let response = admin
+            .handle(json_request(
+                "PATCH",
+                "/config/apps/http/servers/srv0/listen/0",
+                json!(":9090"),
+            ))
+            .await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_ne!(
+            admin.store().current().expect("active").id(),
+            generation_now
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_admin_paths_return_caddys_plain_404() {
+        let admin = admin();
+        let response = admin.handle(request("GET", "/nope", "")).await;
+        assert_eq!(response.status, StatusCode::NOT_FOUND);
+        assert_eq!(body_string(&response), "404 page not found\n");
+        assert_eq!(
+            response.headers.get(http::header::CONTENT_TYPE).unwrap(),
+            "text/plain; charset=utf-8"
+        );
+    }
+
+    /// Test-only runtime upstream counter source.
+    #[derive(Debug)]
+    struct StaticUpstreamStatus(Vec<UpstreamStatus>);
+
+    impl UpstreamStatusSource for StaticUpstreamStatus {
+        fn upstream_status(&self) -> Vec<UpstreamStatus> {
+            self.0.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn reverse_proxy_upstreams_merges_runtime_counters_when_a_source_is_registered() {
+        let admin = admin().with_upstream_status_source(Arc::new(StaticUpstreamStatus(vec![
+            UpstreamStatus {
+                address: "127.0.0.1:9001".to_string(),
+                num_requests: 42,
+                fails: 3,
+            },
+            UpstreamStatus {
+                address: "127.0.0.1:9999".to_string(),
+                num_requests: 1,
+                fails: 0,
+            },
+        ])));
+        let config = json!({
+            "apps": {"http": {"servers": {"srv0": {
+                "listen": ["127.0.0.1:0"],
+                "routes": [{"handle": [{"handler": "reverse_proxy", "upstreams": [
+                    {"dial": "127.0.0.1:9001"}, {"dial": "127.0.0.1:9002"}
+                ]}]}]
+            }}}}
+        });
+        assert_eq!(
+            load(&admin, &config.to_string()).await.status,
+            StatusCode::OK
+        );
+
+        let response = admin
+            .handle(request("GET", "/reverse_proxy/upstreams", ""))
+            .await;
+        assert_eq!(response.status, StatusCode::OK);
+        let upstreams: Value = serde_json::from_slice(&response.body).unwrap();
+        let entries = upstreams.as_array().expect("array");
+        assert_eq!(
+            entries.len(),
+            3,
+            "configured + dynamic addresses are merged"
+        );
+        let by_address = |address: &str| {
+            entries
+                .iter()
+                .find(|entry| entry["address"] == address)
+                .cloned()
+                .expect("address entry")
+        };
+        assert_eq!(by_address("127.0.0.1:9001")["num_requests"], 42);
+        assert_eq!(by_address("127.0.0.1:9001")["fails"], 3);
+        assert_eq!(by_address("127.0.0.1:9002")["num_requests"], 0);
+        assert_eq!(
+            by_address("127.0.0.1:9999")["num_requests"],
+            1,
+            "runtime-only (dynamic/in-flight) addresses are included"
+        );
     }
 
     #[tokio::test]
@@ -1705,7 +2033,7 @@ mod tests {
         assert!(!is_running(admin.store()));
         let response = admin.handle(request("GET", "/config/", "")).await;
         assert_eq!(response.status, StatusCode::OK);
-        assert_eq!(response.body, Bytes::from_static(b"{}"));
+        assert_eq!(response.body, Bytes::from_static(b"{}\n"));
     }
 
     #[tokio::test]
@@ -2117,7 +2445,11 @@ mod tests {
         let mut malformed = json_request("PATCH", "/config/apps/http/servers/srv0/listen/0", "");
         malformed.body = Bytes::from_static(b"{not json");
         let response = admin.handle(malformed).await;
-        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Caddy returns malformed-body decode failures as plain 500 errors"
+        );
         assert!(body_string(&response).contains("decoding request body"));
 
         // `...` requires an array payload.
@@ -2190,7 +2522,7 @@ mod tests {
         assert!(!is_running(admin.store()));
         assert_eq!(
             admin.handle(request("GET", "/config/", "")).await.body,
-            Bytes::from_static(b"{}")
+            Bytes::from_static(b"{}\n")
         );
     }
 
