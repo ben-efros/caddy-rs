@@ -31,13 +31,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::BodyExt;
+use hyper_util::client::legacy::connect::Connect;
+use hyper_util::client::legacy::Client;
 use serde_json::Value;
 use tokio::sync::watch;
 
 use caddy_rs_http::{Error as HttpError, Result as HttpResult};
 
-use crate::client::HttpClient;
+use crate::client::ClientBody;
 use crate::upstream::Upstream;
 
 /// Caddy's `caddyhttp.StatusCodeMatches`: an exact match, or — when the configured value is below
@@ -211,10 +213,14 @@ impl HealthCheck {
 
     /// Perform one check. Returns whether the upstream passed.
     ///
-    /// The check uses the same [`HttpClient`] transport as proxying, so TCP and Unix-socket
-    /// upstreams are both supported. Unix-socket checks use `localhost` as the Host, matching
-    /// Caddy's active health checker.
-    pub async fn check_once(&self, client: &HttpClient, upstream: &Upstream) -> bool {
+    /// The check uses the same client/connector as proxying (generic over the connector so each
+    /// upstream's bound client can be used), so TCP, Unix-socket, TLS and HTTP/2 upstreams are all
+    /// supported. Unix-socket checks use `localhost` as the Host, matching Caddy's active health
+    /// checker.
+    pub async fn check_once<C>(&self, client: &Client<C, ClientBody>, upstream: &Upstream) -> bool
+    where
+        C: Connect + Clone + Send + Sync + 'static,
+    {
         // Caddy special-cases a configured `Host` header: it sets the request Host rather than
         // sending a duplicate. Every other configured header is appended (multi-value allowed).
         let Ok(default_host) = http::HeaderValue::from_str(upstream.fallback_host()) else {
@@ -238,7 +244,7 @@ impl HealthCheck {
         let Ok(mut request) = hyper::Request::builder()
             .method(self.method.clone())
             .uri(upstream.url(&self.uri))
-            .body(Full::new(self.body.clone()))
+            .body(crate::client::ClientBody::buffered(self.body.clone()))
         else {
             return false;
         };
@@ -309,14 +315,16 @@ pub struct HealthCheckScheduler {
 }
 
 impl HealthCheckScheduler {
-    /// Spawn the periodic checker for `upstreams`.
+    /// Spawn the periodic checker for `targets` (upstream + that upstream's bound client).
     ///
     /// Takes a snapshot of the upstream list: callers create one scheduler per handler generation.
-    pub fn spawn(
+    pub fn spawn<C>(
         check: Arc<HealthCheck>,
-        upstreams: Vec<Arc<Upstream>>,
-        client: HttpClient,
-    ) -> Self {
+        targets: Vec<(Arc<Upstream>, Client<C, ClientBody>)>,
+    ) -> Self
+    where
+        C: Connect + Clone + Send + Sync + 'static,
+    {
         let (shutdown, mut receiver) = watch::channel(false);
         let interval = check.interval;
         let handle = tokio::spawn(async move {
@@ -329,11 +337,11 @@ impl HealthCheckScheduler {
                     _ = receiver.changed() => break,
                     _ = timer.tick() => {}
                 }
-                for upstream in &upstreams {
+                for (upstream, client) in &targets {
                     if *receiver.borrow() {
                         return;
                     }
-                    let probe_healthy = check.check_once(&client, upstream).await;
+                    let probe_healthy = check.check_once(client, upstream).await;
                     check.apply_probe(
                         counters.entry(upstream.dial.clone()).or_default(),
                         probe_healthy,
@@ -428,6 +436,7 @@ pub async fn drain(body: hyper::body::Incoming) -> Result<Bytes, hyper::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_body_util::Full;
     use hyper::service::service_fn;
     use hyper_util::rt::TokioIo;
     use std::convert::Infallible;
@@ -765,8 +774,7 @@ mod tests {
         });
         let scheduler = HealthCheckScheduler::spawn(
             check,
-            vec![Arc::clone(&upstream)],
-            crate::client::build_client(),
+            vec![(Arc::clone(&upstream), crate::client::build_client())],
         );
 
         wait_until(|| hits.load(Ordering::SeqCst) >= 1).await;
@@ -803,8 +811,7 @@ mod tests {
         });
         let scheduler = HealthCheckScheduler::spawn(
             check,
-            vec![Arc::clone(&upstream)],
-            crate::client::build_client(),
+            vec![(Arc::clone(&upstream), crate::client::build_client())],
         );
 
         wait_until(|| hits.load(Ordering::SeqCst) >= 1).await;
