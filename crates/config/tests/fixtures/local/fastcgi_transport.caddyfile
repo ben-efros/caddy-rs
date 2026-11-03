@@ -1,0 +1,16 @@
+:8884
+
+reverse_proxy unix//run/php.sock {
+	transport fastcgi {
+		root /srv/http
+		split .php .php5
+		env APP_ENV production
+		env OTHER value
+		resolve_root_symlink
+		dial_timeout 3s
+		read_timeout 10s
+		write_timeout 20s
+		capture_stderr
+	}
+	lb_policy random
+}
