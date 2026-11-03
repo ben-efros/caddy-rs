@@ -47,8 +47,8 @@ pub struct Caddyfile {
 /// Global options supported by the adapter.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct GlobalOptions {
-    /// Automatic HTTPS mode from `auto_https`.
-    pub auto_https: Option<AutoHttpsMode>,
+    /// Automatic HTTPS modes from `auto_https` (zero value = Caddy defaults).
+    pub auto_https: AutoHttpsOptions,
     /// `http_port`.
     pub http_port: Option<u16>,
     /// `https_port`.
@@ -127,15 +127,26 @@ pub struct PkiKeyPairConfig {
     pub format: Option<String>,
 }
 
-/// `auto_https` modes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AutoHttpsMode {
-    /// `auto_https off`.
-    Off,
-    /// `auto_https disable_redirects`.
-    DisableRedirects,
-    /// `auto_https ignore_loaded_certs`.
-    IgnoreLoadedCerts,
+/// Automatic-HTTPS modes from the global `auto_https` option. Caddy accepts several modes on one
+/// line (and repeated lines replace each other); each enabled mode maps to one field of Caddy's
+/// `caddyhttp.AutoHTTPSConfig`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AutoHttpsOptions {
+    /// `auto_https off`: disable automatic HTTPS entirely (`automatic_https.disable`).
+    pub off: bool,
+    /// `auto_https disable_redirects` (`automatic_https.disable_redirects`).
+    pub disable_redirects: bool,
+    /// `auto_https disable_certs` (`automatic_https.disable_certificates`).
+    pub disable_certs: bool,
+    /// `auto_https ignore_loaded_certs` (`automatic_https.ignore_loaded_certificates`).
+    pub ignore_loaded_certs: bool,
+}
+
+impl AutoHttpsOptions {
+    /// True when no mode was configured.
+    pub fn is_empty(&self) -> bool {
+        !self.off && !self.disable_redirects && !self.disable_certs && !self.ignore_loaded_certs
+    }
 }
 
 /// One site block.
@@ -1568,20 +1579,31 @@ fn read_global_options(directives: Vec<Directive>) -> Result<GlobalOptions, Pars
     for directive in directives {
         match directive.name.as_str() {
             "auto_https" => {
-                let mode = directive.args.first().map(String::as_str).unwrap_or("");
-                options.auto_https = Some(match mode {
-                    "off" => AutoHttpsMode::Off,
-                    "disable_redirects" => AutoHttpsMode::DisableRedirects,
-                    "ignore_loaded_certs" => AutoHttpsMode::IgnoreLoadedCerts,
-                    other => {
-                        return Err(ParseError::syntax(
-                            directive.position,
-                            format!(
-                                "unknown auto_https mode `{other}`; expected off, disable_redirects, or ignore_loaded_certs"
-                            ),
-                        ))
+                if directive.args.is_empty() {
+                    return Err(ParseError::syntax(
+                        directive.position,
+                        "wrong argument count or unexpected line ending after `auto_https`",
+                    ));
+                }
+                let mut modes = AutoHttpsOptions::default();
+                for mode in &directive.args {
+                    match mode.as_str() {
+                        "off" => modes.off = true,
+                        "disable_redirects" => modes.disable_redirects = true,
+                        "disable_certs" => modes.disable_certs = true,
+                        "ignore_loaded_certs" => modes.ignore_loaded_certs = true,
+                        _ => {
+                            return Err(ParseError::syntax(
+                                directive.position,
+                                "auto_https must be one of 'off', 'disable_redirects', \
+                                 'disable_certs', or 'ignore_loaded_certs'"
+                                    .to_string(),
+                            ))
+                        }
                     }
-                });
+                }
+                // Repeated global option lines replace each other, matching Caddy's options map.
+                options.auto_https = modes;
             }
             "http_port" => {
                 options.http_port = Some(global_port(&directive)?);
@@ -1904,8 +1926,64 @@ mod tests {
     fn parses_global_options() {
         let file =
             parse("{ auto_https off\n http_port 8080\n}\n:80 {\n respond ok\n}\n").expect("parses");
-        assert_eq!(file.options.auto_https, Some(AutoHttpsMode::Off));
+        assert!(file.options.auto_https.off);
         assert_eq!(file.options.http_port, Some(8080));
+    }
+
+    #[test]
+    fn parses_all_auto_https_modes_and_combinations() {
+        let file = parse(
+            "{ auto_https disable_redirects disable_certs ignore_loaded_certs
+}\n:80 {\n respond ok\n}\n",
+        )
+        .expect("parses");
+        let modes = file.options.auto_https;
+        assert!(!modes.off);
+        assert!(modes.disable_redirects);
+        assert!(modes.disable_certs);
+        assert!(modes.ignore_loaded_certs);
+
+        let off =
+            parse("{ auto_https off disable_certs\n}\n:80 {\n respond ok\n}\n").expect("parses");
+        assert!(off.options.auto_https.off);
+        assert!(off.options.auto_https.disable_certs);
+        assert!(!off.options.auto_https.disable_redirects);
+    }
+
+    #[test]
+    fn repeated_auto_https_option_takes_last_line_like_caddy() {
+        // Caddy stores the global option in a map, so a later `auto_https` line replaces the
+        // earlier value entirely.
+        let file = parse(
+            "{ auto_https disable_certs\n auto_https disable_redirects\n}\n:80 {\n respond ok\n}\n",
+        )
+        .expect("parses");
+        assert!(file.options.auto_https.disable_redirects);
+        assert!(!file.options.auto_https.disable_certs);
+    }
+
+    #[test]
+    fn invalid_auto_https_modes_fail_loudly() {
+        for (caddyfile, expected) in [
+            (
+                "{ auto_https bogus\n}\n:80 {\n respond ok\n}\n",
+                "auto_https must be one of",
+            ),
+            (
+                "{ auto_https\n}\n:80 {\n respond ok\n}\n",
+                "wrong argument count",
+            ),
+            (
+                "{ auto_https disable_certs bogus\n}\n:80 {\n respond ok\n}\n",
+                "auto_https must be one of",
+            ),
+        ] {
+            let error = parse(caddyfile).expect_err("must fail");
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected:?} in {error}"
+            );
+        }
     }
 
     #[test]
