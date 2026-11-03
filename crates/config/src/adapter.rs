@@ -81,7 +81,7 @@ pub fn adapt_with_source(
     let site_tls: Vec<Option<SiteTls>> = file
         .sites
         .iter()
-        .map(|site| parse_site_tls(site, source))
+        .map(|site| parse_site_tls(site, source, &mut warnings))
         .collect::<caddy_rs_core::Result<_>>()?;
 
     // Site-level `bind` and `log` directives configure the listener and server log association
@@ -897,6 +897,7 @@ fn pki_key_pair_json(pair: &parser::PkiKeyPairConfig) -> Value {
 fn parse_site_tls(
     site: &SiteBlock,
     source: Option<&std::path::Path>,
+    warnings: &mut Vec<String>,
 ) -> caddy_rs_core::Result<Option<SiteTls>> {
     let mut found: Option<&Directive> = None;
     for directive in &site.directives {
@@ -1077,7 +1078,7 @@ fn parse_site_tls(
                         "duplicate tls option 'client_auth'",
                     ));
                 }
-                config.client_auth = Some(parse_client_auth_option(option, source)?);
+                config.client_auth = Some(parse_client_auth_option(option, source, warnings)?);
             }
             "alpn" => {
                 if config.alpn.is_some() {
@@ -1207,6 +1208,7 @@ fn parse_site_tls(
 fn parse_client_auth_option(
     option: &Directive,
     source: Option<&std::path::Path>,
+    warnings: &mut Vec<String>,
 ) -> caddy_rs_core::Result<Value> {
     let base = source
         .and_then(std::path::Path::parent)
@@ -1256,6 +1258,10 @@ fn parse_client_auth_option(
                     ));
                 }
                 saw_legacy_ca = true;
+                warnings.push(
+                    "The 'trusted_ca_cert' field is deprecated. Use the 'trust_pool' field instead."
+                        .to_string(),
+                );
                 trusted_ca.push(sub.args[0].clone());
             }
             "trusted_ca_cert_file" => {
@@ -1273,6 +1279,10 @@ fn parse_client_auth_option(
                     ));
                 }
                 saw_legacy_ca = true;
+                warnings.push(
+                    "The 'trusted_ca_cert_file' field is deprecated. Use the 'trust_pool' field instead."
+                        .to_string(),
+                );
                 trusted_ca.extend(read_pem_certificates(
                     &base.join(&sub.args[0]),
                     sub.position,
