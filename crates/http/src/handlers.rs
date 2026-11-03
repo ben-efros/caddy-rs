@@ -13,6 +13,8 @@
 //! * `request_body` supports Caddy's `max_size` (lazy `413` when a later handler reads past the
 //!   limit) and experimental `set` (body replacement with `ReplaceKnown` placeholders), matching
 //!   `modules/caddyhttp/requestbody/requestbody.go`.
+//! * `map` supports Caddy's exact/regexp mappings, positional outputs, null outputs and defaults,
+//!   publishing destination placeholders for later handlers (`modules/caddyhttp/map/map.go`).
 
 use std::sync::Arc;
 
@@ -20,6 +22,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use http::{HeaderName, HeaderValue, Method, StatusCode, Uri};
 
+use crate::regex_lite::Regex;
 use crate::router::Router;
 use crate::types::{Error, Handler, Outcome, Request, Response, Result, StreamingOutcome};
 
@@ -658,6 +661,359 @@ impl Handler for RequestBodyHandler {
             // limit before the next body-consuming handler runs (matching Caddy's lazy
             // `MaxBytesReader` semantics: a handler that never reads the body is unaffected).
             request.limit_body(max_size);
+        }
+        Ok(Outcome::Continue(request))
+    }
+}
+
+/// One scalar value in a `map` mapping output or default (Caddy's `any` JSON values).
+#[derive(Debug, Clone, PartialEq)]
+enum MapValue {
+    Null,
+    String(String),
+    Integer(i64),
+    Float(f64),
+    Bool(bool),
+}
+
+impl MapValue {
+    fn from_json(value: &serde_json::Value, path: &str) -> Result<Self> {
+        match value {
+            serde_json::Value::Null => Ok(Self::Null),
+            serde_json::Value::String(value) => Ok(Self::String(value.clone())),
+            serde_json::Value::Bool(value) => Ok(Self::Bool(*value)),
+            serde_json::Value::Number(number) => {
+                if let Some(integer) = number.as_i64() {
+                    Ok(Self::Integer(integer))
+                } else if let Some(float) = number.as_f64() {
+                    Ok(Self::Float(float))
+                } else {
+                    Err(invalid(path, "map number is not representable"))
+                }
+            }
+            serde_json::Value::Array(_) | serde_json::Value::Object(_) => Err(invalid(
+                path,
+                "map outputs/defaults must be strings, numbers, booleans or null",
+            )),
+        }
+    }
+
+    /// Caddy's `caddy.ToString`: `None` for null (the output is treated as not mapped).
+    fn render(&self) -> Option<String> {
+        match self {
+            Self::Null => None,
+            Self::String(value) => Some(value.clone()),
+            Self::Integer(value) => Some(value.to_string()),
+            Self::Float(value) => Some(render_float(*value)),
+            Self::Bool(value) => Some(value.to_string()),
+        }
+    }
+}
+
+/// Go's `fmt.Sprint` style float rendering (`1.0` prints as `1`, `1.5` as `1.5`).
+fn render_float(value: f64) -> String {
+    if value.is_finite() && value.fract() == 0.0 && value.abs() < 1e18 {
+        (value as i64).to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+/// One `map` mapping: an exact input or an input regular expression, plus positional outputs.
+#[derive(Debug)]
+struct MapMapping {
+    input: String,
+    regex: Option<Regex>,
+    outputs: Vec<MapValue>,
+}
+
+/// `map`: map a source placeholder value to destination placeholders (Caddy's `http.handlers.map`).
+///
+/// Supported JSON: `source`, `destinations`, `mappings` (`input` or `input_regexp`, `outputs`)
+/// and `defaults`. Mappings are evaluated in order for each destination; a null output is skipped;
+/// a matching non-null output wins immediately; otherwise the positional default is used and an
+/// absent default leaves the destination placeholder empty (Caddy's nil value).
+///
+/// Caddy evaluates mappings lazily when a destination placeholder is first used; this engine
+/// evaluates them when the handler runs, which is observationally equivalent unless a later
+/// handler changes request state that the source depends on before using a destination.
+#[derive(Debug)]
+pub struct MapHandler {
+    source: String,
+    destinations: Vec<String>,
+    mappings: Vec<MapMapping>,
+    defaults: Vec<MapValue>,
+}
+
+impl MapHandler {
+    /// Build from a `map` handler JSON value.
+    pub fn from_json(value: &serde_json::Value, path: &str) -> Result<Self> {
+        let object = value
+            .as_object()
+            .ok_or_else(|| invalid(path, "map handler configuration must be an object"))?;
+        for field in object.keys() {
+            if !matches!(
+                field.as_str(),
+                "handler" | "source" | "destinations" | "mappings" | "defaults"
+            ) {
+                return Err(invalid(
+                    &format!("{path}.{field}"),
+                    format!("unsupported map field `{field}`"),
+                ));
+            }
+        }
+        let source = match object.get("source") {
+            None | Some(serde_json::Value::Null) => String::new(),
+            Some(serde_json::Value::String(source)) => source.clone(),
+            Some(_) => {
+                return Err(invalid(
+                    &format!("{path}.source"),
+                    "`source` must be a string",
+                ))
+            }
+        };
+        let destinations = match object.get("destinations") {
+            None | Some(serde_json::Value::Null) => Vec::new(),
+            Some(serde_json::Value::Array(items)) => {
+                let mut names = Vec::with_capacity(items.len());
+                for (index, item) in items.iter().enumerate() {
+                    let item_path = format!("{path}.destinations[{index}]");
+                    let destination = item.as_str().ok_or_else(|| {
+                        invalid(&item_path, "destination must be a placeholder string")
+                    })?;
+                    names.push(parse_destination(destination, &item_path)?);
+                }
+                names
+            }
+            Some(_) => {
+                return Err(invalid(
+                    &format!("{path}.destinations"),
+                    "`destinations` must be an array of placeholders",
+                ))
+            }
+        };
+        let mappings = match object.get("mappings") {
+            None | Some(serde_json::Value::Null) => Vec::new(),
+            Some(serde_json::Value::Array(items)) => {
+                let mut mappings = Vec::with_capacity(items.len());
+                let mut seen_inputs: std::collections::BTreeSet<String> =
+                    std::collections::BTreeSet::new();
+                let mut seen_regexps: std::collections::BTreeSet<String> =
+                    std::collections::BTreeSet::new();
+                for (index, item) in items.iter().enumerate() {
+                    let mapping_path = format!("{path}.mappings[{index}]");
+                    let mapping = parse_map_mapping(
+                        item,
+                        &mapping_path,
+                        destinations.len(),
+                        &mut seen_inputs,
+                        &mut seen_regexps,
+                    )?;
+                    mappings.push(mapping);
+                }
+                mappings
+            }
+            Some(_) => {
+                return Err(invalid(
+                    &format!("{path}.mappings"),
+                    "`mappings` must be an array",
+                ))
+            }
+        };
+        let defaults = match object.get("defaults") {
+            None | Some(serde_json::Value::Null) => Vec::new(),
+            Some(serde_json::Value::Array(items)) => items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    MapValue::from_json(item, &format!("{path}.defaults[{index}]"))
+                })
+                .collect::<Result<Vec<_>>>()?,
+            Some(_) => {
+                return Err(invalid(
+                    &format!("{path}.defaults"),
+                    "`defaults` must be an array",
+                ))
+            }
+        };
+        if !defaults.is_empty() && defaults.len() != destinations.len() {
+            return Err(invalid(
+                &format!("{path}.defaults"),
+                format!(
+                    "{} destinations != {} defaults",
+                    destinations.len(),
+                    defaults.len()
+                ),
+            ));
+        }
+        Ok(Self {
+            source,
+            destinations,
+            mappings,
+            defaults,
+        })
+    }
+
+    fn resolve(&self, index: usize, input: &str, request: &Request) -> String {
+        for mapping in &self.mappings {
+            let Some(output) = mapping.outputs[index].render() else {
+                continue;
+            };
+            match &mapping.regex {
+                Some(regex) => {
+                    if let Some(captures) = regex.captures(input) {
+                        // Caddy returns the expanded regexp result directly (it is not run through
+                        // the placeholder replacer on this path).
+                        return regex.expand(&output, input, &captures);
+                    }
+                }
+                None => {
+                    if input == mapping.input {
+                        return request.replace_all(&output);
+                    }
+                }
+            }
+        }
+        match self.defaults.get(index).and_then(MapValue::render) {
+            Some(default) => request.replace_all(&default),
+            // Caddy returns a known-but-nil value; the placeholder expands to empty.
+            None => String::new(),
+        }
+    }
+}
+
+/// Validate a map destination is exactly one placeholder and return its name.
+fn parse_destination(destination: &str, path: &str) -> Result<String> {
+    let valid = destination.starts_with('{')
+        && destination.ends_with('}')
+        && destination.len() >= 3
+        && !destination[1..destination.len() - 1].contains('{')
+        && !destination[1..destination.len() - 1].contains('}');
+    if !valid {
+        return Err(invalid(
+            path,
+            format!(
+                "destination must be a placeholder and only a placeholder, got `{destination}`"
+            ),
+        ));
+    }
+    Ok(destination[1..destination.len() - 1].to_string())
+}
+
+fn parse_map_mapping(
+    value: &serde_json::Value,
+    path: &str,
+    destinations: usize,
+    seen_inputs: &mut std::collections::BTreeSet<String>,
+    seen_regexps: &mut std::collections::BTreeSet<String>,
+) -> Result<MapMapping> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| invalid(path, "map mapping must be an object"))?;
+    for field in object.keys() {
+        if !matches!(field.as_str(), "input" | "input_regexp" | "outputs") {
+            return Err(invalid(
+                &format!("{path}.{field}"),
+                format!("unsupported map mapping field `{field}`"),
+            ));
+        }
+    }
+    let input = match object.get("input") {
+        None | Some(serde_json::Value::Null) => String::new(),
+        Some(serde_json::Value::String(input)) => input.clone(),
+        Some(_) => {
+            return Err(invalid(
+                &format!("{path}.input"),
+                "`input` must be a string",
+            ))
+        }
+    };
+    let input_regexp = match object.get("input_regexp") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(pattern)) => Some(pattern.clone()),
+        Some(_) => {
+            return Err(invalid(
+                &format!("{path}.input_regexp"),
+                "`input_regexp` must be a string",
+            ))
+        }
+    };
+    if input_regexp.is_some() && object.get("input").is_some_and(|value| !value.is_null()) {
+        return Err(invalid(
+            path,
+            "mapping has both `input` and `input_regexp`, which is ambiguous",
+        ));
+    }
+    let regex = match &input_regexp {
+        None => {
+            if !seen_inputs.insert(input.clone()) {
+                return Err(invalid(
+                    path,
+                    format!("duplicate input `{input}` in map mappings"),
+                ));
+            }
+            None
+        }
+        Some(pattern) => {
+            if !seen_regexps.insert(pattern.clone()) {
+                return Err(invalid(
+                    path,
+                    format!("duplicate input_regexp `{pattern}` in map mappings"),
+                ));
+            }
+            Some(Regex::new(pattern).map_err(|error| match error {
+                Error::InvalidConfig { message, .. } => Error::InvalidConfig {
+                    path: format!("{path}.input_regexp"),
+                    message,
+                },
+                other => other,
+            })?)
+        }
+    };
+    let outputs = match object.get("outputs") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| MapValue::from_json(item, &format!("{path}.outputs[{index}]")))
+            .collect::<Result<Vec<_>>>()?,
+        Some(_) => {
+            return Err(invalid(
+                &format!("{path}.outputs"),
+                "`outputs` must be an array",
+            ))
+        }
+    };
+    if outputs.len() != destinations {
+        return Err(invalid(
+            path,
+            format!(
+                "mapping has {} outputs but there are {destinations} destinations defined",
+                outputs.len()
+            ),
+        ));
+    }
+    Ok(MapMapping {
+        input,
+        regex,
+        outputs,
+    })
+}
+
+#[async_trait]
+impl Handler for MapHandler {
+    fn name(&self) -> &'static str {
+        "map"
+    }
+
+    async fn handle(&self, mut request: Request) -> Result<Outcome> {
+        let input = request.replace_all(&self.source);
+        let mut values = Vec::with_capacity(self.destinations.len());
+        for index in 0..self.destinations.len() {
+            values.push(self.resolve(index, &input, &request));
+        }
+        for (destination, value) in self.destinations.iter().zip(values) {
+            request.vars.insert(destination.clone(), value);
         }
         Ok(Outcome::Continue(request))
     }
@@ -1428,5 +1784,210 @@ mod tests {
             consumed.lock().expect("lock").concat(),
             Bytes::from_static(b"1234")
         );
+    }
+
+    // ---- map handler --------------------------------------------------------------------
+
+    fn map_handler(json: serde_json::Value) -> MapHandler {
+        MapHandler::from_json(&json, "handle[0]").expect("map handler builds")
+    }
+
+    fn map_request(path: &str) -> Request {
+        test_request(Method::GET, path)
+    }
+
+    async fn run_map(handler: &MapHandler, path: &str) -> Request {
+        let Outcome::Continue(request) = handler.handle(map_request(path)).await.unwrap() else {
+            panic!("map continues to the next handler");
+        };
+        request
+    }
+
+    #[tokio::test]
+    async fn map_exact_mapping_and_defaults_set_placeholders() {
+        let handler = map_handler(serde_json::json!({
+            "handler": "map",
+            "source": "{http.request.uri.path}",
+            "destinations": ["{mapped}"],
+            "mappings": [{"input": "/foo", "outputs": ["FOO"]}],
+            "defaults": ["DEFAULT"]
+        }));
+        let request = run_map(&handler, "/foo").await;
+        assert_eq!(request.vars.get("mapped").map(String::as_str), Some("FOO"));
+        assert_eq!(
+            request.replace_known("{mapped}"),
+            "FOO",
+            "mapped placeholders resolve through the replacer"
+        );
+        let request = run_map(&handler, "/other").await;
+        assert_eq!(
+            request.vars.get("mapped").map(String::as_str),
+            Some("DEFAULT")
+        );
+    }
+
+    #[tokio::test]
+    async fn map_multiple_destinations_positional_outputs_and_null_fallthrough() {
+        let handler = map_handler(serde_json::json!({
+            "handler": "map",
+            "source": "{http.request.uri.path}",
+            "destinations": ["{one}", "{two}"],
+            "mappings": [
+                // The null output for `{one}` is skipped, so the regexp mapping below can still
+                // match the same input (literal and regexp mappings may overlap).
+                {"input": "/foo", "outputs": [null, "exact-two"]},
+                {"input_regexp": "foo", "outputs": ["regexp-one", null]}
+            ],
+            "defaults": ["default-one", "default-two"]
+        }));
+        let request = run_map(&handler, "/foo").await;
+        assert_eq!(
+            request.vars.get("one").map(String::as_str),
+            Some("regexp-one")
+        );
+        // The regexp mapping's null output for `{two}` is skipped, so the exact mapping won.
+        assert_eq!(
+            request.vars.get("two").map(String::as_str),
+            Some("exact-two")
+        );
+    }
+
+    #[tokio::test]
+    async fn map_regexp_captures_and_expansion() {
+        let handler = map_handler(serde_json::json!({
+            "handler": "map",
+            "source": "{http.request.uri.path}",
+            "destinations": ["{api}", "{fragment}", "{case}"],
+            "mappings": [
+                {"input_regexp": "^/api/(.*)$", "outputs": ["api:${1}", null, null]},
+                {"input_regexp": "(xyz)", "outputs": [null, "...${1}...", null]},
+                {"input_regexp": "(?i)HELLO", "outputs": [null, null, "hello"]}
+            ]
+        }));
+        let request = run_map(&handler, "/api/users").await;
+        assert_eq!(
+            request.vars.get("api").map(String::as_str),
+            Some("api:users")
+        );
+        let request = run_map(&handler, "/ABCxyzDEF").await;
+        assert_eq!(
+            request.vars.get("fragment").map(String::as_str),
+            Some("...xyz...")
+        );
+        let request = run_map(&handler, "/sayhello").await;
+        assert_eq!(request.vars.get("case").map(String::as_str), Some("hello"));
+        // `$1` without braces is also a Go-style capture reference.
+        let handler = map_handler(serde_json::json!({
+            "handler": "map",
+            "source": "{http.request.uri.path}",
+            "destinations": ["{out}"],
+            "mappings": [{"input_regexp": "^/([a-z]+)$", "outputs": ["x-$1"]}]
+        }));
+        let request = run_map(&handler, "/word").await;
+        assert_eq!(request.vars.get("out").map(String::as_str), Some("x-word"));
+    }
+
+    #[tokio::test]
+    async fn map_scalar_output_types_and_placeholder_expansion() {
+        let handler = map_handler(serde_json::json!({
+            "handler": "map",
+            "source": "{http.request.uri.path}",
+            "destinations": ["{int}", "{float}", "{bool}", "{quoted}", "{combined}"],
+            "mappings": [{
+                "input": "/types",
+                "outputs": [42, 1.5, true, "42", "{http.request.method}-mapped"]
+            }]
+        }));
+        let request = run_map(&handler, "/types").await;
+        assert_eq!(request.vars.get("int").map(String::as_str), Some("42"));
+        assert_eq!(request.vars.get("float").map(String::as_str), Some("1.5"));
+        assert_eq!(request.vars.get("bool").map(String::as_str), Some("true"));
+        assert_eq!(request.vars.get("quoted").map(String::as_str), Some("42"));
+        assert_eq!(
+            request.vars.get("combined").map(String::as_str),
+            Some("GET-mapped"),
+            "exact mappings expand placeholders in their outputs"
+        );
+    }
+
+    #[tokio::test]
+    async fn map_no_mapping_and_absent_defaults_leave_placeholders_empty() {
+        let handler = map_handler(serde_json::json!({
+            "handler": "map",
+            "source": "{http.request.uri.path}",
+            "destinations": ["{out}"],
+            "mappings": [{"input": "/foo", "outputs": ["FOO"]}]
+        }));
+        let request = run_map(&handler, "/missing").await;
+        assert_eq!(request.vars.get("out").map(String::as_str), Some(""));
+        assert_eq!(request.replace_known("{out}"), "");
+    }
+
+    #[tokio::test]
+    async fn map_chains_with_headers_and_static_response() {
+        let routes = vec![serde_json::json!({
+            "handle": [
+                {"handler": "map",
+                 "source": "{http.request.uri.path}",
+                 "destinations": ["{greeting}"],
+                 "mappings": [{"input": "/hello", "outputs": ["hi"]}],
+                 "defaults": ["default"]},
+                {"handler": "headers", "response": {"set": {"X-Greeting": ["{greeting}"]}}},
+                {"handler": "static_response", "body": "{greeting} {http.request.uri.path}"}
+            ]
+        })];
+        let router = RouterBuilder::new().build(&routes).expect("router builds");
+
+        let response = router.handle(map_request("/hello")).await.unwrap();
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, Bytes::from_static(b"hi /hello"));
+        assert_eq!(response.headers["x-greeting"], "hi");
+
+        let response = router.handle(map_request("/other")).await.unwrap();
+        assert_eq!(response.body, Bytes::from_static(b"default /other"));
+        assert_eq!(response.headers["x-greeting"], "default");
+    }
+
+    #[test]
+    fn map_config_is_strict() {
+        let invalid = [
+            // Destination is not exactly one placeholder.
+            serde_json::json!({"handler":"map","destinations":["foo"]}),
+            serde_json::json!({"handler":"map","destinations":["{}"]}),
+            serde_json::json!({"handler":"map","destinations":["{a}{b}"]}),
+            // Outputs/defaults must match the destination count.
+            serde_json::json!({"handler":"map","destinations":["{a}"],
+                "mappings":[{"input":"x","outputs":["1","2"]}]}),
+            serde_json::json!({"handler":"map","destinations":["{a}"],"defaults":["1","2"]}),
+            // Ambiguous / duplicate mappings.
+            serde_json::json!({"handler":"map","destinations":["{a}"],
+                "mappings":[{"input":"x","input_regexp":"x","outputs":["1"]}]}),
+            serde_json::json!({"handler":"map","destinations":["{a}"],
+                "mappings":[{"input":"x","outputs":["1"]},{"input":"x","outputs":["2"]}]}),
+            serde_json::json!({"handler":"map","destinations":["{a}"],
+                "mappings":[{"input_regexp":"x","outputs":["1"]},
+                            {"input_regexp":"x","outputs":["2"]}]}),
+            // Invalid or unsupported regular expressions.
+            serde_json::json!({"handler":"map","destinations":["{a}"],
+                "mappings":[{"input_regexp":"(","outputs":["1"]}]}),
+            serde_json::json!({"handler":"map","destinations":["{a}"],
+                "mappings":[{"input_regexp":"\\bword","outputs":["1"]}]}),
+            // Non-scalar outputs and unknown fields are rejected loudly.
+            serde_json::json!({"handler":"map","destinations":["{a}"],
+                "mappings":[{"input":"x","outputs":[["nested"]]}]}),
+            serde_json::json!({"handler":"map","unknown":true}),
+            serde_json::json!({"handler":"map","destinations":["{a}"],
+                "mappings":[{"input":"x","outputs":["1"],"extra":true}]}),
+            serde_json::json!({"handler":"map","source":42}),
+        ];
+        for json in invalid {
+            let error = MapHandler::from_json(&json, "handle[0]")
+                .expect_err("invalid map config must fail");
+            let message = error.to_string();
+            assert!(
+                message.contains("handle[0]"),
+                "error must name the config path: {message} for {json}"
+            );
+        }
     }
 }

@@ -12,6 +12,7 @@ pub mod file_server;
 pub mod handlers;
 pub mod matchers;
 pub mod placeholders;
+pub(crate) mod regex_lite;
 pub mod router;
 pub mod types;
 pub mod upgrade;
@@ -19,8 +20,8 @@ pub mod upgrade;
 pub use auth::{BasicAuthHandler, ForwardAuthHandler};
 pub use body::{Body, BodyError, RequestBody, ResponseBody, StreamingBody, StreamingResponse};
 pub use handlers::{
-    EncodeHandler, HeadersHandler, RequestBodyHandler, RewriteHandler, StaticResponseHandler,
-    SubrouteHandler, VarsHandler,
+    EncodeHandler, HeadersHandler, MapHandler, RequestBodyHandler, RewriteHandler,
+    StaticResponseHandler, SubrouteHandler, VarsHandler,
 };
 pub use placeholders::{Replacer, UnknownPlaceholders};
 pub use router::{CustomHandlerFactory, Route, Router, RouterBuilder};
