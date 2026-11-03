@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 base64 = "0.22.1"
 bytes = { workspace = true }
+caddy-rs-config = { workspace = true }
 caddy-rs-core = { workspace = true }
 http = { workspace = true }
 serde = { workspace = true }
