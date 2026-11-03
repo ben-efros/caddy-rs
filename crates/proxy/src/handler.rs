@@ -304,7 +304,12 @@ impl ReverseProxyHandler {
                     })?)
                 }
             };
-            let parsed = Upstream::parse_dial(dial, tls.is_some())
+            // Caddy's `tls.except_ports` dials those upstream ports without TLS even though the
+            // transport has a TLS configuration.
+            let tls_for_upstream = tls
+                .as_ref()
+                .is_some_and(|tls| tls.should_use_tls(dial_port(dial)));
+            let parsed = Upstream::parse_dial(dial, tls_for_upstream)
                 .map_err(|message| invalid(&upstream_path, message))?
                 .with_max_requests(max_requests);
             upstreams.push(Arc::new(parsed));
@@ -481,7 +486,7 @@ impl ReverseProxyHandler {
             }));
         }
         let mut headers = self.outbound_headers(request, upstream)?;
-        let url = if self.h2_capable() {
+        let url = if self.upstream_h2_capable(upstream) {
             // HTTP/2 `:authority` parity with Caddy/Go: use the original request Host (or a
             // header_up Host override) as the URI authority; the bound per-upstream connector
             // still dials the configured target. The Host field is not forwarded separately.
@@ -492,11 +497,7 @@ impl ReverseProxyHandler {
                 .or_else(|| request.host().map(str::to_string))
                 .unwrap_or_else(|| upstream.fallback_host().to_string());
             headers.remove(http::header::HOST);
-            let scheme = if self.transport.tls.is_some() {
-                "https"
-            } else {
-                "http"
-            };
+            let scheme = if upstream.tls { "https" } else { "http" };
             format!("{scheme}://{host}{path_and_query}")
         } else {
             upstream.url(&path_and_query)
@@ -611,9 +612,10 @@ impl ReverseProxyHandler {
         &self.clients[index]
     }
 
-    /// Whether the transport prefers HTTP/2 (TLS ALPN h2 or cleartext h2c).
-    fn h2_capable(&self) -> bool {
-        self.transport.alpn_h2 || self.transport.h2c
+    /// Whether *this upstream* speaks HTTP/2 (TLS h2 only applies to TLS upstreams; h2c applies to
+    /// cleartext transports).
+    fn upstream_h2_capable(&self, upstream: &Upstream) -> bool {
+        (self.transport.alpn_h2 && upstream.tls) || self.transport.h2c
     }
 
     /// Prepare the outbound request body for one proxy attempt (`T-PROXY-040`).
@@ -656,7 +658,7 @@ impl ReverseProxyHandler {
         // explicit `Host` field (the URI authority is the dial target). For HTTP/2-capable
         // transports the Host is carried by the URI authority instead — hyper/HTTP2 derives
         // `:authority` from it — and no separate `Host` field is sent, matching Go's h2 client.
-        if self.h2_capable() {
+        if self.upstream_h2_capable(upstream) {
             headers.remove(http::header::HOST);
         } else {
             let host = request.host().unwrap_or_else(|| upstream.fallback_host());
@@ -1478,6 +1480,20 @@ struct TransportConfig {
     fastcgi: Option<Arc<FastCgiTransport>>,
 }
 
+/// TCP port of a `host:port` dial, if any (Unix-socket dials have no port).
+fn dial_port(dial: &str) -> Option<u16> {
+    if dial == "unix" || dial.starts_with("unix/") {
+        return None;
+    }
+    let host_port = if dial.starts_with('[') {
+        // `[v6]:port` — take the text after the closing bracket.
+        dial.split_once(']')?.1.strip_prefix(':')?
+    } else {
+        dial.rsplit_once(':')?.1
+    };
+    host_port.parse().ok()
+}
+
 /// Build one client per upstream. The per-upstream connector dials its bound target regardless of
 /// the request URI authority, which lets the proxy put the client's Host in the URI (HTTP/2
 /// `:authority`) while still dialing the configured upstream.
@@ -1489,10 +1505,24 @@ fn build_upstream_clients(
     upstreams
         .iter()
         .map(|upstream| {
-            build_upstream_client(upstream, transport.tls.clone(), transport.h2c, false)
-                .map_err(|message| invalid(&format!("{path}.transport"), message))
+            build_upstream_client(
+                upstream,
+                upstream_tls(upstream, transport),
+                transport.h2c,
+                false,
+            )
+            .map_err(|message| invalid(&format!("{path}.transport"), message))
         })
         .collect()
+}
+
+/// The TLS client configuration for one upstream (`None` when `tls.except_ports` excluded it).
+fn upstream_tls(upstream: &Upstream, transport: &TransportConfig) -> Option<Arc<UpstreamTls>> {
+    if upstream.tls {
+        transport.tls.clone()
+    } else {
+        None
+    }
 }
 
 /// HTTP/1.1-only companion clients used for protocol-upgrade requests when the transport prefers
@@ -1505,8 +1535,13 @@ fn build_upgrade_clients(
     upstreams
         .iter()
         .map(|upstream| {
-            build_upstream_client(upstream, transport.tls.clone(), transport.h2c, true)
-                .map_err(|message| invalid(&format!("{path}.transport"), message))
+            build_upstream_client(
+                upstream,
+                upstream_tls(upstream, transport),
+                transport.h2c,
+                true,
+            )
+            .map_err(|message| invalid(&format!("{path}.transport"), message))
         })
         .collect()
 }
@@ -4958,5 +4993,405 @@ mod body_tests {
             .expect_err("a second streaming attempt cannot be replayed");
         assert!(error.contains("already streamed"), "{error}");
         assert!(error.contains("cannot be replayed"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod tls_client_tests {
+    //! Upstream mutual-TLS client certificates, `ca` module trust roots, and `except_ports`.
+
+    use super::*;
+    use caddy_rs_http::Handler;
+    use http::{Method, StatusCode};
+    use hyper::service::service_fn;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto;
+    use std::convert::Infallible;
+    use std::sync::Arc;
+    use tokio_rustls::TlsAcceptor;
+
+    const SERVER_CERT: &str = include_str!("../testdata/tls/localhost-cert.pem");
+    const SERVER_KEY: &str = include_str!("../testdata/tls/localhost-key.pem");
+    const CLIENT_CA: &str = include_str!("../testdata/tls/client-ca-cert.pem");
+    const CLIENT_CERT: &str = include_str!("../testdata/tls/client-cert.pem");
+    const CLIENT_KEY: &str = include_str!("../testdata/tls/client-key.pem");
+
+    fn write_fixture(directory: &tempfile::TempDir, name: &str, contents: &str) -> String {
+        let path = directory.path().join(name);
+        std::fs::write(&path, contents).unwrap();
+        path.display().to_string()
+    }
+
+    fn server_identity() -> (
+        Vec<rustls::pki_types::CertificateDer<'static>>,
+        rustls::pki_types::PrivateKeyDer<'static>,
+    ) {
+        let certificates = crate::tls::parse_pem_certificates(SERVER_CERT.as_bytes()).unwrap();
+        let key = crate::tls::parse_pem_private_key(SERVER_KEY.as_bytes()).unwrap();
+        (certificates, key)
+    }
+
+    /// TLS server that requires a client certificate signed by `client-ca-cert.pem`.
+    fn mtls_acceptor(alpn: Vec<Vec<u8>>) -> TlsAcceptor {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut roots = rustls::RootCertStore::empty();
+        for certificate in crate::tls::parse_pem_certificates(CLIENT_CA.as_bytes()).unwrap() {
+            roots.add(certificate).unwrap();
+        }
+        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+            .build()
+            .expect("client verifier builds");
+        let (certificates, key) = server_identity();
+        let mut config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(certificates, key)
+            .unwrap();
+        config.alpn_protocols = alpn;
+        TlsAcceptor::from(Arc::new(config))
+    }
+
+    /// TLS server that does not require a client certificate.
+    fn tls_acceptor(alpn: Vec<Vec<u8>>) -> TlsAcceptor {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let (certificates, key) = server_identity();
+        let mut config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(certificates, key)
+            .unwrap();
+        config.alpn_protocols = alpn;
+        TlsAcceptor::from(Arc::new(config))
+    }
+
+    async fn spawn_tls_upstream(acceptor: TlsAcceptor) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(tls) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let service = service_fn(
+                        |request: hyper::Request<hyper::body::Incoming>| async move {
+                            let body = format!(
+                                "version={:?} path={}",
+                                request.version(),
+                                request.uri().path()
+                            );
+                            Ok::<_, Infallible>(
+                                hyper::Response::builder()
+                                    .status(200)
+                                    .header("x-transport", "tls")
+                                    .body(Full::new(Bytes::from(body)))
+                                    .expect("response"),
+                            )
+                        },
+                    );
+                    let _ = auto::Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(tls), service)
+                        .await;
+                });
+            }
+        });
+        address.to_string()
+    }
+
+    async fn spawn_plain_upstream() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let service = service_fn(
+                        |_request: hyper::Request<hyper::body::Incoming>| async move {
+                            Ok::<_, Infallible>(
+                                hyper::Response::builder()
+                                    .status(200)
+                                    .header("x-transport", "plain")
+                                    .body(Full::new(Bytes::from_static(b"plain-h1")))
+                                    .expect("response"),
+                            )
+                        },
+                    );
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        address.to_string()
+    }
+
+    fn build_handler(dial: &str, tls: Value, versions: Option<&[&str]>) -> ReverseProxyHandler {
+        let mut transport = serde_json::json!({"protocol": "http", "tls": tls});
+        if let Some(versions) = versions {
+            transport["versions"] = serde_json::json!(versions);
+        }
+        ReverseProxyHandler::from_json(
+            &serde_json::json!({
+                "handler": "reverse_proxy",
+                "upstreams": [{"dial": dial}],
+                "transport": transport
+            }),
+            "handler",
+        )
+        .expect("handler builds")
+    }
+
+    fn get(path: &str) -> Request {
+        let mut request = Request::new(Method::GET, path.parse().unwrap());
+        request.remote_addr = Some("203.0.113.7:5555".parse().unwrap());
+        request
+            .headers
+            .insert(http::header::HOST, "example.com".parse().unwrap());
+        request
+    }
+
+    fn body_string(response: &Response) -> String {
+        String::from_utf8(response.body.to_vec()).unwrap()
+    }
+
+    fn respond(handler: &ReverseProxyHandler, request: Request) -> Response {
+        let outcome = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(handler.handle(request))
+        });
+        let Outcome::Respond(response) = outcome.expect("handler result") else {
+            panic!("expected proxied response");
+        };
+        response
+    }
+
+    fn tls_with_client_identity(root: &str, client_cert: &str, client_key: &str) -> Value {
+        serde_json::json!({
+            "root_ca_pem_files": [root],
+            "server_name": "localhost",
+            "client_certificate_file": client_cert,
+            "client_certificate_key_file": client_key
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn upstream_client_certificate_authenticates() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = write_fixture(&directory, "root.pem", SERVER_CERT);
+        let cert = write_fixture(&directory, "client.pem", CLIENT_CERT);
+        let key = write_fixture(&directory, "client-key.pem", CLIENT_KEY);
+        let dial = spawn_tls_upstream(mtls_acceptor(vec![b"http/1.1".to_vec()])).await;
+        let handler = build_handler(&dial, tls_with_client_identity(&root, &cert, &key), None);
+        let response = respond(&handler, get("/mtls"));
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.headers["x-transport"], "tls");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn upstream_without_client_certificate_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = write_fixture(&directory, "root.pem", SERVER_CERT);
+        let dial = spawn_tls_upstream(mtls_acceptor(vec![b"http/1.1".to_vec()])).await;
+        let handler = build_handler(
+            &dial,
+            serde_json::json!({
+                "root_ca_pem_files": [root],
+                "server_name": "localhost"
+            }),
+            None,
+        );
+        let response = respond(&handler, get("/mtls"));
+        assert_eq!(
+            response.status,
+            StatusCode::BAD_GATEWAY,
+            "the server requires a client certificate"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn upstream_with_wrong_client_certificate_is_rejected() {
+        // The server trusts only client certs signed by `client-ca-cert.pem`; presenting the
+        // (self-signed) server identity as the client certificate must be rejected.
+        let directory = tempfile::tempdir().unwrap();
+        let root = write_fixture(&directory, "root.pem", SERVER_CERT);
+        let wrong_cert = write_fixture(&directory, "wrong-client.pem", SERVER_CERT);
+        let wrong_key = write_fixture(&directory, "wrong-client-key.pem", SERVER_KEY);
+        let dial = spawn_tls_upstream(mtls_acceptor(vec![b"http/1.1".to_vec()])).await;
+        let handler = build_handler(
+            &dial,
+            tls_with_client_identity(&root, &wrong_cert, &wrong_key),
+            None,
+        );
+        let response = respond(&handler, get("/mtls"));
+        assert_eq!(
+            response.status,
+            StatusCode::BAD_GATEWAY,
+            "an untrusted client certificate must fail the handshake"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn client_certificate_negotiates_http2() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = write_fixture(&directory, "root.pem", SERVER_CERT);
+        let cert = write_fixture(&directory, "client.pem", CLIENT_CERT);
+        let key = write_fixture(&directory, "client-key.pem", CLIENT_KEY);
+        let dial = spawn_tls_upstream(mtls_acceptor(vec![b"h2".to_vec()])).await;
+        let handler = build_handler(
+            &dial,
+            tls_with_client_identity(&root, &cert, &key),
+            Some(&["2"]),
+        );
+        let response = respond(&handler, get("/mtls-h2"));
+        assert_eq!(response.status, StatusCode::OK);
+        assert!(
+            body_string(&response).contains("version=HTTP/2.0"),
+            "client-certificate mTLS should still negotiate HTTP/2"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ca_module_file_provider_trusts_server() {
+        let directory = tempfile::tempdir().unwrap();
+        let ca = write_fixture(&directory, "ca.pem", SERVER_CERT);
+        let dial = spawn_tls_upstream(tls_acceptor(vec![b"http/1.1".to_vec()])).await;
+        let handler = build_handler(
+            &dial,
+            serde_json::json!({
+                "ca": {"provider": "file", "pem_files": [ca]},
+                "server_name": "localhost"
+            }),
+            None,
+        );
+        let response = respond(&handler, get("/ca-file"));
+        assert_eq!(response.status, StatusCode::OK);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ca_module_inline_provider_trusts_server() {
+        let certificate = crate::tls::parse_pem_certificates(SERVER_CERT.as_bytes())
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let encoded = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(certificate.as_ref())
+        };
+        let dial = spawn_tls_upstream(tls_acceptor(vec![b"http/1.1".to_vec()])).await;
+        let handler = build_handler(
+            &dial,
+            serde_json::json!({
+                "ca": {"provider": "inline", "trusted_ca_certs": [encoded]},
+                "server_name": "localhost"
+            }),
+            None,
+        );
+        let response = respond(&handler, get("/ca-inline"));
+        assert_eq!(response.status, StatusCode::OK);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ca_module_and_client_certificate_combine_for_mtls() {
+        // The `ca` module replaces the deprecated root options for server verification; the client
+        // certificate still authenticates to the mTLS server.
+        let directory = tempfile::tempdir().unwrap();
+        let ca = write_fixture(&directory, "ca.pem", SERVER_CERT);
+        let cert = write_fixture(&directory, "client.pem", CLIENT_CERT);
+        let key = write_fixture(&directory, "client-key.pem", CLIENT_KEY);
+        let dial = spawn_tls_upstream(mtls_acceptor(vec![b"http/1.1".to_vec()])).await;
+        let handler = build_handler(
+            &dial,
+            serde_json::json!({
+                "ca": {"provider": "file", "pem_files": [ca]},
+                "server_name": "localhost",
+                "client_certificate_file": cert,
+                "client_certificate_key_file": key
+            }),
+            None,
+        );
+        let response = respond(&handler, get("/ca-mtls"));
+        assert_eq!(response.status, StatusCode::OK);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn except_ports_skips_tls_for_matching_port() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = write_fixture(&directory, "root.pem", SERVER_CERT);
+        let dial = spawn_plain_upstream().await;
+        let port = dial.rsplit_once(':').unwrap().1;
+        let handler = build_handler(
+            &dial,
+            serde_json::json!({
+                "root_ca_pem_files": [root],
+                "server_name": "localhost",
+                "except_ports": [port]
+            }),
+            None,
+        );
+        assert!(
+            !handler.upstreams()[0].tls,
+            "the excepted upstream must be dialed without TLS"
+        );
+        let response = respond(&handler, get("/plain"));
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.headers["x-transport"], "plain");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn except_ports_does_not_skip_tls_for_other_ports() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = write_fixture(&directory, "root.pem", SERVER_CERT);
+        let dial = spawn_tls_upstream(tls_acceptor(vec![b"http/1.1".to_vec()])).await;
+        let handler = build_handler(
+            &dial,
+            serde_json::json!({
+                "root_ca_pem_files": [root],
+                "server_name": "localhost",
+                "except_ports": ["9"]
+            }),
+            None,
+        );
+        assert!(handler.upstreams()[0].tls);
+        let response = respond(&handler, get("/tls"));
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.headers["x-transport"], "tls");
+    }
+
+    #[test]
+    fn except_ports_and_client_cert_fields_are_parsed_from_transport() {
+        let handler = build_handler(
+            "127.0.0.1:9000",
+            serde_json::json!({
+                "insecure_skip_verify": true,
+                "except_ports": ["8080"]
+            }),
+            None,
+        );
+        // 9000 is not excepted, so the upstream still uses TLS.
+        assert!(handler.upstreams()[0].tls);
+        assert!(!handler.upstreams()[0].is_full());
+    }
+
+    #[test]
+    fn except_ports_with_fastcgi_is_rejected() {
+        let error = ReverseProxyHandler::from_json(
+            &serde_json::json!({
+                "handler": "reverse_proxy",
+                "upstreams": [{"dial": "localhost:9000"}],
+                "transport": {"protocol": "fastcgi", "except_ports": ["8080"]}
+            }),
+            "handler",
+        )
+        .err()
+        .expect("except_ports is not a fastcgi transport option");
+        assert!(error.to_string().contains("except_ports"), "{error}");
     }
 }
