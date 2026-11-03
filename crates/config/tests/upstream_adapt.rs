@@ -310,12 +310,15 @@ fn global_acme_dns_maps_to_issuer_dns_challenge() {
 
 #[test]
 fn unsupported_tls_options_are_rejected_loudly() {
+    // `client_auth`, `protocols` and `alpn` are supported now; other advanced connection-policy
+    // options stay loud (see `tls_advanced_options_fail_loudly`).
     let error =
-        adapt("example.com {\n\ttls {\n\t\tclient_auth {\n\t\t\tmode require\n\t\t}\n\t}\n}\n")
+        adapt("example.com {\n\ttls {\n\t\tinsecure_secrets_log /tmp/secrets.log\n\t}\n}\n")
             .expect_err("unsupported tls subdirective must be rejected");
     let message = error.to_string();
     assert!(
-        message.contains("`tls` option `client_auth`") && message.contains("not supported"),
+        message.contains("`tls` option `insecure_secrets_log`")
+            && message.contains("not supported"),
         "unexpected error: {message}"
     );
 }
@@ -851,6 +854,121 @@ fn map_invalid_forms_fail_loudly() {
         assert!(
             error.to_string().contains(expected),
             "error for `{directive}` should contain {expected:?}, got: {error}"
+        );
+    }
+}
+
+#[test]
+fn tls_client_auth_cert_file_matches_caddy() {
+    assert_adapts_like_caddy("tls_client_auth_cert_file.caddyfiletest");
+}
+
+#[test]
+fn tls_client_auth_inline_cert_matches_caddy() {
+    assert_adapts_like_caddy("tls_client_auth_inline_cert.caddyfiletest");
+}
+
+#[test]
+fn tls_client_auth_inline_cert_legacy_matches_caddy() {
+    assert_adapts_like_caddy("tls_client_auth_inline_cert-legacy.caddyfiletest");
+}
+
+fn client_auth_policy(caddyfile: &str) -> Value {
+    let adapted = adapt(caddyfile).unwrap_or_else(|e| panic!("adapt: {e}"));
+    adapted.config["apps"]["http"]["servers"]["srv0"]["tls_connection_policies"][0]
+        ["client_authentication"]
+        .clone()
+}
+
+#[test]
+fn tls_client_auth_modes_match_real_caddy_v2_11_7() {
+    for mode in [
+        "request",
+        "require",
+        "verify_if_given",
+        "require_and_verify",
+    ] {
+        let policy = client_auth_policy(&format!(
+            "localhost {{\n\ttls {{\n\t\tclient_auth {{\n\t\t\tmode {mode}\n\t\t}}\n\t}}\n}}\n"
+        ));
+        assert_eq!(policy, json!({"mode": mode}));
+    }
+}
+
+#[test]
+fn tls_client_auth_trust_pool_inline_and_file_match_real_caddy_v2_11_7() {
+    let der = "MIIBvDCCAWOgAwIBAgIUYoRWmsXmyWi7ReCOwK4PUufOf/QwCgYIKoZIzj0EAwIwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MTAzMTIxMTk0OVoXDTM2MTAyODIxMTk0OVowFDESMBAGA1UEAwwJbG9jYWxob3N0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEFbTRBdAX7WxPQs1D5sHuWV/3VKzbRc9QJ4cxCv61IgvqLmaOxLiPe+uQLyDsX1/a9F1hC+oqfq0HrFU0uGvCGaOBkjCBjzAdBgNVHQ4EFgQUsk16OWiO/BeyggEk4KQ+zT/8PeUwHwYDVR0jBBgwFoAUsk16OWiO/BeyggEk4KQ+zT/8PeUwGgYDVR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMAwGA1UdEwEB/wQCMAAwDgYDVR0PAQH/BAQDAgeAMBMGA1UdJQQMMAoGCCsGAQUFBwMBMAoGCCqGSM49BAMCA0cAMEQCIDpAI8Itus5El0I4/VoCEmKH+1DqFq+Mz2kLwEUyG65OAiB69hDwqMoKucYcfywINUgq+g+T6pU4qOjKp0Vir8EVCw==";
+    assert_eq!(
+        client_auth_policy(&format!(
+            "localhost {{\n\ttls {{\n\t\tclient_auth {{\n\t\t\ttrust_pool inline {{\n\t\t\t\ttrust_der {der}\n\t\t\t}}\n\t\t}}\n\t}}\n}}\n"
+        )),
+        json!({"ca": {"provider": "inline", "trusted_ca_certs": [der]}})
+    );
+    assert_eq!(
+        client_auth_policy(
+            "localhost {\n\ttls {\n\t\tclient_auth {\n\t\t\ttrust_pool file {\n\t\t\t\tpem_file ca.pem\n\t\t\t}\n\t\t}\n\t}\n}\n"
+        ),
+        json!({"ca": {"provider": "file", "pem_files": ["ca.pem"]}})
+    );
+}
+
+#[test]
+fn tls_protocols_map_to_runtime_array_and_alpn_matches_caddy() {
+    // `alpn` matches Caddy's JSON exactly. `protocols` is a documented adapter divergence: Caddy
+    // emits `protocol_min`/`protocol_max`, which the caddy-rs TLS terminator rejects
+    // (TLS-CONN-POLICY), so the adapter emits the runtime's `protocols` array instead. The
+    // translated values are equivalent (tls1.2..tls1.3 inclusive).
+    let adapted =
+        adapt("localhost {\n\ttls {\n\t\tprotocols tls1.2 tls1.3\n\t\talpn h2 http/1.1\n\t}\n}\n")
+            .expect("adapt protocols/alpn");
+    assert_eq!(
+        adapted.config["apps"]["http"]["servers"]["srv0"]["tls_connection_policies"][0],
+        json!({
+            "match": {"sni": ["localhost"]},
+            "protocols": ["tls1.2", "tls1.3"],
+            "alpn": ["h2", "http/1.1"],
+        })
+    );
+    let single = adapt("localhost {\n\ttls {\n\t\tprotocols tls1.3\n\t}\n}\n")
+        .expect("adapt single protocol");
+    assert_eq!(
+        single.config["apps"]["http"]["servers"]["srv0"]["tls_connection_policies"][0]["protocols"],
+        json!(["tls1.3"])
+    );
+}
+
+#[test]
+fn tls_advanced_options_fail_loudly() {
+    for (caddyfile, expected) in [
+        (
+            "localhost {\n\ttls {\n\t\tciphers TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256\n\t}\n}\n",
+            "TLS-CIPHER-SUITES",
+        ),
+        (
+            "localhost {\n\ttls {\n\t\tcurves x25519\n\t}\n}\n",
+            "TLS-CURVES",
+        ),
+        (
+            "localhost {\n\ttls {\n\t\tclient_auth {\n\t\t\tverifier leaf\n\t\t}\n\t}\n}\n",
+            "TLS-CLIENT-AUTH",
+        ),
+        (
+            "localhost {\n\ttls {\n\t\tclient_auth {\n\t\t\ttrust_pool combined { }\n\t\t}\n\t}\n}\n",
+            "provider `combined` is not supported",
+        ),
+        (
+            "localhost {\n\ttls {\n\t\tclient_auth {\n\t\t\tmode bogus\n\t\t}\n\t}\n}\n",
+            "unsupported client authentication mode",
+        ),
+        (
+            "*.example.com {\n\ttls {\n\t\tclient_auth {\n\t\t\tmode request\n\t\t}\n\t}\n}\n",
+            "wildcard hostnames",
+        ),
+    ] {
+        let error = adapt(caddyfile).expect_err("must fail");
+        assert!(
+            error.to_string().contains(expected),
+            "expected {expected:?} in {error}"
         );
     }
 }

@@ -80,7 +80,7 @@ pub fn adapt_with_source(
     let site_tls: Vec<Option<SiteTls>> = file
         .sites
         .iter()
-        .map(parse_site_tls)
+        .map(|site| parse_site_tls(site, source))
         .collect::<caddy_rs_core::Result<_>>()?;
 
     // Site-level `bind` and `log` directives configure the listener and server log association
@@ -725,6 +725,16 @@ struct SiteTls {
     key_type: Option<String>,
     /// `tls { issuer internal { ... } }` options (in addition to the `tls internal` shorthand).
     internal: Option<InternalIssuerOptions>,
+    /// `tls { client_auth { ... } }` canonical `client_authentication` JSON.
+    client_auth: Option<Value>,
+    /// `tls { alpn <protocols...> }`.
+    alpn: Option<Vec<String>>,
+    /// `tls { protocols <min> [<max>] }`, translated to the runtime's `protocols` array.
+    ///
+    /// Caddy's adapted JSON spells this `protocol_min`/`protocol_max`, which the caddy-rs TLS
+    /// terminator does not accept yet; emitting the array keeps the adapted config executable.
+    /// Registered adapter divergence until the runtime grows min/max support (TLS-CONN-POLICY).
+    protocols: Option<Vec<String>>,
 }
 
 /// Options of `tls { issuer internal { ... } }` (Caddy's `tls.issuance.internal`).
@@ -883,7 +893,10 @@ fn pki_key_pair_json(pair: &parser::PkiKeyPairConfig) -> Value {
 
 /// Parse the `tls` directive of a site block. Only the documented subset is implemented; other
 /// forms fail loudly.
-fn parse_site_tls(site: &SiteBlock) -> caddy_rs_core::Result<Option<SiteTls>> {
+fn parse_site_tls(
+    site: &SiteBlock,
+    source: Option<&std::path::Path>,
+) -> caddy_rs_core::Result<Option<SiteTls>> {
     let mut found: Option<&Directive> = None;
     for directive in &site.directives {
         if directive.name != "tls" {
@@ -1056,6 +1069,100 @@ fn parse_site_tls(site: &SiteBlock) -> caddy_rs_core::Result<Option<SiteTls>> {
                 }
                 config.internal = Some(internal);
             }
+            "client_auth" => {
+                if config.client_auth.is_some() {
+                    return Err(adapter_error(
+                        option.position,
+                        "duplicate tls option 'client_auth'",
+                    ));
+                }
+                config.client_auth = Some(parse_client_auth_option(option, source)?);
+            }
+            "alpn" => {
+                if config.alpn.is_some() {
+                    return Err(adapter_error(
+                        option.position,
+                        "duplicate tls option 'alpn'",
+                    ));
+                }
+                if option.args.is_empty() || !option.block.is_empty() {
+                    return Err(adapter_error(
+                        option.position,
+                        "`alpn` requires one or more protocol names",
+                    ));
+                }
+                config.alpn = Some(option.args.clone());
+            }
+            "protocols" => {
+                if config.protocols.is_some() {
+                    return Err(adapter_error(
+                        option.position,
+                        "duplicate tls option 'protocols'",
+                    ));
+                }
+                if !option.block.is_empty() {
+                    return Err(adapter_error(
+                        option.position,
+                        "`protocols` does not take a block",
+                    ));
+                }
+                const VERSIONS: [&str; 2] = ["tls1.2", "tls1.3"];
+                let index_of = |version: &str| {
+                    VERSIONS
+                        .iter()
+                        .position(|candidate| *candidate == version)
+                        .ok_or_else(|| {
+                            adapter_error(
+                                option.position,
+                                format!(
+                                    "unsupported TLS protocol `{version}`; expected `tls1.2` or \
+                                     `tls1.3`"
+                                ),
+                            )
+                        })
+                };
+                let protocols: Vec<String> = match option.args.as_slice() {
+                    [min] => {
+                        let start = index_of(min)?;
+                        VERSIONS[start..].iter().map(|v| v.to_string()).collect()
+                    }
+                    [min, max] => {
+                        let start = index_of(min)?;
+                        let end = index_of(max)?;
+                        if start > end {
+                            return Err(adapter_error(
+                                option.position,
+                                "`protocols` minimum version is newer than the maximum version",
+                            ));
+                        }
+                        VERSIONS[start..=end]
+                            .iter()
+                            .map(|v| v.to_string())
+                            .collect()
+                    }
+                    _ => {
+                        return Err(adapter_error(
+                            option.position,
+                            "`protocols` takes one or two values (min [max])",
+                        ))
+                    }
+                };
+                config.protocols = Some(protocols);
+            }
+            "ciphers" => {
+                return Err(adapter_error(
+                    option.position,
+                    "`tls` option `ciphers` is not supported by this build: the rustls terminator \
+                     has no cipher-suite selection configuration (tracked as TLS-CIPHER-SUITES)",
+                ))
+            }
+            "curves" => {
+                return Err(adapter_error(
+                    option.position,
+                    "`tls` option `curves` is not supported by this build: the rustls terminator \
+                     has no key-exchange-group selection configuration (tracked as TLS-CURVES)",
+                ))
+            }
             other => {
                 return Err(adapter_error(
                     option.position,
@@ -1063,6 +1170,19 @@ fn parse_site_tls(site: &SiteBlock) -> caddy_rs_core::Result<Option<SiteTls>> {
                 ))
             }
         }
+    }
+    if config.client_auth.is_some()
+        && site
+            .addresses
+            .iter()
+            .any(|address| address.host.contains('*'))
+    {
+        return Err(adapter_error(
+            position,
+            "`client_auth` on wildcard hostnames requires Caddy's TLS shield-policy hoisting, \
+             which is not supported by this build (tracked as TLS-CLIENT-AUTH); use explicit \
+             hostnames",
+        ));
     }
     if config.internal_options().is_some() && (config.ca.is_some() || config.dns.is_some()) {
         return Err(adapter_error(
@@ -1077,6 +1197,337 @@ fn parse_site_tls(site: &SiteBlock) -> caddy_rs_core::Result<Option<SiteTls>> {
         ));
     }
     Ok(Some(config))
+}
+
+/// Parse a `tls { client_auth { ... } }` block into Caddy's canonical
+/// `client_authentication` JSON: `mode`, legacy `trusted_ca_cert`/`trusted_leaf_cert` fields
+/// (file variants are read at adapt time, as Caddy does), and the `trust_pool inline|file`
+/// modules. Unsupported providers/verifiers fail loudly.
+fn parse_client_auth_option(
+    option: &Directive,
+    source: Option<&std::path::Path>,
+) -> caddy_rs_core::Result<Value> {
+    let base = source
+        .and_then(std::path::Path::parent)
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let mut mode: Option<String> = None;
+    let mut trusted_ca: Vec<String> = Vec::new();
+    let mut trusted_leaf: Vec<String> = Vec::new();
+    let mut ca_pool: Option<Value> = None;
+    let mut saw_legacy_ca = false;
+    for sub in &option.block {
+        match sub.name.as_str() {
+            "mode" => {
+                if sub.args.len() != 1 || !sub.block.is_empty() {
+                    return Err(adapter_error(
+                        sub.position,
+                        "`client_auth` `mode` requires exactly one value",
+                    ));
+                }
+                match sub.args[0].as_str() {
+                    "request" | "require" | "verify_if_given" | "require_and_verify" => {
+                        mode = Some(sub.args[0].clone());
+                    }
+                    other => {
+                        return Err(adapter_error(
+                            sub.position,
+                            format!(
+                                "unsupported client authentication mode `{other}`; expected \
+                                 request, require, verify_if_given or require_and_verify"
+                            ),
+                        ))
+                    }
+                }
+            }
+            "trusted_ca_cert" => {
+                if ca_pool.is_some() {
+                    return Err(adapter_error(
+                        sub.position,
+                        "cannot specify both 'trust_pool' and 'trusted_ca_cert' or \
+                         'trusted_ca_cert_file'",
+                    ));
+                }
+                if sub.args.len() != 1 || !sub.block.is_empty() {
+                    return Err(adapter_error(
+                        sub.position,
+                        "`trusted_ca_cert` requires exactly one base64 DER value",
+                    ));
+                }
+                saw_legacy_ca = true;
+                trusted_ca.push(sub.args[0].clone());
+            }
+            "trusted_ca_cert_file" => {
+                if ca_pool.is_some() {
+                    return Err(adapter_error(
+                        sub.position,
+                        "cannot specify both 'trust_pool' and 'trusted_ca_cert' or \
+                         'trusted_ca_cert_file'",
+                    ));
+                }
+                if sub.args.len() != 1 || !sub.block.is_empty() {
+                    return Err(adapter_error(
+                        sub.position,
+                        "`trusted_ca_cert_file` requires exactly one PEM file",
+                    ));
+                }
+                saw_legacy_ca = true;
+                trusted_ca.extend(read_pem_certificates(
+                    &base.join(&sub.args[0]),
+                    sub.position,
+                )?);
+            }
+            "trusted_leaf_cert" => {
+                if sub.args.len() != 1 || !sub.block.is_empty() {
+                    return Err(adapter_error(
+                        sub.position,
+                        "`trusted_leaf_cert` requires exactly one base64 DER value",
+                    ));
+                }
+                trusted_leaf.push(sub.args[0].clone());
+            }
+            "trusted_leaf_cert_file" => {
+                if sub.args.len() != 1 || !sub.block.is_empty() {
+                    return Err(adapter_error(
+                        sub.position,
+                        "`trusted_leaf_cert_file` requires exactly one PEM file",
+                    ));
+                }
+                trusted_leaf.extend(read_pem_certificates(
+                    &base.join(&sub.args[0]),
+                    sub.position,
+                )?);
+            }
+            "trust_pool" => {
+                if !trusted_ca.is_empty() {
+                    return Err(adapter_error(
+                        sub.position,
+                        "cannot specify both 'trust_pool' and 'trusted_ca_cert' or \
+                         'trusted_ca_cert_file'",
+                    ));
+                }
+                if ca_pool.is_some() {
+                    return Err(adapter_error(sub.position, "duplicate `trust_pool`"));
+                }
+                let Some(provider) = sub.args.first() else {
+                    return Err(adapter_error(
+                        sub.position,
+                        "`trust_pool` requires a provider module",
+                    ));
+                };
+                ca_pool = Some(match provider.as_str() {
+                    "inline" => {
+                        let mut certs = Vec::new();
+                        for entry in &sub.block {
+                            if entry.name != "trust_der" {
+                                return Err(adapter_error(
+                                    entry.position,
+                                    format!(
+                                        "`trust_pool inline` option `{}` is not supported by this \
+                                         build",
+                                        entry.name
+                                    ),
+                                ));
+                            }
+                            if entry.args.len() != 1 || !entry.block.is_empty() {
+                                return Err(adapter_error(
+                                    entry.position,
+                                    "`trust_der` requires exactly one base64 DER value",
+                                ));
+                            }
+                            certs.push(json!(entry.args[0]));
+                        }
+                        json!({"provider": "inline", "trusted_ca_certs": certs})
+                    }
+                    "file" => {
+                        let mut files = Vec::new();
+                        for entry in &sub.block {
+                            if entry.name != "pem_file" {
+                                return Err(adapter_error(
+                                    entry.position,
+                                    format!(
+                                        "`trust_pool file` option `{}` is not supported by this \
+                                         build",
+                                        entry.name
+                                    ),
+                                ));
+                            }
+                            if entry.args.len() != 1 || !entry.block.is_empty() {
+                                return Err(adapter_error(
+                                    entry.position,
+                                    "`pem_file` requires exactly one path",
+                                ));
+                            }
+                            files.push(json!(entry.args[0]));
+                        }
+                        json!({"provider": "file", "pem_files": files})
+                    }
+                    other => {
+                        return Err(adapter_error(
+                            sub.position,
+                            format!(
+                                "client-auth trust pool provider `{other}` is not supported by \
+                                 this build (runtime supports `inline` and `file`; tracked as \
+                                 TLS-CLIENT-AUTH)"
+                            ),
+                        ))
+                    }
+                });
+            }
+            "verifier" => {
+                return Err(adapter_error(
+                    sub.position,
+                    "custom client-auth verifiers (`verifier`) are not supported by this build \
+                     (tracked as TLS-CLIENT-AUTH)",
+                ))
+            }
+            other => {
+                return Err(adapter_error(
+                    sub.position,
+                    format!("unknown subdirective for client_auth: {other}"),
+                ))
+            }
+        }
+    }
+    let mut object = Map::new();
+    if let Some(pool) = ca_pool {
+        object.insert("ca".to_string(), pool);
+    } else if saw_legacy_ca {
+        object.insert(
+            "ca".to_string(),
+            json!({"provider": "inline", "trusted_ca_certs": trusted_ca}),
+        );
+    }
+    if !trusted_leaf.is_empty() {
+        object.insert("trusted_leaf_certs".to_string(), json!(trusted_leaf));
+    }
+    if let Some(mode) = mode {
+        object.insert("mode".to_string(), json!(mode));
+    }
+    Ok(Value::Object(object))
+}
+
+/// Read a PEM file and return every `CERTIFICATE` block as base64 DER, matching Caddy's
+/// `convertPEMFilesToDER` (which the deprecated `trusted_ca_cert_file`/`trusted_leaf_cert_file`
+/// options use at adapt time).
+fn read_pem_certificates(
+    path: &std::path::Path,
+    position: Position,
+) -> caddy_rs_core::Result<Vec<String>> {
+    let pem = std::fs::read_to_string(path).map_err(|error| {
+        adapter_error(
+            position,
+            format!(
+                "`trusted_ca_cert_file`/`trusted_leaf_cert_file` requires a readable PEM file at \
+                 adapt time; reading `{}` failed: {error}",
+                path.display()
+            ),
+        )
+    })?;
+    let mut certificates = Vec::new();
+    let mut lines = pem.lines();
+    while let Some(line) = lines.next() {
+        if line.trim() != "-----BEGIN CERTIFICATE-----" {
+            continue;
+        }
+        let mut body = String::new();
+        let mut closed = false;
+        for line in lines.by_ref() {
+            if line.trim() == "-----END CERTIFICATE-----" {
+                closed = true;
+                break;
+            }
+            body.push_str(line.trim());
+        }
+        if !closed {
+            return Err(adapter_error(
+                position,
+                format!(
+                    "PEM file `{}` has an unterminated certificate",
+                    path.display()
+                ),
+            ));
+        }
+        let der = base64_decode(&body).ok_or_else(|| {
+            adapter_error(
+                position,
+                format!("PEM file `{}` contains invalid base64", path.display()),
+            )
+        })?;
+        certificates.push(base64_encode(&der));
+    }
+    if certificates.is_empty() {
+        return Err(adapter_error(
+            position,
+            format!("PEM file `{}` contains no certificates", path.display()),
+        ));
+    }
+    Ok(certificates)
+}
+
+const BASE64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn base64_encode(input: &[u8]) -> String {
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(BASE64_ALPHABET[((triple >> 18) & 0x3f) as usize] as char);
+        out.push(BASE64_ALPHABET[((triple >> 12) & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(BASE64_ALPHABET[((triple >> 6) & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(BASE64_ALPHABET[(triple & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    let mut values = Vec::with_capacity(input.len());
+    for byte in input.bytes() {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => continue,
+            b'\n' | b'\r' | b' ' | b'\t' => continue,
+            _ => return None,
+        };
+        values.push(value as u32);
+    }
+    let mut out = Vec::with_capacity(values.len() * 3 / 4);
+    for chunk in values.chunks(4) {
+        match chunk.len() {
+            4 => {
+                let triple = (chunk[0] << 18) | (chunk[1] << 12) | (chunk[2] << 6) | chunk[3];
+                out.push((triple >> 16) as u8);
+                out.push((triple >> 8) as u8);
+                out.push(triple as u8);
+            }
+            3 => {
+                let triple = (chunk[0] << 18) | (chunk[1] << 12) | (chunk[2] << 6);
+                out.push((triple >> 16) as u8);
+                out.push((triple >> 8) as u8);
+            }
+            2 => {
+                let triple = (chunk[0] << 18) | (chunk[1] << 12);
+                out.push((triple >> 16) as u8);
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
 }
 
 /// `certmagic.DefaultIssuers`: the default ACME issuer, plus Zerossl when an email is set.
@@ -1703,7 +2154,19 @@ fn build_tls_plan(
                         json!({"any_tag": [tag]}),
                     );
                 }
-                if connection_policy.contains_key("certificate_selection") {
+                if let Some(client_auth) = &tls.client_auth {
+                    connection_policy
+                        .insert("client_authentication".to_string(), client_auth.clone());
+                }
+                if let Some(alpn) = &tls.alpn {
+                    connection_policy.insert("alpn".to_string(), json!(alpn));
+                }
+                if let Some(protocols) = &tls.protocols {
+                    connection_policy.insert("protocols".to_string(), json!(protocols));
+                }
+                let has_listener_options =
+                    tls.client_auth.is_some() || tls.alpn.is_some() || tls.protocols.is_some();
+                if connection_policy.contains_key("certificate_selection") || has_listener_options {
                     if hosts.is_empty() {
                         state.has_catch_all = true;
                     }
