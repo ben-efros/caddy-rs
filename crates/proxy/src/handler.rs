@@ -9,8 +9,18 @@
 //!   Prior values are only trusted when the peer is in `trusted_proxies`.
 //! * `Via` is appended to the upstream response, matching Caddy.
 //!
-//! Upstreams may be `host:port` TCP dials or Unix sockets (`unix//path`); the shared
-//! [`crate::client::HttpClient`] selects the transport from the outbound URI.
+//! Upstreams may be `host:port` TCP dials or Unix sockets (`unix//path`); the client selects the
+//! transport from the outbound URI.
+//!
+//! Request bodies follow the `T-PROXY-039` capability policy: handlers that can retry
+//! (`retries`/`try_duration`) or that run `handle_response` buffer the body once and replay it,
+//! while every other handler streams the body exactly once (`Request::take_body`). A retry that
+//! would require replaying an already-streamed body fails loudly with a 502 instead of forwarding
+//! an empty body.
+//!
+//! For HTTP/2-capable transports the outbound URI authority is the original request `Host` (so
+//! HTTP/2 `:authority` matches Caddy/Go) while a per-upstream client connector still dials the
+//! configured upstream target; no separate `Host` field is forwarded on h2.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -19,19 +29,20 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Version};
+#[cfg(test)]
 use http_body_util::Full;
 use serde_json::Value;
 
 use hyper_util::rt::TokioIo;
 
 use caddy_rs_http::{
-    body::{Body, StreamingBody, StreamingResponse},
+    body::{Body, RequestBody, StreamingBody, StreamingResponse},
     requested_upgrade_type, CustomHandlerFactory, Error as HttpError, Handler, Outcome, Request,
     Response, Result as HttpResult, StreamingOutcome, Tunnel, UpgradedResponse,
 };
 
 use crate::balancer::{self, Balancer};
-use crate::client::{build_client_with_transport, HttpClient};
+use crate::client::{build_upstream_client, UpstreamClient};
 use crate::forward_auth::{HandleResponse, HandleResponseResult, RequestRewrite};
 use crate::health::{HealthCheck, HealthCheckScheduler};
 use crate::passive::PassiveHealth;
@@ -208,11 +219,16 @@ impl IpNet {
 
 /// Reverse proxy handler configuration and runtime.
 pub struct ReverseProxyHandler {
-    client: HttpClient,
-    /// HTTP/1.1-only companion client used for protocol-upgrade (WebSocket) requests when the
+    /// One client per upstream. Each connector dials its bound upstream target, so the request URI
+    /// authority can carry the client's Host (HTTP/2 `:authority` parity) without affecting which
+    /// target is dialed.
+    clients: Vec<UpstreamClient>,
+    /// HTTP/1.1-only companion clients used for protocol-upgrade (WebSocket) requests when the
     /// configured upstream transport prefers HTTP/2 (ALPN h2 or h2c). HTTP/1.1 upgrades cannot be
     /// carried over HTTP/2, and Caddy likewise disables ALPN h2 for upgradable connections.
-    upgrade_client: Option<HttpClient>,
+    upgrade_clients: Option<Vec<UpstreamClient>>,
+    /// Parsed transport configuration (TLS client config and HTTP version policy).
+    transport: TransportConfig,
     upstreams: Vec<Arc<Upstream>>,
     balancer: Box<dyn Balancer>,
     request_header_ops: HeaderOps,
@@ -309,7 +325,13 @@ impl ReverseProxyHandler {
             &format!("{path}.load_balancing.retry_match"),
         )?;
 
-        let (client, upgrade_client) = build_transport_clients(&transport);
+        let clients = build_upstream_clients(&upstreams, &transport, path)?;
+        let h2_capable = transport.alpn_h2 || transport.h2c;
+        let upgrade_clients = if h2_capable {
+            Some(build_upgrade_clients(&upstreams, &transport, path)?)
+        } else {
+            None
+        };
 
         let header_config = parse_headers(object.get("headers"), path)?;
 
@@ -329,8 +351,9 @@ impl ReverseProxyHandler {
         )?;
 
         Ok(Self {
-            client,
-            upgrade_client,
+            clients,
+            upgrade_clients,
+            transport,
             upstreams,
             balancer,
             request_header_ops: header_config.request,
@@ -365,8 +388,8 @@ impl ReverseProxyHandler {
 
     /// The outbound client (TLS-aware), exposed for crate-level health-check tests.
     #[cfg(test)]
-    pub(crate) fn client(&self) -> &HttpClient {
-        &self.client
+    pub(crate) fn client(&self) -> &UpstreamClient {
+        &self.clients[0]
     }
 
     /// Passive health-check state, when `health_checks.passive` is configured.
@@ -381,11 +404,13 @@ impl ReverseProxyHandler {
     /// free of runtime-lifetime concerns while making the scheduler drivable by the server crate.
     pub fn spawn_health_checks(&self) -> Option<HealthCheckScheduler> {
         self.health_check.as_ref().map(|check| {
-            HealthCheckScheduler::spawn(
-                Arc::clone(check),
-                self.upstreams.clone(),
-                self.client.clone(),
-            )
+            let targets = self
+                .upstreams
+                .iter()
+                .cloned()
+                .zip(self.clients.iter().cloned())
+                .collect();
+            HealthCheckScheduler::spawn(Arc::clone(check), targets)
         })
     }
 
@@ -397,8 +422,9 @@ impl ReverseProxyHandler {
     /// upstream transfer.
     async fn forward_streaming(
         &self,
-        upstream: &Upstream,
+        upstream: &Arc<Upstream>,
         request: &Request,
+        body: RequestBody,
     ) -> Result<Forwarded, ProxyError> {
         // `forward_auth` (and any configured `rewrite`) changes only the auth sub-request: the
         // original request is untouched so later handlers still see the client's method/URI/body.
@@ -414,22 +440,46 @@ impl ReverseProxyHandler {
                     .to_string(),
             ),
         };
+        // Canonical `forward_auth` rewrites the method to GET, which drops the sub-request body
+        // (the original request body stays untouched for later handlers).
         let body = match &self.rewrite {
-            Some(rewrite) if rewrite.drops_body() => Bytes::new(),
-            _ => request.body.clone(),
+            Some(rewrite) if rewrite.drops_body() => RequestBody::empty(),
+            _ => body,
         };
-        let url = upstream.url(&path_and_query);
-        let headers = self.outbound_headers(request, upstream)?;
+        let mut headers = self.outbound_headers(request, upstream)?;
+        let url = if self.h2_capable() {
+            // HTTP/2 `:authority` parity with Caddy/Go: use the original request Host (or a
+            // header_up Host override) as the URI authority; the bound per-upstream connector
+            // still dials the configured target. The Host field is not forwarded separately.
+            let host = headers
+                .get(http::header::HOST)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+                .or_else(|| request.host().map(str::to_string))
+                .unwrap_or_else(|| upstream.fallback_host().to_string());
+            headers.remove(http::header::HOST);
+            let scheme = if self.transport.tls.is_some() {
+                "https"
+            } else {
+                "http"
+            };
+            format!("{scheme}://{host}{path_and_query}")
+        } else {
+            upstream.url(&path_and_query)
+        };
 
         let mut outbound = hyper::Request::builder()
             .method(method)
             .uri(url)
-            .body(Full::new(body))
+            .body(body)
             .map_err(|error| ProxyError::Request(error.to_string()))?;
         *outbound.headers_mut() = headers;
 
         let started = std::time::Instant::now();
-        let mut response = self.upstream_client(request).request(outbound).await?;
+        let mut response = self
+            .upstream_client(upstream, request)
+            .request(outbound)
+            .await?;
         let latency = started.elapsed();
         let status = response.status();
         let version = response.version();
@@ -487,10 +537,11 @@ impl ReverseProxyHandler {
     /// ([`Handler::handle_streaming`]) uses [`Self::forward_streaming`] directly.
     async fn forward(
         &self,
-        upstream: &Upstream,
+        upstream: &Arc<Upstream>,
         request: &Request,
+        body: RequestBody,
     ) -> Result<ForwardedResponse, ProxyError> {
-        let forwarded = match self.forward_streaming(upstream, request).await? {
+        let forwarded = match self.forward_streaming(upstream, request, body).await? {
             Forwarded::Streaming(forwarded) => forwarded,
             Forwarded::Upgrade(_) => return Err(ProxyError::UpgradeNotSupported),
         };
@@ -507,17 +558,50 @@ impl ReverseProxyHandler {
         })
     }
 
-    /// The client used for this request.
+    /// The per-upstream client used for this request.
     ///
     /// Protocol-upgrade (WebSocket) requests go through the HTTP/1.1-only companion client when
     /// the main upstream transport prefers HTTP/2: HTTP/1.1 upgrades cannot be expressed over
     /// HTTP/2, and Caddy likewise disables ALPN h2 for upgradable connections.
-    fn upstream_client(&self, request: &Request) -> &HttpClient {
-        match &self.upgrade_client {
-            Some(upgrade) if caddy_rs_http::requested_upgrade_type(&request.headers).is_some() => {
-                upgrade
+    fn upstream_client(&self, upstream: &Arc<Upstream>, request: &Request) -> &UpstreamClient {
+        let index = self
+            .upstreams
+            .iter()
+            .position(|candidate| Arc::ptr_eq(candidate, upstream))
+            .unwrap_or(0);
+        if requested_upgrade_type(&request.headers).is_some() {
+            if let Some(upgrade_clients) = &self.upgrade_clients {
+                return &upgrade_clients[index];
             }
-            _ => &self.client,
+        }
+        &self.clients[index]
+    }
+
+    /// Whether the transport prefers HTTP/2 (TLS ALPN h2 or cleartext h2c).
+    fn h2_capable(&self) -> bool {
+        self.transport.alpn_h2 || self.transport.h2c
+    }
+
+    /// Prepare the outbound request body for one proxy attempt (`T-PROXY-040`).
+    ///
+    /// A retry-capable handler buffers the body once before the loop and replays it; otherwise the
+    /// streaming body is taken out exactly once. A second streaming attempt cannot be replayed, so
+    /// it fails loudly instead of silently forwarding an empty body.
+    fn attempt_body(
+        &self,
+        request: &mut Request,
+        buffered: bool,
+        stream_taken: &mut bool,
+    ) -> Result<RequestBody, &'static str> {
+        if buffered {
+            Ok(RequestBody::buffered(request.body.clone()))
+        } else if *stream_taken {
+            Err(
+                "request body was already streamed to an upstream and cannot be replayed for a retry",
+            )
+        } else {
+            *stream_taken = true;
+            Ok(request.take_body())
         }
     }
 
@@ -534,14 +618,20 @@ impl ReverseProxyHandler {
             headers.insert(http::header::TE, HeaderValue::from_static("trailers"));
         }
 
-        // Caddy forwards the client's Host header unchanged; the URI authority is only the dial
-        // target. A request without a Host falls back to the upstream address (or `localhost`
-        // for Unix sockets), matching what Go's transport does.
-        let host = request.host().unwrap_or_else(|| upstream.fallback_host());
-        headers.insert(
-            http::header::HOST,
-            HeaderValue::from_str(host).map_err(|error| ProxyError::Request(error.to_string()))?,
-        );
+        // Caddy forwards the client's Host unchanged. For HTTP/1.1-only transports it becomes an
+        // explicit `Host` field (the URI authority is the dial target). For HTTP/2-capable
+        // transports the Host is carried by the URI authority instead — hyper/HTTP2 derives
+        // `:authority` from it — and no separate `Host` field is sent, matching Go's h2 client.
+        if self.h2_capable() {
+            headers.remove(http::header::HOST);
+        } else {
+            let host = request.host().unwrap_or_else(|| upstream.fallback_host());
+            headers.insert(
+                http::header::HOST,
+                HeaderValue::from_str(host)
+                    .map_err(|error| ProxyError::Request(error.to_string()))?,
+            );
+        }
 
         self.add_forwarded_headers(&mut headers, request, upstream)?;
 
@@ -805,7 +895,34 @@ impl Handler for ReverseProxyHandler {
         "reverse_proxy"
     }
 
+    /// `T-PROXY-039` capability policy: a handler that can retry (`retries`/`try_duration`) or
+    /// run `handle_response` routes needs the complete request body buffered before dispatch so it
+    /// can be replayed. Otherwise the proxy streams the body exactly once.
+    fn requires_buffered_request_body(&self) -> bool {
+        self.retries > 0 || !self.try_duration.is_zero() || self.handle_response.is_configured()
+    }
+
     async fn handle(&self, request: Request) -> HttpResult<Outcome> {
+        let mut request = request;
+        let buffered_body = self.requires_buffered_request_body();
+        if buffered_body {
+            match request.collect_body(None).await {
+                Ok(_) => {}
+                Err(caddy_rs_http::body::BodyError::TooLarge { .. }) => {
+                    return Ok(Outcome::Respond(Response::text(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "413 Request Entity Too Large",
+                    )))
+                }
+                Err(error) => {
+                    return Ok(Outcome::Respond(Response::text(
+                        StatusCode::BAD_GATEWAY,
+                        format!("502 Bad Gateway: cannot read request body: {error}"),
+                    )))
+                }
+            }
+        }
+        let mut stream_taken = false;
         let deadline = if self.try_duration.is_zero() {
             None
         } else {
@@ -837,7 +954,16 @@ impl Handler for ReverseProxyHandler {
                 continue;
             };
             let _guard = upstream.connection_started();
-            match self.forward(&upstream, &request).await {
+            let body = match self.attempt_body(&mut request, buffered_body, &mut stream_taken) {
+                Ok(body) => body,
+                Err(message) => {
+                    return Ok(Outcome::Respond(Response::text(
+                        StatusCode::BAD_GATEWAY,
+                        format!("502 Bad Gateway: {message}"),
+                    )))
+                }
+            };
+            match self.forward(&upstream, &request, body).await {
                 Ok(forwarded) => {
                     // Caddy applies passive response checks before deciding on retry_match, so an
                     // unhealthy_status strike is recorded even when the response is retried.
@@ -934,6 +1060,30 @@ impl Handler for ReverseProxyHandler {
     /// buffered path; the only difference is that the body is not collected. A retried response
     /// drops its upstream body, cancelling the upstream transfer.
     async fn handle_streaming(&self, request: Request) -> HttpResult<StreamingOutcome> {
+        let mut request = request;
+        let buffered_body = self.requires_buffered_request_body();
+        if buffered_body {
+            match request.collect_body(None).await {
+                Ok(_) => {}
+                Err(caddy_rs_http::body::BodyError::TooLarge { .. }) => {
+                    return Ok(StreamingOutcome::Respond(StreamingResponse::from_buffered(
+                        Response::text(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            "413 Request Entity Too Large",
+                        ),
+                    )))
+                }
+                Err(error) => {
+                    return Ok(StreamingOutcome::Respond(StreamingResponse::from_buffered(
+                        Response::text(
+                            StatusCode::BAD_GATEWAY,
+                            format!("502 Bad Gateway: cannot read request body: {error}"),
+                        ),
+                    )))
+                }
+            }
+        }
+        let mut stream_taken = false;
         let deadline = if self.try_duration.is_zero() {
             None
         } else {
@@ -959,7 +1109,18 @@ impl Handler for ReverseProxyHandler {
                 continue;
             };
             let _guard = upstream.connection_started();
-            match self.forward_streaming(&upstream, &request).await {
+            let body = match self.attempt_body(&mut request, buffered_body, &mut stream_taken) {
+                Ok(body) => body,
+                Err(message) => {
+                    return Ok(StreamingOutcome::Respond(StreamingResponse::from_buffered(
+                        Response::text(
+                            StatusCode::BAD_GATEWAY,
+                            format!("502 Bad Gateway: {message}"),
+                        ),
+                    )))
+                }
+            };
+            match self.forward_streaming(&upstream, &request, body).await {
                 Ok(Forwarded::Upgrade(forwarded)) => {
                     if let Some(passive) = &self.passive {
                         passive.record_response(
@@ -1266,17 +1427,37 @@ struct TransportConfig {
     alpn_h2: bool,
 }
 
-/// Build the main client and, when the transport prefers HTTP/2, the h1-only companion used for
-/// protocol upgrades.
-fn build_transport_clients(transport: &TransportConfig) -> (HttpClient, Option<HttpClient>) {
-    let client = build_client_with_transport(transport.tls.clone(), transport.h2c);
-    let upgrade_client = if transport.alpn_h2 || transport.h2c {
-        let h1_tls = transport.tls.as_ref().map(|tls| Arc::new(tls.h1_only()));
-        Some(build_client_with_transport(h1_tls, false))
-    } else {
-        None
-    };
-    (client, upgrade_client)
+/// Build one client per upstream. The per-upstream connector dials its bound target regardless of
+/// the request URI authority, which lets the proxy put the client's Host in the URI (HTTP/2
+/// `:authority`) while still dialing the configured upstream.
+fn build_upstream_clients(
+    upstreams: &[Arc<Upstream>],
+    transport: &TransportConfig,
+    path: &str,
+) -> HttpResult<Vec<UpstreamClient>> {
+    upstreams
+        .iter()
+        .map(|upstream| {
+            build_upstream_client(upstream, transport.tls.clone(), transport.h2c, false)
+                .map_err(|message| invalid(&format!("{path}.transport"), message))
+        })
+        .collect()
+}
+
+/// HTTP/1.1-only companion clients used for protocol-upgrade requests when the transport prefers
+/// HTTP/2 (upgrades cannot be carried over HTTP/2).
+fn build_upgrade_clients(
+    upstreams: &[Arc<Upstream>],
+    transport: &TransportConfig,
+    path: &str,
+) -> HttpResult<Vec<UpstreamClient>> {
+    upstreams
+        .iter()
+        .map(|upstream| {
+            build_upstream_client(upstream, transport.tls.clone(), transport.h2c, true)
+                .map_err(|message| invalid(&format!("{path}.transport"), message))
+        })
+        .collect()
 }
 
 /// Parse `transport` (Caddy's `http` transport) into TLS and HTTP-version configuration.
@@ -4113,11 +4294,9 @@ mod h2_tests {
     }
 
     #[tokio::test]
-    async fn h2_authority_is_the_upstream_dial_and_host_header_is_forwarded() {
-        // Documented divergence: Caddy forwards the original Host as the HTTP/2 `:authority`
-        // pseudo-header (Go's transport derives it from req.Host). caddy-rs builds the outbound
-        // URI from the upstream dial address, so `:authority` is the dial while the original Host
-        // header is still forwarded as a regular header field.
+    async fn h2_authority_uses_original_host_without_a_separate_host_field() {
+        // T-PROXY-041: the original request Host becomes HTTP/2 `:authority` (Caddy/Go parity),
+        // while the connector still dials the configured upstream. No separate Host field is sent.
         let seen: SeenList = Arc::new(Mutex::new(Vec::new()));
         let dial = spawn_tls_versioned_upstream(vec![b"h2".to_vec()], Arc::clone(&seen)).await;
         let directory = tempfile::tempdir().unwrap();
@@ -4127,8 +4306,123 @@ mod h2_tests {
         let response = respond(&handler, "/authority").await;
         let body = body_string(&response);
         assert!(body.contains("version=HTTP/2.0"), "{body}");
-        assert!(body.contains(&format!("authority={dial}")), "{body}");
+        assert!(
+            body.contains("authority=example.com"),
+            "h2 :authority must be the original Host, not the dial: {body}"
+        );
+        assert!(
+            body.contains("host=missing"),
+            "no separate Host field should accompany h2 :authority: {body}"
+        );
+        // The request still reached the bound dial target (the server we spawned above).
+        assert_eq!(*seen.lock().unwrap(), vec![Seen::Http2]);
+    }
+
+    #[tokio::test]
+    async fn h2_authority_tracks_a_host_different_from_the_dial() {
+        // Mismatch case: Host (app.example.com) differs from the dial host (127.0.0.1). The
+        // `:authority` must be the Host; the connection must still go to the dialed upstream.
+        let seen: SeenList = Arc::new(Mutex::new(Vec::new()));
+        let dial = spawn_tls_versioned_upstream(vec![b"h2".to_vec()], Arc::clone(&seen)).await;
+        let directory = tempfile::tempdir().unwrap();
+        let root = write_root(&directory);
+        let handler = tls_handler(&dial, &root, Some(&["2"]), false);
+
+        let mut request = get("/mismatch");
+        request
+            .headers
+            .insert(http::header::HOST, "app.example.com".parse().unwrap());
+        let Outcome::Respond(response) = handler.handle(request).await.unwrap() else {
+            panic!("expected proxied response");
+        };
+        let body = body_string(&response);
+        assert!(body.contains("authority=app.example.com"), "{body}");
+        assert!(body.contains("host=missing"), "{body}");
+        assert_eq!(*seen.lock().unwrap(), vec![Seen::Http2]);
+    }
+
+    #[tokio::test]
+    async fn h1_fallback_keeps_host_field_from_the_uri_authority() {
+        // On the HTTP/1.1 fallback path the same URI authority becomes the auto-generated Host
+        // field (the explicit Host was removed for h2-capable transports).
+        let seen: SeenList = Arc::new(Mutex::new(Vec::new()));
+        let dial =
+            spawn_tls_versioned_upstream(vec![b"http/1.1".to_vec()], Arc::clone(&seen)).await;
+        let directory = tempfile::tempdir().unwrap();
+        let root = write_root(&directory);
+        let handler = tls_handler(&dial, &root, Some(&["1.1", "2"]), false);
+
+        let response = respond(&handler, "/h1-fallback").await;
+        let body = body_string(&response);
+        assert!(body.contains("version=HTTP/1.1"), "{body}");
         assert!(body.contains("host=example.com"), "{body}");
+        assert_eq!(*seen.lock().unwrap(), vec![Seen::Http1]);
+    }
+
+    #[tokio::test]
+    async fn h2_authority_over_unix_socket_tls_upstream() {
+        #[cfg(not(unix))]
+        return;
+        #[cfg(unix)]
+        {
+            let directory = tempfile::tempdir().unwrap();
+            let socket = directory.path().join("h2-tls.sock");
+            let seen: SeenList = Arc::new(Mutex::new(Vec::new()));
+            let acceptor = tls_acceptor(vec![b"h2".to_vec()]);
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let seen_server = Arc::clone(&seen);
+            tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let acceptor = acceptor.clone();
+                    let seen = Arc::clone(&seen_server);
+                    tokio::spawn(async move {
+                        let Ok(tls) = acceptor.accept(stream).await else {
+                            return;
+                        };
+                        let service = service_fn(move |request| {
+                            let seen = Arc::clone(&seen);
+                            async move { Ok::<_, Infallible>(version_response(&request, &seen)) }
+                        });
+                        let _ = auto::Builder::new(TokioExecutor::new())
+                            .serve_connection(TokioIo::new(tls), service)
+                            .await;
+                    });
+                }
+            });
+            let root_dir = tempfile::tempdir().unwrap();
+            let root = write_root(&root_dir);
+            let dial = format!("unix/{}", socket.display());
+            let handler = build(serde_json::json!({
+                "handler": "reverse_proxy",
+                "upstreams": [{"dial": dial}],
+                "transport": {
+                    "protocol": "http",
+                    "versions": ["2"],
+                    "tls": {"root_ca_pem_files": [root], "server_name": "localhost"}
+                }
+            }));
+            let response = respond(&handler, "/unix-h2").await;
+            let body = body_string(&response);
+            assert!(body.contains("version=HTTP/2.0"), "{body}");
+            assert!(body.contains("authority=example.com"), "{body}");
+            assert!(body.contains("host=missing"), "{body}");
+            assert_eq!(*seen.lock().unwrap(), vec![Seen::Http2]);
+        }
+    }
+
+    #[tokio::test]
+    async fn h2c_authority_uses_original_host() {
+        let seen: SeenList = Arc::new(Mutex::new(Vec::new()));
+        let dial = spawn_plain_versioned_upstream(Arc::clone(&seen)).await;
+        let handler = plain_handler(&dial, &["h2c"]);
+        let response = respond(&handler, "/h2c-authority").await;
+        let body = body_string(&response);
+        assert!(body.contains("version=HTTP/2.0"), "{body}");
+        assert!(body.contains("authority=example.com"), "{body}");
+        assert!(body.contains("host=missing"), "{body}");
     }
 
     #[tokio::test]
@@ -4244,5 +4538,358 @@ mod h2_tests {
             vec![Seen::Http2, Seen::Http1],
             "upgrade request must use the h1-only companion client"
         );
+    }
+}
+
+#[cfg(test)]
+mod body_tests {
+    //! Request-body forwarding (T-PROXY-040 / T-PROXY-039 proxy half).
+    //!
+    //! Policy under test: retry-capable handlers (`retries`/`try_duration`) and `handle_response`
+    //! handlers buffer the body once and replay it per attempt; everything else streams the body
+    //! exactly once via `Request::take_body`, never forwarding a silently empty body. A second
+    //! streaming attempt fails loudly.
+
+    use super::*;
+    use bytes::{Bytes, BytesMut};
+    use caddy_rs_http::body::{BodyError, RequestBody, StreamingBody};
+    use http::{Method, StatusCode};
+    use http_body_util::{BodyExt, Full};
+    use hyper::service::service_fn;
+    use hyper_util::rt::TokioIo;
+    use std::convert::Infallible;
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::mpsc;
+
+    #[derive(Debug, Clone, Default)]
+    struct CapturedBody {
+        body: Bytes,
+        chunks: usize,
+        content_length: Option<String>,
+        transfer_encoding: Option<String>,
+    }
+
+    /// Upstream that captures the request body frame-by-frame and signals when the first data
+    /// frame arrives (proving the proxy streams rather than buffering).
+    async fn spawn_body_capture_upstream(
+    ) -> (String, Arc<Mutex<Option<CapturedBody>>>, mpsc::Receiver<()>) {
+        let captured = Arc::new(Mutex::new(None::<CapturedBody>));
+        let (first_tx, first_rx) = mpsc::channel(1);
+        let first_tx = Arc::new(Mutex::new(Some(first_tx)));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let captured_server = Arc::clone(&captured);
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let captured = Arc::clone(&captured_server);
+                let first_tx = Arc::clone(&first_tx);
+                tokio::spawn(async move {
+                    let service =
+                        service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
+                            let captured = Arc::clone(&captured);
+                            let first_tx = Arc::clone(&first_tx);
+                            async move {
+                                let content_length = request
+                                    .headers()
+                                    .get(http::header::CONTENT_LENGTH)
+                                    .and_then(|value| value.to_str().ok())
+                                    .map(str::to_string);
+                                let transfer_encoding = request
+                                    .headers()
+                                    .get(http::header::TRANSFER_ENCODING)
+                                    .and_then(|value| value.to_str().ok())
+                                    .map(str::to_string);
+                                let mut body = request.into_body();
+                                let mut buffer = BytesMut::new();
+                                let mut chunks = 0_usize;
+                                while let Some(frame) = body.frame().await {
+                                    let Ok(frame) = frame else {
+                                        break;
+                                    };
+                                    let Ok(data) = frame.into_data() else {
+                                        continue;
+                                    };
+                                    if data.is_empty() {
+                                        continue;
+                                    }
+                                    chunks += 1;
+                                    if chunks == 1 {
+                                        let sender = first_tx
+                                            .lock()
+                                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                            .take();
+                                        if let Some(sender) = sender {
+                                            let _ = sender.send(()).await;
+                                        }
+                                    }
+                                    buffer.extend_from_slice(&data);
+                                }
+                                let body = buffer.freeze();
+                                *captured
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                    Some(CapturedBody {
+                                        body: body.clone(),
+                                        chunks,
+                                        content_length,
+                                        transfer_encoding,
+                                    });
+                                let response_body = format!("len={}", body.len());
+                                Ok::<_, Infallible>(
+                                    hyper::Response::builder()
+                                        .status(200)
+                                        .header("x-chunks", chunks.to_string())
+                                        .body(Full::new(Bytes::from(response_body)))
+                                        .expect("response"),
+                                )
+                            }
+                        });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        (address.to_string(), captured, first_rx)
+    }
+
+    fn build(value: Value) -> ReverseProxyHandler {
+        ReverseProxyHandler::from_json(&value, "handler").expect("handler builds")
+    }
+
+    fn proxy(dial: &str) -> ReverseProxyHandler {
+        build(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": dial}]
+        }))
+    }
+
+    fn post_request(path: &str) -> Request {
+        let mut request = Request::new(Method::POST, path.parse().unwrap());
+        request.remote_addr = Some("203.0.113.7:5555".parse().unwrap());
+        request
+            .headers
+            .insert(http::header::HOST, "example.com".parse().unwrap());
+        request
+    }
+
+    fn streaming_request(
+        path: &str,
+    ) -> (Request, mpsc::Sender<std::result::Result<Bytes, BodyError>>) {
+        let (sender, receiver) = mpsc::channel(8);
+        let request = post_request(path)
+            .with_streaming_body(RequestBody::streaming(StreamingBody::from_chunks(receiver)));
+        (request, sender)
+    }
+
+    fn captured(captured: &Arc<Mutex<Option<CapturedBody>>>) -> CapturedBody {
+        captured
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .expect("upstream captured a body")
+    }
+
+    #[test]
+    fn body_buffering_policy_matches_retry_capability() {
+        // Nothing retry-like configured: stream.
+        assert!(!proxy("localhost:8080").requires_buffered_request_body());
+        // retries > 0: buffer once for replay.
+        let retrying = build(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": "localhost:8080"}],
+            "load_balancing": {"retries": 1}
+        }));
+        assert!(retrying.requires_buffered_request_body());
+        // try_duration-only retry budget: buffer.
+        let duration = build(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": "localhost:8080"}],
+            "load_balancing": {"try_duration": 1_000_000u64}
+        }));
+        assert!(duration.requires_buffered_request_body());
+        // handle_response may continue the chain / replay: buffer.
+        let response = build(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": "localhost:8080"}],
+            "handle_response": [{"routes": []}]
+        }));
+        assert!(response.requires_buffered_request_body());
+        // retry_match without any retry budget can never retry: keep streaming.
+        let match_only = build(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": "localhost:8080"}],
+            "load_balancing": {"retry_match": [{"method": ["GET"]}]}
+        }));
+        assert!(!match_only.requires_buffered_request_body());
+    }
+
+    #[tokio::test]
+    async fn streaming_request_body_is_forwarded_once_without_buffering() {
+        let (dial, captured_body, mut first_chunk) = spawn_body_capture_upstream().await;
+        let handler = proxy(&dial);
+        assert!(!handler.requires_buffered_request_body());
+        let (request, sender) = streaming_request("/upload");
+
+        let call = tokio::spawn(async move { handler.handle(request).await });
+        // First chunk reaches the upstream while the client body stream is still open: the proxy
+        // did not buffer the whole body.
+        sender
+            .send(Ok(Bytes::from_static(b"first-chunk-")))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), first_chunk.recv())
+            .await
+            .expect("upstream must observe the first chunk before the body finishes")
+            .expect("first-chunk signal");
+        assert!(!sender.is_closed(), "client body stream must still be open");
+
+        sender
+            .send(Ok(Bytes::from_static(b"second-chunk")))
+            .await
+            .unwrap();
+        drop(sender);
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), call)
+            .await
+            .expect("proxy call timed out")
+            .expect("handler task panicked")
+            .expect("handler result");
+        let Outcome::Respond(response) = outcome else {
+            panic!("expected proxied response");
+        };
+        assert_eq!(response.status, StatusCode::OK);
+
+        let captured_body = captured(&captured_body);
+        assert_eq!(
+            captured_body.body,
+            Bytes::from_static(b"first-chunk-second-chunk"),
+            "the streamed body must arrive intact (never a silent empty body)"
+        );
+        assert_eq!(
+            captured_body.chunks, 2,
+            "h1 chunked forwarding keeps frames"
+        );
+        assert_eq!(
+            captured_body.content_length, None,
+            "an unknown-length streamed body is forwarded chunked, not with a made-up length"
+        );
+        assert_eq!(
+            captured_body.transfer_encoding.as_deref(),
+            Some("chunked"),
+            "streamed bodies use chunked transfer encoding"
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_request_body_is_forwarded_with_content_length() {
+        let (dial, captured_body, _first_chunk) = spawn_body_capture_upstream().await;
+        let handler = proxy(&dial);
+        let mut request = post_request("/buffered");
+        request.body = Bytes::from_static(b"hello buffered body");
+        request
+            .headers
+            .insert(http::header::CONTENT_LENGTH, "19".parse().unwrap());
+
+        let Outcome::Respond(response) = handler.handle(request).await.unwrap() else {
+            panic!("expected proxied response");
+        };
+        assert_eq!(response.status, StatusCode::OK);
+        let captured_body = captured(&captured_body);
+        assert_eq!(
+            captured_body.body,
+            Bytes::from_static(b"hello buffered body")
+        );
+        assert_eq!(
+            captured_body.content_length.as_deref(),
+            Some("19"),
+            "buffered bodies keep their Content-Length"
+        );
+        assert_eq!(captured_body.transfer_encoding, None);
+    }
+
+    #[tokio::test]
+    async fn retry_capable_handler_replays_the_streamed_body_on_a_dial_failure() {
+        // Reserve a closed port so the first selected upstream fails to dial.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_dial = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let (good_dial, captured_body, _first_chunk) = spawn_body_capture_upstream().await;
+        let handler = build(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": dead_dial}, {"dial": good_dial}],
+            "load_balancing": {"retries": 1}
+        }));
+        assert!(handler.requires_buffered_request_body());
+
+        let (request, sender) = streaming_request("/replayed");
+        sender
+            .send(Ok(Bytes::from_static(b"replay-me-")))
+            .await
+            .unwrap();
+        sender.send(Ok(Bytes::from_static(b"twice"))).await.unwrap();
+        drop(sender);
+
+        let Outcome::Respond(response) = handler.handle(request).await.unwrap() else {
+            panic!("expected proxied response");
+        };
+        assert_eq!(response.status, StatusCode::OK);
+        let captured_body = captured(&captured_body);
+        assert_eq!(
+            captured_body.body,
+            Bytes::from_static(b"replay-me-twice"),
+            "the buffered body must be replayed on the retry attempt"
+        );
+        assert_eq!(
+            captured_body.content_length.as_deref(),
+            Some("15"),
+            "a replayed buffered body has a known length"
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_policy_maps_an_oversized_streamed_body_to_413() {
+        // A retry-capable handler buffers the body; if collecting it trips the configured limit
+        // (server-side request-body limit carried on RequestBody) the proxy must surface 413, not
+        // forward a truncated body or a misleading 502.
+        let (dial, _captured_body, _first_chunk) = spawn_body_capture_upstream().await;
+        let handler = build(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": dial}],
+            "load_balancing": {"retries": 1}
+        }));
+        let (sender, receiver) = mpsc::channel(8);
+        let body = RequestBody::streaming(StreamingBody::from_chunks(receiver)).with_limit(Some(4));
+        let mut request = post_request("/too-large").with_streaming_body(body);
+        let _ = &mut request;
+        sender.send(Ok(Bytes::from_static(b"1234"))).await.unwrap();
+        sender.send(Ok(Bytes::from_static(b"5"))).await.unwrap();
+        drop(sender);
+
+        let Outcome::Respond(response) = handler.handle(request).await.unwrap() else {
+            panic!("expected a response");
+        };
+        assert_eq!(response.status, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn a_second_streaming_attempt_fails_loudly_instead_of_sending_an_empty_body() {
+        let handler = proxy("localhost:8080");
+        let (mut request, _sender) = streaming_request("/once");
+        let mut stream_taken = false;
+        assert!(
+            handler
+                .attempt_body(&mut request, false, &mut stream_taken)
+                .is_ok(),
+            "the first attempt takes the streaming body"
+        );
+        let error = handler
+            .attempt_body(&mut request, false, &mut stream_taken)
+            .expect_err("a second streaming attempt cannot be replayed");
+        assert!(error.contains("already streamed"), "{error}");
+        assert!(error.contains("cannot be replayed"), "{error}");
     }
 }

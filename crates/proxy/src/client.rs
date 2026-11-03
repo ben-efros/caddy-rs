@@ -21,8 +21,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+#[cfg(test)]
 use bytes::Bytes;
+use caddy_rs_http::body::RequestBody;
 use http::Uri;
+#[cfg(test)]
 use http_body_util::Full;
 use hyper_util::client::legacy::connect::{Connected, Connection, HttpConnector};
 use hyper_util::client::legacy::Client;
@@ -32,12 +35,21 @@ use tokio_rustls::client::TlsStream;
 use tower_service::Service;
 
 use crate::tls::UpstreamTls;
+use crate::upstream::{Transport, Upstream};
 
 /// Hyper client body type used for outbound requests.
-pub type ClientBody = Full<Bytes>;
+///
+/// [`RequestBody`] supports both buffered bytes and streamed chunks, so the proxy can forward a
+/// request body without buffering it (see `T-PROXY-040`).
+pub type ClientBody = RequestBody;
 
-/// The outbound client type.
+/// The generic outbound client type (URI-scheme-directed connector; used by tests/health helpers).
 pub type HttpClient = Client<UpstreamConnector, ClientBody>;
+
+/// A per-upstream client: the connector always dials one configured upstream regardless of the
+/// request URI authority, so the URI authority can carry the client's Host for HTTP/2
+/// `:authority` parity (see `crate::client::FixedUpstreamConnector`).
+pub type UpstreamClient = Client<FixedUpstreamConnector, ClientBody>;
 
 /// Connector supporting TCP, Unix-socket, TLS, HTTP/2-ALPN and cleartext-h2c upstreams.
 #[derive(Clone, Debug)]
@@ -408,6 +420,147 @@ pub fn build_client_with_transport(tls: Option<Arc<UpstreamTls>>, h2c: bool) -> 
     Client::builder(TokioExecutor::new()).build(UpstreamConnector::with_transport(tls, h2c))
 }
 
+/// How a per-upstream client reaches its upstream.
+#[derive(Clone, Debug)]
+enum DialTarget {
+    /// `host:port` TCP target.
+    Tcp(String),
+    /// Unix domain socket path.
+    #[cfg(unix)]
+    Unix(std::path::PathBuf),
+}
+
+/// Connector bound to one upstream target.
+///
+/// hyper's client derives the HTTP/2 `:authority` pseudo-header (and HTTP/1.1 `Host`, when the
+/// header is absent) from the request URI, not from the connector. To match Caddy/Go — where the
+/// client's `Host` becomes `:authority` while the configured upstream is still what gets dialed —
+/// the proxy gives each upstream a client whose connector ignores the URI authority and always
+/// connects to its configured target. TLS SNI is likewise derived from the *dial* target (or the
+/// explicit `transport.tls.server_name`), never from the URI authority.
+#[derive(Clone, Debug)]
+pub struct FixedUpstreamConnector {
+    tcp: HttpConnector,
+    target: DialTarget,
+    tls: Option<Arc<UpstreamTls>>,
+    server_name: Option<ServerName<'static>>,
+    h2c: bool,
+}
+
+impl Service<Uri> for FixedUpstreamConnector {
+    type Response = TokioIo<UpstreamStream>;
+    type Error = io::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _uri: Uri) -> Self::Future {
+        let mut tcp = self.tcp.clone();
+        let target = self.target.clone();
+        let tls = self.tls.clone();
+        let server_name = self.server_name.clone();
+        let h2c = self.h2c;
+        Box::pin(async move {
+            match target {
+                DialTarget::Tcp(address) => {
+                    let dial_uri: Uri = format!("http://{address}/").parse().map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("invalid upstream dial `{address}`: {error}"),
+                        )
+                    })?;
+                    let stream = tcp
+                        .call(dial_uri)
+                        .await
+                        .map_err(io::Error::other)?
+                        .into_inner();
+                    match tls {
+                        Some(tls) => {
+                            let server_name = server_name.ok_or_else(no_server_name)?;
+                            let stream = connect_tls(&tls, server_name, stream).await?;
+                            Ok(TokioIo::new(UpstreamStream::tls(stream)))
+                        }
+                        None => Ok(TokioIo::new(UpstreamStream::plain(stream, h2c))),
+                    }
+                }
+                #[cfg(unix)]
+                DialTarget::Unix(path) => {
+                    let stream = tokio::net::UnixStream::connect(&path).await?;
+                    match tls {
+                        Some(tls) => {
+                            let server_name = server_name.ok_or_else(no_server_name)?;
+                            let stream = connect_tls(&tls, server_name, stream).await?;
+                            Ok(TokioIo::new(UpstreamStream::tls(stream)))
+                        }
+                        None => Ok(TokioIo::new(UpstreamStream::plain(stream, h2c))),
+                    }
+                }
+            }
+        })
+    }
+}
+
+fn no_server_name() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "TLS upstream has no server name (this is validated at config load)",
+    )
+}
+
+/// Strip the port from a `host:port` (or `[v6]:port`) dial address.
+fn host_without_port(address: &str) -> &str {
+    if let Some(rest) = address.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    address
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .unwrap_or(address)
+}
+
+/// Build a client bound to `upstream`.
+///
+/// * `tls` / `h2c` come from the handler's parsed `transport`; `http1_only` builds the companion
+///   used for protocol upgrades (ALPN/h2c disabled).
+/// * TLS server name: explicit `transport.tls.server_name`, else the dial host (Caddy default).
+pub fn build_upstream_client(
+    upstream: &Upstream,
+    tls: Option<Arc<UpstreamTls>>,
+    h2c: bool,
+    http1_only: bool,
+) -> Result<UpstreamClient, String> {
+    let tls = if http1_only {
+        tls.map(|tls| Arc::new(tls.h1_only()))
+    } else {
+        tls
+    };
+    let h2c = h2c && !http1_only;
+    let server_name = match &tls {
+        Some(tls) => Some(match upstream.transport() {
+            Transport::Tcp { address } => tls.server_name_for(Some(host_without_port(address)))?,
+            #[cfg(unix)]
+            Transport::Unix { .. } => tls.server_name_for(None)?,
+        }),
+        None => None,
+    };
+    let target = match upstream.transport() {
+        Transport::Tcp { address } => DialTarget::Tcp(address.clone()),
+        #[cfg(unix)]
+        Transport::Unix { path } => DialTarget::Unix(path.clone()),
+    };
+    Ok(
+        Client::builder(TokioExecutor::new()).build(FixedUpstreamConnector {
+            tcp: tcp_connector(),
+            target,
+            tls,
+            server_name,
+            h2c,
+        }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -460,7 +613,7 @@ mod tests {
         let client = build_client();
         let request = hyper::Request::builder()
             .uri(upstream.url("/over-unix"))
-            .body(Full::new(Bytes::new()))
+            .body(RequestBody::empty())
             .unwrap();
         let response = client.request(request).await.unwrap();
         assert_eq!(response.status(), 200);
@@ -481,7 +634,7 @@ mod tests {
         let client = build_client();
         let request = hyper::Request::builder()
             .uri(upstream.url("/"))
-            .body(Full::new(Bytes::new()))
+            .body(RequestBody::empty())
             .unwrap();
         let error = client
             .request(request)
@@ -495,7 +648,7 @@ mod tests {
         let client = build_client();
         let request = hyper::Request::builder()
             .uri("https://127.0.0.1:9/")
-            .body(Full::new(Bytes::new()))
+            .body(RequestBody::empty())
             .unwrap();
         let error = client
             .request(request)
