@@ -764,6 +764,18 @@ mod tests {
     }
 
     #[test]
+    fn accepts_file_matcher() {
+        let config = minimal_http_config(
+            serde_json::json!({"handler": "static_response", "body": "ok"}),
+            Some(serde_json::json!({
+                "file": {"try_files": ["{http.request.uri.path}", "/index.html"]}
+            })),
+        );
+        let report = validate_config(&config, &registry()).expect("file matcher is registered");
+        assert_eq!(report.matchers, 1);
+    }
+
+    #[test]
     fn rejects_unknown_handler_with_path_and_name() {
         let config = minimal_http_config(serde_json::json!({"handler": "does_not_exist"}), None);
         let error = validate_config(&config, &registry()).expect_err("unknown handler");

@@ -42,6 +42,10 @@
 //! | `{http.request.cookie.NAME}` | First cookie value with that name (case-insensitive) |
 //! | `{http.request.host.labels.N}` | `N`th host label (0-based, from the right, lowercased) |
 //! | `{http.vars.NAME}` | Request variable set by the `vars` handler |
+//! | `{http.matchers.file.relative}` | Root-relative path of the file matched by the `file` matcher |
+//! | `{http.matchers.file.absolute}` | Absolute path of the file matched by the `file` matcher |
+//! | `{http.matchers.file.type}` | `file` or `directory` for the `file` matcher |
+//! | `{http.matchers.file.remainder}` | Path remainder after `split_path` in the `file` matcher |
 //! | `{http.auth.user.NAME}` | Authenticated user metadata (`id` = username), set by `basic_auth` |
 //! | `{vars.NAME}` | Alias for `{http.vars.NAME}`; Caddy's Caddyfile adapter rewrites this form |
 //! | `{env.NAME}` | Environment variable, empty when unset |
@@ -163,6 +167,17 @@ impl<'a> Replacer<'a> {
             _ => {
                 if let Some(name) = name.strip_prefix("env.") {
                     return Some(std::env::var(name).unwrap_or_default());
+                }
+                if let Some(name) = name.strip_prefix("http.matchers.file.") {
+                    // Recorded by the `file` matcher in request vars (Caddy sets these on its
+                    // request-scoped replacer when the matcher matches).
+                    return Some(
+                        self.request
+                            .vars
+                            .get(&format!("matchers.file.{name}"))
+                            .cloned()
+                            .unwrap_or_default(),
+                    );
                 }
                 if let Some(name) = name.strip_prefix("http.vars.") {
                     // Caddy always reports variables as known; unset ones are empty.

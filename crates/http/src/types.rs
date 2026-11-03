@@ -431,6 +431,15 @@ pub trait Matcher: Send + Sync {
     /// Whether the request matches.
     fn matches(&self, request: &Request) -> bool;
 
+    /// Whether the request matches, applying matcher side effects (placeholders) on success.
+    ///
+    /// The default delegates to [`Matcher::matches`]. Matchers that publish Caddy placeholders —
+    /// today `http.matchers.file`, which sets `{http.matchers.file.relative}` and friends — override
+    /// this to record them in [`Request::vars`] when they match.
+    fn matches_mut(&self, request: &mut Request) -> bool {
+        self.matches(request)
+    }
+
     /// Human-readable description for logs.
     fn describe(&self) -> String;
 }

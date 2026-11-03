@@ -609,6 +609,12 @@ pub const BUILTIN_MODULES: &[Module] = &[
         ModuleKind::HttpMatcher,
         "Match query parameters",
     ),
+    Module::new(
+        "http.matchers.file",
+        "file",
+        ModuleKind::HttpMatcher,
+        "Match requests by file existence under a root (try_files)",
+    ),
     // Storage
     Module::new(
         "caddy.storage.file_system",
@@ -793,6 +799,7 @@ mod tests {
             (ModuleKind::HttpHandler, "authentication"),
             (ModuleKind::HttpHandler, "basic_auth"),
             (ModuleKind::HttpHandler, "request_body"),
+            (ModuleKind::HttpMatcher, "file"),
         ] {
             assert!(
                 registry.get_by_key(kind, key).is_some(),

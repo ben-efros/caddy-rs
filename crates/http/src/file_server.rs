@@ -19,7 +19,7 @@ fn invalid(path: &str, message: impl Into<String>) -> Error {
 
 /// Serve files from a root directory.
 pub struct FileServerHandler {
-    root: PathBuf,
+    root: String,
     hide: Vec<String>,
     index_names: Vec<String>,
     browse: bool,
@@ -34,10 +34,12 @@ impl FileServerHandler {
         let object = value
             .as_object()
             .ok_or_else(|| invalid(path, "file_server must be an object"))?;
+        // Caddy's file_server defaults its root to `{http.vars.root}`; the adapter sets that
+        // variable from the `root` directive. Placeholders are expanded per request in `handle`.
         let root = object
             .get("root")
             .and_then(serde_json::Value::as_str)
-            .unwrap_or(".")
+            .unwrap_or("{http.vars.root}")
             .to_string();
         let hide = object
             .get("hide")
@@ -88,7 +90,7 @@ impl FileServerHandler {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(true);
         Ok(Self {
-            root: PathBuf::from(root),
+            root,
             hide,
             index_names,
             browse,
@@ -143,7 +145,14 @@ impl Handler for FileServerHandler {
         if self.hidden(relative) {
             return self.not_found(request);
         }
-        let full_path = self.root.join(relative);
+        // Expand `{http.vars.root}` and friends (Caddy's file_server root supports placeholders).
+        let expanded_root = request.replace_all(&self.root);
+        let root = if expanded_root.is_empty() {
+            PathBuf::from(".")
+        } else {
+            PathBuf::from(expanded_root)
+        };
+        let full_path = root.join(relative);
 
         let metadata = match fs::metadata(&full_path).await {
             Ok(metadata) => metadata,
