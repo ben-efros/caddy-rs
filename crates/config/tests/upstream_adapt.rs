@@ -854,3 +854,33 @@ fn map_invalid_forms_fail_loudly() {
         );
     }
 }
+
+#[test]
+fn php_fastcgi_index_off_matches_caddy() {
+    assert_adapts_like_caddy("php_fastcgi_index_off.caddyfiletest");
+}
+
+#[test]
+fn php_fastcgi_matcher_matches_caddy() {
+    assert_adapts_like_caddy("php_fastcgi_matcher.caddyfiletest");
+}
+
+#[test]
+fn php_fastcgi_subdirectives_matches_caddy() {
+    assert_adapts_like_caddy("php_fastcgi_subdirectives.caddyfiletest");
+}
+
+#[test]
+fn php_fastcgi_try_files_override_matches_caddy() {
+    assert_adapts_like_caddy("php_fastcgi_try_files_override.caddyfiletest");
+}
+
+#[test]
+fn php_fastcgi_try_files_override_no_dir_index_matches_caddy() {
+    assert_adapts_like_caddy("php_fastcgi_try_files_override_no_dir_index.caddyfiletest");
+}
+
+#[test]
+fn reverse_proxy_empty_non_http_transport_matches_caddy() {
+    assert_adapts_like_caddy("reverse_proxy_empty_non_http_transport.caddyfiletest");
+}

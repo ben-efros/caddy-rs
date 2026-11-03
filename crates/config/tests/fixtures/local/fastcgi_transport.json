@@ -1,0 +1,49 @@
+{
+  "apps": {
+    "http": {
+      "servers": {
+        "srv0": {
+          "listen": [
+            ":8884"
+          ],
+          "routes": [
+            {
+              "handle": [
+                {
+                  "handler": "reverse_proxy",
+                  "load_balancing": {
+                    "selection_policy": {
+                      "policy": "random"
+                    }
+                  },
+                  "transport": {
+                    "capture_stderr": true,
+                    "dial_timeout": 3000000000,
+                    "env": {
+                      "APP_ENV": "production",
+                      "OTHER": "value"
+                    },
+                    "protocol": "fastcgi",
+                    "read_timeout": 10000000000,
+                    "resolve_root_symlink": true,
+                    "root": "/srv/http",
+                    "split_path": [
+                      ".php",
+                      ".php5"
+                    ],
+                    "write_timeout": 20000000000
+                  },
+                  "upstreams": [
+                    {
+                      "dial": "unix//run/php.sock"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

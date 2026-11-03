@@ -40,6 +40,7 @@ const DIRECTIVE_ORDER: &[&str] = &[
     "route",
     "respond",
     "reverse_proxy",
+    "php_fastcgi",
     "file_server",
 ];
 
@@ -2373,6 +2374,11 @@ fn build_routes(
                     entries.push((name, route));
                 }
             }
+            "php_fastcgi" => {
+                for route in build_php_fastcgi_routes(directive, matchers)? {
+                    entries.push((name, route));
+                }
+            }
             _ => {
                 let mut args = directive.args.clone();
                 // `root` is ambiguous: a single argument is always the root path, never a path
@@ -2652,6 +2658,321 @@ fn parse_caddy_size(value: &str) -> Result<u64, String> {
         return Err(format!("size {value} is out of range"));
     }
     Ok(product as u64)
+}
+
+/// FastCGI transport fields shared by `php_fastcgi` subdirectives and
+/// `reverse_proxy { transport fastcgi { ... } }`.
+///
+/// Caddy's `fastcgi.Transport` JSON omits unset fields (omitempty): only options the user wrote
+/// (plus `php_fastcgi`'s always-set `split_path`) appear in the adapted transport object.
+#[derive(Debug, Default)]
+struct FastCgiFields {
+    root: Option<String>,
+    split_path: Option<Vec<String>>,
+    resolve_root_symlink: bool,
+    env: BTreeMap<String, String>,
+    dial_timeout: Option<i64>,
+    read_timeout: Option<i64>,
+    write_timeout: Option<i64>,
+    capture_stderr: bool,
+}
+
+impl FastCgiFields {
+    /// Parse one `transport fastcgi` block option, failing loudly for unknown fields.
+    fn parse_transport_option(&mut self, option: &Directive) -> caddy_rs_core::Result<()> {
+        let mut args = option.args.clone();
+        let one_arg = |args: &[String], name: &str| -> caddy_rs_core::Result<String> {
+            if args.len() != 1 || !option.block.is_empty() {
+                return Err(adapter_error(
+                    option.position,
+                    format!("`{name}` requires exactly one argument"),
+                ));
+            }
+            Ok(args[0].clone())
+        };
+        match option.name.as_str() {
+            "root" => self.root = Some(qualify_placeholders(&one_arg(&args, "root")?)),
+            "split" => {
+                if args.is_empty() {
+                    return Err(adapter_error(
+                        option.position,
+                        "`split` requires at least one path suffix",
+                    ));
+                }
+                self.split_path = Some(std::mem::take(&mut args));
+            }
+            "env" => {
+                if args.len() != 2 || !option.block.is_empty() {
+                    return Err(adapter_error(
+                        option.position,
+                        "`env` requires exactly two arguments: <key> <value>",
+                    ));
+                }
+                self.env
+                    .insert(args[0].clone(), qualify_placeholders(&args[1]));
+            }
+            "resolve_root_symlink" => {
+                if !args.is_empty() || !option.block.is_empty() {
+                    return Err(adapter_error(
+                        option.position,
+                        "`resolve_root_symlink` does not take arguments",
+                    ));
+                }
+                self.resolve_root_symlink = true;
+            }
+            "dial_timeout" | "read_timeout" | "write_timeout" => {
+                let value = one_arg(&args, &option.name)?;
+                let nanoseconds = crate::parser::parse_duration_ns(&value).map_err(|reason| {
+                    adapter_error(
+                        option.position,
+                        format!("bad timeout value {value}: {reason}"),
+                    )
+                })?;
+                match option.name.as_str() {
+                    "dial_timeout" => self.dial_timeout = Some(nanoseconds),
+                    "read_timeout" => self.read_timeout = Some(nanoseconds),
+                    _ => self.write_timeout = Some(nanoseconds),
+                }
+            }
+            "capture_stderr" => {
+                if !args.is_empty() || !option.block.is_empty() {
+                    return Err(adapter_error(
+                        option.position,
+                        "`capture_stderr` does not take arguments",
+                    ));
+                }
+                self.capture_stderr = true;
+            }
+            other => {
+                return Err(adapter_error(
+                    option.position,
+                    format!("unrecognized subdirective `{other}` for the fastcgi transport"),
+                ))
+            }
+        }
+        Ok(())
+    }
+
+    /// Encode the Caddy JSON transport object. `php_fastcgi` always sets `split_path` to its
+    /// extension list; `transport fastcgi` uses the `split` option.
+    fn transport_json(&self, php_split_path: Option<&[String]>) -> Value {
+        let mut transport = Map::new();
+        transport.insert("protocol".to_string(), json!("fastcgi"));
+        if let Some(root) = &self.root {
+            transport.insert("root".to_string(), json!(root));
+        }
+        let split_path = php_split_path.or(self.split_path.as_deref());
+        if let Some(split_path) = split_path {
+            if !split_path.is_empty() {
+                transport.insert("split_path".to_string(), json!(split_path));
+            }
+        }
+        if !self.env.is_empty() {
+            transport.insert("env".to_string(), json!(self.env));
+        }
+        if self.resolve_root_symlink {
+            transport.insert("resolve_root_symlink".to_string(), json!(true));
+        }
+        if let Some(timeout) = self.dial_timeout {
+            transport.insert("dial_timeout".to_string(), json!(timeout));
+        }
+        if let Some(timeout) = self.read_timeout {
+            transport.insert("read_timeout".to_string(), json!(timeout));
+        }
+        if let Some(timeout) = self.write_timeout {
+            transport.insert("write_timeout".to_string(), json!(timeout));
+        }
+        if self.capture_stderr {
+            transport.insert("capture_stderr".to_string(), json!(true));
+        }
+        Value::Object(transport)
+    }
+}
+
+/// Caddy's `php_fastcgi` directive: a canonical expansion to three handlers.
+///
+/// The emitted routes are Caddy's own output: a 308 canonical-path redirect for directory
+/// requests, a `try_files` rewrite to the PHP index, and the FastCGI `reverse_proxy` handler
+/// matched on `*.php`. php_fastcgi-specific subdirectives are consumed here; the remaining block
+/// options are the normal reverse_proxy syntax (load balancing, retries, ...). A user matcher
+/// wraps the expansion in one matched subroute, matching Caddy's `ExtractMatcherSet` behaviour.
+fn build_php_fastcgi_routes(
+    directive: &Directive,
+    matchers: &BTreeMap<String, Value>,
+) -> caddy_rs_core::Result<Vec<Value>> {
+    let mut args = directive.args.clone();
+    let user_matcher = matcher_for_args(&mut args, matchers, directive.position)?;
+    if args.is_empty() {
+        return Err(adapter_error(
+            directive.position,
+            "`php_fastcgi` requires at least one upstream address",
+        ));
+    }
+
+    let mut fields = FastCgiFields::default();
+    let mut extensions: Vec<String> = vec![".php".to_string()];
+    let mut index_file = "index.php".to_string();
+    let mut try_files: Vec<String> = Vec::new();
+    let mut passthrough: Vec<Directive> = Vec::new();
+    for option in &directive.block {
+        match option.name.as_str() {
+            "split" => {
+                if option.args.is_empty() {
+                    return Err(adapter_error(
+                        option.position,
+                        "`split` requires at least one path suffix",
+                    ));
+                }
+                extensions = option.args.clone();
+            }
+            "index" => {
+                if option.args.len() != 1 || !option.block.is_empty() {
+                    return Err(adapter_error(
+                        option.position,
+                        "`index` requires exactly one argument",
+                    ));
+                }
+                index_file = option.args[0].clone();
+            }
+            "try_files" => {
+                if option.args.is_empty() || !option.block.is_empty() {
+                    return Err(adapter_error(
+                        option.position,
+                        "`try_files` requires at least one file argument",
+                    ));
+                }
+                try_files = option.args.clone();
+            }
+            "transport" => {
+                return Err(adapter_error(
+                    option.position,
+                    "`php_fastcgi` does not accept a `transport` override",
+                ))
+            }
+            "handle_response" => {
+                return Err(adapter_error(
+                    option.position,
+                    "`php_fastcgi` handle_response blocks are not supported by this build (they need reverse_proxy response matchers)",
+                ))
+            }
+            name if name.starts_with('@') => {
+                return Err(adapter_error(
+                    option.position,
+                    format!(
+                        "`php_fastcgi` response matcher `{name}` is not supported by this build"
+                    ),
+                ))
+            }
+            "root"
+            | "env"
+            | "resolve_root_symlink"
+            | "dial_timeout"
+            | "read_timeout"
+            | "write_timeout"
+            | "capture_stderr" => fields.parse_transport_option(option)?,
+            _ => passthrough.push(option.clone()),
+        }
+    }
+
+    let synthetic = Directive {
+        name: "reverse_proxy".to_string(),
+        args: args.clone(),
+        arg_quoted: vec![false; args.len()],
+        block: passthrough,
+        position: directive.position,
+    };
+    let mut handler = reverse_proxy_handler(&synthetic, &args)?;
+    let Value::Object(handler_object) = &mut handler else {
+        unreachable!("reverse_proxy_handler always returns an object")
+    };
+    if handler_object.contains_key("transport") {
+        return Err(adapter_error(
+            directive.position,
+            "`php_fastcgi` does not accept a `transport` override",
+        ));
+    }
+    handler_object.insert(
+        "transport".to_string(),
+        fields.transport_json(Some(&extensions)),
+    );
+
+    let mut routes: Vec<Value> = Vec::new();
+    if index_file != "off" {
+        let directory_index = format!("{{http.request.uri.path}}/{index_file}");
+        let (try_files, try_policy, redirect_directories) = if try_files.is_empty() {
+            (
+                vec![
+                    "{http.request.uri.path}".to_string(),
+                    directory_index.clone(),
+                    index_file.clone(),
+                ],
+                Some("first_exist_fallback"),
+                true,
+            )
+        } else {
+            let qualified: Vec<String> = try_files
+                .iter()
+                .map(|value| qualify_placeholders(value))
+                .collect();
+            let redirect_directories = qualified.contains(&directory_index);
+            let try_policy = qualified
+                .last()
+                .map(|value| value.ends_with(".php"))
+                .unwrap_or(false)
+                .then_some("first_exist_fallback");
+            (qualified, try_policy, redirect_directories)
+        };
+
+        if redirect_directories {
+            routes.push(json!({
+                "match": [{
+                    "file": {"try_files": [directory_index]},
+                    "not": [{"path": ["*/"]}],
+                }],
+                "handle": [{
+                    "handler": "static_response",
+                    "headers": {
+                        "Location": [
+                            "{http.request.orig_uri.path}/{http.request.orig_uri.prefixed_query}"
+                        ],
+                    },
+                    "status_code": 308,
+                }],
+            }));
+        }
+
+        let mut file_matcher = Map::new();
+        file_matcher.insert("try_files".to_string(), json!(try_files));
+        if let Some(policy) = try_policy {
+            file_matcher.insert("try_policy".to_string(), json!(policy));
+        }
+        file_matcher.insert("split_path".to_string(), json!(extensions));
+        routes.push(json!({
+            "match": [{"file": Value::Object(file_matcher)}],
+            "handle": [{
+                "handler": "rewrite",
+                "uri": "{http.matchers.file.relative}",
+            }],
+        }));
+    }
+
+    let php_paths: Vec<String> = extensions
+        .iter()
+        .map(|extension| format!("*{extension}"))
+        .collect();
+    routes.push(json!({
+        "match": [{"path": php_paths}],
+        "handle": [handler],
+    }));
+
+    if let Some(user_matcher) = user_matcher {
+        Ok(vec![json!({
+            "match": [user_matcher],
+            "handle": [{"handler": "subroute", "routes": routes}],
+        })])
+    } else {
+        Ok(routes)
+    }
 }
 
 fn build_handlers(
@@ -3877,6 +4198,7 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
     let mut https_target = false;
     let mut h2c_target = false;
     let mut extra_transport = Map::new();
+    let mut fastcgi_transport: Option<Value> = None;
     for target in args {
         let parsed = parse_upstreams(target).map_err(|message| {
             adapter_error(
@@ -4175,34 +4497,55 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
                 );
             }
             "transport" => {
-                if item.args.first().map(String::as_str) != Some("http") {
-                    return Err(adapter_error(
-                        item.position,
-                        "only `transport http` is supported by this build",
-                    ));
-                }
-                for option in &item.block {
-                    match option.name.as_str() {
-                        "tls" => {
-                            extra_transport.insert("tls".to_string(), json!({}));
-                        }
-                        "tls_insecure_skip_verify" => {
-                            let tls = extra_transport
-                                .entry("tls".to_string())
-                                .or_insert_with(|| json!({}));
-                            if let Some(tls) = tls.as_object_mut() {
-                                tls.insert("insecure_skip_verify".to_string(), json!(true));
+                match item.args.first().map(String::as_str) {
+                    Some("http") => {
+                        for option in &item.block {
+                            match option.name.as_str() {
+                                "tls" => {
+                                    extra_transport.insert("tls".to_string(), json!({}));
+                                }
+                                "tls_insecure_skip_verify" => {
+                                    let tls = extra_transport
+                                        .entry("tls".to_string())
+                                        .or_insert_with(|| json!({}));
+                                    if let Some(tls) = tls.as_object_mut() {
+                                        tls.insert("insecure_skip_verify".to_string(), json!(true));
+                                    }
+                                }
+                                other => {
+                                    return Err(adapter_error(
+                                        option.position,
+                                        format!(
+                                        "transport option `{other}` is not supported by this build"
+                                    ),
+                                    ))
+                                }
                             }
                         }
-                        other => {
-                            return Err(adapter_error(
-                                option.position,
-                                format!(
-                                    "transport option `{other}` is not supported by this build"
-                                ),
-                            ))
-                        }
                     }
+                    Some("fastcgi") => {
+                        if item.args.len() != 1 {
+                            return Err(adapter_error(
+                                item.position,
+                                "`transport fastcgi` does not take arguments",
+                            ));
+                        }
+                        if fastcgi_transport.is_some() {
+                            return Err(adapter_error(
+                                item.position,
+                                "`transport` may only be specified once",
+                            ));
+                        }
+                        let mut fields = FastCgiFields::default();
+                        for option in &item.block {
+                            fields.parse_transport_option(option)?;
+                        }
+                        fastcgi_transport = Some(fields.transport_json(None));
+                    }
+                    _ => return Err(adapter_error(
+                        item.position,
+                        "only `transport http` and `transport fastcgi` are supported by this build",
+                    )),
                 }
             }
             other => {
@@ -4236,7 +4579,15 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
         }
         object.insert("headers".to_string(), Value::Object(headers));
     }
-    if https_target || h2c_target || !extra_transport.is_empty() {
+    if let Some(transport) = fastcgi_transport {
+        if https_target || h2c_target || !extra_transport.is_empty() {
+            return Err(adapter_error(
+                directive.position,
+                "`transport fastcgi` cannot be combined with HTTP/TLS/h2c upstream options",
+            ));
+        }
+        object.insert("transport".to_string(), transport);
+    } else if https_target || h2c_target || !extra_transport.is_empty() {
         let mut transport = Map::new();
         transport.insert("protocol".to_string(), json!("http"));
         if https_target {
