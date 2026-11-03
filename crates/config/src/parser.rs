@@ -213,6 +213,10 @@ pub struct Directive {
     pub name: String,
     /// Arguments on the directive line.
     pub args: Vec<String>,
+    /// Parallel to [`Directive::args`]: whether each argument was written as a quoted/backtick/
+    /// heredoc string. Caddy's `ScalarVal` conversion (e.g. `map`/`vars` outputs) treats quoted
+    /// tokens as strings even when they look numeric or boolean.
+    pub arg_quoted: Vec<bool>,
     /// Nested block, if any.
     pub block: Vec<Directive>,
     /// Source position of the name.
@@ -865,10 +869,12 @@ impl Parser {
             ));
         }
         let mut args = Vec::new();
+        let mut arg_quoted = Vec::new();
         loop {
             match self.peek().map(|t| (&t.kind, &t.text)) {
-                Some((TokenKind::Word | TokenKind::Quoted, text)) => {
+                Some((kind @ (TokenKind::Word | TokenKind::Quoted), text)) => {
                     args.push(text.clone());
+                    arg_quoted.push(matches!(kind, TokenKind::Quoted));
                     self.cursor += 1;
                 }
                 _ => break,
@@ -886,6 +892,7 @@ impl Parser {
         out.push(Directive {
             name: name_token.text,
             args,
+            arg_quoted,
             block,
             position: name_token.position,
         });

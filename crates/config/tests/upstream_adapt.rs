@@ -742,3 +742,115 @@ fn auto_https_combined_modes_match_real_caddy_v2_11_7() {
         })
     );
 }
+
+fn map_helper(directive: &str) -> Value {
+    let adapted = adapt(&format!("example.com {{\n\t{directive}\n}}\n"))
+        .unwrap_or_else(|e| panic!("adapt map `{directive}`: {e}"));
+    adapted.config["apps"]["http"]["servers"]["srv0"]["routes"][0]["handle"][0]["routes"][0]
+        ["handle"][0]
+        .clone()
+}
+
+#[test]
+fn map_and_vars_with_raw_types_matches_caddy() {
+    assert_adapts_like_caddy("map_and_vars_with_raw_types.caddyfiletest");
+}
+
+#[test]
+fn map_forms_match_real_caddy_v2_11_7() {
+    // Goldens from `caddy adapt` v2.11.7 for the supported subset.
+    assert_eq!(
+        map_helper("map {host} {my_var} {\n\t\texample.com value1\n\t\tdefault value2\n\t}"),
+        json!({
+            "handler": "map",
+            "source": "{http.request.host}",
+            "destinations": ["{my_var}"],
+            "mappings": [{"input": "example.com", "outputs": ["value1"]}],
+            "defaults": ["value2"],
+        })
+    );
+    assert_eq!(
+        map_helper(
+            "map {host} {a} {b} {\n\t\texample.com one two\n\t\tfoo\n\t\tdefault d1 d2\n\t}"
+        ),
+        json!({
+            "handler": "map",
+            "source": "{http.request.host}",
+            "destinations": ["{a}", "{b}"],
+            "mappings": [
+                {"input": "example.com", "outputs": ["one", "two"]},
+                {"input": "foo", "outputs": [null, null]},
+            ],
+            "defaults": ["d1", "d2"],
+        })
+    );
+    assert_eq!(
+        map_helper("map {host} {v} {\n\t\t~(.*)\\.example\\.com ${1}-sub\n\t}"),
+        json!({
+            "handler": "map",
+            "source": "{http.request.host}",
+            "destinations": ["{v}"],
+            "mappings": [{"input_regexp": "(.*)\\.example\\.com", "outputs": ["${1}-sub"]}],
+        })
+    );
+    // Quoted tokens stay strings even when numeric/boolean-looking; unquoted `-` is null.
+    assert_eq!(
+        map_helper("map {host} {a} {\n\t\tkey \"5\"\n\t\tkey2 true\n\t\tkey3 -\n\t}"),
+        json!({
+            "handler": "map",
+            "source": "{http.request.host}",
+            "destinations": ["{a}"],
+            "mappings": [
+                {"input": "key", "outputs": ["5"]},
+                {"input": "key2", "outputs": [true]},
+                {"input": "key3", "outputs": [null]},
+            ],
+        })
+    );
+}
+
+#[test]
+fn map_with_matcher_token_matches_real_caddy_v2_11_7() {
+    // Golden from `caddy adapt` v2.11.7: handler-directive matcher token becomes the route match.
+    let adapted = adapt("example.com {\n\tmap /api/* {host} {v} {\n\t\t* val\n\t}\n}\n")
+        .expect("adapt map with matcher");
+    assert_eq!(
+        adapted.config["apps"]["http"]["servers"]["srv0"]["routes"][0]["handle"][0]["routes"][0],
+        json!({
+            "match": [{"path": ["/api/*"]}],
+            "handle": [{
+                "handler": "map",
+                "source": "{http.request.host}",
+                "destinations": ["{v}"],
+                "mappings": [{"input": "*", "outputs": ["val"]}],
+            }],
+        })
+    );
+}
+
+#[test]
+fn map_invalid_forms_fail_loudly() {
+    for (directive, expected) in [
+        (
+            "map {host} {host} {\n\t\tdefault x\n\t}",
+            "conflicts with a Caddyfile placeholder shorthand",
+        ),
+        ("map {host} {a} {\n\t\tkey x y\n\t}", "too many outputs"),
+        (
+            "map {host} {a} {\n\t\tdefault x\n\t\tdefault y\n\t}",
+            "defaults already defined",
+        ),
+        (
+            "map {host} {\n\t\tdefault x\n\t}",
+            "missing destination argument(s)",
+        ),
+        ("map {\n\t\tdefault x\n\t}", "requires a source argument"),
+    ] {
+        let error = adapt(&format!("example.com {{\n\t{directive}\n}}\n"))
+            .expect_err(&format!("`{directive}` must fail"));
+        assert!(
+            error.to_string().contains(expected),
+            "error for `{directive}` should contain {expected:?}, got: {error}"
+        );
+    }
+}
