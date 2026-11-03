@@ -1674,7 +1674,7 @@ pub use order::{
     ChallengePolicy, ChallengeStatus, ChallengeType, Identifier, IssuedCertificate,
     NewOrderRequest, Order, OrderFetch, OrderHandle, OrderStatus, PollPolicy, TokioClock,
 };
-pub use transport::{read_root_certificates_pem_files, HyperTransport};
+pub use transport::{read_root_certificates_pem_files, HyperTransport, NoAcmeTransport};
 
 #[cfg(test)]
 mod tests {

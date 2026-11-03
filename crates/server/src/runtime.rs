@@ -23,8 +23,9 @@ use caddy_rs_http::RouterBuilder;
 use caddy_rs_tls::{
     build_server_config, build_server_config_with_cert_resolver, listener_uses_tls,
     plan_automatic_https, resolver_from_config, AcmeTlsAlpnResolver, AcmeTransport,
-    AutomaticHttpsPlan, AutomaticHttpsProvisioner, AutomaticHttpsRenewals, CertificateResolver,
-    HyperTransport, TlsAlpn01TokenStore, TlsServerOptions, DEFAULT_HTTPS_PORT,
+    AutomaticHttpsIssuer, AutomaticHttpsPlan, AutomaticHttpsProvisioner, AutomaticHttpsRenewals,
+    CertificateResolver, HyperTransport, NoAcmeTransport, TlsAlpn01TokenStore, TlsServerOptions,
+    DEFAULT_HTTPS_PORT,
 };
 use tokio::sync::watch;
 
@@ -794,9 +795,18 @@ impl ServerRuntime {
                     .map(std::path::PathBuf::from)
             })
             .unwrap_or_else(|| std::path::PathBuf::from(".caddy-rs"));
+        // Construct the ACME transport lazily: a default-on plan whose issuers are all internal
+        // (for example `localhost` sites) must not require a platform CA bundle, and an injected
+        // test transport is never bypassed. Public-name plans construct the production transport
+        // here and fail loudly if no CA bundle is available; issuance failures roll the apply back.
+        let needs_acme = plan
+            .policies
+            .iter()
+            .any(|policy| matches!(policy.issuer, AutomaticHttpsIssuer::Acme(_)));
         let transport: Arc<dyn AcmeTransport> = match &self.acme_transport {
             Some(transport) => Arc::clone(transport),
-            None => Arc::new(HyperTransport::new()?),
+            None if needs_acme => Arc::new(HyperTransport::new()?),
+            None => Arc::new(NoAcmeTransport),
         };
         let base_resolver = resolver_from_config(config)?;
         let provisioner =

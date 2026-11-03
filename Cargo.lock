@@ -151,6 +151,7 @@ dependencies = [
  "base64",
  "bytes",
  "caddy-rs-admin",
+ "caddy-rs-config",
  "caddy-rs-core",
  "caddy-rs-http",
  "caddy-rs-proxy",

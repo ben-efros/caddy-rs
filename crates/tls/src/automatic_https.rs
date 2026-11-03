@@ -5,19 +5,36 @@
 //! rustls server boundary in [`crate::tls_server`]. It deliberately stops at *plans* and
 //! *certificates*: the server supervisor owns listener binding and HTTP request handling.
 //!
-//! # Opt-in policy (divergence from Caddy)
+//! # Default-on policy
 //!
-//! Caddy enables automatic HTTPS by default for every site address. caddy-rs enables it only
-//! when the configuration explicitly declares automation — `apps.tls.automation.policies` or
-//! `apps.tls.certificates.automate`. This keeps offline/embedding runs deterministic: a TLS
-//! listener without certificates still fails loudly at apply time instead of starting a network
-//! ACME transaction. See the divergence register (DIV-0034).
+//! Like Caddy, automatic HTTPS is **on by default**: host matchers on a server that terminates
+//! TLS are managed automatically, and HTTP requests for those hosts are redirected to HTTPS,
+//! without requiring `apps.tls.automation` or `tls_connection_policies`. A server signals TLS by
+//! listening on the effective HTTPS port (`apps.http.https_port`, default 443) or by declaring
+//! `tls_connection_policies`; implicit HTTPS on any other port is ambiguous in raw JSON and fails
+//! loudly instead of silently serving cleartext.
+//!
+//! Opt-outs mirror Caddy: `automatic_https.disable` (also emitted by the Caddyfile `auto_https
+//! off` global option) skips a server; `disable_redirects`, `disable_certs`,
+//! `ignore_loaded_certificates`, `skip`, and `skip_certs` are honoured. `auto_https disable_certs`
+//! and `ignore_loaded_certificates` are read from the preserved `automatic_https` field because
+//! the typed model does not yet expose them (adapter support is a separate change).
+//!
+//! **No-CA policy:** ordinary public names use the default ACME issuer (Let's Encrypt). Local
+//! names (localhost/*.local/*.internal/private IPs and other non-public subjects) use the
+//! built-in internal CA automatically, so they work offline; `localhost`-style certificates are
+//! self-signed by that CA. A public-name configuration with no reachable CA fails the apply
+//! loudly and rolls back to the previous generation (Caddy instead keeps retrying in the
+//! background). Tests inject a fake ACME transport through the server runtime's
+//! `with_acme_transport` seam (or the provisioner seam) and never touch the network.
 //!
 //! # What is derived
 //!
 //! * **subjects**: host matchers of HTTP servers that terminate TLS (`tls_connection_policies`
 //!   or the effective HTTPS port) plus `apps.tls.certificates.automate`, minus
-//!   `automatic_https.skip`/`skip_certs`; servers with `automatic_https.disable` are manual.
+//!   `automatic_https.skip`/`skip_certs`; manually loaded certificates suppress automatic
+//!   management unless `automatic_https.ignore_loaded_certificates` is set. Servers with
+//!   `automatic_https.disable` are manual.
 //! * **policies**: `apps.tls.automation.policies` in order, matched by subject (empty subjects =
 //!   catch-all, `*` wildcards supported). The first issuer in a policy becomes either an ACME
 //!   issuer ([`crate::issuer::AcmeIssuerConfig`]) or Caddy's local internal CA
@@ -68,6 +85,7 @@
 //! and on-demand TLS are not implemented.
 
 use std::collections::BTreeMap;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -76,7 +94,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use serde_json::Value;
 
-use caddy_rs_core::config::{AutomationPolicy, Config, TlsApp};
+use caddy_rs_core::config::{AutoHttps, AutomationPolicy, Config, TlsApp};
 use caddy_rs_core::listen::{ListenAddr, Network};
 
 use crate::acme::{AcmeClock, AcmeStorage, AcmeTransport, PollPolicy, TokioClock};
@@ -136,6 +154,9 @@ pub struct AutomaticHttpsPlan {
     /// Whether the supervisor must derive an HTTP listener on `http_port` (challenge/redirect
     /// serving) because the configuration does not already have one.
     pub needs_http_listener: bool,
+    /// Subjects whose loaded certificates must be ignored: renewals/issuance are forced even when
+    /// a matching certificate is already loaded (`automatic_https.ignore_loaded_certificates`).
+    pub force_reissue: Vec<String>,
     /// Automation policies in evaluation order.
     pub policies: Vec<AutomaticHttpsPolicy>,
 }
@@ -178,53 +199,65 @@ pub fn plan(config: &Config) -> Result<Option<AutomaticHttpsPlan>> {
         return Ok(None);
     };
     let tls = config.tls();
-    let explicitly_enabled = tls
-        .map(|tls| {
-            !tls.automation_policies().is_empty()
-                || tls_automate(tls).is_some_and(|subjects| !subjects.is_empty())
-        })
-        .unwrap_or(false);
-    if !explicitly_enabled {
-        return Ok(None);
-    }
     let http_port = http.http_port.unwrap_or(DEFAULT_HTTP_PORT);
     let https_port = http
         .https_port
         .unwrap_or(crate::tls_server::DEFAULT_HTTPS_PORT);
 
     let mut policies = tls.map(parse_policies).transpose()?.unwrap_or_default();
-    // Caddy applies a default automation policy (ACME issuers) to subjects that no configured
-    // policy matches; model that as a catch-all policy appended after the configured ones.
-    if !policies.iter().any(|policy| policy.subjects.is_empty()) {
-        policies.push(AutomaticHttpsPolicy {
-            subjects: Vec::new(),
-            issuer: AutomaticHttpsIssuer::Acme(Box::default()),
-            on_demand: false,
-        });
-    }
+    let explicit_policies = !policies.is_empty();
+    let explicit_automate: Vec<String> = tls
+        .and_then(tls_automate)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+        .to_vec();
+    // Caddy's default automation policy is implicit: public names get the default ACME issuers.
+    // Configured policies are matched first; implicit policies for derived subjects are appended
+    // after them (internal subjects before the catch-all ACME policy).
+
+    // Manually configured certificates suppress automatic management unless the server opts out
+    // with `ignore_loaded_certificates` (Caddy checks its loaded-certificate cache; storage-loaded
+    // certificates are additionally consulted during provisioning).
+    let loaded_resolver = crate::tls_server::resolver_from_config(config)?;
 
     let mut subjects: Vec<String> = Vec::new();
     let mut redirect_hosts: Vec<String> = Vec::new();
     let mut redirect_all = false;
-    let mut has_manual_disable = false;
-    for server in http.servers.values() {
-        let auto_https = server.automatic_https.clone().unwrap_or_default();
+    let mut force_reissue: Vec<String> = Vec::new();
+    let mut internal_subjects: Vec<String> = Vec::new();
+    let mut public_subjects: Vec<String> = Vec::new();
+    let mut enabled_servers = 0usize;
+    let mut explicit_skip_patterns: Vec<String> = Vec::new();
+
+    for (server_name, server) in &http.servers {
+        let auto = server.automatic_https.clone().unwrap_or_default();
+        if auto.disable {
+            continue;
+        }
+        enabled_servers += 1;
+        explicit_skip_patterns.extend(auto.skip.iter().cloned());
+
+        let mut ports: Vec<u16> = Vec::new();
+        for listen in &server.listen {
+            let Ok(address) = ListenAddr::parse(listen) else {
+                continue;
+            };
+            if address.network == Network::Tcp {
+                if let Some(port) = address.port() {
+                    if !ports.contains(&port) {
+                        ports.push(port);
+                    }
+                }
+            }
+        }
         let policies_present = server
             .tls_connection_policies
             .as_ref()
             .is_some_and(|policies| !policies.is_empty());
-        let terminates_tls = policies_present
-            || server.listen.iter().any(|listen| {
-                ListenAddr::parse(listen)
-                    .ok()
-                    .and_then(|address| address.port())
-                    == Some(https_port)
-            });
-        if !terminates_tls {
-            continue;
-        }
-        if auto_https.disable {
-            has_manual_disable = true;
+        if !ports.is_empty() && ports.iter().all(|port| *port == http_port) && !policies_present {
+            // Caddy warns and disables automatic HTTPS for a server listening only on the HTTP
+            // port; there is no TLS to manage. Explicit TLS connection policies preserve the
+            // pre-default-on behaviour (tests/embedders may use an ephemeral HTTP port for TLS).
             continue;
         }
         let routes = serde_json::to_value(&server.routes).map_err(|error| {
@@ -237,61 +270,179 @@ pub fn plan(config: &Config) -> Result<Option<AutomaticHttpsPlan>> {
         if let Some(routes) = routes.as_array() {
             collect_route_hosts(routes, &mut hosts, &mut catch_all);
         }
-        let skipped = |host: &str| {
-            auto_https
-                .skip
-                .iter()
-                .any(|pattern| host_matches(pattern, host))
-                || auto_https
-                    .skip_certs
-                    .iter()
-                    .any(|pattern| host_matches(pattern, host))
-        };
-        for host in hosts {
-            let host = normalize_host(&host);
-            if host.is_empty() || skipped(&host) {
+        let has_https_port = ports.iter().any(|port| *port == https_port);
+        let has_http_port = ports.iter().any(|port| *port == http_port);
+        let has_other_port = ports
+            .iter()
+            .any(|port| *port != http_port && *port != https_port);
+        let uses_tls = policies_present || has_https_port;
+
+        if hosts.is_empty() {
+            // Hostless servers have no certificate subjects. Preserve the pre-default-on
+            // behaviour for explicit TLS policy servers: they only participate in automatic HTTPS
+            // when automation is explicitly configured (catch-all/on-demand TLS is not supported).
+            if policies_present && (explicit_policies || !explicit_automate.is_empty()) {
+                if catch_all && !auto.disable_redirects {
+                    redirect_all = true;
+                }
+            }
+            continue;
+        }
+        let path = format!("apps.http.servers.{server_name}.listen");
+        if !uses_tls {
+            // A host matcher on a non-standard port without TLS policies would be served in
+            // cleartext by caddy-rs while Caddy would infer HTTPS; that ambiguity is loud.
+            return Err(Error::TlsConfig {
+                path,
+                message: format!(
+                    "host matchers require TLS but the listener port(s) {ports:?} are neither \
+                     the HTTP port {http_port} nor the HTTPS port {https_port}; add \
+                     `tls_connection_policies` or set apps.http.https_port"
+                ),
+            });
+        }
+        if has_http_port && uses_tls && !policies_present {
+            return Err(Error::TlsConfig {
+                path,
+                message: format!(
+                    "a server cannot mix cleartext (port {http_port}) and TLS listeners in one \
+                     block; split the HTTP and HTTPS sites into separate server blocks"
+                ),
+            });
+        }
+        if !policies_present && has_other_port {
+            return Err(Error::TlsConfig {
+                path,
+                message: format!(
+                    "implicit HTTPS on non-standard port(s) {ports:?} is ambiguous; use the \
+                     configured HTTPS port {https_port} or declare `tls_connection_policies`"
+                ),
+            });
+        }
+
+        let redirects_for_server =
+            !auto.disable_redirects && (has_https_port || (policies_present && explicit_policies));
+        let disable_certs = auto_disable_certs(&auto);
+        for raw_host in hosts {
+            let host = normalize_host(&raw_host);
+            if host.is_empty() {
                 continue;
             }
-            if !subjects.contains(&host) {
-                subjects.push(host.clone());
+            if auto.skip.iter().any(|pattern| host_matches(pattern, &host)) {
+                // Caddy's `skip` disables both certificate management and redirects for the name.
+                continue;
             }
-            if !auto_https.disable_redirects && !redirect_hosts.contains(&host) {
-                redirect_hosts.push(host);
+            let skip_certs = auto
+                .skip_certs
+                .iter()
+                .any(|pattern| host_matches(pattern, &host));
+            if !disable_certs && !skip_certs && subject_qualifies_for_cert(&host) {
+                let already_planned = subjects.iter().any(|subject| subject == &host);
+                let loaded = loaded_resolver
+                    .as_ref()
+                    .is_some_and(|resolver| resolver.covers(&host));
+                if loaded && !auto.ignore_loaded_certs {
+                    // A manually loaded certificate already covers this name; Caddy keeps it and
+                    // only redirects. The name is not added to automatic management.
+                } else if !already_planned {
+                    subjects.push(host.clone());
+                    if auto.ignore_loaded_certs {
+                        force_reissue.push(host.clone());
+                    }
+                    if subject_uses_internal_issuer(&host, explicit_policies) {
+                        internal_subjects.push(host.clone());
+                    } else {
+                        public_subjects.push(host.clone());
+                    }
+                }
+            }
+            if redirects_for_server && !redirect_hosts.contains(&host) {
+                redirect_hosts.push(host.clone());
             }
         }
-        if catch_all && !auto_https.disable_redirects {
+        if catch_all && redirects_for_server {
             redirect_all = true;
         }
     }
-    let skip_patterns: Vec<String> = http
-        .servers
-        .values()
-        .filter_map(|server| server.automatic_https.as_ref())
-        .flat_map(|auto| auto.skip.iter().cloned())
-        .collect();
+
     // Explicitly automated subjects (`apps.tls.certificates.automate`) are managed even when no
     // host matcher covers them (Caddy uses this for hosts sharing a server block with a hostless
     // address).
-    if let Some(tls) = tls {
-        for subject in tls_automate(tls).map(Vec::as_slice).unwrap_or(&[]) {
-            let subject = normalize_host(subject);
-            if subject.is_empty()
-                || skip_patterns
-                    .iter()
-                    .any(|pattern| host_matches(pattern, &subject))
-            {
-                continue;
-            }
-            if !subjects.contains(&subject) {
-                subjects.push(subject.clone());
-            }
-            if !redirect_hosts.contains(&subject) {
-                redirect_hosts.push(subject);
+    for subject in &explicit_automate {
+        let subject = normalize_host(subject);
+        if subject.is_empty()
+            || explicit_skip_patterns
+                .iter()
+                .any(|pattern| host_matches(pattern, &subject))
+        {
+            continue;
+        }
+        if !subjects.contains(&subject) {
+            subjects.push(subject.clone());
+            if subject_uses_internal_issuer(&subject, explicit_policies) {
+                internal_subjects.push(subject.clone());
+            } else {
+                public_subjects.push(subject.clone());
             }
         }
+        if !redirect_hosts.contains(&subject) {
+            redirect_hosts.push(subject.clone());
+        }
     }
+
     subjects.sort();
+    subjects.dedup();
     redirect_hosts.sort();
+    redirect_hosts.dedup();
+    force_reissue.sort();
+    force_reissue.dedup();
+
+    // Derive implicit automation policies for managed subjects that no configured policy matches.
+    let unmatched = |subjects: &[String]| -> Vec<String> {
+        subjects
+            .iter()
+            .filter(|subject| {
+                !policies
+                    .iter()
+                    .any(|policy| policy_matches(&policy.subjects, subject))
+            })
+            .cloned()
+            .collect()
+    };
+    let unmatched_internal = unmatched(&internal_subjects);
+    let unmatched_public = unmatched(&public_subjects);
+    if !unmatched_internal.is_empty() {
+        policies.push(AutomaticHttpsPolicy {
+            subjects: unmatched_internal,
+            issuer: AutomaticHttpsIssuer::Internal,
+            on_demand: false,
+        });
+    }
+    let needs_default_acme = !policies.iter().any(|policy| policy.subjects.is_empty())
+        && (!unmatched_public.is_empty() || explicit_policies || !explicit_automate.is_empty());
+    if needs_default_acme {
+        // Caddy's default automation policy: public names use the default ACME issuers.
+        policies.push(AutomaticHttpsPolicy {
+            subjects: Vec::new(),
+            issuer: AutomaticHttpsIssuer::Acme(Box::default()),
+            on_demand: false,
+        });
+    }
+
+    if enabled_servers == 0 {
+        // Every server opted out with `automatic_https.disable` (for example Caddyfile
+        // `auto_https off`): automatic HTTPS is inert.
+        return Ok(None);
+    }
+    if subjects.is_empty()
+        && redirect_hosts.is_empty()
+        && !redirect_all
+        && policies.is_empty()
+        && explicit_automate.is_empty()
+    {
+        return Ok(None);
+    }
+
     let redirects_enabled = !redirect_hosts.is_empty() || redirect_all;
 
     // Does an existing cleartext listener already serve the HTTP port (and thus challenges)?
@@ -313,9 +464,6 @@ pub fn plan(config: &Config) -> Result<Option<AutomaticHttpsPlan>> {
         && !has_http_listener
         && http_port != https_port;
 
-    if policies.is_empty() && subjects.is_empty() && !has_manual_disable {
-        return Ok(None);
-    }
     Ok(Some(AutomaticHttpsPlan {
         http_port,
         https_port,
@@ -324,8 +472,76 @@ pub fn plan(config: &Config) -> Result<Option<AutomaticHttpsPlan>> {
         redirect_all,
         redirects_enabled,
         needs_http_listener,
+        force_reissue,
         policies,
     }))
+}
+
+/// Whether the server opted out of certificate management with the untyped
+/// `automatic_https.disable_certs` option (Caddy's `auto_https disable_certs`).
+fn auto_disable_certs(auto: &AutoHttps) -> bool {
+    auto.extra
+        .get("disable_certs")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Whether `subject` can be issued by a CA (certmagic's `SubjectQualifiesForCert`).
+fn subject_qualifies_for_cert(subject: &str) -> bool {
+    let subject = subject.trim();
+    !subject.is_empty()
+        && !subject.starts_with('.')
+        && !subject.ends_with('.')
+        && (!subject.contains('*') || subject.starts_with("*.") || subject == "*")
+        && !subject.contains([
+            '(', ')', '[', ']', '{', '}', '<', '>', ' ', '\t', '\n', '"', '\\', '!', '@', '#', '$',
+            '%', '^', '&', '|', ';', '\'', '+', '=',
+        ])
+}
+
+/// Whether `subject` is internal (certmagic's `SubjectIsInternal`): localhost-style names,
+/// `.local`/`.internal`/`.home.arpa` and private/link-local/loopback IPs. These get an internal
+/// CA certificate by default so local sites work without any public CA.
+fn subject_is_internal(subject: &str) -> bool {
+    let subject = normalize_host(subject);
+    subject == "localhost"
+        || subject.ends_with(".localhost")
+        || subject.ends_with(".local")
+        || subject.ends_with(".internal")
+        || subject.ends_with(".home.arpa")
+        || subject_is_internal_ip(&subject)
+}
+
+/// Caddy assigns self-signed/internal certificates to IP addresses when no explicit automation
+/// policies exist (public CAs do not issue for IPs through the default issuers); with explicit
+/// policies an IP would go to whatever the policy says, so it is treated as public here.
+fn subject_uses_internal_issuer(subject: &str, explicit_policies: bool) -> bool {
+    subject_is_internal(subject) || (subject_is_ip(subject) && !explicit_policies)
+}
+
+fn subject_is_ip(subject: &str) -> bool {
+    normalize_host(subject).parse::<IpAddr>().is_ok()
+}
+
+fn subject_is_internal_ip(subject: &str) -> bool {
+    let Ok(address) = subject.parse::<IpAddr>() else {
+        return false;
+    };
+    match address {
+        IpAddr::V4(address) => {
+            address.is_loopback()
+                || address.is_private()
+                || address.is_link_local()
+                || address.is_unspecified()
+        }
+        IpAddr::V6(address) => {
+            let segments = address.segments();
+            address.is_loopback()
+                || address.is_unspecified()
+                || (segments[0] & 0xfe00) == 0xfc00 // unique local fc00::/7
+                || (segments[0] & 0xffc0) == 0xfe80 // link local fe80::/10
+        }
+    }
 }
 
 fn tls_automate(tls: &TlsApp) -> Option<&Vec<String>> {
@@ -868,7 +1084,9 @@ impl AutomaticHttpsProvisioner {
 
         let mut issued = Vec::new();
         for subject in &plan.subjects {
-            if resolver.covers(subject) {
+            if resolver.covers(subject)
+                && !plan.force_reissue.iter().any(|forced| forced == subject)
+            {
                 continue;
             }
             let policy = plan.policy_for(subject).ok_or_else(|| {
@@ -1421,10 +1639,9 @@ mod tests {
     fn plan_respects_auto_https_disable() {
         let mut value = serde_json::to_value(https_config()).unwrap();
         value["apps"]["http"]["servers"]["srv0"]["automatic_https"] = json!({"disable": true});
-        let plan = plan(&Config::from_value(value).unwrap()).unwrap().unwrap();
-        assert!(plan.subjects.is_empty());
-        assert!(!plan.redirects_enabled);
-        assert!(!plan.needs_http_listener);
+        // `automatic_https.disable` (Caddyfile `auto_https off`) makes automatic HTTPS inert,
+        // even when automation policies are present; manual TLS still uses configured certs.
+        assert!(plan(&Config::from_value(value).unwrap()).unwrap().is_none());
     }
 
     #[test]
@@ -1436,6 +1653,184 @@ mod tests {
         assert!(plan
             .redirect_hosts
             .contains(&"extra.example.com".to_string()));
+    }
+
+    fn implicit_https_config(hosts: &[&str]) -> Config {
+        config(json!({
+            "apps": {"http": {"servers": {"srv0": {
+                "listen": [":443"],
+                "routes": [{"match": [{"host": hosts}],
+                            "handle": [{"handler": "static_response", "body": "ok"}]}]
+            }}}}
+        }))
+    }
+
+    #[test]
+    fn plan_defaults_on_for_implicit_https_hosts() {
+        let plan = plan(&implicit_https_config(&["example.com"]))
+            .unwrap()
+            .expect("default-on plan");
+        assert_eq!(plan.subjects, vec!["example.com".to_string()]);
+        assert_eq!(plan.redirect_hosts, vec!["example.com".to_string()]);
+        assert!(plan.redirects_enabled);
+        assert!(plan.needs_http_listener);
+        assert_eq!(plan.https_port, 443);
+        match &plan.policy_for("example.com").unwrap().issuer {
+            AutomaticHttpsIssuer::Acme(config) => {
+                assert!(config.ca.contains("letsencrypt.org"), "{}", config.ca)
+            }
+            other => panic!("public host must use the default ACME policy: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_defaults_off_for_http_only_sites() {
+        let plain = config(json!({
+            "apps": {"http": {"servers": {"srv0": {
+                "listen": [":80"],
+                "routes": [{"match": [{"host": ["example.com"]}],
+                            "handle": [{"handler": "static_response", "body": "ok"}]}]
+            }}}}
+        }));
+        assert!(plan(&plain).unwrap().is_none());
+    }
+
+    #[test]
+    fn plan_default_on_honours_disable_redirects() {
+        let mut value = serde_json::to_value(implicit_https_config(&["example.com"])).unwrap();
+        value["apps"]["http"]["servers"]["srv0"]["automatic_https"] =
+            json!({"disable_redirects": true});
+        let plan = plan(&Config::from_value(value).unwrap()).unwrap().unwrap();
+        assert_eq!(plan.subjects, vec!["example.com".to_string()]);
+        assert!(!plan.redirects_enabled);
+        assert!(
+            plan.needs_http_listener,
+            "challenge serving still needs the HTTP listener"
+        );
+    }
+
+    #[test]
+    fn plan_default_on_honours_disable_certs() {
+        let mut value = serde_json::to_value(implicit_https_config(&["example.com"])).unwrap();
+        // `disable_certs` is preserved in the untyped automatic_https object until the typed
+        // model/adapter expose it.
+        value["apps"]["http"]["servers"]["srv0"]["automatic_https"] =
+            json!({"disable_certs": true});
+        let plan = plan(&Config::from_value(value).unwrap()).unwrap().unwrap();
+        assert!(
+            plan.subjects.is_empty(),
+            "certificate management is disabled"
+        );
+        assert_eq!(plan.redirect_hosts, vec!["example.com".to_string()]);
+        assert!(plan.redirects_enabled);
+    }
+
+    #[test]
+    fn plan_default_on_honours_skip_and_skip_certs() {
+        let mut value = serde_json::to_value(implicit_https_config(&[
+            "example.com",
+            "skip.example.com",
+            "certs.example.com",
+        ]))
+        .unwrap();
+        value["apps"]["http"]["servers"]["srv0"]["automatic_https"] = json!({
+            "skip": ["skip.example.com"],
+            "skip_certs": ["certs.example.com"]
+        });
+        let plan = plan(&Config::from_value(value).unwrap()).unwrap().unwrap();
+        assert!(plan.subjects.contains(&"example.com".to_string()));
+        assert!(!plan.subjects.contains(&"skip.example.com".to_string()));
+        assert!(!plan.subjects.contains(&"certs.example.com".to_string()));
+        assert!(!plan
+            .redirect_hosts
+            .contains(&"skip.example.com".to_string()));
+        assert!(
+            plan.redirect_hosts
+                .contains(&"certs.example.com".to_string()),
+            "skip_certs only disables certificate management, not redirects"
+        );
+    }
+
+    #[test]
+    fn plan_default_on_routes_internal_names_to_the_internal_issuer() {
+        let internal_plan = plan(&implicit_https_config(&["localhost", "app.internal"]))
+            .unwrap()
+            .expect("internal default-on plan");
+        assert!(internal_plan.subjects.contains(&"localhost".to_string()));
+        assert!(internal_plan.subjects.contains(&"app.internal".to_string()));
+        assert!(matches!(
+            internal_plan.policy_for("localhost").unwrap().issuer,
+            AutomaticHttpsIssuer::Internal
+        ));
+        assert!(matches!(
+            internal_plan.policy_for("app.internal").unwrap().issuer,
+            AutomaticHttpsIssuer::Internal
+        ));
+
+        // With no explicit policies, IP addresses are self-signed by the internal CA as well.
+        let plan = plan(&implicit_https_config(&["203.0.113.7"]))
+            .unwrap()
+            .expect("public IP default-on plan");
+        assert!(matches!(
+            plan.policy_for("203.0.113.7").unwrap().issuer,
+            AutomaticHttpsIssuer::Internal
+        ));
+    }
+
+    #[test]
+    fn plan_ignores_loaded_manual_certificates_unless_forced() {
+        let mut value = serde_json::to_value(implicit_https_config(&["example.com"])).unwrap();
+        value["apps"]["tls"] = json!({"certificates": {"load_pem": [{
+            "certificate": include_str!("../testdata/https/example.com.pem"),
+            "key": include_str!("../testdata/https/example.com.key")
+        }]}});
+        let loaded_plan = plan(&Config::from_value(value.clone()).unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(
+            loaded_plan.subjects.is_empty(),
+            "a loaded certificate suppresses automatic management"
+        );
+        assert!(loaded_plan.redirects_enabled, "redirects still apply");
+
+        value["apps"]["http"]["servers"]["srv0"]["automatic_https"] =
+            json!({"ignore_loaded_certificates": true});
+        let forced_plan = plan(&Config::from_value(value).unwrap()).unwrap().unwrap();
+        assert_eq!(forced_plan.subjects, vec!["example.com".to_string()]);
+        assert_eq!(forced_plan.force_reissue, vec!["example.com".to_string()]);
+    }
+
+    #[test]
+    fn plan_rejects_ambiguous_implicit_https_port() {
+        let value = json!({
+            "apps": {"http": {"servers": {"srv0": {
+                "listen": [":8443"],
+                "routes": [{"match": [{"host": ["example.com"]}],
+                            "handle": [{"handler": "static_response", "body": "ok"}]}]
+            }}}}
+        });
+        let error = plan(&Config::from_value(value).unwrap()).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("neither the HTTP port") || message.contains("ambiguous"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn plan_rejects_mixed_cleartext_and_tls_listeners() {
+        let value = json!({
+            "apps": {"http": {"servers": {"srv0": {
+                "listen": [":80", ":443"],
+                "routes": [{"match": [{"host": ["example.com"]}],
+                            "handle": [{"handler": "static_response", "body": "ok"}]}]
+            }}}}
+        });
+        let error = plan(&Config::from_value(value).unwrap()).unwrap_err();
+        assert!(
+            error.to_string().contains("cannot mix cleartext"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1878,6 +2273,7 @@ mod tests {
             redirect_all: false,
             redirects_enabled: true,
             needs_http_listener: false,
+            force_reissue: Vec::new(),
             policies: Vec::new(),
         };
         let provisioner = AutomaticHttpsProvisioner::new(

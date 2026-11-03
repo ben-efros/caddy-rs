@@ -29,6 +29,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
+caddy-rs-config = { workspace = true }
 base64 = "0.22.1"
 ring = "0.17.14"
 tempfile = "3.27.0"

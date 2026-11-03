@@ -166,7 +166,7 @@ fn signed_payload(request: &HttpRequest) -> serde_json::Value {
 impl AcmeTransport for FakeCa {
     async fn request(&self, request: HttpRequest) -> caddy_rs_tls::Result<HttpResponse> {
         let url = request.url.clone();
-        if request.method == HttpMethod::Get && url == DIRECTORY {
+        if request.method == HttpMethod::Get && url.ends_with("/directory") {
             return Ok(json_response(
                 200,
                 serde_json::json!({
@@ -1736,5 +1736,171 @@ async fn failed_apply_aborts_the_new_scheduler_and_keeps_the_previous_one() {
     let (status, _, body) = http_get(&mut stream, "example.com", "/").await;
     assert_eq!(status, 200);
     assert_eq!(body, "hello https");
+    runtime.shutdown().await;
+}
+
+// ---- default-on automatic HTTPS -------------------------------------------------------------
+
+/// An implicit-HTTPS config: no `apps.tls`, no `tls_connection_policies`, just a host matcher on
+/// the HTTPS listener (what an adapted `example.com { respond ... }` Caddyfile looks like).
+fn implicit_https_config(
+    listen: &str,
+    http_port: u16,
+    https_port: u16,
+    storage_root: &str,
+    automatic_https: Option<serde_json::Value>,
+) -> Config {
+    let mut server = serde_json::json!({
+        "listen": [listen],
+        "routes": [{
+            "match": [{"host": ["example.com"]}],
+            "handle": [{"handler": "static_response", "body": "hello default https"}]
+        }]
+    });
+    if let Some(automatic_https) = automatic_https {
+        server["automatic_https"] = automatic_https;
+    }
+    Config::from_value(serde_json::json!({
+        "admin": {"disabled": true},
+        "storage": {"module": "file_system", "root": storage_root},
+        "apps": {"http": {
+            "http_port": http_port,
+            "https_port": https_port,
+            "servers": {"srv0": server}
+        }}
+    }))
+    .expect("implicit HTTPS config decodes")
+}
+
+#[tokio::test]
+async fn default_on_issues_certificate_for_implicit_https_site() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().to_string_lossy().to_string();
+    let (https_address, activation) = prebound_listener();
+    let listen = https_address.to_string();
+    let https_port = https_address.port();
+    let http_port = free_loopback_port();
+    let store = Arc::new(GenerationStore::with_builtin_registry());
+    store
+        .load(implicit_https_config(
+            &listen, http_port, https_port, &root, None,
+        ))
+        .expect("implicit HTTPS config validates");
+    let fake = Arc::new(FakeCa::new(false));
+    let mut runtime = ServerRuntime::new(Arc::clone(&store))
+        .with_acme_transport(fake.clone())
+        .with_data_root(directory.path())
+        .with_socket_activation(activation);
+    runtime
+        .apply()
+        .await
+        .expect("default-on automatic HTTPS must obtain a certificate");
+
+    // The default ACME policy managed the implicit host, without any apps.tls automation.
+    assert_eq!(fake.domains(), vec!["example.com".to_string()]);
+    let address = runtime
+        .listener_address(&listen)
+        .expect("implicit HTTPS listener bound");
+    let mut stream = tls_connect(address, "example.com").await;
+    let (status, _, body) = http_get(&mut stream, "example.com", "/").await;
+    assert_eq!(status, 200);
+    assert_eq!(body, "hello default https");
+
+    // A derived cleartext listener redirects the host to the HTTPS port.
+    let http = runtime
+        .listener_address(&format!(":{http_port}"))
+        .expect("derived HTTP redirect listener bound");
+    let (status, headers, _) = plain_get(http, "example.com", "/path?q=1").await;
+    assert_eq!(status, 308);
+    let location = header(&headers, "location").expect("redirect Location");
+    assert_eq!(
+        location,
+        format!("https://example.com:{https_port}/path?q=1")
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn default_on_disable_does_not_issue_and_fails_loudly_without_certificates() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().to_string_lossy().to_string();
+    let (https_address, activation) = prebound_listener();
+    let listen = https_address.to_string();
+    let store = Arc::new(GenerationStore::with_builtin_registry());
+    store
+        .load(implicit_https_config(
+            &listen,
+            free_loopback_port(),
+            https_address.port(),
+            &root,
+            Some(serde_json::json!({"disable": true})),
+        ))
+        .expect("auto_https off config validates");
+    let fake = Arc::new(FakeCa::new(false));
+    let mut runtime = ServerRuntime::new(Arc::clone(&store))
+        .with_acme_transport(fake.clone())
+        .with_data_root(directory.path())
+        .with_socket_activation(activation);
+    let error = runtime
+        .apply()
+        .await
+        .expect_err("auto_https off with a TLS listener and no certificates must fail loudly");
+    assert!(
+        error.to_string().contains("apps.tls.certificates"),
+        "{error}"
+    );
+    assert!(error.to_string().contains("terminates TLS"), "{error}");
+    assert!(
+        fake.domains().is_empty(),
+        "auto_https off must not obtain certificates"
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn default_on_caddyfile_end_to_end() {
+    let directory = tempfile::tempdir().unwrap();
+    let http_port = free_loopback_port();
+    let https_port = free_loopback_port();
+    let caddyfile = format!(
+        "{{\n\thttp_port {http_port}\n\thttps_port {https_port}\n}}\n\nexample.com {{\n\trespond \"hello caddyfile\"\n}}\n"
+    );
+    let adapted = caddy_rs_config::adapt_with_source(&caddyfile, None)
+        .expect("simple public-host Caddyfile adapts");
+    let config = Config::from_value(adapted.config).expect("adapted JSON decodes");
+    // The adapter relies on Caddy's default-on automatic HTTPS: no apps.tls automation, no
+    // explicit tls_connection_policies are required.
+    assert!(
+        config
+            .tls()
+            .map(|tls| tls.automation_policies().is_empty())
+            .unwrap_or(true),
+        "test must not rely on explicit automation policies"
+    );
+    let store = Arc::new(GenerationStore::with_builtin_registry());
+    store.load(config).expect("adapted Caddyfile validates");
+    let fake = Arc::new(FakeCa::new(false));
+    let mut runtime = ServerRuntime::new(Arc::clone(&store))
+        .with_acme_transport(fake.clone())
+        .with_data_root(directory.path());
+    runtime
+        .apply()
+        .await
+        .expect("adapted Caddyfile gets automatic HTTPS by default");
+    assert_eq!(fake.domains(), vec!["example.com".to_string()]);
+
+    let https = SocketAddr::from(([127, 0, 0, 1], https_port));
+    let mut stream = tls_connect(https, "example.com").await;
+    let (status, _, body) = http_get(&mut stream, "example.com", "/").await;
+    assert_eq!(status, 200);
+    assert_eq!(body, "hello caddyfile");
+
+    let http = SocketAddr::from(([127, 0, 0, 1], http_port));
+    let (status, headers, _) = plain_get(http, "example.com", "/").await;
+    assert_eq!(status, 308);
+    assert_eq!(
+        header(&headers, "location"),
+        Some(format!("https://example.com:{https_port}/").as_str())
+    );
     runtime.shutdown().await;
 }
