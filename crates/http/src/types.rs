@@ -389,15 +389,25 @@ pub trait Handler: Send + Sync {
     /// Process a request with the buffered compatibility API.
     async fn handle(&self, request: Request) -> Result<Outcome>;
 
-    /// Whether this handler consumes the request body and therefore requires it to be buffered
-    /// before dispatch.
+    /// Whether this handler requires the complete request body before dispatch.
     ///
-    /// The server buffers request bodies for routers that contain such a handler (today that is
-    /// `reverse_proxy`; streaming request bodies through the proxy is the T-PROXY-004 follow-up).
-    /// The router derives the same flag from the configuration JSON so external crates do not have
-    /// to override this (see [`crate::RouterBuilder`]).
+    /// The server buffers `hyper::body::Incoming` for routers that contain such a handler. Handlers
+    /// that can consume a streamed request body (streaming `reverse_proxy`) return `false`; the
+    /// router composes this capability over every built handler, including nested subroutes, so
+    /// custom handlers supplied through [`crate::CustomHandlerFactory`] are honoured too.
     fn requires_buffered_request_body(&self) -> bool {
         false
+    }
+
+    /// Whether this handler reads the request body at all, even if it can consume a streamed body
+    /// without needing it pre-buffered (for example streaming `reverse_proxy`).
+    ///
+    /// The router uses this to enforce a `request_body` limit before dispatching to a
+    /// body-consuming handler, because that handler is the one that would observe Caddy's lazy
+    /// `413`. The default mirrors [`Handler::requires_buffered_request_body`]: a handler that
+    /// needs the complete body up front clearly consumes it.
+    fn consumes_request_body(&self) -> bool {
+        self.requires_buffered_request_body()
     }
 
     /// Process a request on the streaming path.

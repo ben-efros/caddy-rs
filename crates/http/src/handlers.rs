@@ -524,6 +524,10 @@ impl Handler for SubrouteHandler {
         self.router.requires_buffered_request_body()
     }
 
+    fn consumes_request_body(&self) -> bool {
+        self.router.consumes_request_body()
+    }
+
     async fn handle(&self, request: Request) -> Result<Outcome> {
         // Caddy compiles a subroute's routes with the *outer* handler chain as their continuation
         // (`RouteList.Compile(next)`), so an empty or non-matching subroute is a no-op that passes
@@ -1027,7 +1031,7 @@ mod tests {
 
     // ---- request_body ---------------------------------------------------------------
 
-    use crate::body::{BodyError, RequestBody, StreamingBody};
+    use crate::body::{BodyError, RequestBody, StreamingBody, StreamingResponse};
     use crate::router::RouterBuilder;
     use tokio::sync::mpsc;
 
@@ -1292,5 +1296,137 @@ mod tests {
             .unwrap();
         assert_eq!(response.status, StatusCode::OK);
         assert_eq!(response.body, Bytes::from_static(b"1234"));
+    }
+
+    /// Streaming `reverse_proxy` stub: reports the buffering capability as false (like the real
+    /// proxy without retries) and consumes the request body frame by frame.
+    struct StreamingProxyStub {
+        consumed: Arc<std::sync::Mutex<Vec<Bytes>>>,
+    }
+
+    #[async_trait]
+    impl Handler for StreamingProxyStub {
+        fn name(&self) -> &'static str {
+            "reverse_proxy"
+        }
+
+        async fn handle(&self, _request: Request) -> Result<Outcome> {
+            panic!("streaming proxy stub uses the streaming path");
+        }
+
+        async fn handle_streaming(&self, mut request: Request) -> Result<StreamingOutcome> {
+            let mut body = request.take_body();
+            let mut consumed = Vec::new();
+            while let Some(frame) = body.next_frame().await {
+                let frame = frame?;
+                if let Ok(data) = frame.into_data() {
+                    consumed.push(data);
+                }
+            }
+            *self.consumed.lock().expect("lock") = consumed;
+            Ok(StreamingOutcome::Respond(StreamingResponse::from_buffered(
+                Response::text(StatusCode::OK, "proxied"),
+            )))
+        }
+    }
+
+    fn streaming_proxy_factory(
+        consumed: Arc<std::sync::Mutex<Vec<Bytes>>>,
+    ) -> crate::router::CustomHandlerFactory {
+        Arc::new(move |value, _path| {
+            Ok(
+                match value.get("handler").and_then(serde_json::Value::as_str) {
+                    Some("reverse_proxy") => Some(Arc::new(StreamingProxyStub {
+                        consumed: Arc::clone(&consumed),
+                    }) as crate::SharedHandler),
+                    _ => None,
+                },
+            )
+        })
+    }
+
+    fn streaming_request(chunks: Vec<&'static [u8]>) -> Request {
+        let (sender, receiver) = mpsc::channel::<std::result::Result<Bytes, BodyError>>(8);
+        for chunk in chunks {
+            sender.try_send(Ok(Bytes::from_static(chunk))).unwrap();
+        }
+        drop(sender);
+        test_request(Method::POST, "/upload")
+            .with_streaming_body(RequestBody::streaming(StreamingBody::from_chunks(receiver)))
+    }
+
+    #[tokio::test]
+    async fn streaming_proxy_receives_chunks_without_forced_buffering() {
+        let consumed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = RouterBuilder::new()
+            .with_custom_handler(streaming_proxy_factory(Arc::clone(&consumed)))
+            .build(&[serde_json::json!({
+                "handle": [{"handler": "reverse_proxy", "upstreams": [{"dial": "127.0.0.1:9"}]}]
+            })])
+            .expect("router builds");
+        // Capability composition: the streaming proxy does not ask the server to buffer, but it is
+        // marked as a body consumer for `request_body` limit enforcement.
+        assert!(!router.requires_buffered_request_body());
+        assert!(router.consumes_request_body());
+
+        let response = router
+            .handle_streaming(streaming_request(vec![b"abc", b"defg", b"hi"]))
+            .await
+            .unwrap();
+        let response = response.into_buffered().await.unwrap();
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            *consumed.lock().expect("lock"),
+            vec![
+                Bytes::from_static(b"abc"),
+                Bytes::from_static(b"defg"),
+                Bytes::from_static(b"hi")
+            ],
+            "the proxy stub must receive the streamed frames without the server buffering them"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_body_enforces_limit_for_a_streaming_body_consumer() {
+        let consumed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = RouterBuilder::new()
+            .with_custom_handler(streaming_proxy_factory(Arc::clone(&consumed)))
+            .build(&[serde_json::json!({
+                "handle": [
+                    {"handler": "request_body", "max_size": 4},
+                    {"handler": "reverse_proxy", "upstreams": [{"dial": "127.0.0.1:9"}]}
+                ]
+            })])
+            .expect("router builds");
+        assert!(!router.requires_buffered_request_body());
+        assert!(router.consumes_request_body());
+
+        // Over the limit: the router reads the stream up to the limit and returns Caddy's 413
+        // before the streaming consumer sees a proxy-side read error.
+        let response = router
+            .handle_streaming(streaming_request(vec![b"12", b"345"]))
+            .await
+            .unwrap();
+        let response = response.into_buffered().await.unwrap();
+        assert_eq!(response.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(response.body.is_empty());
+        assert!(
+            consumed.lock().expect("lock").is_empty(),
+            "the streaming consumer must not run for an over-limit body"
+        );
+
+        // Within the limit: the consumer receives the complete body. The router buffers only when
+        // a `request_body` limit is configured and the next handler consumes the body, so the
+        // lazy `413` outcome matches Caddy.
+        let response = router
+            .handle_streaming(streaming_request(vec![b"12", b"34"]))
+            .await
+            .unwrap();
+        let response = response.into_buffered().await.unwrap();
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            consumed.lock().expect("lock").concat(),
+            Bytes::from_static(b"1234")
+        );
     }
 }
