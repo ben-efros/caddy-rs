@@ -18,6 +18,7 @@
 
 pub mod adapter;
 pub mod config;
+pub mod duration;
 pub mod error;
 pub mod generation;
 pub mod lifecycle;
@@ -33,6 +34,7 @@ pub use config::{
     ProviderModuleRef, Route, ServerLogConfig, SessionTicketService, SinkLog, StorageConfig,
     StringList, TlsApp, TlsAutomation,
 };
+pub use duration::{parse_caddy_duration, CaddyDuration};
 pub use error::{Error, Result};
 pub use generation::{
     drain, DrainOutcome, Generation, GenerationStore, LifecycleState, LoadResult, StopResult,

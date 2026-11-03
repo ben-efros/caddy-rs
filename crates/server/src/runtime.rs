@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use caddy_rs_admin::{
     AdminApi, CertificateMetrics, LoggingConfig, MetricsRegistry, SharedRequestRecorder,
@@ -51,6 +51,32 @@ impl RuntimeStatus {
     /// Find the actual bound address for a configured listen string.
     pub fn listener_address(&self, configured: &str) -> Option<&str> {
         self.listeners.get(configured).map(String::as_str)
+    }
+}
+
+/// Caddy's shutdown timing configuration (`apps.http.grace_period` / `shutdown_delay`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ShutdownTiming {
+    /// Time to keep serving after a shutdown is requested, before initiating the grace period.
+    shutdown_delay: Option<Duration>,
+    /// Maximum time to wait for active connections after shutdown is initiated; `None`/zero means
+    /// no grace period (immediate shutdown).
+    grace_period: Option<Duration>,
+}
+
+impl ShutdownTiming {
+    fn from_config(config: &caddy_rs_core::Config) -> Self {
+        let http = config.http();
+        Self {
+            shutdown_delay: http
+                .and_then(|http| http.shutdown_delay)
+                .map(caddy_rs_core::CaddyDuration::as_duration)
+                .filter(|duration| !duration.is_zero()),
+            grace_period: http
+                .and_then(|http| http.grace_period)
+                .map(caddy_rs_core::CaddyDuration::as_duration)
+                .filter(|duration| !duration.is_zero()),
+        }
     }
 }
 
@@ -176,6 +202,8 @@ pub struct ServerRuntime {
     access_log_generation: Option<u64>,
     /// Number of renewal-scheduler history entries already exported as metrics, per generation.
     renewal_metrics_seen: BTreeMap<u64, usize>,
+    /// Shutdown timing of the last active generation (`apps.http.grace_period`/`shutdown_delay`).
+    shutdown_timing: ShutdownTiming,
 }
 
 /// How inherited systemd sockets are discovered for this runtime.
@@ -217,6 +245,7 @@ impl ServerRuntime {
             access_log: None,
             access_log_generation: None,
             renewal_metrics_seen: BTreeMap::new(),
+            shutdown_timing: ShutdownTiming::default(),
         }
     }
 
@@ -648,20 +677,46 @@ impl ServerRuntime {
     /// listeners and the admin endpoint), for every adapter and for automatic-HTTPS generations.
     /// Without this, `run` would idle forever with no listeners and the CLI process would never
     /// exit, which was the real-Caddy-oracle `admin-stop#stop` finding.
-    pub async fn run(mut self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
+    pub async fn run(self, shutdown: watch::Receiver<bool>) -> Result<()> {
+        self.run_loop(shutdown, None).await
+    }
+
+    /// Serve until `shutdown` becomes true, with a second [`force`](Self::run_with_force) signal
+    /// that skips the configured grace period and closes connections immediately.
+    pub async fn run_with_force(
+        self,
+        shutdown: watch::Receiver<bool>,
+        force: watch::Receiver<bool>,
+    ) -> Result<()> {
+        self.run_loop(shutdown, Some(force)).await
+    }
+
+    /// Shared runtime loop: reconcile configuration until a shutdown signal or a stopped
+    /// configuration, then apply the shutdown delay/grace period.
+    async fn run_loop(
+        mut self,
+        mut shutdown: watch::Receiver<bool>,
+        force: Option<watch::Receiver<bool>>,
+    ) -> Result<()> {
         let mut seen_active_generation = self.store.current().is_some();
+        let mut store_stopped = false;
         loop {
-            seen_active_generation |= self.store.current().is_some();
-            if let Err(error) = self.apply().await {
-                eprintln!("caddy-rs: cannot apply configuration: {error}");
-            }
-            // `apply` with no active generation stops every listener and the admin endpoint; the
-            // store is the source of truth for "the server was told to stop".
+            // The store is the source of truth for "the server was told to stop". Detect a stop
+            // *before* applying so the listeners stay up for the grace-period drain instead of
+            // being torn down by the empty-generation apply.
             if seen_active_generation && self.store.current().is_none() {
                 tracing::info!(
                     "configuration stopped; ending the server runtime loop (Caddy /stop semantics)"
                 );
+                store_stopped = true;
                 break;
+            }
+            seen_active_generation |= self.store.current().is_some();
+            if let Err(error) = self.apply().await {
+                eprintln!("caddy-rs: cannot apply configuration: {error}");
+            }
+            if let Some(generation) = self.store.current() {
+                self.shutdown_timing = ShutdownTiming::from_config(generation.config());
             }
             tokio::select! {
                 changed = shutdown.changed() => {
@@ -673,22 +728,134 @@ impl ServerRuntime {
                 _ = tokio::time::sleep(Duration::from_millis(200)) => {}
             }
         }
-        self.stop_all().await;
+        let reason = if store_stopped {
+            "configuration stopped"
+        } else {
+            "shutdown signal"
+        };
+        tracing::info!(
+            reason,
+            shutdown_delay_ms = self
+                .shutdown_timing
+                .shutdown_delay
+                .map(|d| d.as_millis() as u64),
+            grace_period_ms = self
+                .shutdown_timing
+                .grace_period
+                .map(|d| d.as_millis() as u64),
+            "initiating shutdown"
+        );
+        self.graceful_stop(force).await;
         Ok(())
     }
 
-    /// Stop every listener and consume the runtime.
+    /// Apply the configured shutdown delay/grace period, then stop every listener.
+    ///
+    /// * `shutdown_delay`: keep accepting and serving requests for this long after the shutdown
+    ///   request (matching Caddy, which schedules shutdown instead of dropping traffic instantly).
+    /// * `grace_period`: after listeners stop accepting, wait up to this long for active
+    ///   connections (including streamed responses and upgraded tunnels) to finish.
+    /// * a second signal / `force` channel skips both waits and force-closes connections.
+    async fn graceful_stop(&mut self, mut force: Option<watch::Receiver<bool>>) {
+        let timing = self.shutdown_timing;
+        let mut forced = false;
+
+        if let Some(delay) = timing.shutdown_delay {
+            tracing::info!(
+                delay_ms = delay.as_millis() as u64,
+                "shutdown delay configured; keeping listeners open"
+            );
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = force_requested(&mut force) => forced = true,
+            }
+        }
+        if forced {
+            tracing::info!("forced shutdown requested; closing connections immediately");
+            self.force_all();
+            self.stop_all().await;
+            return;
+        }
+
+        // Stop accepting new connections before draining in-flight work.
+        if let Some(admin) = &self.admin {
+            admin.begin_graceful();
+        }
+        for handle in self.listeners.values() {
+            handle.begin_graceful();
+        }
+
+        let trackers: Vec<Arc<crate::listeners::ConnectionTracker>> = self
+            .admin
+            .iter()
+            .map(crate::listeners::ListenerHandle::tracker)
+            .chain(
+                self.listeners
+                    .values()
+                    .map(crate::listeners::ListenerHandle::tracker),
+            )
+            .collect();
+
+        if let Some(grace) = timing.grace_period {
+            tracing::info!(
+                grace_ms = grace.as_millis() as u64,
+                "servers shutting down; grace period initiated"
+            );
+            let deadline = Instant::now() + grace;
+            let drained = wait_for_trackers(&trackers, deadline, &mut force).await;
+            if !drained {
+                tracing::warn!(
+                    grace_ms = grace.as_millis() as u64,
+                    "grace period expired; force-closing remaining connections"
+                );
+                self.force_all();
+            }
+        } else {
+            // Caddy without a grace period uses an eternal grace period; caddy-rs keeps the
+            // historical immediate-exit behaviour and closes open connections.
+            tracing::info!("servers shutting down without a grace period");
+            self.force_all();
+        }
+
+        self.stop_all().await;
+    }
+
+    /// Force-close connections on every listener and the admin endpoint.
+    fn force_all(&self) {
+        if let Some(admin) = &self.admin {
+            admin.begin_force();
+        }
+        for handle in self.listeners.values() {
+            handle.begin_force();
+        }
+    }
+
+    /// Number of currently active connections across all listeners (including the admin endpoint).
+    pub fn active_connections(&self) -> usize {
+        self.admin
+            .iter()
+            .map(crate::listeners::ListenerHandle::active_connections)
+            .chain(
+                self.listeners
+                    .values()
+                    .map(crate::listeners::ListenerHandle::active_connections),
+            )
+            .sum()
+    }
+
+    /// Stop every listener and consume the runtime, force-closing active connections.
     pub async fn shutdown(mut self) {
+        self.force_all();
         self.stop_all().await;
     }
 
     async fn stop_all(&mut self) {
         if let Some(admin) = self.admin.take() {
-            admin.stop().await;
+            admin.stop_forcibly().await;
         }
         let listeners = std::mem::take(&mut self.listeners);
         for (_, handle) in listeners {
-            handle.stop().await;
+            handle.stop_forcibly().await;
         }
         let renewals = std::mem::take(&mut self.renewals);
         for (generation, renewals) in renewals {
@@ -1026,5 +1193,53 @@ impl ServerRuntime {
             }
         }
         Ok(states)
+    }
+}
+
+/// Wait until the force channel fires (or forever when no force channel was provided).
+async fn force_requested(force: &mut Option<watch::Receiver<bool>>) -> bool {
+    match force {
+        None => std::future::pending::<()>().await,
+        Some(receiver) => {
+            if *receiver.borrow() {
+                return true;
+            }
+            let _ = receiver.changed().await;
+        }
+    }
+    true
+}
+
+/// Wait for every connection tracker to drain before `deadline`; returns `false` when the grace
+/// period expired or a forced shutdown was requested.
+async fn wait_for_trackers(
+    trackers: &[Arc<crate::listeners::ConnectionTracker>],
+    deadline: Instant,
+    force: &mut Option<watch::Receiver<bool>>,
+) -> bool {
+    if trackers.iter().all(|tracker| tracker.active() == 0) {
+        return true;
+    }
+    let now = Instant::now();
+    if now >= deadline {
+        return false;
+    }
+    let remaining = deadline - now;
+    let drained = async {
+        for tracker in trackers {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            if !tracker.wait_drained(Some(deadline - now)).await {
+                return false;
+            }
+        }
+        true
+    };
+    tokio::select! {
+        drained = drained => drained,
+        _ = force_requested(force) => false,
+        _ = tokio::time::sleep(remaining) => false,
     }
 }

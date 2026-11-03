@@ -254,8 +254,11 @@ async fn run(command: Command) -> anyhow::Result<()> {
             if let Some(admin) = &status.admin {
                 eprintln!("caddy-rs: admin API listening on {admin}");
             }
-            let shutdown = signals::shutdown_channel()?;
-            runtime.run(shutdown).await.context("runtime failed")?;
+            let channels = signals::shutdown_channels()?;
+            runtime
+                .run_with_force(channels.shutdown, channels.force)
+                .await
+                .context("runtime failed")?;
         }
         Command::Reload {
             config,

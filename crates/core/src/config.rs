@@ -12,6 +12,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::duration::CaddyDuration;
 use crate::error::{Error, Result};
 
 /// The root of a Caddy configuration document.
@@ -273,9 +274,15 @@ pub struct HttpApp {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub https_port: Option<u16>,
 
-    /// Grace period for graceful shutdown; a duration string such as `"5s"` in Caddy JSON.
+    /// Grace period for graceful shutdown. Caddy serializes `caddy.Duration` as integer
+    /// nanoseconds and accepts Go duration strings (`"5s"`) on input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub grace_period: Option<Value>,
+    pub grace_period: Option<CaddyDuration>,
+
+    /// How long to keep serving after a shutdown is scheduled, before initiating the grace period
+    /// (`apps.http.shutdown_delay`, Caddy's `caddy.Duration`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shutdown_delay: Option<CaddyDuration>,
 
     /// HTTP servers keyed by server name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -292,6 +299,7 @@ impl Default for HttpApp {
             http_port: None,
             https_port: None,
             grace_period: None,
+            shutdown_delay: None,
             servers: BTreeMap::new(),
             extra: BTreeMap::new(),
         }
@@ -1380,5 +1388,45 @@ mod tests {
             Some("pem_file")
         );
         assert_eq!(config.to_value().expect("serializes"), json);
+    }
+    #[test]
+    fn http_app_grace_period_and_shutdown_delay_are_typed() {
+        let config = Config::from_value(serde_json::json!({
+            "apps": {"http": {
+                "grace_period": "5s",
+                "shutdown_delay": 1_500_000_000_u64,
+                "servers": {}
+            }}
+        }))
+        .expect("typed shutdown timing decodes");
+        let http = config.http().expect("http app");
+        assert_eq!(http.grace_period.map(|d| d.as_nanos()), Some(5_000_000_000));
+        assert_eq!(
+            http.shutdown_delay.map(|d| d.as_nanos()),
+            Some(1_500_000_000)
+        );
+        // Caddy marshals caddy.Duration as integer nanoseconds.
+        let value = config.to_value().expect("serializes");
+        assert_eq!(
+            value["apps"]["http"]["grace_period"],
+            serde_json::json!(5_000_000_000_u64)
+        );
+        assert_eq!(
+            value["apps"]["http"]["shutdown_delay"],
+            serde_json::json!(1_500_000_000_u64)
+        );
+
+        // Invalid durations and negative numbers fail configuration decoding (Caddy rejects them
+        // while unmarshalling too) instead of being preserved as opaque JSON.
+        for bad in [
+            serde_json::json!({"apps": {"http": {"grace_period": "soon"}}}),
+            serde_json::json!({"apps": {"http": {"grace_period": "5"}}}),
+            serde_json::json!({"apps": {"http": {"shutdown_delay": -5}}}),
+        ] {
+            assert!(
+                Config::from_value(bad.clone()).is_err(),
+                "invalid shutdown timing must be rejected: {bad}"
+            );
+        }
     }
 }
