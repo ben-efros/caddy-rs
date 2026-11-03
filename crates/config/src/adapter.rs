@@ -26,6 +26,8 @@ const DIRECTIVE_ORDER: &[&str] = &[
     "header",
     "redir",
     "method",
+    "uri",
+    "try_files",
     "basicauth",
     "basic_auth",
     "forward_auth",
@@ -79,6 +81,19 @@ pub fn adapt_with_source(
         .map(parse_site_tls)
         .collect::<caddy_rs_core::Result<_>>()?;
 
+    // Site-level `bind` and `log` directives configure the listener and server log association
+    // rather than HTTP handlers; parse them before the routes so both can be emitted together.
+    let site_binds: Vec<Vec<BindAddress>> = file
+        .sites
+        .iter()
+        .map(parse_site_bind)
+        .collect::<caddy_rs_core::Result<_>>()?;
+    let site_logs: Vec<bool> = file
+        .sites
+        .iter()
+        .map(parse_site_log)
+        .collect::<caddy_rs_core::Result<_>>()?;
+
     // Named-route definitions are emitted as `named_routes` on each server that invokes them,
     // transitively (Caddy's `extractNamedRoutes`/`namedRouteInvokes`).
     let mut named_route_json: BTreeMap<String, Value> = BTreeMap::new();
@@ -97,20 +112,59 @@ pub fn adapt_with_source(
     }
 
     // Assign each site address to the server (listener) that serves it. Caddy groups site blocks
-    // per listener address; `bind` is not supported, so the listener is the wildcard address for
-    // the address's effective port.
-    let mut seen_addresses: BTreeMap<String, Position> = BTreeMap::new();
-    let mut servers: Vec<ServerBuilder> = Vec::new();
+    // per listener address: the wildcard address for the effective port unless `bind` overrides it.
+    let mut listener_entries: BTreeMap<String, ListenerEntry> = BTreeMap::new();
     for (site_index, site) in file.sites.iter().enumerate() {
-        let mut addresses_by_listener: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         for (address_index, address) in site.addresses.iter().enumerate() {
+            let port = address.effective_port(http_port, https_port);
+            // Without `bind` Caddy listens on the wildcard address for the site's port; with
+            // `bind` each bind address becomes a listener for that port (and its protocols).
+            let listeners: Vec<String> = if site_binds[site_index].is_empty() {
+                vec![listen_address(port)]
+            } else {
+                let mut listeners: Vec<String> = Vec::new();
+                for bind in &site_binds[site_index] {
+                    let listen = join_bind_address(bind, port)?;
+                    if !listeners.contains(&listen) {
+                        listeners.push(listen);
+                    }
+                }
+                listeners
+            };
+            for listen in listeners {
+                let entry = listener_entries
+                    .entry(listen)
+                    .or_insert_with(|| ListenerEntry { keys: Vec::new() });
+                let key = (site_index, address_index);
+                if !entry.keys.contains(&key) {
+                    entry.keys.push(key);
+                }
+            }
+        }
+    }
+
+    // Caddy consolidates listeners that serve an identical set of keys (and protocols) into one
+    // server; the server's listen list is the sorted listener addresses.
+    let mut grouped: BTreeMap<Vec<(usize, usize)>, Vec<String>> = BTreeMap::new();
+    for (listen, mut entry) in listener_entries {
+        entry.keys.sort_unstable();
+        grouped.entry(entry.keys).or_default().push(listen);
+    }
+    let mut servers: Vec<ServerBuilder> = Vec::new();
+    for (keys, mut listens) in grouped {
+        listens.sort();
+        // Caddy rejects two site blocks that define the same key on the same listener set.
+        let mut seen_keys: BTreeMap<String, Position> = BTreeMap::new();
+        for (site_index, address_index) in &keys {
+            let site = &file.sites[*site_index];
+            let address = &site.addresses[*address_index];
             let normalized = format!(
                 "{}://{}:{}",
                 address.scheme.as_deref().unwrap_or("auto"),
                 address.host,
                 address.effective_port(http_port, https_port)
             );
-            if let Some(previous) = seen_addresses.insert(normalized, site.position) {
+            if let Some(previous) = seen_keys.insert(normalized, site.position) {
                 return Err(adapter_error(
                     site.position,
                     format!(
@@ -119,51 +173,49 @@ pub fn adapt_with_source(
                     ),
                 ));
             }
-            let port = address.effective_port(http_port, https_port);
-            let listen = listen_address(port);
-            let https = address.is_https(http_port, https_port);
-            let index = match servers.iter().position(|server| server.listen == listen) {
-                Some(index) => index,
-                None => {
-                    servers.push(ServerBuilder {
-                        listen: listen.clone(),
-                        blocks: Vec::new(),
-                        https,
-                        skip_auto_https: Vec::new(),
-                    });
-                    servers.len() - 1
-                }
-            };
-            let server = &mut servers[index];
-            server.https |= https;
-            if address.scheme.as_deref() == Some("http")
-                && port != http_port
-                && !address.host.is_empty()
+        }
+        let mut blocks: Vec<SiteBlockPlan> = Vec::new();
+        for (site_index, address_index) in keys {
+            match blocks
+                .iter_mut()
+                .find(|block| block.site_index == site_index)
             {
-                let host = address.host.trim_start_matches('[').trim_end_matches(']');
-                if !server.skip_auto_https.iter().any(|skip| skip == host) {
-                    server.skip_auto_https.push(host.to_string());
+                Some(block) => block.address_indices.push(address_index),
+                None => blocks.push(SiteBlockPlan {
+                    site_index,
+                    address_indices: vec![address_index],
+                }),
+            }
+        }
+        let mut https = false;
+        let mut skip_auto_https: Vec<String> = Vec::new();
+        for block in &blocks {
+            let site = &file.sites[block.site_index];
+            for address_index in &block.address_indices {
+                let address = &site.addresses[*address_index];
+                https |= address.is_https(http_port, https_port);
+                let port = address.effective_port(http_port, https_port);
+                if address.scheme.as_deref() == Some("http")
+                    && port != http_port
+                    && !address.host.is_empty()
+                {
+                    let host = address.host.trim_start_matches('[').trim_end_matches(']');
+                    if !skip_auto_https.iter().any(|skip| skip == host) {
+                        skip_auto_https.push(host.to_string());
+                    }
                 }
             }
-            addresses_by_listener
-                .entry(listen)
-                .or_default()
-                .push(address_index);
         }
-        for (listen, address_indices) in addresses_by_listener {
-            let server = servers
-                .iter_mut()
-                .find(|server| server.listen == listen)
-                .expect("listener was registered above");
-            server.blocks.push(SiteBlockPlan {
-                site_index,
-                address_indices,
-            });
-        }
+        servers.push(ServerBuilder {
+            listens,
+            blocks,
+            https,
+            skip_auto_https,
+        });
     }
 
     // Caddy names servers ("srv0", ...) in sorted listener-address order.
-    servers.sort_by(|left, right| left.listen.cmp(&right.listen));
+    servers.sort_by(|left, right| left.listens.cmp(&right.listens));
 
     // Caddy sorts the server blocks of each listener once, before building both routes and TLS.
     for server in &mut servers {
@@ -252,7 +304,7 @@ pub fn adapt_with_source(
             .collect();
 
         let mut object = Map::new();
-        object.insert("listen".to_string(), json!([server.listen]));
+        object.insert("listen".to_string(), json!(server.listens));
         let mut automatic_https = Map::new();
         match options.auto_https {
             Some(AutoHttpsMode::Off) => {
@@ -289,9 +341,11 @@ pub fn adapt_with_source(
         if !attached.is_empty() {
             object.insert("named_routes".to_string(), json!(attached));
         }
+        if let Some(logs) = build_server_logs(&file, &server, &site_logs) {
+            object.insert("logs".to_string(), logs);
+        }
         server_map.insert(format!("srv{index}"), Value::Object(object));
     }
-
     let mut apps = Map::new();
     // Caddy's caddyhttp.App carries the global HTTP/HTTPS ports (used for automatic-HTTPS
     // redirects and ACME challenge ports); they are emitted only when explicitly configured.
@@ -318,10 +372,16 @@ pub fn adapt_with_source(
 }
 
 struct ServerBuilder {
-    listen: String,
+    /// Listen addresses sorted as Caddy's paired address list.
+    listens: Vec<String>,
     blocks: Vec<SiteBlockPlan>,
     https: bool,
     skip_auto_https: Vec<String>,
+}
+
+/// One listener address and the site address keys it serves.
+struct ListenerEntry {
+    keys: Vec<(usize, usize)>,
 }
 
 /// One site block as served by one listener: the block's routes plus which of its addresses are
@@ -332,9 +392,198 @@ struct SiteBlockPlan {
 }
 
 fn listen_address(port: u16) -> String {
-    // Caddy site addresses name virtual hosts, not bind addresses; binding is controlled by the
-    // `bind` directive. All sites therefore listen on the wildcard address for their port.
+    // Without a `bind` directive Caddy listens on the wildcard address for the site's port.
     format!(":{port}")
+}
+
+/// One `bind` address: optional network prefix (`tcp`, `tcp4`, `tcp6`) and host.
+struct BindAddress {
+    network: String,
+    host: String,
+}
+
+/// Parse the site block's `bind` directives. Only network addresses the runtime can listen on are
+/// accepted; unsupported networks or block options fail loudly instead of being dropped.
+fn parse_site_bind(site: &SiteBlock) -> caddy_rs_core::Result<Vec<BindAddress>> {
+    let mut binds = Vec::new();
+    for directive in &site.directives {
+        if directive.name != "bind" {
+            continue;
+        }
+        if directive.args.is_empty() {
+            return Err(adapter_error(
+                directive.position,
+                "directive `bind` requires at least one address",
+            ));
+        }
+        if let Some(option) = directive.block.first() {
+            return Err(adapter_error(
+                option.position,
+                format!(
+                    "`bind` option `{}` is not supported by this build (listener protocols are \
+                     not wired into the runtime yet; tracked as T-CONF-012)",
+                    option.name
+                ),
+            ));
+        }
+        for raw in &directive.args {
+            let (network, rest) = match raw.split_once('/') {
+                Some((network, rest)) => (network.to_ascii_lowercase(), rest.to_string()),
+                None => (String::new(), raw.clone()),
+            };
+            if !matches!(network.as_str(), "" | "tcp" | "tcp4" | "tcp6") {
+                return Err(adapter_error(
+                    directive.position,
+                    format!(
+                        "`bind` network `{network}` is not supported by this build \
+                         (supported: tcp, tcp4, tcp6 and plain addresses)"
+                    ),
+                ));
+            }
+            // A bind address may include a port (Caddy ignores it in favour of the site key's
+            // port); strip it so `[::1]:8080` and `[::1]` behave the same.
+            let host = strip_bind_port(&rest);
+            binds.push(BindAddress { network, host });
+        }
+    }
+    Ok(binds)
+}
+
+/// Strip an optional port from a bind address host, keeping IPv6 brackets off.
+fn strip_bind_port(address: &str) -> String {
+    let address = address.trim();
+    if let Some(rest) = address.strip_prefix('[') {
+        // `[::1]` or `[::1]:8080`
+        if let Some((host, _port)) = rest.split_once(']') {
+            return host.to_string();
+        }
+    }
+    // Bare IPv6 addresses contain multiple colons; a trailing `:port` is only meaningful for
+    // hostnames/IPv4.
+    if address.matches(':').count() == 1 {
+        if let Some((host, port)) = address.rsplit_once(':') {
+            if !host.is_empty() && port.chars().all(|c| c.is_ascii_digit()) {
+                return host.to_string();
+            }
+        }
+    }
+    address.to_string()
+}
+
+/// Join a bind address with the listener port using Caddy's `JoinNetworkAddress` form.
+fn join_bind_address(bind: &BindAddress, port: u16) -> caddy_rs_core::Result<String> {
+    let host = bind.host.as_str();
+    let address = if host.is_empty() {
+        format!(":{port}")
+    } else if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    if bind.network.is_empty() {
+        Ok(address)
+    } else {
+        if host.contains('%') || host.contains('/') {
+            return Err(caddy_rs_core::Error::invalid(
+                "Caddyfile",
+                format!("unsupported bind address `{}`", bind.host),
+            ));
+        }
+        Ok(format!("{}/{}", bind.network, address))
+    }
+}
+
+/// Extract the port from a listener address (`":443"`, `"127.0.0.1:443"`, `"tcp6/[::1]:443"`).
+fn listen_port_of(listen: &str) -> Option<u16> {
+    let (_, port) = listen.rsplit_once(':')?;
+    port.parse::<u16>().ok()
+}
+
+/// Parse the site block's `log` directives. Only the plain `log` form is implemented; options
+/// must fail loudly until per-server logging is wired into the runtime (T-ADMIN-020).
+fn parse_site_log(site: &SiteBlock) -> caddy_rs_core::Result<bool> {
+    let mut has_log = false;
+    for directive in &site.directives {
+        if directive.name != "log" {
+            continue;
+        }
+        if !directive.args.is_empty() || !directive.block.is_empty() {
+            return Err(adapter_error(
+                directive.position,
+                "`log` options are not supported by this build (plain `log` only; tracked as \
+                 T-ADMIN-020)",
+            ));
+        }
+        has_log = true;
+    }
+    Ok(has_log)
+}
+
+/// Hostnames of a site block for access-log association: host only, with ports stripped, like
+/// Caddy's `hostsFromKeys` + `net.SplitHostPort` sequence.
+fn block_log_hosts(site: &SiteBlock, block: &SiteBlockPlan) -> (Vec<String>, bool) {
+    let mut hosts = Vec::new();
+    let mut catch_all = false;
+    for address_index in &block.address_indices {
+        let address = &site.addresses[*address_index];
+        if address.host.is_empty() {
+            catch_all = true;
+            continue;
+        }
+        let host = address
+            .host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_string();
+        if !hosts.iter().any(|existing| existing == &host) {
+            hosts.push(host);
+        }
+    }
+    (hosts, catch_all)
+}
+
+/// Server-level access-log association emitted by the plain `log` directive: logger names per host
+/// plus the hosts that must be skipped because their site block does not enable logging.
+fn build_server_logs(
+    file: &parser::Caddyfile,
+    server: &ServerBuilder,
+    site_logs: &[bool],
+) -> Option<Value> {
+    if !server
+        .blocks
+        .iter()
+        .any(|block| site_logs[block.site_index])
+    {
+        return None;
+    }
+    let mut logger_names: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut skip_hosts: Vec<String> = Vec::new();
+    let mut skip_unmapped_hosts = false;
+    for block in &server.blocks {
+        let site = &file.sites[block.site_index];
+        let (hosts, catch_all) = block_log_hosts(site, block);
+        if site_logs[block.site_index] {
+            for host in hosts {
+                logger_names.entry(host).or_default().push(String::new());
+            }
+        } else if catch_all {
+            skip_unmapped_hosts = true;
+        } else {
+            skip_hosts.extend(hosts);
+        }
+    }
+    skip_hosts.sort();
+    let mut logs = Map::new();
+    if !logger_names.is_empty() {
+        logs.insert("logger_names".to_string(), json!(logger_names));
+    }
+    if !skip_hosts.is_empty() {
+        logs.insert("skip_hosts".to_string(), json!(skip_hosts));
+    }
+    if skip_unmapped_hosts {
+        logs.insert("skip_unmapped_hosts".to_string(), json!(true));
+    }
+    Some(Value::Object(logs))
 }
 
 /// Sort site blocks the way Caddy's `httptype.go` does: descending host specificity, catch-all
@@ -1356,9 +1605,9 @@ fn build_tls_plan(
 
     for (server_index, server) in servers.iter().enumerate() {
         let listen_port = server
-            .listen
-            .strip_prefix(':')
-            .and_then(|port| port.parse::<u16>().ok());
+            .listens
+            .first()
+            .and_then(|listen| listen_port_of(listen));
         if listen_port == Some(http_port) {
             continue;
         }
@@ -1564,6 +1813,124 @@ fn build_tls_plan(
         app: (!tls_object.is_empty()).then_some(Value::Object(tls_object)),
         connection_policies,
     })
+}
+
+/// `try_files` is not a handler directive: Caddy expands it to a file matcher plus a rewrite of
+/// the matched relative path. Arguments with a query string become separate grouped routes.
+fn build_try_files_routes(directive: &Directive) -> caddy_rs_core::Result<Vec<Value>> {
+    if directive.args.is_empty() {
+        return Err(adapter_error(
+            directive.position,
+            "directive `try_files` requires at least one file argument",
+        ));
+    }
+    let mut policy: Option<String> = None;
+    for option in &directive.block {
+        match option.name.as_str() {
+            "policy" => {
+                if policy.is_some() {
+                    return Err(adapter_error(
+                        option.position,
+                        "try policy already configured",
+                    ));
+                }
+                let Some(value) = option.args.first() else {
+                    return Err(adapter_error(
+                        option.position,
+                        "`policy` requires an argument",
+                    ));
+                };
+                if !matches!(
+                    value.as_str(),
+                    "first_exist"
+                        | "first_exist_fallback"
+                        | "largest_size"
+                        | "smallest_size"
+                        | "most_recently_modified"
+                ) {
+                    return Err(adapter_error(
+                        option.position,
+                        format!("unrecognized try policy: {value}"),
+                    ));
+                }
+                policy = Some(value.clone());
+            }
+            other => {
+                return Err(adapter_error(
+                    option.position,
+                    format!("`try_files` option `{other}` is not supported"),
+                ));
+            }
+        }
+    }
+    let make_route = |try_files: &[String], query: &str| -> Value {
+        let mut file_matcher = Map::new();
+        file_matcher.insert("try_files".to_string(), json!(try_files));
+        if let Some(policy) = &policy {
+            file_matcher.insert("try_policy".to_string(), json!(policy));
+        }
+        let route = json!({
+            "match": [{"file": Value::Object(file_matcher)}],
+            "handle": [{"handler": "rewrite", "uri": format!("{{http.matchers.file.relative}}{query}")}],
+        });
+        route
+    };
+    let mut routes: Vec<Value> = Vec::new();
+    let mut pending: Vec<String> = Vec::new();
+    for item in &directive.args {
+        let item = &qualify_placeholders(item);
+        if let Some(index) = item.find('?') {
+            if !pending.is_empty() {
+                routes.push(make_route(&pending, ""));
+                pending.clear();
+            }
+            routes.push(make_route(&[item[..index].to_string()], &item[index..]));
+        } else {
+            pending.push(item.clone());
+        }
+    }
+    if !pending.is_empty() {
+        routes.push(make_route(&pending, ""));
+    }
+    // Caddy groups these routes so only the first matching rewrite runs.
+    if routes.len() > 1 {
+        for route in &mut routes {
+            route["group"] = json!("group1");
+        }
+    }
+    Ok(routes)
+}
+
+/// `uri strip_prefix` maps directly onto the rewrite handler's `strip_path_prefix`, which the
+/// runtime implements; the other `uri` operations have no runtime support yet and fail loudly.
+fn uri_handler(args: &[String], position: Position) -> caddy_rs_core::Result<Value> {
+    let Some(operation) = args.first() else {
+        return Err(adapter_error(
+            position,
+            "directive `uri` requires an operation (strip_prefix)",
+        ));
+    };
+    match operation.as_str() {
+        "strip_prefix" => {
+            if args.len() != 2 {
+                return Err(adapter_error(
+                    position,
+                    "`uri strip_prefix` requires exactly one argument",
+                ));
+            }
+            Ok(json!({
+                "handler": "rewrite",
+                "strip_path_prefix": qualify_placeholders(&args[1]),
+            }))
+        }
+        other => Err(adapter_error(
+            position,
+            format!(
+                "`uri {other}` is not supported by this build (only `strip_prefix` has a \
+                 runtime implementation; tracked as T-CONF-027)"
+            ),
+        )),
+    }
 }
 
 fn build_site_routes(
@@ -1916,6 +2283,19 @@ fn build_routes(
                 "directive `tls` can only be used directly in a site block",
             ));
         }
+        if directive.name == "bind" || directive.name == "log" {
+            if top_level {
+                // Handled at the server/listener level, not as an HTTP handler.
+                continue;
+            }
+            return Err(adapter_error(
+                directive.position,
+                format!(
+                    "directive `{}` can only be used directly in a site block",
+                    directive.name
+                ),
+            ));
+        }
         if !DIRECTIVE_ORDER.contains(&directive.name.as_str()) {
             return Err(adapter_error(
                 directive.position,
@@ -1985,6 +2365,11 @@ fn build_routes(
                     route["group"] = json!("group1");
                 }
                 entries.push((name, route));
+            }
+            "try_files" => {
+                for route in build_try_files_routes(directive)? {
+                    entries.push((name, route));
+                }
             }
             _ => {
                 let mut args = directive.args.clone();
@@ -2169,6 +2554,7 @@ fn build_handlers(
         "file_server" => vec![file_server_handler(directive)?],
         "root" => vec![root_handler(args, directive.position)?],
         "method" => vec![method_handler(args, directive.position)?],
+        "uri" => vec![uri_handler(args, directive.position)?],
         "header" => header_handlers(directive, args)?,
         "encode" => vec![encode_handler(directive)?],
         "reverse_proxy" => vec![reverse_proxy_handler(directive, args)?],
@@ -3824,6 +4210,8 @@ fn qualify_placeholders(value: &str) -> String {
         ("{labels.", "{http.request.host.labels."),
         ("{query.", "{http.request.uri.query."),
         ("{path.", "{http.request.uri.path."),
+        ("{query}", "{http.request.uri.query}"),
+        ("{?query}", "{http.request.uri.prefixed_query}"),
         ("{host}", "{http.request.host}"),
         ("{uri}", "{http.request.uri}"),
         ("{path}", "{http.request.uri.path}"),

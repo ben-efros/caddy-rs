@@ -1,0 +1,4 @@
+example.com {
+	uri strip_prefix /api
+	respond "ok"
+}
