@@ -76,6 +76,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "bytes",
+ "caddy-rs-config",
  "caddy-rs-core",
  "http",
  "serde",

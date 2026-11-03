@@ -9,8 +9,8 @@
 //!
 //! | Endpoint | Behaviour |
 //! |---|---|
-//! | `GET /config/` | Current configuration as JSON (`{}` when no generation is active) |
-//! | `GET /config/<path>` | JSON traversal by object key or array index |
+//! | `GET /config/` | Current configuration as JSON (`{}` when no generation is active), strong ETag, `If-None-Match` 304 |
+//! | `GET /config/<path>` | JSON traversal by object key or array index, with an ETag for that subtree |
 //! | `POST`/`PUT`/`PATCH`/`DELETE /config/<path>` | Partial configuration update with validation and rollback |
 //! | `GET /id/<id>` | Object (route) addressed by its `@id`, including nested subroutes |
 //! | `POST`/`PUT`/`PATCH`/`DELETE /id/<id>[/<path>]` | Partial update addressed by `@id` |
@@ -20,6 +20,8 @@
 //! | `GET /pki/ca/<id>` | Caddy-compatible metadata for a provisioned local CA (`caInfo` JSON) |
 //! | `GET /pki/ca/<id>/certificates` | PEM certificate chain: intermediate(s) then root |
 //! | `GET /pki/ca/<id>/certificates/<name>` | One PEM file from the CA directory (`root.crt`/`intermediate.crt`, caddy-rs extension) |
+//! | `GET /reverse_proxy/upstreams` | Configured `reverse_proxy` upstream addresses in Caddy's status shape (counters/health are not wired yet) |
+//! | `POST /adapt` | Adapt a Caddyfile (selected by `Content-Type`, like Caddy) or a `{config, adapter, wrap}` JSON object to Caddy JSON |
 //!
 //! Partial updates follow upstream Caddy's semantics exactly (see `config_path`):
 //!
@@ -70,9 +72,23 @@
 //!
 //! - Malformed bodies and traversal errors return `400` with a located message. Upstream Caddy
 //!   only wraps *some* errors in `APIError`, so several equivalent failures surface as `500`.
-//! - `If-Match` preconditions, `Cache-Control: must-revalidate`, `ETag` generation, and the
-//!   "config unchanged" short-circuit are not implemented; every accepted update yields a new
-//!   generation.
+//! - ETags and `If-Match` are implemented with Caddy's strong-ETag format
+//!   (`"<config path> <xxhash64 hex>"`, same xxhash64 algorithm) and its 400/412 semantics.
+//!   Differences from Caddy v2.11.7: the "config unchanged" short-circuit is not implemented, so
+//!   every accepted update still creates a generation and `Cache-Control: must-revalidate` is
+//!   accepted but has no observable effect; Caddy ignores `If-None-Match` entirely, while
+//!   caddy-rs serves `304` on a matching config read and `412` on a conditional write
+//!   (documented extension); no `Last-Modified` is sent (Caddy sends none either). The ETag hash
+//!   is over caddy-rs's serialized JSON, so it can differ from Caddy's for a semantically equal
+//!   config if key order/formatting differs between the two serializers.
+//! - `GET /reverse_proxy/upstreams` reports the configured upstream addresses, de-duplicated and
+//!   sorted, in Caddy's `[{address,num_requests,fails}]` shape. Live proxy counters and health are
+//!   not exposed to this crate yet, so `num_requests`/`fails` are always `0`; dynamic upstream
+//!   sources are not modelled.
+//! - `POST /adapt` follows Caddy's `Content-Type`-selected adapter semantics; the additional
+//!   `{config, adapter, wrap}` JSON request form (with `wrap:false` returning the raw adapted JSON)
+//!   is a caddy-rs extension. Adapter warnings are rendered as Caddy-shaped
+//!   `[{"message": "..."}]` objects (the caddy-rs adapter only produces messages).
 //! - `POST /config/` replaces the whole configuration; `DELETE /config/` unloads it (Caddy
 //!   reaches the same state through `run(nil)` via its `rawCfg` wrapper).
 //! - Origin enforcement is evaluated from the active generation on each request; the server crate
@@ -111,6 +127,7 @@ pub mod pki;
 pub mod recorder;
 pub mod sink;
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -226,6 +243,138 @@ impl AdminResponse {
     pub fn api_error(status: StatusCode, message: impl AsRef<str>) -> Self {
         Self::json(status, &json!({ "error": message.as_ref() }))
     }
+}
+
+/// FNV-1a 64 fallback is not used: ETag hashing must match Caddy's xxhash64 so optimistic
+/// concurrency headers are stable across implementations of the same config document.
+
+/// 64-bit xxHash (seed 0), the algorithm Caddy uses for config ETags (`admin.go: etagHasher`).
+///
+/// Implemented locally because the workspace has no cached xxhash crate; the values are validated
+/// against the reference vectors in the tests below, and the output format matches Caddy's
+/// `"%s %x"` ETag string (`"<config path> <16 hex digits>"`).
+fn xxh64(bytes: &[u8]) -> u64 {
+    const PRIME1: u64 = 0x9E37_79B1_85EB_CA87;
+    const PRIME2: u64 = 0xC2B2_AE3D_27D4_EB4F;
+    const PRIME3: u64 = 0x1656_67B1_9E37_79F9;
+    const PRIME4: u64 = 0x85EB_CA77_C2B2_AE63;
+    const PRIME5: u64 = 0x27D4_EB2F_1656_67C5;
+
+    fn round(accumulator: u64, input: u64) -> u64 {
+        accumulator
+            .wrapping_add(input.wrapping_mul(PRIME2))
+            .rotate_left(31)
+            .wrapping_mul(PRIME1)
+    }
+    fn merge_round(accumulator: u64, value: u64) -> u64 {
+        (accumulator ^ round(0, value))
+            .wrapping_mul(PRIME1)
+            .wrapping_add(PRIME4)
+    }
+
+    let length = bytes.len() as u64;
+    let mut offset = 0usize;
+    let mut hash = if bytes.len() >= 32 {
+        let mut v1 = PRIME1.wrapping_add(PRIME2);
+        let mut v2 = PRIME2;
+        let mut v3 = 0u64;
+        let mut v4 = 0u64.wrapping_sub(PRIME1);
+        while offset + 32 <= bytes.len() {
+            let read = |at: usize| {
+                let mut value = [0u8; 8];
+                value.copy_from_slice(&bytes[at..at + 8]);
+                u64::from_le_bytes(value)
+            };
+            v1 = round(v1, read(offset));
+            v2 = round(v2, read(offset + 8));
+            v3 = round(v3, read(offset + 16));
+            v4 = round(v4, read(offset + 24));
+            offset += 32;
+        }
+        let mut hash = v1
+            .rotate_left(1)
+            .wrapping_add(v2.rotate_left(7))
+            .wrapping_add(v3.rotate_left(12))
+            .wrapping_add(v4.rotate_left(18));
+        hash = merge_round(hash, v1);
+        hash = merge_round(hash, v2);
+        hash = merge_round(hash, v3);
+        hash = merge_round(hash, v4);
+        hash
+    } else {
+        PRIME5
+    };
+
+    hash = hash.wrapping_add(length);
+    while offset + 8 <= bytes.len() {
+        let mut value = [0u8; 8];
+        value.copy_from_slice(&bytes[offset..offset + 8]);
+        let k1 = round(0, u64::from_le_bytes(value));
+        hash ^= k1;
+        hash = hash
+            .rotate_left(27)
+            .wrapping_mul(PRIME1)
+            .wrapping_add(PRIME4);
+        offset += 8;
+    }
+    if offset + 4 <= bytes.len() {
+        let mut value = [0u8; 4];
+        value.copy_from_slice(&bytes[offset..offset + 4]);
+        hash ^= u64::from(u32::from_le_bytes(value)).wrapping_mul(PRIME1);
+        hash = hash
+            .rotate_left(23)
+            .wrapping_mul(PRIME2)
+            .wrapping_add(PRIME3);
+        offset += 4;
+    }
+    while offset < bytes.len() {
+        hash ^= u64::from(bytes[offset]).wrapping_mul(PRIME5);
+        hash = hash.rotate_left(11).wrapping_mul(PRIME1);
+        offset += 1;
+    }
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(PRIME2);
+    hash ^= hash >> 29;
+    hash = hash.wrapping_mul(PRIME3);
+    hash ^= hash >> 32;
+    hash
+}
+
+/// A strong ETag in Caddy's exact format: `"<config path> <xxhash64 of the JSON at that path>"`.
+fn config_etag(path: &str, body: &[u8]) -> HeaderValue {
+    let value = format!("\"{path} {:016x}\"", xxh64(body));
+    HeaderValue::from_str(&value).unwrap_or_else(|_| HeaderValue::from_static("\"\""))
+}
+
+/// Weak comparison of an `If-None-Match` header against the current strong ETag (RFC 7232 3.2).
+fn if_none_match_matches(headers: &HeaderMap, etag: &HeaderValue) -> bool {
+    let Ok(current) = etag.to_str() else {
+        return false;
+    };
+    headers
+        .get_all(http::header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|candidate| {
+            let candidate = candidate.trim();
+            candidate == "*"
+                || candidate == current
+                || candidate
+                    .strip_prefix("W/")
+                    .is_some_and(|weak| weak == current)
+        })
+}
+
+fn warning_json(warnings: &[String]) -> Value {
+    // Caddy's `caddyconfig.Warning` marshals as an object; the caddy-rs adapter produces message
+    // strings, so map each to `{"message": "..."}` (file/line/directive are absent for this build).
+    Value::Array(
+        warnings
+            .iter()
+            .map(|message| json!({ "message": message }))
+            .collect(),
+    )
 }
 
 /// Admin API logic bound to a generation store.
@@ -413,12 +562,8 @@ impl AdminApi {
             if method != "GET" {
                 return self.handle_config_update(path, request);
             }
-            let config = self
-                .store
-                .current()
-                .and_then(|generation| generation.config().to_value().ok())
-                .unwrap_or_else(|| json!({}));
-            return AdminResponse::json(StatusCode::OK, &config);
+            let config = self.current_config_or_empty();
+            return self.config_read_response("/config/", &config, request);
         }
 
         if let Some(pointer) = path.strip_prefix("/config/") {
@@ -428,7 +573,7 @@ impl AdminApi {
             let current = self.current_config_value();
             let parts = config_path::split_path(pointer);
             return match navigate(&current, &parts) {
-                Some(value) => AdminResponse::json(StatusCode::OK, value),
+                Some(value) => self.config_read_response(path, value, request),
                 None => AdminResponse::text(
                     StatusCode::NOT_FOUND,
                     format!("config path `{pointer}` not found"),
@@ -497,6 +642,8 @@ impl AdminApi {
                 );
                 response
             }
+            "/adapt" => self.handle_adapt(request),
+            "/reverse_proxy/upstreams" => self.handle_reverse_proxy_upstreams(request),
             "/healthz" => AdminResponse::json(
                 StatusCode::OK,
                 &json!({
@@ -510,6 +657,218 @@ impl AdminApi {
                 format!("admin endpoint `{path}` is not implemented"),
             ),
         }
+    }
+
+    /// The active configuration as JSON, or `{}` when no generation is active (the same document
+    /// `GET /config/` serves and hashes for its ETag).
+    fn current_config_or_empty(&self) -> Value {
+        let value = self.current_config_value();
+        if value.is_null() {
+            json!({})
+        } else {
+            value
+        }
+    }
+
+    /// The `(etag path, document)` pair for a config path used by ETags and preconditions.
+    ///
+    /// `path` is a full admin path (`/config/`, `/config/<...>`); `/id/...` callers pass the
+    /// expanded path. `None` means the path does not resolve to a value (missing key, or an
+    /// `If-Match` path outside `/config`).
+    fn etag_document(&self, path: &str) -> Option<(String, Value)> {
+        let path = if path == "/config" { "/config/" } else { path };
+        if path == "/config/" {
+            return Some(("/config/".to_string(), self.current_config_or_empty()));
+        }
+        let pointer = path.strip_prefix("/config/")?;
+        let current = self.current_config_value();
+        let value = navigate(&current, &config_path::split_path(pointer))?;
+        Some((path.to_string(), value.clone()))
+    }
+
+    /// Build a config read response with Caddy's strong ETag, honouring `If-None-Match`.
+    ///
+    /// Caddy v2.11.7 sends the ETag but ignores `If-None-Match` (it has no 304 path); serving 304
+    /// on a match is a caddy-rs extension. `Last-Modified` is not sent by Caddy and is not added.
+    fn config_read_response(
+        &self,
+        etag_path: &str,
+        value: &Value,
+        request: &AdminRequest,
+    ) -> AdminResponse {
+        let body = serde_json::to_vec(value).unwrap_or_else(|error| {
+            format!("{{\"error\":\"serialization: {error}\"}}").into_bytes()
+        });
+        let etag = config_etag(etag_path, &body);
+        if if_none_match_matches(&request.headers, &etag) {
+            let mut response = AdminResponse::empty(StatusCode::NOT_MODIFIED);
+            response.headers.insert(http::header::ETAG, etag);
+            return response;
+        }
+        let mut response = AdminResponse::empty(StatusCode::OK);
+        response.headers.insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        response.headers.insert(http::header::ETAG, etag);
+        response.body = Bytes::from(body);
+        response
+    }
+
+    /// Validate `If-Match` (Caddy-compatible 400/412) and `If-None-Match` (caddy-rs extension).
+    fn check_write_preconditions(
+        &self,
+        path: &str,
+        request: &AdminRequest,
+    ) -> std::result::Result<(), AdminResponse> {
+        if let Some(header) = request.headers.get(http::header::IF_MATCH) {
+            let header = header.to_str().unwrap_or("");
+            let inner = header
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+                .ok_or_else(|| {
+                    AdminResponse::api_error(
+                        StatusCode::BAD_REQUEST,
+                        "malformed If-Match header; expect quoted string",
+                    )
+                })?;
+            let parts: Vec<&str> = inner.split_whitespace().collect();
+            if parts.len() != 2 {
+                return Err(AdminResponse::api_error(
+                    StatusCode::BAD_REQUEST,
+                    "malformed If-Match header; expect format \"<path> <hash>\"",
+                ));
+            }
+            let mismatch = || {
+                AdminResponse::api_error(
+                    StatusCode::PRECONDITION_FAILED,
+                    "If-Match header did not match current config hash",
+                )
+            };
+            let (_, value) = self.etag_document(parts[0]).ok_or_else(mismatch)?;
+            let body = serde_json::to_vec(&value).unwrap_or_default();
+            let current_hash = format!("{:016x}", xxh64(&body));
+            if current_hash != parts[1] {
+                return Err(mismatch());
+            }
+        }
+
+        if request.headers.contains_key(http::header::IF_NONE_MATCH) {
+            let mismatch = || {
+                AdminResponse::api_error(
+                    StatusCode::PRECONDITION_FAILED,
+                    "If-None-Match precondition failed: configuration changed",
+                )
+            };
+            let (etag_path, value) = self.etag_document(path).ok_or_else(mismatch)?;
+            let body = serde_json::to_vec(&value).unwrap_or_default();
+            let etag = config_etag(&etag_path, &body);
+            if if_none_match_matches(&request.headers, &etag) {
+                return Err(mismatch());
+            }
+        }
+        Ok(())
+    }
+
+    /// `POST /adapt`: adapt a Caddyfile (or pass JSON through) using the config adapter.
+    ///
+    /// Caddy v2.11.7 selects the adapter from the `Content-Type` header
+    /// (`text/caddyfile` -> `caddyfile`, `*/json` or empty -> no adaptation) and responds with
+    /// `{"warnings":[...],"result":<json>}`. This implementation matches that shape and
+    /// additionally accepts a JSON body of the form `{"config":...,"adapter":"caddyfile","wrap":bool}`
+    /// as documented in the task (a caddy-rs extension; `wrap:false` returns the adapted JSON
+    /// directly). Unsupported adapters and adaptation errors are located 400s.
+    fn handle_adapt(&self, request: &AdminRequest) -> AdminResponse {
+        if request.method != Method::POST {
+            return AdminResponse::api_error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+        }
+        let content_type = request
+            .headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let media_type = content_type
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        let json_media = media_type.is_empty() || media_type.ends_with("/json");
+
+        // caddy-rs extension: explicit `{config, adapter, wrap}` request object.
+        if json_media {
+            if let Ok(value) = serde_json::from_slice::<Value>(&request.body) {
+                if let Some(object) = value.as_object() {
+                    if let (Some(config), Some(adapter)) = (
+                        object.get("config"),
+                        object.get("adapter").and_then(Value::as_str),
+                    ) {
+                        let wrap = object.get("wrap").and_then(Value::as_bool).unwrap_or(true);
+                        return adapt_explicit(config, adapter, wrap);
+                    }
+                }
+            }
+        }
+
+        // Caddy's content-type driven behaviour.
+        if json_media {
+            let result = match serde_json::from_slice::<Value>(&request.body) {
+                Ok(result) => result,
+                Err(error) => {
+                    return AdminResponse::api_error(
+                        StatusCode::BAD_REQUEST,
+                        format!("invalid config JSON: {error}"),
+                    )
+                }
+            };
+            return adapt_response(&result, &[], true);
+        }
+        let Some((_type, adapter_name)) = media_type.split_once('/') else {
+            return AdminResponse::api_error(StatusCode::BAD_REQUEST, "malformed Content-Type");
+        };
+        let result = match adapter_name {
+            "caddyfile" => {
+                let Ok(text) = std::str::from_utf8(&request.body) else {
+                    return AdminResponse::api_error(
+                        StatusCode::BAD_REQUEST,
+                        "adapting config using caddyfile adapter: input is not valid UTF-8",
+                    );
+                };
+                match caddy_rs_config::adapt(text) {
+                    Ok(adapted) => adapt_response(&adapted.config, &adapted.warnings, true),
+                    Err(error) => AdminResponse::api_error(
+                        StatusCode::BAD_REQUEST,
+                        format!("adapting config using caddyfile adapter: {error}"),
+                    ),
+                }
+            }
+            other => AdminResponse::api_error(
+                StatusCode::BAD_REQUEST,
+                format!("unrecognized config adapter '{other}'"),
+            ),
+        };
+        result
+    }
+
+    /// `GET /reverse_proxy/upstreams`: Caddy's upstream-status shape for the configured upstreams.
+    ///
+    /// The proxy runtime does not expose live counters/health to this crate, so every entry reports
+    /// `num_requests: 0` and `fails: 0` (documented divergence). Dynamic upstream sources are not
+    /// modelled. Addresses are de-duplicated like Caddy's global host pool and sorted for
+    /// deterministic output.
+    fn handle_reverse_proxy_upstreams(&self, request: &AdminRequest) -> AdminResponse {
+        if request.method != Method::GET {
+            return AdminResponse::api_error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+        }
+        let config = self.current_config_or_empty();
+        let mut addresses = BTreeSet::new();
+        collect_reverse_proxy_upstreams(&config, &mut addresses);
+        let upstreams: Vec<Value> = addresses
+            .into_iter()
+            .map(|address| json!({"address": address, "num_requests": 0, "fails": 0}))
+            .collect();
+        AdminResponse::json(StatusCode::OK, &Value::Array(upstreams))
     }
 
     /// Handle Caddy's read-only `/pki` endpoints.
@@ -593,6 +952,12 @@ impl AdminApi {
             }
         };
 
+        // Caddy validates `If-Match` after reading the body and before mutating. `If-None-Match`
+        // for mutations is a caddy-rs extension (Caddy ignores it): a match fails with 412.
+        if let Err(response) = self.check_write_preconditions(path, request) {
+            return response;
+        }
+
         let mut parts = config_path::split_path(path);
         let ellipses = parts.last().is_some_and(|part| *part == "...");
         if ellipses {
@@ -671,9 +1036,15 @@ impl AdminApi {
         let mut parts: Vec<&str> = expanded.iter().map(String::as_str).collect();
         parts.extend(trailing.iter().copied());
 
+        let expanded_path = if parts.is_empty() {
+            "/config/".to_string()
+        } else {
+            format!("/config/{}", parts.join("/"))
+        };
+
         if request.method == Method::GET {
             if let Some(value) = navigate(&current, &parts) {
-                return AdminResponse::json(StatusCode::OK, value);
+                return self.config_read_response(&expanded_path, value, request);
             }
             return AdminResponse::text(
                 StatusCode::NOT_FOUND,
@@ -681,11 +1052,6 @@ impl AdminApi {
             );
         }
 
-        let expanded_path = if parts.is_empty() {
-            "/config/".to_string()
-        } else {
-            format!("/config/{}", parts.join("/"))
-        };
         let mut rewritten = request.clone();
         rewritten.path = expanded_path.clone();
         self.handle_config_update(&expanded_path, &rewritten)
@@ -721,6 +1087,80 @@ impl AdminApi {
         }
         self.notify_reload();
         AdminResponse::empty(StatusCode::OK)
+    }
+}
+
+/// Build the `POST /adapt` response: `{"warnings":[...],"result":...}` (warnings omitted when
+/// empty, matching Caddy's `omitempty`), or the raw adapted JSON when `wrap` is false.
+fn adapt_response(result: &Value, warnings: &[String], wrap: bool) -> AdminResponse {
+    if !wrap {
+        return AdminResponse::json(StatusCode::OK, result);
+    }
+    let mut body = serde_json::Map::new();
+    if !warnings.is_empty() {
+        body.insert("warnings".to_string(), warning_json(warnings));
+    }
+    body.insert("result".to_string(), result.clone());
+    AdminResponse::json(StatusCode::OK, &Value::Object(body))
+}
+
+/// The `{config, adapter, wrap}` extension form of `POST /adapt`.
+fn adapt_explicit(config: &Value, adapter: &str, wrap: bool) -> AdminResponse {
+    match adapter {
+        "json" => adapt_response(config, &[], wrap),
+        "caddyfile" => {
+            let Some(text) = config.as_str() else {
+                return AdminResponse::api_error(
+                    StatusCode::BAD_REQUEST,
+                    "adapting config using caddyfile adapter: `config` must be a Caddyfile string",
+                );
+            };
+            match caddy_rs_config::adapt(text) {
+                Ok(adapted) => adapt_response(&adapted.config, &adapted.warnings, wrap),
+                Err(error) => AdminResponse::api_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("adapting config using caddyfile adapter: {error}"),
+                ),
+            }
+        }
+        other => AdminResponse::api_error(
+            StatusCode::BAD_REQUEST,
+            format!("unrecognized config adapter '{other}'"),
+        ),
+    }
+}
+
+/// Collect configured `reverse_proxy` upstream dial addresses from a config document.
+fn collect_reverse_proxy_upstreams(value: &Value, addresses: &mut BTreeSet<String>) {
+    match value {
+        Value::Object(object) => {
+            if object.get("handler").and_then(Value::as_str) == Some("reverse_proxy") {
+                if let Some(upstreams) = object.get("upstreams").and_then(Value::as_array) {
+                    for upstream in upstreams {
+                        match upstream {
+                            Value::String(dial) => {
+                                addresses.insert(dial.clone());
+                            }
+                            Value::Object(upstream) => {
+                                if let Some(dial) = upstream.get("dial").and_then(Value::as_str) {
+                                    addresses.insert(dial.to_string());
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            for nested in object.values() {
+                collect_reverse_proxy_upstreams(nested, addresses);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_reverse_proxy_upstreams(item, addresses);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -880,6 +1320,362 @@ mod tests {
             .handle(request("GET", "/config/apps/missing", ""))
             .await;
         assert_eq!(response.status, StatusCode::NOT_FOUND);
+    }
+
+    fn etag_of(response: &AdminResponse) -> String {
+        response
+            .headers
+            .get(http::header::ETAG)
+            .expect("response carries an ETag")
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    async fn config_etag_for_path(admin: &AdminApi, path: &str) -> String {
+        let response = admin.handle(request("GET", path, "")).await;
+        assert_eq!(response.status, StatusCode::OK, "GET {path}");
+        etag_of(&response)
+    }
+
+    fn with_header(
+        mut request: AdminRequest,
+        name: http::header::HeaderName,
+        value: &str,
+    ) -> AdminRequest {
+        request
+            .headers
+            .insert(name, HeaderValue::from_str(value).unwrap());
+        request
+    }
+
+    #[test]
+    fn xxh64_matches_reference_vectors_and_caddy_etag_format() {
+        // Vectors from xxHash's reference implementation (validated with `xxh64sum`).
+        assert_eq!(xxh64(b""), 0xef46_db37_51d8_e999);
+        assert_eq!(xxh64(b"abc"), 0x44bc_2cf5_ad77_0999);
+        assert_eq!(xxh64(b"hello"), 0x26c7_827d_889f_6da3);
+        assert_eq!(xxh64(b"message digest"), 0x066e_d728_fcee_b3be);
+        assert_eq!(
+            config_etag("/config/", b"{}").to_str().unwrap(),
+            format!("\"/config/ {:016x}\"", xxh64(b"{}"))
+        );
+    }
+
+    #[tokio::test]
+    async fn config_etags_are_strong_and_change_with_the_config() {
+        let admin = admin();
+        load(&admin, &valid_config()).await;
+
+        let response = admin.handle(request("GET", "/config/", "")).await;
+        assert_eq!(response.status, StatusCode::OK);
+        let etag = etag_of(&response);
+        assert!(
+            etag.starts_with("\"/config/ ") && etag.ends_with('"'),
+            "Caddy ETag shape expected, got {etag}"
+        );
+        let hash_start = etag.find(' ').expect("ETag has a space") + 1;
+        let hash = etag[hash_start..etag.len() - 1].to_string();
+        assert_eq!(hash.len(), 16, "16 hex digits expected");
+        assert!(hash.chars().all(|character| character.is_ascii_hexdigit()));
+
+        // Unchanged config: identical ETag.
+        assert_eq!(config_etag_for_path(&admin, "/config/").await, etag);
+
+        // Subtree ETags carry the requested path and the subtree hash.
+        let subtree_etag = config_etag_for_path(&admin, "/config/apps/http").await;
+        assert!(
+            subtree_etag.starts_with("\"/config/apps/http "),
+            "got {subtree_etag}"
+        );
+
+        // A config mutation changes the ETag (reload/generation change).
+        let response = admin
+            .handle(json_request(
+                "PATCH",
+                "/config/apps/http/servers/srv0/listen/0",
+                json!(":9090"),
+            ))
+            .await;
+        assert_eq!(response.status, StatusCode::OK);
+        let after = config_etag_for_path(&admin, "/config/").await;
+        assert_ne!(after, etag, "ETag must change when the config changes");
+
+        // A GET with the matching If-None-Match is a 304 with no body and the current ETag.
+        let conditional = with_header(
+            request("GET", "/config/", ""),
+            http::header::IF_NONE_MATCH,
+            &after,
+        );
+        let response = admin.handle(conditional).await;
+        assert_eq!(response.status, StatusCode::NOT_MODIFIED);
+        assert!(response.body.is_empty());
+        assert_eq!(etag_of(&response), after);
+    }
+
+    #[tokio::test]
+    async fn if_match_precondition_protects_config_updates() {
+        let admin = admin();
+        load(&admin, &valid_config()).await;
+        let etag = config_etag_for_path(&admin, "/config/").await;
+
+        // Matching If-Match: the update applies.
+        let conditional = with_header(
+            json_request(
+                "PATCH",
+                "/config/apps/http/servers/srv0/listen/0",
+                json!(":9090"),
+            ),
+            http::header::IF_MATCH,
+            &etag,
+        );
+        let response = admin.handle(conditional).await;
+        assert_eq!(response.status, StatusCode::OK);
+        let updated_etag = config_etag_for_path(&admin, "/config/").await;
+        assert_ne!(updated_etag, etag);
+
+        // Stale If-Match: 412 with Caddy's exact message, config unchanged.
+        let stale = with_header(
+            json_request(
+                "PATCH",
+                "/config/apps/http/servers/srv0/listen/0",
+                json!(":9091"),
+            ),
+            http::header::IF_MATCH,
+            &etag,
+        );
+        let response = admin.handle(stale).await;
+        assert_eq!(response.status, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(
+            body_string(&response),
+            "{\"error\":\"If-Match header did not match current config hash\"}"
+        );
+        assert_eq!(config_etag_for_path(&admin, "/config/").await, updated_etag);
+
+        // Malformed headers: Caddy's 400 messages.
+        for (value, expected) in [
+            ("abc", "malformed If-Match header; expect quoted string"),
+            ("\"abc\"", "malformed If-Match header; expect format"),
+        ] {
+            let malformed = with_header(
+                json_request(
+                    "PATCH",
+                    "/config/apps/http/servers/srv0/listen/0",
+                    json!(":9092"),
+                ),
+                http::header::IF_MATCH,
+                value,
+            );
+            let response = admin.handle(malformed).await;
+            assert_eq!(response.status, StatusCode::BAD_REQUEST, "header {value}");
+            assert!(body_string(&response).contains(expected));
+        }
+
+        // A path that does not resolve is a mismatch (Caddy returns 412 for this too).
+        let missing = with_header(
+            json_request(
+                "PATCH",
+                "/config/apps/http/servers/srv0/listen/0",
+                json!(":9093"),
+            ),
+            http::header::IF_MATCH,
+            "\"/config/nope 0000000000000000\"",
+        );
+        let response = admin.handle(missing).await;
+        assert_eq!(response.status, StatusCode::PRECONDITION_FAILED);
+        assert!(body_string(&response).contains("If-Match header did not match"));
+    }
+
+    #[tokio::test]
+    async fn if_none_match_is_a_documented_caddy_rs_extension() {
+        let admin = admin();
+        load(&admin, &valid_config()).await;
+        let etag = config_etag_for_path(&admin, "/config/").await;
+
+        // Matching If-None-Match on a read: 304.
+        let response = admin
+            .handle(with_header(
+                request("GET", "/config/apps/http", ""),
+                http::header::IF_NONE_MATCH,
+                &config_etag_for_path(&admin, "/config/apps/http").await,
+            ))
+            .await;
+        assert_eq!(response.status, StatusCode::NOT_MODIFIED);
+
+        // Non-matching If-None-Match on a read: normal 200.
+        let response = admin
+            .handle(with_header(
+                request("GET", "/config/", ""),
+                http::header::IF_NONE_MATCH,
+                "\"/config/ 0000000000000000\"",
+            ))
+            .await;
+        assert_eq!(response.status, StatusCode::OK);
+
+        // Matching If-None-Match on a write: 412 (Caddy itself ignores the header). The
+        // precondition is evaluated against the ETag of the write target path.
+        let target_path = "/config/apps/http/servers/srv0/listen/0";
+        let target_etag = config_etag_for_path(&admin, target_path).await;
+        let conditional = with_header(
+            json_request("PATCH", target_path, json!(":9094")),
+            http::header::IF_NONE_MATCH,
+            &target_etag,
+        );
+        let response = admin.handle(conditional).await;
+        assert_eq!(response.status, StatusCode::PRECONDITION_FAILED);
+        assert!(body_string(&response).contains("If-None-Match precondition failed"));
+
+        // Non-matching If-None-Match on a write: applies.
+        let conditional = with_header(
+            json_request(
+                "PATCH",
+                "/config/apps/http/servers/srv0/listen/0",
+                json!(":9095"),
+            ),
+            http::header::IF_NONE_MATCH,
+            "\"/config/ 0000000000000000\"",
+        );
+        assert_eq!(admin.handle(conditional).await.status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn reverse_proxy_upstreams_reports_configured_addresses() {
+        let admin = admin();
+        let config = json!({
+            "apps": {"http": {"servers": {"srv0": {
+                "listen": ["127.0.0.1:0"],
+                "routes": [
+                    {"handle": [{"handler": "reverse_proxy", "upstreams": [
+                        {"dial": "127.0.0.1:9001"}, {"dial": "127.0.0.1:9002"}
+                    ]}]},
+                    {"handle": [{"handler": "reverse_proxy", "upstreams": [
+                        {"dial": "127.0.0.1:9001"}
+                    ]}]},
+                    {"handle": [{"handler": "static_response", "body": "ok"}]}
+                ]
+            }}}}
+        });
+        assert_eq!(
+            load(&admin, &config.to_string()).await.status,
+            StatusCode::OK
+        );
+
+        let response = admin
+            .handle(request("GET", "/reverse_proxy/upstreams", ""))
+            .await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            response.headers.get(http::header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let upstreams: Value = serde_json::from_slice(&response.body).unwrap();
+        let addresses: Vec<&str> = upstreams
+            .as_array()
+            .expect("upstreams array")
+            .iter()
+            .map(|entry| entry["address"].as_str().expect("address"))
+            .collect();
+        assert_eq!(
+            addresses,
+            vec!["127.0.0.1:9001", "127.0.0.1:9002"],
+            "configured upstreams are de-duplicated and sorted"
+        );
+        for entry in upstreams.as_array().unwrap() {
+            assert_eq!(entry["num_requests"], 0);
+            assert_eq!(entry["fails"], 0);
+        }
+
+        // Caddy returns 405 for non-GET.
+        let response = admin
+            .handle(request("POST", "/reverse_proxy/upstreams", ""))
+            .await;
+        assert_eq!(response.status, StatusCode::METHOD_NOT_ALLOWED);
+        assert!(body_string(&response).contains("method not allowed"));
+
+        // No active config: empty array (not an error).
+        admin.handle(request("POST", "/stop", "")).await;
+        let response = admin
+            .handle(request("GET", "/reverse_proxy/upstreams", ""))
+            .await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&response.body).unwrap(),
+            json!([])
+        );
+    }
+
+    #[tokio::test]
+    async fn adapt_endpoint_supports_caddy_content_type_and_explicit_shapes() {
+        let admin = admin();
+
+        // Caddy-compatible: adapter selected by Content-Type, result wrapped, warnings omitted.
+        let mut caddyfile = request("POST", "/adapt", ":8080 {\n\trespond \"ok\"\n}\n");
+        caddyfile.headers.insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/caddyfile"),
+        );
+        let response = admin.handle(caddyfile).await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            response.headers.get(http::header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let adapted: Value = serde_json::from_slice(&response.body).unwrap();
+        assert!(adapted.get("warnings").is_none(), "no warnings expected");
+        let result = &adapted["result"];
+        assert!(result["apps"]["http"]["servers"].is_object());
+
+        // JSON content type: no adaptation; the document is returned as the result.
+        let mut json_request = request("POST", "/adapt", "{\"apps\":{}}");
+        json_request.headers.insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        let response = admin.handle(json_request).await;
+        assert_eq!(response.status, StatusCode::OK);
+        let adapted: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(adapted["result"], json!({"apps": {}}));
+
+        // caddy-rs extension: {config, adapter, wrap}; wrap:false returns the raw adapted JSON.
+        let explicit_body = json!({
+            "config": ":8081 {\n\trespond \"ok\"\n}\n",
+            "adapter": "caddyfile",
+            "wrap": false
+        })
+        .to_string();
+        let mut explicit = request("POST", "/adapt", &explicit_body);
+        explicit.headers.insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        let response = admin.handle(explicit).await;
+        assert_eq!(response.status, StatusCode::OK);
+        let adapted: Value = serde_json::from_slice(&response.body).unwrap();
+        assert!(adapted["apps"]["http"]["servers"].is_object());
+        assert!(adapted.get("result").is_none(), "wrap:false is unwrapped");
+
+        // Unknown adapters: located 400s.
+        let mut unknown = request("POST", "/adapt", "x");
+        unknown.headers.insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/nope"),
+        );
+        let response = admin.handle(unknown).await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        assert!(body_string(&response).contains("unrecognized config adapter 'nope'"));
+
+        let mut malformed = request("POST", "/adapt", "not a caddyfile {");
+        malformed.headers.insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/caddyfile"),
+        );
+        let response = admin.handle(malformed).await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        assert!(body_string(&response).contains("adapting config using caddyfile adapter"));
+
+        // Non-POST is 405 like Caddy.
+        let response = admin.handle(request("GET", "/adapt", "")).await;
+        assert_eq!(response.status, StatusCode::METHOD_NOT_ALLOWED);
     }
 
     #[tokio::test]
