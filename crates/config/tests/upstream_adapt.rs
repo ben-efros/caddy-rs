@@ -600,3 +600,115 @@ fn try_files_with_query_groups_routes_like_real_caddy_v2_11_7() {
         })
     );
 }
+
+#[test]
+fn request_body_matches_caddy() {
+    assert_adapts_like_caddy("request_body.caddyfiletest");
+}
+
+fn adapted_request_body(directive: &str) -> Value {
+    let adapted = adapt(&format!("localhost {{\n\t{directive}\n}}\n"))
+        .unwrap_or_else(|e| panic!("adapt `{directive}`: {e}"));
+    adapted.config["apps"]["http"]["servers"]["srv0"]["routes"][0]["handle"][0]["routes"][0]
+        ["handle"]
+        .clone()
+}
+
+#[test]
+fn request_body_size_suffixes_match_real_caddy_v2_11_7() {
+    // Cases verified against `caddy adapt` v2.11.7: decimal suffixes are powers of 1000, `i`
+    // suffixes powers of 1024, bare k/m/g/t/p/e accepted, fractions and comma separators allowed,
+    // zero is omitted (Caddy's `omitempty`), and a duplicate subdirective takes the last value.
+    let cases: &[(&str, u64)] = &[
+        ("max_size 1MB", 1_000_000),
+        ("max_size 1MiB", 1_048_576),
+        ("max_size 1000", 1000),
+        ("max_size 1kb", 1_000),
+        ("max_size 1KiB", 1_024),
+        ("max_size 1.5MB", 1_500_000),
+        ("max_size .5MB", 500_000),
+        ("max_size 1,000KB", 1_000_000),
+        ("max_size 1g", 1_000_000_000),
+        ("max_size 1GiB", 1_073_741_824),
+        ("max_size 1t", 1_000_000_000_000),
+    ];
+    for (directive, expected) in cases {
+        assert_eq!(
+            adapted_request_body(&format!("request_body {{\n\t\t{directive}\n\t}}")),
+            json!([{"handler": "request_body", "max_size": expected}]),
+            "size parsing differs for `{directive}`"
+        );
+    }
+    assert_eq!(
+        adapted_request_body("request_body {\n\t\tmax_size 1MB\n\t\tmax_size 2MB\n\t}"),
+        json!([{"handler": "request_body", "max_size": 2_000_000}]),
+        "duplicate max_size must take the last value"
+    );
+    assert_eq!(
+        adapted_request_body("request_body {\n\t\tmax_size 0\n\t}"),
+        json!([{"handler": "request_body"}]),
+        "max_size 0 is omitted by Caddy's omitempty"
+    );
+}
+
+#[test]
+fn request_body_set_and_matcher_match_real_caddy_v2_11_7() {
+    // Golden from `caddy adapt` v2.11.7: handler-directive matcher token, `set` placeholder is
+    // qualified like every other Caddyfile placeholder.
+    let adapted =
+        adapt("localhost {\n\trequest_body /api/* {\n\t\tmax_size 1MB\n\t\tset {path}\n\t}\n}\n")
+            .expect("adapt request_body with matcher and set");
+    assert_eq!(
+        adapted.config["apps"]["http"]["servers"]["srv0"]["routes"][0]["handle"][0]["routes"][0],
+        json!({
+            "match": [{"path": ["/api/*"]}],
+            "handle": [{
+                "handler": "request_body",
+                "max_size": 1_000_000,
+                "set": "{http.request.uri.path}",
+            }],
+        })
+    );
+}
+
+#[test]
+fn request_body_invalid_forms_fail_loudly() {
+    for (directive, expected) in [
+        ("request_body {\n\t\tmax_size abc\n\t}", "parsing max_size"),
+        (
+            "request_body {\n\t\tmax_size 1z\n\t}",
+            "unhandled size name: z",
+        ),
+        (
+            "request_body {\n\t\tmax_size 1e3\n\t}",
+            "unhandled size name: e3",
+        ),
+        ("request_body {\n\t\tmax_size -1MB\n\t}", "parsing max_size"),
+        (
+            "request_body {\n\t\tbogus x\n\t}",
+            "unrecognized request_body subdirective",
+        ),
+        ("request_body {\n\t\tset a b\n\t}", "wrong argument count"),
+        (
+            "request_body {\n\t\tmax_size 1MB 2MB\n\t}",
+            "wrong argument count",
+        ),
+    ] {
+        let error = adapt(&format!("localhost {{\n\t{directive}\n}}\n"))
+            .expect_err(&format!("`{directive}` must fail"));
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains(expected),
+            "error for `{directive}` should contain {expected:?}, got: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn request_body_directive_arguments_are_ignored_like_caddy() {
+    // Caddy's parseCaddyfile only reads the block; extra non-matcher arguments are ignored.
+    assert_eq!(
+        adapted_request_body("request_body 1MB"),
+        json!([{"handler": "request_body"}])
+    );
+}

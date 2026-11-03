@@ -1,0 +1,48 @@
+{
+    "apps": {
+        "http": {
+            "servers": {
+                "srv0": {
+                    "listen": [
+                        ":443"
+                    ],
+                    "routes": [
+                        {
+                            "match": [
+                                {
+                                    "host": [
+                                        "localhost"
+                                    ]
+                                }
+                            ],
+                            "handle": [
+                                {
+                                    "handler": "subroute",
+                                    "routes": [
+                                        {
+                                            "handle": [
+                                                {
+                                                    "handler": "request_body",
+                                                    "max_size": 1000000,
+                                                    "set": "{http.request.uri.path}"
+                                                }
+                                            ],
+                                            "match": [
+                                                {
+                                                    "path": [
+                                                        "/api/*"
+                                                    ]
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                }
+                            ],
+                            "terminal": true
+                        }
+                    ]
+                }
+            }
+        }
+    }
+}
