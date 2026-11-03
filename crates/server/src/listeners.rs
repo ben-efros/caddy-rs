@@ -84,17 +84,114 @@ pub(crate) struct ListenerState {
 /// Listener state shared with accept loops, keyed by configured listen address.
 pub(crate) type SharedListeners = Arc<RwLock<HashMap<String, Arc<ListenerState>>>>;
 
+/// Tracks connections accepted by one listener so shutdown can wait for in-flight work.
+#[derive(Debug, Default)]
+pub(crate) struct ConnectionTracker {
+    active: AtomicUsize,
+    notify: tokio::sync::Notify,
+}
+
+impl ConnectionTracker {
+    /// Register one active connection. The returned guard decrements the count when dropped.
+    pub(crate) fn guard(self: &Arc<Self>) -> TrackedConnection {
+        self.active.fetch_add(1, Ordering::AcqRel);
+        TrackedConnection {
+            tracker: Arc::clone(self),
+        }
+    }
+
+    /// Number of active connections.
+    pub(crate) fn active(&self) -> usize {
+        self.active.load(Ordering::Acquire)
+    }
+
+    /// Wait until no connections are active, or the timeout expires.
+    ///
+    /// Returns `true` when the tracker drained, `false` when the timeout expired first. `None`
+    /// waits indefinitely.
+    pub(crate) async fn wait_drained(&self, timeout: Option<Duration>) -> bool {
+        let deadline = timeout.map(|timeout| tokio::time::Instant::now() + timeout);
+        loop {
+            if self.active() == 0 {
+                return true;
+            }
+            let notified = self.notify.notified();
+            if self.active() == 0 {
+                return true;
+            }
+            match deadline {
+                None => notified.await,
+                Some(deadline) => {
+                    let now = tokio::time::Instant::now();
+                    if now >= deadline {
+                        return self.active() == 0;
+                    }
+                    tokio::select! {
+                        _ = notified => {}
+                        _ = tokio::time::sleep_until(deadline) => {
+                            return self.active() == 0;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Guards one registered active connection; dropped when the connection task ends (or when the
+/// last upgraded-tunnel reference is dropped).
+pub(crate) struct TrackedConnection {
+    tracker: Arc<ConnectionTracker>,
+}
+
+impl Drop for TrackedConnection {
+    fn drop(&mut self) {
+        self.tracker.active.fetch_sub(1, Ordering::AcqRel);
+        self.tracker.notify.notify_waiters();
+    }
+}
+
 /// A running listener task.
 pub(crate) struct ListenerHandle {
     pub(crate) shutdown: watch::Sender<bool>,
+    pub(crate) force: watch::Sender<bool>,
+    pub(crate) tracker: Arc<ConnectionTracker>,
     pub(crate) task: JoinHandle<()>,
     pub(crate) bound: String,
     pub(crate) socket_addr: Option<SocketAddr>,
 }
 
 impl ListenerHandle {
-    pub(crate) async fn stop(self) {
+    /// Stop accepting new connections and ask existing connections to finish gracefully.
+    pub(crate) fn begin_graceful(&self) {
         let _ = self.shutdown.send(true);
+    }
+
+    /// Drop existing connections immediately (used after the grace period or on a second signal).
+    pub(crate) fn begin_force(&self) {
+        let _ = self.force.send(true);
+    }
+
+    /// The tracker for this listener's connections.
+    pub(crate) fn tracker(&self) -> Arc<ConnectionTracker> {
+        Arc::clone(&self.tracker)
+    }
+
+    /// Number of active connections accepted by this listener.
+    pub(crate) fn active_connections(&self) -> usize {
+        self.tracker.active()
+    }
+
+    /// Gracefully stop the listener (accept loop ends; in-flight connections finish on their own).
+    pub(crate) async fn stop(self) {
+        self.begin_graceful();
+        let _ = self.task.await;
+    }
+
+    /// Stop the listener and force-close its connections immediately.
+    pub(crate) async fn stop_forcibly(self) {
+        self.begin_graceful();
+        self.begin_force();
         let _ = self.task.await;
     }
 }
@@ -141,10 +238,21 @@ pub(crate) async fn bind(
                 .local_addr()
                 .map_err(|error| Error::bind(configured, error))?;
             let (shutdown, receiver) = watch::channel(false);
-            let task =
-                spawn_tcp_accept_loop(listener, configured.to_string(), listeners, store, receiver);
+            let (force, force_receiver) = watch::channel(false);
+            let tracker = Arc::new(ConnectionTracker::default());
+            let task = spawn_tcp_accept_loop(
+                listener,
+                configured.to_string(),
+                listeners,
+                store,
+                receiver,
+                force_receiver,
+                Arc::clone(&tracker),
+            );
             Ok(ListenerHandle {
                 shutdown,
+                force,
+                tracker,
                 task,
                 bound: socket_addr.to_string(),
                 socket_addr: Some(socket_addr),
@@ -182,15 +290,21 @@ pub(crate) async fn bind(
                 }
             };
             let (shutdown, receiver) = watch::channel(false);
+            let (force, force_receiver) = watch::channel(false);
+            let tracker = Arc::new(ConnectionTracker::default());
             let task = spawn_unix_accept_loop(
                 listener,
                 configured.to_string(),
                 listeners,
                 store,
                 receiver,
+                force_receiver,
+                Arc::clone(&tracker),
             );
             Ok(ListenerHandle {
                 shutdown,
+                force,
+                tracker,
                 task,
                 bound: path,
                 socket_addr: None,
@@ -376,6 +490,8 @@ fn spawn_tcp_accept_loop(
     listeners: SharedListeners,
     store: Arc<GenerationStore>,
     mut shutdown: watch::Receiver<bool>,
+    force: watch::Receiver<bool>,
+    tracker: Arc<ConnectionTracker>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let active = Arc::new(AtomicUsize::new(0));
@@ -395,6 +511,8 @@ fn spawn_tcp_accept_loop(
                     };
                     let generation = store.acquire();
                     let connection_shutdown = shutdown.clone();
+                    let connection_force = force.clone();
+                    let tracked = tracker.guard();
                     tokio::spawn(serve_accepted(
                         stream,
                         Some(peer),
@@ -402,6 +520,8 @@ fn spawn_tcp_accept_loop(
                         permit,
                         generation,
                         connection_shutdown,
+                        connection_force,
+                        tracked,
                     ));
                 }
             }
@@ -415,6 +535,8 @@ fn spawn_unix_accept_loop(
     listeners: SharedListeners,
     store: Arc<GenerationStore>,
     mut shutdown: watch::Receiver<bool>,
+    force: watch::Receiver<bool>,
+    tracker: Arc<ConnectionTracker>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let active = Arc::new(AtomicUsize::new(0));
@@ -434,6 +556,8 @@ fn spawn_unix_accept_loop(
                     };
                     let generation = store.acquire();
                     let connection_shutdown = shutdown.clone();
+                    let connection_force = force.clone();
+                    let tracked = tracker.guard();
                     tokio::spawn(serve_accepted(
                         stream,
                         None,
@@ -441,6 +565,8 @@ fn spawn_unix_accept_loop(
                         permit,
                         generation,
                         connection_shutdown,
+                        connection_force,
+                        tracked,
                     ));
                 }
             }
@@ -449,6 +575,7 @@ fn spawn_unix_accept_loop(
 }
 
 /// Terminate TLS when the listener is a TLS listener, then serve the connection.
+#[allow(clippy::too_many_arguments)]
 async fn serve_accepted<I>(
     stream: I,
     peer: Option<SocketAddr>,
@@ -456,6 +583,8 @@ async fn serve_accepted<I>(
     permit: ConnectionPermit,
     generation: Option<Arc<Generation>>,
     shutdown: watch::Receiver<bool>,
+    force: watch::Receiver<bool>,
+    tracked: TrackedConnection,
 ) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -464,6 +593,9 @@ async fn serve_accepted<I>(
     // service is dropped when the connection ends, releasing both.
     let permit = Arc::new(permit);
     let generation = generation;
+    // One tracked-connection guard per accepted connection; cloned into the upgrade tunnel when
+    // the socket is handed off, so it survives until the tunnel ends.
+    let tracked = Arc::new(tracked);
     let limits = Arc::clone(&context.limits);
     let activity = Arc::new(ConnectionActivity::default());
     let router = context.router;
@@ -516,9 +648,10 @@ async fn serve_accepted<I>(
             Arc::clone(&activity),
             Arc::clone(&permit),
             generation.clone(),
-            shutdown.clone(),
+            force.clone(),
+            Arc::clone(&tracked),
         );
-        serve_connection(tls_stream, service, shutdown, limits, activity).await;
+        serve_connection(tls_stream, service, shutdown, force, limits, activity).await;
     } else {
         let service = connection_service(
             router,
@@ -535,9 +668,10 @@ async fn serve_accepted<I>(
             Arc::clone(&activity),
             Arc::clone(&permit),
             generation.clone(),
-            shutdown.clone(),
+            force.clone(),
+            Arc::clone(&tracked),
         );
-        serve_connection(stream, service, shutdown, limits, activity).await;
+        serve_connection(stream, service, shutdown, force, limits, activity).await;
     }
 }
 
@@ -557,7 +691,8 @@ fn connection_service(
     activity: Arc<ConnectionActivity>,
     permit: Arc<ConnectionPermit>,
     generation: Option<Arc<Generation>>,
-    shutdown: watch::Receiver<bool>,
+    force: watch::Receiver<bool>,
+    tracked: Arc<TrackedConnection>,
 ) -> impl hyper::service::Service<
     hyper::Request<Incoming>,
     Response = hyper::Response<Body>,
@@ -578,7 +713,8 @@ fn connection_service(
         let automatic = automatic.clone();
         let permit = Arc::clone(&permit);
         let generation = generation.clone();
-        let shutdown = shutdown.clone();
+        let force = force.clone();
+        let tracked = Arc::clone(&tracked);
         async move {
             let _in_flight = activity.begin();
             let started = std::time::Instant::now();
@@ -652,7 +788,7 @@ fn connection_service(
                     tunnel,
                     on_upgrade,
                 } => {
-                    spawn_upgraded_tunnel(on_upgrade, tunnel, shutdown, permit, generation);
+                    spawn_upgraded_tunnel(on_upgrade, tunnel, force, permit, generation, tracked);
                     Ok::<_, std::convert::Infallible>(response)
                 }
             }
@@ -669,14 +805,16 @@ fn connection_service(
 fn spawn_upgraded_tunnel(
     on_upgrade: hyper::upgrade::OnUpgrade,
     tunnel: caddy_rs_http::Tunnel,
-    mut shutdown: watch::Receiver<bool>,
+    mut force: watch::Receiver<bool>,
     permit: Arc<ConnectionPermit>,
     generation: Option<Arc<Generation>>,
+    tracked: Arc<TrackedConnection>,
 ) {
     tokio::spawn(async move {
         let _permit = permit;
         let _generation = generation;
-        if *shutdown.borrow() {
+        let _tracked = tracked;
+        if *force.borrow() {
             return;
         }
         let client = match on_upgrade.await {
@@ -702,8 +840,8 @@ fn spawn_upgraded_tunnel(
                     Err(error) => tracing::debug!(%error, "upgraded connection copy failed"),
                 }
             }
-            _ = shutdown.changed() => {
-                tracing::debug!("closing upgraded connection on shutdown");
+            _ = force.changed() => {
+                tracing::debug!("closing upgraded connection on forced shutdown");
             }
         }
         // Dropping `client` and `upstream` closes both sides of the tunnel.
@@ -715,6 +853,7 @@ async fn serve_connection<I, S>(
     io: I,
     service: S,
     mut shutdown: watch::Receiver<bool>,
+    mut force: watch::Receiver<bool>,
     limits: Arc<ServerLimits>,
     activity: Arc<ConnectionActivity>,
 ) where
@@ -751,9 +890,20 @@ async fn serve_connection<I, S>(
                 tracing::debug!(%error, "connection ended with error");
             }
         }
+        _ = force.changed() => {
+            // A forced shutdown (grace period expired or second signal) drops the connection
+            // without waiting for in-flight work.
+            tracing::debug!("force-closing connection");
+        }
         _ = shutdown.changed() => {
             connection.as_mut().graceful_shutdown();
-            let _ = connection.as_mut().await;
+            // Finish in-flight work, but a forced shutdown must not wait for it.
+            tokio::select! {
+                _ = connection.as_mut() => {}
+                _ = force.changed() => {
+                    tracing::debug!("force-closing connection during graceful shutdown");
+                }
+            }
         }
         _ = idle.as_mut() => {
             tracing::debug!(
@@ -937,6 +1087,9 @@ pub(crate) async fn bind_admin(configured: &str, api: AdminApi) -> Result<Listen
         .local_addr()
         .map_err(|error| Error::bind(configured, error))?;
     let (shutdown, mut receiver) = watch::channel(false);
+    let (force, mut force_receiver) = watch::channel(false);
+    let tracker = Arc::new(ConnectionTracker::default());
+    let loop_tracker = Arc::clone(&tracker);
     let task = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -945,11 +1098,19 @@ pub(crate) async fn bind_admin(configured: &str, api: AdminApi) -> Result<Listen
                         break;
                     }
                 }
+                changed = force_receiver.changed() => {
+                    if changed.is_err() || *force_receiver.borrow() {
+                        break;
+                    }
+                }
                 accepted = listener.accept() => {
                     let Ok((stream, _peer)) = accepted else { continue };
                     let api = api.clone();
                     let connection_shutdown = receiver.clone();
+                    let connection_force = force_receiver.clone();
+                    let tracked = loop_tracker.guard();
                     tokio::spawn(async move {
+                        let _tracked = tracked;
                         let service = service_fn(move |request: hyper::Request<Incoming>| {
                             let api = api.clone();
                             async move {
@@ -984,7 +1145,15 @@ pub(crate) async fn bind_admin(configured: &str, api: AdminApi) -> Result<Listen
                         });
                         let limits = Arc::new(ServerLimits::default());
                         let activity = Arc::new(ConnectionActivity::default());
-                        serve_connection(stream, service, connection_shutdown, limits, activity).await;
+                        serve_connection(
+                            stream,
+                            service,
+                            connection_shutdown,
+                            connection_force,
+                            limits,
+                            activity,
+                        )
+                        .await;
                     });
                 }
             }
@@ -992,6 +1161,8 @@ pub(crate) async fn bind_admin(configured: &str, api: AdminApi) -> Result<Listen
     });
     Ok(ListenerHandle {
         shutdown,
+        force,
+        tracker,
         task,
         bound: socket_addr.to_string(),
         socket_addr: Some(socket_addr),
