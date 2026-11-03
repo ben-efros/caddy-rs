@@ -820,6 +820,21 @@ mod tests {
     }
 
     #[test]
+    fn accepts_map_handler() {
+        let config = minimal_http_config(
+            serde_json::json!({
+                "handler": "map",
+                "source": "{http.request.uri.path}",
+                "destinations": ["{mapped}"],
+                "mappings": [{"input": "/old", "outputs": ["/new"]}]
+            }),
+            None,
+        );
+        let report = validate_config(&config, &registry()).expect("map is registered");
+        assert_eq!(report.handlers, 1);
+    }
+
+    #[test]
     fn accepts_file_matcher() {
         let config = minimal_http_config(
             serde_json::json!({"handler": "static_response", "body": "ok"}),

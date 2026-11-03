@@ -572,6 +572,12 @@ pub const BUILTIN_MODULES: &[Module] = &[
         ModuleKind::HttpHandler,
         "Limit or replace the request body for later handlers",
     ),
+    Module::new(
+        "http.handlers.map",
+        "map",
+        ModuleKind::HttpHandler,
+        "Map a source value to destination placeholders",
+    ),
     // HTTP matchers
     Module::new(
         "http.matchers.host",
@@ -799,6 +805,7 @@ mod tests {
             (ModuleKind::HttpHandler, "authentication"),
             (ModuleKind::HttpHandler, "basic_auth"),
             (ModuleKind::HttpHandler, "request_body"),
+            (ModuleKind::HttpHandler, "map"),
             (ModuleKind::HttpMatcher, "file"),
         ] {
             assert!(

@@ -14,8 +14,8 @@ use crate::auth::{BasicAuthHandler, ForwardAuthHandler};
 use crate::body::StreamingResponse;
 use crate::file_server::FileServerHandler;
 use crate::handlers::{
-    EncodeHandler, HeadersHandler, RequestBodyHandler, RewriteHandler, StaticResponseHandler,
-    SubrouteHandler, VarsHandler,
+    EncodeHandler, HeadersHandler, MapHandler, RequestBodyHandler, RewriteHandler,
+    StaticResponseHandler, SubrouteHandler, VarsHandler,
 };
 use crate::matchers::build_matcher_set;
 use crate::types::{
@@ -437,6 +437,7 @@ impl RouterBuilder {
             "vars" => Arc::new(VarsHandler::from_json(value, path)?),
             "rewrite" => Arc::new(RewriteHandler::from_json(value, path)?),
             "request_body" => Arc::new(RequestBodyHandler::from_json(value, path)?),
+            "map" => Arc::new(MapHandler::from_json(value, path)?),
             "encode" => Arc::new(EncodeHandler),
             "file_server" => Arc::new(FileServerHandler::from_json(value, path)?),
             "forward_auth" => Arc::new(ForwardAuthHandler::from_json(value, path)?),

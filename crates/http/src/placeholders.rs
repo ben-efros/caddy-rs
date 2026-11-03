@@ -213,6 +213,11 @@ impl<'a> Replacer<'a> {
                 if let Some(name) = name.strip_prefix("http.request.uri.path.") {
                     return path_segment(path, name);
                 }
+                // Caddy's `map` handler registers arbitrary placeholder names (`{foo}`); the
+                // handler records them in request vars, so resolve any remaining name there.
+                if let Some(value) = self.request.vars.get(name) {
+                    return Some(value.clone());
+                }
                 None
             }
         }
