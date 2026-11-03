@@ -16,7 +16,12 @@
 //!   `certificate_selection.any_tag` for per-connection certificate selection (evaluated by
 //!   [`ConnectionPolicyResolver`] after the ClientHello, in policy order, with `{}` as the
 //!   catch-all fallback);
-//! * [`build_server_config`] assembles the rustls [`ServerConfig`] with the `ring` provider.
+//! * [`build_server_config`] assembles the rustls [`ServerConfig`] with the `ring` provider and
+//!   applies `tls_connection_policies[0].curves`/`cipher_suites` to a custom
+//!   [`CryptoProvider`] (Caddy/Go curve names x25519/secp256r1/secp384r1 and the six ECDHE
+//!   AES-GCM/ChaCha20 TLS 1.2 suites). TLS 1.3 cipher suites are fixed by rustls/Go and cannot be
+//!   configured; unsupported curve/cipher names (including secp521r1, x25519mlkem768, RSA
+//!   key-exchange suites and TLS 1.3 suites) fail loudly with TLS-POLICY tracking.
 //!
 //! Listener policy (documented for the server supervisor, see [`listener_uses_tls`]): a TCP
 //! listener terminates TLS when its server has non-empty `tls_connection_policies`, or when its
@@ -31,7 +36,7 @@ use std::sync::{Arc, RwLock};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use rustls::crypto::CryptoProvider;
+use rustls::crypto::{CryptoProvider, SupportedKxGroup};
 use rustls::pki_types::{
     CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
     UnixTime,
@@ -41,7 +46,7 @@ use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
 use rustls::sign::CertifiedKey;
 use rustls::{
     CertificateError, DigitallySignedStruct, DistinguishedName, RootCertStore, ServerConfig,
-    SignatureScheme, SupportedProtocolVersion,
+    SignatureScheme, SupportedCipherSuite, SupportedProtocolVersion,
 };
 use serde_json::Value;
 
@@ -133,6 +138,128 @@ impl TlsVersions {
     }
 }
 
+/// TLS key-exchange group / curve selected by `tls_connection_policies[].curves`.
+///
+/// Caddy/Go names are `x25519`, `secp256r1`, `secp384r1`, `secp521r1` and
+/// `x25519mlkem768`. The rustls *ring* provider supports only X25519, P-256 and P-384; the
+/// unsupported names fail loudly when parsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsCurve {
+    /// X25519 (Go `x25519`).
+    X25519,
+    /// NIST P-256 (Go `secp256r1`).
+    P256,
+    /// NIST P-384 (Go `secp384r1`).
+    P384,
+}
+
+impl TlsCurve {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "x25519" => Ok(Self::X25519),
+            "secp256r1" => Ok(Self::P256),
+            "secp384r1" => Ok(Self::P384),
+            "secp521r1" | "x25519mlkem768" => Err(Error::Unsupported {
+                path: "tls_connection_policies[0].curves".to_string(),
+                feature: format!(
+                    "TLS curve `{value}` (the rustls ring provider supports x25519, secp256r1 and secp384r1)"
+                ),
+                tracking_id: "TLS-POLICY",
+            }),
+            other => Err(Error::TlsConfig {
+                path: "tls_connection_policies[0].curves".to_string(),
+                message: format!(
+                    "unsupported TLS curve `{other}`; expected x25519, secp256r1, secp384r1, secp521r1 or x25519mlkem768"
+                ),
+            }),
+        }
+    }
+
+    fn kx_group(self) -> &'static dyn SupportedKxGroup {
+        match self {
+            Self::X25519 => rustls::crypto::ring::kx_group::X25519,
+            Self::P256 => rustls::crypto::ring::kx_group::SECP256R1,
+            Self::P384 => rustls::crypto::ring::kx_group::SECP384R1,
+        }
+    }
+}
+
+/// TLS 1.2 cipher suite selected by `tls_connection_policies[].cipher_suites`.
+///
+/// These are the six ECDHE AEAD suites rustls' ring provider implements. TLS 1.3 cipher suites
+/// are not configurable in rustls (or Go), so listing them fails loudly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tls12CipherSuite {
+    /// `TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256`.
+    EcdheEcdsaAes128GcmSha256,
+    /// `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384`.
+    EcdheEcdsaAes256GcmSha384,
+    /// `TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256`.
+    EcdheEcdsaChacha20Poly1305,
+    /// `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256`.
+    EcdheRsaAes128GcmSha256,
+    /// `TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384`.
+    EcdheRsaAes256GcmSha384,
+    /// `TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256`.
+    EcdheRsaChacha20Poly1305,
+}
+
+impl Tls12CipherSuite {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256" => Ok(Self::EcdheEcdsaAes128GcmSha256),
+            "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384" => Ok(Self::EcdheEcdsaAes256GcmSha384),
+            "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256" => Ok(Self::EcdheEcdsaChacha20Poly1305),
+            "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256" => Ok(Self::EcdheRsaAes128GcmSha256),
+            "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384" => Ok(Self::EcdheRsaAes256GcmSha384),
+            "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256" => Ok(Self::EcdheRsaChacha20Poly1305),
+            name if name.starts_with("TLS_AES_")
+                || name.starts_with("TLS_CHACHA20_")
+                || name.starts_with("TLS13_") =>
+            {
+                Err(Error::Unsupported {
+                    path: "tls_connection_policies[0].cipher_suites".to_string(),
+                    feature: format!(
+                        "TLS 1.3 cipher suite `{name}` (TLS 1.3 cipher suites are fixed by rustls and Go; only TLS 1.2 suites are configurable)"
+                    ),
+                    tracking_id: "TLS-POLICY",
+                })
+            }
+            "TLS_RSA_WITH_3DES_EDE_CBC_SHA" | "TLS_RSA_WITH_AES_128_CBC_SHA"
+            | "TLS_RSA_WITH_AES_256_CBC_SHA" | "TLS_RSA_WITH_AES_128_GCM_SHA256"
+            | "TLS_RSA_WITH_AES_256_GCM_SHA384" | "TLS_RSA_WITH_CHACHA20_POLY1305_SHA256" => {
+                Err(Error::Unsupported {
+                    path: "tls_connection_policies[0].cipher_suites".to_string(),
+                    feature: format!(
+                        "RSA key-exchange cipher suite `{value}` (rustls only implements ECDHE suites)"
+                    ),
+                    tracking_id: "TLS-POLICY",
+                })
+            }
+            other => Err(Error::TlsConfig {
+                path: "tls_connection_policies[0].cipher_suites".to_string(),
+                message: format!(
+                    "unsupported cipher suite `{other}`; expected a TLS 1.2 ECDHE AES-GCM/ChaCha20 suite"
+                ),
+            }),
+        }
+    }
+
+    fn supported_suite(self) -> SupportedCipherSuite {
+        use rustls::crypto::ring::cipher_suite as suites;
+        match self {
+            Self::EcdheEcdsaAes128GcmSha256 => suites::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+            Self::EcdheEcdsaAes256GcmSha384 => suites::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+            Self::EcdheEcdsaChacha20Poly1305 => {
+                suites::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+            }
+            Self::EcdheRsaAes128GcmSha256 => suites::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+            Self::EcdheRsaAes256GcmSha384 => suites::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+            Self::EcdheRsaChacha20Poly1305 => suites::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+        }
+    }
+}
+
 /// Options for the rustls server configuration derived from a connection policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TlsServerOptions {
@@ -140,6 +267,12 @@ pub struct TlsServerOptions {
     pub alpn: Vec<Vec<u8>>,
     /// Enabled TLS protocol versions.
     pub versions: TlsVersions,
+    /// Key-exchange group preference (`tls_connection_policies[0].curves`); empty means the
+    /// provider defaults (X25519, P-256, P-384).
+    pub curves: Vec<TlsCurve>,
+    /// TLS 1.2 cipher-suite preference (`cipher_suites`/`ciphers`); empty means the provider
+    /// defaults. TLS 1.3 suites are fixed by rustls and cannot be configured here.
+    pub cipher_suites: Vec<Tls12CipherSuite>,
     /// Client certificate authentication mode.
     pub client_auth: ClientAuthMode,
     /// Trust anchors used to verify client certificates (`client_authentication.ca` /
@@ -204,6 +337,8 @@ impl Default for TlsServerOptions {
                 .map(|protocol| protocol.to_vec())
                 .collect(),
             versions: TlsVersions::Default,
+            curves: Vec::new(),
+            cipher_suites: Vec::new(),
             client_auth: ClientAuthMode::None,
             client_auth_roots: Vec::new(),
             client_auth_leaf_certs: Vec::new(),
@@ -309,6 +444,69 @@ impl TlsServerOptions {
                 (true, false) => TlsVersions::Tls12Only,
                 (false, true) => TlsVersions::Tls13Only,
             };
+        }
+        if let Some(curves) = policy.get("curves") {
+            let curves = curves.as_array().ok_or_else(|| Error::TlsConfig {
+                path: "tls_connection_policies[0].curves".to_string(),
+                message: "must be an array of curve names".to_string(),
+            })?;
+            let mut parsed: Vec<TlsCurve> = Vec::with_capacity(curves.len());
+            for (index, curve) in curves.iter().enumerate() {
+                let path = format!("tls_connection_policies[0].curves[{index}]");
+                let curve = curve.as_str().ok_or_else(|| Error::TlsConfig {
+                    path: path.clone(),
+                    message: "curve name must be a string".to_string(),
+                })?;
+                let curve = TlsCurve::parse(curve).map_err(|error| match error {
+                    Error::Unsupported {
+                        feature,
+                        tracking_id,
+                        ..
+                    } => Error::Unsupported {
+                        path: path.clone(),
+                        feature,
+                        tracking_id,
+                    },
+                    other => other,
+                })?;
+                if !parsed.contains(&curve) {
+                    parsed.push(curve);
+                }
+            }
+            options.curves = parsed;
+        }
+        if let Some(cipher_suites) = policy
+            .get("cipher_suites")
+            .or_else(|| policy.get("ciphers"))
+        {
+            let cipher_suites = cipher_suites.as_array().ok_or_else(|| Error::TlsConfig {
+                path: "tls_connection_policies[0].cipher_suites".to_string(),
+                message: "must be an array of cipher suite names".to_string(),
+            })?;
+            let mut parsed: Vec<Tls12CipherSuite> = Vec::with_capacity(cipher_suites.len());
+            for (index, suite) in cipher_suites.iter().enumerate() {
+                let path = format!("tls_connection_policies[0].cipher_suites[{index}]");
+                let suite = suite.as_str().ok_or_else(|| Error::TlsConfig {
+                    path: path.clone(),
+                    message: "cipher suite name must be a string".to_string(),
+                })?;
+                let suite = Tls12CipherSuite::parse(suite).map_err(|error| match error {
+                    Error::Unsupported {
+                        feature,
+                        tracking_id,
+                        ..
+                    } => Error::Unsupported {
+                        path: path.clone(),
+                        feature,
+                        tracking_id,
+                    },
+                    other => other,
+                })?;
+                if !parsed.contains(&suite) {
+                    parsed.push(suite);
+                }
+            }
+            options.cipher_suites = parsed;
         }
         if let Some(client_authentication) = policy.get("client_authentication") {
             let parsed = parse_client_authentication(client_authentication)?;
@@ -441,7 +639,12 @@ fn parse_connection_policy(value: &Value, index: usize) -> Result<CertificatePol
                     }
                 }
             }
-            "alpn" | "protocols" | "client_authentication" => {
+            "alpn"
+            | "protocols"
+            | "curves"
+            | "cipher_suites"
+            | "ciphers"
+            | "client_authentication" => {
                 if index != 0 {
                     return Err(Error::Unsupported {
                         path: format!("{path}.{field}"),
@@ -955,6 +1158,39 @@ impl ResolvesServerCert for ConnectionPolicyResolver {
     }
 }
 
+/// Build the rustls crypto provider for a listener, applying the configured key-exchange
+/// groups and TLS 1.2 cipher suites on top of the ring defaults.
+///
+/// TLS 1.3 cipher suites are fixed in rustls (and Go's `crypto/tls`), so only TLS 1.2 suites can
+/// be restricted; the provider always retains the fixed TLS 1.3 suites.
+fn crypto_provider(options: &TlsServerOptions) -> Result<Arc<CryptoProvider>> {
+    let mut provider = rustls::crypto::ring::default_provider();
+    if !options.curves.is_empty() {
+        provider.kx_groups = options
+            .curves
+            .iter()
+            .map(|curve| curve.kx_group())
+            .collect();
+    }
+    if !options.cipher_suites.is_empty() {
+        let mut suites: Vec<SupportedCipherSuite> = options
+            .cipher_suites
+            .iter()
+            .map(|suite| suite.supported_suite())
+            .collect();
+        // TLS 1.3 suites cannot be configured; keep every provider default.
+        suites.extend(
+            provider
+                .cipher_suites
+                .iter()
+                .filter(|suite| suite.version() == &rustls::version::TLS13)
+                .copied(),
+        );
+        provider.cipher_suites = suites;
+    }
+    Ok(Arc::new(provider))
+}
+
 /// Build a rustls server configuration from a [`CertificateResolver`] and options.
 pub fn build_server_config(
     resolver: Arc<CertificateResolver>,
@@ -996,7 +1232,7 @@ pub fn build_server_config_with_cert_resolver(
             policies: options.certificate_policies.clone(),
         })
     };
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = crypto_provider(options)?;
     let builder = ServerConfig::builder_with_provider(Arc::clone(&provider))
         .with_protocol_versions(options.versions.rustls_versions())
         .map_err(|error| Error::TlsConfig {
@@ -2292,14 +2528,6 @@ mod tests {
             error.to_string().contains("TLS connection policy field"),
             "{error}"
         );
-        let error = TlsServerOptions::from_connection_policies(Some(&[serde_json::json!({
-            "curves": ["x25519"]
-        })]))
-        .unwrap_err();
-        assert!(
-            error.to_string().contains("TLS connection policy field"),
-            "{error}"
-        );
     }
 
     fn client_ca_der_base64() -> String {
@@ -2681,6 +2909,292 @@ mod tests {
             .is_err(),
             "non-allowlisted leaf must be rejected"
         );
+    }
+
+    fn provider_with(
+        curves: Option<&[&'static dyn SupportedKxGroup]>,
+        suites: Option<Vec<SupportedCipherSuite>>,
+    ) -> Arc<CryptoProvider> {
+        let mut provider = rustls::crypto::ring::default_provider();
+        if let Some(curves) = curves {
+            provider.kx_groups = curves.to_vec();
+        }
+        if let Some(suites) = suites {
+            provider.cipher_suites = suites;
+        }
+        Arc::new(provider)
+    }
+
+    fn policy_server(
+        curves: Vec<TlsCurve>,
+        cipher_suites: Vec<Tls12CipherSuite>,
+        versions: TlsVersions,
+    ) -> Arc<ServerConfig> {
+        let resolver =
+            Arc::new(CertificateResolver::from_certificates([example()]).expect("resolver builds"));
+        let options = TlsServerOptions {
+            versions,
+            curves,
+            cipher_suites,
+            ..TlsServerOptions::default()
+        };
+        build_server_config(resolver, &options).expect("restricted TLS policy config builds")
+    }
+
+    /// Handshake against a server with a custom client provider and report the negotiated
+    /// cipher suite, key-exchange group and protocol version from the client connection.
+    async fn handshake_with_provider(
+        server_config: Arc<ServerConfig>,
+        client_provider: Arc<CryptoProvider>,
+        versions: &'static [&'static SupportedProtocolVersion],
+    ) -> std::result::Result<
+        (
+            rustls::CipherSuite,
+            rustls::NamedGroup,
+            rustls::ProtocolVersion,
+        ),
+        String,
+    > {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|error| error.to_string())?;
+        let address = listener.local_addr().map_err(|error| error.to_string())?;
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.map_err(|error| error.to_string())?;
+            acceptor
+                .accept(stream)
+                .await
+                .map(|_| ())
+                .map_err(|error| format!("server handshake: {error}"))
+        });
+        let client = rustls::ClientConfig::builder_with_provider(Arc::clone(&client_provider))
+            .with_protocol_versions(versions)
+            .map_err(|error| error.to_string())?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyCertificate(client_provider)))
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
+        let stream = tokio::net::TcpStream::connect(address)
+            .await
+            .map_err(|error| error.to_string())?;
+        let server_name = rustls::pki_types::ServerName::try_from("example.com").unwrap();
+        let client_result = connector.connect(server_name, stream).await;
+        let server_result = server
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string());
+        let tls = client_result.map_err(|error| format!("client handshake: {error}"))?;
+        server_result?;
+        let (_, connection) = tls.get_ref();
+        let suite = connection
+            .negotiated_cipher_suite()
+            .ok_or_else(|| "no negotiated cipher suite".to_string())?
+            .suite();
+        let group = connection
+            .negotiated_key_exchange_group()
+            .ok_or_else(|| "no negotiated key exchange group".to_string())?
+            .name();
+        let version = connection
+            .protocol_version()
+            .ok_or_else(|| "no negotiated protocol version".to_string())?;
+        Ok((suite, group, version))
+    }
+
+    #[test]
+    fn parses_curve_and_cipher_suite_policy_fields() {
+        let options = TlsServerOptions::from_connection_policies(Some(&[serde_json::json!({
+            "curves": ["x25519", "secp384r1", "x25519"],
+            "cipher_suites": [
+                "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+                "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+                "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256"
+            ]
+        })]))
+        .expect("curves and cipher suites parse");
+        assert_eq!(options.curves, vec![TlsCurve::X25519, TlsCurve::P384]);
+        assert_eq!(
+            options.cipher_suites,
+            vec![
+                Tls12CipherSuite::EcdheEcdsaAes128GcmSha256,
+                Tls12CipherSuite::EcdheRsaAes256GcmSha384,
+            ]
+        );
+
+        // The task-facing `ciphers` alias also works; empty arrays mean provider defaults.
+        let options = TlsServerOptions::from_connection_policies(Some(&[
+            serde_json::json!({"ciphers": ["TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384"]}),
+        ]))
+        .expect("ciphers alias parses");
+        assert_eq!(
+            options.cipher_suites,
+            vec![Tls12CipherSuite::EcdheEcdsaAes256GcmSha384]
+        );
+        let options = TlsServerOptions::from_connection_policies(Some(&[
+            serde_json::json!({"curves": [], "cipher_suites": []}),
+        ]))
+        .expect("empty policy arrays parse");
+        assert!(options.curves.is_empty());
+        assert!(options.cipher_suites.is_empty());
+    }
+
+    #[test]
+    fn unsupported_curve_and_cipher_names_fail_loudly() {
+        for curve in ["secp521r1", "x25519mlkem768"] {
+            let error = TlsServerOptions::from_connection_policies(Some(&[
+                serde_json::json!({"curves": [curve]}),
+            ]))
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("unsupported TLS curve")
+                    || error.to_string().contains("TLS curve"),
+                "{curve}: {error}"
+            );
+        }
+
+        let error = TlsServerOptions::from_connection_policies(Some(&[
+            serde_json::json!({"cipher_suites": ["TLS_AES_128_GCM_SHA256"]}),
+        ]))
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("TLS 1.3 cipher suite"),
+            "{error}"
+        );
+
+        let error = TlsServerOptions::from_connection_policies(Some(&[
+            serde_json::json!({"cipher_suites": ["TLS_RSA_WITH_AES_128_CBC_SHA"]}),
+        ]))
+        .unwrap_err();
+        assert!(error.to_string().contains("RSA key-exchange"), "{error}");
+
+        let error = TlsServerOptions::from_connection_policies(Some(&[
+            serde_json::json!({"cipher_suites": ["TLS_BOGUS"]}),
+        ]))
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("unsupported cipher suite"),
+            "{error}"
+        );
+
+        let error = TlsServerOptions::from_connection_policies(Some(&[
+            serde_json::json!({}),
+            serde_json::json!({"curves": ["x25519"]}),
+        ]))
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("per-connection policy field"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn restricted_tls12_cipher_suites_are_negotiated() {
+        use rustls::crypto::ring::cipher_suite;
+        let server = policy_server(
+            Vec::new(),
+            vec![Tls12CipherSuite::EcdheEcdsaAes128GcmSha256],
+            TlsVersions::Tls12Only,
+        );
+        let client = provider_with(
+            None,
+            Some(vec![cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256]),
+        );
+        let (suite, _group, version) = handshake_with_provider(server, client, TLS12_ONLY)
+            .await
+            .expect("restricted TLS 1.2 cipher suite negotiates");
+        assert_eq!(
+            suite,
+            rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+        );
+        assert_eq!(version, rustls::ProtocolVersion::TLSv1_2);
+
+        let server = policy_server(
+            Vec::new(),
+            vec![Tls12CipherSuite::EcdheEcdsaAes128GcmSha256],
+            TlsVersions::Tls12Only,
+        );
+        let mismatched_client = provider_with(
+            None,
+            Some(vec![cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384]),
+        );
+        assert!(
+            handshake_with_provider(server, mismatched_client, TLS12_ONLY)
+                .await
+                .is_err(),
+            "no common TLS 1.2 cipher suite must fail the handshake"
+        );
+    }
+
+    #[tokio::test]
+    async fn restricted_curves_are_negotiated() {
+        use rustls::crypto::ring::kx_group;
+        // TLS 1.3 restriction: server offers only P-384, client only supplies P-384.
+        let server = policy_server(vec![TlsCurve::P384], Vec::new(), TlsVersions::Default);
+        let client = provider_with(Some(&[kx_group::SECP384R1]), None);
+        let (_, group, _) = handshake_with_provider(server, client, TLS12_AND_13)
+            .await
+            .expect("restricted P-384 handshake");
+        assert_eq!(group, rustls::NamedGroup::secp384r1);
+
+        // A client that offers only X25519 cannot complete a P-384-only handshake.
+        let server = policy_server(vec![TlsCurve::P384], Vec::new(), TlsVersions::Default);
+        let client = provider_with(Some(&[kx_group::X25519]), None);
+        assert!(
+            handshake_with_provider(server, client, TLS12_AND_13)
+                .await
+                .is_err(),
+            "no common key-exchange group must fail the handshake"
+        );
+
+        // The restriction also applies to TLS 1.3.
+        let server = policy_server(vec![TlsCurve::X25519], Vec::new(), TlsVersions::Tls13Only);
+        let client = provider_with(Some(&[kx_group::X25519]), None);
+        let (_, group, version) = handshake_with_provider(server, client, TLS13_ONLY)
+            .await
+            .expect("restricted TLS 1.3 handshake");
+        assert_eq!(group, rustls::NamedGroup::X25519);
+        assert_eq!(version, rustls::ProtocolVersion::TLSv1_3);
+    }
+
+    #[tokio::test]
+    async fn tls13_cipher_suites_remain_fixed_when_tls12_is_restricted() {
+        use rustls::crypto::ring::cipher_suite;
+        let server = policy_server(
+            Vec::new(),
+            vec![Tls12CipherSuite::EcdheEcdsaAes128GcmSha256],
+            TlsVersions::Tls13Only,
+        );
+        let client = provider_with(
+            None,
+            Some(vec![
+                cipher_suite::TLS13_AES_128_GCM_SHA256,
+                cipher_suite::TLS13_AES_256_GCM_SHA384,
+                cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
+            ]),
+        );
+        let (suite, _group, version) = handshake_with_provider(server, client, TLS13_ONLY)
+            .await
+            .expect("TLS 1.3 still negotiates with a TLS 1.2 cipher restriction");
+        assert_eq!(version, rustls::ProtocolVersion::TLSv1_3);
+        assert!(matches!(
+            suite,
+            rustls::CipherSuite::TLS13_AES_128_GCM_SHA256
+                | rustls::CipherSuite::TLS13_AES_256_GCM_SHA384
+                | rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256
+        ));
+    }
+
+    #[tokio::test]
+    async fn default_tls_policy_negotiates_provider_defaults() {
+        let server = policy_server(Vec::new(), Vec::new(), TlsVersions::Default);
+        let client = provider_with(None, None);
+        let (_suite, _group, version) = handshake_with_provider(server, client, TLS12_AND_13)
+            .await
+            .expect("default policy handshake");
+        assert!(matches!(
+            version,
+            rustls::ProtocolVersion::TLSv1_3 | rustls::ProtocolVersion::TLSv1_2
+        ));
     }
 
     #[test]
