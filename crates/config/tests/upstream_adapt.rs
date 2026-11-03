@@ -1002,3 +1002,152 @@ fn tls_advanced_options_fail_loudly() {
         );
     }
 }
+
+#[test]
+fn rewrite_directive_permutations_match_caddy() {
+    assert_adapts_like_caddy("rewrite_directive_permutations.caddyfiletest");
+}
+
+fn authentication_provider(caddyfile: &str) -> Value {
+    let adapted = adapt(caddyfile).unwrap_or_else(|e| panic!("adapt: {e}"));
+    adapted.config["apps"]["http"]["servers"]["srv0"]["routes"][0]["handle"][0]["routes"][0]
+        ["handle"][0]
+        .clone()
+}
+
+#[test]
+fn basic_auth_forms_match_real_caddy_v2_11_7() {
+    const BCRYPT: &str = "$2a$14$abcdefghijklmnopqrstuv";
+    const ARGON2ID: &str =
+        "$argon2id$v=19$m=65536,t=3,p=2$c29tZXNhbHQ$RdescudvJCsgt3ub+b+dWRWJTmaaJObG";
+    // Default algorithm is bcrypt, explicit bcrypt/argon2id select the hash module, realm is a
+    // second argument, and Caddy always emits an empty hash_cache object.
+    let default = authentication_provider(&format!(
+        "example.com {{\n\tbasic_auth {{\n\t\talice {BCRYPT}\n\t}}\n}}\n"
+    ));
+    assert_eq!(
+        default,
+        json!({
+            "handler": "authentication",
+            "providers": {"http_basic": {
+                "hash": {"algorithm": "bcrypt"},
+                "hash_cache": {},
+                "accounts": [{"username": "alice", "password": BCRYPT}],
+            }},
+        })
+    );
+    let argon = authentication_provider(&format!(
+        "example.com {{\n\tbasic_auth argon2id {{\n\t\talice {ARGON2ID}\n\t}}\n}}\n"
+    ));
+    assert_eq!(
+        argon,
+        json!({
+            "handler": "authentication",
+            "providers": {"http_basic": {
+                "hash": {"algorithm": "argon2id"},
+                "hash_cache": {},
+                "accounts": [{"username": "alice", "password": ARGON2ID}],
+            }},
+        })
+    );
+    let realm = authentication_provider(&format!(
+        "example.com {{\n\tbasic_auth bcrypt \"My Realm\" {{\n\t\talice {BCRYPT}\n\t}}\n}}\n"
+    ));
+    assert_eq!(realm["providers"]["http_basic"]["realm"], json!("My Realm"));
+    // Handler-directive matcher token becomes the route matcher.
+    let adapted = adapt(&format!(
+        "example.com {{\n\tbasic_auth /private/* bcrypt {{\n\t\talice {BCRYPT}\n\t}}\n}}\n"
+    ))
+    .expect("adapt basic_auth with matcher");
+    assert_eq!(
+        adapted.config["apps"]["http"]["servers"]["srv0"]["routes"][0]["handle"][0]["routes"][0]
+            ["match"],
+        json!([{"path": ["/private/*"]}])
+    );
+}
+
+#[test]
+fn basic_auth_invalid_forms_fail_loudly() {
+    for (caddyfile, expected) in [
+        (
+            "example.com {\n\tbasic_auth sha256 {\n\t\talice $2a$14$hash\n\t}\n}\n",
+            "unrecognized hash algorithm: sha256",
+        ),
+        (
+            "example.com {\n\tbasic_auth {\n\t\talice\n\t}\n}\n",
+            "username and password cannot be empty or missing",
+        ),
+        (
+            "example.com {\n\tbasic_auth a b c {\n\t\talice hash\n\t}\n}\n",
+            "at most a hash algorithm and a realm",
+        ),
+    ] {
+        let error = adapt(caddyfile).expect_err("must fail");
+        assert!(
+            error.to_string().contains(expected),
+            "expected {expected:?} in {error}"
+        );
+    }
+}
+
+#[test]
+fn rewrite_supported_forms_match_real_caddy_v2_11_7() {
+    for (caddyfile, expected_uri, expected_match) in [
+        ("example.com {\n\trewrite /d\n}\n", "/d", Value::Null),
+        (
+            "example.com {\n\trewrite /old /new\n}\n",
+            "/new",
+            json!([{"path": ["/old"]}]),
+        ),
+        (
+            "example.com {\n\t@m method GET\n\trewrite @m /c\n}\n",
+            "/c",
+            json!([{"method": ["GET"]}]),
+        ),
+        (
+            "example.com {\n\trewrite /old /new/{path}\n}\n",
+            "/new/{http.request.uri.path}",
+            json!([{"path": ["/old"]}]),
+        ),
+    ] {
+        let adapted = adapt(caddyfile).expect("adapt rewrite");
+        let route = &adapted.config["apps"]["http"]["servers"]["srv0"]["routes"][0]["handle"][0]
+            ["routes"][0];
+        assert_eq!(route["handle"][0]["handler"], json!("rewrite"));
+        assert_eq!(route["handle"][0]["uri"], json!(expected_uri));
+        if expected_match.is_null() {
+            assert!(
+                route.get("match").is_none(),
+                "unexpected matcher for {caddyfile}"
+            );
+        } else {
+            assert_eq!(route["match"], expected_match);
+        }
+        assert_eq!(route["group"], json!("group1"));
+    }
+    let error = adapt("example.com {\n\trewrite\n}\n").expect_err("missing URI must fail");
+    assert!(error.to_string().contains("too few arguments"), "{error}");
+}
+
+#[test]
+fn uri_remaining_operations_fail_loudly_with_runtime_owner() {
+    for (operation, caddyfile) in [
+        (
+            "strip_suffix",
+            "example.com {\n\turi strip_suffix .html\n}\n",
+        ),
+        ("replace", "example.com {\n\turi replace /a /b\n}\n"),
+        (
+            "path_regexp",
+            "example.com {\n\turi path_regexp ^/a /b\n}\n",
+        ),
+        ("query", "example.com {\n\turi query +a b\n}\n"),
+    ] {
+        let error = adapt(caddyfile).expect_err("unsupported uri operation must fail");
+        let message = error.to_string();
+        assert!(
+            message.contains(operation) && message.contains("REWRITE-HANDLER-FIELDS"),
+            "error for uri {operation} should name the runtime owner, got: {message}"
+        );
+    }
+}
