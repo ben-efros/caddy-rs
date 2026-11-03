@@ -754,6 +754,16 @@ mod tests {
     }
 
     #[test]
+    fn accepts_request_body_handler() {
+        let config = minimal_http_config(
+            serde_json::json!({"handler": "request_body", "max_size": 1024}),
+            None,
+        );
+        let report = validate_config(&config, &registry()).expect("request_body is registered");
+        assert_eq!(report.handlers, 1);
+    }
+
+    #[test]
     fn rejects_unknown_handler_with_path_and_name() {
         let config = minimal_http_config(serde_json::json!({"handler": "does_not_exist"}), None);
         let error = validate_config(&config, &registry()).expect_err("unknown handler");

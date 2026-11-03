@@ -10,6 +10,9 @@
 //! * `rewrite` method, `uri` and `strip_path_prefix`, and `vars` keys/values use `ReplaceAll`
 //!   semantics (unknown placeholders expand to nothing), matching
 //!   `modules/caddyhttp/rewrite/rewrite.go` and `modules/caddyhttp/vars.go`.
+//! * `request_body` supports Caddy's `max_size` (lazy `413` when a later handler reads past the
+//!   limit) and experimental `set` (body replacement with `ReplaceKnown` placeholders), matching
+//!   `modules/caddyhttp/requestbody/requestbody.go`.
 
 use std::sync::Arc;
 
@@ -551,6 +554,111 @@ impl Handler for EncodeHandler {
     }
 }
 
+/// `request_body`: limit the request body size read by later handlers and/or replace it.
+///
+/// Mirrors Caddy's `http.handlers.request_body` (v2.11.7):
+///
+/// * `max_size` — maximum number of bytes a later handler may read from the body. Exceeding it is
+///   a `413` error: the router enforces it just before dispatching to a body-consuming handler
+///   (for a body the engine already buffered, for example when `reverse_proxy` is in the route
+///   tree), and streamed bodies fail lazily with [`crate::body::BodyError::TooLarge`]. Handlers
+///   that never read the body are unaffected, matching Caddy's lazy `MaxBytesReader` semantics.
+///   The `413` response has an empty body and no content type, matching the Caddy v2.11.7 oracle.
+///   Caddy's field is an `int64`; JSON numbers must be non-negative integers, `0`/absent means
+///   unlimited.
+/// * `set` — replace the request body with a string, expanding known placeholders
+///   (`ReplaceKnown` semantics, unknown placeholders stay visible, matching Caddy's comment on
+///   user-supplied bodies). `Content-Length` is updated to the replacement length.
+///
+/// Unknown fields are rejected loudly (this build's configuration policy), whereas Caddy's
+/// default `encoding/json` decoding silently ignores them.
+#[derive(Debug)]
+pub struct RequestBodyHandler {
+    max_size: Option<u64>,
+    set: Option<String>,
+}
+
+impl RequestBodyHandler {
+    /// Build from a `request_body` handler JSON value.
+    pub fn from_json(value: &serde_json::Value, path: &str) -> Result<Self> {
+        let object = value
+            .as_object()
+            .ok_or_else(|| invalid(path, "request_body handler configuration must be an object"))?;
+        let mut max_size = None;
+        if let Some(field) = object.get("max_size") {
+            let field_path = format!("{path}.max_size");
+            let bytes = field.as_u64().ok_or_else(|| {
+                invalid(
+                    &field_path,
+                    "must be a non-negative integer number of bytes",
+                )
+            })?;
+            if bytes > i64::MAX as u64 {
+                return Err(invalid(
+                    &field_path,
+                    "must fit in a signed 64-bit integer (Caddy's `max_size` is `int64`)",
+                ));
+            }
+            // Caddy applies the limit only when `MaxSize > 0`; `0` means unlimited.
+            if bytes > 0 {
+                max_size = Some(bytes);
+            }
+        }
+        let set = match object.get("set") {
+            Some(serde_json::Value::String(set)) => Some(set.clone()),
+            Some(_) => return Err(invalid(&format!("{path}.set"), "must be a string")),
+            None => None,
+        };
+        for field in object.keys() {
+            if !matches!(field.as_str(), "handler" | "max_size" | "set") {
+                return Err(invalid(
+                    &format!("{path}.{field}"),
+                    format!("unsupported request_body field `{field}`"),
+                ));
+            }
+        }
+        Ok(Self { max_size, set })
+    }
+}
+
+#[async_trait]
+impl Handler for RequestBodyHandler {
+    fn name(&self) -> &'static str {
+        "request_body"
+    }
+
+    async fn handle(&self, mut request: Request) -> Result<Outcome> {
+        if let Some(set) = &self.set {
+            // `ReplaceKnown`: unknown placeholders stay visible so JSON bodies with braces are not
+            // blanked.
+            let replaced = request.replace_known(set);
+            let body = Bytes::from(replaced);
+            let length = body.len();
+            request.set_body_bytes(body);
+            if length == 0 {
+                request.headers.remove(http::header::CONTENT_LENGTH);
+            } else {
+                request.headers.insert(
+                    http::header::CONTENT_LENGTH,
+                    HeaderValue::from_str(&length.to_string()).map_err(|error| {
+                        invalid(
+                            "request_body.set",
+                            format!("cannot set Content-Length: {error}"),
+                        )
+                    })?,
+                );
+            }
+        }
+        if let Some(max_size) = self.max_size {
+            // Streaming bodies fail lazily when read; for buffered bodies the router enforces the
+            // limit before the next body-consuming handler runs (matching Caddy's lazy
+            // `MaxBytesReader` semantics: a handler that never reads the body is unaffected).
+            request.limit_body(max_size);
+        }
+        Ok(Outcome::Continue(request))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -915,5 +1023,274 @@ mod tests {
             request.vars.get("prefix-GET").map(String::as_str),
             Some("/srv//old/path")
         );
+    }
+
+    // ---- request_body ---------------------------------------------------------------
+
+    use crate::body::{BodyError, RequestBody, StreamingBody};
+    use crate::router::RouterBuilder;
+    use tokio::sync::mpsc;
+
+    fn request_body_handler(json: serde_json::Value) -> RequestBodyHandler {
+        RequestBodyHandler::from_json(&json, "handle[0]").expect("request_body config builds")
+    }
+
+    fn post_request_with_body(path: &str, body: &'static [u8]) -> Request {
+        let mut request = test_request(Method::POST, path);
+        request.body = Bytes::from_static(body);
+        request
+    }
+
+    #[tokio::test]
+    async fn request_body_max_size_marks_buffered_body_for_router_enforcement() {
+        let handler = request_body_handler(serde_json::json!({
+            "handler": "request_body",
+            "max_size": 4
+        }));
+        // A buffered body is already read; the handler records the limit and the router turns it
+        // into a 413 only when a body-consuming handler is about to run (Caddy is lazy).
+        let Outcome::Continue(request) = handler
+            .handle(post_request_with_body("/upload", b"12345"))
+            .await
+            .unwrap()
+        else {
+            panic!("request_body always continues");
+        };
+        assert_eq!(request.body, Bytes::from_static(b"12345"));
+        assert_eq!(request.body_limit(), Some(4));
+
+        let Outcome::Continue(request) = handler
+            .handle(post_request_with_body("/upload", b"1234"))
+            .await
+            .unwrap()
+        else {
+            panic!("body at the limit continues");
+        };
+        assert_eq!(request.body, Bytes::from_static(b"1234"));
+        assert_eq!(request.body_limit(), Some(4));
+    }
+
+    #[tokio::test]
+    async fn request_body_limits_a_streaming_body_lazily() {
+        let handler = request_body_handler(serde_json::json!({
+            "handler": "request_body",
+            "max_size": 4
+        }));
+        let (sender, receiver) = mpsc::channel::<std::result::Result<Bytes, BodyError>>(4);
+        sender.send(Ok(Bytes::from_static(b"12"))).await.unwrap();
+        sender.send(Ok(Bytes::from_static(b"345"))).await.unwrap();
+        drop(sender);
+        let request = test_request(Method::POST, "/upload")
+            .with_streaming_body(RequestBody::streaming(StreamingBody::from_chunks(receiver)));
+        let Outcome::Continue(mut request) = handler.handle(request).await.unwrap() else {
+            panic!("streaming bodies are limited lazily");
+        };
+        let error = request
+            .take_body()
+            .collect(None)
+            .await
+            .expect_err("reading past max_size must fail");
+        assert!(
+            matches!(error, BodyError::TooLarge { limit: 4 }),
+            "{error:?}"
+        );
+
+        // A streaming body within the limit is delivered unchanged.
+        let (sender, receiver) = mpsc::channel::<std::result::Result<Bytes, BodyError>>(4);
+        sender.send(Ok(Bytes::from_static(b"12"))).await.unwrap();
+        sender.send(Ok(Bytes::from_static(b"34"))).await.unwrap();
+        drop(sender);
+        let request = test_request(Method::POST, "/upload")
+            .with_streaming_body(RequestBody::streaming(StreamingBody::from_chunks(receiver)));
+        let Outcome::Continue(mut request) = handler.handle(request).await.unwrap() else {
+            panic!("streaming body continues");
+        };
+        assert_eq!(
+            request.take_body().collect(None).await.unwrap(),
+            Bytes::from_static(b"1234")
+        );
+    }
+
+    #[tokio::test]
+    async fn request_body_set_replaces_body_and_content_length() {
+        let handler = request_body_handler(serde_json::json!({
+            "handler": "request_body",
+            "set": "{http.request.method}:{not.a.placeholder}"
+        }));
+        let mut request = post_request_with_body("/upload", b"old body");
+        request
+            .headers
+            .insert(http::header::CONTENT_LENGTH, HeaderValue::from_static("8"));
+        let Outcome::Continue(request) = handler.handle(request).await.unwrap() else {
+            panic!("set continues to the next handler");
+        };
+        assert_eq!(
+            request.body,
+            Bytes::from_static(b"POST:{not.a.placeholder}")
+        );
+        assert_eq!(
+            request.headers[http::header::CONTENT_LENGTH],
+            request.body.len().to_string().as_str()
+        );
+        assert!(!request.has_streaming_body());
+    }
+
+    #[tokio::test]
+    async fn request_body_set_then_max_size_marks_the_replacement() {
+        let handler = request_body_handler(serde_json::json!({
+            "handler": "request_body",
+            "set": "12345",
+            "max_size": 4
+        }));
+        let request = test_request(Method::POST, "/upload");
+        let Outcome::Continue(request) = handler.handle(request).await.unwrap() else {
+            panic!("request_body continues; the router enforces the limit");
+        };
+        assert_eq!(request.body, Bytes::from_static(b"12345"));
+        assert_eq!(request.body_limit(), Some(4));
+    }
+
+    #[tokio::test]
+    async fn request_body_zero_max_size_means_unlimited() {
+        let handler = request_body_handler(serde_json::json!({
+            "handler": "request_body",
+            "max_size": 0
+        }));
+        let large = Bytes::from(vec![b'x'; 1024]);
+        let mut request = test_request(Method::POST, "/upload");
+        request.body = large.clone();
+        let Outcome::Continue(request) = handler.handle(request).await.unwrap() else {
+            panic!("max_size 0 is unlimited");
+        };
+        assert_eq!(request.body, large);
+    }
+
+    #[test]
+    fn request_body_config_rejects_invalid_and_unknown_fields() {
+        for (field, value, expected_path) in [
+            ("max_size", serde_json::json!("4"), "handle[0].max_size"),
+            ("max_size", serde_json::json!(-1), "handle[0].max_size"),
+            ("max_size", serde_json::json!(1.5), "handle[0].max_size"),
+            (
+                "max_size",
+                serde_json::json!((i64::MAX as u64) + 1),
+                "handle[0].max_size",
+            ),
+            ("set", serde_json::json!(5), "handle[0].set"),
+        ] {
+            let error = RequestBodyHandler::from_json(
+                &serde_json::json!({"handler": "request_body", field: value}),
+                "handle[0]",
+            )
+            .expect_err("invalid request_body field must fail");
+            assert!(error.to_string().contains(expected_path), "{field} {error}");
+        }
+        let error = RequestBodyHandler::from_json(
+            &serde_json::json!({"handler": "request_body", "curves": ["x25519"]}),
+            "handle[0]",
+        )
+        .expect_err("unknown request_body field must fail");
+        assert!(error.to_string().contains("handle[0].curves"), "{error}");
+        assert!(error.to_string().contains("unsupported request_body field"));
+
+        // The object itself must be a JSON object.
+        let error = RequestBodyHandler::from_json(&serde_json::json!("request_body"), "handle[0]")
+            .expect_err("non-object fails");
+        assert!(error.to_string().contains("must be an object"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn request_body_runs_before_later_handlers() {
+        let router = RouterBuilder::new()
+            .build(&[serde_json::json!({
+                "handle": [
+                    {"handler": "request_body", "max_size": 4},
+                    {"handler": "rewrite", "uri": "/rewritten"},
+                    {"handler": "static_response", "body": "{http.request.uri}"}
+                ]
+            })])
+            .expect("router builds");
+        // `request_body` itself does not force buffering.
+        assert!(!router.requires_buffered_request_body());
+
+        // The later handlers here never read the body, so Caddy's lazy limit does not fire: the
+        // oversized body passes through to `static_response` (oracle: 200 "static ok").
+        let response = router
+            .handle(post_request_with_body("/upload", b"12345"))
+            .await
+            .unwrap();
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, Bytes::from_static(b"/rewritten"));
+
+        let response = router
+            .handle(post_request_with_body("/upload", b"1234"))
+            .await
+            .unwrap();
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, Bytes::from_static(b"/rewritten"));
+    }
+
+    /// Stub for the `reverse_proxy` module id: records the buffered request body it received.
+    struct ProxyBodyStub;
+
+    #[async_trait]
+    impl Handler for ProxyBodyStub {
+        fn name(&self) -> &'static str {
+            "reverse_proxy"
+        }
+
+        fn requires_buffered_request_body(&self) -> bool {
+            true
+        }
+
+        async fn handle(&self, request: Request) -> Result<Outcome> {
+            Ok(Outcome::Respond(Response {
+                status: StatusCode::OK,
+                headers: http::HeaderMap::new(),
+                body: request.body,
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn request_body_orders_before_a_body_consuming_proxy() {
+        let factory: crate::router::CustomHandlerFactory = Arc::new(|value, _path| {
+            Ok(
+                match value.get("handler").and_then(serde_json::Value::as_str) {
+                    Some("reverse_proxy") => Some(Arc::new(ProxyBodyStub) as crate::SharedHandler),
+                    _ => None,
+                },
+            )
+        });
+        let router = RouterBuilder::new()
+            .with_custom_handler(factory)
+            .build(&[serde_json::json!({
+                "handle": [
+                    {"handler": "request_body", "max_size": 4},
+                    {"handler": "headers", "response": {"set": {"X-Limit": ["yes"]}}},
+                    {"handler": "reverse_proxy", "upstreams": [{"dial": "127.0.0.1:1"}]}
+                ]
+            })])
+            .expect("router builds");
+        // `reverse_proxy` forces the router to buffer request bodies, so the limit is enforced
+        // eagerly by `request_body` before the proxy sees the body.
+        assert!(router.requires_buffered_request_body());
+
+        let response = router
+            .handle(post_request_with_body("/upload", b"12345"))
+            .await
+            .unwrap();
+        assert_eq!(response.status, StatusCode::PAYLOAD_TOO_LARGE);
+        // Caddy's default request-body-limit error has an empty body and no content type
+        // (oracle v2.11.7), while response headers staged by preceding handlers still apply.
+        assert!(response.body.is_empty());
+        assert_eq!(response.headers["x-limit"], "yes");
+
+        let response = router
+            .handle(post_request_with_body("/upload", b"1234"))
+            .await
+            .unwrap();
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, Bytes::from_static(b"1234"));
     }
 }
