@@ -17,9 +17,11 @@ use std::time::{Duration, Instant};
 
 use caddy_rs_admin::{
     AdminApi, CertificateMetrics, LoggingConfig, MetricsRegistry, SharedRequestRecorder,
+    UpstreamStatusSource,
 };
 use caddy_rs_core::{Generation, GenerationStore};
 use caddy_rs_http::RouterBuilder;
+use caddy_rs_proxy::{handler_factory_with_status_sink, UpstreamStatusSink};
 use caddy_rs_tls::{
     build_server_config, build_server_config_with_cert_resolver, listener_uses_tls,
     plan_automatic_https, resolver_from_config, AcmeTlsAlpnResolver, AcmeTransport,
@@ -35,6 +37,7 @@ use crate::error::{Error, Result};
 use crate::limits::ServerLimits;
 use crate::listeners::{bind, bind_admin, ListenerHandle, ListenerState, SharedListeners};
 use crate::observability::{record_certificate_metrics, AccessLogRuntime, ServerAccessLogPolicy};
+use crate::upstream_status::ProxyUpstreamStatusSource;
 
 /// Observable runtime state after an apply.
 #[derive(Debug, Clone, Default)]
@@ -204,6 +207,9 @@ pub struct ServerRuntime {
     renewal_metrics_seen: BTreeMap<u64, usize>,
     /// Shutdown timing of the last active generation (`apps.http.grace_period`/`shutdown_delay`).
     shutdown_timing: ShutdownTiming,
+    /// Live reverse-proxy upstream counters for `GET /reverse_proxy/upstreams`; the active
+    /// generation's sink is swapped only after a successful apply.
+    upstream_status: Arc<ProxyUpstreamStatusSource>,
 }
 
 /// How inherited systemd sockets are discovered for this runtime.
@@ -224,7 +230,12 @@ impl ServerRuntime {
     /// Create a runtime for a generation store.
     pub fn new(store: Arc<GenerationStore>) -> Self {
         let reload = Arc::new(tokio::sync::Notify::new());
-        let admin_api = AdminApi::new(Arc::clone(&store)).with_reload_notify(Arc::clone(&reload));
+        let upstream_status = ProxyUpstreamStatusSource::new();
+        let admin_api = AdminApi::new(Arc::clone(&store))
+            .with_reload_notify(Arc::clone(&reload))
+            .with_upstream_status_source(
+                Arc::clone(&upstream_status) as Arc<dyn UpstreamStatusSource>
+            );
         let recorder = admin_api.request_recorder();
         let certificate_metrics = admin_api.certificate_metrics();
         Self {
@@ -246,6 +257,7 @@ impl ServerRuntime {
             access_log_generation: None,
             renewal_metrics_seen: BTreeMap::new(),
             shutdown_timing: ShutdownTiming::default(),
+            upstream_status,
         }
     }
 
@@ -387,11 +399,14 @@ impl ServerRuntime {
             None => AccessLogRuntime::disabled(),
         };
         let pending = self.prepare_automatic_https(&generation)?;
+        // A fresh sink per generation: handlers built by the router factories register here, and
+        // it becomes the admin source only after the generation is serving.
+        let status_sink = UpstreamStatusSink::new();
         let mut newly_bound: Vec<String> = Vec::new();
 
         // Without automatic HTTPS there is nothing to provision: the original single-phase path.
         let Some(pending) = pending else {
-            let states = self.build_listener_states(&generation, None, &access)?;
+            let states = self.build_listener_states(&generation, None, &access, &status_sink)?;
             self.resolve_activation(&states)?;
             self.publish_states(&states);
             if let Err(error) = self.start_new_listeners(&states, &mut newly_bound).await {
@@ -405,6 +420,7 @@ impl ServerRuntime {
             self.retire_stale_renewals(generation.id()).await;
             self.install_access_log(generation.id(), access_log);
             self.record_certificate_metrics(&generation);
+            self.upstream_status.install(Arc::clone(&status_sink));
             return Ok(self.finish_apply(&generation));
         };
         // Snapshot for rollback: a failed provisioning pass must leave the previous generation's
@@ -416,7 +432,8 @@ impl ServerRuntime {
             .clone();
 
         // Phase 1: challenge-capable states, then start the listeners before provisioning.
-        let bootstrap = self.build_bootstrap_states(&generation, &pending, &access)?;
+        let bootstrap =
+            self.build_bootstrap_states(&generation, &pending, &access, &status_sink)?;
         self.resolve_activation(&bootstrap)?;
         self.publish_states(&bootstrap);
         if let Err(error) = self.start_new_listeners(&bootstrap, &mut newly_bound).await {
@@ -451,13 +468,14 @@ impl ServerRuntime {
             http_listener: plan.http_listener(),
             bootstrap: false,
         };
-        let states = match self.build_listener_states(&generation, Some(&context), &access) {
-            Ok(states) => states,
-            Err(error) => {
-                self.rollback_states(&previous_states, &newly_bound).await;
-                return Err(error);
-            }
-        };
+        let states =
+            match self.build_listener_states(&generation, Some(&context), &access, &status_sink) {
+                Ok(states) => states,
+                Err(error) => {
+                    self.rollback_states(&previous_states, &newly_bound).await;
+                    return Err(error);
+                }
+            };
         self.publish_states(&states);
         if let Err(error) = self.start_new_listeners(&states, &mut newly_bound).await {
             self.rollback_states(&previous_states, &newly_bound).await;
@@ -475,6 +493,7 @@ impl ServerRuntime {
         self.retire_stale_renewals(generation.id()).await;
         self.install_access_log(generation.id(), access_log);
         self.record_certificate_metrics(&generation);
+        self.upstream_status.install(Arc::clone(&status_sink));
         Ok(self.finish_apply(&generation))
     }
 
@@ -1012,6 +1031,7 @@ impl ServerRuntime {
         generation: &Generation,
         pending: &PendingAutomaticHttps,
         access_log: &Arc<AccessLogRuntime>,
+        status_sink: &Arc<UpstreamStatusSink>,
     ) -> Result<std::collections::HashMap<String, Arc<ListenerState>>> {
         let context = AutomaticHttpsContext {
             resolver: resolver_from_config(generation.config())?.map(Arc::new),
@@ -1021,7 +1041,7 @@ impl ServerRuntime {
             http_listener: pending.plan.http_listener(),
             bootstrap: true,
         };
-        self.build_listener_states(generation, Some(&context), access_log)
+        self.build_listener_states(generation, Some(&context), access_log, status_sink)
     }
 
     /// Build the per-listen-address serving state for a generation.
@@ -1039,6 +1059,7 @@ impl ServerRuntime {
         generation: &Generation,
         automatic: Option<&AutomaticHttpsContext<'_>>,
         access_log: &Arc<AccessLogRuntime>,
+        status_sink: &Arc<UpstreamStatusSink>,
     ) -> Result<std::collections::HashMap<String, Arc<ListenerState>>> {
         let mut states = std::collections::HashMap::new();
         let Some(http) = generation.config().http() else {
@@ -1076,7 +1097,7 @@ impl ServerRuntime {
             })?;
             let routes = routes_value.as_array().cloned().unwrap_or_default();
             let router = RouterBuilder::new()
-                .with_custom_handler(caddy_rs_proxy::handler_factory())
+                .with_custom_handler(handler_factory_with_status_sink(Arc::clone(status_sink)))
                 .build(&routes)
                 .map_err(|error| {
                     eprintln!("caddy-rs: server `{server_name}`: {error}");

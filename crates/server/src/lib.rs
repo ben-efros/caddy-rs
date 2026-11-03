@@ -20,6 +20,7 @@ pub mod limits;
 pub mod listeners;
 mod observability;
 pub mod runtime;
+pub mod upstream_status;
 
 pub use activation::{
     plan_activation, ActivationPlan, InheritedSocket, LocalSocket, SocketActivation,
@@ -27,6 +28,7 @@ pub use activation::{
 pub use error::Error;
 pub use limits::{parse_caddy_duration, ServerLimits};
 pub use runtime::{RuntimeStatus, ServerRuntime};
+pub use upstream_status::ProxyUpstreamStatusSource;
 
 /// The default admin API listen address, matching Caddy.
 pub const DEFAULT_ADMIN_LISTEN: &str = "localhost:2019";
