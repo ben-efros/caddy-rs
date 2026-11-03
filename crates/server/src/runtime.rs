@@ -129,6 +129,8 @@ struct AutomaticHttpsContext<'a> {
     tokens: &'a Arc<TlsAlpn01TokenStore>,
     /// Pre-routing state for cleartext listeners (HTTP-01, redirects).
     serving: &'a Arc<crate::auto_https::AutomaticHttpsServing>,
+    /// Listener ports the plan terminates TLS on (includes implicitly-HTTPS non-standard ports).
+    tls_ports: &'a [u16],
     /// Derived HTTP listener address from the plan, when the configuration needs one.
     http_listener: Option<String>,
     /// Whether this is the pre-provisioning build (allows a missing certificate resolver so the
@@ -416,6 +418,7 @@ impl ServerRuntime {
             resolver: Some(Arc::clone(&resolver)),
             tokens: &tls_alpn01_tokens,
             serving: &serving,
+            tls_ports: &plan.tls_ports,
             http_listener: plan.http_listener(),
             bootstrap: false,
         };
@@ -815,7 +818,9 @@ impl ServerRuntime {
         let redirect = plan.redirects_enabled.then(|| RedirectPolicy {
             hosts: plan.redirect_hosts.clone(),
             redirect_all: plan.redirect_all,
+            host_ports: plan.redirect_ports.clone(),
             https_port: plan.https_port,
+            redirect_all_port: plan.redirect_all_port,
         });
         Ok(Some(PendingAutomaticHttps {
             plan,
@@ -845,6 +850,7 @@ impl ServerRuntime {
             resolver: resolver_from_config(generation.config())?.map(Arc::new),
             tokens: &pending.tls_alpn01_tokens,
             serving: &pending.serving,
+            tls_ports: &pending.plan.tls_ports,
             http_listener: pending.plan.http_listener(),
             bootstrap: true,
         };
@@ -911,8 +917,19 @@ impl ServerRuntime {
                 })?;
             let router = Arc::new(router);
             for listen in &server.listen {
-                let terminates_tls =
-                    listener_uses_tls(listen, https_port, has_connection_policies)?;
+                let listen_port = caddy_rs_core::ListenAddr::parse(listen)
+                    .ok()
+                    .and_then(|address| address.port());
+                // Under an automatic-HTTPS plan, a listener is TLS when it has explicit policies
+                // or when the plan derived TLS for its port (implicit HTTPS on a non-standard
+                // port). Without a plan the historical rule applies.
+                let terminates_tls = match automatic {
+                    Some(context) => {
+                        has_connection_policies
+                            || listen_port.is_some_and(|port| context.tls_ports.contains(&port))
+                    }
+                    None => listener_uses_tls(listen, https_port, has_connection_policies)?,
+                };
                 let tls = if terminates_tls {
                     match automatic {
                         Some(context) => {

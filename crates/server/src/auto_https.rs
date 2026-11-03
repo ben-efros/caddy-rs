@@ -11,6 +11,7 @@
 //!    `https://<host><path?query>` with `308 Permanent Redirect` (unless `disable_redirects`);
 //! 3. everything else reaches the configured routes.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -28,8 +29,13 @@ pub(crate) struct RedirectPolicy {
     pub(crate) hosts: Vec<String>,
     /// Whether every Host should be redirected (a hostless HTTPS site exists).
     pub(crate) redirect_all: bool,
-    /// Effective HTTPS port; omitted from the `Location` when 443.
+    /// HTTPS destination port per host (implicit HTTPS on a non-standard port redirects to that
+    /// same port); hosts absent from the map use [`Self::https_port`].
+    pub(crate) host_ports: BTreeMap<String, u16>,
+    /// Legacy/fallback HTTPS port for hosts without a per-host destination.
     pub(crate) https_port: u16,
+    /// HTTPS destination for hostless/catch-all redirects.
+    pub(crate) redirect_all_port: u16,
 }
 
 impl RedirectPolicy {
@@ -43,10 +49,17 @@ impl RedirectPolicy {
 
     fn location(&self, host: &str, path_and_query: &str) -> String {
         let host = normalize_host(host);
-        if self.https_port == 443 {
+        let port = self.host_ports.get(&host).copied().unwrap_or_else(|| {
+            if self.redirect_all {
+                self.redirect_all_port
+            } else {
+                self.https_port
+            }
+        });
+        if port == 443 {
             format!("https://{host}{path_and_query}")
         } else {
-            format!("https://{host}:{}{path_and_query}", self.https_port)
+            format!("https://{host}:{port}{path_and_query}")
         }
     }
 }
