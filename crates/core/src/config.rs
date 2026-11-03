@@ -333,9 +333,99 @@ pub struct HttpServer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_timeout: Option<Value>,
 
+    /// Per-server access-log association (`logs`), Caddy's `ServerLogConfig`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logs: Option<ServerLogConfig>,
+
     /// Unknown server fields, preserved.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+/// Per-server access-log association (`apps.http.servers.*.logs`).
+///
+/// Mirrors Caddy's `modules/caddyhttp.ServerLogConfig`: which logger name(s) a request host maps
+/// to, and which hosts are skipped. The runtime applies this when emitting access entries; the
+/// global `logging.logs[]` configuration still decides where those named loggers are written.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ServerLogConfig {
+    /// Logger name for hosts that do not match [`ServerLogConfig::logger_names`].
+    ///
+    /// An empty/absent name means Caddy's base access logger (`http.log.access`); a name `foo`
+    /// means `http.log.access.foo`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_logger_name: Option<String>,
+
+    /// Host pattern to logger name(s) mapping. Keys are hostnames without ports and may contain
+    /// `*` labels (`*.example.com`); a single string is also accepted in place of an array.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub logger_names: BTreeMap<String, StringList>,
+
+    /// Request hosts whose access entries are dropped (unless mapped by `logger_names`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skip_hosts: Vec<String>,
+
+    /// Drop entries for hosts that do not appear in `logger_names`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub skip_unmapped_hosts: bool,
+
+    /// Log credential header values instead of redacting them (modeled for round-tripping; the
+    /// runtime currently applies the global encoder redaction policy — see DIV for T-CONF-030).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub should_log_credentials: bool,
+
+    /// Log each invoked handler at DEBUG level (modeled for round-tripping; handler tracing is not
+    /// emitted yet).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub trace: bool,
+
+    /// Unknown per-server log fields, preserved.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+/// A list of strings that also accepts a single JSON string (Caddy's `StringArray`).
+///
+/// Caddy accepts `"logger_names": {"example.com": "name"}` for backwards compatibility and always
+/// serializes an array; this type does the same.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct StringList(pub Vec<String>);
+
+impl StringList {
+    /// The contained strings.
+    pub fn as_slice(&self) -> &[String] {
+        &self.0
+    }
+
+    /// Whether the list is empty.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl From<Vec<String>> for StringList {
+    fn from(values: Vec<String>) -> Self {
+        Self(values)
+    }
+}
+
+impl<'de> Deserialize<'de> for StringList {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            One(String),
+            Many(Vec<String>),
+        }
+        Ok(Self(match Repr::deserialize(deserializer)? {
+            Repr::One(value) => vec![value],
+            Repr::Many(values) => values,
+        }))
+    }
 }
 
 /// Automatic HTTPS policy (`automatic_https`).
@@ -936,6 +1026,70 @@ mod tests {
                 .id
                 .as_deref(),
             Some("proxy")
+        );
+    }
+
+    #[test]
+    fn round_trips_per_server_access_log_association() {
+        let json = serde_json::json!({
+            "apps": {"http": {"servers": {"srv0": {
+                "listen": [":443"],
+                "routes": [],
+                "logs": {
+                    "default_logger_name": "fallback",
+                    "logger_names": {
+                        "example.com": ["one", "two"],
+                        "*.internal.example.com": ["internal"]
+                    },
+                    "skip_hosts": ["skip.example.com"],
+                    "skip_unmapped_hosts": true,
+                    "should_log_credentials": true,
+                    "trace": true,
+                    "future_logs_field": {"kept": true}
+                }
+            }}}}
+        });
+        let config = Config::from_value(json.clone()).expect("typed model decodes");
+        let server = &config.http().expect("http app").servers["srv0"];
+        let logs = server.logs.as_ref().expect("logs typed");
+        assert_eq!(logs.default_logger_name.as_deref(), Some("fallback"));
+        assert_eq!(
+            logs.logger_names["example.com"].as_slice(),
+            ["one".to_string(), "two".to_string()]
+        );
+        assert_eq!(logs.skip_hosts, vec!["skip.example.com".to_string()]);
+        assert!(logs.skip_unmapped_hosts);
+        assert!(logs.should_log_credentials);
+        assert!(logs.trace);
+        assert!(logs.extra.contains_key("future_logs_field"));
+        // Canonical Caddy JSON round-trips exactly (unknown fields preserved).
+        assert_eq!(config.to_value().expect("serializes"), json);
+    }
+
+    #[test]
+    fn logger_names_accepts_a_single_string_like_caddy_string_array() {
+        // Caddy's `StringArray` accepts a bare string for backwards compatibility and always
+        // serializes an array.
+        let config = Config::from_value(serde_json::json!({
+            "apps": {"http": {"servers": {"srv0": {
+                "listen": [":443"],
+                "routes": [],
+                "logs": {"logger_names": {"example.com": "only"}}
+            }}}}
+        }))
+        .expect("string form decodes");
+        let logs = config.http().unwrap().servers["srv0"]
+            .logs
+            .clone()
+            .expect("logs");
+        assert_eq!(
+            logs.logger_names["example.com"].as_slice(),
+            ["only".to_string()]
+        );
+        let value = config.to_value().expect("serializes");
+        assert_eq!(
+            value["apps"]["http"]["servers"]["srv0"]["logs"]["logger_names"]["example.com"],
+            serde_json::json!(["only"])
         );
     }
 

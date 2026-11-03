@@ -50,7 +50,8 @@ use crate::error::Error;
 use crate::http::{serve_request_with_automatic_upgradable, ServedResponse};
 use crate::limits::ServerLimits;
 use crate::observability::{
-    body_len, observe_request, request_started, AccessLogRuntime, RequestSnapshot, TlsLogInfo,
+    body_len, observe_request, request_started, AccessLogRuntime, RequestSnapshot,
+    ServerAccessLogPolicy, TlsLogInfo,
 };
 
 /// Router map shared with accept loops, keyed by configured listen address.
@@ -76,6 +77,8 @@ pub(crate) struct ListenerState {
     pub(crate) recorder: SharedRequestRecorder,
     /// Access-log sinks for this generation.
     pub(crate) access_log: Arc<AccessLogRuntime>,
+    /// Per-server access-log association (`apps.http.servers.<name>.logs`).
+    pub(crate) access_log_policy: Arc<ServerAccessLogPolicy>,
 }
 
 /// Listener state shared with accept loops, keyed by configured listen address.
@@ -287,6 +290,8 @@ struct ConnectionContext {
     recorder: SharedRequestRecorder,
     /// Access-log sinks for the connection's generation.
     access_log: Arc<AccessLogRuntime>,
+    /// Per-server access-log association.
+    access_log_policy: Arc<ServerAccessLogPolicy>,
 }
 
 /// Look up the state of an accepted connection and acquire a connection slot.
@@ -312,6 +317,7 @@ fn admit_connection(
             server_name: state.server_name.clone(),
             recorder: Arc::clone(&state.recorder),
             access_log: Arc::clone(&state.access_log),
+            access_log_policy: Arc::clone(&state.access_log_policy),
         },
         None => ConnectionContext {
             router: None,
@@ -321,6 +327,7 @@ fn admit_connection(
             server_name: String::new(),
             recorder: caddy_rs_admin::noop_recorder(),
             access_log: AccessLogRuntime::disabled(),
+            access_log_policy: Arc::new(ServerAccessLogPolicy::default()),
         },
     };
     let permit = ConnectionPermit::try_acquire(Arc::clone(active), context.limits.max_connections)?;
@@ -464,6 +471,7 @@ async fn serve_accepted<I>(
     let server_name = context.server_name;
     let recorder = context.recorder;
     let access_log = context.access_log;
+    let access_log_policy = context.access_log_policy;
     if let Some(tls) = context.tls {
         let acceptor = TlsAcceptor::from(tls);
         let tls_stream = match acceptor.accept(stream).await {
@@ -503,6 +511,7 @@ async fn serve_accepted<I>(
             server_name,
             recorder,
             access_log,
+            access_log_policy,
             automatic,
             Arc::clone(&activity),
             Arc::clone(&permit),
@@ -521,6 +530,7 @@ async fn serve_accepted<I>(
             server_name,
             recorder,
             access_log,
+            access_log_policy,
             automatic,
             Arc::clone(&activity),
             Arc::clone(&permit),
@@ -542,6 +552,7 @@ fn connection_service(
     server_name: String,
     recorder: SharedRequestRecorder,
     access_log: Arc<AccessLogRuntime>,
+    access_log_policy: Arc<ServerAccessLogPolicy>,
     automatic: Option<Arc<AutomaticHttpsServing>>,
     activity: Arc<ConnectionActivity>,
     permit: Arc<ConnectionPermit>,
@@ -563,6 +574,7 @@ fn connection_service(
         let server_name = server_name.clone();
         let recorder = Arc::clone(&recorder);
         let access_log = Arc::clone(&access_log);
+        let access_log_policy = Arc::clone(&access_log_policy);
         let automatic = automatic.clone();
         let permit = Arc::clone(&permit);
         let generation = generation.clone();
@@ -583,6 +595,7 @@ fn connection_service(
                 observe_request(
                     &recorder,
                     &access_log,
+                    &access_log_policy,
                     &server_name,
                     &method,
                     snapshot.as_ref(),
@@ -622,6 +635,7 @@ fn connection_service(
             observe_request(
                 &recorder,
                 &access_log,
+                &access_log_policy,
                 &server_name,
                 &method,
                 snapshot.as_ref(),
