@@ -5,6 +5,7 @@
 
 pub mod balancer;
 pub mod client;
+pub mod fastcgi;
 pub mod forward_auth;
 pub mod handler;
 pub mod health;
@@ -15,6 +16,7 @@ pub mod tls;
 pub mod upstream;
 
 pub use balancer::{from_policy, Balancer, First, LeastConnections, RoundRobin};
+pub use fastcgi::{FastCgiError, FastCgiTransport};
 pub use handler::{handler_factory, FlushInterval, ReverseProxyHandler};
 pub use health::{status_matches, HealthCheck, HealthCheckScheduler};
 pub use passive::{PassiveHealth, PassiveHealthConfig};
