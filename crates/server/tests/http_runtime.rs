@@ -118,6 +118,7 @@ async fn host_matching_routes_by_host_header() {
                 "admin": {"disabled": true},
                 "apps": {"http": {"servers": {"srv0": {
                     "listen": ["127.0.0.1:0"],
+                    "automatic_https": {"disable": true},
                     "routes": [
                         {"match": [{"host": ["example.com"]}],
                          "handle": [{"handler": "static_response", "body": "matched"}]}

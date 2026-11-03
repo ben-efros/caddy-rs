@@ -31,8 +31,8 @@ pub use acme::{
     CertificateRequest, Challenge, ChallengeFetch, ChallengePolicy, ChallengeStatus, ChallengeType,
     Directory, DirectoryMeta, ExternalAccount, HttpMethod, HttpRequest, HttpResponse,
     HyperTransport, Identifier, IssuedCertificate, Jwk, MemoryAcmeStorage, NewAccountRequest,
-    NewOrderRequest, Order, OrderFetch, OrderHandle, OrderStatus, PollPolicy, Problem,
-    StoredAccount, TokioClock,
+    NewOrderRequest, NoAcmeTransport, Order, OrderFetch, OrderHandle, OrderStatus, PollPolicy,
+    Problem, StoredAccount, TokioClock,
 };
 pub use automatic_https::{
     plan as plan_automatic_https, AutomaticHttpsIssuer, AutomaticHttpsPlan, AutomaticHttpsPolicy,

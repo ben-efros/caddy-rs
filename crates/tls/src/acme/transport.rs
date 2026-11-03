@@ -201,6 +201,27 @@ impl AcmeTransport for HyperTransport {
     }
 }
 
+/// ACME transport for a generation whose automation policies are all internal.
+///
+/// No network ACME request is possible in that case; any request fails loudly instead of silently
+/// falling back to the platform transport. Used by automatic HTTPS when a config only manages
+/// local names (for example `localhost`) and no ACME issuer is configured.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoAcmeTransport;
+
+#[async_trait]
+impl AcmeTransport for NoAcmeTransport {
+    async fn request(&self, request: HttpRequest) -> Result<HttpResponse> {
+        Err(AcmeError::Transport {
+            url: request.url,
+            reason:
+                "automatic HTTPS generation has no ACME issuer; refusing a network ACME request"
+                    .to_string(),
+        }
+        .into())
+    }
+}
+
 /// Load trust roots from the platform CA bundle.
 ///
 /// Tries [`SYSTEM_CA_BUNDLES`] in order. Returns a located error when no bundle is found so an
