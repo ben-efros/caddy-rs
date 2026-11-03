@@ -5,7 +5,7 @@
 //! (the canonical Caddy form for an absolute path) or as `unix/run/app.sock` for a relative one.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// How an upstream is reached.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +35,10 @@ pub struct Upstream {
     active_connections: AtomicUsize,
     /// Caddy `upstreams[].max_requests`: maximum simultaneous requests (`None` = unlimited).
     max_requests: Option<usize>,
+    /// Cumulative number of proxy attempts sent to this upstream (live admin counter).
+    num_requests: AtomicU64,
+    /// Cumulative number of failed attempts to this upstream (live admin counter).
+    fails: AtomicU64,
 }
 
 impl Upstream {
@@ -50,6 +54,8 @@ impl Upstream {
             healthy: AtomicBool::new(true),
             active_connections: AtomicUsize::new(0),
             max_requests: None,
+            num_requests: AtomicU64::new(0),
+            fails: AtomicU64::new(0),
         }
     }
 
@@ -89,6 +95,8 @@ impl Upstream {
                     healthy: AtomicBool::new(true),
                     active_connections: AtomicUsize::new(0),
                     max_requests: None,
+                    num_requests: AtomicU64::new(0),
+                    fails: AtomicU64::new(0),
                 });
             }
             #[cfg(not(unix))]
@@ -167,6 +175,33 @@ impl Upstream {
     pub fn with_max_requests(mut self, max_requests: Option<usize>) -> Self {
         self.max_requests = max_requests;
         self
+    }
+
+    /// Count one proxy attempt against this upstream (live `/reverse_proxy/upstreams` counter).
+    pub fn record_request(&self) {
+        self.num_requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one failed attempt against this upstream (live `/reverse_proxy/upstreams` counter).
+    pub fn record_failure(&self) {
+        self.fails.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count `count` passive-health failure strikes against this upstream.
+    pub fn record_failures(&self, count: u32) {
+        if count > 0 {
+            self.fails.fetch_add(u64::from(count), Ordering::Relaxed);
+        }
+    }
+
+    /// Cumulative proxy attempts sent to this upstream.
+    pub fn num_requests(&self) -> u64 {
+        self.num_requests.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative failed proxy attempts for this upstream.
+    pub fn fails(&self) -> u64 {
+        self.fails.load(Ordering::Relaxed)
     }
 
     /// Caddy `Upstream.Full()`: the configured simultaneous-request limit is reached.

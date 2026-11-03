@@ -23,7 +23,7 @@
 //! configured upstream target; no separate `Host` field is forwarded on h2.
 
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -38,7 +38,7 @@ use hyper_util::rt::TokioIo;
 use caddy_rs_http::{
     body::{Body, RequestBody, StreamingBody, StreamingResponse},
     requested_upgrade_type, CustomHandlerFactory, Error as HttpError, Handler, Outcome, Request,
-    Response, Result as HttpResult, StreamingOutcome, Tunnel, UpgradedResponse,
+    Response, Result as HttpResult, SharedHandler, StreamingOutcome, Tunnel, UpgradedResponse,
 };
 
 use crate::balancer::{self, Balancer};
@@ -228,6 +228,86 @@ impl IpNet {
             }
             _ => false,
         }
+    }
+}
+
+/// Live per-upstream counters in Caddy's `GET /reverse_proxy/upstreams` shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamStatus {
+    /// Upstream dial address (`host:port` or `unix/...`).
+    pub address: String,
+    /// Proxy attempts sent to this upstream since it was configured.
+    pub num_requests: u64,
+    /// Failed attempts (including passive-health strikes) for this upstream.
+    pub fails: u64,
+}
+
+/// Collects the live [`ReverseProxyHandler`] instances built for one configuration generation.
+///
+/// The server runtime builds a fresh sink for every apply and installs it as the active source for
+/// `GET /reverse_proxy/upstreams` only after the generation was applied successfully, so values
+/// always describe the active generation and a reload swaps them atomically. Handlers are held
+/// weakly: when a retired generation's routers are dropped, its counters disappear.
+#[derive(Default)]
+pub struct UpstreamStatusSink {
+    handlers: Mutex<Vec<Weak<ReverseProxyHandler>>>,
+}
+
+impl std::fmt::Debug for UpstreamStatusSink {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let handlers = self
+            .handlers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        formatter
+            .debug_struct("UpstreamStatusSink")
+            .field("handlers", &handlers.len())
+            .finish()
+    }
+}
+
+impl UpstreamStatusSink {
+    /// Create an empty sink (shared by the server runtime and the handler factory).
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Track a handler built for this generation (kept weakly).
+    pub fn register(&self, handler: &Arc<ReverseProxyHandler>) {
+        let mut handlers = self
+            .handlers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        handlers.push(Arc::downgrade(handler));
+    }
+
+    /// Snapshot the live counters, merging handlers that share an upstream address (Caddy keeps
+    /// one global pool per address; caddy-rs keeps per-handler counters, so duplicates are summed).
+    pub fn snapshot(&self) -> Vec<UpstreamStatus> {
+        let mut handlers = self
+            .handlers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        handlers.retain(|handler| handler.strong_count() > 0);
+        let mut merged: std::collections::BTreeMap<String, UpstreamStatus> =
+            std::collections::BTreeMap::new();
+        for handler in handlers.iter() {
+            let Some(handler) = handler.upgrade() else {
+                continue;
+            };
+            for status in handler.upstream_statuses() {
+                let entry = merged
+                    .entry(status.address.clone())
+                    .or_insert(UpstreamStatus {
+                        address: status.address.clone(),
+                        num_requests: 0,
+                        fails: 0,
+                    });
+                entry.num_requests += status.num_requests;
+                entry.fails += status.fails;
+            }
+        }
+        merged.into_values().collect()
     }
 }
 
@@ -612,6 +692,18 @@ impl ReverseProxyHandler {
         &self.clients[index]
     }
 
+    /// Live per-upstream counters (used by the admin `/reverse_proxy/upstreams` endpoint).
+    pub fn upstream_statuses(&self) -> Vec<UpstreamStatus> {
+        self.upstreams
+            .iter()
+            .map(|upstream| UpstreamStatus {
+                address: upstream.dial.clone(),
+                num_requests: upstream.num_requests(),
+                fails: upstream.fails(),
+            })
+            .collect()
+    }
+
     /// Whether *this upstream* speaks HTTP/2 (TLS h2 only applies to TLS upstreams; h2c applies to
     /// cleartext transports).
     fn upstream_h2_capable(&self, upstream: &Upstream) -> bool {
@@ -994,6 +1086,7 @@ impl Handler for ReverseProxyHandler {
                 continue;
             };
             let _guard = upstream.connection_started();
+            upstream.record_request();
             let body = match self.attempt_body(&mut request, buffered_body, &mut stream_taken) {
                 Ok(body) => body,
                 Err(message) => {
@@ -1008,12 +1101,13 @@ impl Handler for ReverseProxyHandler {
                     // Caddy applies passive response checks before deciding on retry_match, so an
                     // unhealthy_status strike is recorded even when the response is retried.
                     if let Some(passive) = &self.passive {
-                        passive.record_response(
+                        let strikes = passive.record_response(
                             &upstream.dial,
                             forwarded.status,
                             forwarded.latency,
                             std::time::Instant::now(),
                         );
+                        upstream.record_failures(strikes);
                     }
                     let mut response = Response {
                         status: forwarded.status,
@@ -1081,6 +1175,7 @@ impl Handler for ReverseProxyHandler {
                             format!("{status}"),
                         )));
                     }
+                    upstream.record_failure();
                     if let Some(passive) = &self.passive {
                         passive.record_failure(&upstream.dial, std::time::Instant::now());
                     }
@@ -1155,6 +1250,7 @@ impl Handler for ReverseProxyHandler {
                 continue;
             };
             let _guard = upstream.connection_started();
+            upstream.record_request();
             let body = match self.attempt_body(&mut request, buffered_body, &mut stream_taken) {
                 Ok(body) => body,
                 Err(message) => {
@@ -1169,12 +1265,13 @@ impl Handler for ReverseProxyHandler {
             match self.forward_streaming(&upstream, &request, body).await {
                 Ok(Forwarded::Upgrade(forwarded)) => {
                     if let Some(passive) = &self.passive {
-                        passive.record_response(
+                        let strikes = passive.record_response(
                             &upstream.dial,
                             forwarded.status,
                             forwarded.latency,
                             std::time::Instant::now(),
                         );
+                        upstream.record_failures(strikes);
                     }
                     // A configured retry match may still ask for another attempt; the tunnel is
                     // dropped (which closes the upstream) before retrying. Once the retry budget is
@@ -1202,12 +1299,13 @@ impl Handler for ReverseProxyHandler {
                 }
                 Ok(Forwarded::Streaming(forwarded)) => {
                     if let Some(passive) = &self.passive {
-                        passive.record_response(
+                        let strikes = passive.record_response(
                             &upstream.dial,
                             forwarded.status,
                             forwarded.latency,
                             std::time::Instant::now(),
                         );
+                        upstream.record_failures(strikes);
                     }
                     // `retry_match` only inspects the request and the response status, so a
                     // bodyless probe response is enough to evaluate it; the stream is untouched.
@@ -1282,6 +1380,7 @@ impl Handler for ReverseProxyHandler {
                             Response::text(status, format!("{status}")),
                         )));
                     }
+                    upstream.record_failure();
                     if let Some(passive) = &self.passive {
                         passive.record_failure(&upstream.dial, std::time::Instant::now());
                     }
@@ -1801,6 +1900,25 @@ pub fn handler_factory() -> CustomHandlerFactory {
     })
 }
 
+/// Build the `reverse_proxy` handler factory and track every handler it builds in `sink`.
+///
+/// The server runtime uses this to expose live `/reverse_proxy/upstreams` counters for the active
+/// configuration generation: each apply builds a fresh sink, and the sink only becomes the admin
+/// source once that generation is serving.
+pub fn handler_factory_with_status_sink(sink: Arc<UpstreamStatusSink>) -> CustomHandlerFactory {
+    Arc::new(move |value: &Value, path: &str| {
+        let name = value.get("handler").and_then(Value::as_str);
+        if name == Some("reverse_proxy") {
+            let handler = Arc::new(ReverseProxyHandler::from_json(value, path)?);
+            sink.register(&handler);
+            let shared: SharedHandler = handler;
+            Ok(Some(shared))
+        } else {
+            Ok(None)
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1939,6 +2057,113 @@ mod tests {
 
     fn body_text(response: &Response) -> String {
         String::from_utf8(response.body.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn upstream_counters_track_successful_attempts() {
+        let dial = spawn_echo_upstream().await;
+        let handler = handler(&dial);
+        let Outcome::Respond(response) =
+            handler.handle(get_request("/counted", None)).await.unwrap()
+        else {
+            panic!("expected proxied response");
+        };
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            handler.upstream_statuses(),
+            vec![UpstreamStatus {
+                address: dial.clone(),
+                num_requests: 1,
+                fails: 0,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_counters_count_each_retry_attempt_and_failure() {
+        // Reserve then release a loopback port so the dial is refused: retries = 1 means two
+        // attempts against the same (dead) upstream, and both are failures.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dial = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": dial}],
+            "load_balancing": {"retries": 1}
+        }));
+        let Outcome::Respond(response) = handler.handle(get_request("/dead", None)).await.unwrap()
+        else {
+            panic!("expected 502 response");
+        };
+        assert_eq!(response.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            handler.upstream_statuses(),
+            vec![UpstreamStatus {
+                address: dial,
+                num_requests: 2,
+                fails: 2,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_counters_track_streaming_requests() {
+        let dial = spawn_echo_upstream().await;
+        let handler = handler(&dial);
+        let outcome = handler
+            .handle_streaming(get_request("/streamed", None))
+            .await
+            .unwrap();
+        let StreamingOutcome::Respond(response) = outcome else {
+            panic!("expected proxied response");
+        };
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            handler.upstream_statuses(),
+            vec![UpstreamStatus {
+                address: dial,
+                num_requests: 1,
+                fails: 0,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_status_sink_tracks_built_handlers_and_drops_retired_ones() {
+        let dial = spawn_echo_upstream().await;
+        let sink = UpstreamStatusSink::new();
+        let factory = handler_factory_with_status_sink(Arc::clone(&sink));
+        let config = serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": dial}]
+        });
+        let first = factory(&config, "handler").unwrap().unwrap();
+        let second = factory(&config, "handler").unwrap().unwrap();
+        let Outcome::Respond(response) = first.handle(get_request("/one", None)).await.unwrap()
+        else {
+            panic!("expected proxied response");
+        };
+        assert_eq!(response.status, StatusCode::OK);
+        let Outcome::Respond(response) = second.handle(get_request("/two", None)).await.unwrap()
+        else {
+            panic!("expected proxied response");
+        };
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            sink.snapshot(),
+            vec![UpstreamStatus {
+                address: dial,
+                num_requests: 2,
+                fails: 0,
+            }],
+            "handlers sharing an address are merged like Caddy's global host pool"
+        );
+        drop(first);
+        drop(second);
+        assert!(
+            sink.snapshot().is_empty(),
+            "retired handlers must disappear from the sink"
+        );
     }
 
     #[tokio::test]
