@@ -38,6 +38,7 @@ use http::HeaderMap;
 use caddy_rs_admin::{
     AccessLogEntry, AccessLogRequest, AccessLogTls, BuiltAccessLogSink, CertificateMetrics,
     LoggingConfig, LoggingConfigError, RequestObservation, SharedRequestRecorder,
+    ACCESS_LOG_LOGGER,
 };
 use hyper::body::Incoming;
 
@@ -142,6 +143,151 @@ impl Drop for AccessLogRuntime {
     fn drop(&mut self) {
         self.close();
     }
+}
+
+/// Per-server access-log association from `apps.http.servers.*.logs`.
+///
+/// Caddy's `ServerLogConfig` decides *which logger* a request host belongs to and whether the host
+/// is skipped; the global `logging.logs[]` sinks decide where that logger is written. An absent
+/// per-server `logs` object keeps caddy-rs's historical behaviour (emit with the base
+/// `http.log.access` logger when any logging is configured).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ServerAccessLogPolicy {
+    /// Whether the server declared a `logs` object (per-server semantics apply only then).
+    configured: bool,
+    default_logger_name: String,
+    logger_names: Vec<(String, Vec<String>)>,
+    skip_hosts: Vec<String>,
+    skip_unmapped_hosts: bool,
+}
+
+/// What the per-server policy decided for one request host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AccessLogRoute {
+    /// Do not emit an access entry for this request (metrics are still recorded).
+    Skip,
+    /// Emit one entry per logger name; an empty name is the base `http.log.access` logger.
+    Loggers(Vec<String>),
+}
+
+impl ServerAccessLogPolicy {
+    /// Build the policy for one server; `None` means the server has no per-server log config.
+    pub(crate) fn from_config(logs: Option<&caddy_rs_core::ServerLogConfig>) -> Self {
+        let Some(logs) = logs else {
+            return Self::default();
+        };
+        Self {
+            configured: true,
+            default_logger_name: logs.default_logger_name.clone().unwrap_or_default(),
+            logger_names: logs
+                .logger_names
+                .iter()
+                .map(|(host, names)| (normalize_host_pattern(host), names.as_slice().to_vec()))
+                .collect(),
+            skip_hosts: logs
+                .skip_hosts
+                .iter()
+                .map(|host| normalize_host_pattern(host))
+                .collect(),
+            skip_unmapped_hosts: logs.skip_unmapped_hosts,
+            // `should_log_credentials` and `trace` are modeled in core but not applied here; the
+            // sink encoder owns credential redaction (see the module docs / DIV for T-CONF-030).
+        }
+    }
+
+    /// Decide how the request host is logged.
+    pub(crate) fn route(&self, host: &str) -> AccessLogRoute {
+        if !self.configured {
+            // No per-server association: historical default logger for every host.
+            return AccessLogRoute::Loggers(vec![String::new()]);
+        }
+        let host = normalize_host(host);
+        // Caddy's `shouldLogRequest` checks the logger_names mapping first, so a mapped host is
+        // always logged even when it also matches skip_hosts.
+        if let Some(names) = self.logger_hosts(&host) {
+            return AccessLogRoute::Loggers(names.to_vec());
+        }
+        if self
+            .skip_hosts
+            .iter()
+            .any(|pattern| host_matches(&host, pattern))
+        {
+            return AccessLogRoute::Skip;
+        }
+        if self.skip_unmapped_hosts {
+            return AccessLogRoute::Skip;
+        }
+        AccessLogRoute::Loggers(vec![self.default_logger_name.clone()])
+    }
+
+    /// Caddy's `getLoggerHosts`: exact host first, then wildcard variants replacing each label with
+    /// `*` from left to right.
+    fn logger_hosts(&self, host: &str) -> Option<&[String]> {
+        if let Some((_, names)) = self
+            .logger_names
+            .iter()
+            .find(|(pattern, _)| pattern == host)
+        {
+            return Some(names);
+        }
+        let mut labels: Vec<String> = host.split('.').map(str::to_string).collect();
+        for index in 0..labels.len() {
+            if labels[index].is_empty() {
+                continue;
+            }
+            labels[index] = "*".to_string();
+            let wildcard = labels.join(".");
+            if let Some((_, names)) = self
+                .logger_names
+                .iter()
+                .find(|(pattern, _)| *pattern == wildcard)
+            {
+                return Some(names);
+            }
+        }
+        None
+    }
+}
+
+/// The full zap logger name for an access logger component: empty is the base access logger.
+pub(crate) fn logger_name(component: &str) -> String {
+    if component.is_empty() {
+        ACCESS_LOG_LOGGER.to_string()
+    } else {
+        format!("{ACCESS_LOG_LOGGER}.{component}")
+    }
+}
+
+/// Normalize a request host: lowercase, strip port, strip trailing dot.
+fn normalize_host(host: &str) -> String {
+    let host = host.trim();
+    let host = if let Some(rest) = host.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        host.rsplit_once(':').map(|(name, _)| name).unwrap_or(host)
+    };
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Normalize a configured host pattern the same way (without stripping `*`).
+fn normalize_host_pattern(pattern: &str) -> String {
+    pattern.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Caddy/certmagic-style wildcard match: same label count, `*` labels match anything.
+fn host_matches(host: &str, pattern: &str) -> bool {
+    if host == pattern {
+        return true;
+    }
+    let host_labels: Vec<&str> = host.split('.').collect();
+    let pattern_labels: Vec<&str> = pattern.split('.').collect();
+    if host_labels.len() != pattern_labels.len() {
+        return false;
+    }
+    host_labels
+        .iter()
+        .zip(pattern_labels.iter())
+        .all(|(host_label, pattern_label)| *pattern_label == "*" || host_label == pattern_label)
 }
 
 /// TLS handshake details for the access-log `request.tls` object.
@@ -294,9 +440,11 @@ pub(crate) fn request_started(
 /// change the served response. `handler` is currently always empty because the router does not
 /// expose the matched route id at the connection boundary.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn observe_request(
     recorder: &SharedRequestRecorder,
     access_log: &AccessLogRuntime,
+    policy: &ServerAccessLogPolicy,
     server_name: &str,
     method: &str,
     snapshot: Option<&RequestSnapshot>,
@@ -331,7 +479,15 @@ pub(crate) fn observe_request(
     let Some(snapshot) = snapshot else {
         return;
     };
-    access_log.emit(&snapshot.access_entry(status, duration, response_size, response_headers));
+    let route = policy.route(&snapshot.host);
+    let AccessLogRoute::Loggers(loggers) = route else {
+        return;
+    };
+    for component in loggers {
+        let mut entry = snapshot.access_entry(status, duration, response_size, response_headers);
+        entry.logger = logger_name(&component);
+        access_log.emit(&entry);
+    }
 }
 
 /// Content length of a buffered body, if known.

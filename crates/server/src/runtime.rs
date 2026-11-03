@@ -34,7 +34,7 @@ use crate::auto_https::{PreparedAutomaticHttps, RedirectPolicy};
 use crate::error::{Error, Result};
 use crate::limits::ServerLimits;
 use crate::listeners::{bind, bind_admin, ListenerHandle, ListenerState, SharedListeners};
-use crate::observability::{record_certificate_metrics, AccessLogRuntime};
+use crate::observability::{record_certificate_metrics, AccessLogRuntime, ServerAccessLogPolicy};
 
 /// Observable runtime state after an apply.
 #[derive(Debug, Clone, Default)]
@@ -991,6 +991,9 @@ impl ServerRuntime {
                         server_name: server_name.clone(),
                         recorder: Arc::clone(&self.recorder),
                         access_log: Arc::clone(access_log),
+                        access_log_policy: Arc::new(ServerAccessLogPolicy::from_config(
+                            server.logs.as_ref(),
+                        )),
                     }),
                 );
             }
@@ -1016,6 +1019,7 @@ impl ServerRuntime {
                             server_name: String::new(),
                             recorder: Arc::clone(&self.recorder),
                             access_log: Arc::clone(access_log),
+                            access_log_policy: Arc::new(ServerAccessLogPolicy::default()),
                         }),
                     );
                 }

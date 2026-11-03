@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use crate::config::{
     AutomationPolicy, BaseLog, CertificateAuthority, CertificatesConfig, Config, HttpApp, Logging,
-    ModuleRef, PkiApp, PkiKeyPair, Route, StorageConfig, TlsApp, TlsAutomation,
+    ModuleRef, PkiApp, PkiKeyPair, Route, ServerLogConfig, StorageConfig, TlsApp, TlsAutomation,
 };
 use crate::error::{Error, Result};
 use crate::listen::ListenAddr;
@@ -95,6 +95,59 @@ pub fn validate_config(config: &Config, registry: &ModuleRegistry) -> Result<Val
     }
 
     Ok(validator.report)
+}
+
+/// Validate one server's access-log association (`apps.http.servers.*.logs`).
+///
+/// Caddy itself performs no structural validation here; caddy-rs rejects host patterns that can
+/// never match a portless host (empty, whitespace/control characters) with a located error, so a
+/// typo cannot silently disable access logging for a site.
+fn validate_server_logs(logs: &ServerLogConfig, path: &str) -> Result<()> {
+    if let Some(name) = &logs.default_logger_name {
+        validate_logger_name(name, &format!("{path}.default_logger_name"))?;
+    }
+    for (host, names) in &logs.logger_names {
+        validate_log_host(host, &format!("{path}.logger_names[{host:?}]"))?;
+        for (index, name) in names.as_slice().iter().enumerate() {
+            validate_logger_name(name, &format!("{path}.logger_names[{host:?}][{index}]"))?;
+        }
+    }
+    for (index, host) in logs.skip_hosts.iter().enumerate() {
+        validate_log_host(host, &format!("{path}.skip_hosts[{index}]"))?;
+    }
+    Ok(())
+}
+
+/// A host pattern for `logger_names`/`skip_hosts`: a non-empty hostname without a port, optionally
+/// with `*` labels.
+fn validate_log_host(host: &str, path: &str) -> Result<()> {
+    if host.trim().is_empty() {
+        return Err(Error::invalid(path, "host pattern must not be empty"));
+    }
+    if host
+        .chars()
+        .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return Err(Error::invalid(
+            path,
+            format!("host pattern `{host}` must not contain whitespace or control characters"),
+        ));
+    }
+    Ok(())
+}
+
+/// A zap logger name component. Empty is valid (it selects the base access logger).
+fn validate_logger_name(name: &str, path: &str) -> Result<()> {
+    if name
+        .chars()
+        .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return Err(Error::invalid(
+            path,
+            format!("logger name `{name}` must not contain whitespace or control characters"),
+        ));
+    }
+    Ok(())
 }
 
 /// Validate the `logging` section: every configured writer, encoder and core must be a module this
@@ -237,6 +290,9 @@ impl Validator<'_> {
                         format!("unknown automatic_https field(s): {}", fields.join(", ")),
                     ));
                 }
+            }
+            if let Some(logs) = &server.logs {
+                validate_server_logs(logs, &format!("{server_path}.logs"))?;
             }
             self.routes(&server.routes, &format!("{server_path}.routes"))?;
             self.report.servers += 1;
@@ -967,6 +1023,56 @@ mod tests {
         );
         let report = validate_config(&config, &registry()).expect("valid reverse_proxy");
         assert_eq!(report.handlers, 1);
+    }
+
+    #[test]
+    fn validates_per_server_access_log_association() {
+        let config = config_from(serde_json::json!({
+            "apps": {"http": {"servers": {"srv0": {
+                "listen": [":443"],
+                "logs": {
+                    "default_logger_name": "fallback",
+                    "logger_names": {
+                        "example.com": ["one", "two"],
+                        "*.internal.example.com": "internal"
+                    },
+                    "skip_hosts": ["skip.example.com"],
+                    "skip_unmapped_hosts": true
+                }
+            }}}}
+        }));
+        validate_config(&config, &registry()).expect("per-server logs validate");
+    }
+
+    #[test]
+    fn rejects_invalid_per_server_log_hosts_with_located_path() {
+        let config = config_from(serde_json::json!({
+            "apps": {"http": {"servers": {"srv0": {
+                "listen": [":443"],
+                "logs": {"logger_names": {"": ["named"]}}
+            }}}}
+        }));
+        let error = validate_config(&config, &registry()).expect_err("empty host pattern");
+        let message = error.to_string();
+        assert!(
+            message.contains("apps.http.servers.srv0.logs.logger_names"),
+            "{message}"
+        );
+        assert!(message.contains("must not be empty"), "{message}");
+
+        let config = config_from(serde_json::json!({
+            "apps": {"http": {"servers": {"srv0": {
+                "listen": [":443"],
+                "logs": {"skip_hosts": ["bad host"]}
+            }}}}
+        }));
+        let error = validate_config(&config, &registry()).expect_err("whitespace host pattern");
+        let message = error.to_string();
+        assert!(
+            message.contains("apps.http.servers.srv0.logs.skip_hosts[0]"),
+            "{message}"
+        );
+        assert!(message.contains("whitespace"), "{message}");
     }
 
     #[test]
