@@ -21,6 +21,7 @@ use crate::parser::{self, Directive, SiteBlock};
 
 /// Canonical directive order, mirroring Caddy's default order for the supported subset.
 const DIRECTIVE_ORDER: &[&str] = &[
+    "map",
     "vars",
     "root",
     "header",
@@ -2404,14 +2405,24 @@ fn build_routes(
             if left_position != right_position {
                 return left_position.cmp(&right_position);
             }
-            // `vars` is sorted least-specific first so the last matching route wins (Caddy's
-            // `sortRoutes` reverse special case).
-            if left.0 == "vars" {
-                route_path_order(&right.1, &left.1)
-            } else {
-                route_path_order(&left.1, &right.1)
-            }
+            route_path_order(&left.1, &right.1)
         });
+        // Caddy's `sortRoutes` special-cases `vars`: it reverses the (most-specific-first) order
+        // so the least-specific matcher runs first and the last matching `vars` wins. Since
+        // several `vars` routes share one directive slot they form one contiguous run.
+        let mut start = 0;
+        while start < entries.len() {
+            if entries[start].0 != "vars" {
+                start += 1;
+                continue;
+            }
+            let mut end = start + 1;
+            while end < entries.len() && entries[end].0 == "vars" {
+                end += 1;
+            }
+            entries[start..end].reverse();
+            start = end;
+        }
     }
 
     Ok(consolidate_routes(
@@ -2663,6 +2674,7 @@ fn build_handlers(
         "forward_auth" => vec![forward_auth_handler(directive, args)?],
         "invoke" => vec![invoke_handler(args, directive.position)?],
         "vars" => vec![vars_handler(directive, args)?],
+        "map" => vec![map_handler(directive, args)?],
         other => {
             return Err(adapter_error(
                 directive.position,
@@ -2810,6 +2822,7 @@ fn forward_auth_handler(directive: &Directive, args: &[String]) -> caddy_rs_core
     let synthetic = Directive {
         name: "reverse_proxy".to_string(),
         args: Vec::new(),
+        arg_quoted: Vec::new(),
         block: passthrough,
         position: directive.position,
     };
@@ -2951,6 +2964,106 @@ fn scalar_json(text: &str) -> Value {
         return json!(false);
     }
     json!(text)
+}
+
+/// Caddy's `http.handlers.map` handler: map the placeholder in `source` through the block's
+/// mappings into one or more destination placeholders. Exact inputs are compared literally, inputs
+/// prefixed with `~` are regular expressions (with `${N}` capture references in the outputs),
+/// `default` supplies fallbacks, and outputs are Caddy scalars (quoted tokens stay strings; an
+/// unquoted `-` becomes null).
+fn map_handler(directive: &Directive, args: &[String]) -> caddy_rs_core::Result<Value> {
+    let Some(source) = args.first() else {
+        return Err(adapter_error(
+            directive.position,
+            "directive `map` requires a source argument",
+        ));
+    };
+    let destinations: Vec<String> = args[1..].to_vec();
+    if destinations.is_empty() {
+        return Err(adapter_error(
+            directive.position,
+            "missing destination argument(s)",
+        ));
+    }
+    for destination in &destinations {
+        let qualified = qualify_placeholders(destination);
+        if qualified != *destination {
+            return Err(adapter_error(
+                directive.position,
+                format!(
+                    "destination {destination} conflicts with a Caddyfile placeholder shorthand"
+                ),
+            ));
+        }
+    }
+    let mut mappings: Vec<Value> = Vec::new();
+    let mut defaults: Option<Vec<Value>> = None;
+    for item in &directive.block {
+        if item.name == "default" {
+            if defaults.is_some() {
+                return Err(adapter_error(item.position, "defaults already defined"));
+            }
+            let mut values: Vec<Value> = item
+                .args
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    scalar_json_quoted(value, item.arg_quoted.get(index).copied().unwrap_or(false))
+                })
+                .collect();
+            while values.len() < destinations.len() {
+                values.push(json!(""));
+            }
+            defaults = Some(values);
+            continue;
+        }
+        let input = qualify_placeholders(&item.name);
+        let mut outputs: Vec<Value> = item
+            .args
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let text = qualify_placeholders(value);
+                scalar_json_quoted(&text, item.arg_quoted.get(index).copied().unwrap_or(false))
+            })
+            .collect();
+        if outputs.len() > destinations.len() {
+            return Err(adapter_error(item.position, "too many outputs"));
+        }
+        while outputs.len() < destinations.len() {
+            outputs.push(Value::Null);
+        }
+        let mapping = if let Some(regexp) = input.strip_prefix('~') {
+            json!({"input_regexp": regexp, "outputs": outputs})
+        } else {
+            json!({"input": input, "outputs": outputs})
+        };
+        mappings.push(mapping);
+    }
+    let mut object = Map::new();
+    object.insert("handler".to_string(), json!("map"));
+    object.insert("source".to_string(), json!(qualify_placeholders(source)));
+    object.insert("destinations".to_string(), json!(destinations));
+    if !mappings.is_empty() {
+        object.insert("mappings".to_string(), Value::Array(mappings));
+    }
+    if let Some(defaults) = defaults {
+        object.insert("defaults".to_string(), Value::Array(defaults));
+    }
+    Ok(Value::Object(object))
+}
+
+/// `caddyfile.Dispenser.ScalarVal`: quoted tokens are always strings; unquoted tokens are parsed
+/// as integers, floats, or booleans where possible. `-` is null in Caddy's map outputs (handled by
+/// the caller via [`scalar_json_quoted`] before scalar conversion).
+fn scalar_json_quoted(text: &str, quoted: bool) -> Value {
+    if text == "-" {
+        return Value::Null;
+    }
+    if quoted {
+        return json!(text);
+    }
+    scalar_json(text)
 }
 
 /// Names invoked by a directive list, recursively.
@@ -4259,7 +4372,9 @@ fn parse_upstreams(target: &str) -> Result<Vec<ParsedUpstream>, String> {
         }
         return Ok(expanded);
     }
-    let dial = if authority_has_port(authority) {
+    let dial = if authority_has_port(authority) || authority.contains('{') {
+        // An explicit port stays as written; a placeholder without a port is resolved at request
+        // time, so Caddy does not append a default port (it would break `{upstream}` style dials).
         authority.to_string()
     } else {
         format!("{authority}:{default_port}")

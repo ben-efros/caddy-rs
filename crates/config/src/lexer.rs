@@ -159,6 +159,15 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
                         chars.next();
                         column += 1;
                     }
+                    Some('"') => {
+                        // Caddy checks for a quote at token start before consuming the pending
+                        // escape, so `\"` opens a quoted token whose first content quote is
+                        // escaped (e.g. `\"""` is the one-character token `"`).
+                        chars.next();
+                        column += 1;
+                        let token = scan_quoted_escaped_open(&mut chars, position, &mut column)?;
+                        tokens.push(token);
+                    }
                     _ => match scan_word(&mut chars, position, &mut column) {
                         Some(token) => tokens.push(token),
                         None => unreachable!("a word starting with `\\` must consume input"),
@@ -348,6 +357,58 @@ fn scan_quoted(
                     }
                 }
             }
+            '\n' => {
+                return Err(LexError::new(
+                    position.line,
+                    position.column,
+                    "unterminated quoted string before newline",
+                ));
+            }
+            other => text.push(other),
+        }
+    }
+    if !closed {
+        return Err(LexError::new(
+            position.line,
+            position.column,
+            "unterminated quoted string",
+        ));
+    }
+    Ok(Token {
+        kind: TokenKind::Quoted,
+        text,
+        position,
+    })
+}
+
+/// Scan a quoted string that started as `\"`: the opening quote was preceded by a backslash,
+/// whose pending escape makes the first content quote literal (as in Caddy's tokenizer).
+fn scan_quoted_escaped_open(
+    cursor: &mut Cursor<'_>,
+    position: Position,
+    column: &mut usize,
+) -> Result<Token, LexError> {
+    cursor.next(); // the opening quote
+    *column += 1;
+    let mut text = String::new();
+    let mut escaped = true;
+    let mut closed = false;
+    while let Some((_, next)) = cursor.next() {
+        *column += 1;
+        if escaped {
+            if next != '"' {
+                text.push('\\');
+            }
+            text.push(next);
+            escaped = false;
+            continue;
+        }
+        match next {
+            '"' => {
+                closed = true;
+                break;
+            }
+            '\\' => escaped = true,
             '\n' => {
                 return Err(LexError::new(
                     position.line,
@@ -929,5 +990,14 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn backslash_before_quote_opens_a_quoted_token_like_caddy() {
+        // Caddy checks for an opening quote before consuming a pending backslash escape, so
+        // `\"` at token start begins a quoted token and the carried escape makes the first
+        // content quote literal: `\\"""` is the single-character token `"`.
+        let tokens = texts("\\\"\"\"");
+        assert_eq!(tokens, vec![(TokenKind::Quoted, "\"".to_string())]);
     }
 }
