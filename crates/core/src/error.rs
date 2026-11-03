@@ -75,6 +75,35 @@ pub enum Error {
     #[error("module registry: module id `{0}` is already registered")]
     DuplicateModule(&'static str),
 
+    /// Two modules of the same kind were registered with the same JSON key.
+    ///
+    /// Resolution is by `(kind, json key)`, so a key must map to exactly one module id; a second
+    /// registration would silently shadow the first.
+    #[error(
+        "module registry: {kind} key `{key}` already resolves to `{existing}` \
+         (cannot also resolve to `{incoming}`)"
+    )]
+    ModuleKeyConflict {
+        /// Module category label (see [`crate::ModuleKind::label`]).
+        kind: &'static str,
+        /// Short JSON key that collides.
+        key: &'static str,
+        /// Module id the key already resolves to.
+        existing: &'static str,
+        /// Module id that tried to claim the key.
+        incoming: &'static str,
+    },
+
+    /// A module definition is malformed (empty id/key, illegal characters, ...).
+    ///
+    /// Dynamic registrations are validated at registration time so a plugin cannot poison the
+    /// registry with ids that can never be resolved or listed deterministically.
+    #[error("module registry: invalid module definition: {message}")]
+    InvalidModuleDefinition {
+        /// Diagnosis naming the offending field and value.
+        message: String,
+    },
+
     /// A requested capability is recognised but intentionally not implemented yet.
     #[error("not implemented: {feature} ({tracking_id})")]
     NotImplemented {

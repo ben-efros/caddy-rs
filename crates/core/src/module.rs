@@ -5,12 +5,43 @@
 //! (`reverse_proxy`). This registry models both, and is the single place where "is this module
 //! known?" is answered during validation and runtime construction.
 //!
-//! Built-in modules are statically registered (the Caddy model). Third-party modules are a
-//! planned out-of-process/WASM extension mechanism (WS-08); see `docs/ARCHITECTURE.md`.
+//! Built-in modules are statically registered (the Caddy model). On top of that this module
+//! supports *runtime registration* for tests, embedders and (later) plugins:
+//!
+//! * [`Module::owned`] builds a module descriptor from owned strings (interned for the process
+//!   lifetime, matching Caddy's init-time registration model);
+//! * [`ModuleRegistryBuilder`] layers custom modules over the built-in registry without mutating
+//!   any global state — each builder produces its own [`ModuleRegistry`];
+//! * [`ModuleRegistry::overlay`] returns a new registry with extra modules, leaving the base
+//!   registry (and the default registry) untouched;
+//! * [`ModuleRegistry::register_owned`] registers into an existing mutable registry.
+//!
+//! Registration validates definitions (non-empty id/key, no control/whitespace characters) and
+//! rejects duplicate ids as well as `(kind, json key)` collisions, so resolution stays
+//! deterministic. The registry is a plain immutable value after construction: it is `Send + Sync`
+//! and can be shared through [`SharedModuleRegistry`]/`Arc` across threads.
+//!
+//! Validation and listing already take the registry as a parameter
+//! ([`crate::validate_config`], [`ModuleRegistry::modules`], [`ModuleRegistry::entries`]), so a
+//! custom registry from this builder can validate configurations that reference custom handler or
+//! matcher ids without touching the built-in path. The module descriptors carry metadata only:
+//! executing a custom module still requires the owning subsystem (HTTP engine, TLS, ...) to know
+//! how to construct it. Third-party out-of-process/WASM modules remain a future mechanism
+//! (WS-08); see `docs/ARCHITECTURE.md`.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::error::{Error, Result};
+
+/// A module definition with process-lifetime strings, produced by [`Module::owned`].
+///
+/// Registration is expected to happen at startup (like Caddy's `init`-time module registration),
+/// so the id/key/summary strings are interned for the process lifetime. Do not register modules
+/// per request or otherwise unbounded.
+fn intern(value: impl Into<String>) -> &'static str {
+    Box::leak(value.into().into_boxed_str())
+}
 
 /// Category of a module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -97,7 +128,7 @@ pub struct Module {
 }
 
 impl Module {
-    /// Construct a module record.
+    /// Construct a static module record (used by the built-in table and tests).
     pub const fn new(
         id: &'static str,
         json_key: &'static str,
@@ -111,14 +142,62 @@ impl Module {
             summary,
         }
     }
+
+    /// Construct a runtime module record from owned strings.
+    ///
+    /// The strings are interned for the process lifetime; this is intended for startup-time
+    /// registration (tests, embedders, plugin loaders), matching Caddy's module registration
+    /// model. Use [`ModuleRegistryBuilder::register`] for a validated registration path.
+    pub fn owned(
+        id: impl Into<String>,
+        json_key: impl Into<String>,
+        kind: ModuleKind,
+        summary: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: intern(id),
+            json_key: intern(json_key),
+            kind,
+            summary: intern(summary),
+        }
+    }
+
+    /// Construct a runtime module record, validating the id/JSON key *before* interning.
+    ///
+    /// Prefer this over [`Module::owned`] for caller-supplied strings: a rejected definition does
+    /// not leak its strings.
+    pub fn try_owned(
+        id: impl Into<String>,
+        json_key: impl Into<String>,
+        kind: ModuleKind,
+        summary: impl Into<String>,
+    ) -> Result<Self> {
+        let id = id.into();
+        let json_key = json_key.into();
+        validate_definition_parts(&id, &json_key)?;
+        Ok(Self {
+            id: intern(id),
+            json_key: intern(json_key),
+            kind,
+            summary: intern(summary),
+        })
+    }
 }
 
-/// Registry of modules known to this build.
+/// Registry of modules known to this build plus any runtime-registered modules.
+///
+/// The registry is an immutable value after construction: registration methods take `&mut self`
+/// and the runtime shares an `Arc<ModuleRegistry>` (see [`SharedModuleRegistry`]). Cloning is
+/// cheap enough for overlays, and overlaying never mutates the source registry, so the built-in
+/// default cannot be changed by a test or a plugin.
 #[derive(Debug, Clone, Default)]
 pub struct ModuleRegistry {
     by_id: BTreeMap<&'static str, Module>,
     by_key: BTreeMap<(&'static str, &'static str), &'static str>,
 }
+
+/// A shared, immutable module registry (what the generation store and runtimes hold).
+pub type SharedModuleRegistry = Arc<ModuleRegistry>;
 
 impl ModuleRegistry {
     /// An empty registry.
@@ -143,15 +222,69 @@ impl ModuleRegistry {
         registry
     }
 
-    /// Register a module. Duplicate ids are an error.
+    /// Register a module, rejecting duplicate ids and `(kind, json key)` collisions.
+    ///
+    /// Runtime registrations should go through [`ModuleRegistry::register_owned`] or
+    /// [`ModuleRegistryBuilder`], which build the [`Module`] for you; this method accepts static or
+    /// [`Module::owned`] descriptors alike.
     pub fn register(&mut self, module: Module) -> Result<()> {
+        validate_module_definition(&module)?;
         if self.by_id.contains_key(module.id) {
             return Err(Error::DuplicateModule(module.id));
         }
-        self.by_key
-            .insert((module.kind.label(), module.json_key), module.id);
+        let key = (module.kind.label(), module.json_key);
+        if let Some(existing) = self.by_key.get(&key) {
+            return Err(Error::ModuleKeyConflict {
+                kind: module.kind.label(),
+                key: module.json_key,
+                existing,
+                incoming: module.id,
+            });
+        }
+        self.by_key.insert(key, module.id);
         self.by_id.insert(module.id, module);
         Ok(())
+    }
+
+    /// Build a module from owned strings and register it.
+    ///
+    /// This is the runtime-extension entry point: a test or embedder can register a custom
+    /// handler/matcher/storage module and then validate or list configurations against the
+    /// resulting registry. See [`ModuleRegistryBuilder`] for the layered-over-builtins form.
+    pub fn register_owned(
+        &mut self,
+        id: impl Into<String>,
+        json_key: impl Into<String>,
+        kind: ModuleKind,
+        summary: impl Into<String>,
+    ) -> Result<&mut Self> {
+        self.register(Module::try_owned(id, json_key, kind, summary)?)?;
+        Ok(self)
+    }
+
+    /// Return a new registry consisting of this registry plus `modules`.
+    ///
+    /// The source registry (including [`ModuleRegistry::builtin`]) is never modified, so callers
+    /// can layer custom modules over the default without global-state hazards.
+    pub fn overlay<I>(&self, modules: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = Module>,
+    {
+        let mut next = self.clone();
+        for module in modules {
+            next.register(module)?;
+        }
+        Ok(next)
+    }
+
+    /// Start a builder that layers custom modules over this registry.
+    pub fn builder_with_overlay(&self) -> ModuleRegistryBuilder {
+        ModuleRegistryBuilder::from_registry(self.clone())
+    }
+
+    /// A registry builder that includes every built-in module (the common case).
+    pub fn builder() -> ModuleRegistryBuilder {
+        ModuleRegistryBuilder::with_builtins()
     }
 
     /// Look a module up by fully qualified id.
@@ -211,9 +344,25 @@ impl ModuleRegistry {
         self.by_id.contains_key(id)
     }
 
-    /// All registered modules, ordered by id.
+    /// All registered modules, ordered by id (deterministic; includes runtime registrations).
     pub fn modules(&self) -> impl Iterator<Item = &Module> {
         self.by_id.values()
+    }
+
+    /// Alias for [`ModuleRegistry::modules`], making the listing/plugin API explicit.
+    pub fn entries(&self) -> impl Iterator<Item = &Module> {
+        self.modules()
+    }
+
+    /// Whether `id` is one of this build's statically listed modules (not a runtime addition).
+    pub fn is_builtin_module(&self, id: &str) -> bool {
+        BUILTIN_MODULES.iter().any(|module| module.id == id)
+    }
+
+    /// Validate `config` against this registry (convenience for embedders/tests holding a custom
+    /// registry; equivalent to [`crate::validate_config`]).
+    pub fn validate(&self, config: &crate::Config) -> Result<crate::ValidationReport> {
+        crate::validate::validate_config(config, self)
     }
 
     /// Number of registered modules.
@@ -225,6 +374,121 @@ impl ModuleRegistry {
     pub fn is_empty(&self) -> bool {
         self.by_id.is_empty()
     }
+}
+
+/// Builds a module registry, optionally layered over the built-in modules.
+///
+/// The builder owns its registry, so concurrent builders never share mutable state and building
+/// the same sequence of registrations always yields the same (id-ordered) registry. Duplicate ids
+/// and key collisions are rejected by [`ModuleRegistryBuilder::register`].
+///
+/// ```ignore
+/// let registry = ModuleRegistry::builder()
+///     .register("http.handlers.my_plugin", "my_plugin", ModuleKind::HttpHandler, "My plugin")
+///     .and_then(|builder| builder.register("http.matchers.my_matcher", "my_matcher", ModuleKind::HttpMatcher, "My matcher"))
+///     .expect("no duplicates")
+///     .build();
+/// let report = registry.validate(&config)?; // custom ids validate like built-ins
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct ModuleRegistryBuilder {
+    registry: ModuleRegistry,
+}
+
+impl ModuleRegistryBuilder {
+    /// A builder starting from an empty registry (no built-ins).
+    pub fn empty() -> Self {
+        Self {
+            registry: ModuleRegistry::empty(),
+        }
+    }
+
+    /// A builder starting from the built-in registry (custom modules are layered on top).
+    pub fn with_builtins() -> Self {
+        Self {
+            registry: ModuleRegistry::builtin(),
+        }
+    }
+
+    /// A builder starting from a copy of `registry`.
+    pub fn from_registry(registry: ModuleRegistry) -> Self {
+        Self { registry }
+    }
+
+    /// The registry as built so far (useful for assertions while chaining).
+    pub fn registry(&self) -> &ModuleRegistry {
+        &self.registry
+    }
+
+    /// Register a module from owned strings.
+    pub fn register(
+        mut self,
+        id: impl Into<String>,
+        json_key: impl Into<String>,
+        kind: ModuleKind,
+        summary: impl Into<String>,
+    ) -> Result<Self> {
+        self.registry.register_owned(id, json_key, kind, summary)?;
+        Ok(self)
+    }
+
+    /// Register an existing (static or owned) module descriptor.
+    pub fn register_module(mut self, module: Module) -> Result<Self> {
+        self.registry.register(module)?;
+        Ok(self)
+    }
+
+    /// Register every module in `modules`, failing on the first duplicate/conflict.
+    pub fn overlay<I>(mut self, modules: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = Module>,
+    {
+        for module in modules {
+            self.registry.register(module)?;
+        }
+        Ok(self)
+    }
+
+    /// Finish building the registry.
+    pub fn build(self) -> ModuleRegistry {
+        self.registry
+    }
+}
+
+/// Reject module definitions that can never be resolved or listed deterministically.
+fn validate_module_definition(module: &Module) -> Result<()> {
+    validate_definition_parts(module.id, module.json_key)
+}
+
+fn validate_definition_parts(id: &str, json_key: &str) -> Result<()> {
+    let invalid = |message: String| Err(Error::InvalidModuleDefinition { message });
+    if id.is_empty() {
+        return invalid("module id must not be empty".to_string());
+    }
+    if id
+        .chars()
+        .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return invalid(format!(
+            "module id `{id}` must not contain whitespace or control characters"
+        ));
+    }
+    if id.contains(|character| character == '{' || character == '}') {
+        return invalid(format!("module id `{id}` must not contain braces"));
+    }
+    if json_key.is_empty() {
+        return invalid(format!("module `{id}` must have a non-empty JSON key"));
+    }
+    if json_key
+        .chars()
+        .any(|character| character.is_control() || character.is_whitespace())
+        || json_key.contains(|character| character == '{' || character == '}' || character == '/')
+    {
+        return invalid(format!(
+            "module `{id}` JSON key `{json_key}` contains an illegal character"
+        ));
+    }
+    Ok(())
 }
 
 /// Modules implemented by this build.
@@ -551,5 +815,285 @@ mod tests {
             ))
             .expect_err("duplicate id");
         assert!(matches!(err, Error::DuplicateModule("http.handlers.a")));
+    }
+
+    fn config_with_handler(handler: &str) -> crate::Config {
+        crate::Config::from_value(serde_json::json!({
+            "apps": {"http": {"servers": {"srv0": {
+                "listen": [":443"],
+                "routes": [{"handle": [{"handler": handler}]}]
+            }}}}
+        }))
+        .expect("config decodes")
+    }
+
+    #[test]
+    fn builder_layers_custom_modules_over_builtins() {
+        let builtin_count = ModuleRegistry::builtin().len();
+        let registry = ModuleRegistry::builder()
+            .register(
+                "http.handlers.custom_echo",
+                "custom_echo",
+                ModuleKind::HttpHandler,
+                "Test handler",
+            )
+            .expect("custom handler registers")
+            .register(
+                "http.matchers.custom_match",
+                "custom_match",
+                ModuleKind::HttpMatcher,
+                "Test matcher",
+            )
+            .expect("custom matcher registers")
+            .build();
+
+        assert_eq!(registry.len(), builtin_count + 2);
+        let handler = registry
+            .resolve_handler("custom_echo")
+            .expect("custom handler resolves");
+        assert_eq!(handler.id, "http.handlers.custom_echo");
+        assert_eq!(handler.kind, ModuleKind::HttpHandler);
+        assert_eq!(handler.summary, "Test handler");
+        assert!(!registry.is_builtin_module("http.handlers.custom_echo"));
+        assert!(registry.is_builtin_module("http.handlers.static_response"));
+        // Built-ins are still resolvable through the same registry.
+        assert!(registry.resolve_handler("static_response").is_some());
+        assert!(registry.resolve_matcher("custom_match").is_some());
+    }
+
+    #[test]
+    fn custom_module_validates_config_and_unknown_still_rejected() {
+        let registry = ModuleRegistry::builder()
+            .register(
+                "http.handlers.custom_echo",
+                "custom_echo",
+                ModuleKind::HttpHandler,
+                "Test handler",
+            )
+            .expect("registers")
+            .build();
+        let config = config_with_handler("custom_echo");
+
+        // The custom registry accepts the configuration through both the free function and the
+        // convenience method.
+        crate::validate::validate_config(&config, &registry).expect("custom handler validates");
+        registry
+            .validate(&config)
+            .expect("convenience method agrees");
+
+        // The built-in registry still rejects the unknown handler with a located error.
+        let error = crate::validate::validate_config(&config, &ModuleRegistry::builtin())
+            .expect_err("built-in registry must reject the custom handler");
+        let message = error.to_string();
+        assert!(
+            message.contains("unknown HTTP handler module `custom_echo`"),
+            "{message}"
+        );
+        assert!(message.contains("handle[0]"), "{message}");
+    }
+
+    #[test]
+    fn duplicate_builtin_id_and_key_conflicts_are_rejected() {
+        // Re-registering a built-in id is refused even with a different key.
+        let error = ModuleRegistry::builder()
+            .register(
+                "http.handlers.static_response",
+                "another_key",
+                ModuleKind::HttpHandler,
+                "shadow",
+            )
+            .expect_err("duplicate built-in id");
+        assert!(matches!(error, Error::DuplicateModule(_)), "{error}");
+
+        // A different id claiming an existing (kind, key) pair is refused too.
+        let error = ModuleRegistry::builder()
+            .register(
+                "http.handlers.not_static_response",
+                "static_response",
+                ModuleKind::HttpHandler,
+                "shadow",
+            )
+            .expect_err("duplicate json key");
+        match error {
+            Error::ModuleKeyConflict {
+                existing, incoming, ..
+            } => {
+                assert_eq!(existing, "http.handlers.static_response");
+                assert_eq!(incoming, "http.handlers.not_static_response");
+            }
+            other => panic!("expected ModuleKeyConflict, got {other}"),
+        }
+
+        // The same key under a *different kind* is legal (resolution is per kind).
+        ModuleRegistry::builder()
+            .register(
+                "http.matchers.static_response",
+                "static_response",
+                ModuleKind::HttpMatcher,
+                "matcher with the same short key",
+            )
+            .expect("different kind may reuse the key");
+    }
+
+    #[test]
+    fn overlay_does_not_mutate_base_or_default() {
+        let base = ModuleRegistry::builtin();
+        let base_count = base.len();
+        let custom = Module::owned(
+            "http.handlers.overlay_only",
+            "overlay_only",
+            ModuleKind::HttpHandler,
+            "overlay",
+        );
+        let layered = base.overlay([custom]).expect("overlay registers");
+
+        assert_eq!(base.len(), base_count, "base registry is unchanged");
+        assert!(base.resolve_handler("overlay_only").is_none());
+        assert!(layered.resolve_handler("overlay_only").is_some());
+        assert_eq!(layered.len(), base_count + 1);
+
+        // A fresh default registry is untouched as well: registration is per-instance only.
+        let fresh_default = ModuleRegistry::builtin();
+        assert!(fresh_default.resolve_handler("overlay_only").is_none());
+        assert_eq!(fresh_default.len(), base_count);
+
+        // A duplicate in an overlay fails without mutating the source.
+        let error = base
+            .overlay([Module::owned(
+                "http.handlers.static_response",
+                "hijack",
+                ModuleKind::HttpHandler,
+                "hijack",
+            )])
+            .expect_err("overlay cannot shadow a built-in id");
+        assert!(matches!(error, Error::DuplicateModule(_)), "{error}");
+        assert_eq!(base.len(), base_count);
+    }
+
+    #[test]
+    fn invalid_module_definitions_are_rejected() {
+        for (id, key) in [
+            ("", "key"),
+            ("http.handlers.", ""),
+            ("http.handlers.bad id", "bad_id"),
+            ("http.handlers.bad\tid", "bad_tab"),
+            ("http.handlers.bad{id", "bad_braces"),
+            ("http.handlers.ok", "bad key"),
+            ("http.handlers.ok", "bad/key"),
+        ] {
+            let error = ModuleRegistry::empty()
+                .register_owned(id, key, ModuleKind::HttpHandler, "bad")
+                .expect_err("definition must be rejected");
+            assert!(
+                matches!(error, Error::InvalidModuleDefinition { .. }),
+                "id {id:?} key {key:?} produced {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn listing_is_deterministic_regardless_of_registration_order() {
+        let first = ModuleRegistry::builder()
+            .register("http.handlers.zeta", "zeta", ModuleKind::HttpHandler, "z")
+            .and_then(|registry| {
+                registry.register("http.handlers.alpha", "alpha", ModuleKind::HttpHandler, "a")
+            })
+            .and_then(|registry| {
+                registry.register("http.handlers.beta", "beta", ModuleKind::HttpHandler, "b")
+            })
+            .expect("registrations")
+            .build();
+        let second = ModuleRegistry::builder()
+            .register("http.handlers.zeta", "zeta", ModuleKind::HttpHandler, "z")
+            .and_then(|registry| {
+                registry.register("http.handlers.beta", "beta", ModuleKind::HttpHandler, "b")
+            })
+            .and_then(|registry| {
+                registry.register("http.handlers.alpha", "alpha", ModuleKind::HttpHandler, "a")
+            })
+            .expect("registrations")
+            .build();
+
+        let ids: Vec<&str> = first.entries().map(|module| module.id).collect();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(ids, sorted, "listing is id-ordered");
+        assert_eq!(
+            ids,
+            second.entries().map(|module| module.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn registry_is_send_sync_and_concurrent_reads_are_safe() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ModuleRegistry>();
+
+        let registry = Arc::new(
+            ModuleRegistry::builder()
+                .register(
+                    "http.handlers.custom_echo",
+                    "custom_echo",
+                    ModuleKind::HttpHandler,
+                    "Test handler",
+                )
+                .expect("registers")
+                .build(),
+        );
+        let expected_count = registry.len();
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let registry = Arc::clone(&registry);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..100 {
+                    assert!(registry.resolve_handler("custom_echo").is_some());
+                    assert_eq!(registry.len(), expected_count);
+                }
+                registry
+                    .entries()
+                    .map(|module| module.id)
+                    .collect::<Vec<_>>()
+            }));
+        }
+        let listings: Vec<Vec<&'static str>> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("read thread"))
+            .collect();
+        assert!(listings.iter().all(|listing| listing == &listings[0]));
+    }
+
+    #[test]
+    fn concurrent_builders_do_not_share_state() {
+        let base = Arc::new(ModuleRegistry::builtin());
+        let base_count = base.len();
+        let mut handles = Vec::new();
+        for index in 0..8 {
+            let base = Arc::clone(&base);
+            handles.push(std::thread::spawn(move || {
+                let id: &'static str =
+                    Box::leak(format!("http.handlers.plugin_{index}").into_boxed_str());
+                let key: &'static str = Box::leak(format!("plugin_{index}").into_boxed_str());
+                let registry = base
+                    .overlay([Module::new(id, key, ModuleKind::HttpHandler, "plugin")])
+                    .expect("overlay");
+                assert_eq!(registry.len(), base_count + 1);
+                assert!(registry.resolve_handler(key).is_some());
+                // Each builder only sees its own addition.
+                for other in 0..8 {
+                    if other != index {
+                        let other_key = format!("plugin_{other}");
+                        assert!(registry.resolve_handler(&other_key).is_none());
+                    }
+                }
+                key
+            }));
+        }
+        let keys: Vec<&'static str> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("builder thread"))
+            .collect();
+        assert_eq!(keys.len(), 8);
+        // The shared base never changed.
+        assert_eq!(base.len(), base_count);
     }
 }
