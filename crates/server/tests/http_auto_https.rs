@@ -1904,3 +1904,99 @@ async fn default_on_caddyfile_end_to_end() {
     );
     runtime.shutdown().await;
 }
+
+/// Config with implicit HTTPS on an arbitrary listener port (no `apps.tls`, no
+/// `tls_connection_policies`, no `apps.http.https_port` match): Caddy treats this as HTTPS on the
+/// listener's port.
+fn implicit_nonstandard_https_config(listen: &str, http_port: u16, storage_root: &str) -> Config {
+    Config::from_value(serde_json::json!({
+        "admin": {"disabled": true},
+        "storage": {"module": "file_system", "root": storage_root},
+        "apps": {"http": {
+            "http_port": http_port,
+            "servers": {"srv0": {
+                "listen": [listen],
+                "routes": [{
+                    "match": [{"host": ["example.com"]}],
+                    "handle": [{"handler": "static_response", "body": "hello nonstandard https"}]
+                }]
+            }}
+        }}
+    }))
+    .expect("implicit non-standard HTTPS config decodes")
+}
+
+#[tokio::test]
+async fn adapted_plain_http_site_serves_cleartext() {
+    // Regression: Caddyfile `http://127.0.0.1:<port>` adapts to a host matcher on a non-standard
+    // port plus server-level `automatic_https.skip`; it must stay plaintext instead of failing
+    // with "host matchers require TLS".
+    let directory = tempfile::tempdir().unwrap();
+    let port = free_loopback_port();
+    let caddyfile = format!("http://127.0.0.1:{port} {{\n\trespond \"plain ok\"\n}}\n");
+    let adapted =
+        caddy_rs_config::adapt_with_source(&caddyfile, None).expect("plain HTTP Caddyfile adapts");
+    let config = Config::from_value(adapted.config).expect("adapted JSON decodes");
+    let store = Arc::new(GenerationStore::with_builtin_registry());
+    store
+        .load(config)
+        .expect("adapted plain HTTP config validates");
+    let mut runtime = ServerRuntime::new(Arc::clone(&store));
+    runtime
+        .apply()
+        .await
+        .expect("skipped host must not demand automatic HTTPS");
+    runtime
+        .listener_address(&format!(":{port}"))
+        .expect("plain HTTP listener bound");
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    let (status, _, body) = plain_get(address, "127.0.0.1", "/").await;
+    assert_eq!(status, 200);
+    assert_eq!(body, "plain ok");
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn implicit_https_on_non_standard_port_terminates_tls_and_redirects_to_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().to_string_lossy().to_string();
+    let (https_address, activation) = prebound_listener();
+    let https_port = https_address.port();
+    let listen = https_address.to_string();
+    let http_port = free_loopback_port();
+    assert_ne!(https_port, 443, "pre-bound test port is non-standard");
+    let store = Arc::new(GenerationStore::with_builtin_registry());
+    store
+        .load(implicit_nonstandard_https_config(&listen, http_port, &root))
+        .expect("implicit non-standard HTTPS config validates");
+    let fake = Arc::new(FakeCa::new(false));
+    let mut runtime = ServerRuntime::new(Arc::clone(&store))
+        .with_acme_transport(fake.clone())
+        .with_data_root(directory.path())
+        .with_socket_activation(activation);
+    runtime
+        .apply()
+        .await
+        .expect("implicit HTTPS on a non-standard port must issue and serve");
+
+    assert_eq!(fake.domains(), vec!["example.com".to_string()]);
+    let address = runtime
+        .listener_address(&listen)
+        .expect("implicit non-standard HTTPS listener bound");
+    let mut stream = tls_connect(address, "example.com").await;
+    let (status, _, body) = http_get(&mut stream, "example.com", "/").await;
+    assert_eq!(status, 200);
+    assert_eq!(body, "hello nonstandard https");
+
+    // Redirect destination must be the listener's own HTTPS port, not apps.http.https_port (443).
+    let http = runtime
+        .listener_address(&format!(":{http_port}"))
+        .expect("derived HTTP redirect listener bound");
+    let (status, headers, _) = plain_get(http, "example.com", "/path?q=1").await;
+    assert_eq!(status, 308);
+    assert_eq!(
+        header(&headers, "location"),
+        Some(format!("https://example.com:{https_port}/path?q=1").as_str())
+    );
+    runtime.shutdown().await;
+}

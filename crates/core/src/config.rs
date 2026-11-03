@@ -349,6 +349,18 @@ pub struct AutoHttps {
     #[serde(default, skip_serializing_if = "is_false")]
     pub disable_redirects: bool,
 
+    /// Keep automatic HTTPS and redirects but disable automatic certificate management.
+    ///
+    /// Caddy JSON spells this `disable_certificates`; the shorter alias is accepted for
+    /// compatibility with earlier caddy-rs test fixtures.
+    #[serde(
+        rename = "disable_certificates",
+        alias = "disable_certs",
+        default,
+        skip_serializing_if = "is_false"
+    )]
+    pub disable_certs: bool,
+
     /// Ignore certificates already loaded from storage when deciding what to automate.
     #[serde(
         rename = "ignore_loaded_certificates",
@@ -361,8 +373,14 @@ pub struct AutoHttps {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skip: Vec<String>,
 
-    /// Hosts whose certificates are skipped.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Hosts whose certificates are skipped (Caddy's `skip_certificates`; the short alias is
+    /// accepted for compatibility with earlier caddy-rs fixtures).
+    #[serde(
+        rename = "skip_certificates",
+        alias = "skip_certs",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub skip_certs: Vec<String>,
 
     /// Prefer wildcard certificates when possible.
