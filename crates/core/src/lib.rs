@@ -40,7 +40,7 @@ pub use lifecycle::{
     CancellationToken, GenerationHooks, GenerationResource, GenerationResources, ResourceLifecycle,
 };
 pub use listen::{ListenAddr, Network};
-pub use module::{Module, ModuleKind, ModuleRegistry};
+pub use module::{Module, ModuleKind, ModuleRegistry, ModuleRegistryBuilder, SharedModuleRegistry};
 pub use validate::{validate_config, ValidationReport};
 
 /// Version reported by `caddy-rs version`.
