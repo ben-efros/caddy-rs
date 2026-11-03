@@ -48,6 +48,13 @@ impl Route {
             .any(|handler| handler.requires_buffered_request_body())
     }
 
+    /// Whether any handler in this route reads the request body.
+    fn consumes_request_body(&self) -> bool {
+        self.handlers
+            .iter()
+            .any(|handler| handler.consumes_request_body())
+    }
+
     fn matches(&self, request: &Request) -> bool {
         self.matcher_sets.is_empty()
             || self
@@ -57,38 +64,24 @@ impl Route {
     }
 }
 
-/// Handler modules that consume the request body on their buffered path.
+/// Handler modules whose streaming path takes the request body, used to mark the handler for
+/// `request_body` limit enforcement.
 ///
-/// Until request streaming through the reverse proxy lands (T-PROXY-004 follow-up), these handlers
-/// need the full body, so the server buffers request bodies for any router whose configuration
-/// contains one. Adding a handler here is the extension point for future body-consuming modules.
-const BODY_BUFFERING_HANDLERS: &[&str] = &["reverse_proxy"];
+/// This is deliberately **not** the request-buffering decision: whether a router needs the server
+/// to buffer a request body comes from [`Handler::requires_buffered_request_body`] (the proxy
+/// implements it from its retry/`handle_response` configuration). The proxy's streaming path still
+/// consumes the body lazily, so the router needs to know a handler will read it before enforcing a
+/// `request_body` limit. Adding a handler here is the extension point for future streaming
+/// body-consuming modules.
+const BODY_CONSUMING_HANDLERS: &[&str] = &["reverse_proxy"];
 
-/// Whether this configuration subtree contains a handler that needs a buffered request body.
-fn requests_buffered_request_body(value: &Value) -> bool {
-    match value {
-        Value::Object(map) => {
-            if map
-                .get("handler")
-                .and_then(Value::as_str)
-                .is_some_and(|name| BODY_BUFFERING_HANDLERS.contains(&name))
-            {
-                return true;
-            }
-            map.values().any(requests_buffered_request_body)
-        }
-        Value::Array(items) => items.iter().any(requests_buffered_request_body),
-        _ => false,
-    }
-}
-
-/// Wraps a handler whose JSON module id is known to consume the request body on its buffered
-/// path (`BODY_BUFFERING_HANDLERS`).
+/// Wraps a handler that reads the request body on its streaming path
+/// ([`BODY_CONSUMING_HANDLERS`]) so [`Handler::consumes_request_body`] is true.
 ///
-/// The server's buffered-dispatch decision is configuration-derived, but `request_body` limit
-/// enforcement happens per handler at dispatch time, so the router needs a per-handler signal.
-/// Wrapping makes [`Handler::requires_buffered_request_body`] true for the actual proxy handler
-/// without changing the proxy crate.
+/// The wrapper deliberately **forwards** [`Handler::requires_buffered_request_body`] to the inner
+/// handler: the proxy can stream request bodies, so its policy decides whether the server buffers
+/// (retries/try_duration/handle_response) or streams (default). Body-consumption and
+/// buffering-requirement are distinct capabilities.
 struct BodyConsumingHandler(SharedHandler);
 
 #[async_trait]
@@ -98,6 +91,10 @@ impl Handler for BodyConsumingHandler {
     }
 
     fn requires_buffered_request_body(&self) -> bool {
+        self.0.requires_buffered_request_body()
+    }
+
+    fn consumes_request_body(&self) -> bool {
         true
     }
 
@@ -110,10 +107,23 @@ impl Handler for BodyConsumingHandler {
     }
 }
 
+/// Caddy-shaped response for a `request_body` limit error: `413` with an empty body and no content
+/// type, keeping response headers staged by preceding `headers` handlers.
+fn body_limit_response(request: &Request) -> StreamingOutcome {
+    let mut response = StreamingResponse::from_buffered(Response {
+        status: http::StatusCode::PAYLOAD_TOO_LARGE,
+        headers: http::HeaderMap::new(),
+        body: bytes::Bytes::new(),
+    });
+    apply_pending_headers(&mut response.headers, request);
+    StreamingOutcome::Respond(response)
+}
+
 /// An ordered route list.
 pub struct Router {
     routes: Vec<Route>,
     requires_buffered_request_body: bool,
+    consumes_request_body: bool,
 }
 
 impl Router {
@@ -135,6 +145,16 @@ impl Router {
     /// receive a streaming request body and never buffer it.
     pub fn requires_buffered_request_body(&self) -> bool {
         self.requires_buffered_request_body
+    }
+
+    /// Whether any handler in this route tree reads the request body (streamed or buffered).
+    ///
+    /// Distinct from [`Router::requires_buffered_request_body`]: a streaming `reverse_proxy`
+    /// consumes the body but does not require it pre-buffered. The router uses this flag for
+    /// `request_body` lazy-limit enforcement; nested routers report it through their subroute
+    /// handler.
+    pub fn consumes_request_body(&self) -> bool {
+        self.consumes_request_body
     }
 
     /// Evaluate a request through the route tree, returning a buffered response.
@@ -208,25 +228,34 @@ impl Router {
             }
 
             for handler in &route.handlers {
-                // `request_body` records a byte limit for buffered request bodies. Caddy's limit
-                // is lazy: only a handler that actually reads the body observes it. Enforce it
-                // just before dispatching to such a handler so non-reading handlers still pass
-                // through (oracle: `request_body` + `static_response` returns 200 for an
-                // oversized body).
+                // `request_body` records a byte limit. Caddy's limit is lazy: only a handler
+                // that actually reads the body observes it, so non-reading handlers still pass an
+                // oversized body through. When the next handler consumes the body, enforce the
+                // limit now: a buffered body can be compared directly, while a streamed body is
+                // read up to the limit so an over-limit request returns Caddy's `413` instead of
+                // surfacing later as a proxy-side read error.
                 if let Some(limit) = current.body_limit() {
-                    if !current.has_streaming_body()
-                        && current.body.len() as u64 > limit
-                        && handler.requires_buffered_request_body()
-                    {
-                        let mut response = StreamingResponse::from_buffered(Response {
-                            status: http::StatusCode::PAYLOAD_TOO_LARGE,
-                            headers: http::HeaderMap::new(),
-                            body: bytes::Bytes::new(),
-                        });
-                        // Keep response headers staged by preceding `headers` handlers, like any
-                        // other response the router returns.
-                        apply_pending_headers(&mut response.headers, &current);
-                        return Ok(StreamingOutcome::Respond(response));
+                    if handler.consumes_request_body() {
+                        if current.has_streaming_body() {
+                            match current.collect_body(Some(limit)).await {
+                                Ok(_) => {}
+                                Err(crate::body::BodyError::TooLarge { .. }) => {
+                                    return Ok(body_limit_response(&current));
+                                }
+                                Err(error) => {
+                                    return Ok(StreamingOutcome::Respond(
+                                        StreamingResponse::from_buffered(Response::text(
+                                            http::StatusCode::BAD_GATEWAY,
+                                            format!(
+                                                "502 Bad Gateway: cannot read request body: {error}"
+                                            ),
+                                        )),
+                                    ));
+                                }
+                            }
+                        } else if current.body.len() as u64 > limit {
+                            return Ok(body_limit_response(&current));
+                        }
                     }
                 }
                 // A handler consumes the request. Keep the pre-handler request so staged response
@@ -301,9 +330,18 @@ impl RouterBuilder {
 
     /// Build a router from a `routes` array.
     pub fn build(&self, routes: &[Value]) -> Result<Router> {
+        let routes = self.build_routes(routes, "routes")?;
+        // Capability composition: each built handler reports whether it needs a buffered body and
+        // whether it reads the body at all. Subroute handlers forward their inner router's flags,
+        // so nesting works without re-scanning raw JSON (and a custom handler factory's handler is
+        // honoured, unlike a module-name scan).
+        let requires_buffered_request_body =
+            routes.iter().any(Route::requires_buffered_request_body);
+        let consumes_request_body = routes.iter().any(Route::consumes_request_body);
         Ok(Router {
-            routes: self.build_routes(routes, "routes")?,
-            requires_buffered_request_body: routes.iter().any(requests_buffered_request_body),
+            routes,
+            requires_buffered_request_body,
+            consumes_request_body,
         })
     }
 
@@ -426,10 +464,10 @@ impl RouterBuilder {
                 }
             }
         };
-        // The router's buffered-dispatch decision and `request_body` limit enforcement both need
-        // to know which handlers read the request body. The configuration scan above sets the
-        // router-wide flag; this wrapper marks the individual handler for per-dispatch checks.
-        let handler: SharedHandler = if BODY_BUFFERING_HANDLERS.contains(&name) {
+        // The buffering requirement comes from the handler's own capability (forwarded by the
+        // wrapper). The wrapper only marks handlers whose streaming path reads the body so
+        // `request_body` can enforce its lazy limit before dispatch.
+        let handler: SharedHandler = if BODY_CONSUMING_HANDLERS.contains(&name) {
             Arc::new(BodyConsumingHandler(handler))
         } else {
             handler
@@ -822,6 +860,7 @@ mod tests {
                 Some("reverse_proxy") => Ok(Some(
                     Arc::new(ChunkHandler { frames: Vec::new() }) as SharedHandler
                 )),
+                Some("retrying_proxy") => Ok(Some(Arc::new(RetryingProxyStub) as SharedHandler)),
                 _ => Ok(None),
             }
         })
@@ -864,8 +903,29 @@ mod tests {
         );
     }
 
+    /// Stub whose buffering capability is true, like a retrying `reverse_proxy`.
+    struct RetryingProxyStub;
+
+    #[async_trait]
+    impl Handler for RetryingProxyStub {
+        fn name(&self) -> &'static str {
+            "retrying_proxy"
+        }
+
+        fn requires_buffered_request_body(&self) -> bool {
+            true
+        }
+
+        async fn handle(&self, _request: Request) -> Result<Outcome> {
+            Ok(Outcome::Respond(Response::text(
+                http::StatusCode::OK,
+                "retried",
+            )))
+        }
+    }
+
     #[tokio::test]
-    async fn router_detects_body_buffering_handlers_including_nested_routes() {
+    async fn router_composes_handler_body_capabilities_including_nested_routes() {
         let recorder = Arc::new(RequestBodyRecorder {
             streaming_chunks: Arc::new(Mutex::new(Vec::new())),
             buffered_lengths: Arc::new(Mutex::new(Vec::new())),
@@ -877,20 +937,31 @@ mod tests {
             .build(&[json!({"handle": [{"handler": "static_response", "body": "x"}]})])
             .unwrap();
         assert!(!static_router.requires_buffered_request_body());
+        assert!(!static_router.consumes_request_body());
 
         let recorder_router = builder()
             .build(&[json!({"handle": [{"handler": "request_body_recorder"}]})])
             .unwrap();
         assert!(!recorder_router.requires_buffered_request_body());
 
-        let proxy_router = builder()
+        // Streaming `reverse_proxy` (the stub implements the capability as false, like the proxy
+        // without retries) must not force server buffering, but it does consume the body.
+        let streaming_proxy_router = builder()
             .build(&[json!({"handle": [{"handler": "reverse_proxy", "upstreams": [{"dial": "localhost:9"}]}]})])
             .unwrap();
-        assert!(proxy_router.requires_buffered_request_body());
+        assert!(!streaming_proxy_router.requires_buffered_request_body());
+        assert!(streaming_proxy_router.consumes_request_body());
 
-        // Nested subroute/handle_response configurations are detected too: the proxy handler only
-        // appears inside the subroute's route JSON.
-        let nested_router = builder()
+        // A handler that reports the buffering capability (retrying proxy) forces it, and a custom
+        // handler supplied through the factory is composed by capability, not by JSON module name.
+        let retrying_router = builder()
+            .build(&[json!({"handle": [{"handler": "retrying_proxy"}]})])
+            .unwrap();
+        assert!(retrying_router.requires_buffered_request_body());
+        assert!(retrying_router.consumes_request_body());
+
+        // Nested subroutes forward both capabilities.
+        let nested_streaming = builder()
             .build(&[json!({
                 "handle": [
                     {"handler": "subroute", "routes": [
@@ -899,7 +970,21 @@ mod tests {
                 ]
             })])
             .unwrap();
-        assert!(nested_router.requires_buffered_request_body());
+        assert!(!nested_streaming.requires_buffered_request_body());
+        assert!(nested_streaming.consumes_request_body());
+
+        let nested_buffering = builder()
+            .build(&[json!({
+                "handle": [
+                    {"handler": "static_response", "body": "before"},
+                    {"handler": "subroute", "routes": [
+                        {"handle": [{"handler": "retrying_proxy"}]}
+                    ]}
+                ]
+            })])
+            .unwrap();
+        assert!(nested_buffering.requires_buffered_request_body());
+        assert!(nested_buffering.consumes_request_body());
     }
 
     /// Buffered-only handler: records `request.body` through the default `handle_streaming`
@@ -910,6 +995,11 @@ mod tests {
     impl Handler for BufferedBodyHandler {
         fn name(&self) -> &'static str {
             "buffered_body_handler"
+        }
+
+        // This handler reads `request.body` directly, so it needs the complete body buffered.
+        fn requires_buffered_request_body(&self) -> bool {
+            true
         }
 
         async fn handle(&self, request: Request) -> Result<Outcome> {
@@ -1046,8 +1136,15 @@ mod tests {
     }
 
     fn router_with_handlers(handlers: Vec<SharedHandler>) -> Router {
+        let requires_buffered_request_body = handlers
+            .iter()
+            .any(|handler| handler.requires_buffered_request_body());
+        let consumes_request_body = handlers
+            .iter()
+            .any(|handler| handler.consumes_request_body());
         Router {
-            requires_buffered_request_body: false,
+            requires_buffered_request_body,
+            consumes_request_body,
             routes: vec![Route {
                 matcher_sets: Vec::new(),
                 handlers,
