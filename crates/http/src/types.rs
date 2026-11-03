@@ -77,6 +77,9 @@ pub struct Request {
     /// Cloned requests do not carry the streaming body; clones are only used for response-side
     /// bookkeeping.
     body_stream: Option<std::sync::Mutex<RequestBody>>,
+    /// Byte limit set by `request_body` for buffered bodies, enforced by the router before a
+    /// body-consuming handler runs (streaming bodies carry the limit inside [`RequestBody`]).
+    body_limit: Option<u64>,
     /// Peer address, when known.
     pub remote_addr: Option<SocketAddr>,
     /// Whether the connection is TLS.
@@ -96,6 +99,7 @@ impl Request {
             headers: HeaderMap::new(),
             body: Bytes::new(),
             body_stream: None,
+            body_limit: None,
             remote_addr: None,
             tls: false,
             vars: BTreeMap::new(),
@@ -114,6 +118,41 @@ impl Request {
     /// Whether the request body is streamed rather than buffered.
     pub fn has_streaming_body(&self) -> bool {
         self.body_stream.is_some()
+    }
+
+    /// Replace the request body with already-buffered bytes, dropping any streaming source.
+    ///
+    /// Used by middleware that synthesises a body (the `request_body` handler's `set` field). The
+    /// caller is responsible for keeping framing headers (`Content-Length`) in sync.
+    pub fn set_body_bytes(&mut self, body: impl Into<Bytes>) {
+        self.body = body.into();
+        self.body_stream = None;
+    }
+
+    /// Apply a byte limit to the request body for later consumers.
+    ///
+    /// Streaming bodies carry the limit inside [`RequestBody`], so reading past it fails lazily
+    /// with [`BodyError::TooLarge`]. Buffered bodies are already fully read into [`Request::body`];
+    /// the limit is recorded in [`Request::body_limit`] and the router turns it into a `413`
+    /// before the next body-consuming handler runs (matching Caddy, where a handler that never
+    /// reads the body does not trigger the limit error).
+    pub fn limit_body(&mut self, limit: u64) {
+        self.body_limit = Some(limit);
+        if let Some(body) = self.body_stream.take() {
+            let body = body
+                .into_inner()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .with_limit(Some(limit));
+            self.body_stream = Some(std::sync::Mutex::new(body));
+        }
+    }
+
+    /// The byte limit set by `request_body` for the request body, if any.
+    ///
+    /// The router enforces it for buffered bodies before dispatching to a body-consuming handler;
+    /// streaming bodies enforce it lazily while being read.
+    pub fn body_limit(&self) -> Option<u64> {
+        self.body_limit
     }
 
     /// Take the request body for explicit consumption (buffered bodies are moved out too).
@@ -296,6 +335,7 @@ impl Clone for Request {
             headers: self.headers.clone(),
             body: self.body.clone(),
             body_stream: None,
+            body_limit: self.body_limit,
             remote_addr: self.remote_addr,
             tls: self.tls,
             vars: self.vars.clone(),

@@ -566,6 +566,12 @@ pub const BUILTIN_MODULES: &[Module] = &[
         ModuleKind::HttpHandler,
         "Response compression (config only; runtime is a pass-through)",
     ),
+    Module::new(
+        "http.handlers.request_body",
+        "request_body",
+        ModuleKind::HttpHandler,
+        "Limit or replace the request body for later handlers",
+    ),
     // HTTP matchers
     Module::new(
         "http.matchers.host",
@@ -786,6 +792,7 @@ mod tests {
             (ModuleKind::HttpHandler, "forward_auth"),
             (ModuleKind::HttpHandler, "authentication"),
             (ModuleKind::HttpHandler, "basic_auth"),
+            (ModuleKind::HttpHandler, "request_body"),
         ] {
             assert!(
                 registry.get_by_key(kind, key).is_some(),

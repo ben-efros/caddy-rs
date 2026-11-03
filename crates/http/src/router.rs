@@ -7,19 +7,20 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::auth::{BasicAuthHandler, ForwardAuthHandler};
 use crate::body::StreamingResponse;
 use crate::file_server::FileServerHandler;
 use crate::handlers::{
-    EncodeHandler, HeadersHandler, RewriteHandler, StaticResponseHandler, SubrouteHandler,
-    VarsHandler,
+    EncodeHandler, HeadersHandler, RequestBodyHandler, RewriteHandler, StaticResponseHandler,
+    SubrouteHandler, VarsHandler,
 };
 use crate::matchers::build_matcher_set;
 use crate::types::{
-    Error, Outcome, Request, Response, ResponseOutcome, Result, SharedHandler, SharedMatcher,
-    StreamingOutcome,
+    Error, Handler, Outcome, Request, Response, ResponseOutcome, Result, SharedHandler,
+    SharedMatcher, StreamingOutcome,
 };
 
 /// A custom handler factory, used by crates outside this one (for example `caddy-rs-proxy`) to
@@ -78,6 +79,34 @@ fn requests_buffered_request_body(value: &Value) -> bool {
         }
         Value::Array(items) => items.iter().any(requests_buffered_request_body),
         _ => false,
+    }
+}
+
+/// Wraps a handler whose JSON module id is known to consume the request body on its buffered
+/// path (`BODY_BUFFERING_HANDLERS`).
+///
+/// The server's buffered-dispatch decision is configuration-derived, but `request_body` limit
+/// enforcement happens per handler at dispatch time, so the router needs a per-handler signal.
+/// Wrapping makes [`Handler::requires_buffered_request_body`] true for the actual proxy handler
+/// without changing the proxy crate.
+struct BodyConsumingHandler(SharedHandler);
+
+#[async_trait]
+impl Handler for BodyConsumingHandler {
+    fn name(&self) -> &'static str {
+        self.0.name()
+    }
+
+    fn requires_buffered_request_body(&self) -> bool {
+        true
+    }
+
+    async fn handle(&self, request: Request) -> Result<Outcome> {
+        self.0.handle(request).await
+    }
+
+    async fn handle_streaming(&self, request: Request) -> Result<StreamingOutcome> {
+        self.0.handle_streaming(request).await
     }
 }
 
@@ -179,6 +208,27 @@ impl Router {
             }
 
             for handler in &route.handlers {
+                // `request_body` records a byte limit for buffered request bodies. Caddy's limit
+                // is lazy: only a handler that actually reads the body observes it. Enforce it
+                // just before dispatching to such a handler so non-reading handlers still pass
+                // through (oracle: `request_body` + `static_response` returns 200 for an
+                // oversized body).
+                if let Some(limit) = current.body_limit() {
+                    if !current.has_streaming_body()
+                        && current.body.len() as u64 > limit
+                        && handler.requires_buffered_request_body()
+                    {
+                        let mut response = StreamingResponse::from_buffered(Response {
+                            status: http::StatusCode::PAYLOAD_TOO_LARGE,
+                            headers: http::HeaderMap::new(),
+                            body: bytes::Bytes::new(),
+                        });
+                        // Keep response headers staged by preceding `headers` handlers, like any
+                        // other response the router returns.
+                        apply_pending_headers(&mut response.headers, &current);
+                        return Ok(StreamingOutcome::Respond(response));
+                    }
+                }
                 // A handler consumes the request. Keep the pre-handler request so staged response
                 // headers survive into a response produced by a later handler.
                 let staged = current.clone();
@@ -335,6 +385,7 @@ impl RouterBuilder {
             "headers" => Arc::new(HeadersHandler::from_json(value, path)?),
             "vars" => Arc::new(VarsHandler::from_json(value, path)?),
             "rewrite" => Arc::new(RewriteHandler::from_json(value, path)?),
+            "request_body" => Arc::new(RequestBodyHandler::from_json(value, path)?),
             "encode" => Arc::new(EncodeHandler),
             "file_server" => Arc::new(FileServerHandler::from_json(value, path)?),
             "forward_auth" => Arc::new(ForwardAuthHandler::from_json(value, path)?),
@@ -374,6 +425,14 @@ impl RouterBuilder {
                     });
                 }
             }
+        };
+        // The router's buffered-dispatch decision and `request_body` limit enforcement both need
+        // to know which handlers read the request body. The configuration scan above sets the
+        // router-wide flag; this wrapper marks the individual handler for per-dispatch checks.
+        let handler: SharedHandler = if BODY_BUFFERING_HANDLERS.contains(&name) {
+            Arc::new(BodyConsumingHandler(handler))
+        } else {
+            handler
         };
         Ok(handler)
     }
