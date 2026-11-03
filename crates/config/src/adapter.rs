@@ -17,7 +17,7 @@ use caddy_rs_core::{AdaptedConfig, ConfigAdapter, Error as CoreError};
 use serde_json::{json, Map, Value};
 
 use crate::lexer::Position;
-use crate::parser::{self, AutoHttpsMode, Directive, SiteBlock};
+use crate::parser::{self, Directive, SiteBlock};
 
 /// Canonical directive order, mirroring Caddy's default order for the supported subset.
 const DIRECTIVE_ORDER: &[&str] = &[
@@ -307,17 +307,17 @@ pub fn adapt_with_source(
         let mut object = Map::new();
         object.insert("listen".to_string(), json!(server.listens));
         let mut automatic_https = Map::new();
-        match options.auto_https {
-            Some(AutoHttpsMode::Off) => {
-                automatic_https.insert("disable".to_string(), json!(true));
-            }
-            Some(AutoHttpsMode::DisableRedirects) => {
-                automatic_https.insert("disable_redirects".to_string(), json!(true));
-            }
-            Some(AutoHttpsMode::IgnoreLoadedCerts) => {
-                automatic_https.insert("ignore_loaded_certificates".to_string(), json!(true));
-            }
-            None => {}
+        if options.auto_https.off {
+            automatic_https.insert("disable".to_string(), json!(true));
+        }
+        if options.auto_https.disable_redirects {
+            automatic_https.insert("disable_redirects".to_string(), json!(true));
+        }
+        if options.auto_https.disable_certs {
+            automatic_https.insert("disable_certificates".to_string(), json!(true));
+        }
+        if options.auto_https.ignore_loaded_certs {
+            automatic_https.insert("ignore_loaded_certificates".to_string(), json!(true));
         }
         if !server.skip_auto_https.is_empty() {
             automatic_https.insert("skip".to_string(), json!(server.skip_auto_https));
@@ -1558,7 +1558,7 @@ fn build_tls_plan(
     https_port: u16,
 ) -> caddy_rs_core::Result<TlsPlan> {
     let options = &file.options;
-    let auto_https_off = matches!(options.auto_https, Some(AutoHttpsMode::Off));
+    let auto_https_off = options.auto_https.off;
 
     // Hosts that share a server block with a hostless key are not route-matcher hosts, so Caddy
     // adds them to `certificates.automate` explicitly.

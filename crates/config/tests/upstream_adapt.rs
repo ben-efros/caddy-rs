@@ -712,3 +712,33 @@ fn request_body_directive_arguments_are_ignored_like_caddy() {
         json!([{"handler": "request_body"}])
     );
 }
+
+#[test]
+fn auto_https_disable_certs_matches_real_caddy_v2_11_7() {
+    // Golden from `caddy adapt` v2.11.7: the Caddyfile spelling `disable_certs` maps to the JSON
+    // field `disable_certificates` on every server.
+    let adapted = adapt("{ auto_https disable_certs\n}\n\nlocalhost {\n\trespond \"ok\"\n}\n")
+        .expect("adapt auto_https disable_certs");
+    assert_eq!(
+        adapted.config["apps"]["http"]["servers"]["srv0"]["automatic_https"],
+        json!({"disable_certificates": true})
+    );
+}
+
+#[test]
+fn auto_https_combined_modes_match_real_caddy_v2_11_7() {
+    // Golden from `caddy adapt` v2.11.7 for all four modes on one line.
+    let adapted = adapt(
+        "{ auto_https off disable_redirects disable_certs ignore_loaded_certs\n}\n\nlocalhost {\n\trespond \"ok\"\n}\n",
+    )
+    .expect("adapt combined auto_https modes");
+    assert_eq!(
+        adapted.config["apps"]["http"]["servers"]["srv0"]["automatic_https"],
+        json!({
+            "disable": true,
+            "disable_redirects": true,
+            "disable_certificates": true,
+            "ignore_loaded_certificates": true,
+        })
+    );
+}

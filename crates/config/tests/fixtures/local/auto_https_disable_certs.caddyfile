@@ -1,0 +1,7 @@
+{
+	auto_https disable_certs
+}
+
+localhost {
+	respond "ok"
+}
