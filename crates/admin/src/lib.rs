@@ -1665,7 +1665,6 @@ mod tests {
     async fn if_none_match_is_a_documented_caddy_rs_extension() {
         let admin = admin();
         load(&admin, &valid_config()).await;
-        let etag = config_etag_for_path(&admin, "/config/").await;
 
         // Matching If-None-Match on a read: 304.
         let response = admin

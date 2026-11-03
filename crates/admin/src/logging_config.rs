@@ -32,17 +32,32 @@
 //! }
 //! ```
 //!
-//! * `writer.output`: `stderr` (default), `stdout`, `discard`, `file` (requires `filename`).
-//!   File rotation (`roll_*`), permissions (`mode`, `dir_mode`) and other writer modules (`net`)
-//!   are rejected loudly (rotation is a documented sink gap, `T-ADMIN-025`).
-//! * `encoder.format`: `json` (also the default when omitted) or `filter` wrapping `json`.
-//!   `console`, `append`, `journald`, `nop`, nested filter encoders and non-default JSON encoder
-//!   options are rejected loudly.
+//! * `writer.output`: `stderr` (default), `stdout`, `discard`, `file` and `net`.
+//!   * File writers support `mode`/`dir_mode` (octal strings), `roll` (default true),
+//!     `roll_size_mb`, `roll_keep` and `roll_keep_days`. Missing parent directories are created
+//!     (with `dir_mode`). Rotation renames the current file to `<filename>.<unix-millis>` (the
+//!     naming/compression scheme differs from Caddy's timberjack writer: `roll_interval`,
+//!     `roll_minutes`, `roll_at`, `roll_compression`, `roll_gzip`, `roll_local_time` and
+//!     `backup_time_format` are rejected loudly).
+//!   * Net writers support `address` (`host:port` or Caddy's `tcp/`/`udp/` prefix), `dial_timeout`
+//!     (ns, JSON number) and `soft_start`; TCP reconnects once and retries the failed line, and
+//!     `soft_start` falls back to stderr while reconnecting. Unix sockets are rejected loudly.
+//! * `encoder.format`: `json` (also the default when omitted), `console`, or `filter` wrapping
+//!   `json`/`console`. JSON encoders support `message_key`, `level_key`, `time_key`, `name_key`
+//!   and `line_ending`; `time_format`/`time_local`/`duration_format`/`level_format` and
+//!   `caller_key`/`stacktrace_key` are rejected loudly. The console encoder uses Caddy's console
+//!   defaults (colored level, UTC `wall_milli` time, spaced JSON fields) and `append`/`journald`/
+//!   `nop` encoders are rejected loudly.
 //! * Filter fields: `delete` of a selectable top-level entry field maps to
 //!   [`AccessLogConfig::exclude`](crate::AccessLogConfig), `delete`/`replace` of
 //!   `request>headers>Name` or `resp_headers>Name` maps to
-//!   [`RedactionPolicy`](crate::RedactionPolicy) header rules. Every other filter/path is rejected
-//!   loudly (hash/ip_mask/query/cookie/set_cookie/regexp/rename/multi_regexp are not implemented).
+//!   [`RedactionPolicy`](crate::RedactionPolicy) header rules, and generic `delete`, `replace`,
+//!   `rename`, `hash` and `ip_mask` operations map to
+//!   [`AccessLogConfig::filters`](crate::AccessLogConfig). `hash` is Caddy's SHA-256 first-4-bytes
+//!   filter; `ip_mask` supports `ipv4_cidr`/`ipv6_cidr`. `query`/`cookie`/`set_cookie`/`regexp`/
+//!   `multi_regexp` filters and nested filter encoders are rejected loudly (regexp would need a
+//!   regex engine that is not available in the offline dependency set; a silent approximation
+//!   would be a compatibility lie).
 //! * `level`: `DEBUG`/`INFO`/`WARN`/`ERROR`/`PANIC`/`FATAL`, case-insensitive. The threshold is
 //!   enforced by the sink ([`AccessLogSink::emit`](crate::AccessLogSink::emit) returns
 //!   `FilteredOut`). `PANIC`/`FATAL` map to the highest access-entry level (`ERROR`): access
@@ -91,8 +106,10 @@ use crate::access_log::{
     AccessLogConfig, AccessLogField, HeaderRedaction, HeaderTarget, LogLevel, RedactionPolicy,
     SamplingConfig, ACCESS_LOG_LOGGER,
 };
+use crate::access_log::{FieldFilter, FieldFilterOperation};
 use crate::sink::{
-    AccessLogOutput, AccessLogSink, AccessLogSinkConfig, DEFAULT_ACCESS_LOG_BUFFER_BYTES,
+    AccessLogFormat, AccessLogOutput, AccessLogSink, AccessLogSinkConfig, FileWriterOptions,
+    NetProtocol, NetWriterConfig, DEFAULT_ACCESS_LOG_BUFFER_BYTES,
 };
 
 /// Tracking id for the unsupported parts of Caddy's logging configuration.
@@ -420,39 +437,61 @@ fn logger_allowed(name: &str, include: &[String], exclude: &[String]) -> bool {
 
 fn convert_log(name: &str, log: &CustomLog) -> Result<AccessLogSinkConfig, LoggingConfigError> {
     let path = format!("logging.logs.{name}");
-    let (output, filename) = parse_writer(&path, log.base.writer.as_ref())?;
+    let writer = parse_writer(&path, log.base.writer.as_ref())?;
     let encoder = parse_encoder(&path, log.base.encoder.as_ref())?;
     let level = parse_level(&path, log.base.level.as_deref())?;
     let sampling = parse_sampling(&path, log.base.sampling.as_ref())?;
 
     let config = AccessLogSinkConfig {
-        output,
-        filename,
+        output: writer.output,
+        filename: writer.filename,
+        format: encoder.format,
+        file: writer.file,
+        net: writer.net,
         encoder: AccessLogConfig {
+            filters: encoder.filters,
             include: Vec::new(),
             exclude: encoder.exclude,
             log_credentials: false,
             redaction: encoder.redaction,
             sampling,
+            message_key: encoder.message_key,
+            level_key: encoder.level_key,
+            time_key: encoder.time_key,
+            name_key: encoder.name_key,
+            line_ending: encoder.line_ending,
         },
         buffer_bytes: DEFAULT_ACCESS_LOG_BUFFER_BYTES,
         level,
     };
     config.validate().map_err(|error| {
         LoggingConfigError::new(
-            format!("{path}.encoder.{}", error.path()),
+            format!("{path}.{}", error.path()),
             error.message().to_string(),
         )
     })?;
     Ok(config)
 }
 
+/// Parsed `logging.logs.<name>.writer` selection.
+struct WriterSelection {
+    output: AccessLogOutput,
+    filename: Option<PathBuf>,
+    file: FileWriterOptions,
+    net: Option<NetWriterConfig>,
+}
+
 fn parse_writer(
     path: &str,
     writer: Option<&LogWriter>,
-) -> Result<(AccessLogOutput, Option<PathBuf>), LoggingConfigError> {
+) -> Result<WriterSelection, LoggingConfigError> {
     let Some(writer) = writer else {
-        return Ok((AccessLogOutput::Stderr, None));
+        return Ok(WriterSelection {
+            output: AccessLogOutput::Stderr,
+            filename: None,
+            file: FileWriterOptions::default(),
+            net: None,
+        });
     };
     let writer_path = format!("{path}.writer");
     let Some(output) = writer.output.as_deref() else {
@@ -475,11 +514,15 @@ fn parse_writer(
                 "stdout" => AccessLogOutput::Stdout,
                 _ => AccessLogOutput::Discard,
             };
-            Ok((destination, None))
+            Ok(WriterSelection {
+                output: destination,
+                filename: None,
+                file: FileWriterOptions::default(),
+                net: None,
+            })
         }
         "file" => {
-            let filename = writer.extra.get("filename");
-            let filename = match filename {
+            let filename = match writer.extra.get("filename") {
                 Some(Value::String(filename)) if !filename.is_empty() => PathBuf::from(filename),
                 Some(Value::String(_)) => {
                     return Err(LoggingConfigError::new(
@@ -500,52 +543,204 @@ fn parse_writer(
                     ))
                 }
             };
-            if let Some(field) = writer
-                .extra
-                .keys()
-                .find(|field| field.as_str() != "filename")
-            {
-                let detail = if field.starts_with("roll")
-                    || matches!(field.as_str(), "mode" | "dir_mode" | "backup_time_format")
-                {
-                    "log rotation/permission options are not implemented by the caddy-rs \
-                     access-log sink"
-                } else {
-                    "writer option is not supported by the caddy-rs access-log sink"
-                };
-                return Err(LoggingConfigError::unsupported(
-                    format!("{writer_path}.{field}"),
-                    format!("file writer option `{field}` is not supported: {detail}"),
-                ));
+            let mut file = FileWriterOptions::default();
+            for (field, value) in &writer.extra {
+                let field_path = format!("{writer_path}.{field}");
+                match field.as_str() {
+                    "filename" => {}
+                    "mode" => file.mode = Some(parse_octal_mode(value, &field_path)?),
+                    "dir_mode" => {
+                        if let Some(value) = value.as_str() {
+                            if value == "inherit" || value == "from_file" {
+                                return Err(LoggingConfigError::unsupported(
+                                    field_path,
+                                    format!(
+                                        "file writer `dir_mode: {value:?}` is not implemented                                          (use a numeric octal mode)"
+                                    ),
+                                ));
+                            }
+                        }
+                        file.dir_mode = Some(parse_octal_mode(value, &field_path)?);
+                    }
+                    "roll" => {
+                        file.roll = value.as_bool().ok_or_else(|| {
+                            LoggingConfigError::new(&field_path, "`roll` must be a boolean")
+                        })?
+                    }
+                    "roll_size_mb" => file.roll_size_mb = Some(parse_u64(value, &field_path)?),
+                    "roll_keep" => {
+                        file.roll_keep = usize::try_from(parse_u64(value, &field_path)?)
+                            .map_err(|_| {
+                                LoggingConfigError::new(
+                                    &field_path,
+                                    "`roll_keep` is too large for this platform",
+                                )
+                            })?
+                    }
+                    "roll_keep_days" => file.roll_keep_days = Some(parse_u64(value, &field_path)?),
+                    "roll_interval" | "roll_minutes" | "roll_at" | "roll_compression"
+                    | "roll_gzip" | "roll_local_time" | "backup_time_format" => {
+                        return Err(LoggingConfigError::unsupported(
+                            field_path,
+                            format!(
+                                "file writer option `{field}` is not implemented by this build                                  (supported rotation options: roll, roll_size_mb, roll_keep,                                  roll_keep_days)"
+                            ),
+                        ))
+                    }
+                    other => {
+                        return Err(LoggingConfigError::unsupported(
+                            format!("{writer_path}.{other}"),
+                            format!("file writer option `{other}` is not supported"),
+                        ))
+                    }
+                }
             }
-            Ok((AccessLogOutput::File, Some(filename)))
+            Ok(WriterSelection {
+                output: AccessLogOutput::File,
+                filename: Some(filename),
+                file,
+                net: None,
+            })
         }
-        "net" => Err(LoggingConfigError::unsupported(
-            format!("{writer_path}.output"),
-            "the `net` log writer is not supported by this build's access-log sink \
-             (supported: stderr, stdout, discard, file)",
-        )),
+        "net" => {
+            let address = match writer.extra.get("address") {
+                Some(Value::String(address)) if !address.is_empty() => address.clone(),
+                Some(Value::String(_)) => {
+                    return Err(LoggingConfigError::new(
+                        format!("{writer_path}.address"),
+                        "net writer `address` must not be empty",
+                    ))
+                }
+                Some(_) => {
+                    return Err(LoggingConfigError::new(
+                        format!("{writer_path}.address"),
+                        "net writer `address` must be a string",
+                    ))
+                }
+                None => {
+                    return Err(LoggingConfigError::new(
+                        format!("{writer_path}.address"),
+                        "net writer requires an `address`",
+                    ))
+                }
+            };
+            let (network, address) =
+                parse_network_address(&address, &format!("{writer_path}.address"))?;
+            let mut net = NetWriterConfig {
+                address,
+                network,
+                dial_timeout_ns: None,
+                soft_start: false,
+            };
+            for (field, value) in &writer.extra {
+                if field == "address" {
+                    continue;
+                }
+                let field_path = format!("{writer_path}.{field}");
+                match field.as_str() {
+                    "dial_timeout" => net.dial_timeout_ns = Some(parse_u64(value, &field_path)?),
+                    "soft_start" => {
+                        net.soft_start = value.as_bool().ok_or_else(|| {
+                            LoggingConfigError::new(&field_path, "`soft_start` must be a boolean")
+                        })?
+                    }
+                    other => {
+                        return Err(LoggingConfigError::unsupported(
+                            field_path,
+                            format!("net writer option `{other}` is not supported"),
+                        ))
+                    }
+                }
+            }
+            Ok(WriterSelection {
+                output: AccessLogOutput::Net,
+                filename: None,
+                file: FileWriterOptions::default(),
+                net: Some(net),
+            })
+        }
         other => Err(LoggingConfigError::unsupported(
             format!("{writer_path}.output"),
-            format!("unknown log writer `{other}` (supported: stderr, stdout, discard, file)"),
+            format!("unknown log writer `{other}` (supported: stderr, stdout, discard, file, net)"),
         )),
     }
 }
 
-struct EncoderSelection {
-    exclude: Vec<AccessLogField>,
-    redaction: RedactionPolicy,
+fn parse_octal_mode(value: &Value, path: &str) -> Result<u32, LoggingConfigError> {
+    let Some(text) = value.as_str() else {
+        return Err(LoggingConfigError::new(
+            path,
+            "file mode must be an octal string like \"0600\"",
+        ));
+    };
+    u32::from_str_radix(text.trim_start_matches("0o"), 8).map_err(|error| {
+        LoggingConfigError::new(path, format!("invalid octal file mode `{text}`: {error}"))
+    })
 }
 
+fn parse_u64(value: &Value, path: &str) -> Result<u64, LoggingConfigError> {
+    value
+        .as_u64()
+        .ok_or_else(|| LoggingConfigError::new(path, "expected a non-negative integer"))
+}
+
+/// Parse Caddy's network address (`tcp/host:port`, `udp/host:port`, `host:port`; unix unsupported).
+fn parse_network_address(
+    address: &str,
+    path: &str,
+) -> Result<(NetProtocol, String), LoggingConfigError> {
+    match address.split_once('/') {
+        None => Ok((NetProtocol::Tcp, address.to_string())),
+        Some((prefix, rest)) => match prefix {
+            "tcp" | "tcp4" | "tcp6" => {
+                if prefix != "tcp" {
+                    return Err(LoggingConfigError::unsupported(
+                        path,
+                        format!("net writer network `{prefix}` is not supported (use tcp/udp)"),
+                    ));
+                }
+                Ok((NetProtocol::Tcp, rest.to_string()))
+            }
+            "udp" | "udp4" | "udp6" => {
+                if prefix != "udp" {
+                    return Err(LoggingConfigError::unsupported(
+                        path,
+                        format!("net writer network `{prefix}` is not supported (use tcp/udp)"),
+                    ));
+                }
+                Ok((NetProtocol::Udp, rest.to_string()))
+            }
+            "unix" | "unixgram" => Err(LoggingConfigError::unsupported(
+                path,
+                "unix-socket log writers are not implemented by this build (tcp/udp only)",
+            )),
+            other => Err(LoggingConfigError::new(
+                path,
+                format!("unknown net writer network prefix `{other}`"),
+            )),
+        },
+    }
+}
+
+/// Parsed `logging.logs.<name>.encoder` selection.
+#[derive(Default)]
+struct EncoderSelection {
+    format: AccessLogFormat,
+    exclude: Vec<AccessLogField>,
+    redaction: RedactionPolicy,
+    filters: Vec<FieldFilter>,
+    message_key: Option<String>,
+    level_key: Option<String>,
+    time_key: Option<String>,
+    name_key: Option<String>,
+    line_ending: Option<String>,
+}
 fn parse_encoder(
     path: &str,
     encoder: Option<&LogEncoder>,
 ) -> Result<EncoderSelection, LoggingConfigError> {
     let Some(encoder) = encoder else {
-        return Ok(EncoderSelection {
-            exclude: Vec::new(),
-            redaction: RedactionPolicy::default(),
-        });
+        return Ok(EncoderSelection::default());
     };
     let encoder_path = format!("{path}.encoder");
     let format = encoder.format.as_deref().ok_or_else(|| {
@@ -555,34 +750,95 @@ fn parse_encoder(
         )
     })?;
     match format {
-        "json" => {
+        "json" => parse_json_encoder_options(&encoder_path, &encoder.extra, AccessLogFormat::Json),
+        "console" => {
             if let Some(field) = encoder.extra.keys().next() {
                 return Err(LoggingConfigError::unsupported(
                     format!("{encoder_path}.{field}"),
                     format!(
-                        "json encoder option `{field}` is not supported: caddy-rs emits the fixed \
-                         Caddy default JSON field names"
+                        "console encoder option `{field}` is not supported (caddy-rs uses Caddy's \
+                         console defaults: color levels, wall_milli UTC timestamps)"
                     ),
                 ));
             }
             Ok(EncoderSelection {
-                exclude: Vec::new(),
-                redaction: RedactionPolicy::default(),
+                format: AccessLogFormat::Console,
+                ..EncoderSelection::default()
             })
         }
         "filter" => parse_filter_encoder(&encoder_path, &encoder.extra),
-        "console" | "append" | "journald" | "nop" => Err(LoggingConfigError::unsupported(
+        "append" | "journald" | "nop" => Err(LoggingConfigError::unsupported(
             format!("{encoder_path}.format"),
             format!(
                 "the `{format}` log encoder is not supported by this build's access-log sink \
-                 (supported: json, filter-wrapping-json)"
+                 (supported: json, console, filter-wrapping-json/console)"
             ),
         )),
         other => Err(LoggingConfigError::unsupported(
             format!("{encoder_path}.format"),
-            format!("unknown log encoder `{other}` (supported: json, filter-wrapping-json)"),
+            format!(
+                "unknown log encoder `{other}` (supported: json, console, \
+                 filter-wrapping-json/console)"
+            ),
         )),
     }
+}
+
+fn parse_json_encoder_options(
+    path: &str,
+    extra: &BTreeMap<String, Value>,
+    format: AccessLogFormat,
+) -> Result<EncoderSelection, LoggingConfigError> {
+    let mut selection = EncoderSelection {
+        format,
+        ..EncoderSelection::default()
+    };
+    for (field, value) in extra {
+        let field_path = format!("{path}.{field}");
+        let string = |required: bool| -> Result<Option<String>, LoggingConfigError> {
+            match value {
+                Value::String(text) if !text.is_empty() => Ok(Some(text.clone())),
+                Value::String(_) if required => Err(LoggingConfigError::new(
+                    &field_path,
+                    "encoder key names must not be empty",
+                )),
+                Value::String(_) => Ok(None),
+                _ => Err(LoggingConfigError::new(&field_path, "expected a string")),
+            }
+        };
+        match field.as_str() {
+            "message_key" => selection.message_key = string(true)?,
+            "level_key" => selection.level_key = string(true)?,
+            "time_key" => selection.time_key = string(true)?,
+            "name_key" => selection.name_key = string(true)?,
+            "line_ending" => selection.line_ending = Some(string(true)?.unwrap_or_default()),
+            "caller_key" | "stacktrace_key" => {
+                return Err(LoggingConfigError::unsupported(
+                    field_path,
+                    format!(
+                        "`{field}` is not implemented: access entries have no caller/stacktrace \
+                         fields"
+                    ),
+                ))
+            }
+            "time_format" | "time_local" | "duration_format" | "level_format" => {
+                return Err(LoggingConfigError::unsupported(
+                    field_path,
+                    format!(
+                        "`{field}` is not implemented; caddy-rs uses Caddy's default JSON \
+                         formatting (float seconds, lowercase level)"
+                    ),
+                ))
+            }
+            other => {
+                return Err(LoggingConfigError::unsupported(
+                    field_path,
+                    format!("json encoder option `{other}` is not supported"),
+                ))
+            }
+        }
+    }
+    Ok(selection)
 }
 
 fn parse_filter_encoder(
@@ -598,38 +854,57 @@ fn parse_filter_encoder(
         }
     }
 
-    // The wrapped encoder: only a plain JSON encoder; a nested filter is not supported.
-    match extra.get("wrap") {
-        None => {}
+    let mut selection = match extra.get("wrap") {
+        None => EncoderSelection::default(),
         Some(Value::Object(wrapped)) => {
-            let wrapped = LogEncoder {
-                format: wrapped
+            let wrapped_format =
+                wrapped
                     .get("format")
                     .and_then(Value::as_str)
-                    .map(str::to_string),
-                extra: wrapped
-                    .iter()
-                    .filter(|(key, _)| key.as_str() != "format")
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect(),
-            };
-            let format = wrapped.format.as_deref().ok_or_else(|| {
-                LoggingConfigError::new(
-                    format!("{path}.wrap.format"),
-                    "filter encoder `wrap` is missing its inline `format` key",
-                )
-            })?;
-            if format != "json" {
-                return Err(LoggingConfigError::unsupported(
-                    format!("{path}.wrap.format"),
-                    format!("filter encoder wraps `{format}`, but only json is supported"),
-                ));
-            }
-            if let Some(field) = wrapped.extra.keys().next() {
-                return Err(LoggingConfigError::unsupported(
-                    format!("{path}.wrap.{field}"),
-                    format!("json encoder option `{field}` is not supported"),
-                ));
+                    .ok_or_else(|| {
+                        LoggingConfigError::new(
+                            format!("{path}.wrap.format"),
+                            "filter encoder `wrap` is missing its inline `format` key",
+                        )
+                    })?;
+            let wrapped_extra: BTreeMap<String, Value> = wrapped
+                .iter()
+                .filter(|(key, _)| key.as_str() != "format")
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            match wrapped_format {
+                "json" => parse_json_encoder_options(
+                    &format!("{path}.wrap"),
+                    &wrapped_extra,
+                    AccessLogFormat::Json,
+                )?,
+                "console" => {
+                    if let Some(field) = wrapped_extra.keys().next() {
+                        return Err(LoggingConfigError::unsupported(
+                            format!("{path}.wrap.{field}"),
+                            format!("console encoder option `{field}` is not supported"),
+                        ));
+                    }
+                    EncoderSelection {
+                        format: AccessLogFormat::Console,
+                        ..EncoderSelection::default()
+                    }
+                }
+                "filter" => {
+                    return Err(LoggingConfigError::unsupported(
+                        format!("{path}.wrap.format"),
+                        "nested filter encoders are not supported by this build",
+                    ))
+                }
+                other => {
+                    return Err(LoggingConfigError::unsupported(
+                        format!("{path}.wrap.format"),
+                        format!(
+                            "filter encoder wraps `{other}`, but only json and console are \
+                             supported"
+                        ),
+                    ))
+                }
             }
         }
         Some(_) => {
@@ -638,12 +913,8 @@ fn parse_filter_encoder(
                 "filter encoder `wrap` must be an encoder object",
             ))
         }
-    }
-
-    let mut selection = EncoderSelection {
-        exclude: Vec::new(),
-        redaction: RedactionPolicy::default(),
     };
+
     let Some(Value::Object(fields)) = extra.get("fields") else {
         if extra.contains_key("fields") {
             return Err(LoggingConfigError::new(
@@ -673,7 +944,6 @@ fn parse_filter_encoder(
     }
     Ok(selection)
 }
-
 fn apply_field_filter(
     path: &str,
     field_path: &str,
@@ -682,6 +952,13 @@ fn apply_field_filter(
     selection: &mut EncoderSelection,
 ) -> Result<(), LoggingConfigError> {
     let filter_path = format!("{path}.fields.{field_path}");
+    let segments = split_filter_path(field_path, &filter_path)?;
+    if matches!(segments[0].as_str(), "ts" | "level" | "logger" | "msg") {
+        return Err(LoggingConfigError::new(
+            format!("{filter_path}.filter"),
+            format!("fundamental log field `{}` cannot be filtered", segments[0]),
+        ));
+    }
     match filter_name {
         "delete" => {
             reject_filter_options(&filter_path, filter_object, filter_name, &[])?;
@@ -692,31 +969,14 @@ fn apply_field_filter(
                 });
                 return Ok(());
             }
-            let Some(field) = access_log_field(field_path) else {
-                return Err(LoggingConfigError::unsupported(
-                    format!("{filter_path}.filter"),
-                    format!(
-                        "delete filter on `{field_path}` is not supported; only top-level access \
-                         entry fields and request/response headers can be deleted"
-                    ),
-                ));
-            };
-            if matches!(
-                field,
-                AccessLogField::Ts
-                    | AccessLogField::Level
-                    | AccessLogField::Logger
-                    | AccessLogField::Msg
-            ) {
-                return Err(LoggingConfigError::new(
-                    format!("{filter_path}.filter"),
-                    format!(
-                        "fundamental log field `{}` cannot be filtered",
-                        field.as_str()
-                    ),
-                ));
+            if let Some(field) = access_log_field(field_path) {
+                selection.exclude.push(field);
+                return Ok(());
             }
-            selection.exclude.push(field);
+            selection.filters.push(FieldFilter {
+                path: segments,
+                operation: FieldFilterOperation::Delete,
+            });
             Ok(())
         }
         "replace" => {
@@ -731,35 +991,114 @@ fn apply_field_filter(
                     ))
                 }
             };
-            let Some((header, target)) = header_field_target(field_path) else {
-                return Err(LoggingConfigError::unsupported(
-                    format!("{filter_path}.filter"),
-                    format!(
-                        "replace filter on `{field_path}` is not supported; only request and \
-                         response header fields can be replaced"
-                    ),
-                ));
-            };
-            selection.redaction.headers.push(HeaderRedaction::Replace {
-                header,
-                value,
-                target,
+            if let Some((header, target)) = header_field_target(field_path) {
+                selection.redaction.headers.push(HeaderRedaction::Replace {
+                    header,
+                    value,
+                    target,
+                });
+                return Ok(());
+            }
+            selection.filters.push(FieldFilter {
+                path: segments,
+                operation: FieldFilterOperation::Replace { value },
             });
             Ok(())
         }
-        "hash" | "ip_mask" | "query" | "cookie" | "set_cookie" | "regexp" | "rename"
-        | "multi_regexp" => Err(LoggingConfigError::unsupported(
-            format!("{filter_path}.filter"),
-            format!(
-                "the `{filter_name}` log field filter is not implemented by this build \
-                 (supported: delete, replace for headers)"
-            ),
-        )),
+        "rename" => {
+            reject_filter_options(&filter_path, filter_object, filter_name, &["name"])?;
+            let name = match filter_object.get("name") {
+                Some(Value::String(name)) if !name.is_empty() => name.clone(),
+                Some(_) => {
+                    return Err(LoggingConfigError::new(
+                        format!("{filter_path}.name"),
+                        "rename filter `name` must be a non-empty string",
+                    ))
+                }
+                None => {
+                    return Err(LoggingConfigError::new(
+                        format!("{filter_path}.name"),
+                        "rename filter requires a `name`",
+                    ))
+                }
+            };
+            selection.filters.push(FieldFilter {
+                path: segments,
+                operation: FieldFilterOperation::Rename { name },
+            });
+            Ok(())
+        }
+        "hash" => {
+            reject_filter_options(&filter_path, filter_object, filter_name, &[])?;
+            selection.filters.push(FieldFilter {
+                path: segments,
+                operation: FieldFilterOperation::Hash,
+            });
+            Ok(())
+        }
+        "ip_mask" => {
+            reject_filter_options(
+                &filter_path,
+                filter_object,
+                filter_name,
+                &["ipv4_cidr", "ipv6_cidr"],
+            )?;
+            let mask = |field: &str| -> Result<Option<u8>, LoggingConfigError> {
+                match filter_object.get(field) {
+                    None | Some(Value::Null) => Ok(None),
+                    Some(value) => value
+                        .as_u64()
+                        .and_then(|mask| u8::try_from(mask).ok())
+                        .ok_or_else(|| {
+                            LoggingConfigError::new(
+                                format!("{filter_path}.{field}"),
+                                "expected a CIDR prefix length (integer)",
+                            )
+                        })
+                        .map(Some),
+                }
+            };
+            selection.filters.push(FieldFilter {
+                path: segments,
+                operation: FieldFilterOperation::IpMask {
+                    v4_mask: mask("ipv4_cidr")?,
+                    v6_mask: mask("ipv6_cidr")?,
+                },
+            });
+            Ok(())
+        }
+        "query" | "cookie" | "set_cookie" | "regexp" | "multi_regexp" => {
+            Err(LoggingConfigError::unsupported(
+                format!("{filter_path}.filter"),
+                format!(
+                    "the `{filter_name}` log field filter is not implemented by this build \
+                     (supported: delete, replace, rename, hash, ip_mask)"
+                ),
+            ))
+        }
         other => Err(LoggingConfigError::new(
             format!("{filter_path}.filter"),
-            format!("unknown log field filter `{other}` (supported: delete, replace)"),
+            format!(
+                "unknown log field filter `{other}` (supported: delete, replace, rename, hash, \
+                 ip_mask)"
+            ),
         )),
     }
+}
+
+/// Split a Caddy filter field path (`request>headers>User-Agent`) into segments.
+fn split_filter_path(
+    field_path: &str,
+    filter_path: &str,
+) -> Result<Vec<String>, LoggingConfigError> {
+    let segments: Vec<String> = field_path.split('>').map(str::to_string).collect();
+    if segments.is_empty() || segments.iter().any(String::is_empty) {
+        return Err(LoggingConfigError::new(
+            format!("{filter_path}.filter"),
+            "filter field path must not be empty",
+        ));
+    }
+    Ok(segments)
 }
 
 fn reject_filter_options(
@@ -1099,23 +1438,45 @@ mod tests {
     }
 
     #[test]
-    fn unknown_and_unsupported_writers_fail_loudly() {
+    fn writer_modules_map_net_and_reject_unknown_options() {
+        let targets = targets_from(&json!({
+            "logs": {"default": {"writer": {
+                "output": "net",
+                "address": "tcp/127.0.0.1:9999",
+                "dial_timeout": 250000000,
+                "soft_start": true
+            }}}
+        }));
+        let config = targets[0].sink_config();
+        assert_eq!(config.output, AccessLogOutput::Net);
+        let net = config.net.as_ref().expect("net config");
+        assert_eq!(net.address, "127.0.0.1:9999");
+        assert_eq!(net.dial_timeout_ns, Some(250_000_000));
+        assert!(net.soft_start);
+
         let unknown = LoggingConfig::from_json(&json!({
             "logs": {"default": {"writer": {"output": "carrier-pigeon"}}}
         }))
         .expect_err("unknown writer");
         assert_eq!(unknown.path(), "logging.logs.default.writer.output");
         assert_eq!(unknown.tracking_id(), Some(LOGGING_TRACKING_ID));
-        assert!(
-            unknown.message().contains("unknown log writer"),
-            "{unknown}"
-        );
+        assert!(unknown.message().contains("unknown log writer"));
 
-        let net = LoggingConfig::from_json(&json!({
-            "logs": {"default": {"writer": {"output": "net", "address": "tcp/127.0.0.1:9999"}}}
+        // Unix sockets and unsupported net options are rejected loudly.
+        let unix = LoggingConfig::from_json(&json!({
+            "logs": {"default": {"writer": {"output": "net", "address": "unix//tmp/sock"}}}
         }))
-        .expect_err("net writer unsupported");
-        assert_eq!(net.tracking_id(), Some(LOGGING_TRACKING_ID));
+        .expect_err("unix socket");
+        assert_eq!(unix.tracking_id(), Some(LOGGING_TRACKING_ID));
+
+        let bad_option = LoggingConfig::from_json(&json!({
+            "logs": {"default": {"writer": {"output": "net", "address": "127.0.0.1:1", "tls": true}}}
+        }))
+        .expect_err("net option");
+        assert!(
+            bad_option.message().contains("not supported"),
+            "{bad_option}"
+        );
 
         let missing_filename = LoggingConfig::from_json(&json!({
             "logs": {"default": {"writer": {"output": "file"}}}
@@ -1128,8 +1489,37 @@ mod tests {
     }
 
     #[test]
-    fn file_rotation_and_permission_options_are_rejected() {
-        for option in ["roll_size_mb", "roll_keep", "roll", "mode", "dir_mode"] {
+
+    fn file_rotation_and_permission_options_map_and_reject_unsupported_ones() {
+        let targets = targets_from(&json!({
+            "logs": {"default": {"writer": {
+                "output": "file",
+                "filename": "/tmp/access.log",
+                "mode": "0640",
+                "dir_mode": "0750",
+                "roll": true,
+                "roll_size_mb": 100,
+                "roll_keep": 5,
+                "roll_keep_days": 30
+            }}}
+        }));
+        let config = targets[0].sink_config();
+        assert_eq!(config.file.mode, Some(0o640));
+        assert_eq!(config.file.dir_mode, Some(0o750));
+        assert!(config.file.roll);
+        assert_eq!(config.file.roll_size_mb, Some(100));
+        assert_eq!(config.file.roll_keep, 5);
+        assert_eq!(config.file.roll_keep_days, Some(30));
+
+        for option in [
+            "roll_interval",
+            "roll_minutes",
+            "roll_at",
+            "roll_compression",
+            "roll_gzip",
+            "roll_local_time",
+            "backup_time_format",
+        ] {
             let logging = json!({
                 "logs": {"default": {"writer": {
                     "output": "file",
@@ -1143,13 +1533,36 @@ mod tests {
                 "path mentions the option: {error}"
             );
             assert_eq!(error.tracking_id(), Some(LOGGING_TRACKING_ID));
-            assert!(error.message().contains("not supported"), "{error}");
+            assert!(error.message().contains("not implemented"), "{error}");
         }
     }
 
     #[test]
-    fn unknown_and_unsupported_encoders_fail_loudly() {
-        for format in ["console", "append", "journald", "nop", "bogus"] {
+
+    fn encoder_formats_and_key_options_map_and_unsupported_ones_fail() {
+        let targets = targets_from(&json!({
+            "logs": {"default": {"encoder": {"format": "console"}}}
+        }));
+        assert_eq!(targets[0].sink_config().format, AccessLogFormat::Console);
+
+        let targets = targets_from(&json!({
+            "logs": {"default": {"encoder": {
+                "format": "json",
+                "message_key": "message",
+                "level_key": "severity",
+                "time_key": "timestamp",
+                "name_key": "logger_name",
+                "line_ending": "\r\n"
+            }}}
+        }));
+        let encoder = &targets[0].sink_config().encoder;
+        assert_eq!(encoder.message_key.as_deref(), Some("message"));
+        assert_eq!(encoder.level_key.as_deref(), Some("severity"));
+        assert_eq!(encoder.time_key.as_deref(), Some("timestamp"));
+        assert_eq!(encoder.name_key.as_deref(), Some("logger_name"));
+        assert_eq!(encoder.line_ending.as_deref(), Some("\r\n"));
+
+        for format in ["append", "journald", "nop", "bogus"] {
             let logging = json!({
                 "logs": {"default": {"encoder": {"format": format}}}
             });
@@ -1158,15 +1571,24 @@ mod tests {
             assert_eq!(error.tracking_id(), Some(LOGGING_TRACKING_ID));
         }
 
-        let remapped = LoggingConfig::from_json(&json!({
-            "logs": {"default": {"encoder": {"format": "json", "message_key": "message"}}}
-        }))
-        .expect_err("json encoder option");
-        assert!(remapped.path().contains("message_key"), "{remapped}");
-        assert_eq!(remapped.tracking_id(), Some(LOGGING_TRACKING_ID));
+        for option in [
+            "time_format",
+            "duration_format",
+            "level_format",
+            "time_local",
+            "caller_key",
+        ] {
+            let logging = json!({
+                "logs": {"default": {"encoder": {"format": "json", option: "x"}}}
+            });
+            let error = LoggingConfig::from_json(&logging).expect_err(option);
+            assert!(error.path().contains(option), "{error}");
+            assert_eq!(error.tracking_id(), Some(LOGGING_TRACKING_ID));
+        }
     }
 
     #[test]
+
     fn filter_encoder_maps_delete_and_replace_to_access_log_config() {
         let logging = json!({
             "logs": {"default": {
@@ -1214,17 +1636,55 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_filter_encoders_and_fields_fail_loudly() {
-        for filter in [
-            "hash",
-            "ip_mask",
-            "query",
-            "cookie",
-            "set_cookie",
-            "regexp",
-            "rename",
-            "multi_regexp",
-        ] {
+    fn filter_modules_map_and_unsupported_ones_fail_loudly() {
+        let logging = json!({
+            "logs": {"default": {"encoder": {
+                "format": "filter",
+                "wrap": {"format": "json"},
+                "fields": {
+                    "request>uri": {"filter": "hash"},
+                    "request>remote_ip": {"filter": "ip_mask", "ipv4_cidr": 24, "ipv6_cidr": 64},
+                    "request>headers>X-Debug": {"filter": "rename", "name": "X-Renamed"},
+                    "request>headers>X-Secret": {"filter": "replace", "value": "***"}
+                }
+            }}}
+        });
+        let targets = targets_from(&logging);
+        let filters = &targets[0].sink_config().encoder.filters;
+        assert_eq!(
+            filters.len(),
+            3,
+            "header rename/hash/ip_mask map to generic filters"
+        );
+        assert!(filters
+            .iter()
+            .any(|filter| matches!(filter.operation, FieldFilterOperation::Hash)));
+        assert!(filters.iter().any(|filter| matches!(
+            filter.operation,
+            FieldFilterOperation::IpMask {
+                v4_mask: Some(24),
+                v6_mask: Some(64)
+            }
+        )));
+
+        // The mapping actually applies through the encoder.
+        let sink = AccessLogSink::to_writer(
+            RecordingWriter::new(),
+            targets[0].sink_config().encoder.clone(),
+        )
+        .expect("sink");
+        let mut log_entry = entry(200, "hello");
+        log_entry.request.uri = "/path?token=secret".to_string();
+        log_entry.request.remote_ip = "192.0.2.10".to_string();
+        log_entry
+            .request
+            .headers
+            .insert("X-Debug".to_string(), vec!["value".to_string()]);
+        sink.emit(&log_entry).expect("emit");
+        let recorder = sink.encoder().config();
+        assert!(!recorder.filters.is_empty());
+
+        for filter in ["query", "cookie", "set_cookie", "regexp", "multi_regexp"] {
             let logging = json!({
                 "logs": {"default": {"encoder": {
                     "format": "filter",
@@ -1251,10 +1711,7 @@ mod tests {
             }}}
         }))
         .expect_err("unknown filter");
-        assert!(
-            unknown.message().contains("unknown log field filter"),
-            "{unknown}"
-        );
+        assert!(unknown.message().contains("unknown log field filter"));
 
         let fundamental = LoggingConfig::from_json(&json!({
             "logs": {"default": {"encoder": {
@@ -1263,19 +1720,7 @@ mod tests {
             }}}
         }))
         .expect_err("fundamental field");
-        assert!(
-            fundamental.message().contains("fundamental"),
-            "{fundamental}"
-        );
-
-        let replace_non_header = LoggingConfig::from_json(&json!({
-            "logs": {"default": {"encoder": {
-                "format": "filter",
-                "fields": {"request>uri": {"filter": "replace", "value": "x"}}
-            }}}
-        }))
-        .expect_err("replace non-header");
-        assert_eq!(replace_non_header.tracking_id(), Some(LOGGING_TRACKING_ID));
+        assert!(fundamental.message().contains("fundamental"));
 
         let nested = LoggingConfig::from_json(&json!({
             "logs": {"default": {"encoder": {

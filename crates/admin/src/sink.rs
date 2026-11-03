@@ -18,12 +18,29 @@
 //!   `close` is idempotent and makes later emissions fail with a located error instead of silently
 //!   dropping records. `Drop` performs a best-effort flush.
 //!
-//! ## Log rotation
+//! ## Writers and rotation
 //!
-//! This sink deliberately does **not** rotate files: Caddy's `roll_*` writer options are not
-//! implemented (tracked as a follow-up; see the task report/DIV). Operators rotate externally
-//! (logrotate/container runtime) or reopen the sink; the file is opened in append mode so external
-//! rotation + reopen does not truncate it.
+//! Supported destinations: `stdout`, `stderr`, `discard`, `file` and `net`.
+//!
+//! File sinks honour Caddy's `mode`/`dir_mode` (Unix), create missing parent directories, and
+//! rotate by size (`roll_size_mb`, default roll enabled when configured) keeping at most
+//! `roll_keep` backup files and deleting backups older than `roll_keep_days`. Rotated files are
+//! named `<filename>.<unix-millis>` (a documented divergence from Caddy's timberjack naming and
+//! compression; `roll_interval`/`roll_minutes`/`roll_at`/`roll_compression`/`roll_local_time`/
+//! `backup_time_format` are rejected by the configuration mapper).
+//!
+//! Net sinks (`net` writer) connect with `dial_timeout`, reconnect once and retry a failed line,
+//! and with `soft_start` fall back to stderr while the socket is unavailable. Unix sockets are
+//! not supported.
+//!
+//! ## Encoders
+//!
+//! `AccessLogFormat::Json` is the default (compact JSON + `line_ending`, default newline).
+//! `AccessLogFormat::Console` renders Caddy's console encoder framing:
+//! `<UTC wall time with millis>\t<colored LEVEL>\t[logger\t]<msg>\t<fields JSON with ": "/", ">
+//! separators`. JSON encoder key options (`message_key`, `level_key`, `time_key`, `name_key`) and
+//! filter-encoder field operations (`delete`, `replace`, `rename`, `hash` = SHA-256 first 4 bytes
+//! hex, `ip_mask`) are applied by [`AccessLogEncoder`] via [`AccessLogConfig`].
 //!
 //! ## Errors
 //!
@@ -35,10 +52,11 @@
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
-use std::path::PathBuf;
+use std::net::{TcpStream, UdpSocket};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -61,8 +79,10 @@ pub enum AccessLogOutput {
     /// Encode (and sample) but discard the bytes. Useful to disable output without changing the
     /// encoder/sampling configuration, mirroring Caddy's `discard` writer.
     Discard,
-    /// Append to [`AccessLogSinkConfig::filename`].
+    /// Append to [`AccessLogSinkConfig::filename`] (with optional rotation/modes).
     File,
+    /// Write to a network socket (Caddy's `net` writer; TCP or UDP).
+    Net,
 }
 
 impl AccessLogOutput {
@@ -73,8 +93,103 @@ impl AccessLogOutput {
             AccessLogOutput::Stdout => "stdout",
             AccessLogOutput::Discard => "discard",
             AccessLogOutput::File => "file",
+            AccessLogOutput::Net => "net",
         }
     }
+}
+
+/// Encoder framing used by a sink.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessLogFormat {
+    /// One compact JSON object per line (Caddy's `json` encoder).
+    #[default]
+    Json,
+    /// Caddy's `console` encoder: `<utc wall time with millis>\t<colored level>\t[logger\t]<msg>\t<fields>`.
+    Console,
+}
+
+impl AccessLogFormat {
+    /// Stable lowercase name (Caddy's `encoder.format` spelling).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Json => "json",
+            Self::Console => "console",
+        }
+    }
+}
+
+/// Caddy `file` writer options supported by caddy-rs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileWriterOptions {
+    /// File permissions (octal value, e.g. `0o600`); applied on Unix only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
+    /// Directory permissions for directories created to reach the log file (octal value).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir_mode: Option<u32>,
+    /// Whether to rotate the file (Caddy's `roll`; default true).
+    #[serde(default = "default_roll")]
+    pub roll: bool,
+    /// Rotate when the file exceeds roughly this many megabytes (Caddy `roll_size_mb`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roll_size_mb: Option<u64>,
+    /// Number of rotated files to keep (Caddy `roll_keep`, default 10).
+    #[serde(default = "default_roll_keep")]
+    pub roll_keep: usize,
+    /// Delete rotated files older than this many days (Caddy `roll_keep_days`, default 90).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roll_keep_days: Option<u64>,
+}
+
+fn default_roll() -> bool {
+    true
+}
+
+fn default_roll_keep() -> usize {
+    10
+}
+
+impl Default for FileWriterOptions {
+    fn default() -> Self {
+        Self {
+            mode: None,
+            dir_mode: None,
+            roll: true,
+            roll_size_mb: None,
+            roll_keep: 10,
+            roll_keep_days: None,
+        }
+    }
+}
+
+/// Network protocol for the `net` writer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetProtocol {
+    /// TCP stream with reconnect-on-write-failure (Caddy's default).
+    #[default]
+    Tcp,
+    /// UDP datagrams (each encoded line is one datagram).
+    Udp,
+}
+
+/// Caddy `net` writer options supported by caddy-rs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetWriterConfig {
+    /// Socket address (`host:port`). Caddy's `tcp/`/`udp/` prefix form is accepted by the
+    /// configuration mapper.
+    pub address: String,
+    /// Protocol (Caddy infers it from the address prefix; explicit form for caddy-rs configs).
+    #[serde(default)]
+    pub network: NetProtocol,
+    /// Connection timeout in nanoseconds (Caddy `dial_timeout`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dial_timeout_ns: Option<u64>,
+    /// Allow startup with an unreachable socket; writes fall back to stderr while reconnecting
+    /// (Caddy `soft_start`).
+    #[serde(default)]
+    pub soft_start: bool,
 }
 
 /// Configuration for one access-log sink.
@@ -94,6 +209,15 @@ pub struct AccessLogSinkConfig {
     /// Field selection, redaction and sampling policy.
     #[serde(default)]
     pub encoder: AccessLogConfig,
+    /// Encoder framing (`json` or `console`).
+    #[serde(default)]
+    pub format: AccessLogFormat,
+    /// File writer options (rotation/permissions), used when `output` is `file`.
+    #[serde(default)]
+    pub file: FileWriterOptions,
+    /// Network writer options, required when `output` is `net`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net: Option<NetWriterConfig>,
     /// Capacity of the write buffer in bytes.
     #[serde(default = "default_buffer_bytes")]
     pub buffer_bytes: usize,
@@ -112,6 +236,9 @@ impl Default for AccessLogSinkConfig {
         Self {
             output: AccessLogOutput::Stderr,
             filename: None,
+            format: AccessLogFormat::Json,
+            file: FileWriterOptions::default(),
+            net: None,
             encoder: AccessLogConfig::default(),
             buffer_bytes: DEFAULT_ACCESS_LOG_BUFFER_BYTES,
             level: None,
@@ -157,6 +284,54 @@ impl AccessLogSinkConfig {
                 }
                 Some(_) => {}
             }
+            if self.file.roll_keep == 0 {
+                return Err(AccessLogError::new(
+                    "writer.roll_keep",
+                    "must be greater than zero",
+                ));
+            }
+            if self.file.roll_size_mb == Some(0) {
+                return Err(AccessLogError::new(
+                    "writer.roll_size_mb",
+                    "must be greater than zero",
+                ));
+            }
+            if self.file.roll_keep_days == Some(0) {
+                return Err(AccessLogError::new(
+                    "writer.roll_keep_days",
+                    "must be greater than zero",
+                ));
+            }
+            if let Some(mode) = self.file.mode {
+                if mode > 0o7777 {
+                    return Err(AccessLogError::new(
+                        "writer.mode",
+                        "must be an octal file mode (0-07777)",
+                    ));
+                }
+            }
+            if let Some(mode) = self.file.dir_mode {
+                if mode > 0o7777 {
+                    return Err(AccessLogError::new(
+                        "writer.dir_mode",
+                        "must be an octal file mode (0-07777)",
+                    ));
+                }
+            }
+        }
+        if self.output == AccessLogOutput::Net {
+            let Some(net) = &self.net else {
+                return Err(AccessLogError::new(
+                    "writer.address",
+                    "net output requires an address",
+                ));
+            };
+            if net.address.is_empty() {
+                return Err(AccessLogError::new(
+                    "writer.address",
+                    "net writer address must not be empty",
+                ));
+            }
         }
         Ok(())
     }
@@ -194,13 +369,27 @@ pub struct AccessLogSinkStats {
 #[derive(Debug, Clone)]
 pub struct AccessLogEncoder {
     config: AccessLogConfig,
+    format: AccessLogFormat,
 }
 
 impl AccessLogEncoder {
-    /// Validate `config` and build an encoder.
+    /// Validate `config` and build a JSON encoder.
     pub fn new(config: AccessLogConfig) -> Result<Self, AccessLogError> {
+        Self::with_format(config, AccessLogFormat::Json)
+    }
+
+    /// Validate `config` and build an encoder using `format`.
+    pub fn with_format(
+        config: AccessLogConfig,
+        format: AccessLogFormat,
+    ) -> Result<Self, AccessLogError> {
         config.validate()?;
-        Ok(Self { config })
+        Ok(Self { config, format })
+    }
+
+    /// The encoder framing in use.
+    pub fn format(&self) -> AccessLogFormat {
+        self.format
     }
 
     /// The encoder's configuration (field selection, redaction, sampling policy).
@@ -214,10 +403,16 @@ impl AccessLogEncoder {
     /// value and a redaction rule always sees the full record.
     pub fn encode_line(&self, entry: &AccessLogEntry) -> Result<Vec<u8>, AccessLogError> {
         let rendered = entry.render(&self.config)?;
-        let mut line = serde_json::to_vec(&rendered)
-            .map_err(|error| AccessLogError::new("entry", format!("cannot encode: {error}")))?;
-        line.push(b'\n');
-        Ok(line)
+        match self.format {
+            AccessLogFormat::Json => {
+                let mut line = serde_json::to_vec(&rendered).map_err(|error| {
+                    AccessLogError::new("entry", format!("cannot encode: {error}"))
+                })?;
+                line.push(b'\n');
+                Ok(line)
+            }
+            AccessLogFormat::Console => encode_console_line(&rendered),
+        }
     }
 
     /// Encode one entry to a compact JSON string (without the trailing newline).
@@ -228,11 +423,388 @@ impl AccessLogEncoder {
     }
 }
 
+/// Format a Unix timestamp (floating seconds) as Caddy's console `wall_milli` time in UTC:
+/// `YYYY/MM/DD HH:MM:SS.mmm` (zap's console encoder uses UTC unless `time_local` is set).
+fn format_wall_milli(seconds: f64) -> String {
+    let whole = seconds.floor() as i64;
+    let millis = ((seconds - whole as f64) * 1000.0)
+        .round()
+        .clamp(0.0, 999.0) as u32;
+    let days = whole.div_euclid(86_400);
+    let seconds_of_day = whole.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = seconds_of_day / 3600;
+    let minute = (seconds_of_day % 3600) / 60;
+    let second = seconds_of_day % 60;
+    format!("{year:04}/{month:02}/{day:02} {hour:02}:{minute:02}:{second:02}.{millis:03}")
+}
+
+/// Howard Hinnant's `civil_from_days` (days since 1970-01-01 -> year/month/day).
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    (
+        year + i64::from(month <= 2),
+        u32::try_from(month).unwrap_or(1),
+        u32::try_from(day).unwrap_or(1),
+    )
+}
+
+/// zap's colored level names (console encoder default `level_format: color`).
+fn colored_level(level: &str) -> String {
+    let color = match level {
+        "error" | "fatal" | "panic" | "dpanic" => 31,
+        "warn" => 33,
+        "info" => 34,
+        _ => 35,
+    };
+    format!("\u{1b}[{color}m{}\u{1b}[0m", level.to_ascii_uppercase())
+}
+
+/// Encode one rendered entry in Caddy's console format:
+/// `<time>\t<level>\t[logger\t]<msg>\t<json fields>\n`.
+fn encode_console_line(rendered: &serde_json::Value) -> Result<Vec<u8>, AccessLogError> {
+    let object = rendered
+        .as_object()
+        .ok_or_else(|| AccessLogError::new("entry", "console encoding requires an entry object"))?;
+    let timestamp = object
+        .get("ts")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0);
+    let level = object
+        .get("level")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("info");
+    let logger = object
+        .get("logger")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let message = object
+        .get("msg")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let mut fields = object.clone();
+    for fundamental in ["ts", "level", "logger", "msg"] {
+        fields.remove(fundamental);
+    }
+    let fields = spaced_json(&serde_json::Value::Object(fields));
+    let time = format_wall_milli(timestamp);
+    let level = colored_level(level);
+    let text = if logger.is_empty() {
+        format!("{time}\t{level}\t{message}\t{fields}\n")
+    } else {
+        format!("{time}\t{level}\t{logger}\t{message}\t{fields}\n")
+    };
+    Ok(text.into_bytes())
+}
+
+/// Serialize JSON with zap console's `": "` and `", "` separators (outside strings).
+fn spaced_json(value: &serde_json::Value) -> String {
+    let compact = serde_json::to_string(value).unwrap_or_else(|_| "null".to_string());
+    let mut result = String::with_capacity(compact.len() + compact.len() / 8);
+    let mut in_string = false;
+    let mut escaped = false;
+    for character in compact.chars() {
+        result.push(character);
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+        } else if character == '"' {
+            in_string = true;
+        } else if character == ':' || character == ',' {
+            result.push(' ');
+        }
+    }
+    result
+}
+
+/// File destination with Caddy-style size rotation and optional permissions.
+struct FileSink {
+    path: PathBuf,
+    options: FileWriterOptions,
+    capacity: usize,
+    writer: BufWriter<File>,
+    bytes: u64,
+}
+
+impl FileSink {
+    fn open(path: PathBuf, options: FileWriterOptions, capacity: usize) -> io::Result<Self> {
+        create_parent_directories(&path, &options)?;
+        let file = open_append(&path, &options)?;
+        let bytes = file.metadata()?.len();
+        Ok(Self {
+            path,
+            options,
+            capacity,
+            writer: BufWriter::with_capacity(capacity, file),
+            bytes,
+        })
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if self.should_roll(bytes.len()) {
+            self.rotate()?;
+        }
+        self.writer.write_all(bytes)?;
+        self.bytes += bytes.len() as u64;
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+
+    fn should_roll(&self, incoming: usize) -> bool {
+        if !self.options.roll {
+            return false;
+        }
+        let Some(size_mb) = self.options.roll_size_mb else {
+            return false;
+        };
+        let limit = size_mb.saturating_mul(1024 * 1024);
+        self.bytes.saturating_add(incoming as u64) > limit
+    }
+
+    fn rotate(&mut self) -> io::Result<()> {
+        self.writer.flush()?;
+        let backup = unique_backup_path(&self.path);
+        std::fs::rename(&self.path, &backup)?;
+        let file = open_append(&self.path, &self.options)?;
+        self.writer = BufWriter::with_capacity(self.capacity, file);
+        self.bytes = 0;
+        prune_backups(&self.path, &self.options);
+        Ok(())
+    }
+}
+
+fn open_append(path: &Path, options: &FileWriterOptions) -> io::Result<File> {
+    let mut open = OpenOptions::new();
+    open.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        if let Some(mode) = options.mode {
+            open.mode(mode);
+        }
+    }
+    open.open(path)
+}
+
+fn create_parent_directories(path: &Path, options: &FileWriterOptions) -> io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    if parent.as_os_str().is_empty() || parent.exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(parent)?;
+    #[cfg(unix)]
+    if let Some(dir_mode) = options.dir_mode {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(dir_mode))?;
+    }
+    let _ = options;
+    Ok(())
+}
+
+fn unique_backup_path(path: &Path) -> PathBuf {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    let mut candidate = PathBuf::from(format!("{}.{millis}", path.display()));
+    let mut counter = 0u32;
+    while candidate.exists() {
+        counter += 1;
+        candidate = PathBuf::from(format!("{}.{millis}.{counter}", path.display()));
+    }
+    candidate
+}
+
+/// Delete rotated files beyond `roll_keep` (and older than `roll_keep_days`), best-effort.
+fn prune_backups(path: &Path, options: &FileWriterOptions) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    let Some(prefix) = path.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    let mut backups: Vec<(SystemTime, PathBuf)> = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            if !name.starts_with(&format!("{prefix}.")) {
+                return None;
+            }
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            Some((modified, entry.path()))
+        })
+        .collect();
+    backups.sort_by_key(|(modified, _)| *modified);
+    let keep = options.roll_keep.max(1);
+    let keep_days = options
+        .roll_keep_days
+        .map(Duration::from_secs)
+        .map(|days| days.as_secs() * 24 * 3600);
+    let now = SystemTime::now();
+    while backups.len() > keep {
+        if let Some((_, path)) = backups.first() {
+            let _ = std::fs::remove_file(path);
+        }
+        backups.remove(0);
+    }
+    if let Some(limit) = keep_days {
+        for (modified, path) in &backups {
+            if now
+                .duration_since(*modified)
+                .map(|age| age.as_secs() > limit)
+                .unwrap_or(false)
+            {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
+
+enum NetConnection {
+    Tcp(TcpStream),
+    Udp(UdpSocket),
+}
+
+/// Network destination: dials on first use, reconnects once on write failure, and (with
+/// `soft_start`) falls back to stderr while the socket is unavailable, like Caddy's net writer.
+struct NetSink {
+    config: NetWriterConfig,
+    connection: Option<NetConnection>,
+}
+
+impl NetSink {
+    fn new(config: NetWriterConfig) -> io::Result<Self> {
+        let mut sink = Self {
+            config,
+            connection: None,
+        };
+        match sink.connect() {
+            Ok(connection) => sink.connection = Some(connection),
+            Err(error) if sink.config.soft_start => {
+                eprintln!(
+                    "caddy-rs: net log writer failed to connect to {}: {error} (will retry; logs fall back to stderr)",
+                    sink.config.address
+                );
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(sink)
+    }
+
+    fn connect(&self) -> io::Result<NetConnection> {
+        let timeout = self.config.dial_timeout_ns.map(Duration::from_nanos);
+        match self.config.network {
+            NetProtocol::Tcp => {
+                let stream = match timeout {
+                    Some(timeout) => {
+                        let address =
+                            self.config.address.to_socket_addrs_first().ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    format!("invalid address `{}`", self.config.address),
+                                )
+                            })?;
+                        TcpStream::connect_timeout(&address, timeout)?
+                    }
+                    None => TcpStream::connect(&self.config.address)?,
+                };
+                let _ = stream.set_nodelay(true);
+                Ok(NetConnection::Tcp(stream))
+            }
+            NetProtocol::Udp => {
+                let socket = UdpSocket::bind("0.0.0.0:0")?;
+                socket.connect(&self.config.address)?;
+                Ok(NetConnection::Udp(socket))
+            }
+        }
+    }
+
+    fn send(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if self.connection.is_none() {
+            self.connection = Some(self.connect()?);
+        }
+        let result = match self.connection.as_mut() {
+            Some(NetConnection::Tcp(stream)) => stream.write_all(bytes),
+            Some(NetConnection::Udp(socket)) => socket.send(bytes).map(|_| ()),
+            None => unreachable!("connection established above"),
+        };
+        if result.is_err() {
+            // Reconnect once and retry the line, like Caddy's redialerConn.
+            self.connection = None;
+            self.connection = Some(self.connect()?);
+            match self.connection.as_mut() {
+                Some(NetConnection::Tcp(stream)) => stream.write_all(bytes),
+                Some(NetConnection::Udp(socket)) => socket.send(bytes).map(|_| ()),
+                None => unreachable!(),
+            }?;
+        }
+        Ok(())
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+        match self.send(bytes) {
+            Ok(()) => Ok(()),
+            Err(error) if self.config.soft_start => {
+                eprintln!(
+                    "caddy-rs: net log writer {} unavailable: {error}; falling back to stderr",
+                    self.config.address
+                );
+                let _ = io::stderr().write_all(bytes);
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if let Some(NetConnection::Tcp(stream)) = &mut self.connection {
+            stream.flush()?;
+        }
+        Ok(())
+    }
+}
+
+/// Resolve a host:port string to one socket address without requiring a full resolver API.
+trait ToSocketAddrsFirst {
+    fn to_socket_addrs_first(&self) -> Option<std::net::SocketAddr>;
+}
+
+impl ToSocketAddrsFirst for str {
+    fn to_socket_addrs_first(&self) -> Option<std::net::SocketAddr> {
+        use std::net::ToSocketAddrs;
+        self.to_socket_addrs().ok()?.next()
+    }
+}
+
 enum SinkTarget {
     Stdout(BufWriter<io::Stdout>),
     Stderr(BufWriter<io::Stderr>),
     Discard,
-    File(BufWriter<File>),
+    File(FileSink),
+    Net(NetSink),
     Custom(BufWriter<Box<dyn Write + Send>>),
 }
 
@@ -243,6 +815,7 @@ impl fmt::Debug for SinkTarget {
             SinkTarget::Stderr(_) => "AccessLogTarget::Stderr",
             SinkTarget::Discard => "AccessLogTarget::Discard",
             SinkTarget::File(_) => "AccessLogTarget::File",
+            SinkTarget::Net(_) => "AccessLogTarget::Net",
             SinkTarget::Custom(_) => "AccessLogTarget::Custom",
         })
     }
@@ -254,7 +827,8 @@ impl SinkTarget {
             SinkTarget::Stdout(writer) => writer.write_all(bytes),
             SinkTarget::Stderr(writer) => writer.write_all(bytes),
             SinkTarget::Discard => Ok(()),
-            SinkTarget::File(writer) => writer.write_all(bytes),
+            SinkTarget::File(file) => file.write(bytes),
+            SinkTarget::Net(net) => net.write(bytes),
             SinkTarget::Custom(writer) => writer.write_all(bytes),
         }
     }
@@ -264,7 +838,8 @@ impl SinkTarget {
             SinkTarget::Stdout(writer) => writer.flush(),
             SinkTarget::Stderr(writer) => writer.flush(),
             SinkTarget::Discard => Ok(()),
-            SinkTarget::File(writer) => writer.flush(),
+            SinkTarget::File(file) => file.flush(),
+            SinkTarget::Net(net) => net.flush(),
             SinkTarget::Custom(writer) => writer.flush(),
         }
     }
@@ -320,7 +895,7 @@ impl AccessLogSink {
     /// fail rather than silently dropping access records.
     pub fn from_config(config: &AccessLogSinkConfig) -> Result<Self, AccessLogError> {
         config.validate()?;
-        let encoder = AccessLogEncoder::new(config.encoder.clone())?;
+        let encoder = AccessLogEncoder::with_format(config.encoder.clone(), config.format)?;
         let capacity = config.buffer_bytes;
         let target = match config.output {
             AccessLogOutput::Stdout => {
@@ -333,19 +908,30 @@ impl AccessLogSink {
             AccessLogOutput::File => {
                 let path = config
                     .filename
-                    .as_ref()
+                    .clone()
                     .expect("validated file output has a filename");
-                let file = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                    .map_err(|error| {
+                let file = FileSink::open(path.clone(), config.file.clone(), capacity).map_err(
+                    |error| {
                         AccessLogError::new(
                             "writer.filename",
                             format!("cannot open `{}`: {error}", path.display()),
                         )
-                    })?;
-                SinkTarget::File(BufWriter::with_capacity(capacity, file))
+                    },
+                )?;
+                SinkTarget::File(file)
+            }
+            AccessLogOutput::Net => {
+                let net = config
+                    .net
+                    .clone()
+                    .expect("validated net output has a configuration");
+                let net = NetSink::new(net).map_err(|error| {
+                    AccessLogError::new(
+                        "writer.address",
+                        format!("cannot connect net log writer: {error}"),
+                    )
+                })?;
+                SinkTarget::Net(net)
             }
         };
         let sampler = match &config.encoder.sampling {
@@ -858,12 +1444,23 @@ mod tests {
     #[test]
     fn invalid_file_sink_fails_loudly() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let missing_parent = directory.path().join("does-not-exist").join("access.log");
-        let error = AccessLogSink::from_config(&AccessLogSinkConfig::file(&missing_parent))
-            .expect_err("missing parent directory");
+        // Caddy creates missing parent directories (with the configured dir_mode); caddy-rs does
+        // the same, so a missing parent is no longer an error.
+        let nested = directory.path().join("does-not-exist").join("access.log");
+        let sink = AccessLogSink::from_config(&AccessLogSinkConfig::file(&nested))
+            .expect("missing parent directories are created");
+        sink.close().expect("close");
+        assert!(nested.is_file());
+
+        // A parent path that is itself a file still fails loudly and names the path.
+        let file_parent = directory.path().join("not-a-directory");
+        std::fs::write(&file_parent, b"x").expect("write file");
+        let invalid = file_parent.join("access.log");
+        let error = AccessLogSink::from_config(&AccessLogSinkConfig::file(&invalid))
+            .expect_err("parent is a file");
         assert_eq!(error.path(), "writer.filename");
         assert!(
-            error.message().contains("does-not-exist"),
+            error.message().contains("access.log"),
             "error names the offending path: {error}"
         );
 
@@ -1021,5 +1618,144 @@ mod tests {
         assert_eq!(decoded, config);
         // Default output is Caddy's stderr writer.
         assert_eq!(AccessLogOutput::default(), AccessLogOutput::Stderr);
+    }
+
+    // ---- expanded writers/encoders (T-ADMIN-032) -------------------------------------------
+
+    #[test]
+    fn size_rotation_rolls_and_prunes_backups() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("access.log");
+        let sink = AccessLogSink::from_config(&AccessLogSinkConfig {
+            output: AccessLogOutput::File,
+            filename: Some(path.clone()),
+            file: FileWriterOptions {
+                roll: true,
+                roll_size_mb: Some(1),
+                roll_keep: 2,
+                roll_keep_days: None,
+                ..FileWriterOptions::default()
+            },
+            encoder: AccessLogConfig {
+                exclude: vec![],
+                ..AccessLogConfig::default()
+            },
+            ..AccessLogSinkConfig::default()
+        })
+        .expect("rotating sink");
+
+        // Write a bit more than three megabytes so the 1 MiB file rolls repeatedly.
+        let line_padding = "x".repeat(256);
+        let large = AccessLogEntry {
+            user_id: line_padding,
+            ..entry("rotated", 200)
+        };
+        for _ in 0..14_000 {
+            sink.emit(&large).expect("emit");
+        }
+        sink.close().expect("close");
+        assert!(path.is_file(), "current log file exists");
+        let backups: Vec<_> = std::fs::read_dir(directory.path())
+            .expect("dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("access.log.")
+            })
+            .collect();
+        assert!(!backups.is_empty(), "rotation created backup files");
+        assert!(
+            backups.len() <= 2,
+            "roll_keep prunes old backups, got {}",
+            backups.len()
+        );
+    }
+
+    #[test]
+    fn net_writer_streams_lines_to_a_tcp_listener() {
+        use std::io::{BufRead, BufReader};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let sink = AccessLogSink::from_config(&AccessLogSinkConfig {
+            output: AccessLogOutput::Net,
+            net: Some(NetWriterConfig {
+                address: address.to_string(),
+                network: NetProtocol::Tcp,
+                dial_timeout_ns: Some(1_000_000_000),
+                soft_start: false,
+            }),
+            ..AccessLogSinkConfig::default()
+        })
+        .expect("net sink");
+        sink.emit(&entry("over the wire", 200)).expect("emit");
+        let (stream, _peer) = listener.accept().expect("accept");
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read line");
+        let value: Value = serde_json::from_str(line.trim()).expect("json line");
+        assert_eq!(value["status"], 200);
+        assert_eq!(value["msg"], "handled request");
+        sink.close().expect("close");
+    }
+
+    #[test]
+    fn net_writer_fails_loudly_without_soft_start_and_tolerates_soft_start() {
+        // Nothing is listening on this reserved-but-closed ephemeral port.
+        let address = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.local_addr().expect("address").to_string()
+        };
+        let error = AccessLogSink::from_config(&AccessLogSinkConfig {
+            output: AccessLogOutput::Net,
+            net: Some(NetWriterConfig {
+                address: address.clone(),
+                network: NetProtocol::Tcp,
+                dial_timeout_ns: Some(100_000_000),
+                soft_start: false,
+            }),
+            ..AccessLogSinkConfig::default()
+        })
+        .expect_err("unreachable socket");
+        assert_eq!(error.path(), "writer.address");
+
+        // soft_start tolerates the unreachable socket and falls back to stderr while reconnecting.
+        let sink = AccessLogSink::from_config(&AccessLogSinkConfig {
+            output: AccessLogOutput::Net,
+            net: Some(NetWriterConfig {
+                address,
+                network: NetProtocol::Tcp,
+                dial_timeout_ns: Some(100_000_000),
+                soft_start: true,
+            }),
+            ..AccessLogSinkConfig::default()
+        })
+        .expect("soft start");
+        assert_eq!(
+            sink.emit(&entry("fallback", 200)).expect("emit"),
+            EmitOutcome::Written
+        );
+        sink.close().expect("close");
+    }
+
+    #[test]
+    fn console_encoder_matches_caddys_console_framing() {
+        let encoder =
+            AccessLogEncoder::with_format(AccessLogConfig::default(), AccessLogFormat::Console)
+                .expect("encoder");
+        let mut log_entry = entry("console", 200);
+        log_entry.timestamp = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let line = encoder.encode_line(&log_entry).expect("console line");
+        let line = String::from_utf8(line).expect("utf8");
+        assert!(
+            line.starts_with("2023/11/14 22:13:20.000\t\u{1b}[34mINFO\u{1b}[0m\thttp.log.access\thandled request\t{"),
+            "got: {line}"
+        );
+        assert!(
+            line.contains("\"status\": 200"),
+            "spaced JSON fields: {line}"
+        );
+        assert!(line.ends_with('\n'));
     }
 }

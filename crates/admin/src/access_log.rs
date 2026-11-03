@@ -356,6 +356,8 @@ impl AccessLogEntry {
         entry.apply_redaction(config);
         let mut value = entry.to_json_value()?;
         config.apply_field_selection(&mut value);
+        config.apply_field_filters(&mut value);
+        config.apply_key_options(&mut value);
         Ok(value)
     }
 
@@ -676,6 +678,238 @@ impl AccessLogSampler {
     }
 }
 
+/// One Caddy `logging.encoders.filter` field rule applied to the rendered JSON entry.
+///
+/// This is caddy-rs's representation of Caddy's filter modules that operate on a named field
+/// (`fields: {"<path>": {"filter": "<module>", ...}}`). Path segments are separated by `>` (for
+/// example `request>headers>User-Agent`). The fundamental encoder fields (`ts`, `level`,
+/// `logger`, `msg`) cannot be filtered, matching Caddy.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FieldFilter {
+    /// Field path segments (`>`-separated in Caddy JSON, already split here).
+    pub path: Vec<String>,
+    /// Operation to apply to the field value.
+    pub operation: FieldFilterOperation,
+}
+
+/// A supported Caddy log-field filter operation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldFilterOperation {
+    /// Remove the field.
+    Delete,
+    /// Replace the value (or every element of a string array) with a fixed string.
+    Replace {
+        /// Replacement value.
+        value: String,
+    },
+    /// Rename the field key (within its containing object).
+    Rename {
+        /// New field name.
+        name: String,
+    },
+    /// Replace string value(s) with the first 4 bytes of their SHA-256 hash, hex-encoded
+    /// (Caddy's `hash` filter: `fmt.Sprintf("%.4x", sha256.Sum256(...))`).
+    Hash,
+    /// Mask IP address(es) with CIDR prefix lengths (Caddy's `ip_mask` filter).
+    IpMask {
+        /// IPv4 prefix length (0-32); absent leaves the address unmasked.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        v4_mask: Option<u8>,
+        /// IPv6 prefix length (0-128); absent leaves the address unmasked.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        v6_mask: Option<u8>,
+    },
+}
+
+/// Caddy's `hash` filter: first 4 bytes of SHA-256, lower-case hex (8 characters).
+fn short_sha256(value: &str) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, value.as_bytes());
+    digest.as_ref()[..4]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn mask_ip(value: &str, v4_mask: Option<u8>, v6_mask: Option<u8>) -> String {
+    value
+        .split(',')
+        .map(|part| {
+            let part = part.trim();
+            let (host, port) = if let Some((host, port)) = part.rsplit_once(':') {
+                if port.parse::<u16>().is_ok() {
+                    let host = host
+                        .strip_prefix('[')
+                        .and_then(|host| host.strip_suffix(']'))
+                        .unwrap_or(host);
+                    (host, Some(port))
+                } else {
+                    (part, None)
+                }
+            } else {
+                (part, None)
+            };
+            let Ok(address) = host.parse::<std::net::IpAddr>() else {
+                return part.to_string();
+            };
+            let masked = match address {
+                std::net::IpAddr::V4(address) => match v4_mask {
+                    Some(mask) => {
+                        let shift = 32u32.saturating_sub(u32::from(mask.min(32)));
+                        let masked = u32::MAX.checked_shl(shift).unwrap_or(0);
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::from(u32::from(address) & masked))
+                    }
+                    None => std::net::IpAddr::V4(address),
+                },
+                std::net::IpAddr::V6(address) => match v6_mask {
+                    Some(mask) => {
+                        let shift = 128u32.saturating_sub(u32::from(mask.min(128)));
+                        let masked = u128::MAX.checked_shl(shift).unwrap_or(0);
+                        std::net::IpAddr::V6(std::net::Ipv6Addr::from(u128::from(address) & masked))
+                    }
+                    None => std::net::IpAddr::V6(address),
+                },
+            };
+            match port {
+                Some(port) if masked.is_ipv6() => format!("[{masked}]:{port}"),
+                Some(port) => format!("{masked}:{port}"),
+                None => masked.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+impl FieldFilter {
+    fn validate(&self) -> Result<(), AccessLogError> {
+        if self.path.is_empty() || self.path.iter().any(String::is_empty) {
+            return Err(AccessLogError::new(
+                "filter.path",
+                "filter field path must not be empty",
+            ));
+        }
+        if FUNDAMENTAL_FIELDS.contains(&self.path[0].as_str()) {
+            return Err(AccessLogError::new(
+                format!("filter.{}", self.path.join(">")),
+                "fundamental log fields (ts, level, logger, msg) cannot be filtered",
+            ));
+        }
+        match &self.operation {
+            FieldFilterOperation::Rename { name } if name.is_empty() => Err(AccessLogError::new(
+                format!("filter.{}", self.path.join(">")),
+                "rename filter requires a non-empty `name`",
+            )),
+            FieldFilterOperation::IpMask { v4_mask, v6_mask } => {
+                if v4_mask.is_some_and(|mask| mask > 32) {
+                    return Err(AccessLogError::new(
+                        format!("filter.{}", self.path.join(">")),
+                        "ip_mask v4_mask must be <= 32",
+                    ));
+                }
+                if v6_mask.is_some_and(|mask| mask > 128) {
+                    return Err(AccessLogError::new(
+                        format!("filter.{}", self.path.join(">")),
+                        "ip_mask v6_mask must be <= 128",
+                    ));
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn apply(&self, value: &mut serde_json::Value) {
+        let Some(parent) = path_parent(value, &self.path) else {
+            return;
+        };
+        let key = &self.path[self.path.len() - 1];
+        match &self.operation {
+            FieldFilterOperation::Delete => {
+                if let serde_json::Value::Object(map) = parent {
+                    map.remove(key);
+                }
+            }
+            FieldFilterOperation::Replace { value: replacement } => {
+                map_strings(parent, key, |_| Some(replacement.clone()));
+            }
+            FieldFilterOperation::Rename { name } => {
+                if let serde_json::Value::Object(map) = parent {
+                    if let Some(entry) = map.remove(key) {
+                        map.insert(name.clone(), entry);
+                    }
+                }
+            }
+            FieldFilterOperation::Hash => {
+                map_strings(parent, key, |existing| Some(short_sha256(existing)));
+            }
+            FieldFilterOperation::IpMask { v4_mask, v6_mask } => {
+                map_strings(parent, key, |existing| {
+                    Some(mask_ip(existing, *v4_mask, *v6_mask))
+                });
+            }
+        }
+    }
+}
+
+/// Navigate to the parent container of a `>`-separated field path.
+fn path_parent<'a>(
+    value: &'a mut serde_json::Value,
+    path: &[String],
+) -> Option<&'a mut serde_json::Value> {
+    let (_, parents) = path.split_last()?;
+    let mut current = value;
+    for segment in parents {
+        current = match current {
+            serde_json::Value::Object(map) => map.get_mut(segment)?,
+            serde_json::Value::Array(items) => items.get_mut(segment.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
+    }
+    Some(current)
+}
+
+fn map_strings(
+    parent: &mut serde_json::Value,
+    key: &str,
+    transform: impl Fn(&str) -> Option<String>,
+) {
+    match parent {
+        serde_json::Value::Object(map) => {
+            if let Some(value) = map.get_mut(key) {
+                apply_to_value(value, &transform);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            if let Ok(index) = key.parse::<usize>() {
+                if let Some(value) = items.get_mut(index) {
+                    apply_to_value(value, &transform);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn apply_to_value(value: &mut serde_json::Value, transform: &impl Fn(&str) -> Option<String>) {
+    match value {
+        serde_json::Value::String(existing) => {
+            if let Some(replacement) = transform(existing) {
+                *existing = replacement;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                if let serde_json::Value::String(existing) = item {
+                    if let Some(replacement) = transform(existing) {
+                        *existing = replacement;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Field selection and redaction configuration for one access-log sink.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AccessLogConfig {
@@ -695,6 +929,24 @@ pub struct AccessLogConfig {
     /// Optional sampling policy (no sampling when absent).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sampling: Option<SamplingConfig>,
+    /// Caddy filter-encoder field operations, applied after field selection.
+    #[serde(default)]
+    pub filters: Vec<FieldFilter>,
+    /// Encoder key renaming (Caddy `message_key`/`level_key`/`time_key`/`name_key`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_key: Option<String>,
+    /// Encoder key for the level field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level_key: Option<String>,
+    /// Encoder key for the timestamp field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_key: Option<String>,
+    /// Encoder key for the logger name field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_key: Option<String>,
+    /// Line terminator written after each encoded entry (Caddy `line_ending`, default `\n`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_ending: Option<String>,
 }
 
 impl AccessLogConfig {
@@ -736,7 +988,56 @@ impl AccessLogConfig {
         if let Some(sampling) = &self.sampling {
             sampling.validate()?;
         }
+        for filter in &self.filters {
+            filter.validate()?;
+        }
+        for (index, key) in [
+            &self.message_key,
+            &self.level_key,
+            &self.time_key,
+            &self.name_key,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if key.as_deref() == Some("") {
+                return Err(AccessLogError::new(
+                    format!("key_options[{index}]"),
+                    "encoder key names must not be empty",
+                ));
+            }
+        }
+        if self.line_ending.as_deref() == Some("") {
+            return Err(AccessLogError::new(
+                "line_ending",
+                "line ending must not be empty",
+            ));
+        }
         Ok(())
+    }
+
+    fn apply_key_options(&self, value: &mut serde_json::Value) {
+        let serde_json::Value::Object(map) = value else {
+            return;
+        };
+        for (original, renamed) in [
+            ("msg", &self.message_key),
+            ("level", &self.level_key),
+            ("ts", &self.time_key),
+            ("logger", &self.name_key),
+        ] {
+            if let Some(renamed) = renamed {
+                if let Some(entry) = map.remove(original) {
+                    map.insert(renamed.clone(), entry);
+                }
+            }
+        }
+    }
+
+    fn apply_field_filters(&self, value: &mut serde_json::Value) {
+        for filter in &self.filters {
+            filter.apply(value);
+        }
     }
 
     fn apply_field_selection(&self, value: &mut serde_json::Value) {
@@ -1356,6 +1657,7 @@ mod tests {
                 cookies: vec![],
             },
             sampling: Some(SamplingConfig::default()),
+            ..AccessLogConfig::default()
         };
         let text = serde_json::to_string(&config).expect("config serializes");
         assert!(text.contains("\"action\":\"delete\""), "got: {text}");
@@ -1388,5 +1690,73 @@ mod tests {
         let text = entry.render_string(&AccessLogConfig::default()).unwrap();
         assert!(text.contains("\"Authorization\":[\"REDACTED\"]"));
         assert!(text.contains("\"status\":200"));
+    }
+
+    #[test]
+    fn field_filters_apply_hash_ip_mask_rename_and_delete() {
+        let config = AccessLogConfig {
+            filters: vec![
+                FieldFilter {
+                    path: vec!["request".to_string(), "uri".to_string()],
+                    operation: FieldFilterOperation::Hash,
+                },
+                FieldFilter {
+                    path: vec!["request".to_string(), "remote_ip".to_string()],
+                    operation: FieldFilterOperation::IpMask {
+                        v4_mask: Some(24),
+                        v6_mask: Some(64),
+                    },
+                },
+                FieldFilter {
+                    path: vec![
+                        "request".to_string(),
+                        "headers".to_string(),
+                        "X-Debug".to_string(),
+                    ],
+                    operation: FieldFilterOperation::Rename {
+                        name: "X-Renamed".to_string(),
+                    },
+                },
+                FieldFilter {
+                    path: vec![
+                        "request".to_string(),
+                        "headers".to_string(),
+                        "X-Secret".to_string(),
+                    ],
+                    operation: FieldFilterOperation::Delete,
+                },
+                FieldFilter {
+                    path: vec!["upstream".to_string()],
+                    operation: FieldFilterOperation::Replace {
+                        value: "removed".to_string(),
+                    },
+                },
+            ],
+            ..AccessLogConfig::default()
+        };
+        let mut entry = AccessLogEntry::new(AccessLogRequest::default());
+        entry.request.uri = "secret".to_string();
+        entry.request.remote_ip = "192.0.2.10".to_string();
+        entry
+            .request
+            .headers
+            .insert("X-Debug".to_string(), vec!["debug".to_string()]);
+        entry
+            .request
+            .headers
+            .insert("X-Secret".to_string(), vec!["secret".to_string()]);
+        let rendered = entry.render(&config).expect("render");
+        // Caddy hash filter: first 4 bytes of SHA-256, hex (sha256("secret") = 2bb80d53...).
+        assert_eq!(rendered["request"]["uri"], "2bb80d53");
+        assert_eq!(rendered["request"]["remote_ip"], "192.0.2.0");
+        let headers = rendered["request"]["headers"].as_object().expect("headers");
+        assert!(headers.get("X-Debug").is_none());
+        assert_eq!(headers["X-Renamed"][0], "debug");
+        assert!(headers.get("X-Secret").is_none());
+        // Arrays of strings are transformed element-wise; missing fields are no-ops.
+        assert!(
+            rendered.get("upstream").is_none(),
+            "absent field is a no-op"
+        );
     }
 }
