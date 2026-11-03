@@ -1,0 +1,6 @@
+localhost {
+	request_body /api/* {
+		max_size 1MB
+		set {path}
+	}
+}

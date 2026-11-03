@@ -24,6 +24,7 @@ const DIRECTIVE_ORDER: &[&str] = &[
     "vars",
     "root",
     "header",
+    "request_body",
     "redir",
     "method",
     "uri",
@@ -2543,6 +2544,105 @@ fn build_handle_route(
     Ok(Value::Object(route))
 }
 
+/// Caddy's `request_body` directive: emit the canonical `request_body` handler with `max_size`
+/// (humanize.ParseBytes units, decimal by default) and the experimental `set` body replacement.
+fn request_body_handler(directive: &Directive) -> caddy_rs_core::Result<Value> {
+    let mut object = Map::new();
+    object.insert("handler".to_string(), json!("request_body"));
+    for option in &directive.block {
+        match option.name.as_str() {
+            "max_size" => {
+                if option.args.len() != 1 {
+                    return Err(adapter_error(
+                        option.position,
+                        "wrong argument count or unexpected line ending after `max_size`",
+                    ));
+                }
+                let size = parse_caddy_size(&option.args[0]).map_err(|error| {
+                    adapter_error(option.position, format!("parsing max_size: {error}"))
+                })?;
+                if size > i64::MAX as u64 {
+                    return Err(adapter_error(
+                        option.position,
+                        format!("parsing max_size: size {size} is out of range"),
+                    ));
+                }
+                // Caddy's RequestBody uses `omitempty`, and its ServeHTTP applies the limit only
+                // when MaxSize > 0.
+                if size > 0 {
+                    object.insert("max_size".to_string(), json!(size));
+                }
+            }
+            "set" => {
+                if option.args.len() != 1 {
+                    return Err(adapter_error(
+                        option.position,
+                        "wrong argument count or unexpected line ending after `set`",
+                    ));
+                }
+                let value = qualify_placeholders(&option.args[0]);
+                if !value.is_empty() {
+                    object.insert("set".to_string(), json!(value));
+                }
+            }
+            other => {
+                return Err(adapter_error(
+                    option.position,
+                    format!("unrecognized request_body subdirective '{other}'"),
+                ));
+            }
+        }
+    }
+    Ok(Value::Object(object))
+}
+
+/// Parse a size the way Caddy does (`go-humanize.ParseBytes`): an optional fractional number
+/// (commas allowed as thousand separators) followed by an optional size suffix. Decimal suffixes
+/// (`kb`, `mb`, …) use powers of 1000; `kib`/`mib`/… use powers of 1024; the bare `k`/`m`/`g`/…
+/// forms are also accepted. Results are truncated to whole bytes.
+fn parse_caddy_size(value: &str) -> Result<u64, String> {
+    let text = value.trim();
+    let mut end = 0;
+    for (index, character) in text.char_indices() {
+        if character.is_ascii_digit() || character == '.' || character == ',' {
+            end = index + character.len_utf8();
+        } else {
+            break;
+        }
+    }
+    let number_text = text[..end].replace(',', "");
+    let suffix = text[end..].trim().to_ascii_lowercase();
+    let number: f64 = number_text
+        .parse()
+        .map_err(|_| format!("strconv.ParseFloat: parsing \"{number_text}\": invalid syntax"))?;
+    let multiplier: u64 = match suffix.as_str() {
+        "" | "b" => 1,
+        "k" | "kb" => 1_000,
+        "kib" => 1_024,
+        "m" | "mb" => 1_000_000,
+        "mib" => 1_048_576,
+        "g" | "gb" => 1_000_000_000,
+        "gib" => 1_073_741_824,
+        "t" | "tb" => 1_000_000_000_000,
+        "tib" => 1_099_511_627_776,
+        "p" | "pb" => 1_000_000_000_000_000,
+        "pib" => 1_125_899_906_842_624,
+        "e" | "eb" => 1_000_000_000_000_000_000,
+        "eib" => 1_152_921_504_606_846_976,
+        other => return Err(format!("unhandled size name: {other}")),
+    };
+    if !number.is_finite() || number < 0.0 {
+        return Err(format!(
+            "strconv.ParseFloat: parsing \"{number_text}\": invalid syntax"
+        ));
+    }
+    let product = number * multiplier as f64;
+    if product >= u64::MAX as f64 {
+        return Err(format!("size {value} is out of range"));
+    }
+    Ok(product as u64)
+}
+
 fn build_handlers(
     directive: &Directive,
     args: &[String],
@@ -2556,6 +2656,7 @@ fn build_handlers(
         "method" => vec![method_handler(args, directive.position)?],
         "uri" => vec![uri_handler(args, directive.position)?],
         "header" => header_handlers(directive, args)?,
+        "request_body" => vec![request_body_handler(directive)?],
         "encode" => vec![encode_handler(directive)?],
         "reverse_proxy" => vec![reverse_proxy_handler(directive, args)?],
         "basicauth" | "basic_auth" => vec![basic_auth_handler(directive, args)?],
