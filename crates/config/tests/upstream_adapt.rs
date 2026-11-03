@@ -519,3 +519,84 @@ fn tls_cert_key_emits_caddys_connection_policies() {
         ])
     );
 }
+
+#[test]
+fn bind_ipv6_matches_caddy() {
+    assert_adapts_like_caddy("bind_ipv6.caddyfiletest");
+}
+
+#[test]
+fn log_skip_hosts_matches_caddy() {
+    assert_adapts_like_caddy("log_skip_hosts.caddyfiletest");
+}
+
+#[test]
+fn try_files_matches_real_caddy_v2_11_7() {
+    // Golden output from `caddy adapt` v2.11.7 (release oracle) with route groups normalised.
+    let adapted =
+        adapt("example.com {\n\troot * /srv\n\ttry_files {path} {path}/ /index.html\n}\n")
+            .expect("adapt try_files");
+    let mut actual = adapted.config;
+    normalize_groups(&mut actual);
+    let expected: Value = serde_json::from_str(
+        r#"{
+            "apps": {"http": {"servers": {"srv0": {
+                "listen": [":443"],
+                "routes": [{
+                    "match": [{"host": ["example.com"]}],
+                    "handle": [{
+                        "handler": "subroute",
+                        "routes": [
+                            {"handle": [{"handler": "vars", "root": "/srv"}]},
+                            {"handle": [{"handler": "rewrite", "uri": "{http.matchers.file.relative}"}],
+                             "match": [{"file": {"try_files": [
+                                 "{http.request.uri.path}",
+                                 "{http.request.uri.path}/",
+                                 "/index.html"
+                             ]}}]}
+                        ]
+                    }],
+                    "terminal": true
+                }]
+            }}}}
+        }"#,
+    )
+    .expect("golden JSON");
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn try_files_with_query_groups_routes_like_real_caddy_v2_11_7() {
+    // `caddy adapt` v2.11.7: consecutive non-query entries form one route, then each entry with a
+    // query string gets its own route with that query appended to the rewrite URI; all grouped.
+    let adapted =
+        adapt("example.com {\n\troot * /srv\n\ttry_files {path} index.php?{query}&p={path}\n}\n")
+            .expect("adapt try_files with query");
+    let mut actual = adapted.config;
+    normalize_groups(&mut actual);
+    let routes = actual["apps"]["http"]["servers"]["srv0"]["routes"][0]["handle"][0]["routes"]
+        .as_array()
+        .expect("subroute routes");
+    assert_eq!(
+        routes.len(),
+        3,
+        "one root route plus two grouped rewrite routes"
+    );
+    assert_eq!(
+        routes[1],
+        json!({
+            "match": [{"file": {"try_files": ["{http.request.uri.path}"]}}],
+            "handle": [{"handler": "rewrite", "uri": "{http.matchers.file.relative}"}],
+            "group": "<group>",
+        })
+    );
+    assert_eq!(
+        routes[2],
+        json!({
+            "match": [{"file": {"try_files": ["index.php"]}}],
+            "handle": [{"handler": "rewrite",
+                        "uri": "{http.matchers.file.relative}?{http.request.uri.query}&p={http.request.uri.path}"}],
+            "group": "<group>",
+        })
+    );
+}
