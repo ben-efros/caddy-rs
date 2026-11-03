@@ -1,36 +1,37 @@
 {
-  "apps": {
-    "http": {
-      "servers": {
-        "srv0": {
-          "listen": [
-            ":8083"
-          ],
-          "routes": [
-            {
-              "handle": [
-                {
-                  "handler": "authentication",
-                  "providers": {
-                    "http_basic": {
-                      "accounts": [
+    "apps": {
+        "http": {
+            "servers": {
+                "srv0": {
+                    "listen": [
+                        ":8083"
+                    ],
+                    "routes": [
                         {
-                          "password": "$argon2id$v=19$m=65536,t=3,p=2$c29tZXNhbHQ$cmVzdWx0",
-                          "username": "carol"
+                            "handle": [
+                                {
+                                    "handler": "authentication",
+                                    "providers": {
+                                        "http_basic": {
+                                            "accounts": [
+                                                {
+                                                    "password": "$argon2id$v=19$m=65536,t=3,p=2$c29tZXNhbHQ$cmVzdWx0",
+                                                    "username": "carol"
+                                                }
+                                            ],
+                                            "hash": {
+                                                "algorithm": "argon2id"
+                                            },
+                                            "hash_cache": {},
+                                            "realm": "Auth realm"
+                                        }
+                                    }
+                                }
+                            ]
                         }
-                      ],
-                      "hash": {
-                        "algorithm": "argon2id"
-                      },
-                      "realm": "Auth realm"
-                    }
-                  }
+                    ]
                 }
-              ]
             }
-          ]
         }
-      }
     }
-  }
 }

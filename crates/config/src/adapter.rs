@@ -28,6 +28,7 @@ const DIRECTIVE_ORDER: &[&str] = &[
     "request_body",
     "redir",
     "method",
+    "rewrite",
     "uri",
     "try_files",
     "basicauth",
@@ -2402,8 +2403,10 @@ fn uri_handler(args: &[String], position: Position) -> caddy_rs_core::Result<Val
         other => Err(adapter_error(
             position,
             format!(
-                "`uri {other}` is not supported by this build (only `strip_prefix` has a \
-                 runtime implementation; tracked as T-CONF-027)"
+                "`uri {other}` is not supported by this build: the caddy-rs rewrite handler \
+                 implements only `uri`, `method` and `strip_path_prefix`, so `uri {other}` needs \
+                 runtime rewrite-handler support (no plan task owns it yet; tracking id \
+                 REWRITE-HANDLER-FIELDS)"
             ),
         )),
     }
@@ -2856,7 +2859,9 @@ fn build_routes(
                 let mut args = directive.args.clone();
                 // `root` is ambiguous: a single argument is always the root path, never a path
                 // matcher (Caddy's parseRoot uses the argument count to disambiguate).
-                let matcher = if name == "root" && args.len() == 1 {
+                let matcher = if (name == "root" && args.len() == 1)
+                    || (name == "rewrite" && directive.args.len() == 1)
+                {
                     None
                 } else {
                     matcher_for_args(&mut args, matchers, directive.position)?
@@ -2865,13 +2870,18 @@ fn build_routes(
                 if handlers.is_empty() {
                     continue;
                 }
-                let route = match matcher {
+                let mut route = match matcher {
                     Some(matcher) => json!({
                         "match": [matcher],
                         "handle": handlers,
                     }),
                     None => json!({"handle": handlers}),
                 };
+                // Caddy always puts `rewrite` routes in a mutually-exclusive group (even a single
+                // one) so only the first matching rewrite runs; group names are normalised.
+                if name == "rewrite" {
+                    route["group"] = json!("group1");
+                }
                 entries.push((name, route));
             }
         }
@@ -3459,6 +3469,7 @@ fn build_handlers(
         "file_server" => vec![file_server_handler(directive)?],
         "root" => vec![root_handler(args, directive.position)?],
         "method" => vec![method_handler(args, directive.position)?],
+        "rewrite" => vec![rewrite_handler(args, directive.position)?],
         "uri" => vec![uri_handler(args, directive.position)?],
         "header" => header_handlers(directive, args)?,
         "request_body" => vec![request_body_handler(directive)?],
@@ -3477,6 +3488,33 @@ fn build_handlers(
         }
     };
     Ok(handlers)
+}
+
+/// Caddy's `rewrite` directive: `rewrite [<matcher>] <to>` emits a rewrite handler that changes
+/// only the URI (Caddy's handler also supports other fields, but the runtime only implements
+/// `uri`, `method` and `strip_path_prefix`; the Caddyfile directive only sets the URI anyway).
+fn rewrite_handler(args: &[String], position: Position) -> caddy_rs_core::Result<Value> {
+    match args {
+        [] => Err(adapter_error(
+            position,
+            "too few arguments; must have at least a rewrite URI",
+        )),
+        [uri] => Ok(json!({
+            "handler": "rewrite",
+            "uri": qualify_placeholders(uri),
+        })),
+        // Caddy's parser consumes the first token as the URI even when a second token did not
+        // parse as a matcher, silently ignoring the rest in that case; mirror the observed
+        // v2.11.7 adapt output for parity.
+        [uri, _ignored] => Ok(json!({
+            "handler": "rewrite",
+            "uri": qualify_placeholders(uri),
+        })),
+        _ => Err(adapter_error(
+            position,
+            "too many arguments; should only be a matcher and a URI",
+        )),
+    }
 }
 
 /// Caddy's `basic_auth` directive: emit the canonical `authentication` handler with the
@@ -3526,6 +3564,9 @@ fn basic_auth_handler(directive: &Directive, args: &[String]) -> caddy_rs_core::
 
     let mut provider = Map::new();
     provider.insert("hash".to_string(), json!({"algorithm": hash_name}));
+    // `parseCaddyfile` always allocates a HashCache, so Caddy's adapted JSON carries
+    // `"hash_cache": {}` for every `basic_auth`/`basicauth` handler.
+    provider.insert("hash_cache".to_string(), json!({}));
     if !accounts.is_empty() {
         provider.insert("accounts".to_string(), Value::Array(accounts));
     }

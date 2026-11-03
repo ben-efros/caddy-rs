@@ -1,39 +1,40 @@
 {
-  "apps": {
-    "http": {
-      "servers": {
-        "srv0": {
-          "listen": [
-            ":8082"
-          ],
-          "routes": [
-            {
-              "handle": [
-                {
-                  "handler": "authentication",
-                  "providers": {
-                    "http_basic": {
-                      "accounts": [
+    "apps": {
+        "http": {
+            "servers": {
+                "srv0": {
+                    "listen": [
+                        ":8082"
+                    ],
+                    "routes": [
                         {
-                          "password": "$2a$14$abcdefghijklmnopqrstuv",
-                          "username": "alice"
-                        },
-                        {
-                          "password": "$2b$14$zyxwvutsrqponmlkjihgfe",
-                          "username": "bob"
+                            "handle": [
+                                {
+                                    "handler": "authentication",
+                                    "providers": {
+                                        "http_basic": {
+                                            "accounts": [
+                                                {
+                                                    "password": "$2a$14$abcdefghijklmnopqrstuv",
+                                                    "username": "alice"
+                                                },
+                                                {
+                                                    "password": "$2b$14$zyxwvutsrqponmlkjihgfe",
+                                                    "username": "bob"
+                                                }
+                                            ],
+                                            "hash": {
+                                                "algorithm": "bcrypt"
+                                            },
+                                            "hash_cache": {}
+                                        }
+                                    }
+                                }
+                            ]
                         }
-                      ],
-                      "hash": {
-                        "algorithm": "bcrypt"
-                      }
-                    }
-                  }
+                    ]
                 }
-              ]
             }
-          ]
         }
-      }
     }
-  }
 }
