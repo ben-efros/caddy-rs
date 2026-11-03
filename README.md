@@ -66,7 +66,7 @@ work queue.
 - Acceptance: local acceptance harness (forward_auth/Authelia, streaming, WebSocket, TLS, internal
   CA auto-HTTPS, admin) and Pebble real-ACME acceptance (HTTP-01/TLS-ALPN-01, account reuse)
 - Compatibility: real Caddy v2.11.7 oracle acquisition (no Docker), adapt/validate/runtime probes,
-  drift triage and nightly workflow; 76 registered divergences with tracking tasks
+  drift triage and nightly workflow; 80 registered divergences with tracking tasks
 - CLI: `version`, `list-modules`, `adapt`, `validate`, `run`, `reload`, `stop`
 
 ## What does not work yet (registered, not hidden)
