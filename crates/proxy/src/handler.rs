@@ -43,6 +43,7 @@ use caddy_rs_http::{
 
 use crate::balancer::{self, Balancer};
 use crate::client::{build_upstream_client, UpstreamClient};
+use crate::fastcgi::{FastCgiError, FastCgiTransport};
 use crate::forward_auth::{HandleResponse, HandleResponseResult, RequestRewrite};
 use crate::health::{HealthCheck, HealthCheckScheduler};
 use crate::passive::PassiveHealth;
@@ -91,6 +92,9 @@ enum ProxyError {
          (T-PROXY-032)"
     )]
     UpgradeNotSupported,
+    /// FastCGI transport failure (dial, protocol, timeout or body error).
+    #[error("fastcgi transport error: {0}")]
+    FastCgi(#[from] FastCgiError),
 }
 
 impl ProxyError {
@@ -101,7 +105,17 @@ impl ProxyError {
     fn is_dial_error(&self) -> bool {
         match self {
             ProxyError::Client(error) => error.is_connect(),
+            ProxyError::FastCgi(error) => error.is_connect(),
             _ => false,
+        }
+    }
+
+    /// A specific HTTP status Caddy would surface for this failure (e.g. 411 for a FastCGI
+    /// request whose body has no known length), when it is not the generic 502.
+    fn explicit_status(&self) -> Option<StatusCode> {
+        match self {
+            ProxyError::FastCgi(error) => error.status(),
+            _ => None,
         }
     }
 
@@ -344,6 +358,13 @@ impl ReverseProxyHandler {
         let trusted_proxies = parse_trusted_proxies(object.get("trusted_proxies"), path)?;
 
         let (health_check, passive) = parse_health_checks(object.get("health_checks"), path)?;
+        if transport.fastcgi.is_some() && health_check.is_some() {
+            return Err(HttpError::NotImplemented {
+                feature:
+                    "active health checks over the FastCGI transport (the probe client is HTTP-only)",
+                tracking_id: "PROXY-FASTCGI-HEALTH",
+            });
+        }
 
         let flush_interval = parse_flush_interval(
             object.get("flush_interval"),
@@ -446,6 +467,19 @@ impl ReverseProxyHandler {
             Some(rewrite) if rewrite.drops_body() => RequestBody::empty(),
             _ => body,
         };
+        if let Some(fastcgi) = &self.transport.fastcgi {
+            let started = std::time::Instant::now();
+            let response = fastcgi
+                .forward(upstream, request, method, &path_and_query, body)
+                .await?;
+            let latency = started.elapsed();
+            return Ok(Forwarded::Streaming(ForwardedStreamingResponse {
+                status: response.status,
+                latency,
+                headers: self.response_headers(&response.headers, Version::HTTP_11),
+                body: response.body,
+            }));
+        }
         let mut headers = self.outbound_headers(request, upstream)?;
         let url = if self.h2_capable() {
             // HTTP/2 `:authority` parity with Caddy/Go: use the original request Host (or a
@@ -899,7 +933,11 @@ impl Handler for ReverseProxyHandler {
     /// run `handle_response` routes needs the complete request body buffered before dispatch so it
     /// can be replayed. Otherwise the proxy streams the body exactly once.
     fn requires_buffered_request_body(&self) -> bool {
-        self.retries > 0 || !self.try_duration.is_zero() || self.handle_response.is_configured()
+        // FastCGI cannot express a body of unknown length (`CONTENT_LENGTH` is required).
+        self.transport.fastcgi.is_some()
+            || self.retries > 0
+            || !self.try_duration.is_zero()
+            || self.handle_response.is_configured()
     }
 
     async fn handle(&self, request: Request) -> HttpResult<Outcome> {
@@ -1035,6 +1073,12 @@ impl Handler for ReverseProxyHandler {
                         "caddy-rs: reverse_proxy upstream `{}` failed: {error}",
                         upstream.dial
                     );
+                    if let Some(status) = error.explicit_status() {
+                        return Ok(Outcome::Respond(Response::text(
+                            status,
+                            format!("{status}"),
+                        )));
+                    }
                     if let Some(passive) = &self.passive {
                         passive.record_failure(&upstream.dial, std::time::Instant::now());
                     }
@@ -1231,6 +1275,11 @@ impl Handler for ReverseProxyHandler {
                         "caddy-rs: reverse_proxy upstream `{}` failed: {error}",
                         upstream.dial
                     );
+                    if let Some(status) = error.explicit_status() {
+                        return Ok(StreamingOutcome::Respond(StreamingResponse::from_buffered(
+                            Response::text(status, format!("{status}")),
+                        )));
+                    }
                     if let Some(passive) = &self.passive {
                         passive.record_failure(&upstream.dial, std::time::Instant::now());
                     }
@@ -1425,6 +1474,8 @@ struct TransportConfig {
     h2c: bool,
     /// TLS ALPN offers HTTP/2 (Caddy `versions` containing `2` or `h2c`).
     alpn_h2: bool,
+    /// FastCGI transport configuration when `protocol` is `"fastcgi"`.
+    fastcgi: Option<Arc<FastCgiTransport>>,
 }
 
 /// Build one client per upstream. The per-upstream connector dials its bound target regardless of
@@ -1481,13 +1532,24 @@ fn parse_transport(value: Option<&Value>, path: &str) -> HttpResult<TransportCon
         .as_object()
         .ok_or_else(|| invalid(&transport_path, "`transport` must be an object"))?;
 
-    if let Some(protocol) = object.get("protocol").and_then(Value::as_str) {
-        if protocol != "http" {
-            return Err(HttpError::NotImplemented {
-                feature: "non-HTTP upstream transports (for example FastCGI)",
-                tracking_id: "PROXY-TRANSPORT-PROTOCOL",
-            });
-        }
+    let protocol = object
+        .get("protocol")
+        .and_then(Value::as_str)
+        .unwrap_or("http");
+    if protocol == "fastcgi" {
+        // Caddy's FastCGI transport has its own module shape; `from_json` rejects any HTTP
+        // transport field (`tls`, `versions`, ...) instead of silently ignoring it.
+        let fastcgi = FastCgiTransport::from_json(value, &transport_path)?;
+        return Ok(TransportConfig {
+            fastcgi: Some(Arc::new(fastcgi)),
+            ..TransportConfig::default()
+        });
+    }
+    if protocol != "http" {
+        return Err(HttpError::NotImplemented {
+            feature: "non-HTTP upstream transports other than FastCGI",
+            tracking_id: "PROXY-TRANSPORT-PROTOCOL",
+        });
     }
 
     // Caddy defaults `versions` to ["1.1", "2"] when unset.
@@ -1629,7 +1691,12 @@ fn parse_transport(value: Option<&Value>, path: &str) -> HttpResult<TransportCon
             .iter()
             .any(|version| version == "2" || version == "h2c");
     let h2c = !tls_present && versions.iter().any(|version| version == "h2c");
-    Ok(TransportConfig { tls, h2c, alpn_h2 })
+    Ok(TransportConfig {
+        tls,
+        h2c,
+        alpn_h2,
+        fastcgi: None,
+    })
 }
 
 /// A Unix-socket upstream with TLS has no dial host for SNI/verification, so it must configure
