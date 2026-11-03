@@ -79,6 +79,7 @@ dependencies = [
  "caddy-rs-config",
  "caddy-rs-core",
  "http",
+ "ring",
  "serde",
  "serde_json",
  "tempfile",

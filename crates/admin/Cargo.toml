@@ -13,6 +13,7 @@ bytes = { workspace = true }
 caddy-rs-config = { workspace = true }
 caddy-rs-core = { workspace = true }
 http = { workspace = true }
+ring = "0.17.14"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
