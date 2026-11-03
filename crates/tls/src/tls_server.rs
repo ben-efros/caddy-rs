@@ -29,12 +29,20 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
+use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{
     CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
+    UnixTime,
 };
+use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
 use rustls::sign::CertifiedKey;
-use rustls::{RootCertStore, ServerConfig, SupportedProtocolVersion};
+use rustls::{
+    CertificateError, DigitallySignedStruct, DistinguishedName, RootCertStore, ServerConfig,
+    SignatureScheme, SupportedProtocolVersion,
+};
 use serde_json::Value;
 
 use caddy_rs_core::config::{CertKeyPemPair, Config, TlsApp};
@@ -56,10 +64,16 @@ pub enum ClientAuthMode {
     /// Do not ask for a client certificate (Caddy's default).
     #[default]
     None,
-    /// Ask for a client certificate and verify it when supplied, but allow none.
+    /// Ask for a client certificate but allow none and do not verify it (Caddy `request`).
     Request,
-    /// Require a client certificate and verify it against the configured roots.
+    /// Require a client certificate but do not verify it (Caddy `require`).
     Require,
+    /// Ask for a client certificate, allow none, and verify it when supplied
+    /// (Caddy `verify_if_given`).
+    VerifyIfGiven,
+    /// Require a valid client certificate that chains to the configured trust pool
+    /// (Caddy `require_and_verify`).
+    RequireAndVerify,
 }
 
 impl ClientAuthMode {
@@ -67,14 +81,28 @@ impl ClientAuthMode {
     pub fn parse(value: &str) -> Result<Self> {
         match value {
             "request" => Ok(Self::Request),
-            "require" | "require_and_verify" => Ok(Self::Require),
+            "require" => Ok(Self::Require),
+            "verify_if_given" => Ok(Self::VerifyIfGiven),
+            "require_and_verify" => Ok(Self::RequireAndVerify),
             other => Err(Error::TlsConfig {
                 path: "tls_connection_policies[0].client_authentication.mode".to_string(),
                 message: format!(
-                    "unsupported client authentication mode `{other}`; expected `request`, `require` or `require_and_verify`"
+                    "unsupported client authentication mode `{other}`; expected `request`, \
+                     `require`, `verify_if_given` or `require_and_verify`"
                 ),
             }),
         }
+    }
+
+    /// Whether this mode verifies the certificate chain (Caddy's `VerifyClientCertIfGiven` and
+    /// `RequireAndVerifyClientCert`).
+    pub fn verifies(self) -> bool {
+        matches!(self, Self::VerifyIfGiven | Self::RequireAndVerify)
+    }
+
+    /// Whether a client certificate is mandatory for this mode.
+    pub fn requires_certificate(self) -> bool {
+        matches!(self, Self::Require | Self::RequireAndVerify)
     }
 }
 
@@ -114,9 +142,14 @@ pub struct TlsServerOptions {
     pub versions: TlsVersions,
     /// Client certificate authentication mode.
     pub client_auth: ClientAuthMode,
-    /// PEM CA bundle used to verify client certificates for [`ClientAuthMode::Request`] and
-    /// [`ClientAuthMode::Require`]. Configuration-driven CA pools are not modelled yet; embedders
-    /// that need client auth supply the bundle explicitly.
+    /// Trust anchors used to verify client certificates (`client_authentication.ca` /
+    /// deprecated PEM fields). Parsed eagerly so invalid pools fail the configuration.
+    pub client_auth_roots: Vec<CertificateDer<'static>>,
+    /// Client leaf certificates accepted by exact DER equality (`trusted_leaf_certs` /
+    /// `trusted_leaf_cert_file`). When non-empty the presented leaf must be in this list in
+    /// addition to any chain verification.
+    pub client_auth_leaf_certs: Vec<CertificateDer<'static>>,
+    /// PEM CA bundle used to verify client certificates (embedder convenience, legacy field).
     pub client_auth_roots_pem: Option<String>,
     /// Per-connection certificate selection policies, in configuration order.
     ///
@@ -172,6 +205,8 @@ impl Default for TlsServerOptions {
                 .collect(),
             versions: TlsVersions::Default,
             client_auth: ClientAuthMode::None,
+            client_auth_roots: Vec::new(),
+            client_auth_leaf_certs: Vec::new(),
             client_auth_roots_pem: None,
             certificate_policies: Vec::new(),
         }
@@ -276,29 +311,10 @@ impl TlsServerOptions {
             };
         }
         if let Some(client_authentication) = policy.get("client_authentication") {
-            let object = client_authentication
-                .as_object()
-                .ok_or_else(|| Error::TlsConfig {
-                    path: "tls_connection_policies[0].client_authentication".to_string(),
-                    message: "must be an object".to_string(),
-                })?;
-            if object.contains_key("trusted_ca_pool")
-                || object.contains_key("trusted_leaf_cert_file")
-            {
-                return Err(Error::NotImplemented {
-                    feature: "ACME client authentication CA pools (`client_authentication.trusted_ca_pool`)",
-                    tracking_id: "TLS-CLIENT-AUTH",
-                });
-            }
-            let mode =
-                object
-                    .get("mode")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| Error::TlsConfig {
-                        path: "tls_connection_policies[0].client_authentication.mode".to_string(),
-                        message: "client authentication requires a `mode`".to_string(),
-                    })?;
-            options.client_auth = ClientAuthMode::parse(mode)?;
+            let parsed = parse_client_authentication(client_authentication)?;
+            options.client_auth = parsed.mode;
+            options.client_auth_roots = parsed.roots;
+            options.client_auth_leaf_certs = parsed.leaf_certs;
         }
         // Parse every connection policy: the first one supplied the listener-wide options above,
         // and each policy contributes per-connection certificate selection. Caddy evaluates the
@@ -990,25 +1006,70 @@ pub fn build_server_config_with_cert_resolver(
     let builder = match options.client_auth {
         ClientAuthMode::None => builder.with_no_client_auth(),
         mode => {
-            let roots_pem = options.client_auth_roots_pem.as_deref().ok_or_else(|| {
-                Error::TlsConfig {
-                    path: "tls_connection_policies[0].client_authentication".to_string(),
-                    message: format!(
-                        "client authentication mode `{mode:?}` requires a trusted CA bundle; configuration-driven `trusted_ca_pool` modules are not implemented (TLS-CLIENT-AUTH)"
-                    ),
-                }
-            })?;
-            let roots = root_store_from_pem(roots_pem)?;
-            let verifier_builder =
-                WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider);
-            let verifier = match mode {
-                ClientAuthMode::Request => verifier_builder.allow_unauthenticated().build(),
-                _ => verifier_builder.build(),
+            let mut roots = options.client_auth_roots.clone();
+            if let Some(pem) = options.client_auth_roots_pem.as_deref() {
+                roots.extend(certificate_chain_from_pem(pem).map_err(|error| {
+                    Error::TlsConfig {
+                        path: CLIENT_AUTH_PATH.to_string(),
+                        message: format!("cannot parse client-auth root PEM bundle: {error}"),
+                    }
+                })?);
             }
-            .map_err(|error| Error::TlsConfig {
-                path: "tls_connection_policies[0].client_authentication".to_string(),
-                message: format!("cannot build client certificate verifier: {error}"),
-            })?;
+            let trusted_leaves: Vec<Vec<u8>> = options
+                .client_auth_leaf_certs
+                .iter()
+                .map(|certificate| certificate.as_ref().to_vec())
+                .collect();
+            let verifier: Arc<dyn ClientCertVerifier> = if mode.verifies() {
+                if !roots.is_empty() {
+                    let store = root_store_from_client_auth_roots(roots)?;
+                    let verifier_builder = WebPkiClientVerifier::builder_with_provider(
+                        Arc::new(store),
+                        Arc::clone(&provider),
+                    );
+                    let webpki = if mode.requires_certificate() {
+                        verifier_builder.build()
+                    } else {
+                        verifier_builder.allow_unauthenticated().build()
+                    }
+                    .map_err(|error| Error::TlsConfig {
+                        path: CLIENT_AUTH_PATH.to_string(),
+                        message: format!("cannot build client certificate verifier: {error}"),
+                    })?;
+                    if trusted_leaves.is_empty() {
+                        webpki
+                    } else {
+                        Arc::new(LeafAllowlistClientCertVerifier {
+                            inner: webpki,
+                            trusted_leaves,
+                        })
+                    }
+                } else if !trusted_leaves.is_empty() {
+                    // Leaf-allowlist-only configurations: exact-leaf authentication without a CA
+                    // bundle (Caddy falls back to system roots for chain verification; this build
+                    // requires the exact leaf, documented divergence).
+                    Arc::new(AcceptAnyClientCertVerifier {
+                        provider: Arc::clone(&provider),
+                        mandatory: mode.requires_certificate(),
+                        trusted_leaves,
+                    })
+                } else {
+                    return Err(Error::TlsConfig {
+                        path: CLIENT_AUTH_PATH.to_string(),
+                        message: format!(
+                            "client authentication mode `{mode:?}` requires a trusted CA bundle (`client_authentication.ca` or `trusted_ca_pem_files`) or `trusted_leaf_cert_file`"
+                        ),
+                    });
+                }
+            } else {
+                // Caddy's `request`/`require` modes ask for a certificate but do not verify its
+                // chain; an optional exact-leaf allowlist is still enforced.
+                Arc::new(AcceptAnyClientCertVerifier {
+                    provider: Arc::clone(&provider),
+                    mandatory: mode.requires_certificate(),
+                    trusted_leaves,
+                })
+            };
             builder.with_client_cert_verifier(verifier)
         }
     };
@@ -1212,21 +1273,463 @@ fn private_key_from_pem(pem: &str) -> Result<PrivateKeyDer<'static>> {
     })
 }
 
-fn root_store_from_pem(pem: &str) -> Result<RootCertStore> {
-    let mut roots = RootCertStore::empty();
-    for certificate in certificate_chain_from_pem(pem)? {
-        roots.add(certificate).map_err(|error| Error::TlsConfig {
-            path: "tls_connection_policies[0].client_authentication".to_string(),
-            message: format!("invalid client-auth trust root: {error}"),
-        })?;
+/// Located path for client-authentication configuration errors.
+const CLIENT_AUTH_PATH: &str = "tls_connection_policies[0].client_authentication";
+
+/// Parsed `client_authentication` configuration.
+#[derive(Debug, Default)]
+struct ParsedClientAuthentication {
+    mode: ClientAuthMode,
+    roots: Vec<CertificateDer<'static>>,
+    leaf_certs: Vec<CertificateDer<'static>>,
+}
+
+/// Parse Caddy's `tls_connection_policies[].client_authentication`.
+///
+/// Supports the `ca` module (`tls.ca_pool.source.inline` / `tls.ca_pool.source.file`), the
+/// deprecated direct trust fields (`trusted_ca_certs`, `trusted_ca_certs_pem_files`,
+/// `trusted_leaf_certs`) and the task-facing aliases (`trusted_ca_pool`, `trusted_ca_pem_files`,
+/// `trusted_leaf_cert_file`). Unsupported verifier modules and unknown fields fail loudly.
+fn parse_client_authentication(value: &Value) -> Result<ParsedClientAuthentication> {
+    let object = value.as_object().ok_or_else(|| Error::TlsConfig {
+        path: CLIENT_AUTH_PATH.to_string(),
+        message: "must be an object".to_string(),
+    })?;
+    let mut parsed = ParsedClientAuthentication::default();
+    let mut mode = None;
+    let mut saw_ca_module = false;
+    let mut saw_direct_roots = false;
+    for (key, field) in object {
+        let path = format!("{CLIENT_AUTH_PATH}.{key}");
+        match key.as_str() {
+            "mode" => {
+                let mode_value = field.as_str().ok_or_else(|| Error::TlsConfig {
+                    path: path.clone(),
+                    message: "mode must be a string".to_string(),
+                })?;
+                mode = Some(ClientAuthMode::parse(mode_value)?);
+            }
+            "ca" => {
+                saw_ca_module = true;
+                parse_client_auth_ca_pool(field, &path, &mut parsed.roots)?;
+            }
+            "trusted_ca_pool" => {
+                saw_direct_roots = true;
+                parse_client_auth_ca_pool(field, &path, &mut parsed.roots)?;
+            }
+            "trusted_ca_certs" | "trusted_ca_cert" => {
+                saw_direct_roots = true;
+                parsed
+                    .roots
+                    .extend(parse_base64_der_cert_list(field, &path)?);
+            }
+            "trusted_ca_certs_pem_files" | "trusted_ca_pem_files" | "trusted_ca_cert_file" => {
+                saw_direct_roots = true;
+                parsed
+                    .roots
+                    .extend(parse_client_auth_pem_files(field, &path)?);
+            }
+            "trusted_leaf_certs" | "trusted_leaf_cert" => {
+                parsed
+                    .leaf_certs
+                    .extend(parse_base64_der_cert_list(field, &path)?);
+            }
+            "trusted_leaf_cert_file" => {
+                parsed
+                    .leaf_certs
+                    .extend(parse_client_auth_pem_files(field, &path)?);
+            }
+            "verifiers" => {
+                return Err(Error::NotImplemented {
+                    feature: "custom client-certificate verifiers (`client_authentication.verifiers`, e.g. CRL/OCSP)",
+                    tracking_id: "TLS-CLIENT-AUTH",
+                })
+            }
+            other => {
+                return Err(Error::Unsupported {
+                    path,
+                    feature: format!("client authentication field `{other}`"),
+                    tracking_id: "TLS-CLIENT-AUTH",
+                })
+            }
+        }
     }
+    if saw_ca_module && saw_direct_roots {
+        return Err(Error::TlsConfig {
+            path: CLIENT_AUTH_PATH.to_string(),
+            message: "conflicting client authentication trust configuration: `ca` cannot be combined with trusted CA fields".to_string(),
+        });
+    }
+    let actionable = mode.is_some() || !parsed.roots.is_empty() || !parsed.leaf_certs.is_empty();
+    if !actionable {
+        parsed.mode = ClientAuthMode::None;
+        return Ok(parsed);
+    }
+    // Caddy's default: require_and_verify when a trust pool/leaf list is provided, otherwise
+    // require. Explicit `mode` always wins.
+    parsed.mode = mode.unwrap_or(if parsed.roots.is_empty() && parsed.leaf_certs.is_empty() {
+        ClientAuthMode::Require
+    } else {
+        ClientAuthMode::RequireAndVerify
+    });
+    Ok(parsed)
+}
+
+/// Parse one CA pool source (`ca` module or the `trusted_ca_pool` alias).
+fn parse_client_auth_ca_pool(
+    value: &Value,
+    path: &str,
+    roots: &mut Vec<CertificateDer<'static>>,
+) -> Result<()> {
+    match value {
+        // The task-facing alias also accepts a bare array of base64 DER certificates.
+        Value::Array(_) => {
+            roots.extend(parse_base64_der_cert_list(value, path)?);
+            return Ok(());
+        }
+        Value::Object(object) => {
+            let provider = object
+                .get("provider")
+                .or_else(|| object.get("module"))
+                .and_then(Value::as_str);
+            let provider = match provider {
+                Some(provider) => provider,
+                None => {
+                    // No explicit provider: accept the inline fields directly.
+                    if object.contains_key("trusted_ca_certs")
+                        || object.contains_key("trusted_ca_pool")
+                    {
+                        "inline"
+                    } else if object.contains_key("pem_files")
+                        || object.contains_key("trusted_ca_pem_files")
+                        || object.contains_key("trusted_ca_certs_pem_files")
+                    {
+                        "file"
+                    } else {
+                        return Err(Error::TlsConfig {
+                            path: path.to_string(),
+                            message: "CA pool source must name a `provider` (`inline` or `file`)"
+                                .to_string(),
+                        });
+                    }
+                }
+            };
+            let provider = provider
+                .strip_prefix("tls.ca_pool.source.")
+                .unwrap_or(provider);
+            match provider {
+                "inline" => {
+                    for (key, value) in object {
+                        match key.as_str() {
+                            "provider" | "module" => {}
+                            "trusted_ca_certs" | "trusted_ca_pool" => roots.extend(
+                                parse_base64_der_cert_list(
+                                    value,
+                                    &format!("{path}.{key}"),
+                                )?,
+                            ),
+                            "pem_files" | "trusted_ca_pem_files"
+                            | "trusted_ca_certs_pem_files" => roots.extend(
+                                parse_client_auth_pem_files(
+                                    value,
+                                    &format!("{path}.{key}"),
+                                )?,
+                            ),
+                            other => {
+                                return Err(Error::Unsupported {
+                                    path: format!("{path}.{other}"),
+                                    feature: format!("inline client-auth CA pool field `{other}`"),
+                                    tracking_id: "TLS-CLIENT-AUTH",
+                                })
+                            }
+                        }
+                    }
+                }
+                "file" => {
+                    let mut saw_files = false;
+                    for (key, value) in object {
+                        match key.as_str() {
+                            "provider" | "module" => {}
+                            "pem_files" | "trusted_ca_pem_files"
+                            | "trusted_ca_certs_pem_files" => {
+                                saw_files = true;
+                                roots.extend(parse_client_auth_pem_files(
+                                    value,
+                                    &format!("{path}.{key}"),
+                                )?);
+                            }
+                            other => {
+                                return Err(Error::Unsupported {
+                                    path: format!("{path}.{other}"),
+                                    feature: format!("file client-auth CA pool field `{other}`"),
+                                    tracking_id: "TLS-CLIENT-AUTH",
+                                })
+                            }
+                        }
+                    }
+                    if !saw_files {
+                        return Err(Error::TlsConfig {
+                            path: path.to_string(),
+                            message: "file client-auth CA pool requires `pem_files`".to_string(),
+                        });
+                    }
+                }
+                other => {
+                    return Err(Error::Unsupported {
+                        path: path.to_string(),
+                        feature: format!(
+                            "client authentication CA pool provider `{other}` (supported: inline, file)"
+                        ),
+                        tracking_id: "TLS-CLIENT-AUTH",
+                    })
+                }
+            }
+        }
+        _ => {
+            return Err(Error::TlsConfig {
+                path: path.to_string(),
+                message: "CA pool source must be an object or an array of base64 DER certificates"
+                    .to_string(),
+            })
+        }
+    }
+    Ok(())
+}
+
+/// Parse a list (or single string) of base64 DER certificates.
+fn parse_base64_der_cert_list(value: &Value, path: &str) -> Result<Vec<CertificateDer<'static>>> {
+    let values: Vec<&Value> = match value {
+        Value::Array(values) => values.iter().collect(),
+        Value::String(_) => vec![value],
+        _ => {
+            return Err(Error::TlsConfig {
+                path: path.to_string(),
+                message: "must be an array of base64 DER certificates".to_string(),
+            })
+        }
+    };
+    let mut certificates = Vec::with_capacity(values.len());
+    for (index, value) in values.iter().enumerate() {
+        let encoded = value.as_str().ok_or_else(|| Error::TlsConfig {
+            path: format!("{path}[{index}]"),
+            message: "certificate must be a base64 DER string".to_string(),
+        })?;
+        let der = BASE64.decode(encoded).map_err(|error| Error::TlsConfig {
+            path: format!("{path}[{index}]"),
+            message: format!("invalid base64 DER certificate: {error}"),
+        })?;
+        if der.is_empty() {
+            return Err(Error::TlsConfig {
+                path: format!("{path}[{index}]"),
+                message: "certificate is empty".to_string(),
+            });
+        }
+        certificates.push(CertificateDer::from(der));
+    }
+    Ok(certificates)
+}
+
+/// Parse a PEM file path (or array of paths) into DER certificates.
+fn parse_client_auth_pem_files(value: &Value, path: &str) -> Result<Vec<CertificateDer<'static>>> {
+    let paths: Vec<&str> = match value {
+        Value::Array(values) => {
+            let mut paths = Vec::with_capacity(values.len());
+            for (index, value) in values.iter().enumerate() {
+                let value = value.as_str().ok_or_else(|| Error::TlsConfig {
+                    path: format!("{path}[{index}]"),
+                    message: "PEM file path must be a string".to_string(),
+                })?;
+                if value.trim().is_empty() {
+                    return Err(Error::TlsConfig {
+                        path: format!("{path}[{index}]"),
+                        message: "PEM file path must not be empty".to_string(),
+                    });
+                }
+                paths.push(value);
+            }
+            paths
+        }
+        Value::String(path) => vec![path.as_str()],
+        _ => {
+            return Err(Error::TlsConfig {
+                path: path.to_string(),
+                message: "must be a PEM file path or array of paths".to_string(),
+            })
+        }
+    };
+    if paths.is_empty() {
+        return Err(Error::TlsConfig {
+            path: path.to_string(),
+            message: "at least one PEM file is required".to_string(),
+        });
+    }
+    let mut certificates = Vec::new();
+    for (index, file) in paths.iter().enumerate() {
+        let pem = std::fs::read_to_string(file).map_err(|error| Error::TlsConfig {
+            path: format!("{path}[{index}]"),
+            message: format!("cannot read client-auth PEM file `{file}`: {error}"),
+        })?;
+        let parsed = certificate_chain_from_pem(&pem).map_err(|error| Error::TlsConfig {
+            path: format!("{path}[{index}]"),
+            message: format!("cannot parse client-auth PEM file `{file}`: {error}"),
+        })?;
+        certificates.extend(parsed);
+    }
+    Ok(certificates)
+}
+
+/// Client-certificate verifier that asks for a certificate but does not validate its chain
+/// (Caddy's `request`/`require` modes) while still enforcing an optional exact-leaf allowlist.
+#[derive(Debug)]
+struct AcceptAnyClientCertVerifier {
+    provider: Arc<CryptoProvider>,
+    mandatory: bool,
+    trusted_leaves: Vec<Vec<u8>>,
+}
+
+impl ClientCertVerifier for AcceptAnyClientCertVerifier {
+    fn client_auth_mandatory(&self) -> bool {
+        self.mandatory
+    }
+
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> std::result::Result<ClientCertVerified, rustls::Error> {
+        if !self.trusted_leaves.is_empty()
+            && !self
+                .trusted_leaves
+                .iter()
+                .any(|trusted| trusted.as_slice() == end_entity.as_ref())
+        {
+            return Err(rustls::Error::InvalidCertificate(
+                CertificateError::UnknownIssuer,
+            ));
+        }
+        Ok(ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Wrapper that adds exact-leaf allowlist enforcement after a chain verifier accepted the
+/// certificate (Caddy's deprecated `trusted_leaf_certs` verifier).
+#[derive(Debug)]
+struct LeafAllowlistClientCertVerifier {
+    inner: Arc<dyn ClientCertVerifier>,
+    trusted_leaves: Vec<Vec<u8>>,
+}
+
+impl ClientCertVerifier for LeafAllowlistClientCertVerifier {
+    fn offer_client_auth(&self) -> bool {
+        self.inner.offer_client_auth()
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        self.inner.client_auth_mandatory()
+    }
+
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        self.inner.root_hint_subjects()
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
+    ) -> std::result::Result<ClientCertVerified, rustls::Error> {
+        self.inner
+            .verify_client_cert(end_entity, intermediates, now)?;
+        if !self
+            .trusted_leaves
+            .iter()
+            .any(|trusted| trusted.as_slice() == end_entity.as_ref())
+        {
+            return Err(rustls::Error::InvalidCertificate(
+                CertificateError::UnknownIssuer,
+            ));
+        }
+        Ok(ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+/// Build a rustls client-auth root store from already-parsed DER certificates.
+fn root_store_from_client_auth_roots(roots: Vec<CertificateDer<'static>>) -> Result<RootCertStore> {
     if roots.is_empty() {
         return Err(Error::TlsConfig {
-            path: "tls_connection_policies[0].client_authentication".to_string(),
+            path: CLIENT_AUTH_PATH.to_string(),
             message: "client-auth trust root bundle is empty".to_string(),
         });
     }
-    Ok(roots)
+    let mut store = RootCertStore::empty();
+    for certificate in roots {
+        store.add(certificate).map_err(|error| Error::TlsConfig {
+            path: CLIENT_AUTH_PATH.to_string(),
+            message: format!("invalid client-auth trust root: {error}"),
+        })?;
+    }
+    Ok(store)
 }
 
 /// Match one SNI pattern against a normalized server name.
@@ -1447,6 +1950,93 @@ mod tests {
 
     fn certificate_der(certificate: &TlsCertificate) -> Vec<u8> {
         certificate.chain()[0].as_ref().to_vec()
+    }
+
+    const CLIENT_CA_CERT: &str = include_str!("../testdata/auto-https/ca.pem");
+    const CLIENT_CERT: &str = include_str!("../testdata/client-auth/client.pem");
+    const CLIENT_KEY: &str = include_str!("../testdata/client-auth/client.key");
+    const OTHER_CLIENT_CERT: &str = include_str!("../testdata/client-auth/other-client.pem");
+    const OTHER_CLIENT_KEY: &str = include_str!("../testdata/client-auth/other-client.key");
+    const UNTRUSTED_CLIENT_CERT: &str =
+        include_str!("../testdata/client-auth/untrusted-client.pem");
+    const UNTRUSTED_CLIENT_KEY: &str = include_str!("../testdata/client-auth/untrusted-client.key");
+
+    fn client_auth_server(
+        mode: ClientAuthMode,
+        roots_pem: Option<&str>,
+        leaf_certs: &[&str],
+    ) -> Arc<ServerConfig> {
+        let resolver =
+            Arc::new(CertificateResolver::from_certificates([example()]).expect("resolver builds"));
+        let mut options = TlsServerOptions {
+            client_auth: mode,
+            ..TlsServerOptions::default()
+        };
+        if let Some(pem) = roots_pem {
+            options.client_auth_roots =
+                certificate_chain_from_pem(pem).expect("client CA fixture parses");
+        }
+        for leaf in leaf_certs {
+            options
+                .client_auth_leaf_certs
+                .extend(certificate_chain_from_pem(leaf).expect("leaf fixture parses"));
+        }
+        build_server_config(resolver, &options).expect("client-auth server config builds")
+    }
+
+    /// Run a real rustls handshake with an optional client certificate.
+    async fn handshake_with_client_auth(
+        server_config: Arc<ServerConfig>,
+        identity: Option<(&str, &str)>,
+        versions: &'static [&'static SupportedProtocolVersion],
+    ) -> std::result::Result<(), String> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|error| error.to_string())?;
+        let address = listener.local_addr().map_err(|error| error.to_string())?;
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.map_err(|error| error.to_string())?;
+            acceptor
+                .accept(stream)
+                .await
+                .map(|_| ())
+                .map_err(|error| format!("server handshake: {error}"))
+        });
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let builder = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+            .with_protocol_versions(versions)
+            .map_err(|error| error.to_string())?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyCertificate(provider)));
+        let mut client = match identity {
+            Some((certificate, key)) => builder
+                .with_client_auth_cert(
+                    certificate_chain_from_pem(certificate).expect("client cert parses"),
+                    private_key_from_pem(key).expect("client key parses"),
+                )
+                .map_err(|error| error.to_string())?,
+            None => builder.with_no_client_auth(),
+        };
+        client.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
+        let stream = tokio::net::TcpStream::connect(address)
+            .await
+            .map_err(|error| error.to_string())?;
+        let server_name = rustls::pki_types::ServerName::try_from("example.com").unwrap();
+        let client_result = connector
+            .connect(server_name, stream)
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("client handshake: {error}"));
+        let server_result = server
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string());
+        match (client_result, server_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (client, server) => Err(format!("client={client:?} server={server:?}")),
+        }
     }
 
     fn fixture_stored(cert_pem: &str, key_pem: &str, domains: &[&str]) -> StoredCertificate {
@@ -1712,37 +2302,385 @@ mod tests {
         );
     }
 
+    fn client_ca_der_base64() -> String {
+        use base64::Engine as _;
+        let der = certificate_chain_from_pem(CLIENT_CA_CERT).unwrap()[0]
+            .as_ref()
+            .to_vec();
+        BASE64.encode(der)
+    }
+
     #[test]
-    fn option_parsing_rejects_unmodelled_client_auth_ca_pools() {
-        let error = TlsServerOptions::from_connection_policies(Some(&[serde_json::json!({
-            "client_authentication": {
-                "mode": "require",
-                "trusted_ca_pool": {"module": "tls.ca_pool.source.inline"}
-            }
-        })]))
+    fn client_auth_mode_parsing_accepts_all_caddy_modes() {
+        for (value, mode) in [
+            ("request", ClientAuthMode::Request),
+            ("require", ClientAuthMode::Require),
+            ("verify_if_given", ClientAuthMode::VerifyIfGiven),
+            ("require_and_verify", ClientAuthMode::RequireAndVerify),
+        ] {
+            let options = TlsServerOptions::from_connection_policies(Some(&[
+                serde_json::json!({"client_authentication": {"mode": value}}),
+            ]))
+            .unwrap();
+            assert_eq!(options.client_auth, mode, "mode {value}");
+        }
+        // An empty client_authentication object is inert, like Caddy's inactive config.
+        let options = TlsServerOptions::from_connection_policies(Some(&[
+            serde_json::json!({"client_authentication": {}}),
+        ]))
+        .unwrap();
+        assert_eq!(options.client_auth, ClientAuthMode::None);
+        let error = TlsServerOptions::from_connection_policies(Some(&[
+            serde_json::json!({"client_authentication": {"mode": "bogus"}}),
+        ]))
         .unwrap_err();
         assert!(
-            error.to_string().contains("client authentication CA pools"),
+            error
+                .to_string()
+                .contains("unsupported client authentication mode"),
             "{error}"
         );
     }
 
     #[test]
-    fn client_auth_requires_explicit_roots() {
-        let resolver = Arc::new(CertificateResolver::from_certificates([example()]).unwrap());
-        let mut options = TlsServerOptions {
-            client_auth: ClientAuthMode::Require,
-            ..TlsServerOptions::default()
-        };
-        let error = build_server_config(Arc::clone(&resolver), &options).unwrap_err();
+    fn parses_client_auth_inline_ca_pool() {
+        let encoded = client_ca_der_base64();
+        let options = TlsServerOptions::from_connection_policies(Some(&[
+            serde_json::json!({"client_authentication": {
+                "ca": {"provider": "inline", "trusted_ca_certs": [encoded]}
+            }}),
+        ]))
+        .expect("inline CA pool parses");
+        // Caddy's default mode with a trust pool is require_and_verify.
+        assert_eq!(options.client_auth, ClientAuthMode::RequireAndVerify);
+        assert_eq!(options.client_auth_roots.len(), 1);
+        assert!(options.client_auth_leaf_certs.is_empty());
+    }
+
+    #[test]
+    fn parses_client_auth_file_ca_pool_and_legacy_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let ca_path = directory.path().join("client-ca.pem");
+        std::fs::write(&ca_path, CLIENT_CA_CERT).unwrap();
+        let ca_path = ca_path.to_string_lossy().to_string();
+
+        let options = TlsServerOptions::from_connection_policies(Some(&[
+            serde_json::json!({"client_authentication": {
+                "mode": "verify_if_given",
+                "ca": {"provider": "file", "pem_files": [ca_path]}
+            }}),
+        ]))
+        .expect("file CA pool parses");
+        assert_eq!(options.client_auth, ClientAuthMode::VerifyIfGiven);
+        assert_eq!(options.client_auth_roots.len(), 1);
+
+        // Deprecated/direct Caddy fields plus the task-facing aliases.
+        let encoded = client_ca_der_base64();
+        let options = TlsServerOptions::from_connection_policies(Some(&[
+            serde_json::json!({"client_authentication": {
+                "trusted_ca_pool": [encoded],
+                "trusted_leaf_cert_file": ca_path,
+            }}),
+        ]))
+        .expect("direct trusted fields parse");
+        assert_eq!(options.client_auth, ClientAuthMode::RequireAndVerify);
+        assert_eq!(options.client_auth_roots.len(), 1);
+        assert_eq!(options.client_auth_leaf_certs.len(), 1);
+
+        let options = TlsServerOptions::from_connection_policies(Some(&[
+            serde_json::json!({"client_authentication": {
+                "trusted_ca_certs_pem_files": [ca_path],
+            }}),
+        ]))
+        .expect("canonical PEM files field parses");
+        assert_eq!(options.client_auth, ClientAuthMode::RequireAndVerify);
+        assert_eq!(options.client_auth_roots.len(), 1);
+    }
+
+    #[test]
+    fn client_auth_config_errors_are_loud() {
+        let error = TlsServerOptions::from_connection_policies(Some(&[
+            serde_json::json!({"client_authentication": {
+                "trusted_ca_certs": ["not-base64!"]
+            }}),
+        ]))
+        .unwrap_err();
         assert!(
-            error.to_string().contains("requires a trusted CA bundle"),
+            error.to_string().contains("invalid base64 DER certificate"),
             "{error}"
         );
 
-        options.client_auth_roots_pem = Some(EXAMPLE_CERT.to_string());
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing.pem");
+        let error = TlsServerOptions::from_connection_policies(Some(&[
+            serde_json::json!({"client_authentication": {
+                "trusted_ca_pem_files": [missing.to_string_lossy()]
+            }}),
+        ]))
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot read client-auth PEM file"),
+            "{error}"
+        );
+
+        let error = TlsServerOptions::from_connection_policies(Some(&[
+            serde_json::json!({"client_authentication": {
+                "ca": {"provider": "system"}
+            }}),
+        ]))
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("supported: inline, file"),
+            "{error}"
+        );
+
+        let error = TlsServerOptions::from_connection_policies(Some(&[
+            serde_json::json!({"client_authentication": {
+                "verifiers": [{"verifier": "leaf"}]
+            }}),
+        ]))
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("custom client-certificate verifiers"),
+            "{error}"
+        );
+
+        let encoded = client_ca_der_base64();
+        let error = TlsServerOptions::from_connection_policies(Some(&[
+            serde_json::json!({"client_authentication": {
+                "ca": {"provider": "inline", "trusted_ca_certs": [encoded]},
+                "trusted_ca_certs": [encoded],
+            }}),
+        ]))
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("conflicting client authentication"),
+            "{error}"
+        );
+
+        let error = TlsServerOptions::from_connection_policies(Some(&[
+            serde_json::json!({"client_authentication": {"unknown_field": true}}),
+        ]))
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("client authentication field"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn client_auth_verifying_modes_require_roots() {
+        let resolver = Arc::new(CertificateResolver::from_certificates([example()]).unwrap());
+        for mode in [
+            ClientAuthMode::VerifyIfGiven,
+            ClientAuthMode::RequireAndVerify,
+        ] {
+            let options = TlsServerOptions {
+                client_auth: mode,
+                ..TlsServerOptions::default()
+            };
+            let error = build_server_config(Arc::clone(&resolver), &options).unwrap_err();
+            assert!(
+                error.to_string().contains("requires a trusted CA bundle"),
+                "{mode:?}: {error}"
+            );
+        }
+
+        // `request` and `require` do not verify the chain, so no trust pool is needed.
+        for mode in [ClientAuthMode::Request, ClientAuthMode::Require] {
+            let options = TlsServerOptions {
+                client_auth: mode,
+                ..TlsServerOptions::default()
+            };
+            build_server_config(Arc::clone(&resolver), &options)
+                .unwrap_or_else(|error| panic!("{mode:?}: {error}"));
+        }
+
+        // The programmatic PEM convenience still works for verifying modes.
+        let options = TlsServerOptions {
+            client_auth: ClientAuthMode::RequireAndVerify,
+            client_auth_roots_pem: Some(CLIENT_CA_CERT.to_string()),
+            ..TlsServerOptions::default()
+        };
         let config = build_server_config(resolver, &options).unwrap();
         assert!(config.alpn_protocols.contains(&b"h2".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn client_auth_request_mode_allows_missing_and_unverified_certificates() {
+        // Caddy `request`: ask for a certificate but verify nothing.
+        let server = client_auth_server(ClientAuthMode::Request, None, &[]);
+        handshake_with_client_auth(Arc::clone(&server), None, TLS12_AND_13)
+            .await
+            .expect("request mode allows no client certificate");
+        handshake_with_client_auth(
+            Arc::clone(&server),
+            Some((CLIENT_CERT, CLIENT_KEY)),
+            TLS12_AND_13,
+        )
+        .await
+        .expect("request mode accepts a client certificate");
+        handshake_with_client_auth(
+            server,
+            Some((UNTRUSTED_CLIENT_CERT, UNTRUSTED_CLIENT_KEY)),
+            TLS12_AND_13,
+        )
+        .await
+        .expect("request mode does not verify the certificate");
+    }
+
+    #[tokio::test]
+    async fn client_auth_require_mode_requires_but_does_not_verify() {
+        let server = client_auth_server(ClientAuthMode::Require, None, &[]);
+        assert!(
+            handshake_with_client_auth(Arc::clone(&server), None, TLS12_AND_13)
+                .await
+                .is_err(),
+            "require mode must reject a missing client certificate"
+        );
+        handshake_with_client_auth(
+            Arc::clone(&server),
+            Some((CLIENT_CERT, CLIENT_KEY)),
+            TLS12_AND_13,
+        )
+        .await
+        .expect("require mode accepts a certificate");
+        handshake_with_client_auth(
+            server,
+            Some((UNTRUSTED_CLIENT_CERT, UNTRUSTED_CLIENT_KEY)),
+            TLS12_AND_13,
+        )
+        .await
+        .expect("require mode does not verify the chain (Caddy semantics)");
+    }
+
+    #[tokio::test]
+    async fn client_auth_verify_if_given_accepts_missing_and_rejects_untrusted() {
+        let server = client_auth_server(ClientAuthMode::VerifyIfGiven, Some(CLIENT_CA_CERT), &[]);
+        handshake_with_client_auth(Arc::clone(&server), None, TLS12_AND_13)
+            .await
+            .expect("verify_if_given allows no client certificate");
+        handshake_with_client_auth(
+            Arc::clone(&server),
+            Some((CLIENT_CERT, CLIENT_KEY)),
+            TLS12_AND_13,
+        )
+        .await
+        .expect("verify_if_given accepts a trusted certificate");
+        assert!(
+            handshake_with_client_auth(
+                server,
+                Some((UNTRUSTED_CLIENT_CERT, UNTRUSTED_CLIENT_KEY)),
+                TLS12_AND_13,
+            )
+            .await
+            .is_err(),
+            "verify_if_given must reject an untrusted certificate"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_auth_require_and_verify_enforces_both() {
+        let server =
+            client_auth_server(ClientAuthMode::RequireAndVerify, Some(CLIENT_CA_CERT), &[]);
+        assert!(
+            handshake_with_client_auth(Arc::clone(&server), None, TLS12_AND_13)
+                .await
+                .is_err(),
+            "require_and_verify must reject a missing certificate"
+        );
+        handshake_with_client_auth(
+            Arc::clone(&server),
+            Some((CLIENT_CERT, CLIENT_KEY)),
+            TLS12_AND_13,
+        )
+        .await
+        .expect("require_and_verify accepts a trusted certificate");
+        assert!(
+            handshake_with_client_auth(
+                server,
+                Some((UNTRUSTED_CLIENT_CERT, UNTRUSTED_CLIENT_KEY)),
+                TLS12_AND_13,
+            )
+            .await
+            .is_err(),
+            "require_and_verify must reject an untrusted certificate"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_auth_require_and_verify_works_for_tls12_and_tls13() {
+        for versions in [TLS12_ONLY, TLS13_ONLY] {
+            let server =
+                client_auth_server(ClientAuthMode::RequireAndVerify, Some(CLIENT_CA_CERT), &[]);
+            handshake_with_client_auth(
+                Arc::clone(&server),
+                Some((CLIENT_CERT, CLIENT_KEY)),
+                versions,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("valid client cert: {error}"));
+            assert!(
+                handshake_with_client_auth(server, None, versions)
+                    .await
+                    .is_err(),
+                "missing client cert must fail for {versions:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn client_auth_leaf_allowlist_is_enforced_after_chain_verification() {
+        let server = client_auth_server(
+            ClientAuthMode::RequireAndVerify,
+            Some(CLIENT_CA_CERT),
+            &[CLIENT_CERT],
+        );
+        handshake_with_client_auth(
+            Arc::clone(&server),
+            Some((CLIENT_CERT, CLIENT_KEY)),
+            TLS12_AND_13,
+        )
+        .await
+        .expect("allowlisted leaf is accepted");
+        assert!(
+            handshake_with_client_auth(
+                server,
+                Some((OTHER_CLIENT_CERT, OTHER_CLIENT_KEY)),
+                TLS12_AND_13,
+            )
+            .await
+            .is_err(),
+            "a trusted-CA leaf not in the allowlist must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_auth_leaf_only_configuration_accepts_exact_leaf() {
+        let server = client_auth_server(ClientAuthMode::RequireAndVerify, None, &[CLIENT_CERT]);
+        handshake_with_client_auth(
+            Arc::clone(&server),
+            Some((CLIENT_CERT, CLIENT_KEY)),
+            TLS12_AND_13,
+        )
+        .await
+        .expect("exact allowlisted leaf is accepted without a CA bundle");
+        assert!(
+            handshake_with_client_auth(
+                server,
+                Some((UNTRUSTED_CLIENT_CERT, UNTRUSTED_CLIENT_KEY)),
+                TLS12_AND_13,
+            )
+            .await
+            .is_err(),
+            "non-allowlisted leaf must be rejected"
+        );
     }
 
     #[test]
