@@ -29,9 +29,10 @@ pub mod validate;
 pub use adapter::{AdaptedConfig, ConfigAdapter};
 pub use config::{
     AdminConfig, Apps, AutoHttps, AutomationPolicy, BaseLog, CertKeyFilePair, CertKeyPemPair,
-    CertificateAuthority, CertificatesConfig, Config, CustomLog, HttpApp, HttpServer, LogEncoder,
-    LogSampling, LogWriter, Logging, ModuleRef, NamedModuleRef, OnDemandConfig, PkiApp, PkiKeyPair,
-    ProviderModuleRef, Route, ServerLogConfig, SessionTicketService, SinkLog, StorageConfig,
+    CertificateAuthority, CertificatesConfig, Config, CustomLog, HttpApp, HttpServer,
+    ListenerWrapperConfig, LogEncoder, LogSampling, LogWriter, Logging, ModuleRef, NamedModuleRef,
+    OnDemandConfig, PkiApp, PkiKeyPair, ProviderModuleRef, ProxyProtocolConfig,
+    ProxyProtocolPolicy, Route, ServerLogConfig, SessionTicketService, SinkLog, StorageConfig,
     StringList, TlsApp, TlsAutomation,
 };
 pub use duration::{parse_caddy_duration, CaddyDuration};

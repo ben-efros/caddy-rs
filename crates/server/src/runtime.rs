@@ -37,6 +37,7 @@ use crate::error::{Error, Result};
 use crate::limits::ServerLimits;
 use crate::listeners::{bind, bind_admin, ListenerHandle, ListenerState, SharedListeners};
 use crate::observability::{record_certificate_metrics, AccessLogRuntime, ServerAccessLogPolicy};
+use crate::proxy_protocol::ListenerWrappers;
 use crate::upstream_status::ProxyUpstreamStatusSource;
 
 /// Observable runtime state after an apply.
@@ -1182,6 +1183,7 @@ impl ServerRuntime {
                         access_log_policy: Arc::new(ServerAccessLogPolicy::from_config(
                             server.logs.as_ref(),
                         )),
+                        wrappers: Arc::new(ListenerWrappers::from_server(server)?),
                     }),
                 );
             }
@@ -1208,6 +1210,7 @@ impl ServerRuntime {
                             recorder: Arc::clone(&self.recorder),
                             access_log: Arc::clone(access_log),
                             access_log_policy: Arc::new(ServerAccessLogPolicy::default()),
+                            wrappers: Arc::new(ListenerWrappers::default()),
                         }),
                     );
                 }

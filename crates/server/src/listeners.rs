@@ -53,6 +53,7 @@ use crate::observability::{
     body_len, observe_request, request_started, AccessLogRuntime, RequestSnapshot,
     ServerAccessLogPolicy, TlsLogInfo,
 };
+use crate::proxy_protocol::{ListenerWrappers, PrefixedStream};
 
 /// Router map shared with accept loops, keyed by configured listen address.
 ///
@@ -79,6 +80,8 @@ pub(crate) struct ListenerState {
     pub(crate) access_log: Arc<AccessLogRuntime>,
     /// Per-server access-log association (`apps.http.servers.<name>.logs`).
     pub(crate) access_log_policy: Arc<ServerAccessLogPolicy>,
+    /// Listener wrappers (PROXY protocol) applied to accepted connections.
+    pub(crate) wrappers: Arc<ListenerWrappers>,
 }
 
 /// Listener state shared with accept loops, keyed by configured listen address.
@@ -406,6 +409,8 @@ struct ConnectionContext {
     access_log: Arc<AccessLogRuntime>,
     /// Per-server access-log association.
     access_log_policy: Arc<ServerAccessLogPolicy>,
+    /// Listener wrappers for accepted connections.
+    wrappers: Arc<ListenerWrappers>,
 }
 
 /// Look up the state of an accepted connection and acquire a connection slot.
@@ -432,6 +437,7 @@ fn admit_connection(
             recorder: Arc::clone(&state.recorder),
             access_log: Arc::clone(&state.access_log),
             access_log_policy: Arc::clone(&state.access_log_policy),
+            wrappers: Arc::clone(&state.wrappers),
         },
         None => ConnectionContext {
             router: None,
@@ -442,6 +448,7 @@ fn admit_connection(
             recorder: caddy_rs_admin::noop_recorder(),
             access_log: AccessLogRuntime::disabled(),
             access_log_policy: Arc::new(ServerAccessLogPolicy::default()),
+            wrappers: Arc::new(ListenerWrappers::default()),
         },
     };
     let permit = ConnectionPermit::try_acquire(Arc::clone(active), context.limits.max_connections)?;
@@ -513,9 +520,11 @@ fn spawn_tcp_accept_loop(
                     let connection_shutdown = shutdown.clone();
                     let connection_force = force.clone();
                     let tracked = tracker.guard();
-                    tokio::spawn(serve_accepted(
+                    let local = stream.local_addr().ok();
+                    tokio::spawn(serve_wrapped(
                         stream,
                         Some(peer),
+                        local,
                         context,
                         permit,
                         generation,
@@ -558,8 +567,9 @@ fn spawn_unix_accept_loop(
                     let connection_shutdown = shutdown.clone();
                     let connection_force = force.clone();
                     let tracked = tracker.guard();
-                    tokio::spawn(serve_accepted(
+                    tokio::spawn(serve_wrapped(
                         stream,
+                        None,
                         None,
                         context,
                         permit,
@@ -574,11 +584,58 @@ fn spawn_unix_accept_loop(
     })
 }
 
+/// Apply the configured listener wrappers (PROXY protocol) to an accepted connection, then serve.
+///
+/// The wrapper reads the PROXY header from the transport *before* TLS termination and replaces the
+/// remote/local addresses for the rest of the connection.
+#[allow(clippy::too_many_arguments)]
+async fn serve_wrapped<I>(
+    stream: I,
+    peer: Option<SocketAddr>,
+    local: Option<SocketAddr>,
+    context: ConnectionContext,
+    permit: ConnectionPermit,
+    generation: Option<Arc<Generation>>,
+    shutdown: watch::Receiver<bool>,
+    force: watch::Receiver<bool>,
+    tracked: TrackedConnection,
+) where
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (stream, remote_override, local_override) = match context.wrappers.proxy_protocol() {
+        Some(settings) => match crate::proxy_protocol::wrap(stream, peer, local, settings).await {
+            Ok(wrapped) => wrapped,
+            Err(error) => {
+                tracing::warn!(
+                    peer = ?peer,
+                    %error,
+                    "rejecting connection: PROXY protocol wrapper failed"
+                );
+                return;
+            }
+        },
+        None => (PrefixedStream::new(stream, Vec::new()), None, None),
+    };
+    serve_accepted(
+        stream,
+        remote_override.or(peer),
+        local_override.or(local),
+        context,
+        permit,
+        generation,
+        shutdown,
+        force,
+        tracked,
+    )
+    .await;
+}
+
 /// Terminate TLS when the listener is a TLS listener, then serve the connection.
 #[allow(clippy::too_many_arguments)]
 async fn serve_accepted<I>(
     stream: I,
     peer: Option<SocketAddr>,
+    local_addr: Option<SocketAddr>,
     context: ConnectionContext,
     permit: ConnectionPermit,
     generation: Option<Arc<Generation>>,
@@ -637,6 +694,7 @@ async fn serve_accepted<I>(
             router,
             Arc::clone(&limits),
             peer,
+            local_addr,
             true,
             alpn,
             Some(tls_info),
@@ -657,6 +715,7 @@ async fn serve_accepted<I>(
             router,
             Arc::clone(&limits),
             peer,
+            local_addr,
             false,
             None,
             None,
@@ -680,6 +739,7 @@ fn connection_service(
     router: Option<Arc<Router>>,
     limits: Arc<ServerLimits>,
     remote_addr: Option<SocketAddr>,
+    local_addr: Option<SocketAddr>,
     tls: bool,
     alpn: Option<String>,
     tls_info: Option<TlsLogInfo>,
@@ -706,6 +766,7 @@ fn connection_service(
         let activity = Arc::clone(&activity);
         let alpn = alpn.clone();
         let tls_info = tls_info.clone();
+        let local_addr = local_addr;
         let server_name = server_name.clone();
         let recorder = Arc::clone(&recorder);
         let access_log = Arc::clone(&access_log);
@@ -751,6 +812,7 @@ fn connection_service(
                 router,
                 request,
                 remote_addr,
+                local_addr,
                 tls,
                 alpn.as_deref(),
                 automatic,

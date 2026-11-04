@@ -139,6 +139,7 @@ pub(crate) async fn serve_request_with_automatic(
         router,
         request,
         remote_addr,
+        None,
         tls,
         tls_alpn,
         automatic,
@@ -170,6 +171,7 @@ pub(crate) async fn serve_request_with_automatic_upgradable(
     router: Arc<Router>,
     request: hyper::Request<Incoming>,
     remote_addr: Option<SocketAddr>,
+    local_addr: Option<SocketAddr>,
     tls: bool,
     tls_alpn: Option<&str>,
     automatic: Option<Arc<AutomaticHttpsServing>>,
@@ -218,6 +220,22 @@ pub(crate) async fn serve_request_with_automatic_upgradable(
     internal.headers = parts.headers;
     internal.remote_addr = remote_addr;
     internal.tls = tls;
+    if let Some(local) = local_addr {
+        // Caddy exposes `{http.request.local.*}`; the placeholder subset in `caddy-rs-http` does
+        // not cover local addresses yet, so the server exposes them as request variables until
+        // the HTTP crate adds the placeholders.
+        internal
+            .vars
+            .insert("http.request.local".to_string(), local.to_string());
+        internal.vars.insert(
+            "http.request.local.host".to_string(),
+            local.ip().to_string(),
+        );
+        internal.vars.insert(
+            "http.request.local.port".to_string(),
+            local.port().to_string(),
+        );
+    }
     // Streamed dispatch is used when:
     // * no handler in the route tree needs the buffered body (today only `reverse_proxy` does, and
     //   proxy request-body streaming is the T-PROXY-004 follow-up), and

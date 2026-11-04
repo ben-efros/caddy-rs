@@ -12,8 +12,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::Value;
 
 use crate::config::{
-    AutomationPolicy, BaseLog, CertificateAuthority, CertificatesConfig, Config, HttpApp, Logging,
-    ModuleRef, PkiApp, PkiKeyPair, Route, ServerLogConfig, StorageConfig, TlsApp, TlsAutomation,
+    AutomationPolicy, BaseLog, CertificateAuthority, CertificatesConfig, Config, HttpApp,
+    ListenerWrapperConfig, Logging, ModuleRef, PkiApp, PkiKeyPair, ProxyProtocolConfig, Route,
+    ServerLogConfig, StorageConfig, TlsApp, TlsAutomation,
 };
 use crate::error::{Error, Result};
 use crate::listen::ListenAddr;
@@ -95,6 +96,98 @@ pub fn validate_config(config: &Config, registry: &ModuleRegistry) -> Result<Val
     }
 
     Ok(validator.report)
+}
+
+/// Validate one server's `listener_wrappers` list.
+///
+/// Wrapper modules must be registered (only `proxy_protocol` and the implicit `tls` marker are
+/// implemented in this build), `proxy_protocol` options must decode into the typed configuration
+/// with valid CIDR ranges, and the Caddy ordering rules for the `tls` marker are enforced (it may
+/// not be first and may only appear once).
+fn validate_listener_wrappers(
+    wrappers: &[ListenerWrapperConfig],
+    base: &str,
+    registry: &ModuleRegistry,
+) -> Result<()> {
+    let mut seen_tls = false;
+    for (index, wrapper) in wrappers.iter().enumerate() {
+        let path = format!("{base}[{index}]");
+        let name = wrapper.wrapper.as_deref().ok_or_else(|| {
+            Error::invalid(
+                format!("{path}.wrapper"),
+                "listener wrapper object must name a `wrapper`",
+            )
+        })?;
+        let module =
+            registry
+                .resolve_listener_wrapper(name)
+                .ok_or_else(|| Error::UnknownModule {
+                    kind: "listener wrapper",
+                    name: name.to_string(),
+                    path: format!("{path}.wrapper"),
+                })?;
+        if module.json_key == "proxy_protocol" {
+            let options: ProxyProtocolConfig =
+                serde_json::from_value(Value::Object(wrapper.extra.clone().into_iter().collect()))
+                    .map_err(|error| {
+                        Error::invalid(&path, format!("invalid proxy_protocol options: {error}"))
+                    })?;
+            for (cidr_index, cidr) in options.allow.iter().enumerate() {
+                validate_cidr(cidr, &format!("{path}.allow[{cidr_index}]"))?;
+            }
+            for (cidr_index, cidr) in options.deny.iter().enumerate() {
+                validate_cidr(cidr, &format!("{path}.deny[{cidr_index}]"))?;
+            }
+        } else if module.json_key == "tls" {
+            if index == 0 {
+                return Err(Error::invalid(
+                    format!("{path}.wrapper"),
+                    "the `tls` listener wrapper must not be first: wrappers listed before it run \
+                     before the TLS handshake",
+                ));
+            }
+            if seen_tls {
+                return Err(Error::invalid(
+                    format!("{path}.wrapper"),
+                    "the `tls` listener wrapper may only be specified once",
+                ));
+            }
+            seen_tls = true;
+        }
+    }
+    Ok(())
+}
+
+/// Validate a CIDR range such as `10.0.0.0/8` or `2001:db8::/32`.
+fn validate_cidr(value: &str, path: &str) -> Result<()> {
+    use std::net::IpAddr;
+
+    let (address, prefix) = match value.split_once('/') {
+        Some((address, prefix)) => (address, Some(prefix)),
+        None => (value, None),
+    };
+    let address: IpAddr = address.parse().map_err(|_| {
+        Error::invalid(
+            path,
+            format!("`{value}` is not a valid IP address or CIDR range"),
+        )
+    })?;
+    if let Some(prefix) = prefix {
+        let prefix: u8 = prefix
+            .parse()
+            .map_err(|_| Error::invalid(path, format!("`{value}` has an invalid prefix length")))?;
+        let max = match address {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        if prefix > max {
+            return Err(Error::invalid(
+                path,
+                format!("`{value}` prefix length must be at most {max}"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Validate one server's access-log association (`apps.http.servers.*.logs`).
@@ -294,6 +387,11 @@ impl Validator<'_> {
             if let Some(logs) = &server.logs {
                 validate_server_logs(logs, &format!("{server_path}.logs"))?;
             }
+            validate_listener_wrappers(
+                &server.listener_wrappers,
+                &format!("{server_path}.listener_wrappers"),
+                self.registry,
+            )?;
             self.routes(&server.routes, &format!("{server_path}.routes"))?;
             self.report.servers += 1;
         }
@@ -1069,6 +1167,97 @@ mod tests {
             }}}}
         }));
         validate_config(&config, &registry()).expect("per-server logs validate");
+    }
+
+    #[test]
+    fn validates_listener_wrappers() {
+        let config = config_from(serde_json::json!({
+            "apps": {"http": {"servers": {"srv0": {
+                "listen": [":443"],
+                "listener_wrappers": [
+                    {
+                        "wrapper": "proxy_protocol",
+                        "timeout": "5s",
+                        "allow": ["10.0.0.0/8", "2001:db8::/32"],
+                        "deny": ["192.0.2.0/24"],
+                        "fallback_policy": "IGNORE"
+                    },
+                    {"wrapper": "tls"}
+                ]
+            }}}}
+        }));
+        validate_config(&config, &registry()).expect("valid wrappers");
+    }
+
+    #[test]
+    fn rejects_invalid_listener_wrappers_with_located_errors() {
+        // Unknown wrapper module.
+        let config = config_from(serde_json::json!({
+            "apps": {"http": {"servers": {"srv0": {
+                "listen": [":443"],
+                "listener_wrappers": [{"wrapper": "carrier_pigeon"}]
+            }}}}
+        }));
+        let error = validate_config(&config, &registry()).expect_err("unknown wrapper");
+        assert!(error.to_string().contains("carrier_pigeon"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("apps.http.servers.srv0.listener_wrappers[0].wrapper"),
+            "{error}"
+        );
+
+        // Invalid CIDR range.
+        let config = config_from(serde_json::json!({
+            "apps": {"http": {"servers": {"srv0": {
+                "listen": [":443"],
+                "listener_wrappers": [{"wrapper": "proxy_protocol", "deny": ["not-a-cidr"]}]
+            }}}}
+        }));
+        let error = validate_config(&config, &registry()).expect_err("bad CIDR");
+        assert!(
+            error.to_string().contains("listener_wrappers[0].deny[0]"),
+            "{error}"
+        );
+
+        // Invalid fallback policy (serde-level, still located at the wrapper).
+        let config = config_from(serde_json::json!({
+            "apps": {"http": {"servers": {"srv0": {
+                "listen": [":443"],
+                "listener_wrappers": [{"wrapper": "proxy_protocol", "fallback_policy": "SOMETIMES"}]
+            }}}}
+        }));
+        let error = validate_config(&config, &registry()).expect_err("bad policy");
+        assert!(
+            error.to_string().contains("listener_wrappers[0]"),
+            "{error}"
+        );
+
+        // The implicit TLS marker may not be first and may only appear once.
+        let config = config_from(serde_json::json!({
+            "apps": {"http": {"servers": {"srv0": {
+                "listen": [":443"],
+                "listener_wrappers": [{"wrapper": "tls"}]
+            }}}}
+        }));
+        let error = validate_config(&config, &registry()).expect_err("tls first");
+        assert!(error.to_string().contains("must not be first"), "{error}");
+
+        let config = config_from(serde_json::json!({
+            "apps": {"http": {"servers": {"srv0": {
+                "listen": [":443"],
+                "listener_wrappers": [
+                    {"wrapper": "proxy_protocol"},
+                    {"wrapper": "tls"},
+                    {"wrapper": "tls"}
+                ]
+            }}}}
+        }));
+        let error = validate_config(&config, &registry()).expect_err("duplicate tls");
+        assert!(
+            error.to_string().contains("only be specified once"),
+            "{error}"
+        );
     }
 
     #[test]

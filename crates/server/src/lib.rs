@@ -19,6 +19,7 @@ pub mod http;
 pub mod limits;
 pub mod listeners;
 mod observability;
+mod proxy_protocol;
 pub mod runtime;
 pub mod upstream_status;
 

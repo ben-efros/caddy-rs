@@ -362,3 +362,50 @@ async fn unimplemented_connection_policy_field_fails_loudly() {
     );
     assert!(error.to_string().contains("TLS-CONN-POLICY"), "{error}");
 }
+
+#[tokio::test]
+async fn proxy_protocol_header_is_consumed_before_the_tls_handshake() {
+    // A TLS server with the proxy_protocol wrapper in REQUIRE mode: a PROXY header is mandatory and
+    // must be consumed before rustls sees the ClientHello.
+    let mut value = config("127.0.0.1:0", true, None, true)
+        .to_value()
+        .expect("config serializes");
+    value["apps"]["http"]["servers"]["srv0"]["listener_wrappers"] = serde_json::json!([
+        {"wrapper": "proxy_protocol", "fallback_policy": "REQUIRE"}
+    ]);
+    value["apps"]["http"]["servers"]["srv0"]["routes"] = serde_json::json!([{
+        "handle": [{"handler": "static_response",
+                    "body": "{http.request.remote.host}:{http.request.remote.port}"}]
+    }]);
+    let config = Config::from_value(value).expect("proxy protocol TLS config decodes");
+    let (runtime, address) = start(config).await;
+
+    // With a header the TLS handshake succeeds and the handler sees the header addresses.
+    let stream = TcpStream::connect(address).await.expect("TCP connect");
+    let mut stream = stream;
+    stream
+        .write_all(b"PROXY TCP4 203.0.113.7 198.51.100.1 44444 443\r\n")
+        .await
+        .expect("write PROXY header");
+    let connector = TlsConnector::from(client_config(vec![b"http/1.1".to_vec()]));
+    let server_name = ServerName::try_from("example.com".to_string()).expect("server name");
+    let mut tls = connector
+        .connect(server_name, stream)
+        .await
+        .expect("TLS handshake after a PROXY header");
+    let (status, body) = http1_get(&mut tls, "example.com").await;
+    assert_eq!(status, 200);
+    assert_eq!(body.trim(), "203.0.113.7:44444");
+
+    // Without a header REQUIRE rejects the connection before the TLS handshake.
+    let stream = TcpStream::connect(address).await.expect("TCP connect");
+    let connector = TlsConnector::from(client_config(vec![]));
+    let server_name = ServerName::try_from("example.com".to_string()).expect("server name");
+    let result = connector.connect(server_name, stream).await;
+    assert!(
+        result.is_err(),
+        "a missing PROXY header must be rejected before TLS"
+    );
+
+    runtime.shutdown().await;
+}
