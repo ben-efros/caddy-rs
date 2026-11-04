@@ -1,0 +1,7 @@
+example.com {
+	tls {
+		ciphers
+		curves
+	}
+	respond "ok"
+}

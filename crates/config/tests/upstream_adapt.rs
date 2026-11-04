@@ -969,15 +969,9 @@ fn tls_protocols_map_to_runtime_array_and_alpn_matches_caddy() {
 
 #[test]
 fn tls_advanced_options_fail_loudly() {
+    // `ciphers`/`curves` are supported for the runtime subset (see `tests/tls_ciphers.rs`);
+    // client-auth forms that need Caddy's provider modules still fail loudly.
     for (caddyfile, expected) in [
-        (
-            "localhost {\n\ttls {\n\t\tciphers TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256\n\t}\n}\n",
-            "TLS-CIPHER-SUITES",
-        ),
-        (
-            "localhost {\n\ttls {\n\t\tcurves x25519\n\t}\n}\n",
-            "TLS-CURVES",
-        ),
         (
             "localhost {\n\ttls {\n\t\tclient_auth {\n\t\t\tverifier leaf\n\t\t}\n\t}\n}\n",
             "TLS-CLIENT-AUTH",
