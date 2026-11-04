@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::types::{Error, Matcher, Request, Result, SharedMatcher};
+use crate::types::{Error, Matcher, MatcherError, Request, Result, SharedMatcher};
 
 /// Build a matcher set from one JSON object.
 pub fn build_matcher_set(value: &Value) -> Result<Vec<SharedMatcher>> {
@@ -336,9 +336,22 @@ struct SelectedFile {
 /// `.remainder` for later handlers (for example the adapter's try_files rewrite to
 /// `{http.matchers.file.relative}`).
 ///
-/// Not supported (reported in the task divergences): custom filesystem modules (`fs`), glob
-/// expansion in `try_files`, and the `=NNN` error fallback of `first_exist` (both are loud/absent
-/// rather than approximated).
+/// `try_files` patterns are expanded like Caddy's `makeCandidates`: placeholders are expanded with
+/// glob metacharacters in their values escaped (so request data cannot inject globs), then Go
+/// `filepath.Glob` semantics apply — `*`, `?`, `[...]` classes and `\` escapes per path component,
+/// sorted results, existing paths only, and meta-patterns ending in a path separator matching
+/// nothing. Patterns without metacharacters behave like Go's `Glob`: the path itself when it
+/// exists, else no candidate (so a nonexistent literal fallback does not match).
+///
+/// In `first_exist`/`first_exist_fallback`, a `try_files` entry of the form `=NNN` (100–999) is
+/// Caddy's error fallback: matching aborts route evaluation and the router responds with that
+/// status (an empty-body response, matching the Caddy v2.11.7 oracle). Other policies treat `=NNN`
+/// as a literal candidate, like Caddy.
+///
+/// Not supported (loud/absent rather than approximated): custom filesystem modules (`fs`; loud
+/// `NotImplemented`). Glob subset gaps: malformed patterns/classes are treated as non-matching
+/// rather than `ErrBadPattern`, non-UTF-8 file names are lossily compared, and the offline build
+/// does not implement Go's `filepath.Match` escapes beyond the documented `\` form.
 #[derive(Debug)]
 pub struct FileMatcher {
     root: String,
@@ -457,8 +470,13 @@ impl FileMatcher {
     }
 
     /// Expand and clean one `try_files` pattern into candidate file paths.
+    ///
+    /// Mirrors Caddy's `makeCandidates`: placeholders are expanded with glob metacharacters in
+    /// their *values* escaped, the path is cleaned/split, joined under the root, and then expanded
+    /// with Go `filepath.Glob` semantics (`*`, `?`, `[...]`, `\` escapes; sorted; existing files
+    /// only; a glob pattern with a trailing separator matches nothing).
     fn candidates(&self, root: &str, request: &Request, pattern: &str) -> Vec<FileCandidate> {
-        let expanded = request.replace_all(pattern);
+        let expanded = expand_glob_safe(request, pattern);
         let cleaned = path_clean(&expanded);
         let (mut before_split, remainder) = first_split(&cleaned, &self.split_path);
         // Caddy restores the trailing slash from the *original* pattern after cleaning/splitting so
@@ -467,18 +485,44 @@ impl FileMatcher {
             before_split.push('/');
         }
         let fullpath = sanitized_join(root, &before_split);
-        let relative = fullpath
-            .strip_prefix(root)
-            .map(str::to_string)
-            .unwrap_or_else(|| fullpath.clone());
-        vec![FileCandidate {
-            fullpath,
-            relative,
-            remainder,
-        }]
+        let trailing = fullpath.ends_with('/');
+        let glob_pattern = if trailing {
+            fullpath.trim_end_matches('/').to_string()
+        } else {
+            fullpath.clone()
+        };
+        let glob_pattern = if glob_pattern.is_empty() {
+            "/".to_string()
+        } else {
+            glob_pattern
+        };
+        // Go's `filepath.Glob`: a pattern containing metacharacters and ending in a path separator
+        // matches nothing (the last, empty component never matches a directory entry).
+        if trailing && path_has_glob_meta(&glob_pattern) {
+            return Vec::new();
+        }
+        let mut results = glob_expand(&glob_pattern);
+        results.sort();
+        results
+            .into_iter()
+            .map(|mut fullpath| {
+                if trailing && !fullpath.ends_with('/') {
+                    fullpath.push('/');
+                }
+                let relative = fullpath
+                    .strip_prefix(root)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| fullpath.clone());
+                FileCandidate {
+                    fullpath,
+                    relative,
+                    remainder: remainder.clone(),
+                }
+            })
+            .collect()
     }
 
-    fn select(&self, request: &Request) -> Option<SelectedFile> {
+    fn select(&self, request: &Request) -> std::result::Result<Option<SelectedFile>, MatcherError> {
         let root = self.expanded_root(request);
         match self.try_policy {
             FileTryPolicy::FirstExist | FileTryPolicy::FirstExistFallback => {
@@ -488,20 +532,30 @@ impl FileMatcher {
                     None
                 };
                 for (index, pattern) in self.try_files.iter().enumerate() {
+                    // A `=NNN` candidate is Caddy's error fallback: it aborts route evaluation and
+                    // responds with that status instead of matching a file.
+                    if let Some(status) = parse_error_code(pattern) {
+                        return Err(MatcherError {
+                            status,
+                            message: format!("file matcher fallback {pattern}"),
+                        });
+                    }
                     for candidate in self.candidates(&root, request, pattern) {
                         if Some(index) == fallback_index {
-                            // The last candidate always matches under `first_exist_fallback`.
-                            return Some(SelectedFile {
+                            // The last candidate that glob produced always matches under
+                            // `first_exist_fallback` (nonexistent literal patterns produce no
+                            // candidates, matching Go's `filepath.Glob`).
+                            return Ok(Some(SelectedFile {
                                 candidate,
                                 is_dir: false,
-                            });
+                            }));
                         }
                         if let Some(is_dir) = strict_file_exists(&candidate.fullpath) {
-                            return Some(SelectedFile { candidate, is_dir });
+                            return Ok(Some(SelectedFile { candidate, is_dir }));
                         }
                     }
                 }
-                None
+                Ok(None)
             }
             FileTryPolicy::SmallestSize | FileTryPolicy::LargestSize => {
                 let mut best: Option<(SelectedFile, u64)> = None;
@@ -530,7 +584,7 @@ impl FileMatcher {
                         };
                     }
                 }
-                best.map(|(selected, _)| selected)
+                Ok(best.map(|(selected, _)| selected))
             }
             FileTryPolicy::MostRecentlyModified => {
                 let mut best: Option<(SelectedFile, std::time::SystemTime)> = None;
@@ -549,7 +603,7 @@ impl FileMatcher {
                         }
                     }
                 }
-                best.map(|(selected, _)| selected)
+                Ok(best.map(|(selected, _)| selected))
             }
         }
     }
@@ -557,12 +611,17 @@ impl FileMatcher {
 
 impl Matcher for FileMatcher {
     fn matches(&self, request: &Request) -> bool {
-        self.select(request).is_some()
+        self.select(request).ok().flatten().is_some()
     }
 
     fn matches_mut(&self, request: &mut Request) -> bool {
-        let Some(selected) = self.select(request) else {
-            return false;
+        let selected = match self.select(request) {
+            Ok(Some(selected)) => selected,
+            Ok(None) => return false,
+            Err(error) => {
+                request.set_matcher_error(error.status, error.message);
+                return false;
+            }
         };
         let vars = &mut request.vars;
         vars.insert(
@@ -591,6 +650,262 @@ impl Matcher for FileMatcher {
     fn describe(&self) -> String {
         format!("file try_files {}", self.try_files.join(" "))
     }
+}
+
+/// Caddy's `=NNN` error fallback: a pattern of the form `=404` aborts matching and responds with
+/// that status (`100..=999`; other `=...` strings are ordinary literal candidates).
+fn parse_error_code(pattern: &str) -> Option<http::StatusCode> {
+    let digits = pattern.strip_prefix('=')?;
+    if digits.is_empty() {
+        return None;
+    }
+    let code: i64 = digits.parse().ok()?;
+    if (100..=999).contains(&code) {
+        http::StatusCode::from_u16(code as u16).ok()
+    } else {
+        None
+    }
+}
+
+/// Expand placeholders in a `try_files` pattern like Caddy's `ReplaceFunc`, escaping glob
+/// metacharacters in the replacement *values* so request/placeholder data cannot inject globs.
+fn expand_glob_safe(request: &Request, pattern: &str) -> String {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut output = String::with_capacity(pattern.len());
+    let mut index = 0;
+    while index < chars.len() {
+        let current = chars[index];
+        // Escaped braces are literal, matching the replacer's `\{`/`\}` handling.
+        if current == '\\'
+            && index + 1 < chars.len()
+            && (chars[index + 1] == '{' || chars[index + 1] == '}')
+        {
+            output.push(chars[index + 1]);
+            index += 2;
+            continue;
+        }
+        if current == '{' {
+            if let Some(offset) = chars[index + 1..].iter().position(|c| *c == '}') {
+                let name: String = chars[index + 1..index + 1 + offset].iter().collect();
+                let value = request.get_placeholder(&name).unwrap_or_default();
+                output.push_str(&escape_glob_metacharacters(&value));
+                index += offset + 2;
+                continue;
+            }
+        }
+        output.push(current);
+        index += 1;
+    }
+    output
+}
+
+fn escape_glob_metacharacters(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if matches!(character, '*' | '[' | '?' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
+}
+
+/// Whether the pattern contains unescaped glob metacharacters (`*`, `?`, `[`).
+fn path_has_glob_meta(pattern: &str) -> bool {
+    let mut escaped = false;
+    for character in pattern.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if matches!(character, '*' | '?' | '[') {
+            return true;
+        }
+    }
+    false
+}
+
+/// Expand a filesystem glob with Go `filepath.Glob` semantics: `*`, `?`, `[...]` and `\` escapes
+/// per path component, sorted results, and only paths that exist (`Lstat` succeeds). A pattern
+/// without metacharacters behaves like Go's `Glob`: the path itself when it exists, else nothing.
+fn glob_expand(pattern: &str) -> Vec<String> {
+    let absolute = pattern.starts_with('/');
+    let (mut results, body): (Vec<String>, &str) = if absolute {
+        (vec!["/".to_string()], &pattern[1..])
+    } else if let Some(rest) = pattern.strip_prefix("./") {
+        (vec!["./".to_string()], rest)
+    } else {
+        (vec![String::new()], pattern)
+    };
+
+    for component in body.split('/') {
+        if component.is_empty() || component == "." {
+            continue;
+        }
+        if path_has_glob_meta(component) {
+            let mut next = Vec::new();
+            for base in &results {
+                let directory = if base.is_empty() { "." } else { base.as_str() };
+                let Ok(entries) = std::fs::read_dir(directory) else {
+                    continue;
+                };
+                let mut names: Vec<String> = entries
+                    .filter_map(|entry| entry.ok())
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect();
+                names.sort();
+                for name in names {
+                    if glob_path_match(component, &name) {
+                        next.push(join_glob_path(base, &name));
+                    }
+                }
+            }
+            results = next;
+        } else {
+            let literal = unescape_glob(component);
+            results = results
+                .into_iter()
+                .map(|base| join_glob_path(&base, &literal))
+                .collect();
+        }
+        if results.is_empty() {
+            return Vec::new();
+        }
+    }
+
+    results = results
+        .into_iter()
+        .map(|path| {
+            if path.is_empty() {
+                ".".to_string()
+            } else {
+                path
+            }
+        })
+        .collect();
+    // Go's Glob uses Lstat for literal patterns and only returns names that exist.
+    results.retain(|path| std::fs::symlink_metadata(path).is_ok());
+    results
+}
+
+fn join_glob_path(base: &str, name: &str) -> String {
+    if base.is_empty() {
+        name.to_string()
+    } else if base == "/" {
+        format!("/{name}")
+    } else if base.ends_with('/') {
+        format!("{base}{name}")
+    } else {
+        format!("{base}/{name}")
+    }
+}
+
+fn unescape_glob(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut unescaped = String::with_capacity(text.len());
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] == '\\' && index + 1 < chars.len() {
+            unescaped.push(chars[index + 1]);
+            index += 2;
+        } else {
+            unescaped.push(chars[index]);
+            index += 1;
+        }
+    }
+    unescaped
+}
+
+/// Match one path component against a Go `path.Match` pattern (`*`, `?`, `[class]`, `\` escapes).
+fn glob_path_match(pattern: &str, name: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let name: Vec<char> = name.chars().collect();
+    glob_match_here(&pattern, &name)
+}
+
+fn glob_match_here(pattern: &[char], name: &[char]) -> bool {
+    let Some(current) = pattern.first() else {
+        return name.is_empty();
+    };
+    match current {
+        '*' => {
+            let mut rest = pattern;
+            while rest.first() == Some(&'*') {
+                rest = &rest[1..];
+            }
+            for index in 0..=name.len() {
+                if glob_match_here(rest, &name[index..]) {
+                    return true;
+                }
+            }
+            false
+        }
+        '?' => !name.is_empty() && glob_match_here(&pattern[1..], &name[1..]),
+        '[' => {
+            if name.is_empty() {
+                return false;
+            }
+            match parse_glob_class(pattern, name[0]) {
+                Some((matched, consumed)) => {
+                    matched && glob_match_here(&pattern[consumed..], &name[1..])
+                }
+                None => false,
+            }
+        }
+        '\\' if pattern.len() > 1 => {
+            !name.is_empty() && name[0] == pattern[1] && glob_match_here(&pattern[2..], &name[1..])
+        }
+        literal => {
+            !name.is_empty() && name[0] == *literal && glob_match_here(&pattern[1..], &name[1..])
+        }
+    }
+}
+
+/// Parse a `[...]` class at the start of `pattern`; returns whether `name` matched and how many
+/// pattern characters the class consumed.
+fn parse_glob_class(pattern: &[char], name: char) -> Option<(bool, usize)> {
+    let mut index = 1;
+    let mut negated = false;
+    if pattern.get(index) == Some(&'^') {
+        negated = true;
+        index += 1;
+    }
+    let mut matched = false;
+    let mut first = true;
+    while index < pattern.len() {
+        let current = pattern[index];
+        if current == ']' && !first {
+            return Some((matched != negated, index + 1));
+        }
+        first = false;
+        let mut start = current;
+        if start == '\\' {
+            index += 1;
+            start = *pattern.get(index)?;
+        }
+        index += 1;
+        let mut end = start;
+        if pattern.get(index) == Some(&'-')
+            && pattern.get(index + 1).is_some_and(|next| *next != ']')
+        {
+            index += 1;
+            let mut last = *pattern.get(index)?;
+            if last == '\\' {
+                index += 1;
+                last = *pattern.get(index)?;
+            }
+            index += 1;
+            end = last;
+        }
+        if name >= start && name <= end {
+            matched = true;
+        }
+    }
+    None
 }
 
 /// A lexical `path.Clean` for slash-separated paths (Go's `path.Clean` semantics).
@@ -955,13 +1270,14 @@ mod tests {
             Some("/index.html")
         );
 
-        // Fallback also matches when *no* candidate exists, unlike first_exist.
-        let fallback = file_matcher(serde_json::json!({
+        // A nonexistent literal last candidate yields no glob results (Go's filepath.Glob
+        // returns nothing for a missing literal path), so even the fallback does not match.
+        let fallback_missing = file_matcher(serde_json::json!({
             "root": directory.path().to_string_lossy(),
             "try_files": ["/missing.txt", "/also-missing.html"],
             "try_policy": "first_exist_fallback"
         }));
-        assert!(fallback.matches(&file_request("/anything", directory.path())));
+        assert!(!fallback_missing.matches(&file_request("/anything", directory.path())));
         let first_exist = file_matcher(serde_json::json!({
             "root": directory.path().to_string_lossy(),
             "try_files": ["/missing.txt", "/also-missing.html"]
@@ -1157,5 +1473,229 @@ mod tests {
         let response = router.handle(request).await.expect("handled");
         assert_eq!(response.status, http::StatusCode::OK);
         assert_eq!(response.body, Bytes::from_static(b"body{}"));
+    }
+
+    fn glob_fixture() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(directory.path().join("assets").join("nested")).unwrap();
+        std::fs::write(directory.path().join("assets").join("app.css"), b"APP").unwrap();
+        std::fs::write(directory.path().join("assets").join("z.css"), b"Z").unwrap();
+        std::fs::write(directory.path().join("assets").join("b.js"), b"B").unwrap();
+        std::fs::write(
+            directory
+                .path()
+                .join("assets")
+                .join("nested")
+                .join("deep.css"),
+            b"DEEP",
+        )
+        .unwrap();
+        std::fs::write(directory.path().join("index.html"), b"INDEX").unwrap();
+        directory
+    }
+
+    #[test]
+    fn file_matcher_glob_expands_existing_files_in_sorted_order() {
+        let directory = glob_fixture();
+        let root = directory.path().to_string_lossy().to_string();
+        let mut request = file_request("/anything", directory.path());
+        let matcher = file_matcher(serde_json::json!({
+            "root": root,
+            "try_files": ["/assets/*.css"]
+        }));
+        assert!(matcher.matches_mut(&mut request));
+        // Go's Glob sorts matches: app.css before z.css.
+        assert_eq!(
+            request
+                .vars
+                .get("matchers.file.relative")
+                .map(String::as_str),
+            Some("/assets/app.css")
+        );
+        assert_eq!(
+            request
+                .vars
+                .get("matchers.file.absolute")
+                .map(String::as_str),
+            Some(
+                directory
+                    .path()
+                    .join("assets")
+                    .join("app.css")
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        assert_eq!(
+            request.vars.get("matchers.file.type").map(String::as_str),
+            Some("file")
+        );
+    }
+
+    #[test]
+    fn file_matcher_glob_classes_and_fallback() {
+        let directory = glob_fixture();
+        let root = directory.path().to_string_lossy().to_string();
+        let class_matcher = file_matcher(serde_json::json!({
+            "root": root,
+            "try_files": ["/assets/[az]*.css"]
+        }));
+        let mut request = file_request("/anything", directory.path());
+        assert!(class_matcher.matches_mut(&mut request));
+        assert_eq!(
+            request
+                .vars
+                .get("matchers.file.relative")
+                .map(String::as_str),
+            Some("/assets/app.css")
+        );
+
+        // A glob with no matches falls through to the next candidate.
+        let fallback = file_matcher(serde_json::json!({
+            "root": directory.path().to_string_lossy(),
+            "try_files": ["/nope/*.css", "/index.html"]
+        }));
+        let mut request = file_request("/anything", directory.path());
+        assert!(fallback.matches_mut(&mut request));
+        assert_eq!(
+            request
+                .vars
+                .get("matchers.file.relative")
+                .map(String::as_str),
+            Some("/index.html")
+        );
+    }
+
+    #[test]
+    fn file_matcher_escapes_glob_metacharacters_from_placeholders() {
+        let directory = glob_fixture();
+        let matcher = file_matcher(serde_json::json!({
+            "root": directory.path().to_string_lossy(),
+            "try_files": ["{http.vars.attempt}"]
+        }));
+        // A placeholder value containing `*` must be treated literally, not as a glob (Caddy's
+        // globSafeRepl). `/assets/*` does not exist even though `/assets/app.css` matches `*`.
+        let mut request = file_request("/anything", directory.path());
+        request
+            .vars
+            .insert("attempt".to_string(), "/assets/*".to_string());
+        assert!(!matcher.matches(&request));
+        // A placeholder value pointing at an existing file still matches.
+        let mut request = file_request("/anything", directory.path());
+        request
+            .vars
+            .insert("attempt".to_string(), "/assets/app.css".to_string());
+        assert!(matcher.matches_mut(&mut request));
+        assert_eq!(
+            request
+                .vars
+                .get("matchers.file.relative")
+                .map(String::as_str),
+            Some("/assets/app.css")
+        );
+    }
+
+    #[test]
+    fn file_matcher_globs_cannot_escape_the_root() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("root");
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        std::fs::write(root.join("assets").join("ok.css"), b"OK").unwrap();
+        std::fs::write(parent.path().join("secret.css"), b"SECRET").unwrap();
+        let matcher = file_matcher(serde_json::json!({
+            "root": root.to_string_lossy(),
+            "try_files": ["{http.vars.attempt}"]
+        }));
+        let mut request = file_request("/anything", &root);
+        request
+            .vars
+            .insert("attempt".to_string(), "/../*.css".to_string());
+        assert!(!matcher.matches(&request));
+        // The escaped glob stays inside the root: a pattern matching only inside root works.
+        let mut request = file_request("/anything", &root);
+        request
+            .vars
+            .insert("attempt".to_string(), "/assets/*.css".to_string());
+        let mut request_for_match = file_request("/anything", &root);
+        assert!(!matcher.matches_mut(&mut request));
+        // Also verify a literal containment case even when the placeholder contains no globs.
+        request_for_match
+            .vars
+            .insert("attempt".to_string(), "/../secret.css".to_string());
+        assert!(!matcher.matches(&request_for_match));
+    }
+
+    #[test]
+    fn file_matcher_trailing_slash_glob_matches_nothing() {
+        let directory = glob_fixture();
+        let matcher = file_matcher(serde_json::json!({
+            "root": directory.path().to_string_lossy(),
+            "try_files": ["/assets/*/"]
+        }));
+        // Go's filepath.Glob treats the trailing separator as an empty last component, so a glob
+        // pattern ending in `/` matches nothing (Caddy oracle v2.11.7).
+        assert!(!matcher.matches(&file_request("/anything", directory.path())));
+    }
+
+    #[test]
+    fn file_matcher_error_code_sets_matcher_error() {
+        let directory = glob_fixture();
+        let matcher = file_matcher(serde_json::json!({
+            "root": directory.path().to_string_lossy(),
+            "try_files": ["=404"]
+        }));
+        let mut request = file_request("/anything", directory.path());
+        assert!(!matcher.matches_mut(&mut request));
+        let error = request
+            .take_matcher_error()
+            .expect("=404 records a matcher error");
+        assert_eq!(error.status, http::StatusCode::NOT_FOUND);
+
+        // `=1000` is not a valid status-code fallback; it is an ordinary literal candidate.
+        let literal = file_matcher(serde_json::json!({
+            "root": directory.path().to_string_lossy(),
+            "try_files": ["=1000"]
+        }));
+        let mut request = file_request("/anything", directory.path());
+        assert!(!literal.matches_mut(&mut request));
+        assert!(request.take_matcher_error().is_none());
+
+        // Only `first_exist`/`first_exist_fallback` treat `=NNN` specially; other policies try it
+        // as a literal candidate.
+        let policy = file_matcher(serde_json::json!({
+            "root": directory.path().to_string_lossy(),
+            "try_files": ["=404"],
+            "try_policy": "largest_size"
+        }));
+        let mut request = file_request("/anything", directory.path());
+        assert!(!policy.matches_mut(&mut request));
+        assert!(request.take_matcher_error().is_none());
+    }
+
+    #[tokio::test]
+    async fn file_matcher_error_code_short_circuits_route_evaluation() {
+        use crate::router::RouterBuilder;
+        use http::Method;
+
+        let directory = glob_fixture();
+        let root = directory.path().to_string_lossy().to_string();
+        let routes = vec![
+            serde_json::json!({
+                "match": [{"file": {"root": root, "try_files": ["=418"]}}],
+                "handle": [{"handler": "static_response", "body": "should not run"}]
+            }),
+            serde_json::json!({
+                "handle": [{"handler": "static_response", "body": "default route"}]
+            }),
+        ];
+        let router = RouterBuilder::new().build(&routes).expect("router builds");
+        let mut request = Request::new(Method::GET, "/anything".parse().unwrap());
+        request
+            .headers
+            .insert(http::header::HOST, "example.com".parse().unwrap());
+        let response = router.handle(request).await.expect("handled");
+        assert_eq!(response.status, http::StatusCode::IM_A_TEAPOT);
+        assert!(response.body.is_empty());
+        assert!(response.headers.is_empty());
     }
 }

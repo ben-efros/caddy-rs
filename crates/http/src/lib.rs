@@ -26,7 +26,7 @@ pub use handlers::{
 pub use placeholders::{Replacer, UnknownPlaceholders};
 pub use router::{CustomHandlerFactory, Route, Router, RouterBuilder};
 pub use types::{
-    Error, Handler, Matcher, Outcome, Request, Response, ResponseOutcome, Result, SharedHandler,
-    SharedMatcher, StreamingOutcome,
+    Error, Handler, Matcher, MatcherError, Outcome, Request, Response, ResponseOutcome, Result,
+    SharedHandler, SharedMatcher, StreamingOutcome,
 };
 pub use upgrade::{requested_upgrade_type, Tunnel, TunnelStream, UpgradedResponse};

@@ -122,6 +122,21 @@ impl Handler for BodyConsumingHandler {
 
 /// Caddy-shaped response for a `request_body` limit error: `413` with an empty body and no content
 /// type, keeping response headers staged by preceding `headers` handlers.
+/// Response for a matcher error (Caddy's `MatcherErrorVarKey`): the error status with an empty
+/// body and no content type (oracle v2.11.7), keeping staged `headers` response operations.
+fn matcher_error_response(
+    error: crate::types::MatcherError,
+    request: &Request,
+) -> StreamingOutcome {
+    let mut response = StreamingResponse::from_buffered(Response {
+        status: error.status,
+        headers: http::HeaderMap::new(),
+        body: bytes::Bytes::new(),
+    });
+    apply_pending_headers(&mut response.headers, request);
+    StreamingOutcome::Respond(response)
+}
+
 fn body_limit_response(request: &Request) -> StreamingOutcome {
     let mut response = StreamingResponse::from_buffered(Response {
         status: http::StatusCode::PAYLOAD_TOO_LARGE,
@@ -233,7 +248,13 @@ impl Router {
                     continue;
                 }
             }
-            if !route.matches(&mut current) {
+            let matched = route.matches(&mut current);
+            // A matcher can record an error (the `file` matcher's `=NNN` fallback); Caddy aborts
+            // route evaluation and responds with that status.
+            if let Some(error) = current.take_matcher_error() {
+                return Ok(matcher_error_response(error, &current));
+            }
+            if !matched {
                 continue;
             }
             if let Some(group) = &route.group {
