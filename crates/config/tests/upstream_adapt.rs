@@ -1151,3 +1151,22 @@ fn uri_remaining_operations_fail_loudly_with_runtime_owner() {
         );
     }
 }
+
+#[test]
+fn global_grace_period_and_shutdown_delay_match_real_caddy_v2_11_7() {
+    // Golden from `caddy adapt` v2.11.7: `caddy.Duration` marshals as integer nanoseconds.
+    let adapted = adapt(
+        "{\n\tgrace_period 1m30s\n\tshutdown_delay 10s\n}\n\nlocalhost {\n\trespond \"ok\"\n}\n",
+    )
+    .expect("adapt grace options");
+    let http = &adapted.config["apps"]["http"];
+    assert_eq!(http["grace_period"], json!(90_000_000_000_i64));
+    assert_eq!(http["shutdown_delay"], json!(10_000_000_000_i64));
+
+    // Zero is omitted by Caddy's `omitempty`.
+    let zero =
+        adapt("{\n\tgrace_period 0s\n\tshutdown_delay 0\n}\n\nlocalhost {\n\trespond \"ok\"\n}\n")
+            .expect("adapt zero grace options");
+    assert!(zero.config["apps"]["http"].get("grace_period").is_none());
+    assert!(zero.config["apps"]["http"].get("shutdown_delay").is_none());
+}

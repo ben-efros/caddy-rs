@@ -1,0 +1,8 @@
+{
+	grace_period 0s
+	shutdown_delay 0
+}
+
+localhost {
+	respond "ok"
+}
