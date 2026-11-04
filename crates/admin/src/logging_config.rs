@@ -34,30 +34,34 @@
 //!
 //! * `writer.output`: `stderr` (default), `stdout`, `discard`, `file` and `net`.
 //!   * File writers support `mode`/`dir_mode` (octal strings), `roll` (default true),
-//!     `roll_size_mb`, `roll_keep` and `roll_keep_days`. Missing parent directories are created
-//!     (with `dir_mode`). Rotation renames the current file to `<filename>.<unix-millis>` (the
-//!     naming/compression scheme differs from Caddy's timberjack writer: `roll_interval`,
-//!     `roll_minutes`, `roll_at`, `roll_compression`, `roll_gzip`, `roll_local_time` and
-//!     `backup_time_format` are rejected loudly).
-//!   * Net writers support `address` (`host:port` or Caddy's `tcp/`/`udp/` prefix), `dial_timeout`
-//!     (ns, JSON number) and `soft_start`; TCP reconnects once and retries the failed line, and
-//!     `soft_start` falls back to stderr while reconnecting. Unix sockets are rejected loudly.
+//!     `roll_size_mb`, `roll_keep`, `roll_keep_days`, and time-based rotation via `roll_interval`
+//!     (ns), `roll_minutes` (UTC clock minutes) and `roll_at` (UTC `HH:MM` times). Missing parent
+//!     directories are created (with `dir_mode`). Rotation renames the current file to
+//!     `<filename>.<unix-millis>`; compression (`roll_compression` other than `none`,
+//!     `roll_gzip`), `roll_local_time` (no timezone database) and `backup_time_format` are
+//!     rejected loudly. Time schedules are UTC.
+//!   * Net writers support `address` (`host:port` or Caddy's `tcp/`/`udp/`/`unix/`/`unixgram/`
+//!     prefix), `dial_timeout` (ns, JSON number) and `soft_start`; TCP/Unix streams reconnect
+//!     once and retry the failed line, and `soft_start` falls back to stderr while reconnecting.
 //! * `encoder.format`: `json` (also the default when omitted), `console`, or `filter` wrapping
-//!   `json`/`console`. JSON encoders support `message_key`, `level_key`, `time_key`, `name_key`
-//!   and `line_ending`; `time_format`/`time_local`/`duration_format`/`level_format` and
-//!   `caller_key`/`stacktrace_key` are rejected loudly. The console encoder uses Caddy's console
-//!   defaults (colored level, UTC `wall_milli` time, spaced JSON fields) and `append`/`journald`/
-//!   `nop` encoders are rejected loudly.
+//!   `json`/`console`. Encoders support `message_key`, `level_key`, `time_key`, `name_key`,
+//!   `line_ending`, `time_format` (wall_milli/wall/wall_nano/iso8601/rfc3339/rfc3339_nano/
+//!   unix_seconds_float/unix_milli_float/unix_nano/common_log), `level_format`
+//!   (lower/upper/color) and `duration_format` (seconds/ms/ns/string); `time_local=true` (no
+//!   timezone database) and `caller_key`/`stacktrace_key` (no caller fields) are rejected loudly.
+//!   The console encoder defaults to Caddy's console framing (colored level, UTC `wall_milli`
+//!   time, spaced JSON fields); `append`/`journald`/`nop` encoders are rejected loudly.
 //! * Filter fields: `delete` of a selectable top-level entry field maps to
 //!   [`AccessLogConfig::exclude`](crate::AccessLogConfig), `delete`/`replace` of
 //!   `request>headers>Name` or `resp_headers>Name` maps to
 //!   [`RedactionPolicy`](crate::RedactionPolicy) header rules, and generic `delete`, `replace`,
-//!   `rename`, `hash` and `ip_mask` operations map to
-//!   [`AccessLogConfig::filters`](crate::AccessLogConfig). `hash` is Caddy's SHA-256 first-4-bytes
-//!   filter; `ip_mask` supports `ipv4_cidr`/`ipv6_cidr`. `query`/`cookie`/`set_cookie`/`regexp`/
-//!   `multi_regexp` filters and nested filter encoders are rejected loudly (regexp would need a
-//!   regex engine that is not available in the offline dependency set; a silent approximation
-//!   would be a compatibility lie).
+//!   `rename`, `hash`, `ip_mask`, `query`, `cookie`, `set_cookie`, `regexp` and `multi_regexp`
+//!   operations map to [`AccessLogConfig::filters`](crate::AccessLogConfig). `hash` is Caddy's
+//!   SHA-256 first-4-bytes filter; `ip_mask` supports `ipv4_cidr`/`ipv6_cidr`; `query`/`cookie`/
+//!   `set_cookie` apply replace/hash/delete actions; `regexp`/`multi_regexp` use a bundled
+//!   minimal RE2-subset engine (see [`crate::regex_lite`], copied from the HTTP crate with
+//!   attribution) with Go-style `$N` expansion — unsupported regexp constructs fail loudly.
+//!   Nested filter encoders are rejected loudly.
 //! * `level`: `DEBUG`/`INFO`/`WARN`/`ERROR`/`PANIC`/`FATAL`, case-insensitive. The threshold is
 //!   enforced by the sink ([`AccessLogSink::emit`](crate::AccessLogSink::emit) returns
 //!   `FilteredOut`). `PANIC`/`FATAL` map to the highest access-entry level (`ERROR`): access
@@ -106,7 +110,9 @@ use crate::access_log::{
     AccessLogConfig, AccessLogField, HeaderRedaction, HeaderTarget, LogLevel, RedactionPolicy,
     SamplingConfig, ACCESS_LOG_LOGGER,
 };
-use crate::access_log::{FieldFilter, FieldFilterOperation};
+use crate::access_log::{
+    FieldFilter, FieldFilterOperation, FilterAction, FilterActionKind, RegexpOperation,
+};
 use crate::sink::{
     AccessLogFormat, AccessLogOutput, AccessLogSink, AccessLogSinkConfig, FileWriterOptions,
     NetProtocol, NetWriterConfig, DEFAULT_ACCESS_LOG_BUFFER_BYTES,
@@ -460,6 +466,10 @@ fn convert_log(name: &str, log: &CustomLog) -> Result<AccessLogSinkConfig, Loggi
             time_key: encoder.time_key,
             name_key: encoder.name_key,
             line_ending: encoder.line_ending,
+            time_format: encoder.time_format,
+            time_local: encoder.time_local,
+            level_format: encoder.level_format,
+            duration_format: encoder.duration_format,
         },
         buffer_bytes: DEFAULT_ACCESS_LOG_BUFFER_BYTES,
         level,
@@ -569,8 +579,8 @@ fn parse_writer(
                     }
                     "roll_size_mb" => file.roll_size_mb = Some(parse_u64(value, &field_path)?),
                     "roll_keep" => {
-                        file.roll_keep = usize::try_from(parse_u64(value, &field_path)?)
-                            .map_err(|_| {
+                        file.roll_keep =
+                            usize::try_from(parse_u64(value, &field_path)?).map_err(|_| {
                                 LoggingConfigError::new(
                                     &field_path,
                                     "`roll_keep` is too large for this platform",
@@ -578,13 +588,95 @@ fn parse_writer(
                             })?
                     }
                     "roll_keep_days" => file.roll_keep_days = Some(parse_u64(value, &field_path)?),
-                    "roll_interval" | "roll_minutes" | "roll_at" | "roll_compression"
-                    | "roll_gzip" | "roll_local_time" | "backup_time_format" => {
+                    "roll_interval" => file.roll_interval_ns = Some(parse_u64(value, &field_path)?),
+                    "roll_minutes" => {
+                        let Some(values) = value.as_array() else {
+                            return Err(LoggingConfigError::new(
+                                &field_path,
+                                "`roll_minutes` must be an array of integers 0-59",
+                            ));
+                        };
+                        let mut minutes = Vec::with_capacity(values.len());
+                        for value in values {
+                            let Some(minute) = value.as_u64().and_then(|v| u8::try_from(v).ok())
+                            else {
+                                return Err(LoggingConfigError::new(
+                                    &field_path,
+                                    "`roll_minutes` entries must be integers 0-59",
+                                ));
+                            };
+                            if minute > 59 {
+                                return Err(LoggingConfigError::new(
+                                    &field_path,
+                                    "`roll_minutes` entries must be 0-59",
+                                ));
+                            }
+                            minutes.push(u32::from(minute));
+                        }
+                        file.roll_minutes = Some(minutes);
+                    }
+                    "roll_at" => {
+                        let Some(values) = value.as_array() else {
+                            return Err(LoggingConfigError::new(
+                                &field_path,
+                                "`roll_at` must be an array of \"HH:MM\" strings",
+                            ));
+                        };
+                        let mut times = Vec::with_capacity(values.len());
+                        for value in values {
+                            let Some(text) = value.as_str() else {
+                                return Err(LoggingConfigError::new(
+                                    &field_path,
+                                    "`roll_at` entries must be \"HH:MM\" strings",
+                                ));
+                            };
+                            let valid = text.len() == 5
+                                && text.as_bytes()[2] == b':'
+                                && text[..2].parse::<u32>().map(|h| h < 24).unwrap_or(false)
+                                && text[3..].parse::<u32>().map(|m| m < 60).unwrap_or(false);
+                            if !valid {
+                                return Err(LoggingConfigError::new(
+                                    &field_path,
+                                    format!("invalid `roll_at` time `{text}` (expected HH:MM)"),
+                                ));
+                            }
+                            times.push(text.to_string());
+                        }
+                        file.roll_at = Some(times);
+                    }
+                    "roll_compression" => {
+                        if value.as_str() != Some("none") {
+                            return Err(LoggingConfigError::unsupported(
+                                field_path,
+                                "roll_compression is only supported with `none` (no compression \
+                                 dependencies are available offline; gzip/zstd are rejected \
+                                 loudly)",
+                            ));
+                        }
+                    }
+                    "roll_gzip" => {
+                        if value.as_bool() != Some(false) {
+                            return Err(LoggingConfigError::unsupported(
+                                field_path,
+                                "roll_gzip compression is not supported (use \
+                                 `roll_compression: \"none\"`; gzip is rejected loudly)",
+                            ));
+                        }
+                    }
+                    "roll_local_time" => {
+                        if value.as_bool() != Some(false) {
+                            return Err(LoggingConfigError::unsupported(
+                                field_path,
+                                "roll_local_time=true is not supported by this build (rotation \
+                                 schedules use UTC; no timezone database)",
+                            ));
+                        }
+                    }
+                    "backup_time_format" => {
                         return Err(LoggingConfigError::unsupported(
                             field_path,
-                            format!(
-                                "file writer option `{field}` is not implemented by this build                                  (supported rotation options: roll, roll_size_mb, roll_keep,                                  roll_keep_days)"
-                            ),
+                            "backup_time_format is not implemented (caddy-rs names rotated files \
+                             `<filename>.<unix-millis>`)",
                         ))
                     }
                     other => {
@@ -710,10 +802,8 @@ fn parse_network_address(
                 }
                 Ok((NetProtocol::Udp, rest.to_string()))
             }
-            "unix" | "unixgram" => Err(LoggingConfigError::unsupported(
-                path,
-                "unix-socket log writers are not implemented by this build (tcp/udp only)",
-            )),
+            "unix" => Ok((NetProtocol::Unix, rest.to_string())),
+            "unixgram" => Ok((NetProtocol::Unixgram, rest.to_string())),
             other => Err(LoggingConfigError::new(
                 path,
                 format!("unknown net writer network prefix `{other}`"),
@@ -734,6 +824,10 @@ struct EncoderSelection {
     time_key: Option<String>,
     name_key: Option<String>,
     line_ending: Option<String>,
+    time_format: Option<String>,
+    time_local: bool,
+    level_format: Option<String>,
+    duration_format: Option<String>,
 }
 fn parse_encoder(
     path: &str,
@@ -752,19 +846,7 @@ fn parse_encoder(
     match format {
         "json" => parse_json_encoder_options(&encoder_path, &encoder.extra, AccessLogFormat::Json),
         "console" => {
-            if let Some(field) = encoder.extra.keys().next() {
-                return Err(LoggingConfigError::unsupported(
-                    format!("{encoder_path}.{field}"),
-                    format!(
-                        "console encoder option `{field}` is not supported (caddy-rs uses Caddy's \
-                         console defaults: color levels, wall_milli UTC timestamps)"
-                    ),
-                ));
-            }
-            Ok(EncoderSelection {
-                format: AccessLogFormat::Console,
-                ..EncoderSelection::default()
-            })
+            parse_json_encoder_options(&encoder_path, &encoder.extra, AccessLogFormat::Console)
         }
         "filter" => parse_filter_encoder(&encoder_path, &encoder.extra),
         "append" | "journald" | "nop" => Err(LoggingConfigError::unsupported(
@@ -821,14 +903,23 @@ fn parse_json_encoder_options(
                     ),
                 ))
             }
-            "time_format" | "time_local" | "duration_format" | "level_format" => {
-                return Err(LoggingConfigError::unsupported(
-                    field_path,
-                    format!(
-                        "`{field}` is not implemented; caddy-rs uses Caddy's default JSON \
-                         formatting (float seconds, lowercase level)"
-                    ),
-                ))
+            "time_format" => selection.time_format = Some(string(true)?.unwrap_or_default()),
+            "duration_format" => {
+                selection.duration_format = Some(string(true)?.unwrap_or_default())
+            }
+            "level_format" => selection.level_format = Some(string(true)?.unwrap_or_default()),
+            "time_local" => {
+                let local = value.as_bool().ok_or_else(|| {
+                    LoggingConfigError::new(&field_path, "`time_local` must be a boolean")
+                })?;
+                if local {
+                    return Err(LoggingConfigError::unsupported(
+                        field_path,
+                        "time_local=true is not supported by this build (no timezone database); \
+                         timestamps are UTC",
+                    ));
+                }
+                selection.time_local = false;
             }
             other => {
                 return Err(LoggingConfigError::unsupported(
@@ -878,18 +969,11 @@ fn parse_filter_encoder(
                     &wrapped_extra,
                     AccessLogFormat::Json,
                 )?,
-                "console" => {
-                    if let Some(field) = wrapped_extra.keys().next() {
-                        return Err(LoggingConfigError::unsupported(
-                            format!("{path}.wrap.{field}"),
-                            format!("console encoder option `{field}` is not supported"),
-                        ));
-                    }
-                    EncoderSelection {
-                        format: AccessLogFormat::Console,
-                        ..EncoderSelection::default()
-                    }
-                }
+                "console" => parse_json_encoder_options(
+                    &format!("{path}.wrap"),
+                    &wrapped_extra,
+                    AccessLogFormat::Console,
+                )?,
                 "filter" => {
                     return Err(LoggingConfigError::unsupported(
                         format!("{path}.wrap.format"),
@@ -1067,14 +1151,127 @@ fn apply_field_filter(
             });
             Ok(())
         }
-        "query" | "cookie" | "set_cookie" | "regexp" | "multi_regexp" => {
-            Err(LoggingConfigError::unsupported(
-                format!("{filter_path}.filter"),
-                format!(
-                    "the `{filter_name}` log field filter is not implemented by this build \
-                     (supported: delete, replace, rename, hash, ip_mask)"
-                ),
-            ))
+        "query" => {
+            reject_filter_options(&filter_path, filter_object, filter_name, &["actions"])?;
+            let actions = parse_filter_actions(&filter_path, filter_object, "parameter")?;
+            selection.filters.push(FieldFilter {
+                path: segments,
+                operation: FieldFilterOperation::Query { actions },
+            });
+            Ok(())
+        }
+        "cookie" | "set_cookie" => {
+            reject_filter_options(&filter_path, filter_object, filter_name, &["actions"])?;
+            let actions = parse_filter_actions(&filter_path, filter_object, "name")?;
+            selection.filters.push(FieldFilter {
+                path: segments,
+                operation: if filter_name == "cookie" {
+                    FieldFilterOperation::Cookie { actions }
+                } else {
+                    FieldFilterOperation::SetCookie { actions }
+                },
+            });
+            Ok(())
+        }
+        "regexp" => {
+            reject_filter_options(
+                &filter_path,
+                filter_object,
+                filter_name,
+                &["regexp", "value"],
+            )?;
+            let pattern = filter_object
+                .get("regexp")
+                .and_then(Value::as_str)
+                .filter(|pattern| !pattern.is_empty())
+                .ok_or_else(|| {
+                    LoggingConfigError::new(
+                        format!("{filter_path}.regexp"),
+                        "regexp filter requires a non-empty `regexp` pattern",
+                    )
+                })?;
+            let replacement = filter_object
+                .get("value")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            crate::regex_lite::Regex::new(pattern).map_err(|error| {
+                LoggingConfigError::new(
+                    format!("{filter_path}.regexp"),
+                    format!("invalid regexp filter pattern: {error}"),
+                )
+            })?;
+            selection.filters.push(FieldFilter {
+                path: segments,
+                operation: FieldFilterOperation::Regexp {
+                    pattern: pattern.to_string(),
+                    replacement: replacement.to_string(),
+                },
+            });
+            Ok(())
+        }
+        "multi_regexp" => {
+            reject_filter_options(&filter_path, filter_object, filter_name, &["operations"])?;
+            let Some(Value::Array(operations)) = filter_object.get("operations") else {
+                return Err(LoggingConfigError::new(
+                    format!("{filter_path}.operations"),
+                    "multi_regexp requires an `operations` array",
+                ));
+            };
+            if operations.is_empty() {
+                return Err(LoggingConfigError::new(
+                    format!("{filter_path}.operations"),
+                    "multi_regexp requires at least one operation",
+                ));
+            }
+            let parsed: Vec<RegexpOperation> = operations
+                .iter()
+                .enumerate()
+                .map(|(index, operation)| {
+                    let operation_path = format!("{filter_path}.operations[{index}]");
+                    let object = operation.as_object().ok_or_else(|| {
+                        LoggingConfigError::new(
+                            &operation_path,
+                            "a multi_regexp operation must be an object",
+                        )
+                    })?;
+                    let pattern = object
+                        .get("regexp")
+                        .and_then(Value::as_str)
+                        .filter(|pattern| !pattern.is_empty())
+                        .ok_or_else(|| {
+                            LoggingConfigError::new(
+                                format!("{operation_path}.regexp"),
+                                "multi_regexp operation requires a non-empty `regexp`",
+                            )
+                        })?;
+                    if pattern.len() > 1000 {
+                        return Err(LoggingConfigError::new(
+                            format!("{operation_path}.regexp"),
+                            "multi_regexp patterns must be at most 1000 characters",
+                        ));
+                    }
+                    crate::regex_lite::Regex::new(pattern).map_err(|error| {
+                        LoggingConfigError::new(
+                            format!("{operation_path}.regexp"),
+                            format!("invalid multi_regexp pattern: {error}"),
+                        )
+                    })?;
+                    let replacement = object
+                        .get("value")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    Ok(RegexpOperation {
+                        pattern: pattern.to_string(),
+                        replacement,
+                    })
+                })
+                .collect::<Result<_, LoggingConfigError>>()?;
+            selection.filters.push(FieldFilter {
+                path: segments,
+                operation: FieldFilterOperation::MultiRegexp { operations: parsed },
+            });
+            Ok(())
         }
         other => Err(LoggingConfigError::new(
             format!("{filter_path}.filter"),
@@ -1084,6 +1281,75 @@ fn apply_field_filter(
             ),
         )),
     }
+}
+
+/// Parse Caddy query/cookie filter `actions` arrays.
+fn parse_filter_actions(
+    filter_path: &str,
+    filter_object: &serde_json::Map<String, Value>,
+    name_field: &str,
+) -> Result<Vec<FilterAction>, LoggingConfigError> {
+    let Some(Value::Array(actions)) = filter_object.get("actions") else {
+        return Err(LoggingConfigError::new(
+            format!("{filter_path}.actions"),
+            "filter requires an `actions` array",
+        ));
+    };
+    if actions.is_empty() {
+        return Err(LoggingConfigError::new(
+            format!("{filter_path}.actions"),
+            "filter requires at least one action",
+        ));
+    }
+    actions
+        .iter()
+        .enumerate()
+        .map(|(index, action)| {
+            let action_path = format!("{filter_path}.actions[{index}]");
+            let object = action.as_object().ok_or_else(|| {
+                LoggingConfigError::new(&action_path, "a filter action must be an object")
+            })?;
+            let kind = match object.get("type").and_then(Value::as_str) {
+                Some("replace") => FilterActionKind::Replace,
+                Some("hash") => FilterActionKind::Hash,
+                Some("delete") => FilterActionKind::Delete,
+                Some(other) => {
+                    return Err(LoggingConfigError::new(
+                        format!("{action_path}.type"),
+                        format!(
+                            "unknown filter action `{other}` (supported: replace, hash, delete)"
+                        ),
+                    ))
+                }
+                None => {
+                    return Err(LoggingConfigError::new(
+                        format!("{action_path}.type"),
+                        "filter action requires a `type`",
+                    ))
+                }
+            };
+            let name = object
+                .get(name_field)
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| {
+                    LoggingConfigError::new(
+                        format!("{action_path}.{name_field}"),
+                        format!("filter action requires a non-empty `{name_field}`"),
+                    )
+                })?;
+            let value = object
+                .get("value")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            Ok(FilterAction {
+                action: kind,
+                name: name.to_string(),
+                value,
+            })
+        })
+        .collect()
 }
 
 /// Split a Caddy filter field path (`request>headers>User-Agent`) into segments.
@@ -1462,12 +1728,13 @@ mod tests {
         assert_eq!(unknown.tracking_id(), Some(LOGGING_TRACKING_ID));
         assert!(unknown.message().contains("unknown log writer"));
 
-        // Unix sockets and unsupported net options are rejected loudly.
-        let unix = LoggingConfig::from_json(&json!({
-            "logs": {"default": {"writer": {"output": "net", "address": "unix//tmp/sock"}}}
-        }))
-        .expect_err("unix socket");
-        assert_eq!(unix.tracking_id(), Some(LOGGING_TRACKING_ID));
+        // Unix sockets are supported (Unix platforms) and unsupported net options stay loud.
+        let unix = targets_from(&json!({
+            "logs": {"default": {"writer": {"output": "net", "address": "unix//tmp/caddy.sock"}}}
+        }));
+        let net = unix[0].sink_config().net.as_ref().expect("net config");
+        assert_eq!(net.network, NetProtocol::Unix);
+        assert_eq!(net.address, "/tmp/caddy.sock");
 
         let bad_option = LoggingConfig::from_json(&json!({
             "logs": {"default": {"writer": {"output": "net", "address": "127.0.0.1:1", "tls": true}}}
@@ -1500,7 +1767,13 @@ mod tests {
                 "roll": true,
                 "roll_size_mb": 100,
                 "roll_keep": 5,
-                "roll_keep_days": 30
+                "roll_keep_days": 30,
+                "roll_interval": 3600000000000u64,
+                "roll_minutes": [0, 30],
+                "roll_at": ["12:00", "00:00"],
+                "roll_compression": "none",
+                "roll_gzip": false,
+                "roll_local_time": false
             }}}
         }));
         let config = targets[0].sink_config();
@@ -1510,21 +1783,19 @@ mod tests {
         assert_eq!(config.file.roll_size_mb, Some(100));
         assert_eq!(config.file.roll_keep, 5);
         assert_eq!(config.file.roll_keep_days, Some(30));
+        assert_eq!(config.file.roll_interval_ns, Some(3_600_000_000_000));
+        assert_eq!(config.file.roll_minutes, Some(vec![0, 30]));
+        assert_eq!(
+            config.file.roll_at,
+            Some(vec!["12:00".to_string(), "00:00".to_string()])
+        );
 
-        for option in [
-            "roll_interval",
-            "roll_minutes",
-            "roll_at",
-            "roll_compression",
-            "roll_gzip",
-            "roll_local_time",
-            "backup_time_format",
-        ] {
+        for option in ["backup_time_format"] {
             let logging = json!({
                 "logs": {"default": {"writer": {
                     "output": "file",
                     "filename": "/tmp/access.log",
-                    option: 1
+                    option: "x"
                 }}}
             });
             let error = LoggingConfig::from_json(&logging).expect_err(option);
@@ -1533,7 +1804,39 @@ mod tests {
                 "path mentions the option: {error}"
             );
             assert_eq!(error.tracking_id(), Some(LOGGING_TRACKING_ID));
-            assert!(error.message().contains("not implemented"), "{error}");
+        }
+        for (option, value) in [
+            ("roll_compression", json!("gzip")),
+            ("roll_gzip", json!(true)),
+            ("roll_local_time", json!(true)),
+        ] {
+            let logging = json!({
+                "logs": {"default": {"writer": {
+                    "output": "file",
+                    "filename": "/tmp/access.log",
+                    option: value
+                }}}
+            });
+            let error = LoggingConfig::from_json(&logging).expect_err(option);
+            assert!(
+                error.path().ends_with(option),
+                "path mentions the option: {error}"
+            );
+            assert_eq!(error.tracking_id(), Some(LOGGING_TRACKING_ID), "{option}");
+        }
+        for (option, value) in [("roll_minutes", json!([60])), ("roll_at", json!(["25:00"]))] {
+            let logging = json!({
+                "logs": {"default": {"writer": {
+                    "output": "file",
+                    "filename": "/tmp/access.log",
+                    option: value
+                }}}
+            });
+            let error = LoggingConfig::from_json(&logging).expect_err(option);
+            assert!(
+                error.path().ends_with(option),
+                "path mentions the option: {error}"
+            );
         }
     }
 
@@ -1571,19 +1874,43 @@ mod tests {
             assert_eq!(error.tracking_id(), Some(LOGGING_TRACKING_ID));
         }
 
-        for option in [
-            "time_format",
-            "duration_format",
-            "level_format",
-            "time_local",
-            "caller_key",
+        // Format options are now mapped (console and JSON).
+        let targets = targets_from(&json!({
+            "logs": {"default": {"encoder": {
+                "format": "console",
+                "time_format": "rfc3339",
+                "duration_format": "ms",
+                "level_format": "upper",
+                "time_local": false
+            }}}
+        }));
+        let encoder = &targets[0].sink_config().encoder;
+        assert_eq!(encoder.time_format.as_deref(), Some("rfc3339"));
+        assert_eq!(encoder.duration_format.as_deref(), Some("ms"));
+        assert_eq!(encoder.level_format.as_deref(), Some("upper"));
+        assert!(!encoder.time_local);
+
+        let caller = LoggingConfig::from_json(&json!({
+            "logs": {"default": {"encoder": {"format": "json", "caller_key": "caller"}}}
+        }))
+        .expect_err("caller_key");
+        assert!(caller.path().contains("caller_key"), "{caller}");
+        assert_eq!(caller.tracking_id(), Some(LOGGING_TRACKING_ID));
+
+        for (option, value) in [
+            ("time_format", json!("bogus")),
+            ("level_format", json!("bogus")),
+            ("duration_format", json!("bogus")),
+            ("time_local", json!(true)),
         ] {
             let logging = json!({
-                "logs": {"default": {"encoder": {"format": "json", option: "x"}}}
+                "logs": {"default": {"encoder": {"format": "json", option: value}}}
             });
             let error = LoggingConfig::from_json(&logging).expect_err(option);
-            assert!(error.path().contains(option), "{error}");
-            assert_eq!(error.tracking_id(), Some(LOGGING_TRACKING_ID));
+            assert!(
+                error.path().contains("encoder") || error.path().contains(option),
+                "{error}"
+            );
         }
     }
 
@@ -1684,23 +2011,70 @@ mod tests {
         let recorder = sink.encoder().config();
         assert!(!recorder.filters.is_empty());
 
-        for filter in ["query", "cookie", "set_cookie", "regexp", "multi_regexp"] {
+        // Query/cookie/set_cookie/regexp/multi_regexp are mapped to generic field filters.
+        let extended = LoggingConfig::from_json(&json!({
+            "logs": {"default": {"encoder": {
+                "format": "filter",
+                "fields": {
+                    "request>uri": {"filter": "query", "actions": [
+                        {"type": "replace", "parameter": "token", "value": "***"},
+                        {"type": "hash", "parameter": "id"},
+                        {"type": "delete", "parameter": "secret"}
+                    ]},
+                    "request>headers>Cookie": {"filter": "cookie", "actions": [
+                        {"type": "hash", "name": "session"}
+                    ]},
+                    "resp_headers>Set-Cookie": {"filter": "set_cookie", "actions": [
+                        {"type": "replace", "name": "session", "value": "REDACTED"}
+                    ]},
+                    "request>uri>test": {"filter": "regexp", "regexp": "(?i)token=\\w+", "value": "token=***"},
+                    "request>user_id": {"filter": "multi_regexp", "operations": [
+                        {"regexp": "a+", "value": "A"},
+                        {"regexp": "b+", "value": "B"}
+                    ]}
+                }
+            }}}
+        }))
+        .expect("extended filters map");
+        let filters = &extended.targets()[0].sink_config().encoder.filters;
+        assert_eq!(filters.len(), 5);
+        assert!(filters
+            .iter()
+            .any(|filter| matches!(filter.operation, FieldFilterOperation::Query { .. })));
+        assert!(filters
+            .iter()
+            .any(|filter| matches!(filter.operation, FieldFilterOperation::Cookie { .. })));
+        assert!(filters
+            .iter()
+            .any(|filter| matches!(filter.operation, FieldFilterOperation::SetCookie { .. })));
+        assert!(filters
+            .iter()
+            .any(|filter| matches!(filter.operation, FieldFilterOperation::Regexp { .. })));
+        assert!(filters
+            .iter()
+            .any(|filter| matches!(filter.operation, FieldFilterOperation::MultiRegexp { .. })));
+
+        // Malformed filter shapes and unsupported regexp constructs fail loudly.
+        for bad in [
+            json!({"filter": "query"}),
+            json!({"filter": "query", "actions": [{"type": "bogus", "parameter": "x"}]}),
+            json!({"filter": "cookie", "actions": [{"type": "delete"}]}),
+            json!({"filter": "regexp", "regexp": "(?=lookahead)"}),
+            json!({"filter": "multi_regexp", "operations": []}),
+        ] {
             let logging = json!({
                 "logs": {"default": {"encoder": {
                     "format": "filter",
-                    "fields": {"request>headers>Authorization": {"filter": filter}}
+                    "fields": {"request>uri": bad}
                 }}}
             });
-            let error = LoggingConfig::from_json(&logging).expect_err(filter);
-            assert!(error.path().contains("fields"), "{error}");
-            assert_eq!(
-                error.tracking_id(),
-                Some(LOGGING_TRACKING_ID),
-                "filter {filter}"
-            );
+            let error = LoggingConfig::from_json(&logging).expect_err("invalid filter");
             assert!(
-                error.message().contains(filter),
-                "message names the filter: {error}"
+                error.tracking_id() == Some(LOGGING_TRACKING_ID)
+                    || error.message().contains("invalid regexp")
+                    || error.message().contains("unknown filter action")
+                    || error.message().contains("requires"),
+                "{error}"
             );
         }
 
