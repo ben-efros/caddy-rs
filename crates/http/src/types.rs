@@ -55,6 +55,19 @@ pub enum Error {
 /// Result alias for the HTTP crate.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// A matcher-recorded error that short-circuits route evaluation (Caddy's `MatcherErrorVarKey`).
+///
+/// Caddy matchers can set an error variable while returning "no match"; the route list then
+/// aborts evaluation and responds with the error status. The `file` matcher uses this for its
+/// `=NNN` `first_exist` fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatcherError {
+    /// HTTP status to respond with.
+    pub status: StatusCode,
+    /// Diagnostic message (not sent to the client).
+    pub message: String,
+}
+
 /// An internal HTTP request, decoupled from hyper so handlers are testable without sockets.
 #[derive(Debug)]
 pub struct Request {
@@ -80,6 +93,8 @@ pub struct Request {
     /// Byte limit set by `request_body` for buffered bodies, enforced by the router before a
     /// body-consuming handler runs (streaming bodies carry the limit inside [`RequestBody`]).
     body_limit: Option<u64>,
+    /// Error recorded by a matcher during route evaluation (`file` matcher `=NNN` fallback).
+    matcher_error: Option<MatcherError>,
     /// Peer address, when known.
     pub remote_addr: Option<SocketAddr>,
     /// Whether the connection is TLS.
@@ -100,6 +115,7 @@ impl Request {
             body: Bytes::new(),
             body_stream: None,
             body_limit: None,
+            matcher_error: None,
             remote_addr: None,
             tls: false,
             vars: BTreeMap::new(),
@@ -153,6 +169,20 @@ impl Request {
     /// streaming bodies enforce it lazily while being read.
     pub fn body_limit(&self) -> Option<u64> {
         self.body_limit
+    }
+
+    /// Record a matcher error that the router must turn into an HTTP response (Caddy's
+    /// `MatcherErrorVarKey`).
+    pub fn set_matcher_error(&mut self, status: StatusCode, message: impl Into<String>) {
+        self.matcher_error = Some(MatcherError {
+            status,
+            message: message.into(),
+        });
+    }
+
+    /// Take the matcher error, if one was recorded during this evaluation.
+    pub fn take_matcher_error(&mut self) -> Option<MatcherError> {
+        self.matcher_error.take()
     }
 
     /// Take the request body for explicit consumption (buffered bodies are moved out too).
@@ -336,6 +366,7 @@ impl Clone for Request {
             body: self.body.clone(),
             body_stream: None,
             body_limit: self.body_limit,
+            matcher_error: self.matcher_error.clone(),
             remote_addr: self.remote_addr,
             tls: self.tls,
             vars: self.vars.clone(),
