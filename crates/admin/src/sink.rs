@@ -23,15 +23,15 @@
 //! Supported destinations: `stdout`, `stderr`, `discard`, `file` and `net`.
 //!
 //! File sinks honour Caddy's `mode`/`dir_mode` (Unix), create missing parent directories, and
-//! rotate by size (`roll_size_mb`, default roll enabled when configured) keeping at most
-//! `roll_keep` backup files and deleting backups older than `roll_keep_days`. Rotated files are
-//! named `<filename>.<unix-millis>` (a documented divergence from Caddy's timberjack naming and
-//! compression; `roll_interval`/`roll_minutes`/`roll_at`/`roll_compression`/`roll_local_time`/
-//! `backup_time_format` are rejected by the configuration mapper).
+//! rotate by size (`roll_size_mb`) and/or time (`roll_interval`, `roll_minutes` UTC minutes,
+//! `roll_at` UTC `HH:MM`), keeping at most `roll_keep` backup files and deleting backups older
+//! than `roll_keep_days`. Rotated files are named `<filename>.<unix-millis>` (a documented
+//! divergence from Caddy's timberjack naming/compression; compression options are rejected by the
+//! configuration mapper).
 //!
-//! Net sinks (`net` writer) connect with `dial_timeout`, reconnect once and retry a failed line,
-//! and with `soft_start` fall back to stderr while the socket is unavailable. Unix sockets are
-//! not supported.
+//! Net sinks (`net` writer) support TCP, UDP, Unix stream and Unix datagram sockets, connect with
+//! `dial_timeout`, reconnect once and retry a failed line, and with `soft_start` fall back to
+//! stderr while the socket is unavailable.
 //!
 //! ## Encoders
 //!
@@ -140,6 +140,15 @@ pub struct FileWriterOptions {
     /// Delete rotated files older than this many days (Caddy `roll_keep_days`, default 90).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roll_keep_days: Option<u64>,
+    /// Rotate after this many nanoseconds since the last roll (Caddy `roll_interval`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roll_interval_ns: Option<u64>,
+    /// Rotate when the UTC clock minute matches one of these values 0-59 (Caddy `roll_minutes`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roll_minutes: Option<Vec<u32>>,
+    /// Rotate at these UTC `HH:MM` times once per day (Caddy `roll_at`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roll_at: Option<Vec<String>>,
 }
 
 fn default_roll() -> bool {
@@ -159,6 +168,9 @@ impl Default for FileWriterOptions {
             roll_size_mb: None,
             roll_keep: 10,
             roll_keep_days: None,
+            roll_interval_ns: None,
+            roll_minutes: None,
+            roll_at: None,
         }
     }
 }
@@ -172,6 +184,10 @@ pub enum NetProtocol {
     Tcp,
     /// UDP datagrams (each encoded line is one datagram).
     Udp,
+    /// Unix stream socket (Caddy's `unix/` network address; Unix only).
+    Unix,
+    /// Unix datagram socket (Caddy's `unixgram/` network address; Unix only).
+    Unixgram,
 }
 
 /// Caddy `net` writer options supported by caddy-rs.
@@ -411,7 +427,7 @@ impl AccessLogEncoder {
                 line.push(b'\n');
                 Ok(line)
             }
-            AccessLogFormat::Console => encode_console_line(&rendered),
+            AccessLogFormat::Console => encode_console_line(&rendered, &self.config),
         }
     }
 
@@ -458,6 +474,18 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     )
 }
 
+/// Current UTC `(days since epoch, minute of day)` for time-based rotation.
+fn utc_days_and_minute(now: SystemTime) -> (i64, u32) {
+    let seconds = now
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    (
+        seconds.div_euclid(86_400),
+        (seconds.rem_euclid(86_400) / 60) as u32,
+    )
+}
+
 /// zap's colored level names (console encoder default `level_format: color`).
 fn colored_level(level: &str) -> String {
     let color = match level {
@@ -471,14 +499,20 @@ fn colored_level(level: &str) -> String {
 
 /// Encode one rendered entry in Caddy's console format:
 /// `<time>\t<level>\t[logger\t]<msg>\t<json fields>\n`.
-fn encode_console_line(rendered: &serde_json::Value) -> Result<Vec<u8>, AccessLogError> {
+fn encode_console_line(
+    rendered: &serde_json::Value,
+    config: &AccessLogConfig,
+) -> Result<Vec<u8>, AccessLogError> {
     let object = rendered
         .as_object()
         .ok_or_else(|| AccessLogError::new("entry", "console encoding requires an entry object"))?;
-    let timestamp = object
-        .get("ts")
-        .and_then(serde_json::Value::as_f64)
-        .unwrap_or(0.0);
+    let timestamp = match object.get("ts") {
+        Some(serde_json::Value::String(rendered)) => rendered.clone(),
+        Some(serde_json::Value::Number(number)) => {
+            format_wall_milli(number.as_f64().unwrap_or(0.0))
+        }
+        _ => format_wall_milli(0.0),
+    };
     let level = object
         .get("level")
         .and_then(serde_json::Value::as_str)
@@ -496,8 +530,12 @@ fn encode_console_line(rendered: &serde_json::Value) -> Result<Vec<u8>, AccessLo
         fields.remove(fundamental);
     }
     let fields = spaced_json(&serde_json::Value::Object(fields));
-    let time = format_wall_milli(timestamp);
-    let level = colored_level(level);
+    let time = timestamp;
+    let level = match config.level_format.as_deref() {
+        Some("upper") => level.to_ascii_uppercase(),
+        Some("lower") => level.to_ascii_lowercase(),
+        _ => colored_level(level),
+    };
     let text = if logger.is_empty() {
         format!("{time}\t{level}\t{message}\t{fields}\n")
     } else {
@@ -538,6 +576,10 @@ struct FileSink {
     capacity: usize,
     writer: BufWriter<File>,
     bytes: u64,
+    /// Time of the last roll (used by interval/minute/clock rotation).
+    last_roll: SystemTime,
+    /// Minute (`days, minute_of_day`) of the last roll, to roll at most once per matching minute.
+    last_roll_minute: Option<(i64, u32)>,
 }
 
 impl FileSink {
@@ -551,6 +593,8 @@ impl FileSink {
             capacity,
             writer: BufWriter::with_capacity(capacity, file),
             bytes,
+            last_roll: SystemTime::now(),
+            last_roll_minute: None,
         })
     }
 
@@ -571,11 +615,38 @@ impl FileSink {
         if !self.options.roll {
             return false;
         }
-        let Some(size_mb) = self.options.roll_size_mb else {
-            return false;
-        };
-        let limit = size_mb.saturating_mul(1024 * 1024);
-        self.bytes.saturating_add(incoming as u64) > limit
+        if let Some(size_mb) = self.options.roll_size_mb {
+            let limit = size_mb.saturating_mul(1024 * 1024);
+            if self.bytes.saturating_add(incoming as u64) > limit {
+                return true;
+            }
+        }
+        let now = SystemTime::now();
+        let (days, minute_of_day) = utc_days_and_minute(now);
+        if let Some(interval_ns) = self.options.roll_interval_ns {
+            if now
+                .duration_since(self.last_roll)
+                .map(|elapsed| elapsed.as_nanos() as u64 >= interval_ns)
+                .unwrap_or(false)
+            {
+                return true;
+            }
+        }
+        let same_minute = self.last_roll_minute == Some((days, minute_of_day));
+        if !same_minute {
+            if let Some(minutes) = &self.options.roll_minutes {
+                if minutes.contains(&minute_of_day) {
+                    return true;
+                }
+            }
+            if let Some(clock_times) = &self.options.roll_at {
+                let clock = format!("{:02}:{:02}", minute_of_day / 60, minute_of_day % 60);
+                if clock_times.iter().any(|time| time == &clock) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     fn rotate(&mut self) -> io::Result<()> {
@@ -585,6 +656,9 @@ impl FileSink {
         let file = open_append(&self.path, &self.options)?;
         self.writer = BufWriter::with_capacity(self.capacity, file);
         self.bytes = 0;
+        self.last_roll = SystemTime::now();
+        let (days, minute_of_day) = utc_days_and_minute(self.last_roll);
+        self.last_roll_minute = Some((days, minute_of_day));
         prune_backups(&self.path, &self.options);
         Ok(())
     }
@@ -686,6 +760,10 @@ fn prune_backups(path: &Path, options: &FileWriterOptions) {
 enum NetConnection {
     Tcp(TcpStream),
     Udp(UdpSocket),
+    #[cfg(unix)]
+    Unix(std::os::unix::net::UnixStream),
+    #[cfg(unix)]
+    Unixgram(std::os::unix::net::UnixDatagram),
 }
 
 /// Network destination: dials on first use, reconnects once on write failure, and (with
@@ -739,6 +817,8 @@ impl NetSink {
                 socket.connect(&self.config.address)?;
                 Ok(NetConnection::Udp(socket))
             }
+            NetProtocol::Unix => unix_stream_connection(&self.config.address),
+            NetProtocol::Unixgram => unix_datagram_connection(&self.config.address),
         }
     }
 
@@ -749,6 +829,10 @@ impl NetSink {
         let result = match self.connection.as_mut() {
             Some(NetConnection::Tcp(stream)) => stream.write_all(bytes),
             Some(NetConnection::Udp(socket)) => socket.send(bytes).map(|_| ()),
+            #[cfg(unix)]
+            Some(NetConnection::Unix(stream)) => stream.write_all(bytes),
+            #[cfg(unix)]
+            Some(NetConnection::Unixgram(socket)) => socket.send(bytes).map(|_| ()),
             None => unreachable!("connection established above"),
         };
         if result.is_err() {
@@ -758,6 +842,10 @@ impl NetSink {
             match self.connection.as_mut() {
                 Some(NetConnection::Tcp(stream)) => stream.write_all(bytes),
                 Some(NetConnection::Udp(socket)) => socket.send(bytes).map(|_| ()),
+                #[cfg(unix)]
+                Some(NetConnection::Unix(stream)) => stream.write_all(bytes),
+                #[cfg(unix)]
+                Some(NetConnection::Unixgram(socket)) => socket.send(bytes).map(|_| ()),
                 None => unreachable!(),
             }?;
         }
@@ -780,11 +868,42 @@ impl NetSink {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        if let Some(NetConnection::Tcp(stream)) = &mut self.connection {
-            stream.flush()?;
+        match &mut self.connection {
+            Some(NetConnection::Tcp(stream)) => stream.flush()?,
+            #[cfg(unix)]
+            Some(NetConnection::Unix(stream)) => stream.flush()?,
+            _ => {}
         }
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn unix_stream_connection(address: &str) -> io::Result<NetConnection> {
+    std::os::unix::net::UnixStream::connect(address).map(NetConnection::Unix)
+}
+
+#[cfg(unix)]
+fn unix_datagram_connection(address: &str) -> io::Result<NetConnection> {
+    let socket = std::os::unix::net::UnixDatagram::unbound()?;
+    socket.connect(address)?;
+    Ok(NetConnection::Unixgram(socket))
+}
+
+#[cfg(not(unix))]
+fn unix_stream_connection(_address: &str) -> io::Result<NetConnection> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "unix sockets are only supported on Unix platforms",
+    ))
+}
+
+#[cfg(not(unix))]
+fn unix_datagram_connection(_address: &str) -> io::Result<NetConnection> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "unix sockets are only supported on Unix platforms",
+    ))
 }
 
 /// Resolve a host:port string to one socket address without requiring a full resolver API.
@@ -1757,5 +1876,87 @@ mod tests {
             "spaced JSON fields: {line}"
         );
         assert!(line.ends_with('\n'));
+    }
+
+    #[test]
+    fn unix_net_writer_streams_lines_to_a_unix_listener() {
+        use std::io::BufRead;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let socket_path = directory.path().join("access.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).expect("bind unix");
+        let sink = AccessLogSink::from_config(&AccessLogSinkConfig {
+            output: AccessLogOutput::Net,
+            net: Some(NetWriterConfig {
+                address: socket_path.display().to_string(),
+                network: NetProtocol::Unix,
+                dial_timeout_ns: None,
+                soft_start: false,
+            }),
+            ..AccessLogSinkConfig::default()
+        })
+        .expect("unix net sink");
+        sink.emit(&entry("unix", 200)).expect("emit");
+        let (stream, _) = listener.accept().expect("accept");
+        let mut reader = std::io::BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read");
+        assert!(line.contains("\"status\":200"), "{line}");
+        sink.close().expect("close");
+    }
+
+    #[test]
+    fn time_based_rotation_rolls_on_interval() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("interval.log");
+        let sink = AccessLogSink::from_config(&AccessLogSinkConfig {
+            output: AccessLogOutput::File,
+            filename: Some(path.clone()),
+            file: FileWriterOptions {
+                roll: true,
+                roll_interval_ns: Some(1),
+                roll_keep: 5,
+                ..FileWriterOptions::default()
+            },
+            ..AccessLogSinkConfig::default()
+        })
+        .expect("interval sink");
+        sink.emit(&entry("first", 200)).expect("emit first");
+        std::thread::sleep(Duration::from_millis(2));
+        sink.emit(&entry("second", 200)).expect("emit second");
+        sink.close().expect("close");
+        let backups: Vec<_> = std::fs::read_dir(directory.path())
+            .expect("dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("interval.log.")
+            })
+            .collect();
+        assert!(!backups.is_empty(), "interval rotation created a backup");
+    }
+
+    #[test]
+    fn console_encoder_honors_time_and_level_format_options() {
+        let mut config = AccessLogConfig {
+            time_format: Some("rfc3339".to_string()),
+            level_format: Some("upper".to_string()),
+            ..AccessLogConfig::default()
+        };
+        config.line_ending = None;
+        let encoder =
+            AccessLogEncoder::with_format(config, AccessLogFormat::Console).expect("encoder");
+        let mut log_entry = entry("console", 200);
+        log_entry.timestamp = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let line = String::from_utf8(encoder.encode_line(&log_entry).expect("line")).expect("utf8");
+        assert!(
+            line.starts_with("2023-11-14T22:13:20Z\tINFO\thttp.log.access\thandled request\t{"),
+            "got: {line}"
+        );
+        assert!(
+            !line.contains('\u{1b}'),
+            "no ANSI color when level_format=upper"
+        );
     }
 }

@@ -131,6 +131,7 @@ pub mod metrics;
 mod origin;
 pub mod pki;
 pub mod recorder;
+mod regex_lite;
 pub mod sink;
 
 use std::collections::BTreeSet;

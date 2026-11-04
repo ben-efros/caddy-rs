@@ -358,6 +358,7 @@ impl AccessLogEntry {
         config.apply_field_selection(&mut value);
         config.apply_field_filters(&mut value);
         config.apply_key_options(&mut value);
+        config.apply_format_options(&mut value);
         Ok(value)
     }
 
@@ -720,6 +721,337 @@ pub enum FieldFilterOperation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         v6_mask: Option<u8>,
     },
+    /// Filter URL query parameters (Caddy's `query` filter) on string value(s).
+    Query {
+        /// Ordered actions applied to the query string.
+        actions: Vec<FilterAction>,
+    },
+    /// Filter `Cookie` header values (Caddy's `cookie` filter).
+    Cookie {
+        /// Ordered cookie-name actions (first matching action per name wins, as in Caddy).
+        actions: Vec<FilterAction>,
+    },
+    /// Filter `Set-Cookie` header values, preserving the attribute suffix verbatim (Caddy's
+    /// `set_cookie` filter).
+    SetCookie {
+        /// Ordered cookie-name actions (first matching action per name wins).
+        actions: Vec<FilterAction>,
+    },
+    /// Replace regexp matches using Go-style `$N`/`${N}` capture expansion (Caddy's `regexp`
+    /// filter).
+    Regexp {
+        /// Go/RE2-subset pattern (see [`crate::regex_lite`]).
+        pattern: String,
+        /// Replacement template.
+        replacement: String,
+    },
+    /// Apply several regexp replacements in order (Caddy's `multi_regexp` filter).
+    MultiRegexp {
+        /// Ordered regexp replacements (Caddy caps this at 50).
+        operations: Vec<RegexpOperation>,
+    },
+}
+
+/// One `query`/`cookie`/`set_cookie` filter action (Caddy's `{type, parameter|name, value}`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FilterAction {
+    /// Action type (`replace`, `hash` or `delete`).
+    pub action: FilterActionKind,
+    /// Query parameter name or cookie name.
+    pub name: String,
+    /// Replacement value for `replace` (empty for the other actions).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub value: String,
+}
+
+/// Supported query/cookie filter action types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FilterActionKind {
+    /// Replace the value with [`FilterAction::value`].
+    Replace,
+    /// Replace the value with the first 4 bytes of its SHA-256 (Caddy's hash helper).
+    Hash,
+    /// Remove the parameter/cookie.
+    Delete,
+}
+
+/// One regexp replacement in a `multi_regexp` operation list.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RegexpOperation {
+    /// Go/RE2-subset pattern.
+    pub pattern: String,
+    /// Replacement template (`$1` capture expansion).
+    pub replacement: String,
+}
+
+/// Caddy's `multi_regexp` limits (security hardening from Caddy v2.11.7).
+const MAX_REGEXP_OPERATIONS: usize = 50;
+const MAX_REGEXP_PATTERN_LENGTH: usize = 1000;
+
+/// Memoized regex compilation for filter patterns (compiled once per distinct pattern).
+fn compiled_regex(pattern: &str) -> Option<crate::regex_lite::Regex> {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<std::collections::BTreeMap<String, crate::regex_lite::Regex>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()));
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(regex) = cache.get(pattern) {
+        return Some(regex.clone());
+    }
+    match crate::regex_lite::Regex::new(pattern) {
+        Ok(regex) => {
+            cache.insert(pattern.to_string(), regex.clone());
+            Some(regex)
+        }
+        Err(_) => None,
+    }
+}
+
+/// Replace all regexp matches in `input` using Go-style capture expansion.
+fn regexp_replace_all(pattern: &str, replacement: &str, input: &str) -> String {
+    let Some(regex) = compiled_regex(pattern) else {
+        return input.to_string();
+    };
+    let mut output = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(captures) = regex.captures(rest) {
+        let (start, end) = captures.group(0).expect("whole match is always captured");
+        output.push_str(&rest[..start]);
+        output.push_str(&regex.expand(replacement, rest, &captures));
+        let matched = &rest[start..end];
+        if matched.is_empty() {
+            // Zero-length match: copy one char and advance to avoid looping forever.
+            if let Some(character) = rest[start..].chars().next() {
+                output.push(character);
+                let advance = start + character.len_utf8();
+                rest = &rest[advance..];
+            } else {
+                rest = "";
+            }
+        } else {
+            rest = &rest[end..];
+        }
+    }
+    output.push_str(rest);
+    output
+}
+
+/// Convert days since 1970-01-01 to (year, month, day) (Howard Hinnant's algorithm).
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    (
+        year + i64::from(month <= 2),
+        u32::try_from(month).unwrap_or(1),
+        u32::try_from(day).unwrap_or(1),
+    )
+}
+
+/// Format a Unix timestamp in one of Caddy/zap's named encoder formats (UTC; `time_local` is
+/// rejected by validation because the offline build has no timezone database).
+fn format_time(seconds: f64, format: &str) -> serde_json::Value {
+    let whole = seconds.floor() as i64;
+    let nanos = ((seconds - whole as f64) * 1_000_000_000.0)
+        .round()
+        .clamp(0.0, 999_999_999.0) as u32;
+    let days = whole.div_euclid(86_400);
+    let seconds_of_day = whole.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = seconds_of_day / 3600;
+    let minute = (seconds_of_day % 3600) / 60;
+    let second = seconds_of_day % 60;
+    let millis = nanos / 1_000_000;
+    match format {
+        "unix_seconds_float" => serde_json::Value::from(seconds),
+        "unix_milli_float" => serde_json::Value::from(seconds * 1000.0),
+        "unix_nano" => serde_json::Value::from((seconds * 1_000_000_000.0).round() as i64),
+        "wall_milli" => serde_json::Value::String(format!(
+            "{year:04}/{month:02}/{day:02} {hour:02}:{minute:02}:{second:02}.{millis:03}"
+        )),
+        "wall" => serde_json::Value::String(format!(
+            "{year:04}/{month:02}/{day:02} {hour:02}:{minute:02}:{second:02}"
+        )),
+        "wall_nano" => serde_json::Value::String(format!(
+            "{year:04}/{month:02}/{day:02} {hour:02}:{minute:02}:{second:02}.{nanos:09}"
+        )),
+        "iso8601" | "rfc3339" => serde_json::Value::String(format!(
+            "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z"
+        )),
+        "rfc3339_nano" => serde_json::Value::String(format!(
+            "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{nanos:09}Z"
+        )),
+        "common_log" => {
+            const MONTHS: [&str; 12] = [
+                "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+            ];
+            let month_name = MONTHS[usize::try_from(month).unwrap_or(1) - 1];
+            serde_json::Value::String(format!(
+                "{day:02}/{month_name}/{year:04}:{hour:02}:{minute:02}:{second:02} +0000"
+            ))
+        }
+        _ => serde_json::Value::String(format!(
+            "{year:04}/{month:02}/{day:02} {hour:02}:{minute:02}:{second:02}.{millis:03}"
+        )),
+    }
+}
+
+fn level_color(level: &str) -> u8 {
+    match level.to_ascii_lowercase().as_str() {
+        "error" | "fatal" | "panic" | "dpanic" => 31,
+        "warn" => 33,
+        "info" => 34,
+        _ => 35,
+    }
+}
+
+/// Render a duration the way zap's string duration encoder does for common magnitudes.
+fn format_duration(seconds: f64) -> String {
+    let nanos = (seconds * 1_000_000_000.0) as i128;
+    if nanos.abs() >= 1_000_000_000 {
+        format!("{seconds}s")
+    } else if nanos.abs() >= 1_000_000 {
+        format!("{}ms", seconds * 1000.0)
+    } else if nanos.abs() >= 1000 {
+        format!("{}µs", seconds * 1_000_000.0)
+    } else {
+        format!("{nanos}ns")
+    }
+}
+
+/// Apply query-parameter actions to one URL/path string (preserving pair order).
+fn filter_query(value: &str, actions: &[FilterAction]) -> String {
+    let (before_fragment, fragment) = match value.split_once('#') {
+        Some((before, fragment)) => (before, Some(fragment)),
+        None => (value, None),
+    };
+    let (path, query) = match before_fragment.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (before_fragment, None),
+    };
+    let Some(query) = query else {
+        return value.to_string();
+    };
+    let mut pairs: Vec<String> = Vec::new();
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (name, _original_value) = match pair.split_once('=') {
+            Some((name, value)) => (name, value),
+            None => (pair, ""),
+        };
+        let mut removed = false;
+        let mut replacement: Option<String> = None;
+        for action in actions {
+            if action.name != name {
+                continue;
+            }
+            match action.action {
+                FilterActionKind::Replace => replacement = Some(action.value.clone()),
+                FilterActionKind::Hash => {
+                    replacement = Some(short_sha256(pair.split_once('=').map_or("", |(_, v)| v)))
+                }
+                FilterActionKind::Delete => removed = true,
+            }
+            break; // Caddy applies the first matching action per parameter.
+        }
+        if removed {
+            continue;
+        }
+        match replacement {
+            Some(value) => pairs.push(format!("{name}={value}")),
+            None => pairs.push(pair.to_string()),
+        }
+    }
+    let mut result = path.to_string();
+    if !pairs.is_empty() {
+        result.push('?');
+        result.push_str(&pairs.join("&"));
+    }
+    if let Some(fragment) = fragment {
+        result.push('#');
+        result.push_str(fragment);
+    }
+    result
+}
+
+/// Apply cookie actions to a `Cookie` header value.
+fn filter_cookie_header(value: &str, actions: &[FilterAction]) -> String {
+    let mut cookies = Vec::new();
+    for cookie in value.split(';') {
+        let cookie = cookie.trim();
+        if cookie.is_empty() {
+            continue;
+        }
+        let (name, cookie_value) = match cookie.split_once('=') {
+            Some((name, value)) => (name.trim(), value),
+            None => (cookie, ""),
+        };
+        let mut removed = false;
+        let mut replacement: Option<String> = None;
+        for action in actions {
+            if action.name != name {
+                continue;
+            }
+            match action.action {
+                FilterActionKind::Replace => replacement = Some(action.value.clone()),
+                FilterActionKind::Hash => replacement = Some(short_sha256(cookie_value)),
+                FilterActionKind::Delete => removed = true,
+            }
+            break;
+        }
+        if removed {
+            continue;
+        }
+        match replacement {
+            Some(value) => cookies.push(format!("{name}={value}")),
+            None => cookies.push(cookie.to_string()),
+        }
+    }
+    cookies.join("; ")
+}
+
+/// Apply cookie actions to a `Set-Cookie` value, preserving the attribute suffix verbatim.
+fn filter_set_cookie(value: &str, actions: &[FilterAction]) -> String {
+    let (cookie, attributes) = match value.split_once(';') {
+        Some((cookie, attributes)) => (cookie, Some(attributes)),
+        None => (value, None),
+    };
+    let Some((name, cookie_value)) = cookie.split_once('=') else {
+        return value.to_string();
+    };
+    let mut removed = false;
+    let mut replacement: Option<String> = None;
+    for action in actions {
+        if action.name != name.trim() {
+            continue;
+        }
+        match action.action {
+            FilterActionKind::Replace => replacement = Some(action.value.clone()),
+            FilterActionKind::Hash => replacement = Some(short_sha256(cookie_value)),
+            FilterActionKind::Delete => removed = true,
+        }
+        break;
+    }
+    if removed {
+        return String::new();
+    }
+    let cookie = format!("{name}={}", replacement.as_deref().unwrap_or(cookie_value));
+    match attributes {
+        Some(attributes) => format!("{cookie};{attributes}"),
+        None => cookie,
+    }
 }
 
 /// Caddy's `hash` filter: first 4 bytes of SHA-256, lower-case hex (8 characters).
@@ -799,6 +1131,63 @@ impl FieldFilter {
                 format!("filter.{}", self.path.join(">")),
                 "rename filter requires a non-empty `name`",
             )),
+            FieldFilterOperation::Query { actions }
+            | FieldFilterOperation::Cookie { actions }
+            | FieldFilterOperation::SetCookie { actions } => {
+                if actions.is_empty() {
+                    return Err(AccessLogError::new(
+                        format!("filter.{}", self.path.join(">")),
+                        "filter requires at least one action",
+                    ));
+                }
+                if actions.iter().any(|action| action.name.is_empty()) {
+                    return Err(AccessLogError::new(
+                        format!("filter.{}", self.path.join(">")),
+                        "filter action parameter/name must not be empty",
+                    ));
+                }
+                Ok(())
+            }
+            FieldFilterOperation::Regexp { pattern, .. } => {
+                crate::regex_lite::Regex::new(pattern).map_err(|error| {
+                    AccessLogError::new(
+                        format!("filter.{}", self.path.join(">")),
+                        format!("invalid regexp filter pattern: {}", error),
+                    )
+                })?;
+                Ok(())
+            }
+            FieldFilterOperation::MultiRegexp { operations } => {
+                if operations.is_empty() {
+                    return Err(AccessLogError::new(
+                        format!("filter.{}", self.path.join(">")),
+                        "multi_regexp requires at least one operation",
+                    ));
+                }
+                if operations.len() > MAX_REGEXP_OPERATIONS {
+                    return Err(AccessLogError::new(
+                        format!("filter.{}", self.path.join(">")),
+                        format!("multi_regexp supports at most {MAX_REGEXP_OPERATIONS} operations"),
+                    ));
+                }
+                for operation in operations {
+                    if operation.pattern.is_empty()
+                        || operation.pattern.len() > MAX_REGEXP_PATTERN_LENGTH
+                    {
+                        return Err(AccessLogError::new(
+                            format!("filter.{}", self.path.join(">")),
+                            "multi_regexp patterns must be non-empty and at most 1000 characters",
+                        ));
+                    }
+                    crate::regex_lite::Regex::new(&operation.pattern).map_err(|error| {
+                        AccessLogError::new(
+                            format!("filter.{}", self.path.join(">")),
+                            format!("invalid multi_regexp pattern: {}", error),
+                        )
+                    })?;
+                }
+                Ok(())
+            }
             FieldFilterOperation::IpMask { v4_mask, v6_mask } => {
                 if v4_mask.is_some_and(|mask| mask > 32) {
                     return Err(AccessLogError::new(
@@ -847,6 +1236,37 @@ impl FieldFilter {
                     Some(mask_ip(existing, *v4_mask, *v6_mask))
                 });
             }
+            FieldFilterOperation::Query { actions } => {
+                map_strings(parent, key, |existing| {
+                    Some(filter_query(existing, actions))
+                });
+            }
+            FieldFilterOperation::Cookie { actions } => {
+                map_strings(parent, key, |existing| {
+                    Some(filter_cookie_header(existing, actions))
+                });
+            }
+            FieldFilterOperation::SetCookie { actions } => {
+                map_set_cookie(parent, key, actions);
+            }
+            FieldFilterOperation::Regexp {
+                pattern,
+                replacement,
+            } => {
+                map_strings(parent, key, |existing| {
+                    Some(regexp_replace_all(pattern, replacement, existing))
+                });
+            }
+            FieldFilterOperation::MultiRegexp { operations } => {
+                map_strings(parent, key, |existing| {
+                    let mut value = existing.to_string();
+                    for operation in operations {
+                        value =
+                            regexp_replace_all(&operation.pattern, &operation.replacement, &value);
+                    }
+                    Some(value)
+                });
+            }
         }
     }
 }
@@ -885,6 +1305,43 @@ fn map_strings(
                     apply_to_value(value, &transform);
                 }
             }
+        }
+        _ => {}
+    }
+}
+
+fn map_set_cookie(parent: &mut serde_json::Value, key: &str, actions: &[FilterAction]) {
+    match parent {
+        serde_json::Value::Object(map) => {
+            if let Some(value) = map.get_mut(key) {
+                apply_set_cookie_value(value, actions);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            if let Ok(index) = key.parse::<usize>() {
+                if let Some(value) = items.get_mut(index) {
+                    apply_set_cookie_value(value, actions);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn apply_set_cookie_value(value: &mut serde_json::Value, actions: &[FilterAction]) {
+    match value {
+        serde_json::Value::String(existing) => {
+            *existing = filter_set_cookie(existing, actions);
+        }
+        serde_json::Value::Array(items) => {
+            items.retain_mut(|item| {
+                if let serde_json::Value::String(existing) = item {
+                    *existing = filter_set_cookie(existing, actions);
+                    !existing.is_empty()
+                } else {
+                    true
+                }
+            });
         }
         _ => {}
     }
@@ -947,6 +1404,20 @@ pub struct AccessLogConfig {
     /// Line terminator written after each encoded entry (Caddy `line_ending`, default `\n`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line_ending: Option<String>,
+    /// Encoder timestamp format (Caddy `time_format`; e.g. `wall_milli`, `rfc3339`,
+    /// `unix_seconds_float`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_format: Option<String>,
+    /// Use local time instead of UTC for timestamps (only `false` is supported; `true` fails
+    /// loudly because the offline build has no timezone database).
+    #[serde(default)]
+    pub time_local: bool,
+    /// Encoder level format (Caddy `level_format`: `lower`, `upper`, `color`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level_format: Option<String>,
+    /// Encoder duration format (Caddy `duration_format`: `seconds`, `ms`, `ns`, `string`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_format: Option<String>,
 }
 
 impl AccessLogConfig {
@@ -1013,7 +1484,104 @@ impl AccessLogConfig {
                 "line ending must not be empty",
             ));
         }
+        if self.time_local {
+            return Err(AccessLogError::new(
+                "time_local",
+                "time_local is not supported by this build (no timezone database); timestamps are UTC",
+            ));
+        }
+        if let Some(format) = &self.time_format {
+            if !matches!(
+                format.as_str(),
+                "wall_milli"
+                    | "wall"
+                    | "wall_nano"
+                    | "iso8601"
+                    | "rfc3339"
+                    | "rfc3339_nano"
+                    | "unix_seconds_float"
+                    | "unix_milli_float"
+                    | "unix_nano"
+                    | "common_log"
+            ) {
+                return Err(AccessLogError::new(
+                    "time_format",
+                    format!(
+                        "unsupported time_format `{format}` (supported: wall_milli, wall, \
+                         wall_nano, iso8601, rfc3339, rfc3339_nano, unix_seconds_float, \
+                         unix_milli_float, unix_nano, common_log)"
+                    ),
+                ));
+            }
+        }
+        if let Some(format) = &self.level_format {
+            if !matches!(format.as_str(), "lower" | "upper" | "color") {
+                return Err(AccessLogError::new(
+                    "level_format",
+                    format!("unsupported level_format `{format}` (supported: lower, upper, color)"),
+                ));
+            }
+        }
+        if let Some(format) = &self.duration_format {
+            if !matches!(format.as_str(), "seconds" | "ms" | "ns" | "string") {
+                return Err(AccessLogError::new(
+                    "duration_format",
+                    format!(
+                        "unsupported duration_format `{format}` (supported: seconds, ms, ns, \
+                         string)"
+                    ),
+                ));
+            }
+        }
         Ok(())
+    }
+
+    fn apply_format_options(&self, value: &mut serde_json::Value) {
+        let serde_json::Value::Object(map) = value else {
+            return;
+        };
+        for key in ["ts", "time"] {
+            let Some(seconds) = map.get(key).and_then(serde_json::Value::as_f64) else {
+                continue;
+            };
+            let Some(format) = &self.time_format else {
+                continue;
+            };
+            let formatted = format_time(seconds, format);
+            map.insert(key.to_string(), formatted);
+        }
+        if self.level_format.as_deref() == Some("color") {
+            if let Some(serde_json::Value::String(level)) = map.get("level").cloned() {
+                map.insert(
+                    "level".to_string(),
+                    serde_json::Value::String(format!(
+                        "\u{1b}[{}m{}\u{1b}[0m",
+                        level_color(&level),
+                        level.to_ascii_uppercase()
+                    )),
+                );
+            }
+        } else if let Some(format) = &self.level_format {
+            if let Some(serde_json::Value::String(level)) = map.get("level").cloned() {
+                let rendered = if format == "upper" {
+                    level.to_ascii_uppercase()
+                } else {
+                    level.to_ascii_lowercase()
+                };
+                map.insert("level".to_string(), serde_json::Value::String(rendered));
+            }
+        }
+        if let Some(seconds) = map.get("duration").and_then(serde_json::Value::as_f64) {
+            if let Some(format) = &self.duration_format {
+                let formatted = match format.as_str() {
+                    "ms" => serde_json::Value::from(seconds * 1000.0),
+                    "ns" => serde_json::Value::from((seconds * 1_000_000_000.0).round() as u64),
+                    "string" => serde_json::Value::String(format_duration(seconds)),
+                    _ => serde_json::Value::from(seconds),
+                };
+                map.insert("duration".to_string(), formatted);
+            }
+        }
     }
 
     fn apply_key_options(&self, value: &mut serde_json::Value) {
@@ -1758,5 +2326,130 @@ mod tests {
             rendered.get("upstream").is_none(),
             "absent field is a no-op"
         );
+    }
+
+    #[test]
+    fn query_cookie_and_regexp_filters_apply() {
+        let config = AccessLogConfig {
+            // Cookie/Set-Cookie logs are credential-redacted by default; allow them so the
+            // filter behavior is observable (Caddy's `should_log_credentials`).
+            log_credentials: true,
+            filters: vec![
+                FieldFilter {
+                    path: vec!["request".to_string(), "uri".to_string()],
+                    operation: FieldFilterOperation::Query {
+                        actions: vec![
+                            FilterAction {
+                                action: FilterActionKind::Replace,
+                                name: "token".to_string(),
+                                value: "***".to_string(),
+                            },
+                            FilterAction {
+                                action: FilterActionKind::Delete,
+                                name: "secret".to_string(),
+                                value: String::new(),
+                            },
+                            FilterAction {
+                                action: FilterActionKind::Hash,
+                                name: "id".to_string(),
+                                value: String::new(),
+                            },
+                        ],
+                    },
+                },
+                FieldFilter {
+                    path: vec![
+                        "request".to_string(),
+                        "headers".to_string(),
+                        "Cookie".to_string(),
+                    ],
+                    operation: FieldFilterOperation::Cookie {
+                        actions: vec![FilterAction {
+                            action: FilterActionKind::Hash,
+                            name: "session".to_string(),
+                            value: String::new(),
+                        }],
+                    },
+                },
+                FieldFilter {
+                    path: vec!["resp_headers".to_string(), "Set-Cookie".to_string()],
+                    operation: FieldFilterOperation::SetCookie {
+                        actions: vec![FilterAction {
+                            action: FilterActionKind::Replace,
+                            name: "sid".to_string(),
+                            value: "REDACTED".to_string(),
+                        }],
+                    },
+                },
+                FieldFilter {
+                    path: vec!["user_id".to_string()],
+                    operation: FieldFilterOperation::Regexp {
+                        pattern: "(?i)admin_(\\w+)".to_string(),
+                        replacement: "user_$1".to_string(),
+                    },
+                },
+                FieldFilter {
+                    path: vec!["request".to_string(), "host".to_string()],
+                    operation: FieldFilterOperation::MultiRegexp {
+                        operations: vec![
+                            RegexpOperation {
+                                pattern: "a+".to_string(),
+                                replacement: "A".to_string(),
+                            },
+                            RegexpOperation {
+                                pattern: "b+".to_string(),
+                                replacement: "B".to_string(),
+                            },
+                        ],
+                    },
+                },
+            ],
+            ..AccessLogConfig::default()
+        };
+        let mut entry = AccessLogEntry::new(AccessLogRequest::default());
+        entry.request.uri = "/path?token=abc&id=secret&secret=x&keep=1".to_string();
+        entry.request.headers.insert(
+            "Cookie".to_string(),
+            vec!["session=topsecret; other=1".to_string()],
+        );
+        entry.resp_headers.insert(
+            "Set-Cookie".to_string(),
+            vec!["sid=abc; Path=/; HttpOnly".to_string()],
+        );
+        entry.user_id = "admin_role".to_string();
+        entry.request.host = "aaabbb.example".to_string();
+        let rendered = entry.render(&config).expect("render");
+        assert_eq!(
+            rendered["request"]["uri"],
+            "/path?token=***&id=2bb80d53&keep=1"
+        );
+        let cookie = rendered["request"]["headers"]["Cookie"][0]
+            .as_str()
+            .expect("cookie");
+        assert!(cookie.contains("session=53336a67"), "{cookie}");
+        assert!(cookie.contains("other=1"), "{cookie}");
+        assert_eq!(
+            rendered["resp_headers"]["Set-Cookie"][0],
+            "sid=REDACTED; Path=/; HttpOnly"
+        );
+        assert_eq!(rendered["user_id"], "user_role");
+        assert_eq!(rendered["request"]["host"], "AB.exAmple");
+    }
+
+    #[test]
+    fn encoder_format_options_apply_to_json_rendering() {
+        let config = AccessLogConfig {
+            time_format: Some("rfc3339".to_string()),
+            level_format: Some("upper".to_string()),
+            duration_format: Some("ms".to_string()),
+            ..AccessLogConfig::default()
+        };
+        let mut entry = AccessLogEntry::new(AccessLogRequest::default());
+        entry.timestamp = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        entry.duration = std::time::Duration::from_millis(1234);
+        let rendered = entry.render(&config).expect("render");
+        assert_eq!(rendered["ts"], "2023-11-14T22:13:20Z");
+        assert_eq!(rendered["level"], "INFO");
+        assert_eq!(rendered["duration"].as_f64().unwrap(), 1234.0);
     }
 }
