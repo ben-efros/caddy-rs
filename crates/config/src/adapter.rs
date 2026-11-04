@@ -749,6 +749,10 @@ struct SiteTls {
     /// terminator does not accept yet; emitting the array keeps the adapted config executable.
     /// Registered adapter divergence until the runtime grows min/max support (TLS-CONN-POLICY).
     protocols: Option<Vec<String>>,
+    /// `tls { ciphers <names...> }` as `cipher_suites`; restricted to the runtime's rustls subset.
+    ciphers: Option<Vec<String>>,
+    /// `tls { curves <names...> }`; restricted to the runtime's rustls subset.
+    curves: Option<Vec<String>>,
 }
 
 /// Options of `tls { issuer internal { ... } }` (Caddy's `tls.issuance.internal`).
@@ -903,6 +907,78 @@ fn pki_key_pair_json(pair: &parser::PkiKeyPairConfig) -> Value {
         object.insert("format".to_string(), json!(format));
     }
     Value::Object(object)
+}
+
+/// TLS 1.2 cipher suites the caddy-rs rustls terminator can select (ring provider ECDHE
+/// AES-GCM/ChaCha20 suites). Caddy accepts more Go suite names; those fail loudly below.
+const SUPPORTED_CIPHER_SUITES: &[&str] = &[
+    "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+    "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+];
+
+/// Cipher suite names Caddy v2.11.7 accepts but the rustls ring provider cannot configure:
+/// TLS 1.3 suites (fixed by both Go and rustls) and ECDHE CBC suites (not implemented by
+/// rustls). These fail loudly instead of being silently dropped from the emitted policy.
+const CADDY_ONLY_CIPHER_SUITES: &[&str] = &[
+    "TLS_AES_128_GCM_SHA256",
+    "TLS_AES_256_GCM_SHA384",
+    "TLS_CHACHA20_POLY1305_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA",
+    "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA",
+    "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA",
+    "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA",
+];
+
+/// Validate one `tls { ciphers ... }` name against the runtime subset, failing loudly for names
+/// Caddy accepts but this build's rustls terminator cannot honour (no silent dropping).
+fn validate_cipher_suite(name: &str, position: Position) -> caddy_rs_core::Result<String> {
+    if SUPPORTED_CIPHER_SUITES.contains(&name) {
+        return Ok(name.to_string());
+    }
+    if CADDY_ONLY_CIPHER_SUITES.contains(&name) {
+        return Err(adapter_error(
+            position,
+            format!(
+                "cipher suite `{name}` is accepted by Caddy but not supported by this build's TLS \
+                 runtime; only the TLS 1.2 ECDHE AES-GCM/ChaCha20 suites are configurable (tracked as TLS-POLICY)"
+            ),
+        ));
+    }
+    Err(adapter_error(
+        position,
+        format!("wrong cipher suite name or cipher suite not supported: `{name}`"),
+    ))
+}
+
+/// TLS key-exchange groups (curves) the rustls ring provider supports.
+const SUPPORTED_CURVES: &[&str] = &["x25519", "secp256r1", "secp384r1"];
+
+/// Curves Caddy v2.11.7 accepts but the rustls ring provider does not implement.
+const CADDY_ONLY_CURVES: &[&str] = &["secp521r1", "x25519mlkem768"];
+
+/// Validate one `tls { curves ... }` name against the runtime subset, failing loudly for names
+/// Caddy accepts but this build cannot honour (no silent dropping).
+fn validate_curve(name: &str, position: Position) -> caddy_rs_core::Result<String> {
+    if SUPPORTED_CURVES.contains(&name) {
+        return Ok(name.to_string());
+    }
+    if CADDY_ONLY_CURVES.contains(&name) {
+        return Err(adapter_error(
+            position,
+            format!(
+                "TLS curve `{name}` is accepted by Caddy but not supported by this build's TLS \
+                 runtime; the rustls ring provider supports x25519, secp256r1 and secp384r1 (tracked as TLS-POLICY)"
+            ),
+        ));
+    }
+    Err(adapter_error(
+        position,
+        format!("wrong curve name or curve not supported: `{name}`"),
+    ))
 }
 
 /// Parse the `tls` directive of a site block. Only the documented subset is implemented; other
@@ -1165,18 +1241,34 @@ fn parse_site_tls(
                 config.protocols = Some(protocols);
             }
             "ciphers" => {
-                return Err(adapter_error(
-                    option.position,
-                    "`tls` option `ciphers` is not supported by this build: the rustls terminator \
-                     has no cipher-suite selection configuration (tracked as TLS-CIPHER-SUITES)",
-                ))
+                if !option.block.is_empty() {
+                    return Err(adapter_error(
+                        option.position,
+                        "`ciphers` does not take a block",
+                    ));
+                }
+                let mut suites = config.ciphers.take().unwrap_or_default();
+                for name in &option.args {
+                    suites.push(validate_cipher_suite(name, option.position)?);
+                }
+                if !suites.is_empty() {
+                    config.ciphers = Some(suites);
+                }
             }
             "curves" => {
-                return Err(adapter_error(
-                    option.position,
-                    "`tls` option `curves` is not supported by this build: the rustls terminator \
-                     has no key-exchange-group selection configuration (tracked as TLS-CURVES)",
-                ))
+                if !option.block.is_empty() {
+                    return Err(adapter_error(
+                        option.position,
+                        "`curves` does not take a block",
+                    ));
+                }
+                let mut curves = config.curves.take().unwrap_or_default();
+                for name in &option.args {
+                    curves.push(validate_curve(name, option.position)?);
+                }
+                if !curves.is_empty() {
+                    config.curves = Some(curves);
+                }
             }
             other => {
                 return Err(adapter_error(
@@ -2188,8 +2280,17 @@ fn build_tls_plan(
                 if let Some(protocols) = &tls.protocols {
                     connection_policy.insert("protocols".to_string(), json!(protocols));
                 }
-                let has_listener_options =
-                    tls.client_auth.is_some() || tls.alpn.is_some() || tls.protocols.is_some();
+                if let Some(ciphers) = &tls.ciphers {
+                    connection_policy.insert("cipher_suites".to_string(), json!(ciphers));
+                }
+                if let Some(curves) = &tls.curves {
+                    connection_policy.insert("curves".to_string(), json!(curves));
+                }
+                let has_listener_options = tls.client_auth.is_some()
+                    || tls.alpn.is_some()
+                    || tls.protocols.is_some()
+                    || tls.ciphers.is_some()
+                    || tls.curves.is_some();
                 if connection_policy.contains_key("certificate_selection") || has_listener_options {
                     if hosts.is_empty() {
                         state.has_catch_all = true;
