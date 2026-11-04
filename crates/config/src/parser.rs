@@ -65,6 +65,10 @@ pub struct GlobalOptions {
     pub local_certs: bool,
     /// Certificate authorities defined by the global `pki` option (`apps.pki` in JSON).
     pub pki: Option<PkiOptions>,
+    /// Global server grace period (`grace_period`), in nanoseconds (`apps.http.grace_period`).
+    pub grace_period_ns: Option<u64>,
+    /// Global shutdown delay (`shutdown_delay`), in nanoseconds (`apps.http.shutdown_delay`).
+    pub shutdown_delay_ns: Option<u64>,
     /// Non-fatal notes produced while preprocessing the Caddyfile (environment-placeholder
     /// expansion) and while reading options. Adapters surface these to callers.
     pub warnings: Vec<String>,
@@ -1618,6 +1622,50 @@ fn read_global_options(directives: Vec<Directive>) -> Result<GlobalOptions, Pars
             "https_port" => {
                 options.https_port = Some(global_port(&directive)?);
             }
+            "grace_period" | "shutdown_delay" => {
+                let name = directive.name.clone();
+                if !directive.block.is_empty() {
+                    return Err(ParseError::syntax(
+                        directive.position,
+                        format!("global option `{name}` does not support a block"),
+                    ));
+                }
+                if directive.args.len() != 1 {
+                    return Err(ParseError::syntax(
+                        directive.position,
+                        format!("wrong argument count or unexpected line ending after `{name}`"),
+                    ));
+                }
+                let value = &directive.args[0];
+                let nanoseconds = parse_go_duration_ns(value).map_err(|reason| {
+                    ParseError::syntax(directive.position, format!("parsing {name}: {reason}"))
+                })?;
+                if nanoseconds < 0 {
+                    // Caddy's adapter accepts negative durations, but its runtime and the
+                    // caddy-rs typed `CaddyDuration` (u64 ns) treat them as invalid; reject
+                    // loudly instead of emitting a config that cannot be provisioned.
+                    return Err(ParseError::syntax(
+                        directive.position,
+                        format!("`{name}` must not be negative, got `{value}`"),
+                    ));
+                }
+                let nanoseconds = nanoseconds as u64;
+                let slot = if name == "grace_period" {
+                    &mut options.grace_period_ns
+                } else {
+                    &mut options.shutdown_delay_ns
+                };
+                if slot.is_some() {
+                    return Err(ParseError::syntax(
+                        directive.position,
+                        format!(
+                            "global option `{name}` is specified more than once; Caddy's adapter \
+                             keeps the last value, caddy-rs rejects duplicates instead"
+                        ),
+                    ));
+                }
+                *slot = Some(nanoseconds);
+            }
             "email" => options.email = Some(global_string(&directive, "email")?),
             "acme_ca" => options.acme_ca = Some(global_string(&directive, "acme_ca")?),
             "acme_ca_root" => {
@@ -1869,6 +1917,95 @@ pub(crate) fn parse_duration_ns(value: &str) -> Result<i64, String> {
     Ok(total.round() as i64)
 }
 
+/// Parse Caddy's Go-duration syntax into nanoseconds, matching `caddy.ParseDuration`:
+/// `time.ParseDuration` units (`ns`, `us`/`µs`/`μs`, `ms`, `s`, `m`, `h`) plus `d` for 24-hour
+/// days, compound forms (`1h30m`), fractional values (`1.5s`) and a leading sign. Fractional
+/// nanoseconds truncate toward zero (Go's behaviour); an unqualified `0` is valid, other bare
+/// numbers need a unit.
+pub(crate) fn parse_go_duration_ns(value: &str) -> Result<i64, String> {
+    if value.len() > 1024 {
+        return Err("parsing duration: input string too long".to_string());
+    }
+    // Caddy preprocesses `Nd` components into hours before calling Go's parser.
+    let mut text = value.to_string();
+    let mut in_number = false;
+    let mut number_start = 0_usize;
+    let mut index = 0_usize;
+    while index < text.len() {
+        let byte = text.as_bytes()[index];
+        if byte == b'd' {
+            let days: f64 = text[number_start..index]
+                .parse()
+                .map_err(|_| format!("time: invalid duration \"{value}\""))?;
+            let hours = days * 24.0;
+            // Go's strconv.FormatFloat(hours, 'f', -1, 64): shortest decimal representation.
+            let hours = format!("{hours}");
+            text = format!("{}{}h{}", &text[..number_start], hours, &text[index + 1..]);
+            index = number_start.saturating_sub(1);
+        } else {
+            if !in_number {
+                number_start = index;
+            }
+            in_number = byte.is_ascii_digit() || matches!(byte, b'.' | b'-' | b'+');
+        }
+        index += 1;
+    }
+
+    let original = value;
+    let mut rest = text.as_str();
+    let mut sign = 1.0_f64;
+    if let Some(stripped) = rest.strip_prefix('-') {
+        sign = -1.0;
+        rest = stripped;
+    } else if let Some(stripped) = rest.strip_prefix('+') {
+        rest = stripped;
+    }
+    if rest == "0" {
+        return Ok(0);
+    }
+    if rest.is_empty() {
+        return Err(format!("time: invalid duration \"{original}\""));
+    }
+    let mut total = 0.0_f64;
+    while !rest.is_empty() {
+        let number_end = rest
+            .find(|character: char| !(character.is_ascii_digit() || character == '.'))
+            .unwrap_or(rest.len());
+        if number_end == 0 {
+            return Err(format!("time: invalid duration \"{original}\""));
+        }
+        let number: f64 = rest[..number_end]
+            .parse()
+            .map_err(|_| format!("time: invalid duration \"{original}\""))?;
+        rest = &rest[number_end..];
+        let unit_end = rest
+            .find(|character: char| character.is_ascii_digit() || character == '.')
+            .unwrap_or(rest.len());
+        let unit = &rest[..unit_end];
+        rest = &rest[unit_end..];
+        let multiplier: f64 = match unit {
+            "ns" => 1.0,
+            "us" | "µs" | "μs" => 1_000.0,
+            "ms" => 1_000_000.0,
+            "s" => 1_000_000_000.0,
+            "m" => 60_000_000_000.0,
+            "h" => 3_600_000_000_000.0,
+            "" => return Err(format!("time: missing unit in duration \"{original}\"")),
+            _ => return Err(format!("time: invalid duration \"{original}\"")),
+        };
+        total += number * multiplier;
+        if !total.is_finite() {
+            return Err(format!("time: invalid duration \"{original}\""));
+        }
+    }
+    let total = sign * total;
+    if total > i64::MAX as f64 || total < i64::MIN as f64 {
+        return Err(format!("time: invalid duration \"{original}\""));
+    }
+    // Go truncates sub-nanosecond fractions toward zero.
+    Ok(total.trunc() as i64)
+}
+
 fn global_string(directive: &Directive, option: &str) -> Result<String, ParseError> {
     if !directive.block.is_empty() {
         return Err(ParseError::syntax(
@@ -1989,6 +2126,94 @@ mod tests {
             assert!(
                 error.to_string().contains(expected),
                 "expected {expected:?} in {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_global_grace_period_and_shutdown_delay() {
+        let file = parse("{ grace_period 1m30s\n shutdown_delay 250ms\n}\n:80 {\n respond ok\n}\n")
+            .expect("parses");
+        assert_eq!(file.options.grace_period_ns, Some(90_000_000_000));
+        assert_eq!(file.options.shutdown_delay_ns, Some(250_000_000));
+
+        let days = parse("{ grace_period 1d12h\n}\n:80 {\n respond ok\n}\n").expect("parses");
+        assert_eq!(days.options.grace_period_ns, Some(129_600_000_000_000));
+        let fractional =
+            parse("{ shutdown_delay 1.5s\n}\n:80 {\n respond ok\n}\n").expect("parses");
+        assert_eq!(fractional.options.shutdown_delay_ns, Some(1_500_000_000));
+        let zero = parse("{ grace_period 0\n}\n:80 {\n respond ok\n}\n").expect("parses");
+        assert_eq!(zero.options.grace_period_ns, Some(0));
+        let unset = parse(":80 {\n respond ok\n}\n").expect("parses");
+        assert_eq!(unset.options.grace_period_ns, None);
+        assert_eq!(unset.options.shutdown_delay_ns, None);
+    }
+
+    #[test]
+    fn invalid_grace_period_values_fail_loudly() {
+        for (caddyfile, expected) in [
+            (
+                "{ grace_period abc\n}\n:80 {\n respond ok\n}\n",
+                "parsing grace_period",
+            ),
+            (
+                "{ grace_period 5\n}\n:80 {\n respond ok\n}\n",
+                "missing unit",
+            ),
+            (
+                "{ grace_period -5s\n}\n:80 {\n respond ok\n}\n",
+                "must not be negative",
+            ),
+            (
+                "{ grace_period 5s\n grace_period 7s\n}\n:80 {\n respond ok\n}\n",
+                "specified more than once",
+            ),
+            (
+                "{ grace_period 5s 10s\n}\n:80 {\n respond ok\n}\n",
+                "wrong argument count",
+            ),
+            (
+                "{ grace_period {\n 5s\n }\n}\n:80 {\n respond ok\n}\n",
+                "does not support a block",
+            ),
+        ] {
+            let error = parse(caddyfile).expect_err("must fail");
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected:?} in {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn go_duration_parser_matches_go_semantics() {
+        // `caddy.ParseDuration` = Go `time.ParseDuration` plus `d` (24h) components.
+        for (value, expected) in [
+            ("5s", 5_000_000_000_i64),
+            ("1m30s", 90_000_000_000),
+            ("1h30m", 5_400_000_000_000),
+            ("1d", 86_400_000_000_000),
+            ("1d12h", 129_600_000_000_000),
+            ("1.5d", 129_600_000_000_000),
+            ("1.5h", 5_400_000_000_000),
+            ("500us", 500_000),
+            ("500µs", 500_000),
+            ("2h45m3.5s", 9_903_500_000_000),
+            ("0", 0),
+            ("+5s", 5_000_000_000),
+            ("0.5ns", 0),
+            ("1s0.5ns", 1_000_000_000),
+        ] {
+            assert_eq!(
+                parse_go_duration_ns(value),
+                Ok(expected),
+                "duration `{value}`"
+            );
+        }
+        for value in ["", "5", "abc", "1x", "5s junk", "1.2.3s"] {
+            assert!(
+                parse_go_duration_ns(value).is_err(),
+                "duration `{value}` should fail"
             );
         }
     }
