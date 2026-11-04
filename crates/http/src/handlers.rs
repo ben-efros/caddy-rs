@@ -7,21 +7,26 @@
 //!   placeholders stay visible), matching Caddy's `modules/caddyhttp/staticresp.go`.
 //! * `headers` request/response names and values use `ReplaceKnown` semantics, matching
 //!   `modules/caddyhttp/headers/headers.go`.
-//! * `rewrite` method, `uri` and `strip_path_prefix`, and `vars` keys/values use `ReplaceAll`
-//!   semantics (unknown placeholders expand to nothing), matching
-//!   `modules/caddyhttp/rewrite/rewrite.go` and `modules/caddyhttp/vars.go`.
+//! * `rewrite` covers Caddy's full field set: `method`, `uri`, `strip_path_prefix`,
+//!   `strip_path_suffix`, `uri_substring`, `path_regexp` and `query` operations in Caddy's order.
+//!   Placeholders use `ReplaceAll` for the setters/strippers/substring replacer and
+//!   `ReplaceKnown` for query replacements, matching `modules/caddyhttp/rewrite/rewrite.go`;
+//!   `path_regexp`/`query.replace` capture expansion uses Go `$N` syntax. `vars` keys/values use
+//!   `ReplaceAll`, matching `modules/caddyhttp/vars.go`.
 //! * `request_body` supports Caddy's `max_size` (lazy `413` when a later handler reads past the
 //!   limit) and experimental `set` (body replacement with `ReplaceKnown` placeholders), matching
 //!   `modules/caddyhttp/requestbody/requestbody.go`.
 //! * `map` supports Caddy's exact/regexp mappings, positional outputs, null outputs and defaults,
 //!   publishing destination placeholders for later handlers (`modules/caddyhttp/map/map.go`).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::{HeaderName, HeaderValue, Method, StatusCode, Uri};
 
+use crate::matchers::percent_decode;
 use crate::regex_lite::Regex;
 use crate::router::Router;
 use crate::types::{Error, Handler, Outcome, Request, Response, Result, StreamingOutcome};
@@ -382,14 +387,66 @@ impl Handler for VarsHandler {
     }
 }
 
-/// `rewrite`: change the request URI, method, or path prefix.
+/// One `uri_substring` replacement (Caddy's `substrReplacer`).
+#[derive(Debug, Clone)]
+struct UriSubstring {
+    find: String,
+    replace: String,
+    /// `limit <= 0` means unlimited (Caddy's sentinel).
+    limit: i64,
+}
+
+/// One `path_regexp` replacement (Caddy's `regexReplacer`).
+#[derive(Debug)]
+struct PathRegexp {
+    replace: String,
+    regex: Regex,
+}
+
+/// One `query` add/set/rename argument (`key`/`val`).
+#[derive(Debug, Clone, Default)]
+struct QueryArgument {
+    key: String,
+    val: String,
+}
+
+/// One `query.replace` operation.
+#[derive(Debug)]
+struct QueryReplacement {
+    key: String,
+    search: String,
+    replace: String,
+    regex: Option<Regex>,
+}
+
+/// Caddy's `queryOps`: rename, set, add, replace and delete query parameters in that order.
+#[derive(Debug, Default)]
+struct QueryOps {
+    rename: Vec<QueryArgument>,
+    set: Vec<QueryArgument>,
+    add: Vec<QueryArgument>,
+    replace: Vec<QueryReplacement>,
+    delete: Vec<String>,
+}
+
+/// `rewrite`: change the request URI, method, or path (Caddy's `http.handlers.rewrite`).
 ///
-/// Order of operations matches Caddy's `Rewrite.Rewrite`: method, then URI, then path prefix.
-/// Placeholders use `ReplaceAll` semantics, as Caddy does for these fields.
+/// Order of operations matches Caddy's `Rewrite.Rewrite`: `method`, `uri`, `strip_path_prefix`,
+/// `strip_path_suffix`, `uri_substring` entries, `path_regexp` entries, then `query` operations.
+///
+/// Expansion/validation follows Caddy: `method`/`uri`/prefix/suffix and `uri_substring`
+/// find/replace use `ReplaceAll` semantics; `path_regexp` replaces are expanded first and then use
+/// Go-style `$N` capture expansion; `query.replace` search/replace use `ReplaceKnown` semantics
+/// (Caddy's code calls `ReplaceKnown` there). Unknown or malformed fields fail loudly.
+#[derive(Debug)]
 pub struct RewriteHandler {
     uri: Option<String>,
     method: Option<String>,
     strip_path_prefix: Option<String>,
+    strip_path_suffix: Option<String>,
+    uri_substring: Vec<UriSubstring>,
+    path_regexp: Vec<PathRegexp>,
+    query: Option<QueryOps>,
 }
 
 impl RewriteHandler {
@@ -398,21 +455,286 @@ impl RewriteHandler {
         let object = value
             .as_object()
             .ok_or_else(|| invalid(path, "rewrite handler must be an object"))?;
+        for field in object.keys() {
+            if !matches!(
+                field.as_str(),
+                "handler"
+                    | "uri"
+                    | "method"
+                    | "strip_path_prefix"
+                    | "strip_path_suffix"
+                    | "uri_substring"
+                    | "path_regexp"
+                    | "query"
+            ) {
+                return Err(invalid(
+                    &format!("{path}.{field}"),
+                    format!("unsupported rewrite field `{field}`"),
+                ));
+            }
+        }
+        let uri = optional_string(object, "uri", path)?;
+        let method = optional_string(object, "method", path)?;
+        let strip_path_prefix = optional_string(object, "strip_path_prefix", path)?;
+        let strip_path_suffix = optional_string(object, "strip_path_suffix", path)?;
+        let uri_substring = parse_uri_substring(object, path)?;
+        let path_regexp = parse_path_regexp(object, path)?;
+        let query = parse_query_ops(object, path)?;
         Ok(Self {
-            uri: object
-                .get("uri")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
-            method: object
-                .get("method")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
-            strip_path_prefix: object
-                .get("strip_path_prefix")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
+            uri,
+            method,
+            strip_path_prefix,
+            strip_path_suffix,
+            uri_substring,
+            path_regexp,
+            query,
         })
     }
+}
+
+fn optional_string(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    path: &str,
+) -> Result<Option<String>> {
+    match object.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(invalid(
+            &format!("{path}.{field}"),
+            format!("`{field}` must be a string"),
+        )),
+    }
+}
+
+fn parse_uri_substring(
+    object: &serde_json::Map<String, serde_json::Value>,
+    path: &str,
+) -> Result<Vec<UriSubstring>> {
+    let Some(value) = object.get("uri_substring") else {
+        return Ok(Vec::new());
+    };
+    let items = value.as_array().ok_or_else(|| {
+        invalid(
+            &format!("{path}.uri_substring"),
+            "`uri_substring` must be an array",
+        )
+    })?;
+    let mut replacements = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let item_path = format!("{path}.uri_substring[{index}]");
+        let item = item
+            .as_object()
+            .ok_or_else(|| invalid(&item_path, "uri_substring entry must be an object"))?;
+        for field in item.keys() {
+            if !matches!(field.as_str(), "find" | "replace" | "limit") {
+                return Err(invalid(
+                    &format!("{item_path}.{field}"),
+                    format!("unsupported uri_substring field `{field}`"),
+                ));
+            }
+        }
+        let find = optional_string(item, "find", &item_path)?.unwrap_or_default();
+        let replace = optional_string(item, "replace", &item_path)?.unwrap_or_default();
+        let limit = match item.get("limit") {
+            None | Some(serde_json::Value::Null) => 0,
+            Some(serde_json::Value::Number(number)) => number.as_i64().ok_or_else(|| {
+                invalid(&format!("{item_path}.limit"), "`limit` must be an integer")
+            })?,
+            Some(_) => {
+                return Err(invalid(
+                    &format!("{item_path}.limit"),
+                    "`limit` must be an integer",
+                ))
+            }
+        };
+        replacements.push(UriSubstring {
+            find,
+            replace,
+            limit,
+        });
+    }
+    Ok(replacements)
+}
+
+fn parse_path_regexp(
+    object: &serde_json::Map<String, serde_json::Value>,
+    path: &str,
+) -> Result<Vec<PathRegexp>> {
+    let Some(value) = object.get("path_regexp") else {
+        return Ok(Vec::new());
+    };
+    let items = value.as_array().ok_or_else(|| {
+        invalid(
+            &format!("{path}.path_regexp"),
+            "`path_regexp` must be an array",
+        )
+    })?;
+    let mut replacements = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let item_path = format!("{path}.path_regexp[{index}]");
+        let item = item
+            .as_object()
+            .ok_or_else(|| invalid(&item_path, "path_regexp entry must be an object"))?;
+        for field in item.keys() {
+            if !matches!(field.as_str(), "find" | "replace") {
+                return Err(invalid(
+                    &format!("{item_path}.{field}"),
+                    format!("unsupported path_regexp field `{field}`"),
+                ));
+            }
+        }
+        let find = optional_string(item, "find", &item_path)?.unwrap_or_default();
+        if find.is_empty() {
+            return Err(invalid(
+                &format!("{item_path}.find"),
+                "path_regexp `find` must not be empty",
+            ));
+        }
+        let replace = optional_string(item, "replace", &item_path)?.unwrap_or_default();
+        let regex = Regex::new(&find).map_err(|error| match error {
+            Error::InvalidConfig { message, .. } => Error::InvalidConfig {
+                path: format!("{item_path}.find"),
+                message,
+            },
+            other => other,
+        })?;
+        replacements.push(PathRegexp { replace, regex });
+    }
+    Ok(replacements)
+}
+
+fn parse_query_arguments(value: &serde_json::Value, path: &str) -> Result<Vec<QueryArgument>> {
+    let items = value.as_array().ok_or_else(|| {
+        invalid(
+            path,
+            "query operation must be an array of {key, val} objects",
+        )
+    })?;
+    let mut arguments = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let item_path = format!("{path}[{index}]");
+        let item = item
+            .as_object()
+            .ok_or_else(|| invalid(&item_path, "query operation entry must be an object"))?;
+        for field in item.keys() {
+            if !matches!(field.as_str(), "key" | "val") {
+                return Err(invalid(
+                    &format!("{item_path}.{field}"),
+                    format!("unsupported query operation field `{field}`"),
+                ));
+            }
+        }
+        arguments.push(QueryArgument {
+            key: optional_string(item, "key", &item_path)?.unwrap_or_default(),
+            val: optional_string(item, "val", &item_path)?.unwrap_or_default(),
+        });
+    }
+    Ok(arguments)
+}
+
+fn parse_query_ops(
+    object: &serde_json::Map<String, serde_json::Value>,
+    path: &str,
+) -> Result<Option<QueryOps>> {
+    let Some(value) = object.get("query") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let query_path = format!("{path}.query");
+    let query = value
+        .as_object()
+        .ok_or_else(|| invalid(&query_path, "`query` must be an object"))?;
+    for field in query.keys() {
+        if !matches!(
+            field.as_str(),
+            "rename" | "set" | "add" | "replace" | "delete"
+        ) {
+            return Err(invalid(
+                &format!("{query_path}.{field}"),
+                format!("unsupported query operation `{field}`"),
+            ));
+        }
+    }
+    let mut ops = QueryOps::default();
+    if let Some(value) = query.get("rename") {
+        ops.rename = parse_query_arguments(value, &format!("{query_path}.rename"))?;
+    }
+    if let Some(value) = query.get("set") {
+        ops.set = parse_query_arguments(value, &format!("{query_path}.set"))?;
+    }
+    if let Some(value) = query.get("add") {
+        ops.add = parse_query_arguments(value, &format!("{query_path}.add"))?;
+    }
+    if let Some(value) = query.get("delete") {
+        let items = value.as_array().ok_or_else(|| {
+            invalid(
+                &format!("{query_path}.delete"),
+                "`delete` must be an array of strings",
+            )
+        })?;
+        let mut deletes = Vec::with_capacity(items.len());
+        for (index, item) in items.iter().enumerate() {
+            let item = item.as_str().ok_or_else(|| {
+                invalid(
+                    &format!("{query_path}.delete[{index}]"),
+                    "`delete` entries must be strings",
+                )
+            })?;
+            deletes.push(item.to_string());
+        }
+        ops.delete = deletes;
+    }
+    if let Some(value) = query.get("replace") {
+        let items = value.as_array().ok_or_else(|| {
+            invalid(
+                &format!("{query_path}.replace"),
+                "`replace` must be an array",
+            )
+        })?;
+        for (index, item) in items.iter().enumerate() {
+            let item_path = format!("{query_path}.replace[{index}]");
+            let item = item
+                .as_object()
+                .ok_or_else(|| invalid(&item_path, "query replace entry must be an object"))?;
+            for field in item.keys() {
+                if !matches!(
+                    field.as_str(),
+                    "key" | "search" | "search_regexp" | "replace"
+                ) {
+                    return Err(invalid(
+                        &format!("{item_path}.{field}"),
+                        format!("unsupported query replace field `{field}`"),
+                    ));
+                }
+            }
+            let key = optional_string(item, "key", &item_path)?.unwrap_or_default();
+            let search = optional_string(item, "search", &item_path)?.unwrap_or_default();
+            let search_regexp = optional_string(item, "search_regexp", &item_path)?;
+            let replace = optional_string(item, "replace", &item_path)?.unwrap_or_default();
+            let regex = match search_regexp.as_deref() {
+                Some(pattern) if !pattern.is_empty() => {
+                    Some(Regex::new(pattern).map_err(|error| match error {
+                        Error::InvalidConfig { message, .. } => Error::InvalidConfig {
+                            path: format!("{item_path}.search_regexp"),
+                            message,
+                        },
+                        other => other,
+                    })?)
+                }
+                _ => None,
+            };
+            ops.replace.push(QueryReplacement {
+                key,
+                search,
+                replace,
+                regex,
+            });
+        }
+    }
+    Ok(Some(ops))
 }
 
 /// Apply a rewritten `uri` template with Caddy's component-wise semantics: a configured URI that
@@ -449,6 +771,37 @@ fn rewritten_uri(request: &Request, template: &str) -> Result<Uri> {
         .map_err(|error| invalid("rewrite.uri", error.to_string()))
 }
 
+/// Replace the request URI's path (keeping the current query string).
+fn set_uri_path(request: &mut Request, path: &str, context: &str) -> Result<()> {
+    let mut rebuilt = path.to_string();
+    if let Some(query) = request.uri.query() {
+        rebuilt.push('?');
+        rebuilt.push_str(query);
+    }
+    request.uri = rebuilt
+        .parse::<Uri>()
+        .map_err(|error| invalid(context, error.to_string()))?;
+    Ok(())
+}
+
+/// Replace the request URI's path and (optional) query string.
+fn set_uri_path_query(
+    request: &mut Request,
+    path: &str,
+    query: Option<&str>,
+    context: &str,
+) -> Result<()> {
+    let mut rebuilt = path.to_string();
+    if let Some(query) = query.filter(|query| !query.is_empty()) {
+        rebuilt.push('?');
+        rebuilt.push_str(query);
+    }
+    request.uri = rebuilt
+        .parse::<Uri>()
+        .map_err(|error| invalid(context, error.to_string()))?;
+    Ok(())
+}
+
 fn strip_path_prefix(request: &mut Request, prefix: &str) -> Result<()> {
     if prefix.is_empty() {
         return Ok(());
@@ -468,14 +821,225 @@ fn strip_path_prefix(request: &mut Request, prefix: &str) -> Result<()> {
         // Caddy's `canonicalizePath` restores the leading slash after trimming.
         format!("/{rest}")
     };
-    let new_uri = match request.uri.query() {
-        Some(query) => format!("{rest}?{query}"),
-        None => rest,
+    set_uri_path(request, &rest, "rewrite.strip_path_prefix")
+}
+
+fn strip_path_suffix(request: &mut Request, suffix: &str) -> Result<()> {
+    if suffix.is_empty() {
+        return Ok(());
+    }
+    let path = request.uri.path().to_string();
+    if path.len() < suffix.len() {
+        return Ok(());
+    }
+    let start = path.len() - suffix.len();
+    if !path.is_char_boundary(start) || !path[start..].eq_ignore_ascii_case(suffix) {
+        return Ok(());
+    }
+    let trimmed = &path[..start];
+    let canonical = if trimmed.is_empty() {
+        "/".to_string()
+    } else if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
     };
-    request.uri = new_uri
-        .parse::<Uri>()
-        .map_err(|error| invalid("rewrite.strip_path_prefix", error.to_string()))?;
-    Ok(())
+    set_uri_path(request, &canonical, "rewrite.strip_path_suffix")
+}
+
+/// Go `strings.Replace`-style replacement. An empty `find` inserts `replace` before each UTF-8
+/// rune and at the end (Go's `strings.ReplaceAll(s, "", new)` behaviour).
+fn replace_occurrences(
+    haystack: &str,
+    find: &str,
+    replacement: &str,
+    limit: Option<usize>,
+) -> String {
+    if find.is_empty() {
+        let mut output = String::with_capacity(haystack.len() + replacement.len());
+        let mut count = 0;
+        for character in haystack.chars() {
+            if limit.is_none_or(|limit| count < limit) {
+                output.push_str(replacement);
+                count += 1;
+            }
+            output.push(character);
+        }
+        if limit.is_none_or(|limit| count < limit) {
+            output.push_str(replacement);
+        }
+        return output;
+    }
+    let mut output = String::with_capacity(haystack.len());
+    let mut rest = haystack;
+    let mut count = 0;
+    while limit.is_none_or(|limit| count < limit) {
+        let Some(position) = rest.find(find) else {
+            break;
+        };
+        output.push_str(&rest[..position]);
+        output.push_str(replacement);
+        rest = &rest[position + find.len()..];
+        count += 1;
+    }
+    output.push_str(rest);
+    output
+}
+
+/// Apply one `uri_substring` operation to both the path and the query (Caddy's `substrReplacer`).
+fn apply_uri_substring(request: &mut Request, substring: &UriSubstring) -> Result<()> {
+    if substring.find.is_empty() {
+        return Ok(());
+    }
+    let find = request.replace_all(&substring.find);
+    let replacement = request.replace_all(&substring.replace);
+    // Caddy checks the configured `find` for emptiness before expansion; an expansion that
+    // becomes empty is still passed to strings.Replace, which inserts the replacement everywhere.
+    let limit = Some(substring.limit)
+        .filter(|limit| *limit > 0)
+        .map(|limit| limit as usize);
+    let path = request.uri.path().to_string();
+    let new_path = replace_occurrences(&path, &find, &replacement, limit);
+    let new_query = request
+        .uri
+        .query()
+        .map(|query| replace_occurrences(query, &find, &replacement, limit));
+    if new_path == path && new_query.as_deref() == request.uri.query() {
+        return Ok(());
+    }
+    set_uri_path_query(
+        request,
+        &new_path,
+        new_query.as_deref(),
+        "rewrite.uri_substring",
+    )
+}
+
+/// Apply one `path_regexp` operation to the URI path (Caddy's `regexReplacer`).
+fn apply_path_regexp(request: &mut Request, regexp: &PathRegexp) -> Result<()> {
+    let template = request.replace_all(&regexp.replace);
+    let path = request.uri.path().to_string();
+    let new_path = regexp.regex.replace_all(&path, &template);
+    if new_path == path {
+        return Ok(());
+    }
+    set_uri_path(request, &new_path, "rewrite.path_regexp")
+}
+
+fn query_escape(input: &str) -> String {
+    let mut escaped = String::with_capacity(input.len());
+    for character in input.chars() {
+        if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '~') {
+            escaped.push(character);
+        } else if character == ' ' {
+            escaped.push('+');
+        } else {
+            let mut buffer = [0_u8; 4];
+            for byte in character.encode_utf8(&mut buffer).bytes() {
+                escaped.push_str(&format!("%{byte:02X}"));
+            }
+        }
+    }
+    escaped
+}
+
+fn parse_query(raw: &str) -> BTreeMap<String, Vec<String>> {
+    let mut query: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for pair in raw.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        query
+            .entry(percent_decode(&key.replace('+', " ")))
+            .or_default()
+            .push(percent_decode(&value.replace('+', " ")));
+    }
+    query
+}
+
+fn encode_query(query: &BTreeMap<String, Vec<String>>) -> String {
+    let mut pairs = Vec::new();
+    for (key, values) in query {
+        for value in values {
+            pairs.push(format!("{}={}", query_escape(key), query_escape(value)));
+        }
+    }
+    pairs.join("&")
+}
+
+fn replace_query_value(
+    value: &str,
+    search: &str,
+    replacement: &str,
+    regex: Option<&Regex>,
+) -> String {
+    match regex {
+        Some(regex) => regex.replace_all(value, replacement),
+        None => replace_occurrences(value, search, replacement, None),
+    }
+}
+
+/// Apply Caddy's `queryOps` in order: rename, set, add, replace, delete.
+fn apply_query_ops(request: &mut Request, ops: &QueryOps) -> Result<()> {
+    let raw = request.uri.query().unwrap_or("").to_string();
+    let mut query = parse_query(&raw);
+
+    for argument in &ops.rename {
+        let key = request.replace_all(&argument.key);
+        let val = request.replace_all(&argument.val);
+        if key.is_empty() || val.is_empty() || key == val {
+            continue;
+        }
+        if let Some(values) = query.remove(&key) {
+            query.insert(val, values);
+        }
+    }
+    for argument in &ops.set {
+        let key = request.replace_all(&argument.key);
+        if key.is_empty() {
+            continue;
+        }
+        let val = request.replace_all(&argument.val);
+        query.insert(key, vec![val]);
+    }
+    for argument in &ops.add {
+        let key = request.replace_all(&argument.key);
+        if key.is_empty() {
+            continue;
+        }
+        let val = request.replace_all(&argument.val);
+        query.entry(key).or_default().push(val);
+    }
+    for replacement in &ops.replace {
+        let key = request.replace_all(&replacement.key);
+        let search = request.replace_known(&replacement.search);
+        let replace = request.replace_known(&replacement.replace);
+        if key == "*" {
+            for values in query.values_mut() {
+                for value in values {
+                    *value =
+                        replace_query_value(value, &search, &replace, replacement.regex.as_ref());
+                }
+            }
+        } else if let Some(values) = query.get_mut(&key) {
+            for value in values {
+                *value = replace_query_value(value, &search, &replace, replacement.regex.as_ref());
+            }
+        }
+    }
+    for delete in &ops.delete {
+        let key = request.replace_all(delete);
+        if !key.is_empty() {
+            query.remove(&key);
+        }
+    }
+
+    let encoded = encode_query(&query);
+    let path = request.uri.path().to_string();
+    let query = if encoded.is_empty() {
+        None
+    } else {
+        Some(encoded.as_str())
+    };
+    set_uri_path_query(request, &path, query, "rewrite.query")
 }
 
 #[async_trait]
@@ -485,6 +1049,7 @@ impl Handler for RewriteHandler {
     }
 
     async fn handle(&self, mut request: Request) -> Result<Outcome> {
+        // Order matches Caddy's `Rewrite.Rewrite`.
         if let Some(method) = &self.method {
             let expanded = request.replace_all(method).to_ascii_uppercase();
             request.method = Method::from_bytes(expanded.as_bytes())
@@ -498,6 +1063,19 @@ impl Handler for RewriteHandler {
         if let Some(prefix) = &self.strip_path_prefix {
             let expanded = request.replace_all(prefix);
             strip_path_prefix(&mut request, &expanded)?;
+        }
+        if let Some(suffix) = &self.strip_path_suffix {
+            let expanded = request.replace_all(suffix);
+            strip_path_suffix(&mut request, &expanded)?;
+        }
+        for substring in &self.uri_substring {
+            apply_uri_substring(&mut request, substring)?;
+        }
+        for regexp in &self.path_regexp {
+            apply_path_regexp(&mut request, regexp)?;
+        }
+        if let Some(query) = &self.query {
+            apply_query_ops(&mut request, query)?;
         }
         Ok(Outcome::Continue(request))
     }
@@ -1989,5 +2567,223 @@ mod tests {
                 "error must name the config path: {message} for {json}"
             );
         }
+    }
+
+    // ---- rewrite handler fields --------------------------------------------------------
+
+    fn rewrite_handler(json: serde_json::Value) -> RewriteHandler {
+        RewriteHandler::from_json(&json, "handle[0]").expect("rewrite handler builds")
+    }
+
+    async fn run_rewrite(handler: &RewriteHandler, uri: &str) -> Request {
+        let Outcome::Continue(request) = handler
+            .handle(test_request(Method::GET, uri))
+            .await
+            .unwrap()
+        else {
+            panic!("rewrite continues to the next handler");
+        };
+        request
+    }
+
+    #[tokio::test]
+    async fn rewrite_strip_path_suffix_preserves_query() {
+        let handler = rewrite_handler(serde_json::json!({
+            "handler": "rewrite",
+            "strip_path_suffix": ".html"
+        }));
+        let request = run_rewrite(&handler, "/page.html?user=bob").await;
+        assert_eq!(request.uri.path(), "/page");
+        assert_eq!(request.uri.query(), Some("user=bob"));
+        // Suffix matching is case-insensitive like Caddy's trimPathSuffix.
+        let request = run_rewrite(&handler, "/PAGE.HTML").await;
+        assert_eq!(request.uri.path(), "/PAGE");
+        // A non-matching suffix is a no-op.
+        let request = run_rewrite(&handler, "/page.htm").await;
+        assert_eq!(request.uri.path(), "/page.htm");
+    }
+
+    #[tokio::test]
+    async fn rewrite_uri_substring_replaces_path_and_query_with_limit() {
+        let handler = rewrite_handler(serde_json::json!({
+            "handler": "rewrite",
+            "uri_substring": [
+                {"find": "/old", "replace": "/new"},
+                {"find": "a", "replace": "b", "limit": 1}
+            ]
+        }));
+        let request = run_rewrite(&handler, "/old/a/a?q=a&x=aa").await;
+        assert_eq!(request.uri.path(), "/new/b/a");
+        // Caddy applies the per-string limit separately to the path and the query.
+        assert_eq!(request.uri.query(), Some("q=b&x=aa"));
+    }
+
+    #[tokio::test]
+    async fn rewrite_path_regexp_expands_captures() {
+        let handler = rewrite_handler(serde_json::json!({
+            "handler": "rewrite",
+            "path_regexp": [
+                {"find": "^/old/(.*)$", "replace": "/new/$1"}
+            ]
+        }));
+        let request = run_rewrite(&handler, "/old/rest?x=1").await;
+        assert_eq!(request.uri.path(), "/new/rest");
+        assert_eq!(request.uri.query(), Some("x=1"));
+
+        // Placeholders in the replacement are expanded before regex capture expansion.
+        let handler = rewrite_handler(serde_json::json!({
+            "handler": "rewrite",
+            "path_regexp": [
+                {"find": "^/(.*)$", "replace": "/{http.request.method}/$1"}
+            ]
+        }));
+        let request = run_rewrite(&handler, "/thing").await;
+        assert_eq!(request.uri.path(), "/GET/thing");
+    }
+
+    #[tokio::test]
+    async fn rewrite_query_operations_follow_caddy_order_and_encoding() {
+        let handler = rewrite_handler(serde_json::json!({
+            "handler": "rewrite",
+            "query": {
+                "rename": [{"key": "changethis", "val": "changed"}],
+                "set": [
+                    {"key": "taz", "val": "test"},
+                    {"key": "key=value", "val": "example"}
+                ],
+                "add": [
+                    {"key": "foo", "val": "bar"},
+                    {"key": "foo1", "val": "baz"}
+                ],
+                "replace": [{"key": "findme", "search": "value", "replace": "replacement"}],
+                "delete": ["baz"]
+            }
+        }));
+        let request = run_rewrite(&handler, "/path?changethis=1&baz=2&findme=value&foo=old").await;
+        assert_eq!(
+            request.uri.query(),
+            Some("changed=1&findme=replacement&foo=old&foo=bar&foo1=baz&key%3Dvalue=example&taz=test")
+        );
+    }
+
+    #[tokio::test]
+    async fn rewrite_query_replace_supports_star_and_regexp() {
+        let handler = rewrite_handler(serde_json::json!({
+            "handler": "rewrite",
+            "query": {
+                "replace": [{
+                    "key": "*",
+                    "search_regexp": "v([0-9])",
+                    "replace": "x${1}"
+                }]
+            }
+        }));
+        let request = run_rewrite(&handler, "/x?a=v1&b=v2").await;
+        assert_eq!(request.uri.query(), Some("a=x1&b=x2"));
+    }
+
+    #[tokio::test]
+    async fn rewrite_uri_substring_applies_to_braces() {
+        // Caddy fixture `uri_replace_brace_escape`: escaped braces in the configured find/replace
+        // are literal backslash sequences; here a percent-encoded brace in the query is replaced.
+        let handler = rewrite_handler(serde_json::json!({
+            "handler": "rewrite",
+            "uri_substring": [
+                {"find": "%5C%7D", "replace": "%7D"},
+                {"find": "%5C%7B", "replace": "%7B"}
+            ]
+        }));
+        let request = run_rewrite(&handler, "/x?q=%5C%7D%5C%7B").await;
+        assert_eq!(request.uri.query(), Some("q=%7D%7B"));
+    }
+
+    #[test]
+    fn rewrite_config_is_strict() {
+        let invalid = [
+            serde_json::json!({"handler": "rewrite", "unknown": true}),
+            serde_json::json!({"handler": "rewrite", "uri": 42}),
+            serde_json::json!({"handler": "rewrite", "strip_path_suffix": 42}),
+            serde_json::json!({"handler": "rewrite", "uri_substring": "x"}),
+            serde_json::json!({"handler": "rewrite",
+                "uri_substring": [{"find": "x", "replace": "y", "limit": "1"}]}),
+            serde_json::json!({"handler": "rewrite",
+                "uri_substring": [{"find": "x", "unknown": true}]}),
+            serde_json::json!({"handler": "rewrite", "path_regexp": "x"}),
+            serde_json::json!({"handler": "rewrite",
+                "path_regexp": [{"find": "", "replace": "x"}]}),
+            serde_json::json!({"handler": "rewrite",
+                "path_regexp": [{"find": "(", "replace": "x"}]}),
+            serde_json::json!({"handler": "rewrite", "query": "x"}),
+            serde_json::json!({"handler": "rewrite", "query": {"unknown": []}}),
+            serde_json::json!({"handler": "rewrite", "query": {"delete": [42]}}),
+            serde_json::json!({"handler": "rewrite", "query": {"set": [{"key": "a", "unknown": "b"}]}}),
+            serde_json::json!({"handler": "rewrite", "query": {"replace": [{
+                "key": "a", "search_regexp": "(", "replace": "b"}]}}),
+        ];
+        for json in invalid {
+            let error = RewriteHandler::from_json(&json, "handle[0]")
+                .expect_err("invalid rewrite config must fail");
+            assert!(
+                error.to_string().contains("handle[0]"),
+                "error must name the config path: {error} for {json}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn adapted_uri_query_operations_fixture_builds_and_runs() {
+        use crate::router::RouterBuilder;
+
+        // Canonical JSON from upstream `uri_query_operations.caddyfiletest` (Caddy v2.11.7).
+        let routes = vec![serde_json::json!({
+            "handle": [
+                {"handler": "rewrite", "query": {"add": [{"key": "foo", "val": "bar"}]}},
+                {"handler": "rewrite", "query": {"delete": ["baz"]}},
+                {"handler": "rewrite", "query": {"set": [{"key": "taz", "val": "test"}]}},
+                {"handler": "rewrite", "query": {"set": [{"key": "key=value", "val": "example"}]}},
+                {"handler": "rewrite", "query": {"rename": [{"key": "changethis", "val": "changed"}]}},
+                {"handler": "rewrite", "query": {
+                    "add": [{"key": "foo1", "val": "baz"}],
+                    "replace": [{"key": "findme", "replace": "replacement",
+                                 "search_regexp": "value"}]
+                }},
+                {"handler": "static_response", "body": "{http.request.uri.query}"}
+            ]
+        })];
+        let router = RouterBuilder::new()
+            .build(&routes)
+            .expect("fixture routes build");
+        let request = test_request(Method::GET, "/path?changethis=1&baz=2&findme=value&foo=old");
+        let response = router.handle(request).await.expect("handled");
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            response.body,
+            Bytes::from_static(
+                b"changed=1&findme=replacement&foo=old&foo=bar&foo1=baz&key%3Dvalue=example&taz=test"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn adapted_uri_replace_brace_escape_fixture_builds_and_runs() {
+        use crate::router::RouterBuilder;
+
+        // Canonical JSON from upstream `uri_replace_brace_escape.caddyfiletest`.
+        let routes = vec![serde_json::json!({
+            "handle": [
+                {"handler": "rewrite",
+                 "uri_substring": [{"find": "\\}", "replace": "%7D"}]},
+                {"handler": "rewrite",
+                 "uri_substring": [{"find": "\\{", "replace": "%7B"}]},
+                {"handler": "static_response", "body": "{http.request.uri.query}"}
+            ]
+        })];
+        let router = RouterBuilder::new()
+            .build(&routes)
+            .expect("fixture routes build");
+        let request = test_request(Method::GET, "/path?q=test");
+        let response = router.handle(request).await.expect("handled");
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, Bytes::from_static(b"q=test"));
     }
 }

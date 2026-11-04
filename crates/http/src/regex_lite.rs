@@ -218,6 +218,42 @@ impl Regex {
         output
     }
 
+    /// Replace every non-overlapping match with `template` (Go `Regexp.ReplaceAllString`).
+    ///
+    /// `template` may contain `$N`/`${N}` capture references; they are expanded against each match.
+    /// Empty matches advance by one character so replacement always terminates.
+    pub fn replace_all(&self, input: &str, template: &str) -> String {
+        let mut output = String::with_capacity(input.len());
+        let mut search_start = 0;
+        while search_start <= input.len() {
+            let haystack = &input[search_start..];
+            let Some(captures) = self.captures(haystack) else {
+                output.push_str(haystack);
+                break;
+            };
+            let Some((match_start, match_end)) = captures.group(0) else {
+                output.push_str(haystack);
+                break;
+            };
+            output.push_str(&haystack[..match_start]);
+            // Capture offsets are relative to `haystack`, which is what `expand` slices.
+            output.push_str(&self.expand(template, haystack, &captures));
+            if match_end == match_start {
+                // Zero-width match: copy one character and continue after it.
+                match haystack[match_end..].chars().next() {
+                    Some(character) => {
+                        output.push(character);
+                        search_start += match_end + character.len_utf8();
+                    }
+                    None => break,
+                }
+            } else {
+                search_start += match_end;
+            }
+        }
+        output
+    }
+
     fn run(
         &self,
         pc: usize,
@@ -814,6 +850,14 @@ mod tests {
         assert!(captures("(?i)abc", "xxABC").is_some());
         assert!(captures(r"(\^|`|<|>|%|\\|\{|\}|\|)", "a|b").is_some());
         assert!(captures(r"\d+", "abc123").is_some());
+    }
+
+    #[test]
+    fn replaces_all_matches_with_capture_expansion() {
+        let regex = Regex::new("([a-z]+)").unwrap();
+        assert_eq!(regex.replace_all("/foo/bar", "<${1}>"), "/<foo>/<bar>");
+        let anchored = Regex::new("^/old/(.*)$").unwrap();
+        assert_eq!(anchored.replace_all("/old/rest", "/new/${1}"), "/new/rest");
     }
 
     #[test]
