@@ -345,9 +345,118 @@ pub struct HttpServer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logs: Option<ServerLogConfig>,
 
+    /// Listener wrappers (`listener_wrappers`), applied in order to accepted connections.
+    ///
+    /// caddy-rs implements `proxy_protocol` (PROXY protocol v1/v2 header parsing before TLS) and
+    /// accepts the Caddy `tls` marker as an ordering no-op; other wrappers are rejected loudly at
+    /// validation time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub listener_wrappers: Vec<ListenerWrapperConfig>,
+
     /// Unknown server fields, preserved.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+/// One listener wrapper (`apps.http.servers.*.listener_wrappers[i]`).
+///
+/// Caddy's JSON shape is a module object with the wrapper name in `wrapper` and the module's
+/// options flattened alongside it (for example `{"wrapper":"proxy_protocol","timeout":"5s"}`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ListenerWrapperConfig {
+    /// Listener wrapper module name (`caddy.listeners.*` short key, for example `proxy_protocol`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wrapper: Option<String>,
+
+    /// Wrapper-specific options, preserved and validated per wrapper.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+/// Options of the `proxy_protocol` listener wrapper (`caddy.listeners.proxy_protocol`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ProxyProtocolConfig {
+    /// Maximum time to read the PROXY header; absent/zero disables the timeout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<CaddyDuration>,
+
+    /// CIDR ranges from which a PROXY header is required/used (policy `USE`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+
+    /// CIDR ranges from which a PROXY header is rejected (policy `REJECT`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<String>,
+
+    /// Policy for peers that are neither allowed nor denied. Default `IGNORE`.
+    #[serde(default, skip_serializing_if = "is_default_proxy_policy")]
+    pub fallback_policy: ProxyProtocolPolicy,
+
+    /// Unknown wrapper options, preserved.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+/// Connection policy of the `proxy_protocol` listener wrapper, matching go-proxyproto's `Policy`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum ProxyProtocolPolicy {
+    /// Use PROXY header addresses when present, accept without header otherwise (default).
+    #[default]
+    Ignore,
+    /// Require and use the PROXY header addresses; reject connections without one.
+    Use,
+    /// Reject connections that send a PROXY header; accept connections without one.
+    Reject,
+    /// Require a PROXY header and use its addresses (same acceptance as `Use`).
+    Require,
+    /// Do not read a PROXY header; always use the real connection addresses.
+    Skip,
+}
+
+impl ProxyProtocolPolicy {
+    /// The Caddy/go-proxyproto spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ignore => "IGNORE",
+            Self::Use => "USE",
+            Self::Reject => "REJECT",
+            Self::Require => "REQUIRE",
+            Self::Skip => "SKIP",
+        }
+    }
+
+    /// Parse a policy name (case-insensitive, like Caddy's `Policy.UnmarshalText`).
+    pub fn parse(value: &str) -> std::result::Result<Self, String> {
+        match value.to_ascii_uppercase().as_str() {
+            "IGNORE" => Ok(Self::Ignore),
+            "USE" => Ok(Self::Use),
+            "REJECT" => Ok(Self::Reject),
+            "REQUIRE" => Ok(Self::Require),
+            "SKIP" => Ok(Self::Skip),
+            other => Err(format!(
+                "invalid proxy_protocol fallback_policy `{other}` (expected IGNORE, USE, REJECT, REQUIRE or SKIP)"
+            )),
+        }
+    }
+}
+
+impl TryFrom<String> for ProxyProtocolPolicy {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        Self::parse(&value)
+    }
+}
+
+impl From<ProxyProtocolPolicy> for String {
+    fn from(value: ProxyProtocolPolicy) -> Self {
+        value.as_str().to_string()
+    }
+}
+
+fn is_default_proxy_policy(policy: &ProxyProtocolPolicy) -> bool {
+    *policy == ProxyProtocolPolicy::Ignore
 }
 
 /// Per-server access-log association (`apps.http.servers.*.logs`).
@@ -1035,6 +1144,92 @@ mod tests {
                 .as_deref(),
             Some("proxy")
         );
+    }
+
+    #[test]
+    fn round_trips_listener_wrappers() {
+        let json = serde_json::json!({
+            "apps": {"http": {"servers": {"srv0": {
+                "listen": [":443"],
+                "routes": [],
+                "listener_wrappers": [
+                    {
+                        "wrapper": "proxy_protocol",
+                        "timeout": "5s",
+                        "allow": ["10.0.0.0/8"],
+                        "deny": ["192.0.2.0/24"],
+                        "fallback_policy": "REQUIRE",
+                        "future_option": {"kept": true}
+                    },
+                    {"wrapper": "tls"}
+                ]
+            }}}}
+        });
+        let config = Config::from_value(json).expect("typed wrappers decode");
+        let server = &config.http().expect("http app").servers["srv0"];
+        assert_eq!(server.listener_wrappers.len(), 2);
+        let proxy = &server.listener_wrappers[0];
+        assert_eq!(proxy.wrapper.as_deref(), Some("proxy_protocol"));
+        let options: crate::ProxyProtocolConfig = serde_json::from_value(
+            serde_json::Value::Object(proxy.extra.clone().into_iter().collect()),
+        )
+        .expect("options decode");
+        assert_eq!(
+            options.timeout.map(|timeout| timeout.as_nanos()),
+            Some(5_000_000_000)
+        );
+        assert_eq!(options.allow, vec!["10.0.0.0/8".to_string()]);
+        assert_eq!(options.deny, vec!["192.0.2.0/24".to_string()]);
+        assert_eq!(options.fallback_policy, crate::ProxyProtocolPolicy::Require);
+        assert!(options.extra.contains_key("future_option"));
+        assert_eq!(server.listener_wrappers[1].wrapper.as_deref(), Some("tls"));
+
+        // Wrapper options are preserved verbatim in the flattened extra map, so the original JSON
+        // (including the Go duration string spelling) round-trips losslessly.
+        let value = config.to_value().expect("serializes");
+        assert_eq!(
+            value["apps"]["http"]["servers"]["srv0"]["listener_wrappers"][0]["timeout"],
+            serde_json::json!("5s")
+        );
+        assert_eq!(
+            value["apps"]["http"]["servers"]["srv0"]["listener_wrappers"][0]["fallback_policy"],
+            serde_json::json!("REQUIRE")
+        );
+        assert_eq!(
+            value["apps"]["http"]["servers"]["srv0"]["listener_wrappers"][0]["future_option"]
+                ["kept"],
+            serde_json::json!(true)
+        );
+
+        // Caddy's canonical integer-nanosecond representation also decodes, and policy names are
+        // case-insensitive.
+        let options: crate::ProxyProtocolConfig = serde_json::from_value(serde_json::json!({
+            "timeout": 5_000_000_000_u64,
+            "fallback_policy": "ignore"
+        }))
+        .expect("canonical options decode");
+        assert_eq!(
+            options.timeout.map(|timeout| timeout.as_nanos()),
+            Some(5_000_000_000)
+        );
+        assert_eq!(options.fallback_policy, crate::ProxyProtocolPolicy::Ignore);
+    }
+
+    #[test]
+    fn proxy_protocol_policy_parses_case_insensitively() {
+        for (input, expected) in [
+            ("ignore", crate::ProxyProtocolPolicy::Ignore),
+            ("Use", crate::ProxyProtocolPolicy::Use),
+            ("REJECT", crate::ProxyProtocolPolicy::Reject),
+            ("require", crate::ProxyProtocolPolicy::Require),
+            ("SKIP", crate::ProxyProtocolPolicy::Skip),
+        ] {
+            assert_eq!(
+                crate::ProxyProtocolPolicy::parse(input).expect("valid policy"),
+                expected
+            );
+        }
+        assert!(crate::ProxyProtocolPolicy::parse("sometimes").is_err());
     }
 
     #[test]

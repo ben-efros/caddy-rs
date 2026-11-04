@@ -68,6 +68,8 @@ pub enum ModuleKind {
     LogWriter,
     /// Log core (`caddy.logging.cores.*`).
     LogCore,
+    /// Listener wrapper (`caddy.listeners.*`).
+    ListenerWrapper,
     /// Application module (`apps.*`).
     App,
     /// Anything else.
@@ -89,6 +91,7 @@ impl ModuleKind {
             ModuleKind::LogEncoder => "log encoder",
             ModuleKind::LogWriter => "log writer",
             ModuleKind::LogCore => "log core",
+            ModuleKind::ListenerWrapper => "listener wrapper",
             ModuleKind::App => "app",
             ModuleKind::Other => "module",
         }
@@ -108,6 +111,7 @@ impl ModuleKind {
             ModuleKind::LogEncoder => "caddy.logging.encoders.",
             ModuleKind::LogWriter => "caddy.logging.writers.",
             ModuleKind::LogCore => "caddy.logging.cores.",
+            ModuleKind::ListenerWrapper => "caddy.listeners.",
             ModuleKind::App => "apps.",
             ModuleKind::Other => "",
         }
@@ -334,6 +338,11 @@ impl ModuleRegistry {
         self.get_by_key(ModuleKind::StekProvider, json_key)
     }
 
+    /// Resolve a listener wrapper key (`caddy.listeners.*`).
+    pub fn resolve_listener_wrapper(&self, json_key: &str) -> Option<&Module> {
+        self.get_by_key(ModuleKind::ListenerWrapper, json_key)
+    }
+
     /// Resolve an On-Demand TLS permission module key (`tls.permission.*`).
     pub fn resolve_tls_permission(&self, json_key: &str) -> Option<&Module> {
         self.get_by_key(ModuleKind::TlsPermission, json_key)
@@ -496,6 +505,25 @@ fn validate_definition_parts(id: &str, json_key: &str) -> Result<()> {
 /// Keep this table in sync with `list-modules` output and `docs/compatibility/MODULE-PARITY.md`.
 /// The module inventory generator compares it against upstream `caddy.RegisterModule` calls.
 pub const BUILTIN_MODULES: &[Module] = &[
+    // Listener wrappers
+    Module::new(
+        "caddy.listeners.proxy_protocol",
+        "proxy_protocol",
+        ModuleKind::ListenerWrapper,
+        "PROXY protocol v1/v2 header parsing on TCP/Unix listeners",
+    ),
+    Module::new(
+        "caddy.listeners.tls",
+        "tls",
+        ModuleKind::ListenerWrapper,
+        "TLS handshake listener wrapper (implicit in caddy-rs; accepted as ordering marker)",
+    ),
+    Module::new(
+        "caddy.listeners.http_redirect",
+        "http_redirect",
+        ModuleKind::ListenerWrapper,
+        "Automatic HTTP-to-HTTPS redirect listener (planned, handled internally by the server)",
+    ),
     // Applications
     Module::new("http", "http", ModuleKind::App, "HTTP server app"),
     Module::new("tls", "tls", ModuleKind::App, "TLS app"),
