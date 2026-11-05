@@ -6,7 +6,7 @@
 //! Divergence from Caddy v2.11.7:
 //! - Adaptive challenge selection (T-TLS-076: documented below)
 //! - Alternate port support for TLS challenges (T-TLS-076: documented below)
-//!   * Status: DIV-0001
+//!   * Status: DIV-NNNN
 //!   * Behaviour: TLS-ALPN-01 challenges may be served on non-standard ports when configured
 //!   * Rationale: Enables TLS challenge verification on ports other than 443 for environments
 //!     where port 443 is restricted or unavailable (e.g., containerized deployments with
@@ -52,7 +52,7 @@ mod tests {
     #[test]
     fn test_alternate_port() {
         // Verify that ChallengePolicy supports TLS-ALPN-01
-        // This tests the DIV-0001 divergence: alternate port support
+        // This tests the DIV-NNNN divergence: alternate port support
         //
         // Note: Alternate port support is configured via policy configuration
         // and server/transport layer, not in the ACME layer. This test verifies
