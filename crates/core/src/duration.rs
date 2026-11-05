@@ -170,6 +170,141 @@ pub fn parse_caddy_duration(input: &str) -> Result<CaddyDuration, String> {
     Ok(CaddyDuration(nanos))
 }
 
+/// Parse a Caddy `caddy.Duration` JSON value into signed nanoseconds.
+///
+/// This is the signed counterpart of [`parse_caddy_duration`] used by load-time validation of
+/// HTTP server timeout fields: Caddy's `Duration.UnmarshalJSON` accepts integer nanoseconds,
+/// negative integers and Go duration strings (including the extra `d` day unit), and the server
+/// provisioning code treats non-positive values as "disabled". Validation only rejects values
+/// that Caddy's JSON decoding itself would reject.
+pub fn parse_caddy_duration_json(value: &serde_json::Value) -> Result<i64, String> {
+    match value {
+        serde_json::Value::Number(number) => {
+            if let Some(nanos) = number.as_i64() {
+                Ok(nanos)
+            } else if let Some(unsigned) = number.as_u64() {
+                i64::try_from(unsigned).map_err(|_| {
+                    format!("{unsigned} nanoseconds does not fit in a signed 64-bit count")
+                })
+            } else {
+                Err(format!(
+                    "expected an integer number of nanoseconds, got the non-integer number {number}"
+                ))
+            }
+        }
+        serde_json::Value::String(string) => parse_caddy_duration_string(string),
+        other => Err(format!(
+            "expected a duration string or an integer number of nanoseconds, got {}",
+            json_kind(other)
+        )),
+    }
+}
+
+/// Parse a Go-style duration string (plus Caddy's `d` unit) into signed nanoseconds.
+pub fn parse_caddy_duration_string(input: &str) -> Result<i64, String> {
+    if input.len() > 1024 {
+        return Err("duration string is longer than 1024 bytes".to_string());
+    }
+    let (negative, rest) = match input.as_bytes().first() {
+        Some(b'-') => (true, &input[1..]),
+        Some(b'+') => (false, &input[1..]),
+        _ => (false, input),
+    };
+    if rest.is_empty() {
+        return Err(format!("invalid duration {input:?}: empty"));
+    }
+    if rest == "0" {
+        return Ok(0);
+    }
+    let bytes = rest.as_bytes();
+    let mut total: u128 = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        let integer_start = index;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+        let integer_digits = &rest[integer_start..index];
+        let mut fraction = 0.0_f64;
+        let mut has_digits = !integer_digits.is_empty();
+        if index < bytes.len() && bytes[index] == b'.' {
+            index += 1;
+            let fraction_start = index;
+            while index < bytes.len() && bytes[index].is_ascii_digit() {
+                index += 1;
+            }
+            let fraction_digits = &rest[fraction_start..index];
+            if !fraction_digits.is_empty() {
+                fraction = fraction_digits.parse::<f64>().unwrap_or(0.0)
+                    / 10.0_f64.powi(fraction_digits.len() as i32);
+                has_digits = true;
+            }
+        }
+        if !has_digits {
+            return Err(format!("invalid duration {input:?}: expected a number"));
+        }
+        let unit_start = index;
+        while index < bytes.len() && !bytes[index].is_ascii_digit() && bytes[index] != b'.' {
+            index += 1;
+        }
+        let unit = &rest[unit_start..index];
+        if unit.is_empty() {
+            return Err(format!(
+                "invalid duration {input:?}: missing unit in duration (for example \"5s\")"
+            ));
+        }
+        let Some(unit_nanos) = duration_unit(unit) else {
+            return Err(format!("invalid duration {input:?}: unknown unit {unit:?}"));
+        };
+        let integer_part = if integer_digits.is_empty() {
+            0_u128
+        } else {
+            integer_digits
+                .parse::<u128>()
+                .map_err(|_| format!("invalid duration {input:?}: number is too large"))?
+        };
+        let component = integer_part
+            .checked_mul(unit_nanos)
+            .and_then(|value| value.checked_add((fraction * unit_nanos as f64) as u128))
+            .ok_or_else(|| format!("invalid duration {input:?}: duration overflows"))?;
+        total = total
+            .checked_add(component)
+            .ok_or_else(|| format!("invalid duration {input:?}: duration overflows"))?;
+        if total > i64::MAX as u128 {
+            return Err(format!(
+                "invalid duration {input:?}: duration overflows 64-bit nanoseconds"
+            ));
+        }
+    }
+    let total = total as i64;
+    Ok(if negative { -total } else { total })
+}
+
+fn duration_unit(unit: &str) -> Option<u128> {
+    match unit {
+        "ns" => Some(1),
+        "us" | "µs" | "μs" => Some(1_000),
+        "ms" => Some(1_000_000),
+        "s" => Some(1_000_000_000),
+        "m" => Some(60_000_000_000),
+        "h" => Some(3_600_000_000_000),
+        // Caddy adds a day unit, defined as exactly 24 hours.
+        "d" => Some(86_400_000_000_000),
+        _ => None,
+    }
+}
+
+fn json_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

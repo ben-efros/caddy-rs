@@ -13,9 +13,10 @@ use serde_json::Value;
 
 use crate::config::{
     AutomationPolicy, BaseLog, CertificateAuthority, CertificatesConfig, Config, HttpApp,
-    ListenerWrapperConfig, Logging, ModuleRef, PkiApp, PkiKeyPair, ProxyProtocolConfig, Route,
-    ServerLogConfig, StorageConfig, TlsApp, TlsAutomation,
+    HttpServer, ListenerWrapperConfig, Logging, ModuleRef, PkiApp, PkiKeyPair, ProxyProtocolConfig,
+    Route, ServerLogConfig, StorageConfig, TlsApp, TlsAutomation,
 };
+use crate::duration::parse_caddy_duration_json;
 use crate::error::{Error, Result};
 use crate::listen::ListenAddr;
 use crate::module::{ModuleKind, ModuleRegistry};
@@ -186,6 +187,88 @@ fn validate_cidr(value: &str, path: &str) -> Result<()> {
                 format!("`{value}` prefix length must be at most {max}"),
             ));
         }
+    }
+    Ok(())
+}
+
+/// Validate Caddy `caddy.Duration` and numeric HTTP server limit fields at load time.
+///
+/// The core model preserves the timeout fields as JSON so the server crate can parse both Caddy
+/// spellings; this pass parses the same values during validation so malformed durations or
+/// non-integer limits fail `validate`/`load` with a located error instead of only failing apply
+/// (DIV-0039 residual). Caddy's own JSON decoding accepts negative durations (server provisioning
+/// treats non-positive as disabled) and the extra `d` day unit, so those remain valid here.
+fn validate_server_limits(server: &HttpServer, path: &str) -> Result<()> {
+    // Typed Caddy `caddy.Duration` fields.
+    for (field, value) in [
+        ("read_timeout", server.read_timeout.as_ref()),
+        ("write_timeout", server.write_timeout.as_ref()),
+        ("idle_timeout", server.idle_timeout.as_ref()),
+    ] {
+        if let Some(value) = value {
+            validate_duration_field(value, &format!("{path}.{field}"))?;
+        }
+    }
+
+    // Caddy timeout fields preserved in the unknown-field map (not typed in the core model yet).
+    for field in [
+        "read_header_timeout",
+        "read_idle_timeout",
+        "write_idle_timeout",
+        "keepalive_interval",
+        "keepalive_idle",
+    ] {
+        if let Some(value) = server.extra.get(field) {
+            validate_duration_field(value, &format!("{path}.{field}"))?;
+        }
+    }
+
+    // Numeric limits. Caddy-native `max_header_bytes`/`keepalive_count` must be integers; the
+    // caddy-rs extension caps are non-negative integers (DIV-0036), matching the server parser.
+    if let Some(value) = server.extra.get("max_header_bytes") {
+        validate_non_negative_integer(
+            value,
+            &format!("{path}.max_header_bytes"),
+            "number of bytes",
+        )?;
+    }
+    if let Some(value) = server.extra.get("max_request_body_size") {
+        validate_non_negative_integer(
+            value,
+            &format!("{path}.max_request_body_size"),
+            "number of bytes",
+        )?;
+    }
+    if let Some(value) = server.extra.get("max_connections") {
+        validate_non_negative_integer(
+            value,
+            &format!("{path}.max_connections"),
+            "connection count",
+        )?;
+    }
+    if let Some(value) = server.extra.get("keepalive_count") {
+        if value.as_i64().is_none() && value.as_u64().is_none() {
+            return Err(Error::invalid(
+                format!("{path}.keepalive_count"),
+                format!("`keepalive_count` must be an integer, got {value}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_duration_field(value: &Value, path: &str) -> Result<()> {
+    parse_caddy_duration_json(value)
+        .map_err(|message| Error::invalid(path, format!("invalid duration: {message}")))?;
+    Ok(())
+}
+
+fn validate_non_negative_integer(value: &Value, path: &str, unit: &str) -> Result<()> {
+    if value.as_u64().is_none() {
+        return Err(Error::invalid(
+            path,
+            format!("must be a non-negative integer {unit}, got {value}"),
+        ));
     }
     Ok(())
 }
@@ -392,6 +475,7 @@ impl Validator<'_> {
                 &format!("{server_path}.listener_wrappers"),
                 self.registry,
             )?;
+            validate_server_limits(server, &server_path)?;
             self.routes(&server.routes, &format!("{server_path}.routes"))?;
             self.report.servers += 1;
         }
@@ -1780,5 +1864,80 @@ mod tests {
             error.to_string().contains("`ca` must be a string"),
             "{error}"
         );
+    }
+
+    fn server_config(fields: Value) -> Config {
+        let mut server = serde_json::json!({"listen": [":8080"], "routes": []});
+        if let Value::Object(fields) = fields {
+            for (key, value) in fields {
+                server[key] = value;
+            }
+        }
+        Config::from_value(serde_json::json!({
+            "apps": {"http": {"servers": {"srv0": server}}}
+        }))
+        .expect("test config decodes")
+    }
+
+    #[test]
+    fn accepts_caddy_duration_and_numeric_server_limits() {
+        let config = server_config(serde_json::json!({
+            "read_timeout": "5s",
+            "write_timeout": 2_000_000_000_i64,
+            "idle_timeout": "2d",
+            "read_header_timeout": "1m",
+            // Caddy accepts negative durations; provisioning treats them as disabled.
+            "keepalive_interval": "-1s",
+            "read_idle_timeout": 30_000_000_000_i64,
+            "write_idle_timeout": "0",
+            "max_header_bytes": 16_384,
+            "max_request_body_size": 1_048_576,
+            "max_connections": 10,
+            "keepalive_count": 3
+        }));
+        let report = validate_config(&config, &registry()).expect("valid server limits");
+        assert_eq!(report.servers, 1);
+    }
+
+    #[test]
+    fn rejects_malformed_durations_and_numeric_limits_at_load() {
+        for (fields, expected_path) in [
+            (serde_json::json!({"read_timeout": "soon"}), "read_timeout"),
+            (serde_json::json!({"idle_timeout": 1.5}), "idle_timeout"),
+            (serde_json::json!({"write_timeout": true}), "write_timeout"),
+            (
+                serde_json::json!({"read_header_timeout": "5"}),
+                "read_header_timeout",
+            ),
+            (
+                serde_json::json!({"keepalive_interval": "1x"}),
+                "keepalive_interval",
+            ),
+            (
+                serde_json::json!({"max_header_bytes": "16k"}),
+                "max_header_bytes",
+            ),
+            (
+                serde_json::json!({"max_request_body_size": "1MiB"}),
+                "max_request_body_size",
+            ),
+            (
+                serde_json::json!({"max_connections": -1}),
+                "max_connections",
+            ),
+            (
+                serde_json::json!({"keepalive_count": 1.5}),
+                "keepalive_count",
+            ),
+        ] {
+            let config = server_config(fields.clone());
+            let error = validate_config(&config, &registry())
+                .expect_err("malformed server limit must fail validation");
+            let message = error.to_string();
+            assert!(
+                message.contains(expected_path) && message.contains("apps.http.servers.srv0"),
+                "error for {fields} must name the located field, got: {message}"
+            );
+        }
     }
 }

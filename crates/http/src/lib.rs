@@ -29,4 +29,7 @@ pub use types::{
     Error, Handler, Matcher, MatcherError, Outcome, Request, Response, ResponseOutcome, Result,
     SharedHandler, SharedMatcher, StreamingOutcome,
 };
-pub use upgrade::{requested_upgrade_type, Tunnel, TunnelStream, UpgradedResponse};
+pub use upgrade::{
+    h2c_upgrade_headers, is_h2c_upgrade, requested_upgrade_type, Tunnel, TunnelStream,
+    UpgradedResponse, H2C_UPGRADE_TOKEN,
+};

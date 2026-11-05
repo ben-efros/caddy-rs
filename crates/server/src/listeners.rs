@@ -734,6 +734,28 @@ async fn serve_accepted<I>(
     }
 }
 
+/// Everything the per-request service needs, cloned for the h2c upgrade service.
+#[derive(Clone)]
+struct RequestContext {
+    router: Option<Arc<Router>>,
+    limits: Arc<ServerLimits>,
+    remote_addr: Option<SocketAddr>,
+    local_addr: Option<SocketAddr>,
+    tls: bool,
+    alpn: Option<String>,
+    tls_info: Option<TlsLogInfo>,
+    server_name: String,
+    recorder: SharedRequestRecorder,
+    access_log: Arc<AccessLogRuntime>,
+    access_log_policy: Arc<ServerAccessLogPolicy>,
+    automatic: Option<Arc<AutomaticHttpsServing>>,
+    activity: Arc<ConnectionActivity>,
+    permit: Arc<ConnectionPermit>,
+    generation: Option<Arc<Generation>>,
+    force: watch::Receiver<bool>,
+    tracked: Arc<TrackedConnection>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn connection_service(
     router: Option<Arc<Router>>,
@@ -760,102 +782,253 @@ fn connection_service(
     Future: Send,
 > + Send
        + 'static {
-    service_fn(move |mut request: hyper::Request<Incoming>| {
-        let router = router.clone();
-        let limits = Arc::clone(&limits);
-        let activity = Arc::clone(&activity);
-        let alpn = alpn.clone();
-        let tls_info = tls_info.clone();
-        let local_addr = local_addr;
-        let server_name = server_name.clone();
-        let recorder = Arc::clone(&recorder);
-        let access_log = Arc::clone(&access_log);
-        let access_log_policy = Arc::clone(&access_log_policy);
-        let automatic = automatic.clone();
-        let permit = Arc::clone(&permit);
-        let generation = generation.clone();
-        let force = force.clone();
-        let tracked = Arc::clone(&tracked);
-        async move {
-            let _in_flight = activity.begin();
-            let started = std::time::Instant::now();
-            let method = request.method().as_str().to_string();
-            // Capture the access-log fields before the request is consumed. Only done when a sink
-            // is configured, so the common no-logging path pays nothing.
-            let snapshot = access_log
-                .is_enabled()
-                .then(|| RequestSnapshot::capture(&request, remote_addr, tls_info.as_ref()));
-            let _request_guard = request_started(&recorder, &server_name);
+    request_service(RequestContext {
+        router,
+        limits,
+        remote_addr,
+        local_addr,
+        tls,
+        alpn,
+        tls_info,
+        server_name,
+        recorder,
+        access_log,
+        access_log_policy,
+        automatic,
+        activity,
+        permit,
+        generation,
+        force,
+        tracked,
+    })
+}
 
-            let Some(router) = router else {
-                let headers = http::HeaderMap::new();
-                observe_request(
-                    &recorder,
-                    &access_log,
-                    &access_log_policy,
-                    &server_name,
-                    &method,
-                    snapshot.as_ref(),
-                    started,
-                    503,
-                    0,
-                    &headers,
-                );
-                return Ok::<_, std::convert::Infallible>(error_response());
-            };
-            // Take the client-side upgrade future before the request is consumed. Only requests
-            // that actually negotiate an upgrade get one; the router decides whether to switch.
-            let on_upgrade = caddy_rs_http::requested_upgrade_type(request.headers())
-                .map(|_| hyper::upgrade::on(&mut request));
-            let served = serve_request_with_automatic_upgradable(
-                &limits,
-                router,
-                request,
-                remote_addr,
-                local_addr,
-                tls,
-                alpn.as_deref(),
-                automatic,
+fn request_service(
+    context: RequestContext,
+) -> impl hyper::service::Service<
+    hyper::Request<Incoming>,
+    Response = hyper::Response<Body>,
+    Error = std::convert::Infallible,
+    Future: Send,
+> + Send
+       + 'static {
+    service_fn(move |request: hyper::Request<Incoming>| {
+        let context = context.clone();
+        async move { serve_one_request(context, request).await }
+    })
+}
+
+/// Serve one hyper request (also used for requests arriving on an h2c-upgraded connection).
+async fn serve_one_request(
+    context: RequestContext,
+    mut request: hyper::Request<Incoming>,
+) -> Result<hyper::Response<Body>, std::convert::Infallible> {
+    let _in_flight = context.activity.begin();
+    let started = std::time::Instant::now();
+    let method = request.method().as_str().to_string();
+    // Capture the access-log fields before the request is consumed. Only done when a sink is
+    // configured, so the common no-logging path pays nothing.
+    let snapshot = context.access_log.is_enabled().then(|| {
+        RequestSnapshot::capture(&request, context.remote_addr, context.tls_info.as_ref())
+    });
+    let _request_guard = request_started(&context.recorder, &context.server_name);
+
+    let Some(router) = context.router.clone() else {
+        let headers = http::HeaderMap::new();
+        observe_request(
+            &context.recorder,
+            &context.access_log,
+            &context.access_log_policy,
+            &context.server_name,
+            &method,
+            snapshot.as_ref(),
+            started,
+            503,
+            0,
+            &headers,
+        );
+        return Ok(error_response());
+    };
+
+    // Cleartext HTTP/2 upgrade (RFC 7540 §3.2): answer with 101 + Upgrade headers and serve
+    // hyper's HTTP/2 connection on the upgraded stream. Only HTTP/1.1, non-TLS, bodyless requests
+    // are eligible; prior-knowledge h2c is handled by the auto connection builder already.
+    if !context.tls && h2c_upgrade_allowed(&request) {
+        let on_upgrade = hyper::upgrade::on(&mut request);
+        let h2c_service = request_service(context.clone());
+        let mut force = context.force.clone();
+        let permit = Arc::clone(&context.permit);
+        let generation = context.generation.clone();
+        let tracked = Arc::clone(&context.tracked);
+        spawn_h2c_connection(
+            on_upgrade,
+            h2c_service,
+            &mut force,
+            permit,
+            generation,
+            tracked,
+        );
+        let mut response = hyper::Response::builder()
+            .status(http::StatusCode::SWITCHING_PROTOCOLS)
+            .body(Body::empty())
+            .unwrap_or_else(|error| {
+                tracing::error!(%error, "cannot build h2c upgrade response");
+                error_response()
+            });
+        *response.headers_mut() = caddy_rs_http::h2c_upgrade_headers();
+        observe_request(
+            &context.recorder,
+            &context.access_log,
+            &context.access_log_policy,
+            &context.server_name,
+            &method,
+            snapshot.as_ref(),
+            started,
+            101,
+            0,
+            response.headers(),
+        );
+        return Ok(response);
+    }
+
+    // Take the client-side upgrade future before the request is consumed. Only requests
+    // that actually negotiate an upgrade get one; the router decides whether to switch.
+    let on_upgrade = caddy_rs_http::requested_upgrade_type(request.headers())
+        .map(|_| hyper::upgrade::on(&mut request));
+    let served = serve_request_with_automatic_upgradable(
+        &context.limits,
+        router,
+        request,
+        context.remote_addr,
+        context.local_addr,
+        context.tls,
+        context.alpn.as_deref(),
+        context.automatic.clone(),
+        on_upgrade,
+    )
+    .await;
+
+    let (status, response_size, response_headers) = match &served {
+        ServedResponse::Response(response) => (
+            response.status().as_u16(),
+            body_len(response.body()),
+            response.headers().clone(),
+        ),
+        ServedResponse::Upgraded { response, .. } => {
+            (response.status().as_u16(), 0, response.headers().clone())
+        }
+    };
+    observe_request(
+        &context.recorder,
+        &context.access_log,
+        &context.access_log_policy,
+        &context.server_name,
+        &method,
+        snapshot.as_ref(),
+        started,
+        status,
+        response_size,
+        &response_headers,
+    );
+
+    match served {
+        ServedResponse::Response(response) => Ok::<_, std::convert::Infallible>(response),
+        ServedResponse::Upgraded {
+            response,
+            tunnel,
+            on_upgrade,
+        } => {
+            spawn_upgraded_tunnel(
                 on_upgrade,
-            )
-            .await;
-
-            let (status, response_size, response_headers) = match &served {
-                ServedResponse::Response(response) => (
-                    response.status().as_u16(),
-                    body_len(response.body()),
-                    response.headers().clone(),
-                ),
-                ServedResponse::Upgraded { response, .. } => {
-                    (response.status().as_u16(), 0, response.headers().clone())
-                }
-            };
-            observe_request(
-                &recorder,
-                &access_log,
-                &access_log_policy,
-                &server_name,
-                &method,
-                snapshot.as_ref(),
-                started,
-                status,
-                response_size,
-                &response_headers,
+                tunnel,
+                context.force.clone(),
+                context.permit,
+                context.generation,
+                context.tracked,
             );
+            Ok::<_, std::convert::Infallible>(response)
+        }
+    }
+}
 
-            match served {
-                ServedResponse::Response(response) => Ok::<_, std::convert::Infallible>(response),
-                ServedResponse::Upgraded {
-                    response,
-                    tunnel,
-                    on_upgrade,
-                } => {
-                    spawn_upgraded_tunnel(on_upgrade, tunnel, force, permit, generation, tracked);
-                    Ok::<_, std::convert::Infallible>(response)
+/// Whether an HTTP/1.1 request is an eligible h2c Upgrade offer.
+///
+/// RFC 7540 §3.2 requires the upgrade request to have no body; requests with a non-zero
+/// declared length or a transfer-encoding are served as normal HTTP/1.1 requests instead.
+fn h2c_upgrade_allowed(request: &hyper::Request<Incoming>) -> bool {
+    if request.version() != http::Version::HTTP_11
+        || !caddy_rs_http::is_h2c_upgrade(request.headers())
+    {
+        return false;
+    }
+    if request
+        .headers()
+        .contains_key(http::header::TRANSFER_ENCODING)
+    {
+        return false;
+    }
+    match request.headers().get(http::header::CONTENT_LENGTH) {
+        None => true,
+        Some(value) => {
+            value
+                .to_str()
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                == Some(0)
+        }
+    }
+}
+
+/// Serve hyper HTTP/2 on the client stream of a completed h2c Upgrade.
+fn spawn_h2c_connection<S>(
+    on_upgrade: hyper::upgrade::OnUpgrade,
+    service: S,
+    force: &mut watch::Receiver<bool>,
+    permit: Arc<ConnectionPermit>,
+    generation: Option<Arc<Generation>>,
+    tracked: Arc<TrackedConnection>,
+) where
+    S: hyper::service::Service<
+            hyper::Request<Incoming>,
+            Response = hyper::Response<Body>,
+            Error = std::convert::Infallible,
+        > + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    let mut force = force.clone();
+    tokio::spawn(async move {
+        let _permit = permit;
+        let _generation = generation;
+        let _tracked = tracked;
+        if *force.borrow() {
+            return;
+        }
+        let upgraded = match on_upgrade.await {
+            Ok(upgraded) => upgraded,
+            Err(error) => {
+                tracing::debug!(%error, "client h2c upgrade did not complete");
+                return;
+            }
+        };
+        let builder = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
+        // `hyper::upgrade::Upgraded` already implements hyper's IO traits; only the tokio
+        // copy path needs the `TokioIo` adapter.
+        let connection = builder.serve_connection(upgraded, service);
+        tokio::pin!(connection);
+        tokio::select! {
+            result = connection.as_mut() => {
+                if let Err(error) = result {
+                    tracing::debug!(%error, "h2c connection ended with error");
                 }
             }
+            _ = force.changed() => {
+                tracing::debug!("closing h2c connection on forced shutdown");
+                connection.as_mut().graceful_shutdown();
+                let _ = tokio::time::timeout(Duration::from_secs(1), connection.as_mut()).await;
+            }
         }
-    })
+    });
 }
 
 /// Tunnel an upgraded client connection to the upgraded upstream connection.
