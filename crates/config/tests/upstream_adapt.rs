@@ -1124,26 +1124,32 @@ fn rewrite_supported_forms_match_real_caddy_v2_11_7() {
 }
 
 #[test]
-fn uri_remaining_operations_fail_loudly_with_runtime_owner() {
-    for (operation, caddyfile) in [
-        (
-            "strip_suffix",
-            "example.com {\n\turi strip_suffix .html\n}\n",
-        ),
-        ("replace", "example.com {\n\turi replace /a /b\n}\n"),
-        (
-            "path_regexp",
-            "example.com {\n\turi path_regexp ^/a /b\n}\n",
-        ),
-        ("query", "example.com {\n\turi query +a b\n}\n"),
-    ] {
-        let error = adapt(caddyfile).expect_err("unsupported uri operation must fail");
-        let message = error.to_string();
-        assert!(
-            message.contains(operation) && message.contains("REWRITE-HANDLER-FIELDS"),
-            "error for uri {operation} should name the runtime owner, got: {message}"
-        );
-    }
+fn uri_operations_adapt_to_caddy_rewrite_handlers() {
+    // The rewrite handler supports every field Caddy's `uri` directive sets; goldens cover the
+    // upstream fixtures, and this pins the per-operation shapes.
+    let adapted = adapt(
+        "example.com {\n\turi strip_suffix .html\n\turi replace /a /b 2\n\turi path_regexp ^/a /b\n\turi query +a b\n}\n",
+    )
+    .expect("uri operations adapt");
+    let handlers = &adapted.config["apps"]["http"]["servers"]["srv0"]["routes"][0]["handle"][0]
+        ["routes"][0]["handle"];
+    assert_eq!(
+        handlers,
+        &json!([
+            {"handler": "rewrite", "strip_path_suffix": ".html"},
+            {"handler": "rewrite", "uri_substring": [{"find": "/a", "replace": "/b", "limit": 2}]},
+            {"handler": "rewrite", "path_regexp": [{"find": "^/a", "replace": "/b"}]},
+            {"handler": "rewrite", "query": {"add": [{"key": "a", "val": "b"}]}},
+        ])
+    );
+
+    // Unknown operations still fail loudly with a located error.
+    let error =
+        adapt("example.com {\n\turi bogus_op x\n}\n").expect_err("unknown uri operation must fail");
+    assert!(
+        error.to_string().contains("unrecognized URI manipulation"),
+        "{error}"
+    );
 }
 
 #[test]

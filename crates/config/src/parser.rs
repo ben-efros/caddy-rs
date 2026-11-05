@@ -18,17 +18,20 @@
 //! `doImport`: `{args[N]}`/`{args.N}` are replaced inside tokens, a token that is exactly
 //! `{args[start:end]}` splices in a range of arguments, `{block}` and `{blocks.NAME}` splice the
 //! import's following block (or one of its named sub-blocks), and import cycles are rejected with
-//! Caddy's diagnostic. Only imports of snippets defined in the same Caddyfile are implemented:
-//! file/glob imports require a filename at the adapter boundary that this build does not carry,
-//! so they are rejected loudly rather than approximated (tracked as a compatibility gap).
+//! Caddy's diagnostic. `import <file>` and `import <glob>` are resolved relative to the file that
+//! contains the directive (the root Caddyfile's source path is supplied through
+//! [`parse_with_source`]); tokens spliced from an imported file carry its filename in
+//! [`Position::file`] so downstream errors report `sub/extra.caddyfile:3` instead of a root-file
+//! line. Without a source path, file/glob imports fail loudly rather than being approximated.
 //!
 //! Named routes are parsed and validated (duplicate definitions and undefined `invoke` targets
-//! are located errors with Caddy's messages). Emitting Caddy's `named_routes`/`invoke` JSON is the
-//! adapter's responsibility and is not implemented yet, so a Caddyfile that actually invokes a
-//! named route fails loudly in the adapter.
+//! are located errors with Caddy's messages); the adapter emits Caddy's `named_routes`/`invoke`
+//! JSON for reachable routes.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::lexer::{lex, LexError, Position, Token, TokenKind};
 
@@ -239,19 +242,43 @@ pub struct NamedRoute {
 }
 
 /// Parse error.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {
     /// Lexing failed.
-    #[error(transparent)]
-    Lex(#[from] LexError),
+    Lex(LexError),
     /// Grammar error.
-    #[error("Caddyfile {}: {}", position, message)]
     Syntax {
-        /// Location.
+        /// Location (and origin file when the token came from an import).
         position: Position,
         /// Diagnosis.
         message: String,
     },
+}
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Lex(error) => write!(f, "{error}"),
+            Self::Syntax { position, message } => {
+                write!(f, "{}: {message}", position.label())
+            }
+        }
+    }
+}
+
+impl From<LexError> for ParseError {
+    fn from(error: LexError) -> Self {
+        Self::Lex(error)
+    }
+}
+
+impl std::error::Error for ParseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Lex(error) => Some(error),
+            Self::Syntax { .. } => None,
+        }
+    }
 }
 
 impl ParseError {
@@ -490,8 +517,13 @@ struct Parser {
     warnings: Vec<String>,
     /// Number of braced blocks currently being parsed, including the site/global-options block.
     depth: usize,
-    /// Path of the Caddyfile being parsed, used to resolve file/glob imports.
+    /// Path of the Caddyfile being parsed, used to resolve file/glob imports and as the root
+    /// diagnostic label.
     source: Option<PathBuf>,
+    /// Origin paths for tokens spliced in from `import <file>`/`<glob>`, keyed by the diagnostic
+    /// label stored in [`Position::file`]. Nested imports resolve relative to the file they occur
+    /// in (Caddy semantics).
+    source_files: BTreeMap<Arc<str>, PathBuf>,
 }
 
 impl Parser {
@@ -504,6 +536,7 @@ impl Parser {
             snippets: BTreeMap::new(),
             named_routes: Vec::new(),
             import_graph: ImportGraph::default(),
+            source_files: BTreeMap::new(),
             warnings: Vec::new(),
             depth: 0,
             source,
@@ -568,7 +601,7 @@ impl Parser {
         self.skip_newlines();
         let mut options = GlobalOptions::default();
         if matches!(self.peek().map(|t| t.kind), Some(TokenKind::LeftBrace)) {
-            let position = self.advance().expect("peeked").position;
+            let position = self.advance().expect("peeked").position.clone();
             let directives = self.parse_directives(position, true)?;
             options = read_global_options(directives)?;
             self.skip_newlines();
@@ -587,7 +620,7 @@ impl Parser {
                 continue;
             }
             let Some(first) = self.peek() else { break };
-            let position = first.position;
+            let position = first.position.clone();
             let mut raw_addresses = Vec::new();
             while let Some(token) = self.peek() {
                 match token.kind {
@@ -601,7 +634,7 @@ impl Parser {
             if raw_addresses.is_empty() {
                 let token = self.peek().expect("not eof");
                 return Err(ParseError::syntax(
-                    token.position,
+                    token.position.clone(),
                     format!("expected a site address, found `{}`", token.text),
                 ));
             }
@@ -618,12 +651,12 @@ impl Parser {
                     continue;
                 }
             }
-            let addresses = parse_addresses(&raw_addresses, position)?;
+            let addresses = parse_addresses(&raw_addresses, position.clone())?;
             if raw_addresses.len() == 1 {
                 let candidate = raw_addresses[0].trim_end_matches(',');
                 if KNOWN_DIRECTIVES.contains(&candidate) {
                     return Err(ParseError::syntax(
-                        position,
+                        position.clone(),
                         format!(
                             "parsed `{candidate}` as a site address, but it is a known directive; \
                              directives must appear in a site block"
@@ -634,7 +667,7 @@ impl Parser {
             let directives = match self.peek().map(|t| t.kind) {
                 Some(TokenKind::LeftBrace) => {
                     self.cursor += 1;
-                    self.parse_directives(position, true)?
+                    self.parse_directives(position.clone(), true)?
                 }
                 _ => {
                     // Caddy allows a single site block without braces. Everything remaining in the
@@ -653,7 +686,7 @@ impl Parser {
                         if matches!(self.peek().map(|t| t.kind), Some(TokenKind::RightBrace)) {
                             let token = self.peek().expect("peeked");
                             return Err(ParseError::syntax(
-                                token.position,
+                                token.position.clone(),
                                 "unexpected `}` with no matching `{`",
                             ));
                         }
@@ -671,7 +704,7 @@ impl Parser {
 
         if sites.is_empty() {
             return Err(ParseError::syntax(
-                Position { line: 1, column: 1 },
+                Position::new(1, 1),
                 "Caddyfile contains no site blocks",
             ));
         }
@@ -726,7 +759,7 @@ impl Parser {
                 format!("snippet `({name})` must be followed by a `{{` block"),
             ));
         }
-        let tokens = self.collect_braced_block(position)?;
+        let tokens = self.collect_braced_block(position.clone())?;
         if self.snippets.contains_key(name) {
             return Err(ParseError::syntax(
                 position,
@@ -747,12 +780,12 @@ impl Parser {
     fn define_named_route(&mut self, name: &str, position: Position) -> Result<(), ParseError> {
         if !matches!(self.peek().map(|t| t.kind), Some(TokenKind::LeftBrace)) {
             return Err(ParseError::syntax(
-                position,
+                position.clone(),
                 format!("named route `&({name})` must be followed by a `{{` block"),
             ));
         }
         self.cursor += 1;
-        let directives = self.parse_directives(position, true)?;
+        let directives = self.parse_directives(position.clone(), true)?;
         if self.named_routes.iter().any(|route| route.name == name) {
             return Err(ParseError::syntax(
                 position,
@@ -830,13 +863,13 @@ impl Parser {
                 }
                 TokenKind::RightBrace => {
                     return Err(ParseError::syntax(
-                        token.position,
+                        token.position.clone(),
                         "unexpected `}` with no matching `{`",
                     ));
                 }
                 TokenKind::LeftBrace => {
                     return Err(ParseError::syntax(
-                        token.position,
+                        token.position.clone(),
                         "unexpected `{`; expected a directive name",
                     ));
                 }
@@ -868,7 +901,7 @@ impl Parser {
             TokenKind::LeftBrace | TokenKind::RightBrace
         ) {
             return Err(ParseError::syntax(
-                name_token.position,
+                name_token.position.clone(),
                 format!("unexpected `{}`", name_token.text),
             ));
         }
@@ -886,7 +919,7 @@ impl Parser {
         }
         let block = if matches!(self.peek().map(|t| t.kind), Some(TokenKind::LeftBrace)) {
             self.cursor += 1;
-            self.parse_directives(name_token.position, true)?
+            self.parse_directives(name_token.position.clone(), true)?
         } else {
             if matches!(self.peek().map(|t| t.kind), Some(TokenKind::Newline)) {
                 self.cursor += 1;
@@ -898,7 +931,7 @@ impl Parser {
             args,
             arg_quoted,
             block,
-            position: name_token.position,
+            position: name_token.position.clone(),
         });
         Ok(())
     }
@@ -907,7 +940,7 @@ impl Parser {
     /// mirroring Caddy's `doImport`. The cursor ends up on the first spliced token.
     fn expand_import(&mut self) -> Result<(), ParseError> {
         let import_index = self.cursor;
-        let import_position = self.tokens[import_index].position;
+        let import_position = self.tokens[import_index].position.clone();
         self.cursor += 1;
 
         // The import target and any replacement arguments must be on the directive's line.
@@ -938,10 +971,10 @@ impl Parser {
         // An optional block that opens on the same line provides `{block}`/`{blocks.NAME}` values.
         let mut block_tokens = Vec::new();
         if matches!(self.peek().map(|t| t.kind), Some(TokenKind::LeftBrace)) {
-            block_tokens = self.collect_braced_block(import_position)?;
+            block_tokens = self.collect_braced_block(import_position.clone())?;
         }
         let end = self.cursor;
-        let mapping = build_block_mapping(&block_tokens, import_position)?;
+        let mapping = build_block_mapping(&block_tokens, import_position.clone())?;
         let block_tokens = trim_newlines(block_tokens);
 
         let parent_context = self.current_context();
@@ -952,7 +985,7 @@ impl Parser {
             self.import_graph.add_node(&parent_node);
             self.import_graph.add_node(&snippet_node);
             if let Err(message) = self.import_graph.add_edge(&parent_node, &snippet_node) {
-                return Err(ParseError::syntax(import_position, message));
+                return Err(ParseError::syntax(import_position.clone(), message));
             }
 
             let (tokens, contexts) = self.substitute_import(
@@ -969,7 +1002,7 @@ impl Parser {
         }
 
         // Otherwise this is a file or glob import, resolved relative to the Caddyfile.
-        let files = self.resolve_import_files(&pattern, import_position)?;
+        let files = self.resolve_import_files(&pattern, import_position.clone())?;
         let mut imported_tokens = Vec::new();
         let mut imported_contexts = Vec::new();
         for file in &files {
@@ -977,7 +1010,7 @@ impl Parser {
             self.import_graph.add_node(&parent_node);
             self.import_graph.add_node(&node);
             if let Err(message) = self.import_graph.add_edge(&parent_node, &node) {
-                return Err(ParseError::syntax(import_position, message));
+                return Err(ParseError::syntax(import_position.clone(), message));
             }
             if file.is_dir() {
                 return Err(ParseError::syntax(
@@ -987,13 +1020,13 @@ impl Parser {
             }
             let bytes = std::fs::read(file).map_err(|error| {
                 ParseError::syntax(
-                    import_position,
+                    import_position.clone(),
                     format!("Could not import {}: {error}", file.display()),
                 )
             })?;
             let text = String::from_utf8(bytes).map_err(|_| {
                 ParseError::syntax(
-                    import_position,
+                    import_position.clone(),
                     format!(
                         "Could not read tokens while importing {}: not valid UTF-8",
                         file.display()
@@ -1005,18 +1038,21 @@ impl Parser {
                     .push(format!("Import file is empty: {}", file.display()));
                 continue;
             }
+            let label: Arc<str> = self.import_label(file).into();
+            self.source_files.insert(label.clone(), file.clone());
             let expanded = expand_env_vars(&text);
             self.warnings.extend(expanded.warnings);
-            let tokens = lex(&expanded.source).map_err(|error| {
-                ParseError::syntax(
-                    import_position,
-                    format!(
-                        "Could not read tokens while importing {}: {}",
-                        file.display(),
-                        error.message
-                    ),
-                )
+            let mut tokens = lex(&expanded.source).map_err(|error| ParseError::Syntax {
+                position: error.position.clone().with_file(label.clone()),
+                message: format!(
+                    "Could not read tokens while importing {}: {}",
+                    file.display(),
+                    error.message
+                ),
             })?;
+            for token in &mut tokens {
+                token.position.file = Some(label.clone());
+            }
             let (tokens, contexts) = self.substitute_import(
                 &tokens,
                 &args,
@@ -1033,7 +1069,36 @@ impl Parser {
         Ok(())
     }
 
-    /// Resolve `import <file>`/`<glob>` to existing files relative to the Caddyfile.
+    /// Directory used to resolve a relative import: the file containing the `import` directive
+    /// (root Caddyfile or an imported file), matching Caddy's adapter-filename semantics.
+    fn importing_directory(&self, position: &Position) -> Option<PathBuf> {
+        let importing = match &position.file {
+            Some(label) => self.source_files.get(label),
+            None => self.source.as_ref(),
+        }?;
+        absolute_path(importing)
+            .parent()
+            .map(Path::to_path_buf)
+            .or_else(|| Some(PathBuf::from(".")))
+    }
+
+    /// Diagnostic label for an imported file: relative to the root Caddyfile's directory when it
+    /// is inside it, otherwise the resolved path. Keeps `file:line` diagnostics stable and short.
+    fn import_label(&self, file: &Path) -> String {
+        let root_directory = self
+            .source
+            .as_deref()
+            .map(absolute_path)
+            .and_then(|source| source.parent().map(Path::to_path_buf));
+        if let Some(root_directory) = root_directory {
+            if let Ok(relative) = absolute_path(file).strip_prefix(&root_directory) {
+                return relative.display().to_string();
+            }
+        }
+        file.display().to_string()
+    }
+
+    /// Resolve `import <file>`/`<glob>` to existing files relative to the importing file.
     fn resolve_import_files(
         &mut self,
         pattern: &str,
@@ -1043,11 +1108,8 @@ impl Parser {
         let resolved = if raw.is_absolute() {
             raw.to_path_buf()
         } else {
-            match &self.source {
-                Some(source) => absolute_path(source)
-                    .parent()
-                    .map(|parent| parent.join(raw))
-                    .unwrap_or_else(|| raw.to_path_buf()),
+            match self.importing_directory(&position) {
+                Some(directory) => directory.join(raw),
                 None => raw.to_path_buf(),
             }
         };
@@ -1094,14 +1156,14 @@ impl Parser {
         let mut matches = Vec::new();
         let entries = std::fs::read_dir(parent).map_err(|error| {
             ParseError::syntax(
-                position,
+                position.clone(),
                 format!("Failed to use import pattern {pattern}: {error}"),
             )
         })?;
         for entry in entries {
             let entry = entry.map_err(|error| {
                 ParseError::syntax(
-                    position,
+                    position.clone(),
                     format!("Failed to use import pattern {pattern}: {error}"),
                 )
             })?;
@@ -1185,9 +1247,12 @@ impl Parser {
                                 out_contexts.push(imported_context.clone());
                             }
                         }
-                    } else if let Some((start, range_end)) =
-                        parse_variadic(&token.text, args.len(), &mut self.warnings, token.position)
-                    {
+                    } else if let Some((start, range_end)) = parse_variadic(
+                        &token.text,
+                        args.len(),
+                        &mut self.warnings,
+                        token.position.clone(),
+                    ) {
                         for arg in &args[start..range_end] {
                             let mut replaced = token.clone();
                             replaced.text = arg.clone();
@@ -1200,7 +1265,7 @@ impl Parser {
                             &token.text,
                             args,
                             &mut self.warnings,
-                            token.position,
+                            token.position.clone(),
                         );
                         out_tokens.push(replaced);
                         out_contexts.push(snippet_context.clone());
@@ -1324,7 +1389,7 @@ fn build_block_mapping(
 }
 
 fn push_import_warning(warnings: &mut Vec<String>, position: Position, message: String) {
-    warnings.push(format!("Caddyfile line {}: {message}", position.line));
+    warnings.push(format!("{}: {message}", position.label()));
 }
 
 /// Parse a whole-token variadic argument placeholder (`{args[:]}`, `{args[1:]}`, `{args[1:3]}`)
@@ -1414,7 +1479,7 @@ fn replace_args_placeholders(
             return out;
         };
         let key = &after[..close];
-        if let Some(value) = resolve_args_key(key, args, warnings, position) {
+        if let Some(value) = resolve_args_key(key, args, warnings, position.clone()) {
             out.push_str(&value);
         } else {
             out.push('{');
@@ -1506,7 +1571,7 @@ fn collect_invokes(directives: &[Directive], out: &mut Vec<(String, Position)>) 
     for directive in directives {
         if directive.name == "invoke" {
             if let Some(name) = directive.args.first() {
-                out.push((name.clone(), directive.position));
+                out.push((name.clone(), directive.position.clone()));
             }
         }
         collect_invokes(&directive.block, out);
@@ -1524,7 +1589,7 @@ fn parse_addresses(
             if part.is_empty() {
                 continue;
             }
-            addresses.push(parse_address(part, position)?);
+            addresses.push(parse_address(part, position.clone())?);
         }
     }
     if addresses.is_empty() {
@@ -1592,7 +1657,7 @@ fn read_global_options(directives: Vec<Directive>) -> Result<GlobalOptions, Pars
             "auto_https" => {
                 if directive.args.is_empty() {
                     return Err(ParseError::syntax(
-                        directive.position,
+                        directive.position.clone(),
                         "wrong argument count or unexpected line ending after `auto_https`",
                     ));
                 }
@@ -1605,7 +1670,7 @@ fn read_global_options(directives: Vec<Directive>) -> Result<GlobalOptions, Pars
                         "ignore_loaded_certs" => modes.ignore_loaded_certs = true,
                         _ => {
                             return Err(ParseError::syntax(
-                                directive.position,
+                                directive.position.clone(),
                                 "auto_https must be one of 'off', 'disable_redirects', \
                                  'disable_certs', or 'ignore_loaded_certs'"
                                     .to_string(),
@@ -1626,26 +1691,29 @@ fn read_global_options(directives: Vec<Directive>) -> Result<GlobalOptions, Pars
                 let name = directive.name.clone();
                 if !directive.block.is_empty() {
                     return Err(ParseError::syntax(
-                        directive.position,
+                        directive.position.clone(),
                         format!("global option `{name}` does not support a block"),
                     ));
                 }
                 if directive.args.len() != 1 {
                     return Err(ParseError::syntax(
-                        directive.position,
+                        directive.position.clone(),
                         format!("wrong argument count or unexpected line ending after `{name}`"),
                     ));
                 }
                 let value = &directive.args[0];
                 let nanoseconds = parse_go_duration_ns(value).map_err(|reason| {
-                    ParseError::syntax(directive.position, format!("parsing {name}: {reason}"))
+                    ParseError::syntax(
+                        directive.position.clone(),
+                        format!("parsing {name}: {reason}"),
+                    )
                 })?;
                 if nanoseconds < 0 {
                     // Caddy's adapter accepts negative durations, but its runtime and the
                     // caddy-rs typed `CaddyDuration` (u64 ns) treat them as invalid; reject
                     // loudly instead of emitting a config that cannot be provisioned.
                     return Err(ParseError::syntax(
-                        directive.position,
+                        directive.position.clone(),
                         format!("`{name}` must not be negative, got `{value}`"),
                     ));
                 }
@@ -1657,7 +1725,7 @@ fn read_global_options(directives: Vec<Directive>) -> Result<GlobalOptions, Pars
                 };
                 if slot.is_some() {
                     return Err(ParseError::syntax(
-                        directive.position,
+                        directive.position.clone(),
                         format!(
                             "global option `{name}` is specified more than once; Caddy's adapter \
                              keeps the last value, caddy-rs rejects duplicates instead"
@@ -1674,13 +1742,13 @@ fn read_global_options(directives: Vec<Directive>) -> Result<GlobalOptions, Pars
             "acme_dns" => {
                 if !directive.block.is_empty() {
                     return Err(ParseError::syntax(
-                        directive.position,
+                        directive.position.clone(),
                         "global option `acme_dns` does not support a block in this build",
                     ));
                 }
                 let Some(name) = directive.args.first() else {
                     return Err(ParseError::syntax(
-                        directive.position,
+                        directive.position.clone(),
                         "global option `acme_dns` requires a DNS provider name",
                     ));
                 };
@@ -1695,20 +1763,20 @@ fn read_global_options(directives: Vec<Directive>) -> Result<GlobalOptions, Pars
             "local_certs" => {
                 if !directive.args.is_empty() || !directive.block.is_empty() {
                     return Err(ParseError::syntax(
-                        directive.position,
+                        directive.position.clone(),
                         "global option `local_certs` does not take arguments",
                     ));
                 }
                 options.local_certs = true;
             }
             "debug" => return Err(ParseError::syntax(
-                directive.position,
+                directive.position.clone(),
                 "global option `debug` is not implemented by this build (tracked as T-CONF-011); \
                      it is rejected rather than silently ignored",
             )),
             other => {
                 return Err(ParseError::syntax(
-                    directive.position,
+                    directive.position.clone(),
                     format!("unrecognized global option `{other}`"),
                 ))
             }
@@ -1724,7 +1792,7 @@ fn read_global_options(directives: Vec<Directive>) -> Result<GlobalOptions, Pars
 fn parse_pki_option(directive: &Directive) -> Result<PkiOptions, ParseError> {
     if !directive.args.is_empty() {
         return Err(ParseError::syntax(
-            directive.position,
+            directive.position.clone(),
             "global option `pki` does not take arguments; write `pki { ca [<id>] { ... } }`",
         ));
     }
@@ -1732,13 +1800,13 @@ fn parse_pki_option(directive: &Directive) -> Result<PkiOptions, ParseError> {
     for item in &directive.block {
         if item.name != "ca" {
             return Err(ParseError::syntax(
-                item.position,
+                item.position.clone(),
                 format!("unrecognized pki option `{}`", item.name),
             ));
         }
         if item.args.len() > 1 {
             return Err(ParseError::syntax(
-                item.position,
+                item.position.clone(),
                 "`pki ca` takes at most one certificate authority ID",
             ));
         }
@@ -1749,7 +1817,7 @@ fn parse_pki_option(directive: &Directive) -> Result<PkiOptions, ParseError> {
             .unwrap_or_else(|| "local".to_string());
         if id.trim().is_empty() {
             return Err(ParseError::syntax(
-                item.position,
+                item.position.clone(),
                 "certificate authority ID must not be empty (use `local` for the default CA)",
             ));
         }
@@ -1775,7 +1843,7 @@ fn parse_pki_option(directive: &Directive) -> Result<PkiOptions, ParseError> {
                     let value = single(option)?;
                     let ratio = value.parse::<f64>().map_err(|_| {
                         ParseError::syntax(
-                            option.position,
+                            option.position.clone(),
                             format!(
                                 "renewal_window_ratio must be a number in (0, 1], got `{value}`"
                             ),
@@ -1783,7 +1851,7 @@ fn parse_pki_option(directive: &Directive) -> Result<PkiOptions, ParseError> {
                     })?;
                     if !ratio.is_finite() || ratio <= 0.0 || ratio > 1.0 {
                         return Err(ParseError::syntax(
-                            option.position,
+                            option.position.clone(),
                             format!(
                                 "renewal_window_ratio must be a number in (0, 1], got `{value}`"
                             ),
@@ -1797,7 +1865,7 @@ fn parse_pki_option(directive: &Directive) -> Result<PkiOptions, ParseError> {
                 }
                 other => {
                     return Err(ParseError::syntax(
-                        option.position,
+                        option.position.clone(),
                         format!("unrecognized pki ca option `{other}`"),
                     ))
                 }
@@ -1815,7 +1883,7 @@ fn parse_pki_option(directive: &Directive) -> Result<PkiOptions, ParseError> {
 fn parse_pki_key_pair(directive: &Directive, kind: &str) -> Result<PkiKeyPairConfig, ParseError> {
     if !directive.args.is_empty() {
         return Err(ParseError::syntax(
-            directive.position,
+            directive.position.clone(),
             format!("`pki ca {kind}` does not take arguments; use a block"),
         ));
     }
@@ -1828,7 +1896,7 @@ fn parse_pki_key_pair(directive: &Directive, kind: &str) -> Result<PkiKeyPairCon
             "format" => pair.format = Some(value),
             other => {
                 return Err(ParseError::syntax(
-                    option.position,
+                    option.position.clone(),
                     format!("unrecognized pki ca {kind} option `{other}`"),
                 ))
             }
@@ -1841,7 +1909,7 @@ fn parse_pki_key_pair(directive: &Directive, kind: &str) -> Result<PkiKeyPairCon
 fn single_argument(directive: &Directive, context: &str) -> Result<String, ParseError> {
     if directive.args.len() != 1 || !directive.block.is_empty() {
         return Err(ParseError::syntax(
-            directive.position,
+            directive.position.clone(),
             format!("{context} requires exactly one argument"),
         ));
     }
@@ -1853,13 +1921,13 @@ fn duration_argument(directive: &Directive) -> Result<i64, ParseError> {
     let value = single_argument(directive, &format!("`{}`", directive.name))?;
     let nanoseconds = parse_duration_ns(&value).map_err(|reason| {
         ParseError::syntax(
-            directive.position,
+            directive.position.clone(),
             format!("invalid duration `{value}`: {reason}"),
         )
     })?;
     if nanoseconds <= 0 {
         return Err(ParseError::syntax(
-            directive.position,
+            directive.position.clone(),
             format!(
                 "`{}` must be a positive duration, got `{value}`",
                 directive.name
@@ -2009,13 +2077,13 @@ pub(crate) fn parse_go_duration_ns(value: &str) -> Result<i64, String> {
 fn global_string(directive: &Directive, option: &str) -> Result<String, ParseError> {
     if !directive.block.is_empty() {
         return Err(ParseError::syntax(
-            directive.position,
+            directive.position.clone(),
             format!("global option `{option}` does not support a block in this build"),
         ));
     }
     if directive.args.len() != 1 {
         return Err(ParseError::syntax(
-            directive.position,
+            directive.position.clone(),
             format!("global option `{option}` requires exactly one argument"),
         ));
     }
@@ -2025,11 +2093,11 @@ fn global_string(directive: &Directive, option: &str) -> Result<String, ParseErr
 fn global_port(directive: &Directive) -> Result<u16, ParseError> {
     let Some(value) = directive.args.first() else {
         return Err(ParseError::syntax(
-            directive.position,
+            directive.position.clone(),
             format!("`{}` requires a port argument", directive.name),
         ));
     };
-    parse_port(value).map_err(|message| ParseError::syntax(directive.position, message))
+    parse_port(value).map_err(|message| ParseError::syntax(directive.position.clone(), message))
 }
 
 #[cfg(test)]

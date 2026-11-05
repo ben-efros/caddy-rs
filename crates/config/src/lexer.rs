@@ -24,14 +24,46 @@
 use std::fmt;
 use std::iter::Peekable;
 use std::str::CharIndices;
+use std::sync::Arc;
 
 /// Location of a token in the source file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Imported files carry their filename in [`Position::file`] so diagnostics can report the origin
+/// (`subdir/extra.caddyfile:3`) rather than the top-level Caddyfile line. The root Caddyfile keeps
+/// `file: None` and keeps the historical `Caddyfile line N` diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Position {
     /// 1-based line.
     pub line: usize,
     /// 1-based column.
     pub column: usize,
+    /// Origin file for tokens spliced from `import <file>`/`<glob>`, if not the root Caddyfile.
+    pub file: Option<Arc<str>>,
+}
+
+impl Position {
+    /// A position in the root Caddyfile.
+    pub fn new(line: usize, column: usize) -> Self {
+        Self {
+            line,
+            column,
+            file: None,
+        }
+    }
+
+    /// Attach the origin file label (used for tokens spliced in from imported files).
+    pub fn with_file(mut self, file: Arc<str>) -> Self {
+        self.file = Some(file);
+        self
+    }
+
+    /// Diagnostic label: `file:line` for imported files, `Caddyfile line N` for the root file.
+    pub fn label(&self) -> String {
+        match &self.file {
+            Some(file) => format!("{file}:{}", self.line),
+            None => format!("Caddyfile line {}", self.line),
+        }
+    }
 }
 
 impl fmt::Display for Position {
@@ -79,7 +111,7 @@ pub struct LexError {
 impl LexError {
     fn new(line: usize, column: usize, message: impl Into<String>) -> Self {
         Self {
-            position: Position { line, column },
+            position: Position::new(line, column),
             message: message.into(),
         }
     }
@@ -105,7 +137,7 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
     let mut column = 1;
 
     while let Some(&(_, ch)) = chars.peek() {
-        let position = Position { line, column };
+        let position = Position::new(line, column);
         match ch {
             ' ' | '\t' | '\r' => {
                 // Caddy ignores carriage returns rather than treating them as separators; this
@@ -174,17 +206,19 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
                     },
                 }
             }
-            '<' if peek_ahead(&chars, 1) == Some('<') => match lex_heredoc(&mut chars, position)? {
-                Some((token, end_line, end_column)) => {
-                    tokens.push(token);
-                    line = end_line;
-                    column = end_column;
+            '<' if peek_ahead(&chars, 1) == Some('<') => {
+                match lex_heredoc(&mut chars, position.clone())? {
+                    Some((token, end_line, end_column)) => {
+                        tokens.push(token);
+                        line = end_line;
+                        column = end_column;
+                    }
+                    None => match scan_word(&mut chars, position, &mut column) {
+                        Some(token) => tokens.push(token),
+                        None => unreachable!("a word starting with `<` must consume input"),
+                    },
                 }
-                None => match scan_word(&mut chars, position, &mut column) {
-                    Some(token) => tokens.push(token),
-                    None => unreachable!("a word starting with `<` must consume input"),
-                },
-            },
+            }
             '{' => {
                 if brace_is_standalone(&chars, '{') {
                     chars.next();

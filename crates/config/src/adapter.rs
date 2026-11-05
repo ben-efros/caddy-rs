@@ -168,9 +168,9 @@ pub fn adapt_with_source(
                 address.host,
                 address.effective_port(http_port, https_port)
             );
-            if let Some(previous) = seen_keys.insert(normalized, site.position) {
+            if let Some(previous) = seen_keys.insert(normalized, site.position.clone()) {
                 return Err(adapter_error(
-                    site.position,
+                    site.position.clone(),
                     format!(
                         "ambiguous site definition for address `{}` (first defined at {previous})",
                         address.raw
@@ -428,13 +428,13 @@ fn parse_site_bind(site: &SiteBlock) -> caddy_rs_core::Result<Vec<BindAddress>> 
         }
         if directive.args.is_empty() {
             return Err(adapter_error(
-                directive.position,
+                directive.position.clone(),
                 "directive `bind` requires at least one address",
             ));
         }
         if let Some(option) = directive.block.first() {
             return Err(adapter_error(
-                option.position,
+                option.position.clone(),
                 format!(
                     "`bind` option `{}` is not supported by this build (listener protocols are \
                      not wired into the runtime yet; tracked as T-CONF-012)",
@@ -449,7 +449,7 @@ fn parse_site_bind(site: &SiteBlock) -> caddy_rs_core::Result<Vec<BindAddress>> 
             };
             if !matches!(network.as_str(), "" | "tcp" | "tcp4" | "tcp6") {
                 return Err(adapter_error(
-                    directive.position,
+                    directive.position.clone(),
                     format!(
                         "`bind` network `{network}` is not supported by this build \
                          (supported: tcp, tcp4, tcp6 and plain addresses)"
@@ -525,7 +525,7 @@ fn parse_site_log(site: &SiteBlock) -> caddy_rs_core::Result<bool> {
         }
         if !directive.args.is_empty() || !directive.block.is_empty() {
             return Err(adapter_error(
-                directive.position,
+                directive.position.clone(),
                 "`log` options are not supported by this build (plain `log` only; tracked as \
                  T-ADMIN-020)",
             ));
@@ -995,7 +995,7 @@ fn parse_site_tls(
         }
         if found.is_some() {
             return Err(adapter_error(
-                directive.position,
+                directive.position.clone(),
                 "multiple `tls` directives in one site block are not supported by this build",
             ));
         }
@@ -1004,7 +1004,7 @@ fn parse_site_tls(
     let Some(directive) = found else {
         return Ok(None);
     };
-    let position = directive.position;
+    let position = directive.position.clone();
     let mut config = SiteTls::default();
     match directive.args.as_slice() {
         [] => {}
@@ -1039,7 +1039,7 @@ fn parse_site_tls(
             "on_demand" => {
                 if !option.args.is_empty() || !option.block.is_empty() {
                     return Err(adapter_error(
-                        option.position,
+                        option.position.clone(),
                         "`on_demand` does not take arguments",
                     ));
                 }
@@ -1048,7 +1048,7 @@ fn parse_site_tls(
             "ca" => {
                 if option.args.len() != 1 || !option.block.is_empty() {
                     return Err(adapter_error(
-                        option.position,
+                        option.position.clone(),
                         "`ca` requires exactly one ACME CA endpoint",
                     ));
                 }
@@ -1057,13 +1057,13 @@ fn parse_site_tls(
             "dns" => {
                 if !option.block.is_empty() {
                     return Err(adapter_error(
-                        option.position,
+                        option.position.clone(),
                         "`dns` does not support a block in this build",
                     ));
                 }
                 let Some(name) = option.args.first() else {
                     return Err(adapter_error(
-                        option.position,
+                        option.position.clone(),
                         "`dns` requires a DNS provider name",
                     ));
                 };
@@ -1075,7 +1075,7 @@ fn parse_site_tls(
             "key_type" => {
                 if option.args.len() != 1 || !option.block.is_empty() {
                     return Err(adapter_error(
-                        option.position,
+                        option.position.clone(),
                         "`key_type` requires exactly one key type",
                     ));
                 }
@@ -1084,14 +1084,14 @@ fn parse_site_tls(
             "issuer" => {
                 if option.args.as_slice() != ["internal"] {
                     return Err(adapter_error(
-                        option.position,
+                        option.position.clone(),
                         "`tls` option `issuer` only supports `internal`; ACME issuer \
                          configuration is not supported by this build",
                     ));
                 }
                 if config.issuer.is_some() {
                     return Err(adapter_error(
-                        option.position,
+                        option.position.clone(),
                         "cannot specify both `tls internal` and a `tls { issuer ... }` block",
                     ));
                 }
@@ -1101,13 +1101,13 @@ fn parse_site_tls(
                         "ca" => {
                             if sub.args.len() != 1 || !sub.block.is_empty() {
                                 return Err(adapter_error(
-                                    sub.position,
+                                    sub.position.clone(),
                                     "`issuer internal ca` requires exactly one CA ID",
                                 ));
                             }
                             if sub.args[0].trim().is_empty() {
                                 return Err(adapter_error(
-                                    sub.position,
+                                    sub.position.clone(),
                                     "`issuer internal ca` requires a non-empty CA ID",
                                 ));
                             }
@@ -1116,14 +1116,14 @@ fn parse_site_tls(
                         "lifetime" => {
                             if sub.args.len() != 1 || !sub.block.is_empty() {
                                 return Err(adapter_error(
-                                    sub.position,
+                                    sub.position.clone(),
                                     "`issuer internal lifetime` requires exactly one duration",
                                 ));
                             }
                             let nanoseconds = crate::parser::parse_duration_ns(&sub.args[0])
                                 .map_err(|reason| {
                                     adapter_error(
-                                        sub.position,
+                                        sub.position.clone(),
                                         format!(
                                             "invalid `issuer internal lifetime` \
                                              `{}`: {reason}",
@@ -1133,7 +1133,7 @@ fn parse_site_tls(
                                 })?;
                             if nanoseconds <= 0 {
                                 return Err(adapter_error(
-                                    sub.position,
+                                    sub.position.clone(),
                                     "`issuer internal lifetime` must be positive",
                                 ));
                             }
@@ -1142,7 +1142,7 @@ fn parse_site_tls(
                         "sign_with_root" => {
                             if !sub.args.is_empty() || !sub.block.is_empty() {
                                 return Err(adapter_error(
-                                    sub.position,
+                                    sub.position.clone(),
                                     "`issuer internal sign_with_root` does not take arguments",
                                 ));
                             }
@@ -1150,7 +1150,7 @@ fn parse_site_tls(
                         }
                         other => {
                             return Err(adapter_error(
-                                sub.position,
+                                sub.position.clone(),
                                 format!(
                                 "`issuer internal` option `{other}` is not supported by this build"
                             ),
@@ -1163,7 +1163,7 @@ fn parse_site_tls(
             "client_auth" => {
                 if config.client_auth.is_some() {
                     return Err(adapter_error(
-                        option.position,
+                        option.position.clone(),
                         "duplicate tls option 'client_auth'",
                     ));
                 }
@@ -1172,13 +1172,13 @@ fn parse_site_tls(
             "alpn" => {
                 if config.alpn.is_some() {
                     return Err(adapter_error(
-                        option.position,
+                        option.position.clone(),
                         "duplicate tls option 'alpn'",
                     ));
                 }
                 if option.args.is_empty() || !option.block.is_empty() {
                     return Err(adapter_error(
-                        option.position,
+                        option.position.clone(),
                         "`alpn` requires one or more protocol names",
                     ));
                 }
@@ -1187,13 +1187,13 @@ fn parse_site_tls(
             "protocols" => {
                 if config.protocols.is_some() {
                     return Err(adapter_error(
-                        option.position,
+                        option.position.clone(),
                         "duplicate tls option 'protocols'",
                     ));
                 }
                 if !option.block.is_empty() {
                     return Err(adapter_error(
-                        option.position,
+                        option.position.clone(),
                         "`protocols` does not take a block",
                     ));
                 }
@@ -1204,7 +1204,7 @@ fn parse_site_tls(
                         .position(|candidate| *candidate == version)
                         .ok_or_else(|| {
                             adapter_error(
-                                option.position,
+                                option.position.clone(),
                                 format!(
                                     "unsupported TLS protocol `{version}`; expected `tls1.2` or \
                                      `tls1.3`"
@@ -1222,7 +1222,7 @@ fn parse_site_tls(
                         let end = index_of(max)?;
                         if start > end {
                             return Err(adapter_error(
-                                option.position,
+                                option.position.clone(),
                                 "`protocols` minimum version is newer than the maximum version",
                             ));
                         }
@@ -1233,7 +1233,7 @@ fn parse_site_tls(
                     }
                     _ => {
                         return Err(adapter_error(
-                            option.position,
+                            option.position.clone(),
                             "`protocols` takes one or two values (min [max])",
                         ))
                     }
@@ -1243,13 +1243,13 @@ fn parse_site_tls(
             "ciphers" => {
                 if !option.block.is_empty() {
                     return Err(adapter_error(
-                        option.position,
+                        option.position.clone(),
                         "`ciphers` does not take a block",
                     ));
                 }
                 let mut suites = config.ciphers.take().unwrap_or_default();
                 for name in &option.args {
-                    suites.push(validate_cipher_suite(name, option.position)?);
+                    suites.push(validate_cipher_suite(name, option.position.clone())?);
                 }
                 if !suites.is_empty() {
                     config.ciphers = Some(suites);
@@ -1258,13 +1258,13 @@ fn parse_site_tls(
             "curves" => {
                 if !option.block.is_empty() {
                     return Err(adapter_error(
-                        option.position,
+                        option.position.clone(),
                         "`curves` does not take a block",
                     ));
                 }
                 let mut curves = config.curves.take().unwrap_or_default();
                 for name in &option.args {
-                    curves.push(validate_curve(name, option.position)?);
+                    curves.push(validate_curve(name, option.position.clone())?);
                 }
                 if !curves.is_empty() {
                     config.curves = Some(curves);
@@ -1272,7 +1272,7 @@ fn parse_site_tls(
             }
             other => {
                 return Err(adapter_error(
-                    option.position,
+                    option.position.clone(),
                     format!("`tls` option `{other}` is not supported by this build"),
                 ))
             }
@@ -1329,7 +1329,7 @@ fn parse_client_auth_option(
             "mode" => {
                 if sub.args.len() != 1 || !sub.block.is_empty() {
                     return Err(adapter_error(
-                        sub.position,
+                        sub.position.clone(),
                         "`client_auth` `mode` requires exactly one value",
                     ));
                 }
@@ -1339,7 +1339,7 @@ fn parse_client_auth_option(
                     }
                     other => {
                         return Err(adapter_error(
-                            sub.position,
+                            sub.position.clone(),
                             format!(
                                 "unsupported client authentication mode `{other}`; expected \
                                  request, require, verify_if_given or require_and_verify"
@@ -1351,14 +1351,14 @@ fn parse_client_auth_option(
             "trusted_ca_cert" => {
                 if ca_pool.is_some() {
                     return Err(adapter_error(
-                        sub.position,
+                        sub.position.clone(),
                         "cannot specify both 'trust_pool' and 'trusted_ca_cert' or \
                          'trusted_ca_cert_file'",
                     ));
                 }
                 if sub.args.len() != 1 || !sub.block.is_empty() {
                     return Err(adapter_error(
-                        sub.position,
+                        sub.position.clone(),
                         "`trusted_ca_cert` requires exactly one base64 DER value",
                     ));
                 }
@@ -1372,14 +1372,14 @@ fn parse_client_auth_option(
             "trusted_ca_cert_file" => {
                 if ca_pool.is_some() {
                     return Err(adapter_error(
-                        sub.position,
+                        sub.position.clone(),
                         "cannot specify both 'trust_pool' and 'trusted_ca_cert' or \
                          'trusted_ca_cert_file'",
                     ));
                 }
                 if sub.args.len() != 1 || !sub.block.is_empty() {
                     return Err(adapter_error(
-                        sub.position,
+                        sub.position.clone(),
                         "`trusted_ca_cert_file` requires exactly one PEM file",
                     ));
                 }
@@ -1390,13 +1390,13 @@ fn parse_client_auth_option(
                 );
                 trusted_ca.extend(read_pem_certificates(
                     &base.join(&sub.args[0]),
-                    sub.position,
+                    sub.position.clone(),
                 )?);
             }
             "trusted_leaf_cert" => {
                 if sub.args.len() != 1 || !sub.block.is_empty() {
                     return Err(adapter_error(
-                        sub.position,
+                        sub.position.clone(),
                         "`trusted_leaf_cert` requires exactly one base64 DER value",
                     ));
                 }
@@ -1405,29 +1405,32 @@ fn parse_client_auth_option(
             "trusted_leaf_cert_file" => {
                 if sub.args.len() != 1 || !sub.block.is_empty() {
                     return Err(adapter_error(
-                        sub.position,
+                        sub.position.clone(),
                         "`trusted_leaf_cert_file` requires exactly one PEM file",
                     ));
                 }
                 trusted_leaf.extend(read_pem_certificates(
                     &base.join(&sub.args[0]),
-                    sub.position,
+                    sub.position.clone(),
                 )?);
             }
             "trust_pool" => {
                 if !trusted_ca.is_empty() {
                     return Err(adapter_error(
-                        sub.position,
+                        sub.position.clone(),
                         "cannot specify both 'trust_pool' and 'trusted_ca_cert' or \
                          'trusted_ca_cert_file'",
                     ));
                 }
                 if ca_pool.is_some() {
-                    return Err(adapter_error(sub.position, "duplicate `trust_pool`"));
+                    return Err(adapter_error(
+                        sub.position.clone(),
+                        "duplicate `trust_pool`",
+                    ));
                 }
                 let Some(provider) = sub.args.first() else {
                     return Err(adapter_error(
-                        sub.position,
+                        sub.position.clone(),
                         "`trust_pool` requires a provider module",
                     ));
                 };
@@ -1437,7 +1440,7 @@ fn parse_client_auth_option(
                         for entry in &sub.block {
                             if entry.name != "trust_der" {
                                 return Err(adapter_error(
-                                    entry.position,
+                                    entry.position.clone(),
                                     format!(
                                         "`trust_pool inline` option `{}` is not supported by this \
                                          build",
@@ -1447,7 +1450,7 @@ fn parse_client_auth_option(
                             }
                             if entry.args.len() != 1 || !entry.block.is_empty() {
                                 return Err(adapter_error(
-                                    entry.position,
+                                    entry.position.clone(),
                                     "`trust_der` requires exactly one base64 DER value",
                                 ));
                             }
@@ -1460,7 +1463,7 @@ fn parse_client_auth_option(
                         for entry in &sub.block {
                             if entry.name != "pem_file" {
                                 return Err(adapter_error(
-                                    entry.position,
+                                    entry.position.clone(),
                                     format!(
                                         "`trust_pool file` option `{}` is not supported by this \
                                          build",
@@ -1470,7 +1473,7 @@ fn parse_client_auth_option(
                             }
                             if entry.args.len() != 1 || !entry.block.is_empty() {
                                 return Err(adapter_error(
-                                    entry.position,
+                                    entry.position.clone(),
                                     "`pem_file` requires exactly one path",
                                 ));
                             }
@@ -1480,7 +1483,7 @@ fn parse_client_auth_option(
                     }
                     other => {
                         return Err(adapter_error(
-                            sub.position,
+                            sub.position.clone(),
                             format!(
                                 "client-auth trust pool provider `{other}` is not supported by \
                                  this build (runtime supports `inline` and `file`; tracked as \
@@ -1492,14 +1495,14 @@ fn parse_client_auth_option(
             }
             "verifier" => {
                 return Err(adapter_error(
-                    sub.position,
+                    sub.position.clone(),
                     "custom client-auth verifiers (`verifier`) are not supported by this build \
                      (tracked as TLS-CLIENT-AUTH)",
                 ))
             }
             other => {
                 return Err(adapter_error(
-                    sub.position,
+                    sub.position.clone(),
                     format!("unknown subdirective for client_auth: {other}"),
                 ))
             }
@@ -1532,7 +1535,7 @@ fn read_pem_certificates(
 ) -> caddy_rs_core::Result<Vec<String>> {
     let pem = std::fs::read_to_string(path).map_err(|error| {
         adapter_error(
-            position,
+            position.clone(),
             format!(
                 "`trusted_ca_cert_file`/`trusted_leaf_cert_file` requires a readable PEM file at \
                  adapt time; reading `{}` failed: {error}",
@@ -1557,7 +1560,7 @@ fn read_pem_certificates(
         }
         if !closed {
             return Err(adapter_error(
-                position,
+                position.clone(),
                 format!(
                     "PEM file `{}` has an unterminated certificate",
                     path.display()
@@ -1566,7 +1569,7 @@ fn read_pem_certificates(
         }
         let der = base64_decode(&body).ok_or_else(|| {
             adapter_error(
-                position,
+                position.clone(),
                 format!("PEM file `{}` contains invalid base64", path.display()),
             )
         })?;
@@ -1805,9 +1808,7 @@ fn fill_global_acme_defaults(issuer: &mut Value, options: &parser::GlobalOptions
                 .or_insert_with(|| json!({}));
             if let Some(dns) = dns.as_object_mut() {
                 if dns.get("provider").is_none() {
-                    if let Ok(provider) =
-                        dns_provider_json(global_dns, Position { line: 0, column: 0 })
-                    {
+                    if let Ok(provider) = dns_provider_json(global_dns, Position::new(0, 0)) {
                         dns.insert("provider".to_string(), provider);
                     }
                 }
@@ -2211,7 +2212,7 @@ fn build_tls_plan(
                     if let Some(internal) = tls.internal_options() {
                         policy.issuers = vec![internal_issuer_json(&internal)];
                     } else if tls.issuer.is_some() || tls.ca.is_some() || tls.dns.is_some() {
-                        policy.issuers = implicit_acme_issuers(tls, site.position)?;
+                        policy.issuers = implicit_acme_issuers(tls, site.position.clone())?;
                     }
                 }
             }
@@ -2360,7 +2361,7 @@ fn build_tls_plan(
         for subject in &policy.subjects {
             if !seen_subjects.insert(subject.as_str()) {
                 return Err(adapter_error(
-                    Position { line: 0, column: 0 },
+                    Position::new(0, 0),
                     format!(
                         "hostname appears in more than one automation policy, making certificate \
                          management ambiguous: {subject}"
@@ -2410,7 +2411,7 @@ fn build_tls_plan(
 fn build_try_files_routes(directive: &Directive) -> caddy_rs_core::Result<Vec<Value>> {
     if directive.args.is_empty() {
         return Err(adapter_error(
-            directive.position,
+            directive.position.clone(),
             "directive `try_files` requires at least one file argument",
         ));
     }
@@ -2420,13 +2421,13 @@ fn build_try_files_routes(directive: &Directive) -> caddy_rs_core::Result<Vec<Va
             "policy" => {
                 if policy.is_some() {
                     return Err(adapter_error(
-                        option.position,
+                        option.position.clone(),
                         "try policy already configured",
                     ));
                 }
                 let Some(value) = option.args.first() else {
                     return Err(adapter_error(
-                        option.position,
+                        option.position.clone(),
                         "`policy` requires an argument",
                     ));
                 };
@@ -2439,7 +2440,7 @@ fn build_try_files_routes(directive: &Directive) -> caddy_rs_core::Result<Vec<Va
                         | "most_recently_modified"
                 ) {
                     return Err(adapter_error(
-                        option.position,
+                        option.position.clone(),
                         format!("unrecognized try policy: {value}"),
                     ));
                 }
@@ -2447,7 +2448,7 @@ fn build_try_files_routes(directive: &Directive) -> caddy_rs_core::Result<Vec<Va
             }
             other => {
                 return Err(adapter_error(
-                    option.position,
+                    option.position.clone(),
                     format!("`try_files` option `{other}` is not supported"),
                 ));
             }
@@ -2491,38 +2492,232 @@ fn build_try_files_routes(directive: &Directive) -> caddy_rs_core::Result<Vec<Va
     Ok(routes)
 }
 
-/// `uri strip_prefix` maps directly onto the rewrite handler's `strip_path_prefix`, which the
-/// runtime implements; the other `uri` operations have no runtime support yet and fail loudly.
-fn uri_handler(args: &[String], position: Position) -> caddy_rs_core::Result<Value> {
+/// Caddy's `uri` directive: emit one `http.handlers.rewrite` handler for the requested URI
+/// manipulation. The runtime implements every field Caddy's handler has (`strip_path_prefix`,
+/// `strip_path_suffix`, `uri_substring`, `path_regexp`, `query`), so the adapted JSON is Caddy's.
+fn uri_handler(directive: &Directive, args: &[String]) -> caddy_rs_core::Result<Value> {
+    let position = directive.position.clone();
     let Some(operation) = args.first() else {
         return Err(adapter_error(
             position,
-            "directive `uri` requires an operation (strip_prefix)",
+            "directive `uri` requires an operation (strip_prefix, strip_suffix, replace, path_regexp or query)",
         ));
     };
     match operation.as_str() {
-        "strip_prefix" => {
+        "strip_prefix" | "strip_suffix" => {
             if args.len() != 2 {
                 return Err(adapter_error(
                     position,
-                    "`uri strip_prefix` requires exactly one argument",
+                    format!("`uri {operation}` requires exactly one argument"),
                 ));
+            }
+            let field = if operation == "strip_prefix" {
+                "strip_path_prefix"
+            } else {
+                "strip_path_suffix"
+            };
+            Ok(json!({
+                "handler": "rewrite",
+                field: qualify_placeholders(&args[1]),
+            }))
+        }
+        "replace" => {
+            if !(3..=4).contains(&args.len()) {
+                return Err(adapter_error(
+                    position,
+                    "`uri replace` requires <find> <replace> [<limit>]",
+                ));
+            }
+            let limit = match args.get(3) {
+                Some(limit) => Some(limit.parse::<i64>().map_err(|_| {
+                    adapter_error(
+                        position.clone(),
+                        format!("limit must be an integer; invalid: {limit}"),
+                    )
+                })?),
+                None => None,
+            };
+            let mut replacement = Map::new();
+            if !args[1].is_empty() {
+                replacement.insert("find".to_string(), json!(qualify_placeholders(&args[1])));
+            }
+            if !args[2].is_empty() {
+                replacement.insert("replace".to_string(), json!(qualify_placeholders(&args[2])));
+            }
+            if let Some(limit) = limit.filter(|limit| *limit != 0) {
+                replacement.insert("limit".to_string(), json!(limit));
             }
             Ok(json!({
                 "handler": "rewrite",
-                "strip_path_prefix": qualify_placeholders(&args[1]),
+                "uri_substring": [Value::Object(replacement)],
+            }))
+        }
+        "path_regexp" => {
+            if args.len() != 3 {
+                return Err(adapter_error(
+                    position,
+                    "`uri path_regexp` requires <find> <replace>",
+                ));
+            }
+            let mut replacement = Map::new();
+            if !args[1].is_empty() {
+                replacement.insert("find".to_string(), json!(args[1]));
+            }
+            if !args[2].is_empty() {
+                replacement.insert("replace".to_string(), json!(qualify_placeholders(&args[2])));
+            }
+            Ok(json!({
+                "handler": "rewrite",
+                "path_regexp": [Value::Object(replacement)],
+            }))
+        }
+        "query" => {
+            let mut query = UriQueryOps::default();
+            let mut has_args = false;
+            if args.len() > 1 {
+                has_args = true;
+                apply_uri_query_op(&mut query, &args[1..], position.clone())?;
+            }
+            if has_args && !directive.block.is_empty() {
+                return Err(adapter_error(
+                    position,
+                    "Cannot specify uri query rewrites in both argument and block",
+                ));
+            }
+            for option in &directive.block {
+                if !option.block.is_empty() {
+                    return Err(adapter_error(
+                        option.position.clone(),
+                        "nested blocks are not supported in `uri query`",
+                    ));
+                }
+                let mut line = vec![option.name.clone()];
+                line.extend(option.args.iter().cloned());
+                apply_uri_query_op(&mut query, &line, option.position.clone())?;
+            }
+            Ok(json!({
+                "handler": "rewrite",
+                "query": query.to_json(),
             }))
         }
         other => Err(adapter_error(
             position,
-            format!(
-                "`uri {other}` is not supported by this build: the caddy-rs rewrite handler \
-                 implements only `uri`, `method` and `strip_path_prefix`, so `uri {other}` needs \
-                 runtime rewrite-handler support (no plan task owns it yet; tracking id \
-                 REWRITE-HANDLER-FIELDS)"
-            ),
+            format!("unrecognized URI manipulation `{other}`"),
         )),
     }
+}
+
+/// Accumulated `uri query` operations, encoded in Caddy's `queryOps` order and shape.
+#[derive(Debug, Default)]
+struct UriQueryOps {
+    rename: Vec<(String, String)>,
+    set: Vec<(String, String)>,
+    add: Vec<(String, String)>,
+    replace: Vec<(String, String, String)>,
+    delete: Vec<String>,
+}
+
+impl UriQueryOps {
+    fn to_json(&self) -> Value {
+        let arguments = |items: &[(String, String)]| -> Value {
+            Value::Array(
+                items
+                    .iter()
+                    .map(|(key, val)| json!({"key": key, "val": val}))
+                    .collect(),
+            )
+        };
+        let mut object = Map::new();
+        if !self.rename.is_empty() {
+            object.insert("rename".to_string(), arguments(&self.rename));
+        }
+        if !self.set.is_empty() {
+            object.insert("set".to_string(), arguments(&self.set));
+        }
+        if !self.add.is_empty() {
+            object.insert("add".to_string(), arguments(&self.add));
+        }
+        if !self.replace.is_empty() {
+            object.insert(
+                "replace".to_string(),
+                Value::Array(
+                    self.replace
+                        .iter()
+                        .map(|(key, search, replace)| {
+                            json!({
+                                "key": key,
+                                "search_regexp": search,
+                                "replace": replace,
+                            })
+                        })
+                        .collect(),
+                ),
+            );
+        }
+        if !self.delete.is_empty() {
+            object.insert(
+                "delete".to_string(),
+                Value::Array(self.delete.iter().map(|key| json!(key)).collect()),
+            );
+        }
+        Value::Object(object)
+    }
+}
+
+/// Caddy's `applyQueryOps` for one `uri query` operation (argument line or block line).
+fn apply_uri_query_op(
+    query: &mut UriQueryOps,
+    args: &[String],
+    position: Position,
+) -> caddy_rs_core::Result<()> {
+    let Some(key) = args.first() else {
+        return Err(adapter_error(
+            position,
+            "wrong argument count for a `uri query` operation",
+        ));
+    };
+    if let Some(deleted) = key.strip_prefix('-') {
+        if args.len() != 1 {
+            return Err(adapter_error(
+                position,
+                "wrong argument count for a `uri query` delete operation",
+            ));
+        }
+        query
+            .delete
+            .push(deleted.trim_start_matches('-').to_string());
+    } else if let Some(added) = key.strip_prefix('+') {
+        if args.len() != 2 {
+            return Err(adapter_error(
+                position,
+                "wrong argument count for a `uri query` add operation",
+            ));
+        }
+        query
+            .add
+            .push((added.trim_start_matches('+').to_string(), args[1].clone()));
+    } else if let Some((from, to)) = key.split_once('>') {
+        if args.len() != 1 {
+            return Err(adapter_error(
+                position,
+                "wrong argument count for a `uri query` rename operation",
+            ));
+        }
+        query.rename.push((from.to_string(), to.to_string()));
+    } else if args.len() == 3 {
+        query
+            .replace
+            .push((key.clone(), args[1].clone(), args[2].clone()));
+    } else {
+        if args.len() != 2 {
+            return Err(adapter_error(
+                position,
+                "wrong argument count for a `uri query` operation",
+            ));
+        }
+        query.set.push((key.clone(), args[1].clone()));
+    }
+    Ok(())
 }
 
 fn build_site_routes(
@@ -2541,12 +2736,12 @@ fn collect_matchers(directives: &[Directive]) -> caddy_rs_core::Result<BTreeMap<
         };
         if name.is_empty() {
             return Err(adapter_error(
-                directive.position,
+                directive.position.clone(),
                 "matcher name after `@` must not be empty",
             ));
         }
         let mut object = if directive.block.is_empty() {
-            matcher_from_inline_args(&directive.args, directive.position)?
+            matcher_from_inline_args(&directive.args, directive.position.clone())?
         } else {
             matcher_from_directives(&directive.block)?
         };
@@ -2607,15 +2802,20 @@ fn matcher_from_directives(directives: &[Directive]) -> caddy_rs_core::Result<Va
     for directive in directives {
         if directive.name == "not" {
             let inner = if directive.block.is_empty() {
-                matcher_from_inline_args(&directive.args, directive.position)?
+                matcher_from_inline_args(&directive.args, directive.position.clone())?
             } else {
                 matcher_from_directives(&directive.block)?
             };
-            merge_matcher(&mut object, json!({"not": [inner]}), directive.position)?;
+            merge_matcher(
+                &mut object,
+                json!({"not": [inner]}),
+                directive.position.clone(),
+            )?;
             continue;
         }
-        let value = matcher_from_directive(&directive.name, &directive.args, directive.position)?;
-        merge_matcher(&mut object, value, directive.position)?;
+        let value =
+            matcher_from_directive(&directive.name, &directive.args, directive.position.clone())?;
+        merge_matcher(&mut object, value, directive.position.clone())?;
     }
     Ok(Value::Object(object))
 }
@@ -2871,7 +3071,7 @@ fn build_routes(
                 continue;
             }
             return Err(adapter_error(
-                directive.position,
+                directive.position.clone(),
                 "directive `tls` can only be used directly in a site block",
             ));
         }
@@ -2881,7 +3081,7 @@ fn build_routes(
                 continue;
             }
             return Err(adapter_error(
-                directive.position,
+                directive.position.clone(),
                 format!(
                     "directive `{}` can only be used directly in a site block",
                     directive.name
@@ -2890,7 +3090,7 @@ fn build_routes(
         }
         if !DIRECTIVE_ORDER.contains(&directive.name.as_str()) {
             return Err(adapter_error(
-                directive.position,
+                directive.position.clone(),
                 format!(
                     "directive `{}` is not supported by this build (see docs/compatibility/CADDYFILE.md)",
                     directive.name
@@ -2927,10 +3127,11 @@ fn build_routes(
         match name {
             "route" => {
                 let mut route_args = directive.args.clone();
-                let matcher = matcher_for_args(&mut route_args, matchers, directive.position)?;
+                let matcher =
+                    matcher_for_args(&mut route_args, matchers, directive.position.clone())?;
                 if !route_args.is_empty() {
                     return Err(adapter_error(
-                        directive.position,
+                        directive.position.clone(),
                         "unexpected arguments to `route` (only an optional matcher is accepted)",
                     ));
                 }
@@ -2977,7 +3178,7 @@ fn build_routes(
                 {
                     None
                 } else {
-                    matcher_for_args(&mut args, matchers, directive.position)?
+                    matcher_for_args(&mut args, matchers, directive.position.clone())?
                 };
                 let handlers = build_handlers(directive, &args, warnings)?;
                 if handlers.is_empty() {
@@ -3110,7 +3311,7 @@ fn build_handle_route(
     if directive.name == "handle_path" {
         let Some(prefix) = args.first().cloned() else {
             return Err(adapter_error(
-                directive.position,
+                directive.position.clone(),
                 "`handle_path` requires a path prefix argument",
             ));
         };
@@ -3127,7 +3328,7 @@ fn build_handle_route(
         matcher = Some(json!({"path": [prefix]}));
         strip_prefix = Some(strip);
     } else {
-        matcher = matcher_for_args(&mut args, matchers, directive.position)?;
+        matcher = matcher_for_args(&mut args, matchers, directive.position.clone())?;
     }
 
     let mut inner = Vec::new();
@@ -3167,16 +3368,19 @@ fn request_body_handler(directive: &Directive) -> caddy_rs_core::Result<Value> {
             "max_size" => {
                 if option.args.len() != 1 {
                     return Err(adapter_error(
-                        option.position,
+                        option.position.clone(),
                         "wrong argument count or unexpected line ending after `max_size`",
                     ));
                 }
                 let size = parse_caddy_size(&option.args[0]).map_err(|error| {
-                    adapter_error(option.position, format!("parsing max_size: {error}"))
+                    adapter_error(
+                        option.position.clone(),
+                        format!("parsing max_size: {error}"),
+                    )
                 })?;
                 if size > i64::MAX as u64 {
                     return Err(adapter_error(
-                        option.position,
+                        option.position.clone(),
                         format!("parsing max_size: size {size} is out of range"),
                     ));
                 }
@@ -3189,7 +3393,7 @@ fn request_body_handler(directive: &Directive) -> caddy_rs_core::Result<Value> {
             "set" => {
                 if option.args.len() != 1 {
                     return Err(adapter_error(
-                        option.position,
+                        option.position.clone(),
                         "wrong argument count or unexpected line ending after `set`",
                     ));
                 }
@@ -3200,7 +3404,7 @@ fn request_body_handler(directive: &Directive) -> caddy_rs_core::Result<Value> {
             }
             other => {
                 return Err(adapter_error(
-                    option.position,
+                    option.position.clone(),
                     format!("unrecognized request_body subdirective '{other}'"),
                 ));
             }
@@ -3280,7 +3484,7 @@ impl FastCgiFields {
         let one_arg = |args: &[String], name: &str| -> caddy_rs_core::Result<String> {
             if args.len() != 1 || !option.block.is_empty() {
                 return Err(adapter_error(
-                    option.position,
+                    option.position.clone(),
                     format!("`{name}` requires exactly one argument"),
                 ));
             }
@@ -3291,7 +3495,7 @@ impl FastCgiFields {
             "split" => {
                 if args.is_empty() {
                     return Err(adapter_error(
-                        option.position,
+                        option.position.clone(),
                         "`split` requires at least one path suffix",
                     ));
                 }
@@ -3300,7 +3504,7 @@ impl FastCgiFields {
             "env" => {
                 if args.len() != 2 || !option.block.is_empty() {
                     return Err(adapter_error(
-                        option.position,
+                        option.position.clone(),
                         "`env` requires exactly two arguments: <key> <value>",
                     ));
                 }
@@ -3310,7 +3514,7 @@ impl FastCgiFields {
             "resolve_root_symlink" => {
                 if !args.is_empty() || !option.block.is_empty() {
                     return Err(adapter_error(
-                        option.position,
+                        option.position.clone(),
                         "`resolve_root_symlink` does not take arguments",
                     ));
                 }
@@ -3320,7 +3524,7 @@ impl FastCgiFields {
                 let value = one_arg(&args, &option.name)?;
                 let nanoseconds = crate::parser::parse_duration_ns(&value).map_err(|reason| {
                     adapter_error(
-                        option.position,
+                        option.position.clone(),
                         format!("bad timeout value {value}: {reason}"),
                     )
                 })?;
@@ -3333,7 +3537,7 @@ impl FastCgiFields {
             "capture_stderr" => {
                 if !args.is_empty() || !option.block.is_empty() {
                     return Err(adapter_error(
-                        option.position,
+                        option.position.clone(),
                         "`capture_stderr` does not take arguments",
                     ));
                 }
@@ -3341,7 +3545,7 @@ impl FastCgiFields {
             }
             other => {
                 return Err(adapter_error(
-                    option.position,
+                    option.position.clone(),
                     format!("unrecognized subdirective `{other}` for the fastcgi transport"),
                 ))
             }
@@ -3397,10 +3601,10 @@ fn build_php_fastcgi_routes(
     matchers: &BTreeMap<String, Value>,
 ) -> caddy_rs_core::Result<Vec<Value>> {
     let mut args = directive.args.clone();
-    let user_matcher = matcher_for_args(&mut args, matchers, directive.position)?;
+    let user_matcher = matcher_for_args(&mut args, matchers, directive.position.clone())?;
     if args.is_empty() {
         return Err(adapter_error(
-            directive.position,
+            directive.position.clone(),
             "`php_fastcgi` requires at least one upstream address",
         ));
     }
@@ -3415,7 +3619,7 @@ fn build_php_fastcgi_routes(
             "split" => {
                 if option.args.is_empty() {
                     return Err(adapter_error(
-                        option.position,
+                        option.position.clone(),
                         "`split` requires at least one path suffix",
                     ));
                 }
@@ -3424,7 +3628,7 @@ fn build_php_fastcgi_routes(
             "index" => {
                 if option.args.len() != 1 || !option.block.is_empty() {
                     return Err(adapter_error(
-                        option.position,
+                        option.position.clone(),
                         "`index` requires exactly one argument",
                     ));
                 }
@@ -3433,7 +3637,7 @@ fn build_php_fastcgi_routes(
             "try_files" => {
                 if option.args.is_empty() || !option.block.is_empty() {
                     return Err(adapter_error(
-                        option.position,
+                        option.position.clone(),
                         "`try_files` requires at least one file argument",
                     ));
                 }
@@ -3441,19 +3645,19 @@ fn build_php_fastcgi_routes(
             }
             "transport" => {
                 return Err(adapter_error(
-                    option.position,
+                    option.position.clone(),
                     "`php_fastcgi` does not accept a `transport` override",
                 ))
             }
             "handle_response" => {
                 return Err(adapter_error(
-                    option.position,
+                    option.position.clone(),
                     "`php_fastcgi` handle_response blocks are not supported by this build (they need reverse_proxy response matchers)",
                 ))
             }
             name if name.starts_with('@') => {
                 return Err(adapter_error(
-                    option.position,
+                    option.position.clone(),
                     format!(
                         "`php_fastcgi` response matcher `{name}` is not supported by this build"
                     ),
@@ -3475,7 +3679,7 @@ fn build_php_fastcgi_routes(
         args: args.clone(),
         arg_quoted: vec![false; args.len()],
         block: passthrough,
-        position: directive.position,
+        position: directive.position.clone(),
     };
     let mut handler = reverse_proxy_handler(&synthetic, &args)?;
     let Value::Object(handler_object) = &mut handler else {
@@ -3483,7 +3687,7 @@ fn build_php_fastcgi_routes(
     };
     if handler_object.contains_key("transport") {
         return Err(adapter_error(
-            directive.position,
+            directive.position.clone(),
             "`php_fastcgi` does not accept a `transport` override",
         ));
     }
@@ -3578,24 +3782,24 @@ fn build_handlers(
 ) -> caddy_rs_core::Result<Vec<Value>> {
     let handlers = match directive.name.as_str() {
         "respond" => vec![respond_handler(directive, args)?],
-        "redir" => vec![redirect_handler(args, directive.position)?],
+        "redir" => vec![redirect_handler(args, directive.position.clone())?],
         "file_server" => vec![file_server_handler(directive)?],
-        "root" => vec![root_handler(args, directive.position)?],
-        "method" => vec![method_handler(args, directive.position)?],
-        "rewrite" => vec![rewrite_handler(args, directive.position)?],
-        "uri" => vec![uri_handler(args, directive.position)?],
+        "root" => vec![root_handler(args, directive.position.clone())?],
+        "method" => vec![method_handler(args, directive.position.clone())?],
+        "rewrite" => vec![rewrite_handler(args, directive.position.clone())?],
+        "uri" => vec![uri_handler(directive, args)?],
         "header" => header_handlers(directive, args)?,
         "request_body" => vec![request_body_handler(directive)?],
         "encode" => vec![encode_handler(directive)?],
         "reverse_proxy" => vec![reverse_proxy_handler(directive, args)?],
         "basicauth" | "basic_auth" => vec![basic_auth_handler(directive, args)?],
         "forward_auth" => vec![forward_auth_handler(directive, args)?],
-        "invoke" => vec![invoke_handler(args, directive.position)?],
+        "invoke" => vec![invoke_handler(args, directive.position.clone())?],
         "vars" => vec![vars_handler(directive, args)?],
         "map" => vec![map_handler(directive, args)?],
         other => {
             return Err(adapter_error(
-                directive.position,
+                directive.position.clone(),
                 format!("directive `{other}` is not implemented by the adapter"),
             ))
         }
@@ -3644,14 +3848,14 @@ fn basic_auth_handler(directive: &Directive, args: &[String]) -> caddy_rs_core::
         }
         _ => {
             return Err(adapter_error(
-                directive.position,
+                directive.position.clone(),
                 "`basic_auth` takes at most a hash algorithm and a realm",
             ))
         }
     }
     if hash_name != "bcrypt" && hash_name != "argon2id" {
         return Err(adapter_error(
-            directive.position,
+            directive.position.clone(),
             format!("unrecognized hash algorithm: {hash_name}"),
         ));
     }
@@ -3660,7 +3864,7 @@ fn basic_auth_handler(directive: &Directive, args: &[String]) -> caddy_rs_core::
     for account in &directive.block {
         if !account.block.is_empty() || account.args.len() != 1 {
             return Err(adapter_error(
-                account.position,
+                account.position.clone(),
                 "username and password cannot be empty or missing",
             ));
         }
@@ -3668,7 +3872,7 @@ fn basic_auth_handler(directive: &Directive, args: &[String]) -> caddy_rs_core::
         let password = account.args[0].as_str();
         if username.is_empty() || password.is_empty() {
             return Err(adapter_error(
-                account.position,
+                account.position.clone(),
                 "username and password cannot be empty or missing",
             ));
         }
@@ -3705,13 +3909,13 @@ fn forward_auth_handler(directive: &Directive, args: &[String]) -> caddy_rs_core
             "uri" => {
                 if item.args.len() != 1 || !item.block.is_empty() {
                     return Err(adapter_error(
-                        item.position,
+                        item.position.clone(),
                         "`forward_auth` option `uri` requires exactly one argument",
                     ));
                 }
                 if uri.is_some() {
                     return Err(adapter_error(
-                        item.position,
+                        item.position.clone(),
                         format!("cannot re-declare uri: {}", item.args[0]),
                     ));
                 }
@@ -3722,7 +3926,7 @@ fn forward_auth_handler(directive: &Directive, args: &[String]) -> caddy_rs_core
                 for nested in &item.block {
                     if !nested.args.is_empty() || !nested.block.is_empty() {
                         return Err(adapter_error(
-                            nested.position,
+                            nested.position.clone(),
                             "unexpected arguments in a `copy_headers` block",
                         ));
                     }
@@ -3730,7 +3934,7 @@ fn forward_auth_handler(directive: &Directive, args: &[String]) -> caddy_rs_core
                 }
                 if fields.is_empty() {
                     return Err(adapter_error(
-                        item.position,
+                        item.position.clone(),
                         "`copy_headers` requires at least one header field",
                     ));
                 }
@@ -3749,7 +3953,7 @@ fn forward_auth_handler(directive: &Directive, args: &[String]) -> caddy_rs_core
                 for argument in &item.args {
                     if argument == "private_ranges" {
                         return Err(adapter_error(
-                            item.position,
+                            item.position.clone(),
                             "`trusted_proxies private_ranges` is not supported by this build",
                         ));
                     }
@@ -3761,7 +3965,7 @@ fn forward_auth_handler(directive: &Directive, args: &[String]) -> caddy_rs_core
     }
     let Some(uri) = uri else {
         return Err(adapter_error(
-            directive.position,
+            directive.position.clone(),
             "the 'uri' subdirective is required",
         ));
     };
@@ -3772,7 +3976,7 @@ fn forward_auth_handler(directive: &Directive, args: &[String]) -> caddy_rs_core
         args: Vec::new(),
         arg_quoted: Vec::new(),
         block: passthrough,
-        position: directive.position,
+        position: directive.position.clone(),
     };
     let base = reverse_proxy_handler(&synthetic, args)?;
     let mut object = base.as_object().cloned().unwrap_or_default();
@@ -3879,7 +4083,7 @@ fn vars_handler(directive: &Directive, args: &[String]) -> caddy_rs_core::Result
     if !args.is_empty() {
         let [name, value] = args else {
             return Err(adapter_error(
-                directive.position,
+                directive.position.clone(),
                 "`vars` requires a name and a value",
             ));
         };
@@ -3888,7 +4092,7 @@ fn vars_handler(directive: &Directive, args: &[String]) -> caddy_rs_core::Result
     for item in &directive.block {
         if !item.block.is_empty() || item.args.len() != 1 {
             return Err(adapter_error(
-                item.position,
+                item.position.clone(),
                 "`vars` block entries require a name and a value",
             ));
         }
@@ -3922,14 +4126,14 @@ fn scalar_json(text: &str) -> Value {
 fn map_handler(directive: &Directive, args: &[String]) -> caddy_rs_core::Result<Value> {
     let Some(source) = args.first() else {
         return Err(adapter_error(
-            directive.position,
+            directive.position.clone(),
             "directive `map` requires a source argument",
         ));
     };
     let destinations: Vec<String> = args[1..].to_vec();
     if destinations.is_empty() {
         return Err(adapter_error(
-            directive.position,
+            directive.position.clone(),
             "missing destination argument(s)",
         ));
     }
@@ -3937,7 +4141,7 @@ fn map_handler(directive: &Directive, args: &[String]) -> caddy_rs_core::Result<
         let qualified = qualify_placeholders(destination);
         if qualified != *destination {
             return Err(adapter_error(
-                directive.position,
+                directive.position.clone(),
                 format!(
                     "destination {destination} conflicts with a Caddyfile placeholder shorthand"
                 ),
@@ -3949,7 +4153,10 @@ fn map_handler(directive: &Directive, args: &[String]) -> caddy_rs_core::Result<
     for item in &directive.block {
         if item.name == "default" {
             if defaults.is_some() {
-                return Err(adapter_error(item.position, "defaults already defined"));
+                return Err(adapter_error(
+                    item.position.clone(),
+                    "defaults already defined",
+                ));
             }
             let mut values: Vec<Value> = item
                 .args
@@ -3976,7 +4183,7 @@ fn map_handler(directive: &Directive, args: &[String]) -> caddy_rs_core::Result<
             })
             .collect();
         if outputs.len() > destinations.len() {
-            return Err(adapter_error(item.position, "too many outputs"));
+            return Err(adapter_error(item.position.clone(), "too many outputs"));
         }
         while outputs.len() < destinations.len() {
             outputs.push(Value::Null);
@@ -4051,7 +4258,7 @@ fn build_named_route(
 }
 
 fn respond_handler(directive: &Directive, args: &[String]) -> caddy_rs_core::Result<Value> {
-    let position = directive.position;
+    let position = directive.position.clone();
     let mut object = Map::new();
     object.insert("handler".to_string(), json!("static_response"));
 
@@ -4065,7 +4272,7 @@ fn respond_handler(directive: &Directive, args: &[String]) -> caddy_rs_core::Res
             }
             other => {
                 return Err(adapter_error(
-                    item.position,
+                    item.position.clone(),
                     format!("`respond` block option `{other}` is not supported by this build"),
                 ))
             }
@@ -4285,7 +4492,7 @@ fn header_handlers(directive: &Directive, args: &[String]) -> caddy_rs_core::Res
     if has_inline {
         if args.len() > 3 {
             return Err(adapter_error(
-                directive.position,
+                directive.position.clone(),
                 "`header` takes at most a field, value and replacement",
             ));
         }
@@ -4301,13 +4508,13 @@ fn header_handlers(directive: &Directive, args: &[String]) -> caddy_rs_core::Res
             "defer" => {
                 if !item.args.is_empty() {
                     return Err(adapter_error(
-                        item.position,
+                        item.position.clone(),
                         "`header` option `defer` does not take arguments",
                     ));
                 }
                 if has_inline {
                     return Err(adapter_error(
-                        item.position,
+                        item.position.clone(),
                         "cannot specify headers in both arguments and block",
                     ));
                 }
@@ -4316,7 +4523,7 @@ fn header_handlers(directive: &Directive, args: &[String]) -> caddy_rs_core::Res
             "match" => {
                 if has_inline {
                     return Err(adapter_error(
-                        item.position,
+                        item.position.clone(),
                         "cannot specify headers in both arguments and block",
                     ));
                 }
@@ -4327,7 +4534,7 @@ fn header_handlers(directive: &Directive, args: &[String]) -> caddy_rs_core::Res
             _ => {
                 if has_inline {
                     return Err(adapter_error(
-                        item.position,
+                        item.position.clone(),
                         "cannot specify headers in both arguments and block",
                     ));
                 }
@@ -4362,14 +4569,19 @@ fn response_matcher(item: &Directive) -> caddy_rs_core::Result<Map<String, Value
     if item.block.is_empty() {
         if item.args.is_empty() {
             return Err(adapter_error(
-                item.position,
+                item.position.clone(),
                 "`match` requires a response matcher",
             ));
         }
-        add_response_matcher_part(&mut matcher, &item.args[0], &item.args[1..], item.position)?;
+        add_response_matcher_part(
+            &mut matcher,
+            &item.args[0],
+            &item.args[1..],
+            item.position.clone(),
+        )?;
     } else {
         for part in &item.block {
-            add_response_matcher_part(&mut matcher, &part.name, &part.args, part.position)?;
+            add_response_matcher_part(&mut matcher, &part.name, &part.args, part.position.clone())?;
         }
     }
     Ok(matcher)
@@ -4389,7 +4601,8 @@ fn add_response_matcher_part(
             let mut codes = Vec::new();
             for code in args {
                 codes.push(
-                    parse_status_range(code).map_err(|message| adapter_error(position, message))?,
+                    parse_status_range(code)
+                        .map_err(|message| adapter_error(position.clone(), message))?,
                 );
             }
             let entry = matcher
@@ -4469,7 +4682,7 @@ fn file_server_handler(directive: &Directive) -> caddy_rs_core::Result<Value> {
                         "sort" => {
                             if option.args.is_empty() {
                                 return Err(adapter_error(
-                                    option.position,
+                                    option.position.clone(),
                                     "`browse sort` requires one or more fields",
                                 ));
                             }
@@ -4478,13 +4691,13 @@ fn file_server_handler(directive: &Directive) -> caddy_rs_core::Result<Value> {
                         "file_limit" => {
                             if option.args.len() != 1 {
                                 return Err(adapter_error(
-                                    option.position,
+                                    option.position.clone(),
                                     "`browse file_limit` requires exactly one integer",
                                 ));
                             }
                             let limit: u64 = option.args[0].parse().map_err(|_| {
                                 adapter_error(
-                                    option.position,
+                                    option.position.clone(),
                                     format!(
                                         "`browse file_limit` value `{}` is not an integer",
                                         option.args[0]
@@ -4495,7 +4708,7 @@ fn file_server_handler(directive: &Directive) -> caddy_rs_core::Result<Value> {
                         }
                         other => {
                             return Err(adapter_error(
-                                option.position,
+                                option.position.clone(),
                                 format!("`browse` option `{other}` is not supported by this build"),
                             ))
                         }
@@ -4503,7 +4716,7 @@ fn file_server_handler(directive: &Directive) -> caddy_rs_core::Result<Value> {
                 }
                 if !values.is_empty() {
                     return Err(adapter_error(
-                        directive.position,
+                        directive.position.clone(),
                         "`browse` does not take inline arguments",
                     ));
                 }
@@ -4515,7 +4728,7 @@ fn file_server_handler(directive: &Directive) -> caddy_rs_core::Result<Value> {
             "hide" => {
                 if values.is_empty() {
                     return Err(adapter_error(
-                        directive.position,
+                        directive.position.clone(),
                         "`file_server hide` requires one or more paths",
                     ));
                 }
@@ -4524,7 +4737,7 @@ fn file_server_handler(directive: &Directive) -> caddy_rs_core::Result<Value> {
             "index" => {
                 if values.is_empty() {
                     return Err(adapter_error(
-                        directive.position,
+                        directive.position.clone(),
                         "`file_server index` requires one or more filenames",
                     ));
                 }
@@ -4533,7 +4746,7 @@ fn file_server_handler(directive: &Directive) -> caddy_rs_core::Result<Value> {
             "root" => {
                 let Some(root) = values.first() else {
                     return Err(adapter_error(
-                        directive.position,
+                        directive.position.clone(),
                         "`file_server root` requires a path",
                     ));
                 };
@@ -4542,7 +4755,7 @@ fn file_server_handler(directive: &Directive) -> caddy_rs_core::Result<Value> {
             "status" => {
                 let Some(status) = values.first() else {
                     return Err(adapter_error(
-                        directive.position,
+                        directive.position.clone(),
                         "`file_server status` requires a code",
                     ));
                 };
@@ -4572,7 +4785,7 @@ fn file_server_handler(directive: &Directive) -> caddy_rs_core::Result<Value> {
                 for format in &formats {
                     if !matches!(format.as_str(), "br" | "zstd" | "gzip") {
                         return Err(adapter_error(
-                            directive.position,
+                            directive.position.clone(),
                             format!(
                                 "`file_server precompressed` format `{format}` is not supported \
                                  by this build; expected br, zstd or gzip"
@@ -4586,7 +4799,7 @@ fn file_server_handler(directive: &Directive) -> caddy_rs_core::Result<Value> {
             }
             other => {
                 return Err(adapter_error(
-                    directive.position,
+                    directive.position.clone(),
                     format!("`file_server` option `{other}` is not supported by this build"),
                 ))
             }
@@ -4602,7 +4815,7 @@ fn file_server_handler(directive: &Directive) -> caddy_rs_core::Result<Value> {
         index += 1;
         if !is_file_server_option(&name) {
             return Err(adapter_error(
-                directive.position,
+                directive.position.clone(),
                 format!("`file_server` option `{name}` is not supported by this build"),
             ));
         }
@@ -4677,7 +4890,7 @@ fn encode_handler(directive: &Directive) -> caddy_rs_core::Result<Value> {
     for name in &directive.args {
         if !matches!(name.as_str(), "gzip" | "zstd") {
             return Err(adapter_error(
-                directive.position,
+                directive.position.clone(),
                 format!("unsupported encoding `{name}`; expected gzip or zstd"),
             ));
         }
@@ -4694,7 +4907,7 @@ fn encode_handler(directive: &Directive) -> caddy_rs_core::Result<Value> {
                 if let Some(level) = item.args.first() {
                     let level: u32 = level.parse().map_err(|_| {
                         adapter_error(
-                            item.position,
+                            item.position.clone(),
                             format!("gzip level `{level}` is not a number"),
                         )
                     })?;
@@ -4712,7 +4925,7 @@ fn encode_handler(directive: &Directive) -> caddy_rs_core::Result<Value> {
                         options.insert("checksum".to_string(), json!(false));
                     } else {
                         return Err(adapter_error(
-                            option.position,
+                            option.position.clone(),
                             format!("unsupported zstd option `{}`", option.name),
                         ));
                     }
@@ -4725,12 +4938,12 @@ fn encode_handler(directive: &Directive) -> caddy_rs_core::Result<Value> {
             "minimum_length" => {
                 let Some(value) = item.args.first() else {
                     return Err(adapter_error(
-                        item.position,
+                        item.position.clone(),
                         "`minimum_length` requires a value",
                     ));
                 };
                 minimum_length = Some(json!(parse_size(value)
-                    .map_err(|message| { adapter_error(item.position, message) })?));
+                    .map_err(|message| { adapter_error(item.position.clone(), message) })?));
             }
             "match" => {
                 for matcher in &item.block {
@@ -4738,18 +4951,16 @@ fn encode_handler(directive: &Directive) -> caddy_rs_core::Result<Value> {
                         "status" => {
                             let mut codes = Vec::new();
                             for code in &matcher.args {
-                                codes.push(
-                                    parse_status_range(code).map_err(|message| {
-                                        adapter_error(matcher.position, message)
-                                    })?,
-                                );
+                                codes.push(parse_status_range(code).map_err(|message| {
+                                    adapter_error(matcher.position.clone(), message)
+                                })?);
                             }
                             matches.insert("status_code".to_string(), json!(codes));
                         }
                         "header" => {
                             let Some(field) = matcher.args.first() else {
                                 return Err(adapter_error(
-                                    matcher.position,
+                                    matcher.position.clone(),
                                     "`match header` requires a field",
                                 ));
                             };
@@ -4773,7 +4984,7 @@ fn encode_handler(directive: &Directive) -> caddy_rs_core::Result<Value> {
                         }
                         other => {
                             return Err(adapter_error(
-                                matcher.position,
+                                matcher.position.clone(),
                                 format!("unsupported encode match `{other}`"),
                             ))
                         }
@@ -4782,7 +4993,7 @@ fn encode_handler(directive: &Directive) -> caddy_rs_core::Result<Value> {
             }
             other => {
                 return Err(adapter_error(
-                    item.position,
+                    item.position.clone(),
                     format!("unsupported `encode` option `{other}`"),
                 ))
             }
@@ -4811,13 +5022,13 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
     if args.is_empty() {
         if let Some(dynamic) = directive.block.iter().find(|item| item.name == "dynamic") {
             return Err(adapter_error(
-                dynamic.position,
+                dynamic.position.clone(),
                 "`reverse_proxy` dynamic upstreams are not supported by this build \
                  (tracked as T-PROXY-036); use static upstreams",
             ));
         }
         return Err(adapter_error(
-            directive.position,
+            directive.position.clone(),
             "`reverse_proxy` requires at least one upstream",
         ));
     }
@@ -4829,7 +5040,7 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
     for target in args {
         let parsed = parse_upstreams(target).map_err(|message| {
             adapter_error(
-                directive.position,
+                directive.position.clone(),
                 format!("upstream `{target}`: {message}"),
             )
         })?;
@@ -4855,7 +5066,10 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
         match item.name.as_str() {
             "lb_policy" => {
                 let Some(policy) = item.args.first() else {
-                    return Err(adapter_error(item.position, "`lb_policy` requires a value"));
+                    return Err(adapter_error(
+                        item.position.clone(),
+                        "`lb_policy` requires a value",
+                    ));
                 };
                 let mut selection = Map::new();
                 selection.insert("policy".to_string(), json!(policy));
@@ -4864,7 +5078,7 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
                     for weight in item.args.iter().skip(1) {
                         let weight: u64 = weight.parse().map_err(|_| {
                             adapter_error(
-                                item.position,
+                                item.position.clone(),
                                 format!("`lb_policy` weight `{weight}` is not a number"),
                             )
                         })?;
@@ -4877,13 +5091,13 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
             "lb_retries" => {
                 let Some(retries) = item.args.first() else {
                     return Err(adapter_error(
-                        item.position,
+                        item.position.clone(),
                         "`lb_retries` requires a value",
                     ));
                 };
                 let retries: u32 = retries.parse().map_err(|_| {
                     adapter_error(
-                        item.position,
+                        item.position.clone(),
                         format!("`lb_retries` value `{retries}` is not a number"),
                     )
                 })?;
@@ -4892,34 +5106,34 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
             "lb_try_duration" => {
                 let Some(duration) = item.args.first() else {
                     return Err(adapter_error(
-                        item.position,
+                        item.position.clone(),
                         "`lb_try_duration` requires a value",
                     ));
                 };
                 let nanos = parse_duration(duration)
-                    .map_err(|message| adapter_error(item.position, message))?;
+                    .map_err(|message| adapter_error(item.position.clone(), message))?;
                 load_balancing.insert("try_duration".to_string(), json!(nanos));
             }
             "lb_try_interval" => {
                 let Some(duration) = item.args.first() else {
                     return Err(adapter_error(
-                        item.position,
+                        item.position.clone(),
                         "`lb_try_interval` requires a value",
                     ));
                 };
                 let nanos = parse_duration(duration)
-                    .map_err(|message| adapter_error(item.position, message))?;
+                    .map_err(|message| adapter_error(item.position.clone(), message))?;
                 load_balancing.insert("try_interval".to_string(), json!(nanos));
             }
             "lb_retry_match" => {
                 let matcher = if item.block.is_empty() {
                     let Some(name) = item.args.first() else {
                         return Err(adapter_error(
-                            item.position,
+                            item.position.clone(),
                             "`lb_retry_match` requires a matcher",
                         ));
                     };
-                    matcher_from_directive(name, &item.args[1..], item.position)?
+                    matcher_from_directive(name, &item.args[1..], item.position.clone())?
                 } else {
                     matcher_from_directives(&item.block)?
                 };
@@ -4932,7 +5146,7 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
             "health_headers" => {
                 if !item.args.is_empty() {
                     return Err(adapter_error(
-                        item.position,
+                        item.position.clone(),
                         "`health_headers` does not take inline arguments",
                     ));
                 }
@@ -4945,7 +5159,7 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
                     // report it instead of silently dropping the placeholder.
                     if !header.block.is_empty() {
                         return Err(adapter_error(
-                            header.position,
+                            header.position.clone(),
                             "unquoted `{...}` placeholder in a `health_headers` value is not \
                              supported by this build; quote the value",
                         ));
@@ -4978,19 +5192,19 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
             "health_interval" => {
                 let value = single_argument(item, "health_interval")?;
                 let nanos = parse_duration(value)
-                    .map_err(|message| adapter_error(item.position, message))?;
+                    .map_err(|message| adapter_error(item.position.clone(), message))?;
                 health_active_map(&mut health_active).insert("interval".to_string(), json!(nanos));
             }
             "health_timeout" => {
                 let value = single_argument(item, "health_timeout")?;
                 let nanos = parse_duration(value)
-                    .map_err(|message| adapter_error(item.position, message))?;
+                    .map_err(|message| adapter_error(item.position.clone(), message))?;
                 health_active_map(&mut health_active).insert("timeout".to_string(), json!(nanos));
             }
             "health_status" => {
                 let value = single_argument(item, "health_status")?;
                 let status = parse_health_status(value)
-                    .map_err(|message| adapter_error(item.position, message))?;
+                    .map_err(|message| adapter_error(item.position.clone(), message))?;
                 health_active_map(&mut health_active)
                     .insert("expect_status".to_string(), json!(status));
             }
@@ -5002,7 +5216,7 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
             "health_follow_redirects" => {
                 if !item.args.is_empty() {
                     return Err(adapter_error(
-                        item.position,
+                        item.position.clone(),
                         "`health_follow_redirects` does not take arguments",
                     ));
                 }
@@ -5011,48 +5225,48 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
             }
             "health_passes" => {
                 let value = single_argument(item, "health_passes")?;
-                let passes =
-                    parse_count(value).map_err(|message| adapter_error(item.position, message))?;
+                let passes = parse_count(value)
+                    .map_err(|message| adapter_error(item.position.clone(), message))?;
                 health_active_map(&mut health_active).insert("passes".to_string(), json!(passes));
             }
             "health_fails" => {
                 let value = single_argument(item, "health_fails")?;
-                let fails =
-                    parse_count(value).map_err(|message| adapter_error(item.position, message))?;
+                let fails = parse_count(value)
+                    .map_err(|message| adapter_error(item.position.clone(), message))?;
                 health_active_map(&mut health_active).insert("fails".to_string(), json!(fails));
             }
             "max_fails" => {
                 let value = single_argument(item, "max_fails")?;
-                let max_fails =
-                    parse_count(value).map_err(|message| adapter_error(item.position, message))?;
+                let max_fails = parse_count(value)
+                    .map_err(|message| adapter_error(item.position.clone(), message))?;
                 health_passive_map(&mut health_passive)
                     .insert("max_fails".to_string(), json!(max_fails));
             }
             "fail_duration" => {
                 let value = single_argument(item, "fail_duration")?;
                 let nanos = parse_duration(value)
-                    .map_err(|message| adapter_error(item.position, message))?;
+                    .map_err(|message| adapter_error(item.position.clone(), message))?;
                 health_passive_map(&mut health_passive)
                     .insert("fail_duration".to_string(), json!(nanos));
             }
             "unhealthy_request_count" => {
                 let value = single_argument(item, "unhealthy_request_count")?;
-                let count =
-                    parse_count(value).map_err(|message| adapter_error(item.position, message))?;
+                let count = parse_count(value)
+                    .map_err(|message| adapter_error(item.position.clone(), message))?;
                 health_passive_map(&mut health_passive)
                     .insert("unhealthy_request_count".to_string(), json!(count));
             }
             "unhealthy_latency" => {
                 let value = single_argument(item, "unhealthy_latency")?;
                 let nanos = parse_duration(value)
-                    .map_err(|message| adapter_error(item.position, message))?;
+                    .map_err(|message| adapter_error(item.position.clone(), message))?;
                 health_passive_map(&mut health_passive)
                     .insert("unhealthy_latency".to_string(), json!(nanos));
             }
             "unhealthy_status" => {
                 if item.args.is_empty() {
                     return Err(adapter_error(
-                        item.position,
+                        item.position.clone(),
                         "`unhealthy_status` requires at least one status code",
                     ));
                 }
@@ -5060,7 +5274,7 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
                 for value in &item.args {
                     statuses.push(
                         parse_health_status(value)
-                            .map_err(|message| adapter_error(item.position, message))?,
+                            .map_err(|message| adapter_error(item.position.clone(), message))?,
                     );
                 }
                 let passive = health_passive_map(&mut health_passive);
@@ -5076,7 +5290,7 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
             "header_up" => {
                 if item.args.len() < 2 {
                     return Err(adapter_error(
-                        item.position,
+                        item.position.clone(),
                         "`header_up` requires a field and value",
                     ));
                 }
@@ -5088,7 +5302,7 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
             "header_down" => {
                 if item.args.len() < 2 {
                     return Err(adapter_error(
-                        item.position,
+                        item.position.clone(),
                         "`header_down` requires a field and value",
                     ));
                 }
@@ -5100,27 +5314,27 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
             "request_buffers" => {
                 let Some(value) = item.args.first() else {
                     return Err(adapter_error(
-                        item.position,
+                        item.position.clone(),
                         "`request_buffers` requires a value",
                     ));
                 };
                 object.insert(
                     "request_buffers".to_string(),
                     json!(parse_buffer_size(value)
-                        .map_err(|message| adapter_error(item.position, message))?),
+                        .map_err(|message| adapter_error(item.position.clone(), message))?),
                 );
             }
             "response_buffers" => {
                 let Some(value) = item.args.first() else {
                     return Err(adapter_error(
-                        item.position,
+                        item.position.clone(),
                         "`response_buffers` requires a value",
                     ));
                 };
                 object.insert(
                     "response_buffers".to_string(),
                     json!(parse_buffer_size(value)
-                        .map_err(|message| adapter_error(item.position, message))?),
+                        .map_err(|message| adapter_error(item.position.clone(), message))?),
                 );
             }
             "transport" => {
@@ -5141,7 +5355,7 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
                                 }
                                 other => {
                                     return Err(adapter_error(
-                                        option.position,
+                                        option.position.clone(),
                                         format!(
                                         "transport option `{other}` is not supported by this build"
                                     ),
@@ -5153,13 +5367,13 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
                     Some("fastcgi") => {
                         if item.args.len() != 1 {
                             return Err(adapter_error(
-                                item.position,
+                                item.position.clone(),
                                 "`transport fastcgi` does not take arguments",
                             ));
                         }
                         if fastcgi_transport.is_some() {
                             return Err(adapter_error(
-                                item.position,
+                                item.position.clone(),
                                 "`transport` may only be specified once",
                             ));
                         }
@@ -5170,14 +5384,14 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
                         fastcgi_transport = Some(fields.transport_json(None));
                     }
                     _ => return Err(adapter_error(
-                        item.position,
+                        item.position.clone(),
                         "only `transport http` and `transport fastcgi` are supported by this build",
                     )),
                 }
             }
             other => {
                 return Err(adapter_error(
-                    item.position,
+                    item.position.clone(),
                     format!("`reverse_proxy` option `{other}` is not supported by this build"),
                 ))
             }
@@ -5209,7 +5423,7 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
     if let Some(transport) = fastcgi_transport {
         if https_target || h2c_target || !extra_transport.is_empty() {
             return Err(adapter_error(
-                directive.position,
+                directive.position.clone(),
                 "`transport fastcgi` cannot be combined with HTTP/TLS/h2c upstream options",
             ));
         }
@@ -5260,7 +5474,7 @@ fn single_argument<'a>(directive: &'a Directive, option: &str) -> caddy_rs_core:
     match directive.args.as_slice() {
         [value] => Ok(value),
         _ => Err(adapter_error(
-            directive.position,
+            directive.position.clone(),
             format!("`{option}` requires exactly one value"),
         )),
     }
@@ -5493,16 +5707,15 @@ fn parse_status_range(value: &str) -> Result<u16, String> {
 
 fn parse_error(error: parser::ParseError) -> CoreError {
     match error {
-        parser::ParseError::Lex(error) => CoreError::invalid(
-            format!("Caddyfile line {}", error.position.line),
-            error.message,
-        ),
+        parser::ParseError::Lex(error) => {
+            CoreError::invalid(error.position.clone().label(), error.message)
+        }
         parser::ParseError::Syntax { position, message } => {
-            CoreError::invalid(format!("Caddyfile line {}", position.line), message)
+            CoreError::invalid(position.label(), message)
         }
     }
 }
 
 fn adapter_error(position: Position, message: impl Into<String>) -> CoreError {
-    CoreError::invalid(format!("Caddyfile line {}", position.line), message)
+    CoreError::invalid(position.label(), message)
 }
