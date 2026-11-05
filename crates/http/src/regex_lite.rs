@@ -100,6 +100,11 @@ pub struct Captures {
 }
 
 impl Captures {
+    /// Number of capture groups, not counting the whole-match group 0.
+    pub fn group_count(&self) -> usize {
+        self.slots.len() / 2 - 1
+    }
+
     /// Byte range for capture group `index` (0 = whole match).
     pub fn group(&self, index: usize) -> Option<(usize, usize)> {
         let start = self.slots.get(index * 2).copied().flatten()?;
