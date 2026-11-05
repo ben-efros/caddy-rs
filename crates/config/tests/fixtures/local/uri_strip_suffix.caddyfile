@@ -1,0 +1,3 @@
+:9080
+uri strip_suffix .html
+respond ok

@@ -1,0 +1,3 @@
+:9080
+uri path_regexp ^/old/(.*)$ /new/$1
+respond ok

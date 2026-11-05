@@ -1,0 +1,5 @@
+:9080
+uri replace foo bar
+uri replace a b 3
+uri replace /old/ /new/
+respond ok
