@@ -23,6 +23,7 @@
 //!   `RSA PRIVATE KEY` blocks are rejected with a located error;
 //! * ZeroSSL's automatic EAB credential provisioning is not implemented.
 
+pub mod adaptive_challenge;
 pub mod csr;
 pub mod order;
 pub mod transport;
@@ -245,6 +246,12 @@ pub enum AcmeError {
         account_directory_url: String,
         /// Directory URL of the client.
         directory_url: String,
+    },
+    /// Invalid challenge order format (e.g., "dns-01", "http-01", "tls-alpn-01").
+    #[error("Invalid challenge order: {order}")]
+    InvalidChallengeOrder {
+        /// The invalid order string.
+        order: String,
     },
 }
 
