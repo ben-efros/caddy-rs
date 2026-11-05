@@ -649,6 +649,36 @@ pub const BUILTIN_MODULES: &[Module] = &[
         ModuleKind::HttpMatcher,
         "Match requests by file existence under a root (try_files)",
     ),
+    Module::new(
+        "http.matchers.remote_ip",
+        "remote_ip",
+        ModuleKind::HttpMatcher,
+        "Match the direct peer IP",
+    ),
+    Module::new(
+        "http.matchers.client_ip",
+        "client_ip",
+        ModuleKind::HttpMatcher,
+        "Match the resolved client IP",
+    ),
+    Module::new(
+        "http.matchers.local_ip",
+        "local_ip",
+        ModuleKind::HttpMatcher,
+        "Match the local listener IP (caddy-rs extension; Caddy v2.11.7 has no HTTP local_ip matcher)",
+    ),
+    Module::new(
+        "http.matchers.protocol",
+        "protocol",
+        ModuleKind::HttpMatcher,
+        "Match the request protocol",
+    ),
+    Module::new(
+        "http.matchers.tls",
+        "tls",
+        ModuleKind::HttpMatcher,
+        "Match TLS connections",
+    ),
     // Storage
     Module::new(
         "caddy.storage.file_system",
@@ -835,6 +865,11 @@ mod tests {
             (ModuleKind::HttpHandler, "request_body"),
             (ModuleKind::HttpHandler, "map"),
             (ModuleKind::HttpMatcher, "file"),
+            (ModuleKind::HttpMatcher, "remote_ip"),
+            (ModuleKind::HttpMatcher, "client_ip"),
+            (ModuleKind::HttpMatcher, "local_ip"),
+            (ModuleKind::HttpMatcher, "protocol"),
+            (ModuleKind::HttpMatcher, "tls"),
         ] {
             assert!(
                 registry.get_by_key(kind, key).is_some(),

@@ -1,0 +1,13 @@
+:8080 {
+	@h2 protocol http/2
+	respond @h2 "h2"
+
+	@sec tls
+	respond @sec "tls"
+
+	@early tls early_data
+	respond @early "early data"
+
+	@li local_ip 10.0.0.0/8
+	respond @li "local"
+}
