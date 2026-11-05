@@ -5,17 +5,28 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use caddy_rs_http::Request;
+use caddy_rs_http::{Request, Response};
+use http::HeaderMap;
 
 use crate::upstream::Upstream;
 
-/// A load-balancing policy.
+/// A load-balancing policy (Caddy's `Selector`).
 pub trait Balancer: Send + Sync {
     /// Policy name as it appears in Caddy configuration.
     fn name(&self) -> &'static str;
 
     /// Choose an upstream, considering only healthy ones.
-    fn select(&self, upstreams: &[Arc<Upstream>], request: &Request) -> Option<Arc<Upstream>>;
+    ///
+    /// `response` mirrors the response writer Caddy passes to `Selector.Select`: a policy may
+    /// write response headers into it while selecting (the `cookie` policy echoes the chosen
+    /// upstream back with a `Set-Cookie` header when it fallback-selects). Other policies ignore
+    /// it.
+    fn select(
+        &self,
+        upstreams: &[Arc<Upstream>],
+        request: &Request,
+        response: &mut Response,
+    ) -> Option<Arc<Upstream>>;
 }
 
 /// A load-balancing policy configuration error.
@@ -51,7 +62,12 @@ impl Balancer for First {
         "first"
     }
 
-    fn select(&self, upstreams: &[Arc<Upstream>], _request: &Request) -> Option<Arc<Upstream>> {
+    fn select(
+        &self,
+        upstreams: &[Arc<Upstream>],
+        _request: &Request,
+        _response: &mut Response,
+    ) -> Option<Arc<Upstream>> {
         upstreams.iter().find(|u| u.is_healthy()).cloned()
     }
 }
@@ -81,7 +97,12 @@ impl Balancer for RoundRobin {
         "round_robin"
     }
 
-    fn select(&self, upstreams: &[Arc<Upstream>], _request: &Request) -> Option<Arc<Upstream>> {
+    fn select(
+        &self,
+        upstreams: &[Arc<Upstream>],
+        _request: &Request,
+        _response: &mut Response,
+    ) -> Option<Arc<Upstream>> {
         if upstreams.is_empty() {
             return None;
         }
@@ -104,7 +125,12 @@ impl Balancer for LeastConnections {
         "least_conn"
     }
 
-    fn select(&self, upstreams: &[Arc<Upstream>], _request: &Request) -> Option<Arc<Upstream>> {
+    fn select(
+        &self,
+        upstreams: &[Arc<Upstream>],
+        _request: &Request,
+        _response: &mut Response,
+    ) -> Option<Arc<Upstream>> {
         upstreams
             .iter()
             .filter(|upstream| upstream.is_healthy())
@@ -115,35 +141,22 @@ impl Balancer for LeastConnections {
 
 /// `random`: choose a healthy upstream uniformly at random (Caddy's default policy).
 pub struct Random {
-    state: AtomicU64,
+    rng: SplitMix64,
 }
 
 impl Random {
     /// Create a random balancer seeded from the clock.
     pub fn new() -> Self {
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos() as u64)
-            .unwrap_or(0x9E37_79B1_85EB_CA87)
-            ^ 0x9E37_79B1_85EB_CA87;
-        Self::with_seed(seed)
+        Self {
+            rng: SplitMix64::new(),
+        }
     }
 
     /// Create a random balancer with a fixed seed (deterministic tests).
     pub fn with_seed(seed: u64) -> Self {
         Self {
-            state: AtomicU64::new(seed),
+            rng: SplitMix64::with_seed(seed),
         }
-    }
-
-    /// SplitMix64 step.
-    fn next_u64(&self) -> u64 {
-        self.state
-            .fetch_add(0x9E37_79B1_85EB_CA87, Ordering::Relaxed);
-        let mut z = self.state.load(Ordering::Relaxed);
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
     }
 }
 
@@ -158,18 +171,379 @@ impl Balancer for Random {
         "random"
     }
 
-    fn select(&self, upstreams: &[Arc<Upstream>], _request: &Request) -> Option<Arc<Upstream>> {
+    fn select(
+        &self,
+        upstreams: &[Arc<Upstream>],
+        _request: &Request,
+        _response: &mut Response,
+    ) -> Option<Arc<Upstream>> {
         // Reservoir sampling over the available upstreams, like Caddy's `selectRandomHost`.
         let mut selected: Option<Arc<Upstream>> = None;
         let mut count = 0_u64;
         for upstream in upstreams.iter().filter(|upstream| upstream.is_healthy()) {
             count += 1;
-            if self.next_u64() % count == 0 {
+            if self.rng.next_below(count) == 0 {
                 selected = Some(Arc::clone(upstream));
             }
         }
         selected
     }
+}
+
+/// SplitMix64 pseudo-random number generator with an atomic seed, shared by the selection
+/// policies that need randomness (`random`, `random_choose`, and the `cookie` policy's random
+/// fallback). The seedable constructor keeps tests deterministic.
+struct SplitMix64 {
+    state: AtomicU64,
+}
+
+impl SplitMix64 {
+    /// Seed from the clock (the historical `Random` seeding, retained).
+    fn new() -> Self {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos() as u64)
+            .unwrap_or(0x9E37_79B1_85EB_CA87)
+            ^ 0x9E37_79B1_85EB_CA87;
+        Self::with_seed(seed)
+    }
+
+    /// Create a generator with a fixed seed (deterministic tests).
+    fn with_seed(seed: u64) -> Self {
+        Self {
+            state: AtomicU64::new(seed),
+        }
+    }
+
+    /// SplitMix64 step.
+    fn next_u64(&self) -> u64 {
+        self.state
+            .fetch_add(0x9E37_79B1_85EB_CA87, Ordering::Relaxed);
+        let mut z = self.state.load(Ordering::Relaxed);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Uniformly-distributed integer in `0..n` (Go's `rand.IntN`).
+    fn next_below(&self, n: u64) -> u64 {
+        debug_assert!(n > 0);
+        self.next_u64() % n
+    }
+}
+
+/// `random_choose`: sample `choose` healthy upstreams uniformly at random (reservoir sampling,
+/// Algorithm R) and return the one with the fewest active requests (Caddy's
+/// `RandomChoiceSelection`).
+pub struct RandomChoice {
+    choose: usize,
+    rng: SplitMix64,
+}
+
+impl RandomChoice {
+    /// Create a random-choice balancer; `choose` must be at least 2 (Caddy's `Validate`).
+    pub fn new(choose: usize) -> Self {
+        Self {
+            choose,
+            rng: SplitMix64::new(),
+        }
+    }
+
+    /// Create a random-choice balancer with a fixed seed (deterministic tests).
+    pub fn with_seed(choose: usize, seed: u64) -> Self {
+        Self {
+            choose,
+            rng: SplitMix64::with_seed(seed),
+        }
+    }
+
+    /// The configured sub-pool size.
+    pub fn choose(&self) -> usize {
+        self.choose
+    }
+}
+
+impl Balancer for RandomChoice {
+    fn name(&self) -> &'static str {
+        "random_choose"
+    }
+
+    fn select(
+        &self,
+        upstreams: &[Arc<Upstream>],
+        _request: &Request,
+        _response: &mut Response,
+    ) -> Option<Arc<Upstream>> {
+        let k = self.choose.min(upstreams.len());
+        // Reservoir sampling over the available upstreams: the first k fill the reservoir, then
+        // each subsequent one replaces a random reservoir entry with probability k/n, mirroring
+        // Caddy's `RandomChoiceSelection.Select`.
+        let mut choices: Vec<Arc<Upstream>> = Vec::with_capacity(k);
+        let mut available = 0_u64;
+        for upstream in upstreams.iter().filter(|upstream| upstream.is_healthy()) {
+            available += 1;
+            if choices.len() < k {
+                choices.push(Arc::clone(upstream));
+                continue;
+            }
+            let j = self.rng.next_below(available) as usize;
+            if j < k {
+                choices[j] = Arc::clone(upstream);
+            }
+        }
+        least_requests(&choices, &self.rng)
+    }
+}
+
+/// Caddy's `leastRequests`: from the random sub-pool, the upstream with the fewest active
+/// requests. Go breaks ties with the preceding shuffle; the Rust port breaks them at random
+/// with the policy's rng, so every candidate at the minimum load (including zero-load ones)
+/// is collected and the winner is chosen uniformly among them.
+fn least_requests(upstreams: &[Arc<Upstream>], rng: &SplitMix64) -> Option<Arc<Upstream>> {
+    if upstreams.is_empty() {
+        return None;
+    }
+    let mut best: Vec<Arc<Upstream>> = Vec::new();
+    let mut best_requests: i64 = i64::MAX;
+    for upstream in upstreams {
+        let requests = upstream.active_connections() as i64;
+        match requests.cmp(&best_requests) {
+            std::cmp::Ordering::Less => {
+                best_requests = requests;
+                best.clear();
+                best.push(Arc::clone(upstream));
+            }
+            std::cmp::Ordering::Equal => best.push(Arc::clone(upstream)),
+            std::cmp::Ordering::Greater => {}
+        }
+    }
+    if best.len() == 1 {
+        return Some(Arc::clone(&best[0]));
+    }
+    best.get(rng.next_below(best.len() as u64) as usize)
+        .cloned()
+}
+
+/// `cookie`: route by a sticky-session cookie whose value is `HMAC-SHA256(secret, dial)` of the
+/// selected upstream (Caddy's `CookieHashSelection`). When the request carries no matching
+/// cookie, or the named upstream is unavailable, the fallback policy (default `random`) selects
+/// the upstream and the selection is echoed back to the client with a `Set-Cookie` header so
+/// subsequent requests stick.
+pub struct CookieHash {
+    name: String,
+    secret: String,
+    max_age: Option<i64>,
+    fallback: Box<dyn Balancer>,
+}
+
+impl CookieHash {
+    /// Build the policy. `max_age` is Caddy's `caddy.Duration` in nanoseconds (only positive
+    /// values produce a `Max-Age` attribute, matching Caddy's `Provision`-and-`Select` rules).
+    pub fn new(
+        name: String,
+        secret: String,
+        max_age: Option<i64>,
+        fallback: Box<dyn Balancer>,
+    ) -> Self {
+        Self {
+            name,
+            secret,
+            max_age,
+            fallback,
+        }
+    }
+}
+
+impl Balancer for CookieHash {
+    fn name(&self) -> &'static str {
+        "cookie"
+    }
+
+    fn select(
+        &self,
+        upstreams: &[Arc<Upstream>],
+        request: &Request,
+        response: &mut Response,
+    ) -> Option<Arc<Upstream>> {
+        // Select a new host with the fallback policy (Caddy's `selectNewHost`) and write the
+        // sticky-session cookie to the response writer. The closure borrows `response` mutably
+        // through the fallback policy, so the binding itself must be `mut` (a `FnMut` closure).
+        let mut select_new_host = || -> Option<Arc<Upstream>> {
+            let upstream = self.fallback.select(upstreams, request, response)?;
+            let value = hash_cookie(&self.secret, &upstream.dial);
+            let max_age_seconds = self.max_age.map(|nanos| (nanos / 1_000_000_000).max(0));
+            if let Some(cookie) = build_set_cookie(&self.name, &value, max_age_seconds, request) {
+                if let Ok(value) = http::HeaderValue::from_str(&cookie) {
+                    response.headers.append(http::header::SET_COOKIE, value);
+                }
+            }
+            Some(upstream)
+        };
+
+        let Some(cookie_value) = request_cookie_value(&request.headers, &self.name) else {
+            // No cookie: select a host using the fallback policy.
+            return select_new_host();
+        };
+        // The cookie is present: accept the first healthy upstream whose salted hash matches.
+        for upstream in upstreams.iter().filter(|upstream| upstream.is_healthy()) {
+            let digest = hash_cookie(&self.secret, &upstream.dial);
+            if constant_time_eq(digest.as_bytes(), cookie_value.as_bytes()) {
+                return Some(Arc::clone(upstream));
+            }
+        }
+        // The cookie names a host that is unavailable (or unknown): fall back and re-pin.
+        select_new_host()
+    }
+}
+
+/// Caddy's `hashCookie`: `hex(HMAC-SHA256(secret, dial))`.
+fn hash_cookie(secret: &str, dial: &str) -> String {
+    crate::digest::hmac_sha256_hex(secret.as_bytes(), dial.as_bytes())
+}
+
+/// Go's `hmac.Equal` semantics: equal lengths and all bytes equal (constant time on the
+/// byte comparison, as in `crypto/hmac`).
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0_u8;
+    for (a, b) in left.iter().zip(right) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
+/// Read the value of the `name` cookie from the request's `Cookie` headers the way Go's
+/// `http.Request.Cookie` does: `;`-separated `name=value` pairs (RFC 6265 §5.4) with an exact
+/// name match, skipping pairs with invalid names or values.
+fn request_cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    for line in headers.get_all(http::header::COOKIE) {
+        let Ok(line) = line.to_str() else {
+            continue;
+        };
+        for part in line.split(';') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let (candidate, raw_value) = match part.split_once('=') {
+                Some((name, value)) => (name, value),
+                None => (part, ""),
+            };
+            if !is_cookie_name_valid(candidate) {
+                continue;
+            }
+            if candidate == name {
+                if let Some(value) = cookie_value(raw_value) {
+                    return Some(value);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Whether `name` is an RFC 2616 token (Go's `isCookieNameValid`).
+fn is_cookie_name_valid(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(is_token_byte)
+}
+
+/// RFC 2616 `token` production, the character class Go checks cookie names against.
+fn is_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+/// Parse and validate a cookie value like Go's `parseCookieValue` (RFC 6265 §4.1.1): an empty
+/// value is fine, a value wrapped in `"` is unquoted, and the surviving bytes must be in
+/// `0x20..0x7f` excluding `"`, `;` and `\`.
+fn cookie_value(raw: &str) -> Option<String> {
+    if raw.is_empty() {
+        return Some(String::new());
+    }
+    if raw.starts_with('"') {
+        if raw.len() < 2 || !raw.ends_with('"') {
+            return None;
+        }
+    } else if raw.starts_with('\\') {
+        return None;
+    }
+    let unquoted = if raw.len() > 2 && raw.starts_with('"') && raw.ends_with('"') {
+        raw[1..raw.len() - 1]
+            .replace("\\\"", "\"")
+            .replace("\\\\", "\\")
+    } else {
+        raw.to_string()
+    };
+    let valid = unquoted
+        .bytes()
+        .all(|byte| (0x20..0x7f).contains(&byte) && byte != b'"' && byte != b';' && byte != b'\\');
+    valid.then_some(unquoted)
+}
+
+/// Serialize the sticky-session cookie exactly like Go's `net/http.Cookie.String()` for the
+/// fields Caddy sets (name, value, `Path=/`, optional `Max-Age`, `HttpOnly`, `Secure`, and
+/// `SameSite`). Returns `None` (no header written) when the name is not a valid token, matching
+/// Go's empty-string case in `http.SetCookie`.
+fn build_set_cookie(
+    name: &str,
+    value: &str,
+    max_age_seconds: Option<i64>,
+    request: &Request,
+) -> Option<String> {
+    if !is_cookie_name_valid(name) {
+        return None;
+    }
+    // Caddy marks the cookie `Secure; SameSite=None` when the request is over TLS or arrives
+    // from a trusted proxy with `X-Forwarded-Proto: https`.
+    let is_proxy_https = request
+        .vars
+        .get("trusted_proxy")
+        .is_some_and(|value| value == "true")
+        && last_header_value(&request.headers, "x-forwarded-proto")
+            .is_some_and(|value| value == "https");
+    let secure = request.tls || is_proxy_https;
+
+    let mut cookie = format!("{name}={value}; Path=/");
+    if let Some(seconds) = max_age_seconds.filter(|seconds| *seconds > 0) {
+        cookie.push_str(&format!("; Max-Age={seconds}"));
+    }
+    cookie.push_str("; HttpOnly");
+    if secure {
+        cookie.push_str("; Secure");
+        cookie.push_str("; SameSite=None");
+    } else {
+        cookie.push_str("; SameSite=Lax");
+    }
+    Some(cookie)
+}
+
+/// Last value of a header (Caddy's `lastHeaderValue`).
+fn last_header_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    let name = http::HeaderName::from_bytes(name.as_bytes()).ok()?;
+    headers
+        .get_all(name)
+        .iter()
+        .next_back()
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
 }
 
 /// `weighted_round_robin`: weighted rotation over healthy upstreams (Caddy's policy).
@@ -202,7 +576,12 @@ impl Balancer for WeightedRoundRobin {
         "weighted_round_robin"
     }
 
-    fn select(&self, upstreams: &[Arc<Upstream>], _request: &Request) -> Option<Arc<Upstream>> {
+    fn select(
+        &self,
+        upstreams: &[Arc<Upstream>],
+        _request: &Request,
+        _response: &mut Response,
+    ) -> Option<Arc<Upstream>> {
         if upstreams.is_empty() {
             return None;
         }
@@ -311,10 +690,15 @@ impl Balancer for HashSelection {
         self.name
     }
 
-    fn select(&self, upstreams: &[Arc<Upstream>], request: &Request) -> Option<Arc<Upstream>> {
+    fn select(
+        &self,
+        upstreams: &[Arc<Upstream>],
+        request: &Request,
+        response: &mut Response,
+    ) -> Option<Arc<Upstream>> {
         match self.hash_key(request) {
             Some(key) => rendezvous_hash(upstreams, &key),
-            None => self.fallback.select(upstreams, request),
+            None => self.fallback.select(upstreams, request, response),
         }
     }
 }
@@ -422,9 +806,9 @@ fn percent_decode(value: &str) -> String {
 
 /// Parse the `selection_policy` object of `load_balancing` (Caddy's selector modules).
 ///
-/// Supported policies: `random`, `first`, `round_robin`, `least_conn`, `weighted_round_robin`,
-/// `ip_hash`, `client_ip_hash`, `uri_hash`, `header`, and `query`. `cookie` is rejected loudly
-/// (it needs to write a `Set-Cookie` response header, which is tracked as a follow-up).
+/// Supported policies: `random` (the default), `first`, `round_robin`, `least_conn`,
+/// `weighted_round_robin`, `ip_hash`, `client_ip_hash`, `uri_hash`, `header`, `query`, `cookie`,
+/// and `random_choose`.
 pub fn from_selection_policy(
     selection_policy: Option<&serde_json::Value>,
     path: &str,
@@ -443,9 +827,8 @@ fn from_selection_policy_inner(
         )));
     }
     let Some(selection_policy) = selection_policy.filter(|value| !value.is_null()) else {
-        // caddy-rs has historically defaulted to round_robin; Caddy's default is random
-        // (documented divergence). Keep the deterministic historical default here.
-        return Ok(Box::new(RoundRobin::new()));
+        // Caddy's default selection policy is `random`.
+        return Ok(Box::new(Random::new()));
     };
     let object = selection_policy.as_object().ok_or_else(|| {
         BalancerError::Invalid(format!("{path}: `selection_policy` must be an object"))
@@ -470,6 +853,53 @@ fn from_selection_policy_inner(
         "first" => Ok(Box::new(First)),
         "least_conn" => Ok(Box::new(LeastConnections)),
         "random" => Ok(Box::new(Random::new())),
+        "random_choose" => {
+            // Caddy's RandomChoiceSelection: default sub-pool size 2 (an explicit 0 is also
+            // normalized to 2 in `Provision`), minimum 2 (`Validate`).
+            let choose = match object.get("choose") {
+                None | Some(serde_json::Value::Null) => 2,
+                Some(value) => value.as_i64().ok_or_else(|| {
+                    BalancerError::Invalid(format!("{path}: `choose` must be an integer"))
+                })?,
+            };
+            let choose = if choose == 0 { 2 } else { choose };
+            if choose < 2 {
+                return Err(BalancerError::Invalid(format!(
+                    "{path}: choose must be at least 2"
+                )));
+            }
+            Ok(Box::new(RandomChoice::new(choose as usize)))
+        }
+        "cookie" => {
+            // Caddy's CookieHashSelection: cookie name defaults to `lb`, the optional secret
+            // salts the HMAC, `max_age` is a Caddy JSON duration (integer nanoseconds), and the
+            // fallback policy defaults to `random`.
+            let name = object
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .filter(|name| !name.is_empty())
+                .unwrap_or("lb")
+                .to_string();
+            let secret = object
+                .get("secret")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let max_age = match object.get("max_age") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(value) => Some(value.as_i64().ok_or_else(|| {
+                    BalancerError::Invalid(format!(
+                        "{path}: `max_age` must be an integer number of nanoseconds (Caddy JSON duration)"
+                    ))
+                })?),
+            };
+            Ok(Box::new(CookieHash::new(
+                name,
+                secret,
+                max_age,
+                parse_fallback("fallback")?,
+            )))
+        }
         "weighted_round_robin" => {
             let weights = object
                 .get("weights")
@@ -544,14 +974,6 @@ fn from_selection_policy_inner(
                 parse_fallback("fallback")?,
             )))
         }
-        "cookie" => Err(BalancerError::NotImplemented {
-            feature: "the cookie load-balancing selection policy",
-            tracking_id: "T-PROXY-013-COOKIE",
-        }),
-        "random_choose" => Err(BalancerError::NotImplemented {
-            feature: "the random_choose load-balancing selection policy",
-            tracking_id: "T-PROXY-013-RANDOM-CHOOSE",
-        }),
         other => Err(BalancerError::Invalid(format!(
             "{path}: load-balancing policy `{other}` is not implemented by this build"
         ))),
@@ -665,7 +1087,7 @@ mod tests {
     fn first_prefers_first_healthy() {
         let pool = pool(3);
         pool[0].set_healthy(false);
-        let selected = First.select(&pool, &get("/")).unwrap();
+        let selected = First.select(&pool, &get("/"), &mut Response::ok()).unwrap();
         assert_eq!(selected.dial, "localhost:9001");
     }
 
@@ -674,14 +1096,20 @@ mod tests {
         let pool = pool(3);
         let request = get("/");
         let selected: Vec<String> = (0..3)
-            .map(|_| RoundRobin::new().select(&pool, &request))
+            .map(|_| RoundRobin::new().select(&pool, &request, &mut Response::ok()))
             .map(|upstream| upstream.unwrap().dial.clone())
             .collect();
         // A fresh balancer starts at index 0.
         assert_eq!(selected, ["localhost:9000"; 3]);
         let balancer = RoundRobin::new();
         let selected: Vec<String> = (0..4)
-            .map(|_| balancer.select(&pool, &request).unwrap().dial.clone())
+            .map(|_| {
+                balancer
+                    .select(&pool, &request, &mut Response::ok())
+                    .unwrap()
+                    .dial
+                    .clone()
+            })
             .collect();
         assert_eq!(
             selected,
@@ -699,7 +1127,9 @@ mod tests {
         let pool = pool(3);
         let _first = pool[0].connection_started();
         let _second = pool[1].connection_started();
-        let selected = LeastConnections.select(&pool, &get("/")).unwrap();
+        let selected = LeastConnections
+            .select(&pool, &get("/"), &mut Response::ok())
+            .unwrap();
         assert_eq!(selected.dial, "localhost:9002");
     }
 
@@ -753,7 +1183,9 @@ mod tests {
         let balancer = Random::with_seed(42);
         let mut selected = std::collections::BTreeSet::new();
         for _ in 0..200 {
-            let upstream = balancer.select(&pool, &request).unwrap();
+            let upstream = balancer
+                .select(&pool, &request, &mut Response::ok())
+                .unwrap();
             assert_ne!(upstream.dial, "localhost:9003", "unhealthy upstream chosen");
             selected.insert(upstream.dial.clone());
         }
@@ -765,7 +1197,7 @@ mod tests {
         let first: Vec<String> = (0..5)
             .map(|_| {
                 Random::with_seed(7)
-                    .select(&pool, &request)
+                    .select(&pool, &request, &mut Response::ok())
                     .unwrap()
                     .dial
                     .clone()
@@ -774,7 +1206,7 @@ mod tests {
         let second: Vec<String> = (0..5)
             .map(|_| {
                 Random::with_seed(7)
-                    .select(&pool, &request)
+                    .select(&pool, &request, &mut Response::ok())
                     .unwrap()
                     .dial
                     .clone()
@@ -789,7 +1221,13 @@ mod tests {
         let balancer = WeightedRoundRobin::new(vec![3, 1]).unwrap();
         let request = get("/");
         let selected: Vec<String> = (0..8)
-            .map(|_| balancer.select(&pool, &request).unwrap().dial.clone())
+            .map(|_| {
+                balancer
+                    .select(&pool, &request, &mut Response::ok())
+                    .unwrap()
+                    .dial
+                    .clone()
+            })
             .collect();
         let first = selected
             .iter()
@@ -816,15 +1254,27 @@ mod tests {
             "handler",
         )
         .unwrap();
-        let first = balancer.select(&pool, &request).unwrap().dial.clone();
+        let first = balancer
+            .select(&pool, &request, &mut Response::ok())
+            .unwrap()
+            .dial
+            .clone();
         for _ in 0..5 {
-            assert_eq!(balancer.select(&pool, &request).unwrap().dial, first);
+            assert_eq!(
+                balancer
+                    .select(&pool, &request, &mut Response::ok())
+                    .unwrap()
+                    .dial,
+                first
+            );
         }
         request
             .headers
             .insert(http::header::HOST, "other.example".parse().unwrap());
         // A different key may map to a different upstream (it is deterministic either way).
-        let _ = balancer.select(&pool, &request).unwrap();
+        let _ = balancer
+            .select(&pool, &request, &mut Response::ok())
+            .unwrap();
     }
 
     #[test]
@@ -836,10 +1286,14 @@ mod tests {
         )
         .unwrap();
         let request = get("/");
-        assert!(balancer.select(&pool, &request).is_some());
+        assert!(balancer
+            .select(&pool, &request, &mut Response::ok())
+            .is_some());
         let mut request = get("/");
         request.headers.insert("x-session", "abc".parse().unwrap());
-        assert!(balancer.select(&pool, &request).is_some());
+        assert!(balancer
+            .select(&pool, &request, &mut Response::ok())
+            .is_some());
     }
 
     #[test]
@@ -851,11 +1305,15 @@ mod tests {
         )
         .unwrap();
         let request = get("/?user=alice&user=bob");
-        let selected = balancer.select(&pool, &request).unwrap();
+        let selected = balancer
+            .select(&pool, &request, &mut Response::ok())
+            .unwrap();
         assert!(pool.iter().any(|upstream| upstream.dial == selected.dial));
         // Missing key uses the random fallback.
         let request = get("/?other=1");
-        assert!(balancer.select(&pool, &request).is_some());
+        assert!(balancer
+            .select(&pool, &request, &mut Response::ok())
+            .is_some());
     }
 
     #[test]
@@ -871,20 +1329,31 @@ mod tests {
             "handler",
         )
         .unwrap();
-        let by_var = balancer.select(&pool, &request).unwrap().dial.clone();
+        let by_var = balancer
+            .select(&pool, &request, &mut Response::ok())
+            .unwrap()
+            .dial
+            .clone();
         // The peer IP would hash to a different key; verify the var is what is used.
         request.remote_addr = Some("192.0.2.2:5000".parse().unwrap());
-        assert_eq!(balancer.select(&pool, &request).unwrap().dial, by_var);
+        assert_eq!(
+            balancer
+                .select(&pool, &request, &mut Response::ok())
+                .unwrap()
+                .dial,
+            by_var
+        );
         // Without the var the peer IP is used.
         request.vars.clear();
-        let _ = balancer.select(&pool, &request);
+        let _ = balancer.select(&pool, &request, &mut Response::ok());
     }
 
     #[test]
     fn parses_selection_policy_modules() {
+        // Caddy's default selection policy is `random` (T-PROXY-049).
         assert_eq!(
             from_selection_policy(None, "handler").unwrap().name(),
-            "round_robin"
+            "random"
         );
         for (policy, expected) in [
             (serde_json::json!({"policy": "random"}), "random"),
@@ -923,14 +1392,15 @@ mod tests {
                 .err()
                 .expect("header policy without field must fail");
         assert!(error.to_string().contains("field"), "{error}");
-        let error = from_selection_policy(
-            Some(&serde_json::json!({"policy": "cookie", "name": "lb"})),
+        let cookie = from_selection_policy(
+            Some(&serde_json::json!({"policy": "cookie", "name": "lb", "secret": "s3cret"})),
             "handler",
         )
-        .err()
-        .expect("cookie policy must be rejected loudly");
-        assert!(
-            matches!(error, BalancerError::NotImplemented { tracking_id, .. } if tracking_id == "T-PROXY-013-COOKIE")
+        .unwrap();
+        assert_eq!(
+            cookie.name(),
+            "cookie",
+            "cookie policy is now implemented (T-PROXY-048)"
         );
         let error = from_selection_policy(Some(&serde_json::json!({"policy": "magic"})), "handler")
             .err()
@@ -950,8 +1420,129 @@ mod tests {
         let pool = pool(2);
         // No header on the request: the `first` fallback picks the first upstream.
         assert_eq!(
-            balancer.select(&pool, &get("/")).unwrap().dial,
+            balancer
+                .select(&pool, &get("/"), &mut Response::ok())
+                .unwrap()
+                .dial,
             "localhost:9000"
         );
+    }
+
+    #[test]
+    fn cookie_policy_sets_sticky_cookie_and_pins_to_it() {
+        let pool = pool(3);
+        let balancer = CookieHash::new(
+            "lb".to_string(),
+            "s3cret".to_string(),
+            None,
+            Box::new(First),
+        );
+        // No cookie present: the `first` fallback picks upstream 0 and echoes it with Set-Cookie.
+        let mut response = Response::ok();
+        let request = get("/");
+        let first = balancer
+            .select(&pool, &request, &mut response)
+            .expect("fallback must select an upstream");
+        assert_eq!(first.dial, "localhost:9000");
+        let set_cookie = response
+            .headers
+            .get_all(http::header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(set_cookie.len(), 1, "one Set-Cookie expected");
+        assert!(
+            set_cookie[0].starts_with("lb="),
+            "cookie name must be echoed: {set_cookie:?}"
+        );
+        let cookie_attributes = set_cookie[0].strip_prefix("lb=").expect("lb= prefix");
+        let cookie_value = cookie_value(cookie_attributes.split(';').next().expect("cookie value"))
+            .expect("cookie value present");
+        assert_eq!(
+            cookie_value,
+            hash_cookie("s3cret", "localhost:9000"),
+            "cookie must be HMAC-SHA256(secret, dial)"
+        );
+
+        // Replaying the cookie selects the same upstream without touching the response.
+        let mut request = get("/");
+        request.headers.insert(
+            http::header::COOKIE,
+            format!("lb={cookie_value}").parse().unwrap(),
+        );
+        let mut response = Response::ok();
+        let pinned = balancer
+            .select(&pool, &request, &mut response)
+            .expect("pinned upstream must be selected");
+        assert_eq!(pinned.dial, "localhost:9000");
+        assert_eq!(
+            response
+                .headers
+                .get_all(http::header::SET_COOKIE)
+                .iter()
+                .count(),
+            0,
+            "a valid sticky cookie must not rewrite Set-Cookie"
+        );
+
+        // A cookie naming an unavailable upstream falls back and re-pins.
+        pool[0].set_healthy(false);
+        let mut response = Response::ok();
+        let re_pinned = balancer
+            .select(&pool, &request, &mut response)
+            .expect("fallback must re-pin");
+        assert_eq!(re_pinned.dial, "localhost:9001");
+        let rewritten = response
+            .headers
+            .get_all(http::header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(rewritten.len(), 1, "fallback re-pin must echo a new cookie");
+        assert!(rewritten[0].contains("lb="));
+    }
+
+    #[test]
+    fn cookie_policy_max_age_emits_max_age_attribute() {
+        let pool = pool(1);
+        let balancer = CookieHash::new(
+            "lb".to_string(),
+            "".to_string(),
+            Some(86_400_000_000_000), // 24h in nanoseconds
+            Box::new(First),
+        );
+        let mut response = Response::ok();
+        let _ = balancer.select(&pool, &get("/"), &mut response).unwrap();
+        let set_cookie = response
+            .headers
+            .get_all(http::header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(set_cookie.len(), 1);
+        assert!(
+            set_cookie[0].contains("Max-Age=86400"),
+            "positive max_age must emit Max-Age: {set_cookie:?}"
+        );
+    }
+
+    #[test]
+    fn random_choose_subpool_respects_health_and_choose() {
+        let pool = pool(4);
+        pool[3].set_healthy(false);
+        let balancer = RandomChoice::with_seed(42, 7);
+        let mut selected = std::collections::BTreeSet::new();
+        for _ in 0..200 {
+            let upstream = balancer
+                .select(&pool, &get("/"), &mut Response::ok())
+                .unwrap();
+            assert_ne!(upstream.dial, "localhost:9003", "unhealthy upstream chosen");
+            selected.insert(upstream.dial.clone());
+        }
+        assert!(
+            selected.len() >= 2,
+            "random_choose must sample multiple healthy upstreams"
+        );
+        assert!(balancer.choose() >= 2);
     }
 }
