@@ -4,6 +4,7 @@
 //! any handler is written:
 //!
 //! - [`config`]: the Caddy-compatible JSON configuration model.
+//! - [`autosave`]: atomic persistence/loading of the last active config (`--resume` support).
 //! - [`listen`]: Caddy listen-address parsing.
 //! - [`module`]: the static module registry.
 //! - [`validate`]: located validation of handlers, matchers, listeners, and issuers.
@@ -17,6 +18,7 @@
 #![forbid(unsafe_code)]
 
 pub mod adapter;
+pub mod autosave;
 pub mod config;
 pub mod duration;
 pub mod error;

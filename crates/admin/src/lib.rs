@@ -146,6 +146,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use caddy_rs_core::autosave as config_autosave;
 use caddy_rs_core::{drain, Config, GenerationStore, LifecycleState};
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use serde_json::{json, Value};
@@ -499,6 +500,12 @@ fn warning_json(warnings: &[String]) -> Value {
     )
 }
 
+/// Environment variable by which a hosting process announces the autosave file for configs
+/// activated through this API. The CLI `run` command sets it to its effective autosave path
+/// (the `--autosave-path` flag or the `$XDG_CONFIG_HOME`-derived default) before the server
+/// starts, so admin-driven changes autosave to the file `--resume` reads back, like Caddy.
+pub const AUTOSAVE_PATH_ENV: &str = "CADDY_RS_AUTOSAVE_PATH";
+
 /// Admin API logic bound to a generation store.
 #[derive(Debug, Clone)]
 pub struct AdminApi {
@@ -511,6 +518,15 @@ pub struct AdminApi {
     data_dir: Option<PathBuf>,
     /// Optional live reverse-proxy upstream counters supplied by the server runtime.
     upstream_status_source: Option<Arc<dyn UpstreamStatusSource>>,
+    /// Autosave file for configs activated through this API, mirroring Caddy's autosave of every
+    /// non-nil config transition (`caddy.go` `unsyncedDecodeAndRun`, `admin.config.persist`).
+    ///
+    /// `None` disables admin-driven autosave. The CLI `run` command sets
+    /// [`AUTOSAVE_PATH_ENV`] to its effective autosave path before starting the server, so the
+    /// admin API of a running `caddy-rs` persists `POST /load`/`/config/...` changes to the very
+    /// same file `--resume` reads back. This default keeps standalone/embedded uses (and tests)
+    /// write-free unless they opt in.
+    autosave_path: Option<PathBuf>,
 }
 
 impl AdminApi {
@@ -524,6 +540,7 @@ impl AdminApi {
             metrics: MetricsRegistry::new(),
             data_dir: None,
             upstream_status_source: None,
+            autosave_path: std::env::var_os(AUTOSAVE_PATH_ENV).map(PathBuf::from),
         }
     }
 
@@ -549,6 +566,15 @@ impl AdminApi {
     /// server runtime's default).
     pub fn with_data_dir(mut self, data_dir: impl Into<PathBuf>) -> Self {
         self.data_dir = Some(data_dir.into());
+        self
+    }
+
+    /// Autosave every config this API activates to `path` (atomic write, mode 0600).
+    ///
+    /// This is the explicit override for [`AUTOSAVE_PATH_ENV`]; the server runtime does not need
+    /// it because the CLI announces its effective autosave path through the environment variable.
+    pub fn with_autosave_path(mut self, autosave_path: impl Into<PathBuf>) -> Self {
+        self.autosave_path = Some(autosave_path.into());
         self
     }
 
