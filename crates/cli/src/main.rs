@@ -75,10 +75,17 @@ enum Command {
     Run {
         /// Configuration file.
         #[arg(short, long)]
-        config: PathBuf,
+        config: Option<PathBuf>,
         /// Adapter name (`caddyfile` or `json`).
         #[arg(long)]
         adapter: Option<String>,
+        /// Use saved config, if any (and prefer over --config file).
+        #[arg(short = 'r', long)]
+        resume: bool,
+        /// Autosave file to persist and to load with --resume (default:
+        /// `$XDG_CONFIG_HOME/caddy-rs/autosave.json` or `$HOME/.config/caddy-rs/autosave.json`).
+        #[arg(long)]
+        autosave_path: Option<PathBuf>,
     },
     /// Load a new configuration into a running server through its admin API.
     Reload {
@@ -205,14 +212,16 @@ async fn run(command: Command) -> anyhow::Result<()> {
             pretty,
             output,
         } => {
-            let adapted = adapt(&config, adapter.as_deref())?;
+            let (json, warnings) = adapt(&config, adapter.as_deref())?;
             let json = if pretty {
-                serde_json::to_vec_pretty(&adapted.config)
+                let value: serde_json::Value = serde_json::from_slice(&json)
+                    .context("cannot parse adapted JSON for pretty printing")?;
+                serde_json::to_vec_pretty(&value)
+                    .context("cannot serialize adapted configuration")?
             } else {
-                serde_json::to_vec(&adapted.config)
-            }
-            .context("cannot serialize adapted configuration")?;
-            for warning in &adapted.warnings {
+                json
+            };
+            for warning in &warnings {
                 eprintln!("warning: {warning}");
             }
             match output {
@@ -222,27 +231,105 @@ async fn run(command: Command) -> anyhow::Result<()> {
             }
         }
         Command::Validate { config, adapter } => {
-            let (config, warnings) = load_validated(&config, adapter.as_deref())?;
-            for warning in warnings {
+            let loaded = load_validated(&config, adapter.as_deref())?;
+            for warning in &loaded.warnings {
                 eprintln!("warning: {warning}");
             }
-            let _ = config;
             println!("Valid configuration");
         }
-        Command::Run { config, adapter } => {
-            let (config, warnings) = load_validated(&config, adapter.as_deref())?;
+        Command::Run {
+            config,
+            adapter,
+            resume,
+            autosave_path,
+        } => {
+            // Caddy's autosave path: the `--autosave-path` flag wins, then the environment-derived
+            // default (`$XDG_CONFIG_HOME/caddy-rs/autosave.json`, `$HOME/.config/caddy-rs/...`,
+            // `./.caddy-rs/...`); see `caddy_rs_core::autosave`.
+            let autosave_path =
+                autosave_path.unwrap_or_else(caddy_rs_core::autosave::default_autosave_path);
+            // Publish the path to the admin API this process starts, so admin-driven config
+            // changes (`POST /load`, `/config/...`) autosave to the very same file, like Caddy.
+            std::env::set_var(caddy_rs_admin::AUTOSAVE_PATH_ENV, &autosave_path);
+
+            // Caddy's run precedence: `--resume` loads the last autosave when one exists,
+            // preferring it over `--config` (with a warning); a missing autosave file is not an
+            // error and falls back to normal config loading (see cmd/commandfuncs.go runCmd).
+            let loaded = if resume {
+                match caddy_rs_core::autosave::load_autosave(&autosave_path) {
+                    Ok(Some(bytes)) => {
+                        if config.is_some() {
+                            eprintln!(
+                                "caddy-rs: warning: --config and --resume flags were used \
+                                 together; ignoring --config and resuming from last configuration \
+                                 (autosave `{}`)",
+                                autosave_path.display()
+                            );
+                        } else {
+                            eprintln!(
+                                "caddy-rs: resuming from last configuration (autosave `{}`)",
+                                autosave_path.display()
+                            );
+                        }
+                        Some(LoadedConfig::from_autosave(bytes, &autosave_path)?)
+                    }
+                    Ok(None) => {
+                        eprintln!(
+                            "caddy-rs: no autosave file exists (autosave `{}`); loading --config",
+                            autosave_path.display()
+                        );
+                        None
+                    }
+                    Err(error) => {
+                        return Err(anyhow!(
+                            "cannot read autosave file `{}`: {error}",
+                            autosave_path.display()
+                        ))
+                    }
+                }
+            } else {
+                None
+            };
+            let loaded = match loaded {
+                Some(loaded) => loaded,
+                None => match config {
+                    Some(path) => load_validated(&path, adapter.as_deref())?,
+                    None => bail!(
+                        "no configuration to load: pass --config <path> or use --resume with an \
+                         existing autosave file"
+                    ),
+                },
+            };
+            let LoadedConfig {
+                model,
+                warnings,
+                json,
+            } = loaded;
             for warning in warnings {
                 eprintln!("warning: {warning}");
             }
             let store = Arc::new(GenerationStore::new(Arc::new(ModuleRegistry::builtin())));
-            let loaded = store
-                .load(config)
+            let activated = store
+                .load(model)
                 .context("cannot activate configuration")?;
             let mut runtime = ServerRuntime::new(Arc::clone(&store));
             let status = runtime.apply().await.context("cannot start listeners")?;
+            // Caddy autosaves the exact bytes of the successfully loaded config after the config
+            // transition completes (caddy.go, unsyncedDecodeAndRun); a failure to autosave is
+            // logged but never aborts the server.
+            match caddy_rs_core::autosave::autosave(&json, &autosave_path) {
+                Ok(()) => eprintln!(
+                    "caddy-rs: autosaved config (load with --resume flag) `{}`",
+                    autosave_path.display()
+                ),
+                Err(error) => eprintln!(
+                    "caddy-rs: unable to autosave config `{}`: {error}",
+                    autosave_path.display()
+                ),
+            }
             eprintln!(
                 "caddy-rs: configuration active (generation {})",
-                loaded.generation.id()
+                activated.generation.id()
             );
             for (configured, bound) in &status.listeners {
                 if configured == bound {
@@ -265,11 +352,11 @@ async fn run(command: Command) -> anyhow::Result<()> {
             adapter,
             admin,
         } => {
-            let (config, warnings) = load_validated(&config, adapter.as_deref())?;
-            for warning in warnings {
+            let loaded = load_validated(&config, adapter.as_deref())?;
+            for warning in &loaded.warnings {
                 eprintln!("warning: {warning}");
             }
-            let body = config.to_vec().context("cannot encode configuration")?;
+            let body = loaded.model.to_vec().context("cannot encode configuration")?;
             let response = admin_request(&admin, "POST", "/load", Bytes::from(body)).await?;
             ensure_admin_success(&response)?;
             eprintln!("configuration reloaded");
@@ -304,23 +391,61 @@ fn infer_adapter(config: &Path, explicit: Option<&str>) -> Option<String> {
     }
 }
 
-fn adapt(config: &Path, adapter: Option<&str>) -> anyhow::Result<caddy_rs_core::AdaptedConfig> {
+/// A loaded, validated configuration together with the *exact* JSON bytes that produced it — the
+/// bytes Caddy's autosave persists (the raw loaded document for the JSON adapter, the adapter
+/// output for the Caddyfile adapter) and `--resume` loads back.
+struct LoadedConfig {
+    model: Config,
+    warnings: Vec<String>,
+    /// The exact bytes of the successfully loaded/adapted config JSON.
+    json: Vec<u8>,
+}
+
+impl LoadedConfig {
+    /// Parse and validate autosave bytes (always Caddy JSON, no adapter involved).
+    fn from_autosave(bytes: Vec<u8>, path: &Path) -> anyhow::Result<Self> {
+        let model = Config::from_slice(&bytes).with_context(|| {
+            format!(
+                "autosave `{}` does not match the configuration model",
+                path.display()
+            )
+        })?;
+        let registry = ModuleRegistry::builtin();
+        caddy_rs_core::validate_config(&model, &registry).with_context(|| {
+            format!(
+                "autosave `{}` is not a valid configuration",
+                path.display()
+            )
+        })?;
+        Ok(Self {
+            model,
+            warnings: Vec::new(),
+            json: bytes,
+        })
+    }
+}
+
+/// Read `config` and adapt it to Caddy JSON, returning the exact JSON bytes of the loaded/adapted
+/// config plus any adapter warnings. For the JSON adapter the bytes are the file contents verbatim
+/// (Caddy autosaves the exact bytes it loaded); for the Caddyfile adapter they are the adapter's
+/// JSON output.
+fn adapt(config: &Path, adapter: Option<&str>) -> anyhow::Result<(Vec<u8>, Vec<String>)> {
     let input = std::fs::read(config)
         .with_context(|| format!("cannot read config `{}`", config.display()))?;
     match infer_adapter(config, adapter).as_deref() {
         Some("caddyfile") => {
             let text = std::str::from_utf8(&input)
                 .with_context(|| format!("`{}` is not valid UTF-8", config.display()))?;
-            caddy_rs_config::adapt_with_source(text, Some(config))
-                .with_context(|| format!("cannot adapt `{}`", config.display()))
+            let adapted = caddy_rs_config::adapt_with_source(text, Some(config))
+                .with_context(|| format!("cannot adapt `{}`", config.display()))?;
+            let json = serde_json::to_vec(&adapted.config)
+                .context("cannot serialize adapted configuration")?;
+            Ok((json, adapted.warnings))
         }
         Some("json") | None => {
-            let value: serde_json::Value = serde_json::from_slice(&input)
+            serde_json::from_slice::<serde_json::Value>(&input)
                 .with_context(|| format!("`{}` is not valid JSON", config.display()))?;
-            Ok(caddy_rs_core::AdaptedConfig {
-                config: value,
-                warnings: Vec::new(),
-            })
+            Ok((input, Vec::new()))
         }
         Some(other) => {
             bail!("unsupported adapter `{other}`; supported adapters are caddyfile and json")
@@ -328,9 +453,9 @@ fn adapt(config: &Path, adapter: Option<&str>) -> anyhow::Result<caddy_rs_core::
     }
 }
 
-fn load_validated(config: &Path, adapter: Option<&str>) -> anyhow::Result<(Config, Vec<String>)> {
-    let adapted = adapt(config, adapter)?;
-    let model = Config::from_value(adapted.config).with_context(|| {
+fn load_validated(config: &Path, adapter: Option<&str>) -> anyhow::Result<LoadedConfig> {
+    let (json, warnings) = adapt(config, adapter)?;
+    let model = Config::from_slice(&json).with_context(|| {
         format!(
             "`{}` does not match the configuration model",
             config.display()
@@ -339,7 +464,11 @@ fn load_validated(config: &Path, adapter: Option<&str>) -> anyhow::Result<(Confi
     let registry = ModuleRegistry::builtin();
     caddy_rs_core::validate_config(&model, &registry)
         .with_context(|| format!("`{}` is not a valid configuration", config.display()))?;
-    Ok((model, adapted.warnings))
+    Ok(LoadedConfig {
+        model,
+        warnings,
+        json,
+    })
 }
 
 async fn admin_request(
