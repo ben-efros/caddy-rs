@@ -720,6 +720,11 @@ impl ServerRuntime {
     ) -> Result<()> {
         let mut seen_active_generation = self.store.current().is_some();
         let mut store_stopped = false;
+        // Track the generation that has already been applied. Re-applying an unchanged generation
+        // every heartbeat would tear down and restart its renewal schedulers, cancelling any
+        // in-flight ACME renewal; apply only when the active generation actually changes (or a
+        // prior apply failed, leaving no recorded id).
+        let mut applied_generation: Option<u64> = None;
         loop {
             // The store is the source of truth for "the server was told to stop". Detect a stop
             // *before* applying so the listeners stay up for the grace-period drain instead of
@@ -732,9 +737,13 @@ impl ServerRuntime {
                 break;
             }
             seen_active_generation |= self.store.current().is_some();
-            if let Err(error) = self.apply().await {
-                eprintln!("caddy-rs: cannot apply configuration: {error}");
+            let current_id = self.store.current().as_deref().map(Generation::id);
+            if current_id != applied_generation {
+                if let Err(error) = self.apply().await {
+                    eprintln!("caddy-rs: cannot apply configuration: {error}");
+                }
             }
+            applied_generation = self.store.current().as_deref().map(Generation::id);
             if let Some(generation) = self.store.current() {
                 self.shutdown_timing = ShutdownTiming::from_config(generation.config());
             }

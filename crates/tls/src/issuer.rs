@@ -35,6 +35,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use caddy_rs_core::duration::CaddyDuration;
 use rustls::pki_types::CertificateDer;
 
 use crate::acme::{
@@ -202,6 +203,13 @@ impl AcmeIssuerConfig {
                 .and_then(|tls_alpn| tls_alpn.get("disabled"))
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
+        }
+        if let Some(window) = object.get("renewal_window") {
+            let duration =
+                serde_json::from_value::<CaddyDuration>(window.clone()).map_err(|error| {
+                    Error::Issuer(format!("invalid `renewal_window` configuration: {error}"))
+                })?;
+            config.renewal_window = Some(duration.as_duration());
         }
         Ok(config)
     }
@@ -712,6 +720,28 @@ mod tests {
     use crate::storage::MemoryStorage;
     use serde_json::{json, Value};
     use std::collections::VecDeque;
+
+    #[test]
+    fn acme_config_decodes_renewal_window() {
+        let config = AcmeIssuerConfig::from_json(&json!({
+            "module": "acme",
+            "renewal_window": 3600_000_000_000_i64,
+        }))
+        .expect("decode integer");
+        assert_eq!(
+            config.renewal_window,
+            Some(std::time::Duration::from_secs(3600))
+        );
+        let config = AcmeIssuerConfig::from_json(&json!({
+            "module": "acme",
+            "renewal_window": "1h",
+        }))
+        .expect("decode string");
+        assert_eq!(
+            config.renewal_window,
+            Some(std::time::Duration::from_secs(3600))
+        );
+    }
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
 

@@ -124,7 +124,7 @@ use tokio::sync::Mutex as AsyncMutex;
 pub const DEFAULT_HTTP_PORT: u16 = 80;
 
 /// One automation policy that applies to the planned subjects.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AutomaticHttpsPolicy {
     /// Caddy subject patterns (empty = catch-all; `*` wildcards supported).
     pub subjects: Vec<String>,
@@ -143,8 +143,14 @@ pub enum AutomaticHttpsIssuer {
     Internal,
 }
 
+impl Default for AutomaticHttpsIssuer {
+    fn default() -> Self {
+        AutomaticHttpsIssuer::Acme(Box::default())
+    }
+}
+
 /// The automatic-HTTPS plan for one configuration generation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AutomaticHttpsPlan {
     /// Effective HTTP port (`apps.http.http_port`, default 80).
     pub http_port: u16,
@@ -1261,13 +1267,33 @@ impl AutomaticHttpsProvisioner {
                 Arc::clone(&store),
                 Arc::clone(&self.renewal_clock),
             )
-            .with_policy(self.renewal_policy.clone()),
+            .with_policy(renewal_policy_for(plan, self.renewal_policy.clone())),
         );
         let renewals = AutomaticHttpsRenewals::new(scheduler, store);
         if self.renewal_scheduler_enabled {
             renewals.start();
         }
         Ok(Some(renewals))
+    }
+}
+
+/// Choose the renewal policy for a generation's scheduler.
+///
+/// An explicit ACME `renewal_window` (renew this long before `not_after`) overrides the default
+/// one-third-of-lifetime rule. A window at least the certificate's remaining lifetime makes a
+/// freshly issued certificate immediately due. When no ACME policy sets a window the provisioner
+/// default is used unchanged.
+fn renewal_policy_for(plan: &AutomaticHttpsPlan, default: RenewalPolicy) -> RenewalPolicy {
+    let window = plan
+        .policies
+        .iter()
+        .find_map(|policy| match &policy.issuer {
+            AutomaticHttpsIssuer::Acme(config) => config.renewal_window,
+            AutomaticHttpsIssuer::Internal => None,
+        });
+    match window {
+        Some(window) => default.with_renewal_window(Some(window)),
+        None => default,
     }
 }
 
@@ -1480,6 +1506,26 @@ mod tests {
     use std::time::Duration;
     use tokio::net::TcpListener;
     use tokio_rustls::TlsAcceptor;
+
+    #[test]
+    fn renewal_policy_for_applies_acme_renewal_window() {
+        let mut plan = AutomaticHttpsPlan::default();
+        let mut acme = AcmeIssuerConfig::default();
+        acme.renewal_window = Some(Duration::from_secs(3600));
+        plan.policies.push(AutomaticHttpsPolicy {
+            issuer: AutomaticHttpsIssuer::Acme(Box::new(acme)),
+            ..Default::default()
+        });
+        let policy = renewal_policy_for(&plan, RenewalPolicy::default());
+        assert_eq!(policy.renewal_window, Some(Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn renewal_policy_for_keeps_default_without_key_window() {
+        let plan = AutomaticHttpsPlan::default(); // no ACME window
+        let policy = renewal_policy_for(&plan, RenewalPolicy::default());
+        assert_eq!(policy.renewal_window, None);
+    }
 
     fn config(value: Value) -> Config {
         Config::from_value(value).expect("config decodes")
