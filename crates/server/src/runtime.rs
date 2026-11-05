@@ -1193,6 +1193,7 @@ impl ServerRuntime {
                             server.logs.as_ref(),
                         )),
                         wrappers: Arc::new(ListenerWrappers::from_server(server)?),
+                        h2c_upgrade: h2c_upgrade_enabled(server),
                     }),
                 );
             }
@@ -1220,6 +1221,7 @@ impl ServerRuntime {
                             access_log: Arc::clone(access_log),
                             access_log_policy: Arc::new(ServerAccessLogPolicy::default()),
                             wrappers: Arc::new(ListenerWrappers::default()),
+                            h2c_upgrade: false,
                         }),
                     );
                 }
@@ -1227,6 +1229,17 @@ impl ServerRuntime {
         }
         Ok(states)
     }
+}
+
+/// Whether a server explicitly offers cleartext h2c Upgrade (Caddy `protocols` includes `h2c`).
+///
+/// Caddy's defaults are HTTP/1.1 plus HTTP/2 over TLS and do **not** include h2c, so an
+/// `Upgrade: h2c` offer on a default cleartext listener is served as HTTP/1.1.
+fn h2c_upgrade_enabled(server: &caddy_rs_core::config::HttpServer) -> bool {
+    server
+        .protocols
+        .as_ref()
+        .is_some_and(|protocols| protocols.iter().any(|protocol| protocol == "h2c"))
 }
 
 /// Wait until the force channel fires (or forever when no force channel was provided).

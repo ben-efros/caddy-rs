@@ -313,6 +313,14 @@ pub struct HttpServer {
     #[serde(default)]
     pub listen: Vec<String>,
 
+    /// HTTP protocols offered on this server (Caddy's `protocols`).
+    ///
+    /// Supported values are `h1`, `h2` and `h2c`; `h3` and unknown tokens are rejected loudly
+    /// (HTTP/3 is not implemented). Absent means Caddy's defaults: HTTP/1.1 everywhere plus
+    /// HTTP/2 over TLS, with **no** cleartext h2c Upgrade (matching Caddy).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocols: Option<Vec<String>>,
+
     /// Routes, evaluated in order.
     #[serde(default)]
     pub routes: Vec<Route>,

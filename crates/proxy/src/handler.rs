@@ -827,7 +827,9 @@ impl ReverseProxyHandler {
             headers.remove("x-forwarded-host");
             return Ok(());
         };
-        let client_ip = remote.ip();
+        // Caddy formats peers through Go net.IP, which renders IPv4-mapped IPv6 addresses as
+        // dotted IPv4; canonicalize so X-Forwarded-For and trust checks match (DIV-0098).
+        let client_ip = remote.ip().to_canonical();
         // The server runtime sets Caddy's `trusted_proxy` var from the server-level
         // trusted_proxies; the handler-level list is unioned with it, like Caddy.
         let server_trusted = request

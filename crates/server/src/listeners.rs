@@ -82,6 +82,9 @@ pub(crate) struct ListenerState {
     pub(crate) access_log_policy: Arc<ServerAccessLogPolicy>,
     /// Listener wrappers (PROXY protocol) applied to accepted connections.
     pub(crate) wrappers: Arc<ListenerWrappers>,
+    /// Whether this listener may switch HTTP/1.1 to HTTP/2 via the cleartext `Upgrade: h2c`
+    /// handshake (Caddy `protocols` includes `h2c`; the default offers no h2c Upgrade).
+    pub(crate) h2c_upgrade: bool,
 }
 
 /// Listener state shared with accept loops, keyed by configured listen address.
@@ -411,6 +414,8 @@ struct ConnectionContext {
     access_log_policy: Arc<ServerAccessLogPolicy>,
     /// Listener wrappers for accepted connections.
     wrappers: Arc<ListenerWrappers>,
+    /// Whether cleartext h2c Upgrade is enabled for this listener (`protocols` includes h2c).
+    h2c_upgrade: bool,
 }
 
 /// Look up the state of an accepted connection and acquire a connection slot.
@@ -438,6 +443,7 @@ fn admit_connection(
             access_log: Arc::clone(&state.access_log),
             access_log_policy: Arc::clone(&state.access_log_policy),
             wrappers: Arc::clone(&state.wrappers),
+            h2c_upgrade: state.h2c_upgrade,
         },
         None => ConnectionContext {
             router: None,
@@ -449,6 +455,7 @@ fn admit_connection(
             access_log: AccessLogRuntime::disabled(),
             access_log_policy: Arc::new(ServerAccessLogPolicy::default()),
             wrappers: Arc::new(ListenerWrappers::default()),
+            h2c_upgrade: false,
         },
     };
     let permit = ConnectionPermit::try_acquire(Arc::clone(active), context.limits.max_connections)?;
@@ -708,6 +715,7 @@ async fn serve_accepted<I>(
             generation.clone(),
             force.clone(),
             Arc::clone(&tracked),
+            false,
         );
         serve_connection(tls_stream, service, shutdown, force, limits, activity).await;
     } else {
@@ -729,6 +737,7 @@ async fn serve_accepted<I>(
             generation.clone(),
             force.clone(),
             Arc::clone(&tracked),
+            context.h2c_upgrade,
         );
         serve_connection(stream, service, shutdown, force, limits, activity).await;
     }
@@ -754,6 +763,8 @@ struct RequestContext {
     generation: Option<Arc<Generation>>,
     force: watch::Receiver<bool>,
     tracked: Arc<TrackedConnection>,
+    /// Cleartext h2c Upgrade enabled (`protocols` includes h2c).
+    h2c_upgrade: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -775,6 +786,7 @@ fn connection_service(
     generation: Option<Arc<Generation>>,
     force: watch::Receiver<bool>,
     tracked: Arc<TrackedConnection>,
+    h2c_upgrade: bool,
 ) -> impl hyper::service::Service<
     hyper::Request<Incoming>,
     Response = hyper::Response<Body>,
@@ -800,6 +812,7 @@ fn connection_service(
         generation,
         force,
         tracked,
+        h2c_upgrade,
     })
 }
 
@@ -853,7 +866,7 @@ async fn serve_one_request(
     // Cleartext HTTP/2 upgrade (RFC 7540 §3.2): answer with 101 + Upgrade headers and serve
     // hyper's HTTP/2 connection on the upgraded stream. Only HTTP/1.1, non-TLS, bodyless requests
     // are eligible; prior-knowledge h2c is handled by the auto connection builder already.
-    if !context.tls && h2c_upgrade_allowed(&request) {
+    if !context.tls && context.h2c_upgrade && h2c_upgrade_allowed(&request) {
         let on_upgrade = hyper::upgrade::on(&mut request);
         let h2c_service = request_service(context.clone());
         let mut force = context.force.clone();

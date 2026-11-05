@@ -199,6 +199,28 @@ fn validate_cidr(value: &str, path: &str) -> Result<()> {
 /// (DIV-0039 residual). Caddy's own JSON decoding accepts negative durations (server provisioning
 /// treats non-positive as disabled) and the extra `d` day unit, so those remain valid here.
 fn validate_server_limits(server: &HttpServer, path: &str) -> Result<()> {
+    if let Some(protocols) = &server.protocols {
+        if protocols.is_empty() {
+            return Err(Error::invalid(
+                format!("{path}.protocols"),
+                "`protocols` must not be empty when present".to_string(),
+            ));
+        }
+        for protocol in protocols {
+            match protocol.as_str() {
+                "h1" | "h2" | "h2c" => {}
+                // Caddy accepts h3; caddy-rs validates it but does not serve HTTP/3 yet
+                // (tracked as T-HTTP-030/T-HTTP-031), matching Caddy's validation outcome.
+                "h3" => {}
+                other => {
+                    return Err(Error::invalid(
+                        format!("{path}.protocols"),
+                        format!("unsupported HTTP protocol `{other}`; expected h1, h2 or h2c"),
+                    ))
+                }
+            }
+        }
+    }
     // Typed Caddy `caddy.Duration` fields.
     for (field, value) in [
         ("read_timeout", server.read_timeout.as_ref()),

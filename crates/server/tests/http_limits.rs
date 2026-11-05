@@ -333,6 +333,43 @@ async fn http1_and_h2c_share_one_listener() {
 }
 
 #[tokio::test]
+async fn h2c_upgrade_offer_is_served_as_http1_without_h2c_protocol() {
+    // Caddy's default protocols do not include h2c, so a cleartext listener serves an
+    // `Upgrade: h2c` offer as ordinary HTTP/1.1 (200), not 101.
+    let (_store, runtime, address) = start(serde_json::json!({})).await;
+    let mut stream = TcpStream::connect(address).await.expect("connect");
+    let request = "GET / HTTP/1.1\r\n\
+                   Host: example.com\r\n\
+                   Connection: Upgrade, HTTP2-Settings\r\n\
+                   Upgrade: h2c\r\n\
+                   HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
+                   \r\n";
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write h2c offer");
+    let mut head = Vec::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
+            .await
+            .expect("response head timeout")
+            .expect("read response byte");
+        assert!(read > 0, "connection closed before the response head");
+        head.push(byte[0]);
+        if head.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    let head = String::from_utf8_lossy(&head);
+    assert!(
+        head.starts_with("HTTP/1.1 200"),
+        "expected ordinary HTTP/1.1 200 without h2c protocols, got: {head:?}"
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn body_limit_is_per_server() {
     // Two servers on distinct listeners with different body caps. The request is identical; only
     // the owning server's configuration decides the outcome.
@@ -434,10 +471,11 @@ async fn oversized_header_is_rejected() {
 
 #[tokio::test]
 async fn h2c_upgrade_switches_to_http2() {
-    // Caddy serves h2c via the HTTP/1.1 Upgrade mechanism (T-HTTP-022): answer 101 with
-    // Connection/Upgrade headers, then speak HTTP/2 on the upgraded stream. A real h2 client
-    // completes the upgrade and exchanges requests over the switched protocol.
-    let (_store, runtime, address) = start(serde_json::json!({})).await;
+    // Caddy serves h2c via the HTTP/1.1 Upgrade mechanism (T-HTTP-022) only when the server's
+    // `protocols` explicitly include `h2c`: answer 101 with Connection/Upgrade headers, then speak
+    // HTTP/2 on the upgraded stream. A real h2 client completes the upgrade and exchanges requests
+    // over the switched protocol.
+    let (_store, runtime, address) = start(serde_json::json!({"protocols": ["h2c"]})).await;
 
     let mut stream = TcpStream::connect(address).await.expect("connect");
     let request = "GET / HTTP/1.1\r\n\

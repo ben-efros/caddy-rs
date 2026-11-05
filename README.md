@@ -3,13 +3,13 @@
 Hosted at <https://github.com/ben-efros/caddy-rs>.
 
 The Rust implementation of the caddy-rs program: a Caddy-compatible web server, reverse proxy,
-and configuration engine. **Status: M2/M5 (post wave-4/5 sprint)** — the crates compile, **1237 tests pass**, HTTPS
+and configuration engine. **Status: M2/M5 (post wave-4/5 sprint)** — the crates compile, **1292 tests pass**, HTTPS
 termination, **default-on automatic HTTPS** (fake-CA/offline tested, per-server controls and
 non-standard-port derivation), renewal hot-swap, streaming responses and request bodies,
 forward_auth, WebSocket/Upgrade passthrough, HTTP/2+h2c upstreams, PKI/trust, admin ETag
 preconditions/`/adapt`/`/reverse_proxy/upstreams`, and runtime metrics/access-log emission work end
 to end, and the Caddyfile adapter matches Caddy v2.11.7's golden output for every fixture it supports:
-**96 of the 245 upstream adapter fixtures exactly, 0 mismatches** (100% of supported fixtures, 39.2%
+**98 of the 245 upstream adapter fixtures exactly, 0 mismatches** (100% of supported fixtures, 40.0%
 corpus coverage). A real Caddy v2.11.7 binary oracle is acquired and run by the program repository.
 See the program repository's conformance report.
 
@@ -66,7 +66,7 @@ work queue.
 - Acceptance: local acceptance harness (forward_auth/Authelia, streaming, WebSocket, TLS, internal
   CA auto-HTTPS, admin) and Pebble real-ACME acceptance (HTTP-01/TLS-ALPN-01, account reuse)
 - Compatibility: real Caddy v2.11.7 oracle acquisition (no Docker), adapt/validate/runtime probes,
-  drift triage and nightly workflow; 92 registered divergences with tracking tasks
+  drift triage and nightly workflow; 97 registered divergences with tracking tasks
 - CLI: `version`, `list-modules`, `adapt`, `validate`, `run`, `reload`, `stop`
 
 ## What does not work yet (registered, not hidden)
