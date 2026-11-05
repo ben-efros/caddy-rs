@@ -2381,6 +2381,8 @@ mod tests {
             private_key_pem: CERT_KEY_PEM.to_string(),
             domains: vec!["example.com".to_string()],
             not_after_unix: u64::MAX,
+            issuer_data: None,
+            metadata_extra: std::collections::BTreeMap::new(),
         };
         CertificateStorage::store(&storage, "local/example.com", &stored)
             .await

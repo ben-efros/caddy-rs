@@ -786,6 +786,8 @@ impl InternalIssuer {
             private_key_pem: key_pem,
             domains: domains.to_vec(),
             not_after_unix: system_time_to_unix(not_after)?,
+            issuer_data: None,
+            metadata_extra: std::collections::BTreeMap::new(),
         };
         let storage_key = format!(
             "{}/{}",

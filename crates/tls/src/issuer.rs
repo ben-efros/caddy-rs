@@ -182,6 +182,52 @@ impl AcmeIssuerConfig {
             })
             .unwrap_or_default();
         if let Some(challenges) = object.get("challenges") {
+            let challenges = challenges
+                .as_object()
+                .ok_or_else(|| Error::Issuer("`challenges` must be an object".to_string()))?;
+            for (name, value) in challenges {
+                match name.as_str() {
+                    "http" | "tls-alpn" => {
+                        let challenge_path = format!("challenges.{name}");
+                        let options = value.as_object().ok_or_else(|| {
+                            Error::Issuer(format!("`{challenge_path}` must be an object"))
+                        })?;
+                        for (option, option_value) in options {
+                            match option.as_str() {
+                                "disabled" => {
+                                    if !option_value.is_boolean() {
+                                        return Err(Error::Issuer(format!(
+                                            "`{challenge_path}.disabled` must be a boolean"
+                                        )));
+                                    }
+                                }
+                                "alternate_port" => {
+                                    return Err(Error::Unsupported {
+                                        path: format!("{challenge_path}.alternate_port"),
+                                        feature: "alternate ACME challenge ports".to_string(),
+                                        tracking_id: "TLS-ACME-CHALLENGE",
+                                    });
+                                }
+                                other => {
+                                    return Err(Error::Unsupported {
+                                        path: format!("{challenge_path}.{other}"),
+                                        feature: format!("ACME challenge option `{other}`"),
+                                        tracking_id: "TLS-ACME-CHALLENGE",
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    "dns" => {}
+                    other => {
+                        return Err(Error::Unsupported {
+                            path: format!("challenges.{other}"),
+                            feature: format!("ACME challenge type `{other}`"),
+                            tracking_id: "TLS-ACME-CHALLENGE",
+                        });
+                    }
+                }
+            }
             if let Some(dns) = challenges.get("dns") {
                 // Parse Caddy's complete `challenges.dns` object: the provider is an inline module
                 // object ({"name":"cloudflare", "api_token": ...}) or a legacy string, and the
@@ -557,7 +603,15 @@ impl<T: AcmeTransport> AcmeIssuer<T> {
             .wait_for_certificate(&order.url, &self.poll_policy, self.clock.as_ref())
             .await?;
 
-        let stored = stored_certificate(&issued, &csr, domains)?;
+        // CertMagic stores the ACME certificate resource metadata alongside the chain. Mirror
+        // acmez's `acme.Certificate` JSON so Caddy tooling (and ARI/replacement tooling) can read
+        // where the certificate came from after a caddy-rs issuance or renewal.
+        let issuer_data = Some(serde_json::json!({
+            "url": issued.url,
+            "ca": self.config.ca,
+            "account": account_client.account_url(),
+        }));
+        let stored = stored_certificate(&issued, &csr, domains, issuer_data)?;
         self.certificate_storage
             .store(&self.storage_key(domains), &stored)
             .await?;
@@ -650,6 +704,7 @@ fn stored_certificate(
     issued: &IssuedCertificate,
     csr: &CertificateRequest,
     domains: &[String],
+    issuer_data: Option<serde_json::Value>,
 ) -> Result<StoredCertificate> {
     let leaf = issued.certificates_pem.first().ok_or_else(|| {
         Error::Issuer("ACME certificate download returned no PEM certificates".to_string())
@@ -664,6 +719,8 @@ fn stored_certificate(
         private_key_pem: csr.private_key_pem().to_string(),
         domains: domains.to_vec(),
         not_after_unix,
+        issuer_data,
+        metadata_extra: std::collections::BTreeMap::new(),
     })
 }
 
@@ -1125,6 +1182,58 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unsupported_challenge_configuration() {
+        let error = AcmeIssuerConfig::from_json(&serde_json::json!({
+            "module": "acme",
+            "challenges": {"http": {"alternate_port": 8080}}
+        }))
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("TLS-ACME-CHALLENGE")
+                || error.to_string().contains("alternate"),
+            "{error}"
+        );
+
+        let error = AcmeIssuerConfig::from_json(&serde_json::json!({
+            "module": "acme",
+            "challenges": {"http": {"disabled": "yes"}}
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("must be a boolean"), "{error}");
+
+        let error = AcmeIssuerConfig::from_json(&serde_json::json!({
+            "module": "acme",
+            "challenges": {"tls-alpn": {"unknown_option": true}}
+        }))
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("TLS-ACME-CHALLENGE")
+                || error.to_string().contains("unknown_option"),
+            "{error}"
+        );
+
+        let error = AcmeIssuerConfig::from_json(&serde_json::json!({
+            "module": "acme",
+            "challenges": {"device-attest-01": {}}
+        }))
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("TLS-ACME-CHALLENGE")
+                || error.to_string().contains("device-attest"),
+            "{error}"
+        );
+
+        // Supported enable/disable flags still parse.
+        let config = AcmeIssuerConfig::from_json(&serde_json::json!({
+            "module": "acme",
+            "challenges": {"http": {"disabled": true}, "tls-alpn": {"disabled": true}}
+        }))
+        .unwrap();
+        assert!(config.http_challenge_disabled);
+        assert!(config.tls_alpn_challenge_disabled);
+    }
+
+    #[test]
     fn rejects_malformed_external_account_config() {
         let error = AcmeIssuerConfig::from_json(&json!({
             "module": "acme",
@@ -1301,6 +1410,12 @@ mod tests {
             private_key_der(&stored.private_key_pem).unwrap(),
             certificate.private_key_der
         );
+        // CertMagic ACME metadata (`acme.Certificate`) is preserved alongside the certificate so
+        // Caddy/ARI tooling can recover the cert URL, CA directory and account URL.
+        let issuer_data = stored.issuer_data.expect("ACME issuer_data is stored");
+        assert_eq!(issuer_data["url"], CERTIFICATE_URL);
+        assert_eq!(issuer_data["ca"], DIRECTORY_URL);
+        assert_eq!(issuer_data["account"], ACCOUNT_URL);
 
         let requests = transport.requests();
         assert_eq!(requests.len(), 10);
