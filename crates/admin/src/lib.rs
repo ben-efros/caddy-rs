@@ -77,9 +77,9 @@
 //!   Caddy. `POST /load` with an identical config follows the same rule.
 //! - Malformed JSON request bodies on config mutations return `500` with a
 //!   `decoding request body: ...` message (Caddy returns these as plain, non-`APIError` errors).
-//!   Config traversal errors (`invalid traversal path`, array index problems) also return `500`;
-//!   a missing *leaf* config key reads as JSON `null` with `200`, matching Caddy
-//!   (`GET /config/<missing>` is no longer a 404).
+//!   Config traversal errors (`invalid traversal path`, invalid/out-of-range array indexes) return
+//!   `400` with Caddy's message; a missing *leaf* config key reads as JSON `null` with `200`,
+//!   matching Caddy (`GET /config/<missing>` is no longer a 404).
 //! - ETags and `If-Match` are implemented with Caddy's strong-ETag format
 //!   (`"<config path> <xxhash64 hex>"`, same xxhash64 algorithm) and its 400/412 semantics.
 //!   Differences from Caddy v2.11.7: Caddy ignores `If-None-Match` entirely, while
@@ -98,8 +98,14 @@
 //!   `[{"message": "..."}]` objects (the caddy-rs adapter only produces messages).
 //! - `POST /config/` replaces the whole configuration; `DELETE /config/` unloads it (Caddy
 //!   reaches the same state through `run(nil)` via its `rawCfg` wrapper).
-//! - Origin enforcement is evaluated from the active generation on each request; the server crate
-//!   may instead pass the startup policy with [`AdminApi::with_origin_policy`].
+//! - Origin/host enforcement is evaluated from the active generation on each request; the server
+//!   crate may instead pass the startup policy with [`AdminApi::with_origin_policy`]. Caddy's
+//!   DNS-rebinding `Host` check is implemented for non-wildcard TCP admin listeners. CORS
+//!   responses echo `Access-Control-Allow-Origin` and OPTIONS preflights add
+//!   `Access-Control-Allow-Methods`/`Headers`/`Credentials`; like Caddy v2.11.7 no `Vary` header is
+//!   emitted. OPTIONS on `/metrics` renders metrics (Caddy ignores the method), OPTIONS on config
+//!   paths returns Caddy's `method OPTIONS not allowed`, other method-checked endpoints return
+//!   `method not allowed`, and `/pki` 307-redirects to `/pki/`.
 //! - Paths are used as the transport transmits them; percent-encoded segments are not decoded
 //!   (Caddy's `net/url` decodes `URL.Path` before dispatch). The server crate passes the raw
 //!   request path, so `@id` values and object keys containing reserved characters need literal
@@ -292,29 +298,36 @@ fn read_config_value(current: &Value, parts: &[&str]) -> std::result::Result<Val
                 }
                 match object.get(*part) {
                     Some(Value::Null) | None => {
+                        // Caddy discovers the nil value at this segment and errors on the *next*
+                        // iteration, so its message includes one more segment.
+                        let end = (index + 1).min(parts.len().saturating_sub(1));
                         return Err(format!(
-                            "invalid traversal path at: {}",
-                            parts[..=index].join("/")
-                        ))
+                            "invalid traversal path at: config/{}",
+                            parts[..=end].join("/")
+                        ));
                     }
                     Some(value) => ptr = value,
                 }
             }
             Value::Array(items) => {
-                let canonical = part
-                    .parse::<usize>()
-                    .ok()
-                    .filter(|parsed| *part == parsed.to_string());
-                let Some(array_index) = canonical else {
+                let parsed = part.parse::<i64>().ok();
+                let canonical = parsed.filter(|parsed| *parsed >= 0 && *part == parsed.to_string());
+                let Some(array_index) = canonical.and_then(|parsed| usize::try_from(parsed).ok())
+                else {
+                    let reason = if parsed.is_none() {
+                        "not a number".to_string()
+                    } else {
+                        "non-canonical array index".to_string()
+                    };
                     return Err(format!(
-                        "[/{}] invalid array index '{}'",
+                        "[/config/{}] invalid array index '{}': {reason}",
                         parts[..=index].join("/"),
                         part
                     ));
                 };
                 let Some(value) = items.get(array_index) else {
                     return Err(format!(
-                        "[/{}] array index out of bounds: {}",
+                        "[/config/{}] array index out of bounds: {}",
                         parts[..=index].join("/"),
                         part
                     ));
@@ -326,7 +339,7 @@ fn read_config_value(current: &Value, parts: &[&str]) -> std::result::Result<Val
             }
             _ => {
                 return Err(format!(
-                    "invalid traversal path at: {}",
+                    "invalid traversal path at: config/{}",
                     parts[..=index].join("/")
                 ))
             }
@@ -665,12 +678,27 @@ impl AdminApi {
 
         let mut response = self.dispatch(path, &request).await;
 
-        // Caddy echoes the accepted origin for browser clients.
+        // Caddy echoes the accepted origin for browser clients and advertises the preflight
+        // capabilities on OPTIONS requests (no `Vary` header is sent by Caddy v2.11.7).
         if let Some(origin) = origin {
             if let Ok(value) = HeaderValue::from_str(&origin) {
                 response
                     .headers
                     .insert(http::header::ACCESS_CONTROL_ALLOW_ORIGIN, value);
+            }
+            if request.method == Method::OPTIONS {
+                response.headers.insert(
+                    http::header::ACCESS_CONTROL_ALLOW_METHODS,
+                    HeaderValue::from_static("OPTIONS, GET, POST, PUT, PATCH, DELETE"),
+                );
+                response.headers.insert(
+                    http::header::ACCESS_CONTROL_ALLOW_HEADERS,
+                    HeaderValue::from_static("Content-Type, Content-Length, Cache-Control"),
+                );
+                response.headers.insert(
+                    http::header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+                    HeaderValue::from_static("true"),
+                );
             }
         }
         response
@@ -678,6 +706,15 @@ impl AdminApi {
 
     async fn dispatch(&self, path: &str, request: &AdminRequest) -> AdminResponse {
         let method = request.method.as_str();
+
+        // Caddy's ServeMux redirects the bare `/pki` path to `/pki/` (307) for every method.
+        if path == "/pki" {
+            let mut response = AdminResponse::empty(StatusCode::TEMPORARY_REDIRECT);
+            response
+                .headers
+                .insert(http::header::LOCATION, HeaderValue::from_static("/pki/"));
+            return response;
+        }
 
         if path == "/config/" || path == "/config" {
             if method != "GET" {
@@ -695,9 +732,7 @@ impl AdminApi {
             let parts = config_path::split_path(pointer);
             return match read_config_value(&current, &parts) {
                 Ok(value) => self.config_read_response(path, &value, request),
-                Err(message) => {
-                    AdminResponse::api_error(StatusCode::INTERNAL_SERVER_ERROR, message)
-                }
+                Err(message) => AdminResponse::api_error(StatusCode::BAD_REQUEST, message),
             };
         }
 
@@ -716,7 +751,10 @@ impl AdminApi {
             ),
             "/load" => {
                 if method != "POST" {
-                    return AdminResponse::empty(StatusCode::METHOD_NOT_ALLOWED);
+                    return AdminResponse::api_error(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method not allowed",
+                    );
                 }
                 let config = match Config::from_slice(&request.body) {
                     Ok(config) => config,
@@ -756,12 +794,15 @@ impl AdminApi {
             }
             "/stop" => {
                 if method != "POST" {
-                    return AdminResponse::empty(StatusCode::METHOD_NOT_ALLOWED);
+                    return AdminResponse::api_error(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method not allowed",
+                    );
                 }
                 self.unload()
             }
             "/metrics" => {
-                if method != "GET" {
+                if method != "GET" && method != "OPTIONS" {
                     return AdminResponse::empty(StatusCode::METHOD_NOT_ALLOWED);
                 }
                 let mut response = AdminResponse::text(StatusCode::OK, self.metrics.render());
@@ -1079,6 +1120,12 @@ impl AdminApi {
     /// resulting full configuration, rolling back on any decode, index, or validation error.
     fn handle_config_update(&self, path: &str, request: &AdminRequest) -> AdminResponse {
         let Some(mutation) = Mutation::from_method(request.method.as_str()) else {
+            if request.method == Method::OPTIONS {
+                return AdminResponse::api_error(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    format!("method {} not allowed", request.method),
+                );
+            }
             return AdminResponse::empty(StatusCode::METHOD_NOT_ALLOWED);
         };
 
@@ -1213,9 +1260,7 @@ impl AdminApi {
         if request.method == Method::GET {
             return match read_config_value(&current, &parts) {
                 Ok(value) => self.config_read_response(&expanded_path, &value, request),
-                Err(message) => {
-                    AdminResponse::api_error(StatusCode::INTERNAL_SERVER_ERROR, message)
-                }
+                Err(message) => AdminResponse::api_error(StatusCode::BAD_REQUEST, message),
             };
         }
 
@@ -1490,11 +1535,11 @@ mod tests {
         assert_eq!(response.status, StatusCode::OK);
         assert_eq!(response.body, Bytes::from_static(b"null\n"));
         assert!(response.headers.contains_key(http::header::ETAG));
-        // Traversing *through* a missing key is a located 500, like Caddy's plain traversal error.
+        // Traversing *through* a missing key is a located 400, matching Caddy.
         let response = admin
             .handle(request("GET", "/config/apps/missing/deeper", ""))
             .await;
-        assert_eq!(response.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
         assert!(body_string(&response).contains("invalid traversal path"));
     }
 
@@ -2960,7 +3005,14 @@ mod tests {
             "no certificate authority configured with id: nope"
         );
 
-        for path in ["/pki", "/pki/", "/pki/ca/", "/pki/ca/local/nope"] {
+        // The bare `/pki` path redirects to `/pki/` (Caddy's ServeMux canonicalisation).
+        let response = admin.handle(request("GET", "/pki", "")).await;
+        assert_eq!(response.status, StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            response.headers.get(http::header::LOCATION).unwrap(),
+            "/pki/"
+        );
+        for path in ["/pki/", "/pki/ca/", "/pki/ca/local/nope"] {
             assert_eq!(
                 admin.handle(request("GET", path, "")).await.status,
                 StatusCode::NOT_FOUND,
@@ -3107,6 +3159,306 @@ mod tests {
         assert!(
             body.contains("caddy_rs_proxy_requests_total{code=\"200\",method=\"GET\",upstream=\"10.0.0.5:8080\"} 1"),
             "missing proxy series: {body}"
+        );
+    }
+
+    // ---- CORS / origin + config path parity (T-ADMIN-030) ---------------------------------
+
+    fn cors_request(method: &str, path: &str) -> AdminRequest {
+        request(method, path, "")
+    }
+
+    fn with_origin_and_host(mut request: AdminRequest, origin: &str, host: &str) -> AdminRequest {
+        request
+            .headers
+            .insert(http::header::ORIGIN, HeaderValue::from_str(origin).unwrap());
+        request
+            .headers
+            .insert(http::header::HOST, HeaderValue::from_str(host).unwrap());
+        request
+    }
+
+    #[tokio::test]
+    async fn cors_headers_and_preflight_match_caddy() {
+        let admin = admin();
+        // Default admin policy: implicit loopback origins for localhost:2019.
+        let response = admin
+            .handle(with_origin_and_host(
+                cors_request("GET", "/config/"),
+                "http://localhost:2019",
+                "localhost:2019",
+            ))
+            .await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            response
+                .headers
+                .get(http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "http://localhost:2019"
+        );
+        assert!(
+            response.headers.get(http::header::VARY).is_none(),
+            "Caddy v2.11.7 does not send Vary"
+        );
+
+        // Path/query is stripped from the echoed origin.
+        let response = admin
+            .handle(with_origin_and_host(
+                cors_request("GET", "/config/"),
+                "http://localhost:2019/some/path?q=1",
+                "localhost:2019",
+            ))
+            .await;
+        assert_eq!(
+            response
+                .headers
+                .get(http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "http://localhost:2019"
+        );
+
+        // Preflight OPTIONS: CORS capability headers plus Caddy's method error.
+        let response = admin
+            .handle(with_origin_and_host(
+                cors_request("OPTIONS", "/config/"),
+                "http://localhost:2019",
+                "localhost:2019",
+            ))
+            .await;
+        assert_eq!(response.status, StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            response.body,
+            Bytes::from_static(b"{\"error\":\"method OPTIONS not allowed\"}\n")
+        );
+        assert_eq!(
+            response
+                .headers
+                .get(http::header::ACCESS_CONTROL_ALLOW_METHODS)
+                .unwrap(),
+            "OPTIONS, GET, POST, PUT, PATCH, DELETE"
+        );
+        assert_eq!(
+            response
+                .headers
+                .get(http::header::ACCESS_CONTROL_ALLOW_HEADERS)
+                .unwrap(),
+            "Content-Type, Content-Length, Cache-Control"
+        );
+        assert_eq!(
+            response
+                .headers
+                .get(http::header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+                .unwrap(),
+            "true"
+        );
+        assert_eq!(
+            response
+                .headers
+                .get(http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "http://localhost:2019"
+        );
+
+        // OPTIONS on /load uses Caddy's generic message.
+        let response = admin
+            .handle(with_origin_and_host(
+                cors_request("OPTIONS", "/load"),
+                "http://localhost:2019",
+                "localhost:2019",
+            ))
+            .await;
+        assert_eq!(response.status, StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            response.body,
+            Bytes::from_static(b"{\"error\":\"method not allowed\"}\n")
+        );
+
+        // OPTIONS on /metrics renders metrics (Caddy's handler ignores the method).
+        let response = admin
+            .handle(with_origin_and_host(
+                cors_request("OPTIONS", "/metrics"),
+                "http://localhost:2019",
+                "localhost:2019",
+            ))
+            .await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            response.headers.get(http::header::CONTENT_TYPE).unwrap(),
+            METRICS_CONTENT_TYPE
+        );
+
+        // A disallowed origin is still 403 and must not carry CORS headers.
+        let response = admin
+            .handle(with_origin_and_host(
+                cors_request("GET", "/config/"),
+                "http://evil.example",
+                "localhost:2019",
+            ))
+            .await;
+        assert_eq!(response.status, StatusCode::FORBIDDEN);
+        assert!(response
+            .headers
+            .get(http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none());
+
+        // No Origin and no enforcement: no CORS headers.
+        let response = admin.handle(cors_request("GET", "/config/")).await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert!(response
+            .headers
+            .get(http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn host_enforcement_matches_caddy_dns_rebinding_mitigation() {
+        let admin = admin();
+        let config = json!({
+            "admin": {
+                "listen": "127.0.0.1:2019",
+                "enforce_origin": true,
+                "origins": ["http://allowed.example"]
+            },
+            "apps": {"http": {"servers": {"srv0": {"listen": [":8080"], "routes": []}}}}
+        });
+        assert_eq!(
+            load(&admin, &config.to_string()).await.status,
+            StatusCode::OK
+        );
+
+        let response = admin
+            .handle(with_origin_and_host(
+                cors_request("GET", "/config/"),
+                "http://allowed.example",
+                "allowed.example",
+            ))
+            .await;
+        assert_eq!(
+            response.status,
+            StatusCode::OK,
+            "{}",
+            body_string(&response)
+        );
+        assert_eq!(
+            response
+                .headers
+                .get(http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "http://allowed.example"
+        );
+
+        // Wrong Host with an otherwise-allowed Origin is Caddy's 403 host error.
+        let response = admin
+            .handle(with_origin_and_host(
+                cors_request("GET", "/config/"),
+                "http://allowed.example",
+                "evil.example",
+            ))
+            .await;
+        assert_eq!(response.status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            body_string(&response),
+            "{\"error\":\"host not allowed: evil.example\"}\n"
+        );
+
+        // enforce_origin without any Origin: forbidden before host/origin matching finishes.
+        let mut no_origin = cors_request("GET", "/config/");
+        no_origin.headers.insert(
+            http::header::HOST,
+            HeaderValue::from_static("allowed.example"),
+        );
+        let response = admin.handle(no_origin).await;
+        assert_eq!(response.status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn config_path_and_id_edges_match_the_caddy_oracle() {
+        let admin = admin();
+        let config = json!({
+            "admin": {"listen": "127.0.0.1:2019"},
+            "apps": {"http": {"servers": {"srv0": {
+                "listen": [":8080"],
+                "routes": [
+                    {"@id": "route0", "handle": [{"@id": "h0", "handler": "static_response", "body": "ok"}]},
+                    {"@id": "42", "handle": [{"handler": "static_response", "body": "num"}]}
+                ]
+            }}}}
+        });
+        assert_eq!(
+            load(&admin, &config.to_string()).await.status,
+            StatusCode::OK
+        );
+
+        // Missing leaf: null 200 with ETag; traversal errors are 400 like Caddy.
+        let response = admin
+            .handle(request("GET", "/config/apps/missing", ""))
+            .await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, Bytes::from_static(b"null\n"));
+        let response = admin
+            .handle(request("GET", "/config/apps/missing/deeper", ""))
+            .await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body_string(&response),
+            "{\"error\":\"invalid traversal path at: config/apps/missing/deeper\"}\n"
+        );
+
+        let response = admin
+            .handle(request(
+                "GET",
+                "/config/apps/http/servers/srv0/routes/9",
+                "",
+            ))
+            .await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        assert!(body_string(&response).contains("array index out of bounds: 9"));
+
+        let response = admin
+            .handle(request(
+                "GET",
+                "/config/apps/http/servers/srv0/routes/01",
+                "",
+            ))
+            .await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        assert!(
+            body_string(&response).contains("invalid array index '01': non-canonical array index")
+        );
+
+        // Numeric @id and nested @id paths match Caddy's /id redirect semantics.
+        let response = admin.handle(request("GET", "/id/42", "")).await;
+        assert_eq!(response.status, StatusCode::OK);
+        let value: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(value["@id"], "42");
+        let etag = response
+            .headers
+            .get(http::header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            etag.starts_with("\"/config/apps/http/servers/srv0/routes/1 "),
+            "{etag}"
+        );
+
+        let response = admin
+            .handle(request("GET", "/id/42/handle/0/body", ""))
+            .await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, Bytes::from_static(b"\"num\"\n"));
+
+        let response = admin.handle(request("GET", "/id/nope", "")).await;
+        assert_eq!(response.status, StatusCode::NOT_FOUND);
+        assert!(body_string(&response).contains("unknown object ID 'nope'"));
+
+        // Caddy redirects the bare /pki path to /pki/ with 307.
+        let response = admin.handle(request("GET", "/pki", "")).await;
+        assert_eq!(response.status, StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            response.headers.get(http::header::LOCATION).unwrap(),
+            "/pki/"
         );
     }
 }
