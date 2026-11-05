@@ -1,0 +1,73 @@
+{
+  "apps": {
+    "http": {
+      "servers": {
+        "srv0": {
+          "listen": [
+            ":8080"
+          ],
+          "routes": [
+            {
+              "handle": [
+                {
+                  "body": "h2",
+                  "handler": "static_response"
+                }
+              ],
+              "match": [
+                {
+                  "protocol": "http/2"
+                }
+              ]
+            },
+            {
+              "handle": [
+                {
+                  "body": "tls",
+                  "handler": "static_response"
+                }
+              ],
+              "match": [
+                {
+                  "tls": {}
+                }
+              ]
+            },
+            {
+              "handle": [
+                {
+                  "body": "early data",
+                  "handler": "static_response"
+                }
+              ],
+              "match": [
+                {
+                  "tls": {
+                    "handshake_complete": false
+                  }
+                }
+              ]
+            },
+            {
+              "handle": [
+                {
+                  "body": "local",
+                  "handler": "static_response"
+                }
+              ],
+              "match": [
+                {
+                  "local_ip": {
+                    "ranges": [
+                      "10.0.0.0/8"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

@@ -2786,6 +2786,9 @@ fn matcher_from_inline_args(args: &[String], position: Position) -> caddy_rs_cor
         "not",
         "remote_ip",
         "client_ip",
+        "local_ip",
+        "protocol",
+        "tls",
         "vars",
         "vars_regexp",
     ];
@@ -2946,7 +2949,10 @@ fn matcher_from_directive(
             let inner = matcher_from_directive(&args[0], &args[1..], position)?;
             Ok(json!({"not": [inner]}))
         }
-        "remote_ip" | "client_ip" => {
+        // `local_ip` is a caddy-rs extension: Caddy v2.11.7 has no HTTP `local_ip` matcher (the
+        // name exists only as a TLS connection-policy matcher), so the adapter mirrors the
+        // `remote_ip`/`client_ip` shape the caddy-rs engine's `LocalIpMatcher` accepts.
+        "remote_ip" | "client_ip" | "local_ip" => {
             if args.is_empty() {
                 return Err(adapter_error(
                     position,
@@ -2972,6 +2978,45 @@ fn matcher_from_directive(
             }
             Ok(json!({ name: {"ranges": ranges} }))
         }
+        // Caddy v2.11.7's `MatchProtocol` is a single protocol string (its Caddyfile unmarshaler
+        // reads one argument; trailing arguments are silently dropped by Caddy). The caddy-rs
+        // engine matches that JSON shape, so a multi-protocol Caddyfile form cannot be honoured
+        // and fails loudly here instead of silently dropping configuration.
+        "protocol" => {
+            let Some(protocol) = args.first() else {
+                return Err(adapter_error(
+                    position,
+                    "matcher `protocol` requires exactly one protocol",
+                ));
+            };
+            if args.len() > 1 {
+                return Err(adapter_error(
+                    position,
+                    "matcher `protocol` accepts exactly one protocol (Caddy v2.11.7's JSON shape is a single string)",
+                ));
+            }
+            Ok(json!({"protocol": protocol}))
+        }
+        // Caddy v2.11.7's `MatchTLS` exposes only `handshake_complete`, reachable from the
+        // Caddyfile as the bare `tls` matcher or `tls early_data`; `sni`/`client_auth` are TLS
+        // connection-policy fields, not HTTP route matcher fields, and the caddy-rs engine
+        // rejects them loudly (tracking TLS-MATCHER-METADATA).
+        "tls" => match args.first() {
+            None => Ok(json!({"tls": {}})),
+            Some(option) if option == "early_data" && args.len() == 1 => {
+                Ok(json!({"tls": {"handshake_complete": false}}))
+            }
+            Some(option) if option == "early_data" => Err(adapter_error(
+                position,
+                "wrong argument count for matcher `tls`",
+            )),
+            Some(option) => Err(adapter_error(
+                position,
+                format!(
+                    "unrecognized option '{option}' for matcher `tls` (Caddy v2.11.7 only supports `early_data`; sni/client_auth TLS metadata does not reach the HTTP engine)"
+                ),
+            )),
+        },
         other => Err(adapter_error(
             position,
             format!("matcher `{other}` is not supported by this build"),
