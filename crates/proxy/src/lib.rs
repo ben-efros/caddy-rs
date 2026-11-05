@@ -5,6 +5,7 @@
 
 pub mod balancer;
 pub mod client;
+pub mod digest;
 pub mod fastcgi;
 pub mod forward_auth;
 pub mod handler;
@@ -17,8 +18,8 @@ pub mod trusted_proxies;
 pub mod upstream;
 
 pub use balancer::{
-    from_selection_policy, Balancer, BalancerError, First, HashSelection, LeastConnections, Random,
-    RoundRobin, WeightedRoundRobin,
+    from_selection_policy, Balancer, BalancerError, CookieHash, First, HashSelection,
+    LeastConnections, Random, RandomChoice, RoundRobin, WeightedRoundRobin,
 };
 pub use fastcgi::{FastCgiError, FastCgiTransport};
 pub use handler::{

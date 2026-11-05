@@ -8,15 +8,69 @@
 /// SHA-256 round constants: the first 32 bits of the fractional parts of the cube roots of the
 /// first 64 primes.
 const K: [u32; 64] = [
-    0x428a_2f98, 0x7137_4491, 0xb5c0_fbcf, 0xe9b5_dba5, 0x3956_c25b, 0x59f1_11f1, 0x923f_82a4,
-    0xab1c_5ed5, 0xd807_aa98, 0x1283_5b01, 0x2431_85be, 0x550c_7dc3, 0x72be_5d74, 0x80de_b1fe,
-    0x9bdc_06a7, 0xc19b_f174, 0xe49b_69c1, 0xefbe_4786, 0x0fc1_9dc6, 0x240c_a1cc, 0x2de9_2c6f,
-    0x4a74_84aa, 0x5cb0_a9dc, 0x76f9_88da, 0x983e_5152, 0xa831_c66d, 0xb003_27c8, 0xbf59_7fc7,
-    0xc6e0_0bf3, 0xd5a7_9147, 0x06ca_6351, 0x1429_2967, 0x27b7_0a85, 0x2e1b_2138, 0x4d2c_6dfc,
-    0x5338_0d13, 0x650a_7354, 0x766a_0abb, 0x81c2_c92e, 0x9272_2c85, 0xa2bf_e8a1, 0xa81a_664b,
-    0xc24b_8b70, 0xc76c_51a3, 0xd192_e819, 0xd699_0624, 0xf40e_3585, 0x106a_a070, 0x19a4_c116,
-    0x1e37_6c08, 0x2748_774c, 0x34b0_bcb5, 0x391c_0cb3, 0x4ed8_aa4a, 0x5b9c_ca4f, 0x682e_6ff3,
-    0x748f_82ee, 0x78a5_636f, 0x84c8_7814, 0x8cc7_0208, 0x90be_fffa, 0xa450_6ceb, 0xbef9_a3f7,
+    0x428a_2f98,
+    0x7137_4491,
+    0xb5c0_fbcf,
+    0xe9b5_dba5,
+    0x3956_c25b,
+    0x59f1_11f1,
+    0x923f_82a4,
+    0xab1c_5ed5,
+    0xd807_aa98,
+    0x1283_5b01,
+    0x2431_85be,
+    0x550c_7dc3,
+    0x72be_5d74,
+    0x80de_b1fe,
+    0x9bdc_06a7,
+    0xc19b_f174,
+    0xe49b_69c1,
+    0xefbe_4786,
+    0x0fc1_9dc6,
+    0x240c_a1cc,
+    0x2de9_2c6f,
+    0x4a74_84aa,
+    0x5cb0_a9dc,
+    0x76f9_88da,
+    0x983e_5152,
+    0xa831_c66d,
+    0xb003_27c8,
+    0xbf59_7fc7,
+    0xc6e0_0bf3,
+    0xd5a7_9147,
+    0x06ca_6351,
+    0x1429_2967,
+    0x27b7_0a85,
+    0x2e1b_2138,
+    0x4d2c_6dfc,
+    0x5338_0d13,
+    0x650a_7354,
+    0x766a_0abb,
+    0x81c2_c92e,
+    0x9272_2c85,
+    0xa2bf_e8a1,
+    0xa81a_664b,
+    0xc24b_8b70,
+    0xc76c_51a3,
+    0xd192_e819,
+    0xd699_0624,
+    0xf40e_3585,
+    0x106a_a070,
+    0x19a4_c116,
+    0x1e37_6c08,
+    0x2748_774c,
+    0x34b0_bcb5,
+    0x391c_0cb3,
+    0x4ed8_aa4a,
+    0x5b9c_ca4f,
+    0x682e_6ff3,
+    0x748f_82ee,
+    0x78a5_636f,
+    0x84c8_7814,
+    0x8cc7_0208,
+    0x90be_fffa,
+    0xa450_6ceb,
+    0xbef9_a3f7,
     0xc671_78f2,
 ];
 
@@ -33,8 +87,14 @@ impl Sha256 {
     fn new() -> Self {
         Self {
             state: [
-                0x6a09_e667, 0xbb67_ae85, 0x3c6e_f372, 0xa54f_f53a, 0x510e_527f, 0x9b05_688c,
-                0x1f83_d9ab, 0x5be0_cd19,
+                0x6a09_e667,
+                0xbb67_ae85,
+                0x3c6e_f372,
+                0xa54f_f53a,
+                0x510e_527f,
+                0x9b05_688c,
+                0x1f83_d9ab,
+                0x5be0_cd19,
             ],
             buffer: [0; 64],
             buf_len: 0,
@@ -218,11 +278,31 @@ mod tests {
         // Vectors generated with Go's crypto/hmac + crypto/sha256 (the exact primitives behind
         // Caddy's `hashCookie`).
         let cases = [
-            ("", "", "b613679a0814d9ec772f95d778c35fc5ff1697c493715653c6c712144292c5ad"),
-            ("", "localhost:9000", "5eb90ec6fc30c1a63832d0e00eb31be7377f5e3d107ba92dfa0ad3d761d6a086"),
-            ("secret", "localhost:9000", "db30665da3924f711335b91b0804e02646c136f54e1fc66ec64a952b7e140c0a"),
-            ("secret", "127.0.0.1:8080", "f2c88e2d122d30ce28219cb0b15ac7b4c08ef6201bc038e0e11d1bd83151a8cd"),
-            ("", "unix//run/app.sock", "5862eb9a9d0aaaf326b816392834fd74557b3adbf9f893a35427e6cedd661005"),
+            (
+                "",
+                "",
+                "b613679a0814d9ec772f95d778c35fc5ff1697c493715653c6c712144292c5ad",
+            ),
+            (
+                "",
+                "localhost:9000",
+                "5eb90ec6fc30c1a63832d0e00eb31be7377f5e3d107ba92dfa0ad3d761d6a086",
+            ),
+            (
+                "secret",
+                "localhost:9000",
+                "db30665da3924f711335b91b0804e02646c136f54e1fc66ec64a952b7e140c0a",
+            ),
+            (
+                "secret",
+                "127.0.0.1:8080",
+                "f2c88e2d122d30ce28219cb0b15ac7b4c08ef6201bc038e0e11d1bd83151a8cd",
+            ),
+            (
+                "",
+                "unix//run/app.sock",
+                "5862eb9a9d0aaaf326b816392834fd74557b3adbf9f893a35427e6cedd661005",
+            ),
             (
                 "key",
                 "The quick brown fox jumps over the lazy dog",
@@ -238,11 +318,13 @@ mod tests {
         }
     }
 
-    /// Small helper: lowercase hex to bytes for test vectors.
-    fn hex_decode(hex: &str) -> Vec<u8> {
-        (0..hex.len())
-            .step_by(2)
-            .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).unwrap())
-            .collect()
+    /// Small helper: lowercase hex to bytes for test vectors (SHA-256 digests are 32 bytes).
+    fn hex_decode(hex: &str) -> [u8; 32] {
+        assert_eq!(hex.len(), 64, "test vector must be a 32-byte digest");
+        let mut decoded = [0_u8; 32];
+        for (index, byte) in decoded.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).unwrap();
+        }
+        decoded
     }
 }

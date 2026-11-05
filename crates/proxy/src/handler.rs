@@ -1046,6 +1046,22 @@ fn parse_flush_interval(value: Option<&Value>, path: &str) -> HttpResult<FlushIn
     Ok(FlushInterval::Interval(Duration::from_nanos(nanos as u64)))
 }
 
+/// Append any `Set-Cookie` headers a load-balancing policy wrote into `selection` onto
+/// `response`. Caddy hands `Select` the real `ResponseWriter`, so headers written during
+/// selection (the `cookie` policy's sticky-session echo) reach the client; caddy-rs hands it
+/// a scratch response instead, so the headers are merged here, before the final response is
+/// returned.
+fn merge_selection_cookie(response: &mut Response, selection: &Response) {
+    merge_selection_cookie_headers(&mut response.headers, selection);
+}
+
+/// Append the `Set-Cookie` headers accumulated in `selection` onto an arbitrary header map.
+fn merge_selection_cookie_headers(headers: &mut HeaderMap, selection: &Response) {
+    for value in selection.headers.get_all(http::header::SET_COOKIE) {
+        headers.append(http::header::SET_COOKIE, value.clone());
+    }
+}
+
 #[async_trait]
 impl Handler for ReverseProxyHandler {
     fn name(&self) -> &'static str {
@@ -1091,6 +1107,10 @@ impl Handler for ReverseProxyHandler {
         };
         // Number of retries already performed (Caddy's `retries` in `tryAgain`).
         let mut attempts: u32 = 0;
+        // Scratch response for load-balancing selection: policies such as `cookie` write
+        // selection headers (Set-Cookie) into it, mirroring Caddy's Select receiving the real
+        // ResponseWriter. Merged into the final response before it is returned.
+        let mut selection = Response::ok();
         loop {
             // Passive health checks remove temporarily unhealthy (or saturated) upstreams from
             // selection until their failure window expires (Caddy's `Upstream.Available()`).
@@ -1101,14 +1121,14 @@ impl Handler for ReverseProxyHandler {
                 .filter(|upstream| self.upstream_available(upstream, now))
                 .cloned()
                 .collect();
-            let Some(upstream) = self.balancer.select(&candidates, &request) else {
+            let Some(upstream) = self.balancer.select(&candidates, &request, &mut selection) else {
                 // No upstream is available. Caddy retries this state (an upstream may recover)
                 // and surfaces 503 when the retry budget is spent.
                 if !self.retry_allowed(attempts, deadline) {
-                    return Ok(Outcome::Respond(Response::text(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "503 Service Unavailable",
-                    )));
+                    let mut response =
+                        Response::text(StatusCode::SERVICE_UNAVAILABLE, "503 Service Unavailable");
+                    merge_selection_cookie(&mut response, &selection);
+                    return Ok(Outcome::Respond(response));
                 }
                 attempts += 1;
                 self.wait_before_retry().await;
@@ -1119,10 +1139,12 @@ impl Handler for ReverseProxyHandler {
             let body = match self.attempt_body(&mut request, buffered_body, &mut stream_taken) {
                 Ok(body) => body,
                 Err(message) => {
-                    return Ok(Outcome::Respond(Response::text(
+                    let mut response = Response::text(
                         StatusCode::BAD_GATEWAY,
                         format!("502 Bad Gateway: {message}"),
-                    )))
+                    );
+                    merge_selection_cookie(&mut response, &selection);
+                    return Ok(Outcome::Respond(response));
                 }
             };
             match self.forward(&upstream, &request, body).await {
@@ -1151,11 +1173,13 @@ impl Handler for ReverseProxyHandler {
                         }
                         // Caddy closes the matched response body and surfaces the upstream status
                         // once the retry budget is spent (rather than a generic 502).
-                        return Ok(Outcome::Respond(Response {
+                        let mut spent = Response {
                             status: forwarded.status,
                             headers: HeaderMap::new(),
                             body: Bytes::new(),
-                        }));
+                        };
+                        merge_selection_cookie(&mut spent, &selection);
+                        return Ok(Outcome::Respond(spent));
                     }
                     // Caddy evaluates `handle_response` after `retry_match`; a matching 2xx
                     // forward-auth response continues the handler chain (gate passed), while a
@@ -1171,6 +1195,8 @@ impl Handler for ReverseProxyHandler {
                                     Outcome::Continue(request)
                                 }
                                 HandleResponseResult::Respond(response) => {
+                                    let mut response = response;
+                                    merge_selection_cookie(&mut response, &selection);
                                     Outcome::Respond(response)
                                 }
                             });
@@ -1184,6 +1210,7 @@ impl Handler for ReverseProxyHandler {
                         status,
                         &upstream_headers,
                     );
+                    merge_selection_cookie(&mut response, &selection);
                     return Ok(Outcome::Respond(response));
                 }
                 Err(error) if error.is_upgrade_not_supported() => {
@@ -1199,10 +1226,9 @@ impl Handler for ReverseProxyHandler {
                         upstream.dial
                     );
                     if let Some(status) = error.explicit_status() {
-                        return Ok(Outcome::Respond(Response::text(
-                            status,
-                            format!("{status}"),
-                        )));
+                        let mut response = Response::text(status, format!("{status}"));
+                        merge_selection_cookie(&mut response, &selection);
+                        return Ok(Outcome::Respond(response));
                     }
                     upstream.record_failure();
                     if let Some(passive) = &self.passive {
@@ -1211,10 +1237,10 @@ impl Handler for ReverseProxyHandler {
                     let retryable =
                         error.is_dial_error() || self.retry_match.matches_transport_error(&request);
                     if !retryable || !self.retry_allowed(attempts, deadline) {
-                        return Ok(Outcome::Respond(Response::text(
-                            StatusCode::BAD_GATEWAY,
-                            "502 Bad Gateway",
-                        )));
+                        let mut response =
+                            Response::text(StatusCode::BAD_GATEWAY, "502 Bad Gateway");
+                        merge_selection_cookie(&mut response, &selection);
+                        return Ok(Outcome::Respond(response));
                     }
                     attempts += 1;
                     self.wait_before_retry().await;
@@ -1260,6 +1286,10 @@ impl Handler for ReverseProxyHandler {
             Some(tokio::time::Instant::now() + self.try_duration)
         };
         let mut attempts: u32 = 0;
+        // Scratch response for load-balancing selection: policies such as `cookie` write
+        // selection headers (Set-Cookie) into it, mirroring Caddy's Select receiving the real
+        // ResponseWriter. Merged into the final response before it is returned.
+        let mut selection = Response::ok();
         loop {
             let now = std::time::Instant::now();
             let candidates: Vec<Arc<Upstream>> = self
@@ -1268,10 +1298,13 @@ impl Handler for ReverseProxyHandler {
                 .filter(|upstream| self.upstream_available(upstream, now))
                 .cloned()
                 .collect();
-            let Some(upstream) = self.balancer.select(&candidates, &request) else {
+            let Some(upstream) = self.balancer.select(&candidates, &request, &mut selection) else {
                 if !self.retry_allowed(attempts, deadline) {
+                    let mut response =
+                        Response::text(StatusCode::SERVICE_UNAVAILABLE, "503 Service Unavailable");
+                    merge_selection_cookie(&mut response, &selection);
                     return Ok(StreamingOutcome::Respond(StreamingResponse::from_buffered(
-                        Response::text(StatusCode::SERVICE_UNAVAILABLE, "503 Service Unavailable"),
+                        response,
                     )));
                 }
                 attempts += 1;
@@ -1283,16 +1316,18 @@ impl Handler for ReverseProxyHandler {
             let body = match self.attempt_body(&mut request, buffered_body, &mut stream_taken) {
                 Ok(body) => body,
                 Err(message) => {
+                    let mut response = Response::text(
+                        StatusCode::BAD_GATEWAY,
+                        format!("502 Bad Gateway: {message}"),
+                    );
+                    merge_selection_cookie(&mut response, &selection);
                     return Ok(StreamingOutcome::Respond(StreamingResponse::from_buffered(
-                        Response::text(
-                            StatusCode::BAD_GATEWAY,
-                            format!("502 Bad Gateway: {message}"),
-                        ),
-                    )))
+                        response,
+                    )));
                 }
             };
             match self.forward_streaming(&upstream, &request, body).await {
-                Ok(Forwarded::Upgrade(forwarded)) => {
+                Ok(Forwarded::Upgrade(mut forwarded)) => {
                     if let Some(passive) = &self.passive {
                         let strikes = passive.record_response(
                             &upstream.dial,
@@ -1319,7 +1354,9 @@ impl Handler for ReverseProxyHandler {
                         continue;
                     }
                     // `forward_auth`/`handle_response` rules match normal responses; a protocol
-                    // switch is passed through untouched.
+                    // switch is passed through untouched (selection cookies merged like Caddy's
+                    // shared ResponseWriter would carry them).
+                    merge_selection_cookie_headers(&mut forwarded.headers, &selection);
                     return Ok(StreamingOutcome::Upgrade(UpgradedResponse::new(
                         forwarded.status,
                         forwarded.headers,
@@ -1352,12 +1389,14 @@ impl Handler for ReverseProxyHandler {
                             self.wait_before_retry().await;
                             continue;
                         }
+                        let mut spent = Response {
+                            status: forwarded.status,
+                            headers: HeaderMap::new(),
+                            body: Bytes::new(),
+                        };
+                        merge_selection_cookie(&mut spent, &selection);
                         return Ok(StreamingOutcome::Respond(StreamingResponse::from_buffered(
-                            Response {
-                                status: forwarded.status,
-                                headers: HeaderMap::new(),
-                                body: Bytes::new(),
-                            },
+                            spent,
                         )));
                     }
                     // A matching response handler either continues the chain with the auth headers
@@ -1377,6 +1416,8 @@ impl Handler for ReverseProxyHandler {
                                     StreamingOutcome::Continue(request)
                                 }
                                 HandleResponseResult::Respond(response) => {
+                                    let mut response = response;
+                                    merge_selection_cookie(&mut response, &selection);
                                     StreamingOutcome::Respond(StreamingResponse::from_buffered(
                                         response,
                                     ))
@@ -1397,6 +1438,7 @@ impl Handler for ReverseProxyHandler {
                         status,
                         &upstream_headers,
                     );
+                    merge_selection_cookie_headers(&mut response.headers, &selection);
                     return Ok(StreamingOutcome::Respond(response));
                 }
                 Err(error) => {
@@ -1405,8 +1447,10 @@ impl Handler for ReverseProxyHandler {
                         upstream.dial
                     );
                     if let Some(status) = error.explicit_status() {
+                        let mut response = Response::text(status, format!("{status}"));
+                        merge_selection_cookie(&mut response, &selection);
                         return Ok(StreamingOutcome::Respond(StreamingResponse::from_buffered(
-                            Response::text(status, format!("{status}")),
+                            response,
                         )));
                     }
                     upstream.record_failure();
@@ -1416,8 +1460,11 @@ impl Handler for ReverseProxyHandler {
                     let retryable =
                         error.is_dial_error() || self.retry_match.matches_transport_error(&request);
                     if !retryable || !self.retry_allowed(attempts, deadline) {
+                        let mut response =
+                            Response::text(StatusCode::BAD_GATEWAY, "502 Bad Gateway");
+                        merge_selection_cookie(&mut response, &selection);
                         return Ok(StreamingOutcome::Respond(StreamingResponse::from_buffered(
-                            Response::text(StatusCode::BAD_GATEWAY, "502 Bad Gateway"),
+                            response,
                         )));
                     }
                     attempts += 1;
@@ -2254,6 +2301,8 @@ mod tests {
             serde_json::json!({"policy": "header", "field": "X-Session"}),
             serde_json::json!({"policy": "query", "key": "user"}),
             serde_json::json!({"policy": "weighted_round_robin", "weights": [1, 1]}),
+            serde_json::json!({"policy": "random_choose", "choose": 2}),
+            serde_json::json!({"policy": "cookie", "name": "lb"}),
         ] {
             build_handler(serde_json::json!({
                 "handler": "reverse_proxy",
@@ -2261,17 +2310,18 @@ mod tests {
                 "load_balancing": {"selection_policy": policy}
             }));
         }
+        // `random_choose` with choose < 2 must fail loudly (Caddy `Validate` requires >= 2).
         let error = ReverseProxyHandler::from_json(
             &serde_json::json!({
                 "handler": "reverse_proxy",
                 "upstreams": [{"dial": "localhost:9000"}],
-                "load_balancing": {"selection_policy": {"policy": "cookie", "name": "lb"}}
+                "load_balancing": {"selection_policy": {"policy": "random_choose", "choose": 1}}
             }),
             "handler",
         )
         .err()
-        .expect("cookie policy must be rejected loudly");
-        assert!(error.to_string().contains("T-PROXY-013-COOKIE"), "{error}");
+        .expect("random_choose with choose < 2 must fail");
+        assert!(error.to_string().contains("choose"), "{error}");
 
         let error = ReverseProxyHandler::from_json(
             &serde_json::json!({
@@ -2489,6 +2539,9 @@ mod tests {
             "handler": "reverse_proxy",
             "upstreams": [{"dial": bad}, {"dial": good}],
             "load_balancing": {
+                // Pin the deterministic order: with the default `random` policy the first pick is
+                // nondeterministic; round-robin guarantees upstream 0 (502) then upstream 1 (200).
+                "selection_policy": {"policy": "round_robin"},
                 "retries": 1,
                 "retry_match": [{"status": [502, 503]}]
             }
@@ -5358,7 +5411,12 @@ mod body_tests {
         let handler = build(serde_json::json!({
             "handler": "reverse_proxy",
             "upstreams": [{"dial": dead_dial}, {"dial": good_dial}],
-            "load_balancing": {"retries": 1}
+            "load_balancing": {
+                // Pin the order: round-robin guarantees the dead upstream is tried first and the
+                // good one on the retry (the default `random` policy makes the picks nondeterministic).
+                "selection_policy": {"policy": "round_robin"},
+                "retries": 1
+            }
         }));
         assert!(handler.requires_buffered_request_body());
 
