@@ -1050,10 +1050,10 @@ fn request_http_version(request: &Request) -> Option<(u8, u8)> {
         };
     }
     match request.version {
-        Version::HTTP_2 => Some((2, 0)),
-        Version::HTTP_3 => Some((3, 0)),
-        Version::HTTP_11 => Some((1, 1)),
-        Version::HTTP_10 => Some((1, 0)),
+        http::Version::HTTP_2 => Some((2, 0)),
+        http::Version::HTTP_3 => Some((3, 0)),
+        http::Version::HTTP_11 => Some((1, 1)),
+        http::Version::HTTP_10 => Some((1, 0)),
         _ => None,
     }
 }

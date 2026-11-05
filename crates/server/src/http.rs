@@ -217,6 +217,10 @@ pub(crate) async fn serve_request_with_automatic_upgradable(
     }
 
     let mut internal = Request::new(parts.method, parts.uri);
+    // Propagate the negotiated HTTP version (hyper reports HTTP/2 for TLS/ALPN h2,
+    // prior-knowledge h2c, and h2c-upgraded requests alike). This is what the
+    // `http.matchers.protocol` matcher keys off (Caddy's `r.Proto`).
+    internal.version = parts.version;
     internal.headers = parts.headers;
     internal.remote_addr = remote_addr;
     internal.tls = tls;

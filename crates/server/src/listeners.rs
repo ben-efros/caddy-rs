@@ -966,11 +966,14 @@ async fn serve_one_request(
 
 /// Whether an HTTP/1.1 request is an eligible h2c Upgrade offer.
 ///
-/// RFC 7540 §3.2 requires the upgrade request to have no body; requests with a non-zero
-/// declared length or a transfer-encoding are served as normal HTTP/1.1 requests instead.
+/// RFC 7540 §3.2.1 requires the upgrade request to have no body and a valid `HTTP2-Settings`
+/// header; a request with a non-zero declared length, a transfer-encoding, or a missing or
+/// unparseable `HTTP2-Settings` is served as a normal HTTP/1.1 request instead (the server MUST
+/// ignore the `Upgrade: h2c` offer in that case).
 fn h2c_upgrade_allowed(request: &hyper::Request<Incoming>) -> bool {
     if request.version() != http::Version::HTTP_11
         || !caddy_rs_http::is_h2c_upgrade(request.headers())
+        || caddy_rs_http::h2c_upgrade_settings(request.headers()).is_err()
     {
         return false;
     }

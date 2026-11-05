@@ -376,6 +376,7 @@ impl Clone for Request {
             matcher_error: self.matcher_error.clone(),
             remote_addr: self.remote_addr,
             tls: self.tls,
+            version: self.version,
             vars: self.vars.clone(),
             pending_response_headers: self.pending_response_headers.clone(),
         }

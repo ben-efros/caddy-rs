@@ -166,7 +166,9 @@ pub fn h2c_upgrade_settings(headers: &HeaderMap) -> Result<(), H2cSettingsError>
     let value = headers
         .get(HTTP2_SETTINGS_HEADER)
         .ok_or(H2cSettingsError::Missing)?;
-    let value = value.to_str().map_err(|_| H2cSettingsError::InvalidBase64)?;
+    let value = value
+        .to_str()
+        .map_err(|_| H2cSettingsError::InvalidBase64)?;
     let payload = decode_base64url(value).ok_or(H2cSettingsError::InvalidBase64)?;
     if payload.len() % 6 != 0 {
         return Err(H2cSettingsError::InvalidSettings);
@@ -334,8 +336,8 @@ mod tests {
     #[test]
     fn h2c_upgrade_settings_accepts_the_oracle_payload() {
         // The payload used by the live-oracle and integration tests: two SETTINGS entries
-        // (ENABLE_PUSH=3 / MAX_CONCURRENT_STREAMS=100 and INITIAL_WINDOW_SIZE=255), which is a
-        // valid multiple of 6 octets.
+        // (MAX_CONCURRENT_STREAMS=100 and INITIAL_WINDOW_SIZE=65535), which is a valid
+        // multiple of 6 octets.
         let mut headers = HeaderMap::new();
         headers.insert(HTTP2_SETTINGS_HEADER, "AAMAAABkAAQAAP__".parse().unwrap());
         assert_eq!(h2c_upgrade_settings(&headers), Ok(()));
@@ -351,13 +353,13 @@ mod tests {
     fn h2c_upgrade_settings_rejects_missing_or_malformed_values() {
         let mut headers = HeaderMap::new();
         // Missing header: RFC 7540 §3.2.1 forbids upgrading without it.
-        assert_eq!(h2c_upgrade_settings(&headers), Err(H2cSettingsError::Missing));
+        assert_eq!(
+            h2c_upgrade_settings(&headers),
+            Err(H2cSettingsError::Missing)
+        );
 
         // Not base64url at all.
-        headers.insert(
-            HTTP2_SETTINGS_HEADER,
-            "!!!not-base64!!!".parse().unwrap(),
-        );
+        headers.insert(HTTP2_SETTINGS_HEADER, "!!!not-base64!!!".parse().unwrap());
         assert_eq!(
             h2c_upgrade_settings(&headers),
             Err(H2cSettingsError::InvalidBase64)
@@ -380,15 +382,16 @@ mod tests {
 
     #[test]
     fn base64url_decode_handles_the_url_safe_alphabet_and_padding() {
-        // Two SETTINGS entries, base64url with `_` in the final characters.
+        // Two SETTINGS entries, base64url with `_` in the final characters:
+        // MAX_CONCURRENT_STREAMS=100 and INITIAL_WINDOW_SIZE=0xFFFF (65535).
         assert_eq!(
             decode_base64url("AAMAAABkAAQAAP__").as_deref(),
-            Some(&[0x00, 0x03, 0x00, 0x00, 0x00, 0x64, 0x00, 0x04, 0x00, 0x00, 0x00, 0xff][..])
+            Some(&[0x00, 0x03, 0x00, 0x00, 0x00, 0x64, 0x00, 0x04, 0x00, 0x00, 0xff, 0xff][..])
         );
         // Padding is not part of base64url (RFC 4648 §5) but is tolerated at the tail.
         assert_eq!(
             decode_base64url("AAMAAABkAAQAAP__=").as_deref(),
-            Some(&[0x00, 0x03, 0x00, 0x00, 0x00, 0x64, 0x00, 0x04, 0x00, 0x00, 0x00, 0xff][..])
+            Some(&[0x00, 0x03, 0x00, 0x00, 0x00, 0x64, 0x00, 0x04, 0x00, 0x00, 0xff, 0xff][..])
         );
         // The URL-safe `-` alphabet.
         assert_eq!(decode_base64url("-w").as_deref(), Some(&[0xfb][..]));
@@ -399,16 +402,14 @@ mod tests {
 
     #[test]
     fn h2c_settings_error_is_formatted_for_logs() {
-        assert!(H2cSettingsError::Missing.to_string().contains("HTTP2-Settings"));
-        assert!(
-            H2cSettingsError::InvalidBase64
-                .to_string()
-                .contains("base64url")
-        );
-        assert!(
-            H2cSettingsError::InvalidSettings
-                .to_string()
-                .contains("multiple of 6")
-        );
+        assert!(H2cSettingsError::Missing
+            .to_string()
+            .contains("HTTP2-Settings"));
+        assert!(H2cSettingsError::InvalidBase64
+            .to_string()
+            .contains("base64url"));
+        assert!(H2cSettingsError::InvalidSettings
+            .to_string()
+            .contains("multiple of 6"));
     }
 }
