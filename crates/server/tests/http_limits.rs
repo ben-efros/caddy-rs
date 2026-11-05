@@ -205,49 +205,27 @@ async fn read_timeout_closes_stalled_request() {
 }
 
 #[tokio::test]
-async fn malformed_timeout_fails_apply_with_located_error() {
-    let store = Arc::new(GenerationStore::with_builtin_registry());
-    store
-        .load(test_config(serde_json::json!({"read_timeout": "soon"})))
-        .expect("config loads; timeout validation is a runtime/provisioning concern");
-    let mut runtime = ServerRuntime::new(store);
-    let error = runtime
-        .apply()
-        .await
-        .expect_err("a malformed read_timeout must fail the apply");
-    let message = error.to_string();
-    assert!(
-        message.contains("apps.http.servers.srv0.read_timeout"),
-        "error must name the offending field, got: {message}"
-    );
-
-    let store = Arc::new(GenerationStore::with_builtin_registry());
-    store
-        .load(test_config(serde_json::json!({"idle_timeout": 1.5})))
-        .expect("config loads");
-    let mut runtime = ServerRuntime::new(store);
-    let error = runtime
-        .apply()
-        .await
-        .expect_err("a non-integer idle_timeout must fail the apply");
-    assert!(error
-        .to_string()
-        .contains("apps.http.servers.srv0.idle_timeout"));
-
-    let store = Arc::new(GenerationStore::with_builtin_registry());
-    store
-        .load(test_config(
+async fn malformed_timeout_and_limits_fail_validation_with_located_error() {
+    // T-HTTP-042: malformed caddy.Duration/numeric server limits fail at load/validation instead
+    // of being deferred to apply (DIV-0039 residual).
+    for (fields, field) in [
+        (serde_json::json!({"read_timeout": "soon"}), "read_timeout"),
+        (serde_json::json!({"idle_timeout": 1.5}), "idle_timeout"),
+        (
             serde_json::json!({"max_request_body_size": "1MiB"}),
-        ))
-        .expect("config loads");
-    let mut runtime = ServerRuntime::new(store);
-    let error = runtime
-        .apply()
-        .await
-        .expect_err("a non-integer body limit must fail the apply");
-    assert!(error
-        .to_string()
-        .contains("apps.http.servers.srv0.max_request_body_size"));
+            "max_request_body_size",
+        ),
+    ] {
+        let store = Arc::new(GenerationStore::with_builtin_registry());
+        let error = store
+            .load(test_config(fields.clone()))
+            .expect_err("a malformed server limit must fail validation");
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("apps.http.servers.srv0.{field}")),
+            "error for {fields} must name the offending field, got: {message}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -455,10 +433,10 @@ async fn oversized_header_is_rejected() {
 }
 
 #[tokio::test]
-async fn h2c_upgrade_offer_is_not_switched() {
-    // Caddy serves h2c via HTTP/1.1 Upgrade; hyper's auto builder only implements HTTP/2 prior
-    // knowledge, so the upgrade offer is ignored and the request is served as HTTP/1.1. This test
-    // locks that divergence (DIV-0030) until upgrade support is tracked and implemented.
+async fn h2c_upgrade_switches_to_http2() {
+    // Caddy serves h2c via the HTTP/1.1 Upgrade mechanism (T-HTTP-022): answer 101 with
+    // Connection/Upgrade headers, then speak HTTP/2 on the upgraded stream. A real h2 client
+    // completes the upgrade and exchanges requests over the switched protocol.
     let (_store, runtime, address) = start(serde_json::json!({})).await;
 
     let mut stream = TcpStream::connect(address).await.expect("connect");
@@ -468,17 +446,64 @@ async fn h2c_upgrade_offer_is_not_switched() {
                    Upgrade: h2c\r\n\
                    HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
                    \r\n";
-    let _ = stream.write_all(request.as_bytes()).await;
-    let response = read_until_close(&mut stream, Duration::from_secs(2)).await;
-    let response = String::from_utf8_lossy(&response);
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write h2c upgrade request");
+
+    // Read exactly the response head (byte-by-byte) so bytes of the subsequent HTTP/2 server
+    // preface are not consumed.
+    let mut head = Vec::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
+            .await
+            .expect("upgrade response head timeout")
+            .expect("read upgrade response byte");
+        assert!(read > 0, "connection closed before the 101 response");
+        head.push(byte[0]);
+        if head.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    let head = String::from_utf8_lossy(&head);
     assert!(
-        response.starts_with("HTTP/1.1 200"),
-        "expected the h2c upgrade offer to be served as HTTP/1.1, got: {response:?}"
+        head.starts_with("HTTP/1.1 101 Switching Protocols"),
+        "expected a 101 upgrade response, got: {head:?}"
     );
     assert!(
-        !response.contains("101 Switching Protocols"),
-        "h2c upgrade must not be switched until supported: {response:?}"
+        head.to_ascii_lowercase().contains("upgrade: h2c"),
+        "missing Upgrade: h2c header: {head:?}"
     );
+    assert!(
+        head.to_ascii_lowercase().contains("connection: upgrade"),
+        "missing Connection: Upgrade header: {head:?}"
+    );
+
+    // The client performs its HTTP/2 handshake on the upgraded stream and issues a request.
+    let (mut sender, connection) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
+            .await
+            .expect("HTTP/2 handshake after h2c upgrade");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let request = hyper::Request::builder()
+        .method("GET")
+        .uri(format!("http://{address}/"))
+        .header(http::header::HOST, "example.com")
+        .body(Full::<Bytes>::new(Bytes::new()))
+        .expect("valid h2 request");
+    let response = sender.send_request(request).await.expect("h2c request");
+    assert_eq!(response.version(), http::Version::HTTP_2);
+    assert_eq!(response.status(), 200);
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("h2c body")
+        .to_bytes();
+    assert_eq!(body, Bytes::from_static(b"ok"));
 
     runtime.shutdown().await;
 }

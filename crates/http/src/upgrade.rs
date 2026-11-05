@@ -102,6 +102,36 @@ impl UpgradedResponse {
     }
 }
 
+/// HTTP/1.1 `Upgrade: h2c` protocol token (RFC 7540 §3.2 cleartext HTTP/2 upgrade).
+pub const H2C_UPGRADE_TOKEN: &str = "h2c";
+
+/// Whether the request headers offer an h2c (cleartext HTTP/2) protocol upgrade.
+///
+/// This is the RFC 7230 negotiation check plus a case-insensitive `h2c` token comparison, matching
+/// Caddy's cleartext listener behaviour. The server is responsible for only honouring it on an
+/// HTTP/1.1, non-TLS connection and for serving HTTP/2 on the upgraded stream.
+pub fn is_h2c_upgrade(headers: &HeaderMap) -> bool {
+    requested_upgrade_type(headers)
+        .is_some_and(|protocol| protocol.eq_ignore_ascii_case(H2C_UPGRADE_TOKEN))
+}
+
+/// The handshake headers for a `101 Switching Protocols` h2c response.
+///
+/// Caddy sends `Connection: Upgrade` and `Upgrade: h2c`; the server writes this status/header pair
+/// and then serves HTTP/2 on the upgraded stream.
+pub fn h2c_upgrade_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        http::header::CONNECTION,
+        http::HeaderValue::from_static("Upgrade"),
+    );
+    headers.insert(
+        http::header::UPGRADE,
+        http::HeaderValue::from_static(H2C_UPGRADE_TOKEN),
+    );
+    headers
+}
+
 /// The protocol a request asks to upgrade to, following RFC 7230 upgrade negotiation.
 ///
 /// Returns `Some(protocol)` only when the `Connection` header contains the `upgrade` token and the
@@ -184,5 +214,33 @@ mod tests {
         assert_eq!(response.status, StatusCode::SWITCHING_PROTOCOLS);
         assert_eq!(response.headers[http::header::UPGRADE], "websocket");
         assert!(format!("{:?}", response).contains("UpgradedResponse"));
+    }
+
+    #[test]
+    fn detects_h2c_upgrade_offers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONNECTION,
+            "Upgrade, HTTP2-Settings".parse().unwrap(),
+        );
+        headers.insert(http::header::UPGRADE, "h2c".parse().unwrap());
+        assert!(is_h2c_upgrade(&headers));
+        // Case-insensitive protocol token.
+        headers.insert(http::header::UPGRADE, "H2C".parse().unwrap());
+        assert!(is_h2c_upgrade(&headers));
+        // Missing Connection: upgrade token is not an upgrade negotiation.
+        headers.insert(http::header::CONNECTION, "keep-alive".parse().unwrap());
+        assert!(!is_h2c_upgrade(&headers));
+        // Other protocols are not h2c.
+        headers.insert(http::header::CONNECTION, "Upgrade".parse().unwrap());
+        headers.insert(http::header::UPGRADE, "websocket".parse().unwrap());
+        assert!(!is_h2c_upgrade(&headers));
+    }
+
+    #[test]
+    fn h2c_upgrade_headers_are_canonical() {
+        let headers = h2c_upgrade_headers();
+        assert_eq!(headers[http::header::UPGRADE], "h2c");
+        assert_eq!(headers[http::header::CONNECTION], "Upgrade");
     }
 }
