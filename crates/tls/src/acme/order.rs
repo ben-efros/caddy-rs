@@ -529,7 +529,9 @@ impl AcmeClock for TokioClock {
 pub struct PollPolicy {
     /// Delay used when the server sends no `Retry-After` header.
     pub default_interval: Duration,
-    /// Upper bound applied to any `Retry-After` delay.
+    /// Legacy fallback bound (retained for API compatibility). Caddy/acmez honour the server's
+    /// `Retry-After` exactly, so [`Self::delay`] no longer clamps it; this value is unused by the
+    /// polling loop.
     pub max_interval: Duration,
     /// Maximum number of polls before giving up.
     pub max_attempts: u32,
@@ -556,9 +558,10 @@ impl PollPolicy {
     }
 
     fn delay(&self, retry_after: Option<Duration>) -> Duration {
-        retry_after
-            .unwrap_or(self.default_interval)
-            .min(self.max_interval)
+        // Caddy/acmez honour the CA's Retry-After verbatim (`retryAfter` in acmez returns
+        // time.Until(raTime)); clamping it would poll earlier than the CA asked and diverge from
+        // their polling behaviour.
+        retry_after.unwrap_or(self.default_interval)
     }
 }
 
@@ -832,7 +835,7 @@ impl<T: AcmeTransport> AcmeAccountClient<T> {
 
     /// Poll an authorization until it is `valid`.
     ///
-    /// Honours `Retry-After` (bounded by the policy) and returns a typed
+    /// Honours `Retry-After` exactly and returns a typed
     /// [`AcmeError::InvalidAuthorization`] when the CA rejects a challenge.
     pub async fn poll_authorization(
         &self,
@@ -1041,7 +1044,7 @@ fn check_order_not_invalid(url: &str, order: &Order, response: &HttpResponse) ->
     let problem = order.error.clone().or_else(|| response.problem());
     let detail = problem
         .as_ref()
-        .and_then(|problem| problem.detail.clone())
+        .map(crate::acme::Problem::diagnostic)
         .unwrap_or_else(|| "order is invalid".to_string());
     Err(AcmeError::InvalidOrder {
         url: url.to_string(),
@@ -1055,7 +1058,7 @@ fn order_invalid_error(url: &str, order: &Order) -> Error {
     let problem = order.error.clone();
     let detail = problem
         .as_ref()
-        .and_then(|problem| problem.detail.clone())
+        .map(crate::acme::Problem::diagnostic)
         .unwrap_or_else(|| "order is invalid".to_string());
     AcmeError::InvalidOrder {
         url: url.to_string(),
@@ -1073,7 +1076,7 @@ fn authorization_invalid_error(url: &str, authorization: &Authorization) -> Erro
     let problem = failed.and_then(|challenge| challenge.error.clone());
     let detail = problem
         .as_ref()
-        .and_then(|problem| problem.detail.clone())
+        .map(crate::acme::Problem::diagnostic)
         .unwrap_or_else(|| "authorization is invalid".to_string());
     AcmeError::InvalidAuthorization {
         url: url.to_string(),
@@ -1087,7 +1090,7 @@ fn challenge_invalid_error(url: &str, challenge: &Challenge, response: &HttpResp
     let problem = challenge.error.clone().or_else(|| response.problem());
     let detail = problem
         .as_ref()
-        .and_then(|problem| problem.detail.clone())
+        .map(crate::acme::Problem::diagnostic)
         .unwrap_or_else(|| "challenge is invalid".to_string());
     AcmeError::InvalidChallenge {
         url: url.to_string(),
@@ -1339,11 +1342,11 @@ mod tests {
         let parsed = parse_retry_after(&header).unwrap();
         assert!(parsed <= Duration::from_secs(30), "{parsed:?}");
         assert!(parsed >= Duration::from_secs(25), "{parsed:?}");
-        // Retry-After is bounded by the policy.
+        // Retry-After is honoured exactly, matching Caddy/acmez (no policy clamp).
         let policy = PollPolicy::new(Duration::from_secs(2), Duration::from_secs(5), 3);
         assert_eq!(
             policy.delay(Some(Duration::from_secs(120))),
-            Duration::from_secs(5)
+            Duration::from_secs(120)
         );
         assert_eq!(policy.delay(None), Duration::from_secs(2));
     }

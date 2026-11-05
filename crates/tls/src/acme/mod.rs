@@ -650,6 +650,58 @@ pub struct Subproblem {
     pub identifier: Option<serde_json::Value>,
 }
 
+impl Problem {
+    /// The RFC 8555 error code (the part after `urn:ietf:params:acme:error:`), when the CA uses
+    /// the standard namespace.
+    pub fn error_code(&self) -> Option<&str> {
+        self.problem_type.strip_prefix(ACME_ERROR_PREFIX)
+    }
+
+    /// Whether this problem has the given RFC 8555 error code.
+    pub fn is(&self, code: &str) -> bool {
+        self.error_code() == Some(code)
+    }
+
+    /// A human-readable diagnostic combining the CA detail, error code and sub-problems.
+    ///
+    /// Caddy/acmez surface the CA's `detail` (and sub-problem details for order failures); this
+    /// helper produces a useful message even when the top-level problem has no detail.
+    pub fn diagnostic(&self) -> String {
+        let mut message = self
+            .detail
+            .clone()
+            .or_else(|| self.error_code().map(str::to_string))
+            .unwrap_or_else(|| self.problem_type.clone());
+        for subproblem in &self.subproblems {
+            let detail = subproblem
+                .detail
+                .clone()
+                .or_else(|| subproblem.error_code().map(str::to_string));
+            let identifier = subproblem
+                .identifier
+                .as_ref()
+                .and_then(|identifier| identifier.get("value"))
+                .and_then(serde_json::Value::as_str);
+            match (detail, identifier) {
+                (Some(detail), Some(identifier)) => {
+                    message.push_str(&format!(" ({identifier}: {detail})"));
+                }
+                (Some(detail), None) => message.push_str(&format!(" ({detail})")),
+                (None, Some(identifier)) => message.push_str(&format!(" ({identifier})")),
+                (None, None) => {}
+            }
+        }
+        message
+    }
+}
+
+impl Subproblem {
+    /// The RFC 8555 error code, when the CA uses the standard namespace.
+    pub fn error_code(&self) -> Option<&str> {
+        self.problem_type.strip_prefix(ACME_ERROR_PREFIX)
+    }
+}
+
 /// A JSON Web Key for an ACME account (public key only).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Jwk {
@@ -2238,6 +2290,45 @@ mod tests {
             1,
             "no POST may be sent when the terms are not accepted"
         );
+    }
+
+    #[test]
+    fn problem_codes_and_diagnostics_include_subproblems() {
+        let problem = Problem {
+            problem_type: "urn:ietf:params:acme:error:rateLimited".to_string(),
+            detail: Some("too many certificates".to_string()),
+            status: Some(429),
+            subproblems: Vec::new(),
+            identifier: None,
+        };
+        assert_eq!(problem.error_code(), Some("rateLimited"));
+        assert!(problem.is("rateLimited"));
+        assert!(!problem.is("badNonce"));
+        assert_eq!(problem.diagnostic(), "too many certificates");
+
+        let no_detail = Problem {
+            problem_type: "urn:ietf:params:acme:error:badNonce".to_string(),
+            detail: None,
+            status: None,
+            subproblems: Vec::new(),
+            identifier: None,
+        };
+        assert_eq!(no_detail.diagnostic(), "badNonce");
+
+        let with_subproblems = Problem {
+            problem_type: "urn:ietf:params:acme:error:malformed".to_string(),
+            detail: None,
+            status: None,
+            subproblems: vec![Subproblem {
+                problem_type: "urn:ietf:params:acme:error:dns".to_string(),
+                detail: Some("no TXT record".to_string()),
+                identifier: Some(serde_json::json!({"type": "dns", "value": "example.com"})),
+            }],
+            identifier: None,
+        };
+        let diagnostic = with_subproblems.diagnostic();
+        assert_eq!(diagnostic, "malformed (example.com: no TXT record)");
+        assert_eq!(with_subproblems.subproblems[0].error_code(), Some("dns"));
     }
 
     #[tokio::test]

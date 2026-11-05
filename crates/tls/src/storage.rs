@@ -13,7 +13,8 @@
 //! ```text
 //! <root>/certificates/<issuer-key>/<name>/<name>.crt   full PEM chain, leaf first
 //! <root>/certificates/<issuer-key>/<name>/<name>.key   PEM private key
-//! <root>/certificates/<issuer-key>/<name>/<name>.json  CertMagic metadata (`{"sans": [...]}`)
+//! <root>/certificates/<issuer-key>/<name>/<name>.json  CertMagic metadata
+//!                                                  (`{"sans": [...], "issuer_data": {...}}`)
 //! ```
 //!
 //! `<issuer-key>` identifies the issuing CA rather than the issuer module name (Caddy's
@@ -31,6 +32,9 @@
 //! On load, the domains come from the CertMagic `.json` metadata when present (falling back to the
 //! directory name) and `not_after_unix` is recovered from the leaf certificate's validity period.
 //! PEM strings returned by [`FileStorage`] are normalised: one block per entry, no trailing
+//! newline. CertMagic's opaque `issuer_data` (ACME certificate URL/CA/account and ARI info) and
+//! any unknown metadata fields are preserved when a certificate is rewritten, and the metadata is
+//! serialised in CertMagic's tab-indented `sans`-then-`issuer_data` shape without a trailing
 //! newline.
 
 use std::collections::BTreeMap;
@@ -60,6 +64,14 @@ pub struct StoredCertificate {
     pub domains: Vec<String>,
     /// Unix timestamp (seconds) after which the certificate is not valid.
     pub not_after_unix: u64,
+    /// CertMagic's opaque `issuer_data` metadata (for ACME: certificate URL, CA directory and
+    /// account URL). Preserved verbatim when a certificate is rewritten.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer_data: Option<serde_json::Value>,
+    /// Any other metadata fields written by Caddy/CertMagic. Preserved verbatim on rewrite so a
+    /// newer Caddy metadata field survives a caddy-rs renewal.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata_extra: BTreeMap<String, serde_json::Value>,
 }
 
 /// Async certificate storage backend.
@@ -213,7 +225,7 @@ impl CertificateStorage for FileStorage {
         };
 
         let (_, name) = split_storage_key(key)?;
-        let domains = match fs::read(&paths.metadata).await {
+        let (domains, issuer_data, metadata_extra) = match fs::read(&paths.metadata).await {
             Ok(data) => {
                 let metadata: CaddyCertificateMetadata =
                     serde_json::from_slice(&data).map_err(|error| {
@@ -222,14 +234,17 @@ impl CertificateStorage for FileStorage {
                             paths.metadata.display()
                         ))
                     })?;
-                match metadata.sans {
+                let domains = match metadata.sans {
                     Some(sans) if !sans.is_empty() => sans,
                     _ => vec![caddy_certificate_name_from_storage(&name)],
-                }
+                };
+                (domains, metadata.issuer_data, metadata.extra)
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                vec![caddy_certificate_name_from_storage(&name)]
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (
+                vec![caddy_certificate_name_from_storage(&name)],
+                None,
+                BTreeMap::new(),
+            ),
             Err(error) => return Err(Error::Io(error)),
         };
 
@@ -240,6 +255,8 @@ impl CertificateStorage for FileStorage {
             private_key_pem,
             domains,
             not_after_unix,
+            issuer_data,
+            metadata_extra,
         }))
     }
 
@@ -264,10 +281,28 @@ impl CertificateStorage for FileStorage {
         atomic_write(&paths.private_key, key_pem.as_bytes()).await?;
         restrict_private_key_permissions(&paths.private_key).await;
 
-        let metadata = serde_json::json!({ "sans": certificate.domains });
-        let mut data = serde_json::to_vec_pretty(&metadata)
+        // CertMagic serialises `CertificateResource` with `json.MarshalIndent(cert, "", "\t")`:
+        // tab indentation, struct field order (`sans`, then `issuer_data`), no trailing newline.
+        // Preserve any unknown metadata fields after those.
+        #[derive(Serialize)]
+        struct CertMagicMetadata<'a> {
+            sans: &'a [String],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            issuer_data: Option<&'a serde_json::Value>,
+            #[serde(flatten)]
+            extra: &'a BTreeMap<String, serde_json::Value>,
+        }
+        let metadata = CertMagicMetadata {
+            sans: &certificate.domains,
+            issuer_data: certificate.issuer_data.as_ref(),
+            extra: &certificate.metadata_extra,
+        };
+        let mut data = Vec::new();
+        let formatter = serde_json::ser::PrettyFormatter::with_indent(b"\t");
+        let mut serializer = serde_json::Serializer::with_formatter(&mut data, formatter);
+        metadata
+            .serialize(&mut serializer)
             .map_err(|error| Error::Storage(error.to_string()))?;
-        data.push(b'\n');
         atomic_write(&paths.metadata, &data).await?;
         Ok(())
     }
@@ -359,12 +394,19 @@ impl<T: CertificateStorage + ?Sized> CertificateStorage for Arc<T> {
 
 /// Metadata file written by CertMagic alongside `<name>.crt` / `<name>.key`.
 ///
-/// Only the fields this build needs are decoded; unknown fields (for example CertMagic's
-/// `issuer_data`) are ignored so files written by Caddy remain readable.
+/// CertMagic's JSON has `sans` and an opaque `issuer_data` object (for ACME: certificate URL,
+/// CA directory and account URL, optionally ARI renewal info). Unknown fields are preserved on
+/// rewrite so a newer Caddy metadata key survives a caddy-rs renewal.
 #[derive(Debug, Deserialize)]
 struct CaddyCertificateMetadata {
     #[serde(default)]
     sans: Option<Vec<String>>,
+    /// CertMagic's issuer-specific metadata (`acme.Certificate` for ACME: url/ca/account/ARI).
+    #[serde(default)]
+    issuer_data: Option<serde_json::Value>,
+    /// Other fields preserved for forward compatibility (for example future CertMagic keys).
+    #[serde(flatten)]
+    extra: BTreeMap<String, serde_json::Value>,
 }
 
 /// Convert an issuer identity to Caddy's on-disk issuer directory name.
@@ -824,6 +866,8 @@ mod tests {
                 .to_string(),
             domains: vec!["example.com".to_string()],
             not_after_unix: 4_000_000_000,
+            issuer_data: None,
+            metadata_extra: BTreeMap::new(),
         }
     }
 
@@ -844,6 +888,8 @@ mod tests {
             private_key_pem: fixture_key(),
             domains: vec!["example.com".to_string(), "www.example.com".to_string()],
             not_after_unix: 1_775_001_600, // 2026-04-01T00:00:00Z
+            issuer_data: None,
+            metadata_extra: BTreeMap::new(),
         }
     }
 
@@ -1141,6 +1187,55 @@ mod tests {
         assert_eq!(days_from_civil(1970, 1, 1), 0);
         assert_eq!(days_from_civil(2000, 1, 1), 10_957);
         assert_eq!(days_from_civil(2026, 4, 1), 20_544);
+    }
+
+    #[tokio::test]
+    async fn writes_certmagic_metadata_with_issuer_data_and_preserves_unknown_fields() {
+        let temporary = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(temporary.path());
+        let stored = StoredCertificate {
+            certificate_pem: fixture_chain(),
+            private_key_pem: fixture_key(),
+            domains: vec!["example.com".to_string(), "www.example.com".to_string()],
+            not_after_unix: 1_775_001_600,
+            issuer_data: Some(serde_json::json!({
+                "url": "https://acme.test/certificate/1",
+                "ca": "https://acme.test/directory",
+                "account": "https://acme.test/account/1"
+            })),
+            metadata_extra: BTreeMap::from([(
+                "future_field".to_string(),
+                serde_json::json!("kept"),
+            )]),
+        };
+        let key = "acme-v02.api.letsencrypt.org-directory/example.com";
+        storage.store(key, &stored).await.unwrap();
+        let metadata_path = temporary
+            .path()
+            .join("certificates")
+            .join("acme-v02.api.letsencrypt.org-directory")
+            .join(caddy_certificate_storage_name("example.com"))
+            .join("example.com.json");
+        let metadata = std::fs::read_to_string(&metadata_path).unwrap();
+        // CertMagic uses `json.MarshalIndent(cert, "", "\t")`: tab indentation, `sans` first,
+        // then `issuer_data`, no trailing newline. The opaque issuer_data object's keys are sorted
+        // by serde_json's map, which is semantically identical JSON.
+        let expected = "{\n\t\"sans\": [\n\t\t\"example.com\",\n\t\t\"www.example.com\"\n\t],\n\t\"issuer_data\": {\n\t\t\"account\": \"https://acme.test/account/1\",\n\t\t\"ca\": \"https://acme.test/directory\",\n\t\t\"url\": \"https://acme.test/certificate/1\"\n\t},\n\t\"future_field\": \"kept\"\n}";
+        assert_eq!(metadata, expected);
+
+        let loaded = storage
+            .load(key)
+            .await
+            .unwrap()
+            .expect("stored certificate");
+        assert_eq!(loaded.issuer_data, stored.issuer_data);
+        assert_eq!(loaded.metadata_extra, stored.metadata_extra);
+        assert_eq!(loaded.domains, stored.domains);
+        assert_eq!(loaded.not_after_unix, stored.not_after_unix);
+
+        // Rewriting the loaded record keeps the CertMagic metadata byte-for-byte.
+        storage.store(key, &loaded).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&metadata_path).unwrap(), expected);
     }
 
     #[test]

@@ -992,7 +992,7 @@ impl RenewalScheduler {
     }
 
     async fn persist(&self, certificate: &Certificate) -> Result<()> {
-        let stored = stored_certificate(certificate)?;
+        let mut stored = stored_certificate(certificate)?;
         let primary = certificate.domains.first().ok_or_else(|| {
             Error::Certificate("certificate to persist has no domains".to_string())
         })?;
@@ -1001,6 +1001,13 @@ impl RenewalScheduler {
             caddy_issuer_key(&certificate.issuer),
             caddy_certificate_storage_name(primary)
         );
+        // Issuers persist their own metadata (for ACME: url/ca/account) before the scheduler
+        // stores the certificate. Preserve that CertMagic metadata, plus any unknown fields a
+        // newer Caddy may have written, instead of overwriting the `.json` with just `sans`.
+        if let Some(existing) = self.storage.load(&key).await? {
+            stored.issuer_data = existing.issuer_data;
+            stored.metadata_extra = existing.metadata_extra;
+        }
         self.storage.store(&key, &stored).await
     }
 }
@@ -1085,6 +1092,8 @@ fn stored_certificate(certificate: &Certificate) -> Result<StoredCertificate> {
         private_key_pem: pem_encode("PRIVATE KEY", &certificate.private_key_der),
         domains: certificate.domains.clone(),
         not_after_unix: unix_seconds(certificate.not_after)?,
+        issuer_data: None,
+        metadata_extra: std::collections::BTreeMap::new(),
     })
 }
 
