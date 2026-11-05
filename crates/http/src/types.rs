@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use http::{HeaderMap, Method, StatusCode, Uri};
+use http::{HeaderMap, Method, StatusCode, Uri, Version};
 use thiserror::Error;
 
 use crate::body::{BodyError, RequestBody, StreamingResponse};
@@ -99,6 +99,12 @@ pub struct Request {
     pub remote_addr: Option<SocketAddr>,
     /// Whether the connection is TLS.
     pub tls: bool,
+    /// The request's effective HTTP version, propagated by the server from the hyper connection.
+    ///
+    /// This is what the `protocol` matcher keys off (Caddy's `r.Proto`): HTTP/1.1 for plain
+    /// cleartext, HTTP/2 for TLS/ALPN h2, prior-knowledge h2c, and h2c-upgraded requests alike.
+    /// Requests built without a transport default to HTTP/1.1 (the cleartext assumption).
+    pub version: Version,
     /// Per-request variables (Caddy `vars` handler).
     pub vars: BTreeMap<String, String>,
     /// Response headers staged by response middleware (`headers` handler).
@@ -118,6 +124,7 @@ impl Request {
             matcher_error: None,
             remote_addr: None,
             tls: false,
+            version: Version::HTTP_11,
             vars: BTreeMap::new(),
             pending_response_headers: HeaderMap::new(),
         }

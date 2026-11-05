@@ -1035,9 +1035,10 @@ impl Matcher for LocalIpMatcher {
 
 /// The HTTP version inferred for `protocol` matching.
 ///
-/// The engine does not carry the hyper version; the server exposes the negotiated TLS ALPN as
-/// `tls.alpn`. Cleartext connections are assumed to be HTTP/1.1 (h2c prior-knowledge requests
-/// cannot be distinguished until the server forwards the version).
+/// The server propagates the effective negotiated protocol on [`Request::version`] from the hyper
+/// connection (hyper reports HTTP/1.1 for HTTP/1.1 connections and HTTP/2 for h2, prior-knowledge
+/// h2c, and h2c-upgraded requests alike). The negotiated TLS ALPN (`tls.alpn`) remains a fallback
+/// for requests built without a transport.
 fn request_http_version(request: &Request) -> Option<(u8, u8)> {
     if let Some(alpn) = request.vars.get("tls.alpn") {
         return match alpn.as_str() {
@@ -1048,10 +1049,12 @@ fn request_http_version(request: &Request) -> Option<(u8, u8)> {
             _ => None,
         };
     }
-    if request.tls {
-        None
-    } else {
-        Some((1, 1))
+    match request.version {
+        Version::HTTP_2 => Some((2, 0)),
+        Version::HTTP_3 => Some((3, 0)),
+        Version::HTTP_11 => Some((1, 1)),
+        Version::HTTP_10 => Some((1, 0)),
+        _ => None,
     }
 }
 
