@@ -7,7 +7,11 @@
 //! * Hop-by-hop headers are stripped (including headers named by the `Connection` header).
 //! * `X-Forwarded-For`, `X-Forwarded-Proto` and `X-Forwarded-Host` are set from the connection.
 //!   Prior values are only trusted when the peer is in `trusted_proxies`.
-//! * `Via` is appended to the upstream response, matching Caddy.
+//! * `Via` is appended to the upstream request (`<client proto> Caddy`) and to the upstream
+//!   response (`<upstream proto> Caddy`), matching Caddy.
+//! * Server-level `trusted_proxies` is consumed through the `trusted_proxy`/`client_ip` request
+//!   variables set by the server (`crate::trusted_proxies`); the handler-level `trusted_proxies`
+//!   list still works and is unioned with the server decision, like Caddy.
 //!
 //! Upstreams may be `host:port` TCP dials or Unix sockets (`unix//path`); the client selects the
 //! transport from the outbound URI.
@@ -399,11 +403,19 @@ impl ReverseProxyHandler {
         }
 
         let load_balancing = object.get("load_balancing");
-        let policy = load_balancing
-            .and_then(|lb| lb.get("selection_policy"))
-            .and_then(|policy| policy.get("policy"))
-            .and_then(Value::as_str);
-        let balancer = balancer::from_policy(policy).map_err(|message| invalid(path, message))?;
+        let selection_policy = load_balancing.and_then(|lb| lb.get("selection_policy"));
+        let balancer =
+            balancer::from_selection_policy(selection_policy, &format!("{path}.load_balancing"))
+                .map_err(|error| match error {
+                    balancer::BalancerError::Invalid(message) => invalid(path, message),
+                    balancer::BalancerError::NotImplemented {
+                        feature,
+                        tracking_id,
+                    } => HttpError::NotImplemented {
+                        feature,
+                        tracking_id,
+                    },
+                })?;
         let retries = load_balancing
             .and_then(|lb| lb.get("retries"))
             .and_then(Value::as_u64)
@@ -778,6 +790,14 @@ impl ReverseProxyHandler {
             );
         }
 
+        // Caddy appends `Via: <client proto> Caddy` to the upstream request after the forwarded
+        // headers and before `header_up` operations (so user operations can still override it).
+        headers.append(
+            http::header::VIA,
+            HeaderValue::from_str(&client_via_value(request))
+                .map_err(|error| ProxyError::Request(error.to_string()))?,
+        );
+
         // `header_up` operations are applied last and win over the implicit headers. Values are
         // templates: canonical `forward_auth` relies on `{http.request.method}` / `{http.request.uri}`
         // carrying the *original* request values to the auth service.
@@ -808,10 +828,17 @@ impl ReverseProxyHandler {
             return Ok(());
         };
         let client_ip = remote.ip();
-        let trusted = self
-            .trusted_proxies
-            .iter()
-            .any(|network| network.contains(client_ip));
+        // The server runtime sets Caddy's `trusted_proxy` var from the server-level
+        // trusted_proxies; the handler-level list is unioned with it, like Caddy.
+        let server_trusted = request
+            .vars
+            .get("trusted_proxy")
+            .is_some_and(|value| value == "true");
+        let trusted = server_trusted
+            || self
+                .trusted_proxies
+                .iter()
+                .any(|network| network.contains(client_ip));
 
         let forwarded_for = joined_header_value(headers, "x-forwarded-for");
         if trusted
@@ -1072,7 +1099,7 @@ impl Handler for ReverseProxyHandler {
                 .filter(|upstream| self.upstream_available(upstream, now))
                 .cloned()
                 .collect();
-            let Some(upstream) = self.balancer.select(&candidates) else {
+            let Some(upstream) = self.balancer.select(&candidates, &request) else {
                 // No upstream is available. Caddy retries this state (an upstream may recover)
                 // and surfaces 503 when the retry budget is spent.
                 if !self.retry_allowed(attempts, deadline) {
@@ -1239,7 +1266,7 @@ impl Handler for ReverseProxyHandler {
                 .filter(|upstream| self.upstream_available(upstream, now))
                 .cloned()
                 .collect();
-            let Some(upstream) = self.balancer.select(&candidates) else {
+            let Some(upstream) = self.balancer.select(&candidates, &request) else {
                 if !self.retry_allowed(attempts, deadline) {
                     return Ok(StreamingOutcome::Respond(StreamingResponse::from_buffered(
                         Response::text(StatusCode::SERVICE_UNAVAILABLE, "503 Service Unavailable"),
@@ -1483,6 +1510,22 @@ fn last_header_value(headers: &HeaderMap, name: &str) -> Option<String> {
 }
 
 /// The `Via` entry Caddy appends for a given upstream HTTP version.
+/// Caddy's upstream request `Via` value: `<client HTTP major.minor> Caddy`.
+///
+/// caddy-rs' `Request` does not carry the client HTTP version; the server sets Caddy's
+/// `{http.request.proto}` placeholder value (for example `HTTP/2.0`) in the `http.request.proto`
+/// request variable when preparing requests (server-side follow-up for T-PROXY-024). Without it the
+/// value falls back to `1.1`, matching the HTTP/1.1 baseline of the current server pipeline.
+fn client_via_value(request: &Request) -> String {
+    let raw = request
+        .vars
+        .get("http.request.proto")
+        .map(String::as_str)
+        .unwrap_or("1.1");
+    let proto = raw.strip_prefix("HTTP/").unwrap_or(raw);
+    format!("{proto} Caddy")
+}
+
 fn via_value(version: Version) -> &'static str {
     match version {
         Version::HTTP_09 => "0.9 Caddy",
@@ -2164,6 +2207,171 @@ mod tests {
             sink.snapshot().is_empty(),
             "retired handlers must disappear from the sink"
         );
+    }
+
+    /// Upstream that reports the outbound `Via`, `X-Forwarded-For` and `X-Forwarded-Host` values.
+    async fn spawn_forwarded_probe_upstream() -> String {
+        spawn_upstream(
+            move |request: hyper::Request<hyper::body::Incoming>| async move {
+                let header = |name: &str| {
+                    request
+                        .headers()
+                        .get_all(name)
+                        .iter()
+                        .filter_map(|value| value.to_str().ok())
+                        .collect::<Vec<_>>()
+                        .join("|")
+                };
+                let body = format!(
+                    "via={}\nxff={}\nxfh={}",
+                    header("via"),
+                    header("x-forwarded-for"),
+                    header("x-forwarded-host"),
+                );
+                Ok::<_, Infallible>(
+                    hyper::Response::builder()
+                        .status(200)
+                        .body(Full::new(Bytes::from(body)))
+                        .expect("response"),
+                )
+            },
+        )
+        .await
+    }
+
+    #[test]
+    fn load_balancing_policy_modules_are_parsed() {
+        for policy in [
+            serde_json::json!({"policy": "random"}),
+            serde_json::json!({"policy": "first"}),
+            serde_json::json!({"policy": "round_robin"}),
+            serde_json::json!({"policy": "least_conn"}),
+            serde_json::json!({"policy": "ip_hash"}),
+            serde_json::json!({"policy": "client_ip_hash"}),
+            serde_json::json!({"policy": "uri_hash"}),
+            serde_json::json!({"policy": "header", "field": "X-Session"}),
+            serde_json::json!({"policy": "query", "key": "user"}),
+            serde_json::json!({"policy": "weighted_round_robin", "weights": [1, 1]}),
+        ] {
+            build_handler(serde_json::json!({
+                "handler": "reverse_proxy",
+                "upstreams": [{"dial": "localhost:9000"}, {"dial": "localhost:9001"}],
+                "load_balancing": {"selection_policy": policy}
+            }));
+        }
+        let error = ReverseProxyHandler::from_json(
+            &serde_json::json!({
+                "handler": "reverse_proxy",
+                "upstreams": [{"dial": "localhost:9000"}],
+                "load_balancing": {"selection_policy": {"policy": "cookie", "name": "lb"}}
+            }),
+            "handler",
+        )
+        .err()
+        .expect("cookie policy must be rejected loudly");
+        assert!(error.to_string().contains("T-PROXY-013-COOKIE"), "{error}");
+
+        let error = ReverseProxyHandler::from_json(
+            &serde_json::json!({
+                "handler": "reverse_proxy",
+                "upstreams": [{"dial": "localhost:9000"}],
+                "load_balancing": {"selection_policy": {"policy": "magic"}}
+            }),
+            "handler",
+        )
+        .err()
+        .expect("unknown policy must be rejected");
+        assert!(error.to_string().contains("magic"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn upstream_request_gets_via_with_the_client_protocol() {
+        let dial = spawn_forwarded_probe_upstream().await;
+        let handler = handler(&dial);
+        let mut request = get_request("/via", Some("203.0.113.7:5555"));
+        request
+            .vars
+            .insert("http.request.proto".to_string(), "HTTP/2.0".to_string());
+        let Outcome::Respond(response) = handler.handle(request).await.unwrap() else {
+            panic!("expected proxied response");
+        };
+        let body = body_text(&response);
+        assert!(body.contains("via=2.0 Caddy"), "{body}");
+
+        // Without the proto variable (current server pipeline) the HTTP/1.1 baseline is used.
+        let Outcome::Respond(response) = handler
+            .handle(get_request("/via-default", Some("203.0.113.7:5555")))
+            .await
+            .unwrap()
+        else {
+            panic!("expected proxied response");
+        };
+        let body = body_text(&response);
+        assert!(body.contains("via=1.1 Caddy"), "{body}");
+
+        // A client-supplied Via is preserved and Caddy's value is appended.
+        let mut request = get_request("/via-client", Some("203.0.113.7:5555"));
+        request
+            .headers
+            .insert(http::header::VIA, "1.0 edge".parse().unwrap());
+        request
+            .vars
+            .insert("http.request.proto".to_string(), "1.1".to_string());
+        let Outcome::Respond(response) = handler.handle(request).await.unwrap() else {
+            panic!("expected proxied response");
+        };
+        let body = body_text(&response);
+        assert!(body.contains("1.0 edge"), "{body}");
+        assert!(body.contains("1.1 Caddy"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn server_trusted_proxy_var_makes_forwarded_headers_trusted() {
+        let dial = spawn_forwarded_probe_upstream().await;
+        let handler = handler(&dial);
+
+        // Untrusted peer (no server/handler trusted_proxies): prior forwarded headers are dropped.
+        let mut request = get_request("/untrusted", Some("198.51.100.9:5555"));
+        request
+            .headers
+            .insert("x-forwarded-for", "203.0.113.5".parse().unwrap());
+        request
+            .headers
+            .insert("x-forwarded-host", "prior.example".parse().unwrap());
+        request
+            .vars
+            .insert("trusted_proxy".to_string(), "false".to_string());
+        let Outcome::Respond(response) = handler.handle(request).await.unwrap() else {
+            panic!("expected proxied response");
+        };
+        let body = body_text(&response);
+        assert!(body.contains("xff=198.51.100.9"), "{body}");
+        assert!(body.contains("xfh=example.com"), "{body}");
+
+        // Server-level trusted_proxies (simulated through Caddy's request variable) trusts prior
+        // forwarded values and appends the peer address.
+        let mut request = get_request("/trusted", Some("198.51.100.9:5555"));
+        request
+            .headers
+            .insert("x-forwarded-for", "203.0.113.5".parse().unwrap());
+        request
+            .headers
+            .insert("x-forwarded-host", "prior.example".parse().unwrap());
+        request
+            .vars
+            .insert("trusted_proxy".to_string(), "true".to_string());
+        request
+            .vars
+            .insert("client_ip".to_string(), "203.0.113.5".to_string());
+        let Outcome::Respond(response) = handler.handle(request).await.unwrap() else {
+            panic!("expected proxied response");
+        };
+        let body = body_text(&response);
+        assert!(
+            body.contains("xff=203.0.113.5, 198.51.100.9"),
+            "trusted server peer must keep prior X-Forwarded-For: {body}"
+        );
+        assert!(body.contains("xfh=prior.example"), "{body}");
     }
 
     #[tokio::test]

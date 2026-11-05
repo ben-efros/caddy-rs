@@ -13,9 +13,13 @@ pub mod passive;
 pub mod retry;
 pub mod template;
 pub mod tls;
+pub mod trusted_proxies;
 pub mod upstream;
 
-pub use balancer::{from_policy, Balancer, First, LeastConnections, RoundRobin};
+pub use balancer::{
+    from_selection_policy, Balancer, BalancerError, First, HashSelection, LeastConnections, Random,
+    RoundRobin, WeightedRoundRobin,
+};
 pub use fastcgi::{FastCgiError, FastCgiTransport};
 pub use handler::{
     handler_factory, handler_factory_with_status_sink, FlushInterval, ReverseProxyHandler,
@@ -25,4 +29,5 @@ pub use health::{status_matches, HealthCheck, HealthCheckScheduler};
 pub use passive::{PassiveHealth, PassiveHealthConfig};
 pub use retry::RetryMatch;
 pub use tls::UpstreamTls;
+pub use trusted_proxies::{IpNet, ServerTrustedProxies};
 pub use upstream::Upstream;
