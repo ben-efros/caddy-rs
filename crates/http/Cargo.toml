@@ -21,4 +21,5 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
+caddy-rs-config = { workspace = true }
 tempfile = "3.27.0"

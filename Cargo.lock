@@ -112,6 +112,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "caddy-rs-config",
  "caddy-rs-core",
  "http",
  "http-body",

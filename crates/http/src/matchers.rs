@@ -4,10 +4,12 @@
 //! the set when every matcher matches. A route's `match` array is a list of matcher sets combined
 //! with OR (the route matches when any set matches), mirroring Caddy.
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use serde_json::Value;
 
+use crate::regex_lite::Regex;
 use crate::types::{Error, Matcher, MatcherError, Request, Result, SharedMatcher};
 
 /// Build a matcher set from one JSON object.
@@ -109,10 +111,12 @@ fn build_single_matcher(name: &str, value: &Value) -> Result<SharedMatcher> {
             Ok(Arc::new(QueryMatcher { pairs }))
         }
         "file" => Ok(Arc::new(FileMatcher::from_json(value, &path)?)),
-        "path_regexp" => Err(Error::NotImplemented {
-            feature: "path_regexp matcher (no regex dependency in the offline build)",
-            tracking_id: "CORE-MATCH-REGEXP",
-        }),
+        "path_regexp" => Ok(Arc::new(PathRegexpMatcher::from_json(value, &path)?)),
+        "remote_ip" => Ok(Arc::new(RemoteIpMatcher::from_json(value, &path)?)),
+        "client_ip" => Ok(Arc::new(ClientIpMatcher::from_json(value, &path)?)),
+        "local_ip" => Ok(Arc::new(LocalIpMatcher::from_json(value, &path)?)),
+        "protocol" => Ok(Arc::new(ProtocolMatcher::from_json(value, &path)?)),
+        "tls" => Ok(Arc::new(TlsMatcher::from_json(value, &path)?)),
         other => Err(Error::InvalidConfig {
             path,
             message: format!("matcher `{other}` is not implemented by the HTTP engine"),
@@ -649,6 +653,515 @@ impl Matcher for FileMatcher {
 
     fn describe(&self) -> String {
         format!("file try_files {}", self.try_files.join(" "))
+    }
+}
+
+/// Caddy's `cleanPath`: Go `path.Clean` plus preservation of a trailing slash.
+fn caddy_clean_path(path: &str) -> String {
+    let mut cleaned = path_clean(path);
+    if cleaned != "/" && path.ends_with('/') && !cleaned.ends_with('/') {
+        cleaned.push('/');
+    }
+    cleaned
+}
+
+/// `http.matchers.path_regexp`: RE2-subset regular expression match on the cleaned request path.
+///
+/// JSON shape: `{"path_regexp": {"name": "optional-name", "pattern": "^/foo(.*)$"}}`. On a match
+/// the capture groups are published like Caddy's `MatchRegexp.Match`:
+/// `{http.regexp.<name>.<index>}` (when a name is configured) and `{http.regexp.<index>}` for every
+/// index (0 = whole match). The pattern is compiled by the crate-internal `regex_lite` engine, so
+/// unsupported RE2 constructs (look-around, named groups, word boundaries, lazy quantifiers,
+/// mid-pattern flags) are rejected loudly at configuration time instead of being approximated.
+pub struct PathRegexpMatcher {
+    /// Optional capture namespace (Caddy `name`; must be word characters when set).
+    pub name: Option<String>,
+    /// The configured pattern (kept for diagnostics).
+    pub pattern: String,
+    regex: Regex,
+}
+
+impl PathRegexpMatcher {
+    fn from_json(value: &Value, path: &str) -> Result<Self> {
+        let object = value.as_object().ok_or_else(|| Error::InvalidConfig {
+            path: path.to_string(),
+            message: "path_regexp matcher must be an object with `pattern` and optional `name`"
+                .to_string(),
+        })?;
+        let pattern = object
+            .get("pattern")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::InvalidConfig {
+                path: format!("{path}.pattern"),
+                message: "path_regexp matcher requires a string `pattern`".to_string(),
+            })?;
+        let name = match object.get("name") {
+            None => None,
+            Some(Value::String(name)) => {
+                if name.is_empty()
+                    || !name
+                        .chars()
+                        .all(|character| character.is_ascii_alphanumeric() || character == '_')
+                {
+                    return Err(Error::InvalidConfig {
+                        path: format!("{path}.name"),
+                        message: format!(
+                            "invalid regexp name (must contain only word characters): {name}"
+                        ),
+                    });
+                }
+                Some(name.clone())
+            }
+            Some(_) => {
+                return Err(Error::InvalidConfig {
+                    path: format!("{path}.name"),
+                    message: "path_regexp matcher `name` must be a string".to_string(),
+                })
+            }
+        };
+        if pattern.contains("(?P<") || pattern.contains("(?<") {
+            return Err(Error::NotImplemented {
+                feature: "path_regexp named capture groups: only numeric `{http.regexp.N}` placeholders are supported by this build",
+                tracking_id: "CORE-MATCH-REGEXP",
+            });
+        }
+        let regex = Regex::new(pattern).map_err(|error| match error {
+            Error::InvalidConfig { message, .. } => Error::InvalidConfig {
+                path: format!("{path}.pattern"),
+                message: format!("path_regexp `{pattern}`: {message}"),
+            },
+            other => other,
+        })?;
+        Ok(Self {
+            name,
+            pattern: pattern.to_string(),
+            regex,
+        })
+    }
+
+    fn record_captures(&self, request: &mut Request, cleaned_path: &str) {
+        let Some(captures) = self.regex.captures(cleaned_path) else {
+            return;
+        };
+        for index in 0..=captures.group_count() {
+            let value = captures
+                .group(index)
+                .and_then(|(start, end)| cleaned_path.get(start..end))
+                .unwrap_or("")
+                .to_string();
+            if let Some(name) = &self.name {
+                request
+                    .vars
+                    .insert(format!("http.regexp.{name}.{index}"), value.clone());
+            }
+            request.vars.insert(format!("http.regexp.{index}"), value);
+        }
+    }
+}
+
+impl Matcher for PathRegexpMatcher {
+    fn matches(&self, request: &Request) -> bool {
+        let path = percent_decode(request.path());
+        self.regex.captures(&caddy_clean_path(&path)).is_some()
+    }
+
+    fn matches_mut(&self, request: &mut Request) -> bool {
+        let path = percent_decode(request.path());
+        let cleaned_path = caddy_clean_path(&path);
+        if self.regex.captures(&cleaned_path).is_none() {
+            return false;
+        }
+        self.record_captures(request, &cleaned_path);
+        true
+    }
+
+    fn describe(&self) -> String {
+        match &self.name {
+            Some(name) => format!("path_regexp {name} {}", self.pattern),
+            None => format!("path_regexp {}", self.pattern),
+        }
+    }
+}
+
+/// Caddy's private-network CIDR list (`internal.PrivateRangesCIDR`), used when a matcher range
+/// says `private_ranges` (the Caddyfile adapter normally expands this before JSON).
+pub const PRIVATE_RANGES: &[&str] = &[
+    "192.168.0.0/16",
+    "172.16.0.0/12",
+    "10.0.0.0/8",
+    "127.0.0.1/8",
+    "fd00::/8",
+    "::1",
+];
+
+/// One parsed IP address or CIDR range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IpRange {
+    base: IpAddr,
+    prefix: u8,
+}
+
+impl IpRange {
+    /// Parse one IP or CIDR string (Caddy also accepts a zone suffix, which is ignored here).
+    pub fn parse(value: &str) -> Option<Self> {
+        let value = value.split('%').next().unwrap_or(value).trim();
+        let (address, prefix) = match value.split_once('/') {
+            Some((address, prefix)) => (address, Some(prefix.parse::<u8>().ok()?)),
+            None => (value, None),
+        };
+        let base: IpAddr = address.parse().ok()?;
+        let max = match base {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        let prefix = prefix.unwrap_or(max);
+        if prefix > max {
+            return None;
+        }
+        Some(Self { base, prefix })
+    }
+
+    /// Whether `address` is inside this range.
+    pub fn contains(&self, address: IpAddr) -> bool {
+        match (self.base, address) {
+            (IpAddr::V4(base), IpAddr::V4(address)) => {
+                let mask = if self.prefix == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - self.prefix)
+                };
+                (u32::from(base) & mask) == (u32::from(address) & mask)
+            }
+            (IpAddr::V6(base), IpAddr::V6(address)) => {
+                let mask = if self.prefix == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - self.prefix)
+                };
+                (u128::from(base) & mask) == (u128::from(address) & mask)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Expand `{env.NAME}` placeholders in a matcher range at provision time (Caddy's provisioners
+/// run `ReplaceAll` over the configured ranges; the offline replacer exposes environment values).
+fn expand_env(value: &str) -> String {
+    if !value.contains('{') {
+        return value.to_string();
+    }
+    let mut output = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find('{') {
+        output.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('}') else {
+            output.push_str(&rest[start..]);
+            return output;
+        };
+        let name = &after[..end];
+        match name.strip_prefix("env.") {
+            Some(variable) => output.push_str(&std::env::var(variable).unwrap_or_default()),
+            None => {
+                output.push('{');
+                output.push_str(name);
+                output.push('}');
+            }
+        }
+        rest = &after[end + 1..];
+    }
+    output.push_str(rest);
+    output
+}
+
+/// Parse a `{"ranges": [...]}` matcher object into IP ranges.
+fn parse_ip_ranges(value: &Value, path: &str) -> Result<Vec<IpRange>> {
+    let object = value.as_object().ok_or_else(|| Error::InvalidConfig {
+        path: path.to_string(),
+        message: "matcher must be an object with a `ranges` array".to_string(),
+    })?;
+    let mut ranges = Vec::new();
+    match object.get("ranges") {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(values)) => {
+            for (index, value) in values.iter().enumerate() {
+                let range_path = format!("{path}.ranges[{index}]");
+                let range = value.as_str().ok_or_else(|| Error::InvalidConfig {
+                    path: range_path.clone(),
+                    message: "each range must be a string".to_string(),
+                })?;
+                let range = expand_env(range);
+                if range == "private_ranges" {
+                    for private in PRIVATE_RANGES {
+                        ranges.push(IpRange::parse(private).expect("built-in range is valid"));
+                    }
+                    continue;
+                }
+                let parsed = IpRange::parse(&range).ok_or_else(|| Error::InvalidConfig {
+                    path: range_path,
+                    message: format!("`{range}` is not a valid IP address or CIDR range"),
+                })?;
+                ranges.push(parsed);
+            }
+        }
+        Some(_) => {
+            return Err(Error::InvalidConfig {
+                path: format!("{path}.ranges"),
+                message: "`ranges` must be an array of IP addresses or CIDR ranges".to_string(),
+            })
+        }
+    }
+    Ok(ranges)
+}
+
+/// `http.matchers.remote_ip`: match the direct connection's peer IP against IP/CIDR ranges.
+pub struct RemoteIpMatcher {
+    /// Parsed ranges.
+    pub ranges: Vec<IpRange>,
+}
+
+impl RemoteIpMatcher {
+    fn from_json(value: &Value, path: &str) -> Result<Self> {
+        Ok(Self {
+            ranges: parse_ip_ranges(value, path)?,
+        })
+    }
+}
+
+impl Matcher for RemoteIpMatcher {
+    fn matches(&self, request: &Request) -> bool {
+        let Some(remote) = request.remote_addr else {
+            return false;
+        };
+        self.ranges.iter().any(|range| range.contains(remote.ip()))
+    }
+
+    fn describe(&self) -> String {
+        "remote_ip".to_string()
+    }
+}
+
+/// Parse an address-ish string (`ip`, `host:port`, `[v6]:port`) into an IP.
+fn parse_address_ip(value: &str) -> Option<IpAddr> {
+    if let Ok(address) = value.parse::<SocketAddr>() {
+        return Some(address.ip());
+    }
+    if let Ok(ip) = value.parse::<IpAddr>() {
+        return Some(ip);
+    }
+    value
+        .rsplit_once(':')
+        .and_then(|(host, _)| host.trim_matches(['[', ']']).parse::<IpAddr>().ok())
+}
+
+/// `http.matchers.client_ip`: match the resolved client IP, considering trusted proxies.
+///
+/// Caddy stores the resolved client IP in the `client_ip` request variable; caddy-rs's server sets
+/// it when trusted-proxy resolution is enabled. When the variable is absent this falls back to the
+/// direct peer IP (the same value Caddy's server uses when no proxy is trusted).
+pub struct ClientIpMatcher {
+    /// Parsed ranges.
+    pub ranges: Vec<IpRange>,
+}
+
+impl ClientIpMatcher {
+    fn from_json(value: &Value, path: &str) -> Result<Self> {
+        Ok(Self {
+            ranges: parse_ip_ranges(value, path)?,
+        })
+    }
+}
+
+impl Matcher for ClientIpMatcher {
+    fn matches(&self, request: &Request) -> bool {
+        let client_ip = request
+            .vars
+            .get("client_ip")
+            .and_then(|value| parse_address_ip(value))
+            .or_else(|| request.remote_addr.map(|remote| remote.ip()));
+        let Some(client_ip) = client_ip else {
+            return false;
+        };
+        self.ranges.iter().any(|range| range.contains(client_ip))
+    }
+
+    fn describe(&self) -> String {
+        "client_ip".to_string()
+    }
+}
+
+/// `http.matchers.local_ip` (caddy-rs extension): match the connection's local (listener) address.
+///
+/// Caddy v2.11.7 has no HTTP `local_ip` matcher (the name exists only as a TLS connection-policy
+/// matcher); caddy-rs exposes the listener address as `http.request.local.host` request variables
+/// (set by the server, including the PROXY protocol destination address), so the same filtering is
+/// available for HTTP routes. JSON shape matches `remote_ip`: `{"ranges": [...]}`.
+pub struct LocalIpMatcher {
+    /// Parsed ranges.
+    pub ranges: Vec<IpRange>,
+}
+
+impl LocalIpMatcher {
+    fn from_json(value: &Value, path: &str) -> Result<Self> {
+        Ok(Self {
+            ranges: parse_ip_ranges(value, path)?,
+        })
+    }
+}
+
+impl Matcher for LocalIpMatcher {
+    fn matches(&self, request: &Request) -> bool {
+        let local_ip = request
+            .vars
+            .get("http.request.local.host")
+            .and_then(|value| value.parse::<IpAddr>().ok())
+            .or_else(|| {
+                request
+                    .vars
+                    .get("http.request.local")
+                    .and_then(|value| parse_address_ip(value))
+            });
+        let Some(local_ip) = local_ip else {
+            return false;
+        };
+        self.ranges.iter().any(|range| range.contains(local_ip))
+    }
+
+    fn describe(&self) -> String {
+        "local_ip".to_string()
+    }
+}
+
+/// The HTTP version inferred for `protocol` matching.
+///
+/// The engine does not carry the hyper version; the server exposes the negotiated TLS ALPN as
+/// `tls.alpn`. Cleartext connections are assumed to be HTTP/1.1 (h2c prior-knowledge requests
+/// cannot be distinguished until the server forwards the version).
+fn request_http_version(request: &Request) -> Option<(u8, u8)> {
+    if let Some(alpn) = request.vars.get("tls.alpn") {
+        return match alpn.as_str() {
+            "h2" => Some((2, 0)),
+            "h3" => Some((3, 0)),
+            "http/1.1" => Some((1, 1)),
+            "http/1.0" => Some((1, 0)),
+            _ => None,
+        };
+    }
+    if request.tls {
+        None
+    } else {
+        Some((1, 1))
+    }
+}
+
+/// `http.matchers.protocol`: match the request protocol (Caddy's `http`, `https`, `grpc` and
+/// HTTP-version strings such as `http/2` or `http/2+`).
+pub struct ProtocolMatcher {
+    /// Configured protocol string (Caddy passes it through; unknown values never match).
+    pub protocol: String,
+}
+
+impl ProtocolMatcher {
+    fn from_json(value: &Value, path: &str) -> Result<Self> {
+        let protocol = value.as_str().ok_or_else(|| Error::InvalidConfig {
+            path: path.to_string(),
+            message: "protocol matcher must be a string".to_string(),
+        })?;
+        Ok(Self {
+            protocol: protocol.to_ascii_lowercase(),
+        })
+    }
+}
+
+impl Matcher for ProtocolMatcher {
+    fn matches(&self, request: &Request) -> bool {
+        match self.protocol.as_str() {
+            "grpc" => request
+                .headers
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("application/grpc")),
+            "https" => request.tls,
+            "http" => !request.tls,
+            version => {
+                let Some((major, minor)) = request_http_version(request) else {
+                    return false;
+                };
+                match version {
+                    "http/1.0" => (major, minor) == (1, 0),
+                    "http/1.1" => (major, minor) == (1, 1),
+                    "http/2" => major == 2,
+                    "http/3" => major == 3,
+                    "http/1.0+" => (major, minor) >= (1, 0),
+                    "http/1.1+" => (major, minor) >= (1, 1),
+                    "http/2+" => major >= 2,
+                    "http/3+" => major >= 3,
+                    _ => false,
+                }
+            }
+        }
+    }
+
+    fn describe(&self) -> String {
+        format!("protocol {}", self.protocol)
+    }
+}
+
+/// `http.matchers.tls`: match TLS (and Caddy's `handshake_complete` early-data predicate).
+///
+/// Caddy v2.11.7's TLS matcher only exposes `handshake_complete`; TLS version, cipher suite, SNI
+/// and resumption are not HTTP route matcher fields (they are connection-policy fields and
+/// `{http.request.tls.*}` placeholders). Configuring those here is rejected loudly rather than
+/// silently ignored; see the report for the server-side TLS-metadata wiring that a caddy-rs
+/// extension would need.
+pub struct TlsMatcher {
+    /// `handshake_complete`: `Some(false)` is Caddy's Caddyfile `tls early_data` form.
+    pub handshake_complete: Option<bool>,
+}
+
+impl TlsMatcher {
+    fn from_json(value: &Value, path: &str) -> Result<Self> {
+        let object = value.as_object().ok_or_else(|| Error::InvalidConfig {
+            path: path.to_string(),
+            message: "tls matcher must be an object".to_string(),
+        })?;
+        let mut handshake_complete = None;
+        for (key, value) in object {
+            match key.as_str() {
+                "handshake_complete" => {
+                    let flag = value.as_bool().ok_or_else(|| Error::InvalidConfig {
+                        path: format!("{path}.handshake_complete"),
+                        message: "handshake_complete must be a boolean".to_string(),
+                    })?;
+                    handshake_complete = Some(flag);
+                }
+                _ => {
+                    return Err(Error::NotImplemented {
+                        feature: "tls matcher fields version_min/version_max/cipher_suites/sni/resumed (not part of Caddy v2.11.7's HTTP TLS matcher; TLS metadata does not reach the HTTP engine yet)",
+                        tracking_id: "TLS-MATCHER-METADATA",
+                    });
+                }
+            }
+        }
+        Ok(Self { handshake_complete })
+    }
+}
+
+impl Matcher for TlsMatcher {
+    fn matches(&self, request: &Request) -> bool {
+        if !request.tls {
+            return false;
+        }
+        // caddy-rs serves TLS only after a completed handshake (no 0-RTT early data).
+        match self.handshake_complete {
+            Some(false) => false,
+            Some(true) | None => true,
+        }
+    }
+
+    fn describe(&self) -> String {
+        "tls".to_string()
     }
 }
 
@@ -1697,5 +2210,284 @@ mod tests {
         assert_eq!(response.status, http::StatusCode::IM_A_TEAPOT);
         assert!(response.body.is_empty());
         assert!(response.headers.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod matcher_network_tls_tests {
+    use super::*;
+    use http::{Method, Uri};
+
+    fn make_request(uri: &str) -> Request {
+        Request::new(Method::GET, uri.parse::<Uri>().unwrap())
+    }
+
+    /// Test wrapper giving `Result<..>` a `Debug` bound for `expect`/`expect_err`.
+    struct TestMatcher(SharedMatcher);
+
+    impl std::fmt::Debug for TestMatcher {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("TestMatcher")
+        }
+    }
+
+    impl std::ops::Deref for TestMatcher {
+        type Target = dyn Matcher;
+
+        fn deref(&self) -> &Self::Target {
+            &*self.0
+        }
+    }
+
+    fn build(name: &str, value: serde_json::Value) -> Result<TestMatcher> {
+        build_single_matcher(name, &value).map(TestMatcher)
+    }
+
+    #[test]
+    fn path_regexp_records_captures_and_placeholders() {
+        let matcher = build(
+            "path_regexp",
+            serde_json::json!({"name": "match", "pattern": "^/foo(.*)$"}),
+        )
+        .expect("compiles");
+        let mut request = make_request("/foo/bar/baz");
+        assert!(matcher.matches_mut(&mut request));
+        assert_eq!(
+            request.vars.get("http.regexp.match.1").map(String::as_str),
+            Some("/bar/baz")
+        );
+        assert_eq!(
+            request.vars.get("http.regexp.1").map(String::as_str),
+            Some("/bar/baz")
+        );
+        assert_eq!(
+            request.vars.get("http.regexp.match.0").map(String::as_str),
+            Some("/foo/bar/baz")
+        );
+        assert_eq!(
+            request.replace_all("{http.regexp.match.1}"),
+            "/bar/baz",
+            "captured placeholder resolves through the request replacer"
+        );
+        assert_eq!(request.replace_all("{http.regexp.1}"), "/bar/baz");
+
+        // Unnamed path_regexp matchers only publish numeric placeholders.
+        let matcher =
+            build("path_regexp", serde_json::json!({"pattern": "^/(a)(b)$"})).expect("compiles");
+        let mut request = make_request("/ab");
+        assert!(matcher.matches_mut(&mut request));
+        assert_eq!(
+            request.vars.get("http.regexp.1").map(String::as_str),
+            Some("a")
+        );
+        assert_eq!(
+            request.vars.get("http.regexp.2").map(String::as_str),
+            Some("b")
+        );
+        assert!(!request.vars.contains_key("http.regexp.match.1"));
+    }
+
+    #[test]
+    fn path_regexp_matches_cleaned_and_decoded_paths() {
+        let matcher =
+            build("path_regexp", serde_json::json!({"pattern": "^/foo/bar$"})).expect("compiles");
+        assert!(matcher.matches(&make_request("/foo//bar")));
+        assert!(matcher.matches(&make_request("/foo/./bar")));
+        assert!(matcher.matches(&make_request("/foo/../foo/bar")));
+        // The trailing slash is preserved by Caddy's cleanPath.
+        let slash =
+            build("path_regexp", serde_json::json!({"pattern": "^/foo/$"})).expect("compiles");
+        assert!(slash.matches(&make_request("/foo/")));
+        // Percent-encoded request paths are decoded before matching, like Go's URL.Path.
+        let encoded =
+            build("path_regexp", serde_json::json!({"pattern": "^/a b$"})).expect("compiles");
+        assert!(encoded.matches(&make_request("/a%20b")));
+    }
+
+    #[test]
+    fn path_regexp_rejects_unsupported_constructs_loudly() {
+        for pattern in ["(?P<name>a)", "(?=a)", "\\bword\\b", "(?!a)"] {
+            let error = build("path_regexp", serde_json::json!({"pattern": pattern}))
+                .expect_err("unsupported construct must be loud");
+            let message = error.to_string();
+            assert!(message.contains("path_regexp"), "{pattern}: {message}");
+        }
+        // Non-capturing groups and the leading case-insensitive flag are supported.
+        for pattern in ["a(?:b)?", "(?i)^/foo"] {
+            build("path_regexp", serde_json::json!({"pattern": pattern}))
+                .unwrap_or_else(|error| panic!("{pattern} should compile: {error}"));
+        }
+        let error = build(
+            "path_regexp",
+            serde_json::json!({"name": "bad-name", "pattern": "a"}),
+        )
+        .expect_err("invalid regexp name");
+        assert!(error.to_string().contains("word characters"), "{error}");
+
+        let error =
+            build("path_regexp", serde_json::json!({"pattern": "("})).expect_err("invalid pattern");
+        assert!(error.to_string().contains(".pattern"), "{error}");
+    }
+
+    #[test]
+    fn remote_ip_matches_ip_and_cidr_ranges() {
+        let matcher = build(
+            "remote_ip",
+            serde_json::json!({"ranges": ["10.0.0.0/8", "203.0.113.7", "2001:db8::/32"]}),
+        )
+        .expect("valid ranges");
+        let mut inside = make_request("/");
+        inside.remote_addr = Some("10.1.2.3:5000".parse().unwrap());
+        assert!(matcher.matches(&inside));
+        let mut exact = make_request("/");
+        exact.remote_addr = Some("203.0.113.7:1234".parse().unwrap());
+        assert!(matcher.matches(&exact));
+        let mut outside = make_request("/");
+        outside.remote_addr = Some("198.51.100.1:1234".parse().unwrap());
+        assert!(!matcher.matches(&outside));
+        let mut v6 = make_request("/");
+        v6.remote_addr = Some("[2001:db8::1]:443".parse().unwrap());
+        assert!(matcher.matches(&v6));
+        assert!(
+            !matcher.matches(&make_request("/")),
+            "no peer address never matches"
+        );
+
+        // The Caddyfile `private_ranges` expansion as accepted in JSON.
+        let matcher = build(
+            "remote_ip",
+            serde_json::json!({"ranges": ["private_ranges"]}),
+        )
+        .expect("private ranges");
+        let mut private = make_request("/");
+        private.remote_addr = Some("192.168.1.10:80".parse().unwrap());
+        assert!(matcher.matches(&private));
+    }
+
+    #[test]
+    fn remote_ip_rejects_invalid_ranges_loudly() {
+        for ranges in [
+            serde_json::json!(["not-an-ip"]),
+            serde_json::json!(["10.0.0.0/33"]),
+            serde_json::json!("10.0.0.0/8"),
+            serde_json::json!([42]),
+        ] {
+            let value = serde_json::json!({"ranges": ranges});
+            let error = build("remote_ip", value).expect_err("invalid ranges");
+            assert!(error.to_string().contains("match.remote_ip"), "{error}");
+        }
+    }
+
+    #[test]
+    fn client_ip_uses_the_resolved_client_address() {
+        let matcher = build("client_ip", serde_json::json!({"ranges": ["10.0.0.0/8"]}))
+            .expect("valid ranges");
+        let mut request = make_request("/");
+        request.remote_addr = Some("198.51.100.1:443".parse().unwrap());
+        assert!(!matcher.matches(&request));
+        request
+            .vars
+            .insert("client_ip".to_string(), "10.9.8.7".to_string());
+        assert!(matcher.matches(&request));
+        // Falls back to the peer address when no trusted-proxy resolution happened.
+        let mut fallback = make_request("/");
+        fallback.remote_addr = Some("10.1.1.1:443".parse().unwrap());
+        assert!(matcher.matches(&fallback));
+    }
+
+    #[test]
+    fn local_ip_matches_the_listener_address_variable() {
+        let matcher = build(
+            "local_ip",
+            serde_json::json!({"ranges": ["198.51.100.0/24"]}),
+        )
+        .expect("valid ranges");
+        let mut request = make_request("/");
+        assert!(!matcher.matches(&request), "no local address available");
+        request.vars.insert(
+            "http.request.local.host".to_string(),
+            "198.51.100.10".to_string(),
+        );
+        assert!(matcher.matches(&request));
+        let mut outside = make_request("/");
+        outside.vars.insert(
+            "http.request.local.host".to_string(),
+            "203.0.113.1".to_string(),
+        );
+        assert!(!matcher.matches(&outside));
+    }
+
+    #[test]
+    fn protocol_matches_scheme_versions_and_grpc() {
+        let plain = build("protocol", serde_json::json!("http")).expect("protocol");
+        assert!(plain.matches(&make_request("/")));
+        let mut tls = make_request("/");
+        tls.tls = true;
+        assert!(!plain.matches(&tls));
+
+        let https = build("protocol", serde_json::json!("https")).expect("protocol");
+        assert!(https.matches(&tls));
+        assert!(!https.matches(&make_request("/")));
+
+        // HTTP/1.1 is the assumed cleartext version (h2c is indistinguishable).
+        let http11 = build("protocol", serde_json::json!("http/1.1")).expect("protocol");
+        assert!(http11.matches(&make_request("/")));
+        let http2 = build("protocol", serde_json::json!("http/2")).expect("protocol");
+        let mut h2 = make_request("/");
+        h2.tls = true;
+        h2.vars.insert("tls.alpn".to_string(), "h2".to_string());
+        assert!(http2.matches(&h2));
+        let http2_plus = build("protocol", serde_json::json!("http/2+")).expect("protocol");
+        assert!(http2_plus.matches(&h2));
+
+        let grpc = build("protocol", serde_json::json!("grpc")).expect("protocol");
+        let mut grpc_request = make_request("/");
+        grpc_request.headers.insert(
+            http::header::CONTENT_TYPE,
+            "application/grpc+proto".parse().unwrap(),
+        );
+        assert!(grpc.matches(&grpc_request));
+        assert!(!grpc.matches(&make_request("/")));
+
+        // Unknown protocol strings never match (Caddy behaviour) and are accepted.
+        let unknown = build("protocol", serde_json::json!("http/9")).expect("protocol accepted");
+        assert!(!unknown.matches(&make_request("/")));
+    }
+
+    #[test]
+    fn tls_matcher_checks_tls_and_handshake_completeness() {
+        let matcher = build("tls", serde_json::json!({})).expect("tls");
+        assert!(!matcher.matches(&make_request("/")));
+        let mut tls = make_request("/");
+        tls.tls = true;
+        assert!(matcher.matches(&tls));
+
+        // Caddy's Caddyfile `tls early_data` emits handshake_complete=false, which only matches a
+        // 0-RTT (incomplete) handshake; caddy-rs has no early data, so it never matches.
+        let early = build("tls", serde_json::json!({"handshake_complete": false})).expect("tls");
+        assert!(!early.matches(&tls));
+        let complete = build("tls", serde_json::json!({"handshake_complete": true})).expect("tls");
+        assert!(complete.matches(&tls));
+
+        // TLS metadata fields are not part of Caddy's matcher; they fail loudly instead of being
+        // silently ignored.
+        let error = build("tls", serde_json::json!({"version_min": "tls1.3"}))
+            .expect_err("unsupported tls field");
+        assert!(matches!(error, Error::NotImplemented { .. }), "{error}");
+    }
+
+    #[test]
+    fn not_matcher_negates_network_matchers() {
+        let inner =
+            build("remote_ip", serde_json::json!({"ranges": ["10.0.0.0/8"]})).expect("valid");
+        let not = NotMatcher {
+            inner: vec![inner.0],
+        };
+        let mut inside = make_request("/");
+        inside.remote_addr = Some("10.1.1.1:1".parse().unwrap());
+        assert!(!not.matches(&inside));
+        let mut outside = make_request("/");
+        outside.remote_addr = Some("203.0.113.1:1".parse().unwrap());
+        assert!(not.matches(&outside));
     }
 }

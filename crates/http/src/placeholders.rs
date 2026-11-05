@@ -47,6 +47,7 @@
 //! | `{http.matchers.file.type}` | `file` or `directory` for the `file` matcher |
 //! | `{http.matchers.file.remainder}` | Path remainder after `split_path` in the `file` matcher |
 //! | `{http.auth.user.NAME}` | Authenticated user metadata (`id` = username), set by `basic_auth` |
+//! | `{http.regexp.NAME.N}` / `{http.regexp.N}` | Capture groups recorded by the `path_regexp` matcher (0 = whole match) |
 //! | `{vars.NAME}` | Alias for `{http.vars.NAME}`; Caddy's Caddyfile adapter rewrites this form |
 //! | `{env.NAME}` | Environment variable, empty when unset |
 //! | `{http.response.header.NAME}` | Response header values, only when a replacer is built with [`Replacer::with_response_headers`] |
