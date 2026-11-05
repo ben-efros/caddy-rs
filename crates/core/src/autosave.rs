@@ -46,13 +46,19 @@ pub const FALLBACK_CONFIG_DIR: &str = ".caddy-rs";
 /// `$HOME/.config/caddy-rs` otherwise, and `./.caddy-rs` when `HOME` is also unavailable. This is
 /// the caddy-rs analogue of Caddy's `AppConfigDir()`.
 pub fn config_dir() -> PathBuf {
-    config_dir_with(std::env::var_os(XDG_CONFIG_HOME_ENV), std::env::var_os(HOME_ENV))
+    config_dir_with(
+        std::env::var_os(XDG_CONFIG_HOME_ENV),
+        std::env::var_os(HOME_ENV),
+    )
 }
 
 /// Testable form of [`config_dir`] with the environment values supplied explicitly.
 ///
 /// An empty `XDG_CONFIG_HOME` is treated as unset, matching Caddy's `if basedir != ""` check.
-pub fn config_dir_with(xdg_config_home: Option<std::ffi::OsString>, home: Option<std::ffi::OsString>) -> PathBuf {
+pub fn config_dir_with(
+    xdg_config_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> PathBuf {
     if let Some(base) = xdg_config_home.filter(|value| !value.is_empty()) {
         PathBuf::from(base).join(CONFIG_DIR_SUBDIR)
     } else if let Some(home) = home.filter(|value| !value.is_empty()) {
@@ -80,7 +86,8 @@ pub fn autosave(config_json: &[u8], path: &Path) -> io::Result<()> {
     create_dir_private(&directory)?;
 
     let temp_path = temporary_path(path);
-    let result = write_temp(&temp_path, config_json).and_then(|()| std::fs::rename(&temp_path, path));
+    let result =
+        write_temp(&temp_path, config_json).and_then(|()| std::fs::rename(&temp_path, path));
     if result.is_err() {
         // Best effort: never leave a half-written temp file behind.
         let _ = std::fs::remove_file(&temp_path);
@@ -200,20 +207,14 @@ mod tests {
     #[test]
     fn config_dir_follows_xdg_then_home_then_fallback() {
         assert_eq!(
-            config_dir_with(
-                Some("/xdg".into()),
-                Some("/home/user".into())
-            ),
+            config_dir_with(Some("/xdg".into()), Some("/home/user".into())),
             PathBuf::from("/xdg/caddy-rs")
         );
         assert_eq!(
             config_dir_with(None, Some("/home/user".into())),
             PathBuf::from("/home/user/.config/caddy-rs")
         );
-        assert_eq!(
-            config_dir_with(None, None),
-            PathBuf::from(".caddy-rs")
-        );
+        assert_eq!(config_dir_with(None, None), PathBuf::from(".caddy-rs"));
         // An empty XDG_CONFIG_HOME means "unset", matching Caddy's `!= ""` check.
         assert_eq!(
             config_dir_with(Some("".into()), Some("/home/user".into())),
@@ -264,21 +265,19 @@ mod tests {
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
             .expect("read dir")
             .filter_map(|entry| entry.ok())
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .contains(".tmp.")
-            })
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp."))
             .collect();
-        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
     }
 
     #[cfg(unix)]
     #[test]
     fn autosave_replaces_an_existing_file_and_keeps_reading_atomic() {
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+        use std::sync::Arc;
         use std::thread;
 
         let dir = TestDir::new("atomic");
@@ -288,19 +287,32 @@ mod tests {
         // A previously-autosaved file is replaced atomically: concurrent readers must always
         // observe either the old or the new complete document, never a mix or a truncation.
         let payloads: Vec<Vec<u8>> = (0..64)
-            .map(|index| format!("{{ \"generation\": {index}, \"padding\": \"{}\" }}", "x".repeat(4096)).into_bytes())
+            .map(|index| {
+                format!(
+                    "{{ \"generation\": {index}, \"padding\": \"{}\" }}",
+                    "x".repeat(4096)
+                )
+                .into_bytes()
+            })
             .collect();
         let keep_reading = Arc::new(AtomicBool::new(true));
+        // Barrier: each reader signals after its first loop iteration starts, and the writer
+        // waits for all readers before writing. Without it a reader thread can be scheduled so
+        // late that `keep_reading` already flipped false and it never observes a document.
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut readers = Vec::new();
         for _ in 0..4 {
             let target = target.clone();
             let keep_reading = Arc::clone(&keep_reading);
+            let started = Arc::clone(&started);
             readers.push(thread::spawn(move || {
                 let mut seen = std::collections::BTreeSet::new();
                 while keep_reading.load(AtomicOrdering::Relaxed) {
+                    started.fetch_add(1, AtomicOrdering::Relaxed);
                     match std::fs::read(&target) {
                         Ok(bytes) => {
-                            let parsed: Result<serde_json::Value, _> = serde_json::from_slice(&bytes);
+                            let parsed: Result<serde_json::Value, _> =
+                                serde_json::from_slice(&bytes);
                             assert!(
                                 parsed.is_ok(),
                                 "reader observed a partially-written autosave ({} bytes)",
@@ -318,6 +330,10 @@ mod tests {
                 }
                 assert!(!seen.is_empty());
             }));
+        }
+        // Wait until every reader is inside its loop so the writes below race with active reads.
+        while started.load(std::sync::atomic::Ordering::Relaxed) < readers.len() {
+            std::thread::yield_now();
         }
 
         let mut writer_round = 0u64;

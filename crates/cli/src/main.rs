@@ -309,9 +309,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 eprintln!("warning: {warning}");
             }
             let store = Arc::new(GenerationStore::new(Arc::new(ModuleRegistry::builtin())));
-            let activated = store
-                .load(model)
-                .context("cannot activate configuration")?;
+            let activated = store.load(model).context("cannot activate configuration")?;
             let mut runtime = ServerRuntime::new(Arc::clone(&store));
             let status = runtime.apply().await.context("cannot start listeners")?;
             // Caddy autosaves the exact bytes of the successfully loaded config after the config
@@ -356,7 +354,10 @@ async fn run(command: Command) -> anyhow::Result<()> {
             for warning in &loaded.warnings {
                 eprintln!("warning: {warning}");
             }
-            let body = loaded.model.to_vec().context("cannot encode configuration")?;
+            let body = loaded
+                .model
+                .to_vec()
+                .context("cannot encode configuration")?;
             let response = admin_request(&admin, "POST", "/load", Bytes::from(body)).await?;
             ensure_admin_success(&response)?;
             eprintln!("configuration reloaded");
@@ -412,10 +413,7 @@ impl LoadedConfig {
         })?;
         let registry = ModuleRegistry::builtin();
         caddy_rs_core::validate_config(&model, &registry).with_context(|| {
-            format!(
-                "autosave `{}` is not a valid configuration",
-                path.display()
-            )
+            format!("autosave `{}` is not a valid configuration", path.display())
         })?;
         Ok(Self {
             model,
