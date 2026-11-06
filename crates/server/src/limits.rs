@@ -43,6 +43,28 @@ pub const MAX_REQUEST_BODY_SIZE_FIELD: &str = "max_request_body_size";
 /// caddy-rs extension: maximum concurrent connections on the listener (`0`/absent = unlimited).
 pub const MAX_CONNECTIONS_FIELD: &str = "max_connections";
 
+/// Fields that look like HTTP/2 tuning knobs but do not exist in Caddy v2.11.7's server JSON.
+///
+/// Caddy hands `new(http2.Server)` to `http2.ConfigureServer`, so h2 streams/frames/windows use Go
+/// defaults and have no configuration fields. Accepting an invented field as an opaque unknown
+/// would silently ignore it, so these are rejected at apply with a located error. (Unknown server
+/// fields in general are preserved by the core model; strict rejection of every non-Caddy field is
+/// tracked separately.)
+pub const UNSUPPORTED_H2_TUNING_FIELDS: &[&str] = &[
+    "max_streams",
+    "max_concurrent_streams",
+    "max_frame_size",
+    "initial_window_size",
+    "initial_stream_window_size",
+    "initial_connection_window_size",
+    "max_header_list_size",
+    "http2",
+    "h2",
+    "http2_settings",
+    "adaptive_window",
+    "max_send_buf_size",
+];
+
 /// Caddy server field for the header-read timeout (typed in Caddy, read from the preserved
 /// unknown-field map here).
 pub const READ_HEADER_TIMEOUT_FIELD: &str = "read_header_timeout";
@@ -103,6 +125,19 @@ impl ServerLimits {
     /// runtime applies the generation instead of silently ignoring the field.
     pub fn from_http_server(server_name: &str, server: &HttpServer) -> Result<Self, CoreError> {
         let base = format!("apps.http.servers.{server_name}");
+
+        // Caddy v2.11.7 exposes no HTTP/2 tuning fields (Go defaults via `new(http2.Server)`);
+        // fail loudly on invented ones instead of silently preserving them (T-HTTP-021).
+        for field in UNSUPPORTED_H2_TUNING_FIELDS {
+            if server.extra.contains_key(*field) {
+                return Err(CoreError::invalid(
+                    format!("{base}.{field}"),
+                    format!(
+                        "Caddy v2.11.7 has no HTTP/2 tuning server field `{field}`; h2 stream/frame/window settings use Go defaults and are not configurable (T-HTTP-021)"
+                    ),
+                ));
+            }
+        }
 
         let read_timeout = optional_timeout(server.read_timeout.as_ref(), &base, "read_timeout")?;
         let write_timeout =
