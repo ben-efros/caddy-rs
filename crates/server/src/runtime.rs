@@ -199,6 +199,13 @@ pub struct ServerRuntime {
     /// the previous generation's scheduler after a successful reload and stops every scheduler on
     /// shutdown (`/stop`, no active generation, or process shutdown).
     renewals: BTreeMap<u64, AutomaticHttpsRenewals>,
+    /// In-memory certificate store of the active generation.
+    ///
+    /// Handed to the next generation's provisioner so a reload can seed its resolver from the
+    /// still-running certificates instead of re-issuing them (`T-TLS-065`, DIV-0064). Kept separate
+    /// from `renewals` because the store must outlive a failed apply: a failed generation must not
+    /// clear it.
+    certificate_store: Option<Arc<caddy_rs_tls::SharedCertificateStore>>,
     /// Shared metrics recorder handed to every listener; renders through the admin `/metrics`
     /// endpoint because it shares the admin API's registry.
     recorder: SharedRequestRecorder,
@@ -256,6 +263,7 @@ impl ServerRuntime {
             status: RuntimeStatus::default(),
             activation: ActivationState::Environment,
             renewals: BTreeMap::new(),
+            certificate_store: None,
             recorder,
             certificate_metrics,
             access_log: None,
@@ -546,6 +554,9 @@ impl ServerRuntime {
         // failure above drops `renewals`, which aborts the just-started scheduler and leaves the
         // previous generation's scheduler untouched.
         if let Some(renewals) = renewals {
+            // Retain the generation's certificate store so the next generation can seed its
+            // resolver from it (DIV-0064); the scheduler keeps owning the same Arc.
+            self.certificate_store = Some(Arc::clone(renewals.store()));
             self.renewals.insert(generation.id(), renewals);
         }
         self.retire_stale_renewals(generation.id()).await;
@@ -1067,6 +1078,13 @@ impl ServerRuntime {
         let base_resolver = resolver_from_config(config)?;
         let provisioner =
             AutomaticHttpsProvisioner::new(transport, root, Arc::clone(&self.challenge_tokens));
+        // Seed the new generation from the still-active certificates: a reload must not re-issue
+        // what the previous generation already holds in memory (storage may be empty, transient or
+        // pending a write). Resolver hot-swap keeps in-flight handshakes on the old Arc.
+        let provisioner = match &self.certificate_store {
+            Some(store) => provisioner.with_certificate_store(Arc::clone(store)),
+            None => provisioner,
+        };
         let tls_alpn01_tokens = Arc::clone(provisioner.tls_alpn01_token_store());
         let redirect = plan.redirects_enabled.then(|| RedirectPolicy {
             hosts: plan.redirect_hosts.clone(),

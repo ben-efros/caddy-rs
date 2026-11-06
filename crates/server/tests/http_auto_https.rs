@@ -839,11 +839,33 @@ fn config_with_admin(
     storage_root: &str,
     admin: serde_json::Value,
 ) -> Config {
+    config_with_admin_host(
+        listen,
+        http_port,
+        disable_redirects,
+        auto_https_disable,
+        storage_root,
+        admin,
+        "example.com",
+    )
+}
+
+/// Same as [`config_with_admin`] for an explicit host: a reload that introduces a new subject
+/// cannot reuse the previous generation's in-memory certificates, so issuance is really attempted.
+fn config_with_admin_host(
+    listen: &str,
+    http_port: Option<u16>,
+    disable_redirects: bool,
+    auto_https_disable: bool,
+    storage_root: &str,
+    admin: serde_json::Value,
+    host: &str,
+) -> Config {
     let mut server = serde_json::json!({
         "listen": [listen],
         "tls_connection_policies": [{}],
         "routes": [{
-            "match": [{"host": ["example.com"]}],
+            "match": [{"host": [host]}],
             "handle": [{"handler": "static_response", "body": "hello https"}]
         }]
     });
@@ -866,7 +888,7 @@ fn config_with_admin(
         "storage": {"module": "file_system", "root": storage_root},
         "apps": {
             "tls": {"automation": {"policies": [{
-                "subjects": ["example.com"],
+                "subjects": [host],
                 "issuers": [{"module": "acme", "ca": DIRECTORY, "email": "ops@example.com"}]
             }]}},
             "http": http
@@ -1737,9 +1759,10 @@ async fn failed_apply_aborts_the_new_scheduler_and_keeps_the_previous_one() {
         .expect("first generation scheduler")
         .is_running());
 
-    // Remove the persisted certificate so the reload must issue again, then make the fake CA fail
-    // newOrder: provisioning (and the renewal scheduler it would start) fails, while the previous
-    // generation's in-memory certificate and scheduler keep running.
+    // The runtime reuses the previous generation's in-memory certificates (DIV-0064), so deleting
+    // storage alone no longer forces issuance. Reload with a NEW subject instead: it has no cached
+    // certificate, so provisioning must issue — and the fake CA rejects newOrder, which must fail
+    // the apply while the previous generation keeps serving.
     let storage = FileStorage::new(directory.path());
     for key in storage.list("").await.expect("storage list") {
         storage
@@ -1748,7 +1771,15 @@ async fn failed_apply_aborts_the_new_scheduler_and_keeps_the_previous_one() {
             .expect("delete persisted certificate");
     }
     store
-        .load(config("127.0.0.1:0", Some(0), false, false, &root))
+        .load(config_with_admin_host(
+            "127.0.0.1:0",
+            Some(0),
+            false,
+            false,
+            &root,
+            serde_json::json!({"disabled": true}),
+            "added.example.com",
+        ))
         .expect("second generation validates");
     let failed_generation = store.current().expect("second generation loaded").id();
     fake.set_fail_new_order(true);
@@ -1979,7 +2010,7 @@ async fn adapted_plain_http_site_serves_cleartext() {
     // Regression: Caddyfile `http://127.0.0.1:<port>` adapts to a host matcher on a non-standard
     // port plus server-level `automatic_https.skip`; it must stay plaintext instead of failing
     // with "host matchers require TLS".
-    let directory = tempfile::tempdir().unwrap();
+    let _directory = tempfile::tempdir().unwrap();
     let port = free_loopback_port();
     let caddyfile = format!("http://127.0.0.1:{port} {{\n\trespond \"plain ok\"\n}}\n");
     let adapted =
@@ -2046,5 +2077,60 @@ async fn implicit_https_on_non_standard_port_terminates_tls_and_redirects_to_it(
         header(&headers, "location"),
         Some(format!("https://example.com:{https_port}/path?q=1").as_str())
     );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn reload_reuses_the_previous_generations_in_memory_certificates() {
+    // The runtime hands the active generation's in-memory certificate store to the next
+    // generation's provisioner (T-TLS-065, DIV-0064). Proof: wipe the persisted certificates and
+    // make the fake CA reject any new order, then reload — with a shared store the reload must
+    // succeed without issuing anything, because the still-running certificate is reused.
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().to_string_lossy().to_string();
+    let store = Arc::new(GenerationStore::with_builtin_registry());
+    store
+        .load(config("127.0.0.1:0", Some(0), false, false, &root))
+        .expect("first generation validates");
+    let fake = Arc::new(FakeCa::new(false));
+    let mut runtime = ServerRuntime::new(Arc::clone(&store))
+        .with_acme_transport(fake.clone())
+        .with_data_root(directory.path());
+    runtime
+        .apply()
+        .await
+        .expect("first apply issues a certificate");
+    let first_generation = runtime.status().generation_id.expect("generation active");
+
+    let storage = FileStorage::new(directory.path());
+    for key in storage.list("").await.expect("storage list") {
+        storage
+            .delete(&key)
+            .await
+            .expect("delete persisted certificate");
+    }
+    fake.set_fail_new_order(true);
+
+    store
+        .load(config("127.0.0.1:0", Some(0), false, false, &root))
+        .expect("second generation validates");
+    runtime
+        .apply()
+        .await
+        .expect("reload must reuse the in-memory certificate instead of issuing");
+    let second_generation = runtime
+        .status()
+        .generation_id
+        .expect("generation is active");
+    assert_ne!(second_generation, first_generation);
+
+    // The site still serves the reused certificate after the reload.
+    let address = runtime
+        .listener_address("127.0.0.1:0")
+        .expect("HTTPS listener bound");
+    let mut stream = tls_connect(address, "example.com").await;
+    let (status, _, body) = http_get(&mut stream, "example.com", "/").await;
+    assert_eq!(status, 200);
+    assert_eq!(body, "hello https");
     runtime.shutdown().await;
 }
