@@ -721,3 +721,42 @@ fn trust_fails_loudly_before_touching_the_os_when_the_ca_is_missing() {
         "{stderr}"
     );
 }
+
+#[test]
+fn validate_reports_a_stable_error_code_and_a_did_you_mean_hint() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config.json");
+    std::fs::write(
+        &config,
+        r#"{"admin":{"disabled":true},"apps":{"http":{"servers":{"srv0":{"listen":["127.0.0.1:0"],"routes":[{"handle":[{"handler":"revers_proxy"}]}]}}}}}"#,
+    )
+    .unwrap();
+    let (code, stdout, stderr) = run(&["validate", "--config", config.to_str().unwrap()]);
+    assert_ne!(code, 0, "an unknown handler must fail validation");
+    assert!(stdout.is_empty(), "{stdout}");
+    // Machine-readable code for tooling, then the located message including the suggestion.
+    assert!(
+        stderr.contains("error[module.unknown]:"),
+        "the error must carry its stable code: {stderr}"
+    );
+    assert!(
+        stderr.contains("unknown HTTP handler module `revers_proxy`"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("(did you mean `reverse_proxy`?)"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn validate_keeps_the_plain_error_form_for_non_configuration_failures() {
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("does-not-exist.json");
+    let (code, _stdout, stderr) = run(&["validate", "--config", missing.to_str().unwrap()]);
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("caddy-rs: error: ") && !stderr.contains("error["),
+        "a missing file is not a configuration error code: {stderr}"
+    );
+}

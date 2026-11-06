@@ -353,6 +353,26 @@ impl ModuleRegistry {
         self.by_id.contains_key(id)
     }
 
+    /// A located "unknown module" error that suggests the closest registered key of `kind`.
+    ///
+    /// Every unknown-module diagnostic goes through this so the "did you mean" suggestion can
+    /// never disagree with the registry: the candidates are exactly the JSON keys registered for
+    /// that kind (plus their dotted ids, so a mistyped qualified reference is still recognised).
+    /// `Error::code` reports the stable machine-readable code `module.unknown` for all of them.
+    pub fn unknown_module(
+        &self,
+        kind: ModuleKind,
+        name: impl AsRef<str>,
+        path: impl Into<String>,
+    ) -> Error {
+        let candidates: Vec<&str> = self
+            .modules()
+            .filter(|module| module.kind == kind)
+            .flat_map(|module| [module.json_key, module.id])
+            .collect();
+        Error::unknown_module(kind.label(), name.as_ref(), path, candidates)
+    }
+
     /// All registered modules, ordered by id (deterministic; includes runtime registrations).
     pub fn modules(&self) -> impl Iterator<Item = &Module> {
         self.by_id.values()

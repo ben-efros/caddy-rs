@@ -119,14 +119,13 @@ fn validate_listener_wrappers(
                 "listener wrapper object must name a `wrapper`",
             )
         })?;
-        let module =
-            registry
-                .resolve_listener_wrapper(name)
-                .ok_or_else(|| Error::UnknownModule {
-                    kind: "listener wrapper",
-                    name: name.to_string(),
-                    path: format!("{path}.wrapper"),
-                })?;
+        let module = registry.resolve_listener_wrapper(name).ok_or_else(|| {
+            registry.unknown_module(
+                ModuleKind::ListenerWrapper,
+                name.to_string(),
+                format!("{path}.wrapper"),
+            )
+        })?;
         if module.json_key == "proxy_protocol" {
             let options: ProxyProtocolConfig =
                 serde_json::from_value(Value::Object(wrapper.extra.clone().into_iter().collect()))
@@ -371,11 +370,11 @@ fn validate_base_log(base: &BaseLog, registry: &ModuleRegistry, path: &str) -> R
             "output",
         )?;
         if registry.resolve_log_writer(name).is_none() {
-            return Err(Error::UnknownModule {
-                kind: "log writer",
-                name: name.to_string(),
-                path: writer_path,
-            });
+            return Err(registry.unknown_module(
+                ModuleKind::LogWriter,
+                name.to_string(),
+                writer_path,
+            ));
         }
     }
     if let Some(encoder) = &base.encoder {
@@ -387,22 +386,18 @@ fn validate_base_log(base: &BaseLog, registry: &ModuleRegistry, path: &str) -> R
             "format",
         )?;
         if registry.resolve_log_encoder(name).is_none() {
-            return Err(Error::UnknownModule {
-                kind: "log encoder",
-                name: name.to_string(),
-                path: encoder_path,
-            });
+            return Err(registry.unknown_module(
+                ModuleKind::LogEncoder,
+                name.to_string(),
+                encoder_path,
+            ));
         }
     }
     if let Some(core) = &base.core {
         let core_path = format!("{path}.core.module");
         let name = require_module_name(core.module.as_deref(), &core_path, "log core", "module")?;
         if registry.resolve_log_core(name).is_none() {
-            return Err(Error::UnknownModule {
-                kind: "log core",
-                name: name.to_string(),
-                path: core_path,
-            });
+            return Err(registry.unknown_module(ModuleKind::LogCore, name.to_string(), core_path));
         }
     }
     Ok(())
@@ -431,11 +426,7 @@ fn validate_storage(storage: &StorageConfig, registry: &ModuleRegistry, path: &s
         .as_deref()
         .ok_or_else(|| Error::invalid(&module_path, "storage object must name a `module`"))?;
     if registry.get_by_key(ModuleKind::Storage, module).is_none() {
-        return Err(Error::UnknownModule {
-            kind: "storage",
-            name: module.to_string(),
-            path: module_path,
-        });
+        return Err(registry.unknown_module(ModuleKind::Storage, module.to_string(), module_path));
     }
     Ok(())
 }
@@ -552,14 +543,13 @@ impl Validator<'_> {
             .ok_or_else(|| {
                 Error::invalid(path, "handler object is missing string field `handler`")
             })?;
-        let module = self
-            .registry
-            .resolve_handler(name)
-            .ok_or_else(|| Error::UnknownModule {
-                kind: "HTTP handler",
-                name: name.to_string(),
-                path: format!("{path}.handler"),
-            })?;
+        let module = self.registry.resolve_handler(name).ok_or_else(|| {
+            self.registry.unknown_module(
+                ModuleKind::HttpHandler,
+                name.to_string(),
+                format!("{path}.handler"),
+            )
+        })?;
         self.report.handlers += 1;
 
         match module.json_key {
@@ -653,11 +643,11 @@ impl Validator<'_> {
                 continue;
             }
             if self.registry.resolve_matcher(key).is_none() {
-                return Err(Error::UnknownModule {
-                    kind: "HTTP matcher",
-                    name: key.clone(),
-                    path: format!("{path}.{key}"),
-                });
+                return Err(self.registry.unknown_module(
+                    ModuleKind::HttpMatcher,
+                    key.clone(),
+                    format!("{path}.{key}"),
+                ));
             }
             self.report.matchers += 1;
         }
@@ -800,11 +790,11 @@ impl Validator<'_> {
                     .get_by_key(ModuleKind::StekProvider, provider)
                     .is_none()
                 {
-                    return Err(Error::UnknownModule {
-                        kind: "session ticket key provider",
-                        name: provider.to_string(),
-                        path: path.to_string(),
-                    });
+                    return Err(self.registry.unknown_module(
+                        ModuleKind::StekProvider,
+                        provider.to_string(),
+                        path.to_string(),
+                    ));
                 }
             }
         }
@@ -816,11 +806,11 @@ impl Validator<'_> {
                 .get_by_key(ModuleKind::DnsProvider, name)
                 .is_none()
             {
-                return Err(Error::UnknownModule {
-                    kind: "DNS provider",
-                    name: name.to_string(),
-                    path: path.to_string(),
-                });
+                return Err(self.registry.unknown_module(
+                    ModuleKind::DnsProvider,
+                    name.to_string(),
+                    path.to_string(),
+                ));
             }
         }
         Ok(())
@@ -850,11 +840,11 @@ impl Validator<'_> {
             .get_by_key(ModuleKind::TlsCertificateLoader, name)
             .is_none()
         {
-            return Err(Error::UnknownModule {
-                kind: "TLS certificate loader",
-                name: name.to_string(),
-                path: path.to_string(),
-            });
+            return Err(self.registry.unknown_module(
+                ModuleKind::TlsCertificateLoader,
+                name.to_string(),
+                path.to_string(),
+            ));
         }
         Ok(())
     }
@@ -877,11 +867,11 @@ impl Validator<'_> {
                     .get_by_key(ModuleKind::TlsPermission, module)
                     .is_none()
                 {
-                    return Err(Error::UnknownModule {
-                        kind: "TLS on-demand permission",
-                        name: module.to_string(),
-                        path: path.to_string(),
-                    });
+                    return Err(self.registry.unknown_module(
+                        ModuleKind::TlsPermission,
+                        module.to_string(),
+                        path.to_string(),
+                    ));
                 }
             }
         }
@@ -904,11 +894,11 @@ impl Validator<'_> {
                 .get_by_key(ModuleKind::TlsIssuer, module)
                 .is_none()
             {
-                return Err(Error::UnknownModule {
-                    kind: "TLS issuer",
-                    name: module.to_string(),
-                    path: module_path,
-                });
+                return Err(self.registry.unknown_module(
+                    ModuleKind::TlsIssuer,
+                    module.to_string(),
+                    module_path,
+                ));
             }
             if module == "internal" {
                 self.internal_issuer_ca(issuer, &issuer_path)?;
@@ -970,11 +960,11 @@ impl Validator<'_> {
                 .get_by_key(ModuleKind::DnsProvider, provider)
                 .is_none()
             {
-                return Err(Error::UnknownModule {
-                    kind: "DNS provider",
-                    name: provider.to_string(),
-                    path: format!("{path}.challenges.dns.provider"),
-                });
+                return Err(self.registry.unknown_module(
+                    ModuleKind::DnsProvider,
+                    provider.to_string(),
+                    format!("{path}.challenges.dns.provider"),
+                ));
             }
         }
         Ok(())

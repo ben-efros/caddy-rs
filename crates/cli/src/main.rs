@@ -161,10 +161,25 @@ async fn main() -> ExitCode {
     match run(cli.command).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("caddy-rs: error: {error:#}");
+            match core_error_code(&error) {
+                Some(code) => eprintln!("caddy-rs: error[{code}]: {error:#}"),
+                None => eprintln!("caddy-rs: error: {error:#}"),
+            }
             ExitCode::FAILURE
         }
     }
+}
+
+/// The stable, machine-readable code of the first [`caddy_rs_core::Error`] in the chain, if any.
+///
+/// The code is what scripts and editors match on (`error[module.unknown]`), so it must survive
+/// message rewording; see [`caddy_rs_core::Error::code`]. Errors that do not originate in the
+/// configuration/validation layer (I/O, TLS, runtime) keep the plain `error:` form.
+fn core_error_code(error: &anyhow::Error) -> Option<&'static str> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<caddy_rs_core::Error>())
+        .map(caddy_rs_core::Error::code)
 }
 
 async fn run(command: Command) -> anyhow::Result<()> {

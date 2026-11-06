@@ -15,7 +15,11 @@ pub enum Error {
     },
 
     /// A module name that the registry does not know how to load.
-    #[error("unknown {kind} module `{name}` at `{path}`")]
+    ///
+    /// `hint` is pre-rendered (empty, or `` (did you mean `reverse_proxy`?) ``) so the message can
+    /// stay a plain `thiserror` format string; see [`Error::unknown_module`] and
+    /// [`crate::ModuleRegistry::unknown_module`], which choose it from the registry.
+    #[error("unknown {kind} module `{name}` at `{path}`{hint}")]
     UnknownModule {
         /// Module category, for example `HTTP handler`.
         kind: &'static str,
@@ -23,6 +27,8 @@ pub enum Error {
         name: String,
         /// JSON path of the reference.
         path: String,
+        /// Pre-rendered "did you mean" suffix (empty when no candidate is close enough).
+        hint: String,
     },
 
     /// A listen address that cannot be parsed.
@@ -165,6 +171,54 @@ impl Error {
         }
     }
 
+    /// Convenience constructor for a located "unknown module" error with a "did you mean" hint.
+    ///
+    /// `candidates` are the JSON keys (or ids) that *are* registered for this module category; the
+    /// closest one is suggested when it is within a small edit distance of `name`. Callers with a
+    /// [`crate::ModuleRegistry`] should use [`crate::ModuleRegistry::unknown_module`], which
+    /// supplies the candidates automatically.
+    pub fn unknown_module<'a>(
+        kind: &'static str,
+        name: impl Into<String>,
+        path: impl Into<String>,
+        candidates: impl IntoIterator<Item = &'a str>,
+    ) -> Self {
+        let name = name.into();
+        let hint = match closest_match(&name, candidates) {
+            Some(suggestion) => format!(" (did you mean `{suggestion}`?)"),
+            None => String::new(),
+        };
+        Self::UnknownModule {
+            kind,
+            name,
+            path: path.into(),
+            hint,
+        }
+    }
+
+    /// Stable, machine-readable error code for tooling.
+    ///
+    /// The codes are part of the diagnostics contract (they are what scripts and editors match on),
+    /// so they must not change when a message is reworded. [`Self::Invalid`] is deliberately
+    /// coarse: the located JSON path, not the code, identifies the offending value.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Invalid { .. } => "config.invalid",
+            Self::UnknownModule { .. } => "module.unknown",
+            Self::InvalidListen { .. } => "listen.invalid",
+            Self::ConfigIo { .. } => "config.io",
+            Self::Json { .. } => "config.json",
+            Self::Unsupported { .. } => "config.unsupported",
+            Self::DuplicateModule(_) => "module.duplicate",
+            Self::ModuleKeyConflict { .. } => "module.key_conflict",
+            Self::InvalidModuleDefinition { .. } => "module.invalid_definition",
+            Self::NotImplemented { .. } => "not_implemented",
+            Self::Lifecycle { .. } => "lifecycle.failed",
+            Self::LifecycleCancelled { .. } => "lifecycle.cancelled",
+            Self::LifecycleState { .. } => "lifecycle.state",
+        }
+    }
+
     /// Convenience constructor for a located "recognised but unsupported" error.
     pub fn unsupported(
         path: impl Into<String>,
@@ -177,4 +231,77 @@ impl Error {
             tracking_id,
         }
     }
+}
+
+/// The closest registered name to `name`, when it is close enough to be a useful suggestion.
+///
+/// "Close enough" is a small edit-distance budget that grows with the length of the name (one
+/// edit for short names, up to three for long ones), so `revers_proxy` suggests `reverse_proxy`
+/// while an unrelated name suggests nothing. Ties are broken lexicographically so the suggestion is
+/// deterministic. A qualified id (`http.handlers.reverse_proxy`) is compared with its last segment
+/// as well, matching how Caddy's JSON usually names modules.
+fn closest_match<'a>(name: &str, candidates: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let tail = trimmed.rsplit('.').next().unwrap_or(trimmed);
+    let budget = match trimmed.len().max(tail.len()) {
+        0..=4 => 1,
+        5..=9 => 2,
+        _ => 3,
+    };
+    let mut best: Option<(usize, &'a str)> = None;
+    for candidate in candidates {
+        if candidate == trimmed {
+            // The registry would have resolved an exact key; nothing to suggest.
+            continue;
+        }
+        // A qualified reference (`http.handlers.reverse_proxy`) is compared by its last segment,
+        // which is the short key Caddy's JSON actually uses.
+        let distance = edit_distance_budgeted(tail, candidate, budget)
+            .or_else(|| edit_distance_budgeted(trimmed, candidate, budget));
+        let Some(distance) = distance else { continue };
+        let better = match best {
+            None => true,
+            Some((best_distance, best_name)) => {
+                distance < best_distance || (distance == best_distance && candidate < best_name)
+            }
+        };
+        if better {
+            best = Some((distance, candidate));
+        }
+    }
+    best.map(|(_, candidate)| candidate)
+}
+
+/// Levenshtein distance, abandoned as soon as it exceeds `budget` (returns `None`).
+///
+/// The early exit keeps a suggestion over a large registry cheap: a candidate whose prefix already
+/// drifts too far is rejected without filling the whole matrix.
+fn edit_distance_budgeted(left: &str, right: &str, budget: usize) -> Option<usize> {
+    let left: Vec<char> = left.chars().collect();
+    let right: Vec<char> = right.chars().collect();
+    if left.len().abs_diff(right.len()) > budget {
+        return None;
+    }
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    let mut current = vec![0usize; right.len() + 1];
+    for (i, left_char) in left.iter().enumerate() {
+        current[0] = i + 1;
+        let mut row_minimum = current[0];
+        for (j, right_char) in right.iter().enumerate() {
+            let substitution = previous[j] + usize::from(left_char != right_char);
+            let insertion = current[j] + 1;
+            let deletion = previous[j + 1] + 1;
+            current[j + 1] = substitution.min(insertion).min(deletion);
+            row_minimum = row_minimum.min(current[j + 1]);
+        }
+        if row_minimum > budget {
+            return None;
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    let distance = previous[right.len()];
+    (distance <= budget).then_some(distance)
 }
