@@ -29,6 +29,7 @@
 //!   [`AcmeIssuer::with_configured_dns_solver`] (currently Cloudflare); a caller can still attach
 //!   its own [`DnsProvider`] with [`AcmeIssuer::with_dns01_solver`].
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -38,10 +39,12 @@ use async_trait::async_trait;
 use caddy_rs_core::duration::CaddyDuration;
 use rustls::pki_types::CertificateDer;
 
+use crate::acme::adaptive_challenge::AdaptiveChallengeSelector;
 use crate::acme::{
-    AccountRegistration, AcmeAccountClient, AcmeClient, AcmeClock, AcmeStorage, AcmeTransport,
-    AuthorizationStatus, CertificateRequest, ChallengePolicy, ChallengeType, HyperTransport,
-    IssuedCertificate, NewOrderRequest, OrderStatus, PollPolicy, TokioClock,
+    AccountRegistration, AcmeAccountClient, AcmeClient, AcmeClock, AcmeError, AcmeStorage,
+    AcmeTransport, Authorization, AuthorizationStatus, CertificateRequest, Challenge,
+    ChallengePolicy, ChallengeType, HyperTransport, IssuedCertificate, NewOrderRequest,
+    OrderHandle, OrderStatus, PollPolicy, TokioClock,
 };
 use crate::certificate::Certificate;
 use crate::dns::{DnsChallengeConfig, DnsProvider};
@@ -330,6 +333,7 @@ pub struct AcmeIssuer<T: AcmeTransport> {
     clock: Arc<dyn AcmeClock>,
     poll_policy: PollPolicy,
     challenge_policy: Option<ChallengePolicy>,
+    challenge_selector: AdaptiveChallengeSelector,
 }
 
 /// Production ACME issuer using the hyper/rustls HTTP transport.
@@ -370,6 +374,7 @@ impl<T: AcmeTransport> AcmeIssuer<T> {
             clock: Arc::new(TokioClock),
             poll_policy: PollPolicy::default(),
             challenge_policy: None,
+            challenge_selector: AdaptiveChallengeSelector::default(),
         }
     }
 
@@ -463,8 +468,17 @@ impl<T: AcmeTransport> AcmeIssuer<T> {
             // operator explicitly selects a DNS challenge provider.
             return ChallengePolicy::dns_only();
         }
-        let mut policy = ChallengePolicy::default()
-            .with_preference(vec![ChallengeType::Http01, ChallengeType::TlsAlpn01]);
+        // Adaptive order (DIV-0097 / T-TLS-076): once authorization offers have been recorded,
+        // the selector's order — one-time shuffle, then stable descending success ratio —
+        // becomes the preference, matching acmez's adaptive randomized selection. Fresh
+        // issuers fall back to HTTP-01 with TLS-ALPN-01 second.
+        let adaptive = self.challenge_selector.ordered();
+        let preference = if adaptive.is_empty() {
+            vec![ChallengeType::Http01, ChallengeType::TlsAlpn01]
+        } else {
+            adaptive
+        };
+        let mut policy = ChallengePolicy::default().with_preference(preference);
         policy.dns01 = false;
         policy.http01 =
             !self.config.http_challenge_disabled && self.solvers.contains(ChallengeType::Http01);
@@ -540,59 +554,67 @@ impl<T: AcmeTransport> AcmeIssuer<T> {
         presented: &mut Vec<(Arc<dyn ChallengeSolver>, ChallengeHandle)>,
     ) -> Result<Certificate> {
         let order_request = NewOrderRequest::for_domains(domains);
-        let order = account_client.new_order(&order_request).await?;
 
-        if order.order.status == OrderStatus::Valid {
-            // A valid order has no local CSR/private key, so the certificate cannot be stored.
-            return Err(Error::Issuer(
-                "ACME order is already valid but no local private key exists; start a new order"
-                    .to_string(),
-            ));
-        }
+        // acmez `ObtainCertificate` parity (DIV-0097 / T-TLS-076): retry the whole order
+        // transaction up to `MAX_ATTEMPTS` times. Each attempt creates a fresh order and
+        // remembers which challenge types failed for each identifier, so a later attempt can
+        // pick the next-best type instead of failing the issuance outright.
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut failed_challenge_types: HashMap<String, Vec<ChallengeType>> = HashMap::new();
+        let mut order: Option<OrderHandle> = None;
+        let mut attempt_error: Option<Error> = None;
 
-        if order.order.status == OrderStatus::Pending {
-            let authorizations = account_client.fetch_authorizations(&order.order).await?;
-            let policy = self.challenge_policy();
-            let thumbprint = account_client.client().account_key().thumbprint()?;
-            for fetched in &authorizations {
-                if fetched.authorization.status == AuthorizationStatus::Valid {
-                    continue;
-                }
-                let challenge = policy.select(&fetched.authorization)?;
-                let challenge_type = challenge.kind().ok_or_else(|| {
-                    Error::Issuer(format!(
-                        "ACME authorization offered unsupported challenge type `{}`",
-                        challenge.challenge_type
-                    ))
-                })?;
-                let solver = self.solvers.get(challenge_type).ok_or_else(|| {
-                    Error::Issuer(format!(
-                        "no challenge solver is configured for `{challenge_type}`"
-                    ))
-                })?;
-                let domain = fetched
-                    .authorization
-                    .identifier
-                    .as_ref()
-                    .map(|identifier| identifier.value.clone())
-                    .ok_or_else(|| {
-                        Error::Issuer("ACME authorization is missing its identifier".to_string())
-                    })?;
-                let key_authorization = key_authorization(&challenge.token, &thumbprint);
-                let handle = solver
-                    .present(&domain, challenge, &key_authorization)
-                    .await?;
-                presented.push((solver, handle));
-                account_client.acknowledge_challenge(challenge).await?;
+        for attempt in 1..=MAX_ATTEMPTS {
+            if attempt > 1 {
+                // acmez waits one second between order attempts.
+                self.clock.sleep(Duration::from_secs(1)).await;
             }
-            for fetched in &authorizations {
-                if fetched.authorization.status != AuthorizationStatus::Valid {
-                    account_client
-                        .poll_authorization(&fetched.url, &self.poll_policy, self.clock.as_ref())
-                        .await?;
+            let candidate = account_client.new_order(&order_request).await?;
+            if candidate.order.status == OrderStatus::Valid {
+                // A valid order has no local CSR/private key, so the certificate cannot be
+                // stored.
+                return Err(Error::Issuer(
+                    "ACME order is already valid but no local private key exists; start a new \
+                     order"
+                        .to_string(),
+                ));
+            }
+            if candidate.order.status == OrderStatus::Pending {
+                let attempt_start = presented.len();
+                match self
+                    .solve_order_authorizations(
+                        account_client,
+                        &candidate,
+                        presented,
+                        &mut failed_challenge_types,
+                    )
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(SolveAttemptError::Retryable(error)) => {
+                        // Clean up this attempt's evidence before retrying, mirroring acmez's
+                        // `defer CleanUp` in `solveChallenges`.
+                        let failed_attempt: Vec<_> = presented.drain(attempt_start..).collect();
+                        for (solver, handle) in failed_attempt.into_iter().rev() {
+                            let _ = solver.withdraw(&handle).await;
+                        }
+                        attempt_error = Some(error);
+                        continue;
+                    }
+                    Err(SolveAttemptError::Fatal(error)) => return Err(error),
                 }
             }
+            order = Some(candidate);
+            break;
         }
+
+        let order = order.ok_or_else(|| {
+            attempt_error.unwrap_or_else(|| {
+                Error::Issuer(format!(
+                    "ACME order was not solved after {MAX_ATTEMPTS} attempts"
+                ))
+            })
+        })?;
 
         account_client
             .poll_order_ready(&order.url, &self.poll_policy, self.clock.as_ref())
@@ -616,6 +638,178 @@ impl<T: AcmeTransport> AcmeIssuer<T> {
             .store(&self.storage_key(domains), &stored)
             .await?;
         self.build_certificate(&issued, &csr, domains)
+    }
+
+    /// Solve every pending authorization of one order attempt (acmez `solveChallenges`).
+    ///
+    /// Records the failed challenge type per identifier and returns
+    /// [`SolveAttemptError::Retryable`] when the CA reports a retryable problem and another
+    /// solver-backed challenge type remains for the authorization; the caller then recreates
+    /// the order (acmez `ObtainCertificate`).
+    async fn solve_order_authorizations<U: AcmeTransport + ?Sized>(
+        &self,
+        account_client: &AcmeAccountClient<&U>,
+        order: &OrderHandle,
+        presented: &mut Vec<(Arc<dyn ChallengeSolver>, ChallengeHandle)>,
+        failed_challenge_types: &mut HashMap<String, Vec<ChallengeType>>,
+    ) -> std::result::Result<(), SolveAttemptError> {
+        let authorizations = account_client
+            .fetch_authorizations(&order.order)
+            .await
+            .map_err(SolveAttemptError::Fatal)?;
+        // DIV-0097 / T-TLS-076: feed every offered challenge type into the adaptive selector
+        // before selecting (acmez `getAuthzObjects` initial fill), so the preference order
+        // reflects what the CA actually offers and later issuances prefer higher-success types.
+        for fetched in &authorizations {
+            let offered: Vec<ChallengeType> = fetched
+                .authorization
+                .challenges
+                .iter()
+                .filter_map(|challenge| challenge.kind())
+                .collect();
+            if !offered.is_empty() {
+                self.challenge_selector
+                    .record_offered(&offered)
+                    .map_err(SolveAttemptError::Fatal)?;
+            }
+        }
+        let policy = self.challenge_policy();
+        let thumbprint = account_client
+            .client()
+            .account_key()
+            .thumbprint()
+            .map_err(SolveAttemptError::Fatal)?;
+        let mut selected_by_url: HashMap<String, ChallengeType> = HashMap::new();
+
+        // Present and initiate one challenge per pending authorization (acmez
+        // `presentForNextChallenge` + `initiateCurrentChallenge`; caddy-rs
+        // `acknowledge_challenge` performs the initiate request).
+        for fetched in &authorizations {
+            if fetched.authorization.status == AuthorizationStatus::Valid {
+                continue;
+            }
+            let identifier = identifier_key(&fetched.authorization);
+            let failed = failed_challenge_types
+                .get(&identifier)
+                .cloned()
+                .unwrap_or_default();
+            let challenge =
+                select_remaining_challenge(&policy, &self.solvers, &fetched.authorization, &failed)
+                    .map_err(SolveAttemptError::Fatal)?;
+            let challenge_type = challenge.kind().ok_or_else(|| {
+                SolveAttemptError::Fatal(Error::Issuer(format!(
+                    "ACME authorization offered unsupported challenge type `{}`",
+                    challenge.challenge_type
+                )))
+            })?;
+            selected_by_url.insert(fetched.url.clone(), challenge_type);
+            let solver = self.solvers.get(challenge_type).ok_or_else(|| {
+                SolveAttemptError::Fatal(Error::Issuer(format!(
+                    "no challenge solver is configured for `{challenge_type}`"
+                )))
+            })?;
+            let domain = fetched
+                .authorization
+                .identifier
+                .as_ref()
+                .map(|identifier| identifier.value.clone())
+                .ok_or_else(|| {
+                    SolveAttemptError::Fatal(Error::Issuer(
+                        "ACME authorization is missing its identifier".to_string(),
+                    ))
+                })?;
+            let key_authorization = key_authorization(&challenge.token, &thumbprint);
+            let handle = solver
+                .present(&domain, challenge, &key_authorization)
+                .await
+                .map_err(SolveAttemptError::Fatal)?;
+            presented.push((solver, handle));
+            if let Err(error) = account_client.acknowledge_challenge(challenge).await {
+                // acmez treats challenge initiation failures as fatal, but some CAs (and the
+                // caddy-rs test CA) report a validation failure directly on the challenge POST;
+                // apply the same retryable-problem gate here so the observable order-level
+                // behaviour matches.
+                self.challenge_selector
+                    .record_attempt(challenge_type, false);
+                if is_retryable_challenge_problem(&error)
+                    && self.remember_failed_challenge_type(
+                        &policy,
+                        &fetched.authorization,
+                        challenge_type,
+                        failed_challenge_types,
+                    )
+                {
+                    return Err(SolveAttemptError::Retryable(error));
+                }
+                return Err(SolveAttemptError::Fatal(error));
+            }
+        }
+
+        // Poll each authorization (acmez `pollAuthorization`): update the adaptive success
+        // statistics and retry the order with a different challenge type when the problem is
+        // one acmez considers recoverable.
+        for fetched in &authorizations {
+            if fetched.authorization.status == AuthorizationStatus::Valid {
+                continue;
+            }
+            let challenge_type = selected_by_url.get(&fetched.url).copied();
+            let outcome = account_client
+                .poll_authorization(&fetched.url, &self.poll_policy, self.clock.as_ref())
+                .await;
+            match outcome {
+                Ok(_) => {
+                    if let Some(challenge_type) = challenge_type {
+                        self.challenge_selector.record_attempt(challenge_type, true);
+                    }
+                }
+                Err(error) => {
+                    let Some(challenge_type) = challenge_type else {
+                        return Err(SolveAttemptError::Fatal(error));
+                    };
+                    self.challenge_selector
+                        .record_attempt(challenge_type, false);
+                    if is_retryable_challenge_problem(&error)
+                        && self.remember_failed_challenge_type(
+                            &policy,
+                            &fetched.authorization,
+                            challenge_type,
+                            failed_challenge_types,
+                        )
+                    {
+                        return Err(SolveAttemptError::Retryable(error));
+                    }
+                    return Err(SolveAttemptError::Fatal(error));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Remember `challenge_type` as failed for the authorization's identifier and report whether
+    /// another solver-backed challenge type remains (acmez `rememberFailedChallenge` +
+    /// `countAvailableChallenges`).
+    fn remember_failed_challenge_type(
+        &self,
+        policy: &ChallengePolicy,
+        authorization: &Authorization,
+        challenge_type: ChallengeType,
+        failed_challenge_types: &mut HashMap<String, Vec<ChallengeType>>,
+    ) -> bool {
+        let identifier = identifier_key(authorization);
+        let mut failed = failed_challenge_types
+            .get(&identifier)
+            .cloned()
+            .unwrap_or_default();
+        failed.push(challenge_type);
+        if remaining_challenge_types(policy, &self.solvers, authorization, &failed).is_empty() {
+            return false;
+        }
+        failed_challenge_types
+            .entry(identifier)
+            .or_default()
+            .push(challenge_type);
+        true
     }
 
     fn storage_key(&self, domains: &[String]) -> String {
@@ -763,6 +957,106 @@ pub fn within_renewal_window(
         .duration_since(now)
         .map(|remaining| remaining <= renewal_window)
         .unwrap_or(true)
+}
+
+/// Outcome of solving one order attempt (acmez `solveChallenges`).
+enum SolveAttemptError {
+    /// acmez `retryableErr`: a challenge failed with a retryable problem type and another
+    /// solver-backed challenge type remains, so the order should be recreated.
+    Retryable(Error),
+    /// Any other failure; propagate it unchanged.
+    Fatal(Error),
+}
+
+/// acmez `failedChallengeMap.idKey`: identifier type concatenated with its value.
+fn identifier_key(authorization: &Authorization) -> String {
+    authorization
+        .identifier
+        .as_ref()
+        .map(|identifier| format!("{}{}", identifier.identifier_type, identifier.value))
+        .unwrap_or_default()
+}
+
+/// Whether an ACME problem is one acmez retries with a different challenge type
+/// (`connection`, `dns`, `serverInternal`, `unauthorized`, `tls`; acmez v3.1.7
+/// `pollAuthorization`).
+fn is_retryable_challenge_problem(error: &Error) -> bool {
+    let Error::Acme(error) = error else {
+        return false;
+    };
+    let problem = match error.as_ref() {
+        AcmeError::Problem { problem, .. } => problem,
+        AcmeError::InvalidAuthorization {
+            problem: Some(problem),
+            ..
+        } => problem,
+        AcmeError::InvalidChallenge {
+            problem: Some(problem),
+            ..
+        } => problem,
+        _ => return false,
+    };
+    matches!(
+        problem.error_code(),
+        Some("connection" | "dns" | "serverInternal" | "unauthorized" | "tls")
+    )
+}
+
+/// Challenge types that can still be attempted for `authorization`: enabled by `policy`,
+/// solver-backed, offered by the CA, and not already failed for this identifier (acmez
+/// `remainingChallenges` after `enqueueUnfailedChallenges` and `nextChallenge`).
+fn remaining_challenge_types(
+    policy: &ChallengePolicy,
+    solvers: &SolverRegistry,
+    authorization: &Authorization,
+    failed: &[ChallengeType],
+) -> Vec<ChallengeType> {
+    policy
+        .ordered_types()
+        .into_iter()
+        .filter(|challenge_type| !failed.contains(challenge_type))
+        .filter(|challenge_type| solvers.contains(*challenge_type))
+        .filter(|challenge_type| {
+            authorization
+                .challenges
+                .iter()
+                .any(|challenge| challenge.kind() == Some(*challenge_type))
+        })
+        .collect()
+}
+
+/// Select the next challenge to solve for `authorization` (acmez `nextChallenge`): the
+/// most-preferred remaining challenge type that also has a configured solver.
+fn select_remaining_challenge<'authorization>(
+    policy: &ChallengePolicy,
+    solvers: &SolverRegistry,
+    authorization: &'authorization Authorization,
+    failed: &[ChallengeType],
+) -> Result<&'authorization Challenge> {
+    for challenge_type in remaining_challenge_types(policy, solvers, authorization, failed) {
+        if let Some(challenge) = authorization
+            .challenges
+            .iter()
+            .find(|challenge| challenge.kind() == Some(challenge_type))
+        {
+            return Ok(challenge);
+        }
+    }
+    let offered: Vec<String> = authorization
+        .challenges
+        .iter()
+        .map(|challenge| challenge.challenge_type.clone())
+        .collect();
+    let identifier = authorization
+        .identifier
+        .as_ref()
+        .map(|identifier| identifier.value.clone())
+        .unwrap_or_else(|| "unknown identifier".to_string());
+    Err(AcmeError::NoSupportedChallenge {
+        identifier,
+        offered,
+    }
+    .into())
 }
 
 #[cfg(test)]
@@ -1671,6 +1965,104 @@ mod tests {
         );
         assert!(certificate_storage.list("").await.unwrap().is_empty());
         assert_eq!(transport.requests().len(), 5);
+        assert_eq!(transport.remaining(), 0);
+    }
+
+    /// Deterministic randomness source: always returns index 0, which reverses the first-fill
+    /// Fisher–Yates shuffle (the bound is inclusive), so a selector offered
+    /// `[http-01, tls-alpn-01]` prefers TLS-ALPN-01 first.
+    struct AlwaysZeroRng;
+
+    impl crate::acme::adaptive_challenge::ChallengeRng for AlwaysZeroRng {
+        fn random_index(
+            &self,
+            _max: usize,
+        ) -> std::result::Result<usize, ring::error::Unspecified> {
+            Ok(0)
+        }
+    }
+
+    /// Clock that records sleeps instead of waiting, so the acmez inter-attempt delay is
+    /// asserted without slowing the suite.
+    #[derive(Default)]
+    struct RecordingClock {
+        sleeps: Mutex<Vec<Duration>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AcmeClock for RecordingClock {
+        async fn sleep(&self, duration: Duration) {
+            self.sleeps.lock().unwrap().push(duration);
+        }
+    }
+
+    #[tokio::test]
+    async fn retryable_tls_alpn_failure_retries_the_order_with_http01() {
+        let transport = TestTransport::new();
+        let account_storage = Arc::new(MemoryAcmeStorage::new());
+        let certificate_storage = Arc::new(MemoryStorage::new());
+        let mut issuer = issuer_with(
+            transport.clone(),
+            http_config(),
+            account_storage,
+            &certificate_storage,
+        );
+        issuer.challenge_selector = AdaptiveChallengeSelector::with_rng(Box::new(AlwaysZeroRng));
+        let clock = Arc::new(RecordingClock::default());
+        issuer.clock = clock.clone();
+        let tls_alpn_tokens = Arc::clone(issuer.tls_alpn01_token_store());
+
+        // Both challenge types are offered; the deterministic selector tries TLS-ALPN-01 first and
+        // the CA rejects it with a retryable `connection` problem.
+        script_account_and_order(&transport, &["http-01", "tls-alpn-01"]);
+        transport.expect(
+            HttpMethod::Post,
+            CHALLENGE_URL,
+            with_nonce(
+                problem_response(400, "connection", "fake CA cannot validate tls-alpn-01"),
+                "nonce-4",
+            ),
+        );
+        // acmez `ObtainCertificate` (client.go:123-200) creates a fresh order for the second
+        // attempt after a one-second pause, and picks the next solver-backed challenge type.
+        transport.expect(
+            HttpMethod::Post,
+            NEW_ORDER_URL,
+            with_nonce(
+                with_location(json_response(201, order_document("pending")), ORDER_URL),
+                "nonce-5",
+            ),
+        );
+        transport.expect(
+            HttpMethod::Post,
+            AUTHZ_URL,
+            with_nonce(
+                json_response(
+                    200,
+                    authorization_document("pending", &["http-01", "tls-alpn-01"]),
+                ),
+                "nonce-6",
+            ),
+        );
+        script_finalization(&transport, "http-01");
+
+        let certificate = issuer
+            .obtain(&issuance_request())
+            .await
+            .expect("retryable TLS-ALPN-01 failure must retry with HTTP-01");
+        assert_eq!(certificate.domains, vec!["example.com".to_string()]);
+        assert!(
+            tls_alpn_tokens.lookup("example.com").is_none(),
+            "the failed attempt's TLS-ALPN-01 evidence must be withdrawn before retrying"
+        );
+        assert_eq!(
+            *clock.sleeps.lock().unwrap(),
+            vec![Duration::from_secs(1)],
+            "acmez waits one second between order attempts"
+        );
+        // First attempt: directory, account, order, authz, challenge. Second attempt: order,
+        // authz, challenge, authz, order-ready, finalize, order-valid, certificate.
+        assert_eq!(transport.requests().len(), 13);
         assert_eq!(transport.remaining(), 0);
     }
 
