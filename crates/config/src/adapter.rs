@@ -62,6 +62,663 @@ impl ConfigAdapter for CaddyfileAdapter {
     }
 }
 
+/// Server-level options parsed from the Caddyfile global `servers` block.
+///
+/// The shared parser does not model this global option yet and rejects it before the adapter runs,
+/// so the adapter extracts the block from the raw input first (masking it out with spaces to keep
+/// line numbers stable), then applies the parsed options to the generated servers. Only the
+/// `listener_wrappers` subset is implemented; every other `servers` sub-option is a located error.
+#[derive(Debug, Clone, Default)]
+struct GlobalServerOptions {
+    /// `None` applies to every server; otherwise only to servers with an exactly matching
+    /// listener address (Caddy's `ListenerAddress`).
+    listener_address: Option<String>,
+    listener_wrappers: Vec<Value>,
+}
+
+/// Mask one byte span with spaces (keeping newlines) so parser diagnostics keep their line/column.
+fn mask_span(bytes: &mut [u8], start: usize, end: usize) {
+    for byte in &mut bytes[start..end] {
+        if *byte != b'\n' {
+            *byte = b' ';
+        }
+    }
+}
+
+/// 1-based line/column of a byte offset (used for located errors from the pre-scan).
+fn position_at(input: &str, offset: usize) -> Position {
+    let prefix = &input[..offset.min(input.len())];
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let column = prefix
+        .rfind('\n')
+        .map(|newline| offset - newline)
+        .unwrap_or(offset + 1);
+    Position::new(line, column)
+}
+
+/// Skip spaces, tabs and `#` comments (not newlines).
+fn skip_inline_trivia(bytes: &[u8], index: &mut usize) {
+    while let Some(byte) = bytes.get(*index) {
+        match byte {
+            b' ' | b'\t' | b'\r' => *index += 1,
+            b'#' => {
+                while *index < bytes.len() && bytes[*index] != b'\n' {
+                    *index += 1;
+                }
+            }
+            _ => break,
+        }
+    }
+}
+
+/// Skip whitespace (including newlines) and comments.
+fn skip_trivia(bytes: &[u8], index: &mut usize) {
+    loop {
+        while matches!(bytes.get(*index), Some(b' ' | b'\t' | b'\r' | b'\n')) {
+            *index += 1;
+        }
+        match bytes.get(*index) {
+            Some(b'#') => {
+                while *index < bytes.len() && bytes[*index] != b'\n' {
+                    *index += 1;
+                }
+            }
+            _ => break,
+        }
+    }
+}
+
+/// Advance past a quoted string starting at `index` (the opening quote).
+fn skip_quoted(input: &str, index: usize) -> caddy_rs_core::Result<usize> {
+    let bytes = input.as_bytes();
+    let mut cursor = index + 1;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'\\' => cursor += 2,
+            b'"' => return Ok(cursor + 1),
+            b'\n' => {
+                return Err(adapter_error(
+                    position_at(input, index),
+                    "unterminated quoted string in global options",
+                ))
+            }
+            _ => cursor += 1,
+        }
+    }
+    Err(adapter_error(
+        position_at(input, index),
+        "unterminated quoted string in global options",
+    ))
+}
+
+/// Advance past a backtick string starting at `index` (the opening backtick).
+fn skip_backtick(input: &str, index: usize) -> caddy_rs_core::Result<usize> {
+    let bytes = input.as_bytes();
+    let Some(found) = bytes[index + 1..].iter().position(|byte| *byte == b'`') else {
+        return Err(adapter_error(
+            position_at(input, index),
+            "unterminated backtick string in global options",
+        ));
+    };
+    Ok(index + 1 + found + 1)
+}
+
+/// Find the `}` matching the `{` at `open`, skipping quoted strings, backtick strings and comments.
+fn find_matching_brace(input: &str, open: usize) -> caddy_rs_core::Result<usize> {
+    let bytes = input.as_bytes();
+    let mut depth = 0_usize;
+    let mut index = open;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(index);
+                }
+            }
+            b'"' => {
+                index = skip_quoted(input, index)?;
+                continue;
+            }
+            b'`' => {
+                index = skip_backtick(input, index)?;
+                continue;
+            }
+            b'#' => {
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+                continue;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    Err(adapter_error(
+        position_at(input, open),
+        "unterminated `{` in global options",
+    ))
+}
+
+/// Read one bare word (or quoted/backtick string) starting at `index`, advancing it.
+fn read_word(input: &str, index: &mut usize) -> caddy_rs_core::Result<String> {
+    let bytes = input.as_bytes();
+    let start = *index;
+    match bytes.get(start) {
+        Some(b'"') => {
+            let end = skip_quoted(input, start)?;
+            let inner = &input[start + 1..end - 1];
+            let mut decoded = String::new();
+            let mut characters = inner.chars();
+            while let Some(character) = characters.next() {
+                if character == '\\' {
+                    match characters.next() {
+                        Some('n') => decoded.push('\n'),
+                        Some('r') => decoded.push('\r'),
+                        Some('t') => decoded.push('\t'),
+                        Some('"') => decoded.push('"'),
+                        Some('\\') => decoded.push('\\'),
+                        Some(other) => {
+                            decoded.push('\\');
+                            decoded.push(other);
+                        }
+                        None => decoded.push('\\'),
+                    }
+                } else {
+                    decoded.push(character);
+                }
+            }
+            *index = end;
+            Ok(decoded)
+        }
+        Some(b'`') => {
+            let end = skip_backtick(input, start)?;
+            let text = input[start + 1..end - 1].to_string();
+            *index = end;
+            Ok(text)
+        }
+        Some(_) => {
+            let mut end = start;
+            while let Some(byte) = bytes.get(end) {
+                if matches!(byte, b' ' | b'\t' | b'\r' | b'\n' | b'{' | b'}' | b'#') {
+                    break;
+                }
+                end += 1;
+            }
+            if end == start {
+                return Err(adapter_error(
+                    position_at(input, start),
+                    "unexpected character in global options",
+                ));
+            }
+            *index = end;
+            Ok(input[start..end].to_string())
+        }
+        None => Err(adapter_error(
+            position_at(input, start),
+            "unexpected end of global options",
+        )),
+    }
+}
+
+/// One token in a `servers` block.
+#[derive(Debug, Clone)]
+enum ServerBlockToken {
+    Word(String, Position),
+    OpenBrace(Position),
+    CloseBrace(Position),
+    Newline,
+}
+
+struct ServerBlockCursor<'a> {
+    input: &'a str,
+    index: usize,
+    end: usize,
+}
+
+impl<'a> ServerBlockCursor<'a> {
+    fn new(input: &'a str, start: usize, end: usize) -> Self {
+        Self {
+            input,
+            index: start,
+            end,
+        }
+    }
+
+    fn next(&mut self) -> caddy_rs_core::Result<Option<ServerBlockToken>> {
+        let bytes = self.input.as_bytes();
+        loop {
+            if self.index >= self.end {
+                return Ok(None);
+            }
+            match bytes[self.index] {
+                b' ' | b'\t' | b'\r' => self.index += 1,
+                b'\n' => {
+                    self.index += 1;
+                    return Ok(Some(ServerBlockToken::Newline));
+                }
+                b'#' => {
+                    while self.index < self.end && bytes[self.index] != b'\n' {
+                        self.index += 1;
+                    }
+                }
+                b'{' => {
+                    let position = position_at(self.input, self.index);
+                    self.index += 1;
+                    return Ok(Some(ServerBlockToken::OpenBrace(position)));
+                }
+                b'}' => {
+                    let position = position_at(self.input, self.index);
+                    self.index += 1;
+                    return Ok(Some(ServerBlockToken::CloseBrace(position)));
+                }
+                _ => {
+                    let position = position_at(self.input, self.index);
+                    let word = read_word(self.input, &mut self.index)?;
+                    return Ok(Some(ServerBlockToken::Word(word, position)));
+                }
+            }
+        }
+    }
+
+    /// Read the rest of the current line (arguments) and whether a block follows.
+    fn rest_of_line(&mut self) -> caddy_rs_core::Result<(Vec<String>, bool)> {
+        let mut arguments = Vec::new();
+        loop {
+            match self.next()? {
+                None | Some(ServerBlockToken::Newline) => return Ok((arguments, false)),
+                Some(ServerBlockToken::OpenBrace(_)) => return Ok((arguments, true)),
+                Some(ServerBlockToken::CloseBrace(position)) => {
+                    return Err(adapter_error(position, "unexpected `}` in servers options"))
+                }
+                Some(ServerBlockToken::Word(word, _)) => arguments.push(word),
+            }
+        }
+    }
+}
+
+/// Parse the contents of a `servers [<addr>] { ... }` block, supporting only `listener_wrappers`.
+fn parse_servers_block(input: &str, start: usize, end: usize) -> caddy_rs_core::Result<Vec<Value>> {
+    let mut cursor = ServerBlockCursor::new(input, start, end);
+    let mut wrappers = Vec::new();
+    loop {
+        let Some(token) = cursor.next()? else {
+            break;
+        };
+        match token {
+            ServerBlockToken::Newline => continue,
+            ServerBlockToken::CloseBrace(_) | ServerBlockToken::OpenBrace(_) => {
+                return Err(adapter_error(
+                    position_at(input, start),
+                    "unexpected brace in servers options",
+                ))
+            }
+            ServerBlockToken::Word(option, position) => {
+                let (arguments, has_block) = cursor.rest_of_line()?;
+                match option.as_str() {
+                    "listener_wrappers" => {
+                        if !arguments.is_empty() {
+                            return Err(adapter_error(
+                                position,
+                                "`listener_wrappers` does not take arguments",
+                            ));
+                        }
+                        if has_block {
+                            wrappers.extend(parse_listener_wrappers_block(input, &mut cursor)?);
+                        }
+                    }
+                    other => {
+                        return Err(adapter_error(
+                            position,
+                            format!(
+                                "`servers` option `{other}` is not supported by this build \
+                                 (tracked as T-CONF-036); supported: listener_wrappers"
+                            ),
+                        ))
+                    }
+                }
+            }
+        }
+    }
+    Ok(wrappers)
+}
+
+/// Parse the body of a `listener_wrappers { ... }` block (the opening `{` is already consumed).
+fn parse_listener_wrappers_block(
+    input: &str,
+    cursor: &mut ServerBlockCursor<'_>,
+) -> caddy_rs_core::Result<Vec<Value>> {
+    let mut wrappers = Vec::new();
+    loop {
+        let Some(token) = cursor.next()? else {
+            return Err(adapter_error(
+                position_at(input, 0),
+                "unterminated `listener_wrappers` block",
+            ));
+        };
+        match token {
+            ServerBlockToken::Newline => continue,
+            ServerBlockToken::CloseBrace(_) => return Ok(wrappers),
+            ServerBlockToken::OpenBrace(position) => {
+                return Err(adapter_error(
+                    position,
+                    "unexpected `{` in listener_wrappers",
+                ))
+            }
+            ServerBlockToken::Word(name, position) => {
+                let (arguments, has_block) = cursor.rest_of_line()?;
+                match name.as_str() {
+                    "http_redirect" => {
+                        if !arguments.is_empty() {
+                            return Err(adapter_error(
+                                position,
+                                "`http_redirect` does not take arguments",
+                            ));
+                        }
+                        if has_block {
+                            return Err(adapter_error(
+                                position,
+                                "`http_redirect` does not take a block",
+                            ));
+                        }
+                        wrappers.push(json!({"wrapper": "http_redirect"}));
+                    }
+                    "tls" => {
+                        if !arguments.is_empty() {
+                            return Err(adapter_error(position, "`tls` does not take arguments"));
+                        }
+                        if has_block {
+                            return Err(adapter_error(position, "`tls` does not take a block"));
+                        }
+                        wrappers.push(json!({"wrapper": "tls"}));
+                    }
+                    "proxy_protocol" => {
+                        if !arguments.is_empty() {
+                            return Err(adapter_error(
+                                position,
+                                "`proxy_protocol` does not take same-line arguments",
+                            ));
+                        }
+                        let mut wrapper = Map::new();
+                        wrapper.insert("wrapper".to_string(), json!("proxy_protocol"));
+                        if has_block {
+                            parse_proxy_protocol_block(input, cursor, &mut wrapper)?;
+                        }
+                        wrappers.push(Value::Object(wrapper));
+                    }
+                    other => {
+                        return Err(adapter_error(
+                            position,
+                            format!(
+                                "listener wrapper `{other}` is not supported by this build \
+                                 (tracked as T-CONF-036); supported: proxy_protocol, tls, \
+                                 http_redirect"
+                            ),
+                        ))
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Parse the `proxy_protocol { ... }` wrapper options into the module JSON object.
+fn parse_proxy_protocol_block(
+    input: &str,
+    cursor: &mut ServerBlockCursor<'_>,
+    wrapper: &mut Map<String, Value>,
+) -> caddy_rs_core::Result<()> {
+    loop {
+        let Some(token) = cursor.next()? else {
+            return Err(adapter_error(
+                position_at(input, 0),
+                "unterminated `proxy_protocol` block",
+            ));
+        };
+        match token {
+            ServerBlockToken::Newline => continue,
+            ServerBlockToken::CloseBrace(_) => return Ok(()),
+            ServerBlockToken::OpenBrace(position) => {
+                return Err(adapter_error(position, "unexpected `{` in proxy_protocol"))
+            }
+            ServerBlockToken::Word(option, position) => {
+                let (arguments, has_block) = cursor.rest_of_line()?;
+                if has_block {
+                    return Err(adapter_error(
+                        position,
+                        format!("`proxy_protocol` option `{option}` does not take a block"),
+                    ));
+                }
+                match option.as_str() {
+                    "timeout" => {
+                        let [value] = arguments.as_slice() else {
+                            return Err(adapter_error(
+                                position,
+                                "`proxy_protocol` `timeout` requires exactly one duration",
+                            ));
+                        };
+                        let error_position = position.clone();
+                        let nanoseconds =
+                            parser::parse_go_duration_ns(value).map_err(|reason| {
+                                adapter_error(
+                                    error_position,
+                                    format!("parsing proxy_protocol timeout: {reason}"),
+                                )
+                            })?;
+                        if nanoseconds < 0 {
+                            return Err(adapter_error(
+                                position,
+                                "`proxy_protocol` `timeout` must not be negative",
+                            ));
+                        }
+                        if nanoseconds > 0 {
+                            wrapper.insert("timeout".to_string(), json!(nanoseconds));
+                        } else {
+                            wrapper.remove("timeout");
+                        }
+                    }
+                    "allow" | "deny" => {
+                        if arguments.is_empty() {
+                            return Err(adapter_error(
+                                position,
+                                format!("`proxy_protocol` `{option}` requires at least one CIDR"),
+                            ));
+                        }
+                        let existing = wrapper
+                            .entry(option.clone())
+                            .or_insert_with(|| Value::Array(Vec::new()));
+                        if let Value::Array(values) = existing {
+                            for argument in arguments {
+                                values.push(json!(argument));
+                            }
+                        }
+                    }
+                    "fallback_policy" => {
+                        let [value] = arguments.as_slice() else {
+                            return Err(adapter_error(
+                                position,
+                                "`proxy_protocol` `fallback_policy` requires exactly one policy",
+                            ));
+                        };
+                        let policy = match value.to_ascii_uppercase().as_str() {
+                            "USE" | "IGNORE" | "REJECT" | "REQUIRE" | "SKIP" => {
+                                value.to_ascii_uppercase()
+                            }
+                            other => {
+                                return Err(adapter_error(
+                                    position,
+                                    format!("{other} is invalid policy"),
+                                ))
+                            }
+                        };
+                        if policy == "IGNORE" {
+                            wrapper.remove("fallback_policy");
+                        } else {
+                            wrapper.insert("fallback_policy".to_string(), json!(policy));
+                        }
+                    }
+                    other => {
+                        return Err(adapter_error(
+                            position,
+                            format!(
+                                "`proxy_protocol` option `{other}` is not supported by this build \
+                                 (tracked as T-CONF-036); supported: timeout, allow, deny, \
+                                 fallback_policy"
+                            ),
+                        ))
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Extract and parse every global `servers [<addr>] { ... }` option from the Caddyfile, masking
+/// them out of the input so the shared parser (which does not model `servers`) accepts the rest.
+fn extract_global_server_options(
+    input: &str,
+) -> caddy_rs_core::Result<(String, Vec<GlobalServerOptions>)> {
+    if !input.contains("servers") {
+        return Ok((input.to_string(), Vec::new()));
+    }
+    let bytes = input.as_bytes();
+    let mut start = 0_usize;
+    skip_trivia(bytes, &mut start);
+    if bytes.get(start) != Some(&b'{') {
+        return Ok((input.to_string(), Vec::new()));
+    }
+    let close = find_matching_brace(input, start)?;
+    let mut masked = bytes.to_vec();
+    let mut options: Vec<GlobalServerOptions> = Vec::new();
+    let mut index = start + 1;
+    while index < close {
+        skip_trivia(bytes, &mut index);
+        if index >= close {
+            break;
+        }
+        let name_start = index;
+        let name = read_word(input, &mut index)?;
+        if name != "servers" {
+            // Skip a global option this pre-scan does not model; the parser handles it later.
+            let mut cursor = index;
+            loop {
+                if cursor >= close {
+                    break;
+                }
+                match bytes[cursor] {
+                    b'{' => {
+                        let block_end = find_matching_brace(input, cursor)?;
+                        cursor = block_end + 1;
+                        break;
+                    }
+                    b'\n' => {
+                        cursor += 1;
+                        break;
+                    }
+                    b'#' => {
+                        while cursor < close && bytes[cursor] != b'\n' {
+                            cursor += 1;
+                        }
+                    }
+                    b'"' => cursor = skip_quoted(input, cursor)?,
+                    b'`' => cursor = skip_backtick(input, cursor)?,
+                    _ => cursor += 1,
+                }
+            }
+            index = cursor;
+            continue;
+        }
+        // `servers [<addr>] [<block>]`
+        let mut cursor = index;
+        skip_inline_trivia(bytes, &mut cursor);
+        let mut listener_address = None;
+        if cursor < close && !matches!(bytes[cursor], b'{' | b'\n' | b'\r') {
+            let address = read_word(input, &mut cursor)?;
+            if address.contains("{$") {
+                return Err(adapter_error(
+                    position_at(input, cursor),
+                    "environment placeholders are not supported in the global `servers` option",
+                ));
+            }
+            listener_address = Some(address);
+            skip_inline_trivia(bytes, &mut cursor);
+        }
+        let mut wrappers = Vec::new();
+        let end = if cursor < close && bytes[cursor] == b'{' {
+            let block_end = find_matching_brace(input, cursor)?;
+            wrappers = parse_servers_block(input, cursor + 1, block_end)?;
+            block_end + 1
+        } else if cursor < close && !matches!(bytes[cursor], b'\n' | b'\r') {
+            return Err(adapter_error(
+                position_at(input, cursor),
+                "wrong argument count or unexpected line ending after `servers`",
+            ));
+        } else {
+            let mut line_end = cursor;
+            while line_end < close && bytes[line_end] != b'\n' {
+                line_end += 1;
+            }
+            line_end
+        };
+        options.push(GlobalServerOptions {
+            listener_address,
+            listener_wrappers: wrappers,
+        });
+        mask_span(&mut masked, name_start, end);
+        index = end;
+    }
+    // Caddy rejects duplicate listener addresses (the empty address is `""`).
+    let mut seen = BTreeSet::new();
+    for option in &options {
+        let key = option.listener_address.clone().unwrap_or_default();
+        if !seen.insert(key.clone()) {
+            return Err(CoreError::invalid(
+                "Caddyfile",
+                format!(
+                    "cannot have 'servers' global options with duplicate listener addresses: {key}"
+                ),
+            ));
+        }
+    }
+    // Caddy applies the longest (most specific) listener address first.
+    options.sort_by_key(|option| {
+        std::cmp::Reverse(
+            option
+                .listener_address
+                .as_ref()
+                .map(String::len)
+                .unwrap_or(0),
+        )
+    });
+    let masked = String::from_utf8(masked)
+        .map_err(|_| CoreError::invalid("Caddyfile", "internal error masking global options"))?;
+    Ok((masked, options))
+}
+
+/// Apply parsed global `servers` options to one generated server object (Caddy's first-match rule).
+fn apply_global_server_options(
+    object: &mut Map<String, Value>,
+    listens: &[String],
+    options: &[GlobalServerOptions],
+) {
+    let Some(matching) = options
+        .iter()
+        .find(|option| match &option.listener_address {
+            None => true,
+            Some(address) => listens.iter().any(|listen| listen == address),
+        })
+    else {
+        return;
+    };
+    if !matching.listener_wrappers.is_empty() {
+        object.insert(
+            "listener_wrappers".to_string(),
+            Value::Array(matching.listener_wrappers.clone()),
+        );
+    }
+}
+
 /// Adapt a Caddyfile string to Caddy JSON.
 pub fn adapt(input: &str) -> caddy_rs_core::Result<AdaptedConfig> {
     adapt_with_source(input, None)
@@ -72,7 +729,8 @@ pub fn adapt_with_source(
     input: &str,
     source: Option<&std::path::Path>,
 ) -> caddy_rs_core::Result<AdaptedConfig> {
-    let file = parser::parse_with_source(input, source).map_err(parse_error)?;
+    let (effective_input, global_server_options) = extract_global_server_options(input)?;
+    let file = parser::parse_with_source(&effective_input, source).map_err(parse_error)?;
     let options = &file.options;
     let http_port = options.http_port.unwrap_or(80);
     let https_port = options.https_port.unwrap_or(443);
@@ -309,6 +967,7 @@ pub fn adapt_with_source(
 
         let mut object = Map::new();
         object.insert("listen".to_string(), json!(server.listens));
+        apply_global_server_options(&mut object, &server.listens, &global_server_options);
         let mut automatic_https = Map::new();
         if options.auto_https.off {
             automatic_https.insert("disable".to_string(), json!(true));

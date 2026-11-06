@@ -1170,3 +1170,171 @@ fn global_grace_period_and_shutdown_delay_match_real_caddy_v2_11_7() {
     assert!(zero.config["apps"]["http"].get("grace_period").is_none());
     assert!(zero.config["apps"]["http"].get("shutdown_delay").is_none());
 }
+
+#[test]
+fn servers_listener_wrappers_match_real_caddy_v2_11_7() {
+    // Golden from `caddy adapt` v2.11.7: wrapper module objects are emitted on every server in the
+    // order written, and the JSON is identical to the upstream `servers` global option.
+    let adapted = adapt(
+        "{\n\tservers {\n\t\tlistener_wrappers {\n\t\t\thttp_redirect\n\t\t\ttls\n\t\t}\n\t}\n}\n\n:8080 {\n\trespond \"ok\"\n}\n",
+    )
+    .expect("adapt servers listener_wrappers");
+    assert_eq!(
+        adapted.config["apps"]["http"]["servers"]["srv0"]["listener_wrappers"],
+        json!([
+            {"wrapper": "http_redirect"},
+            {"wrapper": "tls"},
+        ])
+    );
+}
+
+#[test]
+fn servers_proxy_protocol_options_match_real_caddy_v2_11_7() {
+    // Golden from `caddy adapt` v2.11.7: caddy.Duration integer ns, allow/deny lists and the
+    // upper-case fallback policy text; `ignore` is the zero value and is omitted.
+    let adapted = adapt(
+        "{\n\tservers {\n\t\tlistener_wrappers {\n\t\t\tproxy_protocol {\n\t\t\t\ttimeout 5s\n\t\t\t\tallow 10.0.0.0/8 192.0.2.1\n\t\t\t\tdeny 1.2.3.4\n\t\t\t\tfallback_policy require\n\t\t\t}\n\t\t}\n\t}\n}\n\n:8080 {\n\trespond \"ok\"\n}\n",
+    )
+    .expect("adapt proxy_protocol options");
+    assert_eq!(
+        adapted.config["apps"]["http"]["servers"]["srv0"]["listener_wrappers"],
+        json!([{
+            "wrapper": "proxy_protocol",
+            "timeout": 5_000_000_000_i64,
+            "allow": ["10.0.0.0/8", "192.0.2.1"],
+            "deny": ["1.2.3.4"],
+            "fallback_policy": "REQUIRE",
+        }])
+    );
+    let ignoring = adapt(
+        "{\n\tservers {\n\t\tlistener_wrappers {\n\t\t\tproxy_protocol {\n\t\t\t\tfallback_policy ignore\n\t\t\t}\n\t\t}\n\t}\n}\n\n:8080 {\n\trespond \"ok\"\n}\n",
+    )
+    .expect("adapt proxy_protocol ignore policy");
+    assert_eq!(
+        ignoring.config["apps"]["http"]["servers"]["srv0"]["listener_wrappers"],
+        json!([{"wrapper": "proxy_protocol"}])
+    );
+}
+
+#[test]
+fn servers_options_apply_to_matching_listener_address_only() {
+    // Caddy applies a `servers <addr>` option only to servers whose listen list contains the exact
+    // address; other servers are untouched.
+    let adapted = adapt(
+        "{\n\tservers :8080 {\n\t\tlistener_wrappers {\n\t\t\tproxy_protocol\n\t\t}\n\t}\n}\n\n:8080 {\n\trespond \"a\"\n}\n\n:9090 {\n\trespond \"b\"\n}\n",
+    )
+    .expect("adapt address-specific servers options");
+    let servers = adapted.config["apps"]["http"]["servers"]
+        .as_object()
+        .expect("servers object");
+    let with_wrapper = servers.values().find(|server| {
+        server["listen"]
+            .as_array()
+            .is_some_and(|listen| listen.iter().any(|value| value == ":8080"))
+    });
+    let without_wrapper = servers.values().find(|server| {
+        server["listen"]
+            .as_array()
+            .is_some_and(|listen| listen.iter().any(|value| value == ":9090"))
+    });
+    assert_eq!(
+        with_wrapper.expect("srv0")["listener_wrappers"],
+        json!([{"wrapper": "proxy_protocol"}])
+    );
+    assert!(without_wrapper
+        .expect("srv1")
+        .get("listener_wrappers")
+        .is_none());
+}
+
+#[test]
+fn servers_options_keep_other_global_options_intact() {
+    // The pre-scan masks the `servers` option out of the input; adjacent global options must still
+    // adapt normally (and line numbers stay stable for diagnostics).
+    let adapted = adapt(
+        "{\n\thttp_port 8080\n\tservers {\n\t\tlistener_wrappers {\n\t\t\tproxy_protocol\n\t\t}\n\t}\n}\n\nlocalhost {\n\trespond \"ok\"\n}\n",
+    )
+    .expect("adapt servers with neighbouring global options");
+    assert_eq!(adapted.config["apps"]["http"]["http_port"], json!(8080));
+    assert_eq!(
+        adapted.config["apps"]["http"]["servers"]["srv0"]["listener_wrappers"],
+        json!([{"wrapper": "proxy_protocol"}])
+    );
+}
+
+#[test]
+fn servers_duplicate_listener_addresses_are_rejected_like_caddy() {
+    let error = adapt(
+        "{\n\tservers :8080 {\n\t\tlistener_wrappers {\n\t\t\tproxy_protocol\n\t\t}\n\t}\n\tservers :8080 {\n\t\tlistener_wrappers {\n\t\t\ttls\n\t\t}\n\t}\n}\n\n:8080 {\n\trespond \"ok\"\n}\n",
+    )
+    .expect_err("duplicate listener addresses must be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("cannot have 'servers' global options with duplicate listener addresses"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn servers_unsupported_suboptions_and_wrappers_fail_loudly() {
+    for (caddyfile, expected) in [
+        (
+            "{\n\tservers {\n\t\ttimeouts {\n\t\t\tread_body 30s\n\t\t}\n\t}\n}\n:8080 {\n\trespond \"ok\"\n}\n",
+            "`servers` option `timeouts` is not supported by this build (tracked as T-CONF-036)",
+        ),
+        (
+            "{\n\tservers {\n\t\tname https\n\t}\n}\n:8080 {\n\trespond \"ok\"\n}\n",
+            "`servers` option `name` is not supported by this build",
+        ),
+        (
+            "{\n\tservers {\n\t\tlistener_wrappers {\n\t\t\ttrusted_proxies_unix\n\t\t}\n\t}\n}\n:8080 {\n\trespond \"ok\"\n}\n",
+            "listener wrapper `trusted_proxies_unix` is not supported by this build",
+        ),
+        (
+            "{\n\tservers {\n\t\tlistener_wrappers {\n\t\t\ttls foo\n\t\t}\n\t}\n}\n:8080 {\n\trespond \"ok\"\n}\n",
+            "`tls` does not take arguments",
+        ),
+        (
+            "{\n\tservers {\n\t\tlistener_wrappers {\n\t\t\tproxy_protocol {\n\t\t\t\tfallback_policy bogus\n\t\t\t}\n\t\t}\n\t}\n}\n:8080 {\n\trespond \"ok\"\n}\n",
+            "invalid policy",
+        ),
+        (
+            "{\n\tservers {\n\t\tlistener_wrappers {\n\t\t\tproxy_protocol {\n\t\t\t\tfallback_policy ignore-use\n\t\t\t}\n\t\t}\n\t}\n}\n:8080 {\n\trespond \"ok\"\n}\n",
+            "invalid policy",
+        ),
+    ] {
+        let error = adapt(caddyfile).expect_err("unsupported servers form must fail loudly");
+        assert!(
+            error.to_string().contains(expected),
+            "expected {expected:?} in {error}"
+        );
+    }
+}
+
+#[test]
+fn servers_without_block_or_with_address_only_are_noops_like_caddy() {
+    // Caddy accepts a bare `servers` (or `servers <addr>`) with no block; it registers empty
+    // server options, so the adapted JSON is unchanged.
+    for caddyfile in [
+        "{\n\tservers\n}\n\n:8080 {\n\trespond \"ok\"\n}\n",
+        "{\n\tservers :8080\n}\n\n:8080 {\n\trespond \"ok\"\n}\n",
+    ] {
+        let adapted = adapt(caddyfile).expect("empty servers option adapts");
+        assert_eq!(
+            adapted.config["apps"]["http"]["servers"]["srv0"]["listen"],
+            json!([":8080"])
+        );
+        assert!(adapted.config["apps"]["http"]["servers"]["srv0"]
+            .get("listener_wrappers")
+            .is_none());
+    }
+    let error = adapt("{\n\tservers foo bar\n}\n\n:8080 {\n\trespond \"ok\"\n}\n")
+        .expect_err("extra servers arguments must be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("wrong argument count or unexpected line ending after `servers`"),
+        "unexpected error: {error}"
+    );
+}

@@ -1,0 +1,12 @@
+{
+	servers {
+		listener_wrappers {
+			proxy_protocol
+			tls
+		}
+	}
+}
+
+:8080 {
+	respond "ok"
+}
