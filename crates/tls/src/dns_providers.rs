@@ -595,6 +595,7 @@ mod tests {
         IssuanceRequest {
             domains: vec!["example.com".to_string()],
             internal: false,
+            key_type: crate::acme::csr::CertificateKeyType::P256,
         }
     }
 
@@ -656,6 +657,7 @@ mod tests {
         let certificate = crate::automatic_https::obtain_acme_certificate(
             &dns_issuer_config(),
             &["example.com".to_string()],
+            crate::acme::csr::CertificateKeyType::P256,
             &shared,
             directory.path().to_path_buf(),
             &Arc::new(Http01TokenStore::new()),

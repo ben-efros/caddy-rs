@@ -20,6 +20,13 @@ tokio = { workspace = true }
 base64 = "0.22.1"
 ring = "0.17.14"
 
+# RSA account keys and certificate keys (certmagic supports rsa2048/rsa4096). All transitive
+# dependencies are present in the offline registry cache; feature set avoids network/build-script
+# dependencies.
+rsa = { version = "0.9.10", default-features = false, features = ["std", "pem", "u64_digit"] }
+sha2 = { version = "0.10.9", features = ["oid"] }
+rand = "0.8.8"
+
 # ACME order client: production HTTP(S) transport over hyper + rustls (ring provider).
 # All of these are already in the offline registry cache; feature sets deliberately avoid
 # aws-lc-rs, rustls-native-certs and webpki-roots (not cached in this workspace).

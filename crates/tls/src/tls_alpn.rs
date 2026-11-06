@@ -35,11 +35,12 @@
 //! validated as its base domain); lookups normalise case and trailing dots.
 
 use std::collections::BTreeMap;
+use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use ring::rand::SystemRandom;
+use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
@@ -56,8 +57,8 @@ pub const ACME_TLS_ALPN_PROTOCOL: &[u8] = b"acme-tls/1";
 /// `id-pe-acmeIdentifier` object identifier (`1.3.6.1.5.5.7.1.31`).
 pub const ACME_IDENTIFIER_OID: &[u64] = &[1, 3, 6, 1, 5, 5, 7, 1, 31];
 
-/// How long a challenge certificate is valid around the moment it is generated.
-const CHALLENGE_VALIDITY_SECONDS: u64 = 3600;
+/// Challenge certificate lifetime: acmez sets `NotAfter` to one year after generation.
+const CHALLENGE_VALIDITY_SECONDS: u64 = 24 * 60 * 60 * 365;
 
 /// A generated TLS-ALPN-01 challenge certificate and its private key.
 #[derive(Debug)]
@@ -362,12 +363,15 @@ fn challenge_certificate(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let not_before = now.saturating_sub(CHALLENGE_VALIDITY_SECONDS);
+    // acmez's TLSALPN01ChallengeCert profile: notBefore "now", notAfter one year later, a random
+    // 128-bit serial, subject CN "ACME challenge", serverAuth EKU and the critical
+    // id-pe-acmeIdentifier extension (RFC 8737 §3).
+    let not_before = now;
     let not_after = now.saturating_add(CHALLENGE_VALIDITY_SECONDS);
     let signature_algorithm = der_sequence(&[der_oid(&[1, 2, 840, 10045, 4, 3, 2])]);
     let name = der_sequence(&[der_set(&[der_sequence(&[
         der_oid(&[2, 5, 4, 3]),
-        der_utf8(domain),
+        der_utf8("ACME challenge"),
     ])])]);
     let validity = der_sequence(&[der_utc_time(not_before), der_utc_time(not_after)]);
     let spki = der_sequence(&[
@@ -378,10 +382,15 @@ fn challenge_certificate(
         der_bit_string(public_key),
     ]);
 
-    // subjectAltName: exactly one dNSName.
+    // subjectAltName: a dNSName, or an iPAddress for ACME IP identifiers.
+    let general_name = match domain.parse::<IpAddr>() {
+        Ok(IpAddr::V4(address)) => der_tlv(0x87, &address.octets()),
+        Ok(IpAddr::V6(address)) => der_tlv(0x87, &address.octets()),
+        Err(_) => der_tlv(0x82, domain.as_bytes()),
+    };
     let subject_alt_name = der_sequence(&[
         der_oid(&[2, 5, 29, 17]),
-        der_octet_string(&der_sequence(&[der_tlv(0x82, domain.as_bytes())])),
+        der_octet_string(&der_sequence(&[general_name])),
     ]);
     // id-pe-acmeIdentifier: critical, OCTET STRING wrapping the SHA-256 digest (RFC 8737 §3).
     let acme_identifier = der_sequence(&[
@@ -394,10 +403,28 @@ fn challenge_certificate(
         der_oid(&[2, 5, 29, 19]),
         der_octet_string(&der_sequence(&[der_boolean(false)])),
     ]);
-    let extensions = der_sequence(&[subject_alt_name, acme_identifier, basic_constraints]);
+    // extKeyUsage: serverAuth (2.5.29.37 / 1.3.6.1.5.5.7.3.1).
+    let extended_key_usage = der_sequence(&[
+        der_oid(&[2, 5, 29, 37]),
+        der_octet_string(&der_sequence(&[der_oid(&[1, 3, 6, 1, 5, 5, 7, 3, 1])])),
+    ]);
+    let extensions = der_sequence(&[
+        subject_alt_name,
+        acme_identifier,
+        basic_constraints,
+        extended_key_usage,
+    ]);
+    let mut serial = [0_u8; 16];
+    SystemRandom::new()
+        .fill(&mut serial)
+        .map_err(|error| issuer_error(format!("generating challenge serial: {error}")))?;
+    serial[0] &= 0x7f;
+    if serial.iter().all(|byte| *byte == 0) {
+        serial[15] = 1;
+    }
     let tbs = der_sequence(&[
         der_tlv(0xA0, &der_integer(2)), // v3
-        der_integer(now.max(1)),
+        der_integer_from_bytes(&serial),
         signature_algorithm.clone(),
         name.clone(),
         validity,
@@ -453,6 +480,21 @@ fn der_integer(value: u64) -> Vec<u8> {
         .position(|byte| *byte != 0)
         .unwrap_or(bytes.len() - 1);
     let mut content = bytes[first..].to_vec();
+    if content[0] & 0x80 != 0 {
+        content.insert(0, 0);
+    }
+    der_tlv(0x02, &content)
+}
+
+fn der_integer_from_bytes(bytes: &[u8]) -> Vec<u8> {
+    let first = bytes
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(bytes.len().saturating_sub(1));
+    let mut content = bytes[first..].to_vec();
+    if content.is_empty() {
+        content.push(0);
+    }
     if content[0] & 0x80 != 0 {
         content.insert(0, 0);
     }
@@ -737,6 +779,35 @@ mod tests {
             challenge.key_authorization().as_bytes(),
         );
         assert!(contains(challenge.certificate_der(), digest.as_ref()));
+    }
+
+    #[test]
+    fn challenge_certificate_matches_acmez_profile() {
+        let challenge = challenge();
+        let der = challenge.certificate_der();
+        // acmez's TLSALPN01ChallengeCert profile (certmagic 0.25.6 / acmez v3):
+        // CN "ACME challenge", serverAuth EKU, CA:FALSE basicConstraints, critical ACME id.
+        assert!(contains(der, b"ACME challenge"), "subject CN");
+        let server_auth_oid = der_oid(&[1, 3, 6, 1, 5, 5, 7, 3, 1]);
+        let eku_oid = der_oid(&[2, 5, 29, 37]);
+        assert!(contains(der, &server_auth_oid), "serverAuth EKU OID");
+        assert!(contains(der, &eku_oid), "extKeyUsage extension OID");
+        let basic_constraints_oid = der_oid(&[2, 5, 29, 19]);
+        assert!(
+            contains(der, &basic_constraints_oid),
+            "basicConstraints OID"
+        );
+        let acme_oid = der_oid(ACME_IDENTIFIER_OID);
+        assert!(contains(der, &acme_oid), "id-pe-acmeIdentifier OID");
+
+        // IP identifiers use an iPAddress SAN instead of dNSName.
+        let ip_challenge =
+            TlsAlpn01Challenge::generate("127.0.0.1", "token.thumb").expect("IP challenge");
+        let ip_san = der_tlv(0x87, &[127, 0, 0, 1]);
+        assert!(
+            contains(ip_challenge.certificate_der(), &ip_san),
+            "IP identifier SAN"
+        );
     }
 
     #[test]
