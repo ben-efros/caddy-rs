@@ -47,17 +47,18 @@ struct Cidr {
 }
 
 impl Cidr {
-    fn parse(value: &str) -> Option<Self> {
-        let (address, prefix) = match value.split_once('/') {
-            Some((address, prefix)) => (address, Some(prefix.parse::<u8>().ok()?)),
-            None => (value, None),
-        };
+    /// Parse one Caddy `allow`/`deny` entry exactly like Caddy's listener wrapper, which calls
+    /// `netip.ParsePrefix`: an explicit prefix length is mandatory, so a bare address such as
+    /// `192.0.2.1` is rejected (Caddy's own Caddyfile adapter emits bare addresses for
+    /// `allow 192.0.2.1`, and its provisioner rejects that JSON — caddy-rs matches the rejection).
+    fn parse_caddy_prefix(value: &str) -> Option<Self> {
+        let (address, prefix) = value.split_once('/')?;
         let base: IpAddr = address.parse().ok()?;
         let max = match base {
             IpAddr::V4(_) => 32,
             IpAddr::V6(_) => 128,
         };
-        let prefix = prefix.unwrap_or(max);
+        let prefix = prefix.parse::<u8>().ok()?;
         if prefix > max {
             return None;
         }
@@ -106,12 +107,18 @@ impl ProxyProtocolSettings {
         let allow = config
             .allow
             .iter()
-            .map(|cidr| Cidr::parse(cidr).ok_or_else(|| format!("invalid allow CIDR `{cidr}`")))
+            .map(|cidr| {
+                Cidr::parse_caddy_prefix(cidr)
+                    .ok_or_else(|| format!("invalid allow CIDR `{cidr}` (a prefix length is required)"))
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let deny = config
             .deny
             .iter()
-            .map(|cidr| Cidr::parse(cidr).ok_or_else(|| format!("invalid deny CIDR `{cidr}`")))
+            .map(|cidr| {
+                Cidr::parse_caddy_prefix(cidr)
+                    .ok_or_else(|| format!("invalid deny CIDR `{cidr}` (a prefix length is required)"))
+            })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             timeout,

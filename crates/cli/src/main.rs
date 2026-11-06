@@ -235,6 +235,20 @@ async fn run(command: Command) -> anyhow::Result<()> {
             for warning in &loaded.warnings {
                 eprintln!("warning: {warning}");
             }
+            // Caddy's `validate` provisions the apps, so handler/matcher modules, listener
+            // wrappers and routers are constructed before success is reported. Build the same
+            // serving generation here (without binding sockets or obtaining certificates) so a
+            // configuration cannot validate and then fail at `run`.
+            let store = std::sync::Arc::new(GenerationStore::new(std::sync::Arc::new(
+                ModuleRegistry::builtin(),
+            )));
+            store
+                .load(loaded.model)
+                .context("cannot activate configuration")?;
+            let runtime = ServerRuntime::new(store);
+            runtime
+                .validate_provisioning()
+                .context("cannot provision configuration")?;
             println!("Valid configuration");
         }
         Command::Run {

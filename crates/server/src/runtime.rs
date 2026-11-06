@@ -320,6 +320,56 @@ impl ServerRuntime {
             .map_or(0, |access| access.sink_count())
     }
 
+    /// Provision-equivalent validation of the active generation, without binding listeners.
+    ///
+    /// Caddy's `caddy validate` *provisions* the apps, so handler/matcher modules, listener
+    /// wrappers, server limits and routers are constructed before it reports success. caddy-rs
+    /// used to validate only the typed configuration model, so a configuration whose modules
+    /// cannot be built (for example an unsupported `expression` matcher subset or a
+    /// `proxy_protocol` allow-list entry that is not a CIDR) incorrectly validated and failed
+    /// only at `run`. This walks every HTTP server and builds the same router, limits,
+    /// listener-wrapper plan and TLS policy as [`Self::apply`] without resolving certificates or
+    /// binding sockets, so a configuration that terminates TLS without certificates still
+    /// validates (Caddy obtains certificates at start, not at provision time).
+    pub fn validate_provisioning(&self) -> Result<()> {
+        let Some(generation) = self.store.current() else {
+            return Ok(());
+        };
+        // Access-log sinks are provisioned by Caddy too: an unsupported writer/encoder must fail
+        // validation, not the first request.
+        let _access_log = self.access_log_for(&generation)?;
+        let Some(http) = generation.config().http() else {
+            return Ok(());
+        };
+        let https_port = http.https_port.unwrap_or(DEFAULT_HTTPS_PORT);
+        let status_sink = UpstreamStatusSink::new();
+        for (server_name, server) in &http.servers {
+            let _limits = ServerLimits::from_http_server(server_name, server)?;
+            let policies = server.tls_connection_policies.as_deref();
+            let has_connection_policies = policies.is_some_and(|policies| !policies.is_empty());
+            if strict_sni_host_enabled(server.strict_sni_host.as_ref()) {
+                return Err(Error::NotImplemented {
+                    feature: "`strict_sni_host` TLS handshake rejection",
+                    tracking_id: "TLS-STRICT-SNI",
+                });
+            }
+            let _tls_options = TlsServerOptions::from_connection_policies(policies)?;
+            let _router = Self::build_router(server_name, server, &status_sink)?;
+            for listen in &server.listen {
+                if let Err(reason) = caddy_rs_core::ListenAddr::parse(listen) {
+                    return Err(Error::Config(caddy_rs_core::Error::invalid(
+                        format!("apps.http.servers.{server_name}.listen"),
+                        format!("invalid listen address `{listen}`: {reason}"),
+                    )));
+                }
+                // Validate the listener's implied TLS policy without requiring certificates.
+                let _terminates_tls = listener_uses_tls(listen, https_port, has_connection_policies)?;
+            }
+            let _wrappers = ListenerWrappers::from_server(server)?;
+        }
+        Ok(())
+    }
+
     /// Build and install the access-log sinks for one generation (flushing the old ones).
     fn access_log_for(&self, generation: &Generation) -> Result<Option<Arc<AccessLogRuntime>>> {
         if self.access_log_generation == Some(generation.id()) {
@@ -1054,6 +1104,55 @@ impl ServerRuntime {
         self.build_listener_states(generation, Some(&context), access_log, status_sink)
     }
 
+    /// Build one HTTP server's router (error routes + normal routes).
+    ///
+    /// The router builder consumes the raw Caddy JSON route shape. The typed config model preserves
+    /// the handler/matcher objects verbatim, so re-serializing is lossless. Used by both
+    /// [`Self::build_listener_states`] and [`Self::validate_provisioning`] so `validate` and `run`
+    /// construct exactly the same router.
+    fn build_router(
+        server_name: &str,
+        server: &caddy_rs_core::HttpServer,
+        status_sink: &Arc<UpstreamStatusSink>,
+    ) -> Result<Arc<caddy_rs_http::Router>> {
+        let routes_value = serde_json::to_value(&server.routes).map_err(|error| {
+            Error::Config(caddy_rs_core::Error::invalid(
+                format!("apps.http.servers.{server_name}.routes"),
+                format!("cannot serialize routes for the HTTP engine: {error}"),
+            ))
+        })?;
+        let routes = routes_value.as_array().cloned().unwrap_or_default();
+        // Error routes (`handle_errors`) are server-level: serializing the typed model is
+        // lossless because unknown fields are preserved.
+        let errors_value = server
+            .errors
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|error| {
+                Error::Config(caddy_rs_core::Error::invalid(
+                    format!("apps.http.servers.{server_name}.errors"),
+                    format!("cannot serialize error routes for the HTTP engine: {error}"),
+                ))
+            })?;
+        let router_builder = RouterBuilder::new()
+            .with_custom_handler(handler_factory_with_status_sink(Arc::clone(status_sink)));
+        let router_builder = router_builder
+            .with_error_routes(
+                errors_value.as_ref(),
+                &format!("apps.http.servers.{server_name}.errors"),
+            )
+            .map_err(|error| {
+                eprintln!("caddy-rs: server `{server_name}`: {error}");
+                Error::Http(error)
+            })?;
+        let router = router_builder.build(&routes).map_err(|error| {
+            eprintln!("caddy-rs: server `{server_name}`: {error}");
+            Error::Http(error)
+        })?;
+        Ok(Arc::new(router))
+    }
+
     /// Build the per-listen-address serving state for a generation.
     ///
     /// The same server object can own several listen addresses; each gets the same router and the
@@ -1097,44 +1196,7 @@ impl ServerRuntime {
                 });
             }
             let tls_options = TlsServerOptions::from_connection_policies(policies)?;
-            // The router builder consumes the raw Caddy JSON route shape. The typed config model
-            // preserves the handler/matcher objects verbatim, so re-serializing is lossless.
-            let routes_value = serde_json::to_value(&server.routes).map_err(|error| {
-                Error::Config(caddy_rs_core::Error::invalid(
-                    format!("apps.http.servers.{server_name}.routes"),
-                    format!("cannot serialize routes for the HTTP engine: {error}"),
-                ))
-            })?;
-            let routes = routes_value.as_array().cloned().unwrap_or_default();
-            // Error routes (`handle_errors`) are server-level: serializing the typed model is
-            // lossless because unknown fields are preserved.
-            let errors_value = server
-                .errors
-                .as_ref()
-                .map(serde_json::to_value)
-                .transpose()
-                .map_err(|error| {
-                    Error::Config(caddy_rs_core::Error::invalid(
-                        format!("apps.http.servers.{server_name}.errors"),
-                        format!("cannot serialize error routes for the HTTP engine: {error}"),
-                    ))
-                })?;
-            let router_builder = RouterBuilder::new()
-                .with_custom_handler(handler_factory_with_status_sink(Arc::clone(status_sink)));
-            let router_builder = router_builder
-                .with_error_routes(
-                    errors_value.as_ref(),
-                    &format!("apps.http.servers.{server_name}.errors"),
-                )
-                .map_err(|error| {
-                    eprintln!("caddy-rs: server `{server_name}`: {error}");
-                    Error::Http(error)
-                })?;
-            let router = router_builder.build(&routes).map_err(|error| {
-                eprintln!("caddy-rs: server `{server_name}`: {error}");
-                Error::Http(error)
-            })?;
-            let router = Arc::new(router);
+            let router = Self::build_router(server_name, server, status_sink)?;
             for listen in &server.listen {
                 let listen_port = caddy_rs_core::ListenAddr::parse(listen)
                     .ok()

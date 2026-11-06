@@ -1249,6 +1249,20 @@ fn parse_expression(expression: &str) -> std::result::Result<Vec<Vec<ExpressionA
     Ok(clauses)
 }
 
+/// Whether one side of a supported expression atom is a placeholder or an integer literal.
+///
+/// Caddy's CEL supports arbitrary literals, functions and quoted strings; caddy-rs implements only
+/// status-code comparisons, so anything else must be rejected loudly at build time instead of
+/// silently never matching. This also rejects Caddy-CEL syntax that the status subset cannot
+/// evaluate, such as a backticked literal (`` `402` ``), which real Caddy itself fails to compile.
+fn is_supported_expression_operand(token: &str) -> bool {
+    let token = token.trim();
+    if token.len() >= 2 && token.starts_with('{') && token.ends_with('}') {
+        return true;
+    }
+    token.parse::<i64>().is_ok()
+}
+
 fn parse_expression_atom(atom: &str) -> std::result::Result<ExpressionAtom, String> {
     if let Some((left, list)) = atom.split_once(" in ") {
         let list = list.trim();
@@ -1256,11 +1270,24 @@ fn parse_expression_atom(atom: &str) -> std::result::Result<ExpressionAtom, Stri
             .strip_prefix('[')
             .and_then(|list| list.strip_suffix(']'))
             .ok_or_else(|| format!("unsupported expression atom `{atom}`: expected [a, b, ...]"))?;
-        let values = inner
+        let values: Vec<String> = inner
             .split(',')
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .collect();
+        if !is_supported_expression_operand(left) {
+            return Err(format!(
+                "unsupported expression operand `{}` (only placeholders and integer literals are implemented)",
+                left.trim()
+            ));
+        }
+        for value in &values {
+            if !is_supported_expression_operand(value) {
+                return Err(format!(
+                    "unsupported expression operand `{value}` (only placeholders and integer literals are implemented)"
+                ));
+            }
+        }
         return Ok(ExpressionAtom::In {
             left: left.trim().to_string(),
             values,
@@ -1268,6 +1295,18 @@ fn parse_expression_atom(atom: &str) -> std::result::Result<ExpressionAtom, Stri
     }
     for op in ["==", "!=", ">=", "<=", ">", "<"] {
         if let Some((left, right)) = atom.split_once(op) {
+            if !is_supported_expression_operand(left) {
+                return Err(format!(
+                    "unsupported expression operand `{}` (only placeholders and integer literals are implemented)",
+                    left.trim()
+                ));
+            }
+            if !is_supported_expression_operand(right) {
+                return Err(format!(
+                    "unsupported expression operand `{}` (only placeholders and integer literals are implemented)",
+                    right.trim()
+                ));
+            }
             return Ok(ExpressionAtom::Compare {
                 left: left.trim().to_string(),
                 op: match op {

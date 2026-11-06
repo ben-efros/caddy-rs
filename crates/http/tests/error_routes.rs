@@ -199,11 +199,19 @@ fn expression_matcher_supports_handle_errors_status_filters() {
         assert_eq!(matcher.len(), 1);
     }
     // Other expressions are loudly unsupported rather than silently non-matching.
-    let error = match caddy_rs_http::matchers::build_matcher_set(
-        &json!({"expression": {"expr": "method('GET')"}}),
-    ) {
-        Ok(_) => panic!("unsupported expression must be loud"),
-        Err(error) => error,
-    };
-    assert!(matches!(error, Error::NotImplemented { .. }), "{error}");
+    for expression in [
+        "method('GET')",
+        // Caddy CEL that the status subset cannot evaluate: a backticked literal that real Caddy
+        // itself fails to compile must not validate or silently never match here.
+        "{http.error.status_code} == `402`",
+        "{http.error.status_code} in [`402`]",
+    ] {
+        let error = match caddy_rs_http::matchers::build_matcher_set(
+            &json!({"expression": {"expr": expression}}),
+        ) {
+            Ok(_) => panic!("unsupported expression `{expression}` must be loud"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, Error::NotImplemented { .. }), "{expression}: {error}");
+    }
 }
