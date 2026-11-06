@@ -25,6 +25,7 @@ const DIRECTIVE_ORDER: &[&str] = &[
     "vars",
     "root",
     "header",
+    "copy_response_headers",
     "request_body",
     "redir",
     "method",
@@ -39,6 +40,8 @@ const DIRECTIVE_ORDER: &[&str] = &[
     "handle",
     "handle_path",
     "route",
+    "error",
+    "copy_response",
     "respond",
     "reverse_proxy",
     "php_fastcgi",
@@ -769,8 +772,10 @@ pub fn adapt_with_source(
 
     // Each site block's route list is built once; a block may be served on several listeners.
     let mut site_routes: Vec<Vec<Value>> = Vec::with_capacity(file.sites.len());
+    let mut site_error_routes: Vec<Vec<Value>> = Vec::with_capacity(file.sites.len());
     for site in &file.sites {
         site_routes.push(build_site_routes(site, &mut warnings)?);
+        site_error_routes.push(build_error_routes(site, &mut warnings)?);
     }
 
     // Assign each site address to the server (listener) that serves it. Caddy groups site blocks
@@ -940,6 +945,51 @@ pub fn adapt_with_source(
         }
         let routes = consolidate_routes(routes);
 
+        // Error routes: each site block's `handle_errors` wrappers are wrapped with the same host
+        // matcher as its normal routes (Caddy's `appendSubrouteToRouteList`), except for the sole
+        // catch-all block of a server without an inner host matcher.
+        let mut error_routes: Vec<Value> = Vec::new();
+        for block in &server.blocks {
+            let block_errors = site_error_routes[block.site_index].clone();
+            if block_errors.is_empty() {
+                continue;
+            }
+            let site = &file.sites[block.site_index];
+            let catch_all = block
+                .address_indices
+                .iter()
+                .any(|address_index| site.addresses[*address_index].host.is_empty());
+            let mut hosts: Vec<String> = Vec::new();
+            if !catch_all {
+                for address_index in &block.address_indices {
+                    let host = site.addresses[*address_index]
+                        .host
+                        .trim_start_matches('[')
+                        .trim_end_matches(']');
+                    if !hosts.iter().any(|existing| existing == host) {
+                        hosts.push(host.to_string());
+                    }
+                }
+            }
+            let wrap = !(hosts.is_empty()
+                && block_count == 1
+                && !any_route_has_host_matcher(&block_errors));
+            if wrap {
+                let mut route = Map::new();
+                if !hosts.is_empty() {
+                    route.insert("match".to_string(), json!([{"host": hosts}]));
+                }
+                route.insert(
+                    "handle".to_string(),
+                    json!([{"handler": "subroute", "routes": block_errors}]),
+                );
+                route.insert("terminal".to_string(), json!(true));
+                error_routes.push(Value::Object(route));
+            } else {
+                error_routes.extend(block_errors);
+            }
+        }
+
         // Named routes reachable from this server's site blocks, transitively.
         let mut attached: Vec<String> = Vec::new();
         for block in &server.blocks {
@@ -1000,6 +1050,9 @@ pub fn adapt_with_source(
         }
         if !routes.is_empty() {
             object.insert("routes".to_string(), Value::Array(routes));
+        }
+        if !error_routes.is_empty() {
+            object.insert("errors".to_string(), json!({"routes": error_routes}));
         }
         if !attached.is_empty() {
             object.insert("named_routes".to_string(), json!(attached));
@@ -3779,6 +3832,16 @@ fn build_routes(
                 "directive `tls` can only be used directly in a site block",
             ));
         }
+        if directive.name == "handle_errors" {
+            if top_level {
+                // Handled at the server level (errors.routes), not as an HTTP handler.
+                continue;
+            }
+            return Err(adapter_error(
+                directive.position.clone(),
+                "directive `handle_errors` can only be used directly in a site block",
+            ));
+        }
         if directive.name == "bind" || directive.name == "log" {
             if top_level {
                 // Handled at the server/listener level, not as an HTTP handler.
@@ -4479,6 +4542,378 @@ fn build_php_fastcgi_routes(
     }
 }
 
+/// Caddy's `copy_response` handler, valid only inside `reverse_proxy`'s `handle_response` routes.
+///
+/// Syntax: `copy_response [<status>] {{ status <status> }}`; the JSON handler is
+/// `{"handler":"copy_response","status_code":<status>}`.
+fn copy_response_handler(directive: &Directive, args: &[String]) -> caddy_rs_core::Result<Value> {
+    let mut status: Option<String> = None;
+    if args.len() == 1 {
+        if args[0].parse::<i64>().is_ok_and(|value| value > 0) {
+            status = Some(args[0].clone());
+        }
+    }
+    if args.len() > 1 {
+        return Err(adapter_error(
+            directive.position.clone(),
+            "`copy_response` takes at most one status argument",
+        ));
+    }
+    for option in &directive.block {
+        match option.name.as_str() {
+            "status" => {
+                let Some(value) = option.args.first() else {
+                    return Err(adapter_error(
+                        option.position.clone(),
+                        "`status` requires a status code",
+                    ));
+                };
+                status = Some(value.clone());
+            }
+            other => {
+                return Err(adapter_error(
+                    option.position.clone(),
+                    format!("unrecognized subdirective '{other}'"),
+                ))
+            }
+        }
+    }
+    let mut object = Map::new();
+    object.insert("handler".to_string(), json!("copy_response"));
+    if let Some(status) = status {
+        object.insert("status_code".to_string(), weak_status_json(&status));
+    }
+    Ok(Value::Object(object))
+}
+
+/// Caddy's `copy_response_headers` handler (valid only in `handle_response`):
+/// `copy_response_headers {{ include <fields...> | exclude <fields...> }}`.
+fn copy_response_headers_handler(
+    directive: &Directive,
+    args: &[String],
+) -> caddy_rs_core::Result<Value> {
+    if !args.is_empty() {
+        return Err(adapter_error(
+            directive.position.clone(),
+            "`copy_response_headers` does not take arguments",
+        ));
+    }
+    let mut include: Option<Vec<String>> = None;
+    let mut exclude: Option<Vec<String>> = None;
+    for option in &directive.block {
+        let fields = option
+            .args
+            .iter()
+            .map(|field| canonical_header_key(field))
+            .collect::<Vec<_>>();
+        if fields.is_empty() {
+            return Err(adapter_error(
+                option.position.clone(),
+                format!("`{}` requires at least one header field", option.name),
+            ));
+        }
+        match option.name.as_str() {
+            "include" => include = Some(fields),
+            "exclude" => exclude = Some(fields),
+            other => {
+                return Err(adapter_error(
+                    option.position.clone(),
+                    format!("unrecognized subdirective '{other}'"),
+                ))
+            }
+        }
+    }
+    if include.is_some() && exclude.is_some() {
+        return Err(adapter_error(
+            directive.position.clone(),
+            "cannot define both `include` and `exclude` at the same time",
+        ));
+    }
+    let mut object = Map::new();
+    object.insert("handler".to_string(), json!("copy_response_headers"));
+    if let Some(include) = include {
+        object.insert("include".to_string(), json!(include));
+    }
+    if let Some(exclude) = exclude {
+        object.insert("exclude".to_string(), json!(exclude));
+    }
+    Ok(Value::Object(object))
+}
+
+/// Parse one named response matcher (`@name status 5xx` / `@name header Foo *`, block or inline).
+fn parse_response_matcher(
+    directive: &Directive,
+    matchers: &mut BTreeMap<String, Value>,
+) -> caddy_rs_core::Result<()> {
+    let Some(name) = directive.name.strip_prefix('@') else {
+        return Err(adapter_error(
+            directive.position.clone(),
+            "response matcher name must start with @",
+        ));
+    };
+    if name.is_empty() {
+        return Err(adapter_error(
+            directive.position.clone(),
+            "response matcher name must not be empty",
+        ));
+    }
+    if matchers.contains_key(name) {
+        return Err(adapter_error(
+            directive.position.clone(),
+            format!("matcher is defined more than once: {name}"),
+        ));
+    }
+    let mut status_codes: Vec<i64> = Vec::new();
+    let mut headers: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut parse_line = |keyword: &str,
+                          args: &[String],
+                          position: Position|
+     -> caddy_rs_core::Result<()> {
+        match keyword {
+            "status" => {
+                if args.is_empty() {
+                    return Err(adapter_error(
+                        position,
+                        "`status` requires at least one code",
+                    ));
+                }
+                for value in args {
+                    if let Some(class) = value.strip_suffix("xx") {
+                        let class = class.parse::<i64>().map_err(|_| {
+                            adapter_error(position.clone(), format!("bad status value '{value}'"))
+                        })?;
+                        status_codes.push(class);
+                    } else {
+                        let code = value.parse::<i64>().map_err(|_| {
+                            adapter_error(position.clone(), format!("bad status value '{value}'"))
+                        })?;
+                        status_codes.push(code);
+                    }
+                }
+            }
+            "header" => {
+                let Some(field) = args.first() else {
+                    return Err(adapter_error(position, "`header` requires a field name"));
+                };
+                let field = canonical_header_key(field);
+                let values: Vec<String> = if args.len() > 1 {
+                    args[1..].to_vec()
+                } else {
+                    vec!["*".to_string()]
+                };
+                headers.entry(field).or_default().extend(values);
+            }
+            other => {
+                return Err(adapter_error(
+                    position,
+                    format!(
+                        "unrecognized response matcher option '{other}' (expected status or header)"
+                    ),
+                ))
+            }
+        }
+        Ok(())
+    };
+    if !directive.args.is_empty() {
+        let keyword = directive.args[0].clone();
+        parse_line(&keyword, &directive.args[1..], directive.position.clone())?;
+    }
+    for option in &directive.block {
+        parse_line(&option.name, &option.args, option.position.clone())?;
+    }
+    if status_codes.is_empty() && headers.is_empty() {
+        return Err(adapter_error(
+            directive.position.clone(),
+            "response matcher needs a `status` or `header` line",
+        ));
+    }
+    let mut object = Map::new();
+    if !status_codes.is_empty() {
+        object.insert("status_code".to_string(), json!(status_codes));
+    }
+    if !headers.is_empty() {
+        object.insert("headers".to_string(), json!(headers));
+    }
+    matchers.insert(name.to_string(), Value::Object(object));
+    Ok(())
+}
+
+/// Caddy's `WeakString` JSON encoding: numeric strings marshal as numbers, `true`/`false` as
+/// booleans, everything else as a string.
+fn weak_status_json(value: &str) -> Value {
+    if value == "true" {
+        return json!(true);
+    }
+    if value == "false" {
+        return json!(false);
+    }
+    match value.parse::<i64>() {
+        Ok(number) => json!(number),
+        Err(_) => json!(value),
+    }
+}
+
+/// Caddy's `error` directive (the `http.handlers.error` StaticError module).
+///
+/// Syntax: `error [<matcher>] <status>|<message> [<status>]`, plus a `message <text>` block
+/// option. The matcher is consumed by the caller; `args` are the arguments after it.
+fn error_handler(directive: &Directive, args: &[String]) -> caddy_rs_core::Result<Value> {
+    let mut error = String::new();
+    let mut status: Option<String> = None;
+    match args.len() {
+        1 => {
+            let arg = &args[0];
+            if arg.len() == 3 && arg.parse::<i64>().is_ok_and(|value| value > 0) {
+                status = Some(arg.clone());
+            } else {
+                error = arg.clone();
+            }
+        }
+        2 => {
+            error = args[0].clone();
+            status = Some(args[1].clone());
+        }
+        _ => {
+            return Err(adapter_error(
+                directive.position.clone(),
+                "wrong argument count: expected `error [<matcher>] <status>|<message> [<status>]`",
+            ))
+        }
+    }
+    for option in &directive.block {
+        match option.name.as_str() {
+            "message" => {
+                if !error.is_empty() {
+                    return Err(adapter_error(
+                        option.position.clone(),
+                        "message already specified",
+                    ));
+                }
+                if option.args.is_empty() {
+                    return Err(adapter_error(
+                        option.position.clone(),
+                        "`message` requires a value",
+                    ));
+                }
+                error = option.args.join(" ");
+            }
+            other => {
+                return Err(adapter_error(
+                    option.position.clone(),
+                    format!("unrecognized subdirective '{other}'"),
+                ))
+            }
+        }
+    }
+    let mut object = Map::new();
+    object.insert("handler".to_string(), json!("error"));
+    if !error.is_empty() {
+        object.insert("error".to_string(), json!(qualify_placeholders(&error)));
+    }
+    if let Some(status) = status {
+        object.insert("status_code".to_string(), weak_status_json(&status));
+    }
+    Ok(Value::Object(object))
+}
+
+/// Build one site block's `handle_errors` routes (Caddy's `error_route` ConfigValues collected and
+/// wrapped by `httpcaddyfile`, see `parseHandleErrors` and `httptype.go`).
+///
+/// Each `handle_errors` block becomes a wrapper route whose handler is a `subroute` with the
+/// block's routes; an optional expression matcher filters by `{http.error.status_code}`. Like
+/// Caddy's `sort.SliceStable` on these values (which effectively reverses both groups), routes
+/// with a matcher come first in reverse declaration order, followed by matcher-less routes in
+/// reverse declaration order.
+fn build_error_routes(
+    site: &SiteBlock,
+    warnings: &mut Vec<String>,
+) -> caddy_rs_core::Result<Vec<Value>> {
+    let matchers = collect_matchers(&site.directives)?;
+    let mut with_matchers: Vec<Value> = Vec::new();
+    let mut without_matchers: Vec<Value> = Vec::new();
+    for directive in &site.directives {
+        if directive.name != "handle_errors" {
+            continue;
+        }
+        let mut expression = String::new();
+        let mut codes: Vec<String> = Vec::new();
+        for value in &directive.args {
+            if value.len() != 3 {
+                return Err(adapter_error(
+                    directive.position.clone(),
+                    format!("bad status value '{value}'"),
+                ));
+            }
+            if let Some(class) = value.strip_suffix("xx") {
+                if class.parse::<i64>().is_err() {
+                    return Err(adapter_error(
+                        directive.position.clone(),
+                        format!("bad status value '{value}'"),
+                    ));
+                }
+                if !expression.is_empty() {
+                    expression.push_str(" || ");
+                }
+                expression.push_str(&format!(
+                    "{{http.error.status_code}} >= {class}00 && {{http.error.status_code}} <= {class}99"
+                ));
+                continue;
+            }
+            if value.parse::<i64>().is_err() {
+                return Err(adapter_error(
+                    directive.position.clone(),
+                    format!("bad status value '{value}'"),
+                ));
+            }
+            codes.push(value.clone());
+        }
+        if !codes.is_empty() {
+            if !expression.is_empty() {
+                expression.push_str(" || ");
+            }
+            expression.push_str(&format!(
+                "{{http.error.status_code}} in [{}]",
+                codes.join(", ")
+            ));
+        }
+        let inner = build_routes(&directive.block, &matchers, true, false, warnings)?;
+        let mut wrapper = Map::new();
+        if inner.is_empty() {
+            wrapper.insert("handle".to_string(), json!([{"handler": "subroute"}]));
+        } else {
+            wrapper.insert(
+                "handle".to_string(),
+                json!([{"handler": "subroute", "routes": inner}]),
+            );
+        }
+        if !expression.is_empty() {
+            wrapper.insert(
+                "match".to_string(),
+                // Caddy v2.11.7 serializes the expression matcher as a bare JSON string.
+                json!([{"expression": expression}]),
+            );
+            with_matchers.push(Value::Object(wrapper));
+        } else {
+            without_matchers.push(Value::Object(wrapper));
+        }
+    }
+    with_matchers.reverse();
+    without_matchers.reverse();
+    with_matchers.extend(without_matchers);
+    Ok(with_matchers)
+}
+
+/// Whether any of `routes` carries a `host` matcher set (Caddy's issue #5124 wrapping rule).
+fn any_route_has_host_matcher(routes: &[Value]) -> bool {
+    routes.iter().any(|route| {
+        route
+            .get("match")
+            .and_then(Value::as_array)
+            .map(|sets| sets.iter().any(|set| set.get("host").is_some()))
+            .unwrap_or(false)
+    })
+}
+
 fn build_handlers(
     directive: &Directive,
     args: &[String],
@@ -4501,6 +4936,9 @@ fn build_handlers(
         "invoke" => vec![invoke_handler(args, directive.position.clone())?],
         "vars" => vec![vars_handler(directive, args)?],
         "map" => vec![map_handler(directive, args)?],
+        "error" => vec![error_handler(directive, args)?],
+        "copy_response" => vec![copy_response_handler(directive, args)?],
+        "copy_response_headers" => vec![copy_response_headers_handler(directive, args)?],
         other => {
             return Err(adapter_error(
                 directive.position.clone(),
@@ -5765,9 +6203,85 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
     let mut retry_match: Vec<Value> = Vec::new();
     let mut health_active: Option<Map<String, Value>> = None;
     let mut health_passive: Option<Map<String, Value>> = None;
+    // Response matchers (`@status status 5xx`, `@hdr header Foo *`) are scoped to the
+    // reverse_proxy block and referenced by `handle_response`/`replace_status`.
+    let mut response_matchers: BTreeMap<String, Value> = BTreeMap::new();
+    for item in &directive.block {
+        if item.name.starts_with('@') {
+            parse_response_matcher(item, &mut response_matchers)?;
+        }
+    }
+    let mut handle_response: Vec<Value> = Vec::new();
 
     for item in &directive.block {
+        if item.name.starts_with('@') {
+            continue;
+        }
         match item.name.as_str() {
+            "handle_response" => {
+                if item.args.len() > 1 {
+                    return Err(adapter_error(
+                        item.position.clone(),
+                        format!(
+                            "too many arguments for 'handle_response': only a single response                              matcher name is allowed, but got: {}",
+                            item.args.join(" ")
+                        ),
+                    ));
+                }
+                let mut entry = Map::new();
+                if let Some(matcher_name) = item.args.first() {
+                    let Some(name) = matcher_name.strip_prefix('@') else {
+                        return Err(adapter_error(
+                            item.position.clone(),
+                            "must use a named response matcher, starting with '@'",
+                        ));
+                    };
+                    let Some(matcher) = response_matchers.get(name) else {
+                        return Err(adapter_error(
+                            item.position.clone(),
+                            format!("no named response matcher defined with name '{name}'"),
+                        ));
+                    };
+                    entry.insert("match".to_string(), matcher.clone());
+                }
+                let mut warnings = Vec::new();
+                let routes =
+                    build_routes(&item.block, &BTreeMap::new(), true, false, &mut warnings)?;
+                entry.insert("routes".to_string(), Value::Array(routes));
+                handle_response.push(Value::Object(entry));
+            }
+            "replace_status" => {
+                if item.args.is_empty() || item.args.len() > 2 {
+                    return Err(adapter_error(
+                        item.position.clone(),
+                        "must have one or two arguments: an optional response matcher, and a \
+                         status code",
+                    ));
+                }
+                let (matcher_name, status) = if item.args.len() == 2 {
+                    (Some(item.args[0].as_str()), item.args[1].as_str())
+                } else {
+                    (None, item.args[0].as_str())
+                };
+                let mut entry = Map::new();
+                if let Some(matcher_name) = matcher_name {
+                    let Some(name) = matcher_name.strip_prefix('@') else {
+                        return Err(adapter_error(
+                            item.position.clone(),
+                            "must use a named response matcher, starting with '@'",
+                        ));
+                    };
+                    let Some(matcher) = response_matchers.get(name) else {
+                        return Err(adapter_error(
+                            item.position.clone(),
+                            format!("no named response matcher defined with name '{name}'"),
+                        ));
+                    };
+                    entry.insert("match".to_string(), matcher.clone());
+                }
+                entry.insert("status_code".to_string(), weak_status_json(status));
+                handle_response.push(Value::Object(entry));
+            }
             "lb_policy" => {
                 let Some(policy) = item.args.first() else {
                     return Err(adapter_error(
@@ -6100,6 +6614,22 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
                 ))
             }
         }
+    }
+
+    // Caddy moves `handle_response` entries without a matcher to the end (stable order within
+    // each group): `httptype`/`FinalizeUnmarshalCaddyfile`.
+    if !handle_response.is_empty() {
+        let mut with_matchers = Vec::new();
+        let mut without_matchers = Vec::new();
+        for entry in handle_response {
+            if entry.get("match").is_some() {
+                with_matchers.push(entry);
+            } else {
+                without_matchers.push(entry);
+            }
+        }
+        with_matchers.extend(without_matchers);
+        object.insert("handle_response".to_string(), Value::Array(with_matchers));
     }
 
     if !load_balancing.is_empty() {

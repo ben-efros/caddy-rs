@@ -1106,13 +1106,34 @@ impl ServerRuntime {
                 ))
             })?;
             let routes = routes_value.as_array().cloned().unwrap_or_default();
-            let router = RouterBuilder::new()
-                .with_custom_handler(handler_factory_with_status_sink(Arc::clone(status_sink)))
-                .build(&routes)
+            // Error routes (`handle_errors`) are server-level: serializing the typed model is
+            // lossless because unknown fields are preserved.
+            let errors_value = server
+                .errors
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(|error| {
+                    Error::Config(caddy_rs_core::Error::invalid(
+                        format!("apps.http.servers.{server_name}.errors"),
+                        format!("cannot serialize error routes for the HTTP engine: {error}"),
+                    ))
+                })?;
+            let router_builder = RouterBuilder::new()
+                .with_custom_handler(handler_factory_with_status_sink(Arc::clone(status_sink)));
+            let router_builder = router_builder
+                .with_error_routes(
+                    errors_value.as_ref(),
+                    &format!("apps.http.servers.{server_name}.errors"),
+                )
                 .map_err(|error| {
                     eprintln!("caddy-rs: server `{server_name}`: {error}");
                     Error::Http(error)
                 })?;
+            let router = router_builder.build(&routes).map_err(|error| {
+                eprintln!("caddy-rs: server `{server_name}`: {error}");
+                Error::Http(error)
+            })?;
             let router = Arc::new(router);
             for listen in &server.listen {
                 let listen_port = caddy_rs_core::ListenAddr::parse(listen)

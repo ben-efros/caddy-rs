@@ -499,6 +499,16 @@ impl Validator<'_> {
             )?;
             validate_server_limits(server, &server_path)?;
             self.routes(&server.routes, &format!("{server_path}.routes"))?;
+            if let Some(errors) = &server.errors {
+                if !errors.extra.is_empty() {
+                    let fields: Vec<&str> = errors.extra.keys().map(String::as_str).collect();
+                    return Err(Error::invalid(
+                        format!("{server_path}.errors"),
+                        format!("unknown errors field(s): {}", fields.join(", ")),
+                    ));
+                }
+                self.routes(&errors.routes, &format!("{server_path}.errors.routes"))?;
+            }
             self.report.servers += 1;
         }
         Ok(())

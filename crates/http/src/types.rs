@@ -33,6 +33,19 @@ pub enum Error {
         message: String,
     },
 
+    /// A handler failed the request with a recommended HTTP status (Caddy's `HandlerError`).
+    ///
+    /// The error routes configured on the server (`apps.http.servers.*.errors.routes`) see the
+    /// status, status text and message through the `{http.error.*}` placeholders; without error
+    /// routes the server answers with this status.
+    #[error("handler error (status {status}): {message}")]
+    Handler {
+        /// Recommended HTTP status.
+        status: StatusCode,
+        /// Error message (empty when the handler produced none).
+        message: String,
+    },
+
     /// I/O failure while serving a request.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -50,6 +63,35 @@ pub enum Error {
         /// Router API that received the upgraded response.
         context: &'static str,
     },
+}
+
+impl Error {
+    /// Build a handler error carrying Caddy's recommended HTTP status.
+    pub fn handler(status: StatusCode, message: impl Into<String>) -> Self {
+        Self::Handler {
+            status,
+            message: message.into(),
+        }
+    }
+
+    /// The recommended HTTP status for a handler error (Caddy's `HandlerError.StatusCode`).
+    ///
+    /// Non-handler errors have no status; the server maps them to 500 like Caddy does for plain
+    /// Go errors.
+    pub fn handler_status(&self) -> Option<StatusCode> {
+        match self {
+            Self::Handler { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
+
+    /// The error message used for `{http.error.message}`.
+    pub fn handler_message(&self) -> String {
+        match self {
+            Self::Handler { message, .. } => message.clone(),
+            other => other.to_string(),
+        }
+    }
 }
 
 /// Result alias for the HTTP crate.
