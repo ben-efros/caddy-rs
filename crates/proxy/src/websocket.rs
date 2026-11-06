@@ -112,8 +112,8 @@ pub async fn write_close_frame<W: AsyncWrite + Unpin>(
 /// When `websocket` is false the pump is a plain byte-transparent bidirectional copy that still
 /// reacts to `shutdown`; no WebSocket frames are ever synthesised.
 pub async fn tunnel<C, U>(
-    client: C,
-    upstream: U,
+    mut client: C,
+    mut upstream: U,
     websocket: bool,
     shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()>
@@ -121,6 +121,18 @@ where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    // A forced/grace-expiry shutdown may already have fired while the client upgrade was being
+    // awaited: close immediately (still with the best-effort going-away frame) instead of waiting
+    // for a `changed()` notification that will never come.
+    if *shutdown.borrow() {
+        if websocket {
+            let _ = write_close_frame(&mut client, CLOSE_GOING_AWAY, false).await;
+            let _ = write_close_frame(&mut upstream, CLOSE_GOING_AWAY, true).await;
+        }
+        let _ = client.shutdown().await;
+        let _ = upstream.shutdown().await;
+        return Ok(());
+    }
     let (mut client_read, mut client_write) = tokio::io::split(client);
     let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream);
 
@@ -440,6 +452,27 @@ mod tests {
         let rest = read_to_end(&mut test_client).await;
         assert_eq!(rest, close_frame(CLOSE_NORMAL, false));
         drop(test_client);
+        pump.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn already_signalled_shutdown_sends_going_away_before_close() {
+        // The forced-shutdown signal can fire while the client upgrade is still being awaited; the
+        // pump must still write the going-away frame rather than silently closing.
+        let (proxy_client, mut test_client) = tcp_pair().await;
+        let (proxy_upstream, mut test_upstream) = tcp_pair().await;
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        shutdown_tx.send(true).unwrap();
+        let pump = tokio::spawn(tunnel(proxy_client, proxy_upstream, true, shutdown_rx));
+
+        let client_received = read_to_end(&mut test_client).await;
+        let (client_code, masked) = unmask_close(&client_received);
+        assert_eq!(client_code, CLOSE_GOING_AWAY);
+        assert!(!masked);
+        let upstream_received = read_to_end(&mut test_upstream).await;
+        let (upstream_code, masked) = unmask_close(&upstream_received);
+        assert_eq!(upstream_code, CLOSE_GOING_AWAY);
+        assert!(masked);
         pump.await.unwrap().unwrap();
     }
 
