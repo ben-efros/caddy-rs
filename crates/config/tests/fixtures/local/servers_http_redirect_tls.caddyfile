@@ -1,0 +1,12 @@
+{
+	servers {
+		listener_wrappers {
+			http_redirect
+			tls
+		}
+	}
+}
+
+:8080 {
+	respond "ok"
+}

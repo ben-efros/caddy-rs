@@ -1,0 +1,43 @@
+{
+    "apps": {
+        "http": {
+            "servers": {
+                "srv0": {
+                    "listen": [
+                        ":8080"
+                    ],
+                    "listener_wrappers": [
+                        {
+                            "wrapper": "proxy_protocol"
+                        }
+                    ],
+                    "routes": [
+                        {
+                            "handle": [
+                                {
+                                    "body": "a",
+                                    "handler": "static_response"
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "srv1": {
+                    "listen": [
+                        ":9090"
+                    ],
+                    "routes": [
+                        {
+                            "handle": [
+                                {
+                                    "body": "b",
+                                    "handler": "static_response"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,15 @@
+{
+	servers :8080 {
+		listener_wrappers {
+			proxy_protocol
+		}
+	}
+}
+
+:8080 {
+	respond "a"
+}
+
+:9090 {
+	respond "b"
+}

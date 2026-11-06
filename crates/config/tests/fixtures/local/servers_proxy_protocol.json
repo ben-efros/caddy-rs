@@ -1,0 +1,37 @@
+{
+    "apps": {
+        "http": {
+            "servers": {
+                "srv0": {
+                    "listen": [
+                        ":8080"
+                    ],
+                    "listener_wrappers": [
+                        {
+                            "allow": [
+                                "10.0.0.0/8",
+                                "192.0.2.1"
+                            ],
+                            "deny": [
+                                "1.2.3.4"
+                            ],
+                            "fallback_policy": "REQUIRE",
+                            "timeout": 5000000000,
+                            "wrapper": "proxy_protocol"
+                        }
+                    ],
+                    "routes": [
+                        {
+                            "handle": [
+                                {
+                                    "body": "ok",
+                                    "handler": "static_response"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        }
+    }
+}
