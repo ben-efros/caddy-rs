@@ -192,6 +192,21 @@ async fn read_to_eof_timeout<S: AsyncRead + Unpin>(stream: &mut S) -> usize {
         .expect("read result")
 }
 
+/// Unmasked WebSocket Close control frame with a status code and no reason.
+fn close_frame(status: u16) -> [u8; 4] {
+    let [high, low] = status.to_be_bytes();
+    [0x88, 0x02, high, low]
+}
+
+/// Read exactly one close frame and return its status code.
+async fn read_close_frame<S: AsyncRead + Unpin>(stream: &mut S) -> u16 {
+    let frame = read_exact_timeout(stream, &close_frame(1000)).await;
+    assert_eq!(frame[0], 0x88, "expected a WebSocket close frame");
+    assert_eq!(frame[1], 0x02, "close frame carries only a status code");
+    assert_eq!(frame[2] & 0x80, 0, "server-to-client frames are unmasked");
+    u16::from_be_bytes([frame[2], frame[3]])
+}
+
 // ---- tests -----------------------------------------------------------------------------------
 
 #[tokio::test]
@@ -258,7 +273,14 @@ async fn upstream_close_propagates_to_upgraded_client() {
         read_exact_timeout(&mut client, b"greeting").await,
         b"greeting"
     );
-    // Upstream closed its side; the tunnel must close the client side too.
+    // Upstream closed its side; the proxy synthesises a normal-close control frame so a real
+    // WebSocket client sees a close handshake (code 1000) instead of abnormal closure 1006, then
+    // the client side is closed.
+    assert_eq!(
+        read_close_frame(&mut client).await,
+        1000,
+        "upstream EOF must map to a normal WebSocket close"
+    );
     assert_eq!(read_to_eof_timeout(&mut client).await, 0);
     runtime.shutdown().await;
 }
@@ -377,12 +399,51 @@ async fn shutdown_closes_upgraded_connections() {
         b"greeting"
     );
 
-    // Shutting the runtime down must close the tunnelled connection instead of leaking the copy
-    // task; the client observes EOF on its side.
+    // Shutting the runtime down must send a going-away close frame to the WebSocket client (so it
+    // sees a clean close handshake rather than 1006) and then close the tunnelled connection.
     runtime.shutdown().await;
+    assert_eq!(
+        read_close_frame(&mut client).await,
+        1001,
+        "graceful shutdown must send a going-away WebSocket close"
+    );
     assert_eq!(
         read_to_eof_timeout(&mut client).await,
         0,
         "shutdown must close the upgraded client connection"
     );
+}
+
+/// An HTTP upgrade that is not a real WebSocket handshake (no `Sec-WebSocket-Key`) must stay
+/// byte-transparent: no close frame is synthesised, so the client sees the upstream bytes followed
+/// directly by EOF.
+#[tokio::test]
+async fn non_websocket_upgrade_gets_no_close_frame() {
+    let (dial, _upstream_saw_eof) = spawn_upstream(true).await;
+    let (runtime, address) = start(config(&dial, false)).await;
+
+    let mut client = TcpStream::connect(address).await.expect("client connect");
+    client
+        .write_all(
+            b"GET /custom HTTP/1.1\r\n\
+              Host: example.com\r\n\
+              Connection: keep-alive, Upgrade\r\n\
+              Upgrade: custom-protocol\r\n\
+              \r\n",
+        )
+        .await
+        .expect("write handshake");
+    let head = read_http_head(&mut client).await;
+    assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+    assert_eq!(
+        read_exact_timeout(&mut client, b"greeting").await,
+        b"greeting"
+    );
+    // Upstream EOF immediately: the tunnel must not inject a WebSocket close frame.
+    assert_eq!(
+        read_to_eof_timeout(&mut client).await,
+        0,
+        "a non-WebSocket upgrade must remain byte-transparent"
+    );
+    runtime.shutdown().await;
 }
