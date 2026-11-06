@@ -390,6 +390,103 @@ fn run_json_adapter_admin_stop_exits_process() {
     );
 }
 
+#[test]
+fn run_resume_loads_the_last_autosave_and_prefers_it_over_config() {
+    let _guard = SERVER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let directory = tempfile::tempdir().expect("tempdir");
+    let site_port = free_port();
+    let admin_port = free_port();
+    let other_port = free_port();
+    let autosave = directory.path().join("custom-autosave.json");
+    std::fs::write(
+        &autosave,
+        serde_json::to_string(&serde_json::json!({
+            "admin": {"listen": format!("127.0.0.1:{admin_port}")},
+            "apps": {"http": {"servers": {"srv0": {
+                "listen": [format!("127.0.0.1:{site_port}")],
+                "routes": [{"handle": [{"handler": "static_response", "body": "resumed"}]}]
+            }}}}
+        }))
+        .expect("serialize autosave"),
+    )
+    .expect("write autosave");
+    // A --config passed alongside --resume must be ignored (Caddy's precedence) and warned about.
+    let ignored_config = directory.path().join("ignored.json");
+    std::fs::write(
+        &ignored_config,
+        serde_json::to_string(&serde_json::json!({
+            "admin": {"disabled": true},
+            "apps": {"http": {"servers": {"srv0": {
+                "listen": [format!("127.0.0.1:{other_port}")],
+                "routes": [{"handle": [{"handler": "static_response", "body": "config-file"}]}]
+            }}}}
+        }))
+        .expect("serialize ignored config"),
+    )
+    .expect("write ignored config");
+
+    let log = directory.path().join("resume.stderr");
+    let file = std::fs::File::create(&log).expect("create child log");
+    let mut child = Command::new(binary())
+        .args([
+            "run",
+            "--resume",
+            "--autosave-path",
+            autosave.to_str().expect("utf-8 autosave path"),
+            "--config",
+            ignored_config.to_str().expect("utf-8 config path"),
+            "--adapter",
+            "json",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(file))
+        .spawn()
+        .expect("spawn caddy-rs run --resume");
+
+    if !wait_until(Duration::from_secs(15), || {
+        connect_admin(admin_port).is_some()
+    }) {
+        child_failure(&mut child, &log, "resumed admin API did not start");
+    }
+
+    // The autosave configuration is served ...
+    let served = wait_until(Duration::from_secs(10), || {
+        http_request(SocketAddr::from(([127, 0, 0, 1], site_port)), "GET", "/")
+            .is_some_and(|(status, body)| status == 200 && body == "resumed")
+    });
+    if !served {
+        child_failure(
+            &mut child,
+            &log,
+            "resumed autosave configuration was not served",
+        );
+    }
+    // ... the --config file was ignored (its listener never opens) ...
+    assert!(
+        http_request(SocketAddr::from(([127, 0, 0, 1], other_port)), "GET", "/").is_none(),
+        "--config must be ignored when --resume loads an autosave"
+    );
+    // ... and the precedence is announced on stderr.
+    let stderr = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        stderr.contains("resuming from last configuration"),
+        "resume must be announced, stderr:\n{stderr}"
+    );
+
+    assert_eq!(admin_post_stop(admin_port), 200, "POST /stop returns 200");
+    let Some(status) = wait_for_child_exit(&mut child, Duration::from_secs(10)) else {
+        child_failure(
+            &mut child,
+            &log,
+            "resumed caddy-rs run did not exit after POST /stop",
+        );
+    };
+    assert!(
+        status.success(),
+        "resumed run should exit successfully after /stop, got {status:?}"
+    );
+}
+
 // ---- PKI / trust commands (read-only local CA material) --------------------------------------
 //
 // The fixtures live in the admin crate (`crates/admin/tests/fixtures/pki/authorities/...`); they
