@@ -9,6 +9,7 @@ members = [
     "crates/admin",
     "crates/server",
     "crates/cli",
+    "crates/plug",
 ]
 
 [workspace.package]
@@ -28,6 +29,7 @@ caddy-rs-proxy = { path = "crates/proxy" }
 caddy-rs-tls = { path = "crates/tls" }
 caddy-rs-admin = { path = "crates/admin" }
 caddy-rs-server = { path = "crates/server" }
+caddy-rs-plug = { path = "crates/plug" }
 anyhow = "1.0.104"
 async-trait = "0.1.92"
 bytes = "1.12.1"

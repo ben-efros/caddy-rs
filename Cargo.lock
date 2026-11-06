@@ -126,6 +126,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "caddy-rs-plug"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "caddy-rs-proxy"
 version = "0.1.0"
 dependencies = [
