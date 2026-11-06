@@ -29,6 +29,7 @@ const MAX_CONCURRENT_STREAMS: u16 = 0x3;
 const INITIAL_WINDOW_SIZE: u16 = 0x4;
 const MAX_FRAME_SIZE: u16 = 0x5;
 const MAX_HEADER_LIST_SIZE: u16 = 0x6;
+const ENABLE_CONNECT_PROTOCOL: u16 = 0x8;
 
 fn test_config(server_fields: serde_json::Value) -> Config {
     let mut server = serde_json::json!({
@@ -151,6 +152,14 @@ fn assert_go_defaults(settings: &HashMap<u16, u32>, expected_header_list: u32) {
         settings.get(&MAX_HEADER_LIST_SIZE),
         Some(&expected_header_list),
         "MAX_HEADER_LIST_SIZE must follow Caddy MaxHeaderBytes + Go padding: {settings:?}"
+    );
+    // RFC 8441 / Caddy v2.11.7 parity: Go's net/http HTTP/2 server leaves
+    // SETTINGS_ENABLE_CONNECT_PROTOCOL unadvertised unless the process runs with
+    // `GODEBUG=http2xconnect=1` (Go issue #71128); live Caddy v2.11.7 SETTINGS confirm this.
+    assert_eq!(
+        settings.get(&ENABLE_CONNECT_PROTOCOL),
+        None,
+        "ENABLE_CONNECT_PROTOCOL must not be advertised without GODEBUG=http2xconnect=1: {settings:?}"
     );
 }
 
