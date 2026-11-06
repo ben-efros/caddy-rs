@@ -108,16 +108,18 @@ impl ProxyProtocolSettings {
             .allow
             .iter()
             .map(|cidr| {
-                Cidr::parse_caddy_prefix(cidr)
-                    .ok_or_else(|| format!("invalid allow CIDR `{cidr}` (a prefix length is required)"))
+                Cidr::parse_caddy_prefix(cidr).ok_or_else(|| {
+                    format!("invalid allow CIDR `{cidr}` (a prefix length is required)")
+                })
             })
             .collect::<Result<Vec<_>, _>>()?;
         let deny = config
             .deny
             .iter()
             .map(|cidr| {
-                Cidr::parse_caddy_prefix(cidr)
-                    .ok_or_else(|| format!("invalid deny CIDR `{cidr}` (a prefix length is required)"))
+                Cidr::parse_caddy_prefix(cidr).ok_or_else(|| {
+                    format!("invalid deny CIDR `{cidr}` (a prefix length is required)")
+                })
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {

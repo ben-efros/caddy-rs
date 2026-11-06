@@ -363,7 +363,8 @@ impl ServerRuntime {
                     )));
                 }
                 // Validate the listener's implied TLS policy without requiring certificates.
-                let _terminates_tls = listener_uses_tls(listen, https_port, has_connection_policies)?;
+                let _terminates_tls =
+                    listener_uses_tls(listen, https_port, has_connection_policies)?;
             }
             let _wrappers = ListenerWrappers::from_server(server)?;
         }

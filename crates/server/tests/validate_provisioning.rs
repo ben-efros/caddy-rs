@@ -19,7 +19,9 @@ use caddy_rs_server::ServerRuntime;
 
 fn store_with(value: serde_json::Value) -> std::sync::Arc<GenerationStore> {
     let store = std::sync::Arc::new(GenerationStore::with_builtin_registry());
-    store.load(Config::from_value(value).expect("config decodes")).expect("config validates");
+    store
+        .load(Config::from_value(value).expect("config decodes"))
+        .expect("config validates");
     store
 }
 

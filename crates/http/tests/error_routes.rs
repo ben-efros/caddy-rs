@@ -212,6 +212,9 @@ fn expression_matcher_supports_handle_errors_status_filters() {
             Ok(_) => panic!("unsupported expression `{expression}` must be loud"),
             Err(error) => error,
         };
-        assert!(matches!(error, Error::NotImplemented { .. }), "{expression}: {error}");
+        assert!(
+            matches!(error, Error::NotImplemented { .. }),
+            "{expression}: {error}"
+        );
     }
 }
