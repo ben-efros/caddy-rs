@@ -15,12 +15,12 @@
 //! | `GET /id/<id>` | Object (route) addressed by its `@id`, including nested subroutes |
 //! | `POST`/`PUT`/`PATCH`/`DELETE /id/<id>[/<path>]` | Partial update addressed by `@id` |
 //! | `POST /load` | Validate, provision, and atomically activate a configuration |
-//! | `POST /stop` | Deactivate the running configuration |
+//! | `POST /stop` | Deactivate the running configuration; in the CLI `run` process this terminates the process, like Caddy |
 //! | `GET /metrics` | Prometheus text format (v0.0.4) rendered from the shared [`MetricsRegistry`]; empty until the runtime populates it |
 //! | `GET /pki/ca/<id>` | Caddy-compatible metadata for a provisioned local CA (`caInfo` JSON) |
 //! | `GET /pki/ca/<id>/certificates` | PEM certificate chain: intermediate(s) then root |
 //! | `GET /pki/ca/<id>/certificates/<name>` | One PEM file from the CA directory (`root.crt`/`intermediate.crt`, caddy-rs extension) |
-//! | `GET /reverse_proxy/upstreams` | Configured `reverse_proxy` upstream addresses in Caddy's status shape (counters/health are not wired yet) |
+//! | `GET /reverse_proxy/upstreams` | Configured `reverse_proxy` upstreams in Caddy's status shape, with live counters supplied by the server runtime's [`UpstreamStatusSource`] |
 //! | `POST /adapt` | Adapt a Caddyfile (selected by `Content-Type`, like Caddy) or a `{config, adapter, wrap}` JSON object to Caddy JSON |
 //!
 //! Partial updates follow upstream Caddy's semantics exactly (see `config_path`):
@@ -76,7 +76,9 @@
 //!   body and no new generation. `Cache-Control: must-revalidate` forces the reload, exactly like
 //!   Caddy. `POST /load` with an identical config follows the same rule.
 //! - Malformed JSON request bodies on config mutations return `500` with a
-//!   `decoding request body: ...` message (Caddy returns these as plain, non-`APIError` errors).
+//!   `decoding request body: ...` message (Caddy returns these as plain, non-`APIError` errors and
+//!   the oracle compares admin error responses by status + `{"error": ...}` shape, not wording;
+//!   the message text itself is covered by unit tests and DIV-0048).
 //!   Config traversal errors (`invalid traversal path`, invalid/out-of-range array indexes) return
 //!   `400` with Caddy's message; a missing *leaf* config key reads as JSON `null` with `200`,
 //!   matching Caddy (`GET /config/<missing>` is no longer a 404).
@@ -84,20 +86,28 @@
 //!   (`"<config path> <xxhash64 hex>"`, same xxhash64 algorithm) and its 400/412 semantics.
 //!   Differences from Caddy v2.11.7: Caddy ignores `If-None-Match` entirely, while
 //!   caddy-rs serves `304` on a matching config read and `412` on a conditional write
-//!   (documented extension); no `Last-Modified` is sent (Caddy sends none either). The ETag hash
-//!   is over caddy-rs's serialized JSON, so it can differ from Caddy's for a semantically equal
-//!   config if key order/formatting differs between the two serializers.
+//!   (documented extension); no `Last-Modified` is sent (Caddy sends none either). Config
+//!   responses are Go-`encoding/json` compatible (compact, recursively sorted keys, trailing
+//!   newline), so the oracle verifies identical bodies, ETags and content-length for the scenario
+//!   configs; a config normalized differently by the two implementations could still hash
+//!   differently (T-ADMIN-036 verifies the oracle scenario corpus).
 //! - `GET /reverse_proxy/upstreams` reports the configured upstream addresses, de-duplicated and
-//!   sorted, in Caddy's `[{address,num_requests,fails}]` shape. Live counters require the server
-//!   runtime to register an [`UpstreamStatusSource`] via
-//!   [`AdminApi::with_upstream_status_source`]; until then `num_requests`/`fails` are `0`.
-//!   Dynamic upstream sources are not modelled.
+//!   sorted, in Caddy's `[{address,num_requests,fails}]` shape. The server runtime registers an
+//!   [`UpstreamStatusSource`] via [`AdminApi::with_upstream_status_source`] and supplies live
+//!   `num_requests`/`fails` counters; without a source the counters are `0`. Dynamic upstream
+//!   sources are not modelled and the counter semantics are cumulative rather than Caddy's
+//!   in-flight/expiring values (DIV-0089).
 //! - `POST /adapt` follows Caddy's `Content-Type`-selected adapter semantics; the additional
 //!   `{config, adapter, wrap}` JSON request form (with `wrap:false` returning the raw adapted JSON)
 //!   is a caddy-rs extension. Adapter warnings are rendered as Caddy-shaped
 //!   `[{"message": "..."}]` objects (the caddy-rs adapter only produces messages).
 //! - `POST /config/` replaces the whole configuration; `DELETE /config/` unloads it (Caddy
 //!   reaches the same state through `run(nil)` via its `rawCfg` wrapper).
+//! - `POST /stop` follows Caddy's `handleStop`/`exitProcess`: in the CLI `run` process it
+//!   terminates the process asynchronously after the `200 OK` response (the shutdown runs on an OS
+//!   thread so a stuck runtime cannot leave the process alive). Embedded uses and unit tests keep
+//!   the library behaviour of unloading the generation only; override with
+//!   [`AdminApi::with_process_exit_on_stop`].
 //! - Origin/host enforcement is evaluated from the active generation on each request; the server
 //!   crate may instead pass the startup policy with [`AdminApi::with_origin_policy`]. Caddy's
 //!   DNS-rebinding `Host` check is implemented for non-wildcard TCP admin listeners. CORS
@@ -518,6 +528,14 @@ pub struct AdminApi {
     data_dir: Option<PathBuf>,
     /// Optional live reverse-proxy upstream counters supplied by the server runtime.
     upstream_status_source: Option<Arc<dyn UpstreamStatusSource>>,
+    /// Whether `POST /stop` should terminate the process (Caddy's `handleStop` calls
+    /// `exitProcess`, so an admin `/stop` always ends the server process).
+    ///
+    /// Enabled by default when the hosting process looks like the CLI `run` command (it announces
+    /// its autosave path through [`AUTOSAVE_PATH_ENV`]); embedded uses and unit tests keep the
+    /// library behaviour of unloading the generation only. Override with
+    /// [`AdminApi::with_process_exit_on_stop`].
+    exit_process_on_stop: bool,
     /// Autosave file for configs activated through this API, mirroring Caddy's autosave of every
     /// non-nil config transition (`caddy.go` `unsyncedDecodeAndRun`, `admin.config.persist`).
     ///
@@ -540,6 +558,9 @@ impl AdminApi {
             metrics: MetricsRegistry::new(),
             data_dir: None,
             upstream_status_source: None,
+            // The CLI `run` command is the only process that announces an autosave path; for it,
+            // `/stop` must terminate the process like Caddy. Library uses/tests opt out.
+            exit_process_on_stop: std::env::var_os(AUTOSAVE_PATH_ENV).is_some(),
             autosave_path: std::env::var_os(AUTOSAVE_PATH_ENV).map(PathBuf::from),
         }
     }
@@ -573,6 +594,16 @@ impl AdminApi {
     ///
     /// This is the explicit override for [`AUTOSAVE_PATH_ENV`]; the server runtime does not need
     /// it because the CLI announces its effective autosave path through the environment variable.
+    /// Override whether `POST /stop` terminates the process (Caddy's `/stop` exits).
+    ///
+    /// Defaults to true for the CLI `run` process (see [`AdminApi::new`]) and false for embedded
+    /// uses; embedders that own the process lifecycle can opt in here.
+    pub fn with_process_exit_on_stop(mut self, exit: bool) -> Self {
+        self.exit_process_on_stop = exit;
+        self
+    }
+
+    /// Autosave file for configs activated through this API (see [`AUTOSAVE_PATH_ENV`]).
     pub fn with_autosave_path(mut self, autosave_path: impl Into<PathBuf>) -> Self {
         self.autosave_path = Some(autosave_path.into());
         self
@@ -1316,6 +1347,12 @@ impl AdminApi {
     }
 
     /// Deactivate the running configuration (shared by `POST /stop` and `DELETE /config/`).
+    ///
+    /// Caddy's admin `/stop` calls `exitProcess`, so the CLI process terminates. The library keeps
+    /// that opt-in (`exit_process_on_stop`) so embedded hosts and unit tests can unload a
+    /// generation without exiting; when enabled, the exit runs asynchronously after a short delay
+    /// so the `200 OK` response has time to be written (Caddy likewise shuts its admin listener
+    /// down from a goroutine after the handler returns).
     fn unload(&self) -> AdminResponse {
         if let Some(generation) = self.store.stop() {
             let timeout = self.drain_timeout;
@@ -1324,6 +1361,15 @@ impl AdminApi {
             });
         }
         self.notify_reload();
+        if self.exit_process_on_stop {
+            // Use an OS thread, not a tokio task: the runtime may already be shutting down (that is
+            // precisely the stuck state this exits from), and a spawned task could be dropped
+            // before its timer fires.
+            std::thread::spawn(|| {
+                std::thread::sleep(Duration::from_millis(100));
+                std::process::exit(0);
+            });
+        }
         AdminResponse::empty(StatusCode::OK)
     }
 }
@@ -1882,6 +1928,72 @@ mod tests {
         }
     }
 
+    fn assert_sorted_object_keys(value: &Value) {
+        match value {
+            Value::Object(map) => {
+                let keys: Vec<&String> = map.keys().collect();
+                let mut sorted = keys.clone();
+                sorted.sort();
+                assert_eq!(
+                    keys, sorted,
+                    "object keys are not recursively sorted: {value:?}"
+                );
+                for nested in map.values() {
+                    assert_sorted_object_keys(nested);
+                }
+            }
+            Value::Array(items) => items.iter().for_each(assert_sorted_object_keys),
+            _ => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn config_read_serialization_matches_go_encoding_json_bytes() {
+        // Caddy serves `encoding/json` output: compact, recursively sorted object keys and a
+        // trailing newline from `json.Encoder`; the ETag is xxHash64 over exactly those bytes.
+        let admin = admin();
+        let config = json!({
+            "storage": {"module": "file_system", "root": "/var/lib/caddy"},
+            "apps": {"http": {"servers": {"srv0": {
+                "listen": [":8080"],
+                "routes": [{"@id": "route0", "handle": [
+                    {"handler": "static_response", "body": "hello", "status_code": 200}
+                ]}]
+            }}}},
+            "admin": {"listen": "localhost:2019"}
+        });
+        assert_eq!(
+            load(&admin, &config.to_string()).await.status,
+            StatusCode::OK
+        );
+
+        let response = admin.handle(request("GET", "/config/", "")).await;
+        assert_eq!(response.status, StatusCode::OK);
+        let body = response.body.to_vec();
+        assert!(body.ends_with(b"\n"), "Go json.Encoder newline");
+        let parsed: Value = serde_json::from_slice(&body).expect("config JSON");
+        assert_sorted_object_keys(&parsed);
+        // Byte-for-byte canonical Go encoding: re-serialising the parsed value reproduces the
+        // served bytes (modulo the encoder newline).
+        let canonical = serde_json::to_vec(&parsed).expect("canonical serialization");
+        assert_eq!(&body[..body.len() - 1], canonical.as_slice());
+        // The strong ETag is over the exact served bytes; content-length is body.len().
+        let expected_etag = config_etag("/config/", &body);
+        assert_eq!(
+            response.headers.get(http::header::ETAG).unwrap(),
+            &expected_etag
+        );
+        assert_eq!(body.len(), response.body.len());
+
+        // Determinism: an unchanged config read yields identical bytes and ETag.
+        let again = admin.handle(request("GET", "/config/", "")).await;
+        assert_eq!(again.body, response.body);
+        assert_eq!(
+            again.headers.get(http::header::ETAG).unwrap(),
+            &expected_etag
+        );
+    }
+
     #[tokio::test]
     async fn reverse_proxy_upstreams_merges_runtime_counters_when_a_source_is_registered() {
         let admin = admin().with_upstream_status_source(Arc::new(StaticUpstreamStatus(vec![
@@ -2093,6 +2205,13 @@ mod tests {
         assert_eq!(response.status, StatusCode::BAD_REQUEST);
         assert!(body_string(&response).contains("nope"));
         assert!(is_running(admin.store()));
+    }
+
+    #[tokio::test]
+    async fn stop_deactivates_the_generation_and_process_exit_is_opt_in() {
+        // Unit tests do not announce AUTOSAVE_PATH_ENV, so `/stop` must unload the generation and
+        // let the embedding process decide its lifecycle (the CLI `run` process opts in).
+        assert!(!admin().exit_process_on_stop);
     }
 
     #[tokio::test]
@@ -2521,7 +2640,23 @@ mod tests {
             StatusCode::INTERNAL_SERVER_ERROR,
             "Caddy returns malformed-body decode failures as plain 500 errors"
         );
-        assert!(body_string(&response).contains("decoding request body"));
+        assert_eq!(
+            response.headers.get(http::header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let body = body_string(&response);
+        assert!(
+            body.ends_with('\n'),
+            "JSON admin bodies are newline-terminated"
+        );
+        let error: Value = serde_json::from_str(&body).expect("Caddy APIError shape");
+        assert!(
+            error["error"]
+                .as_str()
+                .expect("string error")
+                .starts_with("decoding request body: "),
+            "{error}"
+        );
 
         // `...` requires an array payload.
         let response = admin
