@@ -156,7 +156,12 @@ pub struct AccessLogRequest {
     pub remote_ip: String,
     /// Peer port, as a string (Caddy logs it as a string).
     pub remote_port: String,
-    /// Client IP derived from a trusted proxy, when configured.
+    /// Client IP (`client_ip` in Caddy's log entry).
+    ///
+    /// Caddy always sets the `client_ip` request variable: it is the peer IP unless a
+    /// `trusted_proxies` matcher rewrites it from a forwarding header. [`AccessLogRequest::with_remote`]
+    /// therefore defaults it to the peer IP; a trusted-proxy-aware caller overrides it with
+    /// [`AccessLogRequest::with_client_ip`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_ip: Option<String>,
     /// HTTP protocol, for example `HTTP/1.1` or `HTTP/2.0`.
@@ -195,16 +200,33 @@ impl AccessLogRequest {
     }
 
     /// Set the peer address (empty strings when unknown, matching a `parsed` split failure).
+    ///
+    /// Also defaults `client_ip` to the peer IP, matching Caddy's default `client_ip` request
+    /// variable (it is only replaced when a trusted-proxy matcher supplies a forwarded address).
     pub fn with_remote(mut self, remote: Option<SocketAddr>) -> Self {
         let (ip, port) = remote_ip_port(remote);
+        if !ip.is_empty() {
+            self.client_ip = Some(ip.clone());
+        }
         self.remote_ip = ip;
         self.remote_port = port;
         self
     }
 
+    /// Override the client IP derived from a trusted proxy (`trusted_proxies` support lives in the
+    /// server layer; the admin crate only owns the log-request shape).
+    pub fn with_client_ip(mut self, client_ip: Option<String>) -> Self {
+        self.client_ip = client_ip;
+        self
+    }
+
     /// Copy headers into the canonicalised, value-array form used in logs.
+    ///
+    /// The `Host` request header is omitted: Caddy logs the request host as `request.host` and its
+    /// `request.headers` object is Go's `http.Header`, which excludes `Host` by construction.
     pub fn with_headers(mut self, headers: &HeaderMap) -> Self {
         self.headers = headers_to_loggable(headers);
+        self.headers.remove("Host");
         self
     }
 }
@@ -1883,12 +1905,12 @@ mod tests {
             "request": {
                 "remote_ip": "192.0.2.10",
                 "remote_port": "54321",
+                "client_ip": "192.0.2.10",
                 "proto": "HTTP/2.0",
                 "method": "GET",
                 "host": "example.com",
                 "uri": "/a?b=c",
                 "headers": {
-                    "Host": ["example.com"],
                     "User-Agent": ["curl/8.5.0"],
                     "Authorization": ["Bearer secret"],
                     "Cookie": ["session=abc; theme=dark"],
@@ -2199,6 +2221,25 @@ mod tests {
         assert_eq!(canonical_header_name("x_forwarded_for"), "X_forwarded_for");
         assert_eq!(canonical_header_name("x-forwarded-for"), "X-Forwarded-For");
         assert_eq!(canonical_header_name(""), "");
+    }
+
+    #[test]
+    fn request_headers_omit_host_and_client_ip_defaults_to_peer() {
+        let request_headers = headers(&[("host", "example.com"), ("x-test", "1")]);
+        let request = AccessLogRequest::new("GET", "example.com", "/")
+            .with_remote(Some("192.0.2.10:54321".parse().unwrap()))
+            .with_headers(&request_headers);
+        assert_eq!(request.client_ip.as_deref(), Some("192.0.2.10"));
+        assert!(
+            !request.headers.contains_key("Host"),
+            "Caddy's request.headers excludes the Host header: {:?}",
+            request.headers
+        );
+        assert_eq!(request.headers.get("X-Test"), Some(&vec!["1".to_string()]));
+
+        let request = request.with_client_ip(Some("203.0.113.9".to_string()));
+        assert_eq!(request.client_ip.as_deref(), Some("203.0.113.9"));
+        assert_eq!(request.remote_ip, "192.0.2.10");
     }
 
     #[test]
