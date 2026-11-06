@@ -40,6 +40,7 @@ use caddy_rs_core::duration::CaddyDuration;
 use rustls::pki_types::CertificateDer;
 
 use crate::acme::adaptive_challenge::AdaptiveChallengeSelector;
+use crate::acme::csr::CertificateKeyType;
 use crate::acme::{
     AccountRegistration, AcmeAccountClient, AcmeClient, AcmeClock, AcmeError, AcmeStorage,
     AcmeTransport, Authorization, AuthorizationStatus, CertificateRequest, Challenge,
@@ -66,6 +67,8 @@ pub struct IssuanceRequest {
     pub domains: Vec<String>,
     /// Whether the certificate may be obtained from an internal CA.
     pub internal: bool,
+    /// Key type for the certificate's private key (Caddy automation policy `key_type`).
+    pub key_type: CertificateKeyType,
 }
 
 /// Certificate issuer.
@@ -79,9 +82,12 @@ pub trait CertificateIssuer: Send + Sync {
 
     /// Renew an existing certificate.
     async fn renew(&self, certificate: &Certificate) -> Result<Certificate> {
+        let key_type = CertificateKeyType::from_private_key_der(&certificate.private_key_der)
+            .unwrap_or(CertificateKeyType::P256);
         self.obtain(&IssuanceRequest {
             domains: certificate.domains.clone(),
             internal: certificate.issuer == "internal",
+            key_type,
         })
         .await
     }
@@ -538,7 +544,7 @@ impl<T: AcmeTransport> AcmeIssuer<T> {
 
         let mut presented: Vec<(Arc<dyn ChallengeSolver>, ChallengeHandle)> = Vec::new();
         let result = self
-            .run_order(&account_client, &domains, &mut presented)
+            .run_order(&account_client, &domains, request.key_type, &mut presented)
             .await;
         // Withdraw challenge evidence in reverse order, whether issuance succeeded or not.
         for (solver, handle) in presented.iter().rev() {
@@ -551,6 +557,7 @@ impl<T: AcmeTransport> AcmeIssuer<T> {
         &self,
         account_client: &AcmeAccountClient<&U>,
         domains: &[String],
+        key_type: CertificateKeyType,
         presented: &mut Vec<(Arc<dyn ChallengeSolver>, ChallengeHandle)>,
     ) -> Result<Certificate> {
         let order_request = NewOrderRequest::for_domains(domains);
@@ -619,7 +626,7 @@ impl<T: AcmeTransport> AcmeIssuer<T> {
         account_client
             .poll_order_ready(&order.url, &self.poll_policy, self.clock.as_ref())
             .await?;
-        let csr = CertificateRequest::generate(domains)?;
+        let csr = CertificateRequest::generate_with_key_type(domains, key_type)?;
         account_client.finalize_order(&order, &csr).await?;
         let issued = account_client
             .wait_for_certificate(&order.url, &self.poll_policy, self.clock.as_ref())
@@ -1411,6 +1418,7 @@ mod tests {
         IssuanceRequest {
             domains: vec!["example.com".to_string()],
             internal: false,
+            key_type: CertificateKeyType::P256,
         }
     }
 
@@ -1616,6 +1624,39 @@ mod tests {
     }
 
     // ---- end-to-end HTTP-01 issuance -----------------------------------------------------
+
+    #[tokio::test]
+    async fn issuance_uses_configured_csr_key_type_for_p384_and_rsa2048() {
+        for key_type in [CertificateKeyType::P384, CertificateKeyType::Rsa2048] {
+            let transport = TestTransport::new();
+            let account_storage = Arc::new(MemoryAcmeStorage::new());
+            let certificate_storage = Arc::new(MemoryStorage::new());
+            let issuer = issuer_with(
+                transport.clone(),
+                http_config(),
+                Arc::clone(&account_storage),
+                &certificate_storage,
+            );
+            script_account_and_order(&transport, &["http-01"]);
+            script_finalization(&transport, "http-01");
+
+            let mut request = issuance_request();
+            request.key_type = key_type;
+            let certificate = issuer.obtain(&request).await.unwrap();
+            let stored = certificate_storage
+                .load(STORAGE_KEY)
+                .await
+                .unwrap()
+                .expect("certificate persisted");
+            let key_der = private_key_der(&stored.private_key_pem).unwrap();
+            assert_eq!(
+                CertificateKeyType::from_private_key_der(&key_der).unwrap(),
+                key_type,
+                "{key_type:?}: CSR key type must drive the certificate key"
+            );
+            assert_eq!(certificate.private_key_der, key_der);
+        }
+    }
 
     #[tokio::test]
     async fn http01_issuance_succeeds_and_persists_certificate() {
@@ -2332,6 +2373,7 @@ mod tests {
             .obtain(&IssuanceRequest {
                 domains: vec!["example.com".to_string()],
                 internal: true,
+                key_type: CertificateKeyType::P256,
             })
             .await
             .unwrap_err();
@@ -2352,6 +2394,7 @@ mod tests {
             .obtain(&IssuanceRequest {
                 domains: Vec::new(),
                 internal: false,
+                key_type: CertificateKeyType::P256,
             })
             .await
             .unwrap_err();

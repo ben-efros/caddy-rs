@@ -5,11 +5,12 @@
 //! module builds the small, fixed DER structure by hand and signs it with the same `ring` backend
 //! used for account keys:
 //!
-//! * fresh ECDSA P-256 certificate key per request (the account key is never reused);
+//! * a fresh certificate key per request (the account key is never reused), selected by Caddy's
+//!   automation-policy `key_type`: ECDSA P-256 (default), ECDSA P-384, RSA 2048 or RSA 4096;
 //! * subject: empty except a `commonName` of the first domain (ACME CAs authorise by SAN);
 //! * subjectAltName extension with `dNSName` entries for DNS identifiers and `iPAddress`
 //!   entries for IP identifiers, wrapped in the `extensionRequest` attribute;
-//! * ECDSA-with-SHA256 signature (`ECDSA_P256_SHA256_ASN1_SIGNING`).
+//! * ECDSA-with-SHA256/384 or SHA-256-with-RSA signatures matching the key type.
 //!
 //! The private key is returned as PKCS#8 PEM next to the CSR so the caller can store it with the
 //! certificate it receives.
@@ -18,8 +19,13 @@ use std::net::IpAddr;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
+use rand::rngs::OsRng;
 use ring::rand::SystemRandom;
-use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+use ring::signature::{
+    EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING, ECDSA_P384_SHA384_ASN1_SIGNING,
+};
+use rsa::pkcs1::DecodeRsaPrivateKey;
+use rsa::pkcs8::DecodePrivateKey;
 
 use super::AcmeError;
 use crate::Result;
@@ -29,8 +35,102 @@ const OID_COMMON_NAME: &[u64] = &[2, 5, 4, 3];
 const OID_EC_PUBLIC_KEY: &[u64] = &[1, 2, 840, 10045, 2, 1];
 const OID_PRIME256V1: &[u64] = &[1, 2, 840, 10045, 3, 1, 7];
 const OID_ECDSA_WITH_SHA256: &[u64] = &[1, 2, 840, 10045, 4, 3, 2];
+const OID_ECDSA_WITH_SHA384: &[u64] = &[1, 2, 840, 10045, 4, 3, 3];
+const OID_SECP384R1: &[u64] = &[1, 3, 132, 0, 34];
+const OID_RSA_ENCRYPTION: &[u64] = &[1, 2, 840, 113549, 1, 1, 1];
+const OID_SHA256_WITH_RSA: &[u64] = &[1, 2, 840, 113549, 1, 1, 11];
 const OID_SUBJECT_ALT_NAME: &[u64] = &[2, 5, 29, 17];
 const OID_EXTENSION_REQUEST: &[u64] = &[1, 2, 840, 113549, 1, 9, 14];
+
+/// Certificate key type selected by Caddy's automation policy `key_type`.
+///
+/// Caddy/certmagic supports `p256` (default), `p384`, `rsa2048`, `rsa4096` and `ed25519`. This
+/// build implements the first four; `ed25519` is rejected with a located error because the
+/// offline registry cache has no Ed25519 signing path for PKCS#10 (see DIV-0032).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CertificateKeyType {
+    /// ECDSA P-256 (default).
+    #[default]
+    P256,
+    /// ECDSA P-384.
+    P384,
+    /// RSA 2048-bit.
+    Rsa2048,
+    /// RSA 4096-bit.
+    Rsa4096,
+}
+
+impl CertificateKeyType {
+    /// Parse Caddy's `key_type` spelling.
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "p256" => Ok(Self::P256),
+            "p384" => Ok(Self::P384),
+            "rsa2048" => Ok(Self::Rsa2048),
+            "rsa4096" => Ok(Self::Rsa4096),
+            "ed25519" => Err(AcmeError::CertificateRequest(
+                "certificate key type `ed25519` is not implemented (offline build has no Ed25519 PKCS#10 signing path); supported: p256, p384, rsa2048, rsa4096"
+                    .to_string(),
+            )
+            .into()),
+            other => Err(AcmeError::CertificateRequest(format!(
+                "unknown certificate key type `{other}`; expected p256, p384, rsa2048 or rsa4096"
+            ))
+            .into()),
+        }
+    }
+
+    /// Infer the key type of a DER private key produced by this module (PKCS#8, SEC1 or PKCS#1).
+    pub fn from_private_key_der(der: &[u8]) -> Result<Self> {
+        if let Ok(private_key) = rsa::RsaPrivateKey::from_pkcs8_der(der) {
+            use rsa::traits::PublicKeyParts;
+            return match private_key.n().bits() {
+                2048 => Ok(Self::Rsa2048),
+                4096 => Ok(Self::Rsa4096),
+                other => Err(AcmeError::CertificateRequest(format!(
+                    "unsupported RSA certificate key size {other} bits"
+                ))
+                .into()),
+            };
+        }
+        if let Ok(private_key) = rsa::RsaPrivateKey::from_pkcs1_der(der) {
+            use rsa::traits::PublicKeyParts;
+            return match private_key.n().bits() {
+                2048 => Ok(Self::Rsa2048),
+                4096 => Ok(Self::Rsa4096),
+                other => Err(AcmeError::CertificateRequest(format!(
+                    "unsupported RSA certificate key size {other} bits"
+                ))
+                .into()),
+            };
+        }
+        if der.len() > 32 {
+            // PKCS#8 EC: detect the named curve OID in the AlgorithmIdentifier.
+            let prime256v1 = der_oid(OID_PRIME256V1);
+            let secp384r1 = der_oid(OID_SECP384R1);
+            if der.windows(prime256v1.len()).any(|w| w == prime256v1) {
+                return Ok(Self::P256);
+            }
+            if der.windows(secp384r1.len()).any(|w| w == secp384r1) {
+                return Ok(Self::P384);
+            }
+        }
+        Err(AcmeError::CertificateRequest(
+            "could not determine certificate key type from the private key".to_string(),
+        )
+        .into())
+    }
+
+    /// Caddy spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::P256 => "p256",
+            Self::P384 => "p384",
+            Self::Rsa2048 => "rsa2048",
+            Self::Rsa4096 => "rsa4096",
+        }
+    }
+}
 
 /// A generated certificate signing request and its private key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,43 +138,183 @@ pub struct CertificateRequest {
     der: Vec<u8>,
     private_key_pem: String,
     public_key: Vec<u8>,
+    key_type: CertificateKeyType,
     domains: Vec<String>,
 }
 
 impl CertificateRequest {
     /// Generate a CSR for `domains` (DNS names and/or IP addresses) with a fresh P-256 key.
     pub fn generate(domains: &[String]) -> Result<Self> {
+        Self::generate_with_key_type(domains, CertificateKeyType::P256)
+    }
+
+    /// Generate a CSR for `domains` with a fresh key of `key_type`.
+    pub fn generate_with_key_type(
+        domains: &[String],
+        key_type: CertificateKeyType,
+    ) -> Result<Self> {
         let domains = normalize_domains(domains)?;
+        match key_type {
+            CertificateKeyType::P256 | CertificateKeyType::P384 => {
+                Self::generate_ec(&domains, key_type)
+            }
+            CertificateKeyType::Rsa2048 | CertificateKeyType::Rsa4096 => {
+                Self::generate_rsa(&domains, key_type)
+            }
+        }
+    }
+
+    fn generate_ec(domains: &[String], key_type: CertificateKeyType) -> Result<Self> {
         let rng = SystemRandom::new();
-        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).map_err(
-            |error| AcmeError::CertificateRequest(format!("generating P-256 key: {error}")),
-        )?;
-        let key_pair =
-            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
+        let (pkcs8, key_pair, public_key, spki, signature_algorithm) = match key_type {
+            CertificateKeyType::P256 => {
+                let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng)
+                    .map_err(|error| {
+                        AcmeError::CertificateRequest(format!("generating P-256 key: {error}"))
+                    })?;
+                let key_pair =
+                    EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
+                        .map_err(|error| {
+                            AcmeError::CertificateRequest(format!(
+                                "reloading generated P-256 key: {error}"
+                            ))
+                        })?;
+                let public_key = key_pair.public_key().as_ref().to_vec();
+                let spki = der_sequence(&[
+                    der_sequence(&[der_oid(OID_EC_PUBLIC_KEY), der_oid(OID_PRIME256V1)]),
+                    der_bit_string(&public_key),
+                ]);
+                (
+                    pkcs8.as_ref().to_vec(),
+                    EcKeyPair::P256(key_pair),
+                    public_key,
+                    spki,
+                    der_sequence(&[der_oid(OID_ECDSA_WITH_SHA256)]),
+                )
+            }
+            CertificateKeyType::P384 => {
+                let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P384_SHA384_ASN1_SIGNING, &rng)
+                    .map_err(|error| {
+                        AcmeError::CertificateRequest(format!("generating P-384 key: {error}"))
+                    })?;
+                let key_pair =
+                    EcdsaKeyPair::from_pkcs8(&ECDSA_P384_SHA384_ASN1_SIGNING, pkcs8.as_ref(), &rng)
+                        .map_err(|error| {
+                            AcmeError::CertificateRequest(format!(
+                                "reloading generated P-384 key: {error}"
+                            ))
+                        })?;
+                let public_key = key_pair.public_key().as_ref().to_vec();
+                let spki = der_sequence(&[
+                    der_sequence(&[der_oid(OID_EC_PUBLIC_KEY), der_oid(OID_SECP384R1)]),
+                    der_bit_string(&public_key),
+                ]);
+                (
+                    pkcs8.as_ref().to_vec(),
+                    EcKeyPair::P384(key_pair),
+                    public_key,
+                    spki,
+                    der_sequence(&[der_oid(OID_ECDSA_WITH_SHA384)]),
+                )
+            }
+            _ => unreachable!(),
+        };
+        let certification_request_info = certification_request_info(&domains, spki)?;
+        let signature = match &key_pair {
+            EcKeyPair::P256(key_pair) => key_pair
+                .sign(&rng, &certification_request_info)
                 .map_err(|error| {
-                    AcmeError::CertificateRequest(format!("reloading generated P-256 key: {error}"))
-                })?;
-        let public_key = key_pair.public_key().as_ref().to_vec();
-
-        let certification_request_info = certification_request_info(&domains, &public_key)?;
-        let signature = key_pair
-            .sign(&rng, &certification_request_info)
-            .map_err(|error| {
-                AcmeError::CertificateRequest(format!("signing certification request: {error}"))
-            })?;
-
+                    AcmeError::CertificateRequest(format!("signing certification request: {error}"))
+                })?
+                .as_ref()
+                .to_vec(),
+            EcKeyPair::P384(key_pair) => key_pair
+                .sign(&rng, &certification_request_info)
+                .map_err(|error| {
+                    AcmeError::CertificateRequest(format!("signing certification request: {error}"))
+                })?
+                .as_ref()
+                .to_vec(),
+        };
         let der = der_sequence(&[
             certification_request_info,
-            der_sequence(&[der_oid(OID_ECDSA_WITH_SHA256)]),
-            der_bit_string(signature.as_ref()),
+            signature_algorithm,
+            der_bit_string(&signature),
         ]);
-
         Ok(Self {
             der,
-            private_key_pem: pem_encode("PRIVATE KEY", pkcs8.as_ref()),
+            private_key_pem: pem_encode("PRIVATE KEY", &pkcs8),
             public_key,
-            domains,
+            key_type,
+            domains: domains.to_vec(),
         })
+    }
+
+    fn generate_rsa(domains: &[String], key_type: CertificateKeyType) -> Result<Self> {
+        let bits = match key_type {
+            CertificateKeyType::Rsa2048 => 2048,
+            CertificateKeyType::Rsa4096 => 4096,
+            _ => unreachable!(),
+        };
+        let private_key = rsa::RsaPrivateKey::new(&mut OsRng, bits).map_err(|error| {
+            AcmeError::CertificateRequest(format!("generating RSA-{bits} key: {error}"))
+        })?;
+        Self::csr_from_rsa(domains, key_type, private_key)
+    }
+
+    /// Build an RSA CSR from an existing private key (test seam for expensive RSA-4096 keys).
+    #[cfg(test)]
+    pub(crate) fn generate_rsa_with_key(
+        domains: &[String],
+        key_type: CertificateKeyType,
+        private_key: rsa::RsaPrivateKey,
+    ) -> Result<Self> {
+        let domains = normalize_domains(domains)?;
+        Self::csr_from_rsa(&domains, key_type, private_key)
+    }
+
+    fn csr_from_rsa(
+        domains: &[String],
+        key_type: CertificateKeyType,
+        private_key: rsa::RsaPrivateKey,
+    ) -> Result<Self> {
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::signature::{SignatureEncoding, Signer};
+        use rsa::traits::PublicKeyParts;
+        let public_key = private_key.to_public_key();
+        let rsa_public_der = der_sequence(&[
+            der_integer_from_bytes(&public_key.n().to_bytes_be()),
+            der_integer_from_bytes(&public_key.e().to_bytes_be()),
+        ]);
+        let spki = der_sequence(&[
+            der_sequence(&[der_oid(OID_RSA_ENCRYPTION), der_null()]),
+            der_bit_string(&rsa_public_der),
+        ]);
+        let certification_request_info = certification_request_info(&domains, spki)?;
+        let signing_key = SigningKey::<sha2::Sha256>::new(private_key.clone());
+        let signature = signing_key.sign(&certification_request_info).to_vec();
+        let signature_algorithm = der_sequence(&[der_oid(OID_SHA256_WITH_RSA), der_null()]);
+        let der = der_sequence(&[
+            certification_request_info,
+            signature_algorithm,
+            der_bit_string(&signature),
+        ]);
+        use rsa::pkcs8::EncodePrivateKey;
+        let pkcs8 = private_key.to_pkcs8_der().map_err(|error| {
+            AcmeError::CertificateRequest(format!("encoding RSA certificate key: {error}"))
+        })?;
+        Ok(Self {
+            der,
+            private_key_pem: pem_encode("PRIVATE KEY", pkcs8.as_bytes()),
+            public_key: rsa_public_der,
+            key_type,
+            domains: domains.to_vec(),
+        })
+    }
+
+    /// The certificate key type.
+    pub fn key_type(&self) -> CertificateKeyType {
+        self.key_type
     }
 
     /// DER-encoded `CertificationRequest`.
@@ -83,11 +323,16 @@ impl CertificateRequest {
     }
 
     /// The CSR's private key in PKCS#8 PEM form.
+    ///
+    /// Runtime TLS loading expects PKCS#8. This differs from certmagic's certificate-key PEM
+    /// (SEC1 `EC PRIVATE KEY` / PKCS#1 `RSA PRIVATE KEY`), which is tracked as a residual
+    /// divergence in DIV-0032; account keys do use certmagic's encodings.
     pub fn private_key_pem(&self) -> &str {
         &self.private_key_pem
     }
 
-    /// The CSR's public key (uncompressed P-256 point: `0x04 || X || Y`).
+    /// The CSR's public key: an uncompressed EC point (`0x04 || X || Y`) for ECDSA keys or the
+    /// PKCS#1 `RSAPublicKey` DER for RSA keys.
     pub fn public_key_bytes(&self) -> &[u8] {
         &self.public_key
     }
@@ -121,11 +366,13 @@ fn normalize_domains(domains: &[String]) -> Result<Vec<String>> {
     Ok(normalized)
 }
 
-fn certification_request_info(domains: &[String], public_key: &[u8]) -> Result<Vec<u8>> {
+enum EcKeyPair {
+    P256(EcdsaKeyPair),
+    P384(EcdsaKeyPair),
+}
+
+fn certification_request_info(domains: &[String], spki: Vec<u8>) -> Result<Vec<u8>> {
     let subject = subject_with_common_name(&domains[0]);
-    // SubjectPublicKeyInfo for an id-ecPublicKey / prime256v1 key.
-    let algorithm = der_sequence(&[der_oid(OID_EC_PUBLIC_KEY), der_oid(OID_PRIME256V1)]);
-    let spki = der_sequence(&[algorithm, der_bit_string(public_key)]);
 
     let general_names = general_names(domains);
     let extension = der_sequence(&[
@@ -208,6 +455,25 @@ fn der_integer(value: u64) -> Vec<u8> {
     der_tlv(0x02, &content)
 }
 
+fn der_integer_from_bytes(bytes: &[u8]) -> Vec<u8> {
+    let first = bytes
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(bytes.len().saturating_sub(1));
+    let mut content = bytes[first..].to_vec();
+    if content.is_empty() {
+        content.push(0);
+    }
+    if content[0] & 0x80 != 0 {
+        content.insert(0, 0);
+    }
+    der_tlv(0x02, &content)
+}
+
+fn der_null() -> Vec<u8> {
+    der_tlv(0x05, &[])
+}
+
 fn der_oid(arcs: &[u64]) -> Vec<u8> {
     let mut content = Vec::new();
     if arcs.len() >= 2 {
@@ -261,7 +527,173 @@ fn pem_encode(label: &str, der: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_ASN1};
+    use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_ASN1, ECDSA_P384_SHA384_ASN1};
+
+    const RSA_4096_CERT_KEY_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
+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
+EVdZ8IcAQzAPk1jBxj0YDC0rR5d09Q==
+-----END PRIVATE KEY-----
+"#;
+
+    /// Verify a CSR signature with the key type's public key.
+    fn verify_csr_any(csr: &CertificateRequest) -> bool {
+        let (tag, body, _) = read_tlv(csr.der());
+        assert_eq!(tag, 0x30);
+        let (info_tag, _info, info_len) = read_tlv(body);
+        assert_eq!(info_tag, 0x30);
+        let tbs = &body[..info_len];
+        let mut offset = info_len;
+        let (_, _, consumed) = read_tlv(&body[offset..]);
+        offset += consumed;
+        let (sig_tag, sig_content, _) = read_tlv(&body[offset..]);
+        assert_eq!(sig_tag, 0x03);
+        let signature = &sig_content[1..];
+        match csr.key_type() {
+            CertificateKeyType::P256 => {
+                UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, csr.public_key_bytes())
+                    .verify(tbs, signature)
+                    .is_ok()
+            }
+            CertificateKeyType::P384 => {
+                UnparsedPublicKey::new(&ECDSA_P384_SHA384_ASN1, csr.public_key_bytes())
+                    .verify(tbs, signature)
+                    .is_ok()
+            }
+            CertificateKeyType::Rsa2048 | CertificateKeyType::Rsa4096 => {
+                use rsa::pkcs1::DecodeRsaPublicKey;
+                use rsa::pkcs1v15::{Signature, VerifyingKey};
+                use rsa::signature::Verifier;
+                let public_key = rsa::RsaPublicKey::from_pkcs1_der(csr.public_key_bytes())
+                    .expect("RSA public key DER");
+                let verifying_key = VerifyingKey::<sha2::Sha256>::new(public_key);
+                match Signature::try_from(signature) {
+                    Ok(signature) => verifying_key.verify(tbs, &signature).is_ok(),
+                    Err(_) => false,
+                }
+            }
+        }
+    }
+
+    fn assert_csr_contents(csr: &CertificateRequest) {
+        assert_eq!(csr.domains()[0], "example.com");
+        assert!(lookup(csr.der(), b"www.example.com").is_some());
+        let cn = &[0x06, 0x03, 0x55, 0x04, 0x03];
+        assert!(lookup(csr.der(), cn).is_some(), "CN attribute present");
+        let der = crate::storage::private_key_der(csr.private_key_pem()).unwrap();
+        assert_eq!(
+            CertificateKeyType::from_private_key_der(&der).unwrap(),
+            csr.key_type()
+        );
+    }
+
+    #[test]
+    fn generates_csrs_for_each_supported_key_type() {
+        let domains = vec!["example.com".to_string(), "www.example.com".to_string()];
+        for key_type in [
+            CertificateKeyType::P256,
+            CertificateKeyType::P384,
+            CertificateKeyType::Rsa2048,
+        ] {
+            let csr = CertificateRequest::generate_with_key_type(&domains, key_type).unwrap();
+            assert_eq!(csr.key_type(), key_type);
+            assert!(
+                csr.private_key_pem().starts_with(
+                    "-----BEGIN PRIVATE KEY-----
+"
+                ),
+                "{key_type:?}: PKCS#8 certificate key"
+            );
+            assert!(verify_csr_any(&csr), "{key_type:?}");
+            assert_csr_contents(&csr);
+        }
+
+        // RSA-4096 generation is too slow for the test suite; a pre-generated key exercises the
+        // same signing/SPKI path and the configured key type.
+        use rsa::pkcs8::DecodePrivateKey;
+        let rsa_4096 = rsa::RsaPrivateKey::from_pkcs8_pem(RSA_4096_CERT_KEY_PEM).unwrap();
+        let csr = CertificateRequest::generate_rsa_with_key(
+            &domains,
+            CertificateKeyType::Rsa4096,
+            rsa_4096,
+        )
+        .unwrap();
+        assert_eq!(csr.key_type(), CertificateKeyType::Rsa4096);
+        assert!(verify_csr_any(&csr));
+        assert_csr_contents(&csr);
+    }
+
+    #[test]
+    fn certificate_key_type_parse_is_located_and_rejects_ed25519() {
+        for (value, expected) in [
+            ("p256", CertificateKeyType::P256),
+            ("P384", CertificateKeyType::P384),
+            ("rsa2048", CertificateKeyType::Rsa2048),
+            ("rsa4096", CertificateKeyType::Rsa4096),
+        ] {
+            assert_eq!(CertificateKeyType::parse(value).unwrap(), expected);
+        }
+        let error = CertificateKeyType::parse("ed25519").unwrap_err();
+        assert!(error.to_string().contains("ed25519"), "{error}");
+        assert!(
+            error.to_string().contains("p256, p384, rsa2048, rsa4096"),
+            "{error}"
+        );
+        let error = CertificateKeyType::parse("bogus").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unknown certificate key type `bogus`"),
+            "{error}"
+        );
+    }
 
     /// One DER TLV: `(tag, content, total_encoded_len)`.
     fn read_tlv(input: &[u8]) -> (u8, &[u8], usize) {

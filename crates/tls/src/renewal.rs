@@ -807,9 +807,13 @@ impl RenewalScheduler {
             return RenewalOutcome::NotDue { domains, due_at };
         }
 
+        let key_type =
+            crate::acme::csr::CertificateKeyType::from_private_key_der(&current.private_key_der)
+                .unwrap_or(crate::acme::csr::CertificateKeyType::P256);
         let request = IssuanceRequest {
             domains: current.domains.clone(),
             internal: current.issuer == "internal",
+            key_type,
         };
         let issued = match self.issuer.obtain(&request).await {
             Ok(certificate) => certificate,

@@ -104,6 +104,7 @@ use serde_json::Value;
 use caddy_rs_core::config::{AutomationPolicy, Config, TlsApp};
 use caddy_rs_core::listen::{ListenAddr, Network};
 
+use crate::acme::csr::CertificateKeyType;
 use crate::acme::{AcmeClock, AcmeStorage, AcmeTransport, PollPolicy, TokioClock};
 use crate::certificate::{Certificate, RenewalItem};
 use crate::internal_ca::{CaCertificates, CaStorage, InternalIssuer, DEFAULT_CA_ID};
@@ -132,6 +133,8 @@ pub struct AutomaticHttpsPolicy {
     pub issuer: AutomaticHttpsIssuer,
     /// Whether the matching policy uses on-demand TLS (not supported by this build).
     pub on_demand: bool,
+    /// Certificate key type from Caddy's automation policy `key_type` (default P-256).
+    pub key_type: CertificateKeyType,
 }
 
 /// The issuer selected by an automation policy.
@@ -482,6 +485,7 @@ pub fn plan(config: &Config) -> Result<Option<AutomaticHttpsPlan>> {
             subjects: unmatched_internal,
             issuer: AutomaticHttpsIssuer::Internal,
             on_demand: false,
+            key_type: CertificateKeyType::P256,
         });
     }
     let needs_default_acme = !policies.iter().any(|policy| policy.subjects.is_empty())
@@ -492,6 +496,7 @@ pub fn plan(config: &Config) -> Result<Option<AutomaticHttpsPlan>> {
             subjects: Vec::new(),
             issuer: AutomaticHttpsIssuer::Acme(Box::default()),
             on_demand: false,
+            key_type: CertificateKeyType::P256,
         });
     }
 
@@ -670,10 +675,16 @@ fn parse_policy(policy: &AutomationPolicy, index: usize) -> Result<AutomaticHttp
         // Caddy's default issuers are the ACME issuers; this build defaults to Let's Encrypt.
         AutomaticHttpsIssuer::Acme(Box::default())
     });
+    let key_type = match policy.key_type.as_deref() {
+        Some(value) => CertificateKeyType::parse(value)
+            .map_err(|error| Error::Issuer(format!("{path}.key_type: {error}")))?,
+        None => CertificateKeyType::P256,
+    };
     Ok(AutomaticHttpsPolicy {
         subjects: policy.subjects.clone(),
         issuer,
         on_demand: policy.on_demand,
+        key_type,
     })
 }
 
@@ -1191,6 +1202,7 @@ impl AutomaticHttpsProvisioner {
                     .obtain(&IssuanceRequest {
                         domains: vec![subject.to_string()],
                         internal: true,
+                        key_type: policy.key_type,
                     })
                     .await
                     .map_err(|error| {
@@ -1203,6 +1215,7 @@ impl AutomaticHttpsProvisioner {
             AutomaticHttpsIssuer::Acme(config) => obtain_acme_certificate(
                 config,
                 &[subject.to_string()],
+                policy.key_type,
                 &self.transport,
                 self.root.clone(),
                 &self.challenge_tokens,
@@ -1346,6 +1359,7 @@ fn acme_transport_for_config(
 pub(crate) async fn obtain_acme_certificate(
     config: &AcmeIssuerConfig,
     domains: &[String],
+    key_type: CertificateKeyType,
     transport: &Arc<dyn AcmeTransport>,
     root: PathBuf,
     challenge_tokens: &Arc<Http01TokenStore>,
@@ -1373,6 +1387,7 @@ pub(crate) async fn obtain_acme_certificate(
         .obtain(&IssuanceRequest {
             domains: domains.to_vec(),
             internal: false,
+            key_type,
         })
         .await
 }
@@ -1432,6 +1447,7 @@ impl CertificateIssuer for RenewalIssuer {
                     .obtain(&IssuanceRequest {
                         domains: request.domains.clone(),
                         internal: true,
+                        key_type: request.key_type,
                     })
                     .await
             }
@@ -1439,6 +1455,7 @@ impl CertificateIssuer for RenewalIssuer {
                 obtain_acme_certificate(
                     config,
                     &request.domains,
+                    request.key_type,
                     &self.transport,
                     self.root.clone(),
                     &self.challenge_tokens,
@@ -1506,6 +1523,65 @@ mod tests {
     use std::time::Duration;
     use tokio::net::TcpListener;
     use tokio_rustls::TlsAcceptor;
+
+    #[test]
+    fn plan_parses_key_type_and_rejects_unknown_values() {
+        let value = json!({
+            "apps": {
+                "tls": {"automation": {"policies": [{
+                    "subjects": ["example.com"],
+                    "key_type": "p384",
+                    "issuers": [{"module": "acme", "ca": "https://acme.test/directory"}]
+                }]}},
+                "http": {"servers": {"srv0": {
+                    "listen": ["127.0.0.1:0"],
+                    "tls_connection_policies": [{}],
+                    "routes": [{"match": [{"host": ["example.com"]}],
+                                "handle": [{"handler": "static_response", "body": "ok"}]}]
+                }}}
+            }
+        });
+        let parsed_plan = plan(&config(value.clone())).unwrap().unwrap();
+        assert_eq!(
+            parsed_plan.policy_for("example.com").unwrap().key_type,
+            CertificateKeyType::P384
+        );
+
+        for key_type in ["rsa2048", "rsa4096", "p256"] {
+            let mut value = value.clone();
+            value["apps"]["tls"]["automation"]["policies"][0]["key_type"] = json!(key_type);
+            let parsed_plan = plan(&config(value)).unwrap().unwrap();
+            assert_eq!(
+                parsed_plan.policy_for("example.com").unwrap().key_type,
+                CertificateKeyType::parse(key_type).unwrap()
+            );
+        }
+
+        let mut unknown = value.clone();
+        unknown["apps"]["tls"]["automation"]["policies"][0]["key_type"] = json!("bogus");
+        let error = plan(&config(unknown)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("apps.tls.automation.policies[0].key_type"),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("unknown certificate key type"),
+            "{error}"
+        );
+
+        let mut ed25519 = value;
+        ed25519["apps"]["tls"]["automation"]["policies"][0]["key_type"] = json!("ed25519");
+        let error = plan(&config(ed25519)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("apps.tls.automation.policies[0].key_type"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("ed25519"), "{error}");
+    }
 
     #[test]
     fn renewal_policy_for_applies_acme_renewal_window() {

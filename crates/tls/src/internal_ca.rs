@@ -827,6 +827,12 @@ impl CertificateIssuer for InternalIssuer {
                 "internal CA certificate request has no domains".to_string(),
             ));
         }
+        if request.key_type != crate::acme::csr::CertificateKeyType::P256 {
+            return Err(Error::Issuer(format!(
+                "internal CA issuer does not support automation policy key_type `{}`; only p256                  is supported for locally-issued certificates (T-TLS-066)",
+                request.key_type.as_str()
+            )));
+        }
         let domains = normalize_domains(&request.domains)?;
         let ca = self.load_ca().await?;
         let now = self.clock.now();
@@ -1599,6 +1605,7 @@ mod tests {
         IssuanceRequest {
             domains: domains.iter().map(|domain| domain.to_string()).collect(),
             internal: false,
+            key_type: crate::acme::csr::CertificateKeyType::P256,
         }
     }
 

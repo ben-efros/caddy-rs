@@ -48,7 +48,7 @@ use crate::{Error, Result};
 use ring::rand::SystemRandom;
 use ring::signature::{
     EcdsaKeyPair, KeyPair, UnparsedPublicKey, ECDSA_P256_SHA256_FIXED,
-    ECDSA_P256_SHA256_FIXED_SIGNING,
+    ECDSA_P256_SHA256_FIXED_SIGNING, ECDSA_P384_SHA384_FIXED, ECDSA_P384_SHA384_FIXED_SIGNING,
 };
 
 /// IANA-registered ACME error namespace prefix.
@@ -717,45 +717,98 @@ impl Subproblem {
 }
 
 /// A JSON Web Key for an ACME account (public key only).
+///
+/// EC keys use `crv`/`x`/`y`; RSA keys use `n`/`e`. The RFC 7638 canonical member order is
+/// `crv,kty,x,y` for EC and `e,kty,n` for RSA.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Jwk {
-    /// Key type, always `EC` for this build.
+    /// Key type: `EC` or `RSA`.
     pub kty: String,
-    /// Curve, always `P-256` for this build.
-    pub crv: String,
-    /// Base64url-encoded X coordinate.
-    pub x: String,
-    /// Base64url-encoded Y coordinate.
-    pub y: String,
+    /// EC curve (`P-256` or `P-384`), absent for RSA keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crv: Option<String>,
+    /// Base64url-encoded EC X coordinate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x: Option<String>,
+    /// Base64url-encoded EC Y coordinate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y: Option<String>,
+    /// Base64url-encoded RSA modulus.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n: Option<String>,
+    /// Base64url-encoded RSA public exponent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub e: Option<String>,
 }
 
 impl Jwk {
     /// Build the JWK for an uncompressed P-256 public key (`0x04 || X || Y`).
     pub fn for_p256(public_key: &[u8]) -> Result<Self> {
-        if public_key.len() != 65 || public_key[0] != 0x04 {
+        Self::for_ec("P-256", public_key, 32)
+    }
+
+    /// Build the JWK for an uncompressed P-384 public key (`0x04 || X || Y`).
+    pub fn for_p384(public_key: &[u8]) -> Result<Self> {
+        Self::for_ec("P-384", public_key, 48)
+    }
+
+    fn for_ec(curve: &str, public_key: &[u8], coordinate_len: usize) -> Result<Self> {
+        let expected = 1 + coordinate_len * 2;
+        if public_key.len() != expected || public_key[0] != 0x04 {
             return Err(AcmeError::AccountKey(format!(
-                "P-256 public key must be 65 bytes in uncompressed form, got {} bytes",
+                "{curve} public key must be {expected} bytes in uncompressed form, got {} bytes",
                 public_key.len()
             ))
             .into());
         }
         Ok(Self {
             kty: "EC".to_string(),
-            crv: "P-256".to_string(),
-            x: URL_SAFE_NO_PAD.encode(&public_key[1..33]),
-            y: URL_SAFE_NO_PAD.encode(&public_key[33..65]),
+            crv: Some(curve.to_string()),
+            x: Some(URL_SAFE_NO_PAD.encode(&public_key[1..1 + coordinate_len])),
+            y: Some(URL_SAFE_NO_PAD.encode(&public_key[1 + coordinate_len..])),
+            n: None,
+            e: None,
+        })
+    }
+
+    /// Build the JWK for an RSA public key.
+    pub fn for_rsa(public_key: &rsa::RsaPublicKey) -> Result<Self> {
+        use rsa::traits::PublicKeyParts;
+        Ok(Self {
+            kty: "RSA".to_string(),
+            crv: None,
+            x: None,
+            y: None,
+            n: Some(URL_SAFE_NO_PAD.encode(public_key.n().to_bytes_be())),
+            e: Some(URL_SAFE_NO_PAD.encode(public_key.e().to_bytes_be())),
         })
     }
 
     /// The RFC 7638 SHA-256 thumbprint, base64url encoded.
     ///
-    /// The canonical form for an EC JWK is `{"crv":...,"kty":...,"x":...,"y":...}` with members
-    /// in lexicographic order and no whitespace.
+    /// The canonical form is the required members in lexicographic order with no whitespace:
+    /// `{"crv":...,"kty":"EC","x":...,"y":...}` or `{"e":...,"kty":"RSA","n":...}`.
     pub fn thumbprint(&self) -> Result<String> {
-        let canonical = format!(
-            "{{\"crv\":\"{}\",\"kty\":\"{}\",\"x\":\"{}\",\"y\":\"{}\"}}",
-            self.crv, self.kty, self.x, self.y
-        );
+        let canonical = match self.kty.as_str() {
+            "EC" => format!(
+                "{{\"crv\":\"{}\",\"kty\":\"{}\",\"x\":\"{}\",\"y\":\"{}\"}}",
+                self.crv.as_deref().unwrap_or_default(),
+                self.kty,
+                self.x.as_deref().unwrap_or_default(),
+                self.y.as_deref().unwrap_or_default()
+            ),
+            "RSA" => format!(
+                "{{\"e\":\"{}\",\"kty\":\"{}\",\"n\":\"{}\"}}",
+                self.e.as_deref().unwrap_or_default(),
+                self.kty,
+                self.n.as_deref().unwrap_or_default()
+            ),
+            other => {
+                return Err(
+                    AcmeError::AccountKey(format!("unsupported JWK key type `{other}`")).into(),
+                )
+            }
+        };
         let digest = ring::digest::digest(&ring::digest::SHA256, canonical.as_bytes());
         Ok(URL_SAFE_NO_PAD.encode(digest.as_ref()))
     }
@@ -772,7 +825,68 @@ impl Jwk {
     }
 }
 
+/// Account private-key algorithm/type supported by Caddy's certmagic.
+///
+/// Certmagic generates ECDSA P-256 keys by default but loads any ECDSA or RSA private key
+/// supplied through `account_key`, selecting the JWS algorithm from the key type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountKeyType {
+    /// ECDSA P-256 / ES256 (certmagic's generated default).
+    P256,
+    /// ECDSA P-384 / ES384.
+    P384,
+    /// RSA 2048-bit / RS256.
+    Rsa2048,
+    /// RSA 4096-bit / RS256.
+    Rsa4096,
+}
+
+impl AccountKeyType {
+    /// Parse a certmagic-style key type name (`p256`, `p384`, `rsa2048`, `rsa4096`).
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "p256" => Ok(Self::P256),
+            "p384" => Ok(Self::P384),
+            "rsa2048" => Ok(Self::Rsa2048),
+            "rsa4096" => Ok(Self::Rsa4096),
+            other => Err(AcmeError::AccountKey(format!(
+                "unsupported account key type `{other}`; expected p256, p384, rsa2048 or rsa4096"
+            ))
+            .into()),
+        }
+    }
+
+    /// Certmagic spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::P256 => "p256",
+            Self::P384 => "p384",
+            Self::Rsa2048 => "rsa2048",
+            Self::Rsa4096 => "rsa4096",
+        }
+    }
+
+    /// JWS signing algorithm used for this key type.
+    pub fn jws_algorithm(self) -> &'static str {
+        match self {
+            Self::P256 => "ES256",
+            Self::P384 => "ES384",
+            Self::Rsa2048 | Self::Rsa4096 => "RS256",
+        }
+    }
+
+    fn rsa_bits(self) -> Option<usize> {
+        match self {
+            Self::Rsa2048 => Some(2048),
+            Self::Rsa4096 => Some(4096),
+            Self::P256 | Self::P384 => None,
+        }
+    }
+}
+
 const PEM_LABEL: &str = "PRIVATE KEY";
+const PEM_LABEL_EC: &str = "EC PRIVATE KEY";
+const PEM_LABEL_RSA: &str = "RSA PRIVATE KEY";
 
 /// Encode DER bytes as a PEM block.
 fn pem_encode(label: &str, der: &[u8]) -> String {
@@ -782,7 +896,6 @@ fn pem_encode(label: &str, der: &[u8]) -> String {
     pem.push_str(label);
     pem.push_str("-----\n");
     for chunk in encoded.as_bytes().chunks(64) {
-        // `encoded` is ASCII base64, so the chunk is always valid UTF-8.
         pem.push_str(std::str::from_utf8(chunk).unwrap_or_default());
         pem.push('\n');
     }
@@ -842,79 +955,456 @@ fn pem_decode(pem: &str) -> Result<(String, Vec<u8>)> {
     Ok((label, der))
 }
 
-/// An ECDSA P-256 ACME account key.
+// ---- minimal DER helpers for EC SEC1 <-> PKCS#8 conversion ---------------------------------
+
+const OID_EC_PUBLIC_KEY: &[u64] = &[1, 2, 840, 10045, 2, 1];
+const OID_PRIME256V1: &[u64] = &[1, 2, 840, 10045, 3, 1, 7];
+const OID_SECP384R1: &[u64] = &[1, 3, 132, 0, 34];
+const OID_ED25519: &[u64] = &[1, 3, 101, 112];
+
+fn der_length(length: usize) -> Vec<u8> {
+    if length < 0x80 {
+        return vec![length as u8];
+    }
+    let mut bytes = length.to_be_bytes().to_vec();
+    while bytes.first() == Some(&0) {
+        bytes.remove(0);
+    }
+    let mut encoded = Vec::with_capacity(bytes.len() + 1);
+    encoded.push(0x80 | bytes.len() as u8);
+    encoded.extend(bytes);
+    encoded
+}
+
+fn der_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(content.len() + 4);
+    encoded.push(tag);
+    encoded.extend(der_length(content.len()));
+    encoded.extend_from_slice(content);
+    encoded
+}
+
+fn der_sequence(items: &[Vec<u8>]) -> Vec<u8> {
+    der_tlv(0x30, &items.concat())
+}
+
+fn der_oid(arcs: &[u64]) -> Vec<u8> {
+    let mut content = Vec::new();
+    if arcs.len() >= 2 {
+        content.push((arcs[0] * 40 + arcs[1]) as u8);
+        for arc in &arcs[2..] {
+            let mut value = *arc;
+            let mut stack = vec![(value & 0x7f) as u8];
+            value >>= 7;
+            while value > 0 {
+                stack.push(((value & 0x7f) as u8) | 0x80);
+                value >>= 7;
+            }
+            stack.reverse();
+            content.extend(stack);
+        }
+    }
+    der_tlv(0x06, &content)
+}
+
+fn der_integer(value: u64) -> Vec<u8> {
+    let bytes = value.to_be_bytes();
+    let first = bytes
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(bytes.len() - 1);
+    let mut content = bytes[first..].to_vec();
+    if content[0] & 0x80 != 0 {
+        content.insert(0, 0);
+    }
+    der_tlv(0x02, &content)
+}
+
+fn der_octet_string(content: &[u8]) -> Vec<u8> {
+    der_tlv(0x04, content)
+}
+
+fn der_bit_string(content: &[u8]) -> Vec<u8> {
+    let mut inner = Vec::with_capacity(content.len() + 1);
+    inner.push(0); // no unused bits
+    inner.extend_from_slice(content);
+    der_tlv(0x03, &inner)
+}
+
+/// One DER TLV: `(tag, content, total_encoded_len)`.
+fn read_tlv(input: &[u8]) -> Result<(u8, &[u8], usize)> {
+    let tag = *input
+        .first()
+        .ok_or_else(|| AcmeError::AccountKey("truncated DER key".to_string()))?;
+    let first = *input
+        .get(1)
+        .ok_or_else(|| AcmeError::AccountKey("truncated DER key length".to_string()))?;
+    let (length, header) = if first & 0x80 == 0 {
+        (first as usize, 2)
+    } else {
+        let count = (first & 0x7f) as usize;
+        if count == 0 || count > 4 || input.len() < 2 + count {
+            return Err(AcmeError::AccountKey("invalid DER key length".to_string()).into());
+        }
+        let mut length = 0usize;
+        for byte in &input[2..2 + count] {
+            length = (length << 8) | *byte as usize;
+        }
+        (length, 2 + count)
+    };
+    if input.len() < header + length {
+        return Err(AcmeError::AccountKey("truncated DER key content".to_string()).into());
+    }
+    Ok((tag, &input[header..header + length], header + length))
+}
+
+fn ec_curve_oid_from_der(der: &[u8]) -> Result<Option<&'static [u64]>> {
+    let (tag, body, _) = read_tlv(der)?;
+    if tag != 0x30 {
+        return Ok(None);
+    }
+    let mut offset = 0;
+    while offset < body.len() {
+        let (tag, content, consumed) = read_tlv(&body[offset..])?;
+        offset += consumed;
+        if tag == 0x30 {
+            // AlgorithmIdentifier SEQUENCE { OID, params }.
+            let (oid_tag, oid, _) = read_tlv(content)?;
+            if oid_tag == 0x06 && oid == &der_oid(OID_EC_PUBLIC_KEY)[2..] {
+                let (param_tag, params, _) = read_tlv(&content[oid.len() + 2..])?;
+                if param_tag == 0x06 {
+                    let prime256v1 = der_oid(OID_PRIME256V1);
+                    let secp384r1 = der_oid(OID_SECP384R1);
+                    if params == &prime256v1[2..] {
+                        return Ok(Some(OID_PRIME256V1));
+                    } else if params == &secp384r1[2..] {
+                        return Ok(Some(OID_SECP384R1));
+                    }
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Convert a SEC1 `ECPrivateKey` DER into PKCS#8 `PrivateKeyInfo` DER.
+fn ec_sec1_to_pkcs8(sec1: &[u8], curve_oid: &[u64]) -> Vec<u8> {
+    der_sequence(&[
+        der_integer(0),
+        der_sequence(&[der_oid(OID_EC_PUBLIC_KEY), der_oid(curve_oid)]),
+        der_octet_string(sec1),
+    ])
+}
+
+/// Encode a certmagic/Go-compatible SEC1 `ECPrivateKey` DER from a PKCS#8 key.
 ///
-/// Signing uses ES256 (ECDSA P-256 + SHA-256), the default account key type generated by Caddy's
-/// certmagic. Key material is kept in PKCS#8 PEM form so it can be persisted with
-/// [`AcmeStorage`].
+/// Go's `x509.MarshalECPrivateKey` writes the named-curve parameters and the public key in
+/// addition to the scalar; `certmagic.PEMEncodePrivateKey` stores that SEC1 encoding. The inner
+/// SEC1 embedded by ring may omit the parameters, so rebuild the structure explicitly.
+fn ec_pkcs8_to_sec1(pkcs8: &[u8], curve_oid: &[u64], public_key: &[u8]) -> Result<Vec<u8>> {
+    let (tag, body, _) = read_tlv(pkcs8)?;
+    if tag != 0x30 {
+        return Err(AcmeError::AccountKey("EC PKCS#8 key is not a SEQUENCE".to_string()).into());
+    }
+    let mut offset = 0;
+    // version
+    let (_, _, consumed) = read_tlv(body)?;
+    offset += consumed;
+    // algorithm identifier
+    let (_, _, consumed) = read_tlv(&body[offset..])?;
+    offset += consumed;
+    // privateKey OCTET STRING containing the SEC1 ECPrivateKey
+    let (tag, inner, _) = read_tlv(&body[offset..])?;
+    if tag != 0x04 {
+        return Err(AcmeError::AccountKey(
+            "EC PKCS#8 private key is not an OCTET STRING".to_string(),
+        )
+        .into());
+    }
+    let (inner_tag, inner_body, _) = read_tlv(inner)?;
+    if inner_tag != 0x30 {
+        return Err(AcmeError::AccountKey("ECPrivateKey is not a SEQUENCE".to_string()).into());
+    }
+    let mut inner_offset = 0;
+    let (_, _, consumed) = read_tlv(inner_body)?; // INTEGER 1
+    inner_offset += consumed;
+    let (scalar_tag, scalar, _) = read_tlv(&inner_body[inner_offset..])?;
+    if scalar_tag != 0x04 {
+        return Err(AcmeError::AccountKey(
+            "ECPrivateKey has no private key OCTET STRING".to_string(),
+        )
+        .into());
+    }
+    Ok(der_sequence(&[
+        der_integer(1),
+        der_octet_string(scalar),
+        der_tlv(0xA0, &der_oid(curve_oid)),
+        der_tlv(0xA1, &der_bit_string(public_key)),
+    ]))
+}
+
+fn ec_curve_oid_from_sec1(sec1: &[u8]) -> Result<&'static [u64]> {
+    let (tag, body, _) = read_tlv(sec1)?;
+    if tag != 0x30 {
+        return Err(AcmeError::AccountKey("EC PRIVATE KEY is not a SEQUENCE".to_string()).into());
+    }
+    let mut offset = 0;
+    let (_, _, consumed) = read_tlv(body)?; // version
+    offset += consumed;
+    let (tag, private_key, _) = read_tlv(&body[offset..])?;
+    if tag != 0x04 {
+        return Err(AcmeError::AccountKey(
+            "EC PRIVATE KEY has no private key OCTET STRING".to_string(),
+        )
+        .into());
+    }
+    // Fall back to the scalar length when parameters are absent.
+    match private_key.len() {
+        32 => Ok(OID_PRIME256V1),
+        48 => Ok(OID_SECP384R1),
+        other => Err(AcmeError::AccountKey(format!(
+            "unsupported EC private key length {other}; expected P-256 or P-384"
+        ))
+        .into()),
+    }
+}
+
+/// An ACME account key.
+///
+/// Certmagic generates an ECDSA P-256 key by default, but its `account_key` configuration can
+/// load ECDSA P-256/P-384 and RSA 2048/4096 keys; the JWS `alg` follows the key type (ES256,
+/// ES384 or RS256). Private keys are persisted using certmagic's PEM encodings: SEC1
+/// `EC PRIVATE KEY` for ECDSA and PKCS#1 `RSA PRIVATE KEY` for RSA.
 pub struct AccountKey {
+    key_type: AccountKeyType,
     pem: String,
     public_key: Vec<u8>,
-    key_pair: EcdsaKeyPair,
+    material: AccountKeyMaterial,
+}
+
+enum AccountKeyMaterial {
+    EcdsaP256(EcdsaKeyPair),
+    EcdsaP384(EcdsaKeyPair),
+    Rsa(rsa::RsaPrivateKey),
 }
 
 impl fmt::Debug for AccountKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("AccountKey")
-            .field("algorithm", &"ES256")
+            .field("algorithm", &self.jws_algorithm())
+            .field("key_type", &self.key_type.as_str())
             .field("public_key", &URL_SAFE_NO_PAD.encode(&self.public_key))
             .finish_non_exhaustive()
     }
 }
 
 impl AccountKey {
-    /// Generate a fresh ECDSA P-256 account key.
+    /// Generate a fresh ECDSA P-256 account key (certmagic's default).
     pub fn generate() -> Result<Self> {
-        let rng = SystemRandom::new();
-        let document = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
-            .map_err(|error| AcmeError::AccountKey(format!("generating P-256 key: {error}")))?;
-        Self::from_pkcs8(document.as_ref())
+        Self::generate_with_key_type(AccountKeyType::P256)
     }
 
-    /// Parse a PKCS#8 DER-encoded ECDSA P-256 account key.
-    pub fn from_pkcs8(der: &[u8]) -> Result<Self> {
+    /// Generate a fresh account key of the given type.
+    pub fn generate_with_key_type(key_type: AccountKeyType) -> Result<Self> {
         let rng = SystemRandom::new();
-        let key_pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, der, &rng)
-            .map_err(|error| {
-                AcmeError::AccountKey(format!(
-                    "only PKCS#8 ECDSA P-256 account keys are supported: {error}"
-                ))
-            })?;
+        match key_type {
+            AccountKeyType::P256 => {
+                let document = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
+                    .map_err(|error| {
+                        AcmeError::AccountKey(format!("generating P-256 key: {error}"))
+                    })?;
+                Self::from_ec_pkcs8(&document.as_ref().to_vec(), AccountKeyType::P256)
+            }
+            AccountKeyType::P384 => {
+                let document = EcdsaKeyPair::generate_pkcs8(&ECDSA_P384_SHA384_FIXED_SIGNING, &rng)
+                    .map_err(|error| {
+                        AcmeError::AccountKey(format!("generating P-384 key: {error}"))
+                    })?;
+                Self::from_ec_pkcs8(&document.as_ref().to_vec(), AccountKeyType::P384)
+            }
+            AccountKeyType::Rsa2048 | AccountKeyType::Rsa4096 => {
+                let bits = key_type.rsa_bits().unwrap_or(2048);
+                let private_key =
+                    rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, bits).map_err(|error| {
+                        AcmeError::AccountKey(format!("generating RSA-{bits} key: {error}"))
+                    })?;
+                Self::from_rsa(private_key)
+            }
+        }
+    }
+
+    fn from_ec_pkcs8(der: &[u8], key_type: AccountKeyType) -> Result<Self> {
+        let rng = SystemRandom::new();
+        let key_pair = match key_type {
+            AccountKeyType::P256 => {
+                EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, der, &rng).map_err(
+                    |error| {
+                        AcmeError::AccountKey(format!("invalid ECDSA P-256 account key: {error}"))
+                    },
+                )?
+            }
+            AccountKeyType::P384 => {
+                EcdsaKeyPair::from_pkcs8(&ECDSA_P384_SHA384_FIXED_SIGNING, der, &rng).map_err(
+                    |error| {
+                        AcmeError::AccountKey(format!("invalid ECDSA P-384 account key: {error}"))
+                    },
+                )?
+            }
+            AccountKeyType::Rsa2048 | AccountKeyType::Rsa4096 => {
+                return Err(AcmeError::AccountKey(
+                    "internal error: non-EC key passed to EC loader".to_string(),
+                )
+                .into())
+            }
+        };
         let public_key = key_pair.public_key().as_ref().to_vec();
-        let pem = pem_encode(PEM_LABEL, der);
+        let curve_oid = match key_type {
+            AccountKeyType::P256 => OID_PRIME256V1,
+            AccountKeyType::P384 => OID_SECP384R1,
+            _ => unreachable!(),
+        };
+        let sec1 = ec_pkcs8_to_sec1(der, curve_oid, &public_key)?;
+        let pem = pem_encode(PEM_LABEL_EC, &sec1);
         Ok(Self {
+            key_type,
             pem,
             public_key,
-            key_pair,
+            material: match key_type {
+                AccountKeyType::P256 => AccountKeyMaterial::EcdsaP256(key_pair),
+                AccountKeyType::P384 => AccountKeyMaterial::EcdsaP384(key_pair),
+                _ => unreachable!(),
+            },
         })
     }
 
-    /// Load an account key from PKCS#8 PEM (`-----BEGIN PRIVATE KEY-----`).
-    pub fn from_pkcs8_pem(pem: &str) -> Result<Self> {
-        let (label, der) = pem_decode(pem)?;
-        if label != PEM_LABEL {
-            return Err(AcmeError::AccountKey(format!(
-                "unsupported account key PEM label `{label}`; expected PKCS#8 `{PEM_LABEL}` with an ECDSA P-256 key"
-            ))
-            .into());
-        }
-        Self::from_pkcs8(&der)
+    fn from_rsa(private_key: rsa::RsaPrivateKey) -> Result<Self> {
+        use rsa::pkcs1::{EncodeRsaPrivateKey, EncodeRsaPublicKey};
+        use rsa::traits::PublicKeyParts;
+        let bits = private_key.n().bits();
+        let key_type = match bits {
+            2048 => AccountKeyType::Rsa2048,
+            4096 => AccountKeyType::Rsa4096,
+            other => {
+                return Err(AcmeError::AccountKey(format!(
+                    "unsupported RSA account key size {other} bits; expected 2048 or 4096"
+                ))
+                .into())
+            }
+        };
+        let public_key = private_key
+            .to_public_key()
+            .to_pkcs1_der()
+            .map_err(|error| AcmeError::AccountKey(format!("encoding RSA public key: {error}")))?;
+        let pem = private_key
+            .to_pkcs1_pem(rsa::pkcs1::LineEnding::LF)
+            .map_err(|error| AcmeError::AccountKey(format!("encoding RSA key PEM: {error}")))?;
+        Ok(Self {
+            key_type,
+            pem: pem.to_string(),
+            public_key: public_key.as_bytes().to_vec(),
+            material: AccountKeyMaterial::Rsa(private_key),
+        })
     }
 
-    /// The account key in PKCS#8 PEM form.
+    /// Load an account key from a certmagic-compatible PEM: SEC1 `EC PRIVATE KEY`, PKCS#1
+    /// `RSA PRIVATE KEY`, or PKCS#8 `PRIVATE KEY` containing either key type.
+    pub fn from_pem(pem: &str) -> Result<Self> {
+        let (label, der) = pem_decode(pem)?;
+        match label.as_str() {
+            PEM_LABEL_EC => {
+                let curve = ec_curve_oid_from_sec1(&der)?;
+                let key_type = if curve == OID_PRIME256V1 {
+                    AccountKeyType::P256
+                } else {
+                    AccountKeyType::P384
+                };
+                let pkcs8 = ec_sec1_to_pkcs8(&der, curve);
+                Self::from_ec_pkcs8(&pkcs8, key_type)
+            }
+            PEM_LABEL_RSA => {
+                use rsa::pkcs1::DecodeRsaPrivateKey;
+                let private_key = rsa::RsaPrivateKey::from_pkcs1_der(&der).map_err(|error| {
+                    AcmeError::AccountKey(format!("invalid PKCS#1 RSA account key: {error}"))
+                })?;
+                Self::from_rsa(private_key)
+            }
+            PEM_LABEL => {
+                // PKCS#8 may contain EC or RSA; detect the algorithm OID.
+                if let Some(curve) = ec_curve_oid_from_der(&der)? {
+                    let key_type = if curve == OID_PRIME256V1 {
+                        AccountKeyType::P256
+                    } else {
+                        AccountKeyType::P384
+                    };
+                    Self::from_ec_pkcs8(&der, key_type)
+                } else if {
+                    let ed25519_oid = der_oid(OID_ED25519);
+                    der.windows(ed25519_oid.len())
+                        .any(|window| window == ed25519_oid)
+                } {
+                    return Err(AcmeError::AccountKey(
+                        "Ed25519 account keys are not supported; expected ECDSA P-256/P-384 or RSA 2048/4096"
+                            .to_string(),
+                    )
+                    .into());
+                } else {
+                    use rsa::pkcs8::DecodePrivateKey;
+                    let private_key =
+                        rsa::RsaPrivateKey::from_pkcs8_der(&der).map_err(|error| {
+                            AcmeError::AccountKey(format!(
+                                "invalid PKCS#8 account key (neither EC nor RSA): {error}"
+                            ))
+                        })?;
+                    Self::from_rsa(private_key)
+                }
+            }
+            other => Err(AcmeError::AccountKey(format!(
+                "unsupported account key PEM label `{other}`; expected EC PRIVATE KEY, \
+                 RSA PRIVATE KEY or PRIVATE KEY"
+            ))
+            .into()),
+        }
+    }
+
+    /// Backwards-compatible alias for [`Self::from_pem`].
+    pub fn from_pkcs8_pem(pem: &str) -> Result<Self> {
+        Self::from_pem(pem)
+    }
+
+    /// The account key in certmagic's PEM form (SEC1 for EC, PKCS#1 for RSA).
+    pub fn to_pem(&self) -> &str {
+        &self.pem
+    }
+
+    /// Backwards-compatible alias for [`Self::to_pem`]; the returned PEM matches what
+    /// certmagic writes (SEC1/PKCS#1), not necessarily PKCS#8.
     pub fn to_pkcs8_pem(&self) -> &str {
         &self.pem
     }
 
-    /// The uncompressed P-256 public key bytes (`0x04 || X || Y`).
+    /// The key type.
+    pub fn key_type(&self) -> AccountKeyType {
+        self.key_type
+    }
+
+    /// The JWS algorithm (`ES256`, `ES384`, `RS256`).
+    pub fn jws_algorithm(&self) -> &'static str {
+        self.key_type.jws_algorithm()
+    }
+
+    /// Raw public key bytes: uncompressed EC point for EC keys, PKCS#1 RSA public key for RSA.
     pub fn public_key_bytes(&self) -> &[u8] {
         &self.public_key
     }
 
     /// The public JWK for this account key.
     pub fn public_jwk(&self) -> Result<Jwk> {
-        Jwk::for_p256(&self.public_key)
+        match &self.material {
+            AccountKeyMaterial::EcdsaP256(_) => Jwk::for_p256(&self.public_key),
+            AccountKeyMaterial::EcdsaP384(_) => Jwk::for_p384(&self.public_key),
+            AccountKeyMaterial::Rsa(private_key) => Jwk::for_rsa(&private_key.to_public_key()),
+        }
     }
 
     /// The RFC 7638 SHA-256 thumbprint, base64url encoded.
@@ -922,31 +1412,99 @@ impl AccountKey {
         self.public_jwk()?.thumbprint()
     }
 
+    /// Sign `message` with the key's JWS algorithm, returning the raw JWS signature bytes.
+    pub fn sign(&self, message: &[u8]) -> Result<Vec<u8>> {
+        match &self.material {
+            AccountKeyMaterial::EcdsaP256(key_pair) => {
+                let rng = SystemRandom::new();
+                let signature = key_pair.sign(&rng, message).map_err(|error| {
+                    AcmeError::Signing(format!("ES256 signing failed: {error}"))
+                })?;
+                let bytes = signature.as_ref();
+                if bytes.len() != 64 {
+                    return Err(AcmeError::Signing(format!(
+                        "ES256 signature must be 64 bytes, got {}",
+                        bytes.len()
+                    ))
+                    .into());
+                }
+                Ok(bytes.to_vec())
+            }
+            AccountKeyMaterial::EcdsaP384(key_pair) => {
+                let rng = SystemRandom::new();
+                let signature = key_pair.sign(&rng, message).map_err(|error| {
+                    AcmeError::Signing(format!("ES384 signing failed: {error}"))
+                })?;
+                let bytes = signature.as_ref();
+                if bytes.len() != 96 {
+                    return Err(AcmeError::Signing(format!(
+                        "ES384 signature must be 96 bytes, got {}",
+                        bytes.len()
+                    ))
+                    .into());
+                }
+                Ok(bytes.to_vec())
+            }
+            AccountKeyMaterial::Rsa(private_key) => {
+                use rsa::pkcs1v15::SigningKey;
+                use rsa::signature::{SignatureEncoding, Signer};
+                let signing_key = SigningKey::<sha2::Sha256>::new(private_key.clone());
+                Ok(signing_key.sign(message).to_vec())
+            }
+        }
+    }
+
     /// Sign `message` with ES256, returning the 64-byte `r || s` signature.
+    ///
+    /// Only valid for P-256 keys; other key types use [`Self::sign`].
     pub fn sign_es256(&self, message: &[u8]) -> Result<[u8; 64]> {
-        let rng = SystemRandom::new();
-        let signature = self
-            .key_pair
-            .sign(&rng, message)
-            .map_err(|error| AcmeError::Signing(format!("ES256 signing failed: {error}")))?;
-        let bytes = signature.as_ref();
-        if bytes.len() != 64 {
+        let signature = self.sign(message)?;
+        if signature.len() != 64 {
             return Err(AcmeError::Signing(format!(
                 "ES256 signature must be 64 bytes, got {}",
-                bytes.len()
+                signature.len()
             ))
             .into());
         }
         let mut fixed = [0_u8; 64];
-        fixed.copy_from_slice(bytes);
+        fixed.copy_from_slice(&signature);
         Ok(fixed)
     }
 
     /// Verify an ES256 signature with this key's public half (used by tests and diagnostics).
     pub fn verify_es256(&self, message: &[u8], signature: &[u8]) -> bool {
+        if self.key_type != AccountKeyType::P256 {
+            return false;
+        }
         UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, &self.public_key)
             .verify(message, signature)
             .is_ok()
+    }
+
+    /// Verify a signature produced by [`Self::sign`] (used by tests and diagnostics).
+    pub fn verify(&self, message: &[u8], signature: &[u8]) -> bool {
+        match &self.material {
+            AccountKeyMaterial::EcdsaP256(_) => {
+                UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, &self.public_key)
+                    .verify(message, signature)
+                    .is_ok()
+            }
+            AccountKeyMaterial::EcdsaP384(_) => {
+                UnparsedPublicKey::new(&ECDSA_P384_SHA384_FIXED, &self.public_key)
+                    .verify(message, signature)
+                    .is_ok()
+            }
+            AccountKeyMaterial::Rsa(private_key) => {
+                use rsa::pkcs1v15::VerifyingKey;
+                use rsa::signature::Verifier;
+                let public_key = private_key.to_public_key();
+                let verifying_key = VerifyingKey::<sha2::Sha256>::new(public_key);
+                match rsa::pkcs1v15::Signature::try_from(signature) {
+                    Ok(signature) => verifying_key.verify(message, &signature).is_ok(),
+                    Err(_) => false,
+                }
+            }
+        }
     }
 }
 
@@ -965,7 +1523,8 @@ struct JwsHeader<'a> {
 /// Sign an ACME request payload as a flattened JWS (RFC 7515 §7.2.2).
 ///
 /// Exactly one of `kid` (existing account) or the account key's `jwk` (new account) is placed in
-/// the protected header. Returns the JSON body to POST as `application/jose+json`.
+/// the protected header. The `alg` header follows the loaded account key type (ES256, ES384 or
+/// RS256). Returns the JSON body to POST as `application/jose+json`.
 pub fn sign_jws(
     key: &AccountKey,
     kid: Option<&str>,
@@ -974,7 +1533,7 @@ pub fn sign_jws(
     payload: &[u8],
 ) -> Result<String> {
     let header = JwsHeader {
-        alg: "ES256",
+        alg: key.jws_algorithm(),
         kid,
         jwk: if kid.is_none() {
             Some(key.public_jwk()?)
@@ -993,7 +1552,7 @@ pub fn sign_jws(
         );
     let encoded_payload = URL_SAFE_NO_PAD.encode(payload);
     let signing_input = format!("{protected}.{encoded_payload}");
-    let signature = key.sign_es256(signing_input.as_bytes())?;
+    let signature = key.sign(signing_input.as_bytes())?;
     let body = serde_json::json!({
         "protected": protected,
         "payload": encoded_payload,
@@ -1929,13 +2488,14 @@ mod tests {
     // ---- account keys ---------------------------------------------------------------------
 
     #[test]
-    fn account_key_generates_and_round_trips_pkcs8_pem() {
+    fn account_key_generates_and_round_trips_certmagic_pem() {
         let key = AccountKey::generate().unwrap();
-        let pem = key.to_pkcs8_pem();
-        assert!(pem.starts_with("-----BEGIN PRIVATE KEY-----\n"), "{pem}");
-        assert!(pem.contains("-----END PRIVATE KEY-----\n"), "{pem}");
+        let pem = key.to_pem();
+        // Certmagic's PEMEncodePrivateKey writes SEC1 `EC PRIVATE KEY` for ECDSA keys.
+        assert!(pem.starts_with("-----BEGIN EC PRIVATE KEY-----\n"), "{pem}");
+        assert!(pem.contains("-----END EC PRIVATE KEY-----\n"), "{pem}");
 
-        let reloaded = AccountKey::from_pkcs8_pem(pem).unwrap();
+        let reloaded = AccountKey::from_pem(pem).unwrap();
         assert_eq!(reloaded.public_key_bytes(), key.public_key_bytes());
         assert_eq!(reloaded.thumbprint().unwrap(), key.thumbprint().unwrap());
         assert_eq!(reloaded.public_jwk().unwrap(), key.public_jwk().unwrap());
@@ -1949,8 +2509,8 @@ mod tests {
 
     #[test]
     fn account_key_rejects_unsupported_pem_labels() {
-        let error = AccountKey::from_pkcs8_pem(
-            "-----BEGIN EC PRIVATE KEY-----\nAA==\n-----END EC PRIVATE KEY-----\n",
+        let error = AccountKey::from_pem(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nAA==\n-----END OPENSSH PRIVATE KEY-----\n",
         )
         .unwrap_err();
         assert!(
@@ -1959,7 +2519,52 @@ mod tests {
                 .contains("unsupported account key PEM label"),
             "{error}"
         );
-        assert!(error.to_string().contains("EC PRIVATE KEY"), "{error}");
+        assert!(error.to_string().contains("OPENSSH PRIVATE KEY"), "{error}");
+    }
+
+    #[test]
+    fn account_key_rejects_ed25519_pkcs8_with_a_located_error() {
+        use ring::signature::Ed25519KeyPair;
+        let rng = SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let pem = pem_encode("PRIVATE KEY", pkcs8.as_ref());
+        let error = AccountKey::from_pem(&pem).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Ed25519 account keys are not supported"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn account_key_rejects_rsa_sizes_outside_the_allowlist() {
+        use rsa::pkcs1::EncodeRsaPrivateKey;
+        let private_key = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 1024).unwrap();
+        let pem = private_key
+            .to_pkcs1_pem(rsa::pkcs1::LineEnding::LF)
+            .unwrap();
+        let error = AccountKey::from_pem(&pem).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported RSA account key size 1024"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn account_key_type_parse_rejects_unknown_types() {
+        for good in ["p256", "P384", "rsa2048", "rsa4096"] {
+            assert!(AccountKeyType::parse(good).is_ok(), "{good}");
+        }
+        let error = AccountKeyType::parse("ed25519").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported account key type `ed25519`"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1970,7 +2575,8 @@ mod tests {
         // Recompute over the canonical member order required by RFC 7638.
         let canonical = format!(
             "{{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"{}\",\"y\":\"{}\"}}",
-            jwk.x, jwk.y
+            jwk.x.as_deref().unwrap_or_default(),
+            jwk.y.as_deref().unwrap_or_default()
         );
         let expected = URL_SAFE_NO_PAD.encode(ring::digest::digest(
             &ring::digest::SHA256,
@@ -2001,6 +2607,230 @@ mod tests {
             default_paths.account_key,
             "acme/acme-v02.api.letsencrypt.org-directory/users/default/account.key"
         );
+    }
+
+    #[test]
+    fn account_keys_support_certmagic_key_types_and_pem_encodings() {
+        for (key_type, label, algorithm, kty, crv) in [
+            (
+                AccountKeyType::P256,
+                "EC PRIVATE KEY",
+                "ES256",
+                "EC",
+                Some("P-256"),
+            ),
+            (
+                AccountKeyType::P384,
+                "EC PRIVATE KEY",
+                "ES384",
+                "EC",
+                Some("P-384"),
+            ),
+            (
+                AccountKeyType::Rsa2048,
+                "RSA PRIVATE KEY",
+                "RS256",
+                "RSA",
+                None,
+            ),
+        ] {
+            let key = AccountKey::generate_with_key_type(key_type).unwrap();
+            assert_eq!(key.key_type(), key_type);
+            assert_eq!(key.jws_algorithm(), algorithm);
+            let pem = key.to_pem();
+            assert!(
+                pem.starts_with(&format!("-----BEGIN {label}-----\n")),
+                "{key_type:?}: {pem}"
+            );
+            // Certmagic/Go SEC1 EC keys include the named-curve parameters and public key.
+            if algorithm != "RS256" {
+                let (label, der) = pem_decode(pem).unwrap();
+                assert_eq!(label, "EC PRIVATE KEY");
+                let curve_oid = match key_type {
+                    AccountKeyType::P256 => der_oid(OID_PRIME256V1),
+                    AccountKeyType::P384 => der_oid(OID_SECP384R1),
+                    _ => unreachable!(),
+                };
+                assert!(
+                    der.windows(curve_oid.len())
+                        .any(|window| window == curve_oid),
+                    "{key_type:?}: SEC1 parameters missing"
+                );
+                let (_, body, _) = read_tlv(&der).unwrap();
+                let mut offset = 0;
+                let mut tags = Vec::new();
+                while offset < body.len() {
+                    let (tag, _, consumed) = read_tlv(&body[offset..]).unwrap();
+                    tags.push(tag);
+                    offset += consumed;
+                }
+                assert_eq!(tags, vec![0x02, 0x04, 0xA0, 0xA1], "{key_type:?}");
+            }
+            let reloaded = AccountKey::from_pem(pem).unwrap();
+            assert_eq!(reloaded.key_type(), key_type);
+            assert_eq!(reloaded.thumbprint().unwrap(), key.thumbprint().unwrap());
+
+            let jwk = key.public_jwk().unwrap();
+            assert_eq!(jwk.kty, kty);
+            assert_eq!(jwk.crv.as_deref(), crv);
+            let message = b"acme-jws-signing-input";
+            let signature = key.sign(message).unwrap();
+            assert!(key.verify(message, &signature), "{key_type:?}");
+            assert!(reloaded.verify(message, &signature), "{key_type:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_transport_accepts_es384_and_rs256_account_keys() {
+        for (key_type, algorithm, kty) in [
+            (AccountKeyType::P384, "ES384", "EC"),
+            (AccountKeyType::Rsa2048, "RS256", "RSA"),
+        ] {
+            let mock = Arc::new(MockTransport::new(vec![
+                (HttpMethod::Get, DIRECTORY_URL, directory_response()),
+                (
+                    HttpMethod::Head,
+                    "https://acme.test/acme/new-nonce",
+                    HttpResponse::new(200).with_header("Replay-Nonce", "nonce-1"),
+                ),
+                (
+                    HttpMethod::Post,
+                    NEW_ACCOUNT_URL,
+                    account_created_response(),
+                ),
+            ]));
+            let key = AccountKey::generate_with_key_type(key_type).unwrap();
+            let client = AcmeClient::connect(mock.clone(), DIRECTORY_URL, key)
+                .await
+                .unwrap();
+            let store = AccountStore::new(
+                MemoryAcmeStorage::new(),
+                Some("ops@example.com".to_string()),
+            );
+            let account = store
+                .register_account(&client, &AccountRegistration::for_email("ops@example.com"))
+                .await
+                .unwrap();
+            assert_eq!(account.account_url, "https://acme.test/acme/account/42");
+            assert_eq!(
+                account.key_thumbprint,
+                client.account_key().thumbprint().unwrap()
+            );
+
+            let requests = mock.records();
+            let post = requests.last().expect("newAccount request");
+            let (header, _payload, signature) = decoded_jws(&post.body);
+            assert_eq!(header["alg"], algorithm);
+            assert_eq!(header["jwk"]["kty"], kty);
+            assert_eq!(
+                header["jwk"],
+                serde_json::to_value(client.account_key().public_jwk().unwrap()).unwrap()
+            );
+            let signing_input = {
+                let jws: serde_json::Value = serde_json::from_slice(&post.body).unwrap();
+                format!(
+                    "{}.{}",
+                    jws["protected"].as_str().unwrap(),
+                    jws["payload"].as_str().unwrap()
+                )
+            };
+            assert!(client
+                .account_key()
+                .verify(signing_input.as_bytes(), &signature));
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_p384_and_rsa_account_keys_take_precedence() {
+        for key_type in [AccountKeyType::P384, AccountKeyType::Rsa2048] {
+            let configured = AccountKey::generate_with_key_type(key_type).unwrap();
+            let store = AccountStore::new(MemoryAcmeStorage::new(), None);
+            let (resolved, created) = store
+                .account_key(DIRECTORY_URL, Some(configured.to_pem()))
+                .await
+                .unwrap();
+            assert!(!created);
+            assert_eq!(resolved.jws_algorithm(), configured.jws_algorithm());
+            assert_eq!(
+                resolved.thumbprint().unwrap(),
+                configured.thumbprint().unwrap()
+            );
+            assert!(store
+                .storage()
+                .load(&store.paths(DIRECTORY_URL).unwrap().account_key)
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    // RSA-4096 generation costs minutes on loaded hosts; load a pre-generated certmagic-style
+    // PKCS#1/PKCS#8 key to exercise the RSA-4096 load/sign path without slowing the suite.
+    const RSA_4096_ACCOUNT_KEY_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
+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
+EVdZ8IcAQzAPk1jBxj0YDC0rR5d09Q==
+-----END PRIVATE KEY-----
+"#;
+
+    #[test]
+    fn account_key_rsa4096_fixture_loads_and_signs() {
+        let key = AccountKey::from_pem(RSA_4096_ACCOUNT_KEY_PEM).unwrap();
+        assert_eq!(key.key_type(), AccountKeyType::Rsa4096);
+        assert_eq!(key.jws_algorithm(), "RS256");
+        let reloaded = AccountKey::from_pem(key.to_pem()).unwrap();
+        assert_eq!(reloaded.public_jwk().unwrap(), key.public_jwk().unwrap());
+        let message = b"rsa-4096-jws-signing-input";
+        let signature = key.sign(message).unwrap();
+        assert!(key.verify(message, &signature));
+        assert!(reloaded.verify(message, &signature));
     }
 
     #[tokio::test]
