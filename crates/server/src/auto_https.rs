@@ -36,6 +36,9 @@ pub(crate) struct RedirectPolicy {
     pub(crate) https_port: u16,
     /// HTTPS destination for hostless/catch-all redirects.
     pub(crate) redirect_all_port: u16,
+    /// Configured HTTP port (`apps.http.http_port`, default 80); a redirect destination on this
+    /// port never needs an explicit port (Caddy `makeRedirRoute`).
+    pub http_port: u16,
 }
 
 impl RedirectPolicy {
@@ -47,20 +50,32 @@ impl RedirectPolicy {
         self.hosts.iter().any(|candidate| candidate == &host)
     }
 
+    /// The `Location` for one redirect, following Caddy's `makeRedirRoute`.
+    ///
+    /// The destination port is omitted when it is the configured HTTP or HTTPS port (or 80/443):
+    /// a site that moved to `https_port 18443` redirects to `https://host/path`, not
+    /// `https://host:18443/path`, exactly like Caddy. Implicitly-HTTPS sites on a non-standard
+    /// port keep the explicit port because the destination is neither configured port.
     fn location(&self, host: &str, path_and_query: &str) -> String {
         let host = normalize_host(host);
-        let port = self.host_ports.get(&host).copied().unwrap_or_else(|| {
+        let destination = self.host_ports.get(&host).copied().unwrap_or_else(|| {
             if self.redirect_all {
                 self.redirect_all_port
             } else {
                 self.https_port
             }
         });
-        if port == 443 {
-            format!("https://{host}{path_and_query}")
-        } else {
-            format!("https://{host}:{port}{path_and_query}")
+        let mut location = format!("https://{host}");
+        if destination != self.http_port
+            && destination != self.https_port
+            && destination != 80
+            && destination != 443
+        {
+            location.push(':');
+            location.push_str(&destination.to_string());
         }
+        location.push_str(path_and_query);
+        location
     }
 }
 

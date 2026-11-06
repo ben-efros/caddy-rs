@@ -284,6 +284,15 @@ pub struct HttpApp {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shutdown_delay: Option<CaddyDuration>,
 
+    /// Experimental HTTP metrics configuration (`apps.http.metrics`).
+    ///
+    /// Caddy v2.11.7 gates the `caddy_http_*` metric families behind this object; caddy-rs records
+    /// them unconditionally but validates the shape so a configuration that Caddy accepts is not
+    /// rejected as an unknown app field, and so the unsupported behaviours (`per_host`, `otlp`) are
+    /// named loudly instead of silently ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<MetricsApp>,
+
     /// HTTP servers keyed by server name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub servers: BTreeMap<String, HttpServer>,
@@ -293,6 +302,47 @@ pub struct HttpApp {
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Caddy's experimental HTTP metrics configuration (`apps.http.metrics`).
+///
+/// Mirrors `modules/caddyhttp/metrics.go` `Metrics`: three omitempty booleans. Unknown fields are
+/// preserved so validation can reject them by name rather than dropping them.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MetricsApp {
+    /// Per-host metric labels (`per_host`). Requires host labelling, which caddy-rs does not
+    /// implement yet; validation rejects `true` loudly.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub per_host: bool,
+
+    /// Allow individual labels for catch-all hosts (`observe_catchall_hosts`); only meaningful with
+    /// `per_host`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub observe_catchall_hosts: bool,
+
+    /// Push metrics over OTLP in addition to scraping (`otlp`); not implemented.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub otlp: bool,
+
+    /// Unknown `apps.http.metrics` fields, preserved for a located validation error.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+impl MetricsApp {
+    /// Whether this object asks for behaviour caddy-rs cannot provide.
+    ///
+    /// Returns the offending field name and its tracking task, or `None` when the configuration is
+    /// representable (metrics are always recorded, so the plain object is a no-op).
+    pub fn unsupported_field(&self) -> Option<(&'static str, &'static str)> {
+        if self.otlp {
+            Some(("otlp", "T-ADMIN-031"))
+        } else if self.per_host {
+            Some(("per_host", "T-ADMIN-031"))
+        } else {
+            None
+        }
+    }
+}
+
 impl Default for HttpApp {
     fn default() -> Self {
         Self {
@@ -300,6 +350,7 @@ impl Default for HttpApp {
             https_port: None,
             grace_period: None,
             shutdown_delay: None,
+            metrics: None,
             servers: BTreeMap::new(),
             extra: BTreeMap::new(),
         }

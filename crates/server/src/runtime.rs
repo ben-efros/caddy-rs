@@ -161,6 +161,10 @@ struct AutomaticHttpsContext<'a> {
     serving: &'a Arc<crate::auto_https::AutomaticHttpsServing>,
     /// Listener ports the plan terminates TLS on (includes implicitly-HTTPS non-standard ports).
     tls_ports: &'a [u16],
+    /// Configured HTTP port. Caddy never terminates TLS on it, even when the server carries
+    /// explicit TLS connection policies (`modules/caddyhttp/app.go`:
+    /// `useTLS := len(TLSConnPolicies) > 0 && port != http_port`).
+    http_port: u16,
     /// Derived HTTP listener address from the plan, when the configuration needs one.
     http_listener: Option<String>,
     /// Whether this is the pre-provisioning build (allows a missing certificate resolver so the
@@ -517,6 +521,7 @@ impl ServerRuntime {
             tokens: &tls_alpn01_tokens,
             serving: &serving,
             tls_ports: &plan.tls_ports,
+            http_port: plan.http_port,
             http_listener: plan.http_listener(),
             bootstrap: false,
         };
@@ -1068,6 +1073,7 @@ impl ServerRuntime {
             host_ports: plan.redirect_ports.clone(),
             https_port: plan.https_port,
             redirect_all_port: plan.redirect_all_port,
+            http_port: plan.http_port,
         });
         Ok(Some(PendingAutomaticHttps {
             plan,
@@ -1099,6 +1105,7 @@ impl ServerRuntime {
             tokens: &pending.tls_alpn01_tokens,
             serving: &pending.serving,
             tls_ports: &pending.plan.tls_ports,
+            http_port: pending.plan.http_port,
             http_listener: pending.plan.http_listener(),
             bootstrap: true,
         };
@@ -1207,8 +1214,16 @@ impl ServerRuntime {
                 // port). Without a plan the historical rule applies.
                 let terminates_tls = match automatic {
                     Some(context) => {
-                        has_connection_policies
-                            || listen_port.is_some_and(|port| context.tls_ports.contains(&port))
+                        let wants_tls = has_connection_policies
+                            || listen_port.is_some_and(|port| context.tls_ports.contains(&port));
+                        // Caddy excludes the configured HTTP port from TLS even when the server
+                        // carries explicit TLS connection policies (`app.go`: `useTLS :=
+                        // len(TLSConnPolicies) > 0 && port != http_port`).
+                        // `:0` is an ephemeral listener, not the configured HTTP port: only a
+                        // concrete, configured HTTP port excludes TLS.
+                        let on_http_port =
+                            context.http_port != 0 && listen_port == Some(context.http_port);
+                        wants_tls && !on_http_port
                     }
                     None => listener_uses_tls(listen, https_port, has_connection_policies)?,
                 };

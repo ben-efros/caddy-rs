@@ -449,6 +449,27 @@ impl Validator<'_> {
             ));
         }
 
+        if let Some(metrics) = &http.metrics {
+            if !metrics.extra.is_empty() {
+                let fields: Vec<&str> = metrics.extra.keys().map(String::as_str).collect();
+                return Err(Error::invalid(
+                    "apps.http.metrics",
+                    format!(
+                        "unknown experimental metrics field(s): {} (Caddy v2.11.7 accepts \
+                         `per_host`, `observe_catchall_hosts` and `otlp`)",
+                        fields.join(", ")
+                    ),
+                ));
+            }
+            if let Some((field, tracking_id)) = metrics.unsupported_field() {
+                return Err(Error::unsupported(
+                    format!("apps.http.metrics.{field}"),
+                    "experimental HTTP metrics option",
+                    tracking_id,
+                ));
+            }
+        }
+
         let mut listeners: BTreeMap<&str, &str> = BTreeMap::new();
         for (server_name, server) in &http.servers {
             let server_path = format!("apps.http.servers.{server_name}");

@@ -161,3 +161,48 @@ fn machine_readable_codes_are_stable_and_distinct() {
         );
     }
 }
+
+#[test]
+fn experimental_metrics_config_is_accepted_and_unsupported_options_are_loud() {
+    // `apps.http.metrics` is Caddy's experimental opt-in for the `caddy_http_*` families. caddy-rs
+    // records those metrics unconditionally, so the plain object is representable and must not be
+    // rejected as an unknown HTTP-app field (the Caddyfile adapter emits it verbatim).
+    fn validate_app(
+        app: serde_json::Value,
+    ) -> caddy_rs_core::Result<caddy_rs_core::ValidationReport> {
+        let config =
+            Config::from_value(json!({"admin": {"disabled": true}, "apps": {"http": app}}))
+                .expect("config decodes");
+        caddy_rs_core::validate_config(&config, &ModuleRegistry::builtin())
+    }
+
+    validate_app(json!({"metrics": {}, "servers": {}})).expect("empty metrics object validates");
+    validate_app(json!({"metrics": {"observe_catchall_hosts": true}, "servers": {}}))
+        .expect("observe_catchall_hosts without per_host is Caddy's no-op");
+
+    // `per_host` and `otlp` need host labelling / OTLP export that caddy-rs does not have: loud,
+    // named, tracked instead of silently ignored.
+    for field in ["per_host", "otlp"] {
+        let error = validate_app(json!({"metrics": {field: true}, "servers": {}}))
+            .expect_err("unsupported metrics option must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains(field),
+            "error must name `{field}`: {message}"
+        );
+        assert!(
+            message.contains("T-ADMIN-031"),
+            "error must name the tracking task: {message}"
+        );
+        assert_eq!(error.code(), "config.unsupported");
+    }
+
+    let error = validate_app(json!({"metrics": {"per_hosts": true}, "servers": {}}))
+        .expect_err("unknown metrics field must be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("unknown experimental metrics field(s): per_hosts"),
+        "{error}"
+    );
+}
