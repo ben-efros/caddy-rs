@@ -909,10 +909,13 @@ async fn serve_one_request(
         return Ok(response);
     }
 
-    // Take the client-side upgrade future before the request is consumed. Only requests
-    // that actually negotiate an upgrade get one; the router decides whether to switch.
-    let on_upgrade = caddy_rs_http::requested_upgrade_type(request.headers())
-        .map(|_| hyper::upgrade::on(&mut request));
+    // Take the client-side upgrade future before the request is consumed. HTTP/1.1 upgrades use
+    // `Upgrade`/`Connection`; HTTP/2 extended CONNECT (RFC 8441) is a `CONNECT` stream whose
+    // duplex stream hyper fulfils through the same `OnUpgrade` mechanism after a 2xx response.
+    let wants_upgrade = caddy_rs_http::requested_upgrade_type(request.headers()).is_some()
+        || (request.version() == http::Version::HTTP_2
+            && request.method() == http::Method::CONNECT);
+    let on_upgrade = wants_upgrade.then(|| hyper::upgrade::on(&mut request));
     let served = serve_request_with_automatic_upgradable(
         &context.limits,
         router,
@@ -955,9 +958,16 @@ async fn serve_one_request(
             response,
             tunnel,
             on_upgrade,
+            extended_connect,
         } => {
-            let websocket = websocket_request
-                && caddy_rs_proxy::websocket::response_negotiated_websocket(response.headers());
+            // An h2 extended CONNECT is a WebSocket-over-HTTP/2 tunnel even though the original
+            // request has no `Upgrade` header: treat it as a WebSocket connection so the existing
+            // close-frame handshake applies to the h2 stream too.
+            let websocket = extended_connect
+                || (websocket_request
+                    && caddy_rs_proxy::websocket::response_negotiated_websocket(
+                        response.headers(),
+                    ));
             spawn_upgraded_tunnel(
                 on_upgrade,
                 tunnel,
@@ -1160,6 +1170,12 @@ fn configure_h2_raw_server(
         .initial_stream_window_size(GO_H2_DEFAULT_INITIAL_WINDOW_SIZE)
         .initial_connection_window_size(GO_H2_DEFAULT_INITIAL_WINDOW_SIZE)
         .max_header_list_size(max_header_list_size);
+    // RFC 8441 / Caddy v2.11.7 parity: Go's net/http HTTP/2 server leaves
+    // SETTINGS_ENABLE_CONNECT_PROTOCOL unadvertised unless the process runs with
+    // `GODEBUG=http2xconnect=1` (Go issue #71128), so caddy-rs mirrors that gate.
+    if crate::http::http2_extended_connect_enabled() {
+        builder.enable_connect_protocol();
+    }
 }
 
 /// The same tuning applied through hyper-util's auto-builder `Http2Builder` wrapper (used for
@@ -1181,6 +1197,11 @@ fn configure_h2_auto_server(
         .initial_stream_window_size(GO_H2_DEFAULT_INITIAL_WINDOW_SIZE)
         .initial_connection_window_size(GO_H2_DEFAULT_INITIAL_WINDOW_SIZE)
         .max_header_list_size(max_header_list_size);
+    // Same gate as the raw h2c-upgrade builder (Go issue #71128 / Caddy v2.11.7): only advertise
+    // HTTP/2 extended CONNECT when GODEBUG=http2xconnect=1 is set.
+    if crate::http::http2_extended_connect_enabled() {
+        builder.enable_connect_protocol();
+    }
 }
 
 /// Serve one connection with the server's limits and graceful-shutdown/idle handling.

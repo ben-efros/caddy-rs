@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+base64 = "0.22.1"
 bytes = { workspace = true }
 caddy-rs-admin = { workspace = true }
 caddy-rs-core = { workspace = true }
@@ -29,6 +30,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
+h2 = "0.4.19"
 caddy-rs-config = { workspace = true }
 base64 = "0.22.1"
 ring = "0.17.14"

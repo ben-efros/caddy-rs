@@ -349,7 +349,7 @@ async fn websocket_upgrade_passthrough_over_tls() {
 }
 
 #[tokio::test]
-async fn http2_extended_connect_is_rejected() {
+async fn plain_h2_connect_without_protocol_is_rejected() {
     use hyper_util::rt::{TokioExecutor, TokioIo};
 
     let (dial, _upstream_saw_eof) = spawn_upstream(false).await;
@@ -363,8 +363,8 @@ async fn http2_extended_connect_is_rejected() {
     tokio::spawn(async move {
         let _ = connection.await;
     });
-    // A CONNECT over HTTP/2 is the transport for WebSocket-over-HTTP/2 (RFC 8441); caddy-rs does
-    // not implement extended CONNECT and must reject it loudly instead of mis-serving it.
+    // A plain CONNECT over HTTP/2 (no RFC 8441 `:protocol`) is not WebSocket-over-HTTP/2 and stays
+    // loudly rejected; the websocket `:protocol` form is covered by `http2_extended_connect.rs`.
     let request = hyper::Request::builder()
         .method(hyper::Method::CONNECT)
         .uri(format!("http://{address}/ws"))
@@ -377,7 +377,7 @@ async fn http2_extended_connect_is_rejected() {
     assert_eq!(
         response.status(),
         http::StatusCode::NOT_IMPLEMENTED,
-        "HTTP/2 extended CONNECT must be rejected with 501"
+        "plain HTTP/2 CONNECT must be rejected with 501"
     );
     runtime.shutdown().await;
 }

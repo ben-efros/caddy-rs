@@ -187,6 +187,7 @@ dependencies = [
  "caddy-rs-http",
  "caddy-rs-proxy",
  "caddy-rs-tls",
+ "h2",
  "http",
  "http-body-util",
  "hyper",

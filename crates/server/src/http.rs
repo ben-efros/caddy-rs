@@ -37,6 +37,7 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use base64::Engine as _;
 use bytes::Bytes;
 use http::{Method, StatusCode, Version};
 use http_body_util::{BodyExt, LengthLimitError, Limited};
@@ -61,12 +62,16 @@ pub(crate) enum ServedResponse {
     Response(hyper::Response<Body>),
     /// A protocol switch: write `response`, then tunnel the client and `tunnel` together.
     Upgraded {
-        /// The `101 Switching Protocols` response to write to the client.
+        /// The response to write to the client: `101 Switching Protocols` for an HTTP/1.1
+        /// upgrade, or `200 OK` for an HTTP/2 extended CONNECT.
         response: hyper::Response<Body>,
         /// The upgraded upstream connection.
         tunnel: Tunnel,
         /// The pending client-side upgrade.
         on_upgrade: OnUpgrade,
+        /// Whether this is an HTTP/2 extended CONNECT (RFC 8441) tunnel rather than an HTTP/1.1
+        /// `101` upgrade.
+        extended_connect: bool,
     },
 }
 
@@ -184,16 +189,81 @@ pub(crate) async fn serve_request_with_automatic_upgradable(
             }
         }
     }
-    // HTTP/2 extended CONNECT (RFC 8441) is not implemented: hyper's auto connection does not
-    // expose it, so reject loudly rather than mis-serving a WebSocket-ish request as CONNECT.
+    // HTTP/2 extended CONNECT (RFC 8441): a CONNECT request with `:protocol: websocket` is routed
+    // to the normal reverse_proxy upgrade path exactly like an HTTP/1.1 `Upgrade: websocket`
+    // request (Caddy's reverse_proxy rewrites it the same way), and the h2 stream is tunnelled to
+    // the HTTP/1.1-upgraded upstream. Non-WebSocket/plain CONNECT remains loudly unsupported.
+    let mut extended_connect = false;
     if request.version() == Version::HTTP_2 && request.method() == Method::CONNECT {
-        tracing::debug!("rejecting HTTP/2 extended CONNECT: WebSocket over HTTP/2 is unsupported");
-        return ServedResponse::Response(status_response(
-            StatusCode::NOT_IMPLEMENTED,
-            "501 Not Implemented: HTTP/2 extended CONNECT (WebSocket over HTTP/2) is unsupported",
-        ));
+        match request.extensions().get::<hyper::ext::Protocol>() {
+            Some(protocol) if protocol.as_str() == "websocket" => {
+                if !http2_extended_connect_enabled() {
+                    // Caddy v2.11.7 parity: Go's net/http HTTP/2 server disables extended CONNECT
+                    // by default (Go issue #71128) and only enables it when the process runs with
+                    // `GODEBUG=http2xconnect=1`. caddy-rs mirrors that gate so a default server
+                    // does not advertise or accept RFC 8441 (see the SETTINGS tests).
+                    tracing::debug!(
+                        "rejecting HTTP/2 extended CONNECT: GODEBUG=http2xconnect=1 is not set"
+                    );
+                    return ServedResponse::Response(status_response(
+                        StatusCode::NOT_IMPLEMENTED,
+                        "501 Not Implemented: HTTP/2 extended CONNECT is disabled by default                          (Caddy/Go parity; set GODEBUG=http2xconnect=1 to enable it)",
+                    ));
+                }
+                extended_connect = true;
+            }
+            Some(protocol) => {
+                let protocol = protocol.as_str();
+                tracing::debug!(
+                    protocol,
+                    "rejecting unsupported HTTP/2 extended CONNECT protocol"
+                );
+                return ServedResponse::Response(status_response_owned(
+                    StatusCode::NOT_IMPLEMENTED,
+                    format!(
+                        "501 Not Implemented: unsupported HTTP/2 extended CONNECT `:protocol` \
+                         `{protocol}` (only `websocket` is supported)"
+                    ),
+                ));
+            }
+            None => {
+                tracing::debug!("rejecting HTTP/2 CONNECT without `:protocol`");
+                return ServedResponse::Response(status_response(
+                    StatusCode::NOT_IMPLEMENTED,
+                    "501 Not Implemented: HTTP/2 CONNECT without the RFC 8441 `:protocol` \
+                     pseudo-header",
+                ));
+            }
+        }
     }
-    let (parts, body) = request.into_parts();
+    let (mut parts, body) = request.into_parts();
+    if extended_connect {
+        // Caddy's prepareRequest equivalent: give the HTTP/1.1 upstream client a WebSocket upgrade
+        // request. The h2 request body is empty (bytes arrive on the upgraded stream after the 2xx
+        // response), so only the method and handshake headers change.
+        parts.method = Method::GET;
+        parts.headers.remove(":protocol");
+        parts.headers.insert(
+            http::header::CONNECTION,
+            http::HeaderValue::from_static("Upgrade"),
+        );
+        parts.headers.insert(
+            http::header::UPGRADE,
+            http::HeaderValue::from_static("websocket"),
+        );
+        // Caddy generates a fresh 16-byte `Sec-WebSocket-Key` for the HTTP/1.1 handshake.
+        parts.headers.insert(
+            "sec-websocket-key",
+            http::HeaderValue::from_str(&websocket_key())
+                .unwrap_or_else(|_| http::HeaderValue::from_static("dGhlIHNhbXBsZSBub25jZQ==")),
+        );
+        if let Some(authority) = parts.uri.authority() {
+            parts.headers.entry(http::header::HOST).or_insert_with(|| {
+                http::HeaderValue::from_str(authority.as_str())
+                    .unwrap_or_else(|_| http::HeaderValue::from_static("localhost"))
+            });
+        }
+    }
     let path = parts.uri.path().to_string();
     let limit = limits.max_request_body_size;
     // A declared body over the limit is rejected before any body bytes are read, for both the
@@ -304,6 +374,38 @@ pub(crate) async fn serve_request_with_automatic_upgradable(
                     "502 Bad Gateway: client connection cannot be upgraded",
                 ));
             };
+            // RFC 8441: the server answers the extended CONNECT with a 2xx response (no 101 and no
+            // WebSocket handshake headers); hyper then keeps the h2 stream open and fulfils
+            // `on_upgrade` with the duplex stream. Caddy does the same and deletes Upgrade,
+            // Connection and Sec-WebSocket-Accept from the response.
+            if extended_connect {
+                let mut builder = hyper::Response::builder().status(StatusCode::OK);
+                for (name, value) in &upgraded.headers {
+                    let name_str = name.as_str();
+                    if name_str.eq_ignore_ascii_case("connection")
+                        || name_str.eq_ignore_ascii_case("upgrade")
+                        || name_str.eq_ignore_ascii_case("sec-websocket-accept")
+                        || name_str.eq_ignore_ascii_case("sec-websocket-protocol")
+                        || name_str.eq_ignore_ascii_case("content-length")
+                    {
+                        continue;
+                    }
+                    builder = builder.header(name, value);
+                }
+                let response = builder.body(Body::empty()).unwrap_or_else(|error| {
+                    eprintln!("caddy-rs: cannot build extended CONNECT response: {error}");
+                    status_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "500 Internal Server Error",
+                    )
+                });
+                return ServedResponse::Upgraded {
+                    response,
+                    tunnel: upgraded.tunnel,
+                    on_upgrade,
+                    extended_connect: true,
+                };
+            }
             // A 101 response has no body; hyper completes the client handshake when the response
             // carries the upgrade headers and status.
             let mut builder = hyper::Response::builder().status(upgraded.status);
@@ -321,6 +423,7 @@ pub(crate) async fn serve_request_with_automatic_upgradable(
                 response,
                 tunnel: upgraded.tunnel,
                 on_upgrade,
+                extended_connect: false,
             }
         }
         Err(error) => {
@@ -423,6 +526,14 @@ pub fn to_hyper_streaming(response: StreamingResponse) -> hyper::Response<Body> 
     })
 }
 
+fn status_response_owned(status: StatusCode, body: String) -> hyper::Response<Body> {
+    hyper::Response::builder()
+        .status(status)
+        .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Body::from_bytes(Bytes::from(body)))
+        .expect("error response is valid")
+}
+
 fn status_response(status: StatusCode, body: &'static str) -> hyper::Response<Body> {
     hyper::Response::builder()
         .status(status)
@@ -462,4 +573,39 @@ mod tests {
         );
         assert_eq!(declared_content_length(&headers), None);
     }
+}
+
+/// Whether HTTP/2 extended CONNECT (RFC 8441) is enabled for this process.
+///
+/// Caddy v2.11.7 relies on Go's `net/http` HTTP/2 server, which (Go issue #71128) leaves
+/// `SETTINGS_ENABLE_CONNECT_PROTOCOL` unadvertised by default; operators must start the process
+/// with `GODEBUG=http2xconnect=1` to turn it on. caddy-rs mirrors that exact gate: without it a
+/// default server never advertises or accepts extended CONNECT.
+pub(crate) fn http2_extended_connect_enabled() -> bool {
+    std::env::var("GODEBUG")
+        .map(|value| value.contains("http2xconnect=1"))
+        .unwrap_or(false)
+}
+
+/// A fresh RFC 6455 `Sec-WebSocket-Key` for the HTTP/1.1 handshake to the upstream: base64 of 16
+/// pseudo-random bytes. The key only needs to be unique per handshake; it is mixed from the clock
+/// and a process counter because the server has no RNG dependency.
+fn websocket_key() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0x9E37_79B1_85EB_CA87);
+    let mut seed = COUNTER.fetch_add(0x9E37_79B1_85EB_CA87, Ordering::Relaxed)
+        ^ std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos() as u64)
+            .unwrap_or(0);
+    let mut key = [0_u8; 16];
+    for chunk in key.chunks_mut(8) {
+        seed = seed
+            .wrapping_add(0x9E37_79B1_85EB_CA87)
+            .rotate_left(17)
+            .wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        let value = seed ^ (seed >> 31);
+        chunk.copy_from_slice(&value.to_le_bytes()[..chunk.len()]);
+    }
+    base64::engine::general_purpose::STANDARD.encode(key)
 }
