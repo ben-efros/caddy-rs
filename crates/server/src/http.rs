@@ -324,11 +324,21 @@ pub(crate) async fn serve_request_with_automatic_upgradable(
             }
         }
         Err(error) => {
-            eprintln!("caddy-rs: handler error: {error}");
-            ServedResponse::Response(status_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "500 Internal Server Error",
-            ))
+            // Caddy writes the recommended HandlerError status (the error routes, when
+            // configured, already had their chance inside the router).
+            match error.handler_status() {
+                Some(status) => ServedResponse::Response(status_response(
+                    status,
+                    status.canonical_reason().unwrap_or("error"),
+                )),
+                None => {
+                    eprintln!("caddy-rs: handler error: {error}");
+                    ServedResponse::Response(status_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "500 Internal Server Error",
+                    ))
+                }
+            }
         }
     }
 }

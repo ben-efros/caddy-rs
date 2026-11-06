@@ -30,22 +30,31 @@
 //! * **rewrite**: changes the outbound method and URI (path/query) of the auth sub-request only.
 //!   Rewriting the method to GET/HEAD drops the forwarded request body, matching Caddy's
 //!   `prepareRequest` (the original request body stays available to later handlers).
-//! * **handle_response**: entries are matched against the upstream response status (a one-digit
-//!   value matches the whole class, e.g. `2` means 2xx). The first matching entry runs its routes
-//!   against a copy of the original request:
-//!   - `headers` request `add`/`set`/`delete` operations are applied (canonical header copy);
-//!   - `vars` without configuration is a no-op (it exists in the expansion only to keep the route
-//!     non-terminal);
-//!   - `static_response` may terminate with a synthetic response;
-//!   - if no route terminates, the modified request is returned so the handler chain **continues**
-//!     (this is what turns `forward_auth` into a gate rather than a full proxy).
-//!     When no `handle_response` entry matches (for example 401/403), the upstream response is
-//!     proxied to the client unchanged — that is how auth challenges reach the browser.
+//! * **handle_response**: entries are matched against Caddy's `ResponseMatcher`: the upstream
+//!   status (a one-digit value matches the whole class, e.g. `2` means 2xx) and/or response
+//!   headers (exact, presence and `*` wildcard values). The first matching entry either:
+//!   - overrides the upstream status (`status_code`, Caddy's `replace_status`) and finalizes the
+//!     upstream response, or
+//!   - runs its routes against a copy of the original request:
+//!     - `headers` request operations are applied (canonical header copy) and `headers` response
+//!       operations are staged onto the final response;
+//!     - `vars` without configuration is a no-op (it exists in the expansion only to keep the
+//!       route non-terminal); configured `vars` set request variables;
+//!     - `static_response` terminates with a synthetic response;
+//!     - `copy_response` finalizes the upstream response (body/headers, optional `status_code`);
+//!       this is the only action that needs the complete upstream body, so the handler buffers it
+//!       only when configured with `copy_response`;
+//!     - `copy_response_headers` copies selected (`include`) or all-but-selected (`exclude`)
+//!       upstream headers onto the response and continues;
+//!     - if no route terminates, the modified request is returned so the handler chain
+//!       **continues** (this is what turns `forward_auth` into a gate rather than a full proxy).
+//!   When no `handle_response` entry matches (for example 401/403), the upstream response is
+//!   proxied to the client unchanged — that is how auth challenges reach the browser.
 //!
 //! Security stance: only the canonical/back-compatible subset is executed. Any other
-//! `handle_response`/`rewrite` form that Caddy implements but this module does not (extra rewrite
-//! fields, response header matchers, `status_code` overrides, unknown route handlers or matchers)
-//! is rejected with a located [`caddy_rs_http::Error::NotImplemented`] at configuration load time.
+//! `handle_response`/`rewrite` form that Caddy implements but this module does not (arbitrary
+//! request matchers inside response routes, unknown route handlers, extra rewrite fields) is
+//! rejected with a located [`caddy_rs_http::Error::NotImplemented`] at configuration load time.
 //! A config is never accepted with a gate silently skipped.
 
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
@@ -208,8 +217,40 @@ pub enum HandleResponseResult {
     /// No route terminated the response: continue the handler chain with the (possibly modified)
     /// original request.
     Continue(Request),
-    /// A route produced a terminal response (for example `static_response`).
+    /// A route produced a terminal response (for example `static_response`, `copy_response`).
     Respond(Response),
+    /// A `status_code` override matched (Caddy's `replace_status`/`handle_response.status_code`):
+    /// the upstream response is finalized normally but with this status code.
+    UseUpstream { status: StatusCode },
+}
+
+/// One response header matcher from `handle_response.match.headers`.
+#[derive(Debug)]
+enum ResponseHeaderMatcher {
+    /// JSON `null`: the header must be absent.
+    Absent,
+    /// JSON `[]`: the header must be present.
+    Present,
+    /// Values with Caddy's wildcard semantics (`*`, `prefix*`, `*suffix`, `*substring*`, exact).
+    Values(Vec<String>),
+}
+
+/// Caddy request/response header matcher wildcard semantics: an exact value, `*` (presence),
+/// `prefix*`, `*suffix` or `*substring*`.
+fn header_wildcard_match(pattern: &str, value: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if let Some(suffix) = pattern.strip_prefix('*') {
+        if let Some(substring) = suffix.strip_suffix('*') {
+            return value.contains(substring);
+        }
+        return value.ends_with(suffix);
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return value.starts_with(prefix);
+    }
+    pattern == value
 }
 
 /// Parsed `reverse_proxy.handle_response` configuration.
@@ -223,6 +264,11 @@ struct ResponseHandler {
     /// `None` means the entry always matches; an empty list (JSON `[]`) matches nothing, matching
     /// Caddy's nil-vs-empty distinction.
     status_codes: Option<Vec<u16>>,
+    /// `match.headers`: each configured field must match (AND).
+    header_matchers: Vec<(HeaderName, ResponseHeaderMatcher)>,
+    /// `status_code`: when set, replaces the upstream status and finalizes the upstream response
+    /// (Caddy's `replace_status`). Placeholders are expanded with the request replacer.
+    status_override: Option<Template>,
     routes: Vec<ResponseRoute>,
 }
 
@@ -241,13 +287,25 @@ enum ResponseCondition {
 
 #[derive(Debug)]
 enum ResponseAction {
-    /// `vars` handler from the canonical expansion: a no-op that keeps the route non-terminal.
+    /// `vars` handler without configuration (canonical forward_auth expansion): a no-op.
     Noop,
+    /// `vars` handler with configuration: set request variables.
+    Vars(Vec<(String, String)>),
+    /// `headers.request` operations on the original request (canonical header copy).
     RequestHeaders(HeaderOps),
+    /// `headers.response` operations staged onto the final response.
+    ResponseHeaders(HeaderOps),
     StaticResponse {
         status: StatusCode,
         headers: Vec<(HeaderName, Template)>,
         body: Option<Template>,
+    },
+    /// `copy_response`: finalize the upstream response (optionally with a different status).
+    CopyResponse { status: Option<Template> },
+    /// `copy_response_headers`: copy selected upstream headers onto the response.
+    CopyResponseHeaders {
+        include: Vec<HeaderName>,
+        exclude: Vec<HeaderName>,
     },
 }
 
@@ -272,7 +330,23 @@ impl HandleResponse {
         !self.handlers.is_empty()
     }
 
+    /// Whether any configured `copy_response` action needs the complete upstream body buffered.
+    pub fn requires_upstream_body(&self) -> bool {
+        self.handlers.iter().any(|handler| {
+            handler.routes.iter().any(|route| {
+                route
+                    .actions
+                    .iter()
+                    .any(|action| matches!(action, ResponseAction::CopyResponse { .. }))
+            })
+        })
+    }
+
     /// Evaluate the response handlers against an upstream response.
+    ///
+    /// `upstream_body` is the buffered upstream body when available (needed by `copy_response`);
+    /// when absent, `copy_response` cannot finalize and answers 500 instead of silently dropping
+    /// the body.
     ///
     /// Returns the first matching handler's outcome, or `None` when no handler matches (the
     /// caller then proxies the upstream response to the client unchanged).
@@ -281,12 +355,37 @@ impl HandleResponse {
         request: &Request,
         status: StatusCode,
         upstream_headers: &HeaderMap,
+        upstream_body: Option<&bytes::Bytes>,
     ) -> Option<HandleResponseResult> {
         for handler in &self.handlers {
-            if !handler.matches(status) {
+            if !handler.matches(status, upstream_headers) {
                 continue;
             }
+            if let Some(template) = &handler.status_override {
+                let context = TemplateContext {
+                    request,
+                    response_status: Some(status),
+                    response_headers: Some(upstream_headers),
+                    vars: Some(&request.vars),
+                };
+                let expanded = template.expand(&context);
+                match expanded
+                    .trim()
+                    .parse::<u16>()
+                    .ok()
+                    .and_then(|code| StatusCode::from_u16(code).ok())
+                {
+                    Some(status) => return Some(HandleResponseResult::UseUpstream { status }),
+                    None => {
+                        return Some(HandleResponseResult::Respond(Response::text(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("invalid status code `{expanded}`"),
+                        )))
+                    }
+                }
+            }
             let mut request = request.clone();
+            let mut response_headers = HeaderMap::new();
             for route in &handler.routes {
                 if let Some(condition) = &route.condition {
                     if !condition.matches(upstream_headers) {
@@ -296,6 +395,12 @@ impl HandleResponse {
                 for action in &route.actions {
                     match action {
                         ResponseAction::Noop => {}
+                        ResponseAction::Vars(vars) => {
+                            for (name, value) in vars {
+                                let expanded = request.replace_all(value);
+                                request.vars.insert(name.clone(), expanded);
+                            }
+                        }
                         ResponseAction::RequestHeaders(ops) => {
                             // Snapshot first: templates read request headers while ops mutate them.
                             let snapshot = request.clone();
@@ -306,6 +411,74 @@ impl HandleResponse {
                                 vars: Some(&snapshot.vars),
                             };
                             ops.apply(&mut request.headers, &context);
+                        }
+                        ResponseAction::ResponseHeaders(ops) => {
+                            let context = TemplateContext {
+                                request: &request,
+                                response_status: Some(status),
+                                response_headers: Some(upstream_headers),
+                                vars: Some(&request.vars),
+                            };
+                            ops.apply(&mut response_headers, &context);
+                        }
+                        ResponseAction::CopyResponseHeaders { include, exclude } => {
+                            for (name, value) in upstream_headers {
+                                if !include.is_empty() && !include.contains(name) {
+                                    continue;
+                                }
+                                if exclude.contains(name) {
+                                    continue;
+                                }
+                                response_headers.append(name.clone(), value.clone());
+                            }
+                        }
+                        ResponseAction::CopyResponse {
+                            status: status_template,
+                        } => {
+                            let Some(upstream_body) = upstream_body else {
+                                return Some(HandleResponseResult::Respond(Response::text(
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    "copy_response requires the upstream body to be buffered",
+                                )));
+                            };
+                            let context = TemplateContext {
+                                request: &request,
+                                response_status: Some(status),
+                                response_headers: Some(upstream_headers),
+                                vars: Some(&request.vars),
+                            };
+                            let final_status = match status_template {
+                                None => status,
+                                Some(template) => {
+                                    let expanded = template.expand(&context);
+                                    match expanded
+                                        .trim()
+                                        .parse::<u16>()
+                                        .ok()
+                                        .and_then(|code| StatusCode::from_u16(code).ok())
+                                    {
+                                        Some(status) => status,
+                                        None => {
+                                            return Some(HandleResponseResult::Respond(
+                                                Response::text(
+                                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                                    format!("invalid status code `{expanded}`"),
+                                                ),
+                                            ))
+                                        }
+                                    }
+                                }
+                            };
+                            let mut response = Response {
+                                status: final_status,
+                                headers: std::mem::take(&mut response_headers),
+                                body: upstream_body.clone(),
+                            };
+                            // Caddy's finalizeResponse copies the upstream headers too.
+                            for (name, value) in upstream_headers {
+                                response.headers.append(name.clone(), value.clone());
+                            }
+                            return Some(HandleResponseResult::Respond(response));
                         }
                         ResponseAction::StaticResponse {
                             status: response_status,
@@ -320,7 +493,7 @@ impl HandleResponse {
                             };
                             let mut response = Response {
                                 status: *response_status,
-                                headers: HeaderMap::new(),
+                                headers: std::mem::take(&mut response_headers),
                                 body: expand_body(body.as_ref(), &context),
                             };
                             for (name, template) in headers {
@@ -347,6 +520,12 @@ impl HandleResponse {
                     }
                 }
             }
+            // No route terminated: continue the chain, preserving staged response headers.
+            for (name, value) in response_headers {
+                if let Some(name) = name {
+                    request.pending_response_headers.append(name, value);
+                }
+            }
             return Some(HandleResponseResult::Continue(request));
         }
         None
@@ -358,14 +537,31 @@ fn is_json_body(body: &[u8]) -> bool {
 }
 
 impl ResponseHandler {
-    fn matches(&self, status: StatusCode) -> bool {
-        match &self.status_codes {
+    fn matches(&self, status: StatusCode, upstream_headers: &HeaderMap) -> bool {
+        let status_matches = match &self.status_codes {
             None => true,
             Some(codes) => codes
                 .iter()
                 .copied()
                 .any(|configured| status_matches(status, configured)),
-        }
+        };
+        status_matches
+            && self
+                .header_matchers
+                .iter()
+                .all(|(name, matcher)| match matcher {
+                    ResponseHeaderMatcher::Absent => !upstream_headers.contains_key(name),
+                    ResponseHeaderMatcher::Present => upstream_headers.contains_key(name),
+                    ResponseHeaderMatcher::Values(patterns) => upstream_headers
+                        .get_all(name)
+                        .iter()
+                        .filter_map(|value| value.to_str().ok())
+                        .any(|value| {
+                            patterns
+                                .iter()
+                                .any(|pattern| header_wildcard_match(pattern, value))
+                        }),
+                })
     }
 }
 
@@ -388,12 +584,24 @@ fn parse_response_handler(value: &Value, path: &str) -> HttpResult<ResponseHandl
             "each `handle_response` entry must be a response-handler object",
         )
     })?;
-    if object.get("status_code").is_some() {
-        return Err(not_implemented(
-            "`handle_response.status_code` overrides (only status matching and routes are implemented)",
-        ));
-    }
+    let status_override = match object.get("status_code") {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(number)) => Some(Template::parse(
+            &number
+                .as_u64()
+                .ok_or_else(|| invalid(&format!("{path}.status_code"), "invalid status code"))?
+                .to_string(),
+        )),
+        Some(Value::String(text)) => Some(Template::parse(text)),
+        Some(_) => {
+            return Err(invalid(
+                &format!("{path}.status_code"),
+                "`status_code` must be an integer or string",
+            ))
+        }
+    };
 
+    let mut header_matchers = Vec::new();
     let status_codes = match object.get("match") {
         None | Some(Value::Null) => None,
         Some(match_value) => {
@@ -401,10 +609,55 @@ fn parse_response_handler(value: &Value, path: &str) -> HttpResult<ResponseHandl
                 .as_object()
                 .ok_or_else(|| invalid(&format!("{path}.match"), "`match` must be an object"))?;
             for field in matcher.keys() {
-                if field != "status_code" {
+                if field != "status_code" && field != "headers" {
                     return Err(not_implemented(
-                        "`handle_response.match` options other than `status_code`",
+                        "`handle_response.match` keys other than `status_code` and `headers`",
                     ));
+                }
+            }
+            if let Some(headers) = matcher.get("headers") {
+                let headers = headers.as_object().ok_or_else(|| {
+                    invalid(
+                        &format!("{path}.match.headers"),
+                        "`headers` must be an object",
+                    )
+                })?;
+                for (field, values) in headers {
+                    let name: HeaderName = field.parse().map_err(|error| {
+                        invalid(
+                            &format!("{path}.match.headers"),
+                            format!("invalid header name `{field}`: {error}"),
+                        )
+                    })?;
+                    let matcher = match values {
+                        Value::Null => ResponseHeaderMatcher::Absent,
+                        Value::Array(values) => {
+                            if values.is_empty() {
+                                ResponseHeaderMatcher::Present
+                            } else {
+                                ResponseHeaderMatcher::Values(
+                                    values
+                                        .iter()
+                                        .map(|value| {
+                                            value.as_str().map(str::to_string).ok_or_else(|| {
+                                                invalid(
+                                                    &format!("{path}.match.headers"),
+                                                    "header matcher values must be strings",
+                                                )
+                                            })
+                                        })
+                                        .collect::<HttpResult<Vec<_>>>()?,
+                                )
+                            }
+                        }
+                        _ => {
+                            return Err(invalid(
+                                &format!("{path}.match.headers"),
+                                "header matcher values must be an array or null",
+                            ))
+                        }
+                    };
+                    header_matchers.push((name, matcher));
                 }
             }
             match matcher.get("status_code") {
@@ -451,6 +704,8 @@ fn parse_response_handler(value: &Value, path: &str) -> HttpResult<ResponseHandl
     }
     Ok(ResponseHandler {
         status_codes,
+        header_matchers,
+        status_override,
         routes,
     })
 }
@@ -466,7 +721,7 @@ fn parse_response_route(value: &Value, path: &str) -> HttpResult<ResponseRoute> 
             .as_array()
             .ok_or_else(|| invalid(&format!("{path}.handle"), "`handle` must be an array"))?;
         for (index, handler) in handlers.iter().enumerate() {
-            actions.push(parse_route_action(
+            actions.extend(parse_route_action(
                 handler,
                 &format!("{path}.handle[{index}]"),
             )?);
@@ -563,7 +818,7 @@ fn parse_proxy_header_placeholder(text: &str) -> Option<HeaderName> {
     name.parse().ok()
 }
 
-fn parse_route_action(value: &Value, path: &str) -> HttpResult<ResponseAction> {
+fn parse_route_action(value: &Value, path: &str) -> HttpResult<Vec<ResponseAction>> {
     let object = value
         .as_object()
         .ok_or_else(|| invalid(path, "route handlers must be objects"))?;
@@ -573,28 +828,42 @@ fn parse_route_action(value: &Value, path: &str) -> HttpResult<ResponseAction> {
         .ok_or_else(|| invalid(path, "route handler object is missing `handler`"))?;
     match handler {
         "vars" => {
-            // The canonical expansion emits a no-op `vars` handler. Actual variable assignment is
-            // not needed for forward_auth, and silently accepting it would be wrong.
-            if object.keys().any(|key| key != "handler") {
-                return Err(not_implemented(
-                    "`vars` handlers inside `handle_response` need configuration",
-                ));
+            let mut vars = Vec::new();
+            for (name, value) in object {
+                if name == "handler" {
+                    continue;
+                }
+                let value = value.as_str().ok_or_else(|| {
+                    not_implemented("`vars` handler values other than strings inside `handle_response`")
+                })?;
+                vars.push((name.clone(), value.to_string()));
             }
-            Ok(ResponseAction::Noop)
+            if vars.is_empty() {
+                // The canonical forward-auth expansion emits a bare `vars` handler to keep the
+                // route non-terminal.
+                Ok(vec![ResponseAction::Noop])
+            } else {
+                Ok(vec![ResponseAction::Vars(vars)])
+            }
         }
         "headers" => {
-            if object.get("response").is_some() {
-                return Err(not_implemented(
-                    "`headers` response operations inside `handle_response`",
-                ));
-            }
-            match object.get("request") {
-                Some(request) => Ok(ResponseAction::RequestHeaders(HeaderOps::from_json(
+            let mut actions = Vec::new();
+            if let Some(request) = object.get("request") {
+                actions.push(ResponseAction::RequestHeaders(HeaderOps::from_json(
                     request,
                     &format!("{path}.request"),
-                )?)),
-                None => Ok(ResponseAction::Noop),
+                )?));
             }
+            if let Some(response) = object.get("response") {
+                actions.push(ResponseAction::ResponseHeaders(HeaderOps::from_json(
+                    response,
+                    &format!("{path}.response"),
+                )?));
+            }
+            if actions.is_empty() {
+                actions.push(ResponseAction::Noop);
+            }
+            Ok(actions)
         }
         "static_response" => {
             let status = match object.get("status_code") {
@@ -672,14 +941,75 @@ fn parse_route_action(value: &Value, path: &str) -> HttpResult<ResponseAction> {
                     }
                 }
             }
-            Ok(ResponseAction::StaticResponse {
+            Ok(vec![ResponseAction::StaticResponse {
                 status,
                 headers,
                 body,
-            })
+            }])
+        }
+        "copy_response" => {
+            let status = match object.get("status_code") {
+                None | Some(Value::Null) => None,
+                Some(Value::Number(number)) => Some(Template::parse(
+                    &number
+                        .as_u64()
+                        .ok_or_else(|| {
+                            invalid(&format!("{path}.status_code"), "invalid status code")
+                        })?
+                        .to_string(),
+                )),
+                Some(Value::String(text)) => Some(Template::parse(text)),
+                Some(_) => {
+                    return Err(invalid(
+                        &format!("{path}.status_code"),
+                        "`status_code` must be an integer or string",
+                    ))
+                }
+            };
+            Ok(vec![ResponseAction::CopyResponse { status }])
+        }
+        "copy_response_headers" => {
+            let mut include = Vec::new();
+            let mut exclude = Vec::new();
+            let parse_fields = |value: &Value| -> HttpResult<Vec<HeaderName>> {
+                let values = value.as_array().ok_or_else(|| {
+                    invalid(&format!("{path}"), "`include`/`exclude` must be arrays")
+                })?;
+                values
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .ok_or_else(|| {
+                                invalid(&format!("{path}"), "header names must be strings")
+                            })
+                            .and_then(|name| {
+                                name.parse::<HeaderName>().map_err(|error| {
+                                    invalid(
+                                        &format!("{path}"),
+                                        format!("invalid header name `{name}`: {error}"),
+                                    )
+                                })
+                            })
+                    })
+                    .collect()
+            };
+            if let Some(value) = object.get("include") {
+                include = parse_fields(value)?;
+            }
+            if let Some(value) = object.get("exclude") {
+                exclude = parse_fields(value)?;
+            }
+            if !include.is_empty() && !exclude.is_empty() {
+                return Err(invalid(
+                    path,
+                    "cannot define both `include` and `exclude` at the same time",
+                ));
+            }
+            Ok(vec![ResponseAction::CopyResponseHeaders { include, exclude }])
         }
         _other => Err(not_implemented(
-            "route handlers inside `handle_response` other than headers/vars/static_response",
+            "route handlers inside `handle_response` other than headers/vars/static_response/copy_response/copy_response_headers",
         )),
     }
 }
@@ -758,7 +1088,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("remote-user", HeaderValue::from_static("alice"));
         let result = handle
-            .evaluate(&request, StatusCode::OK, &headers)
+            .evaluate(&request, StatusCode::OK, &headers, None)
             .expect("2xx matches");
         let HandleResponseResult::Continue(request) = result else {
             panic!("canonical 2xx response must continue the chain");
@@ -776,7 +1106,7 @@ mod tests {
             .headers
             .insert("remote-user", HeaderValue::from_static("attacker"));
         let result = handle
-            .evaluate(&request, StatusCode::OK, &HeaderMap::new())
+            .evaluate(&request, StatusCode::OK, &HeaderMap::new(), None)
             .expect("2xx matches");
         let HandleResponseResult::Continue(request) = result else {
             panic!("2xx must continue");
@@ -798,7 +1128,7 @@ mod tests {
             StatusCode::NOT_FOUND,
         ] {
             assert!(handle
-                .evaluate(&request(Method::GET, "/"), status, &HeaderMap::new())
+                .evaluate(&request(Method::GET, "/"), status, &HeaderMap::new(), None)
                 .is_none());
         }
     }
@@ -815,7 +1145,8 @@ mod tests {
                 .evaluate(
                     &request(Method::GET, "/"),
                     StatusCode::OK,
-                    &HeaderMap::new()
+                    &HeaderMap::new(),
+                    None
                 )
                 .is_none(),
             "JSON [] produces a non-nil empty slice in Caddy, which matches nothing"
@@ -842,6 +1173,7 @@ mod tests {
             &request(Method::GET, "/"),
             StatusCode::UNAUTHORIZED,
             &headers,
+            None,
         ) else {
             panic!("static_response must terminate");
         };
@@ -854,13 +1186,74 @@ mod tests {
     }
 
     #[test]
+    fn response_header_matcher_and_status_override_are_supported() {
+        let handle = HandleResponse::from_json(
+            Some(&serde_json::json!([{
+                "match": {"status_code": [404], "headers": {"X-Reason": ["*"]}},
+                "status_code": 410
+            }])),
+            "handle_response",
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-reason", HeaderValue::from_static("gone"));
+        let result = handle
+            .evaluate(
+                &request(Method::GET, "/"),
+                StatusCode::NOT_FOUND,
+                &headers,
+                None,
+            )
+            .expect("404 matches");
+        let HandleResponseResult::UseUpstream { status } = result else {
+            panic!("status_code override must finalize the upstream response");
+        };
+        assert_eq!(status, StatusCode::GONE);
+        assert!(
+            handle
+                .evaluate(
+                    &request(Method::GET, "/"),
+                    StatusCode::NOT_FOUND,
+                    &HeaderMap::new(),
+                    None
+                )
+                .is_none(),
+            "headers matcher must not match when the header is absent"
+        );
+    }
+
+    #[test]
+    fn copy_response_uses_the_buffered_upstream_body() {
+        let handle = HandleResponse::from_json(
+            Some(&serde_json::json!([{
+                "match": {"status_code": [2]},
+                "routes": [{"handle": [{"handler": "copy_response", "status_code": 202}]}]
+            }])),
+            "handle_response",
+        )
+        .unwrap();
+        let body = bytes::Bytes::from_static(b"created");
+        let mut headers = HeaderMap::new();
+        headers.insert("x-made", HeaderValue::from_static("yes"));
+        let Some(HandleResponseResult::Respond(response)) = handle.evaluate(
+            &request(Method::GET, "/"),
+            StatusCode::CREATED,
+            &headers,
+            Some(&body),
+        ) else {
+            panic!("copy_response must terminate");
+        };
+        assert_eq!(response.status, StatusCode::ACCEPTED);
+        assert_eq!(response.body, body);
+        assert_eq!(response.headers["x-made"], "yes");
+    }
+
+    #[test]
     fn unsupported_response_handler_forms_fail_loudly() {
         for config in [
-            serde_json::json!([{"status_code": 200, "routes": []}]),
-            serde_json::json!([{"match": {"headers": {"X": ["1"]}}, "routes": []}]),
             serde_json::json!([{"routes": [{"match": [{"method": ["GET"]}], "handle": []}]}]),
             serde_json::json!([{"routes": [{"handle": [{"handler": "file_server"}]}]}]),
-            serde_json::json!([{"routes": [{"handle": [{"handler": "headers", "response": {"set": {"X": ["1"]}}}]}]}]),
+            serde_json::json!([{"match": {"protocol": "http/2"}, "routes": []}]),
         ] {
             let error = HandleResponse::from_json(Some(&config), "handle_response")
                 .expect_err("unsupported handle_response form must be rejected");
@@ -876,7 +1269,8 @@ mod tests {
             .evaluate(
                 &request(Method::GET, "/"),
                 StatusCode::OK,
-                &HeaderMap::new()
+                &HeaderMap::new(),
+                None
             )
             .is_none());
     }

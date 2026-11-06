@@ -606,6 +606,12 @@ pub const BUILTIN_MODULES: &[Module] = &[
         ModuleKind::HttpHandler,
         "Map a source value to destination placeholders",
     ),
+    Module::new(
+        "http.handlers.error",
+        "error",
+        ModuleKind::HttpHandler,
+        "Abort with a recommended status and message handled by the server's error routes",
+    ),
     // HTTP matchers
     Module::new(
         "http.matchers.host",
@@ -678,6 +684,12 @@ pub const BUILTIN_MODULES: &[Module] = &[
         "tls",
         ModuleKind::HttpMatcher,
         "Match TLS connections",
+    ),
+    Module::new(
+        "http.matchers.expression",
+        "expression",
+        ModuleKind::HttpMatcher,
+        "CEL expression matcher (implemented subset: integer comparisons used by handle_errors)",
     ),
     // Storage
     Module::new(

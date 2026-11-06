@@ -117,6 +117,7 @@ fn build_single_matcher(name: &str, value: &Value) -> Result<SharedMatcher> {
         "local_ip" => Ok(Arc::new(LocalIpMatcher::from_json(value, &path)?)),
         "protocol" => Ok(Arc::new(ProtocolMatcher::from_json(value, &path)?)),
         "tls" => Ok(Arc::new(TlsMatcher::from_json(value, &path)?)),
+        "expression" => Ok(Arc::new(ExpressionMatcher::from_json(value, &path)?)),
         other => Err(Error::InvalidConfig {
             path,
             message: format!("matcher `{other}` is not implemented by the HTTP engine"),
@@ -1165,6 +1166,173 @@ impl Matcher for TlsMatcher {
 
     fn describe(&self) -> String {
         "tls".to_string()
+    }
+}
+
+/// One comparison atom of a supported expression: `<left> <op> <right>` or `<left> in [list]`.
+#[derive(Debug, Clone)]
+enum ExpressionAtom {
+    Compare {
+        left: String,
+        op: &'static str,
+        right: String,
+    },
+    In {
+        left: String,
+        values: Vec<String>,
+    },
+}
+
+/// `http.matchers.expression`: a deliberately small subset of Caddy's CEL expression matcher.
+///
+/// Caddy's Caddyfile adapter emits expressions for `handle_errors <status...>` of the form
+/// `{http.error.status_code} in [404, 410]` or
+/// `{http.error.status_code} >= 400 && {http.error.status_code} <= 499`. Only integer
+/// comparisons/membership combined with `&&`/`||` (no parentheses, no functions, no string
+/// operations) are implemented; anything else is rejected loudly as not implemented instead of
+/// being silently treated as non-matching.
+pub struct ExpressionMatcher {
+    /// OR of clauses; each clause is an AND of atoms.
+    clauses: Vec<Vec<ExpressionAtom>>,
+    expression: String,
+}
+
+impl ExpressionMatcher {
+    fn from_json(value: &Value, path: &str) -> Result<Self> {
+        // Caddy v2.11.7 marshals the expression matcher as a bare JSON string
+        // (`"expression": "{http.error.status_code} in [404]"`); an object with `expr` is also
+        // accepted for older/adapted forms.
+        let expression = match value {
+            Value::String(expression) => expression.as_str(),
+            Value::Object(object) => {
+                object
+                    .get("expr")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Error::InvalidConfig {
+                        path: format!("{path}.expr"),
+                        message: "expression matcher requires a string `expr`".to_string(),
+                    })?
+            }
+            _ => {
+                return Err(Error::InvalidConfig {
+                    path: path.to_string(),
+                    message: "expression matcher must be a string expression".to_string(),
+                })
+            }
+        };
+        let clauses = parse_expression(expression).map_err(|_message| Error::NotImplemented {
+            feature: "expression matcher subset",
+            tracking_id: "T-ROUTE-012",
+        })?;
+        if clauses.is_empty() {
+            return Err(Error::InvalidConfig {
+                path: format!("{path}.expr"),
+                message: format!("empty expression `{expression}`"),
+            });
+        }
+        Ok(Self {
+            clauses,
+            expression: expression.to_string(),
+        })
+    }
+}
+
+fn parse_expression(expression: &str) -> std::result::Result<Vec<Vec<ExpressionAtom>>, String> {
+    let mut clauses = Vec::new();
+    for clause in expression.split("||") {
+        let mut atoms = Vec::new();
+        for atom in clause.split("&&") {
+            atoms.push(parse_expression_atom(atom.trim())?);
+        }
+        clauses.push(atoms);
+    }
+    Ok(clauses)
+}
+
+fn parse_expression_atom(atom: &str) -> std::result::Result<ExpressionAtom, String> {
+    if let Some((left, list)) = atom.split_once(" in ") {
+        let list = list.trim();
+        let inner = list
+            .strip_prefix('[')
+            .and_then(|list| list.strip_suffix(']'))
+            .ok_or_else(|| format!("unsupported expression atom `{atom}`: expected [a, b, ...]"))?;
+        let values = inner
+            .split(',')
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect();
+        return Ok(ExpressionAtom::In {
+            left: left.trim().to_string(),
+            values,
+        });
+    }
+    for op in ["==", "!=", ">=", "<=", ">", "<"] {
+        if let Some((left, right)) = atom.split_once(op) {
+            return Ok(ExpressionAtom::Compare {
+                left: left.trim().to_string(),
+                op: match op {
+                    "==" => "==",
+                    "!=" => "!=",
+                    ">=" => ">=",
+                    "<=" => "<=",
+                    ">" => ">",
+                    "<" => "<",
+                    _ => unreachable!("matched operator"),
+                },
+                right: right.trim().to_string(),
+            });
+        }
+    }
+    Err(format!(
+        "unsupported expression atom `{atom}` (only integer comparisons and `in [...]` are implemented)"
+    ))
+}
+
+impl Matcher for ExpressionMatcher {
+    fn matches(&self, request: &Request) -> bool {
+        self.clauses.iter().any(|clause| {
+            clause
+                .iter()
+                .all(|atom| expression_atom_matches(atom, request))
+        })
+    }
+
+    fn describe(&self) -> String {
+        format!("expression {}", self.expression)
+    }
+}
+
+fn expression_atom_matches(atom: &ExpressionAtom, request: &Request) -> bool {
+    let value = |token: &str| -> Option<i64> {
+        let expanded = request.replace_all(token);
+        expanded.trim().parse::<i64>().ok()
+    };
+    match atom {
+        ExpressionAtom::Compare { left, op, right } => {
+            let (Some(left), Some(right)) = (value(left), value(right)) else {
+                return false;
+            };
+            match *op {
+                "==" => left == right,
+                "!=" => left != right,
+                ">=" => left >= right,
+                "<=" => left <= right,
+                ">" => left > right,
+                "<" => left < right,
+                _ => false,
+            }
+        }
+        ExpressionAtom::In { left, values } => {
+            let Some(left) = value(left) else {
+                return false;
+            };
+            values.iter().any(|value| {
+                value
+                    .trim()
+                    .parse::<i64>()
+                    .is_ok_and(|candidate| candidate == left)
+            })
+        }
     }
 }
 

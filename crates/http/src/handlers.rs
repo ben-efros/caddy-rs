@@ -215,6 +215,91 @@ impl Handler for StaticResponseHandler {
     }
 }
 
+/// Caddy's `error` handler (`http.handlers.error`, Caddyfile `error` directive).
+///
+/// The handler never writes a response: it returns a [`Error::Handler`] carrying the recommended
+/// status and the expanded message, which the server's error routes (`handle_errors`) or its
+/// fallback response handle. Mirrors `modules/caddyhttp/staticerror.go`.
+pub struct ErrorHandler {
+    /// `status_code`: a fixed status or a placeholder-bearing string expanded at request time.
+    status: Option<ErrorStatus>,
+    /// `error` message template (placeholders expanded with `ReplaceKnown` semantics).
+    message: String,
+}
+
+enum ErrorStatus {
+    Fixed(StatusCode),
+    Template(String),
+}
+
+impl ErrorHandler {
+    /// Build from Caddy JSON (`{"handler":"error","error":"...","status_code":404}`).
+    pub fn from_json(value: &serde_json::Value, path: &str) -> Result<Self> {
+        let object = value
+            .as_object()
+            .ok_or_else(|| invalid(path, "error handler must be an object"))?;
+        let status = match object.get("status_code") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::Number(number)) => {
+                let code = number
+                    .as_u64()
+                    .and_then(|code| u16::try_from(code).ok())
+                    .and_then(|code| StatusCode::from_u16(code).ok())
+                    .ok_or_else(|| invalid(path, "`status_code` is not a valid HTTP status"))?;
+                Some(ErrorStatus::Fixed(code))
+            }
+            Some(serde_json::Value::String(text)) => match text.parse::<u16>() {
+                Ok(code) => StatusCode::from_u16(code)
+                    .map(|code| Some(ErrorStatus::Fixed(code)))
+                    .map_err(|_| invalid(path, "`status_code` is not a valid HTTP status"))?,
+                // Caddy's WeakString allows placeholders; they are expanded per request.
+                Err(_) => Some(ErrorStatus::Template(text.clone())),
+            },
+            Some(_) => return Err(invalid(path, "`status_code` must be a number or string")),
+        };
+        let message = object
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        Ok(Self { status, message })
+    }
+}
+
+#[async_trait]
+impl Handler for ErrorHandler {
+    fn name(&self) -> &'static str {
+        "error"
+    }
+
+    async fn handle(&self, request: Request) -> Result<Outcome> {
+        // Caddy: `ReplaceKnown(e.Error, "")` for the message and `ReplaceAll` for the status; an
+        // empty/unparseable status falls back to 500 with an error message.
+        let message = request.placeholders().replace_known_with(&self.message, "");
+        let status = match &self.status {
+            None => StatusCode::INTERNAL_SERVER_ERROR,
+            Some(ErrorStatus::Fixed(status)) => *status,
+            Some(ErrorStatus::Template(template)) => {
+                let expanded = request.replace_all(template);
+                match expanded
+                    .parse::<u16>()
+                    .ok()
+                    .and_then(|code| StatusCode::from_u16(code).ok())
+                {
+                    Some(status) => status,
+                    None => {
+                        return Err(Error::handler(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("invalid status code `{expanded}`"),
+                        ))
+                    }
+                }
+            }
+        };
+        Err(Error::handler(status, message))
+    }
+}
+
 /// `headers`: stage response header mutations (and apply request header mutations).
 pub struct HeadersHandler {
     request_set: Vec<(String, Vec<String>)>,

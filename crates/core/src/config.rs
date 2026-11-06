@@ -333,6 +333,12 @@ pub struct HttpServer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_connection_policies: Option<Vec<Value>>,
 
+    /// Error handling routes (`handle_errors`): evaluated after a handler fails or produces an
+    /// error status. Absent means Caddy's nil error config (no error routes); a present object
+    /// with an empty `routes` array still enables error-route handling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub errors: Option<HttpErrorConfig>,
+
     /// `strict_sni_host` may be a bool or an object in Caddy; preserved opaquely.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strict_sni_host: Option<Value>,
@@ -362,6 +368,18 @@ pub struct HttpServer {
     pub listener_wrappers: Vec<ListenerWrapperConfig>,
 
     /// Unknown server fields, preserved.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+/// One server's error handling configuration (`apps.http.servers.*.errors`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct HttpErrorConfig {
+    /// Routes evaluated after the primary handler chain returns an error.
+    #[serde(default)]
+    pub routes: Vec<Route>,
+
+    /// Unknown error-config fields, preserved.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
 }

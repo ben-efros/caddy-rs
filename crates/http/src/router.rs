@@ -14,7 +14,7 @@ use crate::auth::{BasicAuthHandler, ForwardAuthHandler};
 use crate::body::StreamingResponse;
 use crate::file_server::FileServerHandler;
 use crate::handlers::{
-    EncodeHandler, HeadersHandler, MapHandler, RequestBodyHandler, RewriteHandler,
+    EncodeHandler, ErrorHandler, HeadersHandler, MapHandler, RequestBodyHandler, RewriteHandler,
     StaticResponseHandler, SubrouteHandler, VarsHandler,
 };
 use crate::matchers::build_matcher_set;
@@ -150,6 +150,10 @@ fn body_limit_response(request: &Request) -> StreamingOutcome {
 /// An ordered route list.
 pub struct Router {
     routes: Vec<Route>,
+    /// Server error routes (`apps.http.servers.*.errors.routes`), evaluated when a handler fails
+    /// or produces an error status. `None` means no error routes are configured, which is
+    /// different from an empty route list (Caddy's nil-vs-empty distinction).
+    error_routes: Option<Vec<Route>>,
     requires_buffered_request_body: bool,
     consumes_request_body: bool,
 }
@@ -240,9 +244,25 @@ impl Router {
     /// contract Caddy's `RouteList.Compile(next)` implements, and it is what lets a `subroute`
     /// with no routes behave as a no-op that passes control on.
     pub async fn handle_streaming_outcome(&self, request: Request) -> Result<StreamingOutcome> {
+        self.evaluate_routes(&self.routes, request, None).await
+    }
+
+    /// Evaluate one route list.
+    ///
+    /// `error_status` is `None` for the normal request chain and `Some(status)` while running the
+    /// server error routes (Caddy's `errorHandlerChain`): in error mode a terminal route or an
+    /// unhandled fall-through produces Caddy's `errorEmptyHandler` response (the original error
+    /// status with an empty body) instead of the normal 200 empty response, and no nested error
+    /// routing happens.
+    async fn evaluate_routes(
+        &self,
+        routes: &[Route],
+        request: Request,
+        error_status: Option<http::StatusCode>,
+    ) -> Result<StreamingOutcome> {
         let mut matched_groups: HashSet<&str> = HashSet::new();
         let mut current = request;
-        for route in &self.routes {
+        for route in routes {
             if let Some(group) = &route.group {
                 if matched_groups.contains(group.as_str()) {
                     continue;
@@ -250,8 +270,15 @@ impl Router {
             }
             let matched = route.matches(&mut current);
             // A matcher can record an error (the `file` matcher's `=NNN` fallback); Caddy aborts
-            // route evaluation and responds with that status.
+            // route evaluation and responds with that status. Error routes do not re-enter.
             if let Some(error) = current.take_matcher_error() {
+                if error_status.is_none() && self.error_routes.is_some() {
+                    return Box::pin(self.run_error_routes(
+                        current.clone(),
+                        Error::handler(error.status, error.message),
+                    ))
+                    .await;
+                }
                 return Ok(matcher_error_response(error, &current));
             }
             if !matched {
@@ -293,27 +320,120 @@ impl Router {
                     }
                 }
                 // A handler consumes the request. Keep the pre-handler request so staged response
-                // headers survive into a response produced by a later handler.
+                // headers survive into a response produced by a later handler, and so error routes
+                // see the request state from before the failing handler (Caddy restores the
+                // original request's method/URI/remote address before running error routes).
                 let staged = current.clone();
-                match handler.handle_streaming(current).await? {
-                    StreamingOutcome::Continue(next) => current = next,
-                    StreamingOutcome::Respond(mut response) => {
+                match handler.handle_streaming(current).await {
+                    Ok(StreamingOutcome::Continue(next)) => current = next,
+                    Ok(StreamingOutcome::Respond(mut response)) => {
+                        // Caddy's error routes only run for handler *errors*; caddy-rs additionally
+                        // routes responses with an error status through them when configured so
+                        // that upstream error statuses (502/503/504 from `reverse_proxy`) reach
+                        // `handle_errors` like Caddy's HandlerError does.
+                        if error_status.is_none()
+                            && self.error_routes.is_some()
+                            && response.status.as_u16() >= 400
+                        {
+                            let message = response
+                                .status
+                                .canonical_reason()
+                                .unwrap_or("error")
+                                .to_string();
+                            return self
+                                .run_error_routes(staged, Error::handler(response.status, message))
+                                .await;
+                        }
                         apply_pending_headers(&mut response.headers, &staged);
                         return Ok(StreamingOutcome::Respond(response));
                     }
-                    StreamingOutcome::Upgrade(mut response) => {
+                    Ok(StreamingOutcome::Upgrade(mut response)) => {
                         apply_pending_headers(&mut response.headers, &staged);
                         return Ok(StreamingOutcome::Upgrade(response));
+                    }
+                    Err(error) => {
+                        if error_status.is_none() && self.error_routes.is_some() {
+                            return Box::pin(self.run_error_routes(staged, error)).await;
+                        }
+                        return Err(error);
                     }
                 }
             }
             if route.terminal {
-                let mut response = StreamingResponse::from_buffered(Response::ok());
+                let status = error_status.unwrap_or(http::StatusCode::OK);
+                let mut response = StreamingResponse::from_buffered(Response {
+                    status,
+                    headers: http::HeaderMap::new(),
+                    body: bytes::Bytes::new(),
+                });
                 apply_pending_headers(&mut response.headers, &current);
                 return Ok(StreamingOutcome::Respond(response));
             }
         }
+        if let Some(status) = error_status {
+            // Caddy's `errorEmptyHandler`: the error chain did not produce a response, so answer
+            // with the original error status and an empty body.
+            let mut response = StreamingResponse::from_buffered(Response {
+                status,
+                headers: http::HeaderMap::new(),
+                body: bytes::Bytes::new(),
+            });
+            apply_pending_headers(&mut response.headers, &current);
+            return Ok(StreamingOutcome::Respond(response));
+        }
         Ok(StreamingOutcome::Continue(current))
+    }
+
+    /// Run the server's `handle_errors` routes for `error` (Caddy's `errorHandlerChain`).
+    ///
+    /// Sets Caddy's error placeholders on the request before evaluating the error routes. A second
+    /// failure inside the error chain falls back to the original error status with an empty body
+    /// (Caddy logs "error handling handler error" and writes the original status).
+    async fn run_error_routes(
+        &self,
+        mut request: Request,
+        error: Error,
+    ) -> Result<StreamingOutcome> {
+        let Some(error_routes) = &self.error_routes else {
+            return Err(error);
+        };
+        let status = error
+            .handler_status()
+            .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
+        let message = error.handler_message();
+        let status_text = status.canonical_reason().unwrap_or("").to_string();
+        request
+            .vars
+            .insert("http.error".to_string(), message.clone());
+        request.vars.insert(
+            "http.error.status_code".to_string(),
+            status.as_u16().to_string(),
+        );
+        request
+            .vars
+            .insert("http.error.status_text".to_string(), status_text);
+        request
+            .vars
+            .insert("http.error.message".to_string(), message);
+        // Caddy sets these only for HandlerError values; caddy-rs has no handler-trace metadata.
+        request
+            .vars
+            .insert("http.error.trace".to_string(), String::new());
+        request
+            .vars
+            .insert("http.error.id".to_string(), String::new());
+        // Error routes receive the pre-failure request but must not inherit a lazy body limit or a
+        // stale matcher error from the failed chain.
+        match Box::pin(self.evaluate_routes(error_routes, request, Some(status))).await {
+            Ok(outcome) => Ok(outcome),
+            Err(_second_error) => Ok(StreamingOutcome::Respond(StreamingResponse::from_buffered(
+                Response {
+                    status,
+                    headers: http::HeaderMap::new(),
+                    body: bytes::Bytes::new(),
+                },
+            ))),
+        }
     }
 
     /// Buffered counterpart of [`Router::handle_streaming_outcome`].
@@ -342,6 +462,7 @@ fn apply_pending_headers(headers: &mut http::HeaderMap, request: &Request) {
 /// Builds routers from Caddy JSON route arrays.
 pub struct RouterBuilder {
     custom: Option<CustomHandlerFactory>,
+    error_routes: Option<Vec<Value>>,
 }
 
 impl Default for RouterBuilder {
@@ -353,7 +474,37 @@ impl Default for RouterBuilder {
 impl RouterBuilder {
     /// A builder with no custom handlers.
     pub fn new() -> Self {
-        Self { custom: None }
+        Self {
+            custom: None,
+            error_routes: None,
+        }
+    }
+
+    /// Configure the server's error routes (`apps.http.servers.*.errors`, Caddy's
+    /// `handle_errors`). `None` disables error-route handling; a present object with an empty
+    /// `routes` array still routes errors through the (empty) error chain, matching Caddy's
+    /// nil-vs-empty distinction.
+    pub fn with_error_routes(mut self, errors: Option<&Value>, path: &str) -> Result<Self> {
+        let Some(errors) = errors else {
+            self.error_routes = None;
+            return Ok(self);
+        };
+        let object = errors.as_object().ok_or_else(|| Error::InvalidConfig {
+            path: path.to_string(),
+            message: "`errors` must be an object with a `routes` array".to_string(),
+        })?;
+        let routes: Vec<Value> = match object.get("routes") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(routes)) => routes.clone(),
+            Some(_) => {
+                return Err(Error::InvalidConfig {
+                    path: format!("{path}.routes"),
+                    message: "`errors.routes` must be an array of routes".to_string(),
+                })
+            }
+        };
+        self.error_routes = Some(routes);
+        Ok(self)
     }
 
     /// Register a factory for handler modules owned by another crate.
@@ -363,8 +514,26 @@ impl RouterBuilder {
     }
 
     /// Build a router from a `routes` array.
+    ///
+    /// Error routes are attached to this top-level router only: nested `subroute` routers must not
+    /// inherit them (Caddy's error handler chain is server-level), and re-attaching them to every
+    /// nested router would recurse forever because error routes themselves contain subroutes.
     pub fn build(&self, routes: &[Value]) -> Result<Router> {
         let routes = self.build_routes(routes, "routes")?;
+        let error_routes = match &self.error_routes {
+            Some(error_routes) => Some(self.build_routes(error_routes, "errors.routes")?),
+            None => None,
+        };
+        Ok(self.router_from(routes, error_routes))
+    }
+
+    /// Build a nested router (`subroute`) without server-level error routes.
+    fn build_nested(&self, routes: &[Value], path: &str) -> Result<Router> {
+        let routes = self.build_routes(routes, path)?;
+        Ok(self.router_from(routes, None))
+    }
+
+    fn router_from(&self, routes: Vec<Route>, error_routes: Option<Vec<Route>>) -> Router {
         // Capability composition: each built handler reports whether it needs a buffered body and
         // whether it reads the body at all. Subroute handlers forward their inner router's flags,
         // so nesting works without re-scanning raw JSON (and a custom handler factory's handler is
@@ -372,11 +541,12 @@ impl RouterBuilder {
         let requires_buffered_request_body =
             routes.iter().any(Route::requires_buffered_request_body);
         let consumes_request_body = routes.iter().any(Route::consumes_request_body);
-        Ok(Router {
+        Router {
             routes,
+            error_routes,
             requires_buffered_request_body,
             consumes_request_body,
-        })
+        }
     }
 
     fn build_routes(&self, routes: &[Value], path: &str) -> Result<Vec<Route>> {
@@ -454,6 +624,7 @@ impl RouterBuilder {
             })?;
         let handler: SharedHandler = match name {
             "static_response" => Arc::new(StaticResponseHandler::from_json(value, path)?),
+            "error" => Arc::new(ErrorHandler::from_json(value, path)?),
             "headers" => Arc::new(HeadersHandler::from_json(value, path)?),
             "vars" => Arc::new(VarsHandler::from_json(value, path)?),
             "rewrite" => Arc::new(RewriteHandler::from_json(value, path)?),
@@ -478,7 +649,7 @@ impl RouterBuilder {
                         })
                     }
                 };
-                let inner = self.build(routes)?;
+                let inner = self.build_nested(routes, &format!("{path}.routes"))?;
                 Arc::new(SubrouteHandler::new(inner))
             }
             other => {
@@ -1178,6 +1349,7 @@ mod tests {
             .iter()
             .any(|handler| handler.consumes_request_body());
         Router {
+            error_routes: None,
             requires_buffered_request_body,
             consumes_request_body,
             routes: vec![Route {

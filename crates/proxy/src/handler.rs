@@ -1189,6 +1189,7 @@ impl Handler for ReverseProxyHandler {
                             &request,
                             response.status,
                             &response.headers,
+                            Some(&response.body),
                         ) {
                             return Ok(match result {
                                 HandleResponseResult::Continue(request) => {
@@ -1196,6 +1197,19 @@ impl Handler for ReverseProxyHandler {
                                 }
                                 HandleResponseResult::Respond(response) => {
                                     let mut response = response;
+                                    merge_selection_cookie(&mut response, &selection);
+                                    Outcome::Respond(response)
+                                }
+                                HandleResponseResult::UseUpstream { status } => {
+                                    response.status = status;
+                                    let status = response.status;
+                                    let upstream_headers = response.headers.clone();
+                                    self.apply_response_headers_to(
+                                        &mut response.headers,
+                                        &request,
+                                        status,
+                                        &upstream_headers,
+                                    );
                                     merge_selection_cookie(&mut response, &selection);
                                     Outcome::Respond(response)
                                 }
@@ -1403,16 +1417,41 @@ impl Handler for ReverseProxyHandler {
                     // copied onto the original request (2xx gate) or terminates with a synthetic
                     // response; otherwise the upstream response is streamed through unchanged.
                     if self.handle_response.is_configured() {
+                        // `copy_response` needs the complete upstream body; buffer it only when
+                        // the configuration asks for it (other response handlers drop or replace
+                        // the body).
+                        let (buffered_upstream_body, upstream_stream) = if self
+                            .handle_response
+                            .requires_upstream_body()
+                        {
+                            match forwarded.body.into_bytes().await {
+                                Ok(body) => (Some(body), None),
+                                Err(error) => {
+                                    let mut response = Response::text(
+                                        StatusCode::BAD_GATEWAY,
+                                        format!("502 Bad Gateway: cannot read upstream response body: {error}"),
+                                    );
+                                    merge_selection_cookie(&mut response, &selection);
+                                    return Ok(StreamingOutcome::Respond(
+                                        StreamingResponse::from_buffered(response),
+                                    ));
+                                }
+                            }
+                        } else {
+                            (None, Some(forwarded.body))
+                        };
                         if let Some(result) = self.handle_response.evaluate(
                             &request,
                             forwarded.status,
                             &forwarded.headers,
+                            buffered_upstream_body.as_ref(),
                         ) {
                             return Ok(match result {
                                 HandleResponseResult::Continue(request) => {
                                     // Cancel the auth response body: the chain continues and the
                                     // auth body is never sent to the client.
-                                    drop(forwarded);
+                                    drop(buffered_upstream_body);
+                                    drop(upstream_stream);
                                     StreamingOutcome::Continue(request)
                                 }
                                 HandleResponseResult::Respond(response) => {
@@ -1422,8 +1461,48 @@ impl Handler for ReverseProxyHandler {
                                         response,
                                     ))
                                 }
+                                HandleResponseResult::UseUpstream { status } => {
+                                    let body = match (buffered_upstream_body, upstream_stream) {
+                                        (Some(bytes), _) => Body::Bytes(bytes),
+                                        (None, Some(stream)) => Body::Stream(stream),
+                                        (None, None) => Body::empty(),
+                                    };
+                                    let mut response =
+                                        StreamingResponse::new(status, forwarded.headers, body);
+                                    let upstream_headers = response.headers.clone();
+                                    self.apply_response_headers_to(
+                                        &mut response.headers,
+                                        &request,
+                                        status,
+                                        &upstream_headers,
+                                    );
+                                    merge_selection_cookie_headers(
+                                        &mut response.headers,
+                                        &selection,
+                                    );
+                                    StreamingOutcome::Respond(response)
+                                }
                             });
                         }
+                        // No response handler matched: stream the upstream response through,
+                        // using the body representation that survived the optional buffering.
+                        let body = match (buffered_upstream_body, upstream_stream) {
+                            (Some(bytes), _) => Body::Bytes(bytes),
+                            (None, Some(stream)) => Body::Stream(stream),
+                            (None, None) => Body::empty(),
+                        };
+                        let mut response =
+                            StreamingResponse::new(forwarded.status, forwarded.headers, body);
+                        let status = response.status;
+                        let upstream_headers = response.headers.clone();
+                        self.apply_response_headers_to(
+                            &mut response.headers,
+                            &request,
+                            status,
+                            &upstream_headers,
+                        );
+                        merge_selection_cookie_headers(&mut response.headers, &selection);
+                        return Ok(StreamingOutcome::Respond(response));
                     }
                     let mut response = StreamingResponse::new(
                         forwarded.status,
@@ -5886,5 +5965,252 @@ mod tls_client_tests {
         .err()
         .expect("except_ports is not a fastcgi transport option");
         assert!(error.to_string().contains("except_ports"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod handle_response_tests {
+    use super::*;
+    use caddy_rs_http::Request;
+    use http::Method;
+    use hyper::service::service_fn;
+    use std::convert::Infallible;
+
+    fn build_handler(value: Value) -> ReverseProxyHandler {
+        ReverseProxyHandler::from_json(&value, "handler").unwrap()
+    }
+
+    async fn spawn_upstream<F, Fut>(serve: F) -> String
+    where
+        F: Fn(hyper::Request<hyper::body::Incoming>) -> Fut + Clone + Send + 'static,
+        Fut: std::future::Future<Output = Result<hyper::Response<Full<Bytes>>, Infallible>>
+            + Send
+            + 'static,
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let serve = serve.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |request| {
+                        let serve = serve.clone();
+                        async move { serve(request).await }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        address.to_string()
+    }
+
+    fn get_request(path: &str, remote: Option<&str>) -> Request {
+        let mut request = Request::new(Method::GET, path.parse().unwrap());
+        request.remote_addr = remote.map(|remote| remote.parse().unwrap());
+        request
+            .headers
+            .insert(http::header::HOST, "example.com".parse().unwrap());
+        request
+    }
+
+    fn body_text(response: &Response) -> String {
+        String::from_utf8(response.body.to_vec()).unwrap()
+    }
+
+    // ---- general reverse_proxy handle_response (T-ROUTE-012) --------------------------------
+
+    async fn upstream_with_response(
+        status: u16,
+        body: &'static str,
+        headers: &'static [(&'static str, &'static str)],
+    ) -> String {
+        spawn_upstream(move |_request| async move {
+            let mut builder = hyper::Response::builder().status(status);
+            for (name, value) in headers {
+                builder = builder.header(*name, *value);
+            }
+            Ok(builder
+                .body(Full::new(Bytes::from_static(body.as_bytes())))
+                .expect("response"))
+        })
+        .await
+    }
+
+    async fn respond_with(handler: &ReverseProxyHandler, path: &str) -> Response {
+        let Outcome::Respond(response) = handler.handle(get_request(path, None)).await.unwrap()
+        else {
+            panic!("expected a response");
+        };
+        response
+    }
+
+    #[tokio::test]
+    async fn handle_response_matches_status_and_replaces_the_body() {
+        let upstream = upstream_with_response(503, "upstream down", &[]).await;
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": upstream}],
+            "handle_response": [{
+                "match": {"status_code": [5]},
+                "routes": [{"handle": [
+                    {"handler": "static_response", "status_code": 200, "body": "friendly error"}
+                ]}]
+            }]
+        }));
+        let response = respond_with(&handler, "/").await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(body_text(&response), "friendly error");
+    }
+
+    #[tokio::test]
+    async fn handle_response_non_matching_status_passes_the_upstream_response_through() {
+        let upstream = upstream_with_response(200, "hello", &[]).await;
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": upstream}],
+            "handle_response": [{
+                "match": {"status_code": [500]},
+                "routes": [{"handle": [{"handler": "static_response", "body": "nope"}]}]
+            }]
+        }));
+        let response = respond_with(&handler, "/").await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(body_text(&response), "hello");
+    }
+
+    #[tokio::test]
+    async fn handle_response_matches_upstream_headers() {
+        let upstream =
+            upstream_with_response(404, "not found", &[("X-Accel-Redirect", "/internal")]).await;
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": upstream}],
+            "handle_response": [{
+                "match": {"headers": {"X-Accel-Redirect": ["*"]}},
+                "routes": [{"handle": [
+                    {"handler": "static_response", "status_code": 200, "body": "internal redirect"}
+                ]}]
+            }]
+        }));
+        let response = respond_with(&handler, "/").await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(body_text(&response), "internal redirect");
+    }
+
+    #[tokio::test]
+    async fn handle_response_status_override_replaces_the_upstream_status() {
+        let upstream = upstream_with_response(404, "missing", &[("X-Upstream", "yes")]).await;
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": upstream}],
+            "handle_response": [{"match": {"status_code": [404]}, "status_code": 410}]
+        }));
+        let response = respond_with(&handler, "/").await;
+        assert_eq!(response.status, StatusCode::GONE);
+        assert_eq!(body_text(&response), "missing");
+        assert_eq!(response.headers.get("x-upstream").unwrap(), "yes");
+    }
+
+    #[tokio::test]
+    async fn copy_response_copies_body_headers_and_optional_status() {
+        let upstream = upstream_with_response(201, "created body", &[("X-Made", "yes")]).await;
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": upstream}],
+            "handle_response": [{
+                "match": {"status_code": [201]},
+                "routes": [{"handle": [
+                    {"handler": "headers", "response": {"set": {"X-Extra": ["staged"]}}},
+                    {"handler": "copy_response", "status_code": 202}
+                ]}]
+            }]
+        }));
+        let response = respond_with(&handler, "/").await;
+        assert_eq!(response.status, StatusCode::ACCEPTED);
+        assert_eq!(body_text(&response), "created body");
+        assert_eq!(response.headers.get("x-made").unwrap(), "yes");
+        assert_eq!(response.headers.get("x-extra").unwrap(), "staged");
+    }
+
+    #[tokio::test]
+    async fn copy_response_headers_copies_only_the_selected_fields() {
+        let upstream =
+            upstream_with_response(200, "body", &[("X-Copied", "one"), ("X-Skipped", "two")]).await;
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": upstream}],
+            "handle_response": [{
+                "match": {"status_code": [2]},
+                "routes": [{"handle": [
+                    {"handler": "copy_response_headers", "include": ["X-Copied"]},
+                    {"handler": "static_response", "body": "copied"}
+                ]}]
+            }]
+        }));
+        let response = respond_with(&handler, "/").await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(body_text(&response), "copied");
+        assert_eq!(response.headers.get("x-copied").unwrap(), "one");
+        assert!(response.headers.get("x-skipped").is_none());
+    }
+
+    #[tokio::test]
+    async fn handle_response_status_classes_and_lists_use_caddy_matching() {
+        // A one-digit status code matches the whole class; exact codes match exactly.
+        let upstream = upstream_with_response(404, "missing", &[]).await;
+        let class_handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": upstream}],
+            "handle_response": [{"match": {"status_code": [4]}, "routes": [
+                {"handle": [{"handler": "static_response", "body": "class match"}]}
+            ]}]
+        }));
+        assert_eq!(
+            body_text(&respond_with(&class_handler, "/").await),
+            "class match"
+        );
+        let exact_handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": upstream}],
+            "handle_response": [{"match": {"status_code": [404, 410]}, "routes": [
+                {"handle": [{"handler": "static_response", "body": "exact match"}]}
+            ]}]
+        }));
+        assert_eq!(
+            body_text(&respond_with(&exact_handler, "/").await),
+            "exact match"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_handle_response_forms_are_rejected_loudly() {
+        let dial = "127.0.0.1:1";
+        for handle_response in [
+            serde_json::json!([{"match": {"status_code": [200], "protocol": "http/2"}, "routes": []}]),
+            serde_json::json!([{"routes": [{"handle": [{"handler": "file_server"}]}]}]),
+            serde_json::json!([{"routes": [{"match": [{"path": ["/x"]}], "handle": []}]}]),
+        ] {
+            let error = match ReverseProxyHandler::from_json(
+                &serde_json::json!({
+                    "handler": "reverse_proxy",
+                    "upstreams": [{"dial": dial}],
+                    "handle_response": handle_response
+                }),
+                "handler",
+            ) {
+                Ok(_) => panic!("unsupported handle_response form must be rejected"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("handle_response")
+                    || error.to_string().contains("not implemented"),
+                "{error}"
+            );
+        }
     }
 }
