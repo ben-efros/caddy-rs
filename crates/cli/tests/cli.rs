@@ -760,3 +760,248 @@ fn validate_keeps_the_plain_error_form_for_non_configuration_failures() {
         "a missing file is not a configuration error code: {stderr}"
     );
 }
+
+// ---- Trust-store installation against stub tools -------------------------------------------
+//
+// These run the real `trust` verb with an injected PATH/HOME/JAVA_HOME and a throwaway
+// CADDY_RS_TRUST_PREFIX, so the platform, NSS/Firefox and Java targets are exercised without
+// touching the host's trust stores. The stub tools emulate `certutil`/`keytool` idempotency with
+// marker files and log their invocations.
+
+#[cfg(unix)]
+fn write_stub(path: &std::path::Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, body).unwrap();
+    let mut permissions = std::fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions).unwrap();
+}
+
+#[cfg(unix)]
+struct TrustFixture {
+    _directory: tempfile::TempDir,
+    root: PathBuf,
+    home: PathBuf,
+    bin: PathBuf,
+    java_home: PathBuf,
+    platform_prefix: PathBuf,
+    calls: PathBuf,
+    nss_marker: PathBuf,
+    java_marker: PathBuf,
+}
+
+#[cfg(unix)]
+fn trust_fixture(stub_tools: bool) -> TrustFixture {
+    let directory = tempfile::tempdir().unwrap();
+    let base = directory.path().to_path_buf();
+    let root = base.join("rootfs");
+    let home = base.join("home");
+    let nss = home.join(".pki/nssdb");
+    std::fs::create_dir_all(&nss).unwrap();
+    std::fs::write(nss.join("cert9.db"), b"").unwrap();
+    let java_home = base.join("jdk");
+    std::fs::create_dir_all(java_home.join("lib/security")).unwrap();
+    std::fs::write(java_home.join("lib/security/cacerts"), b"stub-keystore").unwrap();
+    let bin = base.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let calls = base.join("calls.log");
+    let nss_marker = base.join("nss-installed");
+    let java_marker = base.join("java-installed");
+    if stub_tools {
+        write_stub(
+            &bin.join("update-ca-certificates"),
+            &format!(
+                "#!/bin/sh\necho update-ca-certificates >> '{}'\nexit 0\n",
+                calls.display()
+            ),
+        );
+        write_stub(
+            &bin.join("certutil"),
+            &format!(
+                "#!/bin/sh\necho \"certutil $*\" >> '{}'\ncase \" $* \" in\n  *\" -L \"*) test -f '{}' && exit 0 || exit 1 ;;\n  *\" -A \"*) : > '{}'; exit 0 ;;\nesac\nexit 0\n",
+                calls.display(), nss_marker.display(), nss_marker.display()
+            ),
+        );
+        write_stub(
+            &bin.join("keytool"),
+            &format!(
+                "#!/bin/sh\necho \"keytool $*\" >> '{}'\ncase \" $* \" in\n  *\" -list \"*) test -f '{}' && exit 0 || exit 1 ;;\n  *\" -importcert \"*) : > '{}'; exit 0 ;;\nesac\nexit 0\n",
+                calls.display(), java_marker.display(), java_marker.display()
+            ),
+        );
+    }
+    TrustFixture {
+        _directory: directory,
+        root,
+        home,
+        bin,
+        java_home,
+        platform_prefix: base.join("prefix"),
+        calls,
+        nss_marker,
+        java_marker,
+    }
+}
+
+#[cfg(unix)]
+fn run_trust_with_fixture(
+    fixture: &TrustFixture,
+    extra: &[&str],
+    path_override: Option<&str>,
+) -> (i32, String, String) {
+    let mut command = Command::new(binary());
+    command
+        .args(["trust", "--data-dir"])
+        .arg(pki_fixture_data_dir())
+        .args(extra)
+        .env("HOME", &fixture.home)
+        .env("JAVA_HOME", &fixture.java_home)
+        .env("CADDY_RS_TRUST_PREFIX", &fixture.platform_prefix)
+        .env(
+            "PATH",
+            path_override.map_or_else(|| fixture.bin.display().to_string(), str::to_string),
+        );
+    let output = command.output().expect("run caddy-rs trust");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn trust_dry_run_lists_platform_nss_and_java_targets() {
+    let fixture = trust_fixture(true);
+    let (code, stdout, stderr) = run_trust_with_fixture(&fixture, &["--dry-run"], None);
+    assert_eq!(code, 0, "stderr: {stderr}\nstdout: {stdout}");
+    assert!(stdout.contains("trust stores:"), "{stdout}");
+    assert!(stdout.contains("platform trust store: ready"), "{stdout}");
+    assert!(stdout.contains("NSS/Firefox database"), "{stdout}");
+    assert!(stdout.contains("Java keystore"), "{stdout}");
+    assert!(stdout.contains("update-ca-certificates"), "{stdout}");
+    assert!(stdout.contains("certutil -d sql:"), "{stdout}");
+    assert!(stdout.contains("keytool -importcert"), "{stdout}");
+    assert!(stdout.contains("no changes made (--dry-run)"), "{stdout}");
+    // Dry-run must not touch the stubs or the prefix.
+    assert!(!fixture.calls.exists(), "dry-run executed a stub");
+    assert!(
+        !fixture.platform_prefix.exists(),
+        "dry-run created the prefix"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn trust_installs_with_stub_tools_and_is_idempotent() {
+    let fixture = trust_fixture(true);
+    let (code, stdout, stderr) = run_trust_with_fixture(&fixture, &[], None);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let installed_certificate = fixture
+        .platform_prefix
+        .join("usr/local/share/ca-certificates/caddy-rs-local.crt");
+    assert!(
+        installed_certificate.is_file(),
+        "{}",
+        installed_certificate.display()
+    );
+    assert!(
+        fixture.nss_marker.is_file(),
+        "NSS import stub was not called; stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        fixture.java_marker.is_file(),
+        "Java import stub was not called; stdout: {stdout}\nstderr: {stderr}"
+    );
+    let first_log = std::fs::read_to_string(&fixture.calls).unwrap();
+    assert_eq!(first_log.matches(" -A ").count(), 1, "{first_log}");
+    assert_eq!(first_log.matches(" -importcert ").count(), 1, "{first_log}");
+
+    let (code, stdout, stderr) = run_trust_with_fixture(&fixture, &[], None);
+    assert_eq!(code, 0, "second run stdout: {stdout}\nstderr: {stderr}");
+    assert!(stderr.contains("already trusted"), "{stderr}");
+    let second_log = std::fs::read_to_string(&fixture.calls).unwrap();
+    assert_eq!(
+        second_log.matches(" -A ").count(),
+        1,
+        "idempotent re-run must not re-import into NSS: {second_log}"
+    );
+    assert_eq!(
+        second_log.matches(" -importcert ").count(),
+        1,
+        "idempotent re-run must not re-import into Java: {second_log}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn trust_reports_missing_nss_and_java_tools_loudly_but_installs_platform_store() {
+    let fixture = trust_fixture(true);
+    // Only update-ca-certificates is available: NSS/Java tools are missing.
+    let only_platform_bin = fixture._directory.path().join("platform-only-bin");
+    std::fs::create_dir_all(&only_platform_bin).unwrap();
+    write_stub(
+        &only_platform_bin.join("update-ca-certificates"),
+        "#!/bin/sh\nexit 0\n",
+    );
+    let (code, stdout, stderr) =
+        run_trust_with_fixture(&fixture, &[], Some(only_platform_bin.to_str().unwrap()));
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stderr.contains("warning"), "{stderr}");
+    assert!(stderr.contains("certutil"), "{stderr}");
+    assert!(stderr.contains("keytool"), "{stderr}");
+    assert!(
+        stderr.contains("nss-tools") || stderr.contains("certutil"),
+        "{stderr}"
+    );
+    assert!(fixture
+        .platform_prefix
+        .join("usr/local/share/ca-certificates/caddy-rs-local.crt")
+        .is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn trust_fails_loudly_when_no_trust_store_can_be_updated() {
+    let fixture = trust_fixture(false);
+    let (code, stdout, stderr) = run_trust_with_fixture(&fixture, &[], Some(""));
+    assert_ne!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stderr.contains("no trust store could be updated"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("update-ca-certificates"), "{stderr}");
+    assert!(stderr.contains("certutil"), "{stderr}");
+    assert!(stderr.contains("keytool"), "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+}
+
+#[cfg(unix)]
+#[test]
+fn trust_honours_install_trust_false_from_config_as_a_clear_no_op() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config.json");
+    std::fs::write(
+        &config,
+        r#"{"apps":{"pki":{"certificate_authorities":{"local":{"name":"Test Local CA","install_trust":false}}}}}"#,
+    )
+    .unwrap();
+    let (code, stdout, stderr) = run_pki(&[
+        "trust",
+        "--config",
+        config.to_str().unwrap(),
+        "--data-dir",
+        pki_fixture_data_dir().to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(
+        stderr.contains("install_trust: false"),
+        "the disabled setting must be named: {stderr}"
+    );
+    assert!(stderr.contains("no changes made"), "{stderr}");
+    assert!(
+        stderr.contains("unconfigured clients may show warnings"),
+        "{stderr}"
+    );
+}

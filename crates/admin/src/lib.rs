@@ -127,8 +127,17 @@
 //! - `/pki` is read-only: it serves the local CA material persisted under
 //!   `<data-dir>/pki/authorities/<id>/` but never provisions, repairs or trusts anything. Caddy
 //!   lazily provisions the default `local` CA on a `/pki` read; this build returns `404` instead
-//!   and the CA must already exist (for example from automatic HTTPS). Caddy's CA `name` field is
-//!   reported as the id because `apps.pki` is not modelled by this build. See [`pki`].
+//!   and the CA must already exist (for example from automatic HTTPS). `caInfo.name` reflects
+//!   `apps.pki.certificate_authorities.<id>.name` from the active generation, defaulting to
+//!   Caddy's `Caddy Local Authority` (T-ADMIN-033); the data-directory-only CLI commands cannot
+//!   know that configuration and fall back to the id. See [`pki`].
+//! - Trust-store installation is exposed through [`trust`] and the CLI `trust` verb (T-ADMIN-033):
+//!   the platform store plus discovered NSS/Firefox databases and Java keystores are planned with
+//!   their concrete commands, executed idempotently, and every store that cannot be updated is
+//!   reported with a loud, located limitation (missing `certutil`/`keytool`/platform tool,
+//!   unsupported Windows/other OS). `apps.pki...install_trust: false` is honoured as a no-op when
+//!   the CLI is given `--config`; automatic installation during CA provisioning is not implemented
+//!   (DIV-0073), so `caddy-rs trust` must be run explicitly.
 //! - Metrics rendering, the access-log record/sink model and the Caddy `logging` -> sink mapping
 //!   are crate-level primitives (T-ADMIN-020/021/022/025): `/metrics` renders whatever the
 //!   runtime records through the [`recorder`] API, and [`logging_config`] turns the active
@@ -159,6 +168,7 @@ pub mod pki;
 pub mod recorder;
 mod regex_lite;
 pub mod sink;
+pub mod trust;
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -190,7 +200,8 @@ pub use metrics_config::{
 pub use origin::{OriginPolicy, OriginViolation};
 pub use pki::{
     authorities_directory, resolve_data_dir, CaMaterial, CaSummary, CertificateInfo, PkiError,
-    PkiStore, AUTHORITIES_DIRECTORY, DATA_DIR_ENV, DEFAULT_CA_ID, DEFAULT_DATA_DIR,
+    PkiStore, AUTHORITIES_DIRECTORY, DATA_DIR_ENV, DEFAULT_CA_ID, DEFAULT_CA_NAME,
+    DEFAULT_DATA_DIR,
 };
 pub use recorder::{
     noop_recorder, CertificateMetrics, MetricsRequestRecorder, NoopRequestRecorder,
@@ -199,6 +210,11 @@ pub use recorder::{
 pub use sink::{
     AccessLogEncoder, AccessLogOutput, AccessLogSink, AccessLogSinkConfig, AccessLogSinkStats,
     EmitOutcome, DEFAULT_ACCESS_LOG_BUFFER_BYTES,
+};
+pub use trust::{
+    discover_java_keystores, discover_nss_databases, TrustEnvironment, TrustPlan, TrustPlatform,
+    TrustReport, TrustStatus, TrustStoreKind, TrustTarget, JAVA_KEYSTORE_PASSWORD,
+    TRUST_ALIAS_PREFIX,
 };
 
 use config_path::{index_config, navigate, Mutation};
@@ -1148,6 +1164,26 @@ impl AdminApi {
     /// The local CA material is read from the data directory on every request (no caching), never
     /// created or repaired. Origin enforcement and the shared request handling already apply
     /// because this runs inside [`AdminApi::handle`].
+    /// The user-facing name Caddy reports for a CA (`caInfo.name`).
+    ///
+    /// Caddy defaults the name to `Caddy Local Authority` when a configured CA omits `name`; the
+    /// admin endpoint reads the active generation so `apps.pki.certificate_authorities.<id>.name`
+    /// is reflected without the CA files themselves having to store it.
+    fn configured_ca_name(&self, id: &str) -> String {
+        self.store
+            .current()
+            .and_then(|generation| {
+                generation
+                    .config()
+                    .pki()
+                    .and_then(|pki| pki.certificate_authorities.as_ref())
+                    .and_then(|authorities| authorities.get(id))
+                    .and_then(|authority| authority.name.clone())
+            })
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| pki::DEFAULT_CA_NAME.to_string())
+    }
+
     async fn handle_pki(&self, path: &str, request: &AdminRequest) -> AdminResponse {
         if request.method != Method::GET {
             return AdminResponse::api_error(
@@ -1165,7 +1201,10 @@ impl AdminApi {
         let segments: Vec<&str> = rest.split('/').collect();
         match segments.as_slice() {
             ["ca", id] if !id.is_empty() => match store.load(id).await {
-                Ok(ca) => AdminResponse::json(StatusCode::OK, &ca.info_json()),
+                Ok(ca) => {
+                    let ca = ca.with_name(self.configured_ca_name(id));
+                    AdminResponse::json(StatusCode::OK, &ca.info_json())
+                }
                 Err(error) => pki_error_response(&error, id),
             },
             ["ca", id, "certificates"] if !id.is_empty() => match store.load(id).await {
@@ -3082,6 +3121,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pki_ca_info_reports_the_configured_pki_app_name() {
+        let store = Arc::new(GenerationStore::with_builtin_registry());
+        let config = Config::from_value(json!({
+            "apps": {"pki": {"certificate_authorities": {
+                "local": {"name": "Acme Internal Authority", "install_trust": false}
+            }}}
+        }))
+        .expect("pki config");
+        store.load(config).expect("activate pki config");
+        let admin = AdminApi::new(store).with_data_dir(pki_fixture_data_dir());
+
+        let response = admin.handle(request("GET", "/pki/ca/local", "")).await;
+        assert_eq!(response.status, StatusCode::OK);
+        let info: Value = serde_json::from_slice(&response.body).expect("caInfo JSON");
+        assert_eq!(info["id"], "local", "the id stays the config-facing CA id");
+        assert_eq!(info["name"], "Acme Internal Authority");
+
+        // An explicit empty name behaves like Caddy's `Name == ""` default.
+        let store = Arc::new(GenerationStore::with_builtin_registry());
+        let config = Config::from_value(json!({
+            "apps": {"pki": {"certificate_authorities": {"local": {"name": ""}}}}
+        }))
+        .expect("pki config");
+        store.load(config).expect("activate pki config");
+        let admin = AdminApi::new(store).with_data_dir(pki_fixture_data_dir());
+        let info: Value =
+            serde_json::from_slice(&admin.handle(request("GET", "/pki/ca/local", "")).await.body)
+                .expect("caInfo JSON");
+        assert_eq!(info["name"], "Caddy Local Authority");
+    }
+
+    #[tokio::test]
     async fn pki_ca_metadata_chain_and_certificate_files() {
         let admin = pki_admin();
 
@@ -3096,7 +3167,8 @@ mod tests {
         );
         let info: Value = serde_json::from_slice(&response.body).expect("caInfo JSON");
         assert_eq!(info["id"], "local");
-        assert_eq!(info["name"], "local");
+        // Caddy's default CA name when the active config does not name the CA.
+        assert_eq!(info["name"], "Caddy Local Authority");
         assert_eq!(info["root_common_name"], "caddy-rs test root");
         assert_eq!(
             info["intermediate_common_name"],

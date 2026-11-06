@@ -17,7 +17,7 @@ use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use http_body_util::{BodyExt, Full};
 
-use caddy_rs_admin::pki::{resolve_data_dir, CaMaterial, PkiError, PkiStore, DEFAULT_CA_ID};
+use caddy_rs_admin::pki::{resolve_data_dir, PkiError, PkiStore, DEFAULT_CA_ID};
 use caddy_rs_admin::AdminResponse;
 use caddy_rs_core::{Config, GenerationStore, ModuleRegistry, VERSION};
 use caddy_rs_server::ServerRuntime;
@@ -110,7 +110,7 @@ enum Command {
         #[command(subcommand)]
         command: PkiCommand,
     },
-    /// Install the local CA root certificate into the operating system trust store.
+    /// Install the local CA root certificate into the host trust stores.
     Trust {
         /// Data directory containing `pki/authorities` (default: `$CADDY_RS_DATA_DIR` or `.caddy-rs`).
         #[arg(long)]
@@ -118,7 +118,13 @@ enum Command {
         /// CA identifier (Caddy's default local CA is `local`).
         #[arg(long, default_value = DEFAULT_CA_ID)]
         ca: String,
-        /// Print the exact commands and paths without modifying the OS trust store.
+        /// Configuration whose `apps.pki` `install_trust` and `storage.root` settings apply.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Config adapter for `--config` (for example `caddyfile`).
+        #[arg(long)]
+        adapter: Option<String>,
+        /// Print the exact commands and paths without modifying any trust store.
         #[arg(long)]
         dry_run: bool,
     },
@@ -400,8 +406,10 @@ async fn run(command: Command) -> anyhow::Result<()> {
         Command::Trust {
             data_dir,
             ca,
+            config,
+            adapter,
             dry_run,
-        } => run_trust(data_dir, &ca, dry_run).await?,
+        } => run_trust(data_dir, &ca, config, adapter, dry_run).await?,
     }
     Ok(())
 }
@@ -680,235 +688,128 @@ async fn run_pki(command: PkiCommand) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Operating-system trust-store handling for `caddy-rs trust`.
+/// Install the local CA root certificate into the host trust stores.
 ///
-/// Only the variant for the target OS is constructed by [`current_trust_platform`]; the others are
-/// constructed by unit tests (and would be live when cross-compiled).
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TrustPlatform {
-    Linux,
-    MacOs,
-    Windows,
-    Unsupported,
-}
-
-fn current_trust_platform() -> TrustPlatform {
-    #[cfg(target_os = "linux")]
-    {
-        TrustPlatform::Linux
-    }
-    #[cfg(target_os = "macos")]
-    {
-        TrustPlatform::MacOs
-    }
-    #[cfg(target_os = "windows")]
-    {
-        TrustPlatform::Windows
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    {
-        TrustPlatform::Unsupported
-    }
-}
-
-/// One concrete installation step (executed only when `--dry-run` is not given).
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum InstallStep {
-    Copy { from: PathBuf, to: PathBuf },
-    Run { program: String, args: Vec<String> },
-}
-
-/// A platform-specific plan for installing a CA root certificate.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TrustPlan {
-    platform: TrustPlatform,
-    source: PathBuf,
-    destination: Option<PathBuf>,
-    /// Human-readable commands for `--dry-run`/manual installation.
-    commands: Vec<String>,
-    /// Steps this process performs when installation is requested.
-    steps: Vec<InstallStep>,
-    /// Why automatic installation is unavailable (platform unsupported).
-    unsupported_reason: Option<String>,
-}
-
-fn trust_plan(platform: TrustPlatform, ca: &CaMaterial) -> TrustPlan {
-    trust_plan_for(platform, ca.id(), &ca.directory().join("root.crt"))
-}
-
-fn trust_plan_for(platform: TrustPlatform, ca_id: &str, root_path: &Path) -> TrustPlan {
-    let source = root_path.to_path_buf();
-    match platform {
-        TrustPlatform::Linux => {
-            let destination = PathBuf::from(format!(
-                "/usr/local/share/ca-certificates/caddy-rs-{ca_id}.crt"
-            ));
-            TrustPlan {
-                platform,
-                source: source.clone(),
-                destination: Some(destination.clone()),
-                commands: vec![
-                    format!(
-                        "sudo install -m 0644 '{}' '{}'",
-                        source.display(),
-                        destination.display()
-                    ),
-                    "sudo update-ca-certificates".to_string(),
-                ],
-                steps: vec![
-                    InstallStep::Copy {
-                        from: source,
-                        to: destination,
-                    },
-                    InstallStep::Run {
-                        program: "update-ca-certificates".to_string(),
-                        args: Vec::new(),
-                    },
-                ],
-                unsupported_reason: None,
-            }
+/// Caddy's `caddy trust` fetches the CA through the admin API and installs through
+/// `smallstep/truststore` (platform store plus Firefox/NSS and Java). caddy-rs works directly from
+/// the data directory instead (no running server required) and plans every store in
+/// [`caddy_rs_admin::trust`]: the platform store, each discovered NSS/Firefox database and each
+/// discovered Java `cacerts` keystore. Stores whose tool is missing are reported loudly with the
+/// documented limitation; unsupported platforms fail with their named limitation. `--dry-run`
+/// prints the exact commands without changing anything.
+///
+/// When `--config` names a configuration, the CA's `install_trust: false`
+/// (`apps.pki.certificate_authorities.<id>.install_trust`) is honoured as a no-op with Caddy's
+/// "installation disabled" message, and the configured `storage.root` is used for the data
+/// directory (matching the server's storage resolution).
+async fn run_trust(
+    data_dir: Option<PathBuf>,
+    ca_id: &str,
+    config_path: Option<PathBuf>,
+    adapter: Option<String>,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    let loaded = match &config_path {
+        Some(path) => Some(load_validated(path, adapter.as_deref())?),
+        None => None,
+    };
+    let storage_root = loaded.as_ref().and_then(|loaded| {
+        loaded
+            .model
+            .storage()
+            .and_then(|storage| storage.root())
+            .map(PathBuf::from)
+    });
+    if let Some(loaded) = &loaded {
+        if let Some(message) = trust_installation_disabled(&loaded.model, ca_id) {
+            eprintln!("caddy-rs: {message}");
+            return Ok(());
         }
-        TrustPlatform::MacOs => {
-            let destination = PathBuf::from(format!(
-                "/Library/Keychains/System.keychain (certificate `{}`)",
-                root_path.display()
-            ));
-            TrustPlan {
-                platform,
-                source: source.clone(),
-                destination: Some(destination),
-                commands: vec![format!(
-                    "sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain '{}'",
-                    source.display()
-                )],
-                steps: vec![InstallStep::Run {
-                    program: "security".to_string(),
-                    args: vec![
-                        "add-trusted-cert".to_string(),
-                        "-d".to_string(),
-                        "-r".to_string(),
-                        "trustRoot".to_string(),
-                        "-k".to_string(),
-                        "/Library/Keychains/System.keychain".to_string(),
-                        source.display().to_string(),
-                    ],
-                }],
-                unsupported_reason: None,
-            }
-        }
-        TrustPlatform::Windows => TrustPlan {
-            platform,
-            source: source.clone(),
-            destination: Some(PathBuf::from("CurrentUser\\Root")),
-            commands: vec![format!(
-                "certutil -addstore -user Root \"{}\"",
-                source.display()
-            )],
-            steps: Vec::new(),
-            unsupported_reason: Some(
-                "automatic installation on Windows is not implemented; run the printed certutil \
-                 command (this build never modifies the OS trust store silently)"
-                    .to_string(),
-            ),
-        },
-        TrustPlatform::Unsupported => TrustPlan {
-            platform,
-            source,
-            destination: None,
-            commands: Vec::new(),
-            steps: Vec::new(),
-            unsupported_reason: Some(
-                "this build has no trust-store installation support for this operating system; \
-                 install the root PEM manually with the platform's certificate tool"
-                    .to_string(),
-            ),
-        },
     }
-}
 
-async fn run_trust(data_dir: Option<PathBuf>, ca_id: &str, dry_run: bool) -> anyhow::Result<()> {
-    let store = PkiStore::new(cli_data_dir(data_dir));
+    let store = PkiStore::new(resolve_data_dir(data_dir, storage_root));
     let ca = store.load(ca_id).await.map_err(pki_error)?;
-    let plan = trust_plan(current_trust_platform(), &ca);
+    let environment = caddy_rs_admin::trust::TrustEnvironment::detect();
+    let plan = caddy_rs_admin::trust::TrustPlan::detect(
+        ca.id(),
+        ca.directory().join("root.crt"),
+        &environment,
+    );
 
     if dry_run {
         println!("CA id: {}", ca.id());
-        println!("root certificate: {}", plan.source.display());
+        println!("root certificate: {}", plan.root_path.display());
         if let Some(common_name) = ca.root_common_name() {
             println!("root common name: {common_name}");
         }
-        if let Some(destination) = &plan.destination {
-            println!("trust store destination: {}", destination.display());
-        }
-        if let Some(reason) = &plan.unsupported_reason {
-            println!("automatic installation is not supported: {reason}");
+        println!("trust stores:");
+        for target in &plan.targets {
+            match &target.status {
+                caddy_rs_admin::trust::TrustStatus::Ready => {
+                    println!("  {}: ready", target.kind.label());
+                    for command in &target.commands {
+                        println!("    {command}");
+                    }
+                }
+                status => {
+                    println!("  {}: not installed", target.kind.label());
+                    if let Some(limitation) = status.limitation() {
+                        println!("    limitation: {limitation}");
+                    }
+                }
+            }
         }
         println!("no changes made (--dry-run)");
-        if !plan.commands.is_empty() {
+        let commands: Vec<&str> = plan
+            .targets
+            .iter()
+            .flat_map(|target| target.commands.iter().map(String::as_str))
+            .collect();
+        if !commands.is_empty() {
             println!("to install manually, run:");
-            for command in &plan.commands {
+            for command in commands {
                 println!("  {command}");
             }
         }
         return Ok(());
     }
 
-    if let Some(reason) = &plan.unsupported_reason {
-        bail!(
-            "cannot install the CA root certificate automatically: {reason}; re-run with \
-             `--dry-run` to print the manual instructions"
-        );
-    }
     eprintln!(
         "caddy-rs: installing root certificate for CA `{}` from `{}`",
         ca.id(),
-        plan.source.display()
+        plan.root_path.display()
     );
-    for step in &plan.steps {
-        match step {
-            InstallStep::Copy { from, to } => {
-                eprintln!(
-                    "caddy-rs: copying `{}` to `{}`",
-                    from.display(),
-                    to.display()
-                );
-                if let Some(parent) = to.parent() {
-                    std::fs::create_dir_all(parent).with_context(|| {
-                        format!(
-                            "cannot create `{}` (run as root or use `--dry-run` for manual \
-                             instructions)",
-                            parent.display()
-                        )
-                    })?;
-                }
-                std::fs::copy(from, to).with_context(|| {
-                    format!(
-                        "cannot install `{}` to `{}` (run as root or use `--dry-run` for manual \
-                         instructions)",
-                        from.display(),
-                        to.display()
-                    )
-                })?;
-            }
-            InstallStep::Run { program, args } => {
-                eprintln!("caddy-rs: running `{program} {}`", args.join(" "));
-                let output = std::process::Command::new(program)
-                    .args(args)
-                    .output()
-                    .with_context(|| format!("cannot execute `{program}`"))?;
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    bail!(
-                        "`{program}` failed with {}: {}{}",
-                        output.status,
-                        stdout.trim(),
-                        stderr.trim()
-                    );
-                }
-            }
+    let report = plan.execute()?;
+    for kind in &report.installed {
+        eprintln!("caddy-rs: installed root certificate into {}", kind.label());
+    }
+    for kind in &report.already_installed {
+        eprintln!(
+            "caddy-rs: root certificate already trusted by {} (no changes)",
+            kind.label()
+        );
+    }
+    for (kind, limitation) in &report.skipped {
+        eprintln!("caddy-rs: warning: {kind:?} {}: {limitation}", kind.label());
+    }
+    for (kind, failure) in &report.failures {
+        eprintln!("caddy-rs: warning: {} not updated: {failure}", kind.label());
+    }
+    if !report.any_trusted() {
+        let mut reasons: Vec<String> = report
+            .skipped
+            .iter()
+            .map(|(_, limitation)| limitation.clone())
+            .chain(report.failures.iter().map(|(_, failure)| failure.clone()))
+            .collect();
+        if reasons.is_empty() {
+            reasons.push("no installable trust store was found on this host".to_string());
         }
+        anyhow::bail!(
+            "no trust store could be updated: {}; re-run with `--dry-run` to print the manual \
+             instructions",
+            reasons.join("; ")
+        );
     }
     eprintln!(
         "caddy-rs: installed CA `{}` root certificate; restart browsers and Java applications to \
@@ -918,51 +819,87 @@ async fn run_trust(data_dir: Option<PathBuf>, ca_id: &str, dry_run: bool) -> any
     Ok(())
 }
 
+/// Caddy's `apps.pki.certificate_authorities.<id>.install_trust: false` message, if configured.
+///
+/// Caddy logs this while starting the PKI app and skips `installRoot`; the CLI honours the same
+/// setting when a config is supplied, so `caddy-rs trust --config ...` never silently installs a
+/// CA whose configuration disables trust installation.
+fn trust_installation_disabled(config: &Config, ca_id: &str) -> Option<String> {
+    let ca = config
+        .pki()
+        .and_then(|pki| pki.certificate_authorities.as_ref())
+        .and_then(|authorities| authorities.get(ca_id))?;
+    if ca.install_trust != Some(false) {
+        return None;
+    }
+    Some(format!(
+        "root certificate trust store installation disabled by \
+         apps.pki.certificate_authorities.{ca_id}.install_trust: false; unconfigured clients may \
+         show warnings (no changes made)"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn root_path() -> PathBuf {
-        PathBuf::from("/data/pki/authorities/local/root.crt")
-    }
+    use serde_json::json;
 
     #[test]
-    fn linux_trust_plan_installs_into_ca_certificates_and_updates_the_store() {
-        let plan = trust_plan_for(TrustPlatform::Linux, "local", &root_path());
-        assert_eq!(plan.platform, TrustPlatform::Linux);
-        let destination = plan.destination.as_ref().expect("destination");
-        assert_eq!(
-            destination,
-            &PathBuf::from("/usr/local/share/ca-certificates/caddy-rs-local.crt")
+    fn install_trust_false_is_reported_as_a_disabled_no_op() {
+        let config = Config::from_value(json!({
+            "apps": {"pki": {"certificate_authorities": {
+                "local": {"install_trust": false}
+            }}}
+        }))
+        .expect("config");
+        let message = trust_installation_disabled(&config, "local").expect("disabled message");
+        assert!(message.contains("install_trust: false"), "{message}");
+        assert!(message.contains("no changes made"), "{message}");
+        assert!(
+            message.contains("unconfigured clients may show warnings"),
+            "{message}"
         );
-        assert!(plan.unsupported_reason.is_none());
-        assert!(plan
-            .commands
-            .iter()
-            .any(|command| command.contains("update-ca-certificates")));
-        assert!(matches!(plan.steps[0], InstallStep::Copy { .. }));
-        assert!(matches!(plan.steps[1], InstallStep::Run { .. }));
+        // Default is install-trust enabled (Caddy's default), and other CAs are unaffected.
+        let config = Config::from_value(json!({
+            "apps": {"pki": {"certificate_authorities": {
+                "local": {"install_trust": true},
+                "staging": {"install_trust": false}
+            }}}
+        }))
+        .expect("config");
+        assert_eq!(trust_installation_disabled(&config, "local"), None);
+        assert!(trust_installation_disabled(&config, "staging").is_some());
     }
 
     #[test]
-    fn macos_trust_plan_uses_the_security_tool() {
-        let plan = trust_plan_for(TrustPlatform::MacOs, "staging", &root_path());
-        assert!(plan
-            .commands
-            .iter()
-            .any(|command| command.contains("security add-trusted-cert")));
-        assert!(matches!(
-            &plan.steps[0],
-            InstallStep::Run { program, .. } if program == "security"
+    fn trust_verb_plans_the_platform_store_and_reports_missing_tools_loudly() {
+        let directory = std::env::temp_dir().join(format!(
+            "caddy-rs-cli-trust-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
-    }
-
-    #[test]
-    fn unsupported_platform_reports_a_loud_reason_and_no_steps() {
-        for platform in [TrustPlatform::Windows, TrustPlatform::Unsupported] {
-            let plan = trust_plan_for(platform, "local", &root_path());
-            assert!(plan.unsupported_reason.is_some(), "{platform:?}");
-            assert!(plan.steps.is_empty(), "{platform:?}");
-        }
+        std::fs::create_dir_all(&directory).unwrap();
+        let root = directory.join("root.crt");
+        std::fs::write(
+            &root,
+            "-----BEGIN CERTIFICATE-----\n\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        let environment = caddy_rs_admin::trust::TrustEnvironment::new(
+            caddy_rs_admin::trust::TrustPlatform::Linux,
+            None,
+            Vec::new(),
+        )
+        .with_platform_prefix(&directory);
+        let plan = caddy_rs_admin::trust::TrustPlan::detect("local", &root, &environment);
+        assert!(plan.targets[0].status.limitation().is_some());
+        assert!(plan.targets[0]
+            .status
+            .limitation()
+            .unwrap()
+            .contains("update-ca-certificates"));
     }
 }
