@@ -211,11 +211,70 @@ impl AutomaticHttpsPlan {
             .any(|candidate| candidate == &host)
     }
 
+    /// Caddy's automatic HTTP->HTTPS redirect `Location` for `host` and `path_and_query`.
+    ///
+    /// Mirrors `makeRedirRoute` in Caddy's `autohttps.go`: an explicit port is emitted only when
+    /// the destination is not the configured HTTP/HTTPS port and is neither 80 nor 443. This is
+    /// the location contract the server's redirect responder should use; it keeps the
+    /// `redirect_ports` map as the actual HTTPS listener destination.
+    pub fn redirect_location(&self, host: &str, path_and_query: &str) -> String {
+        let host = normalize_host(host);
+        let destination = self.redirect_ports.get(&host).copied().unwrap_or_else(|| {
+            if self.redirect_all {
+                self.redirect_all_port
+            } else {
+                self.https_port
+            }
+        });
+        let mut location = format!("https://{host}");
+        if destination != self.http_port
+            && destination != self.https_port
+            && destination != DEFAULT_HTTP_PORT
+            && destination != 443
+        {
+            location.push(':');
+            location.push_str(&destination.to_string());
+        }
+        location.push_str(path_and_query);
+        location
+    }
+
     /// The supervisor's derived HTTP listener key, when one is required.
     pub fn http_listener(&self) -> Option<String> {
         self.needs_http_listener
             .then(|| format!(":{}", self.http_port))
     }
+}
+
+/// Caddy's `recordAutoHTTPSRedirectAddress`: keep the first listener port for a name, but replace
+/// it when the configured HTTPS port later appears (the canonical port wins).
+fn record_redirect_port(ports: &mut BTreeMap<String, u16>, name: &str, port: u16, https_port: u16) {
+    match ports.get(name) {
+        None => {
+            ports.insert(name.to_string(), port);
+        }
+        Some(existing) if *existing == port => {}
+        Some(existing) if port == https_port && *existing != https_port => {
+            ports.insert(name.to_string(), port);
+        }
+        Some(_) => {}
+    }
+}
+
+/// Apply [`record_redirect_port`] over a listener list in declaration order.
+fn caddy_redirect_port(ports: &[u16], https_port: u16) -> u16 {
+    let mut winner: Option<u16> = None;
+    for port in ports {
+        match winner {
+            None => winner = Some(*port),
+            Some(existing) if existing == *port => {}
+            Some(existing) if *port == https_port && existing != https_port => {
+                winner = Some(*port);
+            }
+            Some(_) => {}
+        }
+    }
+    winner.unwrap_or(https_port)
 }
 
 /// Derive the automatic-HTTPS plan for `config`.
@@ -257,7 +316,7 @@ pub fn plan(config: &Config) -> Result<Option<AutomaticHttpsPlan>> {
     let mut enabled_servers = 0usize;
     let mut explicit_skip_patterns: Vec<String> = Vec::new();
 
-    for (server_name, server) in &http.servers {
+    for server in http.servers.values() {
         let auto = server.automatic_https.clone().unwrap_or_default();
         if auto.disable {
             continue;
@@ -282,10 +341,16 @@ pub fn plan(config: &Config) -> Result<Option<AutomaticHttpsPlan>> {
             .tls_connection_policies
             .as_ref()
             .is_some_and(|policies| !policies.is_empty());
+        let non_http_ports: Vec<u16> = ports
+            .iter()
+            .copied()
+            .filter(|port| *port != http_port)
+            .collect();
         if !ports.is_empty() && ports.iter().all(|port| *port == http_port) && !policies_present {
             // Caddy warns and disables automatic HTTPS for a server listening only on the HTTP
-            // port; there is no TLS to manage. Explicit TLS connection policies preserve the
-            // pre-default-on behaviour (tests/embedders may use an ephemeral HTTP port for TLS).
+            // port; there is no TLS to manage. Explicit TLS connection policies keep the
+            // pre-default-on behaviour for tests/embedders that use an ephemeral HTTP port for
+            // TLS (reported residual: Caddy excludes the HTTP port even with explicit policies).
             continue;
         }
         let routes = serde_json::to_value(&server.routes).map_err(|error| {
@@ -315,67 +380,43 @@ pub fn plan(config: &Config) -> Result<Option<AutomaticHttpsPlan>> {
             .collect();
 
         if unskipped.is_empty() {
-            // Nothing on this server is managed. Preserve explicit-policy catch-all redirects
-            // (on-demand style) when automation was configured explicitly.
-            if policies_present && (explicit_policies || !explicit_automate.is_empty()) {
-                tls_ports.extend(ports.iter().copied());
-                if catch_all && !auto.disable_redirects {
+            // Caddy still enables HTTP->HTTPS redirects for a TLS server with no host matchers
+            // (for example a catch-all HTTPS server with explicit TLS policies). The listener
+            // port recorded for the catch-all route is the one HTTP redirects target.
+            if policies_present {
+                tls_ports.extend(non_http_ports.iter().copied());
+                if !auto.disable_redirects {
                     redirect_all = true;
-                    redirect_all_port = https_port;
+                    redirect_all_port = caddy_redirect_port(&ports, https_port);
                 }
             }
             continue;
         }
 
-        let path = format!("apps.http.servers.{server_name}.listen");
-        let non_http_ports: Vec<u16> = ports
-            .iter()
-            .copied()
-            .filter(|port| *port != http_port)
-            .collect();
-        let has_https_port = non_http_ports.contains(&https_port);
         let uses_tls = policies_present || !non_http_ports.is_empty();
         if !uses_tls {
-            // All listeners are on the HTTP port (already handled above), or the server has no
-            // TCP listeners; automatic HTTPS does not apply.
             continue;
         }
 
-        // `redirect_port` is the HTTPS destination for this server's hosts, when redirects are
-        // enabled. Explicit TLS policy servers keep the legacy redirect target
-        // (`apps.http.https_port`) so explicit configurations behave as before; implicit HTTPS on
-        // a non-standard port redirects to that same port, matching Caddy's site addresses.
-        let (redirect_port, redirects_for_server) = if policies_present {
-            tls_ports.extend(ports.iter().copied());
-            let redirects = !auto.disable_redirects && (has_https_port || explicit_policies);
-            (https_port, redirects)
-        } else {
-            if ports.contains(&http_port) {
-                return Err(Error::TlsConfig {
-                    path,
-                    message: format!(
-                        "a server cannot mix cleartext (port {http_port}) and HTTPS listeners in \
-                         one block; split the HTTP and HTTPS sites into separate server blocks"
-                    ),
-                });
-            }
-            if non_http_ports.len() > 1 {
-                return Err(Error::TlsConfig {
-                    path,
-                    message: format!(
-                        "implicit HTTPS on multiple non-standard listener ports {non_http_ports:?} \
-                         is ambiguous; use one HTTPS port per server block or declare \
-                         `tls_connection_policies`"
-                    ),
-                });
-            }
-            let tls_port = non_http_ports[0];
-            tls_ports.push(tls_port);
-            if auto.disable_redirects {
-                (tls_port, false)
+        // Explicit TLS policies keep the historical redirect target (`apps.http.https_port`).
+        // Default-on servers record every listener port with Caddy's winner algorithm so mixed
+        // HTTP/HTTPS listeners and multiple non-standard HTTPS ports derive deterministically.
+        // (Caddy also uses listener ports with explicit policies; adopting that is a server/hook
+        // follow-up because it changes observable Location values in existing tests.)
+        let (redirects_for_server, redirect_ports_for_server) = if policies_present {
+            tls_ports.extend(non_http_ports.iter().copied());
+            // Explicit TLS policies still get Caddy's redirects. Use the declared listener ports
+            // like Caddy; keep the historical `apps.http.https_port` fallback for the ephemeral
+            // port-0 test harness (a real Caddy listener on port 0 is not a typical deployment).
+            let listener_ports = if ports.iter().all(|port| *port == 0) {
+                vec![https_port]
             } else {
-                (tls_port, true)
-            }
+                ports.clone()
+            };
+            (!auto.disable_redirects, listener_ports)
+        } else {
+            tls_ports.extend(non_http_ports.iter().copied());
+            (!auto.disable_redirects, ports.clone())
         };
 
         let disable_certs = auto.disable_certs;
@@ -405,20 +446,8 @@ pub fn plan(config: &Config) -> Result<Option<AutomaticHttpsPlan>> {
                 }
             }
             if redirects_for_server {
-                match redirect_ports.get(&host) {
-                    Some(existing) if *existing != redirect_port => {
-                        return Err(Error::TlsConfig {
-                            path: format!("apps.http.servers.{server_name}.routes"),
-                            message: format!(
-                                "host `{host}` is served on HTTPS ports {existing} and \
-                                 {redirect_port}; one redirect destination is required per host"
-                            ),
-                        });
-                    }
-                    Some(_) => {}
-                    None => {
-                        redirect_ports.insert(host.clone(), redirect_port);
-                    }
+                for port in &redirect_ports_for_server {
+                    record_redirect_port(&mut redirect_ports, &host, *port, https_port);
                 }
                 if !redirect_hosts.contains(&host) {
                     redirect_hosts.push(host.clone());
@@ -426,8 +455,10 @@ pub fn plan(config: &Config) -> Result<Option<AutomaticHttpsPlan>> {
             }
         }
         if catch_all && redirects_for_server {
+            // Caddy appends a hostless catch-all redirect for unknown hosts targeting the
+            // configured HTTPS port; known hosts use their listener-derived port above.
             redirect_all = true;
-            redirect_all_port = redirect_port;
+            redirect_all_port = https_port;
         }
     }
 
@@ -2014,7 +2045,10 @@ mod tests {
     }
 
     #[test]
-    fn plan_rejects_mixed_cleartext_and_tls_listeners() {
+    fn plan_derives_mixed_cleartext_and_tls_listeners() {
+        // Caddy allows one server to listen on both the HTTP port and an HTTPS port: the HTTP
+        // port stays cleartext (and serves redirects/challenges) while the other port terminates
+        // TLS. Caddy's per-listener rule is `useTLS && port != http_port`.
         let value = json!({
             "apps": {"http": {"servers": {"srv0": {
                 "listen": [":80", ":443"],
@@ -2022,10 +2056,392 @@ mod tests {
                             "handle": [{"handler": "static_response", "body": "ok"}]}]
             }}}}
         });
-        let error = plan(&Config::from_value(value).unwrap()).unwrap_err();
+        let plan = plan(&Config::from_value(value).unwrap()).unwrap().unwrap();
+        assert_eq!(plan.tls_ports, vec![443], "only the non-HTTP port is TLS");
+        assert_eq!(plan.subjects, vec!["example.com".to_string()]);
+        assert_eq!(plan.redirect_ports.get("example.com"), Some(&443));
+        assert!(plan.redirects_enabled);
         assert!(
-            error.to_string().contains("cannot mix cleartext"),
-            "{error}"
+            !plan.needs_http_listener,
+            "the server already provides a cleartext HTTP listener"
+        );
+        assert_eq!(
+            plan.redirect_location("example.com", "/x?y=1"),
+            "https://example.com/x?y=1"
+        );
+    }
+
+    #[test]
+    fn plan_derives_multiple_non_standard_https_ports() {
+        // Caddy records the first listener port for redirects and replaces it only when the
+        // configured HTTPS port appears later (recordAutoHTTPSRedirectAddress).
+        let value = json!({
+            "apps": {"http": {"servers": {"srv0": {
+                "listen": [":19443", ":18443"],
+                "routes": [{"match": [{"host": ["example.com"]}],
+                            "handle": [{"handler": "static_response", "body": "ok"}]}]
+            }}}}
+        });
+        let parsed_plan = plan(&Config::from_value(value.clone()).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed_plan.tls_ports, vec![18443, 19443]);
+        assert_eq!(parsed_plan.redirect_ports.get("example.com"), Some(&19443));
+        assert_eq!(
+            parsed_plan.redirect_location("example.com", "/path"),
+            "https://example.com:19443/path"
+        );
+
+        // When the configured HTTPS port is present in the listener set it wins the redirect,
+        // and Caddy's makeRedirRoute suppresses the port because it equals the app HTTPS port.
+        let mut value = value;
+        value["apps"]["http"]["https_port"] = json!(18443);
+        let parsed_plan = plan(&Config::from_value(value).unwrap()).unwrap().unwrap();
+        assert_eq!(parsed_plan.redirect_ports.get("example.com"), Some(&18443));
+        assert_eq!(
+            parsed_plan.redirect_location("example.com", "/path"),
+            "https://example.com/path"
+        );
+    }
+
+    #[test]
+    fn plan_derives_mixed_custom_http_and_https_ports() {
+        let value = json!({
+            "apps": {"http": {
+                "http_port": 18080,
+                "https_port": 18443,
+                "servers": {"srv0": {
+                    "listen": [":18080", ":18443"],
+                    "routes": [{"match": [{"host": ["example.com"]}],
+                                "handle": [{"handler": "static_response", "body": "ok"}]}]
+                }}
+            }}
+        });
+        let plan = plan(&Config::from_value(value).unwrap()).unwrap().unwrap();
+        assert_eq!(plan.tls_ports, vec![18443]);
+        assert_eq!(plan.redirect_ports.get("example.com"), Some(&18443));
+        assert_eq!(
+            plan.redirect_location("example.com", "/x"),
+            "https://example.com/x",
+            "Caddy suppresses the port when it equals the configured https_port"
+        );
+        assert!(!plan.needs_http_listener);
+    }
+
+    #[test]
+    fn plan_keeps_explicit_http_hosts_cleartext_when_mixed_with_implicit_https() {
+        // The adapter marks explicit `http://host:port` sites with automatic_https.skip and gives
+        // them their own listener; the skipped host must stay cleartext even when another server
+        // manages the same host over HTTPS.
+        let value = json!({
+            "apps": {"http": {
+                "http_port": 18080,
+                "https_port": 18443,
+                "servers": {
+                    "srv0": {
+                        "listen": [":18081"],
+                        "automatic_https": {"skip": ["localhost"]},
+                        "routes": [{"match": [{"host": ["localhost"]}],
+                                    "handle": [{"handler": "static_response", "body": "plain"}]}]
+                    },
+                    "srv1": {
+                        "listen": [":18443"],
+                        "routes": [{"match": [{"host": ["localhost"]}],
+                                    "handle": [{"handler": "static_response", "body": "secure"}]}]
+                    }
+                }
+            }}
+        });
+        let plan = plan(&Config::from_value(value).unwrap()).unwrap().unwrap();
+        assert_eq!(plan.tls_ports, vec![18443], "18081 stays cleartext");
+        assert_eq!(plan.subjects, vec!["localhost".to_string()]);
+        assert_eq!(plan.redirect_ports.get("localhost"), Some(&18443));
+        assert!(plan.redirects_enabled);
+    }
+
+    #[test]
+    fn plan_derives_catch_all_redirects_for_hostless_tls_servers() {
+        // A catch-all HTTPS server with explicit TLS policies still gets HTTP->HTTPS redirects in
+        // Caddy (there are no host matchers to add to the certificate set).
+        let value = json!({
+            "apps": {"http": {
+                "http_port": 18080,
+                "https_port": 18443,
+                "servers": {"srv0": {
+                    "listen": [":18443"],
+                    "tls_connection_policies": [{}],
+                    "routes": [{"handle": [{"handler": "static_response", "body": "catch all"}]}]
+                }}
+            }}
+        });
+        let plan = plan(&Config::from_value(value).unwrap()).unwrap().unwrap();
+        assert!(plan.subjects.is_empty(), "no hosts to manage");
+        assert!(plan.redirect_all);
+        assert!(plan.redirects_enabled);
+        assert_eq!(plan.redirect_all_port, 18443);
+        assert_eq!(
+            plan.redirect_location("unknown.example", "/x"),
+            "https://unknown.example/x"
+        );
+        assert!(plan.needs_http_listener);
+    }
+
+    #[test]
+    fn plan_redirect_location_follows_caddy_make_redir_route() {
+        let mut plan = AutomaticHttpsPlan {
+            http_port: 80,
+            https_port: 443,
+            redirects_enabled: true,
+            redirect_all: true,
+            redirect_all_port: 8443,
+            ..AutomaticHttpsPlan::default()
+        };
+        plan.redirect_ports.insert("example.com".to_string(), 8443);
+        // Non-standard destination ports are appended.
+        assert_eq!(
+            plan.redirect_location("example.com", "/p?q=1"),
+            "https://example.com:8443/p?q=1"
+        );
+        // The configured app HTTPS port, the HTTP port and 80/443 never get an explicit port.
+        for suppressed in [80_u16, 443, 8443] {
+            let mut plan = plan.clone();
+            plan.https_port = 8443;
+            plan.redirect_ports
+                .insert("example.com".to_string(), suppressed);
+            plan.redirect_all_port = suppressed;
+            let location = plan.redirect_location("example.com", "/x");
+            assert!(
+                !location.contains(&format!(":{suppressed}")),
+                "{suppressed}: {location}"
+            );
+            let unknown = plan.redirect_location("unknown.example", "/x");
+            assert!(!unknown.contains(&format!(":{suppressed}")), "{unknown}");
+        }
+        // Hostless/catch-all destinations also follow the rule.
+        let mut plan = AutomaticHttpsPlan {
+            http_port: 80,
+            https_port: 443,
+            redirects_enabled: true,
+            redirect_all: true,
+            redirect_all_port: 9443,
+            ..AutomaticHttpsPlan::default()
+        };
+        assert_eq!(
+            plan.redirect_location("unknown.example", "/"),
+            "https://unknown.example:9443/"
+        );
+        plan.redirect_all_port = 443;
+        assert_eq!(
+            plan.redirect_location("unknown.example", "/"),
+            "https://unknown.example/"
+        );
+    }
+
+    #[test]
+    fn plan_derives_challenge_listener_when_http_port_differs() {
+        // Caddy derives a redirect/challenge server on `http_port` when the TLS listeners are
+        // elsewhere and no cleartext HTTP listener exists.
+        let value = json!({
+            "apps": {"http": {
+                "http_port": 18080,
+                "https_port": 18443,
+                "servers": {"srv0": {
+                    "listen": [":18443"],
+                    "routes": [{"match": [{"host": ["example.com"]}],
+                                "handle": [{"handler": "static_response", "body": "ok"}]}]
+                }}
+            }}
+        });
+        let parsed_plan = plan(&Config::from_value(value.clone()).unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(parsed_plan.needs_http_listener);
+        assert_eq!(parsed_plan.http_listener().as_deref(), Some(":18080"));
+
+        // An existing cleartext listener on `http_port` is reused instead.
+        let mut value = value;
+        value["apps"]["http"]["servers"]["srv1"] = json!({
+            "listen": [":18080"],
+            "routes": [{"handle": [{"handler": "static_response", "body": "http"}]}]
+        });
+        let parsed_plan = plan(&Config::from_value(value).unwrap()).unwrap().unwrap();
+        assert!(!parsed_plan.needs_http_listener);
+    }
+
+    #[test]
+    fn plan_ignores_disabled_servers_but_keeps_enabled_ones() {
+        let value = json!({
+            "apps": {"http": {
+                "http_port": 18080,
+                "https_port": 18443,
+                "servers": {
+                    "srv0": {
+                        "listen": [":18443"],
+                        "automatic_https": {"disable": true},
+                        "routes": [{"match": [{"host": ["disabled.example"]}],
+                                    "handle": [{"handler": "static_response", "body": "off"}]}]
+                    },
+                    "srv1": {
+                        "listen": [":19443"],
+                        "routes": [{"match": [{"host": ["enabled.example"]}],
+                                    "handle": [{"handler": "static_response", "body": "on"}]}]
+                    }
+                }
+            }}
+        });
+        let parsed_plan = plan(&Config::from_value(value).unwrap()).unwrap().unwrap();
+        assert_eq!(parsed_plan.subjects, vec!["enabled.example".to_string()]);
+        assert_eq!(
+            parsed_plan.redirect_hosts,
+            vec!["enabled.example".to_string()]
+        );
+        assert!(!parsed_plan
+            .redirect_hosts
+            .contains(&"disabled.example".to_string()));
+        assert_eq!(parsed_plan.tls_ports, vec![19443]);
+        assert_eq!(
+            parsed_plan.redirect_ports.get("enabled.example"),
+            Some(&19443)
+        );
+    }
+
+    #[test]
+    fn plan_loaded_certificate_hosts_still_redirect_to_their_listener_port() {
+        let mut value = json!({
+            "apps": {
+                "http": {
+                    "http_port": 18080,
+                    "https_port": 18443,
+                    "servers": {"srv0": {
+                        "listen": [":18443"],
+                        "routes": [{"match": [{"host": ["example.com"]}],
+                                    "handle": [{"handler": "static_response", "body": "ok"}]}]
+                    }}
+                },
+                "tls": {"certificates": {"load_pem": [{
+                    "certificate": include_str!("../testdata/https/example.com.pem"),
+                    "key": include_str!("../testdata/https/example.com.key")
+                }]}}
+            }
+        });
+        let parsed_plan = plan(&Config::from_value(value.clone()).unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(
+            parsed_plan.subjects.is_empty(),
+            "managed certificate suppressed"
+        );
+        assert_eq!(parsed_plan.redirect_hosts, vec!["example.com".to_string()]);
+        assert_eq!(parsed_plan.redirect_ports.get("example.com"), Some(&18443));
+        assert_eq!(
+            parsed_plan.redirect_location("example.com", "/path"),
+            "https://example.com/path"
+        );
+
+        // `ignore_loaded_certificates` forces management but keeps the same redirect.
+        value["apps"]["http"]["servers"]["srv0"]["automatic_https"] =
+            json!({"ignore_loaded_certificates": true});
+        let parsed_plan = plan(&Config::from_value(value).unwrap()).unwrap().unwrap();
+        assert_eq!(parsed_plan.subjects, vec!["example.com".to_string()]);
+        assert_eq!(parsed_plan.force_reissue, vec!["example.com".to_string()]);
+        assert_eq!(parsed_plan.redirect_ports.get("example.com"), Some(&18443));
+    }
+
+    #[test]
+    fn plan_multiple_servers_for_same_host_use_caddy_winning_redirect_port() {
+        let value = json!({
+            "apps": {"http": {
+                "http_port": 18080,
+                "https_port": 18443,
+                "servers": {
+                    "srv0": {
+                        "listen": [":18443"],
+                        "routes": [{"match": [{"host": ["example.com"]}],
+                                    "handle": [{"handler": "static_response", "body": "a"}]}]
+                    },
+                    "srv1": {
+                        "listen": [":19443"],
+                        "routes": [{"match": [{"host": ["example.com"]}],
+                                    "handle": [{"handler": "static_response", "body": "b"}]}]
+                    }
+                }
+            }}
+        });
+        let parsed_plan = plan(&Config::from_value(value).unwrap()).unwrap().unwrap();
+        assert_eq!(parsed_plan.tls_ports, vec![18443, 19443]);
+        assert_eq!(parsed_plan.redirect_ports.get("example.com"), Some(&18443));
+        assert_eq!(
+            parsed_plan.redirect_location("example.com", "/"),
+            "https://example.com/"
+        );
+    }
+
+    #[test]
+    fn plan_ip_and_empty_hosts_derive_internal_certificates_and_redirects() {
+        // IP identifiers with default issuers use the internal CA and redirect to the listener
+        // port like DNS names.
+        let value = json!({
+            "apps": {"http": {"servers": {"srv0": {
+                "listen": [":8443"],
+                "routes": [{"match": [{"host": ["203.0.113.7"]}],
+                            "handle": [{"handler": "static_response", "body": "ip"}]}]
+            }}}}
+        });
+        let parsed_plan = plan(&Config::from_value(value).unwrap()).unwrap().unwrap();
+        assert_eq!(parsed_plan.subjects, vec!["203.0.113.7".to_string()]);
+        assert!(matches!(
+            parsed_plan.policy_for("203.0.113.7").unwrap().issuer,
+            AutomaticHttpsIssuer::Internal
+        ));
+        assert_eq!(
+            parsed_plan.redirect_location("203.0.113.7", "/x"),
+            "https://203.0.113.7:8443/x"
+        );
+
+        // A completely hostless server without TLS policies has no names to manage and no
+        // implicit TLS to derive.
+        let value = json!({
+            "apps": {"http": {"servers": {"srv0": {
+                "listen": [":8443"],
+                "routes": [{"handle": [{"handler": "static_response", "body": "any"}]}]
+            }}}}
+        });
+        assert!(plan(&Config::from_value(value).unwrap()).unwrap().is_none());
+    }
+
+    #[test]
+    fn plan_manual_tls_server_still_gets_redirects() {
+        // A server with explicit TLS policies and a manually loaded certificate does not manage
+        // certificates, but Caddy still derives HTTP->HTTPS redirects for its hosts.
+        let value = json!({
+            "apps": {
+                "http": {
+                    "http_port": 18080,
+                    "https_port": 18443,
+                    "servers": {"srv0": {
+                        "listen": [":18443"],
+                        "tls_connection_policies": [{}],
+                        "routes": [{"match": [{"host": ["example.com"]}],
+                                    "handle": [{"handler": "static_response", "body": "manual"}]}]
+                    }}
+                },
+                "tls": {"certificates": {"load_pem": [{
+                    "certificate": include_str!("../testdata/https/example.com.pem"),
+                    "key": include_str!("../testdata/https/example.com.key")
+                }]}}
+            }
+        });
+        let plan = plan(&Config::from_value(value).unwrap()).unwrap().unwrap();
+        assert!(
+            plan.subjects.is_empty(),
+            "manual certificate, no automation"
+        );
+        assert_eq!(plan.redirect_hosts, vec!["example.com".to_string()]);
+        assert!(plan.redirects_enabled);
+        assert_eq!(plan.redirect_ports.get("example.com"), Some(&18443));
+        assert_eq!(
+            plan.redirect_location("example.com", "/x"),
+            "https://example.com/x"
         );
     }
 
