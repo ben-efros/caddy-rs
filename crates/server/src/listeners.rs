@@ -877,6 +877,7 @@ async fn serve_one_request(
             on_upgrade,
             h2c_service,
             &mut force,
+            Arc::clone(&context.limits),
             permit,
             generation,
             tracked,
@@ -1000,6 +1001,7 @@ fn spawn_h2c_connection<S>(
     on_upgrade: hyper::upgrade::OnUpgrade,
     service: S,
     force: &mut watch::Receiver<bool>,
+    limits: Arc<ServerLimits>,
     permit: Arc<ConnectionPermit>,
     generation: Option<Arc<Generation>>,
     tracked: Arc<TrackedConnection>,
@@ -1027,7 +1029,10 @@ fn spawn_h2c_connection<S>(
                 return;
             }
         };
-        let builder = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
+        let mut builder = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
+        // An h2c-upgraded connection is an HTTP/2 server connection too: apply the same
+        // Caddy/Go-compatible SETTINGS as the prior-knowledge h2 path.
+        configure_h2_raw_server(&mut builder, &limits);
         // `hyper::upgrade::Upgraded` already implements hyper's IO traits; only the tokio
         // copy path needs the `TokioIo` adapter.
         let connection = builder.serve_connection(upgraded, service);
@@ -1099,6 +1104,81 @@ fn spawn_upgraded_tunnel(
     });
 }
 
+/// Caddy applies a 16 KiB default `MaxHeaderBytes` when the server field is absent or <= 0
+/// (`external/caddy/modules/caddyhttp/app.go`, `Server.Start`).
+const CADDY_DEFAULT_MAX_HEADER_BYTES: usize = 16 * 1024;
+
+/// Go's `http2adjustHTTP1MaxHeaderSize`: HTTP/2 counts 32 bytes of per-field overhead per pair and
+/// assumes 10 typical headers, so the advertised `SETTINGS_MAX_HEADER_LIST_SIZE` is the HTTP/1
+/// `MaxHeaderBytes` plus 320 (`net/http/h2_bundle.go`).
+const GO_H2_HEADER_LIST_PADDING: u32 = 10 * 32;
+
+/// Go `x/net/http2` server default for `SETTINGS_MAX_CONCURRENT_STREAMS`
+/// (`http2defaultMaxStreams = 250`, `net/http/h2_bundle.go`).
+const GO_H2_DEFAULT_MAX_CONCURRENT_STREAMS: u32 = 250;
+
+/// Go `x/net/http2` server default for the maximum frame it accepts, which is what the server
+/// advertises as `SETTINGS_MAX_FRAME_SIZE` (`http2defaultMaxReadFrameSize = 1 << 20` in
+/// `net/http/h2_bundle.go`; `ConfigureServer(new(http2.Server))` applies that default). Caddy
+/// constructs `new(http2.Server)`, so Caddy advertises 1 MiB. The protocol's initial maximum frame
+/// size (16384) is a different constant and is not what Go advertises.
+const GO_H2_DEFAULT_MAX_READ_FRAME_SIZE: u32 = 1024 * 1024;
+
+/// Go `x/net/http2` server default receive window per stream and per connection
+/// (`MaxUploadBufferPerStream`/`MaxUploadBufferPerConnection` = 1 MiB).
+const GO_H2_DEFAULT_INITIAL_WINDOW_SIZE: u32 = 1024 * 1024;
+
+/// Apply Caddy/Go-compatible HTTP/2 server tuning explicitly.
+///
+/// Caddy v2.11.7 exposes **no JSON fields** for h2 stream/frame/window tuning: it passes
+/// `new(http2.Server)` to `http2.ConfigureServer`, so Go's defaults apply. Hyper's defaults differ
+/// for `MAX_CONCURRENT_STREAMS` (200 vs Go's 250), so the values are set explicitly here. Header
+/// size comes from the existing per-server `max_header_bytes` field, converted the way Go's
+/// HTTP/2 server converts `http.MaxHeaderBytes`.
+///
+/// Kept deliberately unset: `enable_connect_protocol` (extended CONNECT is not implemented and is
+/// rejected loudly by the request layer), h2 keepalive/PING tuning and `keepalive_*` socket options
+/// (documented gaps: Caddy's `keepalive_*` fields are TCP keepalive, not h2 PING).
+fn configure_h2_raw_server(
+    builder: &mut hyper::server::conn::http2::Builder<TokioExecutor>,
+    limits: &ServerLimits,
+) {
+    let max_header_bytes = limits
+        .max_header_bytes
+        .unwrap_or(CADDY_DEFAULT_MAX_HEADER_BYTES);
+    let max_header_list_size = u32::try_from(max_header_bytes)
+        .unwrap_or(u32::MAX)
+        .saturating_add(GO_H2_HEADER_LIST_PADDING);
+    let _ = builder
+        .timer(TokioTimer::new())
+        .max_concurrent_streams(GO_H2_DEFAULT_MAX_CONCURRENT_STREAMS)
+        .max_frame_size(GO_H2_DEFAULT_MAX_READ_FRAME_SIZE)
+        .initial_stream_window_size(GO_H2_DEFAULT_INITIAL_WINDOW_SIZE)
+        .initial_connection_window_size(GO_H2_DEFAULT_INITIAL_WINDOW_SIZE)
+        .max_header_list_size(max_header_list_size);
+}
+
+/// The same tuning applied through hyper-util's auto-builder `Http2Builder` wrapper (used for
+/// connections served by the automatic HTTP/1-or-HTTP/2 detector).
+fn configure_h2_auto_server(
+    builder: &mut hyper_util::server::conn::auto::Http2Builder<'_, TokioExecutor>,
+    limits: &ServerLimits,
+) {
+    let max_header_bytes = limits
+        .max_header_bytes
+        .unwrap_or(CADDY_DEFAULT_MAX_HEADER_BYTES);
+    let max_header_list_size = u32::try_from(max_header_bytes)
+        .unwrap_or(u32::MAX)
+        .saturating_add(GO_H2_HEADER_LIST_PADDING);
+    let _ = builder
+        .timer(TokioTimer::new())
+        .max_concurrent_streams(GO_H2_DEFAULT_MAX_CONCURRENT_STREAMS)
+        .max_frame_size(GO_H2_DEFAULT_MAX_READ_FRAME_SIZE)
+        .initial_stream_window_size(GO_H2_DEFAULT_INITIAL_WINDOW_SIZE)
+        .initial_connection_window_size(GO_H2_DEFAULT_INITIAL_WINDOW_SIZE)
+        .max_header_list_size(max_header_list_size);
+}
+
 /// Serve one connection with the server's limits and graceful-shutdown/idle handling.
 async fn serve_connection<I, S>(
     io: I,
@@ -1118,16 +1198,18 @@ async fn serve_connection<I, S>(
     S::Future: Send + 'static,
 {
     let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+    // Caddy defaults `MaxHeaderBytes` to 16 KiB when the server field is absent/zero.
     builder
         .http1()
         .timer(TokioTimer::new())
-        .header_read_timeout(Some(limits.read_header_timeout));
-    if let Some(max_header_bytes) = limits.max_header_bytes {
-        builder.http1().max_buf_size(max_header_bytes);
-        builder
-            .http2()
-            .max_header_list_size(u32::try_from(max_header_bytes).unwrap_or(u32::MAX));
-    }
+        .header_read_timeout(Some(limits.read_header_timeout))
+        .max_buf_size(
+            limits
+                .max_header_bytes
+                .unwrap_or(CADDY_DEFAULT_MAX_HEADER_BYTES),
+        );
+    let mut http2 = builder.http2();
+    configure_h2_auto_server(&mut http2, &limits);
 
     let io = TimedIo::new(io, limits.read_timeout, limits.write_timeout);
     let connection = builder.serve_connection_with_upgrades(TokioIo::new(io), service);
