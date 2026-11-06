@@ -253,6 +253,13 @@ pub enum AcmeError {
         /// The invalid order string.
         order: String,
     },
+
+    /// Challenge selection failed in the adaptive order machinery (e.g. a randomness failure).
+    #[error("ACME challenge selection failed: {reason}")]
+    ChallengeSelection {
+        /// Failure description.
+        reason: String,
+    },
 }
 
 impl AcmeError {

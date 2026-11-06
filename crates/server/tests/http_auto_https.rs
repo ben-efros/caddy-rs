@@ -1413,13 +1413,14 @@ async fn normal_tls_clients_are_unaffected_by_tls_alpn_overlay() {
 }
 
 #[tokio::test]
-async fn http01_is_preferred_when_both_challenges_are_available() {
+async fn adaptive_selection_validates_one_of_the_available_challenges() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().to_string_lossy().to_string();
     let (address, activation) = prebound_listener();
     let listen = address.to_string();
     let store = Arc::new(GenerationStore::with_builtin_registry());
-    // No `challenges` options: HTTP-01 and TLS-ALPN-01 are both enabled.
+    // No `challenges` options: HTTP-01 and TLS-ALPN-01 are both enabled and both functional
+    // (the fake CA probes the real TLS listener for TLS-ALPN-01).
     store
         .load(tls_alpn_config(&listen, Some(0), None, &root))
         .expect("config validates");
@@ -1429,15 +1430,64 @@ async fn http01_is_preferred_when_both_challenges_are_available() {
         .with_data_root(directory.path())
         .with_socket_activation(activation);
     runtime.apply().await.expect("apply");
+    // acmez randomizes the initial challenge order when several types are offered
+    // (client.go:281-294), so either type may validate the first issuance; exactly the selected
+    // one must be validated (DIV-0097 / T-TLS-076).
+    assert_eq!(
+        fake.probe_failure(),
+        None,
+        "the CA must be able to validate the selected challenge"
+    );
+    match fake.selected_challenge().as_deref() {
+        Some("http-01") => assert_eq!(
+            fake.tls_alpn_validations(),
+            0,
+            "TLS-ALPN-01 must not be validated when HTTP-01 was selected"
+        ),
+        Some("tls-alpn-01") => assert_eq!(
+            fake.tls_alpn_validations(),
+            1,
+            "the selected TLS-ALPN-01 challenge must be validated exactly once"
+        ),
+        other => panic!("no adaptive challenge was selected: {other:?}"),
+    }
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn unvalidatable_tls_alpn_falls_back_to_http01() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().to_string_lossy().to_string();
+    let (address, activation) = prebound_listener();
+    let listen = address.to_string();
+    let store = Arc::new(GenerationStore::with_builtin_registry());
+    // No `challenges` options (HTTP-01 and TLS-ALPN-01 both enabled) and no TLS-ALPN-01 probe:
+    // the fake CA rejects TLS-ALPN-01 with a retryable `connection` problem.
+    store
+        .load(tls_alpn_config(&listen, Some(0), None, &root))
+        .expect("config validates");
+    let fake = Arc::new(FakeCa::new(false));
+    let mut runtime = ServerRuntime::new(Arc::clone(&store))
+        .with_acme_transport(fake.clone())
+        .with_data_root(directory.path())
+        .with_socket_activation(activation);
+    runtime
+        .apply()
+        .await
+        .expect("issuance must fall back to HTTP-01");
+    // acmez remembers the failed challenge type per identifier and retries the order with the
+    // next solver-backed type (`failedChallengeTypes` + `retryableErr`, client.go:123-200,
+    // 500-600), so whichever type was tried first, the order must finish on HTTP-01
+    // (DIV-0097 / T-TLS-076).
     assert_eq!(
         fake.selected_challenge().as_deref(),
         Some("http-01"),
-        "Caddy prefers HTTP-01 when both challenges are available"
+        "the order must finish on HTTP-01 after TLS-ALPN-01 fails"
     );
     assert_eq!(
         fake.tls_alpn_validations(),
         0,
-        "TLS-ALPN-01 must not be used when HTTP-01 succeeds"
+        "the unprobeable TLS-ALPN-01 challenge must never validate"
     );
     runtime.shutdown().await;
 }
