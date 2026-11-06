@@ -10,7 +10,7 @@ use bytes::Bytes;
 use http::{Method, Uri};
 use serde_json::{json, Value};
 
-use caddy_rs_core::{validate_config, Config, ModuleKind, ModuleRegistry};
+use caddy_rs_core::{validate_config, Config, ModuleRegistry};
 use caddy_rs_http::{Request, RouterBuilder};
 
 /// Routes exactly as emitted by real Caddy v2.11.7 for [`CADDYFILE`].
@@ -191,9 +191,9 @@ fn adapted_matcher_configs_validate_with_the_right_registry() {
     validate_config(&config, &ModuleRegistry::builtin())
         .expect("path_regexp is registered, so adapted JSON validates");
 
-    // The network/protocol/TLS matchers are implemented by the HTTP engine but are not (yet)
-    // registered in the core module registry; a custom registry overlay validates the same
-    // adapted JSON, which is what a follow-up core change should add by default.
+    // The network matchers are implemented by the HTTP engine and registered in the core
+    // builtin registry (wave-9 core split), so adapted JSON using them validates against the
+    // default registry too.
     let subset = r#"
 :8080 {
 	@net remote_ip private_ranges
@@ -205,29 +205,8 @@ fn adapted_matcher_configs_validate_with_the_right_registry() {
 "#;
     let adapted = caddy_rs_config::adapt(subset).expect("adapts");
     let config = Config::from_value(adapted.config).expect("configuration model decodes");
-    let builtin = ModuleRegistry::builtin();
-    let error = validate_config(&config, &builtin)
-        .expect_err("builtin registry does not know remote_ip/client_ip yet");
-    assert!(error.to_string().contains("remote_ip"), "{error}");
-
-    let registry = ModuleRegistry::builder()
-        .register(
-            "http.matchers.remote_ip",
-            "remote_ip",
-            ModuleKind::HttpMatcher,
-            "Match the direct peer IP",
-        )
-        .and_then(|registry| {
-            registry.register(
-                "http.matchers.client_ip",
-                "client_ip",
-                ModuleKind::HttpMatcher,
-                "Match the resolved client IP",
-            )
-        })
-        .expect("custom matcher registration")
-        .build();
-    validate_config(&config, &registry).expect("adapted JSON validates with a registry overlay");
+    validate_config(&config, &ModuleRegistry::builtin())
+        .expect("remote_ip/client_ip are registered in the builtin registry");
 
     // The protocol and tls matchers reach the same validation path.
     let oracle = Config::from_value(json!({
@@ -240,21 +219,6 @@ fn adapted_matcher_configs_validate_with_the_right_registry() {
         }}}}
     }))
     .expect("oracle matcher JSON decodes");
-    let registry = registry
-        .overlay([caddy_rs_core::Module::owned(
-            "http.matchers.protocol",
-            "protocol",
-            ModuleKind::HttpMatcher,
-            "Match the request protocol",
-        )])
-        .and_then(|registry| {
-            registry.overlay([caddy_rs_core::Module::owned(
-                "http.matchers.tls",
-                "tls",
-                ModuleKind::HttpMatcher,
-                "Match TLS connections",
-            )])
-        })
-        .expect("protocol/tls registration");
-    validate_config(&oracle, &registry).expect("protocol/tls matcher JSON validates");
+    validate_config(&oracle, &ModuleRegistry::builtin())
+        .expect("protocol/tls matcher JSON validates");
 }
