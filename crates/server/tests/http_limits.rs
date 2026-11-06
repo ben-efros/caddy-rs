@@ -545,3 +545,83 @@ async fn h2c_upgrade_switches_to_http2() {
 
     runtime.shutdown().await;
 }
+
+#[tokio::test]
+async fn h2c_upgrade_with_malformed_settings_is_served_as_http1() {
+    // RFC 7540 §3.2.1: a server MUST ignore an `Upgrade: h2c` offer whose HTTP2-Settings cannot
+    // be parsed, and serve the request as ordinary HTTP/1.1 rather than answering 101. Here the
+    // server *does* enable h2c, but the offered settings value is not valid base64url.
+    let (_store, runtime, address) = start(serde_json::json!({"protocols": ["h2c"]})).await;
+
+    let mut stream = TcpStream::connect(address).await.expect("connect");
+    let request = "GET / HTTP/1.1\r\n\
+                   Host: example.com\r\n\
+                   Connection: Upgrade, HTTP2-Settings\r\n\
+                   Upgrade: h2c\r\n\
+                   HTTP2-Settings: !!!not-base64!!!\r\n\
+                   \r\n";
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write h2c offer with malformed settings");
+
+    let mut head = Vec::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
+            .await
+            .expect("response head timeout")
+            .expect("read response byte");
+        assert!(read > 0, "connection closed before the response head");
+        head.push(byte[0]);
+        if head.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    let head = String::from_utf8_lossy(&head);
+    assert!(
+        head.starts_with("HTTP/1.1 200"),
+        "malformed HTTP2-Settings must decline the h2c upgrade and serve HTTP/1.1, got: {head:?}"
+    );
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn h2c_upgrade_without_settings_is_served_as_http1() {
+    // RFC 7540 §3.2.1 requires the HTTP2-Settings header on an h2c offer; without it the upgrade
+    // is declined and the request is served as ordinary HTTP/1.1, even with h2c enabled.
+    let (_store, runtime, address) = start(serde_json::json!({"protocols": ["h2c"]})).await;
+
+    let mut stream = TcpStream::connect(address).await.expect("connect");
+    let request = "GET / HTTP/1.1\r\n\
+                   Host: example.com\r\n\
+                   Connection: Upgrade\r\n\
+                   Upgrade: h2c\r\n\
+                   \r\n";
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write h2c offer without settings");
+
+    let mut head = Vec::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
+            .await
+            .expect("response head timeout")
+            .expect("read response byte");
+        assert!(read > 0, "connection closed before the response head");
+        head.push(byte[0]);
+        if head.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    let head = String::from_utf8_lossy(&head);
+    assert!(
+        head.starts_with("HTTP/1.1 200"),
+        "missing HTTP2-Settings must decline the h2c upgrade and serve HTTP/1.1, got: {head:?}"
+    );
+
+    runtime.shutdown().await;
+}

@@ -105,14 +105,103 @@ impl UpgradedResponse {
 /// HTTP/1.1 `Upgrade: h2c` protocol token (RFC 7540 §3.2 cleartext HTTP/2 upgrade).
 pub const H2C_UPGRADE_TOKEN: &str = "h2c";
 
+/// The connection-specific `HTTP2-Settings` header (RFC 7540 §3.2.1).
+pub const HTTP2_SETTINGS_HEADER: &str = "HTTP2-Settings";
+
 /// Whether the request headers offer an h2c (cleartext HTTP/2) protocol upgrade.
 ///
 /// This is the RFC 7230 negotiation check plus a case-insensitive `h2c` token comparison, matching
 /// Caddy's cleartext listener behaviour. The server is responsible for only honouring it on an
-/// HTTP/1.1, non-TLS connection and for serving HTTP/2 on the upgraded stream.
+/// HTTP/1.1, non-TLS connection, for requiring a valid [`HTTP2-Settings`](HTTP2_SETTINGS_HEADER)
+/// header (see [`h2c_upgrade_settings`]), and for serving HTTP/2 on the upgraded stream.
 pub fn is_h2c_upgrade(headers: &HeaderMap) -> bool {
     requested_upgrade_type(headers)
         .is_some_and(|protocol| protocol.eq_ignore_ascii_case(H2C_UPGRADE_TOKEN))
+}
+
+/// Why an h2c Upgrade offer's `HTTP2-Settings` header is not acceptable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum H2cSettingsError {
+    /// The `HTTP2-Settings` header is absent. RFC 7540 §3.2.1 forbids upgrading to HTTP/2
+    /// without it.
+    Missing,
+    /// The header value is not a valid base64url string (RFC 4648 §5).
+    InvalidBase64,
+    /// The decoded value is not a SETTINGS frame payload: RFC 7540 §6.5 requires a length that
+    /// is a multiple of 6 octets (one SETTINGS entry per 6 octets).
+    InvalidSettings,
+}
+
+impl fmt::Display for H2cSettingsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            H2cSettingsError::Missing => write!(
+                formatter,
+                "h2c upgrade request is missing the {HTTP2_SETTINGS_HEADER} header"
+            ),
+            H2cSettingsError::InvalidBase64 => write!(
+                formatter,
+                "{HTTP2_SETTINGS_HEADER} is not a valid base64url string"
+            ),
+            H2cSettingsError::InvalidSettings => write!(
+                formatter,
+                "{HTTP2_SETTINGS_HEADER} is not a SETTINGS frame payload (length must be a \
+                 multiple of 6 octets)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for H2cSettingsError {}
+
+/// Validate the `HTTP2-Settings` header of an h2c Upgrade offer (RFC 7540 §3.2.1).
+///
+/// The header carries the payload of the SETTINGS frame that governs the upgraded HTTP/2
+/// connection, encoded as base64url (RFC 4648 §5) with padding omitted. A server MUST NOT switch
+/// an `Upgrade: h2c` request to HTTP/2 unless this header is present and decodes to a valid
+/// SETTINGS frame payload; callers reject the offer with `400 Bad Request` otherwise. Only the
+/// framing is validated here — unknown SETTINGS identifiers are allowed (RFC 7540 §6.5.2 requires
+/// implementations to ignore parameters they do not understand).
+pub fn h2c_upgrade_settings(headers: &HeaderMap) -> Result<(), H2cSettingsError> {
+    let value = headers
+        .get(HTTP2_SETTINGS_HEADER)
+        .ok_or(H2cSettingsError::Missing)?;
+    let value = value
+        .to_str()
+        .map_err(|_| H2cSettingsError::InvalidBase64)?;
+    let payload = decode_base64url(value).ok_or(H2cSettingsError::InvalidBase64)?;
+    if payload.len() % 6 != 0 {
+        return Err(H2cSettingsError::InvalidSettings);
+    }
+    Ok(())
+}
+
+/// Decode a base64url string (RFC 4648 §5): the URL-safe alphabet (`-` and `_` in place of `+`
+/// and `/`), padding omitted and tolerated at the tail.
+fn decode_base64url(input: &str) -> Option<Vec<u8>> {
+    // RFC 4648 §5 base64url omits padding; tolerate trailing `=` so values encoded by
+    // third-party clients with padding still validate.
+    let input = input.trim_end_matches('=');
+    let mut decoded = Vec::with_capacity(input.len() * 3 / 4 + 3);
+    let mut accumulator: u32 = 0;
+    let mut bits: u32 = 0;
+    for byte in input.bytes() {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            _ => return None,
+        };
+        accumulator = (accumulator << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            decoded.push((accumulator >> bits) as u8);
+        }
+    }
+    Some(decoded)
 }
 
 /// The handshake headers for a `101 Switching Protocols` h2c response.
@@ -242,5 +331,85 @@ mod tests {
         let headers = h2c_upgrade_headers();
         assert_eq!(headers[http::header::UPGRADE], "h2c");
         assert_eq!(headers[http::header::CONNECTION], "Upgrade");
+    }
+
+    #[test]
+    fn h2c_upgrade_settings_accepts_the_oracle_payload() {
+        // The payload used by the live-oracle and integration tests: two SETTINGS entries
+        // (MAX_CONCURRENT_STREAMS=100 and INITIAL_WINDOW_SIZE=65535), which is a valid
+        // multiple of 6 octets.
+        let mut headers = HeaderMap::new();
+        headers.insert(HTTP2_SETTINGS_HEADER, "AAMAAABkAAQAAP__".parse().unwrap());
+        assert_eq!(h2c_upgrade_settings(&headers), Ok(()));
+        // A single SETTINGS frame of 6 octets is valid too (HEADER_TABLE_SIZE=4096).
+        headers.insert(HTTP2_SETTINGS_HEADER, "AAEAABAA".parse().unwrap());
+        assert_eq!(h2c_upgrade_settings(&headers), Ok(()));
+        // An empty payload is an empty SETTINGS frame, which RFC 7540 §6.5 permits.
+        headers.insert(HTTP2_SETTINGS_HEADER, "".parse().unwrap());
+        assert_eq!(h2c_upgrade_settings(&headers), Ok(()));
+    }
+
+    #[test]
+    fn h2c_upgrade_settings_rejects_missing_or_malformed_values() {
+        let mut headers = HeaderMap::new();
+        // Missing header: RFC 7540 §3.2.1 forbids upgrading without it.
+        assert_eq!(
+            h2c_upgrade_settings(&headers),
+            Err(H2cSettingsError::Missing)
+        );
+
+        // Not base64url at all.
+        headers.insert(HTTP2_SETTINGS_HEADER, "!!!not-base64!!!".parse().unwrap());
+        assert_eq!(
+            h2c_upgrade_settings(&headers),
+            Err(H2cSettingsError::InvalidBase64)
+        );
+
+        // Not base64url: standard (+/) alphabet is rejected by the URL-safe alphabet.
+        headers.insert(HTTP2_SETTINGS_HEADER, "AAMAAABkAAQAAP+/".parse().unwrap());
+        assert_eq!(
+            h2c_upgrade_settings(&headers),
+            Err(H2cSettingsError::InvalidBase64)
+        );
+
+        // Decodes, but is not a SETTINGS frame payload (3 octets, not a multiple of 6).
+        headers.insert(HTTP2_SETTINGS_HEADER, "AAAA".parse().unwrap());
+        assert_eq!(
+            h2c_upgrade_settings(&headers),
+            Err(H2cSettingsError::InvalidSettings)
+        );
+    }
+
+    #[test]
+    fn base64url_decode_handles_the_url_safe_alphabet_and_padding() {
+        // Two SETTINGS entries, base64url with `_` in the final characters:
+        // MAX_CONCURRENT_STREAMS=100 and INITIAL_WINDOW_SIZE=0xFFFF (65535).
+        assert_eq!(
+            decode_base64url("AAMAAABkAAQAAP__").as_deref(),
+            Some(&[0x00, 0x03, 0x00, 0x00, 0x00, 0x64, 0x00, 0x04, 0x00, 0x00, 0xff, 0xff][..])
+        );
+        // Padding is not part of base64url (RFC 4648 §5) but is tolerated at the tail.
+        assert_eq!(
+            decode_base64url("AAMAAABkAAQAAP__=").as_deref(),
+            Some(&[0x00, 0x03, 0x00, 0x00, 0x00, 0x64, 0x00, 0x04, 0x00, 0x00, 0xff, 0xff][..])
+        );
+        // The URL-safe `-` alphabet.
+        assert_eq!(decode_base64url("-w").as_deref(), Some(&[0xfb][..]));
+        // Invalid characters and stray `=` inside the value are rejected.
+        assert_eq!(decode_base64url("AA=A"), None);
+        assert_eq!(decode_base64url("A$A"), None);
+    }
+
+    #[test]
+    fn h2c_settings_error_is_formatted_for_logs() {
+        assert!(H2cSettingsError::Missing
+            .to_string()
+            .contains("HTTP2-Settings"));
+        assert!(H2cSettingsError::InvalidBase64
+            .to_string()
+            .contains("base64url"));
+        assert!(H2cSettingsError::InvalidSettings
+            .to_string()
+            .contains("multiple of 6"));
     }
 }

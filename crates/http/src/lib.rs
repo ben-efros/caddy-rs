@@ -30,6 +30,7 @@ pub use types::{
     SharedHandler, SharedMatcher, StreamingOutcome,
 };
 pub use upgrade::{
-    h2c_upgrade_headers, is_h2c_upgrade, requested_upgrade_type, Tunnel, TunnelStream,
-    UpgradedResponse, H2C_UPGRADE_TOKEN,
+    h2c_upgrade_headers, h2c_upgrade_settings, is_h2c_upgrade, requested_upgrade_type,
+    H2cSettingsError, Tunnel, TunnelStream, UpgradedResponse, H2C_UPGRADE_TOKEN,
+    HTTP2_SETTINGS_HEADER,
 };
