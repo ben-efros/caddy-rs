@@ -43,6 +43,7 @@ use tokio_rustls::TlsAcceptor;
 use caddy_rs_admin::{AdminApi, AdminRequest, SharedRequestRecorder};
 use caddy_rs_core::{Generation, GenerationStore, ListenAddr, Network};
 use caddy_rs_http::{Body, Router};
+use caddy_rs_proxy::trusted_proxies::ServerTrustedProxies;
 
 use crate::activation::{adopt_tcp, adopt_unix, InheritedSocket, LocalSocket};
 use crate::auto_https::AutomaticHttpsServing;
@@ -66,6 +67,8 @@ pub type SharedRouters = Arc<RwLock<HashMap<String, Arc<Router>>>>;
 pub(crate) struct ListenerState {
     pub(crate) router: Arc<Router>,
     pub(crate) limits: Arc<ServerLimits>,
+    /// Server-level `trusted_proxies`/`client_ip_headers` policy for this server.
+    pub(crate) trusted_proxies: Arc<ServerTrustedProxies>,
     /// TLS configuration when this listener terminates TLS; `None` for cleartext listeners.
     pub(crate) tls: Option<Arc<rustls::ServerConfig>>,
     /// Automatic-HTTPS pre-routing (challenge responses, HTTP→HTTPS redirects) for cleartext
@@ -400,6 +403,8 @@ struct ConnectionContext {
     /// Router to serve, or `None` while the listener is being retired (responds 503).
     router: Option<Arc<Router>>,
     limits: Arc<ServerLimits>,
+    /// Server-level trusted-proxy policy (empty/default when not configured).
+    trusted_proxies: Arc<ServerTrustedProxies>,
     /// TLS configuration for this accepted connection, when the listener terminates TLS.
     tls: Option<Arc<rustls::ServerConfig>>,
     /// Automatic-HTTPS pre-routing for cleartext connections.
@@ -436,6 +441,7 @@ fn admit_connection(
         Some(state) => ConnectionContext {
             router: Some(Arc::clone(&state.router)),
             limits: Arc::clone(&state.limits),
+            trusted_proxies: Arc::clone(&state.trusted_proxies),
             tls: state.tls.clone(),
             automatic: state.automatic.clone(),
             server_name: state.server_name.clone(),
@@ -448,6 +454,7 @@ fn admit_connection(
         None => ConnectionContext {
             router: None,
             limits: Arc::new(ServerLimits::default()),
+            trusted_proxies: Arc::new(ServerTrustedProxies::default()),
             tls: None,
             automatic: None,
             server_name: String::new(),
@@ -661,6 +668,7 @@ async fn serve_accepted<I>(
     // the socket is handed off, so it survives until the tunnel ends.
     let tracked = Arc::new(tracked);
     let limits = Arc::clone(&context.limits);
+    let trusted_proxies = Arc::clone(&context.trusted_proxies);
     let activity = Arc::new(ConnectionActivity::default());
     let router = context.router;
     let automatic = context.automatic;
@@ -700,6 +708,7 @@ async fn serve_accepted<I>(
         let service = connection_service(
             router,
             Arc::clone(&limits),
+            Arc::clone(&trusted_proxies),
             peer,
             local_addr,
             true,
@@ -722,6 +731,7 @@ async fn serve_accepted<I>(
         let service = connection_service(
             router,
             Arc::clone(&limits),
+            Arc::clone(&trusted_proxies),
             peer,
             local_addr,
             false,
@@ -748,6 +758,7 @@ async fn serve_accepted<I>(
 struct RequestContext {
     router: Option<Arc<Router>>,
     limits: Arc<ServerLimits>,
+    trusted_proxies: Arc<ServerTrustedProxies>,
     remote_addr: Option<SocketAddr>,
     local_addr: Option<SocketAddr>,
     tls: bool,
@@ -771,6 +782,7 @@ struct RequestContext {
 fn connection_service(
     router: Option<Arc<Router>>,
     limits: Arc<ServerLimits>,
+    trusted_proxies: Arc<ServerTrustedProxies>,
     remote_addr: Option<SocketAddr>,
     local_addr: Option<SocketAddr>,
     tls: bool,
@@ -797,6 +809,7 @@ fn connection_service(
     request_service(RequestContext {
         router,
         limits,
+        trusted_proxies,
         remote_addr,
         local_addr,
         tls,
@@ -926,6 +939,7 @@ async fn serve_one_request(
         context.alpn.as_deref(),
         context.automatic.clone(),
         on_upgrade,
+        Arc::clone(&context.trusted_proxies),
     )
     .await;
 

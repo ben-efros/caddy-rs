@@ -48,6 +48,7 @@ use caddy_rs_http::{
     Body, Request, RequestBody, Response, ResponseOutcome, Router, StreamingBody,
     StreamingResponse, Tunnel,
 };
+use caddy_rs_proxy::trusted_proxies::ServerTrustedProxies;
 
 use crate::auto_https::AutomaticHttpsServing;
 use crate::limits::ServerLimits;
@@ -149,6 +150,7 @@ pub(crate) async fn serve_request_with_automatic(
         tls_alpn,
         automatic,
         None,
+        Arc::new(ServerTrustedProxies::default()),
     )
     .await
     {
@@ -169,7 +171,10 @@ pub(crate) async fn serve_request_with_automatic(
 /// before the request is consumed. When the router returns an
 /// [`ResponseOutcome::Upgrade`](caddy_rs_http::ResponseOutcome::Upgrade) and `on_upgrade` is
 /// available, the caller receives [`ServedResponse::Upgraded`] and must write the response and run
-/// the tunnel copy. HTTP/2 extended CONNECT (WebSocket over HTTP/2) is rejected with `501`.
+/// the tunnel copy. The server-level trusted-proxy policy (`apps.http.servers.<name>
+/// .trusted_proxies` + `client_ip_headers`) is applied to the internal request before routing, so
+/// the `trusted_proxy`/`client_ip` request variables are available to reverse_proxy, forward_auth
+/// and matchers exactly like Caddy's `PrepareRequest`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve_request_with_automatic_upgradable(
     limits: &ServerLimits,
@@ -181,6 +186,7 @@ pub(crate) async fn serve_request_with_automatic_upgradable(
     tls_alpn: Option<&str>,
     automatic: Option<Arc<AutomaticHttpsServing>>,
     on_upgrade: Option<OnUpgrade>,
+    trusted_proxies: Arc<ServerTrustedProxies>,
 ) -> ServedResponse {
     if !tls {
         if let Some(automatic) = &automatic {
@@ -358,6 +364,9 @@ pub(crate) async fn serve_request_with_automatic_upgradable(
             .vars
             .insert("tls.alpn".to_string(), alpn.to_string());
     }
+    // Caddy `PrepareRequest`: derive the trusted-proxy decision and effective client IP once for
+    // the whole handler chain, before any handler runs.
+    trusted_proxies.apply(&mut internal);
 
     match router.handle_upgradable(internal).await {
         Ok(ResponseOutcome::Response(response)) => {
