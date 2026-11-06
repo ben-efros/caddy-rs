@@ -307,8 +307,16 @@ mod tests {
             let started = Arc::clone(&started);
             readers.push(thread::spawn(move || {
                 let mut seen = std::collections::BTreeSet::new();
+                // Announce this reader exactly once, from inside its first loop iteration: the
+                // writer waits for one announcement per reader, so a single reader spinning many
+                // iterations can never satisfy the barrier on behalf of a reader that has not
+                // started yet.
+                let mut announced = false;
                 while keep_reading.load(AtomicOrdering::Relaxed) {
-                    started.fetch_add(1, AtomicOrdering::Relaxed);
+                    if !announced {
+                        started.fetch_add(1, AtomicOrdering::SeqCst);
+                        announced = true;
+                    }
                     match std::fs::read(&target) {
                         Ok(bytes) => {
                             let parsed: Result<serde_json::Value, _> =
@@ -331,8 +339,9 @@ mod tests {
                 assert!(!seen.is_empty());
             }));
         }
-        // Wait until every reader is inside its loop so the writes below race with active reads.
-        while started.load(std::sync::atomic::Ordering::Relaxed) < readers.len() {
+        // Wait until every reader has announced itself so the writes below race with active
+        // reads.
+        while started.load(std::sync::atomic::Ordering::SeqCst) < readers.len() {
             std::thread::yield_now();
         }
 
