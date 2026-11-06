@@ -73,8 +73,14 @@ impl HttpMetricsConfig {
         let Some(http) = config.http() else {
             return Ok(None);
         };
-        let app_level = match http.extra.get("metrics") {
-            Some(value) => Self::from_json_at(value, HTTP_METRICS_CONFIG_PATH)?,
+        // The core model types `apps.http.metrics` (`MetricsApp`), so read it there; empty objects
+        // deserialize to `Some(MetricsApp::default())` and therefore still mean "opted in".
+        let app_level = match &http.metrics {
+            Some(metrics) => Some(Self {
+                per_host: metrics.per_host,
+                observe_catchall_hosts: metrics.observe_catchall_hosts,
+                otlp: metrics.otlp,
+            }),
             None => None,
         };
         let mut merged = app_level;
