@@ -16,6 +16,7 @@ pub mod template;
 pub mod tls;
 pub mod trusted_proxies;
 pub mod upstream;
+pub mod websocket;
 
 pub use balancer::{
     from_selection_policy, Balancer, BalancerError, CookieHash, First, HashSelection,
@@ -32,3 +33,7 @@ pub use retry::RetryMatch;
 pub use tls::UpstreamTls;
 pub use trusted_proxies::{IpNet, ServerTrustedProxies};
 pub use upstream::Upstream;
+pub use websocket::{
+    close_frame, is_websocket_handshake, request_is_websocket, response_negotiated_websocket,
+    tunnel, write_close_frame, CLOSE_GOING_AWAY, CLOSE_HANDSHAKE_TIMEOUT, CLOSE_NORMAL,
+};
