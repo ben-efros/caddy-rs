@@ -22,8 +22,11 @@
 //! ## Compatibility notes
 //!
 //! * `GET /pki/ca/<id>` returns Caddy's `caInfo` shape. Caddy's `name` comes from the PKI app
-//!   configuration (`apps.pki.certificate_authorities.<id>.name`); that app is not modelled by
-//!   this build, so the id is reported as the name (documented divergence).
+//!   configuration (`apps.pki.certificate_authorities.<id>.name`, default `Caddy Local Authority`);
+//!   the admin handler reads the active generation's PKI app and reports the configured name via
+//!   [`CaMaterial::with_name`]. Without a config (for example the `caddy-rs pki` CLI commands,
+//!   which only see the data directory) the CA id is reported instead, because the name is not
+//!   persisted in the CA files.
 //! * Caddy lazily provisions the default CA (`local`) when `/pki/ca/local` is requested and PKI is
 //!   not configured. This build is read-only and returns `404` instead (documented divergence).
 
@@ -42,6 +45,9 @@ pub const DEFAULT_DATA_DIR: &str = ".caddy-rs";
 pub const AUTHORITIES_DIRECTORY: &str = "pki/authorities";
 /// Caddy's default local CA identifier.
 pub const DEFAULT_CA_ID: &str = "local";
+/// Caddy's default user-facing CA name (`caddypki` `defaultCAName`, substituted when a configured
+/// CA does not set `name`).
+pub const DEFAULT_CA_NAME: &str = "Caddy Local Authority";
 
 const BEGIN_CERTIFICATE: &str = "-----BEGIN CERTIFICATE-----";
 const END_CERTIFICATE: &str = "-----END CERTIFICATE-----";
@@ -162,6 +168,19 @@ impl std::error::Error for PkiError {
 
 /// Resolve the data directory: explicit override, then `CADDY_RS_DATA_DIR`, then the configured
 /// storage root, then [`DEFAULT_DATA_DIR`].
+///
+/// # Deliberate difference from Caddy
+///
+/// Caddy resolves its data directory with `caddy.AppDataDir()`: `$XDG_DATA_HOME/caddy` when that
+/// variable is set, otherwise `$HOME/.local/share/caddy` on Linux (and platform equivalents such
+/// as `$HOME/Library/Application Support/Caddy` on macOS and `%AppData%\Caddy` on Windows), with
+/// `./caddy` as the last-resort relative fallback. caddy-rs deliberately keeps its historical
+/// project convention instead: the relative `.caddy-rs` directory in the process working
+/// directory (or the configured `storage.root` for `run`), overridable with `CADDY_RS_DATA_DIR`
+/// or an explicit `--data-dir`. Server, admin and CLI all use this same resolver, so they agree
+/// with each other; the difference from Caddy is documented in DIV-0073 and avoids migrating every
+/// existing caddy-rs deployment's CA material. `CADDY_RS_DATA_DIR` is caddy-rs-specific (Caddy has
+/// no data-dir environment override).
 pub fn resolve_data_dir(
     explicit: Option<PathBuf>,
     config_storage_root: Option<PathBuf>,
@@ -216,6 +235,9 @@ pub struct CaMaterial {
     directory: PathBuf,
     root: CertificateInfo,
     intermediates: Vec<CertificateInfo>,
+    /// User-facing CA name from the active configuration (Caddy's `caInfo.name`). `None` means the
+    /// caller only has the data directory, so [`CaMaterial::name`] falls back to the id.
+    configured_name: Option<String>,
 }
 
 impl CaMaterial {
@@ -229,9 +251,16 @@ impl CaMaterial {
         &self.directory
     }
 
-    /// Caddy reports the configured CA name; this build reports the id (see module docs).
+    /// Set the user-facing CA name from configuration (Caddy's `caInfo.name` / `apps.pki` name).
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.configured_name = Some(name.into());
+        self
+    }
+
+    /// Caddy's `caInfo.name`: the configured PKI-app name when known, otherwise the CA id (the
+    /// data-directory-only CLI commands cannot know the configuration).
     pub fn name(&self) -> &str {
-        &self.id
+        self.configured_name.as_deref().unwrap_or(&self.id)
     }
 
     /// The parsed root certificate.
@@ -444,6 +473,7 @@ impl PkiStore {
             directory,
             root,
             intermediates,
+            configured_name: None,
         })
     }
 }
@@ -927,6 +957,20 @@ mod tests {
         assert_eq!(
             resolve_data_dir_with(None, None, None),
             PathBuf::from(DEFAULT_DATA_DIR)
+        );
+    }
+
+    #[test]
+    fn default_data_dir_is_the_documented_caddy_rs_convention() {
+        // caddy-rs deliberately uses the relative `.caddy-rs` project convention instead of
+        // Caddy's XDG/HOME `AppDataDir()`; see the resolve_data_dir documentation and DIV-0073.
+        assert_eq!(
+            resolve_data_dir_with(None, None, None),
+            PathBuf::from(".caddy-rs")
+        );
+        assert_eq!(
+            resolve_data_dir_with(None, None, Some(PathBuf::from("/configured/storage-root"))),
+            PathBuf::from("/configured/storage-root")
         );
     }
 
