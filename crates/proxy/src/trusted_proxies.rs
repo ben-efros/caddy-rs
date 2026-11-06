@@ -235,10 +235,15 @@ fn parse_trusted_proxies_value(value: &Value, path: &str) -> HttpResult<Vec<IpNe
                 .and_then(Value::as_str)
                 .unwrap_or("static");
             if source != "static" {
-                return Err(HttpError::NotImplemented {
-                    feature: "non-static trusted_proxies IP range source modules",
-                    tracking_id: "TRUSTED-PROXIES-SOURCE",
-                });
+                // Located error: Caddy supports pluggable `http.ip_sources` modules, but this
+                // build only implements the built-in `static` source. Name the path so the
+                // offending server field is obvious, and keep the tracking id for the register.
+                return Err(invalid(
+                    path,
+                    format!(
+                        "`trusted_proxies` source `{source}` is not implemented (supported: `static`; TRUSTED-PROXIES-SOURCE)"
+                    ),
+                ));
             }
             let entries = object
                 .get("ranges")
@@ -508,6 +513,62 @@ mod tests {
         trusted.apply(&mut untrusted_request);
         assert_eq!(untrusted_request.vars["trusted_proxy"], "false");
         assert_eq!(untrusted_request.vars["client_ip"], "198.51.100.7");
+    }
+
+    #[test]
+    fn ipv6_trusted_ranges_and_forwarded_headers() {
+        let server = serde_json::json!({
+            "trusted_proxies": {"source": "static", "ranges": ["2001:db8:1::/48"]}
+        });
+        let trusted = ServerTrustedProxies::from_server_json(&server, "server").unwrap();
+        let first = request(
+            Some("[2001:db8:1::1]:443"),
+            Some("2001:db8:1::5, 2001:db9::9"),
+        );
+        let (is_trusted, client_ip) = trusted.determine(&first);
+        assert!(is_trusted);
+        // Non-strict (Caddy default): first valid value from left to right.
+        assert_eq!(client_ip, "2001:db8:1::5");
+
+        // IPv6 strict: right-to-left first value outside the trusted range.
+        let server = serde_json::json!({
+            "trusted_proxies": {"source": "static", "ranges": ["2001:db8:1::/48"]},
+            "trusted_proxies_strict": 1
+        });
+        let strict = ServerTrustedProxies::from_server_json(&server, "server").unwrap();
+        let chained = request(
+            Some("[2001:db8:1::1]:443"),
+            Some("2001:db8:1::5, 2001:db9::9"),
+        );
+        assert_eq!(strict.determine(&chained).1, "2001:db9::9");
+
+        // An IPv6 peer outside the configured prefix is not trusted.
+        let outside = request(Some("[2001:db9::1]:443"), Some("2001:db8:1::2"));
+        assert_eq!(
+            trusted.determine(&outside),
+            (false, "2001:db9::1".to_string())
+        );
+    }
+
+    #[test]
+    fn client_ip_headers_are_considered_in_configured_order() {
+        let server = serde_json::json!({
+            "trusted_proxies": {"source": "static", "ranges": ["127.0.0.1/32"]},
+            "client_ip_headers": ["X-Real-IP", "X-Forwarded-For"]
+        });
+        let trusted = ServerTrustedProxies::from_server_json(&server, "server").unwrap();
+        let mut request = request(Some("127.0.0.1:5000"), Some("203.0.113.9"));
+        request
+            .headers
+            .insert("x-real-ip", "198.51.100.7".parse().unwrap());
+        assert_eq!(trusted.determine(&request).1, "198.51.100.7");
+
+        let server = serde_json::json!({
+            "trusted_proxies": {"source": "static", "ranges": ["127.0.0.1/32"]},
+            "client_ip_headers": ["X-Forwarded-For", "X-Real-IP"]
+        });
+        let trusted = ServerTrustedProxies::from_server_json(&server, "server").unwrap();
+        assert_eq!(trusted.determine(&request).1, "203.0.113.9");
     }
 
     #[test]

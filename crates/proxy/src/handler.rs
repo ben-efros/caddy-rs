@@ -4194,6 +4194,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forward_auth_uses_the_server_derived_trusted_proxy_context() {
+        // T-PROXY-025: the auth subrequest is a reverse_proxy request in the same handler chain, so
+        // it must consume the server-level `trusted_proxy`/`client_ip` variables (set by the
+        // server's PrepareRequest equivalent) instead of re-deriving trust from headers itself.
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let auth = spawn_recording_upstream(200, "", vec![], Arc::clone(&recorded)).await;
+        let router = build_chain_router(vec![canonical_forward_auth_handler(&auth, &[])]);
+        let mut request = post_request("/protected", "");
+        request.remote_addr = Some("198.51.100.9:1234".parse().unwrap());
+        request
+            .headers
+            .insert("x-forwarded-for", "203.0.113.5".parse().unwrap());
+        request
+            .vars
+            .insert("trusted_proxy".to_string(), "true".to_string());
+        request
+            .vars
+            .insert("client_ip".to_string(), "203.0.113.5".to_string());
+        let streamed = router.handle_streaming(request).await.unwrap();
+        let response = streamed.into_buffered().await.unwrap();
+        assert_eq!(response.status, StatusCode::OK);
+        let recorded = recorded.lock().unwrap();
+        let auth_request = recorded.first().expect("auth subrequest recorded");
+        assert_eq!(
+            auth_request
+                .headers
+                .get("x-forwarded-for")
+                .and_then(|value| value.to_str().ok()),
+            Some("203.0.113.5, 198.51.100.9"),
+            "forward_auth must trust prior X-Forwarded-For based on the server context"
+        );
+    }
+
+    #[tokio::test]
     async fn forward_auth_streaming_path_continues_on_2xx() {
         let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
         let auth = spawn_recording_upstream(

@@ -349,6 +349,7 @@ impl ServerRuntime {
         let status_sink = UpstreamStatusSink::new();
         for (server_name, server) in &http.servers {
             let _limits = ServerLimits::from_http_server(server_name, server)?;
+            let _trusted_proxies = parse_server_trusted_proxies(server, server_name)?;
             let policies = server.tls_connection_policies.as_deref();
             let has_connection_policies = policies.is_some_and(|policies| !policies.is_empty());
             if strict_sni_host_enabled(server.strict_sni_host.as_ref()) {
@@ -1195,6 +1196,7 @@ impl ServerRuntime {
         let http_port = http.http_port.unwrap_or(caddy_rs_tls::DEFAULT_HTTP_PORT);
         for (server_name, server) in &http.servers {
             let limits = Arc::new(ServerLimits::from_http_server(server_name, server)?);
+            let trusted_proxies = parse_server_trusted_proxies(server, server_name)?;
             let policies = server.tls_connection_policies.as_deref();
             let has_connection_policies = policies.is_some_and(|policies| !policies.is_empty());
             if strict_sni_host_enabled(server.strict_sni_host.as_ref()) {
@@ -1283,6 +1285,7 @@ impl ServerRuntime {
                     Arc::new(ListenerState {
                         router: Arc::clone(&router),
                         limits: Arc::clone(&limits),
+                        trusted_proxies: Arc::clone(&trusted_proxies),
                         tls,
                         automatic: automatic_serving,
                         server_name: server_name.clone(),
@@ -1313,6 +1316,9 @@ impl ServerRuntime {
                         Arc::new(ListenerState {
                             router,
                             limits: Arc::new(ServerLimits::default()),
+                            trusted_proxies: Arc::new(
+                                caddy_rs_proxy::trusted_proxies::ServerTrustedProxies::default(),
+                            ),
                             tls: None,
                             automatic: Some(Arc::clone(context.serving)),
                             server_name: String::new(),
@@ -1328,6 +1334,37 @@ impl ServerRuntime {
         }
         Ok(states)
     }
+}
+
+/// Parse one server's trusted-proxy policy (`trusted_proxies`, `trusted_proxies_strict`,
+/// `trusted_proxies_unix`, `client_ip_headers`) from the preserved server JSON fields.
+///
+/// The parser lives in `caddy-rs-proxy` because reverse_proxy/forward_auth consume the derived
+/// `trusted_proxy`/`client_ip` request variables; this keeps the server's validation and the
+/// handlers' interpretation of Caddy's module shapes in one place. Unknown IP-range `source`
+/// modules and malformed ranges/headers fail loudly with the located path.
+fn parse_server_trusted_proxies(
+    server: &caddy_rs_core::config::HttpServer,
+    server_name: &str,
+) -> Result<Arc<caddy_rs_proxy::trusted_proxies::ServerTrustedProxies>> {
+    let mut object = serde_json::Map::new();
+    for field in [
+        "trusted_proxies",
+        "trusted_proxies_strict",
+        "trusted_proxies_unix",
+        "client_ip_headers",
+    ] {
+        if let Some(value) = server.extra.get(field) {
+            object.insert(field.to_string(), value.clone());
+        }
+    }
+    let path = format!("apps.http.servers.{server_name}");
+    caddy_rs_proxy::trusted_proxies::ServerTrustedProxies::from_server_json(
+        &serde_json::Value::Object(object),
+        &path,
+    )
+    .map(Arc::new)
+    .map_err(Error::Http)
 }
 
 /// Whether a server explicitly offers cleartext h2c Upgrade (Caddy `protocols` includes `h2c`).
