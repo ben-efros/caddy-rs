@@ -12,8 +12,12 @@
 //!   proxy/certificate extensions.
 //!
 //! The text format is implemented rather than delegated so the output is deterministic: metric
-//! families are sorted by name, series by their sorted label set, and labels are printed in
-//! alphabetical order. Two registries with the same contents render byte-identical text.
+//! families are sorted by name, series by their sorted label set, and variable labels are printed
+//! in alphabetical order with the histogram `le` label last (matching Go's `expfmt` writer). Float
+//! values and bucket bounds use Go's `strconv.FormatFloat(v, 'g', -1, 64)` presentation, and the
+//! exposition content type matches Caddy v2.11.7's `promhttp` response. Two registries with the
+//! same contents therefore render byte-identical text, and a `/metrics` scrape of the
+//! `caddy_http_*` families is byte-compatible with Caddy's for the same observations and labels.
 //!
 //! ## Caddy compatibility
 //!
@@ -40,7 +44,12 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 /// Content type of the Prometheus text exposition format (version 0.0.4).
-pub const METRICS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+///
+/// Matches the header Caddy v2.11.7's `promhttp` handler returns for a default scrape
+/// (`escaping=underscores` is client_golang's default name-escaping scheme; caddy-rs only emits
+/// names and label names that are already valid, so the scheme does not change the rendered text).
+pub const METRICS_CONTENT_TYPE: &str =
+    "text/plain; version=0.0.4; charset=utf-8; escaping=underscores";
 
 /// Default histogram buckets for latencies in seconds, matching `prometheus.DefBuckets` as used by
 /// Caddy's HTTP metrics.
@@ -666,12 +675,25 @@ fn write_sample(output: &mut String, name: &str, labels: &Labels, value: &str) {
     output.push_str(name);
     if !labels.is_empty() {
         output.push('{');
-        for (index, (label, label_value)) in labels.iter().enumerate() {
-            if index > 0 {
+        // Prometheus/Go `expfmt` renders variable labels in sorted order and appends the histogram
+        // `le` label last (it is part of the bucket's series identity, not a variable label). Match
+        // that so a scrape is byte-compatible with Caddy's exposition.
+        let mut first = true;
+        for (label, label_value) in labels.iter().filter(|(label, _)| *label != "le") {
+            if !first {
                 output.push(',');
             }
+            first = false;
             output.push_str(label);
             output.push_str("=\"");
+            escape_label_value(label_value, output);
+            output.push('"');
+        }
+        if let Some(label_value) = labels.get("le") {
+            if !first {
+                output.push(',');
+            }
+            output.push_str("le=\"");
             escape_label_value(label_value, output);
             output.push('"');
         }
@@ -703,18 +725,81 @@ fn escape_label_value(value: &str, output: &mut String) {
     }
 }
 
-/// Format a float the way the Prometheus text format expects: finite values use Rust's shortest
-/// round-trip representation, `±Inf`/`NaN` use the special spellings.
+/// Format a float the way Go's `strconv.FormatFloat(value, 'g', -1, 64)` does, which is what
+/// Prometheus' Go exposition writer uses for sample values and bucket bounds (`±Inf`/`NaN` use the
+/// Prometheus spellings). Matching Go matters for byte-compatible scrapes: Go switches to
+/// exponent form when the decimal exponent is below `-4` or at least `6` (e.g. `1048576` is
+/// rendered `1.048576e+06`), and pads the exponent to two digits (`1e+06`, `8.6e-05`).
 pub fn format_float(value: f64) -> String {
     if value.is_nan() {
-        "NaN".to_string()
-    } else if value == f64::INFINITY {
-        "+Inf".to_string()
-    } else if value == f64::NEG_INFINITY {
-        "-Inf".to_string()
-    } else {
-        format!("{value}")
+        return "NaN".to_string();
     }
+    if value == f64::INFINITY {
+        return "+Inf".to_string();
+    }
+    if value == f64::NEG_INFINITY {
+        return "-Inf".to_string();
+    }
+    if value == 0.0 {
+        return if value.is_sign_negative() {
+            "-0".to_string()
+        } else {
+            "0".to_string()
+        };
+    }
+
+    let negative = value.is_sign_negative();
+    let magnitude = value.abs();
+    // Rust's `LowerExp` yields the shortest round-trip digits, the same digit sequence Go's
+    // shortest-mode formatting produces; only the exponent/decimal presentation differs.
+    let scientific = format!("{magnitude:e}");
+    let (mantissa, exponent) = scientific
+        .split_once('e')
+        .expect("LowerExp always contains an exponent");
+    let exponent: i32 = exponent.parse().expect("LowerExp exponent is an integer");
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    let digits_len = digits.len() as i32;
+
+    // Go's shortest `%g` uses an effective precision of 6: exponent form for exp < -4 || exp >= 6,
+    // where exp is the `d.ddd` exponent.
+    let use_exponent = exponent < -4 || exponent >= 6;
+    let mut output = String::new();
+    if negative {
+        output.push('-');
+    }
+    if use_exponent {
+        output.push_str(&digits[..1]);
+        if digits_len > 1 {
+            output.push('.');
+            output.push_str(&digits[1..]);
+        }
+        output.push('e');
+        output.push(if exponent < 0 { '-' } else { '+' });
+        let absolute = exponent.unsigned_abs();
+        if absolute < 10 {
+            output.push('0');
+        }
+        output.push_str(&absolute.to_string());
+    } else if exponent >= 0 {
+        let integer_digits = (exponent + 1) as usize;
+        if digits_len as usize > integer_digits {
+            output.push_str(&digits[..integer_digits]);
+            output.push('.');
+            output.push_str(&digits[integer_digits..]);
+        } else {
+            output.push_str(&digits);
+            for _ in 0..(integer_digits - digits_len as usize) {
+                output.push('0');
+            }
+        }
+    } else {
+        output.push_str("0.");
+        for _ in 0..(-exponent - 1) {
+            output.push('0');
+        }
+        output.push_str(&digits);
+    }
+    output
 }
 
 /// Sanitize an HTTP method for use as a metric label, matching Caddy's
@@ -1136,6 +1221,31 @@ latency_seconds_count{code=\"200\"} 3
     }
 
     #[test]
+    fn histogram_renders_le_last_with_caddy_labels() {
+        let registry = MetricsRegistry::new();
+        let histogram = registry
+            .histogram(
+                "caddy_http_request_duration_seconds",
+                "Histogram of round-trip request durations.",
+                &[0.005, 1048576.0],
+                &[
+                    ("server", "srv0"),
+                    ("handler", "static_response"),
+                    ("code", "200"),
+                    ("method", "GET"),
+                ],
+            )
+            .unwrap();
+        histogram.observe(0.25).unwrap();
+        let rendered = registry.render();
+        let expected_bucket = "caddy_http_request_duration_seconds_bucket{code=\"200\",handler=\"static_response\",method=\"GET\",server=\"srv0\",le=\"0.005\"} 0";
+        let expected_large = "caddy_http_request_duration_seconds_bucket{code=\"200\",handler=\"static_response\",method=\"GET\",server=\"srv0\",le=\"1.048576e+06\"} 1";
+        assert!(rendered.contains(expected_bucket), "got: {rendered}");
+        assert!(rendered.contains(expected_large), "got: {rendered}");
+        assert_prometheus_text_parses(&rendered);
+    }
+
+    #[test]
     fn escapes_help_and_label_values() {
         let registry = MetricsRegistry::new();
         registry
@@ -1234,6 +1344,19 @@ latency_seconds_count{code=\"200\"} 3
         assert_eq!(format_float(1.0), "1");
         assert_eq!(format_float(f64::INFINITY), "+Inf");
         assert_eq!(format_float(f64::NAN), "NaN");
+        // Go `strconv.FormatFloat(v, 'g', -1, 64)`: exponent form for exp < -4 || exp >= 6, with a
+        // two-digit-minimum signed exponent; shortest round-trip digits otherwise.
+        assert_eq!(format_float(256.0), "256");
+        assert_eq!(format_float(65536.0), "65536");
+        assert_eq!(format_float(262144.0), "262144");
+        assert_eq!(format_float(1048576.0), "1.048576e+06");
+        assert_eq!(format_float(4194304.0), "4.194304e+06");
+        assert_eq!(format_float(1000000.0), "1e+06");
+        assert_eq!(format_float(0.0001), "0.0001");
+        assert_eq!(format_float(0.00001), "1e-05");
+        assert_eq!(format_float(0.007756129), "0.007756129");
+        assert_eq!(format_float(-2.5), "-2.5");
+        assert_eq!(format_float(123456.0), "123456");
     }
 
     /// Minimal Prometheus text-format parser: every non-comment line must be
@@ -1284,9 +1407,16 @@ latency_seconds_count{code=\"200\"} 3
                     );
                     names.push(name.to_string());
                 }
-                let mut sorted = names.clone();
-                sorted.sort();
-                assert_eq!(names, sorted, "labels are not sorted: {line}");
+                // Go `expfmt` sorts variable labels but appends the histogram `le` label last.
+                let mut expected = names.clone();
+                if let Some(position) = expected.iter().position(|name| name == "le") {
+                    let le = expected.remove(position);
+                    expected.sort();
+                    expected.push(le);
+                } else {
+                    expected.sort();
+                }
+                assert_eq!(names, expected, "labels are not in expfmt order: {line}");
             }
         }
         assert!(

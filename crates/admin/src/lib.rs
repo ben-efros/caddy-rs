@@ -134,7 +134,16 @@
 //!   runtime records through the [`recorder`] API, and [`logging_config`] turns the active
 //!   generation's `logging.logs[]` into ready [`AccessLogSink`] targets. The server runtime still
 //!   decides when to build the sinks, emit entries and close them on reload/shutdown. Until it
-//!   does, `/metrics` stays empty and access-log output is inert.
+//!   does, `/metrics` stays empty and access-log output is inert. The rendered `caddy_http_*`
+//!   families now match Caddy v2.11.7's names, HELP text, label ordering, Go float presentation and
+//!   content type (T-ADMIN-031); the remaining oracle-observed differences are label *values* the
+//!   server must supply (route handler name, per-host label, approximate request size) and the
+//!   `Server` response header.
+//! - Caddy's `apps.http.metrics` and `http.handlers.metrics` JSON shapes are parsed and validated by
+//!   [`metrics_config`] with located errors; unsupported behaviour (`otlp`, `per_host`) is rejected
+//!   loudly with the tracking id rather than silently dropped. The core config model/validator and
+//!   the server runtime must call it (they still reject `apps.http.metrics` as an unknown HTTP-app
+//!   field and always record the HTTP series, DIV-0033).
 //! - Access-log file rotation (`roll_*` writer options) is not implemented; files are opened in
 //!   append mode and rotated externally. See [`sink`] for details.
 
@@ -144,6 +153,7 @@ pub mod access_log;
 mod config_path;
 pub mod logging_config;
 pub mod metrics;
+pub mod metrics_config;
 mod origin;
 pub mod pki;
 pub mod recorder;
@@ -172,6 +182,10 @@ pub use logging_config::{
 pub use metrics::{
     HttpMetrics, MetricsError, MetricsRegistry, ProxyObservation, RequestObservation,
     METRICS_CONTENT_TYPE,
+};
+pub use metrics_config::{
+    HttpMetricsConfig, MetricsConfigError, MetricsHandlerConfig, HTTP_METRICS_CONFIG_PATH,
+    METRICS_CONFIG_TRACKING_ID, METRICS_HANDLER_CONFIG_PATH,
 };
 pub use origin::{OriginPolicy, OriginViolation};
 pub use pki::{
