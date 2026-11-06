@@ -714,7 +714,6 @@ async fn serve_accepted<I>(
             Arc::clone(&permit),
             generation.clone(),
             force.clone(),
-            shutdown.clone(),
             Arc::clone(&tracked),
             false,
         );
@@ -737,7 +736,6 @@ async fn serve_accepted<I>(
             Arc::clone(&permit),
             generation.clone(),
             force.clone(),
-            shutdown.clone(),
             Arc::clone(&tracked),
             context.h2c_upgrade,
         );
@@ -764,8 +762,6 @@ struct RequestContext {
     permit: Arc<ConnectionPermit>,
     generation: Option<Arc<Generation>>,
     force: watch::Receiver<bool>,
-    /// Graceful shutdown signal: upgraded WebSocket tunnels send a going-away close frame.
-    shutdown: watch::Receiver<bool>,
     tracked: Arc<TrackedConnection>,
     /// Cleartext h2c Upgrade enabled (`protocols` includes h2c).
     h2c_upgrade: bool,
@@ -789,7 +785,6 @@ fn connection_service(
     permit: Arc<ConnectionPermit>,
     generation: Option<Arc<Generation>>,
     force: watch::Receiver<bool>,
-    shutdown: watch::Receiver<bool>,
     tracked: Arc<TrackedConnection>,
     h2c_upgrade: bool,
 ) -> impl hyper::service::Service<
@@ -816,7 +811,6 @@ fn connection_service(
         permit,
         generation,
         force,
-        shutdown,
         tracked,
         h2c_upgrade,
     })
@@ -968,7 +962,6 @@ async fn serve_one_request(
                 on_upgrade,
                 tunnel,
                 context.force.clone(),
-                context.shutdown.clone(),
                 websocket,
                 context.permit,
                 context.generation,
@@ -1066,33 +1059,6 @@ fn spawn_h2c_connection<S>(
     });
 }
 
-/// Combine the graceful-shutdown and forced-shutdown signals into one cancellation receiver.
-///
-/// An upgraded tunnel cares about "the listener is stopping", not which phase signalled it: both
-/// paths write the best-effort WebSocket going-away close frame before closing.
-fn merge_shutdown_signals(
-    mut shutdown: watch::Receiver<bool>,
-    mut force: watch::Receiver<bool>,
-) -> (watch::Receiver<bool>, Option<tokio::task::JoinHandle<()>>) {
-    let (sender, receiver) = watch::channel(false);
-    if *shutdown.borrow() || *force.borrow() {
-        let _ = sender.send(true);
-        return (receiver, None);
-    }
-    let watcher = tokio::spawn(async move {
-        tokio::select! {
-            result = shutdown.changed() => {
-                let _ = result;
-            }
-            result = force.changed() => {
-                let _ = result;
-            }
-        }
-        let _ = sender.send(true);
-    });
-    (receiver, Some(watcher))
-}
-
 /// Tunnel an upgraded client connection to the upgraded upstream connection.
 ///
 /// The task owns the connection permit and the generation guard for the lifetime of the tunnel, so
@@ -1104,7 +1070,6 @@ fn spawn_upgraded_tunnel(
     on_upgrade: hyper::upgrade::OnUpgrade,
     tunnel: caddy_rs_http::Tunnel,
     force: watch::Receiver<bool>,
-    shutdown: watch::Receiver<bool>,
     websocket: bool,
     permit: Arc<ConnectionPermit>,
     generation: Option<Arc<Generation>>,
@@ -1126,20 +1091,15 @@ fn spawn_upgraded_tunnel(
         };
         // `TokioIo` adapts hyper's upgraded I/O to tokio's AsyncRead/AsyncWrite traits. The proxy
         // crate owns the tunnel pump so WebSocket peers see a close control frame instead of an
-        // abnormal 1006: 1000 (normal) on upstream EOF, 1001 (going away) on graceful shutdown.
+        // abnormal 1006: 1000 (normal) on upstream EOF, 1001 (going away) when the connection is
+        // actually closed (graceful-shutdown grace expiry or a forced shutdown).
         let client = TokioIo::new(client);
         let upstream = tunnel.into_inner();
-        // Treat graceful shutdown and forced shutdown alike: the tunnel sends a going-away close
-        // frame (best effort) before it closes, so a shutdown never looks like abnormal closure to
-        // a WebSocket client.
-        let (cancellation, watcher) = merge_shutdown_signals(shutdown, force);
-        let result =
-            caddy_rs_proxy::websocket::tunnel(client, upstream, websocket, cancellation).await;
-        // The watcher normally exits when a shutdown signal fires; a tunnel that closed on its own
-        // must not leave it behind until the listener stops.
-        if let Some(watcher) = watcher {
-            watcher.abort();
-        }
+        // Only the forced/immediate close cancels the pump. Graceful shutdown leaves upgraded
+        // tunnels alive through the grace period (Caddy's hijacked connections are closed by
+        // `cleanupConnections` at close time); the runtime's grace-expiry force-all signal is what
+        // ends them, and the pump writes the going-away frame at that point.
+        let result = caddy_rs_proxy::websocket::tunnel(client, upstream, websocket, force).await;
         match result {
             Ok(()) => tracing::debug!("upgraded connection closed"),
             Err(error) => tracing::debug!(%error, "upgraded connection tunnel failed"),
