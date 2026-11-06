@@ -37,6 +37,7 @@ use base64::Engine as _;
 use tokio::sync::watch;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 
+use crate::acme::ari::RenewalInfo;
 use crate::certificate::{Certificate, RenewalItem};
 use crate::issuer::{CertificateIssuer, IssuanceRequest};
 use crate::storage::{
@@ -55,6 +56,14 @@ pub const DEFAULT_BACKOFF_MAX: Duration = Duration::from_secs(60 * 60);
 
 /// Fraction of the certificate lifetime that remains when renewal becomes due (one third).
 pub const RENEWAL_REMAINING_FRACTION: f64 = 1.0 / 3.0;
+
+/// Caddy/certmagic's default renewal check interval (also the ARI "renew just before the selected
+/// time" cutoff and the emergency-window divisor).
+pub const DEFAULT_RENEW_CHECK_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+/// How long to wait before retrying an ARI fetch that failed (certmagic uses a retry/backoff; the
+/// scheduler keeps its local heuristic in the meantime).
+const ARI_RETRY_FALLBACK: Duration = Duration::from_secs(10 * 60);
 
 /// Maximum number of renewal outcomes remembered for diagnostics/tests.
 const HISTORY_LIMIT: usize = 64;
@@ -168,6 +177,9 @@ pub struct RenewalPolicy {
     pub backoff_base: Duration,
     /// Upper bound for the exponential retry delay. Defaults to [`DEFAULT_BACKOFF_MAX`].
     pub backoff_max: Duration,
+    /// How often the scheduler checks certificates and, when ARI is present, how far before the
+    /// ARI-selected time renewal becomes due. Defaults to [`DEFAULT_RENEW_CHECK_INTERVAL`].
+    pub check_interval: Duration,
 }
 
 impl Default for RenewalPolicy {
@@ -177,6 +189,7 @@ impl Default for RenewalPolicy {
             jitter: DEFAULT_RENEWAL_JITTER,
             backoff_base: DEFAULT_BACKOFF_BASE,
             backoff_max: DEFAULT_BACKOFF_MAX,
+            check_interval: DEFAULT_RENEW_CHECK_INTERVAL,
         }
     }
 }
@@ -203,6 +216,12 @@ impl RenewalPolicy {
     pub fn with_backoff(mut self, backoff_base: Duration, backoff_max: Duration) -> Self {
         self.backoff_base = backoff_base;
         self.backoff_max = backoff_max;
+        self
+    }
+
+    /// Set the maintenance check interval (also the ARI selected-time cutoff).
+    pub fn with_check_interval(mut self, check_interval: Duration) -> Self {
+        self.check_interval = check_interval;
         self
     }
 
@@ -613,6 +632,12 @@ struct FailureState {
     not_after: SystemTime,
 }
 
+#[derive(Debug, Clone)]
+struct AriState {
+    info: Option<RenewalInfo>,
+    retry_at: Option<SystemTime>,
+}
+
 #[derive(Debug, Default)]
 struct SchedulerState {
     failures: BTreeMap<String, FailureState>,
@@ -632,6 +657,8 @@ pub struct RenewalScheduler {
     clock: Arc<dyn RenewalClock>,
     policy: RenewalPolicy,
     state: Mutex<SchedulerState>,
+    /// Latest ARI per certificate key (in-memory; fetched by [`Self::refresh_renewal_info`]).
+    ari: Mutex<BTreeMap<String, AriState>>,
     locks: Mutex<BTreeMap<String, Arc<AsyncMutex<()>>>>,
     stopped: AtomicBool,
     stop_notify: Notify,
@@ -663,6 +690,7 @@ impl RenewalScheduler {
             clock,
             policy: RenewalPolicy::default(),
             state: Mutex::new(SchedulerState::default()),
+            ari: Mutex::new(BTreeMap::new()),
             locks: Mutex::new(BTreeMap::new()),
             stopped: AtomicBool::new(false),
             stop_notify: Notify::new(),
@@ -685,6 +713,15 @@ impl RenewalScheduler {
         &self.policy
     }
 
+    /// The latest ARI cached for `certificate`, if any.
+    pub fn renewal_info_for(&self, certificate: &Certificate) -> Option<RenewalInfo> {
+        self.ari
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&certificate_key(certificate))
+            .and_then(|state| state.info.clone())
+    }
+
     /// The clock used for scheduling.
     pub fn clock(&self) -> &Arc<dyn RenewalClock> {
         &self.clock
@@ -699,6 +736,70 @@ impl RenewalScheduler {
             .iter()
             .cloned()
             .collect()
+    }
+
+    /// Refresh cached ARI for stored certificates whose document is missing or whose
+    /// `Retry-After` elapsed.
+    ///
+    /// Failures fall back to the local renewal heuristic: a previous ARI is retained and a retry
+    /// is scheduled; a certificate with no ARI is not queried again until its retry time. This
+    /// mirrors certmagic's "log and continue with the local schedule" behaviour without blocking
+    /// renewals on ARI availability.
+    pub async fn refresh_renewal_info(&self, now: SystemTime) {
+        let certificates = self.store.certificates();
+        {
+            let mut ari = self
+                .ari
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let current: BTreeMap<String, SystemTime> = certificates
+                .iter()
+                .map(|certificate| (certificate_key(certificate), certificate.not_after))
+                .collect();
+            ari.retain(|key, _| current.contains_key(key));
+        }
+        for certificate in certificates {
+            let key = certificate_key(&certificate);
+            let state = self
+                .ari
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&key)
+                .cloned();
+            let needs_refresh = match &state {
+                None => true,
+                Some(state) => match &state.info {
+                    Some(info) => info.needs_refresh(now),
+                    None => state.retry_at.is_some_and(|retry_at| now >= retry_at),
+                },
+            };
+            if !needs_refresh {
+                continue;
+            }
+            let new_state = match self.issuer.renewal_info(&certificate).await {
+                Ok(Some(info)) => AriState {
+                    retry_at: info.retry_after,
+                    info: Some(info),
+                },
+                Ok(None) => AriState {
+                    info: None,
+                    retry_at: None,
+                },
+                Err(_) => AriState {
+                    info: state.as_ref().and_then(|state| state.info.clone()),
+                    retry_at: Some(
+                        state
+                            .as_ref()
+                            .and_then(|state| state.retry_at)
+                            .unwrap_or(now + ARI_RETRY_FALLBACK),
+                    ),
+                },
+            };
+            self.ari
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(key, new_state);
+        }
     }
 
     /// The next time the scheduler has work, taking failed-renewal backoff into account.
@@ -717,9 +818,13 @@ impl RenewalScheduler {
         self.store
             .certificates()
             .into_iter()
-            .map(|certificate| RenewalItem {
-                domains: certificate.domains.clone(),
-                due_at: self.effective_due(&certificate, &failures),
+            .map(|certificate| {
+                let due_at = self.effective_due(&certificate, &failures);
+                let (_, wake) = self.ari_times(&certificate);
+                RenewalItem {
+                    domains: certificate.domains.clone(),
+                    due_at: wake.map_or(due_at, |wake| due_at.min(wake)),
+                }
             })
             .min_by_key(|item| item.due_at)
     }
@@ -729,6 +834,7 @@ impl RenewalScheduler {
     /// Failures are captured per certificate in the returned outcomes; the old certificate stays
     /// installed and a backoff retry is scheduled.
     pub async fn run_once(&self, now: SystemTime) -> Vec<RenewalOutcome> {
+        self.refresh_renewal_info(now).await;
         self.prune_failures();
         let failures = self
             .state
@@ -796,6 +902,7 @@ impl RenewalScheduler {
         }
 
         let now = self.clock.now();
+        self.refresh_renewal_info(now).await;
         let failures = self
             .state
             .lock()
@@ -847,6 +954,10 @@ impl RenewalScheduler {
             };
         }
         self.clear_failure(&key);
+        self.ari
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&key);
         RenewalOutcome::Renewed {
             domains: issued.domains,
             not_before: issued.not_before,
@@ -921,12 +1032,44 @@ impl RenewalScheduler {
         }
     }
 
+    /// ARI-derived renewal time and next refresh wake-up.
+    ///
+    /// Certmagic renews at `selected_time - renew_check_interval`, but always honors the emergency
+    /// window (last 1/20 of the lifetime) even if ARI suggests something later. When no usable ARI
+    /// is cached the local heuristic remains authoritative; `Retry-After` is only an extra wake-up
+    /// so a changed CA window is noticed.
+    fn ari_times(&self, certificate: &Certificate) -> (Option<SystemTime>, Option<SystemTime>) {
+        let Some(state) = self
+            .ari
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&certificate_key(certificate))
+            .cloned()
+        else {
+            return (None, None);
+        };
+        let renewal = state.info.as_ref().and_then(|info| {
+            info.selected_time.map(|selected| {
+                let cutoff = selected
+                    .checked_sub(self.policy.check_interval)
+                    .unwrap_or(certificate.not_before);
+                let emergency = certificate
+                    .not_after
+                    .checked_sub(certificate.lifetime() / 20)
+                    .unwrap_or(certificate.not_before);
+                cutoff.min(emergency)
+            })
+        });
+        (renewal, state.retry_at)
+    }
+
     fn effective_due(
         &self,
         certificate: &Certificate,
         failures: &BTreeMap<String, FailureState>,
     ) -> SystemTime {
-        let nominal = self.policy.renewal_time(certificate);
+        let (ari_renewal, _) = self.ari_times(certificate);
+        let nominal = ari_renewal.unwrap_or_else(|| self.policy.renewal_time(certificate));
         match failures.get(&certificate_key(certificate)) {
             Some(failure) if failure.not_after == certificate.not_after => {
                 nominal.max(failure.retry_at)
@@ -1284,6 +1427,8 @@ mod tests {
         delay: Duration,
         not_before: SystemTime,
         not_after: SystemTime,
+        ari: Mutex<Option<RenewalInfo>>,
+        ari_fails: AtomicBool,
     }
 
     impl FakeIssuer {
@@ -1295,6 +1440,8 @@ mod tests {
                 delay: Duration::ZERO,
                 not_before,
                 not_after,
+                ari: Mutex::new(None),
+                ari_fails: AtomicBool::new(false),
             }
         }
 
@@ -1306,12 +1453,36 @@ mod tests {
         fn calls(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
         }
+
+        fn with_ari(self, info: RenewalInfo) -> Self {
+            *self
+                .ari
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(info);
+            self
+        }
+
+        fn with_ari_failure(self) -> Self {
+            self.ari_fails.store(true, Ordering::SeqCst);
+            self
+        }
     }
 
     #[async_trait]
     impl CertificateIssuer for FakeIssuer {
         fn name(&self) -> &'static str {
             "fake"
+        }
+
+        async fn renewal_info(&self, _certificate: &Certificate) -> Result<Option<RenewalInfo>> {
+            if self.ari_fails.load(Ordering::SeqCst) {
+                return Err(Error::Issuer("mock ARI endpoint failed".to_string()));
+            }
+            Ok(self
+                .ari
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone())
         }
 
         async fn obtain(&self, request: &IssuanceRequest) -> Result<Certificate> {
@@ -1365,6 +1536,127 @@ mod tests {
                     .with_backoff(Duration::from_secs(30), Duration::from_secs(300)),
             ),
         )
+    }
+
+    fn ari_window(start: SystemTime, selected: SystemTime) -> RenewalInfo {
+        RenewalInfo {
+            suggested_window: crate::acme::ari::SuggestedWindow {
+                start,
+                end: start + Duration::from_secs(2 * 86_400),
+            },
+            explanation_url: Some("https://ca.test/ari".to_string()),
+            unique_identifier: "test-cert-id".to_string(),
+            retry_after: None,
+            selected_time: Some(selected),
+        }
+    }
+
+    #[tokio::test]
+    async fn ari_selected_time_overrides_the_local_renewal_heuristic() {
+        let start = at(1_000);
+        let certificate = ninety_day_certificate(&["ari.example"], start);
+        let store = Arc::new(SharedCertificateStore::new());
+        store.insert(certificate).unwrap();
+        let clock = Arc::new(ManualClock::new(start + Duration::from_secs(61 * 86_400)));
+        let selected = start + Duration::from_secs(81 * 86_400);
+        // Local heuristic would renew at ~day 60, but ARI suggests day 81.
+        let issuer = Arc::new(
+            FakeIssuer::new(selected, selected + Duration::from_secs(90 * 86_400))
+                .with_ari(ari_window(selected - Duration::from_secs(86_400), selected)),
+        );
+        let scheduler = scheduler(
+            issuer.clone(),
+            Arc::new(MemoryStorage::new()),
+            Arc::clone(&store),
+            Arc::clone(&clock),
+        );
+        let outcomes = scheduler.run_once(clock.now()).await;
+        assert!(outcomes.is_empty(), "ARI window is still in the future");
+        assert_eq!(issuer.calls(), 0);
+        let info = scheduler
+            .renewal_info_for(&store.certificates()[0])
+            .expect("ARI cached");
+        assert_eq!(info.selected_time, Some(selected));
+        let due = scheduler.next_renewal(clock.now()).unwrap().due_at;
+        assert_eq!(
+            due,
+            selected - scheduler.policy().check_interval,
+            "renewal wakes the check interval before the ARI-selected time"
+        );
+
+        clock.set(selected);
+        let outcomes = scheduler.run_once(clock.now()).await;
+        assert!(
+            outcomes.iter().any(RenewalOutcome::is_renewed),
+            "{outcomes:?}"
+        );
+        assert_eq!(issuer.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn ari_can_renew_earlier_than_the_local_heuristic() {
+        let start = at(1_000);
+        let certificate = ninety_day_certificate(&["early.example"], start);
+        let store = Arc::new(SharedCertificateStore::new());
+        store.insert(certificate).unwrap();
+        let selected = start + Duration::from_secs(21 * 86_400);
+        let clock = Arc::new(ManualClock::new(selected));
+        let issuer = Arc::new(
+            FakeIssuer::new(selected, selected + Duration::from_secs(90 * 86_400)).with_ari(
+                ari_window(start + Duration::from_secs(20 * 86_400), selected),
+            ),
+        );
+        let scheduler = scheduler(
+            issuer.clone(),
+            Arc::new(MemoryStorage::new()),
+            Arc::clone(&store),
+            clock,
+        );
+        let outcomes = scheduler.run_once(selected).await;
+        assert!(
+            outcomes.iter().any(RenewalOutcome::is_renewed),
+            "{outcomes:?}"
+        );
+        assert_eq!(issuer.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn ari_failure_or_absence_falls_back_to_the_local_heuristic() {
+        for with_failure in [false, true] {
+            let start = at(1_000);
+            let certificate = ninety_day_certificate(&["fallback.example"], start);
+            let store = Arc::new(SharedCertificateStore::new());
+            store.insert(certificate).unwrap();
+            // Local renewal is at day 60; before that nothing is due even if ARI fetching fails.
+            let clock = Arc::new(ManualClock::new(start + Duration::from_secs(50 * 86_400)));
+            let mut issuer = FakeIssuer::new(
+                start + Duration::from_secs(60 * 86_400),
+                start + Duration::from_secs(150 * 86_400),
+            );
+            if with_failure {
+                issuer = issuer.with_ari_failure();
+            }
+            let issuer = Arc::new(issuer);
+            let scheduler = scheduler(
+                issuer.clone(),
+                Arc::new(MemoryStorage::new()),
+                Arc::clone(&store),
+                Arc::clone(&clock),
+            );
+            assert!(scheduler.run_once(clock.now()).await.is_empty());
+            let due = scheduler.next_renewal(clock.now()).unwrap().due_at;
+            assert!(
+                due <= start + Duration::from_secs(60 * 86_400),
+                "local one-third-lifetime heuristic remains the renewal fallback; an ARI retry may wake earlier: {due:?}"
+            );
+            clock.advance(Duration::from_secs(11 * 86_400));
+            let outcomes = scheduler.run_once(clock.now()).await;
+            assert!(
+                outcomes.iter().any(RenewalOutcome::is_renewed),
+                "{outcomes:?}"
+            );
+            assert_eq!(issuer.calls(), 1);
+        }
     }
 
     // ---- scheduler -----------------------------------------------------------------------

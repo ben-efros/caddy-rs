@@ -104,6 +104,7 @@ use serde_json::Value;
 use caddy_rs_core::config::{AutomationPolicy, Config, TlsApp};
 use caddy_rs_core::listen::{ListenAddr, Network};
 
+use crate::acme::ari::RenewalInfo;
 use crate::acme::csr::CertificateKeyType;
 use crate::acme::{AcmeClock, AcmeStorage, AcmeTransport, PollPolicy, TokioClock};
 use crate::certificate::{Certificate, RenewalItem};
@@ -956,6 +957,11 @@ pub struct AutomaticHttpsProvisioner {
     renewal_scheduler_enabled: bool,
     /// Clock used for internal CA validity windows (tests share a manual clock with renewals).
     internal_ca_clock: Arc<dyn RenewalClock>,
+    /// Optional in-memory certificate cache shared with previous generations. When set, cached
+    /// certificates are inserted into the resolver before storage is consulted and the renewal
+    /// scheduler reuses this store instead of allocating a new one, so a reload does not re-issue
+    /// certificates that are still valid.
+    shared_certificate_store: Option<Arc<SharedCertificateStore>>,
 }
 
 impl std::fmt::Debug for AutomaticHttpsProvisioner {
@@ -995,7 +1001,19 @@ impl AutomaticHttpsProvisioner {
             renewal_policy: RenewalPolicy::default(),
             renewal_scheduler_enabled: true,
             internal_ca_clock: Arc::new(SystemClock),
+            shared_certificate_store: None,
         }
+    }
+
+    /// Share an in-memory certificate store with a previous generation.
+    ///
+    /// The caller should pass the store returned by the previous generation's
+    /// [`AutomaticHttpsRenewals::store`]; provisioning then reuses those certificates before
+    /// consulting storage, avoiding duplicate issuance on a config reload while in-flight
+    /// handshakes keep the previous resolver alive.
+    pub fn with_certificate_store(mut self, store: Arc<SharedCertificateStore>) -> Self {
+        self.shared_certificate_store = Some(store);
+        self
     }
 
     /// Inject the blob storage used for internal CA material.
@@ -1171,6 +1189,26 @@ impl AutomaticHttpsProvisioner {
             resolver.insert(TlsCertificate::from_stored(&stored)?)?;
         }
 
+        // Reuse the previous generation's in-memory certificates first. This is what keeps a
+        // reload from re-issuing certificates when the data directory or transport is transiently
+        // unavailable; storage is still consulted below for certificates absent from the cache.
+        if let Some(shared_store) = &self.shared_certificate_store {
+            for certificate in shared_store.certificates() {
+                resolver.insert(TlsCertificate::from_cache_certificate(&certificate)?)?;
+                if plan.subjects.iter().any(|subject| {
+                    certificate
+                        .domains
+                        .iter()
+                        .any(|domain| host_matches(domain, subject))
+                }) && !managed.iter().any(|existing| {
+                    existing.domains == certificate.domains
+                        && existing.not_after == certificate.not_after
+                }) {
+                    managed.push((*certificate).clone());
+                }
+            }
+        }
+
         // Internal-CA policies load (or generate) the local CA before any subject is examined, so
         // a restart that reuses persisted leaves still exposes the CA certificates for trust
         // installation and CA errors surface before partial provisioning.
@@ -1286,7 +1324,13 @@ impl AutomaticHttpsProvisioner {
             return Ok(None);
         }
         let publisher: Arc<dyn CertificatePublisher> = resolver;
-        let store = Arc::new(SharedCertificateStore::with_publisher(publisher));
+        let store = match &self.shared_certificate_store {
+            Some(store) => {
+                store.set_publisher(Some(publisher));
+                Arc::clone(store)
+            }
+            None => Arc::new(SharedCertificateStore::with_publisher(publisher)),
+        };
         for certificate in &unique {
             store.insert(certificate.clone())?;
         }
@@ -1455,6 +1499,24 @@ impl RenewalIssuer {
 impl CertificateIssuer for RenewalIssuer {
     fn name(&self) -> &'static str {
         "automatic_https"
+    }
+
+    async fn renewal_info(&self, certificate: &Certificate) -> Result<Option<RenewalInfo>> {
+        let Some(subject) = certificate.domains.first() else {
+            return Ok(None);
+        };
+        let Some(policy) = self.plan.policy_for(subject) else {
+            return Ok(None);
+        };
+        match &policy.issuer {
+            AutomaticHttpsIssuer::Internal => Ok(None),
+            AutomaticHttpsIssuer::Acme(config) => {
+                let Some(leaf) = certificate.cert_chain_der.first() else {
+                    return Ok(None);
+                };
+                crate::acme::fetch_renewal_info(&self.transport, &config.ca, leaf).await
+            }
+        }
     }
 
     async fn obtain(&self, request: &IssuanceRequest) -> Result<Certificate> {
@@ -2647,6 +2709,69 @@ mod tests {
             }
             Ok(response)
         }
+    }
+
+    fn fixture_cache_certificate(domain: &str) -> Certificate {
+        let cert_pem = include_str!("../testdata/https/example.com.pem").to_string();
+        let not_after_unix = crate::storage::certificate_validity_unix(&cert_pem)
+            .expect("fixture validity")
+            .1;
+        let stored = StoredCertificate {
+            certificate_pem: vec![cert_pem],
+            private_key_pem: include_str!("../testdata/https/example.com.key").to_string(),
+            domains: vec![domain.to_string()],
+            not_after_unix,
+            issuer_data: None,
+            metadata_extra: std::collections::BTreeMap::new(),
+        };
+        stored_to_certificate(&stored, "acme.test-directory").expect("fixture certificate")
+    }
+
+    #[tokio::test]
+    async fn shared_certificate_store_survives_generations_without_reissue() {
+        let plan = plan(&implicit_https_config(&["example.com"]))
+            .unwrap()
+            .expect("default-on plan");
+        let shared = Arc::new(SharedCertificateStore::new());
+        shared
+            .insert(fixture_cache_certificate("example.com"))
+            .expect("fixture inserts");
+        let directory = tempfile::tempdir().unwrap();
+        // Empty data directory: the only source of the certificate is the shared in-memory cache,
+        // so a re-issue would be observable as a transport request.
+        let transport = Arc::new(NoopTransport::default());
+        let provisioner = AutomaticHttpsProvisioner::new(
+            transport.clone(),
+            directory.path(),
+            Arc::new(Http01TokenStore::new()),
+        )
+        .with_certificate_store(Arc::clone(&shared))
+        .with_renewal_scheduler(false);
+        let provisioned = provisioner
+            .provision(&plan, None)
+            .await
+            .expect("generation reuses shared cache");
+        assert!(
+            provisioned.issued.is_empty(),
+            "valid cached certificate must not be re-issued on reload"
+        );
+        assert!(
+            provisioned.resolver.covers("example.com"),
+            "shared cache certificate is served by the new resolver"
+        );
+        assert_eq!(
+            *transport
+                .calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            0,
+            "no ACME request may be made when the shared cache covers the subject"
+        );
+        let renewals = provisioned.renewals.expect("shared store drives renewals");
+        assert!(
+            Arc::ptr_eq(renewals.store(), &shared),
+            "the generation's renewal scheduler must reuse the shared store"
+        );
     }
 
     #[tokio::test]

@@ -40,6 +40,7 @@ use caddy_rs_core::duration::CaddyDuration;
 use rustls::pki_types::CertificateDer;
 
 use crate::acme::adaptive_challenge::AdaptiveChallengeSelector;
+use crate::acme::ari::RenewalInfo;
 use crate::acme::csr::CertificateKeyType;
 use crate::acme::{
     AccountRegistration, AcmeAccountClient, AcmeClient, AcmeClock, AcmeError, AcmeStorage,
@@ -79,6 +80,15 @@ pub trait CertificateIssuer: Send + Sync {
 
     /// Obtain a new certificate.
     async fn obtain(&self, request: &IssuanceRequest) -> Result<Certificate>;
+
+    /// Fetch ACME Renewal Information for `certificate`, when this issuer supports it.
+    ///
+    /// The default returns `None` (no ARI), so the renewal scheduler keeps its local heuristic.
+    /// ARI errors are surfaced to the scheduler, which falls back to the local schedule.
+    async fn renewal_info(&self, certificate: &Certificate) -> Result<Option<RenewalInfo>> {
+        let _ = certificate;
+        Ok(None)
+    }
 
     /// Renew an existing certificate.
     async fn renew(&self, certificate: &Certificate) -> Result<Certificate> {
@@ -893,6 +903,13 @@ impl<T: AcmeTransport> fmt::Debug for AcmeIssuer<T> {
 impl<T: AcmeTransport> CertificateIssuer for AcmeIssuer<T> {
     fn name(&self) -> &'static str {
         "acme"
+    }
+
+    async fn renewal_info(&self, certificate: &Certificate) -> Result<Option<RenewalInfo>> {
+        let Some(leaf) = certificate.cert_chain_der.first() else {
+            return Ok(None);
+        };
+        crate::acme::fetch_renewal_info(&self.transport, &self.config.ca, leaf).await
     }
 
     async fn obtain(&self, request: &IssuanceRequest) -> Result<Certificate> {

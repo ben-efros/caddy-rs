@@ -24,6 +24,7 @@
 //! * ZeroSSL's automatic EAB credential provisioning is not implemented.
 
 pub mod adaptive_challenge;
+pub mod ari;
 pub mod csr;
 pub mod order;
 pub mod transport;
@@ -32,6 +33,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -42,6 +44,7 @@ use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::sync::Mutex;
 
+use crate::acme::ari::RenewalInfo;
 use crate::storage::FileStorage;
 use crate::{Error, Result};
 
@@ -146,6 +149,13 @@ pub enum AcmeError {
     /// JWS signing failed.
     #[error("ACME JWS signing failed: {0}")]
     Signing(String),
+
+    /// ACME Renewal Information (ARI) fetching or parsing failed.
+    #[error("ACME renewal information: {reason}")]
+    Ari {
+        /// Failure description.
+        reason: String,
+    },
 
     /// External account binding credentials are malformed.
     #[error("ACME external account binding error: {0}")]
@@ -1567,6 +1577,39 @@ pub fn sign_jws(
     })
 }
 
+/// Fetch ARI for `certificate_der` from the CA's advertised `renewalInfo` endpoint.
+///
+/// Returns `Ok(None)` when the directory does not advertise ARI or the CA answers 404/410; other
+/// transport/HTTP/parse errors are returned so the scheduler can fall back to its local renewal
+/// heuristic (certmagic logs and reuses the previous window).
+pub async fn fetch_renewal_info<T: AcmeTransport + ?Sized>(
+    transport: &T,
+    directory_url: &str,
+    certificate_der: &[u8],
+) -> Result<Option<RenewalInfo>> {
+    let response = transport.request(HttpRequest::get(directory_url)).await?;
+    if !response.is_success() {
+        return Err(response_error(directory_url, &response));
+    }
+    let directory = Directory::parse(directory_url, &response.body)?;
+    let Some(renewal_info_url) = directory.renewal_info.clone() else {
+        return Ok(None);
+    };
+    let cert_id = ari::unique_identifier(certificate_der)?;
+    let url = format!("{}/{}", renewal_info_url.trim_end_matches('/'), cert_id);
+    let response = transport.request(HttpRequest::get(&url)).await?;
+    if response.status == 404 || response.status == 410 {
+        return Ok(None);
+    }
+    if !response.is_success() {
+        return Err(response_error(&url, &response));
+    }
+    let now = SystemTime::now();
+    let retry_after = order::retry_after(&response);
+    let info = RenewalInfo::parse(&cert_id, &response.body)?.with_retry_after(now, retry_after);
+    Ok(Some(info))
+}
+
 /// External account binding credentials configured as `external_account` in Caddy's
 /// `tls.issuance.acme` JSON (`{"key_id": "...", "mac_key": "..."}`).
 ///
@@ -2913,6 +2956,64 @@ EVdZ8IcAQzAPk1jBxj0YDC0rR5d09Q==
     }
 
     // ---- client: successful registration --------------------------------------------------
+
+    #[tokio::test]
+    async fn fetches_mock_ari_window_and_falls_back_when_unavailable() {
+        let leaf_pem = include_str!("../../testdata/https/example.com.pem");
+        let leaf_der = crate::storage::certificate_chain_der(&[leaf_pem.to_string()])
+            .unwrap()
+            .remove(0);
+        let cert_id = ari::unique_identifier(&leaf_der).unwrap();
+        let ari_url = format!("https://acme.test/acme/renewal-info/{cert_id}");
+        let body = serde_json::json!({
+            "suggestedWindow": {
+                "start": "2026-04-01T00:00:00Z",
+                "end": "2026-04-03T00:00:00Z"
+            },
+            "explanationURL": "https://acme.test/why"
+        });
+        let mock = Arc::new(MockTransport::new(vec![
+            (HttpMethod::Get, DIRECTORY_URL, directory_response()),
+            (
+                HttpMethod::Get,
+                &ari_url,
+                HttpResponse::with_json(200, &body)
+                    .unwrap()
+                    .with_header("Retry-After", "3600"),
+            ),
+        ]));
+        let info = crate::acme::fetch_renewal_info(&mock, DIRECTORY_URL, &leaf_der)
+            .await
+            .unwrap()
+            .expect("ARI window");
+        assert_eq!(info.unique_identifier, cert_id);
+        assert!(info.suggested_window.end > info.suggested_window.start);
+        let selected = info.selected_time.expect("selected time");
+        assert!(selected >= info.suggested_window.start);
+        assert!(selected < info.suggested_window.end);
+        assert!(info.retry_after.is_some());
+        assert_eq!(
+            info.explanation_url.as_deref(),
+            Some("https://acme.test/why")
+        );
+
+        // A 404 (or a directory without renewalInfo) means "no ARI": the caller falls back to its
+        // local renewal heuristic rather than failing the renewal.
+        let missing = Arc::new(MockTransport::new(vec![
+            (HttpMethod::Get, DIRECTORY_URL, directory_response()),
+            (
+                HttpMethod::Get,
+                &ari_url,
+                HttpResponse::new(404).with_body(Vec::new()),
+            ),
+        ]));
+        assert!(
+            crate::acme::fetch_renewal_info(&missing, DIRECTORY_URL, &leaf_der)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[tokio::test]
     async fn mock_transport_registers_account_and_persists_it() {
