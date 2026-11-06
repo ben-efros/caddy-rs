@@ -1,0 +1,11 @@
+one.example.com {
+	log
+	respond "plain"
+}
+
+two.example.com {
+	log named {
+		output stdout
+	}
+	respond "named"
+}

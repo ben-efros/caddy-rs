@@ -1,0 +1,8 @@
+example.com {
+	log {
+		output stdout
+		format json
+		level INFO
+	}
+	respond "ok"
+}

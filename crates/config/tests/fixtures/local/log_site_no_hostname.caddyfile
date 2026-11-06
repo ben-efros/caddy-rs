@@ -1,0 +1,7 @@
+example.com {
+	log {
+		no_hostname
+		output file /var/log/example-access.log
+	}
+	respond "ok"
+}

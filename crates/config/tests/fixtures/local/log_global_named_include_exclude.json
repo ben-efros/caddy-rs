@@ -1,0 +1,23 @@
+{
+  "logging": {
+    "logs": {
+      "access": {
+        "writer": {
+          "output": "stderr"
+        },
+        "level": "WARN",
+        "include": [
+          "http.log.access.custom"
+        ],
+        "exclude": [
+          "admin.api"
+        ]
+      },
+      "default": {
+        "exclude": [
+          "http.log.access.custom"
+        ]
+      }
+    }
+  }
+}
