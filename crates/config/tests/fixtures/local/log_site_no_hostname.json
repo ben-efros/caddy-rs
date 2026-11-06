@@ -1,0 +1,59 @@
+{
+  "logging": {
+    "logs": {
+      "default": {
+        "exclude": [
+          "http.log.access.log0"
+        ]
+      },
+      "log0": {
+        "writer": {
+          "filename": "/var/log/example-access.log",
+          "output": "file"
+        },
+        "include": [
+          "http.log.access.log0"
+        ]
+      }
+    }
+  },
+  "apps": {
+    "http": {
+      "servers": {
+        "srv0": {
+          "listen": [
+            ":443"
+          ],
+          "routes": [
+            {
+              "match": [
+                {
+                  "host": [
+                    "example.com"
+                  ]
+                }
+              ],
+              "handle": [
+                {
+                  "handler": "subroute",
+                  "routes": [
+                    {
+                      "handle": [
+                        {
+                          "body": "ok",
+                          "handler": "static_response"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ],
+              "terminal": true
+            }
+          ],
+          "logs": {}
+        }
+      }
+    }
+  }
+}

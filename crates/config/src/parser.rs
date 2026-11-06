@@ -72,6 +72,14 @@ pub struct GlobalOptions {
     pub grace_period_ns: Option<u64>,
     /// Global shutdown delay (`shutdown_delay`), in nanoseconds (`apps.http.shutdown_delay`).
     pub shutdown_delay_ns: Option<u64>,
+    /// Raw global `log` options, in source order. The adapter turns them into the top-level
+    /// `logging` app; multiple `log [<name>] { ... }` entries are allowed.
+    pub logs: Vec<Directive>,
+    /// Raw global `metrics` option. The adapter turns it into `apps.http.metrics`.
+    pub metrics: Option<Directive>,
+    /// Caddy's global `debug` option. Caddy's adapter uses it to set custom loggers to DEBUG and to
+    /// add an implicit DEBUG default logger; it is otherwise informational.
+    pub debug: bool,
     /// Non-fatal notes produced while preprocessing the Caddyfile (environment-placeholder
     /// expansion) and while reading options. Adapters surface these to callers.
     pub warnings: Vec<String>,
@@ -706,12 +714,9 @@ impl Parser {
             });
         }
 
-        if sites.is_empty() {
-            return Err(ParseError::syntax(
-                Position::new(1, 1),
-                "Caddyfile contains no site blocks",
-            ));
-        }
+        // A Caddyfile may contain only global options (for example a global `log` block, which
+        // produces a top-level `logging` app). The adapter decides whether the resulting config is
+        // empty; an entirely empty input is rejected there with a located error.
         self.validate_invokes(&sites)?;
         options.warnings.append(&mut self.warnings);
         Ok(Caddyfile {
@@ -1773,11 +1778,29 @@ fn read_global_options(directives: Vec<Directive>) -> Result<GlobalOptions, Pars
                 }
                 options.local_certs = true;
             }
-            "debug" => return Err(ParseError::syntax(
-                directive.position.clone(),
-                "global option `debug` is not implemented by this build (tracked as T-CONF-011); \
-                     it is rejected rather than silently ignored",
-            )),
+            "log" => {
+                // Caddy allows multiple global `log` options (one per logger name); parse them
+                // later in the adapter with the same machinery as the `log` directive.
+                options.logs.push(directive);
+            }
+            "metrics" => {
+                if options.metrics.is_some() {
+                    return Err(ParseError::syntax(
+                        directive.position.clone(),
+                        "global option `metrics` is specified more than once",
+                    ));
+                }
+                options.metrics = Some(directive);
+            }
+            "debug" => {
+                if !directive.args.is_empty() || !directive.block.is_empty() {
+                    return Err(ParseError::syntax(
+                        directive.position.clone(),
+                        "global option `debug` does not take arguments",
+                    ));
+                }
+                options.debug = true;
+            }
             other => {
                 return Err(ParseError::syntax(
                     directive.position.clone(),

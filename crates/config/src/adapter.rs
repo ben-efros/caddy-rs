@@ -732,6 +732,12 @@ pub fn adapt_with_source(
     input: &str,
     source: Option<&std::path::Path>,
 ) -> caddy_rs_core::Result<AdaptedConfig> {
+    if input.trim().is_empty() {
+        return Err(adapter_error(
+            Position::new(1, 1),
+            "Caddyfile is empty: expected at least one site block or global option",
+        ));
+    }
     let (effective_input, global_server_options) = extract_global_server_options(input)?;
     let file = parser::parse_with_source(&effective_input, source).map_err(parse_error)?;
     let options = &file.options;
@@ -753,10 +759,26 @@ pub fn adapt_with_source(
         .iter()
         .map(parse_site_bind)
         .collect::<caddy_rs_core::Result<_>>()?;
-    let site_logs: Vec<bool> = file
+    // Global `log` options create top-level `logging` app entries; site `log` directives create
+    // both server log associations and (when they configure anything) `logging` entries. Caddy's
+    // auto logger names (`log0`, `log1`, ...) come from one counter across all site blocks in
+    // source order.
+    let mut global_log_names: BTreeSet<String> = BTreeSet::new();
+    let mut global_logs: Vec<NamedLog> = Vec::new();
+    let mut global_log_counters = LogNameCounters::default();
+    for directive in &options.logs {
+        global_logs.push(parse_log_entry(
+            directive,
+            true,
+            &mut global_log_names,
+            &mut global_log_counters,
+        )?);
+    }
+    let mut log_name_counters = LogNameCounters::default();
+    let site_logs: Vec<Vec<NamedLog>> = file
         .sites
         .iter()
-        .map(parse_site_log)
+        .map(|site| parse_site_logs(site, &mut log_name_counters))
         .collect::<caddy_rs_core::Result<_>>()?;
 
     // Named-route definitions are emitted as `named_routes` on each server that invokes them,
@@ -1084,8 +1106,13 @@ pub fn adapt_with_source(
             http_app.insert("shutdown_delay".to_string(), json!(nanoseconds));
         }
     }
-    http_app.insert("servers".to_string(), Value::Object(server_map));
-    apps.insert("http".to_string(), Value::Object(http_app));
+    if !server_map.is_empty() {
+        if let Some(metrics) = metrics_option_json(options.metrics.as_ref())? {
+            http_app.insert("metrics".to_string(), metrics);
+        }
+        http_app.insert("servers".to_string(), Value::Object(server_map));
+        apps.insert("http".to_string(), Value::Object(http_app));
+    }
     if let Some(tls) = tls_plan.app.clone() {
         apps.insert("tls".to_string(), tls);
     }
@@ -1093,8 +1120,15 @@ pub fn adapt_with_source(
         apps.insert("pki".to_string(), pki);
     }
 
+    let mut config = Map::new();
+    if !apps.is_empty() {
+        config.insert("apps".to_string(), Value::Object(apps));
+    }
+    if let Some(logging) = build_logging_app(&global_logs, &site_logs, options.debug) {
+        config.insert("logging".to_string(), logging);
+    }
     Ok(AdaptedConfig {
-        config: json!({"apps": Value::Object(apps)}),
+        config: Value::Object(config),
         warnings,
     })
 }
@@ -1227,28 +1261,520 @@ fn listen_port_of(listen: &str) -> Option<u16> {
     port.parse::<u16>().ok()
 }
 
-/// Parse the site block's `log` directives. Only the plain `log` form is implemented; options
-/// must fail loudly until per-server logging is wired into the runtime (T-ADMIN-020).
-fn parse_site_log(site: &SiteBlock) -> caddy_rs_core::Result<bool> {
-    let mut has_log = false;
+/// One named logger requested by a site `log` directive or a global `log` option.
+#[derive(Debug, Clone, PartialEq)]
+struct NamedLog {
+    /// Logger name: explicit, auto-generated (`log0`, ...), empty for plain `log`, or `default`
+    /// for the unnamed global option.
+    name: String,
+    /// Hostname overrides from a site `log { hostnames ... }` option.
+    hostnames: Vec<String>,
+    /// `log { no_hostname }` disables server-level hostname association.
+    no_hostname: bool,
+    /// Caddy `CustomLog` JSON; `None` when the log block configured nothing (plain `log`).
+    config: Option<Value>,
+}
+
+/// Counter Caddy uses for auto-generated site logger names (`log0`, `log1`, ...).
+#[derive(Debug, Default, Clone, Copy)]
+struct LogNameCounters {
+    site: usize,
+}
+
+/// Parse every `log` directive of one site block. `log` configures server-level access-log
+/// association (and a `logging` app entry when the block has options), not an HTTP handler.
+fn parse_site_logs(
+    site: &SiteBlock,
+    counters: &mut LogNameCounters,
+) -> caddy_rs_core::Result<Vec<NamedLog>> {
+    let mut logs = Vec::new();
+    let mut names = BTreeSet::new();
     for directive in &site.directives {
         if directive.name != "log" {
             continue;
         }
-        if !directive.args.is_empty() || !directive.block.is_empty() {
-            return Err(adapter_error(
-                directive.position.clone(),
-                "`log` options are not supported by this build (plain `log` only; tracked as \
-                 T-ADMIN-020)",
-            ));
-        }
-        has_log = true;
+        logs.push(parse_log_entry(directive, false, &mut names, counters)?);
     }
-    Ok(has_log)
+    Ok(logs)
 }
 
-/// Hostnames of a site block for access-log association: host only, with ports stripped, like
-/// Caddy's `hostsFromKeys` + `net.SplitHostPort` sequence.
+/// Parse one `log [<name>] { ... }` directive/option. `global` selects Caddy's global-option rules
+/// (default logger name, no hostnames, `include`/`exclude` allowed, duplicate names rejected).
+fn parse_log_entry(
+    directive: &Directive,
+    global: bool,
+    global_names: &mut BTreeSet<String>,
+    counters: &mut LogNameCounters,
+) -> caddy_rs_core::Result<NamedLog> {
+    if directive.args.len() > 1 {
+        return Err(adapter_error(
+            directive.position.clone(),
+            "`log` takes at most one logger name argument",
+        ));
+    }
+    let explicit_name = directive.args.first().cloned();
+    let mut log = LogOptions::default();
+    log.parse_block(&directive.block, global)?;
+
+    let mut name = explicit_name.unwrap_or_default();
+    if global {
+        if name.is_empty() {
+            name = "default".to_string();
+        }
+        if !global_names.insert(name.clone()) {
+            return Err(adapter_error(
+                directive.position.clone(),
+                format!("duplicate global log option for: {name}"),
+            ));
+        }
+    } else if name.is_empty() && !log.is_empty() {
+        name = format!("log{}", counters.site);
+        counters.site += 1;
+    }
+
+    let mut config = log.to_json();
+    if !global && !name.is_empty() {
+        if let Some(config) = config.as_mut().and_then(Value::as_object_mut) {
+            config.insert(
+                "include".to_string(),
+                json!([format!("http.log.access.{name}")]),
+            );
+        }
+    }
+    Ok(NamedLog {
+        name,
+        hostnames: log.hostnames,
+        no_hostname: log.no_hostname,
+        config,
+    })
+}
+
+/// Parsed `log` block options, in Caddy's `CustomLog` shape.
+#[derive(Debug, Default)]
+struct LogOptions {
+    writer: Option<Value>,
+    encoder: Option<Value>,
+    level: Option<String>,
+    sampling: Option<Value>,
+    include: Vec<String>,
+    exclude: Vec<String>,
+    hostnames: Vec<String>,
+    no_hostname: bool,
+}
+
+impl LogOptions {
+    /// Whether the block configured a `CustomLog` at all (plain `log` configures nothing).
+    fn is_empty(&self) -> bool {
+        self.writer.is_none()
+            && self.encoder.is_none()
+            && self.level.is_none()
+            && self.sampling.is_none()
+            && self.include.is_empty()
+            && self.exclude.is_empty()
+    }
+
+    fn parse_block(&mut self, block: &[Directive], global: bool) -> caddy_rs_core::Result<()> {
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for option in block {
+            match option.name.as_str() {
+                "hostnames" => {
+                    if global {
+                        return Err(adapter_error(
+                            option.position.clone(),
+                            "hostnames is not allowed in the log global options",
+                        ));
+                    }
+                    if option.args.is_empty() || !option.block.is_empty() {
+                        return Err(adapter_error(
+                            option.position.clone(),
+                            "`hostnames` requires at least one hostname and no block",
+                        ));
+                    }
+                    self.hostnames.extend(option.args.iter().cloned());
+                }
+                "output" => {
+                    if !seen.insert("output") {
+                        return Err(adapter_error(
+                            option.position.clone(),
+                            "'output' subdirective specified more than once in the same log block",
+                        ));
+                    }
+                    self.writer = Some(parse_log_writer(option)?);
+                }
+                "format" => {
+                    if !seen.insert("format") {
+                        return Err(adapter_error(
+                            option.position.clone(),
+                            "'format' subdirective specified more than once in the same log block",
+                        ));
+                    }
+                    self.encoder = Some(parse_log_encoder(option)?);
+                }
+                "level" => {
+                    if !seen.insert("level") {
+                        return Err(adapter_error(
+                            option.position.clone(),
+                            "'level' subdirective specified more than once in the same log block",
+                        ));
+                    }
+                    if option.args.len() != 1 || !option.block.is_empty() {
+                        return Err(adapter_error(
+                            option.position.clone(),
+                            "`level` requires exactly one level name",
+                        ));
+                    }
+                    let level = option.args[0].to_ascii_uppercase();
+                    if !matches!(
+                        level.as_str(),
+                        "DEBUG" | "INFO" | "WARN" | "ERROR" | "PANIC" | "FATAL"
+                    ) {
+                        return Err(adapter_error(
+                            option.position.clone(),
+                            format!(
+                                "unsupported log level `{}`; expected DEBUG, INFO, WARN, ERROR, \
+                                 PANIC or FATAL (tracked as T-CONF-012)",
+                                option.args[0]
+                            ),
+                        ));
+                    }
+                    self.level = Some(level);
+                }
+                "sampling" => {
+                    if !seen.insert("sampling") {
+                        return Err(adapter_error(
+                            option.position.clone(),
+                            "'sampling' subdirective specified more than once in the same log block",
+                        ));
+                    }
+                    self.sampling = Some(parse_log_sampling(option)?);
+                }
+                "include" | "exclude" => {
+                    if !global {
+                        return Err(adapter_error(
+                            option.position.clone(),
+                            format!("{} is not allowed in the log directive", option.name),
+                        ));
+                    }
+                    if !option.block.is_empty() {
+                        return Err(adapter_error(
+                            option.position.clone(),
+                            format!("`{}` does not take a block", option.name),
+                        ));
+                    }
+                    let target = if option.name == "include" {
+                        &mut self.include
+                    } else {
+                        &mut self.exclude
+                    };
+                    target.extend(option.args.iter().cloned());
+                }
+                "no_hostname" => {
+                    if !seen.insert("no_hostname") {
+                        return Err(adapter_error(
+                            option.position.clone(),
+                            "'no_hostname' subdirective specified more than once in the same log block",
+                        ));
+                    }
+                    if !option.args.is_empty() || !option.block.is_empty() {
+                        return Err(adapter_error(
+                            option.position.clone(),
+                            "`no_hostname` does not take arguments",
+                        ));
+                    }
+                    self.no_hostname = true;
+                }
+                "core" => return Err(adapter_error(
+                    option.position.clone(),
+                    "`log` option `core` is not supported by this build: the runtime access-log \
+                         sink has no custom zap core (tracked as T-CONF-012)",
+                )),
+                other => {
+                    return Err(adapter_error(
+                        option.position.clone(),
+                        format!("unrecognized log subdirective `{other}` (tracked as T-CONF-012)"),
+                    ))
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn to_json(&self) -> Option<Value> {
+        if self.is_empty() {
+            return None;
+        }
+        let mut object = Map::new();
+        if let Some(writer) = &self.writer {
+            object.insert("writer".to_string(), writer.clone());
+        }
+        if let Some(encoder) = &self.encoder {
+            object.insert("encoder".to_string(), encoder.clone());
+        }
+        if let Some(level) = &self.level {
+            object.insert("level".to_string(), json!(level));
+        }
+        if let Some(sampling) = &self.sampling {
+            object.insert("sampling".to_string(), sampling.clone());
+        }
+        if !self.include.is_empty() {
+            object.insert("include".to_string(), json!(self.include));
+        }
+        if !self.exclude.is_empty() {
+            object.insert("exclude".to_string(), json!(self.exclude));
+        }
+        Some(Value::Object(object))
+    }
+}
+
+/// Parse a `log { output ... }` option into Caddy's logging writer object.
+fn parse_log_writer(option: &Directive) -> caddy_rs_core::Result<Value> {
+    let Some(module) = option.args.first() else {
+        return Err(adapter_error(
+            option.position.clone(),
+            "`output` requires a writer module name",
+        ));
+    };
+    match module.as_str() {
+        "stdout" | "stderr" | "discard" => {
+            if option.args.len() != 1 || !option.block.is_empty() {
+                return Err(adapter_error(
+                    option.position.clone(),
+                    format!("`output {module}` does not take arguments or a block"),
+                ));
+            }
+            Ok(json!({"output": module}))
+        }
+        "file" => {
+            if option.args.len() != 2 {
+                return Err(adapter_error(
+                    option.position.clone(),
+                    "`output file` requires exactly one filename",
+                ));
+            }
+            if let Some(first) = option.block.first() {
+                return Err(adapter_error(
+                    first.position.clone(),
+                    format!(
+                        "file writer option `{}` is not supported by this build (tracked as \
+                         T-CONF-012)",
+                        first.name
+                    ),
+                ));
+            }
+            Ok(json!({"output": "file", "filename": option.args[1]}))
+        }
+        "net" | "syslog" => Err(adapter_error(
+            option.position.clone(),
+            format!("log writer `{module}` is not supported by this build (tracked as T-CONF-012)"),
+        )),
+        other => Err(adapter_error(
+            option.position.clone(),
+            format!("unknown log writer module `{other}` (tracked as T-CONF-012)"),
+        )),
+    }
+}
+
+/// Parse a `log { format ... }` option into Caddy's logging encoder object.
+fn parse_log_encoder(option: &Directive) -> caddy_rs_core::Result<Value> {
+    let Some(module) = option.args.first() else {
+        return Err(adapter_error(
+            option.position.clone(),
+            "`format` requires an encoder module name",
+        ));
+    };
+    match module.as_str() {
+        "json" | "console" => {
+            if option.args.len() != 1 || !option.block.is_empty() {
+                return Err(adapter_error(
+                    option.position.clone(),
+                    format!("`format {module}` does not take arguments or a block"),
+                ));
+            }
+            Ok(json!({"format": module}))
+        }
+        "filter" | "append" | "journald" | "nop" => Err(adapter_error(
+            option.position.clone(),
+            format!(
+                "log encoder `{module}` is not supported by this build's access-log sink \
+                 (tracked as T-CONF-012)"
+            ),
+        )),
+        other => Err(adapter_error(
+            option.position.clone(),
+            format!("unknown log encoder module `{other}` (tracked as T-CONF-012)"),
+        )),
+    }
+}
+
+/// Parse one non-negative integer sampling option (`first` / `thereafter`).
+fn parse_sampling_integer(option: &Directive) -> caddy_rs_core::Result<i64> {
+    if option.args.len() != 1 || !option.block.is_empty() {
+        return Err(adapter_error(
+            option.position.clone(),
+            format!("`sampling {}` requires exactly one integer", option.name),
+        ));
+    }
+    option.args[0].parse::<i64>().map_err(|_| {
+        adapter_error(
+            option.position.clone(),
+            format!("failed to parse {}: {}", option.name, option.args[0]),
+        )
+    })
+}
+
+/// Parse a `log { sampling { ... } }` block into Caddy's `LogSampling` JSON.
+fn parse_log_sampling(option: &Directive) -> caddy_rs_core::Result<Value> {
+    if !option.args.is_empty() {
+        return Err(adapter_error(
+            option.position.clone(),
+            "`sampling` does not take arguments",
+        ));
+    }
+    let mut interval: Option<i64> = None;
+    let mut first: Option<i64> = None;
+    let mut thereafter: Option<i64> = None;
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for option in &option.block {
+        if !seen.insert(option.name.as_str()) {
+            return Err(adapter_error(
+                option.position.clone(),
+                format!(
+                    "'{}' specified more than once in the same sampling block",
+                    option.name
+                ),
+            ));
+        }
+        match option.name.as_str() {
+            "interval" => {
+                if option.args.len() != 1 || !option.block.is_empty() {
+                    return Err(adapter_error(
+                        option.position.clone(),
+                        "`sampling interval` requires exactly one duration",
+                    ));
+                }
+                interval = Some(crate::parser::parse_duration_ns(&option.args[0]).map_err(
+                    |reason| {
+                        adapter_error(
+                            option.position.clone(),
+                            format!("failed to parse interval: {reason}"),
+                        )
+                    },
+                )?);
+            }
+            "first" => {
+                first = Some(parse_sampling_integer(option)?);
+            }
+            "thereafter" => {
+                thereafter = Some(parse_sampling_integer(option)?);
+            }
+            other => {
+                return Err(adapter_error(
+                    option.position.clone(),
+                    format!("unrecognized sampling subdirective `{other}` (tracked as T-CONF-012)"),
+                ))
+            }
+        }
+    }
+    let mut object = Map::new();
+    if let Some(interval) = interval {
+        object.insert("interval".to_string(), json!(interval));
+    }
+    if let Some(first) = first {
+        object.insert("first".to_string(), json!(first));
+    }
+    if let Some(thereafter) = thereafter {
+        object.insert("thereafter".to_string(), json!(thereafter));
+    }
+    Ok(Value::Object(object))
+}
+
+/// Build the top-level `logging` app from global `log` options and site `log` directives, applying
+/// Caddy's default-logger exclusion and `debug` level rules.
+fn build_logging_app(
+    global_logs: &[NamedLog],
+    site_logs: &[Vec<NamedLog>],
+    debug: bool,
+) -> Option<Value> {
+    let mut custom: Vec<NamedLog> = global_logs.to_vec();
+    for logs in site_logs {
+        custom.extend(logs.iter().filter(|log| !log.name.is_empty()).cloned());
+    }
+    let mut has_default = custom.iter().any(|log| log.name == "default");
+    if debug {
+        for log in &mut custom {
+            if let Some(config) = log.config.as_mut().and_then(Value::as_object_mut) {
+                config
+                    .entry("level".to_string())
+                    .or_insert_with(|| json!("DEBUG"));
+            }
+        }
+        if !has_default {
+            custom.push(NamedLog {
+                name: "default".to_string(),
+                hostnames: Vec::new(),
+                no_hostname: false,
+                config: Some(json!({"level": "DEBUG"})),
+            });
+            has_default = true;
+        }
+    }
+    let _ = has_default;
+    let mut logs: BTreeMap<String, Value> = BTreeMap::new();
+    if let Some(default) = custom
+        .iter()
+        .find(|log| log.name == "default")
+        .and_then(|log| log.config.clone())
+    {
+        logs.insert("default".to_string(), default);
+    }
+    for log in &custom {
+        if log.name == "default" {
+            continue;
+        }
+        if let Some(config) = &log.config {
+            logs.insert(log.name.clone(), config.clone());
+            let include = config
+                .get("include")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if !include.is_empty() {
+                let default = logs
+                    .entry("default".to_string())
+                    .or_insert_with(|| json!({}));
+                if let Some(default) = default.as_object_mut() {
+                    let excludes = default
+                        .entry("exclude".to_string())
+                        .or_insert_with(|| Value::Array(Vec::new()));
+                    if let Some(excludes) = excludes.as_array_mut() {
+                        excludes.extend(include);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(default) = logs.get_mut("default").and_then(Value::as_object_mut) {
+        if let Some(excludes) = default.get_mut("exclude").and_then(Value::as_array_mut) {
+            let mut strings: Vec<String> = excludes
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect();
+            strings.sort();
+            strings.dedup();
+            *excludes = strings.into_iter().map(Value::String).collect();
+        }
+    }
+    if logs.is_empty() {
+        None
+    } else {
+        Some(json!({"logs": logs}))
+    }
+}
+
+/// Hostnames of a site block for access-log association: host only, ports stripped, like Caddy's
+/// `hostsFromKeys` + `net.SplitHostPort` sequence. Also reports whether the block has a hostless
+/// (catch-all) key.
 fn block_log_hosts(site: &SiteBlock, block: &SiteBlockPlan) -> (Vec<String>, bool) {
     let mut hosts = Vec::new();
     let mut catch_all = false;
@@ -1270,38 +1796,64 @@ fn block_log_hosts(site: &SiteBlock, block: &SiteBlockPlan) -> (Vec<String>, boo
     (hosts, catch_all)
 }
 
-/// Server-level access-log association emitted by the plain `log` directive: logger names per host
-/// plus the hosts that must be skipped because their site block does not enable logging.
+/// Build the server-level access-log association (`apps.http.servers.*.logs`).
 fn build_server_logs(
     file: &parser::Caddyfile,
     server: &ServerBuilder,
-    site_logs: &[bool],
+    site_logs: &[Vec<NamedLog>],
 ) -> Option<Value> {
     if !server
         .blocks
         .iter()
-        .any(|block| site_logs[block.site_index])
+        .any(|block| !site_logs[block.site_index].is_empty())
     {
         return None;
     }
+    let mut default_logger_name: Option<String> = None;
     let mut logger_names: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut skip_hosts: Vec<String> = Vec::new();
     let mut skip_unmapped_hosts = false;
     for block in &server.blocks {
         let site = &file.sites[block.site_index];
         let (hosts, catch_all) = block_log_hosts(site, block);
-        if site_logs[block.site_index] {
-            for host in hosts {
-                logger_names.entry(host).or_default().push(String::new());
+        let logs = &site_logs[block.site_index];
+        for log in logs {
+            if log.no_hostname {
+                continue;
             }
-        } else if catch_all {
-            skip_unmapped_hosts = true;
-        } else {
-            skip_hosts.extend(hosts);
+            if catch_all && log.hostnames.is_empty() {
+                default_logger_name = Some(log.name.clone());
+            } else if !log.hostnames.is_empty() {
+                for host in &log.hostnames {
+                    logger_names
+                        .entry(host.clone())
+                        .or_default()
+                        .push(log.name.clone());
+                }
+            } else {
+                for host in &hosts {
+                    logger_names
+                        .entry(host.clone())
+                        .or_default()
+                        .push(log.name.clone());
+                }
+            }
+        }
+        if logs.is_empty() {
+            if catch_all {
+                skip_unmapped_hosts = true;
+            } else {
+                skip_hosts.extend(hosts);
+            }
         }
     }
     skip_hosts.sort();
     let mut logs = Map::new();
+    if let Some(name) = default_logger_name {
+        if !name.is_empty() {
+            logs.insert("default_logger_name".to_string(), json!(name));
+        }
+    }
     if !logger_names.is_empty() {
         logs.insert("logger_names".to_string(), json!(logger_names));
     }
@@ -1312,6 +1864,40 @@ fn build_server_logs(
         logs.insert("skip_unmapped_hosts".to_string(), json!(true));
     }
     Some(Value::Object(logs))
+}
+
+/// Encode the global `metrics { ... }` option as `apps.http.metrics` JSON.
+fn metrics_option_json(option: Option<&Directive>) -> caddy_rs_core::Result<Option<Value>> {
+    let Some(option) = option else {
+        return Ok(None);
+    };
+    if !option.args.is_empty() {
+        return Err(adapter_error(
+            option.position.clone(),
+            "global option `metrics` does not take arguments",
+        ));
+    }
+    let mut metrics = Map::new();
+    for sub in &option.block {
+        if !sub.args.is_empty() || !sub.block.is_empty() {
+            return Err(adapter_error(
+                sub.position.clone(),
+                format!("`metrics {}` does not take arguments", sub.name),
+            ));
+        }
+        match sub.name.as_str() {
+            "per_host" | "observe_catchall_hosts" | "otlp" => {
+                metrics.insert(sub.name.clone(), json!(true));
+            }
+            other => {
+                return Err(adapter_error(
+                    sub.position.clone(),
+                    format!("unrecognized metrics option `{other}` (tracked as T-ADMIN-031)"),
+                ))
+            }
+        }
+    }
+    Ok(Some(Value::Object(metrics)))
 }
 
 /// Sort site blocks the way Caddy's `httptype.go` does: descending host specificity, catch-all
