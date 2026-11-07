@@ -6,6 +6,8 @@
 pub mod balancer;
 pub mod client;
 pub mod digest;
+pub mod dns;
+pub mod dynamic_upstreams;
 pub mod fastcgi;
 pub mod forward_auth;
 pub mod handler;
@@ -22,6 +24,8 @@ pub use balancer::{
     from_selection_policy, Balancer, BalancerError, CookieHash, First, HashSelection,
     LeastConnections, Random, RandomChoice, RoundRobin, WeightedRoundRobin,
 };
+pub use dns::{DnsResolver, IpVersion, ResolverAddress, ResolverNetwork, SrvRecord};
+pub use dynamic_upstreams::{DynamicUpstreamSource, DynamicUpstreams};
 pub use fastcgi::{FastCgiError, FastCgiTransport};
 pub use handler::{
     handler_factory, handler_factory_with_status_sink, FlushInterval, ReverseProxyHandler,
