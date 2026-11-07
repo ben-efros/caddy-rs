@@ -1,7 +1,7 @@
-# caddy-rs design notes (implementation repository)
+# caddy-rs design notes
 
-This document is the engineering companion to the program repository's planning hierarchy. It
-explains the decisions the code already encodes; it is not a roadmap (see `../plan/`).
+This document describes how the implementation is put together: the crate graph, the
+configuration and request lifecycles, and the decisions the code encodes.
 
 ## Crate graph
 
@@ -70,8 +70,9 @@ unregistered module with a located error before provisioning. The built-in table
 conservative: a module is registered only when this build can execute it, so the absence of TLS/ACME
 modules is visible at validation time rather than at request time.
 
-Extension path (WS-08): third-party modules are planned as out-of-process/WASM extensions; the
-registry remains the single source of truth for names.
+Extensions: third-party modules run either as WebAssembly guests inside the host process or as
+separate processes speaking the module protocol; the registry remains the single source of truth
+for names (`crates/plug`).
 
 ## Request flow
 
@@ -93,7 +94,7 @@ JSON equality) and locally authored fixtures for the supported subset. See
 `crates/config/tests/fixtures/README.md`. Anything not supported fails with a located error naming
 the construct; nothing silently degrades to different behaviour.
 
-The program repository (`../docs/compatibility/`) is the normative home of the compatibility
+The compatibility contract and its generated evidence are maintained alongside the project; the
 matrix and the numbered divergence register.
 
 ## Offline build note

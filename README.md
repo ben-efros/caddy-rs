@@ -1,116 +1,153 @@
-# caddy-rs (implementation repository)
+<div align="center">
 
-Hosted at <https://github.com/ben-efros/caddy-rs>.
+# caddy-rs
 
-The Rust implementation of the caddy-rs program: a Caddy-compatible web server, reverse proxy,
-and configuration engine. **Status: M2/M5 (post wave-4/5 sprint)** — the crates compile, **1292 tests pass**, HTTPS
-termination, **default-on automatic HTTPS** (fake-CA/offline tested, per-server controls and
-non-standard-port derivation), renewal hot-swap, streaming responses and request bodies,
-forward_auth, WebSocket/Upgrade passthrough, HTTP/2+h2c upstreams, PKI/trust, admin ETag
-preconditions/`/adapt`/`/reverse_proxy/upstreams`, and runtime metrics/access-log emission work end
-to end, and the Caddyfile adapter matches Caddy v2.11.7's golden output for every fixture it supports:
-**98 of the 245 upstream adapter fixtures exactly, 0 mismatches** (100% of supported fixtures, 40.0%
-corpus coverage). A real Caddy v2.11.7 binary oracle is acquired and run by the program repository.
-See the program repository's conformance report.
+**A Caddy-compatible web server, reverse proxy and TLS automation engine, written in Rust.**
 
-See the program repository (`..`) for the plan, compatibility contract, divergence register, and
-work queue.
+Same configuration language. Same operational model. Your Caddyfile either behaves as it does on
+Caddy, or fails at load with an error naming the construct.
 
-## What works today
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+![Baseline](https://img.shields.io/badge/Caddy%20baseline-v2.11.9-informational)
+![Status](https://img.shields.io/badge/release-0.1.0--trial.1-orange)
 
-- Caddy JSON configuration model with lossless round-tripping and located validation errors, typed
-  logging/storage/TLS-app models, and module-reference validation
-- Immutable configuration generations, atomic reload, in-flight draining; generation-scoped
-  supervisor that reuses unchanged listeners and rebinds changed ones
-- Module registry (handlers, matchers, logging/TLS config modules, storage, issuers, DNS providers)
-  with an honest executing/config-only/reserved distinction
-- Caddyfile lexer/parser/adapter: `respond`, `redir`, `file_server`, `root`, `method`,
-  `reverse_proxy` (unix upstreams, balancing, retries, health options, HTTP/2+h2c transports,
-  WebSocket/Upgrade passthrough), `header`, `encode`, `route`, `handle`, `handle_path`,
-  `forward_auth`; matchers `host`, `path`, `method`, `header`, `query`, `not`, `path_regexp`
-  (config-only); heredocs, line continuation, same-file snippets/imports with arguments, named
-  routes and `invoke` JSON, `request_body`, `try_files`, `uri`, `bind` and plain `log` directives;
-  global options (including global ports); 84 exact upstream golden fixtures
-- HTTP/1.1 + cleartext HTTP/2 (h2c) over TCP and Unix sockets; **HTTPS termination** via rustls with
-  SNI (exact/wildcard), ALPN h2/http1.1, TLS versions and client-auth request/require;
-  **automatic HTTPS** for explicit `apps.tls` automation: ACME issuance (HTTP-01, DNS-01,
-  TLS-ALPN-01) and internal CA, challenge listeners, 308 redirects, two-phase apply with rollback,
-  generation-scoped renewal with resolver hot-swap; dual-stack wildcard listeners; per-server
-  timeouts, header/body limits, connection caps and systemd socket activation
-- Route evaluation with matcher sets, terminals, groups, subroutes, header middleware and the
-  placeholder engine (request/vars/env/header placeholders in rewrite/respond/headers/vars)
-- Static file serving with traversal protection, index files, browse, pass_thru
-- Reverse proxy: HTTP, HTTPS (rustls with explicit/system trust, insecure opt-in, SNI) and
-  Unix-socket upstreams, round-robin/first/least-conn balancing, retries with retry_match, active +
-  passive health checks, forwarded headers and trusted proxies, request/response header rewriting,
-  streaming responses (no full-body buffering; mid-stream errors and client cancellation handled),
-  **WebSocket/Upgrade passthrough** (h1, cleartext+TLS), **HTTP/2 and h2c upstreams**
-  (`transport.versions`), canonical forward_auth execution (rewrite/handle_response, header copy,
-  401/403 pass-through); request bodies stream end to end with retry-capable buffering; h2
-  upstreams send the request Host as `:authority`
-- Admin API: `/config/` traversal, full `POST/PUT/PATCH/DELETE` partial updates with validation
-  and rollback, `/id/<id>`, ETag and `If-Match`/`If-None-Match` config preconditions, `/load`,
-  `/stop` (exits the process for all adapters), `POST /adapt`, `GET /reverse_proxy/upstreams`,
-  origin enforcement, `/metrics` Prometheus text endpoint, access-log
-  record/redaction/sampling/sink primitives and Caddy `logging.logs[]` mapping
-- TLS/ACME: certificate model/cache/SNI, Caddy/CertMagic storage layout, ACME directory/account/
-  order/CSR/transport clients, `AcmeIssuer` issuance with HTTP-01/DNS-01/TLS-ALPN-01 solvers,
-  config-constructed Cloudflare DNS-01 provider with DNS-over-HTTPS propagation checks
-  (mock-tested), Caddy-compatible internal CA (`tls internal`), Caddyfile `tls` directive/global
-  ACME options, automatic-HTTPS driver for explicit automation and renewal schedulers
-- Middleware/engine: placeholder engine, forward_auth and basic_auth/authentication handlers,
-  streaming response/request-body engine, request/response header rewriting, static/file serving,
-  vars handler, same-file snippet/import expansion, async generation lifecycle hooks
-- PKI/observability: read-only `/pki` endpoints + `pki list/export/trust` CLI, Prometheus metrics
-  and Caddy `logging.logs[]`-configured access-log emission at runtime
-- Acceptance: local acceptance harness (forward_auth/Authelia, streaming, WebSocket, TLS, internal
-  CA auto-HTTPS, admin) and Pebble real-ACME acceptance (HTTP-01/TLS-ALPN-01, account reuse)
-- Compatibility: real Caddy v2.11.7 oracle acquisition (no Docker), adapt/validate/runtime probes,
-  drift triage and nightly workflow; 97 registered divergences with tracking tasks
-- CLI: `version`, `list-modules`, `adapt`, `validate`, `run`, `reload`, `stop`
+</div>
 
-## What does not work yet (registered, not hidden)
+---
 
-Live ACME/Cloudflare-DNS-01 validation (client logic is mock/Pebble-tested; needs real credentials),
-the remaining default-on automatic-HTTPS derivation edges (mixed listener ports, multiple
-non-standard HTTPS ports, on-demand TLS, ARI), HTTP/3/QUIC, gzip/zstd compression, `templates`,
-generic `handle_response`/error routes, remaining `map`/global-`log`/rewrite operations,
-FastCGI/`php_fastcgi`, dynamic upstreams, PROXY protocol, the WASM/plugin ABI, the file matcher for
-`try_files`, HTTP/2 extended CONNECT, WebSocket close-frame semantics, per-server access-log
-association, and full TLS client-auth policy. Behaviour-level gaps are the divergence register
-(80 entries).
+## What this is
 
-## Workspace map
+caddy-rs is an independent Rust implementation of the Caddy v2 configuration and runtime model. It
+reads the same **Caddyfile** and **JSON** configurations, serves the same protocols, performs the
+same automatic HTTPS flow, and exposes the same admin API — so a deployment that works on Caddy can
+be moved over without rewriting its configuration.
 
-| Crate | Workstream | Responsibility |
-|---|---|---|
-| `caddy-rs-core` | WS-01 core runtime | JSON config model, module registry, validation, generation lifecycle |
-| `caddy-rs-config` | WS-06 configuration | Caddyfile lexer/parser/adapter to Caddy JSON |
-| `caddy-rs-http` | WS-02/05 HTTP + routing | matchers, handlers, route tree, static/file serving |
-| `caddy-rs-proxy` | WS-03 reverse proxy | upstreams, balancers, retries, health checks, proxy handler |
-| `caddy-rs-tls` | WS-04 TLS | certificate storage abstraction, cache, SNI selection, renewal scheduling, issuer traits |
-| `caddy-rs-admin` | WS-07 admin API | `/load`, `/config/`, `/stop` over the admin endpoint |
-| `caddy-rs-server` | WS-01/02 runtime | listener management, hyper HTTP serving, generation-aware reload |
-| `caddy-rs` (crates/cli) | WS-01 | `adapt`, `validate`, `run`, `reload`, `stop`, `list-modules`, `version` |
+Where behaviour deliberately differs, the difference is a documented, tested boundary rather than a
+silent surprise: unsupported configuration fails at load with a located error that names the field.
 
-## Build
+> **Independent project.** caddy-rs is not affiliated with, sponsored by, or endorsed by the Caddy
+> project, its maintainers or its trademark holders. Caddy is a registered trademark of its
+> respective owner. See [NOTICE.md](NOTICE.md).
 
-The sandbox that authored this tree cannot write to the crates.io cache, so the build is offline
-and uses `vendor/httpdate` via `[patch.crates-io]`:
+## Quick start
 
 ```sh
-cargo build --offline --workspace
-cargo test --offline --workspace
+git clone https://github.com/ben-efros/caddy-rs
+cd caddy-rs
+cargo build --release
+
+cat > Caddyfile <<'CF'
+example.com {
+	root * /srv
+	encode gzip zstd
+	file_server
+}
+CF
+
+./target/release/caddy-rs validate --config ./Caddyfile --adapter caddyfile
+./target/release/caddy-rs run      --config ./Caddyfile --adapter caddyfile
 ```
 
-For a normal online build, remove the `[patch.crates-io]` section from `Cargo.toml`.
+That configuration serves static files over HTTPS with a certificate obtained automatically, gzip
+and zstd compression negotiated per request, and HTTP/3 on the same address whenever the client
+supports it.
+
+## Highlights
+
+| Area | What you get |
+|---|---|
+| **Protocols** | HTTP/1.1, HTTP/2, h2c (prior knowledge and upgrade), and HTTP/3 over QUIC — UDP listeners are derived from TLS addresses and advertised with `Alt-Svc`, no extra configuration |
+| **Automatic HTTPS** | Certificates from ACME (HTTP-01, TLS-ALPN-01, DNS-01) or the built-in internal CA, with renewal and hot-swap that never drops a connection |
+| **Reverse proxy** | Every Caddy load-balancing policy, retries, active and passive health checks, dynamic upstreams, upstream TLS with mTLS, FastCGI, and PROXY protocol in both directions |
+| **Routing** | The full route model — matchers, subroutes, groups, named routes, error routes — plus a placeholder engine used consistently across handlers |
+| **Responses** | Streaming bodies end to end, compression, range and conditional requests, precompressed sidecars, and Go-compatible file serving |
+| **Operations** | Structured access logs with credential redaction and rotation, Prometheus metrics, and an admin API for live configuration changes |
+| **Extensibility** | Third-party modules load at runtime as sandboxed WebAssembly or as separate processes — no rebuild of the server required |
+
+The complete, verified list lives in **[docs/FEATURES.md](docs/FEATURES.md)**.
+
+## Configuration
+
+caddy-rs accepts two forms, and converts between them:
+
+- a **Caddyfile** — the human-friendly format Caddy is known for (`caddy-rs adapt` shows the JSON),
+- **native JSON** — the same shape Caddy accepts, including `apps.http`, `apps.tls`, `admin` and
+  `logging`.
+
+```sh
+# what does this Caddyfile mean as JSON?
+caddy-rs adapt --config ./Caddyfile --adapter caddyfile --pretty
+
+# check a configuration without starting the server
+caddy-rs validate --config ./caddy.json --adapter json
+```
+
+Caddyfile and JSON semantics are documented upstream by the Caddy project
+(<https://caddyserver.com/docs/>); the surface this build supports is listed in
+[docs/FEATURES.md](docs/FEATURES.md), and the configuration model is introduced in
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md).
+
+## Command line
+
+```sh
+caddy-rs run          # start the server
+caddy-rs validate     # check configuration, exit non-zero on error
+caddy-rs adapt        # convert Caddyfile to JSON
+caddy-rs reload       # load a new configuration through the admin API
+caddy-rs stop         # stop a running server through the admin API
+caddy-rs list-modules # what this build contains
+caddy-rs pki          # inspect or export the local certificate authority
+caddy-rs trust        # install the local CA root into host trust stores
+```
+
+Full reference: **[docs/CLI.md](docs/CLI.md)**. Installation and build options:
+**[docs/INSTALL.md](docs/INSTALL.md)**.
+
+## Plugins
+
+Modules can be added without rebuilding the server, in two shapes:
+
+- **In-process WebAssembly** — the host runs guest code under an enforced fuel, wall-clock and
+  memory budget, with capabilities granted explicitly and denied by default.
+- **Out-of-process modules** — a separate process (or an operator-provided local socket) speaking a
+  versioned frame protocol; a crash fails that module's session and leaves the server running.
+
+Start at **[docs/PLUGINS.md](docs/PLUGINS.md)**, then read the
+[host ABI](docs/PLUGIN-ABI.md), the [wire protocol](docs/PLUGIN-PROTOCOL.md) or the
+[module author's guide](docs/PLUGIN-DEVELOPMENT.md).
+
+## Compatibility
+
+Compatibility is measured, not asserted. The project compares this implementation against a real
+Caddy v2.11.9 binary and against Caddy's own configuration corpus:
+
+- **541 behavioural probes** against the reference binary, with **no mismatches**;
+- **132 of 264** upstream Caddyfile fixtures adapt byte-identically, with the rest rejected at load
+  rather than approximated;
+- **1,928 tests** across the workspace.
+
+Configuration this build does not support is refused with a located error, so an incompatible
+configuration fails before any listener changes.
 
 ## Documentation
 
-- `docs/DESIGN.md` — architecture and decisions the code encodes
-- `docs/TESTING.md` — test layers and rules
-- Program repository `../docs/` — compatibility contract, divergences, ADRs, planning hierarchy
+| Document | Contents |
+|---|---|
+| [Installation](docs/INSTALL.md) | requirements, building, offline builds, where state lives |
+| [Command line](docs/CLI.md) | every subcommand, option and exit-code convention |
+| [Features](docs/FEATURES.md) | everything the server does, by area |
+| [Configuration](docs/CONFIGURATION.md) | Caddyfile vs JSON, validation, admin API |
+| [Plugins](docs/PLUGINS.md) | runtime module models and how to write one |
+| [Design](docs/DESIGN.md) | crate layout and runtime architecture |
+| [Testing](docs/TESTING.md) | test layers and how to run them |
+
+## Status
+
+This is a **preview release** (`0.1.0-trial.1`). It is suitable for evaluation, internal services and
+deployments you can afford to debug. Before relying on it for public traffic, read the release notes
+that accompany the preview and prefer certificate sources you control (pre-loaded certificates or the
+internal CA) over public ACME issuance.
 
 ## License
 
-Apache-2.0, matching Caddy. See `LICENSE` and `NOTICE.md`.
+Apache-2.0. See [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md).
