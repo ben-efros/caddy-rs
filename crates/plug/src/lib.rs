@@ -38,6 +38,8 @@
 //!   [`HostCallContext`] authorisation and typed results.
 //! * [`bridge`]: request/response heads, streaming body contract, stable frame encodings
 //!   ([`BridgeFrame`]) and total-body accounting ([`BodyBudget`]).
+//! * [`wasm`] (feature `wasm-runtime`, default on): the in-process Wasmtime host runtime for the
+//!   ABI (fuel, wall-clock, memory and body limits, host-function bridging).
 //! * [`host`]: host-side lifecycle for external module services (spawn/handshake/host calls,
 //!   generation scoping via `caddy-rs-core`'s `GenerationResource`, crash isolation and explicit
 //!   supervision with bounded grace/restart policy).
@@ -81,6 +83,8 @@ pub mod host;
 pub mod hostcall;
 pub mod protocol;
 pub mod version;
+#[cfg(feature = "wasm-runtime")]
+pub mod wasm;
 
 pub use bridge::{
     AbiErrorFrame, AbiLimits, BodyBudget, BodyMode, BridgeFrame, BridgeHeaders, BridgeMethod,
@@ -130,4 +134,10 @@ pub use protocol::{
 pub use version::{
     decode_abi_version, encode_abi_version, negotiate, AbiVersion, NegotiatedAbi, ABI_MAJOR,
     ABI_MINOR, ABI_VERSION, HOST_ABI_VERSION,
+};
+#[cfg(feature = "wasm-runtime")]
+pub use wasm::{
+    DefaultHostCalls, HostCallProvider, WasmError, WasmPlugin, WasmResponse, WasmRuntime,
+    WasmRuntimeConfig, DEFAULT_FUEL_PER_REQUEST, DEFAULT_MAX_MEMORY_BYTES,
+    DEFAULT_MAX_MODULE_BYTES, DEFAULT_MAX_REQUEST_BODY_BYTES, DEFAULT_REQUEST_TIMEOUT,
 };
