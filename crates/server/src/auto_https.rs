@@ -100,6 +100,8 @@ pub(crate) struct PreparedAutomaticHttps {
     /// The runtime owns this value for the generation's lifetime: keeping it alive keeps renewing
     /// certificates into the resolver above; dropping it (or stopping it) aborts the scheduler.
     pub(crate) renewals: Option<AutomaticHttpsRenewals>,
+    /// Generation-scoped OCSP refresh scheduler (T-TLS-081).
+    pub(crate) ocsp_refresh: Option<crate::runtime::OcspRefresh>,
 }
 
 /// Per-generation automatic-HTTPS serving state for cleartext listeners.

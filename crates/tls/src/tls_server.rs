@@ -678,6 +678,18 @@ pub struct TlsCertificate {
     ocsp_staple: Option<Vec<u8>>,
 }
 
+impl Clone for TlsCertificate {
+    fn clone(&self) -> Self {
+        Self {
+            names: self.names.clone(),
+            tags: self.tags.clone(),
+            chain: self.chain.clone(),
+            private_key: self.private_key.clone_key(),
+            ocsp_staple: self.ocsp_staple.clone(),
+        }
+    }
+}
+
 impl TlsCertificate {
     /// Load a certificate chain and private key from PEM text.
     ///
@@ -832,6 +844,8 @@ struct ResolverState {
     names: Vec<String>,
     /// Distinct tagged certificates, in insertion order, for `certificate_selection.any_tag`.
     tagged: Vec<TaggedCertificate>,
+    /// Source certificates (with keys) so the server can rebuild entries with OCSP staples.
+    sources: Vec<TlsCertificate>,
 }
 
 #[derive(Debug)]
@@ -846,6 +860,17 @@ struct TaggedCertificate {
 impl ResolverState {
     fn insert(&mut self, certificate: TlsCertificate) -> Result<()> {
         let certified = Arc::new(certificate.certified_key()?);
+        // Keep the source for OCSP re-stapling; replace entries covering the same leaf rather than
+        // growing on each refresh.
+        let leaf = certificate.chain()[0].as_ref().to_vec();
+        self.sources.retain(|source| {
+            source
+                .chain()
+                .first()
+                .map(|der| der.as_ref() != leaf)
+                .unwrap_or(false)
+        });
+        self.sources.push(certificate.clone());
         if self.default.is_none() {
             self.default = Some(Arc::clone(&certified));
         }
@@ -969,6 +994,15 @@ impl CertificateResolver {
     /// Whether the resolver has no certificates.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Snapshot of every served source certificate (used by the OCSP refresh scheduler).
+    pub fn certificates(&self) -> Vec<TlsCertificate> {
+        self.state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .sources
+            .clone()
     }
 
     /// Whether a default certificate is available for empty/unknown SNI.
@@ -3822,5 +3856,28 @@ mod tests {
             TlsServerOptions::from_connection_policies(Some(&policies)).expect("policies parse");
         build_server_config_with_cert_resolver(overlay, &options)
             .expect("ACME overlay with tag-aware fallback builds");
+    }
+
+    #[test]
+    fn resolver_exposes_stapled_certificates() {
+        let certificate = TlsCertificate::from_pem(
+            include_str!("../testdata/https/example.com.pem"),
+            include_str!("../testdata/https/example.com.key"),
+        )
+        .expect("fixture certificate");
+        let resolver = CertificateResolver::new();
+        resolver
+            .insert(certificate.with_ocsp_staple(Some(vec![0x30, 0x00])))
+            .expect("insert stapled certificate");
+        let certified = resolver.select(Some("example.com")).expect("selected");
+        assert_eq!(certified.ocsp.as_deref(), Some(&[0x30, 0x00][..]));
+        let sources = resolver.certificates();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].ocsp_staple(), Some(&[0x30, 0x00][..]));
+        // Re-inserting the same leaf replaces the source snapshot rather than duplicating it.
+        resolver
+            .insert(sources[0].clone().with_ocsp_staple(Some(vec![0x30, 0x01])))
+            .expect("reinsert");
+        assert_eq!(resolver.certificates().len(), 1);
     }
 }

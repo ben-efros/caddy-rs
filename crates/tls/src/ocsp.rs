@@ -222,6 +222,89 @@ impl OcspTransport for DenyOcspTransport {
     }
 }
 
+/// Live OCSP transport over the existing hyper/rustls ACME transport.
+///
+/// Caddy/certmagic POSTs the DER-encoded OCSP request (Content-Type
+/// `application/ocsp-request`) to the responder URL from the leaf's AIA extension; this wrapper
+/// does the same through [`crate::acme::HyperTransport`], with a bounded timeout and typed errors.
+pub struct HyperOcspTransport {
+    transport: Arc<dyn crate::acme::AcmeTransport>,
+    timeout: std::time::Duration,
+}
+
+impl std::fmt::Debug for HyperOcspTransport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HyperOcspTransport")
+            .field("timeout", &self.timeout)
+            .finish_non_exhaustive()
+    }
+}
+
+impl HyperOcspTransport {
+    /// Build a live transport trusting the platform CA bundle.
+    pub fn new() -> Result<Self, OcspError> {
+        let transport = crate::acme::HyperTransport::new().map_err(|error| {
+            OcspError::Transport(format!("cannot build the OCSP HTTP transport: {error}"))
+        })?;
+        Ok(Self {
+            transport: Arc::new(transport),
+            timeout: std::time::Duration::from_secs(30),
+        })
+    }
+
+    /// Build over an injectable ACME transport (tests and embedders).
+    pub fn with_transport(transport: Arc<dyn crate::acme::AcmeTransport>) -> Self {
+        Self {
+            transport,
+            timeout: std::time::Duration::from_secs(30),
+        }
+    }
+
+    /// Override the per-request timeout.
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+}
+
+#[async_trait]
+impl OcspTransport for HyperOcspTransport {
+    async fn fetch(&self, url: &str, request_der: &[u8]) -> Result<Vec<u8>, OcspError> {
+        let request = crate::acme::HttpRequest {
+            method: crate::acme::HttpMethod::Post,
+            url: url.to_string(),
+            headers: vec![
+                (
+                    "Content-Type".to_string(),
+                    "application/ocsp-request".to_string(),
+                ),
+                (
+                    "Accept".to_string(),
+                    "application/ocsp-response".to_string(),
+                ),
+            ],
+            body: request_der.to_vec(),
+        };
+        let response = tokio::time::timeout(self.timeout, self.transport.request(request))
+            .await
+            .map_err(|_| {
+                OcspError::Transport(format!(
+                    "OCSP responder `{url}` timed out after {}s",
+                    self.timeout.as_secs()
+                ))
+            })?
+            .map_err(|error| OcspError::Transport(format!("OCSP responder `{url}`: {error}")))?;
+        if response.status != 200 {
+            return Err(OcspError::Transport(format!(
+                "OCSP responder `{url}` returned HTTP status {}",
+                response.status
+            )));
+        }
+        Ok(response.body)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct RetryState {
     attempts: u32,

@@ -25,10 +25,11 @@ use caddy_rs_http::RouterBuilder;
 use caddy_rs_proxy::{handler_factory_with_status_sink, HealthCheckScheduler, UpstreamStatusSink};
 use caddy_rs_tls::{
     build_server_config, build_server_config_with_cert_resolver, listener_uses_tls,
-    plan_automatic_https, resolver_from_config, AcmeTlsAlpnResolver, AcmeTransport,
-    AutomaticHttpsIssuer, AutomaticHttpsPlan, AutomaticHttpsProvisioner, AutomaticHttpsRenewals,
-    CertificateResolver, HyperTransport, NoAcmeTransport, TlsAlpn01TokenStore, TlsServerOptions,
-    DEFAULT_HTTPS_PORT,
+    plan_automatic_https, resolver_from_config, staple_for_certificate, AcmeTlsAlpnResolver,
+    AcmeTransport, AutomaticHttpsIssuer, AutomaticHttpsPlan, AutomaticHttpsProvisioner,
+    AutomaticHttpsRenewals, CertificateResolver, HyperOcspTransport, HyperTransport,
+    NoAcmeTransport, OcspPolicy, OcspStapler, OcspTransport, SharedOcspStapler,
+    TlsAlpn01TokenStore, TlsServerOptions, DEFAULT_HTTPS_PORT,
 };
 use tokio::sync::watch;
 
@@ -133,6 +134,8 @@ struct PendingAutomaticHttps {
     serving: Arc<crate::auto_https::AutomaticHttpsServing>,
     /// Shared challenge-certificate store handed to the TLS listeners in both phases.
     tls_alpn01_tokens: Arc<TlsAlpn01TokenStore>,
+    /// Shared OCSP stapler (cache survives generations; see T-TLS-081).
+    ocsp_stapler: Option<SharedOcspStapler>,
 }
 
 impl PendingAutomaticHttps {
@@ -145,12 +148,20 @@ impl PendingAutomaticHttps {
             .provisioner
             .provision(&plan, self.base_resolver)
             .await?;
+        let mut resolver = provisioned.resolver;
+        let mut ocsp_refresh = None;
+        if let Some(stapler) = &self.ocsp_stapler {
+            apply_ocsp_staples(&resolver, &plan, stapler).await;
+            let task = spawn_ocsp_refresh(Arc::clone(&resolver), plan.clone(), Arc::clone(stapler));
+            ocsp_refresh = Some(task);
+        }
         Ok(PreparedAutomaticHttps {
-            resolver: provisioned.resolver,
+            resolver,
             plan,
             serving: self.serving,
             tls_alpn01_tokens: tokens,
             renewals: provisioned.renewals,
+            ocsp_refresh,
         })
     }
 }
@@ -209,6 +220,10 @@ pub struct ServerRuntime {
     /// the previous generation's scheduler after a successful reload and stops every scheduler on
     /// shutdown (`/stop`, no active generation, or process shutdown).
     renewals: BTreeMap<u64, AutomaticHttpsRenewals>,
+    /// Shared OCSP stapler across generations (cache/retry state survives reloads).
+    ocsp_stapler: Option<SharedOcspStapler>,
+    /// Generation-scoped OCSP refresh schedulers; aborting the task stops the scan.
+    ocsp_refreshes: BTreeMap<u64, OcspRefresh>,
     /// In-memory certificate store of the active generation.
     ///
     /// Handed to the next generation's provisioner so a reload can seed its resolver from the
@@ -282,6 +297,8 @@ impl ServerRuntime {
             activation: ActivationState::Environment,
             health_schedulers: BTreeMap::new(),
             renewals: BTreeMap::new(),
+            ocsp_stapler: None,
+            ocsp_refreshes: BTreeMap::new(),
             certificate_store: None,
             recorder,
             certificate_metrics,
@@ -515,6 +532,7 @@ impl ServerRuntime {
             self.reconcile_admin(&generation).await?;
             // A generation without automatic HTTPS has no renewal schedulers; retire any left by
             // an earlier automatic-HTTPS generation before publishing the new status.
+            self.retire_stale_ocsp_refreshes(generation.id());
             self.retire_stale_renewals(generation.id()).await;
             self.install_access_log(generation.id(), access_log);
             self.record_certificate_metrics(&generation);
@@ -562,6 +580,7 @@ impl ServerRuntime {
             serving,
             tls_alpn01_tokens,
             renewals,
+            ocsp_refresh,
         } = prepared;
         let context = AutomaticHttpsContext {
             resolver: Some(Arc::clone(&resolver)),
@@ -597,6 +616,10 @@ impl ServerRuntime {
             self.certificate_store = Some(Arc::clone(renewals.store()));
             self.renewals.insert(generation.id(), renewals);
         }
+        if let Some(refresh) = ocsp_refresh {
+            self.ocsp_refreshes.insert(generation.id(), refresh);
+        }
+        self.retire_stale_ocsp_refreshes(generation.id());
         self.retire_stale_renewals(generation.id()).await;
         self.install_access_log(generation.id(), access_log);
         self.record_certificate_metrics(&generation);
@@ -686,7 +709,25 @@ impl ServerRuntime {
         }
     }
 
-    /// Generation ids that currently own a certificate renewal scheduler.
+    /// Abort refresh tasks owned by generations other than `active_generation`.
+    fn retire_stale_ocsp_refreshes(&mut self, active_generation: u64) {
+        let stale: Vec<u64> = self
+            .ocsp_refreshes
+            .keys()
+            .copied()
+            .filter(|generation| *generation != active_generation)
+            .collect();
+        for generation in stale {
+            if self.ocsp_refreshes.remove(&generation).is_some() {
+                tracing::info!(
+                    generation,
+                    "stopping OCSP refresh scheduler for retired generation"
+                );
+            }
+        }
+    }
+
+    /// Generation ids that currently own a renewal scheduler.
     pub fn renewal_scheduler_generations(&self) -> Vec<u64> {
         self.renewals.keys().copied().collect()
     }
@@ -1254,7 +1295,7 @@ impl ServerRuntime {
     /// states must already share it before provisioning runs, otherwise `acme-tls/1` handshakes
     /// cannot be answered while the CA validates the order.
     fn prepare_automatic_https(
-        &self,
+        &mut self,
         generation: &Generation,
     ) -> Result<Option<PendingAutomaticHttps>> {
         let config = generation.config();
@@ -1313,7 +1354,32 @@ impl ServerRuntime {
             redirect_all_port: plan.redirect_all_port,
             http_port: plan.http_port,
         });
+        let ocsp_stapler = match &self.ocsp_stapler {
+            Some(stapler) => Some(Arc::clone(stapler)),
+            None if plan.ocsp_check_interval > std::time::Duration::ZERO => {
+                match HyperOcspTransport::new() {
+                    Ok(transport) => {
+                        let stapler = Arc::new(OcspStapler::new(
+                            Arc::new(transport),
+                            OcspPolicy {
+                                enabled: true,
+                                must_staple: false,
+                                check_interval: plan.ocsp_check_interval,
+                            },
+                        ));
+                        self.ocsp_stapler = Some(Arc::clone(&stapler));
+                        Some(stapler)
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "OCSP stapling disabled: no usable HTTP transport");
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
         Ok(Some(PendingAutomaticHttps {
+            ocsp_stapler,
             plan,
             provisioner,
             base_resolver,
@@ -1838,4 +1904,91 @@ fn validate_udp_listener(
         )));
     }
     Ok(())
+}
+
+/// Generation-scoped OCSP refresh task. Dropping this value aborts the task.
+pub(crate) struct OcspRefresh {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl std::fmt::Debug for OcspRefresh {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OcspRefresh")
+            .field("finished", &self.handle.is_finished())
+            .finish()
+    }
+}
+
+impl Drop for OcspRefresh {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+/// Ensure/refresh staples for every certificate currently in `resolver` and hot-swap entries.
+///
+/// A failed refresh logs and leaves the previously inserted staple in place (the resolver entry is
+/// only replaced after a successful fetch/cached response).
+async fn apply_ocsp_staples(
+    resolver: &CertificateResolver,
+    plan: &AutomaticHttpsPlan,
+    stapler: &OcspStapler,
+) {
+    for certificate in resolver.certificates() {
+        let Some(leaf) = certificate.chain().first() else {
+            continue;
+        };
+        let Some(issuer) = certificate.chain().get(1) else {
+            continue;
+        };
+        let subject = certificate
+            .names()
+            .first()
+            .map(String::as_str)
+            .unwrap_or("");
+        if !plan.ocsp_policy_for(subject).enabled {
+            continue;
+        }
+        match stapler.ensure_staple(leaf.as_ref(), issuer.as_ref()).await {
+            Ok(outcome) if outcome.has_staple() => {
+                match resolver.insert(staple_for_certificate(stapler, certificate.clone())) {
+                    Ok(()) => {}
+                    Err(error) => tracing::warn!(
+                        subject,
+                        %error,
+                        "cannot install stapled certificate into the resolver"
+                    ),
+                }
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(
+                subject,
+                %error,
+                "OCSP staple refresh failed; keeping the previous staple"
+            ),
+        }
+    }
+}
+
+/// Spawn the periodic OCSP freshness scan for one generation.
+fn spawn_ocsp_refresh(
+    resolver: Arc<CertificateResolver>,
+    plan: AutomaticHttpsPlan,
+    stapler: SharedOcspStapler,
+) -> OcspRefresh {
+    let period = plan
+        .ocsp_check_interval
+        .max(std::time::Duration::from_secs(1));
+    let handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(period);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first tick fires immediately; initial provisioning already stapled, but a scan here
+        // keeps failures recoverable after the backoff window.
+        loop {
+            interval.tick().await;
+            apply_ocsp_staples(&resolver, &plan, &stapler).await;
+        }
+    });
+    OcspRefresh { handle }
 }
