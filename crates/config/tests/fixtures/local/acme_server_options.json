@@ -1,0 +1,80 @@
+{
+	"apps": {
+		"http": {
+			"servers": {
+				"srv0": {
+					"listen": [
+						":443"
+					],
+					"routes": [
+						{
+							"match": [
+								{
+									"host": [
+										"acme.example.com"
+									]
+								}
+							],
+							"handle": [
+								{
+									"handler": "subroute",
+									"routes": [
+										{
+											"handle": [
+												{
+													"ca": "local-ca",
+													"challenges": [
+														"dns-01",
+														"http-01"
+													],
+													"handler": "acme_server",
+													"lifetime": 604800000000000,
+													"policy": {
+														"allow": {
+															"domains": [
+																"host-1.internal.example.com"
+															],
+															"ip_ranges": [
+																"10.0.0.0/8"
+															]
+														},
+														"allow_wildcard_names": true,
+														"deny": {
+															"domains": [
+																"dc.internal.example.com"
+															]
+														}
+													},
+													"resolvers": [
+														"1.1.1.1:53",
+														"8.8.8.8"
+													],
+													"sign_with_root": true
+												}
+											],
+											"match": [
+												{
+													"path": [
+														"/acme/*"
+													]
+												}
+											]
+										}
+									]
+								}
+							],
+							"terminal": true
+						}
+					]
+				}
+			}
+		},
+		"pki": {
+			"certificate_authorities": {
+				"local-ca": {
+					"name": "Local CA"
+				}
+			}
+		}
+	}
+}

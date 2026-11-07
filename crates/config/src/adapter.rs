@@ -47,6 +47,7 @@ const DIRECTIVE_ORDER: &[&str] = &[
     "reverse_proxy",
     "php_fastcgi",
     "file_server",
+    "acme_server",
 ];
 
 /// The Caddyfile adapter.
@@ -1232,7 +1233,27 @@ pub fn adapt_with_source(
     if let Some(tls) = tls_plan.app.clone() {
         apps.insert("tls".to_string(), tls);
     }
-    if let Some(pki) = pki_app_json(options) {
+    // `acme_server`'s `ca` option also contributes a `pki.ca` configuration value (Caddy's
+    // `buildPKIApp`): add any CA the global `pki` option did not already define, with the CA's
+    // defaulted fields omitted exactly as Caddy marshals them.
+    let mut pki = pki_app_json(options);
+    let directive_cas = collect_acme_server_cas(&file.sites);
+    if !directive_cas.is_empty() {
+        let mut app = pki
+            .take()
+            .unwrap_or_else(|| json!({ "certificate_authorities": {} }));
+        let authorities = app
+            .get_mut("certificate_authorities")
+            .and_then(Value::as_object_mut)
+            .expect("pki app JSON always contains `certificate_authorities`");
+        for id in directive_cas {
+            if !authorities.contains_key(&id) {
+                authorities.insert(id, json!({}));
+            }
+        }
+        pki = Some(app);
+    }
+    if let Some(pki) = pki {
         apps.insert("pki".to_string(), pki);
     }
 
@@ -4878,15 +4899,6 @@ fn build_routes(
                 ),
             ));
         }
-        if directive.name == "acme_server" {
-            // Named explicitly rather than falling through: the limitation is at the runtime layer
-            // (no `http.handlers.acme_server` module), so a Caddyfile that uses it can never run,
-            // even though the JSON shape is known.
-            return Err(adapter_error(
-                directive.position.clone(),
-                "directive `acme_server` is not supported by this build: the runtime has no                  `http.handlers.acme_server` module (ACME server is not implemented; tracked as                  T-CONF-013, owner T-TLS/T-ADMIN)",
-            ));
-        }
         if !DIRECTIVE_ORDER.contains(&directive.name.as_str()) {
             return Err(adapter_error(
                 directive.position.clone(),
@@ -4925,6 +4937,21 @@ fn build_routes(
         let name = directive.name.as_str();
         match name {
             "route" => {
+                // Caddy's `route` builder insists that every directive in the block produces an
+                // HTTP route; `acme_server` with `ca` also produces a `pki.ca` configuration
+                // value, so Caddy rejects it here ("only handler directives can be used in
+                // routes", caddyconfig/httpcaddyfile/builtins.go `parseRoute`). A `ca`-less
+                // `acme_server` is a plain route and is accepted.
+                if let Some(nested) = directive.block.iter().find(|item| {
+                    item.name == "acme_server" && item.block.iter().any(|sub| sub.name == "ca")
+                }) {
+                    return Err(adapter_error(
+                        nested.position.clone(),
+                        "directive `acme_server` with the `ca` option returns a PKI CA \
+                         configuration value, so it cannot be used inside `route` \
+                         (only handler directives can be used in routes)",
+                    ));
+                }
                 let mut route_args = directive.args.clone();
                 let matcher =
                     matcher_for_args(&mut route_args, matchers, directive.position.clone())?;
@@ -5944,6 +5971,7 @@ fn build_handlers(
         "request_body" => vec![request_body_handler(directive)?],
         "encode" => vec![encode_handler(directive)?],
         "templates" => vec![templates_handler(directive)?],
+        "acme_server" => vec![acme_server_handler(directive, args)?],
         "reverse_proxy" => vec![reverse_proxy_handler(directive, args)?],
         "basicauth" | "basic_auth" => vec![basic_auth_handler(directive, args)?],
         "forward_auth" => vec![forward_auth_handler(directive, args)?],
@@ -5961,6 +5989,222 @@ fn build_handlers(
         }
     };
     Ok(handlers)
+}
+
+/// Caddy's `acme_server` directive, mirroring
+/// `modules/caddypki/acmeserver/caddyfile.go` (`parseACMEServer`) at v2.11.9.
+///
+/// Accepted suboptions: `ca <id>`, `lifetime <duration>`, `resolvers <address...>`,
+/// `challenges <type...>`, `allow_wildcard_names`, `allow { domains|ip_ranges }`,
+/// `deny { domains|ip_ranges }` and `sign_with_root`. Everything else is a located error. Caddy
+/// does not resolve the CA ID or validate challenge names during adaptation (both happen at
+/// provision time), so neither does this adapter.
+fn acme_server_handler(directive: &Directive, args: &[String]) -> caddy_rs_core::Result<Value> {
+    if let Some(extra) = args.first() {
+        return Err(adapter_error(
+            directive.position.clone(),
+            format!(
+                "directive `acme_server` takes no arguments (unexpected `{extra}`); \
+                 only an optional matcher is accepted"
+            ),
+        ));
+    }
+
+    let mut object = Map::new();
+    object.insert("handler".to_string(), json!("acme_server"));
+    let mut challenges: Vec<String> = Vec::new();
+    let mut allow: Option<Value> = None;
+    let mut deny: Option<Value> = None;
+    let mut allow_wildcard_names = false;
+
+    for item in &directive.block {
+        match item.name.as_str() {
+            "ca" => {
+                if item.args.len() != 1 || !item.block.is_empty() {
+                    return Err(adapter_error(
+                        item.position.clone(),
+                        "`acme_server` option `ca` requires exactly one CA ID",
+                    ));
+                }
+                // `json:"ca,omitempty"`: an empty ID is omitted from the handler, but the
+                // corresponding `pki.ca` configuration value is still emitted (see
+                // `collect_acme_server_cas`).
+                if !item.args[0].is_empty() {
+                    object.insert("ca".to_string(), json!(item.args[0]));
+                }
+            }
+            "lifetime" => {
+                if item.args.len() != 1 || !item.block.is_empty() {
+                    return Err(adapter_error(
+                        item.position.clone(),
+                        "`acme_server` option `lifetime` requires exactly one duration",
+                    ));
+                }
+                let nanoseconds =
+                    crate::parser::parse_go_duration_ns(&item.args[0]).map_err(|reason| {
+                        adapter_error(
+                            item.position.clone(),
+                            format!(
+                                "invalid `acme_server` lifetime `{}`: {reason}",
+                                item.args[0]
+                            ),
+                        )
+                    })?;
+                // `caddy.Duration` marshals as integer nanoseconds with `omitempty`; zero is the
+                // only value omitted (negative durations are emitted).
+                if nanoseconds != 0 {
+                    object.insert("lifetime".to_string(), json!(nanoseconds));
+                }
+            }
+            "resolvers" => {
+                if !item.block.is_empty() || item.args.is_empty() {
+                    return Err(adapter_error(
+                        item.position.clone(),
+                        "`acme_server` option `resolvers` must specify at least one resolver address",
+                    ));
+                }
+                object.insert("resolvers".to_string(), json!(item.args));
+            }
+            "challenges" => {
+                if !item.block.is_empty() {
+                    return Err(adapter_error(
+                        item.position.clone(),
+                        "`acme_server` option `challenges` does not take a block",
+                    ));
+                }
+                challenges.extend(item.args.iter().cloned());
+            }
+            "allow_wildcard_names" => {
+                if !item.args.is_empty() || !item.block.is_empty() {
+                    return Err(adapter_error(
+                        item.position.clone(),
+                        "`acme_server` option `allow_wildcard_names` does not take arguments",
+                    ));
+                }
+                allow_wildcard_names = true;
+            }
+            "sign_with_root" => {
+                if !item.args.is_empty() || !item.block.is_empty() {
+                    return Err(adapter_error(
+                        item.position.clone(),
+                        "`acme_server` option `sign_with_root` does not take arguments",
+                    ));
+                }
+                object.insert("sign_with_root".to_string(), json!(true));
+            }
+            "allow" => allow = Some(acme_server_rule_set(item, "allow")?),
+            "deny" => deny = Some(acme_server_rule_set(item, "deny")?),
+            other => {
+                return Err(adapter_error(
+                    item.position.clone(),
+                    format!("unrecognized ACME server directive: {other}"),
+                ))
+            }
+        }
+    }
+
+    if !challenges.is_empty() {
+        object.insert("challenges".to_string(), json!(challenges));
+    }
+    if allow.is_some() || deny.is_some() || allow_wildcard_names {
+        let mut policy = Map::new();
+        if let Some(allow) = allow {
+            policy.insert("allow".to_string(), allow);
+        }
+        if let Some(deny) = deny {
+            policy.insert("deny".to_string(), deny);
+        }
+        if allow_wildcard_names {
+            policy.insert("allow_wildcard_names".to_string(), json!(true));
+        }
+        object.insert("policy".to_string(), Value::Object(policy));
+    }
+
+    Ok(Value::Object(object))
+}
+
+/// One `allow { ... }` / `deny { ... }` rule set of `acme_server`. Caddy rejects a nested
+/// directive without arguments (`h.CountRemainingArgs() == 0` -> `ArgErr`) and accumulates
+/// repeated `domains`/`ip_ranges` lines.
+fn acme_server_rule_set(item: &Directive, name: &str) -> caddy_rs_core::Result<Value> {
+    if !item.args.is_empty() {
+        return Err(adapter_error(
+            item.position.clone(),
+            format!("`acme_server` option `{name}` takes a block, not arguments"),
+        ));
+    }
+    let mut domains: Vec<String> = Vec::new();
+    let mut ip_ranges: Vec<String> = Vec::new();
+    for nested in &item.block {
+        match nested.name.as_str() {
+            "domains" => {
+                if nested.args.is_empty() || !nested.block.is_empty() {
+                    return Err(adapter_error(
+                        nested.position.clone(),
+                        format!("`acme_server` {name} rule `domains` requires at least one domain"),
+                    ));
+                }
+                domains.extend(nested.args.iter().cloned());
+            }
+            "ip_ranges" => {
+                if nested.args.is_empty() || !nested.block.is_empty() {
+                    return Err(adapter_error(
+                        nested.position.clone(),
+                        format!(
+                            "`acme_server` {name} rule `ip_ranges` requires at least one address"
+                        ),
+                    ));
+                }
+                ip_ranges.extend(nested.args.iter().cloned());
+            }
+            other => {
+                return Err(adapter_error(
+                    nested.position.clone(),
+                    format!("unrecognized '{name}' subdirective: {other}"),
+                ))
+            }
+        }
+    }
+    let mut object = Map::new();
+    if !domains.is_empty() {
+        object.insert("domains".to_string(), json!(domains));
+    }
+    if !ip_ranges.is_empty() {
+        object.insert("ip_ranges".to_string(), json!(ip_ranges));
+    }
+    Ok(Value::Object(object))
+}
+
+/// Collect the CA IDs declared by the `ca` option of top-level `acme_server` directives.
+///
+/// Caddy's `parseACMEServer` also returns a `pki.ca` configuration value, which `buildPKIApp`
+/// merges into `apps.pki` (an ID already configured in the global `pki` option wins). That value
+/// is only collected from directives of a server block itself: Caddy's `buildSubroute` drops
+/// non-route values inside `handle`/`handle_errors` subroutes and `parseRoute` rejects them
+/// inside `route`, so nested `acme_server` directives never add a CA.
+fn collect_acme_server_cas(sites: &[SiteBlock]) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for site in sites {
+        for directive in &site.directives {
+            if directive.name != "acme_server" {
+                continue;
+            }
+            // Caddy reuses one `*caddypki.CA`, setting its ID on every `ca` line, so only the
+            // last one is returned as a configuration value.
+            let mut ca: Option<&str> = None;
+            for item in &directive.block {
+                if item.name == "ca" && item.args.len() == 1 && item.block.is_empty() {
+                    ca = Some(item.args[0].as_str());
+                }
+            }
+            if let Some(id) = ca {
+                if !ids.iter().any(|existing| existing == id) {
+                    ids.push(id.to_string());
+                }
+            }
+        }
+    }
+    ids
 }
 
 /// Caddy's `rewrite` directive: `rewrite [<matcher>] <to>` emits a rewrite handler that changes
