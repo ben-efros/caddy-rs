@@ -222,6 +222,79 @@ async fn slow_request_completes_within_grace_period() {
 }
 
 #[tokio::test]
+async fn slow_request_completes_with_eternal_grace_period() {
+    // Caddy's `grace_period` is zero/absent: `modules/caddyhttp/app.go` then logs "servers
+    // shutting down with eternal grace period" and calls `Shutdown(context.Background())`, so an
+    // in-flight request must be allowed to finish rather than being force-closed at once.
+    let upstream = spawn_slow_upstream(Duration::from_millis(300));
+    let (runtime, address) = start(config(&upstream, None, None)).await;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let running = tokio::spawn(async move { runtime.run(shutdown_rx).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut client = send_get(address, "/slow").await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let started = std::time::Instant::now();
+    shutdown_tx.send(true).expect("signal shutdown");
+
+    let response = read_all(&mut client, Duration::from_secs(5)).await;
+    assert!(
+        body_contains(&response, b"slow-ok"),
+        "eternal grace period must let the in-flight request finish: {:?}",
+        String::from_utf8_lossy(&response)
+    );
+    let joined = tokio::time::timeout(Duration::from_secs(3), running)
+        .await
+        .expect("runtime must return after the eternal-grace drain");
+    joined.expect("runtime task").expect("run returns Ok");
+    assert!(
+        started.elapsed() >= Duration::from_millis(250),
+        "shutdown must have waited for the slow response, took {:?}",
+        started.elapsed()
+    );
+    assert!(
+        TcpStream::connect(address).await.is_err(),
+        "listener must be closed after shutdown"
+    );
+}
+
+#[tokio::test]
+async fn upgraded_tunnel_does_not_hang_eternal_grace_period() {
+    // Go's `http.Server.Shutdown` (which Caddy uses for the grace period) neither closes nor waits
+    // for hijacked connections; without a configured grace period the runtime must drain ordinary
+    // connections and then close upgraded tunnels instead of hanging forever.
+    let upstream = spawn_upgrade_echo_upstream();
+    let (runtime, address) = start(config(&upstream, None, None)).await;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let running = tokio::spawn(async move { runtime.run(shutdown_rx).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut client = TcpStream::connect(address).await.expect("client connect");
+    client
+        .write_all(
+            b"GET /ws HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+        )
+        .await
+        .expect("write upgrade request");
+    let head = read_head(&mut client, Duration::from_secs(2)).await;
+    assert!(head.starts_with(b"HTTP/1.1 101"), "upgrade must succeed");
+
+    shutdown_tx.send(true).expect("signal shutdown");
+    let started = std::time::Instant::now();
+    let joined = tokio::time::timeout(Duration::from_secs(3), running)
+        .await
+        .expect("eternal grace must not wait for a hijacked tunnel");
+    joined.expect("runtime task").expect("run returns Ok");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "hijacked tunnel must not block eternal-grace shutdown, took {:?}",
+        started.elapsed()
+    );
+    let tail = read_all(&mut client, Duration::from_secs(2)).await;
+    assert!(tail.is_empty(), "tunnel must be closed by the forced stop");
+}
+
+#[tokio::test]
 async fn over_grace_connection_is_force_closed() {
     let upstream = spawn_slow_upstream(Duration::from_secs(5));
     let (runtime, address) = start(config(&upstream, Some("150ms"), None)).await;
@@ -417,4 +490,201 @@ async fn shutdown_delay_keeps_listeners_open_before_grace() {
         .expect("runtime must exit after delay+grace");
     joined.expect("runtime task").expect("run returns Ok");
     assert!(TcpStream::connect(address).await.is_err());
+}
+
+fn config_with_listen(
+    upstream: &str,
+    listen: &str,
+    grace: Option<&str>,
+    shutdown_delay: Option<&str>,
+) -> Config {
+    let mut http = serde_json::Map::new();
+    if let Some(grace) = grace {
+        http.insert("grace_period".into(), serde_json::json!(grace));
+    }
+    if let Some(delay) = shutdown_delay {
+        http.insert("shutdown_delay".into(), serde_json::json!(delay));
+    }
+    http.insert(
+        "servers".into(),
+        serde_json::json!({"srv0": {
+            "listen": [listen],
+            "routes": [{"handle": [{
+                "handler": "reverse_proxy",
+                "upstreams": [{"dial": upstream}]
+            }]}]
+        }}),
+    );
+    Config::from_value(serde_json::json!({
+        "admin": {"disabled": true},
+        "apps": {"http": http}
+    }))
+    .expect("graceful shutdown config decodes")
+}
+
+#[tokio::test]
+async fn reload_honors_shutdown_delay_and_grace_for_closing_listeners() {
+    // Caddy's `App.stop` (called for a config reload, not only process exit) sleeps
+    // `shutdown_delay` while the closing listener keeps accepting, then bounds the drain with the
+    // grace-period context (`modules/caddyhttp/app.go`). A reload itself does not wait for the
+    // grace period, but the closing listener's over-grace request is force-closed.
+    let upstream = spawn_slow_upstream(Duration::from_secs(2));
+    let old_port = free_loopback_port();
+    let new_port = free_loopback_port();
+    let old_config = config_with_listen(
+        &upstream,
+        &format!("127.0.0.1:{old_port}"),
+        Some("300ms"),
+        Some("200ms"),
+    );
+    let new_config = config_with_listen(
+        &upstream,
+        &format!("127.0.0.1:{new_port}"),
+        Some("300ms"),
+        None,
+    );
+
+    let store = Arc::new(GenerationStore::with_builtin_registry());
+    store.load(old_config).expect("old config loads");
+    let mut runtime = ServerRuntime::new(Arc::clone(&store));
+    runtime.apply().await.expect("old config applies");
+    let old_address = runtime
+        .listener_address(&format!("127.0.0.1:{old_port}"))
+        .expect("old listener bound");
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let running = tokio::spawn(async move { runtime.run(shutdown_rx).await });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let mut old_client = send_get(old_address, "/slow").await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let load_started = std::time::Instant::now();
+    store.load(new_config).expect("new config loads");
+    // The reload applies on the runtime loop's next heartbeat.
+    let new_address: SocketAddr = format!("127.0.0.1:{new_port}")
+        .parse()
+        .expect("new address");
+    let mut new_served = false;
+    for _ in 0..200 {
+        if TcpStream::connect(new_address).await.is_ok() {
+            new_served = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(new_served, "reloaded listener must start serving");
+
+    let response = read_all(&mut old_client, Duration::from_secs(4)).await;
+    let closing_elapsed = load_started.elapsed();
+    assert!(
+        closing_elapsed >= Duration::from_millis(180),
+        "closing listener must honor shutdown_delay before draining, took {closing_elapsed:?}"
+    );
+    assert!(
+        !body_contains(&response, b"slow-ok"),
+        "over-grace request on the closing listener must be force-closed: {:?}",
+        String::from_utf8_lossy(&response)
+    );
+
+    // The new listener keeps serving after the old one is gone.
+    assert!(TcpStream::connect(old_address).await.is_err());
+    let mut client = send_get(new_address, "/fast").await;
+    let response = read_all(&mut client, Duration::from_secs(3)).await;
+    assert!(
+        body_contains(&response, b"slow-ok"),
+        "new listener must serve after the reload: {:?}",
+        String::from_utf8_lossy(&response)
+    );
+
+    shutdown_tx.send(true).expect("shutdown");
+    let joined = tokio::time::timeout(Duration::from_secs(5), running)
+        .await
+        .expect("runtime must return");
+    joined.expect("runtime task").expect("run returns Ok");
+}
+
+#[tokio::test]
+async fn fifty_concurrent_slow_requests_drain_with_eternal_grace() {
+    let upstream = spawn_slow_upstream(Duration::from_millis(250));
+    let (runtime, address) = start(config(&upstream, None, None)).await;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let running = tokio::spawn(async move { runtime.run(shutdown_rx).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut clients = Vec::new();
+    for _ in 0..50 {
+        clients.push(send_get(address, "/slow").await);
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    shutdown_tx.send(true).expect("signal shutdown");
+
+    let mut tasks = Vec::new();
+    for mut client in clients {
+        tasks.push(tokio::spawn(async move {
+            read_all(&mut client, Duration::from_secs(8)).await
+        }));
+    }
+    let mut completed = 0;
+    for task in tasks {
+        let response = task.await.expect("client task");
+        assert!(
+            body_contains(&response, b"slow-ok"),
+            "every in-flight request must finish during the eternal grace period: {:?}",
+            String::from_utf8_lossy(&response)
+        );
+        completed += 1;
+    }
+    assert_eq!(completed, 50);
+
+    let joined = tokio::time::timeout(Duration::from_secs(5), running)
+        .await
+        .expect("runtime must return after all connections drain");
+    joined.expect("runtime task").expect("run returns Ok");
+    assert!(TcpStream::connect(address).await.is_err());
+}
+
+#[tokio::test]
+async fn forced_shutdown_aborts_fifty_in_flight_requests_and_releases_listener() {
+    let upstream = spawn_slow_upstream(Duration::from_secs(5));
+    let (runtime, address) = start(config(&upstream, Some("10s"), None)).await;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (force_tx, force_rx) = watch::channel(false);
+    let running = tokio::spawn(async move { runtime.run_with_force(shutdown_rx, force_rx).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut clients = Vec::new();
+    for _ in 0..50 {
+        clients.push(send_get(address, "/slow").await);
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    shutdown_tx.send(true).expect("first signal");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    force_tx.send(true).expect("second signal");
+
+    let started = std::time::Instant::now();
+    let joined = tokio::time::timeout(Duration::from_secs(3), running)
+        .await
+        .expect("forced shutdown must return promptly");
+    joined.expect("runtime task").expect("run returns Ok");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "forced shutdown must not wait for the 10s grace period, took {:?}",
+        started.elapsed()
+    );
+
+    for mut client in clients {
+        let response = read_all(&mut client, Duration::from_secs(2)).await;
+        assert!(
+            !body_contains(&response, b"slow-ok"),
+            "forced shutdown must abort in-flight requests"
+        );
+    }
+    // The listener socket and its accept task are released, so the same address can be rebound.
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::net::TcpListener::bind(address),
+    )
+    .await
+    .expect("listener address must be released after forced shutdown")
+    .expect("rebinding the released address must succeed");
 }
