@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use http::uri::PathAndQuery;
 use http::{HeaderName, HeaderValue, Method, StatusCode, Uri};
 
 use crate::matchers::percent_decode;
@@ -822,38 +823,297 @@ fn parse_query_ops(
     Ok(Some(ops))
 }
 
-/// Apply a rewritten `uri` template with Caddy's component-wise semantics: a configured URI that
-/// has no `?` preserves the current query string, and a URI with only `?query` preserves the
-/// current path. Fragments are dropped because they are never sent to a server.
+/// Apply a rewritten `uri` template with Caddy's component-wise semantics: only components
+/// present in the configured URI are changed, a bare `?` clears the query, path placeholders are
+/// escaped before parsing, and configured query components are expanded/escaped one component at a
+/// time (duplicate keys are appended, not overwritten).
 fn rewritten_uri(request: &Request, template: &str) -> Result<Uri> {
-    let expanded = request.replace_all(template);
-    let without_fragment = expanded.split('#').next().unwrap_or("");
-    let (path, query) = match without_fragment.split_once('?') {
-        Some((path, query)) => (path, Some(query)),
-        None => (without_fragment, None),
+    // Scan the *configured* template for component boundaries, like Caddy does, so placeholder
+    // values cannot change which part is path/query/fragment.
+    let mut path_start: Option<usize> = None;
+    let mut path_end: Option<usize> = None;
+    let mut query_start: Option<usize> = None;
+    let mut query_end: Option<usize> = None;
+    let mut fragment_start: Option<usize> = None;
+    for (index, ch) in template.char_indices() {
+        if ch == '?' && query_start.is_none() {
+            path_end = Some(index);
+            query_start = Some(index + 1);
+        } else if ch == '#' && fragment_start.is_none() {
+            if query_start.is_none() {
+                path_end = Some(index);
+            } else {
+                query_end = Some(index);
+            }
+            fragment_start = Some(index + 1);
+            break;
+        } else if path_start.is_none() && query_start.is_none() {
+            path_start = Some(index);
+        }
+    }
+    if let Some(start) = path_start {
+        if path_end.is_none() {
+            path_end = Some(template.len());
+        }
+        let _ = start;
+    }
+    if query_start.is_some() && query_end.is_none() && fragment_start.is_none() {
+        query_end = Some(template.len());
+    }
+    let configured_path = match (path_start, path_end) {
+        (Some(start), Some(end)) => Some(&template[start..end]),
+        _ => None,
+    };
+    let configured_query = match (query_start, query_end) {
+        (Some(start), Some(end)) => Some(&template[start..end]),
+        _ => None,
     };
 
     let mut new_path = request.uri.path().to_string();
     let mut new_query = request.uri.query().map(str::to_string);
-    if !path.is_empty() {
-        new_path = path.to_string();
-    }
-    if let Some(query) = query {
-        new_query = if query.is_empty() {
-            None
-        } else {
-            Some(query.to_string())
-        };
+    let mut query_was_set = false;
+
+    if let Some(configured_path) = configured_path {
+        if !configured_path.is_empty() {
+            // Path-valued placeholders must be inserted in escaped form so a literal `?`, `%` or
+            // `#` in a path cannot be reinterpreted as a delimiter/escape by the URI parser.
+            let mut configured_path = configured_path.to_string();
+            for placeholder in [
+                "{http.matchers.file.relative}",
+                "{http.matchers.file.remainder}",
+            ] {
+                let name = placeholder.trim_start_matches('{').trim_end_matches('}');
+                if configured_path.contains(placeholder) {
+                    if let Some(value) = request.get_placeholder(name) {
+                        configured_path = configured_path
+                            .replace(placeholder, &escape_path_preserving_slashes(&value));
+                    }
+                }
+            }
+            let escaped_path = request
+                .replace_all(&configured_path)
+                .replace("{http.request.uri.path}", request.uri.path());
+            let mut expanded_path = escaped_path;
+            if let Some(hash) = expanded_path.find('#') {
+                expanded_path.truncate(hash);
+            }
+            if let Some(question) = expanded_path.find('?') {
+                let injected = expanded_path[question + 1..].to_string();
+                expanded_path.truncate(question);
+                if configured_query.is_none() {
+                    // The injected query came from a replacement value; braces are literal data
+                    // and must not be re-expanded by the query builder.
+                    let injected = injected.replace('{', "%7B").replace('}', "%7D");
+                    new_query = Some(injected);
+                    query_was_set = true;
+                }
+            }
+            if !expanded_path.is_empty() {
+                // Caddy sets `URL.Path` from the path-unescaped value and forces RawPath to be
+                // recomputed, so encoded slashes become literal slashes and other escapes are
+                // re-encoded canonically on RequestURI.
+                new_path = canonical_path_from_uri_setter(&expanded_path);
+            }
+        }
     }
 
+    if let Some(configured_query) = configured_query {
+        if configured_query.is_empty() {
+            new_query = None;
+        } else {
+            new_query = Some(build_query_string(configured_query, request));
+        }
+        query_was_set = true;
+    }
+
+    let _ = query_was_set;
     let mut rebuilt = new_path;
     if let Some(query) = &new_query {
         rebuilt.push('?');
         rebuilt.push_str(query);
     }
-    rebuilt
-        .parse::<Uri>()
-        .map_err(|error| invalid("rewrite.uri", error.to_string()))
+    parse_rewrite_uri(&rebuilt, "rewrite.uri")
+}
+
+/// Escape a file-matcher relative/remainder path for insertion into a rewrite URI path, preserving
+/// slashes (Caddy's `escapePathPreservingSlashes` / `url.PathEscape` with `%2F` restored).
+fn escape_path_preserving_slashes(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'-' | b'_'
+                    | b'.'
+                    | b'~'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b';'
+                    | b'='
+                    | b':'
+                    | b'@'
+                    | b'/'
+            )
+        {
+            output.push(byte as char);
+        } else {
+            output.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    output
+}
+
+/// Decode valid percent escapes in a configured URI path, then re-encode only bytes that are not
+/// legal in a URL path. This mirrors Caddy setting `URL.Path` from `url.PathUnescape(newPath)` and
+/// clearing `RawPath`, so `%2F` becomes a literal slash in the resulting request target.
+fn canonical_path_from_uri_setter(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let high = (bytes[index + 1] as char).to_digit(16);
+            let low = (bytes[index + 2] as char).to_digit(16);
+            if let (Some(high), Some(low)) = (high, low) {
+                decoded.push(((high << 4) | low) as u8);
+                index += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    let Ok(decoded) = String::from_utf8(decoded) else {
+        return input.to_string();
+    };
+    let mut output = String::with_capacity(decoded.len());
+    for character in decoded.chars() {
+        if character.is_ascii_alphanumeric()
+            || matches!(
+                character,
+                '-' | '_'
+                    | '~'
+                    | '!'
+                    | '$'
+                    | '&'
+                    | '\''
+                    | '('
+                    | ')'
+                    | '*'
+                    | '+'
+                    | ','
+                    | ';'
+                    | '='
+                    | ':'
+                    | '@'
+                    | '/'
+            )
+        {
+            output.push(character);
+        } else {
+            let mut buffer = [0_u8; 4];
+            for byte in character.encode_utf8(&mut buffer).bytes() {
+                output.push_str(&format!("%{byte:02X}"));
+            }
+        }
+    }
+    output
+}
+
+/// Caddy's `buildQueryString`: expand and query-escape each key/value component independently,
+/// preserving duplicate keys and the original `=`/`&` structure.
+fn build_query_string(input: &str, request: &Request) -> String {
+    let mut remaining = input;
+    let mut output = String::new();
+    let mut wrote_value = true;
+    while !remaining.is_empty() {
+        let next_eq = remaining.find('=');
+        let next_amp = remaining.find('&');
+        let next_eq = if !wrote_value { next_eq } else { None };
+        let amp_is_next = next_amp.is_some() && (next_eq.is_none_or(|eq| next_amp.unwrap() < eq));
+        let end = if amp_is_next {
+            next_amp.unwrap()
+        } else if let Some(eq) = next_eq {
+            eq
+        } else {
+            remaining.len()
+        };
+        let component = &remaining[..end];
+        let expanded = expand_query_component(component, request, wrote_value);
+        let mut consume = end;
+        if consume < remaining.len() {
+            consume += 1;
+        }
+        remaining = &remaining[consume..];
+        if wrote_value {
+            if !output.is_empty() && !expanded.is_empty() {
+                output.push('&');
+            }
+        } else {
+            output.push('=');
+        }
+        output.push_str(&expanded);
+        wrote_value = amp_is_next;
+    }
+    output
+}
+
+/// Expand placeholders in one query component, query-escaping inserted values. The special
+/// `{http.request.uri.query}` placeholder is already escaped and is passed through when it appears
+/// in a value (Caddy's `buildQueryString` special case).
+fn expand_query_component(component: &str, request: &Request, raw_query_allowed: bool) -> String {
+    let mut output = String::new();
+    let mut rest = component;
+    while let Some(start) = rest.find('{') {
+        output.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('}') else {
+            output.push_str(&rest[start..]);
+            return output;
+        };
+        let name = &after[..end];
+        if name == "http.request.uri.query" && raw_query_allowed {
+            output.push_str(&request.uri.query().unwrap_or("").to_string());
+        } else {
+            let value = request.get_placeholder(name).unwrap_or_default();
+            output.push_str(&query_escape(&value));
+        }
+        rest = &after[end + 1..];
+    }
+    output.push_str(rest);
+    output
+}
+
+/// Parse a rewritten request target. Caddy permits relative paths (the `uri` docs explicitly
+/// allow `foo.html`), which `Uri::from_str` rejects in full-URI parsing; the fallback builds a
+/// path-and-query-only `Uri` so the relative target can be carried internally.
+fn parse_rewrite_uri(value: &str, context: &str) -> Result<Uri> {
+    if let Ok(uri) = value.parse::<Uri>() {
+        return Ok(uri);
+    }
+    if !value.starts_with('/') {
+        return Err(invalid(
+            context,
+            format!(
+                "relative rewrite URI `{value}` is not representable by the caddy-rs URI model; Caddy accepts relative rewrite targets (documented divergence)"
+            ),
+        ));
+    }
+    let path_and_query = PathAndQuery::from_maybe_shared(value.to_string())
+        .map_err(|error| invalid(context, error.to_string()))?;
+    // `Uri::from_parts` permits a path-and-query without scheme/authority (a relative target),
+    // whereas `Uri::builder().path_and_query(relative)` rejects it with "path does not start with
+    // slash". Caddy's rewrite handler deliberately allows relative paths.
+    let mut parts = http::uri::Parts::default();
+    parts.path_and_query = Some(path_and_query);
+    Uri::from_parts(parts).map_err(|error| invalid(context, error.to_string()))
 }
 
 /// Replace the request URI's path (keeping the current query string).
@@ -863,9 +1123,7 @@ fn set_uri_path(request: &mut Request, path: &str, context: &str) -> Result<()> 
         rebuilt.push('?');
         rebuilt.push_str(query);
     }
-    request.uri = rebuilt
-        .parse::<Uri>()
-        .map_err(|error| invalid(context, error.to_string()))?;
+    request.uri = parse_rewrite_uri(&rebuilt, context)?;
     Ok(())
 }
 
@@ -881,55 +1139,196 @@ fn set_uri_path_query(
         rebuilt.push('?');
         rebuilt.push_str(query);
     }
-    request.uri = rebuilt
-        .parse::<Uri>()
-        .map_err(|error| invalid(context, error.to_string()))?;
+    request.uri = parse_rewrite_uri(&rebuilt, context)?;
     Ok(())
 }
 
-fn strip_path_prefix(request: &mut Request, prefix: &str) -> Result<()> {
-    if prefix.is_empty() {
+fn strip_path_prefix(request: &mut Request, configured: &str) -> Result<()> {
+    if configured.is_empty() {
         return Ok(());
     }
-    let mut prefix = prefix.to_string();
-    if !prefix.starts_with('/') {
-        prefix.insert(0, '/');
-    }
-    let Some(rest) = request.uri.path().strip_prefix(prefix.as_str()) else {
-        return Ok(());
-    };
-    let rest = if rest.is_empty() {
-        "/".to_string()
-    } else if rest.starts_with('/') {
-        rest.to_string()
+    let expanded = request.replace_all(configured);
+    let prefix = if expanded.starts_with('/') {
+        expanded
     } else {
-        // Caddy's `canonicalizePath` restores the leading slash after trimming.
-        format!("/{rest}")
+        format!("/{expanded}")
     };
-    set_uri_path(request, &rest, "rewrite.strip_path_prefix")
+    let merge_slashes = !prefix.contains("//");
+    let path = request.uri.path().to_string();
+    let cleaned = clean_path(&path, merge_slashes);
+    let trimmed = trim_path_prefix_escaped(&cleaned, &prefix);
+    let stripped = trimmed != cleaned;
+    let final_path = if stripped {
+        canonicalize_rewrite_path(&trimmed)
+    } else {
+        cleaned
+    };
+    if final_path != path {
+        set_uri_path(request, &final_path, "rewrite.strip_path_prefix")?;
+    }
+    Ok(())
 }
 
-fn strip_path_suffix(request: &mut Request, suffix: &str) -> Result<()> {
-    if suffix.is_empty() {
+fn strip_path_suffix(request: &mut Request, configured: &str) -> Result<()> {
+    if configured.is_empty() {
         return Ok(());
     }
+    let suffix = request.replace_all(configured);
+    let merge_slashes = !suffix.contains("//");
     let path = request.uri.path().to_string();
-    if path.len() < suffix.len() {
-        return Ok(());
-    }
-    let start = path.len() - suffix.len();
-    if !path.is_char_boundary(start) || !path[start..].eq_ignore_ascii_case(suffix) {
-        return Ok(());
-    }
-    let trimmed = &path[..start];
-    let canonical = if trimmed.is_empty() {
-        "/".to_string()
-    } else if trimmed.starts_with('/') {
-        trimmed.to_string()
+    let cleaned = clean_path(&path, merge_slashes);
+    let trimmed = trim_path_suffix_escaped(&cleaned, &suffix);
+    let stripped = trimmed != cleaned;
+    let final_path = if stripped {
+        canonicalize_rewrite_path(&trimmed)
     } else {
-        format!("/{trimmed}")
+        cleaned
     };
-    set_uri_path(request, &canonical, "rewrite.strip_path_suffix")
+    if final_path != path {
+        set_uri_path(request, &final_path, "rewrite.strip_path_suffix")?;
+    }
+    Ok(())
+}
+
+/// Go `path.Clean` with Caddy's trailing-slash preservation; when `collapse_slashes` is false,
+/// empty segments (repeated slashes) are preserved while dot segments are still resolved.
+fn clean_path(path: &str, collapse_slashes: bool) -> String {
+    if path.is_empty() {
+        return ".".to_string();
+    }
+    let rooted = path.starts_with('/');
+    let trailing = path.ends_with('/');
+    let mut segments: Vec<&str> = Vec::new();
+    for (index, segment) in path.split('/').enumerate() {
+        match segment {
+            "" => {
+                // `path.Clean` never emits a leading empty segment; preserve only internal
+                // repeated slashes when slash collapsing is disabled.
+                if !collapse_slashes && index > 0 {
+                    segments.push("");
+                }
+            }
+            "." => {}
+            ".." => {
+                if segments
+                    .last()
+                    .is_some_and(|last| !last.is_empty() && *last != "..")
+                {
+                    segments.pop();
+                } else if !rooted {
+                    segments.push("..");
+                }
+            }
+            other => segments.push(other),
+        }
+    }
+    let mut output = String::new();
+    if rooted {
+        output.push('/');
+    }
+    output.push_str(&segments.join("/"));
+    if output.is_empty() {
+        output.push('.');
+    }
+    if trailing && output != "/" && !output.ends_with('/') {
+        output.push('/');
+    }
+    output
+}
+
+fn canonicalize_rewrite_path(path: &str) -> String {
+    let mut path = path.to_string();
+    if !path.starts_with('/') {
+        path.insert(0, '/');
+    }
+    clean_path(&path, false)
+}
+
+fn has_valid_percent_encoding(input: &str, index: usize) -> bool {
+    let bytes = input.as_bytes();
+    index + 3 <= bytes.len()
+        && bytes[index] == b'%'
+        && bytes[index + 1].is_ascii_hexdigit()
+        && bytes[index + 2].is_ascii_hexdigit()
+}
+
+fn path_unescape_triplet(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    if bytes.len() != 3 || bytes[0] != b'%' {
+        return None;
+    }
+    let high = (bytes[1] as char).to_digit(16)?;
+    let low = (bytes[2] as char).to_digit(16)?;
+    let byte = ((high << 4) | low) as u8;
+    String::from_utf8(vec![byte]).ok()
+}
+
+fn trim_path_prefix_escaped(escaped_path: &str, prefix: &str) -> String {
+    let path = escaped_path.as_bytes();
+    let pattern = prefix.as_bytes();
+    let mut path_index = 0usize;
+    let mut prefix_index = 0usize;
+    while path_index < path.len() && prefix_index < pattern.len() {
+        let mut step = 1usize;
+        let mut character = String::from_utf8_lossy(&path[path_index..path_index + 1]).into_owned();
+        if path[path_index] == b'%'
+            && !has_valid_percent_encoding(prefix, prefix_index)
+            && path.len() >= path_index + 3
+        {
+            match path_unescape_triplet(&escaped_path[path_index..path_index + 3]) {
+                Some(decoded) => {
+                    character = decoded;
+                    step = 3;
+                }
+                None => return escaped_path.to_string(),
+            }
+        }
+        let expected = (pattern[prefix_index] as char).to_string();
+        if !character.eq_ignore_ascii_case(&expected) {
+            return escaped_path.to_string();
+        }
+        path_index += step;
+        prefix_index += 1;
+    }
+    if prefix_index >= pattern.len() {
+        escaped_path[path_index..].to_string()
+    } else {
+        escaped_path.to_string()
+    }
+}
+
+fn trim_path_suffix_escaped(escaped_path: &str, suffix: &str) -> String {
+    let path = escaped_path.as_bytes();
+    let pattern = suffix.as_bytes();
+    let mut path_index = path.len();
+    let mut suffix_index = pattern.len();
+    while path_index > 0 && suffix_index > 0 {
+        let mut step = 1usize;
+        let mut character = String::from_utf8_lossy(&path[path_index - 1..path_index]).into_owned();
+        let path_has_escape = path_index >= 3 && path[path_index - 3] == b'%';
+        let suffix_has_escape = has_valid_percent_encoding(suffix, suffix_index.saturating_sub(3))
+            || has_valid_percent_encoding(suffix, suffix_index.saturating_sub(1));
+        if path_has_escape && !suffix_has_escape {
+            match path_unescape_triplet(&escaped_path[path_index - 3..path_index]) {
+                Some(decoded) => {
+                    character = decoded;
+                    step = 3;
+                }
+                None => return escaped_path.to_string(),
+            }
+        }
+        let expected = (pattern[suffix_index - 1] as char).to_string();
+        if !character.eq_ignore_ascii_case(&expected) {
+            return escaped_path.to_string();
+        }
+        path_index -= step;
+        suffix_index -= 1;
+    }
+    if suffix_index == 0 {
+        escaped_path[..path_index].to_string()
+    } else {
+        escaped_path.to_string()
+    }
 }
 
 /// Go `strings.Replace`-style replacement. An empty `find` inserts `replace` before each UTF-8
@@ -984,7 +1383,11 @@ fn apply_uri_substring(request: &mut Request, substring: &UriSubstring) -> Resul
         .filter(|limit| *limit > 0)
         .map(|limit| limit as usize);
     let path = request.uri.path().to_string();
-    let new_path = replace_occurrences(&path, &find, &replacement, limit);
+    // Caddy cleans the escaped path before substring replacement; repeated slashes are preserved
+    // only when the configured `find` itself contains "//".
+    let merge_slashes = !substring.find.contains("//");
+    let cleaned = clean_path(&path, merge_slashes);
+    let new_path = replace_occurrences(&cleaned, &find, &replacement, limit);
     let new_query = request
         .uri
         .query()
@@ -1136,9 +1539,14 @@ impl Handler for RewriteHandler {
     async fn handle(&self, mut request: Request) -> Result<Outcome> {
         // Order matches Caddy's `Rewrite.Rewrite`.
         if let Some(method) = &self.method {
-            let expanded = request.replace_all(method).to_ascii_uppercase();
-            request.method = Method::from_bytes(expanded.as_bytes())
-                .map_err(|_| invalid("rewrite.method", format!("invalid method `{expanded}`")))?;
+            if !method.is_empty() {
+                let expanded = request.replace_all(method).to_ascii_uppercase();
+                if !expanded.is_empty() {
+                    request.method = Method::from_bytes(expanded.as_bytes()).map_err(|_| {
+                        invalid("rewrite.method", format!("invalid method `{expanded}`"))
+                    })?;
+                }
+            }
         }
         if let Some(uri) = &self.uri {
             if !uri.is_empty() {
