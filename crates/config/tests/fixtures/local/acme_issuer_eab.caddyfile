@@ -1,0 +1,7 @@
+example.com {
+	tls {
+		issuer acme {
+			eab kid_123 mac_456
+		}
+	}
+}

@@ -1,0 +1,15 @@
+{
+	local_certs
+}
+example.com {
+	tls {
+		issuer acme {
+			dir https://acme.example/directory
+			email ops@example.com
+			timeout 10s
+			disable_http_challenge
+			disable_tlsalpn_challenge
+			trusted_roots /etc/ssl/ca.pem
+		}
+	}
+}

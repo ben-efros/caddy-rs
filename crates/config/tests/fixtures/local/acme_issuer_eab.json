@@ -1,0 +1,45 @@
+{
+  "apps": {
+    "http": {
+      "servers": {
+        "srv0": {
+          "listen": [
+            ":443"
+          ],
+          "routes": [
+            {
+              "match": [
+                {
+                  "host": [
+                    "example.com"
+                  ]
+                }
+              ],
+              "terminal": true
+            }
+          ]
+        }
+      }
+    },
+    "tls": {
+      "automation": {
+        "policies": [
+          {
+            "issuers": [
+              {
+                "external_account": {
+                  "key_id": "kid_123",
+                  "mac_key": "mac_456"
+                },
+                "module": "acme"
+              }
+            ],
+            "subjects": [
+              "example.com"
+            ]
+          }
+        ]
+      }
+    }
+  }
+}

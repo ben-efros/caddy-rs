@@ -1,0 +1,62 @@
+{
+  "apps": {
+    "http": {
+      "servers": {
+        "srv0": {
+          "listen": [
+            ":443"
+          ],
+          "routes": [
+            {
+              "match": [
+                {
+                  "host": [
+                    "example.com"
+                  ]
+                }
+              ],
+              "terminal": true
+            }
+          ]
+        }
+      }
+    },
+    "tls": {
+      "automation": {
+        "policies": [
+          {
+            "issuers": [
+              {
+                "acme_timeout": 10000000000,
+                "ca": "https://acme.example/directory",
+                "challenges": {
+                  "http": {
+                    "disabled": true
+                  },
+                  "tls-alpn": {
+                    "disabled": true
+                  }
+                },
+                "email": "ops@example.com",
+                "module": "acme",
+                "trusted_roots_pem_files": [
+                  "/etc/ssl/ca.pem"
+                ]
+              }
+            ],
+            "subjects": [
+              "example.com"
+            ]
+          },
+          {
+            "issuers": [
+              {
+                "module": "internal"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  }
+}

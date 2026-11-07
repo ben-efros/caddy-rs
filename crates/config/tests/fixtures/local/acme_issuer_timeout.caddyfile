@@ -1,0 +1,7 @@
+example.com {
+	tls {
+		issuer acme {
+			timeout 10s
+		}
+	}
+}
