@@ -671,7 +671,7 @@ async fn serve_h3_connection(
     let _permit = permit;
     let _generation = generation;
     let _tracked = tracked;
-    let _tls_info = h3_tls_info(&connection);
+    let tls_info = h3_tls_info(&connection);
     let mut h3_connection =
         match h3::server::Connection::new(h3_quinn::Connection::new(connection.clone())).await {
             Ok(connection) => connection,
@@ -707,6 +707,16 @@ async fn serve_h3_connection(
                         };
                         let started = std::time::Instant::now();
                         let method = request.method().as_str().to_string();
+                        let mut snapshot = context.access_log.is_enabled().then(|| {
+                            RequestSnapshot::capture_http3(
+                                &request,
+                                Some(remote_addr),
+                                Some(&tls_info),
+                            )
+                        });
+                        if let Some(snapshot) = snapshot.as_mut() {
+                            snapshot.resolve_client_ip(&context.trusted_proxies);
+                        }
                         let _request_guard =
                             request_started(&context.recorder, &context.server_name);
                         let limit = context.limits.max_request_body_size;
@@ -747,7 +757,7 @@ async fn serve_h3_connection(
                                 &context.access_log_policy,
                                 &context.server_name,
                                 &method,
-                                None,
+                                snapshot.as_ref(),
                                 started,
                                 413,
                                 0,
@@ -776,7 +786,7 @@ async fn serve_h3_connection(
                                 &context.access_log_policy,
                                 &context.server_name,
                                 &method,
-                                None,
+                                snapshot.as_ref(),
                                 started,
                                 503,
                                 0,
@@ -830,7 +840,7 @@ async fn serve_h3_connection(
                             &context.access_log_policy,
                             &context.server_name,
                             &method,
-                            None,
+                            snapshot.as_ref(),
                             started,
                             response_parts.status.as_u16(),
                             response_bytes.len() as u64,
@@ -1365,9 +1375,12 @@ async fn serve_one_request(
     let method = request.method().as_str().to_string();
     // Capture the access-log fields before the request is consumed. Only done when a sink is
     // configured, so the common no-logging path pays nothing.
-    let snapshot = context.access_log.is_enabled().then(|| {
+    let mut snapshot = context.access_log.is_enabled().then(|| {
         RequestSnapshot::capture(&request, context.remote_addr, context.tls_info.as_ref())
     });
+    if let Some(snapshot) = snapshot.as_mut() {
+        snapshot.resolve_client_ip(&context.trusted_proxies);
+    }
     let _request_guard = request_started(&context.recorder, &context.server_name);
     // Decide once, before the request is consumed, whether this is a real WebSocket handshake
     // offer. The response side (Sec-WebSocket-Accept) is checked when the 101 is returned; only a

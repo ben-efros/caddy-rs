@@ -339,6 +339,10 @@ pub(crate) struct RequestSnapshot {
     /// bytes-read count is not known at logging time; the declared size is the compatible
     /// approximation Caddy reports for `request_size`/`bytes_read` when a length was declared.
     content_length: u64,
+    /// Caddy's `client_ip` request variable: the trusted-proxy-resolved client IP (bare address,
+    /// never a port). `None` until [`RequestSnapshot::resolve_client_ip`] runs; Caddy resolves it
+    /// in `PrepareRequest` before any handler, so it is the peer IP unless the peer is trusted.
+    resolved_client_ip: Option<String>,
 }
 
 impl RequestSnapshot {
@@ -348,40 +352,101 @@ impl RequestSnapshot {
         remote: Option<SocketAddr>,
         tls: Option<&TlsLogInfo>,
     ) -> Self {
-        let host = request
-            .headers()
+        Self::capture_fields(
+            request.method(),
+            request.version(),
+            request.uri(),
+            request.headers(),
+            remote,
+            tls,
+        )
+    }
+
+    /// Capture an HTTP/3 request before its body is read/buffered (the `h3` resolver hands out an
+    /// `http::Request<()>`; access logging still needs the request fields).
+    pub(crate) fn capture_http3(
+        request: &http::Request<()>,
+        remote: Option<SocketAddr>,
+        tls: Option<&TlsLogInfo>,
+    ) -> Self {
+        Self::capture_fields(
+            request.method(),
+            request.version(),
+            request.uri(),
+            request.headers(),
+            remote,
+            tls,
+        )
+    }
+
+    /// Capture from already-split request parts (the buffered HTTP/3 path, where hyper's
+    /// `Request<Incoming>` no longer exists).
+    pub(crate) fn capture_from_parts(
+        parts: &http::request::Parts,
+        remote: Option<SocketAddr>,
+        tls: Option<&TlsLogInfo>,
+    ) -> Self {
+        Self::capture_fields(
+            &parts.method,
+            parts.version,
+            &parts.uri,
+            &parts.headers,
+            remote,
+            tls,
+        )
+    }
+
+    fn capture_fields(
+        method: &http::Method,
+        version: http::Version,
+        uri: &http::Uri,
+        headers: &HeaderMap,
+        remote: Option<SocketAddr>,
+        tls: Option<&TlsLogInfo>,
+    ) -> Self {
+        let host = headers
             .get(http::header::HOST)
             .and_then(|value| value.to_str().ok())
             .map(str::to_string)
-            .or_else(|| {
-                request
-                    .uri()
-                    .authority()
-                    .map(|authority| authority.to_string())
-            })
+            .or_else(|| uri.authority().map(|authority| authority.to_string()))
             .unwrap_or_default();
-        let uri = request
-            .uri()
+        let uri = uri
             .path_and_query()
             .map(|value| value.as_str().to_string())
             .unwrap_or_else(|| "/".to_string());
-        let content_length = request
-            .headers()
+        let content_length = headers
             .get(http::header::CONTENT_LENGTH)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.trim().parse::<u64>().ok())
             .unwrap_or(0);
         Self {
-            method: request.method().as_str().to_string(),
+            method: method.as_str().to_string(),
             host,
             uri,
-            proto: proto_name(request.version()),
-            headers: request.headers().clone(),
+            proto: proto_name(version),
+            headers: headers.clone(),
             content_length,
             remote,
             tls: tls.cloned(),
             timestamp: SystemTime::now(),
+            resolved_client_ip: None,
         }
+    }
+
+    /// Resolve Caddy's `client_ip` request variable exactly like `PrepareRequest` does:
+    /// the peer IP unless the peer is a trusted proxy, in which case the configured
+    /// `client_ip_headers` value (bare address; port stripped). Only called when access logging is
+    /// enabled, so the no-logging path pays nothing.
+    pub(crate) fn resolve_client_ip(
+        &mut self,
+        trusted_proxies: &caddy_rs_proxy::trusted_proxies::ServerTrustedProxies,
+    ) {
+        let mut probe = caddy_rs_http::Request::new(http::Method::GET, http::Uri::from_static("/"));
+        probe.version = http::Version::HTTP_11;
+        probe.headers = self.headers.clone();
+        probe.remote_addr = self.remote;
+        let (_, client_ip) = trusted_proxies.determine(&probe);
+        self.resolved_client_ip = Some(client_ip);
     }
 
     fn access_entry(
@@ -394,6 +459,17 @@ impl RequestSnapshot {
         let mut request = AccessLogRequest::new(&self.method, &self.host, &self.uri)
             .with_remote(self.remote)
             .with_headers(&self.headers);
+        // Go's net/http sets `RemoteAddr` to "@" for Unix-socket peers; Caddy logs
+        // `remote_ip: "@"`, `remote_port: ""` in that case. caddy-rs has no peer `SocketAddr` for
+        // Unix listeners, so represent the missing address the same way.
+        if self.remote.is_none() {
+            request.remote_ip = "@".to_string();
+            request.remote_port = String::new();
+        }
+        // Caddy resolves `client_ip` in `PrepareRequest` and logs the resolved value; a transport
+        // peer that is not a trusted proxy resolves to itself, a trusted proxy resolves through
+        // `client_ip_headers` (never a port). See `resolve_client_ip`.
+        request.client_ip = self.resolved_client_ip.clone();
         request.proto = self.proto.clone();
         request.tls = self.tls.as_ref().map(TlsLogInfo::to_access_tls);
         let mut entry = AccessLogEntry::new(request)
