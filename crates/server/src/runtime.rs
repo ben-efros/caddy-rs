@@ -15,6 +15,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+use caddy_rs_admin::inventory::{RuntimeIntrospectionSource, RuntimeInventorySnapshot};
 use caddy_rs_admin::{
     AdminApi, CertificateMetrics, LoggingConfig, MetricsRegistry, SharedRequestRecorder,
     UpstreamStatusSource,
@@ -231,6 +232,10 @@ pub struct ServerRuntime {
     /// Live reverse-proxy upstream counters for `GET /reverse_proxy/upstreams`; the active
     /// generation's sink is swapped only after a successful apply.
     upstream_status: Arc<ProxyUpstreamStatusSource>,
+    /// Last completed runtime-inventory snapshot for the `GET /runtime/inventory` extension
+    /// (T-ADMIN-023). Refreshed after a successful apply and cleared on shutdown; the admin API
+    /// copies it and marks a mismatch with the active generation as stale.
+    inventory: Arc<crate::inventory::RuntimeInventorySource>,
 }
 
 /// How inherited systemd sockets are discovered for this runtime.
@@ -252,10 +257,14 @@ impl ServerRuntime {
     pub fn new(store: Arc<GenerationStore>) -> Self {
         let reload = Arc::new(tokio::sync::Notify::new());
         let upstream_status = ProxyUpstreamStatusSource::new();
+        let inventory = crate::inventory::RuntimeInventorySource::new();
         let admin_api = AdminApi::new(Arc::clone(&store))
             .with_reload_notify(Arc::clone(&reload))
             .with_upstream_status_source(
                 Arc::clone(&upstream_status) as Arc<dyn UpstreamStatusSource>
+            )
+            .with_runtime_introspection_source(
+                Arc::clone(&inventory) as Arc<dyn RuntimeIntrospectionSource>
             );
         let recorder = admin_api.request_recorder();
         let certificate_metrics = admin_api.certificate_metrics();
@@ -281,6 +290,7 @@ impl ServerRuntime {
             renewal_metrics_seen: BTreeMap::new(),
             shutdown_timing: ShutdownTiming::default(),
             upstream_status,
+            inventory,
         }
     }
 
@@ -512,7 +522,9 @@ impl ServerRuntime {
             let health_schedulers = status_sink.spawn_health_checks();
             self.install_health_schedulers(generation.id(), health_schedulers)
                 .await;
-            return Ok(self.finish_apply(&generation));
+            let status = self.finish_apply(&generation);
+            self.refresh_inventory();
+            return Ok(status);
         };
         // Snapshot for rollback: a failed provisioning pass must leave the previous generation's
         // listener states untouched.
@@ -592,7 +604,9 @@ impl ServerRuntime {
         let health_schedulers = status_sink.spawn_health_checks();
         self.install_health_schedulers(generation.id(), health_schedulers)
             .await;
-        Ok(self.finish_apply(&generation))
+        let status = self.finish_apply(&generation);
+        self.refresh_inventory();
+        Ok(status)
     }
 
     /// Adopt the active health-check schedulers of a successfully applied generation and stop the
@@ -844,6 +858,44 @@ impl ServerRuntime {
     }
 
     /// Record the applied generation in the observable status.
+    /// Rebuild and install the runtime-inventory snapshot after a successful apply.
+    ///
+    /// The snapshot is copied from runtime state into the shared source; the admin endpoint only
+    /// reads that copy, so a later reload cannot race the JSON rendering.
+    fn refresh_inventory(&mut self) {
+        let (configured_admin, listeners, certificates) = match self.store.current() {
+            Some(generation) => {
+                let config = generation.config();
+                let configured_admin = config
+                    .admin
+                    .as_ref()
+                    .map(|admin| admin.listen_addr().to_string());
+                let listeners =
+                    crate::inventory::listener_inventory(config, &self.status.listeners);
+                let managed: Vec<Arc<caddy_rs_tls::Certificate>> = self
+                    .renewals
+                    .values()
+                    .flat_map(|renewals| renewals.managed_certificates())
+                    .collect();
+                let certificates = crate::inventory::certificate_inventory(config, &managed);
+                (configured_admin, listeners, certificates)
+            }
+            None => (None, Vec::new(), Vec::new()),
+        };
+        let admin = crate::inventory::admin_inventory(
+            configured_admin,
+            self.admin.as_ref().map(|handle| handle.bound.clone()),
+        );
+        let health_checks = crate::inventory::health_check_inventory(self.health_schedulers.iter());
+        self.inventory.install(RuntimeInventorySnapshot {
+            generation_id: self.status.generation_id,
+            admin,
+            listeners,
+            certificates,
+            health_checks,
+        });
+    }
+
     fn finish_apply(&mut self, generation: &Generation) -> RuntimeStatus {
         self.status = RuntimeStatus {
             generation_id: Some(generation.id()),
@@ -1121,6 +1173,7 @@ impl ServerRuntime {
             access.close();
         }
         self.access_log_generation = None;
+        self.inventory.clear();
     }
 
     /// Resolve the socket-activation state for the configured listeners, once.
