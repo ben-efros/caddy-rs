@@ -1,6 +1,6 @@
 :8082 {
 	basic_auth {
-		alice $2a$14$abcdefghijklmnopqrstuv
-		bob $2b$14$zyxwvutsrqponmlkjihgfe
+		alice $2a$14$isj44Vmcs86iV2ZGdYP7HuzrAeDY4gYrGh2gOOqnLlaDHZ9Zfgiii
+		bob $2b$14$VgRnxOoKlDhhNqiOLeRPpOO/ob0.lrk5fm4ubShU6DkmqHb5yMhw.
 	}
 }

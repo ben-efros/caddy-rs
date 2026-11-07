@@ -1,5 +1,5 @@
 :8084 {
 	basic_auth /private/* {
-		dave $2a$14$abcdefghijklmnopqrstuv
+		dave $2a$14$TmfPy3tz5oYgX3pXZPF1m.X7krllSIzt0ao0cPPN/5Cjk5SjX3tL2
 	}
 }

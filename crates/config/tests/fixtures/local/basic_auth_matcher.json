@@ -8,13 +8,6 @@
                     ],
                     "routes": [
                         {
-                            "match": [
-                                {
-                                    "path": [
-                                        "/private/*"
-                                    ]
-                                }
-                            ],
                             "handle": [
                                 {
                                     "handler": "authentication",
@@ -22,7 +15,7 @@
                                         "http_basic": {
                                             "accounts": [
                                                 {
-                                                    "password": "$2a$14$abcdefghijklmnopqrstuv",
+                                                    "password": "$2a$14$TmfPy3tz5oYgX3pXZPF1m.X7krllSIzt0ao0cPPN/5Cjk5SjX3tL2",
                                                     "username": "dave"
                                                 }
                                             ],
@@ -32,6 +25,13 @@
                                             "hash_cache": {}
                                         }
                                     }
+                                }
+                            ],
+                            "match": [
+                                {
+                                    "path": [
+                                        "/private/*"
+                                    ]
                                 }
                             ]
                         }

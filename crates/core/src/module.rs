@@ -576,7 +576,7 @@ pub const BUILTIN_MODULES: &[Module] = &[
         "http.handlers.authentication",
         "authentication",
         ModuleKind::HttpHandler,
-        "Authentication middleware with the HTTP Basic provider (bcrypt/argon2id verification          not implemented)",
+        "Authentication middleware with the HTTP Basic provider (native bcrypt and argon2id password-hash verification, constant-time comparison)",
     ),
     Module::new(
         "http.handlers.basic_auth",

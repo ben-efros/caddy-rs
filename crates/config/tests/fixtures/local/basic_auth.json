@@ -15,11 +15,11 @@
                                         "http_basic": {
                                             "accounts": [
                                                 {
-                                                    "password": "$2a$14$abcdefghijklmnopqrstuv",
+                                                    "password": "$2a$14$isj44Vmcs86iV2ZGdYP7HuzrAeDY4gYrGh2gOOqnLlaDHZ9Zfgiii",
                                                     "username": "alice"
                                                 },
                                                 {
-                                                    "password": "$2b$14$zyxwvutsrqponmlkjihgfe",
+                                                    "password": "$2b$14$VgRnxOoKlDhhNqiOLeRPpOO/ob0.lrk5fm4ubShU6DkmqHb5yMhw.",
                                                     "username": "bob"
                                                 }
                                             ],
