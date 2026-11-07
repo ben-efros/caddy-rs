@@ -3,7 +3,7 @@
 //!
 //! The template lives at `crates/plug/template/` with its own `[workspace]` and path dependency on
 //! this crate, so it is intentionally **not** a member of the caddy-rs workspace. This test builds
-//! it with `cargo build --offline --locked` (independent target directory) and then runs the built
+//! it with `cargo build --locked` (independent target directory) and then runs the built
 //! binary through `HostService` for one request round-trip.
 
 use std::path::{Path, PathBuf};
@@ -76,7 +76,8 @@ fn template_compiles_and_serves_a_request() {
         .join("caddy-rs-module-template");
     let build = Command::new(&cargo)
         .arg("build")
-        .arg("--offline")
+        // Not `--offline`: a fresh CI runner has no primed registry cache, so the template's own
+        // workspace must be allowed to fetch. `--locked` still pins the exact dependency set.
         .arg("--locked")
         .arg("--manifest-path")
         .arg(&manifest)
