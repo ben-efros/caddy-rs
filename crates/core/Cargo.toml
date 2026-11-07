@@ -7,6 +7,17 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Build-time module selection. Defaults mirror the full build so nothing changes unless the
+# top-level binary is built with `--no-default-features` (or `--features minimal`).
+default = ["http3", "compression", "templates"]
+# HTTP/3 (`protocols: ["h3"]`, `udp/...` listeners) is served over QUIC.
+http3 = []
+# Response compression handler (`http.handlers.encode`, gzip/zstd).
+compression = []
+# Template handler (`http.handlers.templates`).
+templates = []
+
 [dependencies]
 async-trait = { workspace = true }
 serde = { workspace = true }

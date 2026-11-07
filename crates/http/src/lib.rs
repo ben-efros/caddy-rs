@@ -8,6 +8,7 @@
 
 pub mod auth;
 pub mod body;
+#[cfg(feature = "compression")]
 pub mod encode;
 mod expression;
 pub mod file_server;
@@ -17,12 +18,14 @@ pub mod placeholders;
 pub mod rate_limit;
 pub mod regex_lite;
 pub mod router;
+#[cfg(feature = "templates")]
 pub mod templates;
 pub mod types;
 pub mod upgrade;
 
 pub use auth::{BasicAuthHandler, ForwardAuthHandler};
 pub use body::{Body, BodyError, RequestBody, ResponseBody, StreamingBody, StreamingResponse};
+#[cfg(feature = "compression")]
 pub use encode::EncodeHandler;
 pub use handlers::{
     HeadersHandler, MapHandler, RequestBodyHandler, RewriteHandler, StaticResponseHandler,
@@ -31,6 +34,7 @@ pub use handlers::{
 pub use placeholders::{Replacer, UnknownPlaceholders};
 pub use rate_limit::{ManualClock, RateLimitClock, RateLimitHandler, SystemClock};
 pub use router::{CustomHandlerFactory, Route, Router, RouterBuilder};
+#[cfg(feature = "templates")]
 pub use templates::TemplatesHandler;
 pub use types::{
     cipher_suite_name, ClientCertificate, Error, Handler, Matcher, MatcherError, Outcome, Request,

@@ -71,7 +71,7 @@ pub fn listener_inventory(
             let (network, http3) = caddy_rs_core::ListenAddr::parse(configured)
                 .map(|address| match address.network {
                     caddy_rs_core::Network::Tcp => ("tcp".to_string(), false),
-                    caddy_rs_core::Network::Udp => ("udp".to_string(), true),
+                    caddy_rs_core::Network::Udp => ("udp".to_string(), cfg!(feature = "http3")),
                     caddy_rs_core::Network::Unix => ("unix".to_string(), false),
                 })
                 .unwrap_or_else(|_| ("unknown".to_string(), false));
@@ -80,10 +80,16 @@ pub fn listener_inventory(
             } else {
                 false
             };
+            #[cfg(feature = "http3")]
             let protocols = server
                 .protocols
                 .clone()
                 .unwrap_or_else(|| vec!["h1".to_string(), "h2".to_string(), "h3".to_string()]);
+            #[cfg(not(feature = "http3"))]
+            let protocols = server
+                .protocols
+                .clone()
+                .unwrap_or_else(|| vec!["h1".to_string(), "h2".to_string()]);
             listeners.push(InventoryListener {
                 server: server_name.clone(),
                 configured: configured.clone(),

@@ -28,14 +28,18 @@ use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::Bytes;
+#[cfg(feature = "http3")]
+use bytes::{Buf, BytesMut};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::{TcpListener, UdpSocket, UnixListener};
+#[cfg(feature = "http3")]
+use tokio::net::UdpSocket;
+use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
@@ -388,6 +392,7 @@ pub(crate) async fn bind(
                 socket_addr: None,
             })
         }
+        #[cfg(feature = "http3")]
         Network::Udp => {
             if inherited.is_some() {
                 return Err(Error::Listen {
@@ -456,6 +461,12 @@ pub(crate) async fn bind(
                 socket_addr: Some(socket_addr),
             })
         }
+        #[cfg(not(feature = "http3"))]
+        Network::Udp => Err(Error::Listen {
+            listen: configured.to_string(),
+            reason: "HTTP/3 support is not compiled in; this build cannot serve a UDP listener"
+                .to_string(),
+        }),
     }
 }
 
@@ -535,6 +546,7 @@ fn ipv6_wildcard_unavailable(error: &io::Error) -> bool {
 ///
 /// Hostless addresses (`udp/:443`) request the dual-stack IPv6 wildcard like Caddy's
 /// `net.ListenPacket("udp", ":port")`; IP literals and hostnames bind/resolve like the TCP path.
+#[cfg(feature = "http3")]
 async fn bind_configured_udp(configured: &str, address: &ListenAddr) -> Result<UdpSocket, Error> {
     if address.host().is_empty() {
         let port = address.port().ok_or_else(|| Error::Listen {
@@ -570,6 +582,7 @@ async fn bind_configured_udp(configured: &str, address: &ListenAddr) -> Result<U
 }
 
 /// A dual-stack (`IPv6` wildcard with `IPV6_V6ONLY=0`) UDP socket for a hostless address.
+#[cfg(feature = "http3")]
 fn wildcard_dual_stack_udp(port: u16) -> io::Result<UdpSocket> {
     let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_only_v6(false)?;
@@ -580,6 +593,7 @@ fn wildcard_dual_stack_udp(port: u16) -> io::Result<UdpSocket> {
 
 /// Build a QUIC server configuration from the listener's rustls configuration (Caddy's
 /// `http3.Server` shares the TLS connection policy but negotiates only `h3` over QUIC).
+#[cfg(feature = "http3")]
 fn quic_server_config(
     configured: &str,
     tls: Arc<rustls::ServerConfig>,
@@ -595,6 +609,7 @@ fn quic_server_config(
 }
 
 /// Accept QUIC connections on one UDP listener and serve HTTP/3 through the shared routers.
+#[cfg(feature = "http3")]
 fn spawn_udp_accept_loop(
     endpoint: quinn::Endpoint,
     listen_key: String,
@@ -659,6 +674,7 @@ fn spawn_udp_accept_loop(
 }
 
 /// Serve HTTP/3 on one QUIC connection through the same router pipeline as HTTP/1.1/2.
+#[cfg(feature = "http3")]
 #[allow(clippy::too_many_arguments)]
 async fn serve_h3_connection(
     connection: quinn::Connection,
@@ -931,6 +947,7 @@ fn client_certificate_for_request(
     })
 }
 
+#[cfg(feature = "http3")]
 fn h3_tls_info(connection: &quinn::Connection) -> TlsLogInfo {
     let handshake = connection
         .handshake_data()

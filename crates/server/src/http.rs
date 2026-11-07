@@ -177,6 +177,7 @@ pub(crate) async fn serve_request_with_automatic(
 /// [`caddy_rs_http::Router::handle_upgradable`]. Protocol upgrades (WebSocket/WebTransport) are not
 /// supported over HTTP/3 and are reported as `501 Not Implemented` instead of a silent downgrade.
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "http3")]
 pub(crate) async fn serve_internal_buffered(
     limits: &ServerLimits,
     router: Arc<Router>,

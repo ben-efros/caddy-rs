@@ -12,8 +12,8 @@ base64 = "0.22.1"
 flate2 = "1"
 zstd = "0.13"
 bytes = { workspace = true }
-caddy-rs-config = { workspace = true }
-caddy-rs-core = { workspace = true }
+caddy-rs-config = { workspace = true, default-features = false }
+caddy-rs-core = { workspace = true, default-features = false }
 http = { workspace = true }
 ring = "0.17.14"
 serde = { workspace = true }
