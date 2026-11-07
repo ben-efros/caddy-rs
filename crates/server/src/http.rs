@@ -45,8 +45,8 @@ use hyper::body::Incoming;
 use hyper::upgrade::OnUpgrade;
 
 use caddy_rs_http::{
-    Body, Request, RequestBody, Response, ResponseOutcome, Router, StreamingBody,
-    StreamingResponse, Tunnel,
+    Body, ClientCertificate as HttpClientCertificate, Request, RequestBody, Response,
+    ResponseOutcome, Router, StreamingBody, StreamingResponse, Tunnel,
 };
 use caddy_rs_proxy::trusted_proxies::ServerTrustedProxies;
 
@@ -151,6 +151,7 @@ pub(crate) async fn serve_request_with_automatic(
         automatic,
         None,
         Arc::new(ServerTrustedProxies::default()),
+        None,
     )
     .await
     {
@@ -184,6 +185,7 @@ pub(crate) async fn serve_internal_buffered(
     tls: bool,
     tls_alpn: Option<&str>,
     trusted_proxies: Arc<ServerTrustedProxies>,
+    client_certificate: Option<HttpClientCertificate>,
 ) -> ServedResponse {
     let limit = limits.max_request_body_size;
     let path = parts.uri.path().to_string();
@@ -215,6 +217,7 @@ pub(crate) async fn serve_internal_buffered(
     internal.headers = parts.headers;
     internal.remote_addr = remote_addr;
     internal.tls = tls;
+    internal.client_certificate = client_certificate;
     internal.body = body;
     if let Some(local) = local_addr {
         internal
@@ -281,6 +284,7 @@ pub(crate) async fn serve_request_with_automatic_upgradable(
     automatic: Option<Arc<AutomaticHttpsServing>>,
     on_upgrade: Option<OnUpgrade>,
     trusted_proxies: Arc<ServerTrustedProxies>,
+    client_certificate: Option<HttpClientCertificate>,
 ) -> ServedResponse {
     if !tls {
         if let Some(automatic) = &automatic {
@@ -394,6 +398,7 @@ pub(crate) async fn serve_request_with_automatic_upgradable(
     internal.headers = parts.headers;
     internal.remote_addr = remote_addr;
     internal.tls = tls;
+    internal.client_certificate = client_certificate;
     if let Some(local) = local_addr {
         // Caddy exposes `{http.request.local.*}`; the placeholder subset in `caddy-rs-http` does
         // not cover local addresses yet, so the server exposes them as request variables until

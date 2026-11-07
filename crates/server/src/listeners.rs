@@ -71,6 +71,9 @@ pub(crate) struct ListenerState {
     pub(crate) trusted_proxies: Arc<ServerTrustedProxies>,
     /// TLS configuration when this listener terminates TLS; `None` for cleartext listeners.
     pub(crate) tls: Option<Arc<rustls::ServerConfig>>,
+    /// Whether the listener's client-auth mode verifies client certificates (Caddy
+    /// `require_and_verify`/`verify_if_given`); used for `{http.request.tls.client.*}`.
+    pub(crate) client_auth_verified: bool,
     /// Automatic-HTTPS pre-routing (challenge responses, HTTP→HTTPS redirects) for cleartext
     /// listeners; `None` when automatic HTTPS is not active for this generation.
     pub(crate) automatic: Option<Arc<AutomaticHttpsServing>>,
@@ -810,6 +813,7 @@ async fn serve_h3_connection(
                             true,
                             Some("h3"),
                             Arc::clone(&context.trusted_proxies),
+                            None,
                         )
                         .await;
                         let hyper_response = match served {
@@ -882,6 +886,35 @@ async fn serve_h3_connection(
 ///
 /// quinn exposes the rustls handshake data (ALPN, SNI, resumption) but not the negotiated cipher
 /// suite; HTTP/3 is always TLS 1.3. See the compatibility divergence note.
+/// Map the first presented client certificate to Caddy's HTTP placeholder representation.
+///
+/// `verified` comes from the listener's client-auth mode: Caddy's `require_and_verify` and
+/// `verify_if_given` verify the chain; `require`/`request` only require/request a certificate.
+fn client_certificate_for_request(
+    connection: &rustls::ServerConnection,
+    verified: bool,
+) -> Option<caddy_rs_http::ClientCertificate> {
+    let der = connection.peer_certificates()?.first()?;
+    let info = caddy_rs_tls::ClientCertificateInfo::parse(der.as_ref(), verified).ok()?;
+    let certificate_pem = info.certificate_pem();
+    let certificate_der_base64 = info.certificate_der_base64();
+    Some(caddy_rs_http::ClientCertificate {
+        subject: info.subject,
+        issuer: info.issuer,
+        serial: info.serial,
+        fingerprint: info.fingerprint,
+        public_key_der: info.public_key_der,
+        public_key_sha256: info.public_key_sha256,
+        certificate_pem,
+        certificate_der_base64,
+        dns_names: info.dns_names,
+        emails: info.emails,
+        ips: info.ip_addresses,
+        uris: info.uris,
+        verified: info.verified,
+    })
+}
+
 fn h3_tls_info(connection: &quinn::Connection) -> TlsLogInfo {
     let handshake = connection
         .handshake_data()
@@ -918,6 +951,8 @@ struct ConnectionContext {
     trusted_proxies: Arc<ServerTrustedProxies>,
     /// TLS configuration for this accepted connection, when the listener terminates TLS.
     tls: Option<Arc<rustls::ServerConfig>>,
+    /// Whether the listener's client-auth mode verifies client certificates.
+    client_auth_verified: bool,
     /// Automatic-HTTPS pre-routing for cleartext connections.
     automatic: Option<Arc<AutomaticHttpsServing>>,
     /// Configured HTTP server name for metrics/access-log labels.
@@ -956,6 +991,7 @@ fn admit_connection(
             limits: Arc::clone(&state.limits),
             trusted_proxies: Arc::clone(&state.trusted_proxies),
             tls: state.tls.clone(),
+            client_auth_verified: state.client_auth_verified,
             automatic: state.automatic.clone(),
             server_name: state.server_name.clone(),
             recorder: Arc::clone(&state.recorder),
@@ -970,6 +1006,7 @@ fn admit_connection(
             limits: Arc::new(ServerLimits::default()),
             trusted_proxies: Arc::new(ServerTrustedProxies::default()),
             tls: None,
+            client_auth_verified: false,
             automatic: None,
             server_name: String::new(),
             recorder: caddy_rs_admin::noop_recorder(),
@@ -1220,6 +1257,8 @@ async fn serve_accepted<I>(
             server_name: connection.server_name().unwrap_or("").to_string(),
             ech: false,
         };
+        let client_certificate =
+            client_certificate_for_request(connection, context.client_auth_verified);
         let service = connection_service(
             router,
             Arc::clone(&limits),
@@ -1241,6 +1280,7 @@ async fn serve_accepted<I>(
             Arc::clone(&tracked),
             false,
             context.alt_svc.clone(),
+            client_certificate,
         );
         serve_connection(tls_stream, service, shutdown, force, limits, activity).await;
     } else {
@@ -1265,6 +1305,7 @@ async fn serve_accepted<I>(
             Arc::clone(&tracked),
             context.h2c_upgrade,
             context.alt_svc.clone(),
+            None,
         );
         serve_connection(stream, service, shutdown, force, limits, activity).await;
     }
@@ -1281,6 +1322,8 @@ struct RequestContext {
     tls: bool,
     alpn: Option<String>,
     tls_info: Option<TlsLogInfo>,
+    /// Presented client certificate mapped to the HTTP placeholder representation.
+    client_certificate: Option<caddy_rs_http::ClientCertificate>,
     server_name: String,
     recorder: SharedRequestRecorder,
     access_log: Arc<AccessLogRuntime>,
@@ -1319,6 +1362,7 @@ fn connection_service(
     tracked: Arc<TrackedConnection>,
     h2c_upgrade: bool,
     alt_svc: Option<String>,
+    client_certificate: Option<caddy_rs_http::ClientCertificate>,
 ) -> impl hyper::service::Service<
     hyper::Request<Incoming>,
     Response = hyper::Response<Body>,
@@ -1335,6 +1379,7 @@ fn connection_service(
         tls,
         alpn,
         tls_info,
+        client_certificate,
         server_name,
         recorder,
         access_log,
@@ -1464,6 +1509,7 @@ async fn serve_one_request(
         context.automatic.clone(),
         on_upgrade,
         Arc::clone(&context.trusted_proxies),
+        context.client_certificate.clone(),
     )
     .await;
 

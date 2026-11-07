@@ -110,6 +110,42 @@ pub struct MatcherError {
     pub message: String,
 }
 
+/// Client-certificate metadata exposed through Caddy's `{http.request.tls.client.*}`
+/// placeholders (Caddy v2.11.9 `modules/caddyhttp/replacer.go` client-cert branch).
+///
+/// Populated by the server from the TLS handshake; `verified` records whether the listener's
+/// client-auth mode verified the chain (`require_and_verify`/`verify_if_given`) or merely
+/// required a certificate (`require`/`request`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientCertificate {
+    /// Subject distinguished name (Go `x509.Name.String()` style).
+    pub subject: String,
+    /// Issuer distinguished name.
+    pub issuer: String,
+    /// Serial number in decimal.
+    pub serial: String,
+    /// SHA-256 fingerprint of the DER certificate, lowercase hex.
+    pub fingerprint: String,
+    /// DER-encoded SubjectPublicKeyInfo.
+    pub public_key_der: Vec<u8>,
+    /// SHA-256 of `public_key_der`, lowercase hex.
+    pub public_key_sha256: String,
+    /// PEM-encoded leaf certificate.
+    pub certificate_pem: String,
+    /// Base64 DER leaf certificate.
+    pub certificate_der_base64: String,
+    /// SAN DNS names.
+    pub dns_names: Vec<String>,
+    /// SAN email addresses.
+    pub emails: Vec<String>,
+    /// SAN IP addresses.
+    pub ips: Vec<String>,
+    /// SAN URIs.
+    pub uris: Vec<String>,
+    /// Whether the client certificate chain was verified by the listener.
+    pub verified: bool,
+}
+
 /// An internal HTTP request, decoupled from hyper so handlers are testable without sockets.
 #[derive(Debug)]
 pub struct Request {
@@ -141,6 +177,9 @@ pub struct Request {
     pub remote_addr: Option<SocketAddr>,
     /// Whether the connection is TLS.
     pub tls: bool,
+    /// Presented client certificate, when the TLS listener requested one (Caddy's
+    /// `r.TLS.PeerCertificates[0]`). `None` when no certificate was presented or TLS is off.
+    pub client_certificate: Option<ClientCertificate>,
     /// The request's effective HTTP version, propagated by the server from the hyper connection.
     ///
     /// This is what the `protocol` matcher keys off (Caddy's `r.Proto`): HTTP/1.1 for plain
@@ -185,6 +224,7 @@ impl Request {
             matcher_error: None,
             remote_addr: None,
             tls: false,
+            client_certificate: None,
             version: Version::HTTP_11,
             vars: BTreeMap::new(),
             pending_response_headers: HeaderMap::new(),
@@ -469,6 +509,7 @@ impl Clone for Request {
             matcher_error: self.matcher_error.clone(),
             remote_addr: self.remote_addr,
             tls: self.tls,
+            client_certificate: self.client_certificate.clone(),
             version: self.version,
             vars: self.vars.clone(),
             pending_response_headers: self.pending_response_headers.clone(),
