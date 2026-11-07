@@ -24,9 +24,11 @@
 //! parsing (`Status:`), chunked CGI response decoding, streamed request bodies and a streamed
 //! response body.
 //!
-//! Divergences from Caddy are documented where they occur. `SERVER_PROTOCOL` now reflects the
-//! negotiated request version; the TLS connection details (`SSL_PROTOCOL`, `SSL_CIPHER`) are still
-//! not available through the internal `Request`, so those CGI variables are omitted.
+//! Divergences from Caddy are documented where they occur. `SERVER_PROTOCOL` reflects the
+//! negotiated request version, and `HTTPS`/`SSL_PROTOCOL`/`SSL_CIPHER` come from the TLS session
+//! metadata threaded through `Request` (`SSL_CIPHER` is omitted when the cipher suite is not known,
+//! matching Caddy's lookup loop; HTTP/3 currently exposes the version without a cipher because
+//! quinn does not expose the negotiated suite).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -527,6 +529,18 @@ impl FastCgiTransport {
         }
         if request.tls {
             env.insert("HTTPS".to_string(), "on".to_string());
+            // Caddy's `buildEnv` TLS branch (fastcgi.go): SSL_PROTOCOL from the Go
+            // `tls.Version*` mapping and SSL_CIPHER from the `tls.CipherSuites()` name (both
+            // Apache mod_ssl-compatible). The server threads these through `Request`.
+            if let Some(tls) = &request.tls_connection {
+                env.insert(
+                    "SSL_PROTOCOL".to_string(),
+                    tls.version.caddy_name().to_string(),
+                );
+                if let Some(cipher_suite) = &tls.cipher_suite {
+                    env.insert("SSL_CIPHER".to_string(), cipher_suite.clone());
+                }
+            }
         }
         // Caddy's `SERVER_ADDR` comes from the connection's local address; the server exposes it
         // as request variables until the placeholder set covers local addresses.
@@ -2155,6 +2169,64 @@ mod tests {
             !response.headers.contains_key(http::header::CONTENT_LENGTH),
             "chunked responses must not keep the CGI Content-Length"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fastcgi_tls_session_sets_ssl_protocol_and_cipher() {
+        let (dial, captured) = spawn_tcp_mock(Behavior::responds(0)).await;
+        let handler = build_handler(&dial, transport_json(serde_json::json!({})));
+        for (version, cipher, expected_protocol, expected_cipher) in [
+            (
+                caddy_rs_http::TlsVersion::Tls12,
+                "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+                "TLSv1.2",
+                Some("TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"),
+            ),
+            (
+                caddy_rs_http::TlsVersion::Tls13,
+                "TLS_AES_256_GCM_SHA384",
+                "TLSv1.3",
+                Some("TLS_AES_256_GCM_SHA384"),
+            ),
+        ] {
+            let mut request = request(Method::GET, "/tls");
+            request.tls = true;
+            request.tls_connection = Some(caddy_rs_http::TlsConnection {
+                version,
+                cipher_suite: Some(cipher.to_string()),
+            });
+            assert_eq!(respond(&handler, request).status, StatusCode::OK);
+            let captured = captured.lock().unwrap();
+            let params = &captured.as_ref().expect("mock captured the request").params;
+            assert_eq!(params.get("HTTPS").map(String::as_str), Some("on"));
+            assert_eq!(
+                params.get("SSL_PROTOCOL").map(String::as_str),
+                Some(expected_protocol)
+            );
+            assert_eq!(
+                params.get("SSL_CIPHER").map(String::as_str),
+                expected_cipher
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fastcgi_plain_http_omits_tls_cgi_variables() {
+        let (dial, captured) = spawn_tcp_mock(Behavior::responds(0)).await;
+        let handler = build_handler(&dial, transport_json(serde_json::json!({})));
+        assert_eq!(
+            respond(&handler, request(Method::GET, "/plain")).status,
+            StatusCode::OK
+        );
+        let captured = captured.lock().unwrap();
+        let params = &captured.as_ref().expect("mock captured the request").params;
+        for key in ["HTTPS", "SSL_PROTOCOL", "SSL_CIPHER"] {
+            assert_eq!(
+                params.get(key),
+                None,
+                "plain HTTP must not set {key}: {params:?}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

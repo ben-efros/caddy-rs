@@ -146,6 +146,106 @@ pub struct ClientCertificate {
     pub verified: bool,
 }
 
+/// TLS protocol version for a terminated connection.
+///
+/// This mirrors Go's `tls.VersionTLS*` constants (and Caddy's `r.TLS.Version`) in a TLS-neutral
+/// way so the HTTP crate does not depend on a TLS implementation. The server maps rustls's
+/// negotiated protocol version to this value; requests built without a transport leave it absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsVersion {
+    /// TLS 1.0 (`tls.VersionTLS10`).
+    Tls10,
+    /// TLS 1.1 (`tls.VersionTLS11`).
+    Tls11,
+    /// TLS 1.2 (`tls.VersionTLS12`).
+    Tls12,
+    /// TLS 1.3 (`tls.VersionTLS13`).
+    Tls13,
+}
+
+impl TlsVersion {
+    /// Map an IANA/Go `tls.Version*` numeric value to a version.
+    pub fn from_iana(value: u16) -> Option<Self> {
+        match value {
+            0x0301 => Some(Self::Tls10),
+            0x0302 => Some(Self::Tls11),
+            0x0303 => Some(Self::Tls12),
+            0x0304 => Some(Self::Tls13),
+            _ => None,
+        }
+    }
+
+    /// Caddy's `tlsProtocolStrings` value (used by FastCGI `SSL_PROTOCOL`).
+    pub fn caddy_name(self) -> &'static str {
+        match self {
+            Self::Tls10 => "TLSv1",
+            Self::Tls11 => "TLSv1.1",
+            Self::Tls12 => "TLSv1.2",
+            Self::Tls13 => "TLSv1.3",
+        }
+    }
+
+    /// Numeric IANA/Go value (`tls.VersionTLS*`).
+    pub fn iana_id(self) -> u16 {
+        match self {
+            Self::Tls10 => 0x0301,
+            Self::Tls11 => 0x0302,
+            Self::Tls12 => 0x0303,
+            Self::Tls13 => 0x0304,
+        }
+    }
+}
+
+/// Map an IANA cipher-suite id to Go's `tls.CipherSuite.Name`.
+///
+/// Caddy's FastCGI environment uses `caddytls.SupportedCipherSuites()` (`tls.CipherSuites()`)
+/// names, which are Go's IANA names. Only suites usable by this build's rustls `ring` provider are
+/// mapped; `None` means the id is unknown (the FastCGI `SSL_CIPHER` variable is then omitted, like
+/// Caddy's lookup loop does).
+pub fn cipher_suite_name(id: u16) -> Option<&'static str> {
+    match id {
+        0xC02B => Some("TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256"),
+        0xC02C => Some("TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384"),
+        0xC02F => Some("TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"),
+        0xC030 => Some("TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"),
+        0xCCA8 => Some("TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256"),
+        0xCCA9 => Some("TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256"),
+        0x1301 => Some("TLS_AES_128_GCM_SHA256"),
+        0x1302 => Some("TLS_AES_256_GCM_SHA384"),
+        0x1303 => Some("TLS_CHACHA20_POLY1305_SHA256"),
+        _ => None,
+    }
+}
+
+/// Negotiated TLS session metadata for a request (Caddy's `r.TLS` protocol/cipher fields).
+///
+/// The server populates this from the TLS listener's handshake; non-TLS requests leave
+/// [`Request::tls_connection`] absent. The cipher-suite name matches Go/IANA naming when known
+/// (see [`cipher_suite_name`]); HTTP/3 currently carries the version without a cipher because
+/// quinn does not expose the negotiated suite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsConnection {
+    /// Negotiated protocol version.
+    pub version: TlsVersion,
+    /// Negotiated cipher suite name in Go/IANA form, when known.
+    pub cipher_suite: Option<String>,
+}
+
+impl TlsConnection {
+    /// Build from IANA/Go numeric values (`0` means "not exposed", e.g. the HTTP/3 cipher id).
+    pub fn from_iana(version: u16, cipher_suite: u16) -> Option<Self> {
+        let version = TlsVersion::from_iana(version)?;
+        let cipher_suite = (cipher_suite != 0)
+            .then(|| cipher_suite_name(cipher_suite))
+            .flatten()
+            .map(str::to_string);
+        Some(Self {
+            version,
+            cipher_suite,
+        })
+    }
+}
+
 /// An internal HTTP request, decoupled from hyper so handlers are testable without sockets.
 #[derive(Debug)]
 pub struct Request {
@@ -177,6 +277,8 @@ pub struct Request {
     pub remote_addr: Option<SocketAddr>,
     /// Whether the connection is TLS.
     pub tls: bool,
+    /// Negotiated TLS protocol version and cipher suite, when the connection terminated TLS.
+    pub tls_connection: Option<TlsConnection>,
     /// Presented client certificate, when the TLS listener requested one (Caddy's
     /// `r.TLS.PeerCertificates[0]`). `None` when no certificate was presented or TLS is off.
     pub client_certificate: Option<ClientCertificate>,
@@ -224,6 +326,7 @@ impl Request {
             matcher_error: None,
             remote_addr: None,
             tls: false,
+            tls_connection: None,
             client_certificate: None,
             version: Version::HTTP_11,
             vars: BTreeMap::new(),
@@ -509,6 +612,7 @@ impl Clone for Request {
             matcher_error: self.matcher_error.clone(),
             remote_addr: self.remote_addr,
             tls: self.tls,
+            tls_connection: self.tls_connection.clone(),
             client_certificate: self.client_certificate.clone(),
             version: self.version,
             vars: self.vars.clone(),

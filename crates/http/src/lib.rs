@@ -33,8 +33,9 @@ pub use rate_limit::{ManualClock, RateLimitClock, RateLimitHandler, SystemClock}
 pub use router::{CustomHandlerFactory, Route, Router, RouterBuilder};
 pub use templates::TemplatesHandler;
 pub use types::{
-    ClientCertificate, Error, Handler, Matcher, MatcherError, Outcome, Request, Response,
-    ResponseOutcome, Result, SharedHandler, SharedMatcher, StreamingOutcome,
+    cipher_suite_name, ClientCertificate, Error, Handler, Matcher, MatcherError, Outcome, Request,
+    Response, ResponseOutcome, Result, SharedHandler, SharedMatcher, StreamingOutcome,
+    TlsConnection, TlsVersion,
 };
 pub use upgrade::{
     h2c_upgrade_headers, h2c_upgrade_settings, is_h2c_upgrade, requested_upgrade_type,

@@ -152,6 +152,7 @@ pub(crate) async fn serve_request_with_automatic(
         None,
         Arc::new(ServerTrustedProxies::default()),
         None,
+        None,
     )
     .await
     {
@@ -186,6 +187,7 @@ pub(crate) async fn serve_internal_buffered(
     tls_alpn: Option<&str>,
     trusted_proxies: Arc<ServerTrustedProxies>,
     client_certificate: Option<HttpClientCertificate>,
+    tls_connection: Option<caddy_rs_http::TlsConnection>,
 ) -> ServedResponse {
     let limit = limits.max_request_body_size;
     let path = parts.uri.path().to_string();
@@ -217,6 +219,7 @@ pub(crate) async fn serve_internal_buffered(
     internal.headers = parts.headers;
     internal.remote_addr = remote_addr;
     internal.tls = tls;
+    internal.tls_connection = tls_connection;
     internal.client_certificate = client_certificate;
     internal.body = body;
     if let Some(local) = local_addr {
@@ -285,6 +288,7 @@ pub(crate) async fn serve_request_with_automatic_upgradable(
     on_upgrade: Option<OnUpgrade>,
     trusted_proxies: Arc<ServerTrustedProxies>,
     client_certificate: Option<HttpClientCertificate>,
+    tls_connection: Option<caddy_rs_http::TlsConnection>,
 ) -> ServedResponse {
     if !tls {
         if let Some(automatic) = &automatic {
@@ -398,6 +402,7 @@ pub(crate) async fn serve_request_with_automatic_upgradable(
     internal.headers = parts.headers;
     internal.remote_addr = remote_addr;
     internal.tls = tls;
+    internal.tls_connection = tls_connection;
     internal.client_certificate = client_certificate;
     if let Some(local) = local_addr {
         // Caddy exposes `{http.request.local.*}`; the placeholder subset in `caddy-rs-http` does
