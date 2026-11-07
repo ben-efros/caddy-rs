@@ -15,6 +15,10 @@
 //!   in Caddy.
 //! * `client_certificate_file` / `client_certificate_key_file` configure a client certificate for
 //!   mutual TLS to the upstream (PEM certificate chain + PKCS#8/SEC1/PKCS#1 private key).
+//! * `client_certificate` is a caddy-rs extension for inline PEM client certificates
+//!   (`{"certificate": "-----BEGIN CERTIFICATE...", "key": "-----BEGIN PRIVATE KEY..."}`).
+//!   Caddy v2.11.9 has no such HTTP-transport field (it ignores unknown JSON fields), so this
+//!   extension is documented in DIV-0010/DIV-0086 and is mutually exclusive with the file fields.
 //! * `except_ports` lists upstream ports that must be dialed without TLS even when `tls` is
 //!   configured (Caddy skips TLS for those ports).
 //! * `insecure_skip_verify` disables verification only when explicitly set to `true`.
@@ -94,8 +98,30 @@ impl UpstreamTls {
             .ok_or_else(|| invalid(path, "`transport.tls` must be an object"))?;
 
         validate_unsupported_options(object, path)?;
+        validate_known_options(object, path)?;
         let except_ports = parse_except_ports(object, &format!("{path}.except_ports"))?;
-        let client_auth = parse_client_auth(object, path)?;
+        let inline_client = object
+            .get("client_certificate")
+            .filter(|value| !matches!(value, Value::Null));
+        let file_client = object
+            .get("client_certificate_file")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+            || object
+                .get("client_certificate_key_file")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty());
+        if inline_client.is_some() && file_client {
+            return Err(invalid(
+                path,
+                "`client_certificate` cannot be combined with `client_certificate_file` / \
+                 `client_certificate_key_file`",
+            ));
+        }
+        let client_auth = match inline_client {
+            Some(value) => Some(parse_inline_client_certificate(value, path)?),
+            None => parse_client_auth(object, path)?,
+        };
 
         let insecure_skip_verify = object
             .get("insecure_skip_verify")
@@ -281,6 +307,38 @@ impl UpstreamTls {
     }
 }
 
+/// Every field Caddy v2.11.9's `HTTPTransport.TLSConfig` accepts, plus the caddy-rs inline
+/// `client_certificate` extension. Caddy decodes module configuration strictly, so an unknown
+/// field is a configuration error rather than being silently ignored.
+const KNOWN_TLS_OPTIONS: &[&str] = &[
+    "ca",
+    "root_ca_pool",
+    "root_ca_pem_files",
+    "client_certificate_file",
+    "client_certificate_key_file",
+    "client_certificate_automate",
+    "client_certificate", // caddy-rs extension (DIV-0010/DIV-0086)
+    "insecure_skip_verify",
+    "handshake_timeout",
+    "server_name",
+    "renegotiation",
+    "except_ports",
+    "curves",
+];
+
+/// Reject unknown `transport.tls` fields like Caddy's strict module decoding does.
+fn validate_known_options(object: &serde_json::Map<String, Value>, path: &str) -> HttpResult<()> {
+    for field in object.keys() {
+        if !KNOWN_TLS_OPTIONS.contains(&field.as_str()) {
+            return Err(invalid(
+                &format!("{path}.{field}"),
+                format!("unknown TLS transport option `{field}`"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Options that are genuinely unsupported fail loudly; everything else is parsed by the caller.
 fn validate_unsupported_options(
     object: &serde_json::Map<String, Value>,
@@ -393,24 +451,7 @@ fn parse_client_auth(
                     ),
                 )
             })?;
-            let certificates = parse_pem_certificates(&bytes).map_err(|error| {
-                invalid(
-                    path,
-                    format!(
-                        "cannot parse TLS client certificate `{}`: {error}",
-                        certificate_path.display()
-                    ),
-                )
-            })?;
-            if certificates.is_empty() {
-                return Err(invalid(
-                    path,
-                    format!(
-                        "TLS client certificate `{}` contains no CERTIFICATE blocks",
-                        certificate_path.display()
-                    ),
-                ));
-            }
+            let certificates = parse_client_certificates(&bytes, path, "certificate")?;
             let key_path = PathBuf::from(key_file);
             let key_bytes = fs::read(&key_path).map_err(|error| {
                 invalid(
@@ -421,18 +462,71 @@ fn parse_client_auth(
                     ),
                 )
             })?;
-            let key = parse_pem_private_key(&key_bytes).map_err(|error| {
-                invalid(
-                    path,
-                    format!(
-                        "cannot parse TLS client certificate key `{}`: {error}",
-                        key_path.display()
-                    ),
-                )
-            })?;
+            let key = parse_client_key(&key_bytes, path, "key")?;
             Ok(Some((certificates, key)))
         }
     }
+}
+
+/// Parse an inline `client_certificate` extension (`{"certificate": PEM, "key": PEM}`).
+fn parse_inline_client_certificate(
+    value: &Value,
+    path: &str,
+) -> HttpResult<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    let object = value.as_object().ok_or_else(|| {
+        invalid(
+            &format!("{path}.client_certificate"),
+            "`client_certificate` must be an object with `certificate` and `key` PEM strings",
+        )
+    })?;
+    let certificate = object
+        .get("certificate")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            invalid(
+                &format!("{path}.client_certificate.certificate"),
+                "`client_certificate.certificate` must be a non-empty PEM string",
+            )
+        })?;
+    let key = object
+        .get("key")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            invalid(
+                &format!("{path}.client_certificate.key"),
+                "`client_certificate.key` must be a non-empty PEM string",
+            )
+        })?;
+    let certificates = parse_client_certificates(
+        certificate.as_bytes(),
+        &format!("{path}.client_certificate"),
+        "certificate",
+    )?;
+    let key = parse_client_key(key.as_bytes(), &format!("{path}.client_certificate"), "key")?;
+    Ok((certificates, key))
+}
+
+fn parse_client_certificates(
+    pem: &[u8],
+    path: &str,
+    field: &str,
+) -> HttpResult<Vec<CertificateDer<'static>>> {
+    let certificates = parse_pem_certificates(pem)
+        .map_err(|error| invalid(path, format!("cannot parse TLS client {field}: {error}")))?;
+    if certificates.is_empty() {
+        return Err(invalid(
+            path,
+            format!("TLS client {field} contains no CERTIFICATE blocks"),
+        ));
+    }
+    Ok(certificates)
+}
+
+fn parse_client_key(pem: &[u8], path: &str, field: &str) -> HttpResult<PrivateKeyDer<'static>> {
+    parse_pem_private_key(pem)
+        .map_err(|error| invalid(path, format!("cannot parse TLS client {field}: {error}")))
 }
 
 /// Parse a Caddy `ca` module (`namespace=tls.ca_pool.source`, `inline_key=provider`).
@@ -905,6 +999,7 @@ mod tests {
     use super::*;
 
     const LOCALHOST_CERT: &str = include_str!("../testdata/tls/localhost-cert.pem");
+    const LOCALHOST_KEY: &str = include_str!("../testdata/tls/localhost-key.pem");
     const UNRELATED_CERT: &str = include_str!("../testdata/tls/unrelated-cert.pem");
     const CLIENT_CERT: &str = include_str!("../testdata/tls/client-cert.pem");
     const CLIENT_KEY: &str = include_str!("../testdata/tls/client-key.pem");
@@ -914,6 +1009,150 @@ mod tests {
         let path = directory.path().join(name);
         fs::write(&path, contents).unwrap();
         path
+    }
+
+    #[test]
+    fn inline_client_certificate_extension_parses() {
+        UpstreamTls::from_json(
+            &serde_json::json!({
+                "client_certificate": {
+                    "certificate": CLIENT_CERT,
+                    "key": CLIENT_KEY
+                }
+            }),
+            "transport.tls",
+        )
+        .expect("inline client certificate is accepted");
+
+        // Mutually exclusive with the file fields and validated field by field.
+        let error = UpstreamTls::from_json(
+            &serde_json::json!({
+                "client_certificate": {"certificate": CLIENT_CERT, "key": CLIENT_KEY},
+                "client_certificate_file": "/tmp/client.pem",
+                "client_certificate_key_file": "/tmp/client-key.pem"
+            }),
+            "transport.tls",
+        )
+        .expect_err("inline and file client certificates conflict");
+        assert!(error.to_string().contains("cannot be combined"), "{error}");
+
+        let error = UpstreamTls::from_json(
+            &serde_json::json!({"client_certificate": {"certificate": CLIENT_CERT}}),
+            "transport.tls",
+        )
+        .expect_err("missing inline key fails");
+        assert!(
+            error.to_string().contains("client_certificate.key"),
+            "located at the missing key: {error}"
+        );
+
+        let error = UpstreamTls::from_json(
+            &serde_json::json!({
+                "client_certificate": {"certificate": "not pem", "key": CLIENT_KEY}
+            }),
+            "transport.tls",
+        )
+        .expect_err("bad inline certificate fails");
+        assert!(
+            error.to_string().contains("TLS client certificate"),
+            "{error}"
+        );
+
+        let error = UpstreamTls::from_json(
+            &serde_json::json!({
+                "client_certificate": {"certificate": CLIENT_CERT, "key": "not pem"}
+            }),
+            "transport.tls",
+        )
+        .expect_err("bad inline key fails");
+        assert!(
+            error.to_string().contains("cannot parse TLS client key"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn client_certificate_file_errors_are_located_and_validated_at_load() {
+        let directory = tempfile::tempdir().unwrap();
+        let certificate = write_pem(&directory, "client.pem", CLIENT_CERT);
+        let key = write_pem(&directory, "client-key.pem", CLIENT_KEY);
+
+        let missing = directory.path().join("missing.pem");
+        let error = UpstreamTls::from_json(
+            &serde_json::json!({
+                "client_certificate_file": missing.display().to_string(),
+                "client_certificate_key_file": key.display().to_string()
+            }),
+            "transport.tls",
+        )
+        .expect_err("missing client certificate file fails");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot read TLS client certificate"),
+            "{error}"
+        );
+
+        let bad_pem = write_pem(&directory, "bad.pem", "not a certificate");
+        let error = UpstreamTls::from_json(
+            &serde_json::json!({
+                "client_certificate_file": bad_pem.display().to_string(),
+                "client_certificate_key_file": key.display().to_string()
+            }),
+            "transport.tls",
+        )
+        .expect_err("bad certificate PEM fails");
+        assert!(
+            error.to_string().contains("TLS client certificate"),
+            "{error}"
+        );
+
+        // Encrypted PKCS#8 keys are not supported by Go's `tls.LoadX509KeyPair` either; caddy-rs
+        // fails loudly at configuration load.
+        let encrypted = write_pem(
+            &directory,
+            "encrypted-key.pem",
+            "-----BEGIN ENCRYPTED PRIVATE KEY-----\nAAAA\n-----END ENCRYPTED PRIVATE KEY-----",
+        );
+        let error = UpstreamTls::from_json(
+            &serde_json::json!({
+                "client_certificate_file": certificate.display().to_string(),
+                "client_certificate_key_file": encrypted.display().to_string()
+            }),
+            "transport.tls",
+        )
+        .expect_err("encrypted client key fails");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported private key PEM label"),
+            "{error}"
+        );
+
+        // rustls validates that the client key matches the certificate at configuration load.
+        let server_key = write_pem(&directory, "server-key.pem", LOCALHOST_KEY);
+        let error = UpstreamTls::from_json(
+            &serde_json::json!({
+                "client_certificate_file": certificate.display().to_string(),
+                "client_certificate_key_file": server_key.display().to_string()
+            }),
+            "transport.tls",
+        )
+        .expect_err("mismatched client certificate/key fails");
+        assert!(
+            error.to_string().contains("loading TLS client certificate"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn invalid_root_ca_pool_entries_are_located_errors() {
+        let error = UpstreamTls::from_json(
+            &serde_json::json!({"root_ca_pool": ["not base64!!"]}),
+            "transport.tls",
+        )
+        .expect_err("invalid base64 DER pool entry fails");
+        assert!(error.to_string().contains("root_ca_pool"), "{error}");
     }
 
     #[test]
@@ -1060,6 +1299,20 @@ mod tests {
         assert!(
             message.contains("/nonexistent/ca-certificates.crt"),
             "error must name what was tried: {message}"
+        );
+    }
+
+    #[test]
+    fn unknown_tls_options_are_rejected_like_caddys_strict_decoding() {
+        let error = UpstreamTls::from_json(
+            &serde_json::json!({"tls_timeout": 1_000_000_000u64}),
+            "transport.tls",
+        )
+        .expect_err("unknown TLS option is rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("transport.tls.tls_timeout") && message.contains("unknown TLS"),
+            "located error naming the field: {message}"
         );
     }
 
@@ -1241,6 +1494,20 @@ mod tests {
             error.to_string().contains("cannot include `system`"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn ca_module_system_provider_uses_platform_roots() {
+        // Caddy `tls.ca_pool.source.system`: same platform trust store as the default policy.
+        // Either a platform bundle loads or the loud missing-roots error fires; silently trusting
+        // nothing is not acceptable.
+        match UpstreamTls::from_json(
+            &serde_json::json!({"ca": {"provider": "system"}}),
+            "transport.tls",
+        ) {
+            Ok(tls) => assert!(!tls.insecure_skip_verify()),
+            Err(error) => assert!(error.to_string().contains("no TLS trust roots"), "{error}"),
+        }
     }
 
     #[test]
