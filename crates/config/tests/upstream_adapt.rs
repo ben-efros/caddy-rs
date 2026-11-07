@@ -448,31 +448,6 @@ fn named_matchers_defined_inside_route_match_caddy() {
 }
 
 #[test]
-fn dynamic_upstreams_fail_with_a_construct_specific_error() {
-    for name in [
-        "reverse_proxy_dynamic_upstreams.caddyfiletest",
-        "reverse_proxy_dynamic_upstreams_grace_period.caddyfiletest",
-    ] {
-        let path = format!(
-            "{}/tests/fixtures/unsupported/{name}",
-            env!("CARGO_MANIFEST_DIR")
-        );
-        let raw =
-            std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {path}: {error}"));
-        let (caddyfile, _) = raw
-            .split_once("----------")
-            .unwrap_or_else(|| panic!("fixture {name} has no `----------` separator"));
-        let error = adapt(&caddyfile).expect_err("dynamic upstreams must be rejected");
-        let message = error.to_string();
-        assert!(
-            message.contains("dynamic upstreams are not supported")
-                && message.contains("T-PROXY-036"),
-            "unexpected error for {name}: {message}"
-        );
-    }
-}
-
-#[test]
 fn global_ports_are_emitted_into_apps_http_like_caddy() {
     // The expected values below were confirmed against `caddy adapt` v2.11.7 (release oracle):
     // caddyhttp.App carries http_port/https_port only when the global options set them.

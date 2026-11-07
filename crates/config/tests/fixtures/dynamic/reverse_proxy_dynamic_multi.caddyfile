@@ -1,0 +1,13 @@
+:8080 {
+	reverse_proxy {
+		dynamic multi {
+			a backend.example 8080
+			srv {
+				service api
+				proto tcp
+				name example.com
+				refresh 5m
+			}
+		}
+	}
+}

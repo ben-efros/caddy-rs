@@ -1,0 +1,9 @@
+:8884 {
+	reverse_proxy {
+		dynamic srv {
+			name foo
+			refresh 5m
+			grace_period 5s
+		}
+	}
+}
