@@ -23,12 +23,12 @@ fn version_reports_implementation_and_caddy_baseline() {
     let (code, stdout, _stderr) = run(&["version"]);
     assert_eq!(code, 0);
     assert!(stdout.contains("caddy-rs 0.1.0"), "{stdout}");
-    assert!(stdout.contains("v2.11.7"), "{stdout}");
+    assert!(stdout.contains("v2.11.9"), "{stdout}");
 
     let (code, stdout, _stderr) = run(&["version", "--json"]);
     assert_eq!(code, 0);
     let value: serde_json::Value = serde_json::from_str(&stdout).expect("json");
-    assert_eq!(value["caddy_compat_baseline"], "v2.11.7");
+    assert_eq!(value["caddy_compat_baseline"], "v2.11.9");
 }
 
 #[test]
