@@ -1,0 +1,21 @@
+[package]
+name = "caddy-rs-module-template"
+description = "Starter template for an out-of-process caddy-rs module"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+publish = false
+
+# Independent workspace: this template is not part of the caddy-rs workspace, so copying it
+# (or depending on a published caddy-rs-plug) does not touch the main build graph.
+[workspace]
+
+[dependencies]
+# For a real module, change this to the published version once the crate is released:
+# caddy-rs-plug = "0.1"
+caddy-rs-plug = { path = ".." }
+
+[[bin]]
+name = "module-template"
+path = "src/main.rs"
