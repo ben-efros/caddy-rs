@@ -17,6 +17,7 @@ pub mod placeholders;
 pub mod rate_limit;
 pub mod regex_lite;
 pub mod router;
+pub mod templates;
 pub mod types;
 pub mod upgrade;
 
@@ -30,6 +31,7 @@ pub use handlers::{
 pub use placeholders::{Replacer, UnknownPlaceholders};
 pub use rate_limit::{ManualClock, RateLimitClock, RateLimitHandler, SystemClock};
 pub use router::{CustomHandlerFactory, Route, Router, RouterBuilder};
+pub use templates::TemplatesHandler;
 pub use types::{
     Error, Handler, Matcher, MatcherError, Outcome, Request, Response, ResponseOutcome, Result,
     SharedHandler, SharedMatcher, StreamingOutcome,
