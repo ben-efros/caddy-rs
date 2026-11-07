@@ -547,7 +547,13 @@ impl FastCgiTransport {
     }
 
     async fn dial(&self, upstream: &Upstream) -> Result<FastCgiStream, FastCgiError> {
-        match upstream.transport() {
+        let Some(transport) = upstream.transport() else {
+            return Err(FastCgiError::Request(
+                "FastCGI upstreams require a fixed dial address; placeholder dials are rejected at configuration time"
+                    .to_string(),
+            ));
+        };
+        match transport {
             Transport::Tcp { address } => {
                 let connect = tokio::net::TcpStream::connect(address);
                 match tokio::time::timeout(self.dial_timeout, connect).await {

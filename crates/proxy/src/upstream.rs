@@ -30,7 +30,8 @@ pub struct Upstream {
     pub dial: String,
     /// Whether this upstream TLS is required.
     pub tls: bool,
-    transport: Transport,
+    /// Fixed dial transport; `None` for a placeholder (dynamic) dial expanded per request.
+    transport: Option<Transport>,
     healthy: AtomicBool,
     active_connections: AtomicUsize,
     /// Caddy `upstreams[].max_requests`: maximum simultaneous requests (`None` = unlimited).
@@ -46,9 +47,9 @@ impl Upstream {
     pub fn new(dial: impl Into<String>, tls: bool) -> Self {
         let dial = dial.into();
         Self {
-            transport: Transport::Tcp {
+            transport: Some(Transport::Tcp {
                 address: dial.clone(),
-            },
+            }),
             dial,
             tls,
             healthy: AtomicBool::new(true),
@@ -65,17 +66,36 @@ impl Upstream {
     ///
     /// * `host:port` — plain TCP.
     /// * `unix//absolute/path.sock` and `unix/relative/path.sock` — Unix domain socket.
+    /// * A dial containing Caddy placeholders (for example `{http.request.host}:8080`) is a
+    ///   dynamic upstream: the template is expanded per request with Caddy's `ReplaceAll`
+    ///   semantics and the result is validated before dialing (see the handler).
     ///
-    /// Schemes, placeholders and malformed addresses are rejected by name so that unsupported
+    /// Schemes and malformed static addresses are rejected by name so that unsupported
     /// configuration never silently degrades into a wrong dial.
     pub fn parse_dial(dial: &str, tls: bool) -> Result<Self, String> {
         if dial.is_empty() {
             return Err("upstream dial address is empty".to_string());
         }
         if dial.contains('{') {
-            return Err(format!(
-                "upstream `{dial}` uses placeholders, which are not implemented (HTTP-PLACEHOLDERS)"
-            ));
+            // Dynamic upstream: the placeholder is expanded per request (Caddy
+            // `fillDialInfo`/`ReplaceAll`); the expanded address is parsed and validated before
+            // dialing. Caddy does not allow placeholders together with a scheme (the scheme is a
+            // Caddyfile shorthand resolved before JSON), so keep rejecting that form.
+            if let Some((scheme, _)) = dial.split_once("://") {
+                return Err(format!(
+                    "upstream dial `{dial}` must not combine a scheme (`{scheme}://`) with placeholders; use a concrete host:port without a scheme"
+                ));
+            }
+            return Ok(Self {
+                dial: dial.to_string(),
+                tls,
+                transport: None,
+                healthy: AtomicBool::new(true),
+                active_connections: AtomicUsize::new(0),
+                max_requests: None,
+                num_requests: AtomicU64::new(0),
+                fails: AtomicU64::new(0),
+            });
         }
         if dial == "unix" || dial.starts_with("unix/") {
             let path = dial.strip_prefix("unix/").unwrap_or_default();
@@ -89,9 +109,9 @@ impl Upstream {
                 return Ok(Self {
                     dial: dial.to_string(),
                     tls,
-                    transport: Transport::Unix {
+                    transport: Some(Transport::Unix {
                         path: PathBuf::from(path),
-                    },
+                    }),
                     healthy: AtomicBool::new(true),
                     active_connections: AtomicUsize::new(0),
                     max_requests: None,
@@ -125,9 +145,14 @@ impl Upstream {
         Ok(Self::new(dial, tls))
     }
 
-    /// How this upstream is reached.
-    pub fn transport(&self) -> &Transport {
-        &self.transport
+    /// How this upstream is reached, if it is a fixed (non-placeholder) dial.
+    pub fn transport(&self) -> Option<&Transport> {
+        self.transport.as_ref()
+    }
+
+    /// Whether this upstream's dial contains placeholders and is expanded per request.
+    pub fn is_dynamic(&self) -> bool {
+        self.transport.is_none()
     }
 
     /// Build the absolute URI hyper uses for a request to this upstream.
@@ -142,7 +167,11 @@ impl Upstream {
     /// The socket path is hex-encoded because a URI authority cannot contain `/`;
     /// [`crate::client::UpstreamConnector`] decodes it again before dialing.
     pub fn url(&self, path_and_query: &str) -> String {
-        match (&self.transport, self.tls) {
+        let transport = self
+            .transport
+            .as_ref()
+            .expect("dynamic upstream URL requested before placeholder expansion");
+        match (transport, self.tls) {
             (Transport::Tcp { address }, false) => format!("http://{address}{path_and_query}"),
             (Transport::Tcp { address }, true) => format!("https://{address}{path_and_query}"),
             #[cfg(unix)]
@@ -159,7 +188,11 @@ impl Upstream {
     /// Host header used when a request does not carry one (health checks use `localhost` for Unix
     /// sockets, matching Caddy).
     pub fn fallback_host(&self) -> &str {
-        match &self.transport {
+        let transport = self
+            .transport
+            .as_ref()
+            .expect("dynamic upstream host requested before placeholder expansion");
+        match transport {
             Transport::Tcp { address } => address,
             #[cfg(unix)]
             Transport::Unix { .. } => "localhost",
@@ -329,9 +362,14 @@ mod tests {
     }
 
     #[test]
-    fn reports_placeholders_as_not_implemented() {
-        let error = Upstream::parse_dial("{env.UPSTREAM}", false).unwrap_err();
-        assert!(error.contains("placeholders"), "{error}");
+    fn accepts_placeholder_dials_as_dynamic_upstreams() {
+        let dynamic = Upstream::parse_dial("{env.UPSTREAM}:8080", false).unwrap();
+        assert!(dynamic.is_dynamic());
+        assert_eq!(dynamic.dial, "{env.UPSTREAM}:8080");
+        // Schemes combined with placeholders are still rejected at configuration time, matching
+        // Caddy's Caddyfile parser (`parseUpstreamDialAddress`).
+        let error = Upstream::parse_dial("http://{env.UPSTREAM}", false).unwrap_err();
+        assert!(error.contains("scheme"), "{error}");
     }
 
     #[cfg(unix)]
@@ -341,15 +379,15 @@ mod tests {
         let relative = Upstream::parse_dial("unix/run/app.sock", false).unwrap();
         assert_eq!(
             canonical.transport(),
-            &Transport::Unix {
+            Some(&Transport::Unix {
                 path: PathBuf::from("/run/app.sock")
-            }
+            })
         );
         assert_eq!(
             relative.transport(),
-            &Transport::Unix {
+            Some(&Transport::Unix {
                 path: PathBuf::from("run/app.sock")
-            }
+            })
         );
         assert_eq!(canonical.fallback_host(), "localhost");
         let url = canonical.url("/health");

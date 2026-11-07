@@ -26,6 +26,7 @@
 //! HTTP/2 `:authority` matches Caddy/Go) while a per-upstream client connector still dials the
 //! configured upstream target; no separate `Host` field is forwarded on h2.
 
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -46,7 +47,7 @@ use caddy_rs_http::{
 };
 
 use crate::balancer::{self, Balancer};
-use crate::client::{build_upstream_client, UpstreamClient};
+use crate::client::{build_upstream_client, build_upstream_client_for, UpstreamClient};
 use crate::fastcgi::{FastCgiError, FastCgiTransport};
 use crate::forward_auth::{HandleResponse, HandleResponseResult, RequestRewrite};
 use crate::health::{HealthCheck, HealthCheckScheduler};
@@ -315,16 +316,26 @@ impl UpstreamStatusSink {
     }
 }
 
+/// Per-expanded-address clients for one dynamic upstream.
+struct DynamicClients {
+    main: UpstreamClient,
+    upgrade: Option<UpstreamClient>,
+}
+
 /// Reverse proxy handler configuration and runtime.
 pub struct ReverseProxyHandler {
-    /// One client per upstream. Each connector dials its bound upstream target, so the request URI
-    /// authority can carry the client's Host (HTTP/2 `:authority` parity) without affecting which
-    /// target is dialed.
-    clients: Vec<UpstreamClient>,
+    /// One client per fixed upstream (`None` for a dynamic/placeholder dial, whose clients are
+    /// built lazily per expanded address). Each connector dials its bound upstream target, so the
+    /// request URI authority can carry the client's Host (HTTP/2 `:authority` parity) without
+    /// affecting which target is dialed.
+    clients: Vec<Option<UpstreamClient>>,
     /// HTTP/1.1-only companion clients used for protocol-upgrade (WebSocket) requests when the
     /// configured upstream transport prefers HTTP/2 (ALPN h2 or h2c). HTTP/1.1 upgrades cannot be
     /// carried over HTTP/2, and Caddy likewise disables ALPN h2 for upgradable connections.
-    upgrade_clients: Option<Vec<UpstreamClient>>,
+    upgrade_clients: Option<Vec<Option<UpstreamClient>>>,
+    /// Lazily built clients for dynamic (placeholder) upstream dials, keyed by the expanded dial
+    /// address (Caddy pools per resolved address too).
+    dynamic_clients: Mutex<HashMap<String, Arc<DynamicClients>>>,
     /// Parsed transport configuration (TLS client config and HTTP version policy).
     transport: TransportConfig,
     upstreams: Vec<Arc<Upstream>>,
@@ -455,6 +466,20 @@ impl ReverseProxyHandler {
         let trusted_proxies = parse_trusted_proxies(object.get("trusted_proxies"), path)?;
 
         let (health_check, passive) = parse_health_checks(object.get("health_checks"), path)?;
+        let has_dynamic_dial = upstreams.iter().any(|upstream| upstream.is_dynamic());
+        if has_dynamic_dial && transport.fastcgi.is_some() {
+            return Err(HttpError::NotImplemented {
+                feature: "placeholder placeholders in FastCGI upstream dials",
+                tracking_id: "PROXY-FASTCGI-DYNAMIC-DIAL",
+            });
+        }
+        if has_dynamic_dial && health_check.is_some() {
+            return Err(HttpError::NotImplemented {
+                feature:
+                    "active health checks for upstreams with placeholder (dynamic) dial addresses",
+                tracking_id: "PROXY-DYNAMIC-UPSTREAM-HEALTH",
+            });
+        }
         if transport.fastcgi.is_some() && health_check.is_some() {
             return Err(HttpError::NotImplemented {
                 feature:
@@ -471,6 +496,7 @@ impl ReverseProxyHandler {
         Ok(Self {
             clients,
             upgrade_clients,
+            dynamic_clients: Mutex::new(HashMap::new()),
             transport,
             upstreams,
             balancer,
@@ -507,7 +533,9 @@ impl ReverseProxyHandler {
     /// The outbound client (TLS-aware), exposed for crate-level health-check tests.
     #[cfg(test)]
     pub(crate) fn client(&self) -> &UpstreamClient {
-        &self.clients[0]
+        self.clients[0]
+            .as_ref()
+            .expect("the crate-level client accessor expects a fixed upstream dial")
     }
 
     /// Passive health-check state, when `health_checks.passive` is configured.
@@ -526,7 +554,8 @@ impl ReverseProxyHandler {
                 .upstreams
                 .iter()
                 .cloned()
-                .zip(self.clients.iter().cloned())
+                .zip(self.clients.iter())
+                .filter_map(|(upstream, client)| client.clone().map(|client| (upstream, client)))
                 .collect();
             HealthCheckScheduler::spawn(Arc::clone(check), targets)
         })
@@ -541,6 +570,7 @@ impl ReverseProxyHandler {
     async fn forward_streaming(
         &self,
         upstream: &Arc<Upstream>,
+        client: &UpstreamClient,
         request: &Request,
         body: RequestBody,
     ) -> Result<Forwarded, ProxyError> {
@@ -603,10 +633,7 @@ impl ReverseProxyHandler {
         *outbound.headers_mut() = headers;
 
         let started = std::time::Instant::now();
-        let mut response = self
-            .upstream_client(upstream, request)
-            .request(outbound)
-            .await?;
+        let mut response = client.request(outbound).await?;
         let latency = started.elapsed();
         let status = response.status();
         let version = response.version();
@@ -665,10 +692,14 @@ impl ReverseProxyHandler {
     async fn forward(
         &self,
         upstream: &Arc<Upstream>,
+        client: &UpstreamClient,
         request: &Request,
         body: RequestBody,
     ) -> Result<ForwardedResponse, ProxyError> {
-        let forwarded = match self.forward_streaming(upstream, request, body).await? {
+        let forwarded = match self
+            .forward_streaming(upstream, client, request, body)
+            .await?
+        {
             Forwarded::Streaming(forwarded) => forwarded,
             Forwarded::Upgrade(_) => return Err(ProxyError::UpgradeNotSupported),
         };
@@ -685,25 +716,6 @@ impl ReverseProxyHandler {
         })
     }
 
-    /// The per-upstream client used for this request.
-    ///
-    /// Protocol-upgrade (WebSocket) requests go through the HTTP/1.1-only companion client when
-    /// the main upstream transport prefers HTTP/2: HTTP/1.1 upgrades cannot be expressed over
-    /// HTTP/2, and Caddy likewise disables ALPN h2 for upgradable connections.
-    fn upstream_client(&self, upstream: &Arc<Upstream>, request: &Request) -> &UpstreamClient {
-        let index = self
-            .upstreams
-            .iter()
-            .position(|candidate| Arc::ptr_eq(candidate, upstream))
-            .unwrap_or(0);
-        if requested_upgrade_type(&request.headers).is_some() {
-            if let Some(upgrade_clients) = &self.upgrade_clients {
-                return &upgrade_clients[index];
-            }
-        }
-        &self.clients[index]
-    }
-
     /// Live per-upstream counters (used by the admin `/reverse_proxy/upstreams` endpoint).
     pub fn upstream_statuses(&self) -> Vec<UpstreamStatus> {
         self.upstreams
@@ -714,6 +726,113 @@ impl ReverseProxyHandler {
                 fails: upstream.fails(),
             })
             .collect()
+    }
+
+    /// Resolve one selected upstream for this request.
+    ///
+    /// Fixed upstreams use their pre-built clients. A dynamic (placeholder) dial is expanded with
+    /// Caddy's `ReplaceAll` semantics, validated as a network address and given a lazily built
+    /// client (cached per expanded address). Invalid or empty expansions are a located per-request
+    /// error (Caddy's `fillDialInfo` failure), never a silent request drop.
+    fn resolve_target(
+        &self,
+        upstream: &Arc<Upstream>,
+        request: &Request,
+    ) -> Result<(Arc<Upstream>, UpstreamClient, Option<UpstreamClient>), ProxyError> {
+        if !upstream.is_dynamic() {
+            let Some(index) = self
+                .upstreams
+                .iter()
+                .position(|candidate| Arc::ptr_eq(candidate, upstream))
+            else {
+                return Err(ProxyError::Request(format!(
+                    "upstream `{}`: not part of this handler's pool",
+                    upstream.dial
+                )));
+            };
+            let main = self.clients[index]
+                .as_ref()
+                .expect("fixed upstream has a client")
+                .clone();
+            let upgrade = self.upgrade_clients.as_ref().map(|clients| {
+                clients[index]
+                    .as_ref()
+                    .expect("fixed upstream has an upgrade client")
+                    .clone()
+            });
+            return Ok((Arc::clone(upstream), main, upgrade));
+        }
+        let expanded = request.replace_all(&upstream.dial);
+        if expanded.trim().is_empty() {
+            return Err(ProxyError::Request(format!(
+                "upstream `{}`: dial address is empty after placeholder expansion",
+                upstream.dial
+            )));
+        }
+        let tls_enabled = self
+            .transport
+            .tls
+            .as_ref()
+            .is_some_and(|tls| tls.should_use_tls(dial_port(&expanded)));
+        let resolved = Arc::new(Upstream::parse_dial(&expanded, tls_enabled).map_err(
+            |message| {
+                ProxyError::Request(format!(
+                    "upstream `{}`: invalid dial address `{}`: {message}",
+                    upstream.dial, expanded
+                ))
+            },
+        )?);
+        let clients = self.dynamic_clients_for(&resolved, &expanded)?;
+        Ok((resolved, clients.main.clone(), clients.upgrade.clone()))
+    }
+
+    /// Build (or reuse) the per-address clients for a dynamic upstream.
+    fn dynamic_clients_for(
+        &self,
+        resolved: &Arc<Upstream>,
+        expanded: &str,
+    ) -> Result<Arc<DynamicClients>, ProxyError> {
+        if let Some(clients) = self
+            .dynamic_clients
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(expanded)
+            .cloned()
+        {
+            return Ok(clients);
+        }
+        let transport = resolved.transport().ok_or_else(|| {
+            ProxyError::Request(format!(
+                "upstream `{}`: expanded dial `{expanded}` is still dynamic",
+                resolved.dial
+            ))
+        })?;
+        let tls = if resolved.tls {
+            self.transport.tls.clone()
+        } else {
+            None
+        };
+        let build = |http1_only: bool| {
+            build_upstream_client_for(transport, tls.clone(), self.transport.h2c, http1_only)
+                .map_err(|message| {
+                    ProxyError::Request(format!(
+                        "upstream `{}`: cannot build client for expanded dial `{expanded}`: {message}",
+                        resolved.dial
+                    ))
+                })
+        };
+        let main = build(false)?;
+        let upgrade = if self.transport.alpn_h2 || self.transport.h2c {
+            Some(build(true)?)
+        } else {
+            None
+        };
+        let clients = Arc::new(DynamicClients { main, upgrade });
+        self.dynamic_clients
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(expanded.to_string(), Arc::clone(&clients));
+        Ok(clients)
     }
 
     /// Whether *this upstream* speaks HTTP/2 (TLS h2 only applies to TLS upstreams; h2c applies to
@@ -1134,6 +1253,23 @@ impl Handler for ReverseProxyHandler {
                 self.wait_before_retry().await;
                 continue;
             };
+            let (target, main_client, upgrade_client) =
+                match self.resolve_target(&upstream, &request) {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        let mut response = Response::text(
+                            StatusCode::BAD_GATEWAY,
+                            format!("502 Bad Gateway: {error}"),
+                        );
+                        merge_selection_cookie(&mut response, &selection);
+                        return Ok(Outcome::Respond(response));
+                    }
+                };
+            let client = if requested_upgrade_type(&request.headers).is_some() {
+                upgrade_client.as_ref().unwrap_or(&main_client)
+            } else {
+                &main_client
+            };
             let _guard = upstream.connection_started();
             upstream.record_request();
             let body = match self.attempt_body(&mut request, buffered_body, &mut stream_taken) {
@@ -1147,7 +1283,7 @@ impl Handler for ReverseProxyHandler {
                     return Ok(Outcome::Respond(response));
                 }
             };
-            match self.forward(&upstream, &request, body).await {
+            match self.forward(&target, client, &request, body).await {
                 Ok(forwarded) => {
                     // Caddy applies passive response checks before deciding on retry_match, so an
                     // unhealthy_status strike is recorded even when the response is retried.
@@ -1325,6 +1461,25 @@ impl Handler for ReverseProxyHandler {
                 self.wait_before_retry().await;
                 continue;
             };
+            let (target, main_client, upgrade_client) =
+                match self.resolve_target(&upstream, &request) {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        let mut response = Response::text(
+                            StatusCode::BAD_GATEWAY,
+                            format!("502 Bad Gateway: {error}"),
+                        );
+                        merge_selection_cookie(&mut response, &selection);
+                        return Ok(StreamingOutcome::Respond(StreamingResponse::from_buffered(
+                            response,
+                        )));
+                    }
+                };
+            let client = if requested_upgrade_type(&request.headers).is_some() {
+                upgrade_client.as_ref().unwrap_or(&main_client)
+            } else {
+                &main_client
+            };
             let _guard = upstream.connection_started();
             upstream.record_request();
             let body = match self.attempt_body(&mut request, buffered_body, &mut stream_taken) {
@@ -1340,7 +1495,10 @@ impl Handler for ReverseProxyHandler {
                     )));
                 }
             };
-            match self.forward_streaming(&upstream, &request, body).await {
+            match self
+                .forward_streaming(&target, client, &request, body)
+                .await
+            {
                 Ok(Forwarded::Upgrade(mut forwarded)) => {
                     if let Some(passive) = &self.passive {
                         let strikes = passive.record_response(
@@ -1771,16 +1929,20 @@ fn build_upstream_clients(
     upstreams: &[Arc<Upstream>],
     transport: &TransportConfig,
     path: &str,
-) -> HttpResult<Vec<UpstreamClient>> {
+) -> HttpResult<Vec<Option<UpstreamClient>>> {
     upstreams
         .iter()
         .map(|upstream| {
+            if upstream.is_dynamic() {
+                return Ok(None);
+            }
             build_upstream_client(
                 upstream,
                 upstream_tls(upstream, transport),
                 transport.h2c,
                 false,
             )
+            .map(Some)
             .map_err(|message| invalid(&format!("{path}.transport"), message))
         })
         .collect()
@@ -1801,16 +1963,20 @@ fn build_upgrade_clients(
     upstreams: &[Arc<Upstream>],
     transport: &TransportConfig,
     path: &str,
-) -> HttpResult<Vec<UpstreamClient>> {
+) -> HttpResult<Vec<Option<UpstreamClient>>> {
     upstreams
         .iter()
         .map(|upstream| {
+            if upstream.is_dynamic() {
+                return Ok(None);
+            }
             build_upstream_client(
                 upstream,
                 upstream_tls(upstream, transport),
                 transport.h2c,
                 true,
             )
+            .map(Some)
             .map_err(|message| invalid(&format!("{path}.transport"), message))
         })
         .collect()
@@ -2016,7 +2182,7 @@ fn validate_unix_tls(upstreams: &[Arc<Upstream>], tls: &UpstreamTls, path: &str)
     if upstreams.iter().any(|upstream| {
         matches!(
             upstream.transport(),
-            crate::upstream::Transport::Unix { .. }
+            Some(crate::upstream::Transport::Unix { .. })
         )
     }) {
         return Err(invalid(
@@ -2503,6 +2669,270 @@ mod tests {
             "trusted server peer must keep prior X-Forwarded-For: {body}"
         );
         assert!(body.contains("xfh=prior.example"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn dynamic_upstream_dial_expands_end_to_end_through_a_real_listener() {
+        use hyper::service::service_fn;
+        use hyper_util::rt::TokioIo;
+        use std::convert::Infallible;
+
+        // Upstream echoes the request Host header; the handler's dial is `{http.request.host}`, so
+        // the real listener request's Host selects the dial target (Caddy dynamic dial).
+        let upstream = spawn_upstream(
+            |request: hyper::Request<hyper::body::Incoming>| async move {
+                let host = request
+                    .headers()
+                    .get(http::header::HOST)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("missing")
+                    .to_string();
+                Ok::<_, Infallible>(
+                    hyper::Response::builder()
+                        .status(200)
+                        .body(Full::new(Bytes::from(format!("host={host}"))))
+                        .expect("response"),
+                )
+            },
+        )
+        .await;
+        let router = Arc::new(build_chain_router(vec![serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": "{http.request.hostport}"}]
+        })]));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener_address = listener.local_addr().unwrap();
+        let router_server = Arc::clone(&router);
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let router = Arc::clone(&router_server);
+                tokio::spawn(async move {
+                    let service =
+                        service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
+                            let router = Arc::clone(&router);
+                            async move {
+                                let (parts, body) = request.into_parts();
+                                let body = body
+                                    .collect()
+                                    .await
+                                    .map(|collected| collected.to_bytes())
+                                    .unwrap_or_default();
+                                let mut internal = Request::new(parts.method, parts.uri);
+                                internal.headers = parts.headers;
+                                internal.body = body;
+                                let response = router
+                                    .handle_streaming(internal)
+                                    .await
+                                    .expect("handler chain serves the request")
+                                    .into_buffered()
+                                    .await
+                                    .expect("response buffers");
+                                let mut builder =
+                                    hyper::Response::builder().status(response.status);
+                                for (name, value) in &response.headers {
+                                    builder = builder.header(name, value);
+                                }
+                                Ok::<_, Infallible>(
+                                    builder
+                                        .body(Full::new(response.body))
+                                        .expect("response builds"),
+                                )
+                            }
+                        });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+
+        let client: hyper_util::client::legacy::Client<_, Full<Bytes>> =
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .build_http();
+        let request = hyper::Request::builder()
+            .uri(format!("http://{listener_address}/dynamic"))
+            .header(http::header::HOST, upstream.as_str())
+            .body(Full::new(Bytes::new()))
+            .expect("request builds");
+        let response = client.request(request).await.expect("request succeeds");
+        let status = response.status();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .map(|collected| collected.to_bytes())
+            .unwrap_or_default();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            format!("host={upstream}"),
+            "the dynamic dial expanded {{http.request.hostport}} to the upstream address"
+        );
+    }
+
+    #[tokio::test]
+    async fn header_operations_use_replace_known_while_dynamic_dials_use_replace_all() {
+        // Header values are expanded with Caddy's `ReplaceKnown` semantics: unknown placeholders
+        // stay verbatim. Dynamic dials use `ReplaceAll`: unknown placeholders vanish.
+        let dial = spawn_upstream(
+            |request: hyper::Request<hyper::body::Incoming>| async move {
+                let known = request
+                    .headers()
+                    .get("x-known")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("missing")
+                    .to_string();
+                Ok::<_, Infallible>(
+                    hyper::Response::builder()
+                        .status(200)
+                        .body(Full::new(Bytes::from(format!("x-known={known}"))))
+                        .expect("response"),
+                )
+            },
+        )
+        .await;
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": dial}],
+            "headers": {
+                "request": {"set": {"X-Known": ["{http.request.host}/{env.NOT_SET}"]}},
+                "response": {"set": {"X-Response-Host": ["{http.request.host}"]}}
+            }
+        }));
+        let Outcome::Respond(response) = handler
+            .handle(get_request("/headers", Some("203.0.113.7:5555")))
+            .await
+            .unwrap()
+        else {
+            panic!("expected proxied response");
+        };
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            response.headers["x-response-host"], "example.com",
+            "response header values expand known placeholders"
+        );
+        let body = body_text(&response);
+        assert!(
+            body.contains("x-known=example.com/{env.NOT_SET}"),
+            "unknown placeholders are preserved verbatim in header values (ReplaceKnown): {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_upstream_dial_expands_per_request() {
+        let first = spawn_echo_upstream().await;
+        let second = spawn_echo_upstream().await;
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": "{http.request.header.X-Upstream}"}]
+        }));
+        for dial in [&first, &second] {
+            let mut request = get_request("/dynamic", Some("203.0.113.7:5555"));
+            request.headers.insert("x-upstream", dial.parse().unwrap());
+            let Outcome::Respond(response) = handler.handle(request).await.unwrap() else {
+                panic!("expected proxied response");
+            };
+            assert_eq!(response.status, StatusCode::OK);
+            assert!(!body_text(&response).is_empty());
+        }
+        // Both fixed clients are absent; the per-address cache built one client per expansion.
+        assert!(handler.upstreams()[0].is_dynamic());
+    }
+
+    #[tokio::test]
+    async fn dynamic_upstream_empty_or_invalid_expansion_is_a_located_error() {
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": "{http.request.header.X-Upstream}"}]
+        }));
+        // No header -> ReplaceAll expands to an empty string.
+        let request = get_request("/dynamic", Some("203.0.113.7:5555"));
+        let Outcome::Respond(response) = handler.handle(request).await.unwrap() else {
+            panic!("expected a 502 response");
+        };
+        assert_eq!(response.status, StatusCode::BAD_GATEWAY);
+        let body = body_text(&response);
+        assert!(body.contains("empty after placeholder expansion"), "{body}");
+        assert!(body.contains("{http.request.header.X-Upstream}"), "{body}");
+
+        // A non-address expansion is rejected before dialing.
+        let mut request = get_request("/dynamic", Some("203.0.113.7:5555"));
+        request
+            .headers
+            .insert("x-upstream", "not an address".parse().unwrap());
+        let Outcome::Respond(response) = handler.handle(request).await.unwrap() else {
+            panic!("expected a 502 response");
+        };
+        assert_eq!(response.status, StatusCode::BAD_GATEWAY);
+        let body = body_text(&response);
+        assert!(body.contains("invalid dial address"), "{body}");
+        assert!(body.contains("not an address"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn dynamic_upstream_uses_caddy_replace_all_semantics() {
+        // Caddy expands dynamic dials with `ReplaceAll(u.Dial, "")`: unknown or empty
+        // placeholders vanish instead of keeping their braces.
+        let upstream = spawn_echo_upstream().await;
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{
+                "dial": "{http.request.header.X-Upstream}{http.request.header.X-Missing}"
+            }]
+        }));
+        let mut request = get_request("/dynamic", Some("203.0.113.7:5555"));
+        request
+            .headers
+            .insert("x-upstream", upstream.parse().unwrap());
+        let Outcome::Respond(response) = handler.handle(request).await.unwrap() else {
+            panic!("expected proxied response");
+        };
+        assert_eq!(
+            response.status,
+            StatusCode::OK,
+            "missing known-but-empty placeholder must be removed, not kept literally"
+        );
+    }
+
+    #[test]
+    fn dynamic_upstreams_reject_active_health_checks_and_fastcgi() {
+        let error = ReverseProxyHandler::from_json(
+            &serde_json::json!({
+                "handler": "reverse_proxy",
+                "upstreams": [{"dial": "{http.request.host}:8080"}],
+                "health_checks": {"active": {"uri": "/health"}}
+            }),
+            "handler",
+        )
+        .err()
+        .expect("active health checks for dynamic dials must be rejected loudly");
+        assert!(
+            error.to_string().contains("PROXY-DYNAMIC-UPSTREAM-HEALTH"),
+            "{error}"
+        );
+
+        let error = ReverseProxyHandler::from_json(
+            &serde_json::json!({
+                "handler": "reverse_proxy",
+                "upstreams": [{"dial": "{http.request.host}:8080"}],
+                "transport": {"protocol": "fastcgi"}
+            }),
+            "handler",
+        )
+        .err()
+        .expect("FastCGI with a dynamic dial must be rejected loudly");
+        assert!(
+            error.to_string().contains("PROXY-FASTCGI-DYNAMIC-DIAL"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

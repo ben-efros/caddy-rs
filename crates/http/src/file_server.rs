@@ -209,13 +209,20 @@ impl FileServerHandler {
         }
     }
 
-    fn hidden(&self, relative: &str) -> bool {
+    fn hidden(&self, relative: &str, request: &Request) -> bool {
         let name = Path::new(relative)
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or(relative);
         self.hide.iter().any(|pattern| {
-            let pattern = pattern.strip_prefix("./").unwrap_or(pattern);
+            // Caddy: `hide[i] = repl.ReplaceAll(fsrv.Hide[i], "")` (staticfiles.go).
+            let expanded = request.replace_all(pattern);
+            if expanded.is_empty() {
+                // Caddy compares hide patterns against path components, so an empty expansion
+                // (for example a missing placeholder) never hides anything.
+                return false;
+            }
+            let pattern = expanded.strip_prefix("./").unwrap_or(&expanded);
             glob_match(pattern, relative, false) || glob_match(pattern, name, false)
         })
     }
@@ -532,7 +539,7 @@ impl Handler for FileServerHandler {
         // Caddy trims a trailing `/` before stating the path ("remove any trailing `/` as it
         // breaks fs.ValidPath"); the request path keeps it for the canonical redirect.
         let stat_relative = relative.trim_end_matches('/');
-        if self.hidden(stat_relative) {
+        if self.hidden(stat_relative, &request) {
             return self.not_found(request);
         }
         // Expand `{http.vars.root}` and friends (Caddy's file_server root supports placeholders).
@@ -558,6 +565,11 @@ impl Handler for FileServerHandler {
         let mut implicit_index = false;
         if metadata.is_dir() && !self.index_names.is_empty() {
             for index in &self.index_names {
+                // Caddy: `indexPage := repl.ReplaceAll(indexPage, "")` (staticfiles.go).
+                let index = request.replace_all(index);
+                if index.is_empty() {
+                    continue;
+                }
                 let candidate = filename.join(index);
                 if let Ok(index_metadata) = fs::metadata(&candidate).await {
                     if index_metadata.is_file() {
@@ -593,7 +605,7 @@ impl Handler for FileServerHandler {
         if !metadata.is_file() {
             return self.not_found(request);
         }
-        if self.hidden(&filename.to_string_lossy()) {
+        if self.hidden(&filename.to_string_lossy(), &request) {
             return self.not_found(request);
         }
         if self.canonical_uris {
@@ -2066,6 +2078,86 @@ mod tests {
             parse_range("bytes=5-4", 10),
             Err(RangeError::Invalid),
             "start > end is invalid"
+        );
+    }
+
+    #[tokio::test]
+    async fn root_hide_and_index_names_expand_placeholders() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("site");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("file.txt"), b"hello").unwrap();
+        std::fs::write(root.join("secret.txt"), b"hidden").unwrap();
+        std::fs::write(root.join("index.html"), b"index-body").unwrap();
+
+        // `root` uses ReplaceAll semantics (`{http.vars.root}` plus custom vars).
+        let handler = FileServerHandler::from_json(
+            &serde_json::json!({"handler": "file_server", "root": "{http.vars.root}",
+                "hide": ["{http.request.header.X-Hide}"],
+                "index_names": ["{http.request.header.X-Index}"]}),
+            "handler",
+        )
+        .unwrap();
+        let mut request = make_request(Method::GET, "/file.txt");
+        request
+            .vars
+            .insert("root".to_string(), root.display().to_string());
+        let response = respond(&handler, request).await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, Bytes::from_static(b"hello"));
+
+        // `hide` expands per request (Caddy: `repl.ReplaceAll(fsrv.Hide[i], "")`).
+        let mut request = make_request(Method::GET, "/secret.txt");
+        request
+            .vars
+            .insert("root".to_string(), root.display().to_string());
+        request
+            .headers
+            .insert("x-hide", "secret.txt".parse().unwrap());
+        let response = respond(&handler, request).await;
+        assert_eq!(response.status, StatusCode::NOT_FOUND);
+        assert!(
+            !response.body.is_empty() || response.status == StatusCode::NOT_FOUND,
+            "hidden file must not be served"
+        );
+
+        // `index_names` expands per request (Caddy: `repl.ReplaceAll(indexPage, "")`).
+        let mut request = make_request(Method::GET, "/");
+        request
+            .vars
+            .insert("root".to_string(), root.display().to_string());
+        request
+            .headers
+            .insert("x-index", "index.html".parse().unwrap());
+        let response = respond(&handler, request).await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, Bytes::from_static(b"index-body"));
+    }
+
+    #[tokio::test]
+    async fn placeholder_expansion_does_not_bypass_traversal_guard() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("site");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(parent.path().join("outside.txt"), b"outside").unwrap();
+        let handler = FileServerHandler::from_json(
+            &serde_json::json!({"handler": "file_server", "root": "{http.vars.root}",
+                "hide": ["{http.vars.hide_pattern}"]}),
+            "handler",
+        )
+        .unwrap();
+        let mut request = make_request(Method::GET, "/../outside.txt");
+        request
+            .vars
+            .insert("root".to_string(), root.display().to_string());
+        request
+            .vars
+            .insert("hide_pattern".to_string(), "outside.txt".to_string());
+        let response = respond(&handler, request).await;
+        assert_eq!(
+            response.status,
+            StatusCode::FORBIDDEN,
+            "request-path traversal remains rejected after placeholder expansion"
         );
     }
 }
