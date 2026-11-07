@@ -38,6 +38,10 @@
 //!   [`HostCallContext`] authorisation and typed results.
 //! * [`bridge`]: request/response heads, streaming body contract, stable frame encodings
 //!   ([`BridgeFrame`]) and total-body accounting ([`BodyBudget`]).
+//! * [`protocol`]: the out-of-process/external module protocol (handshake, request multiplexing,
+//!   cancellation, deadlines and connection-scoped errors) that reuses the same frame layout and
+//!   payload encoders for modules running outside the host process (ADR-0006 item 3, see
+//!   `docs/PLUGIN-PROTOCOL.md`).
 //! * [`encoding`]: the bounds-checked little-endian reader/writer used by all encodings.
 //! * [`error`]: typed errors and the stable [`AbiErrorCode`] values sent to plugins.
 //!
@@ -59,6 +63,9 @@
 //! * No Caddy/Go plugin compatibility: Caddy's compiled-module ecosystem is out of scope.
 //! * No WASM runtime, fuel metering, module instantiation or host I/O in this crate (T-PLUG-011).
 //! * No manifest file syntax: descriptors are data; the host chooses the serialization format.
+//! * No transport implementation: the external module protocol in [`protocol`] is a wire/state
+//!   contract; socket/process management, isolation and the HTTP server integration belong to the
+//!   host runtime tasks.
 
 #![forbid(unsafe_code)]
 
@@ -68,6 +75,7 @@ pub mod descriptor;
 pub mod encoding;
 pub mod error;
 pub mod hostcall;
+pub mod protocol;
 pub mod version;
 
 pub use bridge::{
@@ -96,6 +104,19 @@ pub use hostcall::{
     HOST_CALL_NOW, HOST_CALL_RANDOM, HOST_CALL_READ_CONFIG, MAX_CONFIG_KEY_BYTES,
     MAX_CONFIG_VALUE_BYTES, MAX_HOST_CALL_BODY_BYTES, MAX_LOG_FIELDS, MAX_LOG_FIELD_NAME_BYTES,
     MAX_LOG_FIELD_VALUE_BYTES, MAX_LOG_MESSAGE_BYTES, MAX_RANDOM_BYTES, MAX_URL_BYTES,
+};
+pub use protocol::{
+    accept_handshake, tighten_limits, validate_handshake_ack, Cancel, ErrorFrame, HandshakeError,
+    Hello, HelloAck, HostCallFrame, HostCallResultFrame, HostHandshakeConfig, NegotiatedSession,
+    OpenRequest, ProtocolError, ProtocolFrame, Reject, RejectPhase, RequestBodyChunk, RequestEnd,
+    RequestId, ResponseBodyChunk, ResponseEnd, ResponseHeadFrame, DEFAULT_BODY_WINDOW_BYTES,
+    DEFAULT_MAX_IN_FLIGHT_REQUESTS, FIRST_PROTOCOL_TAG, HOST_PROTOCOL_VERSION, LAST_PROTOCOL_TAG,
+    MAX_PROTOCOL_FRAME_PAYLOAD_BYTES, MAX_PROTOCOL_MESSAGE_BYTES, PROTOCOL_VERSION,
+    PROTO_FRAME_CANCEL, PROTO_FRAME_ERROR, PROTO_FRAME_HEADER_BYTES, PROTO_FRAME_HELLO,
+    PROTO_FRAME_HELLO_ACK, PROTO_FRAME_HOST_CALL, PROTO_FRAME_HOST_CALL_RESULT,
+    PROTO_FRAME_OPEN_REQUEST, PROTO_FRAME_REJECT, PROTO_FRAME_REQUEST_BODY_CHUNK,
+    PROTO_FRAME_REQUEST_END, PROTO_FRAME_RESPONSE_BODY_CHUNK, PROTO_FRAME_RESPONSE_END,
+    PROTO_FRAME_RESPONSE_HEAD,
 };
 pub use version::{
     decode_abi_version, encode_abi_version, negotiate, AbiVersion, NegotiatedAbi, ABI_MAJOR,
