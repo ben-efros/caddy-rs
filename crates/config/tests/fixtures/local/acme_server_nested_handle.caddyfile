@@ -1,0 +1,7 @@
+acme.example.com {
+	handle /acme/* {
+		acme_server {
+			ca nested-ca
+		}
+	}
+}

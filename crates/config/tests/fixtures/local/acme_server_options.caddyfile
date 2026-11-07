@@ -1,0 +1,25 @@
+{
+	pki {
+		ca local-ca {
+			name "Local CA"
+		}
+	}
+}
+
+acme.example.com {
+	acme_server /acme/* {
+		ca local-ca
+		lifetime 7d
+		resolvers 1.1.1.1:53 8.8.8.8
+		challenges dns-01 http-01
+		sign_with_root
+		allow {
+			domains host-1.internal.example.com
+			ip_ranges 10.0.0.0/8
+		}
+		deny {
+			domains dc.internal.example.com
+		}
+		allow_wildcard_names
+	}
+}

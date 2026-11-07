@@ -1,0 +1,46 @@
+{
+	"apps": {
+		"http": {
+			"servers": {
+				"srv0": {
+					"listen": [
+						":443"
+					],
+					"routes": [
+						{
+							"match": [
+								{
+									"host": [
+										"acme.example.com"
+									]
+								}
+							],
+							"handle": [
+								{
+									"handler": "subroute",
+									"routes": [
+										{
+											"handle": [
+												{
+													"ca": "custom-ca",
+													"handler": "acme_server",
+													"lifetime": 43200000000000
+												}
+											]
+										}
+									]
+								}
+							],
+							"terminal": true
+						}
+					]
+				}
+			}
+		},
+		"pki": {
+			"certificate_authorities": {
+				"custom-ca": {}
+			}
+		}
+	}
+}

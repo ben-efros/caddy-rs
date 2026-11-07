@@ -1,0 +1,6 @@
+acme.example.com {
+	acme_server {
+		ca custom-ca
+		lifetime 12h
+	}
+}
