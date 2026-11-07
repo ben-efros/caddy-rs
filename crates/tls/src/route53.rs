@@ -14,10 +14,9 @@ use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use hmac::{Hmac, Mac};
-use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use serde_json::{Map, Value};
-use sha2::{Digest, Sha256};
+
+use crate::sigv4::{canonical_query, format_amz_date, sign_sigv4, AwsCredentials, SigV4Request};
 
 use crate::acme::{AcmeTransport, HttpMethod, HttpRequest, HttpResponse};
 use crate::cloudflare::resolve_env_placeholders;
@@ -60,6 +59,17 @@ impl fmt::Debug for Route53Credentials {
                 &self.session_token.as_ref().map(|_| "<redacted>"),
             )
             .finish()
+    }
+}
+
+impl Route53Credentials {
+    /// Shared SigV4 credential view.
+    fn sigv4_credentials(&self) -> AwsCredentials {
+        AwsCredentials {
+            access_key_id: self.access_key_id.clone(),
+            secret_access_key: self.secret_access_key.clone(),
+            session_token: self.session_token.clone(),
+        }
     }
 }
 
@@ -247,18 +257,21 @@ impl<T: AcmeTransport> Route53Provider<T> {
         extra_headers: &[(&str, &str)],
         amz_date: &str,
     ) -> Vec<(String, String)> {
-        sign_sigv4(SigV4Request {
+        let credentials = self.config.credentials.sigv4_credentials();
+        let mut headers = sign_sigv4(SigV4Request {
             method: method.as_str(),
             host: ROUTE53_HOST,
             path,
             query,
             payload,
             extra_headers,
-            credentials: &self.config.credentials,
+            credentials: &credentials,
             region: &self.config.region,
             service: ROUTE53_SERVICE,
             amz_date,
-        })
+        });
+        headers.push(("Accept".to_string(), "text/xml".to_string()));
+        headers
     }
 
     fn api_url(&self, path: &str, query: &[(String, String)]) -> String {
@@ -593,191 +606,6 @@ impl<T: AcmeTransport> DnsProvider for Route53Provider<T> {
     }
 }
 
-// ---- SigV4 -----------------------------------------------------------------------------------
-
-struct SigV4Request<'a> {
-    method: &'a str,
-    host: &'a str,
-    path: &'a str,
-    query: &'a [(String, String)],
-    payload: &'a [u8],
-    extra_headers: &'a [(&'a str, &'a str)],
-    credentials: &'a Route53Credentials,
-    region: &'a str,
-    service: &'a str,
-    amz_date: &'a str,
-}
-
-/// AWS URI-encoding set: encode everything except unreserved characters; the path additionally
-/// preserves `/`.
-const AWS_SET: &AsciiSet = &CONTROLS
-    .add(b' ')
-    .add(b'"')
-    .add(b'#')
-    .add(b'%')
-    .add(b'&')
-    .add(b'+')
-    .add(b',')
-    .add(b'/')
-    .add(b':')
-    .add(b';')
-    .add(b'<')
-    .add(b'=')
-    .add(b'>')
-    .add(b'?')
-    .add(b'@')
-    .add(b'[')
-    .add(b'\\')
-    .add(b']')
-    .add(b'^')
-    .add(b'`')
-    .add(b'{')
-    .add(b'|')
-    .add(b'}');
-
-fn aws_uri_encode(value: &str) -> String {
-    utf8_percent_encode(value, AWS_SET).to_string()
-}
-
-fn canonical_query(query: &[(String, String)]) -> String {
-    let mut pairs: Vec<(String, String)> = query
-        .iter()
-        .map(|(key, value)| (aws_uri_encode(key), aws_uri_encode(value)))
-        .collect();
-    pairs.sort();
-    pairs
-        .into_iter()
-        .map(|(key, value)| format!("{key}={value}"))
-        .collect::<Vec<_>>()
-        .join("&")
-}
-
-fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(data);
-    mac.finalize().into_bytes().to_vec()
-}
-
-fn sha256_hex(data: &[u8]) -> String {
-    hex::encode(Sha256::digest(data))
-}
-
-/// Sign an AWS request (SigV4) and return the headers to send.
-fn sign_sigv4(request: SigV4Request<'_>) -> Vec<(String, String)> {
-    let payload_hash = sha256_hex(request.payload);
-    let mut headers: Vec<(String, String)> = Vec::new();
-    headers.push(("host".to_string(), request.host.to_string()));
-    headers.push(("x-amz-date".to_string(), request.amz_date.to_string()));
-    headers.push(("x-amz-content-sha256".to_string(), payload_hash.clone()));
-    if let Some(token) = &request.credentials.session_token {
-        headers.push(("x-amz-security-token".to_string(), token.clone()));
-    }
-    for (name, value) in request.extra_headers {
-        headers.push((name.to_ascii_lowercase(), value.to_string()));
-    }
-    headers.sort_by(|left, right| left.0.cmp(&right.0));
-    let canonical_headers = headers
-        .iter()
-        .map(|(name, value)| format!("{name}:{}\n", value.trim()))
-        .collect::<String>();
-    let signed_headers = headers
-        .iter()
-        .map(|(name, _)| name.as_str())
-        .collect::<Vec<_>>()
-        .join(";");
-    let canonical_path = if request.path.is_empty() {
-        "/".to_string()
-    } else {
-        request.path.to_string()
-    };
-    let canonical_request = format!(
-        "{}\n{}\n{}\n{}\n{}\n{}",
-        request.method,
-        canonical_path,
-        canonical_query(request.query),
-        canonical_headers,
-        signed_headers,
-        payload_hash
-    );
-    let scope = format!(
-        "{}/{}/{}/aws4_request",
-        &request.amz_date[..8],
-        request.region,
-        request.service
-    );
-    let string_to_sign = format!(
-        "AWS4-HMAC-SHA256\n{}\n{}\n{}",
-        request.amz_date,
-        scope,
-        sha256_hex(canonical_request.as_bytes())
-    );
-    let date_key = hmac_sha256(
-        format!("AWS4{}", request.credentials.secret_access_key).as_bytes(),
-        &request.amz_date[..8].as_bytes(),
-    );
-    let region_key = hmac_sha256(&date_key, request.region.as_bytes());
-    let service_key = hmac_sha256(&region_key, request.service.as_bytes());
-    let signing_key = hmac_sha256(&service_key, b"aws4_request");
-    let signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes()));
-    let authorization = format!(
-        "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
-        request.credentials.access_key_id, scope, signed_headers, signature
-    );
-    let mut out: Vec<(String, String)> = headers
-        .into_iter()
-        .map(|(name, value)| (wire_header_name(&name), value))
-        .collect();
-    out.push(("Authorization".to_string(), authorization));
-    out.push(("Accept".to_string(), "text/xml".to_string()));
-    out
-}
-
-fn wire_header_name(name: &str) -> String {
-    match name {
-        "host" => "Host".to_string(),
-        "x-amz-date" => "X-Amz-Date".to_string(),
-        "x-amz-content-sha256" => "X-Amz-Content-Sha256".to_string(),
-        "x-amz-security-token" => "X-Amz-Security-Token".to_string(),
-        "content-type" => "Content-Type".to_string(),
-        other => other.to_string(),
-    }
-}
-
-/// Format a Unix time as `YYYYMMDDTHHMMSSZ` for AWS.
-fn format_amz_date(time: SystemTime) -> String {
-    let seconds = time
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let days = (seconds / 86_400) as i64;
-    let seconds_of_day = seconds % 86_400;
-    let (year, month, day) = civil_from_days(days);
-    format!(
-        "{year:04}{month:02}{day:02}T{:02}{:02}{:02}Z",
-        seconds_of_day / 3600,
-        (seconds_of_day % 3600) / 60,
-        seconds_of_day % 60
-    )
-}
-
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let day_of_era = (z - era * 146_097) as u32;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let year = year_of_era as i64 + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = if month_prime < 10 {
-        month_prime + 3
-    } else {
-        month_prime - 9
-    };
-    (year, month, day)
-}
-
 // ---- tiny XML helpers -----------------------------------------------------------------------
 
 fn xml_tag(document: &str, tag: &str) -> Option<String> {
@@ -949,7 +777,7 @@ mod tests {
 
     #[test]
     fn sigv4_matches_aws_published_vector() {
-        let credentials = Route53Credentials {
+        let credentials = AwsCredentials {
             access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
             secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
             session_token: None,

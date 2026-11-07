@@ -305,25 +305,11 @@ impl CertificateStorage for FileStorage {
         // CertMagic serialises `CertificateResource` with `json.MarshalIndent(cert, "", "\t")`:
         // tab indentation, struct field order (`sans`, then `issuer_data`), no trailing newline.
         // Preserve any unknown metadata fields after those.
-        #[derive(Serialize)]
-        struct CertMagicMetadata<'a> {
-            sans: &'a [String],
-            #[serde(skip_serializing_if = "Option::is_none")]
-            issuer_data: Option<&'a serde_json::Value>,
-            #[serde(flatten)]
-            extra: &'a BTreeMap<String, serde_json::Value>,
-        }
-        let metadata = CertMagicMetadata {
-            sans: &certificate.domains,
-            issuer_data: certificate.issuer_data.as_ref(),
-            extra: &certificate.metadata_extra,
-        };
-        let mut data = Vec::new();
-        let formatter = serde_json::ser::PrettyFormatter::with_indent(b"\t");
-        let mut serializer = serde_json::Serializer::with_formatter(&mut data, formatter);
-        metadata
-            .serialize(&mut serializer)
-            .map_err(|error| Error::Storage(error.to_string()))?;
+        let data = serialize_certificate_metadata(
+            &certificate.domains,
+            certificate.issuer_data.as_ref(),
+            &certificate.metadata_extra,
+        )?;
         atomic_write(&paths.metadata, &data).await?;
         Ok(())
     }
@@ -419,15 +405,45 @@ impl<T: CertificateStorage + ?Sized> CertificateStorage for Arc<T> {
 /// CA directory and account URL, optionally ARI renewal info). Unknown fields are preserved on
 /// rewrite so a newer Caddy metadata key survives a caddy-rs renewal.
 #[derive(Debug, Deserialize)]
-struct CaddyCertificateMetadata {
+pub(crate) struct CaddyCertificateMetadata {
     #[serde(default)]
-    sans: Option<Vec<String>>,
+    pub(crate) sans: Option<Vec<String>>,
     /// CertMagic's issuer-specific metadata (`acme.Certificate` for ACME: url/ca/account/ARI).
     #[serde(default)]
-    issuer_data: Option<serde_json::Value>,
+    pub(crate) issuer_data: Option<serde_json::Value>,
     /// Other fields preserved for forward compatibility (for example future CertMagic keys).
     #[serde(flatten)]
-    extra: BTreeMap<String, serde_json::Value>,
+    pub(crate) extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// Serialize CertMagic's `CertificateResource` metadata exactly as the file-system backend does:
+/// tab-indented `sans` then opaque `issuer_data` (and preserved unknown fields), no trailing
+/// newline. Shared with the S3-compatible backend (T-TLS-022).
+pub(crate) fn serialize_certificate_metadata(
+    domains: &[String],
+    issuer_data: Option<&serde_json::Value>,
+    extra: &BTreeMap<String, serde_json::Value>,
+) -> Result<Vec<u8>> {
+    #[derive(Serialize)]
+    struct CertMagicMetadata<'a> {
+        sans: &'a [String],
+        #[serde(skip_serializing_if = "Option::is_none")]
+        issuer_data: Option<&'a serde_json::Value>,
+        #[serde(flatten)]
+        extra: &'a BTreeMap<String, serde_json::Value>,
+    }
+    let metadata = CertMagicMetadata {
+        sans: domains,
+        issuer_data,
+        extra,
+    };
+    let mut data = Vec::new();
+    let formatter = serde_json::ser::PrettyFormatter::with_indent(b"\t");
+    let mut serializer = serde_json::Serializer::with_formatter(&mut data, formatter);
+    metadata
+        .serialize(&mut serializer)
+        .map_err(|error| Error::Storage(error.to_string()))?;
+    Ok(data)
 }
 
 /// Convert an issuer identity to Caddy's on-disk issuer directory name.
@@ -454,7 +470,7 @@ pub fn caddy_certificate_storage_name(name: &str) -> String {
 }
 
 /// Recover the certificate name from a filesystem-safe directory name.
-fn caddy_certificate_name_from_storage(stored_name: &str) -> String {
+pub(crate) fn caddy_certificate_name_from_storage(stored_name: &str) -> String {
     match stored_name.strip_prefix("wildcard_") {
         Some(rest) => format!("*{rest}"),
         None => stored_name.to_string(),
@@ -462,7 +478,7 @@ fn caddy_certificate_name_from_storage(stored_name: &str) -> String {
 }
 
 /// Split and validate a `<issuer-key>/<certificate-name>` storage key.
-fn split_storage_key(key: &str) -> Result<(&str, String)> {
+pub(crate) fn split_storage_key(key: &str) -> Result<(&str, String)> {
     if key.is_empty() || key.contains('\0') || key.contains('\\') || key.starts_with('/') {
         return Err(Error::InvalidKey(key.to_string()));
     }
@@ -572,7 +588,7 @@ fn pem_blocks(document: &str, label: &str) -> Result<Vec<String>> {
 }
 
 /// PEM certificate chain blocks from a `.crt` document.
-fn certificate_chain_pem(document: &str) -> Result<Vec<String>> {
+pub(crate) fn certificate_chain_pem(document: &str) -> Result<Vec<String>> {
     let blocks = pem_blocks(document, "CERTIFICATE")?;
     if blocks.is_empty() {
         return Err(Error::Storage(
@@ -586,7 +602,7 @@ fn certificate_chain_pem(document: &str) -> Result<Vec<String>> {
 ///
 /// Caddy stores PKCS#8 (`PRIVATE KEY`) keys, but imported certificates may use `RSA PRIVATE KEY`
 /// or `EC PRIVATE KEY`; all are accepted here.
-fn private_key_pem(document: &str) -> Result<String> {
+pub(crate) fn private_key_pem(document: &str) -> Result<String> {
     for label in ["PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY"] {
         let blocks = pem_blocks(document, label)?;
         if let Some(block) = blocks.into_iter().next() {
@@ -644,7 +660,7 @@ pub(crate) fn certificate_validity_unix(pem: &str) -> Result<(u64, u64)> {
 }
 
 /// Decode a PEM certificate block and return its `notAfter` as Unix seconds.
-fn certificate_not_after_unix(pem: &str) -> Result<u64> {
+pub(crate) fn certificate_not_after_unix(pem: &str) -> Result<u64> {
     Ok(certificate_validity_unix(pem)?.1)
 }
 
@@ -880,7 +896,7 @@ pub fn stored_certificate_expiring(certificate: &StoredCertificate, within: Dura
 /// automation policy, `apps.tls.automation.policies[].storage`); there is no `apps.tls.storage`
 /// field in upstream Caddy. This enum is the tls-crate selection result used by the automatic
 /// HTTPS provisioner and embedders.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum SelectedStorage {
     /// Caddy's `file_system` storage module rooted at a data directory.
     FileSystem {
@@ -889,6 +905,8 @@ pub enum SelectedStorage {
     },
     /// In-memory caddy-rs extension (tests/ephemeral deployments only; not a Caddy module).
     Memory,
+    /// S3-compatible caddy-rs extension (`caddy.storage.s3` is a Caddy plugin, not built in).
+    S3(std::sync::Arc<crate::s3::S3Storage>),
 }
 
 impl SelectedStorage {
@@ -941,6 +959,18 @@ impl SelectedStorage {
             }
             // caddy-rs extension for tests/embedders; Caddy itself has no memory storage module.
             "memory" => Ok(Self::Memory),
+            // caddy-rs extension: Caddy v2.11.7 ships only the file_system storage module; the
+            // well-known `caddy.storage.s3` module is a community plugin.
+            "s3" => {
+                let settings = crate::s3::S3Settings::from_storage_config(storage, "storage")?;
+                let transport = crate::acme::HyperTransport::new().map_err(|error| {
+                    Error::Storage(format!("cannot construct the S3 HTTP transport: {error}"))
+                })?;
+                Ok(Self::S3(std::sync::Arc::new(crate::s3::S3Storage::new(
+                    settings,
+                    std::sync::Arc::new(transport),
+                ))))
+            }
             other => Err(Error::Storage(format!(
                 "storage module `{other}` is not implemented by this build (T-TLS-068)"
             ))),
@@ -951,7 +981,7 @@ impl SelectedStorage {
     pub fn root(&self) -> Option<&Path> {
         match self {
             Self::FileSystem { root } => Some(root),
-            Self::Memory => None,
+            Self::Memory | Self::S3(_) => None,
         }
     }
 
@@ -960,6 +990,7 @@ impl SelectedStorage {
         match self {
             Self::FileSystem { root } => Arc::new(FileStorage::new(root)),
             Self::Memory => Arc::new(MemoryStorage::new()),
+            Self::S3(storage) => Arc::clone(storage) as Arc<dyn CertificateStorage>,
         }
     }
 
@@ -971,6 +1002,7 @@ impl SelectedStorage {
         match self {
             Self::FileSystem { root } => Arc::new(FileStorage::new(root)),
             Self::Memory => Arc::new(crate::acme::MemoryAcmeStorage::new()),
+            Self::S3(storage) => Arc::clone(storage) as Arc<dyn crate::acme::AcmeStorage>,
         }
     }
 }
@@ -1460,13 +1492,23 @@ mod tests {
     #[test]
     fn unknown_storage_modules_are_located_errors() {
         let config = caddy_rs_core::Config::from_value(serde_json::json!({
-            "storage": {"module": "s3", "bucket": "certs"}
+            "storage": {"module": "redis", "address": "localhost:6379"}
         }))
         .unwrap();
         let error = SelectedStorage::from_config(&config, Some(Path::new("/data")))
             .expect_err("unknown storage module");
-        assert!(error.to_string().contains("s3"), "{error}");
+        assert!(error.to_string().contains("redis"), "{error}");
         assert!(error.to_string().contains("T-TLS-068"), "{error}");
+
+        // The S3 extension is selectable from the top-level storage module; missing bucket/
+        // credentials are located errors from the S3 settings parser.
+        let incomplete = caddy_rs_core::Config::from_value(serde_json::json!({
+            "storage": {"module": "s3", "endpoint": "https://s3.example.test"}
+        }))
+        .unwrap();
+        let error = SelectedStorage::from_config(&incomplete, Some(Path::new("/data")))
+            .expect_err("incomplete s3 settings");
+        assert!(error.to_string().contains("bucket"), "{error}");
     }
 
     #[test]

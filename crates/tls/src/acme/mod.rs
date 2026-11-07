@@ -318,6 +318,8 @@ pub enum HttpMethod {
     Post,
     /// `DELETE`
     Delete,
+    /// `PUT` (S3-compatible storage; T-TLS-022)
+    Put,
 }
 
 impl HttpMethod {
@@ -328,6 +330,7 @@ impl HttpMethod {
             Self::Head => "HEAD",
             Self::Post => "POST",
             Self::Delete => "DELETE",
+            Self::Put => "PUT",
         }
     }
 }
