@@ -9,13 +9,13 @@ Each release publishes one archive per platform, plus a checksum file:
 
 | Archive | Platform | Linkage |
 |---|---|---|
-| `caddy-rs-<version>-x86_64-unknown-linux-gnu.tar.gz` | Linux x86_64 | glibc, dynamically linked |
-| `caddy-rs-<version>-aarch64-unknown-linux-gnu.tar.gz` | Linux arm64 | glibc, dynamically linked |
-| `caddy-rs-<version>-x86_64-unknown-linux-musl.tar.gz` | Linux x86_64 | **fully static**, size-optimised |
-| `caddy-rs-<version>-aarch64-unknown-linux-musl.tar.gz` | Linux arm64 | **fully static**, size-optimised |
-| `caddy-rs-<version>-aarch64-apple-darwin.tar.gz` | macOS arm64 | dynamic |
-| `caddy-rs-<version>-x86_64-unknown-linux-musl-minimal.tar.gz` | Linux x86_64 | **static, minimal** |
-| `caddy-rs-<version>-aarch64-unknown-linux-musl-minimal.tar.gz` | Linux arm64 | **static, minimal** |
+| `caddy-rs-<version>-x86_64-glibc.tar.gz` | Linux x86_64 | glibc, dynamically linked |
+| `caddy-rs-<version>-aarch64-glibc.tar.gz` | Linux arm64 | glibc, dynamically linked |
+| `caddy-rs-<version>-x86_64-static.tar.gz` | Linux x86_64 | **fully static**, size-optimised |
+| `caddy-rs-<version>-aarch64-static.tar.gz` | Linux arm64 | **fully static**, size-optimised |
+| `caddy-rs-<version>-x86_64-static-minimal.tar.gz` | Linux x86_64 | **static, minimal** (no HTTP/3, compression, templates) |
+| `caddy-rs-<version>-aarch64-static-minimal.tar.gz` | Linux arm64 | **static, minimal** (no HTTP/3, compression, templates) |
+| `caddy-rs-<version>-aarch64-macos.tar.gz` | macOS arm64 | dynamic |
 
 Every archive contains the `caddy-rs` binary, `LICENSE`, `NOTICE.md` and `README.md`.
 `SHA256SUMS` covers all archives in the release.
@@ -80,8 +80,8 @@ version string, which builds the same artefacts without creating a tag.
 6. **Verify the published release.** Download one archive and check it:
 
    ```sh
-   sha256sum -c caddy-rs-v0.1.0-x86_64-unknown-linux-musl.tar.gz.sha256
-   tar -tzf caddy-rs-v0.1.0-x86_64-unknown-linux-musl.tar.gz
+   sha256sum -c caddy-rs-v0.1.0-x86_64-static.tar.gz.sha256
+   tar -tzf caddy-rs-v0.1.0-x86_64-static.tar.gz
    file caddy-rs                     # "statically linked" for the musl archives
    ```
 
@@ -107,10 +107,10 @@ the workflow does, so no cross toolchain is required in CI.
 ## Installing from a release
 
 ```sh
-curl -LO https://github.com/ben-efros/caddy-rs/releases/download/v0.1.0/caddy-rs-v0.1.0-x86_64-unknown-linux-musl.tar.gz
+curl -LO https://github.com/ben-efros/caddy-rs/releases/download/v0.1.0/caddy-rs-v0.1.0-x86_64-static.tar.gz
 curl -LO https://github.com/ben-efros/caddy-rs/releases/download/v0.1.0/SHA256SUMS
 sha256sum -c SHA256SUMS --ignore-missing
-tar -xzf caddy-rs-v0.1.0-x86_64-unknown-linux-musl.tar.gz
+tar -xzf caddy-rs-v0.1.0-x86_64-static.tar.gz
 sudo install -m 0755 caddy-rs /usr/local/bin/caddy-rs
 caddy-rs version
 ```

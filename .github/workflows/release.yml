@@ -30,23 +30,27 @@ jobs:
         include:
           # glibc builds: the portable default on mainstream Linux distributions.
           - name: x86_64-linux-gnu
+            slug: x86_64-glibc
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             profile: release
             archive: tar.gz
           - name: aarch64-linux-gnu
+            slug: aarch64-glibc
             os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             profile: release
             archive: tar.gz
           # musl builds: fully static, no libc dependency, size-optimised profile.
           - name: x86_64-linux-musl-static
+            slug: x86_64-static
             os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             profile: release-minimal
             archive: tar.gz
             musl: true
           - name: aarch64-linux-musl-static
+            slug: aarch64-static
             os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             profile: release-minimal
@@ -54,23 +58,24 @@ jobs:
             musl: true
           # Minimal builds: the same static profile without HTTP/3, compression or templates.
           - name: x86_64-linux-musl-minimal
+            slug: x86_64-static-minimal
             os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             profile: release-minimal
             features: --no-default-features
-            suffix: -minimal
             archive: tar.gz
             musl: true
           - name: aarch64-linux-musl-minimal
+            slug: aarch64-static-minimal
             os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             profile: release-minimal
             features: --no-default-features
-            suffix: -minimal
             archive: tar.gz
             musl: true
           # macOS build.
           - name: aarch64-macos
+            slug: aarch64-macos
             os: macos-latest
             target: aarch64-apple-darwin
             profile: release
@@ -101,7 +106,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${{ github.event.inputs.version || github.ref_name }}"
-          name="caddy-rs-${version}-${{ matrix.target }}${{ matrix.suffix }}"
+          name="caddy-rs-${version}-${{ matrix.slug }}"
           dir="dist/${name}"
           mkdir -p "$dir"
           bin="target/${{ matrix.target }}/${{ matrix.profile }}/caddy-rs"
