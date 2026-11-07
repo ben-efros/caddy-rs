@@ -1817,6 +1817,32 @@ pub trait AcmeTransport: Send + Sync {
         }
         .into())
     }
+
+    /// Return an equivalent transport that routes ACME HTTP requests through `proxy`
+    /// (Caddy's `network_proxy` module). Only the hyper transport implements this; scripted
+    /// transports fail loudly.
+    fn with_network_proxy(&self, _proxy: &str) -> Result<Arc<dyn AcmeTransport>> {
+        Err(AcmeError::Transport {
+            url: "https://".to_string(),
+            reason: "this ACME transport does not support network_proxy; use HyperTransport"
+                .to_string(),
+        }
+        .into())
+    }
+
+    /// Return an equivalent transport that applies `timeout` to each ACME HTTP request
+    /// (Caddy's `acme_timeout`). Scripted transports fail loudly.
+    fn with_request_timeout(
+        &self,
+        _timeout: std::time::Duration,
+    ) -> Result<Arc<dyn AcmeTransport>> {
+        Err(AcmeError::Transport {
+            url: "https://".to_string(),
+            reason: "this ACME transport does not support acme_timeout; use HyperTransport"
+                .to_string(),
+        }
+        .into())
+    }
 }
 
 #[async_trait]
@@ -1831,6 +1857,14 @@ impl<T: AcmeTransport + ?Sized> AcmeTransport for &T {
     ) -> Result<Arc<dyn AcmeTransport>> {
         (**self).with_trusted_roots(roots)
     }
+
+    fn with_network_proxy(&self, proxy: &str) -> Result<Arc<dyn AcmeTransport>> {
+        (**self).with_network_proxy(proxy)
+    }
+
+    fn with_request_timeout(&self, timeout: std::time::Duration) -> Result<Arc<dyn AcmeTransport>> {
+        (**self).with_request_timeout(timeout)
+    }
 }
 
 #[async_trait]
@@ -1844,6 +1878,14 @@ impl<T: AcmeTransport + ?Sized> AcmeTransport for Arc<T> {
         roots: Vec<CertificateDer<'static>>,
     ) -> Result<Arc<dyn AcmeTransport>> {
         (**self).with_trusted_roots(roots)
+    }
+
+    fn with_network_proxy(&self, proxy: &str) -> Result<Arc<dyn AcmeTransport>> {
+        (**self).with_network_proxy(proxy)
+    }
+
+    fn with_request_timeout(&self, timeout: std::time::Duration) -> Result<Arc<dyn AcmeTransport>> {
+        (**self).with_request_timeout(timeout)
     }
 }
 
