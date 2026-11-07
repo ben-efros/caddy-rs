@@ -1,0 +1,31 @@
+{
+    "apps": {
+        "http": {
+            "servers": {
+                "srv0": {
+                    "listen": [
+                        ":8080"
+                    ],
+                    "routes": [
+                        {
+                            "handle": [
+                                {
+                                    "handler": "reverse_proxy",
+                                    "transport": {
+                                        "protocol": "http",
+                                        "proxy_protocol": "v2"
+                                    },
+                                    "upstreams": [
+                                        {
+                                            "dial": "127.0.0.1:9000"
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        }
+    }
+}

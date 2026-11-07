@@ -7225,6 +7225,37 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
                                         tls.insert("insecure_skip_verify".to_string(), json!(true));
                                     }
                                 }
+                                "proxy_protocol" => {
+                                    // Caddy: `transport http { proxy_protocol v1|v2 }` emits
+                                    // `"proxy_protocol": "v1"` in the HTTP transport object.
+                                    if !option.block.is_empty() {
+                                        return Err(adapter_error(
+                                            option.position.clone(),
+                                            "`proxy_protocol` does not take a block",
+                                        ));
+                                    }
+                                    let Some(value) = option.args.first() else {
+                                        return Err(adapter_error(
+                                            option.position.clone(),
+                                            "`proxy_protocol` requires `v1` or `v2`",
+                                        ));
+                                    };
+                                    match value.as_str() {
+                                        "v1" | "v2" => {
+                                            extra_transport
+                                                .insert("proxy_protocol".to_string(), json!(value));
+                                        }
+                                        other => {
+                                            return Err(adapter_error(
+                                                option.position.clone(),
+                                                format!(
+                                                    "invalid proxy_protocol version `{other}` \
+                                                     (expected v1 or v2)"
+                                                ),
+                                            ))
+                                        }
+                                    }
+                                }
                                 other => {
                                     return Err(adapter_error(
                                         option.position.clone(),

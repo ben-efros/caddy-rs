@@ -1,0 +1,7 @@
+:8080 {
+	reverse_proxy 127.0.0.1:9000 {
+		transport http {
+			proxy_protocol v2
+		}
+	}
+}
