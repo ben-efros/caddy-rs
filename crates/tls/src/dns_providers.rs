@@ -14,7 +14,7 @@
 //! ```
 //!
 //! [`build_dns_provider`] maps the provider module object to a [`DnsProvider`] implementation
-//! (currently `cloudflare`), and [`build_dns01_solver`] pairs it with authoritative propagation
+//! (`cloudflare`, `digitalocean` or `route53`), and [`build_dns01_solver`] pairs it with authoritative propagation
 //! checks ([`DohPropagationChecker`], DNS-over-HTTPS). The HTTP transport is injected: production
 //! automatic HTTPS passes its hyper/rustls transport, and tests pass a scripted mock, so provider
 //! request/response shapes are exercised without network access.
@@ -25,21 +25,25 @@
 //!
 //! Deliberate limitations (reported as divergences):
 //!
-//! * only the `cloudflare` provider module is implemented;
+//! * `cloudflare`, `digitalocean` and `route53` provider modules are implemented; Route 53
+//!   credentials also fall back to the standard AWS environment variables;
 //! * `resolvers` is accepted but not used: propagation is checked via Cloudflare's public DoH
 //!   endpoint rather than the configured raw-DNS resolvers;
 //! * `override_domain` is applied by the constructed solver (the TXT record is published under
 //!   `_acme-challenge.<override_domain>`).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::acme::AcmeTransport;
 use crate::cloudflare::{CloudflareProvider, CLOUDFLARE_PROVIDER_NAME};
+use crate::digitalocean::{DigitalOceanProvider, DIGITALOCEAN_PROVIDER_NAME};
 use crate::dns::{
     DnsChallengeConfig, DnsError, DnsProvider, PropagationTimeout,
     DEFAULT_PROPAGATION_POLL_INTERVAL,
 };
 use crate::propagation::{DohPropagationChecker, PropagationChecker};
+use crate::route53::{Route53Provider, ROUTE53_PROVIDER_NAME};
 use crate::solver::Dns01Solver;
 use crate::{Error, Result};
 
@@ -47,7 +51,11 @@ use crate::{Error, Result};
 pub const DNS_PROVIDER_TRACKING_ID: &str = "T-TLS-063";
 
 /// DNS provider module names this build can construct from configuration.
-pub const SUPPORTED_DNS_PROVIDERS: &[&str] = &[CLOUDFLARE_PROVIDER_NAME];
+pub const SUPPORTED_DNS_PROVIDERS: &[&str] = &[
+    CLOUDFLARE_PROVIDER_NAME,
+    DIGITALOCEAN_PROVIDER_NAME,
+    ROUTE53_PROVIDER_NAME,
+];
 
 /// Build the [`DnsProvider`] described by Caddy's `challenges.dns` configuration.
 ///
@@ -58,6 +66,12 @@ pub fn build_dns_provider(
 ) -> Result<Arc<dyn DnsProvider>> {
     match challenge.provider.as_str() {
         CLOUDFLARE_PROVIDER_NAME => Ok(Arc::new(CloudflareProvider::from_challenge_config(
+            transport, challenge,
+        )?)),
+        DIGITALOCEAN_PROVIDER_NAME => Ok(Arc::new(DigitalOceanProvider::from_challenge_config(
+            transport, challenge,
+        )?)),
+        ROUTE53_PROVIDER_NAME => Ok(Arc::new(Route53Provider::from_challenge_config(
             transport, challenge,
         )?)),
         other => Err(Error::Dns(DnsError::UnsupportedProvider {
@@ -84,6 +98,14 @@ pub fn build_dns01_solver(
     }
     solver = match challenge.propagation_timeout {
         PropagationTimeout::Disabled => solver.without_propagation_wait(),
+        // Route 53 exposes a transaction-status API: poll `GetChange` through the provider
+        // (Caddy's route53 provider waits on the change resource), rather than DNS-over-HTTPS.
+        PropagationTimeout::Default if challenge.provider == ROUTE53_PROVIDER_NAME => {
+            solver.with_propagation(crate::dns::DEFAULT_PROPAGATION_TIMEOUT, Duration::ZERO)
+        }
+        PropagationTimeout::After(timeout) if challenge.provider == ROUTE53_PROVIDER_NAME => {
+            solver.with_propagation(timeout, Duration::ZERO)
+        }
         PropagationTimeout::Default => solver.with_checker(
             doh_checker(transport),
             crate::dns::DEFAULT_PROPAGATION_TIMEOUT,
@@ -336,6 +358,64 @@ mod tests {
 
     // ---- provider/solver construction ----------------------------------------------------
 
+    #[test]
+    fn provider_registry_lists_all_implemented_providers() {
+        for expected in ["cloudflare", "digitalocean", "route53"] {
+            assert!(
+                SUPPORTED_DNS_PROVIDERS.contains(&expected),
+                "missing {expected}: {SUPPORTED_DNS_PROVIDERS:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn builds_digitalocean_and_route53_providers_and_rejects_bad_settings() {
+        let transport: Arc<dyn AcmeTransport> = Arc::new(DnsMock::new());
+
+        let digitalocean = challenge_config(json!({
+            "provider": {"name": "digitalocean", "api_token": "do-secret"}
+        }));
+        let provider = build_dns_provider(&digitalocean, Arc::clone(&transport)).unwrap();
+        assert_eq!(provider.name(), "digitalocean");
+
+        let route53 = challenge_config(json!({
+            "provider": {
+                "name": "route53",
+                "access_key_id": "AKIDEXAMPLE",
+                "secret_access_key": "SECRETEXAMPLE",
+                "region": "us-east-1"
+            }
+        }));
+        let provider = build_dns_provider(&route53, Arc::clone(&transport)).unwrap();
+        assert_eq!(provider.name(), "route53");
+
+        // Located errors for unknown provider options and missing credentials.
+        let unknown = challenge_config(json!({
+            "provider": {"name": "digitalocean", "api_token": "x", "unknown": true}
+        }));
+        let error = match build_dns_provider(&unknown, Arc::clone(&transport)) {
+            Ok(_) => panic!("unknown DigitalOcean option must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("unknown"), "{error}");
+        let missing = challenge_config(json!({
+            "provider": {"name": "digitalocean"}
+        }));
+        let error = match build_dns_provider(&missing, Arc::clone(&transport)) {
+            Ok(_) => panic!("missing DigitalOcean token must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("api_token"), "{error}");
+        let unknown = challenge_config(json!({
+            "provider": {"name": "route53", "access_key_id": "a", "secret_access_key": "b", "profile": "x"}
+        }));
+        let error = match build_dns_provider(&unknown, transport) {
+            Ok(_) => panic!("unknown Route 53 option must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("profile"), "{error}");
+    }
+
     #[tokio::test]
     async fn builds_cloudflare_provider_from_configuration() {
         let challenge = challenge_config(json!({
@@ -368,14 +448,14 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_provider_is_tracked_unsupported() {
-        let challenge = challenge_config(json!({"provider": {"name": "route53"}}));
+        let challenge = challenge_config(json!({"provider": {"name": "bogus-provider"}}));
         let transport: Arc<dyn AcmeTransport> = Arc::new(DnsMock::new());
         let error = match build_dns_provider(&challenge, transport) {
             Ok(_) => panic!("unknown provider must be rejected"),
             Err(error) => error,
         };
         let message = error.to_string();
-        assert!(message.contains("route53"), "{message}");
+        assert!(message.contains("bogus-provider"), "{message}");
         assert!(
             message.contains("not implemented by this build"),
             "{message}"
