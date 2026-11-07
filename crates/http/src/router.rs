@@ -12,9 +12,10 @@ use serde_json::Value;
 
 use crate::auth::{BasicAuthHandler, ForwardAuthHandler};
 use crate::body::StreamingResponse;
+use crate::encode::EncodeHandler;
 use crate::file_server::FileServerHandler;
 use crate::handlers::{
-    EncodeHandler, ErrorHandler, HeadersHandler, MapHandler, RequestBodyHandler, RewriteHandler,
+    ErrorHandler, HeadersHandler, MapHandler, RequestBodyHandler, RewriteHandler,
     StaticResponseHandler, SubrouteHandler, VarsHandler,
 };
 use crate::matchers::build_matcher_set;
@@ -279,6 +280,7 @@ impl Router {
                     ))
                     .await;
                 }
+                current.clear_response_transforms();
                 return Ok(matcher_error_response(error, &current));
             }
             if !matched {
@@ -301,6 +303,7 @@ impl Router {
                             match current.collect_body(Some(limit)).await {
                                 Ok(_) => {}
                                 Err(crate::body::BodyError::TooLarge { .. }) => {
+                                    current.clear_response_transforms();
                                     return Ok(body_limit_response(&current));
                                 }
                                 Err(error) => {
@@ -315,6 +318,7 @@ impl Router {
                                 }
                             }
                         } else if current.body.len() as u64 > limit {
+                            current.clear_response_transforms();
                             return Ok(body_limit_response(&current));
                         }
                     }
@@ -345,6 +349,7 @@ impl Router {
                                 .await;
                         }
                         apply_pending_headers(&mut response.headers, &staged);
+                        let response = apply_response_transforms(&staged, response).await;
                         return Ok(StreamingOutcome::Respond(response));
                     }
                     Ok(StreamingOutcome::Upgrade(mut response)) => {
@@ -423,7 +428,9 @@ impl Router {
             .vars
             .insert("http.error.id".to_string(), String::new());
         // Error routes receive the pre-failure request but must not inherit a lazy body limit or a
-        // stale matcher error from the failed chain.
+        // stale matcher error from the failed chain. Caddy's encode middleware disables encoding
+        // completely when a handler errors, so any registered response transform is discarded.
+        request.clear_response_transforms();
         match Box::pin(self.evaluate_routes(error_routes, request, Some(status))).await {
             Ok(outcome) => Ok(outcome),
             Err(_second_error) => Ok(StreamingOutcome::Respond(StreamingResponse::from_buffered(
@@ -451,6 +458,20 @@ impl Router {
             }),
         }
     }
+}
+
+/// Apply the response transforms registered by middleware handlers (for example `encode`), in
+/// reverse registration order (the transform closest to the response runs first, matching Caddy's
+/// response-flowing-up middleware model). The stack is drained so nested routers never apply the
+/// same transform twice.
+async fn apply_response_transforms(
+    request: &Request,
+    mut response: StreamingResponse,
+) -> StreamingResponse {
+    for transform in request.take_response_transforms().into_iter().rev() {
+        response = transform.transform(response).await;
+    }
+    response
 }
 
 fn apply_pending_headers(headers: &mut http::HeaderMap, request: &Request) {
@@ -630,7 +651,7 @@ impl RouterBuilder {
             "rewrite" => Arc::new(RewriteHandler::from_json(value, path)?),
             "request_body" => Arc::new(RequestBodyHandler::from_json(value, path)?),
             "map" => Arc::new(MapHandler::from_json(value, path)?),
-            "encode" => Arc::new(EncodeHandler),
+            "encode" => Arc::new(EncodeHandler::from_json(value, path)?),
             "file_server" => Arc::new(FileServerHandler::from_json(value, path)?),
             "forward_auth" => Arc::new(ForwardAuthHandler::from_json(value, path)?),
             "authentication" | "basic_auth" => Arc::new(BasicAuthHandler::from_json(value, path)?),

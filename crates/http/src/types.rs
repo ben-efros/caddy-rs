@@ -151,6 +151,25 @@ pub struct Request {
     pub vars: BTreeMap<String, String>,
     /// Response headers staged by response middleware (`headers` handler).
     pub pending_response_headers: HeaderMap,
+    /// Response transforms registered by middleware handlers (`encode`).
+    ///
+    /// Shared across request clones so a transform registered before a nested subroute is applied
+    /// exactly once: the router drains the stack at the point a handler produces the response.
+    response_transforms: Arc<std::sync::Mutex<ResponseTransformList>>,
+}
+
+/// Registered response transforms; `Debug` prints only the count (the trait objects are not
+/// `Debug`).
+#[derive(Default)]
+struct ResponseTransformList(Vec<Arc<dyn ResponseTransform>>);
+
+impl std::fmt::Debug for ResponseTransformList {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("ResponseTransformList")
+            .field(&self.0.len())
+            .finish()
+    }
 }
 
 impl Request {
@@ -169,6 +188,7 @@ impl Request {
             version: Version::HTTP_11,
             vars: BTreeMap::new(),
             pending_response_headers: HeaderMap::new(),
+            response_transforms: Arc::new(std::sync::Mutex::new(ResponseTransformList::default())),
         }
     }
 
@@ -324,6 +344,37 @@ impl Request {
         crate::placeholders::Replacer::new(self)
     }
 
+    /// Register a response transform applied when a handler produces the response (Caddy's
+    /// middleware wrapping model).
+    pub fn push_response_transform(&mut self, transform: Arc<dyn ResponseTransform>) {
+        self.response_transforms
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .0
+            .push(transform);
+    }
+
+    /// Drain the registered response transforms (the router applies them in reverse order).
+    pub(crate) fn take_response_transforms(&self) -> Vec<Arc<dyn ResponseTransform>> {
+        std::mem::take(
+            &mut self
+                .response_transforms
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0,
+        )
+    }
+
+    /// Discard registered transforms (used when the handler chain errors, matching Caddy's
+    /// "disable encoding completely" behaviour for error responses).
+    pub(crate) fn clear_response_transforms(&self) {
+        self.response_transforms
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .0
+            .clear();
+    }
+
     /// Expand placeholders with Caddy's `ReplaceKnown` semantics: unknown placeholders are left
     /// verbatim, known-but-empty ones expand to nothing.
     pub fn replace_known(&self, input: &str) -> String {
@@ -421,6 +472,7 @@ impl Clone for Request {
             version: self.version,
             vars: self.vars.clone(),
             pending_response_headers: self.pending_response_headers.clone(),
+            response_transforms: Arc::clone(&self.response_transforms),
         }
     }
 }
@@ -505,6 +557,21 @@ pub trait Handler: Send + Sync {
             }
         })
     }
+}
+
+/// A response transform registered by a middleware handler (for example `encode`).
+///
+/// Caddy middleware wraps the response writer and mutates the response while it flows back up the
+/// handler chain. caddy-rs handlers return owned [`Outcome`]s, so middleware registers a transform
+/// on the [`Request`] instead; the router applies registered transforms (in reverse registration
+/// order, i.e. closest-to-the-response first) when a handler produces the response.
+#[async_trait]
+pub trait ResponseTransform: Send + Sync {
+    /// Transform a response before it leaves the router.
+    async fn transform(
+        &self,
+        response: crate::body::StreamingResponse,
+    ) -> crate::body::StreamingResponse;
 }
 
 /// A request matcher.

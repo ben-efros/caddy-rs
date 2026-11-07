@@ -1208,22 +1208,6 @@ impl Handler for SubrouteHandler {
     }
 }
 
-/// `encode`: accepted for configuration compatibility; compression is tracked for a later task.
-pub struct EncodeHandler;
-
-#[async_trait]
-impl Handler for EncodeHandler {
-    fn name(&self) -> &'static str {
-        "encode"
-    }
-
-    async fn handle(&self, request: Request) -> Result<Outcome> {
-        // The handler is a no-op rather than an error so configurations remain runnable; the
-        // divergence is recorded in docs/compatibility/BEHAVIOR-DIVERGENCES.md (DIV-0009).
-        Ok(Outcome::Continue(request))
-    }
-}
-
 /// `request_body`: limit the request body size read by later handlers and/or replace it.
 ///
 /// Mirrors Caddy's `http.handlers.request_body` (v2.11.7):
