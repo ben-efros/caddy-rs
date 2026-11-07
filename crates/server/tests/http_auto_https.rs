@@ -1213,8 +1213,16 @@ async fn disable_redirects_serves_http_without_redirect() {
         .with_acme_transport(Arc::new(FakeCa::new(false)))
         .with_data_root(directory.path());
     runtime.apply().await.expect("apply");
-    let http = runtime.listener_address(":0").unwrap();
-    let (status, headers, _) = plain_get(http, "example.com", "/path").await;
+    // Caddy creates the derived HTTP-port listener only while redirects are enabled (its
+    // redirect server doubles as the HTTP-01 challenge server), so `disable_redirects` leaves
+    // the configured listeners alone instead of grabbing the HTTP port (T-HTTP-049).
+    assert!(
+        runtime.listener_address(":0").is_none(),
+        "disable_redirects must not derive an HTTP listener"
+    );
+    let address = runtime.listener_address("127.0.0.1:0").unwrap();
+    let mut stream = tls_connect(address, "example.com").await;
+    let (status, headers, _) = http_get(&mut stream, "example.com", "/path").await;
     assert_ne!(status, 308, "disable_redirects must not redirect");
     assert!(header(&headers, "location").is_none());
     runtime.shutdown().await;

@@ -594,9 +594,12 @@ pub fn plan(config: &Config) -> Result<Option<AutomaticHttpsPlan>> {
                 && !policies_present
         })
     });
-    let needs_http_listener = (redirects_enabled || !subjects.is_empty())
-        && !has_http_listener
-        && http_port != https_port;
+    // Caddy only creates the derived HTTP listener while redirects are enabled: its redirect
+    // server doubles as the HTTP-01 challenge server, and `auto_https disable_redirects` skips
+    // creating it entirely (`modules/caddyhttp/autohttps.go:236-241`). Binding it just because
+    // subjects need certificates made caddy-rs grab :80 on a config that Caddy serves on the
+    // configured ports only.
+    let needs_http_listener = redirects_enabled && !has_http_listener && http_port != https_port;
 
     let ocsp_interval = match tls {
         Some(tls) => ocsp_check_interval(tls)?,
@@ -2067,8 +2070,8 @@ mod tests {
         assert!(!plan.subjects.contains(&"www.example.com".to_string()));
         assert!(!plan.redirects_enabled);
         assert!(
-            plan.needs_http_listener,
-            "subjects still need challenge serving"
+            !plan.needs_http_listener,
+            "disable_redirects must not derive an HTTP listener"
         );
     }
 
@@ -2140,9 +2143,11 @@ mod tests {
         let plan = plan(&Config::from_value(value).unwrap()).unwrap().unwrap();
         assert_eq!(plan.subjects, vec!["example.com".to_string()]);
         assert!(!plan.redirects_enabled);
+        // Caddy's redirect server doubles as the HTTP-01 challenge server and is skipped
+        // entirely when redirects are disabled, so no derived HTTP listener is created.
         assert!(
-            plan.needs_http_listener,
-            "challenge serving still needs the HTTP listener"
+            !plan.needs_http_listener,
+            "disable_redirects must not derive an HTTP listener"
         );
     }
 
