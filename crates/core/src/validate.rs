@@ -214,7 +214,7 @@ fn validate_server_limits(server: &HttpServer, path: &str) -> Result<()> {
                 other => {
                     return Err(Error::invalid(
                         format!("{path}.protocols"),
-                        format!("unsupported HTTP protocol `{other}`; expected h1, h2 or h2c"),
+                        format!("unsupported HTTP protocol `{other}`; expected h1, h2, h2c or h3"),
                     ))
                 }
             }
@@ -481,7 +481,35 @@ impl Validator<'_> {
             }
             for (index, listen) in server.listen.iter().enumerate() {
                 let path = format!("{server_path}.listen[{index}]");
-                ListenAddr::parse_at(listen, path)?;
+                let parsed = ListenAddr::parse_at(listen, path.clone())?;
+                if parsed.network == crate::Network::Udp {
+                    // HTTP/3 is served over QUIC: a UDP listener needs both explicit h3 and TLS,
+                    // otherwise the socket would silently drop every QUIC packet.
+                    let offers_h3 = match server.protocols.as_ref() {
+                        None => true,
+                        Some(protocols) => protocols.iter().any(|protocol| protocol == "h3"),
+                    };
+                    if !offers_h3 {
+                        return Err(Error::invalid(
+                            path.clone(),
+                            "a UDP listener requires `protocols` to include `h3` (HTTP/3);                              configured protocols do not offer it"
+                                .to_string(),
+                        ));
+                    }
+                    let https_port = http.https_port.unwrap_or(443);
+                    let has_policies = server
+                        .tls_connection_policies
+                        .as_ref()
+                        .is_some_and(|policies| !policies.is_empty());
+                    if !(has_policies || parsed.port() == Some(https_port)) {
+                        return Err(Error::invalid(
+                            path.clone(),
+                            format!(
+                                "a UDP listener requires TLS (port {https_port} or                                  `tls_connection_policies`); HTTP/3 is never served cleartext"
+                            ),
+                        ));
+                    }
+                }
                 if let Some(previous) = listeners.insert(listen.as_str(), server_name) {
                     return Err(Error::invalid(
                         format!("{server_path}.listen[{index}]"),
