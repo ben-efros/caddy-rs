@@ -206,7 +206,7 @@ async fn runtime_inventory_tracks_reload_and_health_check_schedulers() {
     // A failed apply must leave the previous generation's snapshot/inventory intact.
     let broken = Config::from_value(serde_json::json!({
         "admin": {"listen": format!("127.0.0.1:{admin_port}")},
-        "apps": {"http": {"servers": {"srv0": {
+        "apps": {"http": {"http_port": 0, "servers": {"srv0": {
             "listen": ["127.0.0.1:0"],
             "tls_connection_policies": [{}],
             "routes": [{"handle": [{"handler": "static_response", "body": "broken"}]}]

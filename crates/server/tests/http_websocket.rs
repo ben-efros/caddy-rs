@@ -45,7 +45,9 @@ fn config(dial: &str, tls: bool) -> Config {
     if tls {
         server["tls_connection_policies"] = serde_json::json!([{}]);
     }
-    let mut apps = serde_json::json!({"http": {"servers": {"srv0": server}}});
+    // An ephemeral HTTP port keeps the derived redirect listener off :80, which CI (unprivileged)
+    // cannot bind.
+    let mut apps = serde_json::json!({"http": {"http_port": 0, "servers": {"srv0": server}}});
     if tls {
         apps["tls"] = serde_json::json!({
             "certificates": {"load_pem": [{"certificate": EXAMPLE_CERT, "key": EXAMPLE_KEY}]}
