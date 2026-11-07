@@ -19,6 +19,7 @@ use crate::handlers::{
     StaticResponseHandler, SubrouteHandler, VarsHandler,
 };
 use crate::matchers::build_matcher_set;
+use crate::rate_limit::RateLimitHandler;
 use crate::types::{
     Error, Handler, Outcome, Request, Response, ResponseOutcome, Result, SharedHandler,
     SharedMatcher, StreamingOutcome,
@@ -652,6 +653,8 @@ impl RouterBuilder {
             "request_body" => Arc::new(RequestBodyHandler::from_json(value, path)?),
             "map" => Arc::new(MapHandler::from_json(value, path)?),
             "encode" => Arc::new(EncodeHandler::from_json(value, path)?),
+            // caddy-rs extension (not a Caddy v2.11.7 built-in): token-bucket rate limiting.
+            "rate_limit" => Arc::new(RateLimitHandler::from_json(value, path)?),
             "file_server" => Arc::new(FileServerHandler::from_json(value, path)?),
             "forward_auth" => Arc::new(ForwardAuthHandler::from_json(value, path)?),
             "authentication" | "basic_auth" => Arc::new(BasicAuthHandler::from_json(value, path)?),

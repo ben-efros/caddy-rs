@@ -13,6 +13,7 @@ pub mod file_server;
 pub mod handlers;
 pub mod matchers;
 pub mod placeholders;
+pub mod rate_limit;
 pub mod regex_lite;
 pub mod router;
 pub mod types;
@@ -26,6 +27,7 @@ pub use handlers::{
     SubrouteHandler, VarsHandler,
 };
 pub use placeholders::{Replacer, UnknownPlaceholders};
+pub use rate_limit::{ManualClock, RateLimitClock, RateLimitHandler, SystemClock};
 pub use router::{CustomHandlerFactory, Route, Router, RouterBuilder};
 pub use types::{
     Error, Handler, Matcher, MatcherError, Outcome, Request, Response, ResponseOutcome, Result,
