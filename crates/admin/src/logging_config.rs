@@ -73,6 +73,17 @@
 //!   `loggerAllowed` semantics to decide whether the log receives `http.log.access`. Caddy's
 //!   provisioning rules for contradictory include/exclude lists are enforced.
 //!
+//! ## Per-request level override
+//!
+//! Caddy's `log_level` Caddyfile directive is not part of the `logging` JSON: it compiles to a
+//! `vars` handler that sets the `log_level` request variable, and the server applies it while
+//! building each access entry. The status default (`INFO`, or `ERROR` for `status >= 500`) is
+//! *replaced* by a valid `DEBUG`/`INFO`/`WARN`/`ERROR` value, which both raises and lowers
+//! verbosity; an absent or invalid variable keeps the default. This module models that override
+//! ([`LOG_LEVEL_VAR`], [`LOG_LEVEL_NAMES`], [`LogLevelOverride`], [`access_log_level`],
+//! [`apply_access_log_level`]) for the server and the Caddyfile adapter; the runtime hook that
+//! captures the request variable lives in the HTTP/server crates.
+//!
 //! ## Defaults
 //!
 //! Caddy always has a `default` log (stderr, JSON in non-terminal environments, INFO). When the
@@ -107,8 +118,8 @@ use http::HeaderName;
 use serde_json::Value;
 
 use crate::access_log::{
-    AccessLogConfig, AccessLogField, HeaderRedaction, HeaderTarget, LogLevel, RedactionPolicy,
-    SamplingConfig, ACCESS_LOG_LOGGER,
+    AccessLogConfig, AccessLogEntry, AccessLogField, HeaderRedaction, HeaderTarget, LogLevel,
+    RedactionPolicy, SamplingConfig, ACCESS_LOG_LOGGER,
 };
 use crate::access_log::{
     FieldFilter, FieldFilterOperation, FilterAction, FilterActionKind, RegexpOperation,
@@ -1486,6 +1497,123 @@ fn parse_level(path: &str, level: Option<&str>) -> Result<Option<LogLevel>, Logg
     }))
 }
 
+/// Caddy's per-request access-log level override (the `log_level` request variable).
+///
+/// Caddy's `log_level` Caddyfile directive compiles to a `vars` handler that writes the
+/// [`LOG_LEVEL_VAR`] request variable (`caddyconfig/httpcaddyfile/builtins.go:1277`,
+/// `modules/caddyhttp/logging.go:315-317`). When the access entry is built, `Server.logRequest`
+/// derives the default level from the response status (`INFO`, or `ERROR` for `status >= 500`) and
+/// then *replaces* it with the parsed variable when the value is valid
+/// (`modules/caddyhttp/server.go:1271-1282`). The override therefore raises and lowers verbosity
+/// alike: `DEBUG` on a `200` logs at DEBUG, `ERROR` on a `200` is suppressed by an INFO threshold,
+/// and `INFO` on a `500` logs at INFO.
+pub const LOG_LEVEL_VAR: &str = "log_level";
+
+/// The level names Caddy accepts for a `log_level` override, in severity order.
+///
+/// `zapcore.ParseLevel` also accepts `DPANIC`, `PANIC` and `FATAL`, but both the Caddyfile parser
+/// and `Server.logRequest` restrict the override to `DEBUG..=ERROR`
+/// (`caddyconfig/httpcaddyfile/builtins.go:1273`, `modules/caddyhttp/server.go:1278`).
+pub const LOG_LEVEL_NAMES: [&str; 4] = ["DEBUG", "INFO", "WARN", "ERROR"];
+
+/// A validated per-request access-log level override: Caddy's `log_level` request variable.
+///
+/// Parse with [`LogLevelOverride::parse`] for a located error (the Caddyfile `log_level` directive
+/// and any strict validator need this), or with [`LogLevelOverride::from_request_var`] for Caddy's
+/// request-time behaviour, where an absent or invalid variable is ignored and the status-derived
+/// level is kept. Apply it to an entry with [`apply_access_log_level`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LogLevelOverride(LogLevel);
+
+impl LogLevelOverride {
+    /// Parse one of the names Caddy accepts for `log_level`.
+    ///
+    /// The match is case-insensitive, mirroring `zapcore.ParseLevel` (which retries the
+    /// lower-cased text), then restricted to `DEBUG..=ERROR` like both Caddy call sites. `DPANIC`,
+    /// `PANIC` and `FATAL` are rejected: zap parses them, but Caddy's range check refuses them.
+    /// An invalid name is a [`LoggingConfigError`] located at `path`, using Caddy's directive
+    /// wording (`invalid log level %q: expected DEBUG, INFO, WARN, or ERROR`).
+    pub fn parse(name: &str, path: impl Into<String>) -> Result<Self, LoggingConfigError> {
+        parse_log_level_name(name).map(Self).ok_or_else(|| {
+            LoggingConfigError::new(
+                path,
+                format!("invalid log level \"{name}\": expected DEBUG, INFO, WARN, or ERROR"),
+            )
+        })
+    }
+
+    /// Caddy's request-time lookup: parse an optional `log_level` variable leniently.
+    ///
+    /// Caddy only uses the variable when `zapcore.ParseLevel` succeeds and the level is in
+    /// `DEBUG..=ERROR`; an absent or invalid value silently keeps the status-derived level
+    /// (`modules/caddyhttp/server.go:1277-1281`). `None` is returned in those cases. This is not a
+    /// located error: invalid request-time values are not configuration errors in Caddy, and the
+    /// adapter/validator should use [`LogLevelOverride::parse`] instead.
+    pub fn from_request_var(value: Option<&str>) -> Option<Self> {
+        parse_log_level_name(value?).map(Self)
+    }
+
+    /// The mapped access-entry level.
+    pub fn level(self) -> LogLevel {
+        self.0
+    }
+
+    /// The canonical upper-case name Caddy documents (`DEBUG`, `INFO`, `WARN`, `ERROR`).
+    pub fn as_str(self) -> &'static str {
+        match self.0 {
+            LogLevel::Debug => "DEBUG",
+            LogLevel::Info => "INFO",
+            LogLevel::Warn => "WARN",
+            LogLevel::Error => "ERROR",
+        }
+    }
+
+    /// The canonical value Caddy writes into the request variable: `zapcore.Level.String()` is
+    /// lower-case, which is also the spelling the adapted `vars` handler carries
+    /// (`caddyconfig/httpcaddyfile/builtins.go:1277`).
+    pub fn as_var_value(self) -> &'static str {
+        match self.0 {
+            LogLevel::Debug => "debug",
+            LogLevel::Info => "info",
+            LogLevel::Warn => "warn",
+            LogLevel::Error => "error",
+        }
+    }
+}
+
+fn parse_log_level_name(name: &str) -> Option<LogLevel> {
+    // Caddy's `zapcore.ParseLevel` lower-cases the text before matching; do not trim, because
+    // `" INFO"` is not a level zap accepts either.
+    Some(match name.to_ascii_lowercase().as_str() {
+        "debug" => LogLevel::Debug,
+        "info" => LogLevel::Info,
+        "warn" => LogLevel::Warn,
+        "error" => LogLevel::Error,
+        _ => return None,
+    })
+}
+
+/// The access-log level Caddy's `Server.logRequest` assigns to a finished request.
+///
+/// The default is status-derived ([`LogLevel::for_status`]: `ERROR` for `status >= 500`, otherwise
+/// `INFO`). A valid [`LOG_LEVEL_VAR`] value *replaces* that default, in either direction; an
+/// invalid value is ignored and the default stands (`modules/caddyhttp/server.go:1271-1282`).
+#[must_use]
+pub fn access_log_level(status: u16, log_level_var: Option<&str>) -> LogLevel {
+    LogLevelOverride::from_request_var(log_level_var)
+        .map_or_else(|| LogLevel::for_status(status), LogLevelOverride::level)
+}
+
+/// Apply the per-request [`LOG_LEVEL_VAR`] override to an [`AccessLogEntry`].
+///
+/// Call this after `AccessLogEntry::with_status`, which sets the status-derived level. The stored
+/// level is what [`AccessLogEntry`] consumers serialise *and* what the sink's configured threshold
+/// filters on, so this reproduces both halves of Caddy's behaviour (Caddy applies the level to
+/// `logger.Check` before writing the entry). `None` keeps the status-derived level.
+pub fn apply_access_log_level(entry: &mut AccessLogEntry, log_level_var: Option<&str>) {
+    entry.level = access_log_level(entry.status, log_level_var);
+}
+
 fn parse_sampling(
     path: &str,
     sampling: Option<&LogSampling>,
@@ -2455,6 +2583,120 @@ mod tests {
         });
         let logging: Logging = serde_json::from_value(value.clone()).expect("decode");
         assert_eq!(serde_json::to_value(&logging).expect("encode"), value);
+    }
+
+    #[test]
+    fn log_level_override_helper_names_match_caddy() {
+        // Caddy's `caddyhttp.LogLevelVar` and the four names its directive/log-time checks accept.
+        assert_eq!(LOG_LEVEL_VAR, "log_level");
+        assert_eq!(LOG_LEVEL_NAMES, ["DEBUG", "INFO", "WARN", "ERROR"]);
+    }
+
+    #[test]
+    fn every_accepted_log_level_name_parses_case_insensitively() {
+        // The located path is the adapted `vars` handler a Caddyfile `log_level` compiles to.
+        const PATH: &str = "apps.http.servers.srv0.routes.0.handle.0.log_level";
+        for (name, expected) in [
+            ("DEBUG", LogLevel::Debug),
+            ("debug", LogLevel::Debug),
+            ("Debug", LogLevel::Debug),
+            ("INFO", LogLevel::Info),
+            ("info", LogLevel::Info),
+            ("WARN", LogLevel::Warn),
+            ("warn", LogLevel::Warn),
+            ("ERROR", LogLevel::Error),
+            ("error", LogLevel::Error),
+            ("ErRoR", LogLevel::Error),
+        ] {
+            let parsed = LogLevelOverride::parse(name, PATH)
+                .unwrap_or_else(|error| panic!("{name:?} should parse: {error}"));
+            assert_eq!(parsed.level(), expected, "{name:?}");
+            // Directive help/validation spelling versus the lower-case value Caddy writes into
+            // the request variable (`zapcore.Level.String()`).
+            assert_eq!(
+                parsed.as_str(),
+                name.to_ascii_uppercase().as_str(),
+                "{name:?}"
+            );
+            assert_eq!(
+                parsed.as_var_value(),
+                name.to_ascii_lowercase().as_str(),
+                "{name:?}"
+            );
+            // The request-time lookup agrees with the strict parse for valid names.
+            assert_eq!(
+                LogLevelOverride::from_request_var(Some(name)),
+                Some(parsed),
+                "{name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_log_level_names_are_located_errors() {
+        const PATH: &str = "apps.http.servers.srv0.routes.0.handle.0.log_level";
+        // `DPANIC`/`PANIC`/`FATAL` are zap levels but Caddy's `DEBUG..=ERROR` range check rejects
+        // them; `" INFO"` is rejected because zap does not trim either.
+        for name in [
+            "", "verbose", "warning", "DPANIC", "panic", "FATAL", "5", " INFO",
+        ] {
+            let error = LogLevelOverride::parse(name, PATH).expect_err(name);
+            assert_eq!(error.path(), PATH, "{name:?}");
+            assert_eq!(
+                error.message(),
+                format!("invalid log level \"{name}\": expected DEBUG, INFO, WARN, or ERROR"),
+                "{name:?}"
+            );
+            assert_eq!(error.tracking_id(), None, "{name:?}");
+            // At request time Caddy silently ignores the invalid value.
+            assert_eq!(
+                LogLevelOverride::from_request_var(Some(name)),
+                None,
+                "{name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn entry_with_a_log_level_override_uses_the_override_level() {
+        // Caddy's override *replaces* the status-derived level in both directions: an ERROR
+        // override suppresses a 200 at INFO sinks, a DEBUG override logs a 500 at DEBUG sinks.
+        let mut raised = entry(200, "ok");
+        assert_eq!(raised.level, LogLevel::Info);
+        apply_access_log_level(&mut raised, Some("ERROR"));
+        assert_eq!(raised.level, LogLevel::Error);
+        assert_eq!(raised.status, 200);
+
+        let mut lowered = entry(500, "boom");
+        assert_eq!(lowered.level, LogLevel::Error);
+        apply_access_log_level(&mut lowered, Some("debug"));
+        assert_eq!(lowered.level, LogLevel::Debug);
+
+        // WARN is a real level, not a synonym for ERROR (unlike the sink's threshold mapping).
+        let mut warned = entry(404, "missing");
+        apply_access_log_level(&mut warned, Some("WARN"));
+        assert_eq!(warned.level, LogLevel::Warn);
+    }
+
+    #[test]
+    fn entry_without_a_log_level_override_keeps_the_status_level() {
+        let mut ok = entry(200, "ok");
+        apply_access_log_level(&mut ok, None);
+        assert_eq!(ok.level, LogLevel::Info);
+
+        let mut server_error = entry(500, "boom");
+        apply_access_log_level(&mut server_error, None);
+        assert_eq!(server_error.level, LogLevel::Error);
+
+        // An invalid request variable keeps the default, exactly like Caddy's `logRequest`.
+        let mut invalid = entry(503, "down");
+        apply_access_log_level(&mut invalid, Some("verbose"));
+        assert_eq!(invalid.level, LogLevel::Error);
+
+        // The status helper agrees with the entry helper.
+        assert_eq!(access_log_level(200, Some("warn")), LogLevel::Warn);
+        assert_eq!(access_log_level(500, None), LogLevel::Error);
+        assert_eq!(access_log_level(500, Some("info")), LogLevel::Info);
     }
 
     /// Minimal recording writer for asserting emitted bytes.
