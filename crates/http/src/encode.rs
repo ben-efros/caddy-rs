@@ -1422,7 +1422,7 @@ mod tests {
             },
             Body::from_stream(StreamingBody::from_chunks(receiver)),
         );
-        let mut response = transform(&handler, &mut request, response).await;
+        let response = transform(&handler, &mut request, response).await;
         assert_eq!(response.headers[header::CONTENT_ENCODING], "gzip");
         assert!(!response.headers.contains_key(header::CONTENT_LENGTH));
         let body = response.body.into_bytes().await.expect("body");

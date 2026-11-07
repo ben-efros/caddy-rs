@@ -993,13 +993,11 @@ pub fn adapt_with_source(
                 }),
             }
         }
-        let mut https = false;
         let mut skip_auto_https: Vec<String> = Vec::new();
         for block in &blocks {
             let site = &file.sites[block.site_index];
             for address_index in &block.address_indices {
                 let address = &site.addresses[*address_index];
-                https |= address.is_https(http_port, https_port);
                 let port = address.effective_port(http_port, https_port);
                 if address.scheme.as_deref() == Some("http")
                     && port != http_port
@@ -1015,7 +1013,6 @@ pub fn adapt_with_source(
         servers.push(ServerBuilder {
             listens,
             blocks,
-            https,
             skip_auto_https,
         });
     }
@@ -1284,7 +1281,6 @@ struct ServerBuilder {
     /// Listen addresses sorted as Caddy's paired address list.
     listens: Vec<String>,
     blocks: Vec<SiteBlockPlan>,
-    https: bool,
     skip_auto_https: Vec<String>,
 }
 

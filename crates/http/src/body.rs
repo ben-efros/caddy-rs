@@ -401,7 +401,6 @@ pub struct RequestBody {
 enum RequestBodyInner {
     Buffered(Option<Bytes>),
     Streaming(Option<StreamingBody>),
-    Consumed,
 }
 
 impl RequestBody {
@@ -440,18 +439,13 @@ impl RequestBody {
         matches!(self.inner, RequestBodyInner::Streaming(_))
     }
 
-    /// Whether the body has already been consumed.
-    pub fn is_consumed(&self) -> bool {
-        matches!(self.inner, RequestBodyInner::Consumed)
-    }
-
     /// Exact size when known: buffered bodies always; streams only when their source reports one.
     pub fn exact_size(&self) -> Option<u64> {
         match &self.inner {
             RequestBodyInner::Buffered(Some(bytes)) => Some(bytes.len() as u64),
             RequestBodyInner::Buffered(None) => Some(0),
             RequestBodyInner::Streaming(Some(stream)) => stream.size_hint().exact(),
-            RequestBodyInner::Streaming(None) | RequestBodyInner::Consumed => None,
+            RequestBodyInner::Streaming(None) => None,
         }
     }
 
@@ -497,9 +491,7 @@ impl RequestBody {
                 }
                 Ok(collected.freeze())
             }
-            RequestBodyInner::Streaming(None) | RequestBodyInner::Consumed => {
-                Err(BodyError::Consumed)
-            }
+            RequestBodyInner::Streaming(None) => Err(BodyError::Consumed),
         }
     }
 
@@ -561,7 +553,6 @@ impl RequestBody {
                 }
                 None => None,
             },
-            RequestBodyInner::Consumed => Some(Err(BodyError::Consumed)),
         }
     }
 }
@@ -608,7 +599,6 @@ impl HttpBody for RequestBody {
                 },
                 None => Poll::Ready(None),
             },
-            RequestBodyInner::Consumed => Poll::Ready(Some(Err(BodyError::Consumed))),
         }
     }
 
@@ -616,7 +606,7 @@ impl HttpBody for RequestBody {
         match &self.inner {
             RequestBodyInner::Buffered(slot) => slot.as_ref().is_none_or(Bytes::is_empty),
             RequestBodyInner::Streaming(Some(stream)) => stream.is_end_stream(),
-            RequestBodyInner::Streaming(None) | RequestBodyInner::Consumed => true,
+            RequestBodyInner::Streaming(None) => true,
         }
     }
 

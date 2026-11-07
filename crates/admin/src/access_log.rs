@@ -3378,7 +3378,7 @@ mod tests {
         request
             .headers
             .insert("Content-Type".to_string(), vec!["text/plain".to_string()]);
-        let mut entry = AccessLogEntry::new(request).with_response_headers(&headers(&[
+        let entry = AccessLogEntry::new(request).with_response_headers(&headers(&[
             ("content-type", "text/plain"),
             ("x-internal", "1"),
         ]));

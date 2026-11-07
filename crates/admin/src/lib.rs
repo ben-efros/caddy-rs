@@ -185,7 +185,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use caddy_rs_core::autosave as config_autosave;
 use caddy_rs_core::{drain, Config, Generation, GenerationStore, LifecycleState};
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use serde_json::{json, Value};

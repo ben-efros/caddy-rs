@@ -11,7 +11,7 @@
 //! Signature Version 4 documentation).
 
 use std::fmt;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use serde_json::{Map, Value};
@@ -691,6 +691,7 @@ fn provider_error(message: impl Into<String>) -> DnsError {
 
 #[cfg(test)]
 mod tests {
+    use std::time::UNIX_EPOCH;
     use super::*;
     use crate::dns::DnsChallengeConfig;
     use std::collections::VecDeque;

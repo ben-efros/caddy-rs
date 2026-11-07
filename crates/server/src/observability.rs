@@ -379,23 +379,6 @@ impl RequestSnapshot {
         )
     }
 
-    /// Capture from already-split request parts (the buffered HTTP/3 path, where hyper's
-    /// `Request<Incoming>` no longer exists).
-    pub(crate) fn capture_from_parts(
-        parts: &http::request::Parts,
-        remote: Option<SocketAddr>,
-        tls: Option<&TlsLogInfo>,
-    ) -> Self {
-        Self::capture_fields(
-            &parts.method,
-            parts.version,
-            &parts.uri,
-            &parts.headers,
-            remote,
-            tls,
-        )
-    }
-
     fn capture_fields(
         method: &http::Method,
         version: http::Version,

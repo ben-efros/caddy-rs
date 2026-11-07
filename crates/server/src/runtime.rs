@@ -28,7 +28,7 @@ use caddy_rs_tls::{
     plan_automatic_https, resolver_from_config, staple_for_certificate, AcmeTlsAlpnResolver,
     AcmeTransport, AutomaticHttpsIssuer, AutomaticHttpsPlan, AutomaticHttpsProvisioner,
     AutomaticHttpsRenewals, CertificateResolver, HyperOcspTransport, HyperTransport,
-    NoAcmeTransport, OcspPolicy, OcspStapler, OcspTransport, SharedOcspStapler,
+    NoAcmeTransport, OcspPolicy, OcspStapler, SharedOcspStapler,
     TlsAlpn01TokenStore, TlsServerOptions, DEFAULT_HTTPS_PORT,
 };
 use tokio::sync::watch;
@@ -148,7 +148,7 @@ impl PendingAutomaticHttps {
             .provisioner
             .provision(&plan, self.base_resolver)
             .await?;
-        let mut resolver = provisioned.resolver;
+        let resolver = provisioned.resolver;
         let mut ocsp_refresh = None;
         if let Some(stapler) = &self.ocsp_stapler {
             apply_ocsp_staples(&resolver, &plan, stapler).await;
@@ -1909,10 +1909,6 @@ fn effective_listens(
         .collect();
     listens.extend(derived);
     listens
-}
-
-fn alt_svc_for_server(server: &HttpServer) -> Option<String> {
-    alt_svc_for_listens(server, &server.listen)
 }
 
 /// Alt-Svc for an explicit listen list (used with [`effective_listens`] so automatically derived

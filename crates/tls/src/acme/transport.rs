@@ -184,7 +184,7 @@ impl HyperTransport {
     }
 
     /// Route ACME HTTP requests through an `http://` forward proxy (Caddy `network_proxy`).
-    pub fn with_proxy(mut self, proxy: impl Into<String>) -> Result<Self> {
+    pub fn with_proxy(self, proxy: impl Into<String>) -> Result<Self> {
         let proxy = proxy.into();
         Self::from_parts(
             self.roots.clone(),

@@ -1,6 +1,6 @@
 //! Real-router tests for the caddy-rs `templates` handler subset (T-ROUTE-026).
 
-use caddy_rs_http::{Body, Outcome, Request, Router, RouterBuilder};
+use caddy_rs_http::{Outcome, Request, Router, RouterBuilder};
 use http::{header, HeaderValue, Method, StatusCode};
 use serde_json::{json, Value};
 

@@ -964,7 +964,7 @@ impl Validator<'_> {
     fn validate_on_demand_policy(
         &self,
         policy: &AutomationPolicy,
-        index: usize,
+        _index: usize,
         permission_configured: bool,
         path: &str,
     ) -> Result<()> {

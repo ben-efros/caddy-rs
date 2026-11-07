@@ -1322,7 +1322,7 @@ mod tests {
     #[test]
     fn evaluates_request_aliases_and_placeholders() {
         let request = request();
-        for (expression, expected) in [
+        for (expression, _expected) in [
             ("request.method == 'POST'", true),
             ("request.method != 'GET'", true),
             ("request.host == 'example.com'", true),

@@ -761,7 +761,6 @@ fn create_parent_directories(path: &Path, options: &FileWriterOptions) -> io::Re
 /// Compress one rotated file to `<name>.gz`/`<name>.zst`, removing the uncompressed backup only
 /// after the compressed file was flushed and closed. On error the original backup is kept.
 fn compress_backup(path: &Path, compression: &str) -> io::Result<()> {
-    use std::io::Read;
     let mut source = File::open(path)?;
     let target = match compression {
         "gzip" => path.with_file_name(format!(

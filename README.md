@@ -142,6 +142,7 @@ configuration fails before any listener changes.
 | [Plugins](docs/PLUGINS.md) | runtime module models and how to write one |
 | [Design](docs/DESIGN.md) | crate layout and runtime architecture |
 | [Testing](docs/TESTING.md) | test layers and how to run them |
+| [Releasing](docs/RELEASING.md) | building and publishing the platform archives |
 
 ## Status
 

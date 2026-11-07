@@ -50,12 +50,7 @@
 //! recording remains unconditional and `per_host` configurations are rejected by the core
 //! validator (DIV-0006).
 
-use std::collections::BTreeSet;
-
-use caddy_rs_core::Config;
 use serde_json::Value;
-
-use crate::metrics::{HostLabelPolicy, HttpMetrics, HttpMetricsPolicy, MetricsRegistry};
 
 /// Default JSON location of the HTTP app metrics config.
 pub const HTTP_METRICS_CONFIG_PATH: &str = "apps.http.metrics";

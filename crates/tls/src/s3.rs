@@ -249,27 +249,6 @@ impl S3Client {
         &self.settings
     }
 
-    fn endpoint_parts(&self) -> (String, String) {
-        // Strip scheme; remainder may include a base path (MinIO often uses none).
-        let (scheme, rest) = self
-            .settings
-            .endpoint
-            .split_once("://")
-            .expect("validated scheme");
-        let scheme = scheme.to_string();
-        let (authority, base_path) = match rest.split_once('/') {
-            Some((authority, path)) => (
-                authority.to_string(),
-                format!("/{}", path.trim_end_matches('/')),
-            ),
-            None => (rest.to_string(), String::new()),
-        };
-        (
-            format!("{scheme}://{authority}"),
-            format!("{authority}{base_path}"),
-        )
-    }
-
     fn request_target(
         &self,
         key: &str,

@@ -2091,7 +2091,7 @@ fn split_front_matter(input: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http::{Method, StatusCode};
+    use http::Method;
 
     fn request(path: &str) -> Request {
         let mut request = Request::new(Method::GET, path.parse().unwrap());

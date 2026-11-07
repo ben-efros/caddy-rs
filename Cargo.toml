@@ -59,3 +59,14 @@ httpdate = { path = "vendor/httpdate" }
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Smallest distributable binary: full LTO, size-optimised codegen, stripped symbols and no
+# unwinding tables. Used for the static (musl) release artefacts; slower to compile, several
+# times smaller on disk.
+[profile.release-minimal]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

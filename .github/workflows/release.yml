@@ -1,0 +1,133 @@
+name: release
+
+# Builds the distributable binaries when a version tag is pushed and attaches them to a
+# GitHub release. Artifacts are self-contained: every archive carries the binary, the
+# licence and notice files, and a matching line in SHA256SUMS.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version being built (used in artifact names only)
+        required: true
+        default: v0.0.0-dev
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # glibc builds: the portable default on mainstream Linux distributions.
+          - name: x86_64-linux-gnu
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            profile: release
+            archive: tar.gz
+          - name: aarch64-linux-gnu
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            profile: release
+            archive: tar.gz
+          # musl builds: fully static, no libc dependency, size-optimised profile.
+          - name: x86_64-linux-musl-static
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            profile: release-minimal
+            archive: tar.gz
+            musl: true
+          - name: aarch64-linux-musl-static
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            profile: release-minimal
+            archive: tar.gz
+            musl: true
+          # macOS builds.
+          - name: x86_64-macos
+            os: macos-13
+            target: x86_64-apple-darwin
+            profile: release
+            archive: tar.gz
+          - name: aarch64-macos
+            os: macos-latest
+            target: aarch64-apple-darwin
+            profile: release
+            archive: tar.gz
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install --profile minimal
+          rustup target add ${{ matrix.target }}
+
+      - name: Install musl toolchain
+        if: matrix.musl
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          echo "CC_${{ matrix.target//-/_ }}=musl-gcc" >> "$GITHUB_ENV"
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.name }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build
+        run: |
+          cargo build --locked --profile ${{ matrix.profile }} --target ${{ matrix.target }} -p caddy-rs
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ github.event.inputs.version || github.ref_name }}"
+          name="caddy-rs-${version}-${{ matrix.target }}"
+          dir="dist/${name}"
+          mkdir -p "$dir"
+          bin="target/${{ matrix.target }}/${{ matrix.profile }}/caddy-rs"
+          strip "$bin" 2>/dev/null || true
+          cp "$bin" "$dir/caddy-rs"
+          cp LICENSE NOTICE.md README.md "$dir/"
+          tar -czf "dist/${name}.tar.gz" -C dist "$name"
+          rm -rf "$dir"
+          ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+          cat "dist/${name}.tar.gz.sha256" >> dist/SHA256SUMS
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
