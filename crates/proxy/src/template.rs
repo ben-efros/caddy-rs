@@ -59,6 +59,11 @@ enum TemplatePart {
     UriPath,
     UriQuery,
     Host,
+    HostPort,
+    RequestPort,
+    Remote,
+    RemoteHost,
+    RemotePort,
     Scheme,
     RequestHeader(HeaderName),
     ProxyStatusCode,
@@ -129,7 +134,42 @@ impl Template {
                     output.push_str(context.request.uri.query().unwrap_or(""))
                 }
                 TemplatePart::Host => {
+                    // Caddy `http.request.host`: Host header without the port.
+                    output.push_str(
+                        context
+                            .request
+                            .host()
+                            .and_then(split_host_port)
+                            .map(|(host, _)| host)
+                            .unwrap_or_default(),
+                    );
+                }
+                TemplatePart::HostPort => {
+                    // Caddy `http.request.hostport`: the full Host header value.
                     output.push_str(context.request.host().unwrap_or_default());
+                }
+                TemplatePart::RequestPort => {
+                    // Caddy `http.request.port`: the Host header's port, empty when absent.
+                    if let Some((_, port)) = context.request.host().and_then(split_host_port) {
+                        output.push_str(port);
+                    }
+                }
+                TemplatePart::Remote => {
+                    if let Some(remote) = context.request.remote_addr {
+                        output.push_str(&remote.to_string());
+                    }
+                }
+                TemplatePart::RemoteHost => {
+                    // Caddy `http.request.remote.host`: the transport peer, never the
+                    // trusted-proxy-resolved `client_ip` (that is `{http.vars.client_ip}`).
+                    if let Some(remote) = context.request.remote_addr {
+                        output.push_str(&remote.ip().to_string());
+                    }
+                }
+                TemplatePart::RemotePort => {
+                    if let Some(remote) = context.request.remote_addr {
+                        output.push_str(&remote.port().to_string());
+                    }
                 }
                 TemplatePart::Scheme => {
                     output.push_str(if context.request.tls { "https" } else { "http" });
@@ -155,6 +195,19 @@ impl Template {
             }
         }
         output
+    }
+}
+
+/// Split a `host[:port]` value (including bracketed IPv6) into `(host, port)`.
+fn split_host_port(value: &str) -> Option<(&str, &str)> {
+    if let Some(rest) = value.strip_prefix('[') {
+        let (host, after) = rest.split_once(']')?;
+        return Some((host, after.strip_prefix(':').unwrap_or("")));
+    }
+    match value.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') => Some((host, port)),
+        Some(_) => None,
+        None => Some((value, "")),
     }
 }
 
@@ -190,6 +243,11 @@ fn parse_placeholder(token: &str) -> Option<TemplatePart> {
         "http.request.uri.path" | "path" => Some(TemplatePart::UriPath),
         "http.request.uri.query" | "query" => Some(TemplatePart::UriQuery),
         "http.request.host" | "host" => Some(TemplatePart::Host),
+        "http.request.hostport" | "hostport" => Some(TemplatePart::HostPort),
+        "http.request.port" | "port" => Some(TemplatePart::RequestPort),
+        "http.request.remote" | "remote" => Some(TemplatePart::Remote),
+        "http.request.remote.host" | "remote_host" => Some(TemplatePart::RemoteHost),
+        "http.request.remote.port" | "remote_port" => Some(TemplatePart::RemotePort),
         "http.request.scheme" | "scheme" => Some(TemplatePart::Scheme),
         "http.reverse_proxy.status_code" | "rp.status_code" => Some(TemplatePart::ProxyStatusCode),
         _ => None,
@@ -450,6 +508,48 @@ mod tests {
             .headers
             .insert(http::header::HOST, HeaderValue::from_static("example.com"));
         request
+    }
+
+    #[test]
+    fn expands_host_and_remote_placeholders_like_caddy() {
+        // Caddy: `http.request.host` excludes the port, `http.request.hostport` is the full Host
+        // header, `http.request.port` is the Host header's port, and `http.request.remote*` is the
+        // transport peer (never the trusted-proxy-resolved client_ip).
+        let mut request = request(Method::GET, "/");
+        request.headers.insert(
+            http::header::HOST,
+            HeaderValue::from_static("example.com:8080"),
+        );
+        request.remote_addr = Some("192.0.2.10:5555".parse().unwrap());
+        let context = TemplateContext {
+            request: &request,
+            response_status: None,
+            response_headers: None,
+            vars: None,
+        };
+        let template = Template::parse(concat!(
+            "{http.request.host}|{http.request.hostport}|{http.request.port}|",
+            "{http.request.remote}|{http.request.remote.host}|{http.request.remote.port}",
+        ));
+        assert_eq!(
+            template.expand(&context),
+            "example.com|example.com:8080|8080|192.0.2.10:5555|192.0.2.10|5555"
+        );
+
+        // No peer address (Unix-socket peer): the remote placeholders render empty, like Caddy's
+        // unknown-address behaviour in caddy-rs's placeholder subset.
+        let mut no_peer = request.clone();
+        no_peer.remote_addr = None;
+        let no_peer_context = TemplateContext {
+            request: &no_peer,
+            response_status: None,
+            response_headers: None,
+            vars: None,
+        };
+        let template = Template::parse(
+            "{http.request.remote}|{http.request.remote.host}|{http.request.remote.port}",
+        );
+        assert_eq!(template.expand(&no_peer_context), "||");
     }
 
     #[test]

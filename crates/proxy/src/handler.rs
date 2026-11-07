@@ -1040,29 +1040,37 @@ impl ReverseProxyHandler {
         request: &Request,
         upstream: &Upstream,
     ) -> Result<(), ProxyError> {
-        let Some(remote) = request.remote_addr.as_ref() else {
-            // Caddy treats a Unix-socket peer as remote address "@": it cannot be a trusted
-            // proxy, so forwarded headers sent by the client are stripped.
-            headers.remove("x-forwarded-for");
-            headers.remove("x-forwarded-proto");
-            headers.remove("x-forwarded-host");
-            return Ok(());
-        };
-        // Caddy formats peers through Go net.IP, which renders IPv4-mapped IPv6 addresses as
-        // dotted IPv4; canonicalize so X-Forwarded-For and trust checks match (DIV-0098).
-        let client_ip = remote.ip().to_canonical();
         // The server runtime sets Caddy's `trusted_proxy` var from the server-level
         // trusted_proxies; the handler-level list is unioned with it, like Caddy.
         let server_trusted = request
             .vars
             .get("trusted_proxy")
             .is_some_and(|value| value == "true");
+        // `http.request.remote.host`/the X-Forwarded-* chain use the transport peer, not the
+        // trusted-proxy-resolved client IP (Caddy's `addForwardedHeaders` parses `req.RemoteAddr`).
+        // Caddy canonicalizes IPv4-mapped IPv6 peers to dotted IPv4 (DIV-0098).
+        let peer_ip = request
+            .remote_addr
+            .as_ref()
+            .map(|remote| remote.ip().to_canonical());
         let trusted = server_trusted
-            || self
-                .trusted_proxies
-                .iter()
-                .any(|network| network.contains(client_ip));
+            || peer_ip.is_some_and(|client_ip| {
+                self.trusted_proxies
+                    .iter()
+                    .any(|network| network.contains(client_ip))
+            });
 
+        if peer_ip.is_none() && !trusted {
+            // Unix-socket peer (`RemoteAddr == "@"` in Caddy) that is not trusted: strip the
+            // de-facto forwarded headers so an upstream never trusts values from the client.
+            headers.remove("x-forwarded-for");
+            headers.remove("x-forwarded-proto");
+            headers.remove("x-forwarded-host");
+            return Ok(());
+        }
+
+        // A trusted Unix peer has no peer IP to append, but its prior forwarded values are kept
+        // (Caddy leaves `clientIP` empty and keeps the existing chain).
         let forwarded_for = joined_header_value(headers, "x-forwarded-for");
         if trusted
             && forwarded_for
@@ -1070,14 +1078,16 @@ impl ReverseProxyHandler {
                 .is_some_and(|prior| !prior.is_empty())
         {
             let mut prior = forwarded_for.unwrap_or_default();
-            prior.push_str(", ");
-            prior.push_str(&client_ip.to_string());
+            if let Some(client_ip) = peer_ip {
+                prior.push_str(", ");
+                prior.push_str(&client_ip.to_string());
+            }
             headers.insert(
                 "x-forwarded-for",
                 HeaderValue::from_str(&prior)
                     .map_err(|error| ProxyError::Request(error.to_string()))?,
             );
-        } else {
+        } else if let Some(client_ip) = peer_ip {
             headers.insert(
                 "x-forwarded-for",
                 HeaderValue::from_str(&client_ip.to_string())
