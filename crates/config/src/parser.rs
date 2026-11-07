@@ -395,11 +395,127 @@ pub fn parse(input: &str) -> Result<Caddyfile, ParseError> {
     parse_with_source(input, None)
 }
 
+/// Caddy v2.11.7's Caddyfile placeholder shorthands (`placeholderShorthands`): every token's text
+/// is rewritten before directives are parsed, exactly like `httpcaddyfile.ShorthandReplacer`
+/// (`ApplyToSegment`). This makes `{path}`, `{orig_path}`, `{file_match.relative}`, etc. expand
+/// in every directive argument, matcher argument and header value.
+fn apply_placeholder_shorthands(tokens: &mut [Token]) {
+    for token in tokens {
+        token.text = apply_placeholder_shorthands_to_text(&token.text);
+    }
+}
+
+fn apply_placeholder_shorthands_to_text(text: &str) -> String {
+    const SIMPLE: &[(&str, &str)] = &[
+        ("{host}", "{http.request.host}"),
+        ("{hostport}", "{http.request.hostport}"),
+        ("{port}", "{http.request.port}"),
+        ("{orig_method}", "{http.request.orig_method}"),
+        ("{orig_uri}", "{http.request.orig_uri}"),
+        ("{orig_path}", "{http.request.orig_uri.path}"),
+        ("{orig_dir}", "{http.request.orig_uri.path.dir}"),
+        ("{orig_file}", "{http.request.orig_uri.path.file}"),
+        ("{orig_query}", "{http.request.orig_uri.query}"),
+        ("{orig_?query}", "{http.request.orig_uri.prefixed_query}"),
+        ("{method}", "{http.request.method}"),
+        ("{uri}", "{http.request.uri}"),
+        ("{%uri}", "{http.request.uri_escaped}"),
+        ("{path}", "{http.request.uri.path}"),
+        ("{%path}", "{http.request.uri.path_escaped}"),
+        ("{dir}", "{http.request.uri.path.dir}"),
+        ("{file}", "{http.request.uri.path.file}"),
+        ("{query}", "{http.request.uri.query}"),
+        ("{%query}", "{http.request.uri.query_escaped}"),
+        ("{?query}", "{http.request.uri.prefixed_query}"),
+        ("{remote}", "{http.request.remote}"),
+        ("{remote_host}", "{http.request.remote.host}"),
+        ("{remote_port}", "{http.request.remote.port}"),
+        ("{scheme}", "{http.request.scheme}"),
+        ("{uuid}", "{http.request.uuid}"),
+        ("{tls_cipher}", "{http.request.tls.cipher_suite}"),
+        ("{tls_version}", "{http.request.tls.version}"),
+        (
+            "{tls_client_fingerprint}",
+            "{http.request.tls.client.fingerprint}",
+        ),
+        ("{tls_client_issuer}", "{http.request.tls.client.issuer}"),
+        ("{tls_client_serial}", "{http.request.tls.client.serial}"),
+        ("{tls_client_subject}", "{http.request.tls.client.subject}"),
+        (
+            "{tls_client_certificate_pem}",
+            "{http.request.tls.client.certificate_pem}",
+        ),
+        (
+            "{tls_client_certificate_der_base64}",
+            "{http.request.tls.client.certificate_der_base64}",
+        ),
+        (
+            "{upstream_hostport}",
+            "{http.reverse_proxy.upstream.hostport}",
+        ),
+        ("{client_ip}", "{http.vars.client_ip}"),
+    ];
+    const PREFIXED: &[(&str, &str)] = &[
+        ("{header.", "{http.request.header."),
+        ("{cookie.", "{http.request.cookie."),
+        ("{labels.", "{http.request.host.labels."),
+        ("{path.", "{http.request.uri.path."),
+        ("{file.", "{http.request.uri.path.file."),
+        ("{query.", "{http.request.uri.query."),
+        ("{re.", "{http.regexp."),
+        ("{vars.", "{http.vars."),
+        ("{rp.", "{http.reverse_proxy."),
+        ("{resp.", "{http.intercept."),
+        ("{err.", "{http.error."),
+        ("{file_match.", "{http.matchers.file."),
+    ];
+
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after_open = &rest[open + 1..];
+        let Some(close) = after_open.find('}') else {
+            out.push_str(&rest[open..]);
+            return out;
+        };
+        let inner = &after_open[..close];
+        let mut replaced = false;
+        for (short, full) in SIMPLE {
+            if inner == &short[1..short.len() - 1] {
+                out.push_str(full);
+                replaced = true;
+                break;
+            }
+        }
+        if !replaced {
+            for (short, full) in PREFIXED {
+                if let Some(suffix) = inner.strip_prefix(&short[1..]) {
+                    out.push_str(full);
+                    out.push_str(suffix);
+                    out.push('}');
+                    replaced = true;
+                    break;
+                }
+            }
+        }
+        if !replaced {
+            out.push('{');
+            out.push_str(inner);
+            out.push('}');
+        }
+        rest = &after_open[close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Parse a Caddyfile whose source path is known, so `import <file>`/`import <glob>` resolve
 /// relative to the Caddyfile's directory (Caddy's adapter filename option).
 pub fn parse_with_source(input: &str, source: Option<&Path>) -> Result<Caddyfile, ParseError> {
     let expansion = expand_env_vars(input);
-    let tokens = lex(&expansion.source)?;
+    let mut tokens = lex(&expansion.source)?;
+    apply_placeholder_shorthands(&mut tokens);
     let parser = Parser::new(tokens, source.map(Path::to_path_buf));
     let mut file = parser.parse_file()?;
     let mut warnings = expansion.warnings;
@@ -1062,6 +1178,7 @@ impl Parser {
             for token in &mut tokens {
                 token.position.file = Some(label.clone());
             }
+            apply_placeholder_shorthands(&mut tokens);
             let (tokens, contexts) = self.substitute_import(
                 &tokens,
                 &args,
@@ -2721,7 +2838,7 @@ mod tests {
         assert_eq!(proxy.block[0].name, "header_up");
         assert_eq!(
             proxy.block[0].args,
-            vec!["Host".to_string(), "{host}".to_string()]
+            vec!["Host".to_string(), "{http.request.host}".to_string()]
         );
     }
 
