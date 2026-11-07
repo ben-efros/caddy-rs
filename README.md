@@ -1,4 +1,5 @@
 <div align="center">
+![Caddy-rs](docs/images/top.webp)
 
 # caddy-rs
 
@@ -52,6 +53,7 @@ That configuration serves static files over HTTPS with a certificate obtained au
 and zstd compression negotiated per request, and HTTP/3 on the same address whenever the client
 supports it.
 
+![Caddy-rs](docs/images/body.webp)
 ## Highlights
 
 | Area | What you get |
