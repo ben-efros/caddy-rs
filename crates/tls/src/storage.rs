@@ -36,6 +36,27 @@
 //! any unknown metadata fields are preserved when a certificate is rewritten, and the metadata is
 //! serialised in CertMagic's tab-indented `sans`-then-`issuer_data` shape without a trailing
 //! newline.
+//!
+//! # Divergences from CertMagic (T-TLS-068)
+//!
+//! * **Locks:** CertMagic guards multi-instance writes with `locks/` entries; this backend uses
+//!   atomic write-then-rename for single-process safety only and does not implement distributed
+//!   locks. Running several caddy-rs instances on one data directory is therefore unsupported
+//!   (reported as a gap, not silently approximated).
+//! * **Storage cleanup:** `apps.tls.automation.storage_clean_interval` is preserved in the typed
+//!   config but no background cleanup task runs; expired assets stay on disk until rewritten.
+//! * **Account JSON:** accounts live at CertMagic's `acme/<ca-dir>/users/<user>/account.{key,json}`
+//!   paths, but the JSON body is caddy-rs's own `StoredAccount` serialisation (it is not
+//!   byte-compatible with certmagic's Go `Account` JSON); the account key is PKCS#8 PEM.
+//! * **Certificate metadata:** the `.json` shape matches CertMagic's `CertificateResource` field
+//!   names (`sans`, `issuer_data`) and tab indentation, but caddy-rs does not synthesise the ARI
+//!   `renewal_info`/`unique_id` fields itself; opaque `issuer_data` provided by the issuer is
+//!   preserved verbatim and unknown metadata fields survive rewrites.
+//! * **`apps.tls.storage`:** upstream Caddy v2.11.7 has no such field; storage is selected by the
+//!   top-level `storage` module and per-automation-policy `apps.tls.automation.policies[].storage`.
+//!   This build wires the top-level module; per-policy storage is a located unsupported error
+//!   (`T-TLS-068`) and `apps.tls.cache` (CertMagic cache tuning: capacity/shards) is preserved but
+//!   not applied because caddy-rs uses its own resolver cache.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -853,6 +874,151 @@ pub fn stored_certificate_expiring(certificate: &StoredCertificate, within: Dura
     certificate.not_after_unix.saturating_sub(now) <= within.as_secs()
 }
 
+/// A storage backend selected from Caddy configuration.
+///
+/// Caddy v2.11.7 selects storage through the top-level `storage` module object (and, per
+/// automation policy, `apps.tls.automation.policies[].storage`); there is no `apps.tls.storage`
+/// field in upstream Caddy. This enum is the tls-crate selection result used by the automatic
+/// HTTPS provisioner and embedders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectedStorage {
+    /// Caddy's `file_system` storage module rooted at a data directory.
+    FileSystem {
+        /// Data directory containing `certificates/`, `acme/`, `pki/`, ... .
+        root: PathBuf,
+    },
+    /// In-memory caddy-rs extension (tests/ephemeral deployments only; not a Caddy module).
+    Memory,
+}
+
+impl SelectedStorage {
+    /// Select the storage backend from a configuration.
+    ///
+    /// * absent configuration -> the `default_root` data directory;
+    /// * `file_system` -> its `root` (environment placeholders expanded) or `default_root`;
+    /// * `memory` -> caddy-rs extension, for tests/embedders only;
+    /// * any other module -> located error (never silently ignored).
+    pub fn from_config(
+        config: &caddy_rs_core::Config,
+        default_root: Option<&Path>,
+    ) -> Result<Self> {
+        match config.storage() {
+            None => match default_root {
+                Some(root) => Ok(Self::FileSystem {
+                    root: root.to_path_buf(),
+                }),
+                None => Err(Error::Storage(
+                    "no `storage` module is configured and no Caddy data directory is available"
+                        .to_string(),
+                )),
+            },
+            Some(storage) => Self::from_storage_config(storage, default_root),
+        }
+    }
+
+    /// Select from one Caddy `storage` module object (`{"module":"file_system","root":"..."}`).
+    pub fn from_storage_config(
+        storage: &caddy_rs_core::config::StorageConfig,
+        default_root: Option<&Path>,
+    ) -> Result<Self> {
+        let module = storage.module_name().unwrap_or("file_system");
+        match module {
+            "file_system" => {
+                let root = match storage.root() {
+                    Some(root) => resolve_storage_root(root)?,
+                    None => match default_root {
+                        Some(root) => root.to_path_buf(),
+                        None => {
+                            return Err(Error::Storage(
+                                "storage module `file_system` has no `root` and no Caddy data \
+                                 directory is available"
+                                    .to_string(),
+                            ))
+                        }
+                    },
+                };
+                Ok(Self::FileSystem { root })
+            }
+            // caddy-rs extension for tests/embedders; Caddy itself has no memory storage module.
+            "memory" => Ok(Self::Memory),
+            other => Err(Error::Storage(format!(
+                "storage module `{other}` is not implemented by this build (T-TLS-068)"
+            ))),
+        }
+    }
+
+    /// The data directory for a file-system backend, if any.
+    pub fn root(&self) -> Option<&Path> {
+        match self {
+            Self::FileSystem { root } => Some(root),
+            Self::Memory => None,
+        }
+    }
+
+    /// The certificate storage backend.
+    pub fn certificate_storage(&self) -> Arc<dyn CertificateStorage> {
+        match self {
+            Self::FileSystem { root } => Arc::new(FileStorage::new(root)),
+            Self::Memory => Arc::new(MemoryStorage::new()),
+        }
+    }
+
+    /// The ACME account storage backend.
+    ///
+    /// CertMagic keeps accounts under `acme/<ca-dir>/users/...` below the same Caddy data
+    /// directory; the in-memory extension mirrors that with [`crate::acme::MemoryAcmeStorage`].
+    pub fn account_storage(&self) -> Arc<dyn crate::acme::AcmeStorage> {
+        match self {
+            Self::FileSystem { root } => Arc::new(FileStorage::new(root)),
+            Self::Memory => Arc::new(crate::acme::MemoryAcmeStorage::new()),
+        }
+    }
+}
+
+/// Expand Caddy environmental placeholders in a storage root (`{env.VAR}` or `{$VAR}`).
+fn resolve_storage_root(root: &str) -> Result<PathBuf> {
+    let mut output = String::with_capacity(root.len());
+    let mut rest = root;
+    while let Some(open) = rest.find('{') {
+        output.push_str(&rest[..open]);
+        rest = &rest[open..];
+        if let Some(close) = rest.find('}') {
+            let token = &rest[1..close];
+            let name = token
+                .strip_prefix("env.")
+                .or_else(|| token.strip_prefix('$'));
+            match name {
+                Some(name) if !name.is_empty() => match std::env::var(name) {
+                    Ok(value) => output.push_str(&value),
+                    Err(_) => {
+                        return Err(Error::Storage(format!(
+                            "storage root placeholder `{{{token}}}` cannot be resolved: \
+                             environment variable `{name}` is not set"
+                        )))
+                    }
+                },
+                _ => {
+                    // Not an environment placeholder: Caddy leaves unrecognised placeholders for
+                    // the replacer; a storage root depending on request data is invalid.
+                    return Err(Error::Storage(format!(
+                        "storage root `{root}` contains an unsupported placeholder `{{{token}}}`"
+                    )));
+                }
+            }
+            rest = &rest[close + 1..];
+        } else {
+            return Err(Error::Storage(format!(
+                "storage root `{root}` contains an unterminated placeholder"
+            )));
+        }
+    }
+    output.push_str(rest);
+    if output.is_empty() {
+        return Err(Error::Storage("storage root is empty".to_string()));
+    }
+    Ok(PathBuf::from(output))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1251,5 +1417,138 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("s3"));
+    }
+
+    #[test]
+    fn selects_file_system_storage_from_config() {
+        let config = caddy_rs_core::Config::from_value(serde_json::json!({
+            "storage": {"module": "file_system", "root": "/srv/caddy-data"}
+        }))
+        .unwrap();
+        let storage = SelectedStorage::from_config(&config, None).expect("configured storage");
+        assert_eq!(storage.root(), Some(Path::new("/srv/caddy-data")));
+        assert_eq!(storage.certificate_storage().name(), "file_system");
+    }
+
+    #[test]
+    fn storage_defaults_to_the_data_directory_and_reports_a_missing_root() {
+        let config = caddy_rs_core::Config::from_value(serde_json::json!({})).unwrap();
+        let storage = SelectedStorage::from_config(&config, Some(Path::new("/data")))
+            .expect("default data directory");
+        assert_eq!(storage.root(), Some(Path::new("/data")));
+        let error = SelectedStorage::from_config(&config, None)
+            .expect_err("no storage and no data directory must be loud");
+        assert!(error.to_string().contains("data directory"), "{error}");
+
+        // `file_system` without `root` falls back to the data directory, but is loud when none is
+        // available.
+        let configured = caddy_rs_core::Config::from_value(serde_json::json!({
+            "storage": {"module": "file_system"}
+        }))
+        .unwrap();
+        assert_eq!(
+            SelectedStorage::from_config(&configured, Some(Path::new("/data")))
+                .unwrap()
+                .root(),
+            Some(Path::new("/data"))
+        );
+        let error = SelectedStorage::from_config(&configured, None)
+            .expect_err("missing file_system root must be loud");
+        assert!(error.to_string().contains("root"), "{error}");
+    }
+
+    #[test]
+    fn unknown_storage_modules_are_located_errors() {
+        let config = caddy_rs_core::Config::from_value(serde_json::json!({
+            "storage": {"module": "s3", "bucket": "certs"}
+        }))
+        .unwrap();
+        let error = SelectedStorage::from_config(&config, Some(Path::new("/data")))
+            .expect_err("unknown storage module");
+        assert!(error.to_string().contains("s3"), "{error}");
+        assert!(error.to_string().contains("T-TLS-068"), "{error}");
+    }
+
+    #[test]
+    fn storage_root_environment_placeholders_are_expanded_and_invalid_ones_loud() {
+        std::env::set_var("CADDY_RS_W16_STORAGE_ROOT", "/tmp/w16-data");
+        assert_eq!(
+            resolve_storage_root("{env.CADDY_RS_W16_STORAGE_ROOT}").unwrap(),
+            PathBuf::from("/tmp/w16-data")
+        );
+        std::env::remove_var("CADDY_RS_W16_STORAGE_ROOT");
+        assert!(resolve_storage_root("{env.CADDY_RS_W16_STORAGE_ROOT}").is_err());
+        assert!(resolve_storage_root("{http.request.host}").is_err());
+    }
+
+    #[test]
+    fn certmagic_certificate_metadata_fixture_round_trips() {
+        let directory = tempfile::tempdir().unwrap();
+        let issuer_dir = directory
+            .path()
+            .join(CERTIFICATES_DIRECTORY)
+            .join("acme.test-directory")
+            .join("example.com");
+        std::fs::create_dir_all(&issuer_dir).unwrap();
+        std::fs::write(
+            issuer_dir.join("example.com.crt"),
+            include_str!("../testdata/https/example.com.pem"),
+        )
+        .unwrap();
+        std::fs::write(
+            issuer_dir.join("example.com.key"),
+            include_str!("../testdata/https/example.com.key"),
+        )
+        .unwrap();
+        // Hand-written CertMagic `CertificateResource` fixture (certmagic v0.25 JSON tags:
+        // `sans`, `issuer_data` with ACME `url`/`ca`/`account` and ARI `renewal_info`).
+        let fixture = "{\n\t\"sans\": [\n\t\t\"example.com\"\n\t],\n\t\"issuer_data\": {\n\t\t\"url\": \"https://acme.test/cert/1\",\n\t\t\"ca\": \"https://acme.test/directory\",\n\t\t\"account\": \"https://acme.test/account/1\",\n\t\t\"renewal_info\": {\"suggestedWindow\": {}},\n\t\t\"unique_id\": \"fixture-id\"\n\t}\n}";
+        std::fs::write(issuer_dir.join("example.com.json"), fixture).unwrap();
+
+        let storage = FileStorage::new(directory.path());
+        let key = "acme.test-directory/example.com";
+        let stored = tokio_test_block_on(CertificateStorage::load(&storage, key)).unwrap();
+        let stored = stored.expect("fixture loads");
+        assert_eq!(stored.domains, vec!["example.com".to_string()]);
+        let issuer_data = stored.issuer_data.as_ref().expect("issuer_data preserved");
+        assert_eq!(issuer_data["url"], "https://acme.test/cert/1");
+        assert_eq!(
+            issuer_data["renewal_info"]["suggestedWindow"],
+            serde_json::json!({})
+        );
+        assert_eq!(issuer_data["unique_id"], "fixture-id");
+
+        // Rewriting preserves issuer_data and any unknown top-level metadata fields; the JSON
+        // shape stays CertMagic's tab-indented `sans`-then-`issuer_data` document without a
+        // trailing newline.
+        let rewritten = StoredCertificate {
+            metadata_extra: BTreeMap::from([(
+                "future_field".to_string(),
+                serde_json::json!("kept"),
+            )]),
+            ..stored
+        };
+        tokio_test_block_on(CertificateStorage::store(&storage, key, &rewritten)).unwrap();
+        let raw = std::fs::read_to_string(issuer_dir.join("example.com.json")).unwrap();
+        assert!(raw.starts_with("{\n\t\"sans\": ["), "{raw}");
+        assert!(raw.contains("\"future_field\": \"kept\""), "{raw}");
+        assert!(
+            !raw.ends_with('\n'),
+            "CertMagic metadata has no trailing newline: {raw:?}"
+        );
+        let reloaded = tokio_test_block_on(CertificateStorage::load(&storage, key))
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.issuer_data, rewritten.issuer_data);
+        assert_eq!(reloaded.metadata_extra, rewritten.metadata_extra);
+    }
+
+    /// Tiny blocking executor for the storage tests (the rest of this module is async-tested).
+    fn tokio_test_block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(future)
     }
 }

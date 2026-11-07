@@ -83,7 +83,7 @@ pub use solver::{
 };
 pub use storage::{
     caddy_certificate_storage_name, caddy_issuer_key, from_config, CertificateStorage, FileStorage,
-    MemoryStorage, StoredCertificate,
+    MemoryStorage, SelectedStorage, StoredCertificate,
 };
 pub use tls_alpn::{
     AcmeTlsAlpnResolver, TlsAlpn01Challenge, TlsAlpn01TokenStore, ACME_IDENTIFIER_OID,

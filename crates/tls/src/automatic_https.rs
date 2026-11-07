@@ -116,7 +116,7 @@ use crate::renewal::{
 };
 use crate::solver::Http01TokenStore;
 use crate::solver::{Http01Solver, TlsAlpn01Solver};
-use crate::storage::{CertificateStorage, FileStorage, StoredCertificate};
+use crate::storage::{CertificateStorage, FileStorage, SelectedStorage, StoredCertificate};
 use crate::tls_alpn::TlsAlpn01TokenStore;
 use crate::tls_server::{CertificateResolver, TlsCertificate};
 use crate::{Error, Result};
@@ -789,6 +789,13 @@ fn parse_policy(
             }
         }
     }
+    if policy.storage.is_some() {
+        return Err(Error::Unsupported {
+            path: format!("{path}.storage"),
+            feature: "per-automation-policy TLS storage backends".to_string(),
+            tracking_id: "T-TLS-068",
+        });
+    }
     let issuer = issuer.unwrap_or_else(|| {
         // Caddy's default issuers are the ACME issuers; this build defaults to Let's Encrypt.
         AutomaticHttpsIssuer::Acme(Box::default())
@@ -1050,6 +1057,9 @@ pub struct AutomaticHttpsProvisioner {
     /// scheduler reuses this store instead of allocating a new one, so a reload does not re-issue
     /// certificates that are still valid.
     shared_certificate_store: Option<Arc<SharedCertificateStore>>,
+    /// Storage backend selected from the configuration (`storage` module) or defaulted to the
+    /// Caddy data directory (T-TLS-068).
+    storage: SelectedStorage,
 }
 
 impl std::fmt::Debug for AutomaticHttpsProvisioner {
@@ -1057,6 +1067,7 @@ impl std::fmt::Debug for AutomaticHttpsProvisioner {
         formatter
             .debug_struct("AutomaticHttpsProvisioner")
             .field("root", &self.root)
+            .field("storage", &self.storage)
             .field("internal_ca_name", &self.internal_ca_name)
             .field("internal_ca_storage", &self.internal_ca_storage.is_some())
             .finish_non_exhaustive()
@@ -1073,9 +1084,10 @@ impl AutomaticHttpsProvisioner {
         root: impl Into<PathBuf>,
         challenge_tokens: Arc<Http01TokenStore>,
     ) -> Self {
+        let root: PathBuf = root.into();
         Self {
             transport,
-            root: root.into(),
+            root: root.clone(),
             challenge_tokens,
             tls_alpn01_tokens: Arc::new(TlsAlpn01TokenStore::new()),
             clock: Arc::new(TokioClock),
@@ -1090,6 +1102,7 @@ impl AutomaticHttpsProvisioner {
             renewal_scheduler_enabled: true,
             internal_ca_clock: Arc::new(SystemClock),
             shared_certificate_store: None,
+            storage: SelectedStorage::FileSystem { root },
         }
     }
 
@@ -1102,6 +1115,20 @@ impl AutomaticHttpsProvisioner {
     pub fn with_certificate_store(mut self, store: Arc<SharedCertificateStore>) -> Self {
         self.shared_certificate_store = Some(store);
         self
+    }
+
+    /// Select the certificate/account storage backend (T-TLS-068).
+    ///
+    /// Build this with [`SelectedStorage::from_config`] using the same Caddy data directory the
+    /// server passes to [`Self::new`]; the default is `file_system` at the data directory.
+    pub fn with_storage(mut self, storage: SelectedStorage) -> Self {
+        self.storage = storage;
+        self
+    }
+
+    /// The selected certificate/account storage backend.
+    pub fn storage(&self) -> &SelectedStorage {
+        &self.storage
     }
 
     /// Inject the blob storage used for internal CA material.
@@ -1189,6 +1216,7 @@ impl AutomaticHttpsProvisioner {
         cached_internal_issuer(
             &self.internal_issuer,
             &self.internal_ca_storage,
+            self.storage.certificate_storage(),
             &self.root,
             &self.internal_ca_name,
             &self.internal_ca_clock,
@@ -1249,7 +1277,7 @@ impl AutomaticHttpsProvisioner {
         plan: &AutomaticHttpsPlan,
         base_resolver: Option<CertificateResolver>,
     ) -> Result<ProvisionedCertificates> {
-        let storage = FileStorage::new(&self.root);
+        let storage = self.storage.certificate_storage();
         let resolver = base_resolver.unwrap_or_default();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1257,7 +1285,7 @@ impl AutomaticHttpsProvisioner {
             .as_secs();
         let mut managed: Vec<Certificate> = Vec::new();
         for key in storage.list("").await? {
-            let Some(stored) = CertificateStorage::load(&storage, &key).await? else {
+            let Some(stored) = CertificateStorage::load(storage.as_ref(), &key).await? else {
                 continue;
             };
             if stored.not_after_unix <= now {
@@ -1374,7 +1402,7 @@ impl AutomaticHttpsProvisioner {
                 &[subject.to_string()],
                 policy.key_type,
                 &self.transport,
-                self.root.clone(),
+                &self.storage,
                 &self.challenge_tokens,
                 &self.tls_alpn01_tokens,
                 &self.clock,
@@ -1426,6 +1454,7 @@ impl AutomaticHttpsProvisioner {
             plan: plan.clone(),
             transport: Arc::clone(&self.transport),
             root: self.root.clone(),
+            storage: self.storage.clone(),
             challenge_tokens: Arc::clone(&self.challenge_tokens),
             tls_alpn01_tokens: Arc::clone(&self.tls_alpn01_tokens),
             acme_clock: Arc::clone(&self.clock),
@@ -1435,7 +1464,7 @@ impl AutomaticHttpsProvisioner {
             internal_ca_clock: Arc::clone(&self.internal_ca_clock),
             internal_issuer: Arc::clone(&self.internal_issuer),
         });
-        let storage: Arc<dyn CertificateStorage> = Arc::new(FileStorage::new(&self.root));
+        let storage: Arc<dyn CertificateStorage> = self.storage.certificate_storage();
         let scheduler = Arc::new(
             RenewalScheduler::new(
                 issuer,
@@ -1473,10 +1502,37 @@ fn renewal_policy_for(plan: &AutomaticHttpsPlan, default: RenewalPolicy) -> Rene
     }
 }
 
+/// Adapts an `Arc<dyn CertificateStorage>` to the boxed storage expected by the internal issuer.
+struct ArcCertificateStorage(Arc<dyn CertificateStorage>);
+
+#[async_trait]
+impl CertificateStorage for ArcCertificateStorage {
+    fn name(&self) -> &'static str {
+        self.0.name()
+    }
+
+    async fn load(&self, key: &str) -> Result<Option<StoredCertificate>> {
+        self.0.load(key).await
+    }
+
+    async fn store(&self, key: &str, certificate: &StoredCertificate) -> Result<()> {
+        self.0.store(key, certificate).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.0.delete(key).await
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        self.0.list(prefix).await
+    }
+}
+
 /// Construct (once) and cache the internal CA issuer shared by provisioning and renewal.
 async fn cached_internal_issuer(
     cache: &Arc<AsyncMutex<Option<Arc<InternalIssuer>>>>,
-    storage: &Option<Arc<dyn CaStorage>>,
+    ca_storage: &Option<Arc<dyn CaStorage>>,
+    certificate_storage: Arc<dyn CertificateStorage>,
     root: &std::path::Path,
     name: &str,
     clock: &Arc<dyn RenewalClock>,
@@ -1485,8 +1541,11 @@ async fn cached_internal_issuer(
     if let Some(issuer) = guard.as_ref() {
         return Ok(Arc::clone(issuer));
     }
-    let issuer = match storage {
-        Some(storage) => InternalIssuer::new(Arc::clone(storage), Box::new(FileStorage::new(root))),
+    let issuer = match ca_storage {
+        Some(storage) => InternalIssuer::new(
+            Arc::clone(storage),
+            Box::new(ArcCertificateStorage(certificate_storage)),
+        ),
         None => InternalIssuer::from_data_directory(root),
     }
     .with_name(name.to_string())
@@ -1524,19 +1583,19 @@ pub(crate) async fn obtain_acme_certificate(
     domains: &[String],
     key_type: CertificateKeyType,
     transport: &Arc<dyn AcmeTransport>,
-    root: PathBuf,
+    storage: &SelectedStorage,
     challenge_tokens: &Arc<Http01TokenStore>,
     tls_alpn01_tokens: &Arc<TlsAlpn01TokenStore>,
     clock: &Arc<dyn AcmeClock>,
     poll_policy: &PollPolicy,
 ) -> Result<Certificate> {
     let transport = acme_transport_for_config(config, transport)?;
-    let account_storage: Arc<dyn AcmeStorage> = Arc::new(FileStorage::new(&root));
+    let account_storage: Arc<dyn AcmeStorage> = storage.account_storage();
     let issuer = AcmeIssuer::new(
         config.clone(),
         Arc::clone(&transport),
         account_storage,
-        Box::new(FileStorage::new(&root)),
+        Box::new(ArcCertificateStorage(storage.certificate_storage())),
     )
     .with_solver(Arc::new(Http01Solver::new(Arc::clone(challenge_tokens))))
     .with_solver(Arc::new(TlsAlpn01Solver::new(Arc::clone(
@@ -1560,6 +1619,7 @@ struct RenewalIssuer {
     plan: AutomaticHttpsPlan,
     transport: Arc<dyn AcmeTransport>,
     root: PathBuf,
+    storage: SelectedStorage,
     challenge_tokens: Arc<Http01TokenStore>,
     tls_alpn01_tokens: Arc<TlsAlpn01TokenStore>,
     acme_clock: Arc<dyn AcmeClock>,
@@ -1575,6 +1635,7 @@ impl RenewalIssuer {
         cached_internal_issuer(
             &self.internal_issuer,
             &self.internal_ca_storage,
+            self.storage.certificate_storage(),
             &self.root,
             &self.internal_ca_name,
             &self.internal_ca_clock,
@@ -1638,7 +1699,7 @@ impl CertificateIssuer for RenewalIssuer {
                     &request.domains,
                     request.key_type,
                     &self.transport,
-                    self.root.clone(),
+                    &self.storage,
                     &self.challenge_tokens,
                     &self.tls_alpn01_tokens,
                     &self.acme_clock,
@@ -3811,5 +3872,112 @@ mod tests {
         );
         assert!(message.contains("T-TLS-051"), "{message}");
         assert!(matches!(error, Error::Unsupported { .. }), "{error:?}");
+    }
+
+    fn all_files_below(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut files = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    files.push(path);
+                }
+            }
+        }
+        files
+    }
+
+    #[test]
+    fn per_policy_storage_is_a_located_unsupported_error() {
+        let mut value = serde_json::to_value(https_config()).unwrap();
+        value["apps"]["tls"]["automation"]["policies"][0]["storage"] =
+            serde_json::json!({"module": "file_system", "root": "/srv/policy-data"});
+        let error = plan(&config(value)).expect_err("per-policy storage must be loud");
+        let message = error.to_string();
+        assert!(message.contains("policies[0].storage"), "{message}");
+        assert!(message.contains("T-TLS-068"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn provisioner_uses_configured_global_storage_and_reloads_from_it() {
+        let configured = tempfile::tempdir().unwrap();
+        let default_data = tempfile::tempdir().unwrap();
+        let mut value = serde_json::to_value(https_config()).unwrap();
+        value["storage"] = serde_json::json!({
+            "module": "file_system",
+            "root": configured.path().to_string_lossy()
+        });
+        let config = config(value);
+        let mut plan = plan(&config).unwrap().unwrap();
+        plan.subjects = vec!["example.com".to_string()];
+
+        // This is the server hook: select the backend from the configuration and hand it to the
+        // provisioner instead of relying on the default data directory.
+        let selected = SelectedStorage::from_config(&config, Some(default_data.path())).unwrap();
+        assert_eq!(selected.root(), Some(configured.path()));
+
+        let transport = Arc::new(FakeAcme::default());
+        let provisioner = AutomaticHttpsProvisioner::new(
+            transport.clone(),
+            default_data.path(),
+            Arc::new(Http01TokenStore::new()),
+        )
+        .with_storage(selected.clone());
+        let result = provisioner.provision(&plan, None).await.unwrap();
+        assert_eq!(result.issued.len(), 1);
+
+        let stored = FileStorage::new(configured.path()).list("").await.unwrap();
+        assert_eq!(stored.len(), 1, "one persisted certificate: {stored:?}");
+        assert!(
+            stored[0].ends_with("/example.com"),
+            "certificate stored under the Caddy layout: {stored:?}"
+        );
+        let default_stored = FileStorage::new(default_data.path())
+            .list("")
+            .await
+            .unwrap();
+        assert!(
+            default_stored.is_empty(),
+            "the default data directory must not be written when another backend is selected: \
+             {default_stored:?}"
+        );
+        // ACME account material is persisted through the selected backend too (CertMagic layout
+        // `acme/<ca-dir>/users/<user>/account.{key,json}`).
+        let account_files = all_files_below(configured.path());
+        assert!(
+            account_files
+                .iter()
+                .any(|path| path.file_name().is_some_and(|name| name == "account.json")),
+            "account.json missing from configured storage: {account_files:?}"
+        );
+        assert!(
+            account_files
+                .iter()
+                .any(|path| path.file_name().is_some_and(|name| name == "account.key")),
+            "account.key missing from configured storage: {account_files:?}"
+        );
+
+        // Reload: a fresh provisioner with the same selected backend loads the persisted
+        // certificate instead of re-issuing.
+        let reload_transport = Arc::new(FakeAcme::default());
+        let reloaded = AutomaticHttpsProvisioner::new(
+            reload_transport.clone(),
+            default_data.path(),
+            Arc::new(Http01TokenStore::new()),
+        )
+        .with_storage(selected);
+        let result = reloaded.provision(&plan, None).await.unwrap();
+        assert!(result.issued.is_empty(), "reload must not re-issue");
+        assert!(result.resolver.covers("example.com"));
+        assert!(
+            reload_transport.inner.requests.lock().unwrap().is_empty(),
+            "reload must not touch the ACME transport"
+        );
     }
 }
