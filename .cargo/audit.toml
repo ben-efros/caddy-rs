@@ -1,0 +1,41 @@
+# cargo-audit policy for caddy-rs.
+#
+# Every ignore below is an explicit, reviewable decision with a reason and a tracking task; the
+# default posture is to upgrade rather than ignore. Run `cargo audit` after changing this file.
+
+[advisories]
+ignore = [
+  # --- rsa: no fixed version exists (RUSTSEC-2023-0071, "Marvin" timing side channel).
+  # Our RSA use is PKCS#1 v1.5 *signing* and verification only (ACME account keys, JWS RS256,
+  # CSR generation). The advisory concerns RSA *decryption* padding oracles, and no code path
+  # here performs RSA decryption with an attacker-influenced ciphertext.
+  "RUSTSEC-2023-0071",
+
+  # --- wasmtime 34: the in-process WASM host. The `wasm-runtime` feature is OFF by default
+  # (see crates/plug/Cargo.toml), so a default or `minimal` build contains no guest runtime.
+  # Upgrading to the fixed releases (>=48) is a major API change tracked by T-PLUG-030; until
+  # then enabling the feature is documented as experimental and not for untrusted plugins.
+  "RUSTSEC-2025-0118",
+  "RUSTSEC-2026-0006",
+  "RUSTSEC-2026-0020",
+  "RUSTSEC-2026-0021",
+  "RUSTSEC-2026-0085",
+  "RUSTSEC-2026-0086",
+  "RUSTSEC-2026-0087",
+  "RUSTSEC-2026-0088",
+  "RUSTSEC-2026-0089",
+  "RUSTSEC-2026-0091",
+  "RUSTSEC-2026-0092",
+  "RUSTSEC-2026-0093",
+  "RUSTSEC-2026-0094",
+  "RUSTSEC-2026-0095",
+  "RUSTSEC-2026-0096",
+  "RUSTSEC-2026-0114",
+  "RUSTSEC-2026-0222",
+  "RUSTSEC-2026-0269",
+  "RUSTSEC-2026-0316",
+  "RUSTSEC-2026-0363",
+  "RUSTSEC-2026-0379",
+  "RUSTSEC-2026-0380",
+  "RUSTSEC-2026-0424",
+]

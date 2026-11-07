@@ -8,10 +8,10 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-# The in-process WASM host runtime (T-PLUG-011). On by default so workspace
-# builds and tests exercise it; out-of-tree crates that only need the external
-# protocol (e.g. the template) can disable it to avoid compiling Wasmtime.
-default = ["wasm-runtime"]
+# The in-process WASM host runtime (T-PLUG-011). Off by default: the pinned Wasmtime release has
+# open sandbox advisories (tracked by T-PLUG-030), so the secure baseline and `minimal` do not
+# compile a guest runtime. Enable explicitly (`--features wasm-runtime`) only for trusted plugins.
+default = []
 wasm-runtime = ["dep:wasmtime"]
 
 [dependencies]
