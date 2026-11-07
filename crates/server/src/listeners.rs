@@ -823,34 +823,20 @@ async fn serve_h3_connection(
                         };
                         let (response_parts, response_body) = hyper_response.into_parts();
                         let mut response_headers = response_parts.headers;
-                        let response_bytes = BodyExt::collect(response_body)
-                            .await
-                            .map(|collected| collected.to_bytes())
-                            .unwrap_or_default();
-                        // Go's HTTP server sets Content-Length for buffered responses (HTTP/3 has
-                        // no transport-level framing headers), including HEAD.
-                        if !response_headers.contains_key(http::header::CONTENT_LENGTH)
-                            && response_parts.status != http::StatusCode::NO_CONTENT
-                            && response_parts.status != http::StatusCode::NOT_MODIFIED
-                        {
-                            if let Ok(value) =
-                                http::HeaderValue::from_str(&response_bytes.len().to_string())
+                        // A buffered body has a known length, so keep the Caddy-compatible
+                        // `Content-Length`; a streamed body is sent chunk by chunk without one and
+                        // is never collected, so a large file does not have to fit in memory.
+                        let known_size = response_body.exact_size();
+                        if let Some(size) = known_size {
+                            if !response_headers.contains_key(http::header::CONTENT_LENGTH)
+                                && response_parts.status != http::StatusCode::NO_CONTENT
+                                && response_parts.status != http::StatusCode::NOT_MODIFIED
                             {
-                                response_headers.insert(http::header::CONTENT_LENGTH, value);
+                                if let Ok(value) = http::HeaderValue::from_str(&size.to_string()) {
+                                    response_headers.insert(http::header::CONTENT_LENGTH, value);
+                                }
                             }
                         }
-                        observe_request(
-                            &context.recorder,
-                            &context.access_log,
-                            &context.access_log_policy,
-                            &context.server_name,
-                            &method,
-                            snapshot.as_ref(),
-                            started,
-                            response_parts.status.as_u16(),
-                            response_bytes.len() as u64,
-                            &response_headers,
-                        );
                         let mut response = http::Response::builder()
                             .status(response_parts.status)
                             .body(())
@@ -862,15 +848,44 @@ async fn serve_h3_connection(
                             tracing::debug!(%error, "HTTP/3 response headers failed");
                             continue;
                         }
-                        if method != "HEAD" && !response_bytes.is_empty() {
-                            if let Err(error) = stream.send_data(response_bytes).await {
-                                tracing::debug!(%error, "HTTP/3 response body failed");
+                        let mut body = std::pin::pin!(response_body);
+                        let mut sent = 0_u64;
+                        let mut failed = false;
+                        while let Some(frame) = body.frame().await {
+                            let Ok(frame) = frame else {
+                                failed = true;
+                                break;
+                            };
+                            let Ok(data) = frame.into_data() else {
+                                continue;
+                            };
+                            sent += data.len() as u64;
+                            if method == "HEAD" || data.is_empty() {
                                 continue;
                             }
+                            if let Err(error) = stream.send_data(data).await {
+                                tracing::debug!(%error, "HTTP/3 response body failed");
+                                failed = true;
+                                break;
+                            }
                         }
-                        if let Err(error) = stream.finish().await {
-                            tracing::debug!(%error, "HTTP/3 response finish failed");
+                        let _ = stream.finish().await;
+                        observe_request(
+                            &context.recorder,
+                            &context.access_log,
+                            &context.access_log_policy,
+                            &context.server_name,
+                            &method,
+                            snapshot.as_ref(),
+                            started,
+                            response_parts.status.as_u16(),
+                            sent,
+                            &response_headers,
+                        );
+                        if failed {
+                            continue;
                         }
+                        continue;
                     }
                     Ok(None) => break,
                     Err(error) => {
