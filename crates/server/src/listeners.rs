@@ -1175,7 +1175,10 @@ async fn serve_wrapped<I>(
 ) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (stream, remote_override, local_override) = match context.wrappers.proxy_protocol() {
+    let (stream, remote_override, local_override, proxy_vars) = match context
+        .wrappers
+        .proxy_protocol()
+    {
         Some(settings) => match crate::proxy_protocol::wrap(stream, peer, local, settings).await {
             Ok(wrapped) => wrapped,
             Err(error) => {
@@ -1187,12 +1190,18 @@ async fn serve_wrapped<I>(
                 return;
             }
         },
-        None => (PrefixedStream::new(stream, Vec::new()), None, None),
+        None => (
+            PrefixedStream::new(stream, Vec::new()),
+            None,
+            None,
+            Vec::new(),
+        ),
     };
     serve_accepted(
         stream,
         remote_override.or(peer),
         local_override.or(local),
+        Arc::new(proxy_vars),
         context,
         permit,
         generation,
@@ -1209,6 +1218,7 @@ async fn serve_accepted<I>(
     stream: I,
     peer: Option<SocketAddr>,
     local_addr: Option<SocketAddr>,
+    proxy_vars: Arc<Vec<(String, String)>>,
     context: ConnectionContext,
     permit: ConnectionPermit,
     generation: Option<Arc<Generation>>,
@@ -1270,6 +1280,7 @@ async fn serve_accepted<I>(
             router,
             Arc::clone(&limits),
             Arc::clone(&trusted_proxies),
+            Arc::clone(&proxy_vars),
             peer,
             local_addr,
             true,
@@ -1295,6 +1306,7 @@ async fn serve_accepted<I>(
             router,
             Arc::clone(&limits),
             Arc::clone(&trusted_proxies),
+            Arc::clone(&proxy_vars),
             peer,
             local_addr,
             false,
@@ -1324,6 +1336,8 @@ struct RequestContext {
     router: Option<Arc<Router>>,
     limits: Arc<ServerLimits>,
     trusted_proxies: Arc<ServerTrustedProxies>,
+    /// PROXY-protocol TLV/Unix variables (empty when no wrapper/header).
+    proxy_vars: Arc<Vec<(String, String)>>,
     remote_addr: Option<SocketAddr>,
     local_addr: Option<SocketAddr>,
     tls: bool,
@@ -1352,6 +1366,7 @@ fn connection_service(
     router: Option<Arc<Router>>,
     limits: Arc<ServerLimits>,
     trusted_proxies: Arc<ServerTrustedProxies>,
+    proxy_vars: Arc<Vec<(String, String)>>,
     remote_addr: Option<SocketAddr>,
     local_addr: Option<SocketAddr>,
     tls: bool,
@@ -1381,6 +1396,7 @@ fn connection_service(
         router,
         limits,
         trusted_proxies,
+        proxy_vars,
         remote_addr,
         local_addr,
         tls,
@@ -1518,6 +1534,7 @@ async fn serve_one_request(
         Arc::clone(&context.trusted_proxies),
         context.client_certificate.clone(),
         request_tls_connection(context.tls_info.as_ref()),
+        &context.proxy_vars,
     )
     .await;
 

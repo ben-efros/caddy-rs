@@ -19,12 +19,16 @@ const BODY: &str = "remote={http.request.remote.host}:{http.request.remote.port}
 
 /// One server with an optional `listener_wrappers` array and the address-echo body.
 fn config(listener_wrappers: serde_json::Value) -> Config {
+    config_with_body(listener_wrappers, BODY)
+}
+
+fn config_with_body(listener_wrappers: serde_json::Value, body: &str) -> Config {
     Config::from_value(serde_json::json!({
         "admin": {"disabled": true},
         "apps": {"http": {"servers": {"srv0": {
             "listen": ["127.0.0.1:0"],
             "listener_wrappers": listener_wrappers,
-            "routes": [{"handle": [{"handler": "static_response", "body": BODY}]}]
+            "routes": [{"handle": [{"handler": "static_response", "body": body}]}]
         }}}}
     }))
     .expect("test config decodes")
@@ -348,4 +352,71 @@ async fn wrapped_and_unwrapped_listeners_coexist() {
     let plain_without_header = raw_get(plain, b"").await;
     assert!(plain_without_header.starts_with(b"HTTP/1.1 200"));
     runtime.shutdown().await;
+
+    fn push_tlv(bytes: &mut Vec<u8>, kind: u8, value: &[u8]) {
+        bytes.push(kind);
+        bytes.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(value);
+    }
+
+    #[tokio::test]
+    async fn v2_tlv_variables_reach_the_handler() {
+        let body = "alpn={http.vars.proxy_protocol.tlv.alpn} \
+                authority={http.vars.proxy_protocol.tlv.authority} \
+                unique={http.vars.proxy_protocol.tlv.unique_id} \
+                cipher={http.vars.proxy_protocol.tlv.ssl.cipher} \
+                version={http.vars.proxy_protocol.tlv.ssl.version}";
+        let (runtime, address) =
+            start(config_with_body(proxy_wrapper(serde_json::json!({})), body)).await;
+        let mut payload = v2_ipv4_payload([203, 0, 113, 9], [198, 51, 100, 2], 55555, 8443);
+        push_tlv(&mut payload, 0x01, b"h2");
+        push_tlv(&mut payload, 0x02, b"proxy.example");
+        push_tlv(&mut payload, 0x05, &[0xde, 0xad, 0xbe, 0xef]);
+        let mut ssl = vec![0x01, 0, 0, 0, 0];
+        push_tlv(&mut ssl, 0x21, b"TLSv1.3");
+        push_tlv(&mut ssl, 0x23, b"TLS_AES_128_GCM_SHA256");
+        push_tlv(&mut payload, 0x20, &ssl);
+        let response = raw_get(address, &v2_header(0x01, 0x11, &payload)).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 200"),
+            "response: {}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_eq!(
+            body_text(&response).trim(),
+            "alpn=h2 authority=proxy.example unique=deadbeef \
+         cipher=TLS_AES_128_GCM_SHA256 version=TLSv1.3"
+                .replace(
+                    " \
+", " "
+                )
+                .trim()
+        );
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn v2_af_unix_header_is_accepted_and_exposes_unix_names() {
+        let body = "remote={http.vars.proxy_protocol.unix.remote} \
+                local={http.vars.proxy_protocol.unix.local} \
+                alpn={http.vars.proxy_protocol.tlv.alpn} \
+                transport={http.request.remote.host}";
+        let (runtime, address) =
+            start(config_with_body(proxy_wrapper(serde_json::json!({})), body)).await;
+        let mut payload = vec![0_u8; 216];
+        payload[..18].copy_from_slice(b"/run/source.sock\0\0");
+        // Destination stays all zeroes: Caddy's net.UnixAddr.String() renders that as "@".
+        push_tlv(&mut payload, 0x01, b"h2");
+        let response = raw_get(address, &v2_header(0x01, 0x31, &payload)).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 200"),
+            "AF_UNIX wrapper must not fail the connection: {}",
+            String::from_utf8_lossy(&response)
+        );
+        let body = body_text(&response);
+        assert!(body.contains("remote=/run/source.sock"), "body: {body}");
+        assert!(body.contains("local=@"), "body: {body}");
+        assert!(body.contains("alpn=h2"), "body: {body}");
+        runtime.shutdown().await;
+    }
 }

@@ -137,19 +137,28 @@ impl<'a> Replacer<'a> {
             "http.request.host" => Some(split_host_port(host).0.to_string()),
             "http.request.hostport" => Some(host.to_string()),
             "http.request.port" => Some(split_host_port(host).1.unwrap_or("").to_string()),
-            "http.request.remote" => Some(format_socket_addr(self.request.remote_addr)),
-            "http.request.remote.host" => Some(
+            "http.request.remote" => Some(
                 self.request
-                    .remote_addr
-                    .map(|addr| addr.ip().to_string())
-                    .unwrap_or_default(),
+                    .remote_addr_text
+                    .clone()
+                    .unwrap_or_else(|| format_socket_addr(self.request.remote_addr)),
             ),
-            "http.request.remote.port" => Some(
+            "http.request.remote.host" => {
+                Some(self.request.remote_addr_text.clone().unwrap_or_else(|| {
+                    self.request
+                        .remote_addr
+                        .map(|addr| addr.ip().to_string())
+                        .unwrap_or_default()
+                }))
+            }
+            "http.request.remote.port" => Some(if self.request.remote_addr_text.is_some() {
+                String::new()
+            } else {
                 self.request
                     .remote_addr
                     .map(|addr| addr.port().to_string())
-                    .unwrap_or_default(),
-            ),
+                    .unwrap_or_default()
+            }),
             "http.request.uri" => Some(request_uri(self.request)),
             "http.request.uri_escaped" => Some(query_escape(&request_uri(self.request))),
             "http.request.uri.path" => Some(path.to_string()),
@@ -705,6 +714,23 @@ mod tests {
         assert_eq!(
             replacer.get("http.request.remote.port").as_deref(),
             Some("5555")
+        );
+        // PROXY protocol v2 AF_UNIX names have no SocketAddr; the server supplies the textual
+        // form Caddy's net.UnixAddr.String() produces (`@` for an empty name).
+        let mut unix = Request::new(Method::GET, "/".parse().unwrap());
+        unix.remote_addr_text = Some("/run/source.sock".to_string());
+        let replacer = Replacer::new(&unix);
+        assert_eq!(
+            replacer.get("http.request.remote").as_deref(),
+            Some("/run/source.sock")
+        );
+        assert_eq!(
+            replacer.get("http.request.remote.host").as_deref(),
+            Some("/run/source.sock")
+        );
+        assert_eq!(
+            replacer.get("http.request.remote.port").as_deref(),
+            Some("")
         );
         let mut unknown = Request::new(Method::GET, "/".parse().unwrap());
         unknown.remote_addr = None;
