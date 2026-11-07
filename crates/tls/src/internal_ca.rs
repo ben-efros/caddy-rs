@@ -54,7 +54,11 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use ring::digest::{digest, SHA1_FOR_LEGACY_USE_ONLY};
 use ring::rand::{SecureRandom, SystemRandom};
-use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+use ring::signature::{
+    EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING, ECDSA_P384_SHA384_ASN1_SIGNING,
+};
+use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey};
+use rsa::RsaPrivateKey;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -744,6 +748,7 @@ impl InternalIssuer {
         &self,
         ca: &LocalCa,
         domains: &[String],
+        key_type: crate::acme::csr::CertificateKeyType,
         now: SystemTime,
     ) -> Result<Certificate> {
         let certificate_storage = self.certificate_storage.as_ref().ok_or_else(|| {
@@ -753,12 +758,12 @@ impl InternalIssuer {
                     .to_string(),
             )
         })?;
-        let key = generate_key()?;
+        let key = generate_leaf_key(key_type)?;
         let not_before = now - self.lifetimes.backdate;
         let not_after = not_before + self.lifetimes.leaf;
 
-        let spki = subject_public_key_info(&key.public_key);
-        let subject_key_id = key_identifier(&key.public_key);
+        let spki = key.spki.clone();
+        let subject_key_id = key.subject_key_id.clone();
         let issuer_key_id = issuer_key_identifier(&ca.intermediate);
         let der = create_certificate(
             &CertSpec {
@@ -827,16 +832,10 @@ impl CertificateIssuer for InternalIssuer {
                 "internal CA certificate request has no domains".to_string(),
             ));
         }
-        if request.key_type != crate::acme::csr::CertificateKeyType::P256 {
-            return Err(Error::Issuer(format!(
-                "internal CA issuer does not support automation policy key_type `{}`; only p256                  is supported for locally-issued certificates (T-TLS-066)",
-                request.key_type.as_str()
-            )));
-        }
         let domains = normalize_domains(&request.domains)?;
         let ca = self.load_ca().await?;
         let now = self.clock.now();
-        self.issue_leaf(&ca, &domains, now).await
+        self.issue_leaf(&ca, &domains, request.key_type, now).await
     }
 }
 
@@ -893,6 +892,89 @@ fn generate_key() -> Result<GeneratedKey> {
         pkcs8_der,
         public_key,
     })
+}
+
+/// A freshly generated leaf key: PKCS#8 private key, SPKI and SubjectKeyIdentifier input.
+struct GeneratedLeafKey {
+    pkcs8_der: Vec<u8>,
+    spki: Vec<u8>,
+    subject_key_id: Vec<u8>,
+}
+
+/// Generate a leaf key of the configured automation-policy type.
+///
+/// P-256/P-384 use ring ECDSA; RSA 2048/4096 use the workspace `rsa` crate. Caddy additionally
+/// supports `ed25519`, which this build rejects at configuration parsing (no PKCS#10 Ed25519
+/// signing path). The certificate's signature algorithm remains the CA's (P-256) — only the
+/// subject key and SPKI vary.
+fn generate_leaf_key(key_type: crate::acme::csr::CertificateKeyType) -> Result<GeneratedLeafKey> {
+    use crate::acme::csr::CertificateKeyType;
+    match key_type {
+        CertificateKeyType::P256 | CertificateKeyType::P384 => {
+            let (algorithm, curve_oid) = match key_type {
+                CertificateKeyType::P256 => (&ECDSA_P256_SHA256_ASN1_SIGNING, OID_PRIME256V1),
+                CertificateKeyType::P384 => (&ECDSA_P384_SHA384_ASN1_SIGNING, OID_SECP384R1),
+                _ => unreachable!("EC branch only"),
+            };
+            let rng = SystemRandom::new();
+            let pkcs8_der = EcdsaKeyPair::generate_pkcs8(algorithm, &rng)
+                .map_err(|error| {
+                    Error::Issuer(format!("internal CA leaf key generation failed: {error}"))
+                })?
+                .as_ref()
+                .to_vec();
+            let pair = EcdsaKeyPair::from_pkcs8(algorithm, &pkcs8_der, &rng).map_err(|error| {
+                Error::Issuer(format!("internal CA leaf key load failed: {error}"))
+            })?;
+            let public_key = pair.public_key().as_ref().to_vec();
+            let spki = der_sequence(&[
+                der_sequence(&[der_oid(OID_EC_PUBLIC_KEY), der_oid(curve_oid)]),
+                der_bit_string(&public_key),
+            ]);
+            Ok(GeneratedLeafKey {
+                pkcs8_der,
+                spki,
+                subject_key_id: key_identifier(&public_key),
+            })
+        }
+        CertificateKeyType::Rsa2048 | CertificateKeyType::Rsa4096 => {
+            let bits = if matches!(key_type, CertificateKeyType::Rsa2048) {
+                2048
+            } else {
+                4096
+            };
+            let mut rng = rsa::rand_core::OsRng;
+            let private_key = RsaPrivateKey::new(&mut rng, bits).map_err(|error| {
+                Error::Issuer(format!(
+                    "internal CA RSA-{bits} key generation failed: {error}"
+                ))
+            })?;
+            let pkcs8_der = private_key
+                .to_pkcs8_der()
+                .map_err(|error| {
+                    Error::Issuer(format!(
+                        "internal CA RSA private key encoding failed: {error}"
+                    ))
+                })?
+                .as_bytes()
+                .to_vec();
+            let spki = private_key
+                .to_public_key()
+                .to_public_key_der()
+                .map_err(|error| {
+                    Error::Issuer(format!(
+                        "internal CA RSA public key encoding failed: {error}"
+                    ))
+                })?
+                .as_bytes()
+                .to_vec();
+            Ok(GeneratedLeafKey {
+                pkcs8_der,
+                subject_key_id: key_identifier(&spki),
+                spki,
+            })
+        }
+    }
 }
 
 fn load_ecdsa_key(pem: &str) -> Result<EcdsaKeyPair> {
@@ -1090,6 +1172,7 @@ fn extension(oid: &[u64], critical: bool, value: &[u8]) -> Vec<u8> {
 const OID_COMMON_NAME: &[u64] = &[2, 5, 4, 3];
 const OID_EC_PUBLIC_KEY: &[u64] = &[1, 2, 840, 10045, 2, 1];
 const OID_PRIME256V1: &[u64] = &[1, 2, 840, 10045, 3, 1, 7];
+const OID_SECP384R1: &[u64] = &[1, 3, 132, 0, 34];
 const OID_ECDSA_WITH_SHA256: &[u64] = &[1, 2, 840, 10045, 4, 3, 2];
 const OID_BASIC_CONSTRAINTS: &[u64] = &[2, 5, 29, 19];
 const OID_KEY_USAGE: &[u64] = &[2, 5, 29, 15];
@@ -2318,5 +2401,39 @@ mod tests {
             at(Duration::ZERO),
         )
         .expect("webpki verifies a renewed chain");
+    }
+
+    #[tokio::test]
+    async fn issued_leaf_uses_configured_key_type() {
+        use crate::acme::csr::CertificateKeyType;
+        let clock = Arc::new(ManualClock::new(at(Duration::ZERO)));
+        for key_type in [
+            CertificateKeyType::P256,
+            CertificateKeyType::P384,
+            CertificateKeyType::Rsa2048,
+            CertificateKeyType::Rsa4096,
+        ] {
+            let (issuer, _, _) = memory_issuer(Arc::clone(&clock)).await;
+            let mut request = issuance(&["example.com"]);
+            request.key_type = key_type;
+            let certificate = issuer.obtain(&request).await.expect("internal issuance");
+            assert_eq!(
+                CertificateKeyType::from_private_key_der(&certificate.private_key_der)
+                    .expect("key type is recognisable"),
+                key_type,
+                "issued key must match the automation policy key_type"
+            );
+            let ca = issuer.load_ca().await.expect("local CA");
+            verify_leaf(
+                ca.root_certificate_der(),
+                &certificate.cert_chain_der[0],
+                ca.intermediate_certificate_der(),
+                &dns_name("example.com"),
+                at(Duration::ZERO),
+            )
+            .unwrap_or_else(|error| {
+                panic!("{key_type:?} leaf must verify against the local CA: {error}")
+            });
+        }
     }
 }
