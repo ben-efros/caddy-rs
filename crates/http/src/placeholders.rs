@@ -199,6 +199,9 @@ impl<'a> Replacer<'a> {
                     let headers = self.response_headers?;
                     return Some(join_header_values(headers, name));
                 }
+                if let Some(rest) = name.strip_prefix("http.request.tls.client.") {
+                    return client_certificate_placeholder(self.request, rest);
+                }
                 if let Some(name) = name.strip_prefix("http.request.header.") {
                     return Some(join_header_values(&self.request.headers, name));
                 }
@@ -321,6 +324,83 @@ fn find_unescaped_close(input: &str) -> Option<usize> {
         index += 1;
     }
     None
+}
+
+/// Caddy v2.11.9's `{http.request.tls.client.*}` values.
+///
+/// Caddy replaces the placeholder with a dummy empty certificate when no client certificate was
+/// presented, so every known suffix expands to an empty string rather than remaining literal
+/// (`modules/caddyhttp/replacer.go`, client-cert branch). SAN list/index forms are supported like
+/// Caddy's replacer.
+fn client_certificate_placeholder(request: &Request, suffix: &str) -> Option<String> {
+    let empty = |value: &str| Some(value.to_string());
+    let Some(certificate) = request.client_certificate.as_ref() else {
+        // Known suffixes with no presented certificate: empty (Caddy's dummy certificate).
+        if suffix.starts_with("san.")
+            || matches!(
+                suffix,
+                "fingerprint"
+                    | "public_key"
+                    | "public_key_sha256"
+                    | "certificate_pem"
+                    | "certificate_der_base64"
+                    | "issuer"
+                    | "serial"
+                    | "subject"
+            )
+        {
+            return Some(String::new());
+        }
+        return None;
+    };
+    match suffix {
+        "fingerprint" => empty(&certificate.fingerprint),
+        "public_key" => empty(&hex_lower(&certificate.public_key_der)),
+        "public_key_sha256" => empty(&certificate.public_key_sha256),
+        "certificate_pem" => empty(&certificate.certificate_pem),
+        "certificate_der_base64" => empty(&certificate.certificate_der_base64),
+        "issuer" => empty(&certificate.issuer),
+        "serial" => empty(&certificate.serial),
+        "subject" => empty(&certificate.subject),
+        other => {
+            if let Some(rest) = other.strip_prefix("san.") {
+                let (field, index) = match rest.split_once('.') {
+                    Some((field, index)) => (field, Some(index)),
+                    None => (rest, None),
+                };
+                let values = match field {
+                    "dns_names" => &certificate.dns_names,
+                    "emails" => &certificate.emails,
+                    "ips" => &certificate.ips,
+                    "uris" => &certificate.uris,
+                    _ => return None,
+                };
+                match index {
+                    None => return Some(values.join(",")),
+                    Some(index) => {
+                        return Some(match index.parse::<usize>() {
+                            Ok(index) => values.get(index).cloned().unwrap_or_default(),
+                            Err(_) => String::new(),
+                        });
+                    }
+                }
+            }
+            // Unknown client-certificate suffix stays unknown (Caddy returns false from its
+            // replacer for these).
+            None
+        }
+    }
+}
+
+/// Lowercase hex encoding used by client-certificate `public_key` (Caddy uses `%x`).
+fn hex_lower(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(DIGITS[(byte >> 4) as usize] as char);
+        out.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 /// Host header (or URI authority) verbatim, or `""` when neither is present.
@@ -831,5 +911,120 @@ mod tests {
         // Sanity check that the request body type is not involved in placeholder expansion.
         let request = Request::new(Method::GET, "/".parse::<Uri>().unwrap());
         assert_eq!(request.body, Bytes::new());
+    }
+
+    fn client_certificate() -> crate::types::ClientCertificate {
+        crate::types::ClientCertificate {
+            subject: "CN=client.example.com".to_string(),
+            issuer: "CN=Test Client CA".to_string(),
+            serial: "123456789".to_string(),
+            fingerprint: "aa".repeat(32),
+            public_key_der: vec![0x01, 0x02, 0xff],
+            public_key_sha256: "bb".repeat(32),
+            certificate_pem: "-----BEGIN CERTIFICATE-----\nZm9v\n-----END CERTIFICATE-----\n"
+                .to_string(),
+            certificate_der_base64: "Zm9v".to_string(),
+            dns_names: vec![
+                "client.example.com".to_string(),
+                "alt.example.com".to_string(),
+            ],
+            emails: vec!["client@example.com".to_string()],
+            ips: vec!["203.0.113.7".to_string()],
+            uris: vec!["spiffe://example.test/client".to_string()],
+            verified: true,
+        }
+    }
+
+    #[test]
+    fn client_certificate_placeholders_match_caddy_fields() {
+        let mut request = request();
+        request.client_certificate = Some(client_certificate());
+        let replacer = Replacer::new(&request);
+        for (name, expected) in [
+            ("http.request.tls.client.subject", "CN=client.example.com"),
+            ("http.request.tls.client.issuer", "CN=Test Client CA"),
+            ("http.request.tls.client.serial", "123456789"),
+            ("http.request.tls.client.fingerprint", &"aa".repeat(32)),
+            ("http.request.tls.client.public_key", "0102ff"),
+            (
+                "http.request.tls.client.public_key_sha256",
+                &"bb".repeat(32),
+            ),
+            ("http.request.tls.client.certificate_der_base64", "Zm9v"),
+            (
+                "http.request.tls.client.certificate_pem",
+                "-----BEGIN CERTIFICATE-----\nZm9v\n-----END CERTIFICATE-----\n",
+            ),
+            (
+                "http.request.tls.client.san.dns_names",
+                "client.example.com,alt.example.com",
+            ),
+            (
+                "http.request.tls.client.san.dns_names.0",
+                "client.example.com",
+            ),
+            ("http.request.tls.client.san.dns_names.1", "alt.example.com"),
+            ("http.request.tls.client.san.dns_names.9", ""),
+            ("http.request.tls.client.san.emails", "client@example.com"),
+            ("http.request.tls.client.san.emails.0", "client@example.com"),
+            ("http.request.tls.client.san.ips", "203.0.113.7"),
+            ("http.request.tls.client.san.ips.0", "203.0.113.7"),
+            (
+                "http.request.tls.client.san.uris",
+                "spiffe://example.test/client",
+            ),
+            (
+                "http.request.tls.client.san.uris.0",
+                "spiffe://example.test/client",
+            ),
+        ] {
+            assert_eq!(
+                replacer.get(name).as_deref(),
+                Some(expected),
+                "placeholder {name}"
+            );
+        }
+        // A nonexistent SAN index expands to empty, not literal.
+        assert_eq!(
+            replacer
+                .get("http.request.tls.client.san.emails.1")
+                .as_deref(),
+            Some("")
+        );
+        // Unknown client-certificate fields stay unrecognised.
+        assert_eq!(replacer.get("http.request.tls.client.unknown"), None);
+        // The header/static-response expansion path sees the same values.
+        assert_eq!(
+            replacer.replace_known(
+                "{http.request.tls.client.subject} {http.request.tls.client.serial}"
+            ),
+            "CN=client.example.com 123456789"
+        );
+    }
+
+    #[test]
+    fn missing_client_certificate_expands_to_caddy_dummy_empty_values() {
+        let request = request();
+        let replacer = Replacer::new(&request);
+        for name in [
+            "http.request.tls.client.subject",
+            "http.request.tls.client.issuer",
+            "http.request.tls.client.serial",
+            "http.request.tls.client.fingerprint",
+            "http.request.tls.client.public_key",
+            "http.request.tls.client.public_key_sha256",
+            "http.request.tls.client.certificate_pem",
+            "http.request.tls.client.certificate_der_base64",
+            "http.request.tls.client.san.dns_names",
+            "http.request.tls.client.san.emails.0",
+            "http.request.tls.client.san.ips",
+            "http.request.tls.client.san.uris.5",
+        ] {
+            assert_eq!(replacer.get(name).as_deref(), Some(""), "{name}");
+        }
+        assert_eq!(
+            replacer.replace_known("{http.request.tls.client.subject}"),
+            ""
+        );
     }
 }
