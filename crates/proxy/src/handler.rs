@@ -1024,6 +1024,7 @@ impl ReverseProxyHandler {
                 self.transport.h2c,
                 http1_only,
                 self.transport.proxy_protocol,
+                self.transport.dial_timeout,
             )
             .map_err(|message| {
                 ProxyError::Request(format!(
@@ -2157,6 +2158,8 @@ struct TransportConfig {
     fastcgi: Option<Arc<FastCgiTransport>>,
     /// Send a PROXY protocol header (`v1`/`v2`) on new upstream connections.
     proxy_protocol: Option<ProxyProtocolVersion>,
+    /// `transport.dial_timeout`: cap on establishing the upstream connection.
+    dial_timeout: Option<Duration>,
 }
 
 /// TCP port of a `host:port` dial, if any (Unix-socket dials have no port).
@@ -2193,6 +2196,7 @@ fn build_upstream_clients(
                 transport.h2c,
                 false,
                 transport.proxy_protocol,
+                transport.dial_timeout,
             )
             .map(Some)
             .map_err(|message| invalid(&format!("{path}.transport"), message))
@@ -2228,6 +2232,7 @@ fn build_upgrade_clients(
                 transport.h2c,
                 true,
                 transport.proxy_protocol,
+                transport.dial_timeout,
             )
             .map(Some)
             .map_err(|message| invalid(&format!("{path}.transport"), message))
@@ -2325,17 +2330,27 @@ fn parse_transport(value: Option<&Value>, path: &str) -> HttpResult<TransportCon
         }
     }
 
+    // `dial_timeout` caps how long establishing the upstream connection may take. Caddy stores a
+    // `caddy.Duration`; zero or negative means "no limit" (Go's `Dialer.Timeout`).
+    let dial_timeout = match object.get("dial_timeout") {
+        None => None,
+        Some(value) => {
+            let nanos = value.as_i64().ok_or_else(|| {
+                invalid(
+                    &format!("{transport_path}.dial_timeout"),
+                    "`dial_timeout` must be an integer number of nanoseconds (Caddy JSON duration)",
+                )
+            })?;
+            (nanos > 0).then(|| Duration::from_nanos(nanos as u64))
+        }
+    };
+
     // Real Caddy transport knobs that this build does not implement: reject rather than ignore.
     const UNSUPPORTED_TRANSPORT_OPTIONS: &[(&str, &str, &str)] = &[
         (
             "keep_alive",
             "PROXY-TRANSPORT-KEEPALIVE",
             "HTTP transport keep-alive tuning",
-        ),
-        (
-            "dial_timeout",
-            "PROXY-TRANSPORT-DIAL-TIMEOUT",
-            "HTTP transport dial timeout",
         ),
         (
             "dial_fallback_delay",
@@ -2442,6 +2457,7 @@ fn parse_transport(value: Option<&Value>, path: &str) -> HttpResult<TransportCon
         alpn_h2,
         fastcgi: None,
         proxy_protocol,
+        dial_timeout,
     })
 }
 

@@ -20,6 +20,7 @@ use std::io;
 use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 use std::task::{Context, Poll};
 
 #[cfg(test)]
@@ -543,6 +544,8 @@ pub struct FixedUpstreamConnector {
     h2c: bool,
     /// Send a PROXY protocol header on every new connection (`transport.proxy_protocol`).
     proxy_protocol: Option<ProxyProtocolVersion>,
+    /// `transport.dial_timeout`: cap on establishing the upstream connection.
+    dial_timeout: Option<Duration>,
 }
 
 impl Service<Uri> for FixedUpstreamConnector {
@@ -561,6 +564,7 @@ impl Service<Uri> for FixedUpstreamConnector {
         let server_name = self.server_name.clone();
         let h2c = self.h2c;
         let proxy_protocol = self.proxy_protocol;
+        let dial_timeout = self.dial_timeout;
         Box::pin(async move {
             // The authority marker carries the PROXY-protocol source address. Health checks build
             // plain upstream URLs (no marker) and therefore send no header, matching Caddy's
@@ -577,11 +581,19 @@ impl Service<Uri> for FixedUpstreamConnector {
                             format!("invalid upstream dial `{address}`: {error}"),
                         )
                     })?;
-                    let mut stream = tcp
-                        .call(dial_uri)
-                        .await
-                        .map_err(io::Error::other)?
-                        .into_inner();
+                    let dial = async {
+                        tcp.call(dial_uri)
+                            .await
+                            .map_err(io::Error::other)
+                            .map(hyper_util::rt::TokioIo::into_inner)
+                    };
+                    let mut stream = match dial_timeout {
+                        Some(limit) => match tokio::time::timeout(limit, dial).await {
+                            Ok(result) => result?,
+                            Err(_) => return Err(dial_timed_out(&address, limit)),
+                        },
+                        None => dial.await?,
+                    };
                     // The header is written before the TLS handshake, so a TLS upstream sees the
                     // PROXY header ahead of the ClientHello (Caddy writes it before wrapping the
                     // connection in the TLS client).
@@ -607,7 +619,14 @@ impl Service<Uri> for FixedUpstreamConnector {
                             "PROXY protocol is not supported for Unix-socket upstreams",
                         ));
                     }
-                    let stream = tokio::net::UnixStream::connect(&path).await?;
+                    let connect = tokio::net::UnixStream::connect(&path);
+                    let stream = match dial_timeout {
+                        Some(limit) => match tokio::time::timeout(limit, connect).await {
+                            Ok(result) => result?,
+                            Err(_) => return Err(dial_timed_out(&path.display().to_string(), limit)),
+                        },
+                        None => connect.await?,
+                    };
                     match tls {
                         Some(tls) => {
                             let server_name = server_name.ok_or_else(no_server_name)?;
@@ -620,6 +639,14 @@ impl Service<Uri> for FixedUpstreamConnector {
             }
         })
     }
+}
+
+/// Error surfaced when `transport.dial_timeout` elapses before the upstream accepts.
+fn dial_timed_out(target: &str, limit: Duration) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("upstream dial `{target}` did not complete within {limit:?}"),
+    )
 }
 
 fn no_server_name() -> io::Error {
@@ -657,7 +684,7 @@ pub fn build_upstream_client(
             upstream.dial
         )
     })?;
-    build_upstream_client_for(transport, tls, h2c, http1_only, None)
+    build_upstream_client_for(transport, tls, h2c, http1_only, None, None)
 }
 
 /// Like [`build_upstream_client`] but with a configured PROXY protocol version.
@@ -667,6 +694,7 @@ pub fn build_upstream_client_with_proxy_protocol(
     h2c: bool,
     http1_only: bool,
     proxy_protocol: Option<ProxyProtocolVersion>,
+    dial_timeout: Option<Duration>,
 ) -> Result<UpstreamClient, String> {
     let transport = upstream.transport().ok_or_else(|| {
         format!(
@@ -674,7 +702,14 @@ pub fn build_upstream_client_with_proxy_protocol(
             upstream.dial
         )
     })?;
-    build_upstream_client_for(transport, tls, h2c, http1_only, proxy_protocol)
+    build_upstream_client_for(
+        transport,
+        tls,
+        h2c,
+        http1_only,
+        proxy_protocol,
+        dial_timeout,
+    )
 }
 
 /// Build a client bound to one already-resolved dial transport.
@@ -687,6 +722,7 @@ pub fn build_upstream_client_for(
     h2c: bool,
     http1_only: bool,
     proxy_protocol: Option<ProxyProtocolVersion>,
+    dial_timeout: Option<Duration>,
 ) -> Result<UpstreamClient, String> {
     let tls = if http1_only {
         tls.map(|tls| Arc::new(tls.h1_only()))
@@ -715,6 +751,7 @@ pub fn build_upstream_client_for(
             server_name,
             h2c,
             proxy_protocol,
+            dial_timeout,
         }),
     )
 }
@@ -737,6 +774,47 @@ mod tests {
         assert_eq!(tcp.scheme_str(), Some("http"));
         let https = Uri::from_static("https://127.0.0.1:8443/health");
         assert_eq!(https.scheme_str(), Some("https"));
+    }
+
+    #[tokio::test]
+    async fn dial_timeout_bounds_the_upstream_dial() {
+        // TEST-NET-1 is not routed, so the dial only ends when the configured cap fires (or the
+        // host rejects the route immediately, in which case it still must not hang).
+        let upstream = crate::upstream::Upstream::parse_dial("192.0.2.1:81", false).unwrap();
+        let client = build_upstream_client_for(
+            upstream.transport().unwrap(),
+            None,
+            false,
+            false,
+            None,
+            Some(Duration::from_millis(150)),
+        )
+        .expect("client with dial_timeout");
+        let request = hyper::Request::builder()
+            .uri(upstream.url("/"))
+            .body(RequestBody::empty())
+            .unwrap();
+        let started = std::time::Instant::now();
+        let error = client.request(request).await.expect_err("dial must fail");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "dial_timeout must bound the wait, took {:?}",
+            started.elapsed()
+        );
+        // hyper wraps connector errors, so check the whole chain for the cause.
+        let mut message = error.to_string();
+        let mut source = std::error::Error::source(&error);
+        while let Some(current) = source {
+            message.push_str(&format!(": {current}"));
+            source = current.source();
+        }
+        assert!(
+            message.contains("did not complete within")
+                || message.contains("unreachable")
+                || message.contains("Connection refused")
+                || message.contains("timed out"),
+            "unexpected dial error: {message}"
+        );
     }
 
     #[cfg(unix)]

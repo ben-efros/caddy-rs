@@ -8,8 +8,7 @@
 //! * Where a construct is recognised but not implemented, adaptation fails with a located error
 //!   naming the construct. Silent fallback would be a compatibility lie.
 //!
-//! Supported directives and matchers are listed in `docs/compatibility/CADDYFILE.md` in the
-//! program repository.
+//! Supported directives and matchers are listed in `docs/compatibility/CADDYFILE.md`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -4909,7 +4908,7 @@ fn build_routes(
             return Err(adapter_error(
                 directive.position.clone(),
                 format!(
-                    "directive `{}` is not supported by this build (see docs/compatibility/CADDYFILE.md)",
+                    "directive `{}` is not supported by this build; see https://github.com/ben-efros/caddy-rs/blob/main/docs/compatibility/CADDYFILE.md",
                     directive.name
                 ),
             ));
@@ -8271,6 +8270,30 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
                                             ))
                                         }
                                     }
+                                }
+                                "dial_timeout" => {
+                                    // `transport http { dial_timeout 5s }` — Caddy stores a
+                                    // `caddy.Duration`; the connector applies it to the dial.
+                                    if !option.block.is_empty() {
+                                        return Err(adapter_error(
+                                            option.position.clone(),
+                                            "`dial_timeout` does not take a block",
+                                        ));
+                                    }
+                                    let Some(value) = option.args.first() else {
+                                        return Err(adapter_error(
+                                            option.position.clone(),
+                                            "`dial_timeout` requires a value",
+                                        ));
+                                    };
+                                    let nanos: i64 = match value.parse::<i64>() {
+                                        Ok(raw) => raw,
+                                        Err(_) => parse_duration(value).map_err(|message| {
+                                            adapter_error(option.position.clone(), message)
+                                        })? as i64,
+                                    };
+                                    extra_transport
+                                        .insert("dial_timeout".to_string(), json!(nanos));
                                 }
                                 other => {
                                     return Err(adapter_error(

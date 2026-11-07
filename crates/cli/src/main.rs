@@ -3,7 +3,7 @@
 //! Command surface follows Caddy's CLI where it is meaningful for this build: `adapt`, `validate`,
 //! `run`, `reload`, `stop`, `list-modules`, `version`. `pki list`/`pki export` and `trust` expose
 //! the local CA material persisted by automatic HTTPS (`<data-dir>/pki/authorities/<id>/`); see
-//! `docs/compatibility/CADDYFILE.md` and the program repository's compatibility register for the
+//! `docs/compatibility/CADDYFILE.md` for the
 //! supported configuration surface.
 
 mod signals;

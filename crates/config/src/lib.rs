@@ -1,7 +1,7 @@
 //! Caddyfile support: lexer, parser, and adapter to Caddy JSON.
 //!
 //! The adapter is the compatibility boundary for the user-facing configuration file. See the
-//! program repository's `docs/compatibility/CADDYFILE.md` for the supported subset and every
+//! `docs/compatibility/CADDYFILE.md` for the supported subset and every
 //! intentional divergence.
 
 #![forbid(unsafe_code)]
