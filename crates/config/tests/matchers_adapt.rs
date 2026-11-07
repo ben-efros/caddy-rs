@@ -216,3 +216,43 @@ fn file_matcher_block_forms_and_errors() {
         );
     }
 }
+
+#[test]
+fn named_expression_matcher_matches_real_caddy_v2_11_9() {
+    // Caddy keeps raw tokens for multi-token expressions (bare JSON string) and the cleaned
+    // single token for one-argument expressions (object with `expr`, named by the @matcher).
+    let multi = adapt(
+        ":8080 {\n\t@multi expression {http.request.method} == 'GET'\n\trespond @multi \"ok\"\n}\n",
+    )
+    .expect("adapt multi-token expression matcher");
+    let route = &multi.config["apps"]["http"]["servers"]["srv0"]["routes"][0];
+    assert_eq!(
+        route["match"][0],
+        json!({"expression": "{http.request.method} == 'GET'"})
+    );
+
+    let single = adapt(":8080 {\n\t@single expression true\n\trespond @single \"ok\"\n}\n")
+        .expect("adapt single-token expression matcher");
+    let route = &single.config["apps"]["http"]["servers"]["srv0"]["routes"][0];
+    assert_eq!(
+        route["match"][0],
+        json!({"expression": {"expr": "true", "name": "single"}})
+    );
+
+    let header = adapt(
+        ":8080 {\n\t@h expression {http.request.header.X-Test} == \"yes\"\n\trespond @h \"ok\"\n}\n",
+    )
+    .expect("adapt quoted-token expression matcher");
+    let route = &header.config["apps"]["http"]["servers"]["srv0"]["routes"][0];
+    assert_eq!(
+        route["match"][0],
+        json!({"expression": "{http.request.header.X-Test} == \"yes\""})
+    );
+
+    let error = adapt(":8080 {\n\t@e expression\n\trespond @e \"ok\"\n}\n")
+        .expect_err("an expression matcher without an expression must fail");
+    assert!(
+        error.to_string().contains("requires a CEL expression"),
+        "unexpected error: {error}"
+    );
+}

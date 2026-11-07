@@ -4154,7 +4154,15 @@ fn collect_matchers(directives: &[Directive]) -> caddy_rs_core::Result<BTreeMap<
             ));
         }
         let mut object = if directive.block.is_empty() {
-            matcher_from_inline_args(&directive.args, directive.position.clone())?
+            if directive.args.first().map(String::as_str) == Some("expression") {
+                expression_matcher(
+                    &directive.args[1..],
+                    directive.arg_quoted.get(1..).unwrap_or(&[]),
+                    directive.position.clone(),
+                )?
+            } else {
+                matcher_from_inline_args(&directive.args, directive.position.clone())?
+            }
         } else {
             matcher_from_directives(&directive.block)?
         };
@@ -4180,6 +4188,46 @@ fn collect_matchers(directives: &[Directive]) -> caddy_rs_core::Result<BTreeMap<
         matchers.insert(name.to_string(), object);
     }
     Ok(matchers)
+}
+
+/// Adapt a named `expression` matcher (`@name expression <CEL>`).
+///
+/// Caddy keeps the raw tokens when the expression spans several arguments (so string literals
+/// survive) and grabs the cleaned single token otherwise (`MatchExpression.UnmarshalCaddyfile`),
+/// emitting the multi-token form as a bare JSON string and the single-token form as an object.
+fn expression_matcher(
+    args: &[String],
+    quoted: &[bool],
+    position: Position,
+) -> caddy_rs_core::Result<Value> {
+    if args.is_empty() {
+        return Err(adapter_error(
+            position,
+            "matcher `expression` requires a CEL expression",
+        ));
+    }
+    if args.len() == 1 {
+        return Ok(json!({"expression": {"expr": args[0].clone()}}));
+    }
+    let mut source = String::new();
+    for (index, argument) in args.iter().enumerate() {
+        if index > 0 {
+            source.push(' ');
+        }
+        if quoted.get(index).copied().unwrap_or(false) {
+            source.push('"');
+            for character in argument.chars() {
+                if character == '"' || character == '\\' {
+                    source.push('\\');
+                }
+                source.push(character);
+            }
+            source.push('"');
+        } else {
+            source.push_str(argument);
+        }
+    }
+    Ok(json!({"expression": source}))
 }
 
 fn matcher_from_inline_args(args: &[String], position: Position) -> caddy_rs_core::Result<Value> {

@@ -715,7 +715,7 @@ pub const BUILTIN_MODULES: &[Module] = &[
         "http.matchers.expression",
         "expression",
         ModuleKind::HttpMatcher,
-        "CEL expression matcher (implemented subset: integer comparisons used by handle_errors)",
+        "CEL expression matcher (documented subset: boolean/comparisons/in over strings, ints and bools; Caddy placeholders and request aliases)",
     ),
     // Storage
     Module::new(
