@@ -26,17 +26,42 @@
 //!
 //! * Credential headers (`Cookie`, `Set-Cookie`, `Authorization`, `Proxy-Authorization`) are
 //!   replaced with `"REDACTED"` unless [`AccessLogConfig::log_credentials`] is set, exactly like
-//!   Caddy's `LoggableHTTPHeader`.
+//!   Caddy's `LoggableHTTPHeader` — for the request headers *and* the `resp_headers` object
+//!   (`modules/caddyhttp/server.go:1314`).
 //! * Header names are canonicalised (MIME header form) because caddy-rs's `http::HeaderMap` may
 //!   store lowercase names, while Caddy emits canonical Go header names.
 //! * `ts` and `duration` are floating-point seconds (zap's JSON encoder), not duration strings.
 //! * The `upstream` field is a caddy-rs extension: Caddy logs upstream selection only at
-//!   DEBUG level via the proxy module, not in the access entry. See
-//!   `docs/compatibility/BEHAVIOR-DIVERGENCES.md` DIV-0034.
+//!   DEBUG level via the proxy module (`reverseproxy.go:1125-1127`), not in the access entry.
+//!   It is documented in the AS-09 schema (`docs/compatibility/ACCEPTANCE.md`) and tracked by
+//!   DIV-0069.
 //! * Field selection is a crate-level primitive; Caddy configures the same idea through
 //!   `filter` encoder modules (`caddy.logging.encoders.filter`) applied to zap fields. The four
 //!   fields zap itself owns (`ts`, `level`, `logger`, `msg`) cannot be filtered, matching Caddy's
 //!   `FilterEncoder` documentation.
+//!
+//! ## Field coverage (T-ADMIN-043)
+//!
+//! Caddy's `logRequest` emits exactly these built-in top-level fields, in order
+//! (`modules/caddyhttp/server.go:1309-1322`): `bytes_read`, `user_id`, `duration`, `size`, `status`,
+//! `resp_headers`, `write_error` (only when the write failed) and then the `ExtraLogFields`
+//! entries. [`AccessLogEntry`] models every one of them with the same JSON key and type.
+//!
+//! * `bytes_read` is the **actual** request-body bytes read, not the declared `Content-Length`
+//!   (Caddy's `lengthReader`, `server.go:1600`). Use [`BodyBytes`] shared with the server's body
+//!   pipeline.
+//! * `size` is the **actual** response-body bytes written (Caddy's `ResponseRecorder.Size()`,
+//!   `responsewriter.go:210`), also available through [`BodyBytes`].
+//! * `duration` is time-to-last-byte, measured after the handler chain (`server.go:710`, `:715`),
+//!   not time-to-headers; [`RequestTiming`] makes that boundary explicit.
+//! * `user_id` is Caddy's `http.auth.user.id` (`server.go:1289-1290`), always emitted and empty
+//!   when the request is anonymous.
+//! * Optional fields (`write_error`, `client_ip`, `transfer_encoding`, `tls`, `uuid`, `traceID`,
+//!   `spanID`, extras) are omitted when unset, exactly like Caddy; the always-emitted fields are
+//!   never dropped.
+//! * [`AccessLogContext`] is the shared per-request carrier for the values only the server and
+//!   handlers can observe (byte counters, user id, upstream attempt, write error, extras), so the
+//!   entry can be rendered after the response body has been streamed.
 //!
 //! ## Request correlation and tracing (T-ADMIN-022)
 //!
@@ -56,11 +81,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::SocketAddr;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use http::{HeaderMap, HeaderName};
 use ring::rand::{SecureRandom, SystemRandom};
+use serde::de::{MapAccess, Visitor};
+use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Default access logger name, matching Caddy's `http.log.access`.
@@ -273,6 +301,421 @@ pub struct AccessLogUpstream {
     pub status: Option<u16>,
 }
 
+/// Actual body byte count shared with the code that moves the bytes.
+///
+/// Caddy counts *actual* bytes, not declared lengths: the request body is wrapped in
+/// `lengthReader` (`modules/caddyhttp/server.go:1600`) whose `Length` is incremented on every
+/// `Read`, and the response size is the `ResponseRecorder`'s byte counter
+/// (`modules/caddyhttp/responsewriter.go:210`). Both feed the access entry as `bytes_read` and
+/// `size` (`server.go:1309`, `server.go:1312`); a streamed or unread body therefore logs `0`
+/// rather than its `Content-Length`.
+///
+/// caddy-rs streams bodies, so the entry is rendered from a counter shared with the body pipeline:
+/// the server clones this handle into its body wrapper (calling [`BodyBytes::add`] for every
+/// chunk) and reads the same handle when the entry is built. Clones share one counter.
+#[derive(Clone, Debug, Default)]
+pub struct BodyBytes {
+    count: Arc<AtomicU64>,
+}
+
+impl BodyBytes {
+    /// A counter at zero.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add bytes moved since the last update (called per body chunk).
+    pub fn add(&self, bytes: u64) {
+        self.count.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Overwrite the count (for a body whose exact size became known in one step).
+    pub fn set(&self, bytes: u64) {
+        self.count.store(bytes, Ordering::Relaxed);
+    }
+
+    /// The bytes counted so far.
+    pub fn get(&self) -> u64 {
+        self.count.load(Ordering::Relaxed)
+    }
+}
+
+/// Monotonic request clock for Caddy's `duration` field.
+///
+/// Caddy computes the access entry's `duration` as `time.Since(start)` *after* the handler chain
+/// returns (`modules/caddyhttp/server.go:710` and `:715`): time-to-last-byte, not time-to-headers.
+/// The proxy's time-to-headers observation is a separate value (`http.reverse_proxy.upstream.latency`,
+/// `modules/caddyhttp/reverseproxy/reverseproxy.go:1154`) and never becomes the access `duration`.
+///
+/// The server starts the clock when it takes ownership of the request, optionally marks when
+/// response headers are committed (time-to-headers, for metrics/`response_duration`), and calls
+/// [`RequestTiming::finish`] when the last byte of the response body has been written. The entry is
+/// then rendered with [`RequestTiming::duration`]. Rendering an unfinished clock returns the
+/// elapsed time so far, exactly like Caddy's `{http.request.duration}` placeholder
+/// (`modules/caddyhttp/replacer.go:212`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestTiming {
+    started: Instant,
+    response_started: Option<Instant>,
+    finished: Option<Instant>,
+}
+
+impl RequestTiming {
+    /// Start the clock now.
+    pub fn start() -> Self {
+        Self::start_at(Instant::now())
+    }
+
+    /// Start the clock at an already captured instant.
+    pub fn start_at(started: Instant) -> Self {
+        Self {
+            started,
+            response_started: None,
+            finished: None,
+        }
+    }
+
+    /// When the clock started.
+    pub fn started_at(&self) -> Instant {
+        self.started
+    }
+
+    /// Mark response headers as committed and return the time-to-headers.
+    pub fn mark_response_started(&mut self) -> Duration {
+        self.mark_response_started_at(Instant::now())
+    }
+
+    /// Mark response headers as committed at `at` and return the time-to-headers.
+    pub fn mark_response_started_at(&mut self, at: Instant) -> Duration {
+        self.response_started = Some(at);
+        at.saturating_duration_since(self.started)
+    }
+
+    /// When response headers were committed, if they were marked.
+    pub fn response_started_at(&self) -> Option<Instant> {
+        self.response_started
+    }
+
+    /// Record the last byte (or the end of the handler chain) and return the total duration.
+    pub fn finish(&mut self) -> Duration {
+        self.finish_at(Instant::now())
+    }
+
+    /// Record the last byte at `at` and return the total duration.
+    pub fn finish_at(&mut self, at: Instant) -> Duration {
+        self.finished = Some(at);
+        at.saturating_duration_since(self.started)
+    }
+
+    /// Whether [`RequestTiming::finish`] has run.
+    pub fn is_finished(&self) -> bool {
+        self.finished.is_some()
+    }
+
+    /// The finished instant, when the response is complete.
+    pub fn finished_at(&self) -> Option<Instant> {
+        self.finished
+    }
+
+    /// Total duration: finished time-to-last-byte, or elapsed time so far.
+    pub fn duration(&self) -> Duration {
+        match self.finished {
+            Some(at) => at.saturating_duration_since(self.started),
+            None => Instant::now().saturating_duration_since(self.started),
+        }
+    }
+
+    /// Time from request start to response headers, when that boundary was marked.
+    pub fn time_to_headers(&self) -> Option<Duration> {
+        self.response_started
+            .map(|at| at.saturating_duration_since(self.started))
+    }
+}
+
+/// One extra top-level access-log field (one entry of Caddy's `ExtraLogFields`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExtraLogField {
+    /// Top-level JSON key.
+    pub key: String,
+    /// JSON value (string, number, array or object).
+    pub value: serde_json::Value,
+}
+
+/// Ordered extra top-level access-log fields, mirroring Caddy's `ExtraLogFields`.
+///
+/// Caddy attaches an `ExtraLogFields` value to the request context
+/// (`modules/caddyhttp/logging.go:320`) and handlers add or replace fields during request
+/// handling; `logRequest` appends them after the built-in fields (`server.go:1321`). Caddy's own
+/// extras are `uuid` (`modules/caddyhttp/replacer.go:228`, `Set` semantics), `traceID`/`spanID`
+/// (`modules/caddyhttp/tracing/tracer.go:111`, `Add` semantics) and arbitrary keys from
+/// `log_append` (`modules/caddyhttp/logging/logappend.go:158`, `Add` semantics).
+///
+/// caddy-rs models `uuid`/`traceID`/`spanID` as dedicated typed fields on [`AccessLogEntry`]; this
+/// container carries any further key the runtime contributes (for example a proxy observation),
+/// serialised inline as a top-level key in insertion order, exactly like Caddy.
+///
+/// Keys must not collide with the built-in entry keys (`status`, `size`, `request`, ...); neither
+/// Caddy's `log_append` nor this container rejects such a collision, but it produces a duplicate
+/// JSON key.
+///
+/// [`AccessLogField`] is a closed enum of Caddy's built-in keys, so `include`/`exclude` field
+/// selection cannot name an extra key (Caddy's filter encoder, which filters zap fields by key,
+/// can). Explicit `include` selection therefore drops extras; targets `FieldFilter` operations
+/// still address them by JSON path.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ExtraLogFields {
+    fields: Vec<ExtraLogField>,
+}
+
+impl ExtraLogFields {
+    /// No extra fields.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether no extra field is present.
+    pub fn is_empty(&self) -> bool {
+        self.fields.is_empty()
+    }
+
+    /// Number of extra fields.
+    pub fn len(&self) -> usize {
+        self.fields.len()
+    }
+
+    /// Add a field, replacing an existing field with the same key in place.
+    ///
+    /// Caddy's `Add` appends unconditionally, so a duplicate key produces a duplicate JSON key;
+    /// caddy-rs keeps a single slot per key (the last value wins for JSON consumers) and preserves
+    /// the original position.
+    pub fn add(&mut self, key: impl Into<String>, value: serde_json::Value) {
+        let key = key.into();
+        if let Some(existing) = self.fields.iter_mut().find(|field| field.key == key) {
+            existing.value = value;
+            return;
+        }
+        self.fields.push(ExtraLogField { key, value });
+    }
+
+    /// Replace an existing field, or append it (Caddy's `ExtraLogFields.Set`).
+    pub fn set(&mut self, key: impl Into<String>, value: serde_json::Value) {
+        self.add(key, value);
+    }
+
+    /// Value of one extra field.
+    pub fn get(&self, key: &str) -> Option<&serde_json::Value> {
+        self.fields
+            .iter()
+            .find(|field| field.key == key)
+            .map(|field| &field.value)
+    }
+
+    /// Iterate `(key, value)` pairs in insertion order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &serde_json::Value)> {
+        self.fields
+            .iter()
+            .map(|field| (field.key.as_str(), &field.value))
+    }
+}
+
+impl Serialize for ExtraLogFields {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(self.fields.len()))?;
+        for field in &self.fields {
+            map.serialize_entry(&field.key, &field.value)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for ExtraLogFields {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ExtraLogFieldsVisitor;
+
+        impl<'de> Visitor<'de> for ExtraLogFieldsVisitor {
+            type Value = ExtraLogFields;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a map of extra access-log fields")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut fields = Vec::with_capacity(map.size_hint().unwrap_or(0));
+                while let Some((key, value)) = map.next_entry::<String, serde_json::Value>()? {
+                    fields.push(ExtraLogField { key, value });
+                }
+                Ok(ExtraLogFields { fields })
+            }
+        }
+
+        deserializer.deserialize_map(ExtraLogFieldsVisitor)
+    }
+}
+
+/// Per-request access-log context shared between the server and the handler pipeline.
+///
+/// Caddy keeps the per-request logging state on the request context: the `ExtraLogFields` value is
+/// installed before routing (`modules/caddyhttp/server.go:1422`) and handlers write to it, the
+/// request body is wrapped in a `lengthReader` (`server.go:1600`) and the response in a
+/// `ResponseRecorder` (`responsewriter.go:210`); `logRequest` reads all of it when the entry is
+/// rendered (`server.go:1289-1322`). caddy-rs has the same shape of data but the server renders the
+/// entry boundary-side, after the body has been streamed, so the observations must be shared.
+///
+/// A server creates one context per request when access logging is enabled, stores it on the
+/// request (or a transport-owned per-request state), lets handlers contribute
+/// (`set_user_id`, `set_upstream`, `add_extra_field`, `set_write_error`) and calls [`apply_to`]
+/// when the response is complete (after [`AccessLogContext::finish`]). All clones share one state.
+///
+/// [`apply_to`]: AccessLogContext::apply_to
+#[derive(Clone, Debug, Default)]
+pub struct AccessLogContext {
+    inner: Arc<Mutex<AccessLogContextState>>,
+}
+
+#[derive(Debug, Default)]
+struct AccessLogContextState {
+    timing: Option<RequestTiming>,
+    request_bytes: BodyBytes,
+    response_bytes: BodyBytes,
+    user_id: Option<String>,
+    upstream: Option<AccessLogUpstream>,
+    write_error: Option<String>,
+    extra_fields: ExtraLogFields,
+}
+
+impl AccessLogContext {
+    /// A context with no observations.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A context whose request clock starts now.
+    pub fn started() -> Self {
+        let context = Self::default();
+        context.start(Instant::now());
+        context
+    }
+
+    /// Start the request clock at `at`.
+    pub fn start(&self, at: Instant) {
+        self.state().timing = Some(RequestTiming::start_at(at));
+    }
+
+    /// The shared request-body byte counter (`bytes_read`).
+    pub fn request_bytes(&self) -> BodyBytes {
+        self.state().request_bytes.clone()
+    }
+
+    /// The shared response-body byte counter (`size`).
+    pub fn response_bytes(&self) -> BodyBytes {
+        self.state().response_bytes.clone()
+    }
+
+    /// The request clock, once started.
+    pub fn timing(&self) -> Option<RequestTiming> {
+        self.state().timing
+    }
+
+    /// Mark response headers as committed; returns the time-to-headers.
+    pub fn mark_response_started(&self) -> Option<Duration> {
+        self.state()
+            .timing
+            .as_mut()
+            .map(RequestTiming::mark_response_started)
+    }
+
+    /// Record the last byte and return the total duration.
+    pub fn finish(&self) -> Option<Duration> {
+        self.state().timing.as_mut().map(RequestTiming::finish)
+    }
+
+    /// Total duration so far (finished or not).
+    pub fn duration(&self) -> Option<Duration> {
+        self.state().timing.map(|timing| timing.duration())
+    }
+
+    /// Replace the authenticated user id (`http.auth.user.id` / Caddy's `user_id`).
+    ///
+    /// Caddy reads this placeholder after the handler chain (`server.go:1289`) and always emits
+    /// the field, with `""` for anonymous requests.
+    pub fn set_user_id(&self, user_id: impl Into<String>) {
+        self.state().user_id = Some(user_id.into());
+    }
+
+    /// The authenticated user id, when a handler set one.
+    pub fn user_id(&self) -> Option<String> {
+        self.state().user_id.clone()
+    }
+
+    /// Record the proxy attempt for the caddy-rs `upstream` extension.
+    pub fn set_upstream(&self, upstream: AccessLogUpstream) {
+        self.state().upstream = Some(upstream);
+    }
+
+    /// The recorded proxy attempt, when the request was proxied.
+    pub fn upstream(&self) -> Option<AccessLogUpstream> {
+        self.state().upstream.clone()
+    }
+
+    /// Record the error that prevented the response from being fully written.
+    pub fn set_write_error(&self, error: impl Into<String>) {
+        self.state().write_error = Some(error.into());
+    }
+
+    /// The recorded write error.
+    pub fn write_error(&self) -> Option<String> {
+        self.state().write_error.clone()
+    }
+
+    /// Add an extra top-level field (Caddy's `ExtraLogFields`).
+    pub fn add_extra_field(&self, key: impl Into<String>, value: serde_json::Value) {
+        self.state().extra_fields.add(key, value);
+    }
+
+    /// Add or replace an extra top-level field (Caddy's `ExtraLogFields.Set`).
+    pub fn set_extra_field(&self, key: impl Into<String>, value: serde_json::Value) {
+        self.state().extra_fields.set(key, value);
+    }
+
+    /// A copy of the extra fields collected so far.
+    pub fn extra_fields(&self) -> ExtraLogFields {
+        self.state().extra_fields.clone()
+    }
+
+    /// Copy every collected observation onto an entry.
+    ///
+    /// The context is authoritative for the fields it tracks: request/response byte counters,
+    /// request duration, authenticated user id, upstream extension, write error and extra fields.
+    /// Call this after [`AccessLogContext::finish`] and after the response body is complete.
+    pub fn apply_to(&self, entry: &mut AccessLogEntry) {
+        let state = self.state();
+        entry.bytes_read = state.request_bytes.get();
+        entry.size = state.response_bytes.get();
+        if let Some(timing) = state.timing {
+            entry.duration = timing.duration();
+        }
+        if let Some(user_id) = &state.user_id {
+            entry.user_id = user_id.clone();
+        }
+        if let Some(upstream) = &state.upstream {
+            entry.upstream = Some(upstream.clone());
+        }
+        if let Some(write_error) = &state.write_error {
+            entry.write_error = Some(write_error.clone());
+        }
+        if !state.extra_fields.is_empty() {
+            entry.extra_fields = state.extra_fields.clone();
+        }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, AccessLogContextState> {
+        // The access-log path must never panic; a poisoned lock still carries the observations.
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 /// One structured access-log entry.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AccessLogEntry {
@@ -323,6 +766,11 @@ pub struct AccessLogEntry {
     /// OpenTelemetry span id from Caddy's tracing handler (extra log field `spanID`).
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "spanID")]
     pub span_id: Option<String>,
+    /// Additional top-level fields contributed by the runtime (Caddy's `ExtraLogFields`).
+    ///
+    /// Serialized inline after the built-in fields, in insertion order; absent when empty.
+    #[serde(default, flatten)]
+    pub extra_fields: ExtraLogFields,
 }
 
 impl Default for AccessLogEntry {
@@ -344,6 +792,7 @@ impl Default for AccessLogEntry {
             uuid: None,
             trace_id: None,
             span_id: None,
+            extra_fields: ExtraLogFields::default(),
         }
     }
 }
@@ -393,9 +842,51 @@ impl AccessLogEntry {
         self
     }
 
+    /// Set the request duration from a [`RequestTiming`] clock.
+    ///
+    /// Caddy's `duration` is time-to-last-byte (`server.go:715`); finish the clock when the last
+    /// response body byte has been written, not when headers are committed.
+    pub fn with_timing(mut self, timing: RequestTiming) -> Self {
+        self.duration = timing.duration();
+        self
+    }
+
+    /// Set the authenticated user id (Caddy's `user_id`, from `http.auth.user.id`).
+    ///
+    /// Caddy always emits the field after the handler chain, with `""` when the request was not
+    /// authenticated (`server.go:1290`); the default entry already has that empty value.
+    pub fn with_user_id(mut self, user_id: impl Into<String>) -> Self {
+        self.user_id = user_id.into();
+        self
+    }
+
+    /// Set the actual number of request-body bytes read (Caddy's `bytes_read`).
+    pub fn with_bytes_read(mut self, bytes: u64) -> Self {
+        self.bytes_read = bytes;
+        self
+    }
+
+    /// Set `bytes_read` from a counter shared with the request body pipeline.
+    pub fn with_bytes_read_counter(mut self, counter: &BodyBytes) -> Self {
+        self.bytes_read = counter.get();
+        self
+    }
+
     /// Set the response size.
     pub fn with_size(mut self, size: u64) -> Self {
         self.size = size;
+        self
+    }
+
+    /// Set `size` from a counter shared with the response body writer.
+    pub fn with_size_counter(mut self, counter: &BodyBytes) -> Self {
+        self.size = counter.get();
+        self
+    }
+
+    /// Set the write error (Caddy's `write_error`, present only when the write failed).
+    pub fn with_write_error(mut self, error: impl Into<String>) -> Self {
+        self.write_error = Some(error.into());
         self
     }
 
@@ -408,6 +899,18 @@ impl AccessLogEntry {
     /// Set the proxy upstream details (caddy-rs extension).
     pub fn with_upstream(mut self, upstream: AccessLogUpstream) -> Self {
         self.upstream = Some(upstream);
+        self
+    }
+
+    /// Add one extra top-level field (Caddy's `ExtraLogFields`).
+    pub fn with_extra_field(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
+        self.extra_fields.add(key, value);
+        self
+    }
+
+    /// Replace the extra top-level fields (Caddy's `ExtraLogFields`).
+    pub fn with_extra_fields(mut self, fields: ExtraLogFields) -> Self {
+        self.extra_fields = fields;
         self
     }
 
@@ -2686,5 +3189,553 @@ mod tests {
         assert_eq!(rendered["ts"], "2023-11-14T22:13:20Z");
         assert_eq!(rendered["level"], "INFO");
         assert_eq!(rendered["duration"].as_f64().unwrap(), 1234.0);
+    }
+
+    // ---- T-ADMIN-043: complete Caddy access-log field coverage ---------------------------------
+
+    #[test]
+    fn user_id_is_always_emitted_and_settable() {
+        // Caddy always emits `user_id`, empty for anonymous requests (`server.go:1290`).
+        let anonymous = AccessLogEntry::new(AccessLogRequest::new("GET", "example.com", "/"))
+            .to_json_value()
+            .unwrap();
+        assert_eq!(anonymous["user_id"], "");
+
+        // The authenticated identity comes from `http.auth.user.id` (`caddyauth.go:170`).
+        let entry = AccessLogEntry::new(AccessLogRequest::new("GET", "example.com", "/"))
+            .with_user_id("alice");
+        assert_eq!(entry.to_json_value().unwrap()["user_id"], "alice");
+        assert_eq!(entry.to_json_value().unwrap()["user_id"], json!("alice"));
+        // It is a plain string field, never omitted and never null.
+        let decoded: AccessLogEntry =
+            serde_json::from_str(&serde_json::to_string(&entry).unwrap()).unwrap();
+        assert_eq!(decoded.user_id, "alice");
+    }
+
+    #[test]
+    fn bytes_read_counts_actual_body_bytes_not_declared_content_length() {
+        // `Content-Length` is only a declaration; Caddy counts bytes read by `lengthReader`
+        // (`server.go:1600`) and reports that number (`server.go:1309`).
+        let request_headers = headers(&[("content-length", "1000")]);
+        let request = AccessLogRequest::new("POST", "example.com", "/upload")
+            .with_remote(Some("192.0.2.10:54321".parse().unwrap()))
+            .with_headers(&request_headers);
+
+        let counter = BodyBytes::new();
+        counter.add(7);
+        counter.add(35);
+        assert_eq!(counter.get(), 42, "the counter accumulates actual reads");
+
+        let read = AccessLogEntry::new(request.clone()).with_bytes_read_counter(&counter);
+        let value = read.to_json_value().unwrap();
+        assert_eq!(value["bytes_read"], 42);
+        assert_ne!(value["bytes_read"], 1000, "declared length is not used");
+
+        // A handler that never reads the body logs 0 even with a declared Content-Length.
+        let unread = AccessLogEntry::new(request).with_bytes_read_counter(&BodyBytes::new());
+        assert_eq!(unread.to_json_value().unwrap()["bytes_read"], 0);
+
+        // Clones share one counter, so the body pipeline can keep the handle while the
+        // server reads it when the entry is rendered.
+        let pipeline = counter.clone();
+        pipeline.add(1);
+        assert_eq!(counter.get(), 43);
+        assert_eq!(pipeline.get(), 43, "clones share one counter");
+        assert_eq!(
+            AccessLogEntry::new(AccessLogRequest::default())
+                .with_bytes_read(11)
+                .to_json_value()
+                .unwrap()["bytes_read"],
+            11
+        );
+    }
+
+    #[test]
+    fn size_counts_actual_response_bytes_written() {
+        // Caddy's `size` is the ResponseRecorder's written-byte counter
+        // (`responsewriter.go:210`), not the body's declared length (`server.go:1312`).
+        let counter = BodyBytes::new();
+        counter.add(100);
+        counter.add(23);
+        let entry = AccessLogEntry::new(AccessLogRequest::default()).with_size_counter(&counter);
+        let value = entry.to_json_value().unwrap();
+        assert_eq!(value["size"], 123);
+        assert_eq!(
+            AccessLogEntry::new(AccessLogRequest::default())
+                .with_size(7)
+                .to_json_value()
+                .unwrap()["size"],
+            7
+        );
+        // A stream that produced no bytes (for example a failed/aborted write) logs 0 even when
+        // the handler declared a longer body.
+        let aborted =
+            AccessLogEntry::new(AccessLogRequest::default()).with_size_counter(&BodyBytes::new());
+        assert_eq!(aborted.to_json_value().unwrap()["size"], 0);
+    }
+
+    #[test]
+    fn duration_is_time_to_last_byte_not_time_to_headers() {
+        let started = Instant::now();
+        let mut timing = RequestTiming::start_at(started);
+        assert_eq!(timing.time_to_headers(), None, "headers not marked yet");
+
+        timing.mark_response_started_at(started + Duration::from_millis(10));
+        assert_eq!(
+            timing.time_to_headers(),
+            Some(Duration::from_millis(10)),
+            "time-to-headers is a separate observation"
+        );
+        // The unfinished clock grows with elapsed time, like `{http.request.duration}`; it is not
+        // the headers boundary.
+        assert!(!timing.is_finished());
+        assert!(timing.duration() >= Duration::ZERO);
+
+        timing.finish_at(started + Duration::from_millis(50));
+        assert_eq!(timing.duration(), Duration::from_millis(50));
+        assert_eq!(
+            timing.time_to_headers(),
+            Some(Duration::from_millis(10)),
+            "marking the last byte does not move the headers boundary"
+        );
+        assert!(timing.is_finished());
+        assert_eq!(timing.started_at(), started);
+        assert_eq!(
+            timing.finished_at(),
+            Some(started + Duration::from_millis(50))
+        );
+
+        // Caddy's access `duration` is the total, serialized as float seconds
+        // (`server.go:1311`; zap `NewProductionEncoderConfig`).
+        let entry = AccessLogEntry::new(AccessLogRequest::default()).with_timing(timing);
+        assert_eq!(entry.duration, Duration::from_millis(50));
+        assert_eq!(entry.to_json_value().unwrap()["duration"], 0.05);
+
+        // An unfinished clock grows like Caddy's `{http.request.duration}`.
+        let running = RequestTiming::start_at(Instant::now() - Duration::from_millis(5));
+        assert!(running.duration() >= Duration::from_millis(5));
+    }
+
+    #[test]
+    fn write_error_is_present_only_when_the_write_failed() {
+        let clean = AccessLogEntry::new(AccessLogRequest::default());
+        assert!(clean.to_json_value().unwrap().get("write_error").is_none());
+
+        let failed = AccessLogEntry::new(AccessLogRequest::default())
+            .with_write_error("write tcp 127.0.0.1: i/o timeout");
+        let value = failed.to_json_value().unwrap();
+        // Caddy appends `zap.NamedError("write_error", ...)` only when the write failed
+        // (`server.go:1320`).
+        assert_eq!(value["write_error"], "write tcp 127.0.0.1: i/o timeout");
+        assert!(value.as_object().unwrap().contains_key("write_error"));
+    }
+
+    #[test]
+    fn response_headers_redact_credentials_and_obey_custom_rules() {
+        let entry =
+            AccessLogEntry::new(AccessLogRequest::default()).with_response_headers(&headers(&[
+                ("content-type", "text/plain"),
+                ("set-cookie", "sid=abc; Path=/"),
+                ("authorization", "Bearer secret"),
+                ("proxy-authorization", "Basic secret"),
+                ("cookie", "session=abc"),
+                ("x-internal", "trace"),
+            ]));
+
+        // Caddy passes the same `should_log_credentials` flag to the response-header object as to
+        // the request one (`server.go:1314`, `internal/logmarshalers.go:20-35`).
+        let redacted = entry.render_default().unwrap();
+        for header in [
+            "Set-Cookie",
+            "Authorization",
+            "Proxy-Authorization",
+            "Cookie",
+        ] {
+            assert_eq!(redacted["resp_headers"][header], json!(["REDACTED"]));
+        }
+        assert_eq!(
+            redacted["resp_headers"]["Content-Type"],
+            json!(["text/plain"])
+        );
+
+        let credentials = AccessLogConfig {
+            log_credentials: true,
+            ..AccessLogConfig::default()
+        };
+        let logged = entry.render(&credentials).unwrap();
+        assert_eq!(
+            logged["resp_headers"]["Set-Cookie"],
+            json!(["sid=abc; Path=/"])
+        );
+        assert_eq!(
+            logged["resp_headers"]["Authorization"],
+            json!(["Bearer secret"])
+        );
+
+        // Custom response-header rules use Caddy's `resp_headers` target and never touch the
+        // request header map.
+        let mut request = AccessLogRequest::new("GET", "example.com", "/");
+        request
+            .headers
+            .insert("Content-Type".to_string(), vec!["text/plain".to_string()]);
+        let mut entry = AccessLogEntry::new(request).with_response_headers(&headers(&[
+            ("content-type", "text/plain"),
+            ("x-internal", "1"),
+        ]));
+        let config = AccessLogConfig {
+            redaction: RedactionPolicy {
+                headers: vec![
+                    HeaderRedaction::Replace {
+                        header: "Content-Type".to_string(),
+                        value: "hidden".to_string(),
+                        target: HeaderTarget::Response,
+                    },
+                    HeaderRedaction::Delete {
+                        header: "X-Internal".to_string(),
+                        target: HeaderTarget::Response,
+                    },
+                ],
+                ..RedactionPolicy::default()
+            },
+            ..AccessLogConfig::default()
+        };
+        let rendered = entry.render(&config).unwrap();
+        assert_eq!(rendered["resp_headers"]["Content-Type"], json!(["hidden"]));
+        assert!(rendered["resp_headers"].get("X-Internal").is_none());
+        assert_eq!(
+            rendered["request"]["headers"]["Content-Type"],
+            json!(["text/plain"])
+        );
+        assert!(entry.render_default().unwrap()["resp_headers"]
+            .get("X-Internal")
+            .is_some());
+    }
+
+    #[test]
+    fn full_representative_entry_matches_caddy_documented_shape() {
+        let mut request = AccessLogRequest::new("POST", "example.com", "/api?q=1")
+            .with_remote(Some("192.0.2.10:54321".parse().unwrap()))
+            .with_headers(&headers(&[
+                ("host", "example.com"),
+                ("content-type", "application/json"),
+                ("authorization", "Bearer secret"),
+            ]));
+        request.proto = "HTTP/2.0".to_string();
+        request.tls = Some(AccessLogTls {
+            resumed: false,
+            version: 772,
+            cipher_suite: 4865,
+            proto: "h2".to_string(),
+            server_name: "example.com".to_string(),
+            ech: false,
+            client_common_name: Some("client".to_string()),
+            client_serial: Some("1234".to_string()),
+        });
+
+        let started = Instant::now();
+        let mut timing = RequestTiming::start_at(started);
+        timing.finish_at(started + Duration::from_millis(50));
+
+        let entry = AccessLogEntry::new(request)
+            .with_timestamp(UNIX_EPOCH + Duration::from_millis(1_700_000_000_500))
+            .with_status(502)
+            .with_timing(timing)
+            .with_user_id("alice")
+            .with_bytes_read(42)
+            .with_size(123)
+            .with_write_error("write tcp 127.0.0.1: i/o timeout")
+            .with_response_headers(&headers(&[
+                ("content-type", "application/json"),
+                ("set-cookie", "sid=abc"),
+            ]))
+            .with_upstream(AccessLogUpstream {
+                dial: "10.0.0.5:8080".to_string(),
+                remote_ip: Some("10.0.0.5".to_string()),
+                remote_port: Some("8080".to_string()),
+                duration: Duration::from_millis(25),
+                status: Some(200),
+            })
+            .with_uuid("a3f1c2d4-1b2c-4d5e-8f90-1234567890ab")
+            .with_trace_context("4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7")
+            .with_extra_field("proxy_attempt", json!(2));
+
+        let expected = json!({
+            "level": "error",
+            "ts": 1_700_000_000.5_f64,
+            "logger": "http.log.access",
+            "msg": "handled request",
+            "request": {
+                "remote_ip": "192.0.2.10",
+                "remote_port": "54321",
+                "client_ip": "192.0.2.10",
+                "proto": "HTTP/2.0",
+                "method": "POST",
+                "host": "example.com",
+                "uri": "/api?q=1",
+                "headers": {
+                    "Content-Type": ["application/json"],
+                    "Authorization": ["REDACTED"],
+                },
+                "tls": {
+                    "resumed": false,
+                    "version": 772,
+                    "cipher_suite": 4865,
+                    "proto": "h2",
+                    "server_name": "example.com",
+                    "ech": false,
+                    "client_common_name": "client",
+                    "client_serial": "1234",
+                },
+            },
+            "bytes_read": 42,
+            "user_id": "alice",
+            "duration": 0.05,
+            "size": 123,
+            "status": 502,
+            "resp_headers": {
+                "Content-Type": ["application/json"],
+                "Set-Cookie": ["REDACTED"],
+            },
+            "write_error": "write tcp 127.0.0.1: i/o timeout",
+            "upstream": {
+                "dial": "10.0.0.5:8080",
+                "remote_ip": "10.0.0.5",
+                "remote_port": "8080",
+                "duration": 0.025,
+                "status": 200,
+            },
+            "uuid": "a3f1c2d4-1b2c-4d5e-8f90-1234567890ab",
+            "traceID": "4bf92f3577b34da6a3ce929d0e0e4736",
+            "spanID": "00f067aa0ba902b7",
+            "proxy_attempt": 2,
+        });
+        let rendered = entry.render_default().unwrap();
+        for (key, expected_value) in expected.as_object().unwrap() {
+            assert_eq!(
+                rendered.get(key),
+                Some(expected_value),
+                "top-level field `{key}` diverges: {rendered}"
+            );
+        }
+        assert_eq!(rendered, expected);
+
+        // Caddy's logical field order: encoder fields first, then `request`, then the built-in
+        // fields in `logRequest` order, then the extra fields.
+        let direct = serde_json::to_string(&entry).unwrap();
+        let positions: Vec<usize> = [
+            "\"level\"",
+            "\"ts\"",
+            "\"request\"",
+            "\"bytes_read\"",
+            "\"user_id\"",
+            "\"duration\"",
+            "\"size\"",
+            "\"status\"",
+            "\"resp_headers\"",
+            "\"write_error\"",
+            "\"upstream\"",
+            "\"uuid\"",
+            "\"traceID\"",
+            "\"spanID\"",
+            "\"proxy_attempt\"",
+        ]
+        .iter()
+        .map(|key| {
+            direct
+                .find(key)
+                .unwrap_or_else(|| panic!("missing {key}: {direct}"))
+        })
+        .collect();
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "unexpected field order: {direct}"
+        );
+    }
+
+    #[test]
+    fn missing_values_omit_optional_fields_exactly_like_caddy() {
+        let entry =
+            AccessLogEntry::new(AccessLogRequest::new("GET", "example.com", "/")).with_status(0);
+        let value = entry.to_json_value().unwrap();
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "bytes_read",
+                "duration",
+                "level",
+                "logger",
+                "msg",
+                "request",
+                "resp_headers",
+                "size",
+                "status",
+                "ts",
+                "user_id",
+            ],
+            "only Caddy's always-present fields are emitted"
+        );
+        // Caddy logs `status: 0` when no response was written (`server.go:1313`,
+        // `responsewriter.go:204`).
+        assert_eq!(value["status"], 0);
+        assert_eq!(value["level"], "info");
+        // Optional fields are absent, never null or empty.
+        for absent in ["write_error", "upstream", "uuid", "traceID", "spanID"] {
+            assert!(value.get(absent).is_none(), "`{absent}` must be omitted");
+        }
+        // The `request` object omits `client_ip` (unresolved), `transfer_encoding` and `tls`
+        // like Caddy's marshalers (`marshalers.go:44-60`).
+        let request = value["request"].as_object().unwrap();
+        for absent in ["client_ip", "transfer_encoding", "tls"] {
+            assert!(
+                request.get(absent).is_none(),
+                "`request.{absent}` must be omitted"
+            );
+        }
+        // Extra fields never add an `extra` wrapper object of their own.
+        assert!(!value.as_object().unwrap().contains_key("extra_fields"));
+    }
+
+    #[test]
+    fn extra_log_fields_serialize_inline_and_round_trip() {
+        let mut extras = ExtraLogFields::new();
+        assert!(extras.is_empty());
+        extras.add("upstream_addr", json!("10.0.0.5:8080"));
+        extras.add("attempt", json!(2));
+        assert_eq!(extras.len(), 2);
+        assert_eq!(extras.get("attempt"), Some(&json!(2)));
+        // A repeated `Add` keeps one slot (last value wins, position preserved).
+        extras.add("attempt", json!(3));
+        assert_eq!(extras.len(), 2);
+        assert_eq!(extras.get("attempt"), Some(&json!(3)));
+        extras.set("upstream_addr", json!("10.0.0.6:8080"));
+        assert_eq!(
+            extras.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            vec!["upstream_addr", "attempt"]
+        );
+
+        let entry = AccessLogEntry::new(AccessLogRequest::new("GET", "example.com", "/"))
+            .with_extra_fields(extras.clone());
+        let value = entry.to_json_value().unwrap();
+        // Caddy's `ExtraLogFields` are inline top-level keys (`server.go:1321`).
+        assert_eq!(value["upstream_addr"], "10.0.0.6:8080");
+        assert_eq!(value["attempt"], 3);
+        assert!(!value.as_object().unwrap().contains_key("extra_fields"));
+
+        let decoded: AccessLogEntry =
+            serde_json::from_str(&serde_json::to_string(&entry).unwrap()).unwrap();
+        assert_eq!(decoded.extra_fields, extras);
+        // Unknown keys are preserved as extra fields when decoding a Caddy-shaped entry.
+        let mut caddy_shaped = entry.to_json_value().unwrap();
+        caddy_shaped
+            .as_object_mut()
+            .unwrap()
+            .insert("unknown_key".to_string(), json!("kept"));
+        let decoded: AccessLogEntry = serde_json::from_value(caddy_shaped).unwrap();
+        assert_eq!(
+            decoded.extra_fields.get("unknown_key"),
+            Some(&json!("kept"))
+        );
+    }
+
+    #[test]
+    fn access_log_context_shares_server_and_handler_observations() {
+        let context = AccessLogContext::started();
+        let handler = context.clone();
+
+        // The server wraps the request body and hands the counter to the body pipeline; handlers
+        // record the authenticated user, proxy attempt, write error and extra fields.
+        handler.request_bytes().add(42);
+        handler.set_user_id("alice");
+        handler.set_upstream(AccessLogUpstream {
+            dial: "10.0.0.5:8080".to_string(),
+            remote_ip: Some("10.0.0.5".to_string()),
+            remote_port: Some("8080".to_string()),
+            duration: Duration::from_millis(25),
+            status: Some(200),
+        });
+        handler.mark_response_started();
+        handler.response_bytes().add(123);
+        handler.set_write_error("connection reset by peer");
+        handler.add_extra_field("proxy_attempt", json!(2));
+        assert_eq!(context.user_id().as_deref(), Some("alice"));
+        let finished = context.finish();
+        assert!(finished.is_some());
+        assert_eq!(context.duration(), finished);
+
+        // The server builds the ordinary entry from its request snapshot and then overlays the
+        // shared observations.
+        let mut entry = AccessLogEntry::new(AccessLogRequest::new("GET", "example.com", "/"))
+            .with_status(200)
+            .with_response_headers(&headers(&[("content-type", "text/plain")]));
+        context.apply_to(&mut entry);
+
+        assert_eq!(entry.bytes_read, 42);
+        assert_eq!(entry.size, 123);
+        assert_eq!(entry.user_id, "alice");
+        assert_eq!(entry.duration, finished.unwrap());
+        assert_eq!(
+            entry
+                .upstream
+                .as_ref()
+                .map(|upstream| upstream.dial.as_str()),
+            Some("10.0.0.5:8080")
+        );
+        assert_eq!(
+            entry.write_error.as_deref(),
+            Some("connection reset by peer")
+        );
+        assert_eq!(entry.extra_fields.get("proxy_attempt"), Some(&json!(2)));
+
+        let value = entry.render_default().unwrap();
+        assert_eq!(value["bytes_read"], 42);
+        assert_eq!(value["size"], 123);
+        assert_eq!(value["user_id"], "alice");
+        assert_eq!(value["upstream"]["dial"], "10.0.0.5:8080");
+        assert_eq!(value["proxy_attempt"], 2);
+        // Headers were not touched by the context.
+        assert_eq!(value["resp_headers"]["Content-Type"], json!(["text/plain"]));
+    }
+
+    #[test]
+    fn access_log_context_is_thread_safe_and_anonymous_by_default() {
+        // The server shares these across its task boundary and handlers write from async tasks.
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<AccessLogContext>();
+        assert_send_sync::<BodyBytes>();
+        assert_send_sync::<ExtraLogFields>();
+        assert_send_sync::<AccessLogEntry>();
+
+        let context = AccessLogContext::new();
+        assert_eq!(context.user_id(), None);
+        assert_eq!(context.timing(), None);
+        assert!(context.extra_fields().is_empty());
+        // A fresh context leaves Caddy's always-emitted defaults intact.
+        let mut entry = AccessLogEntry::new(AccessLogRequest::default());
+        context.apply_to(&mut entry);
+        assert_eq!(entry.user_id, "");
+        assert_eq!(entry.bytes_read, 0);
+        assert_eq!(entry.size, 0);
+
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let context = context.clone();
+                scope.spawn(move || {
+                    for _ in 0..1_000 {
+                        context.request_bytes().add(1);
+                    }
+                });
+            }
+            let context = context.clone();
+            scope.spawn(move || context.set_user_id("alice"));
+        });
+        assert_eq!(context.request_bytes().get(), 4_000);
+        assert_eq!(context.user_id().as_deref(), Some("alice"));
     }
 }
