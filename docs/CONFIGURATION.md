@@ -1,102 +1,229 @@
 # Configuration
 
-caddy-rs accepts the two configuration formats Caddy accepts. Both describe the same model; the
-Caddyfile is adapted into JSON before it is loaded.
+caddy-rs runs one configuration at a time. You can write that configuration as a Caddyfile, which
+the built-in adapter converts to JSON, or as native Caddy JSON. Both forms describe the same
+object: the adapter is a translator, not a second runtime.
 
-## Two formats
+## The two configuration layers
 
-| Format | Use it for | Adapter |
-|---|---|---|
-| Caddyfile | Hand-written configuration, the format Caddy documents | `--adapter caddyfile` |
-| JSON | Generated configuration, exact control over every field | `--adapter json` |
+Native JSON is the runtime format. The process decodes it into the typed configuration model,
+validates every module reference, provisions the generation, and only then starts serving. A JSON
+document can express everything the server supports.
+
+A Caddyfile is the concise, human-facing form. The adapter parses it (including global options,
+snippets, imports, matchers and directive ordering) and emits the JSON that the runtime consumes.
+Use `caddy-rs adapt` to see and keep the result:
 
 ```sh
-# Convert a Caddyfile to JSON (what the server will load)
-caddy-rs adapt --config ./Caddyfile --adapter caddyfile --pretty > caddy.json
-
-# Validate either form without starting the server
-caddy-rs validate --config ./Caddyfile --adapter caddyfile
+caddy-rs adapt --config Caddyfile --pretty
 ```
 
-An invalid configuration fails with the JSON path of the offending field, for example
-`apps.http.servers.srv0.routes[0].handle[0]`, before any listener changes.
-
-## Caddyfile
-
-A Caddyfile starts with an optional global options block, followed by site blocks:
+For example, this Caddyfile:
 
 ```caddyfile
 {
-	email admin@example.com
+    email admin@example.com
 }
 
 example.com {
-	encode gzip zstd
-	reverse_proxy 10.0.0.5:8080 10.0.0.6:8080 {
-		lb_policy least_conn
-		health_uri /healthz
-	}
+    root * /srv/www
+    encode zstd gzip
+    file_server browse
 }
 ```
 
-Supported directives are listed in [FEATURES.md](FEATURES.md); directive semantics follow the
-upstream documentation at <https://caddyserver.com/docs/>.
+adapts to JSON with an `apps.http.servers.srv0` object, a `:443` listener, a route matching the
+`example.com` host, and a handler chain containing `vars` (for `root`), `encode`, `file_server`
+and `subroute` wrappers. The exact JSON is what you would write by hand for the same behaviour.
 
-Placeholders:
+`adapt` selects the adapter from `--adapter` when given, otherwise from a file name that starts
+with `Caddyfile`. The supported adapters are `caddyfile` and `json`; `json` passes the document
+through unchanged.
 
-- `{env.VAR}` resolves an environment variable inside a configuration value.
-- `{$VAR}` resolves an environment variable while the Caddyfile is being parsed.
+## Validate before you run
 
-## JSON
+`run` validates before binding a socket, and you can perform the same check without serving:
 
-The JSON form mirrors Caddy's: a top-level object with optional `admin`, `storage`, `logging` and
-`apps`, where `apps.http` holds servers and `apps.tls` holds certificate automation.
+```sh
+caddy-rs validate --config Caddyfile
+# Valid configuration
+```
 
-| Key | Meaning |
+`validate` adapts and decodes the configuration, runs the full validation pass, and provisions the
+modules the way `run` would (without binding listeners or obtaining certificates). A configuration
+that passes `validate` therefore does not fail later for a module-shape reason.
+
+Errors are located. JSON errors name the exact key or index; Caddyfile errors name the line
+(`Caddyfile line N`, or `file:line` for an imported file). For example, a route whose handler name
+is misspelled produces:
+
+```text
+caddy-rs: error[module.unknown]: `caddy.json` is not a valid configuration: unknown HTTP handler module `revers_proxy` at `apps.http.servers.srv0.routes[0].handle[0].handler` (did you mean `reverse_proxy`?)
+```
+
+The `error[...]` token is stable for scripting; the message after it names the offending input.
+Validation reports the first error it finds, not a list.
+
+## A tour of the JSON shape
+
+The top level accepts four keys. Unknown top-level keys and unknown app names are rejected by
+validation; each module's own fields are validated against its schema.
+
+| Key | Purpose |
 |---|---|
-| `admin` | Admin endpoint: `{"disabled": true}` to turn it off, `{"listen": "localhost:2019"}` to move it, plus `origins`/`enforce_origin` |
-| `storage` | Certificate and account storage. `{"module": "file_system", "root": "/var/lib/caddy"}` or the S3 backend |
-| `apps.http` | HTTP servers (`servers`), global `http_port`/`https_port`, `grace_period`, `shutdown_delay`, `metrics` |
-| `apps.tls` | Certificate automation policies, issuers, certificate loading, connection policies, certificate storage |
-| `logging` | Log sinks, encoders, levels, sampling and filters |
+| `admin` | The management endpoint. `listen` defaults to `localhost:2019`; `disabled: true` turns it off; `enforce_origin` with `origins` restricts cross-origin requests. |
+| `logging` | Structured logging targets. `logs.<name>` selects a writer, encoder, level, sampling and include/exclude filters, and the `default` log is where access entries normally go. |
+| `storage` | The certificate and ACME storage backend. It is a module object: `{"module": "file_system", "root": "/var/lib/caddy-rs"}` selects the filesystem backend and its root. |
+| `apps` | Applications keyed by module name. |
 
-A server entry combines `listen`, `routes`, optional `tls_connection_policies`, `automatic_https`,
-`trusted_proxies`, `listener_wrappers` and limits:
+`apps.http` holds the HTTP app: `http_port` and `https_port` (defaults 80 and 443),
+`grace_period` and `shutdown_delay`, the experimental `metrics` object, and `servers`. Each entry
+in `servers` is a server with listeners, routes, TLS connection policies, per-server logging and
+error routes.
+
+`apps.tls` holds certificate management: `certificates` for manually loaded keys, `automation` for
+issuance policies, and `session_tickets`. An automation policy lists `subjects`, one or more
+`issuers` (`acme` or `internal`), an optional `key_type`, and optional `storage`.
+
+`apps.pki` defines local certificate authorities under `certificate_authorities`, keyed by CA ID
+(`local` is the implicit default). The `http`, `tls` and `pki` apps are the ones this build
+validates; any other app name is an error.
+
+Here is a complete configuration that serves `example.com` from `/srv/www`:
 
 ```json
 {
+  "admin": {
+    "listen": "localhost:2019"
+  },
+  "storage": {
+    "module": "file_system",
+    "root": "/var/lib/caddy-rs"
+  },
   "apps": {
     "http": {
       "servers": {
         "srv0": {
           "listen": [":443"],
-          "routes": [{
-            "handle": [{ "handler": "static_response", "body": "hello" }]
-          }]
+          "routes": [
+            {
+              "@id": "site",
+              "match": [{ "host": ["example.com"] }],
+              "handle": [
+                {
+                  "handler": "encode",
+                  "encodings": { "zstd": {}, "gzip": {} }
+                },
+                {
+                  "handler": "file_server",
+                  "root": "/srv/www",
+                  "browse": true
+                }
+              ],
+              "terminal": true
+            }
+          ]
         }
+      }
+    },
+    "tls": {
+      "automation": {
+        "policies": [
+          {
+            "subjects": ["example.com"],
+            "issuers": [{ "module": "acme" }]
+          }
+        ]
+      }
+    }
+  },
+  "logging": {
+    "logs": {
+      "default": {
+        "writer": { "output": "stderr" },
+        "encoder": { "format": "json" },
+        "level": "INFO"
       }
     }
   }
 }
 ```
 
-## Applying configuration at runtime
+Durations in JSON are either Caddy duration strings (`"5s"`, `"250ms"`, `"1m30s"`, `"2d"`) or
+integer nanoseconds. Modules are named by their short JSON key in a `handler` field or as the key
+of a module map; the qualified module ID (for example `http.handlers.reverse_proxy`) is not the
+JSON spelling. Full per-area details are in [FEATURES.md](FEATURES.md).
 
-A running server accepts a new configuration through its admin API; the load is atomic and a
-rejected configuration leaves the previous one serving.
+## Environment placeholders
+
+Caddyfiles support two kinds of environment substitution, at different times.
+
+`{$NAME}` is replaced when the Caddyfile is parsed, before lexing. `{$NAME:default}` supplies a
+fallback when the variable is unset:
+
+```caddyfile
+:{$PORT:8080} {
+    respond "Hello {$GREETING:world}"
+}
+```
+
+Expansion is one level deep: a value that itself contains `{$OTHER}` is not expanded again.
+Malformed forms such as `{$}` or `{$NAME` are left as literal text.
+
+`{env.NAME}` is a request-time placeholder, evaluated by handlers and matchers for each request.
+It expands to the process environment variable and to an empty string when unset:
+
+```caddyfile
+example.com {
+    respond "Served by {env.HOSTNAME}"
+}
+```
+
+The two forms are independent: `{$NAME}` affects the configuration the adapter emits, while
+`{env.NAME}` stays in the configuration and is read at request time.
+
+## Where to find a directive
+
+This build implements a documented subset of Caddy's configuration surface. The upstream
+documentation remains the reference for directive names, block syntax and semantics; use it to
+look a directive up, then check [FEATURES.md](FEATURES.md) for the behaviour implemented here.
+
+| Topic | Documentation |
+|---|---|
+| Caddyfile concepts (sites, snippets, imports, matchers) | <https://caddyserver.com/docs/caddyfile> |
+| Caddyfile directives | <https://caddyserver.com/docs/caddyfile/directives> |
+| Caddyfile global options | <https://caddyserver.com/docs/caddyfile/options> |
+| JSON configuration structure | <https://caddyserver.com/docs/json/> |
+| Admin API | <https://caddyserver.com/docs/api> |
+| Command line | <https://caddyserver.com/docs/command-line> |
+
+The upstream pages document Caddy itself. This build documents the exact surface it implements in
+[FEATURES.md](FEATURES.md); use that page as the authority when the two differ.
+
+## Load a configuration at runtime
+
+The admin API accepts a full native JSON document at `POST /load`. The process validates,
+provisions and atomically activates it; on failure the previous generation keeps serving.
 
 ```sh
-curl -X POST http://localhost:2019/load \
-  -H 'Content-Type: application/json' \
+curl --fail-with-body \
+  -X POST "http://localhost:2019/load" \
+  -H "Content-Type: application/json" \
   --data-binary @caddy.json
 ```
 
-`caddy-rs reload` performs the same operation from the command line, and `caddy-rs stop` asks a
-running server to shut down.
+To load a Caddyfile, adapt it first (or let `reload` do both steps):
 
-## Where to look next
+```sh
+caddy-rs reload --config Caddyfile
+```
 
-- [FEATURES.md](FEATURES.md) — every handler, matcher and option this build supports.
-- [CLI.md](CLI.md) — commands, flags and exit codes.
-- [INSTALL.md](INSTALL.md) — building, offline builds, and where state is stored.
-- <https://caddyserver.com/docs/> — upstream documentation for the configuration model.
+`reload` validates the configuration locally, then posts the adapted JSON to the admin endpoint.
+`POST /stop` deactivates the running configuration; in the CLI `run` process it terminates the
+process.
+
+Posting a document identical to the running configuration is a no-op. Send
+`Cache-Control: must-revalidate` to force a full reload. Targeted changes can also use
+`/config/<path>` and `/id/<id>` with `POST`, `PUT`, `PATCH` and `DELETE`, which apply the same
+validation and rollback rules to a subtree. See [FEATURES.md](FEATURES.md#admin-api) for the full
+endpoint list.
