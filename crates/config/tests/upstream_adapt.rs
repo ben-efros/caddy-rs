@@ -1354,3 +1354,81 @@ fn servers_without_block_or_with_address_only_are_noops_like_caddy() {
         "unexpected error: {error}"
     );
 }
+
+#[test]
+fn servers_trusted_proxies_options_match_real_caddy_v2_11_9() {
+    // Golden from `caddy adapt` v2.11.9 for the `servers` block: the static IP source is emitted
+    // as a module object with expanded `private_ranges`, the strict flag is the integer 1, the
+    // Unix flag a boolean, and client IP headers an ordered array.
+    let adapted = adapt(
+        "{\n\tservers {\n\t\ttrusted_proxies static 10.0.0.0/8 192.0.2.0/24\n\t\ttrusted_proxies_strict\n\t\ttrusted_proxies_unix\n\t\tclient_ip_headers X-Forwarded-For X-Real-IP\n\t}\n}\n\n:8080 {\n\trespond \"ok\"\n}\n",
+    )
+    .expect("adapt servers trusted_proxies options");
+    let server = &adapted.config["apps"]["http"]["servers"]["srv0"];
+    assert_eq!(
+        server["trusted_proxies"],
+        json!({"source": "static", "ranges": ["10.0.0.0/8", "192.0.2.0/24"]})
+    );
+    assert_eq!(server["trusted_proxies_strict"], json!(1));
+    assert_eq!(server["trusted_proxies_unix"], json!(true));
+    assert_eq!(
+        server["client_ip_headers"],
+        json!(["X-Forwarded-For", "X-Real-IP"])
+    );
+
+    // `private_ranges` expands to Caddy's `internal.PrivateRangesCIDR()` list.
+    let expanded = adapt(
+        "{\n\tservers {\n\t\ttrusted_proxies static private_ranges\n\t}\n}\n\n:8080 {\n\trespond \"ok\"\n}\n",
+    )
+    .expect("adapt private_ranges");
+    assert_eq!(
+        expanded.config["apps"]["http"]["servers"]["srv0"]["trusted_proxies"]["ranges"],
+        json!([
+            "192.168.0.0/16",
+            "172.16.0.0/12",
+            "10.0.0.0/8",
+            "127.0.0.1/8",
+            "fd00::/8",
+            "::1"
+        ])
+    );
+
+    // Address-scoped options only apply to the matching server.
+    let scoped = adapt(
+        "{\n\tservers :8080 {\n\t\ttrusted_proxies_strict\n\t}\n}\n\n:8080 {\n\trespond \"a\"\n}\n\n:8081 {\n\trespond \"b\"\n}\n",
+    )
+    .expect("adapt address-scoped servers options");
+    assert_eq!(
+        scoped.config["apps"]["http"]["servers"]["srv0"]["trusted_proxies_strict"],
+        json!(1)
+    );
+    assert!(scoped.config["apps"]["http"]["servers"]["srv1"]
+        .get("trusted_proxies_strict")
+        .is_none());
+
+    // Located errors for unsupported forms.
+    for (caddyfile, expected) in [
+        (
+            "{\n\tservers {\n\t\ttrusted_proxies cloudflare\n\t}\n}\n\n:8080 {\n\trespond \"ok\"\n}\n",
+            "only `static` is available",
+        ),
+        (
+            "{\n\tservers {\n\t\ttrusted_proxies\n\t}\n}\n\n:8080 {\n\trespond \"ok\"\n}\n",
+            "expects an IP range source module name",
+        ),
+        (
+            "{\n\tservers {\n\t\ttrusted_proxies_strict on\n\t}\n}\n\n:8080 {\n\trespond \"ok\"\n}\n",
+            "does not take arguments",
+        ),
+        (
+            "{\n\tservers {\n\t\tclient_ip_headers X-Real-IP X-Real-IP\n\t}\n}\n\n:8080 {\n\trespond \"ok\"\n}\n",
+            "specified more than once",
+        ),
+    ] {
+        let error = adapt(caddyfile).expect_err("invalid servers option must be located");
+        assert!(
+            error.to_string().contains(expected),
+            "expected `{expected}` in: {error}"
+        );
+    }
+}
