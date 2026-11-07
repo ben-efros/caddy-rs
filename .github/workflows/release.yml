@@ -52,6 +52,21 @@ jobs:
             profile: release-minimal
             archive: tar.gz
             musl: true
+          # Minimal builds: the same static profile without HTTP/3, compression or templates.
+          - name: x86_64-linux-musl-minimal
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            profile: release-minimal
+            features: --no-default-features
+            archive: tar.gz
+            musl: true
+          - name: aarch64-linux-musl-minimal
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            profile: release-minimal
+            features: --no-default-features
+            archive: tar.gz
+            musl: true
           # macOS build.
           - name: aarch64-macos
             os: macos-latest
@@ -77,7 +92,7 @@ jobs:
 
       - name: Build
         run: |
-          cargo build --locked --profile ${{ matrix.profile }} --target ${{ matrix.target }} -p caddy-rs
+          cargo build --locked --profile ${{ matrix.profile }} --target ${{ matrix.target }} ${{ matrix.features }} -p caddy-rs
 
       - name: Package
         shell: bash

@@ -14,11 +14,17 @@ Each release publishes one archive per platform, plus a checksum file:
 | `caddy-rs-<version>-x86_64-unknown-linux-musl.tar.gz` | Linux x86_64 | **fully static**, size-optimised |
 | `caddy-rs-<version>-aarch64-unknown-linux-musl.tar.gz` | Linux arm64 | **fully static**, size-optimised |
 | `caddy-rs-<version>-aarch64-apple-darwin.tar.gz` | macOS arm64 | dynamic |
+| `caddy-rs-<version>-x86_64-unknown-linux-musl-minimal.tar.gz` | Linux x86_64 | **static, minimal** |
+| `caddy-rs-<version>-aarch64-unknown-linux-musl-minimal.tar.gz` | Linux arm64 | **static, minimal** |
 
 Every archive contains the `caddy-rs` binary, `LICENSE`, `NOTICE.md` and `README.md`.
 `SHA256SUMS` covers all archives in the release.
 
-The static archives are built with the `release-minimal` profile (`opt-level = "z"`, fat LTO,
+The **minimal** archives are built from the same targets with `--no-default-features`, which leaves
+out HTTP/3, the compression handler and the templates handler — a 6.5 MiB binary instead of 19.7 MiB.
+A configuration that asks for one of those features is still rejected with a located error naming the
+feature, so a minimal build cannot silently accept a configuration it cannot serve.
+ (`opt-level = "z"`, fat LTO,
 `panic = "abort"`, stripped symbols), so they are the smallest binaries produced. They have no libc
 dependency: they run on any Linux kernel of the target architecture, including Alpine and minimal
 container images.
@@ -63,7 +69,7 @@ version string, which builds the same artefacts without creating a tag.
    git push origin v0.1.0
    ```
 
-5. **Watch the run.** `.github/workflows/release.yml` builds all five targets, packages each one,
+5. **Watch the run.** `.github/workflows/release.yml` builds all seven targets, packages each one,
    appends to `SHA256SUMS`, and publishes a GitHub release with the archives attached.
 
    ```sh
@@ -117,6 +123,6 @@ distroless or `scratch` base image.
 - [ ] Workspace version and `Cargo.lock` updated together.
 - [ ] `caddy-rs version` reports the release version and the Caddy baseline.
 - [ ] At least one archive built and smoke-tested locally.
-- [ ] Tag pushed; workflow green on all five targets.
+- [ ] Tag pushed; workflow green on all seven targets.
 - [ ] `SHA256SUMS` verified against a downloaded archive.
 - [ ] Release notes mention any behaviour change since the previous tag.
