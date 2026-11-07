@@ -1146,9 +1146,7 @@ impl HttpMetrics {
             &labels,
         )?;
         gauge.inc()?;
-        Ok(InFlightGuard {
-            gauge: Some(gauge),
-        })
+        Ok(InFlightGuard { gauge: Some(gauge) })
     }
 
     /// Record one completed request: counters, error counter and the latency/size histograms.
