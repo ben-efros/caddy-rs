@@ -1,6 +1,6 @@
 //! Differential tests against Caddy's own `caddyfile_adapt` golden outputs.
 //!
-//! Each fixture is split into a Caddyfile and the JSON Caddy v2.11.7 emits for it. The adapter
+//! Each fixture is split into a Caddyfile and the JSON Caddy v2.11.9 emits for it. The adapter
 //! must produce semantically identical JSON (object key order is not significant).
 
 use caddy_rs_config::{adapt, adapt_with_source};
@@ -757,6 +757,26 @@ fn map_helper(directive: &str) -> Value {
 #[test]
 fn map_and_vars_with_raw_types_matches_caddy() {
     assert_adapts_like_caddy("map_and_vars_with_raw_types.caddyfiletest");
+}
+
+#[test]
+fn sort_vars_named_matchers_keep_order_matches_caddy() {
+    assert_adapts_like_caddy("sort_vars_named_matchers_keep_order.caddyfiletest");
+}
+
+#[test]
+fn error_multi_site_blocks_matches_caddy() {
+    assert_adapts_like_caddy("error_multi_site_blocks.caddyfiletest");
+}
+
+#[test]
+fn error_range_simple_codes_matches_caddy() {
+    assert_adapts_like_caddy("error_range_simple_codes.caddyfiletest");
+}
+
+#[test]
+fn php_fastcgi_handle_response_matches_caddy() {
+    assert_adapts_like_caddy("php_fastcgi_handle_response.caddyfiletest");
 }
 
 #[test]

@@ -1,6 +1,6 @@
 //! Differential Caddyfile adaptation for `handle_errors` and the `error` directive.
 //!
-//! Expected JSON is the output of real Caddy v2.11.7 (`caddy adapt --adapter caddyfile`) for the
+//! Expected JSON is the output of real Caddy v2.11.9 (`caddy adapt --adapter caddyfile`) for the
 //! same Caddyfile input (see `external/caddy/caddyconfig/httpcaddyfile/builtins.go`
 //! `parseHandleErrors` and `httptype.go` error-route assembly).
 
@@ -48,15 +48,15 @@ fn handle_errors_adapts_byte_identically_for_a_catch_all_site() {
     let expected_errors = json!({
         "routes": [
             {
-                "match": [{"expression": "{http.error.status_code} >= 500 && {http.error.status_code} <= 599"}],
-                "handle": [{"handler": "subroute", "routes": [
-                    {"handle": [{"body": "server error", "handler": "static_response"}]}
-                ]}]
-            },
-            {
                 "match": [{"expression": "{http.error.status_code} in [404, 410]"}],
                 "handle": [{"handler": "subroute", "routes": [
                     {"handle": [{"body": "not here: {http.error.status_code} {http.error.message}", "handler": "static_response"}]}
+                ]}]
+            },
+            {
+                "match": [{"expression": "{http.error.status_code} >= 500 && {http.error.status_code} <= 599"}],
+                "handle": [{"handler": "subroute", "routes": [
+                    {"handle": [{"body": "server error", "handler": "static_response"}]}
                 ]}]
             }
         ]
