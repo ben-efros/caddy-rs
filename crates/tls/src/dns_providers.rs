@@ -739,7 +739,9 @@ mod tests {
             &["example.com".to_string()],
             crate::acme::csr::CertificateKeyType::P256,
             &shared,
-            directory.path().to_path_buf(),
+            &crate::storage::SelectedStorage::FileSystem {
+                root: directory.path().to_path_buf(),
+            },
             &Arc::new(Http01TokenStore::new()),
             &Arc::new(TlsAlpn01TokenStore::new()),
             &(Arc::new(TokioClock) as Arc<dyn AcmeClock>),
