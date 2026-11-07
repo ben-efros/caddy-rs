@@ -77,7 +77,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
-          echo "CC_${{ matrix.target//-/_ }}=musl-gcc" >> "$GITHUB_ENV"
+          target="${{ matrix.target }}"
+          echo "CC_${target//-/_}=musl-gcc" >> "$GITHUB_ENV"
 
       - name: Cache cargo
         uses: actions/cache@v4
