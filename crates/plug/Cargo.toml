@@ -10,5 +10,9 @@ repository.workspace = true
 [dependencies]
 # The ABI types derive Serialize/Deserialize so a future host (T-PLUG-011) can load plugin
 # manifests with whichever format it chooses. This crate defines no format of its own and has no
-# other dependencies: the wire encodings below are hand-written and stable by contract.
+# third-party dependencies. The host lifecycle module additionally reuses the project's
+# configuration-generation vocabulary from `caddy-rs-core` (T-CORE-012) so external module
+# services are generation-scoped exactly like listeners and other runtime resources.
 serde = { workspace = true }
+caddy-rs-core = { workspace = true }
+async-trait = { workspace = true }
