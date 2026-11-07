@@ -1407,3 +1407,39 @@ fn servers_trusted_proxies_options_match_real_caddy_v2_11_9() {
         );
     }
 }
+
+#[test]
+fn flush_interval_adapts_like_caddy() {
+    // Golden from `caddy adapt` v2.11.9: the integer form is nanoseconds (-1 = flush immediately),
+    // and a duration string becomes nanoseconds too.
+    let adapted = adapt(
+        ":8080 {\n\treverse_proxy 127.0.0.1:9000 {\n\t\tflush_interval -1\n\t}\n}\n\n:8081 {\n\treverse_proxy 127.0.0.1:9000 {\n\t\tflush_interval 500ms\n\t}\n}\n",
+    )
+    .expect("adapt flush_interval");
+    let servers = &adapted.config["apps"]["http"]["servers"];
+    assert_eq!(
+        servers["srv0"]["routes"][0]["handle"][0]["flush_interval"],
+        json!(-1)
+    );
+    assert_eq!(
+        servers["srv1"]["routes"][0]["handle"][0]["flush_interval"],
+        json!(500_000_000_i64)
+    );
+
+    for (caddyfile, expected) in [
+        (
+            ":8080 {\n\treverse_proxy 127.0.0.1:9000 {\n\t\tflush_interval\n\t}\n}\n",
+            "requires a value",
+        ),
+        (
+            ":8080 {\n\treverse_proxy 127.0.0.1:9000 {\n\t\tflush_interval later\n\t}\n}\n",
+            "missing numeric value",
+        ),
+    ] {
+        let error = adapt(caddyfile).expect_err("invalid flush_interval must be located");
+        assert!(
+            error.to_string().contains(expected),
+            "expected `{expected}` in: {error}"
+        );
+    }
+}

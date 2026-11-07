@@ -7984,6 +7984,30 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
                     .map_err(|message| adapter_error(item.position.clone(), message))?;
                 load_balancing.insert("try_interval".to_string(), json!(nanos));
             }
+            "flush_interval" => {
+                // Caddy accepts either an integer (nanoseconds) or a duration string and stores
+                // `caddy.Duration`; `-1` is its documented "flush immediately after every write".
+                // caddy-rs streams each chunk immediately, so `-1` describes the runtime exactly.
+                if !item.block.is_empty() {
+                    return Err(adapter_error(
+                        item.position.clone(),
+                        "`flush_interval` does not take a block",
+                    ));
+                }
+                let Some(value) = item.args.first() else {
+                    return Err(adapter_error(
+                        item.position.clone(),
+                        "`flush_interval` requires a value",
+                    ));
+                };
+                let nanos: i64 = match value.parse::<i64>() {
+                    Ok(raw) => raw,
+                    Err(_) => parse_duration(value)
+                        .map(|nanos| nanos as i64)
+                        .map_err(|message| adapter_error(item.position.clone(), message))?,
+                };
+                object.insert("flush_interval".to_string(), json!(nanos));
+            }
             "lb_retry_match" => {
                 let matcher = if item.block.is_empty() {
                     let Some(name) = item.args.first() else {
