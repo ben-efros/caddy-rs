@@ -314,6 +314,26 @@ impl UpstreamStatusSink {
         }
         merged.into_values().collect()
     }
+
+    /// Spawn the active-health-check schedulers for every live handler built for this generation.
+    ///
+    /// The server runtime owns the returned schedulers and shuts them down when the generation is
+    /// replaced or the runtime stops, so health-check tasks are generation-scoped and cannot leak
+    /// across reloads. Handlers that do not configure `health_checks.active` contribute nothing.
+    pub fn spawn_health_checks(&self) -> Vec<HealthCheckScheduler> {
+        let handlers: Vec<Arc<ReverseProxyHandler>> = {
+            let mut handlers = self
+                .handlers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            handlers.retain(|handler| handler.strong_count() > 0);
+            handlers.iter().filter_map(Weak::upgrade).collect()
+        };
+        handlers
+            .iter()
+            .filter_map(|handler| handler.spawn_health_checks())
+            .collect()
+    }
 }
 
 /// Per-expanded-address clients for one dynamic upstream.

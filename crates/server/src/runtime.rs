@@ -21,7 +21,7 @@ use caddy_rs_admin::{
 };
 use caddy_rs_core::{Generation, GenerationStore, HttpServer, ListenAddr, Network};
 use caddy_rs_http::RouterBuilder;
-use caddy_rs_proxy::{handler_factory_with_status_sink, UpstreamStatusSink};
+use caddy_rs_proxy::{handler_factory_with_status_sink, HealthCheckScheduler, UpstreamStatusSink};
 use caddy_rs_tls::{
     build_server_config, build_server_config_with_cert_resolver, listener_uses_tls,
     plan_automatic_https, resolver_from_config, AcmeTlsAlpnResolver, AcmeTransport,
@@ -192,6 +192,11 @@ pub struct ServerRuntime {
     status: RuntimeStatus,
     /// Socket-activation resolution state; resolved once on the first apply.
     activation: ActivationState,
+    /// Generation-scoped active health-check schedulers, one vector per generation that
+    /// configured `reverse_proxy.health_checks.active`. Health checks start only after the
+    /// generation is serving and are stopped when the generation is replaced or the runtime stops,
+    /// so no checker task can leak across reloads.
+    health_schedulers: BTreeMap<u64, Vec<HealthCheckScheduler>>,
     /// Generation-scoped certificate renewal schedulers.
     ///
     /// Each successfully applied generation that manages certificates owns one scheduler, keyed by
@@ -262,6 +267,7 @@ impl ServerRuntime {
             admin_api,
             status: RuntimeStatus::default(),
             activation: ActivationState::Environment,
+            health_schedulers: BTreeMap::new(),
             renewals: BTreeMap::new(),
             certificate_store: None,
             recorder,
@@ -499,6 +505,9 @@ impl ServerRuntime {
             self.install_access_log(generation.id(), access_log);
             self.record_certificate_metrics(&generation);
             self.upstream_status.install(Arc::clone(&status_sink));
+            let health_schedulers = status_sink.spawn_health_checks();
+            self.install_health_schedulers(generation.id(), health_schedulers)
+                .await;
             return Ok(self.finish_apply(&generation));
         };
         // Snapshot for rollback: a failed provisioning pass must leave the previous generation's
@@ -576,7 +585,64 @@ impl ServerRuntime {
         self.install_access_log(generation.id(), access_log);
         self.record_certificate_metrics(&generation);
         self.upstream_status.install(Arc::clone(&status_sink));
+        let health_schedulers = status_sink.spawn_health_checks();
+        self.install_health_schedulers(generation.id(), health_schedulers)
+            .await;
         Ok(self.finish_apply(&generation))
+    }
+
+    /// Adopt the active health-check schedulers of a successfully applied generation and stop the
+    /// previous generation's checkers.
+    async fn install_health_schedulers(
+        &mut self,
+        generation_id: u64,
+        schedulers: Vec<HealthCheckScheduler>,
+    ) {
+        if !schedulers.is_empty() {
+            self.health_schedulers.insert(generation_id, schedulers);
+        }
+        self.retire_stale_health_schedulers(generation_id).await;
+    }
+
+    /// Stop and drop health-check schedulers owned by generations other than
+    /// `active_generation`.
+    ///
+    /// Called only after a successful apply, so a failed reload keeps the previous generation's
+    /// checkers running (the previous upstreams are still the ones serving traffic).
+    async fn retire_stale_health_schedulers(&mut self, active_generation: u64) {
+        let stale: Vec<u64> = self
+            .health_schedulers
+            .keys()
+            .copied()
+            .filter(|generation| *generation != active_generation)
+            .collect();
+        for generation in stale {
+            if let Some(schedulers) = self.health_schedulers.remove(&generation) {
+                if !schedulers.is_empty() {
+                    tracing::info!(
+                        generation,
+                        checkers = schedulers.len(),
+                        "stopping active health-check schedulers for retired generation"
+                    );
+                }
+                for scheduler in schedulers {
+                    scheduler.shutdown().await;
+                }
+            }
+        }
+    }
+
+    /// Number of live generation-scoped active health-check schedulers.
+    ///
+    /// Exposed for runtime tests (the Caddy admin endpoint does not expose health state; see
+    /// DIV-0026).
+    pub fn health_scheduler_count(&self) -> usize {
+        self.health_schedulers.values().map(Vec::len).sum()
+    }
+
+    /// Generations that own at least one active health-check scheduler (for runtime tests).
+    pub fn health_scheduler_generations(&self) -> Vec<u64> {
+        self.health_schedulers.keys().copied().collect()
     }
 
     /// Stop and drop the renewal schedulers owned by generations other than `active_generation`.
@@ -966,6 +1032,19 @@ impl ServerRuntime {
         let listeners = std::mem::take(&mut self.listeners);
         for (_, handle) in listeners {
             handle.stop_forcibly().await;
+        }
+        let health_schedulers = std::mem::take(&mut self.health_schedulers);
+        for (generation, schedulers) in health_schedulers {
+            if !schedulers.is_empty() {
+                tracing::info!(
+                    generation,
+                    checkers = schedulers.len(),
+                    "stopping active health-check schedulers"
+                );
+            }
+            for scheduler in schedulers {
+                scheduler.shutdown().await;
+            }
         }
         let renewals = std::mem::take(&mut self.renewals);
         for (generation, renewals) in renewals {

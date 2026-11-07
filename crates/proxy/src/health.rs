@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use http_body_util::BodyExt;
 use hyper_util::client::legacy::connect::Connect;
 use hyper_util::client::legacy::Client;
@@ -73,6 +73,8 @@ pub struct HealthCheck {
     pub fails: u32,
     /// Maximum response body size to inspect (Caddy `max_size`); only meaningful with body checks.
     pub max_size: Option<u64>,
+    /// Compiled Caddy `expect_body` regular expression; the response body must match it.
+    pub expected_body: Option<caddy_rs_http::regex_lite::Regex>,
 }
 
 impl Default for HealthCheck {
@@ -88,6 +90,7 @@ impl Default for HealthCheck {
             passes: 1,
             fails: 1,
             max_size: None,
+            expected_body: None,
         }
     }
 }
@@ -132,16 +135,6 @@ impl HealthCheck {
             return Err(HttpError::NotImplemented {
                 feature: "active health checks following redirects",
                 tracking_id: "PROXY-HEALTH-REDIRECT",
-            });
-        }
-        if object
-            .get("expect_body")
-            .and_then(Value::as_str)
-            .is_some_and(|expect_body| !expect_body.is_empty())
-        {
-            return Err(HttpError::NotImplemented {
-                feature: "active health-check response body matching (regular expressions)",
-                tracking_id: "PROXY-HEALTH-REGEXP",
             });
         }
 
@@ -208,6 +201,23 @@ impl HealthCheck {
                 check.max_size = Some(max_size as u64);
             }
         }
+        if let Some(expect_body) = object
+            .get("expect_body")
+            .and_then(Value::as_str)
+            .filter(|expect_body| !expect_body.is_empty())
+        {
+            // Caddy compiles `expect_body` as a Go regular expression and marks the upstream
+            // unhealthy when the response body does not match. caddy-rs uses the crate's bounded
+            // regex engine; unsupported constructs fail loudly at configuration load.
+            check.expected_body = Some(
+                caddy_rs_http::regex_lite::Regex::new(expect_body).map_err(|error| {
+                    invalid(
+                        &format!("{path}.expect_body"),
+                        format!("invalid regular expression: {error}"),
+                    )
+                })?,
+            );
+        }
         Ok(Some(check))
     }
 
@@ -249,22 +259,37 @@ impl HealthCheck {
             return false;
         };
         *request.headers_mut() = headers;
-        // The timeout covers both the round trip and draining the response body, mirroring Go's
+        // The timeout covers the round trip and the body inspection/drain, mirroring Go's
         // `http.Client.Timeout` used by Caddy's active health checker.
         let result = tokio::time::timeout(self.timeout, async {
             let response = client.request(request).await.map_err(|_| ())?;
             let status = response.status();
-            let _ = response.into_body().collect().await;
-            Ok::<http::StatusCode, ()>(status)
+            // Caddy evaluates the status first and only inspects the body for matching statuses.
+            let status_ok = match self.expected_status {
+                Some(expected) => status_matches(status, expected),
+                None => status.is_success(),
+            };
+            if !status_ok {
+                let _ = response.into_body().collect().await;
+                return Ok::<bool, ()>(false);
+            }
+            match &self.expected_body {
+                Some(regexp) => {
+                    let body = read_body_limited(response.into_body(), self.max_size).await;
+                    let Some(body) = body else {
+                        return Ok(false);
+                    };
+                    let text = String::from_utf8_lossy(&body);
+                    Ok(regexp.captures(&text).is_some())
+                }
+                None => {
+                    let _ = response.into_body().collect().await;
+                    Ok(true)
+                }
+            }
         })
         .await;
-        let Ok(Ok(status)) = result else {
-            return false;
-        };
-        match self.expected_status {
-            Some(expected) => status_matches(status, expected),
-            None => status.is_success(),
-        }
+        matches!(result, Ok(Ok(true)))
     }
 
     /// Apply one probe result to an upstream, respecting the `passes`/`fails` thresholds.
@@ -293,6 +318,35 @@ impl HealthCheck {
             }
         }
     }
+}
+
+/// Read a probe response body, honouring Caddy's `max_size` byte limit (unlimited when unset).
+async fn read_body_limited(body: hyper::body::Incoming, max_size: Option<u64>) -> Option<Bytes> {
+    let mut collected = BytesMut::new();
+    let mut body = body;
+    while let Some(frame) = body.frame().await {
+        let frame = frame.ok()?;
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        match max_size {
+            Some(max_size) => {
+                let remaining = max_size.saturating_sub(collected.len() as u64);
+                if remaining == 0 {
+                    break;
+                }
+                let take = usize::try_from(remaining)
+                    .unwrap_or(usize::MAX)
+                    .min(data.len());
+                collected.extend_from_slice(&data[..take]);
+                if (take as u64) == remaining {
+                    break;
+                }
+            }
+            None => collected.extend_from_slice(&data),
+        }
+    }
+    Some(collected.freeze())
 }
 
 /// Consecutive pass/fail counters for one upstream's active checker.
@@ -483,6 +537,94 @@ mod tests {
         address.to_string()
     }
 
+    /// Upstream that always answers `status` with `body` (for `expect_body` checks).
+    async fn spawn_body_upstream(status: u16, body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let service = service_fn(
+                        move |_request: hyper::Request<hyper::body::Incoming>| async move {
+                            Ok::<_, Infallible>(
+                                hyper::Response::builder()
+                                    .status(status)
+                                    .body(Full::new(Bytes::from_static(body.as_bytes())))
+                                    .unwrap(),
+                            )
+                        },
+                    );
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        address.to_string()
+    }
+
+    #[test]
+    fn expect_body_is_compiled_and_invalid_regex_fails_loudly() {
+        let check = HealthCheck::from_json(
+            &serde_json::json!({"uri": "/health", "expect_body": "^ok$"}),
+            "health_checks.active",
+        )
+        .unwrap()
+        .expect("active check enabled");
+        assert!(check.expected_body.is_some());
+
+        let error = HealthCheck::from_json(
+            &serde_json::json!({"uri": "/health", "expect_body": "("}),
+            "health_checks.active",
+        )
+        .expect_err("invalid expect_body regex must fail loudly");
+        assert!(
+            error.to_string().contains("expect_body"),
+            "error must be located at expect_body: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_once_matches_expect_body_with_max_size_truncation() {
+        let matching = spawn_body_upstream(200, "healthy").await;
+        let upstream = Arc::new(Upstream::new(matching, false));
+        let client = crate::client::build_client();
+        let check = HealthCheck::from_json(
+            &serde_json::json!({"uri": "/", "expect_body": "^healthy$"}),
+            "health_checks.active",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(check.check_once(&client, &upstream).await);
+
+        // max_size truncates before matching, like Caddy's `io.LimitReader`.
+        let long = spawn_body_upstream(200, "healthy-trailing").await;
+        let upstream = Arc::new(Upstream::new(long, false));
+        let check = HealthCheck::from_json(
+            &serde_json::json!({
+                "uri": "/", "expect_body": "^healthy$", "max_size": 7
+            }),
+            "health_checks.active",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(check.check_once(&client, &upstream).await);
+
+        // A body that does not match is a failed check.
+        let mismatch = spawn_body_upstream(200, "unhealthy").await;
+        let upstream = Arc::new(Upstream::new(mismatch, false));
+        let check = HealthCheck::from_json(
+            &serde_json::json!({"uri": "/", "expect_body": "^healthy$"}),
+            "health_checks.active",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!check.check_once(&client, &upstream).await);
+    }
+
     #[test]
     fn status_matching_supports_exact_codes_and_classes() {
         assert!(status_matches(http::StatusCode::OK, 200));
@@ -579,10 +721,6 @@ mod tests {
     #[test]
     fn unsupported_active_options_fail_loudly() {
         for (config, tracking_id) in [
-            (
-                serde_json::json!({"uri": "/", "expect_body": "^ok$"}),
-                "PROXY-HEALTH-REGEXP",
-            ),
             (
                 serde_json::json!({"uri": "/", "port": 9000}),
                 "PROXY-HEALTH-PORT",
