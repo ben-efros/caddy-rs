@@ -7,6 +7,13 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# The in-process WASM host runtime (T-PLUG-011). On by default so workspace
+# builds and tests exercise it; out-of-tree crates that only need the external
+# protocol (e.g. the template) can disable it to avoid compiling Wasmtime.
+default = ["wasm-runtime"]
+wasm-runtime = ["dep:wasmtime"]
+
 [dependencies]
 # The ABI types derive Serialize/Deserialize so a future host (T-PLUG-011) can load plugin
 # manifests with whichever format it chooses. This crate defines no format of its own and has no
@@ -16,3 +23,4 @@ repository.workspace = true
 serde = { workspace = true }
 caddy-rs-core = { workspace = true }
 async-trait = { workspace = true }
+wasmtime = { version = "34", optional = true }

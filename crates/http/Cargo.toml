@@ -8,7 +8,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+argon2 = "0.5"
 async-trait = { workspace = true }
+bcrypt = "0.16"
 bytes = { workspace = true }
 caddy-rs-core = { workspace = true }
 flate2 = "1"

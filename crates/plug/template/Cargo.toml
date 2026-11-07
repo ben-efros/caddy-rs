@@ -14,7 +14,7 @@ publish = false
 [dependencies]
 # For a real module, change this to the published version once the crate is released:
 # caddy-rs-plug = "0.1"
-caddy-rs-plug = { path = ".." }
+caddy-rs-plug = { path = "..", default-features = false }
 
 [[bin]]
 name = "module-template"
