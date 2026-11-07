@@ -691,11 +691,11 @@ fn provider_error(message: impl Into<String>) -> DnsError {
 
 #[cfg(test)]
 mod tests {
-    use std::time::UNIX_EPOCH;
     use super::*;
     use crate::dns::DnsChallengeConfig;
     use std::collections::VecDeque;
     use std::sync::Mutex;
+    use std::time::UNIX_EPOCH;
 
     struct ScriptedTransport {
         responses: Mutex<VecDeque<(u16, String)>>,

@@ -28,8 +28,8 @@ use caddy_rs_tls::{
     plan_automatic_https, resolver_from_config, staple_for_certificate, AcmeTlsAlpnResolver,
     AcmeTransport, AutomaticHttpsIssuer, AutomaticHttpsPlan, AutomaticHttpsProvisioner,
     AutomaticHttpsRenewals, CertificateResolver, HyperOcspTransport, HyperTransport,
-    NoAcmeTransport, OcspPolicy, OcspStapler, SharedOcspStapler,
-    TlsAlpn01TokenStore, TlsServerOptions, DEFAULT_HTTPS_PORT,
+    NoAcmeTransport, OcspPolicy, OcspStapler, SharedOcspStapler, TlsAlpn01TokenStore,
+    TlsServerOptions, DEFAULT_HTTPS_PORT,
 };
 use tokio::sync::watch;
 
