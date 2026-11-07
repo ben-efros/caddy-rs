@@ -256,3 +256,49 @@ fn named_expression_matcher_matches_real_caddy_v2_11_9() {
         "unexpected error: {error}"
     );
 }
+
+#[test]
+fn templates_directive_matches_real_caddy_v2_11_9() {
+    // Golden from `caddy adapt` v2.11.9: `mime` → mime_types, `between` → delimiters, `root` → file_root.
+    let adapted = adapt(
+        ":8080 {\n\ttemplates {\n\t\tmime text/html text/plain\n\t\tbetween << >>\n\t\troot /srv\n\t}\n\trespond \"ok\"\n}\n",
+    )
+    .expect("adapt templates directive");
+    let handle = &adapted.config["apps"]["http"]["servers"]["srv0"]["routes"][0]["handle"];
+    assert_eq!(handle[0]["handler"], json!("templates"));
+    assert_eq!(handle[0]["mime_types"], json!(["text/html", "text/plain"]));
+    assert_eq!(handle[0]["delimiters"], json!(["<<", ">>"]));
+    assert_eq!(handle[0]["file_root"], json!("/srv"));
+
+    let bare = adapt(":8080 {\n\ttemplates\n\trespond \"ok\"\n}\n")
+        .expect("adapt bare templates directive");
+    assert_eq!(
+        bare.config["apps"]["http"]["servers"]["srv0"]["routes"][0]["handle"][0],
+        json!({"handler": "templates"})
+    );
+
+    for (caddyfile, expected) in [
+        (
+            ":8080 {\n\ttemplates extra\n\trespond \"ok\"\n}\n",
+            "takes no arguments",
+        ),
+        (
+            ":8080 {\n\ttemplates {\n\t\tmime\n\t}\n\trespond \"ok\"\n}\n",
+            "requires one or more MIME types",
+        ),
+        (
+            ":8080 {\n\ttemplates {\n\t\tbetween a b c\n\t}\n\trespond \"ok\"\n}\n",
+            "requires exactly two delimiters",
+        ),
+        (
+            ":8080 {\n\ttemplates {\n\t\textensions foo\n\t}\n\trespond \"ok\"\n}\n",
+            "not implemented by this build",
+        ),
+    ] {
+        let error = adapt(caddyfile).expect_err("invalid templates option must be located");
+        assert!(
+            error.to_string().contains(expected),
+            "expected `{expected}` in: {error}"
+        );
+    }
+}

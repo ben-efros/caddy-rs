@@ -36,6 +36,7 @@ const DIRECTIVE_ORDER: &[&str] = &[
     "basic_auth",
     "forward_auth",
     "encode",
+    "templates",
     "invoke",
     "handle",
     "handle_path",
@@ -5743,6 +5744,7 @@ fn build_handlers(
         "header" => header_handlers(directive, args)?,
         "request_body" => vec![request_body_handler(directive)?],
         "encode" => vec![encode_handler(directive)?],
+        "templates" => vec![templates_handler(directive)?],
         "reverse_proxy" => vec![reverse_proxy_handler(directive, args)?],
         "basicauth" | "basic_auth" => vec![basic_auth_handler(directive, args)?],
         "forward_auth" => vec![forward_auth_handler(directive, args)?],
@@ -6958,6 +6960,61 @@ fn encode_handler(directive: &Directive) -> caddy_rs_core::Result<Value> {
     }
     if !matches.is_empty() {
         object.insert("match".to_string(), Value::Object(matches));
+    }
+    Ok(Value::Object(object))
+}
+
+fn templates_handler(directive: &Directive) -> caddy_rs_core::Result<Value> {
+    if !directive.args.is_empty() {
+        return Err(adapter_error(
+            directive.position.clone(),
+            "`templates` takes no arguments (use a matcher)",
+        ));
+    }
+    let mut object = Map::new();
+    object.insert("handler".to_string(), json!("templates"));
+    for item in &directive.block {
+        match item.name.as_str() {
+            "mime" => {
+                if item.args.is_empty() || !item.block.is_empty() {
+                    return Err(adapter_error(
+                        item.position.clone(),
+                        "`templates mime` requires one or more MIME types",
+                    ));
+                }
+                object.insert("mime_types".to_string(), json!(item.args));
+            }
+            "between" => {
+                if item.args.len() != 2 || !item.block.is_empty() {
+                    return Err(adapter_error(
+                        item.position.clone(),
+                        "`templates between` requires exactly two delimiters",
+                    ));
+                }
+                object.insert("delimiters".to_string(), json!(item.args));
+            }
+            "root" => {
+                if item.args.len() != 1 || !item.block.is_empty() {
+                    return Err(adapter_error(
+                        item.position.clone(),
+                        "`templates root` requires exactly one path",
+                    ));
+                }
+                object.insert("file_root".to_string(), json!(item.args[0]));
+            }
+            "extensions" => {
+                return Err(adapter_error(
+                    item.position.clone(),
+                    "`templates extensions` modules are not implemented by this build",
+                ))
+            }
+            other => {
+                return Err(adapter_error(
+                    item.position.clone(),
+                    format!("unsupported `templates` option `{other}`"),
+                ))
+            }
+        }
     }
     Ok(Value::Object(object))
 }

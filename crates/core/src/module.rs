@@ -579,6 +579,12 @@ pub const BUILTIN_MODULES: &[Module] = &[
         "Authentication middleware with the HTTP Basic provider (native bcrypt and argon2id password-hash verification, constant-time comparison)",
     ),
     Module::new(
+        "http.handlers.templates",
+        "templates",
+        ModuleKind::HttpHandler,
+        "Execute response bodies as templates (documented Go-template subset; caddy-rs implementation)",
+    ),
+    Module::new(
         "http.handlers.rate_limit",
         "rate_limit",
         ModuleKind::HttpHandler,
