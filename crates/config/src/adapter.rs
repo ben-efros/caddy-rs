@@ -1734,12 +1734,10 @@ fn parse_log_encoder(option: &Directive) -> caddy_rs_core::Result<Value> {
             }
             Ok(json!({"format": module}))
         }
-        "filter" | "append" | "journald" | "nop" => Err(adapter_error(
+        "filter" | "append" | "journald" | "nop" => Err(adapter_unsupported(
             option.position.clone(),
-            format!(
-                "log encoder `{module}` is not supported by this build's access-log sink \
-                 (tracked as T-CONF-012)"
-            ),
+            format!("log encoder `{module}` in the access-log sink"),
+            "T-CONF-012",
         )),
         other => Err(adapter_error(
             option.position.clone(),
@@ -2395,12 +2393,13 @@ fn validate_cipher_suite(name: &str, position: Position) -> caddy_rs_core::Resul
         return Ok(name.to_string());
     }
     if CADDY_ONLY_CIPHER_SUITES.contains(&name) {
-        return Err(adapter_error(
+        return Err(adapter_unsupported(
             position,
             format!(
-                "cipher suite `{name}` is accepted by Caddy but not supported by this build's TLS \
-                 runtime; only the TLS 1.2 ECDHE AES-GCM/ChaCha20 suites are configurable (tracked as TLS-POLICY)"
+                "cipher suite `{name}` accepted by Caddy (only the TLS 1.2 ECDHE AES-GCM/ChaCha20 \
+                 suites are configurable)"
             ),
+            "TLS-POLICY",
         ));
     }
     Err(adapter_error(
@@ -2422,12 +2421,13 @@ fn validate_curve(name: &str, position: Position) -> caddy_rs_core::Result<Strin
         return Ok(name.to_string());
     }
     if CADDY_ONLY_CURVES.contains(&name) {
-        return Err(adapter_error(
+        return Err(adapter_unsupported(
             position,
             format!(
-                "TLS curve `{name}` is accepted by Caddy but not supported by this build's TLS \
-                 runtime; the rustls ring provider supports x25519, secp256r1 and secp384r1 (tracked as TLS-POLICY)"
+                "TLS curve `{name}` accepted by Caddy (the rustls ring provider supports x25519, \
+                 secp256r1 and secp384r1)"
             ),
+            "TLS-POLICY",
         ));
     }
     Err(adapter_error(
@@ -8672,9 +8672,55 @@ fn parse_error(error: parser::ParseError) -> CoreError {
         parser::ParseError::Syntax { position, message } => {
             CoreError::invalid(position.label(), message)
         }
+        parser::ParseError::Unsupported {
+            position,
+            feature,
+            tracking_id,
+        } => match tracking_id {
+            Some(tracking_id) => CoreError::unsupported(position.label(), feature, tracking_id),
+            None => CoreError::unsupported_untracked(position.label(), feature),
+        },
     }
 }
 
+/// Adapter diagnostics use the phrase "not supported by this build" for Caddy constructs this
+/// build intentionally rejects (the same marker the conformance classifier uses). Route those
+/// through `config.unsupported` so a valid Caddyfile is never presented as malformed; the
+/// explanatory suffix and any `(tracked as T-...)` text are preserved. New code should prefer
+/// [`adapter_unsupported`] / [`adapter_unsupported_untracked`].
 fn adapter_error(position: Position, message: impl Into<String>) -> CoreError {
-    CoreError::invalid(position.label(), message)
+    let message = message.into();
+    match unsupported_construct(&message) {
+        Some(feature) => CoreError::unsupported_untracked(position.label(), feature),
+        None => CoreError::invalid(position.label(), message),
+    }
+}
+
+fn adapter_unsupported(
+    position: Position,
+    feature: impl Into<String>,
+    tracking_id: &'static str,
+) -> CoreError {
+    CoreError::unsupported(position.label(), feature, tracking_id)
+}
+
+fn adapter_unsupported_untracked(position: Position, feature: impl Into<String>) -> CoreError {
+    CoreError::unsupported_untracked(position.label(), feature)
+}
+
+fn unsupported_construct(message: &str) -> Option<String> {
+    let (before, after) = message.split_once(" is not supported by this build")?;
+    // `this build's ...` needs an explicit `adapter_unsupported*` call: dropping the marker
+    // would leave a dangling possessive ("`filter`'s access-log sink").
+    if after.starts_with("'s") {
+        return None;
+    }
+    let after = after.trim();
+    Some(if after.is_empty() {
+        before.trim().to_string()
+    } else if after.starts_with([';', ',', ')']) {
+        format!("{}{}", before.trim_end(), after)
+    } else {
+        format!("{} {}", before.trim_end(), after)
+    })
 }

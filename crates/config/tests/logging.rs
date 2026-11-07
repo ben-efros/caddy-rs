@@ -176,10 +176,7 @@ fn unsupported_log_options_are_located_errors() {
             "{ metrics {\n\tbogus\n} }\n:80 {\n}\n",
             "unrecognized metrics option `bogus`",
         ),
-        (
-            ":80 {\n\tmetrics /metrics\n}\n",
-            "directive `metrics` is not supported",
-        ),
+        (":80 {\n\tmetrics /metrics\n}\n", "directive `metrics`"),
     ] {
         let error = adapt(caddyfile).expect_err("unsupported form must fail loudly");
         assert!(

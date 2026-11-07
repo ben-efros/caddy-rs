@@ -272,6 +272,15 @@ pub enum ParseError {
         /// Diagnosis.
         message: String,
     },
+    /// A construct that Caddy accepts but this build intentionally does not implement.
+    Unsupported {
+        /// Location (and origin file when the token came from an import).
+        position: Position,
+        /// Human-readable construct name, for example ``global option `persist_config```.
+        feature: String,
+        /// Plan task that tracks implementing the construct, when one exists.
+        tracking_id: Option<&'static str>,
+    },
 }
 
 impl fmt::Display for ParseError {
@@ -280,6 +289,21 @@ impl fmt::Display for ParseError {
             Self::Lex(error) => write!(f, "{error}"),
             Self::Syntax { position, message } => {
                 write!(f, "{}: {message}", position.label())
+            }
+            Self::Unsupported {
+                position,
+                feature,
+                tracking_id,
+            } => {
+                write!(
+                    f,
+                    "{}: {feature} is not supported by this build",
+                    position.label()
+                )?;
+                if let Some(tracking_id) = tracking_id {
+                    write!(f, " (tracked as {tracking_id})")?;
+                }
+                Ok(())
             }
         }
     }
@@ -295,7 +319,7 @@ impl std::error::Error for ParseError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Lex(error) => Some(error),
-            Self::Syntax { .. } => None,
+            Self::Syntax { .. } | Self::Unsupported { .. } => None,
         }
     }
 }
@@ -305,6 +329,18 @@ impl ParseError {
         Self::Syntax {
             position,
             message: message.into(),
+        }
+    }
+
+    fn unsupported(
+        position: Position,
+        feature: impl Into<String>,
+        tracking_id: Option<&'static str>,
+    ) -> Self {
+        Self::Unsupported {
+            position,
+            feature: feature.into(),
+            tracking_id,
         }
     }
 }
@@ -1820,9 +1856,10 @@ fn read_global_options(directives: Vec<Directive>) -> Result<GlobalOptions, Pars
             }
             "admin" => {
                 if !directive.block.is_empty() {
-                    return Err(ParseError::syntax(
+                    return Err(ParseError::unsupported(
                         directive.position.clone(),
-                        "global option `admin` blocks are not supported by this build; use                          `admin off` or `admin <address>`",
+                        "the `admin` global-option block",
+                        Some("T-CONF-055"),
                     ));
                 }
                 if directive.args.len() != 1 {
@@ -1955,15 +1992,85 @@ fn read_global_options(directives: Vec<Directive>) -> Result<GlobalOptions, Pars
                 }
                 options.debug = true;
             }
+            other if is_caddy_global_option(other) => {
+                return Err(ParseError::unsupported(
+                    directive.position.clone(),
+                    format!("global option `{other}`"),
+                    global_option_tracking(other),
+                ))
+            }
             other => {
                 return Err(ParseError::syntax(
                     directive.position.clone(),
-                    format!("unrecognized global option `{other}`"),
+                    format!("unknown global option `{other}`"),
                 ))
             }
         }
     }
     Ok(options)
+}
+
+/// Global options registered by Caddy v2.11.9's Caddyfile adapter.
+///
+/// A name in this list that [`read_global_options`] does not implement is a *recognised but
+/// unsupported* Caddy construct, not a typo. A name outside the list is genuinely unknown and
+/// stays a `config.invalid` syntax error.
+fn is_caddy_global_option(name: &str) -> bool {
+    matches!(
+        name,
+        "acme_ca"
+            | "acme_ca_root"
+            | "acme_dns"
+            | "acme_eab"
+            | "admin"
+            | "auto_https"
+            | "cert_issuer"
+            | "cert_lifetime"
+            | "debug"
+            | "default_bind"
+            | "default_sni"
+            | "dns"
+            | "ech"
+            | "email"
+            | "events"
+            | "fallback_sni"
+            | "filesystem"
+            | "grace_period"
+            | "http_port"
+            | "https_port"
+            | "key_type"
+            | "local_certs"
+            | "log"
+            | "metrics"
+            | "ocsp_interval"
+            | "ocsp_stapling"
+            | "on_demand_tls"
+            | "order"
+            | "persist_config"
+            | "pki"
+            | "preferred_chains"
+            | "renew_interval"
+            | "renewal_window_ratio"
+            | "servers"
+            | "shutdown_delay"
+            | "skip_install_trust"
+            | "storage"
+            | "storage_check"
+            | "storage_clean_interval"
+            | "tls_automate_names"
+            | "tls_resolvers"
+    )
+}
+
+/// Plan task that tracks implementing a recognised global option, when one exists.
+///
+/// Options without a task still fail loudly and identify themselves as unsupported; they simply
+/// omit the `(tracked as ...)` suffix rather than pointing at an unrelated task.
+fn global_option_tracking(name: &str) -> Option<&'static str> {
+    match name {
+        "persist_config" => Some("T-CONF-055"),
+        _ => None,
+    }
 }
 
 /// Parse the global `pki { ca [<id>] { ... } }` option into [`PkiOptions`].

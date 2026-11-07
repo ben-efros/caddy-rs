@@ -209,11 +209,11 @@ impl ListenerWrappers {
                 // marker only; `http_redirect` is implemented by the automatic-HTTPS listener.
                 "tls" | "http_redirect" => {}
                 _ => {
-                    return Err(caddy_rs_core::Error::Unsupported {
-                        path: format!("{path}.wrapper"),
-                        feature: "listener wrapper module",
-                        tracking_id: "T-HTTP-043",
-                    });
+                    return Err(caddy_rs_core::Error::unsupported(
+                        format!("{path}.wrapper"),
+                        "listener wrapper module",
+                        "T-HTTP-043",
+                    ));
                 }
             }
         }

@@ -67,14 +67,21 @@ pub enum Error {
     /// caddy-rs rejects it loudly (DIV-0016) with a tracking task instead of silently
     /// approximating its behaviour. The message must stay recognisable to the compatibility
     /// tooling's "unsupported" class, hence the "not supported by this build" wording.
-    #[error("configuration at `{path}` is not supported by this build: {feature} ({tracking_id})")]
+    ///
+    /// `tracking_suffix` is empty when the construct is known to Caddy but no implementation
+    /// task exists yet; otherwise it is `` (tracked as T-...) ``. Keeping the suffix
+    /// pre-rendered lets the `feature` text be dynamic (for example a rejected option name)
+    /// without allocating a leaked `&'static str`.
+    #[error(
+        "configuration at `{path}` is not supported by this build: {feature}{tracking_suffix}"
+    )]
     Unsupported {
         /// JSON path of the unsupported construct.
         path: String,
         /// Human-readable construct name, e.g. ``reverse_proxy `dynamic_upstreams```.
-        feature: &'static str,
-        /// Plan task id that tracks implementing this construct.
-        tracking_id: &'static str,
+        feature: String,
+        /// Pre-rendered ` (tracked as T-...)` suffix, or empty when untracked.
+        tracking_suffix: String,
     },
 
     /// Two modules were registered with the same id.
@@ -219,16 +226,31 @@ impl Error {
         }
     }
 
-    /// Convenience constructor for a located "recognised but unsupported" error.
+    /// Convenience constructor for a located "recognised but unsupported" error with a tracking
+    /// task.
     pub fn unsupported(
         path: impl Into<String>,
-        feature: &'static str,
+        feature: impl Into<String>,
         tracking_id: &'static str,
     ) -> Self {
         Self::Unsupported {
             path: path.into(),
-            feature,
-            tracking_id,
+            feature: feature.into(),
+            tracking_suffix: format!(" (tracked as {tracking_id})"),
+        }
+    }
+
+    /// Convenience constructor for a located "recognised but unsupported" error with no
+    /// implementation task yet.
+    ///
+    /// This is for Caddy constructs that this build deliberately rejects but that are not yet
+    /// scheduled; the message still says "not supported by this build" and never suggests a
+    /// typo.
+    pub fn unsupported_untracked(path: impl Into<String>, feature: impl Into<String>) -> Self {
+        Self::Unsupported {
+            path: path.into(),
+            feature: feature.into(),
+            tracking_suffix: String::new(),
         }
     }
 }
