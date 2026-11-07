@@ -1583,8 +1583,11 @@ impl Handler for ReverseProxyHandler {
                                     Outcome::Respond(response)
                                 }
                                 HandleResponseResult::UseUpstream { status } => {
+                                    // Adopt the upstream status, then apply the response-header
+                                    // rules against it. The old code re-read
+                                    // `response.status` into `status` right after assigning it,
+                                    // which is a no-op that reads like a swap.
                                     response.status = status;
-                                    let status = response.status;
                                     let upstream_headers = response.headers.clone();
                                     self.apply_response_headers_to(
                                         &mut response.headers,
