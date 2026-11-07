@@ -262,6 +262,19 @@ pub struct CaCertificates {
     pub chain_pem: String,
 }
 
+/// A leaf signed for an externally supplied public key (ACME server use).
+#[derive(Debug, Clone)]
+pub struct SignedExternalCertificate {
+    /// DER-encoded leaf certificate.
+    pub leaf_der: Vec<u8>,
+    /// DER-encoded issuer chain (intermediate first; the ACME client already trusts the root).
+    pub chain_der: Vec<Vec<u8>>,
+    /// Leaf validity start.
+    pub not_before: SystemTime,
+    /// Leaf validity end (clamped to the intermediate's expiry).
+    pub not_after: SystemTime,
+}
+
 /// A loaded local CA: persisted root and intermediate certificates plus signing keys.
 pub struct LocalCa {
     name: String,
@@ -466,6 +479,58 @@ impl InternalIssuer {
         let ca = Arc::new(self.load_or_create_ca(&storage, now).await?);
         *guard = Some(Arc::clone(&ca));
         Ok(ca)
+    }
+
+    /// Sign an externally supplied SubjectPublicKeyInfo (an ACME CSR's key).
+    ///
+    /// Used by the caddy-rs ACME server handler: the CA issues a leaf for the CSR key without
+    /// generating or storing a private key. `sign_with_root` is not implemented (the persisted
+    /// root key is not loaded into [`LocalCa`]); callers must reject it loudly.
+    pub async fn sign_external_spki(
+        &self,
+        spki_der: &[u8],
+        domains: &[String],
+        lifetime: std::time::Duration,
+    ) -> Result<crate::internal_ca::SignedExternalCertificate> {
+        if spki_der.is_empty() {
+            return Err(Error::Issuer(
+                "internal CA ACME signing request has an empty public key".to_string(),
+            ));
+        }
+        let domains = normalize_domains(domains)?;
+        let ca = self.load_ca().await?;
+        let now = self.clock.now();
+        let not_before = now - self.lifetimes.backdate;
+        let mut not_after = not_before + lifetime;
+        if not_after > ca.intermediate.not_after {
+            not_after = ca.intermediate.not_after;
+        }
+        let subject_key_id = key_identifier(spki_der);
+        let issuer_key_id = issuer_key_identifier(&ca.intermediate);
+        let der = create_certificate(
+            &CertSpec {
+                serial: &random_serial()?,
+                issuer_subject: &ca.intermediate.subject_der,
+                subject: &subject_name(&domains[0]),
+                spki: spki_der,
+                not_before,
+                not_after,
+                is_ca: false,
+                path_len: None,
+                key_usage_bits: &[0],
+                server_auth: true,
+                san: &domains,
+                subject_key_id: Some(&subject_key_id),
+                authority_key_id: Some(&issuer_key_id),
+            },
+            &ca.intermediate_key,
+        )?;
+        Ok(SignedExternalCertificate {
+            leaf_der: der,
+            chain_der: vec![ca.intermediate_certificate_der.clone()],
+            not_before,
+            not_after,
+        })
     }
 
     async fn load_or_create_ca(

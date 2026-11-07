@@ -61,8 +61,8 @@ pub use dns_providers::{
 };
 pub use internal_ca::{
     ca_storage_keys, CaCertificates, CaLifetimes, CaStorage, CaStorageKeys, LocalCa,
-    DEFAULT_BACKDATE, DEFAULT_CA_DISPLAY_NAME, DEFAULT_CA_ID, DEFAULT_INTERMEDIATE_LIFETIME,
-    DEFAULT_LEAF_LIFETIME, DEFAULT_ROOT_LIFETIME,
+    SignedExternalCertificate, DEFAULT_BACKDATE, DEFAULT_CA_DISPLAY_NAME, DEFAULT_CA_ID,
+    DEFAULT_INTERMEDIATE_LIFETIME, DEFAULT_LEAF_LIFETIME, DEFAULT_ROOT_LIFETIME,
 };
 pub use issuer::{
     within_renewal_window, AcmeIssuer, AcmeIssuerConfig, CertificateIssuer, InternalIssuer,
