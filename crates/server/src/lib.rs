@@ -16,6 +16,7 @@ pub mod activation;
 pub(crate) mod auto_https;
 pub mod error;
 pub mod http;
+mod inventory;
 pub mod limits;
 pub mod listeners;
 mod observability;

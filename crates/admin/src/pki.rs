@@ -224,6 +224,10 @@ pub struct CertificateInfo {
     pub not_before: Option<String>,
     /// `notAfter` as an RFC 3339-ish UTC string, when parseable.
     pub not_after: Option<String>,
+    /// `notAfter` as Unix seconds (whole seconds).
+    pub not_after_unix: Option<u64>,
+    /// DNS subject alternative names from the `subjectAltName` extension, in certificate order.
+    pub dns_names: Vec<String>,
     /// Serial number as lowercase hex.
     pub serial_hex: String,
 }
@@ -678,6 +682,8 @@ fn parse_certificate_fields(der: &[u8]) -> Result<CertificateInfo, String> {
     let not_before = parse_asn1_time(&validity_fields[0])?;
     let not_after = parse_asn1_time(&validity_fields[1])?;
 
+    let dns_names = find_dns_names(&tbs)?;
+    let not_after_unix = not_after.as_deref().and_then(parse_rfc3339_seconds);
     Ok(CertificateInfo {
         der: der.to_vec(),
         pem: certificate_pem(der),
@@ -685,6 +691,8 @@ fn parse_certificate_fields(der: &[u8]) -> Result<CertificateInfo, String> {
         issuer_common_name: find_common_name(&issuer)?,
         not_before,
         not_after,
+        not_after_unix,
+        dns_names,
         serial_hex,
     })
 }
@@ -738,6 +746,97 @@ fn parse_asn1_time(tlv: &Tlv<'_>) -> Result<Option<String>, String> {
         }
         other => Err(format!("unsupported certificate time tag 0x{other:02x}")),
     }
+}
+
+/// Parse the fixed `YYYY-MM-DDTHH:MM:SSZ` form produced by [`parse_asn1_time`] to Unix seconds.
+fn parse_rfc3339_seconds(text: &str) -> Option<u64> {
+    let bytes = text.as_bytes();
+    if bytes.len() != 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || bytes[19] != b'Z'
+    {
+        return None;
+    }
+    let number =
+        |range: std::ops::Range<usize>| -> Option<i64> { text.get(range)?.parse::<i64>().ok() };
+    let year = number(0..4)?;
+    let month = number(5..7)?;
+    let day = number(8..10)?;
+    let hour = number(11..13)?;
+    let minute = number(14..16)?;
+    let second = number(17..19)?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    // Howard Hinnant's days_from_civil algorithm.
+    let adjusted_year = year - i64::from(month <= 2);
+    let era = adjusted_year.div_euclid(400);
+    let year_of_era = adjusted_year - era * 400;
+    let month_index = if month > 2 { month - 3 } else { month + 9 };
+    let day_of_year = (153 * month_index + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    let seconds = days * 86_400 + hour * 3_600 + minute * 60 + second;
+    u64::try_from(seconds).ok()
+}
+
+/// Extract DNS names (GeneralName tag `[2]`) from the certificate's `subjectAltName` extension.
+fn find_dns_names(tbs: &Tlv<'_>) -> Result<Vec<String>, String> {
+    let fields = tbs.children()?;
+    // tbsCertificate: [0] version?, serial, signature, issuer, validity, subject, spki,
+    // then optional issuerUniqueID [1], subjectUniqueID [2] and extensions [3].
+    let mut index = fields
+        .iter()
+        .position(|field| field.tag == 0xa3)
+        .map(|position| position)
+        .unwrap_or(fields.len());
+    if index == fields.len() {
+        return Ok(Vec::new());
+    }
+    let extensions = &fields[index];
+    let mut names = Vec::new();
+    for extension in extensions.children()? {
+        if extension.tag != 0x30 {
+            continue;
+        }
+        let parts = extension.children()?;
+        if parts.len() < 2 {
+            continue;
+        }
+        // subjectAltName OID = 2.5.29.17 -> 55 1d 11.
+        if parts[0].tag != 0x06 || parts[0].content != [0x55, 0x1d, 0x11] {
+            continue;
+        }
+        let value = parts.last().ok_or("subjectAltName has no value")?;
+        if value.tag != 0x04 {
+            continue;
+        }
+        let (general_names, trailing) = Tlv::parse(value.content)?;
+        if !trailing.is_empty() || general_names.tag != 0x30 {
+            continue;
+        }
+        for general_name in general_names.children()? {
+            if general_name.tag == 0x82 {
+                if let Ok(name) = std::str::from_utf8(general_name.content) {
+                    names.push(name.to_string());
+                }
+            }
+        }
+    }
+    let _ = &mut index;
+    Ok(names)
+}
+
+/// Parse X.509 certificate metadata needed by the runtime inventory.
+///
+/// This is the same minimal parser used by the read-only `/pki` endpoints: it decodes subject and
+/// issuer common names, validity, serial, and DNS subjectAltNames; it never validates signatures.
+pub fn certificate_info_from_der(der: &[u8]) -> Option<CertificateInfo> {
+    parse_certificate_fields(der).ok()
 }
 
 fn find_common_name(name: &Tlv<'_>) -> Result<Option<String>, String> {

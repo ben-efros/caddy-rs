@@ -23,6 +23,7 @@
 //! | `GET /pki/ca/<id>/certificates` | PEM certificate chain: intermediate(s) then root |
 //! | `GET /pki/ca/<id>/certificates/<name>` | One PEM file from the CA directory (`root.crt`/`intermediate.crt`, caddy-rs extension) |
 //! | `GET /reverse_proxy/upstreams` | Configured `reverse_proxy` upstreams in Caddy's status shape, with live counters supplied by the server runtime's [`UpstreamStatusSource`] |
+//! | `GET /runtime/inventory` | caddy-rs extension (not a Caddy endpoint): generation, listeners, certificates, upstream counters and health-check schedulers; read-only, explicit `snapshot.available`/`stale` (DIV-0018) |
 //! | `POST /adapt` | Adapt a Caddyfile (selected by `Content-Type`, like Caddy) or a `{config, adapter, wrap}` JSON object to Caddy JSON |
 //!
 //! Partial updates follow upstream Caddy's semantics exactly (see `config_path`):
@@ -166,6 +167,7 @@
 
 pub mod access_log;
 mod config_path;
+pub mod inventory;
 pub mod logging_config;
 pub mod metrics;
 pub mod metrics_config;
@@ -184,7 +186,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use caddy_rs_core::autosave as config_autosave;
-use caddy_rs_core::{drain, Config, GenerationStore, LifecycleState};
+use caddy_rs_core::{drain, Config, Generation, GenerationStore, LifecycleState};
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use serde_json::{json, Value};
 
@@ -192,6 +194,10 @@ pub use access_log::{
     AccessLogConfig, AccessLogEntry, AccessLogError, AccessLogField, AccessLogRequest,
     AccessLogSampler, AccessLogTls, AccessLogUpstream, HeaderRedaction, HeaderTarget, LogLevel,
     RedactionPolicy, SamplingConfig, ACCESS_LOG_LOGGER,
+};
+pub use inventory::{
+    InventoryAdminListener, InventoryCertificate, InventoryHealthChecks, InventoryListener,
+    RuntimeIntrospectionSource, RuntimeInventorySnapshot,
 };
 pub use logging_config::{
     AccessLogTarget, BuiltAccessLogSink, LoggingConfig, LoggingConfigError, LOGGING_TRACKING_ID,
@@ -569,6 +575,9 @@ pub struct AdminApi {
     data_dir: Option<PathBuf>,
     /// Optional live reverse-proxy upstream counters supplied by the server runtime.
     upstream_status_source: Option<Arc<dyn UpstreamStatusSource>>,
+    /// Optional live runtime-inventory snapshot supplied by the server runtime
+    /// (`GET /runtime/inventory`, caddy-rs extension; DIV-0018).
+    introspection_source: Option<Arc<dyn RuntimeIntrospectionSource>>,
     /// Whether `POST /stop` should terminate the process (Caddy's `handleStop` calls
     /// `exitProcess`, so an admin `/stop` always ends the server process).
     ///
@@ -599,6 +608,7 @@ impl AdminApi {
             metrics: MetricsRegistry::new(),
             data_dir: None,
             upstream_status_source: None,
+            introspection_source: None,
             // The CLI `run` command is the only process that announces an autosave path; for it,
             // `/stop` must terminate the process like Caddy. Library uses/tests opt out.
             exit_process_on_stop: std::env::var_os(AUTOSAVE_PATH_ENV).is_some(),
@@ -656,6 +666,19 @@ impl AdminApi {
     /// configured upstreams with `num_requests: 0`/`fails: 0` (documented divergence).
     pub fn with_upstream_status_source(mut self, source: Arc<dyn UpstreamStatusSource>) -> Self {
         self.upstream_status_source = Some(source);
+        self
+    }
+
+    /// Register the server runtime's runtime-inventory snapshot source for the
+    /// `GET /runtime/inventory` caddy-rs extension.
+    ///
+    /// The server installs a fresh snapshot after every successful apply and clears it on
+    /// shutdown; the endpoint only copies the last completed snapshot, so it never blocks a reload.
+    pub fn with_runtime_introspection_source(
+        mut self,
+        source: Arc<dyn RuntimeIntrospectionSource>,
+    ) -> Self {
+        self.introspection_source = Some(source);
         self
     }
 
@@ -939,6 +962,15 @@ impl AdminApi {
             }
             "/adapt" => self.handle_adapt(request),
             "/reverse_proxy/upstreams" => self.handle_reverse_proxy_upstreams(request),
+            "/runtime/inventory" => {
+                if method != "GET" {
+                    return AdminResponse::api_error(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        format!("method not allowed: {method}"),
+                    );
+                }
+                self.runtime_inventory_response()
+            }
             "/healthz" => AdminResponse::json(
                 StatusCode::OK,
                 &json!({
@@ -1150,6 +1182,102 @@ impl AdminApi {
             ),
         };
         result
+    }
+
+    /// Render the caddy-rs `GET /runtime/inventory` extension snapshot.
+    ///
+    /// The JSON shape is defined by [`inventory`]: the active generation (id, lifecycle state,
+    /// config hash, load time/uptime), the last server-runtime snapshot (admin/listener state,
+    /// certificates, health-check schedulers), live per-upstream counters from the registered
+    /// [`UpstreamStatusSource`], and an explicit `snapshot.available`/`snapshot.stale` marker so a
+    /// missing or mid-reload snapshot is never presented as current. Read-only and non-blocking:
+    /// the server runtime installs complete snapshots under a lock.
+    fn runtime_inventory_response(&self) -> AdminResponse {
+        let current = self.store.current();
+        let current_id = current.as_ref().map(|generation| generation.id());
+        let snapshot = self
+            .introspection_source
+            .as_ref()
+            .map(|source| source.snapshot());
+        let snapshot_available = snapshot.is_some();
+        let snapshot = snapshot.unwrap_or_default();
+        let stale = snapshot_available && snapshot.generation_id != current_id;
+        let now = inventory::unix_seconds(std::time::SystemTime::now()).unwrap_or(0.0);
+        let generation = current.as_ref().map(|generation| {
+            let loaded_at = inventory::unix_seconds(generation.created_at());
+            json!({
+                "id": generation.id(),
+                "state": generation.state().as_str(),
+                "config_hash": self.generation_config_hash(generation),
+                "loaded_at": loaded_at,
+                "uptime_seconds": loaded_at.map(|loaded| (now - loaded).max(0.0)),
+            })
+        });
+        let admin_listener = snapshot.admin.clone();
+        let listeners = snapshot.listeners.clone();
+        let certificates = snapshot.certificates.clone();
+        let health_checks = snapshot.health_checks.clone();
+        let upstreams: Vec<Value> = self
+            .upstream_status_source
+            .as_ref()
+            .map(|source| {
+                source
+                    .upstream_status()
+                    .into_iter()
+                    .map(|status| {
+                        // The proxy crate does not expose active-health state through its status
+                        // source (only cumulative attempts/failures), so `health` is explicit null
+                        // rather than a fabricated value (reported hook; see DIV-0018/docs).
+                        json!({
+                            "address": status.address,
+                            "num_requests": status.num_requests,
+                            "fails": status.fails,
+                            "health": Value::Null,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut notes = vec![
+            "upstream `health` is null: the proxy status source exposes counters only (reported hook)"
+                .to_string(),
+            "certificates: source `managed` = automatic-HTTPS renewal store; `loaded` = apps.tls.certificates"
+                .to_string(),
+        ];
+        if stale {
+            notes.push(
+                "the active store generation differs from the last applied runtime snapshot                  (apply failed or a reload is in progress); listener/certificate/health data is                  from that snapshot, not from the store generation"
+                    .to_string(),
+            );
+        }
+        AdminResponse::json(
+            StatusCode::OK,
+            &json!({
+                "extension": "caddy-rs runtime inventory (caddy-rs extension; Caddy v2.11.7 has no general runtime inventory endpoint; DIV-0018)",
+                "generation": generation,
+                "runtime": {
+                    "applied_generation_id": snapshot.generation_id,
+                    "in_sync": snapshot_available && !stale,
+                },
+                "snapshot": {
+                    "available": snapshot_available,
+                    "generation_id": snapshot.generation_id,
+                    "stale": stale,
+                },
+                "admin": admin_listener,
+                "listeners": listeners,
+                "certificates": certificates,
+                "upstreams": upstreams,
+                "health_checks": health_checks,
+                "notes": notes,
+            }),
+        )
+    }
+
+    /// Stable config hash for the inventory (`xxh64` of the serialized Caddy JSON, hex).
+    fn generation_config_hash(&self, generation: &Generation) -> Option<String> {
+        let bytes = generation.config().to_vec().ok()?;
+        Some(format!("{:016x}", xxh64(&bytes)))
     }
 
     /// `GET /reverse_proxy/upstreams`: Caddy's upstream-status shape for the proxy pools.
@@ -3192,6 +3320,227 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("/debug/pprof/")
         );
+    }
+
+    // -- Runtime inventory extension (GET /runtime/inventory) ------------------------------
+
+    #[derive(Debug)]
+    struct FakeInventorySource {
+        snapshot: RuntimeInventorySnapshot,
+    }
+
+    impl RuntimeIntrospectionSource for FakeInventorySource {
+        fn snapshot(&self) -> RuntimeInventorySnapshot {
+            self.snapshot.clone()
+        }
+    }
+
+    #[derive(Debug)]
+    struct FakeUpstreamSource {
+        statuses: Vec<UpstreamStatus>,
+    }
+
+    impl UpstreamStatusSource for FakeUpstreamSource {
+        fn upstream_status(&self) -> Vec<UpstreamStatus> {
+            self.statuses.clone()
+        }
+    }
+
+    fn inventory_snapshot(generation_id: Option<u64>) -> RuntimeInventorySnapshot {
+        RuntimeInventorySnapshot {
+            generation_id,
+            admin: Some(InventoryAdminListener {
+                configured: Some("localhost:2019".to_string()),
+                bound: Some("[::1]:2019".to_string()),
+            }),
+            listeners: vec![InventoryListener {
+                server: "srv0".to_string(),
+                configured: ":8080".to_string(),
+                bound: Some("0.0.0.0:8080".to_string()),
+                network: "tcp".to_string(),
+                tls: false,
+                protocols: vec!["h1".to_string(), "h2".to_string()],
+                http3: false,
+            }],
+            certificates: vec![InventoryCertificate {
+                subject: "example.com".to_string(),
+                sans: vec!["example.com".to_string(), "www.example.com".to_string()],
+                issuer: Some("https://ca.example/acme".to_string()),
+                not_after: Some(1_800_000_000.0),
+                source: "managed".to_string(),
+            }],
+            health_checks: vec![InventoryHealthChecks {
+                generation: 1,
+                checkers: 2,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_inventory_reports_generation_snapshot_upstreams_and_is_read_only() {
+        let admin = admin()
+            .with_runtime_introspection_source(Arc::new(FakeInventorySource {
+                snapshot: inventory_snapshot(Some(1)),
+            }))
+            .with_upstream_status_source(Arc::new(FakeUpstreamSource {
+                statuses: vec![UpstreamStatus {
+                    address: "127.0.0.1:9000".to_string(),
+                    num_requests: 7,
+                    fails: 1,
+                }],
+            }));
+        load(&admin, &valid_config()).await;
+
+        let response = admin.handle(request("GET", "/runtime/inventory", "")).await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            response
+                .headers
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+        let value: Value = serde_json::from_slice(&response.body).expect("inventory JSON");
+        assert!(value["extension"]
+            .as_str()
+            .expect("extension marker")
+            .contains("DIV-0018"));
+        assert_eq!(value["generation"]["id"], 1);
+        assert_eq!(value["generation"]["state"], "active");
+        let hash = value["generation"]["config_hash"]
+            .as_str()
+            .expect("config hash");
+        assert_eq!(hash.len(), 16, "{hash}");
+        assert!(value["generation"]["uptime_seconds"].as_f64().unwrap() >= 0.0);
+        assert_eq!(value["snapshot"]["available"], true);
+        assert_eq!(value["snapshot"]["generation_id"], 1);
+        assert_eq!(value["snapshot"]["stale"], false);
+        assert_eq!(value["admin"]["bound"], "[::1]:2019");
+        assert_eq!(value["listeners"].as_array().unwrap().len(), 1);
+        assert_eq!(value["listeners"][0]["bound"], "0.0.0.0:8080");
+        assert_eq!(value["listeners"][0]["protocols"][0], "h1");
+        assert_eq!(value["certificates"][0]["subject"], "example.com");
+        assert_eq!(value["certificates"][0]["source"], "managed");
+        assert_eq!(value["certificates"][0]["not_after"], 1_800_000_000.0);
+        assert_eq!(value["upstreams"][0]["address"], "127.0.0.1:9000");
+        assert_eq!(value["upstreams"][0]["num_requests"], 7);
+        assert!(value["upstreams"][0]["health"].is_null());
+        assert_eq!(value["health_checks"][0]["generation"], 1);
+        assert_eq!(value["health_checks"][0]["checkers"], 2);
+
+        // Read-only extension: non-GET methods are rejected.
+        for method in ["POST", "PUT", "PATCH", "DELETE"] {
+            let response = admin
+                .handle(request(method, "/runtime/inventory", "{}"))
+                .await;
+            assert_eq!(response.status, StatusCode::METHOD_NOT_ALLOWED, "{method}");
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_inventory_with_no_generation_is_explicitly_empty() {
+        let admin = admin();
+        let value: Value = serde_json::from_slice(
+            &admin
+                .handle(request("GET", "/runtime/inventory", ""))
+                .await
+                .body,
+        )
+        .expect("inventory JSON");
+        assert!(value["generation"].is_null());
+        assert_eq!(value["snapshot"]["available"], false);
+        assert_eq!(value["runtime"]["in_sync"], false);
+        assert_eq!(value["listeners"], serde_json::json!([]));
+        assert_eq!(value["certificates"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn runtime_inventory_marks_missing_and_stale_snapshots_explicitly() {
+        // No server runtime source: the representation must say so instead of fabricating data.
+        let plain_admin = admin();
+        load(&plain_admin, &valid_config()).await;
+        let value: Value = serde_json::from_slice(
+            &plain_admin
+                .handle(request("GET", "/runtime/inventory", ""))
+                .await
+                .body,
+        )
+        .expect("inventory JSON");
+        assert_eq!(value["snapshot"]["available"], false);
+        assert_eq!(value["snapshot"]["stale"], false);
+        assert_eq!(value["listeners"], serde_json::json!([]));
+        assert_eq!(value["certificates"], serde_json::json!([]));
+        assert_eq!(value["health_checks"], serde_json::json!([]));
+        assert_eq!(value["generation"]["id"], 1);
+
+        // A snapshot captured for an older generation is reported as stale, never as current.
+        let stale_admin =
+            admin().with_runtime_introspection_source(Arc::new(FakeInventorySource {
+                snapshot: inventory_snapshot(Some(1)),
+            }));
+        load(&stale_admin, &valid_config()).await;
+        load(&stale_admin, &valid_config().replace(":8080", ":8081")).await;
+        let value: Value = serde_json::from_slice(
+            &stale_admin
+                .handle(request("GET", "/runtime/inventory", ""))
+                .await
+                .body,
+        )
+        .expect("inventory JSON");
+        assert_eq!(value["generation"]["id"], 2);
+        assert_eq!(value["snapshot"]["generation_id"], 1);
+        assert_eq!(value["snapshot"]["stale"], true);
+    }
+
+    #[tokio::test]
+    async fn runtime_inventory_enforces_origin_policy_and_handles_large_snapshots() {
+        let mut listeners = Vec::new();
+        for index in 0..5_000 {
+            listeners.push(InventoryListener {
+                server: format!("srv{index}"),
+                configured: format!(":{}", 10_000 + (index % 50_000)),
+                bound: Some(format!("127.0.0.1:{}", 10_000 + (index % 50_000))),
+                network: "tcp".to_string(),
+                tls: index % 2 == 0,
+                protocols: vec!["h1".to_string(), "h2".to_string()],
+                http3: false,
+            });
+        }
+        let admin = admin().with_runtime_introspection_source(Arc::new(FakeInventorySource {
+            snapshot: RuntimeInventorySnapshot {
+                generation_id: None,
+                admin: None,
+                listeners,
+                certificates: Vec::new(),
+                health_checks: Vec::new(),
+            },
+        }));
+        let started = std::time::Instant::now();
+        let response = admin.handle(request("GET", "/runtime/inventory", "")).await;
+        assert_eq!(response.status, StatusCode::OK);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "large inventory rendering must not block the admin API, took {elapsed:?}"
+        );
+        let value: Value = serde_json::from_slice(&response.body).expect("inventory JSON");
+        assert_eq!(value["listeners"].as_array().unwrap().len(), 5_000);
+
+        // Origin enforcement is the shared admin policy, like every other endpoint.
+        let policy = OriginPolicy::from_admin(Some(&caddy_rs_core::AdminConfig {
+            enforce_origin: true,
+            origins: vec!["https://allowed.example".to_string()],
+            ..Default::default()
+        }));
+        let origin_admin = AdminApi::new(Arc::new(GenerationStore::with_builtin_registry()))
+            .with_origin_policy(policy);
+        let response = origin_admin
+            .handle(with_origin(
+                request("GET", "/runtime/inventory", ""),
+                "https://evil.example",
+            ))
+            .await;
+        assert_eq!(response.status, StatusCode::FORBIDDEN);
     }
 
     // -- PKI endpoints --------------------------------------------------------------------
