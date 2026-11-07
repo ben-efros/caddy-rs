@@ -6356,6 +6356,131 @@ mod tls_client_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inline_client_certificate_authenticates() {
+        // caddy-rs extension: inline PEM certificate/key instead of files (Caddy's HTTP transport
+        // has only the file fields; documented in DIV-0010/DIV-0086).
+        let directory = tempfile::tempdir().unwrap();
+        let root = write_fixture(&directory, "root.pem", SERVER_CERT);
+        let dial = spawn_tls_upstream(mtls_acceptor(vec![b"http/1.1".to_vec()])).await;
+        let handler = build_handler(
+            &dial,
+            serde_json::json!({
+                "root_ca_pem_files": [root],
+                "server_name": "localhost",
+                "client_certificate": {"certificate": CLIENT_CERT, "key": CLIENT_KEY}
+            }),
+            None,
+        );
+        let response = respond(&handler, get("/inline-mtls"));
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.headers["x-transport"], "tls");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deprecated_root_ca_pool_trusts_the_upstream() {
+        use base64::Engine as _;
+        let directory = tempfile::tempdir().unwrap();
+        let server_der = crate::tls::parse_pem_certificates(SERVER_CERT.as_bytes())
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let pool = base64::engine::general_purpose::STANDARD.encode(server_der.as_ref());
+        // The root_ca_pool is a base64 DER list (Caddy's deprecated field) and replaces the system
+        // store; it must be enough to verify the server identity.
+        let dial = spawn_tls_upstream(tls_acceptor(vec![b"http/1.1".to_vec()])).await;
+        let handler = build_handler(
+            &dial,
+            serde_json::json!({"root_ca_pool": [pool], "server_name": "localhost"}),
+            None,
+        );
+        assert_eq!(respond(&handler, get("/pool")).status, StatusCode::OK);
+
+        // An unrelated pool entry cannot verify the upstream (rejected at handshake).
+        let unrelated = crate::tls::parse_pem_certificates(
+            include_str!("../testdata/tls/unrelated-cert.pem").as_bytes(),
+        )
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+        let unrelated_pool = base64::engine::general_purpose::STANDARD.encode(unrelated.as_ref());
+        let handler = build_handler(
+            &dial,
+            serde_json::json!({"root_ca_pool": [unrelated_pool], "server_name": "localhost"}),
+            None,
+        );
+        assert_eq!(
+            respond(&handler, get("/pool")).status,
+            StatusCode::BAD_GATEWAY
+        );
+        let _ = directory;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn server_name_override_controls_verification() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = write_fixture(&directory, "root.pem", SERVER_CERT);
+        let dial = spawn_tls_upstream(tls_acceptor(vec![b"http/1.1".to_vec()])).await;
+        // The fixture is valid for `localhost`, so an explicit mismatching server_name fails.
+        let handler = build_handler(
+            &dial,
+            serde_json::json!({"root_ca_pem_files": [root], "server_name": "wrong.example"}),
+            None,
+        );
+        assert_eq!(
+            respond(&handler, get("/sni")).status,
+            StatusCode::BAD_GATEWAY
+        );
+
+        // insecure_skip_verify bypasses hostname verification entirely, including the override.
+        let handler = build_handler(
+            &dial,
+            serde_json::json!({
+                "insecure_skip_verify": true,
+                "server_name": "wrong.example"
+            }),
+            None,
+        );
+        assert_eq!(respond(&handler, get("/sni")).status, StatusCode::OK);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handshake_timeout_bounds_a_stalled_tls_handshake() {
+        // Accept TCP but never answer the ClientHello: without the timeout the request would hang
+        // for the server's lifetime.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    drop(stream);
+                });
+            }
+        });
+        let handler = build_handler(
+            &address.to_string(),
+            serde_json::json!({
+                "insecure_skip_verify": true,
+                "handshake_timeout": 100_000_000u64
+            }),
+            None,
+        );
+        let started = std::time::Instant::now();
+        let response = respond(&handler, get("/timeout"));
+        let elapsed = started.elapsed();
+        assert_eq!(response.status, StatusCode::BAD_GATEWAY);
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "handshake_timeout must bound the TLS handshake (elapsed {elapsed:?})"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn upstream_client_certificate_authenticates() {
         let directory = tempfile::tempdir().unwrap();
         let root = write_fixture(&directory, "root.pem", SERVER_CERT);
