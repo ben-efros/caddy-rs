@@ -1291,7 +1291,6 @@ mod tests {
     use super::*;
     use crate::bridge::{BodyMode, BridgeMethod};
     use crate::descriptor::PluginDescriptor;
-    use crate::error::AbiError;
 
     fn descriptor(capabilities: Vec<u32>) -> PluginDescriptor {
         PluginDescriptor {

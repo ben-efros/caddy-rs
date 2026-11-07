@@ -8,13 +8,12 @@ use caddy_rs_plug::{
     accept_handshake, tighten_limits, validate_handshake_ack, AbiErrorCode, AbiLimits, AbiVersion,
     BodyMode, BridgeHeaders, BridgeMethod, Cancel, Capability, CapabilityError, CapabilityPolicy,
     CapabilitySet, ErrorFrame, HandshakeError, Hello, HelloAck, HostHandshakeConfig, NegotiatedAbi,
-    OpenRequest, PluginDescriptor, PluginLimits, ProtocolError, ProtocolFrame, Reject, RejectPhase,
+    OpenRequest, PluginDescriptor, PluginLimits, ProtocolError, ProtocolFrame, RejectPhase,
     RequestBodyChunk, RequestEnd, RequestHead, RequestId, ResponseBodyChunk, ResponseEnd,
-    ResponseHead, ResponseHeadFrame, HOST_ABI_VERSION, HOST_PROTOCOL_VERSION, PROTOCOL_VERSION,
-    PROTO_FRAME_CANCEL, PROTO_FRAME_ERROR, PROTO_FRAME_HEADER_BYTES, PROTO_FRAME_HELLO,
-    PROTO_FRAME_HELLO_ACK, PROTO_FRAME_OPEN_REQUEST, PROTO_FRAME_REQUEST_BODY_CHUNK,
-    PROTO_FRAME_REQUEST_END, PROTO_FRAME_RESPONSE_BODY_CHUNK, PROTO_FRAME_RESPONSE_END,
-    PROTO_FRAME_RESPONSE_HEAD,
+    ResponseHead, ResponseHeadFrame, HOST_ABI_VERSION, PROTOCOL_VERSION, PROTO_FRAME_CANCEL,
+    PROTO_FRAME_ERROR, PROTO_FRAME_HEADER_BYTES, PROTO_FRAME_HELLO, PROTO_FRAME_HELLO_ACK,
+    PROTO_FRAME_OPEN_REQUEST, PROTO_FRAME_REQUEST_BODY_CHUNK, PROTO_FRAME_REQUEST_END,
+    PROTO_FRAME_RESPONSE_BODY_CHUNK, PROTO_FRAME_RESPONSE_END, PROTO_FRAME_RESPONSE_HEAD,
 };
 
 fn limits() -> AbiLimits {

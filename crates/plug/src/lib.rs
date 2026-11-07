@@ -38,6 +38,9 @@
 //!   [`HostCallContext`] authorisation and typed results.
 //! * [`bridge`]: request/response heads, streaming body contract, stable frame encodings
 //!   ([`BridgeFrame`]) and total-body accounting ([`BodyBudget`]).
+//! * [`host`]: host-side lifecycle for external module services (spawn/handshake/host calls,
+//!   generation scoping via `caddy-rs-core`'s `GenerationResource`, crash isolation and explicit
+//!   supervision with bounded grace/restart policy).
 //! * [`protocol`]: the out-of-process/external module protocol (handshake, request multiplexing,
 //!   cancellation, deadlines and connection-scoped errors) that reuses the same frame layout and
 //!   payload encoders for modules running outside the host process (ADR-0006 item 3, see
@@ -74,6 +77,7 @@ pub mod capability;
 pub mod descriptor;
 pub mod encoding;
 pub mod error;
+pub mod host;
 pub mod hostcall;
 pub mod protocol;
 pub mod version;
@@ -98,6 +102,11 @@ pub use encoding::{Reader, Writer};
 pub use error::{
     AbiError, AbiErrorCode, CapabilityError, DescriptorError, HostCallError, NegotiationError,
     WireError,
+};
+pub use host::{
+    read_frame, write_frame, DenyAllHostCalls, GenerationModule, GenerationScope, HostCallHandler,
+    HostError, HostEvent, HostService, HostServiceConfig, ModuleSupervisor, ModuleTransport,
+    ModuleTransportSpec, RestartPolicy, DEFAULT_RESTART_BACKOFF, DEFAULT_STOP_GRACE,
 };
 pub use hostcall::{
     HostCall, HostCallContext, HostCallResult, LogLevel, HOST_CALL_HTTP_REQUEST, HOST_CALL_LOG,
