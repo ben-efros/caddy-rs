@@ -612,7 +612,7 @@ pub const BUILTIN_MODULES: &[Module] = &[
         "http.handlers.encode",
         "encode",
         ModuleKind::HttpHandler,
-        "Response compression (config only; runtime is a pass-through)",
+        "Response compression middleware: gzip/zstd Accept-Encoding negotiation, prefer order, minimum length, response matcher, Content-Encoding/Vary/ETag handling, streaming compression",
     ),
     Module::new(
         "http.handlers.request_body",
