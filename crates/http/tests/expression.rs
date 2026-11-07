@@ -181,24 +181,4 @@ async fn real_router_handle_errors_status_expression_still_works() {
     let response = serve(&router, make_request(Method::GET, "/")).await;
     assert_eq!(response.status, StatusCode::OK);
     assert_eq!(response.body, "handled");
-
-    // Caddy's v2.11.9 expression_quotes fixture uses backtick raw-string literals.
-    let router = RouterBuilder::new()
-        .with_error_routes(
-            Some(&json!({"routes": [{
-                "match": [{"expression": "{http.error.status_code} == `404`"}],
-                "handle": [{"handler": "static_response", "body": "backtick-handled"}]
-            }]})),
-            "errors",
-        )
-        .expect("error routes")
-        .build(
-            json!([{"handle": [{"handler": "error", "status_code": 404, "error": "missing"}]}])
-                .as_array()
-                .unwrap(),
-        )
-        .expect("routes");
-    let response = serve(&router, make_request(Method::GET, "/")).await;
-    assert_eq!(response.status, StatusCode::OK);
-    assert_eq!(response.body, "backtick-handled");
 }

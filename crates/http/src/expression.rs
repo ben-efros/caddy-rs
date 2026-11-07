@@ -525,24 +525,6 @@ fn lex(input: &str) -> std::result::Result<Vec<Token>, String> {
             index = next;
             continue;
         }
-        if byte == b'`' {
-            // CEL raw string literal: everything up to the next backtick is literal, with no
-            // escape processing (a backslash and newlines are ordinary characters). A raw string
-            // cannot contain a backtick; the next one always terminates it.
-            let Some(relative_end) = bytes[index + 1..].iter().position(|byte| *byte == b'`')
-            else {
-                return Err(format!(
-                    "invalid raw string literal: unterminated backtick starting at byte {index}; expected a closing backtick"
-                ));
-            };
-            let end = index + 1 + relative_end;
-            tokens.push(Token {
-                kind: TokenKind::Str(input[index + 1..end].to_string()),
-                start,
-            });
-            index = end + 1;
-            continue;
-        }
         if byte == b'{' {
             let Some(relative_end) = bytes[index + 1..].iter().position(|byte| *byte == b'}')
             else {
@@ -1266,9 +1248,6 @@ mod tests {
             "!false",
             "request.method == 'GET'",
             "request.method != \"POST\"",
-            "request.method == `POST`",
-            "request.path == `\\books\\42`",
-            "{http.error.status_code} == `402`",
             "request.path == '/books/42'",
             "request.host == 'example.com'",
             "request.uri.path == request.path",
@@ -1322,7 +1301,6 @@ mod tests {
             "request.method.startsWith('G')",
             "request.path matches '...'",
             "'unterminated",
-            "request.method == `GET",
             "1 && true",
             "!1",
             "request.path in ['a'] ||",
@@ -1346,8 +1324,6 @@ mod tests {
         let request = request();
         for (expression, expected) in [
             ("request.method == 'POST'", true),
-            ("request.method == `POST`", true),
-            (r"`\foo` == '\\foo'", true),
             ("request.method != 'GET'", true),
             ("request.host == 'example.com'", true),
             ("request.path == '/books/42'", true),
@@ -1481,21 +1457,6 @@ mod tests {
         assert!(matcher(r#"'quote\'inside' == "quote'inside""#)
             .unwrap()
             .matches(&request));
-        // Backtick raw strings are literal (no escapes), can contain backslashes and newlines, and
-        // cannot contain a backtick.
-        assert!(matcher("`line\nbreak` == `line\nbreak`")
-            .unwrap()
-            .matches(&request));
-        assert!(matcher("`a\nb` == `a\nb`").unwrap().matches(&request));
-        assert!(matcher(r"`\raw` == '\\raw'").unwrap().matches(&request));
-    }
-
-    #[test]
-    fn unterminated_backtick_is_a_located_parse_error() {
-        let error = matcher("request.method == `GET").expect_err("unterminated backtick");
-        assert!(error.contains("match.expression"), "{error}");
-        assert!(error.contains("unterminated backtick"), "{error}");
-        assert!(error.contains("byte"), "{error}");
     }
 
     #[test]
