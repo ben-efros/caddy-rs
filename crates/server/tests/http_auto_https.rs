@@ -2134,3 +2134,67 @@ async fn reload_reuses_the_previous_generations_in_memory_certificates() {
     assert_eq!(body, "hello https");
     runtime.shutdown().await;
 }
+
+#[tokio::test]
+async fn configured_storage_root_wins_over_the_data_directory() {
+    // T-TLS-068: the top-level `storage` module now selects the provisioner's storage. Before
+    // the wiring, the runtime preferred its data directory and only fell back to
+    // `storage.root`, so a configured backend could be silently ignored.
+    let data_dir = tempfile::tempdir().unwrap();
+    let storage_dir = tempfile::tempdir().unwrap();
+    let root = storage_dir.path().to_string_lossy().to_string();
+    let (https_address, activation) = prebound_listener();
+    let listen = https_address.to_string();
+    let https_port = https_address.port();
+    let http_port = free_loopback_port();
+    let store = Arc::new(GenerationStore::with_builtin_registry());
+    store
+        .load(implicit_https_config(
+            &listen, http_port, https_port, &root, None,
+        ))
+        .expect("implicit HTTPS config validates");
+    let fake = Arc::new(FakeCa::new(false));
+    let mut runtime = ServerRuntime::new(Arc::clone(&store))
+        .with_acme_transport(fake.clone())
+        .with_data_root(data_dir.path())
+        .with_socket_activation(activation);
+    runtime
+        .apply()
+        .await
+        .expect("automatic HTTPS apply persists through the configured storage");
+
+    // Certificate material is written below the configured storage root...
+    let stored: Vec<_> = walkdir(storage_dir.path());
+    assert!(
+        stored.iter().any(|path| path.contains("certificates")),
+        "configured storage root should hold the certificate material: {stored:?}"
+    );
+    // ...and not into the runtime data directory.
+    let data_entries: Vec<_> = walkdir(data_dir.path());
+    assert!(
+        !data_entries.iter().any(|path| path.contains("certificates")),
+        "data directory must not receive certificate material when `storage` is configured: {data_entries:?}"
+    );
+    runtime.shutdown().await;
+}
+
+/// Collect relative paths below a directory (recursively).
+fn walkdir(root: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path.clone());
+            }
+            if let Ok(relative) = path.strip_prefix(root) {
+                out.push(relative.to_string_lossy().to_string());
+            }
+        }
+    }
+    out
+}

@@ -1208,7 +1208,7 @@ impl ServerRuntime {
         let Some(plan) = plan_automatic_https(config)? else {
             return Ok(None);
         };
-        let root = self
+        let default_root = self
             .data_root
             .clone()
             .or_else(|| {
@@ -1218,6 +1218,15 @@ impl ServerRuntime {
                     .map(std::path::PathBuf::from)
             })
             .unwrap_or_else(|| std::path::PathBuf::from(".caddy-rs"));
+        // Select the Caddy storage module now (T-TLS-068): unknown modules and malformed roots
+        // fail the apply loudly instead of silently falling back to the data directory, and the
+        // provisioner persists certificates, ACME accounts and internal-CA leaves through it.
+        let selected_storage =
+            caddy_rs_tls::SelectedStorage::from_config(config, Some(&default_root))?;
+        let root = selected_storage
+            .root()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| default_root.clone());
         // Construct the ACME transport lazily: a default-on plan whose issuers are all internal
         // (for example `localhost` sites) must not require a platform CA bundle, and an injected
         // test transport is never bypassed. Public-name plans construct the production transport
@@ -1233,7 +1242,8 @@ impl ServerRuntime {
         };
         let base_resolver = resolver_from_config(config)?;
         let provisioner =
-            AutomaticHttpsProvisioner::new(transport, root, Arc::clone(&self.challenge_tokens));
+            AutomaticHttpsProvisioner::new(transport, root, Arc::clone(&self.challenge_tokens))
+                .with_storage(selected_storage);
         // Seed the new generation from the still-active certificates: a reload must not re-issue
         // what the previous generation already holds in memory (storage may be empty, transient or
         // pending a write). Resolver hot-swap keeps in-flight handshakes on the old Arc.
