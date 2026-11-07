@@ -625,26 +625,33 @@ impl Validator<'_> {
             },
             "reverse_proxy" => {
                 // Caddy supports dynamically discovered upstreams (`dynamic_upstreams` with
-                // `source`, `refresh`, `grace_period`, ...). caddy-rs does not implement the
-                // discovery modules, so reject the construct as tracked-unsupported instead of
-                // reporting a misleading "missing upstreams" structural error.
-                if object.get("dynamic_upstreams").is_some() {
-                    return Err(Error::unsupported(
-                        format!("{path}.dynamic_upstreams"),
-                        "reverse_proxy `dynamic_upstreams` (dynamic upstream discovery)",
-                        "T-PROXY-036",
-                    ));
+                // `source`, `refresh`, `grace_period`, ...); the proxy runtime implements the
+                // `srv`/`a`/`multi` sources (T-PROXY-036), so the construct is accepted here and
+                // the source-specific options are validated at provisioning time. `upstreams`
+                // becomes optional when a dynamic source is configured, as in Caddy.
+                let has_dynamic = object.get("dynamic_upstreams").is_some();
+                if has_dynamic {
+                    if let Some(dynamic) = object.get("dynamic_upstreams") {
+                        if !dynamic.is_object() && !dynamic.is_array() {
+                            return Err(Error::invalid(
+                                format!("{path}.dynamic_upstreams"),
+                                "reverse_proxy `dynamic_upstreams` must be an object or array",
+                            ));
+                        }
+                    }
                 }
-                let upstreams = object
-                    .get("upstreams")
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| {
-                        Error::invalid(
+                let empty_upstreams: Vec<Value> = Vec::new();
+                let upstreams = match object.get("upstreams").and_then(Value::as_array) {
+                    Some(upstreams) => upstreams,
+                    None if has_dynamic => &empty_upstreams,
+                    None => {
+                        return Err(Error::invalid(
                             format!("{path}.upstreams"),
                             "reverse_proxy requires an array field `upstreams`",
-                        )
-                    })?;
-                if upstreams.is_empty() {
+                        ))
+                    }
+                };
+                if upstreams.is_empty() && !has_dynamic {
                     return Err(Error::invalid(
                         format!("{path}.upstreams"),
                         "reverse_proxy requires at least one upstream",
@@ -1286,9 +1293,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_reverse_proxy_with_dynamic_upstreams_as_tracked_unsupported() {
+    fn accepts_reverse_proxy_with_dynamic_upstreams() {
         // Shape produced by Caddy's adapter for `reverse_proxy { dynamic srv { ... } }`, including
-        // the nested `grace_period` field.
+        // the nested `grace_period` field. The runtime implements srv/a/multi (T-PROXY-036), so
+        // validation accepts the construct; source-specific options are validated at provisioning.
         let config = minimal_http_config(
             serde_json::json!({
                 "handler": "reverse_proxy",
@@ -1301,17 +1309,9 @@ mod tests {
             }),
             None,
         );
-        let error = validate_config(&config, &registry()).expect_err("dynamic upstreams");
-        let message = error.to_string();
-        assert!(message.contains("dynamic_upstreams"), "{message}");
-        assert!(message.contains("dynamic upstream discovery"), "{message}");
-        assert!(message.contains("T-PROXY-036"), "{message}");
-        assert!(message.contains("not supported by this build"), "{message}");
-        assert!(message.contains("handle[0].dynamic_upstreams"), "{message}");
-        assert!(matches!(error, Error::Unsupported { .. }), "{error:?}");
+        validate_config(&config, &registry()).expect("dynamic-only reverse_proxy is valid");
 
-        // Even together with a normal `upstreams` list the construct is unsupported, so it must
-        // not be silently accepted.
+        // Together with a static pool it is still valid (Caddy allows both).
         let config = minimal_http_config(
             serde_json::json!({
                 "handler": "reverse_proxy",
@@ -1320,8 +1320,18 @@ mod tests {
             }),
             None,
         );
-        let error = validate_config(&config, &registry()).expect_err("dynamic upstreams");
-        assert!(error.to_string().contains("T-PROXY-036"), "{error}");
+        validate_config(&config, &registry()).expect("static + dynamic reverse_proxy is valid");
+
+        // A malformed dynamic_upstreams value is still a structural error.
+        let config = minimal_http_config(
+            serde_json::json!({"handler": "reverse_proxy", "dynamic_upstreams": "srv"}),
+            None,
+        );
+        let error = validate_config(&config, &registry()).expect_err("scalar dynamic_upstreams");
+        assert!(
+            error.to_string().contains("must be an object or array"),
+            "{error}"
+        );
     }
 
     #[test]
