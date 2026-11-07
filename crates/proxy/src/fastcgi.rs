@@ -24,9 +24,9 @@
 //! parsing (`Status:`), chunked CGI response decoding, streamed request bodies and a streamed
 //! response body.
 //!
-//! Divergences from Caddy are documented where they occur; notably `SERVER_PROTOCOL` is always
-//! `HTTP/1.1` (caddy-rs' internal `Request` does not carry the client's HTTP version) and the TLS
-//! connection details (`SSL_PROTOCOL`, `SSL_CIPHER`) are not available.
+//! Divergences from Caddy are documented where they occur. `SERVER_PROTOCOL` now reflects the
+//! negotiated request version; the TLS connection details (`SSL_PROTOCOL`, `SSL_CIPHER`) are still
+//! not available through the internal `Request`, so those CGI variables are omitted.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -298,10 +298,15 @@ impl FastCgiTransport {
         let params = self.build_params(request, &method, path_and_query, content_length)?;
 
         let stream = self.dial(upstream).await?;
+        // Caddy sets absolute connection deadlines once, right after dialing: they are not
+        // refreshed per read/write, so `read_timeout`/`write_timeout` bound the whole exchange.
+        let write_deadline = deadline_after(self.write_timeout);
+        let read_deadline = deadline_after(self.read_timeout);
         let (mut reader, mut writer) = tokio::io::split(stream);
-        self.write_request(&mut writer, &params, body).await?;
+        self.write_request(&mut writer, &params, body, write_deadline)
+            .await?;
 
-        let header = self.read_response_head(&mut reader).await?;
+        let header = self.read_response_head(&mut reader, read_deadline).await?;
         let ResponseHead {
             status,
             headers,
@@ -312,14 +317,22 @@ impl FastCgiTransport {
             log_stderr(&stderr, status);
         }
 
+        // Caddy's `chunked(te)` only inspects the first transfer-coding token.
         let chunked = headers
             .get(http::header::TRANSFER_ENCODING)
             .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| {
-                value
-                    .split(',')
-                    .any(|token| token.trim().eq_ignore_ascii_case("chunked"))
-            });
+            .and_then(|value| value.split(',').next())
+            .is_some_and(|token| token.trim().eq_ignore_ascii_case("chunked"));
+        let content_length = headers
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok());
+        let body_allowed = fastcgi_body_allowed(method.as_str(), status);
+        let declared = if chunked || !body_allowed {
+            None
+        } else {
+            content_length
+        };
         let mut headers = headers;
         if chunked {
             // The decoded body length differs from any CGI Content-Length; drop it so the server
@@ -329,7 +342,6 @@ impl FastCgiTransport {
 
         let (sender, receiver) = mpsc::channel(8);
         let capture_stderr = self.capture_stderr;
-        let read_timeout = self.read_timeout;
         tokio::spawn(async move {
             stream_response_body(
                 reader,
@@ -338,7 +350,9 @@ impl FastCgiTransport {
                 sender,
                 capture_stderr,
                 status,
-                read_timeout,
+                body_allowed,
+                declared,
+                read_deadline,
             )
             .await;
         });
@@ -383,7 +397,9 @@ impl FastCgiTransport {
         let (path, query) = path_and_query
             .split_once('?')
             .unwrap_or((path_and_query, ""));
-        let fpath = if path.is_empty() { "/" } else { path };
+        // Caddy derives the CGI path variables from the decoded, cleaned request path
+        // (`NormalizedPath`); a NUL byte anywhere in the path is a 400 before any dialing.
+        let fpath = normalized_script_path(path)?;
 
         // Caddy's `splitPos`: an empty split-path list yields index 0 (whole path is PATH_INFO).
         let split_pos: Option<usize> = if self.split_path.is_empty() {
@@ -404,7 +420,7 @@ impl FastCgiTransport {
             Some(pos) => {
                 let document_uri = &fpath[..pos];
                 let path_info = &fpath[pos..];
-                let script_name = fpath.strip_suffix(path_info).unwrap_or(fpath);
+                let script_name = fpath.strip_suffix(path_info).unwrap_or(fpath.as_str());
                 (
                     document_uri.to_string(),
                     path_info.to_string(),
@@ -419,7 +435,7 @@ impl FastCgiTransport {
                 path_info = remainder.clone();
                 script_name = fpath
                     .strip_suffix(path_info.as_str())
-                    .unwrap_or(fpath)
+                    .unwrap_or(fpath.as_str())
                     .to_string();
             }
         }
@@ -431,7 +447,8 @@ impl FastCgiTransport {
         let (host_name, host_port) = split_host_port(request.host().unwrap_or_default());
         let (remote_ip, remote_port) = match request.remote_addr {
             Some(address) => (address.ip().to_string(), address.port().to_string()),
-            None => (String::new(), String::new()),
+            // Caddy's Unix-socket peer is the literal `"@"`; REMOTE_PORT is empty there.
+            None => ("@".to_string(), String::new()),
         };
         let request_scheme = if request.tls { "https" } else { "http" };
         let auth_user = request
@@ -469,8 +486,18 @@ impl FastCgiTransport {
         env.insert("REQUEST_METHOD".to_string(), method.as_str().to_string());
         env.insert("REQUEST_SCHEME".to_string(), request_scheme.to_string());
         env.insert("SERVER_NAME".to_string(), host_name.clone());
-        // caddy-rs' internal Request has no HTTP version; Caddy uses r.Proto here.
-        env.insert("SERVER_PROTOCOL".to_string(), "HTTP/1.1".to_string());
+        // Caddy uses `r.Proto` here (caddy-rs carries the negotiated version on Request).
+        env.insert(
+            "SERVER_PROTOCOL".to_string(),
+            match request.version {
+                http::Version::HTTP_09 => "HTTP/0.9",
+                http::Version::HTTP_10 => "HTTP/1.0",
+                http::Version::HTTP_2 => "HTTP/2.0",
+                http::Version::HTTP_3 => "HTTP/3.0",
+                _ => "HTTP/1.1",
+            }
+            .to_string(),
+        );
         env.insert(
             "SERVER_SOFTWARE".to_string(),
             format!("Caddy/{CADDY_COMPAT_VERSION}"),
@@ -501,15 +528,20 @@ impl FastCgiTransport {
         if request.tls {
             env.insert("HTTPS".to_string(), "on".to_string());
         }
-
-        // Configured env vars override defaults (Caddy expands placeholders in the values).
-        for (key, value) in &self.env {
-            env.insert(key.clone(), value.expand(&context));
+        // Caddy's `SERVER_ADDR` comes from the connection's local address; the server exposes it
+        // as request variables until the placeholder set covers local addresses.
+        if let Some(local) = request
+            .vars
+            .get("http.request.local.host")
+            .and_then(|value| value.parse::<std::net::IpAddr>().ok())
+        {
+            env.insert("SERVER_ADDR".to_string(), local.to_string());
         }
 
-        // HTTP_* from request headers (Caddy skips the Proxy header for HTTPoxy mitigation).
+        // HTTP_* from request headers (Caddy skips Host — HTTP_HOST comes from the routed
+        // host — and the Proxy header for HTTPoxy mitigation).
         for (name, _) in request.headers.iter() {
-            if name.as_str() == "proxy" {
+            if name.as_str() == "proxy" || name.as_str() == "host" {
                 continue;
             }
             let env_name = format!(
@@ -521,6 +553,12 @@ impl FastCgiTransport {
                 values.push(value.to_str().unwrap_or_default());
             }
             env.insert(env_name, values.join(", "));
+        }
+
+        // Configured env vars are added last (Caddy: "so a client header cannot override an
+        // HTTP_* variable set by the operator"); placeholders are expanded like Caddy.
+        for (key, value) in &self.env {
+            env.insert(key.clone(), value.expand(&context));
         }
 
         // Per-method CGI overrides matching Caddy's client helpers.
@@ -593,12 +631,13 @@ impl FastCgiTransport {
         writer: &mut W,
         params: &BTreeMap<String, String>,
         mut body: RequestBody,
+        write_deadline: IoDeadline,
     ) -> Result<(), FastCgiError> {
         // BEGIN_REQUEST: role RESPONDER, flags 0 (no keep-connection request), reserved.
         let mut begin = [0_u8; 8];
         begin[0] = (FCGI_RESPONDER >> 8) as u8;
         begin[1] = FCGI_RESPONDER as u8;
-        write_record(writer, FCGI_BEGIN_REQUEST, &begin, self.write_timeout).await?;
+        write_record(writer, FCGI_BEGIN_REQUEST, &begin, write_deadline).await?;
 
         // PARAMS records, terminated by an empty PARAMS record.
         let mut buffer = Vec::with_capacity(MAX_WRITE);
@@ -613,15 +652,15 @@ impl FastCgiTransport {
                 encoded = truncated;
             }
             if buffer.len() + encoded.len() > MAX_WRITE && !buffer.is_empty() {
-                write_record(writer, FCGI_PARAMS, &buffer, self.write_timeout).await?;
+                write_record(writer, FCGI_PARAMS, &buffer, write_deadline).await?;
                 buffer.clear();
             }
             buffer.extend_from_slice(&encoded);
         }
         if !buffer.is_empty() {
-            write_record(writer, FCGI_PARAMS, &buffer, self.write_timeout).await?;
+            write_record(writer, FCGI_PARAMS, &buffer, write_deadline).await?;
         }
-        write_record(writer, FCGI_PARAMS, &[], self.write_timeout).await?;
+        write_record(writer, FCGI_PARAMS, &[], write_deadline).await?;
 
         // STDIN records: stream the body frame by frame (already buffered by policy, but keep the
         // generic Body contract so a future streaming policy can use this unchanged).
@@ -632,10 +671,10 @@ impl FastCgiTransport {
                 continue;
             };
             for chunk in data.chunks(MAX_WRITE) {
-                write_record(writer, FCGI_STDIN, chunk, self.write_timeout).await?;
+                write_record(writer, FCGI_STDIN, chunk, write_deadline).await?;
             }
         }
-        write_record(writer, FCGI_STDIN, &[], self.write_timeout).await?;
+        write_record(writer, FCGI_STDIN, &[], write_deadline).await?;
         writer
             .flush()
             .await
@@ -646,11 +685,12 @@ impl FastCgiTransport {
     async fn read_response_head<R: AsyncRead + Unpin>(
         &self,
         reader: &mut R,
+        read_deadline: IoDeadline,
     ) -> Result<ResponseHead, FastCgiError> {
         let mut header_bytes = BytesMut::new();
         let mut stderr = BytesMut::new();
         loop {
-            let record = read_record(reader, self.read_timeout).await?;
+            let record = read_record(reader, read_deadline).await?;
             match record.kind {
                 FCGI_STDOUT => {
                     header_bytes.extend_from_slice(&record.content);
@@ -692,7 +732,7 @@ async fn write_record<W: AsyncWrite + Unpin>(
     writer: &mut W,
     kind: u8,
     content: &[u8],
-    timeout: Duration,
+    deadline: IoDeadline,
 ) -> Result<(), FastCgiError> {
     let padding = (8 - content.len() % 8) % 8;
     let mut record = Vec::with_capacity(FCGI_HEADER_LEN + content.len() + padding);
@@ -707,12 +747,12 @@ async fn write_record<W: AsyncWrite + Unpin>(
     record.extend_from_slice(content);
     record.extend(std::iter::repeat_n(0_u8, padding));
     let write = writer.write_all(&record);
-    match timeout_or_none(timeout, write).await {
+    match timeout_or_none(deadline, write).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => Err(FastCgiError::Io(format!("writing record: {error}"))),
-        Err(_) => Err(FastCgiError::Timeout(format!(
-            "writing FastCGI record timed out after {timeout:?}"
-        ))),
+        Err(_) => Err(FastCgiError::Timeout(
+            "writing FastCGI record timed out (connection write deadline)".to_string(),
+        )),
     }
 }
 
@@ -724,10 +764,10 @@ struct Record {
 /// Read one FastCGI record (header, content, padding).
 async fn read_record<R: AsyncRead + Unpin>(
     reader: &mut R,
-    timeout: Duration,
+    deadline: IoDeadline,
 ) -> Result<Record, FastCgiError> {
     let mut header = [0_u8; FCGI_HEADER_LEN];
-    read_exact(reader, &mut header, timeout).await?;
+    read_exact(reader, &mut header, deadline).await?;
     if header[0] != FCGI_VERSION_1 {
         return Err(FastCgiError::Protocol(format!(
             "invalid record version {}",
@@ -744,10 +784,10 @@ async fn read_record<R: AsyncRead + Unpin>(
     let content_length = u16::from_be_bytes([header[4], header[5]]) as usize;
     let padding = header[6] as usize;
     let mut content = vec![0_u8; content_length];
-    read_exact(reader, &mut content, timeout).await?;
+    read_exact(reader, &mut content, deadline).await?;
     if padding > 0 {
         let mut padding_bytes = vec![0_u8; padding];
-        read_exact(reader, &mut padding_bytes, timeout).await?;
+        read_exact(reader, &mut padding_bytes, deadline).await?;
     }
     Ok(Record {
         kind,
@@ -758,27 +798,44 @@ async fn read_record<R: AsyncRead + Unpin>(
 async fn read_exact<R: AsyncRead + Unpin>(
     reader: &mut R,
     buffer: &mut [u8],
-    timeout: Duration,
+    deadline: IoDeadline,
 ) -> Result<(), FastCgiError> {
-    match timeout_or_none(timeout, reader.read_exact(buffer)).await {
+    match timeout_or_none(deadline, reader.read_exact(buffer)).await {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(error)) => Err(FastCgiError::Io(format!("reading record: {error}"))),
-        Err(_) => Err(FastCgiError::Timeout(format!(
-            "reading from FastCGI upstream timed out after {timeout:?}"
-        ))),
+        Err(_) => Err(FastCgiError::Timeout(
+            "reading from FastCGI upstream timed out (connection read deadline)".to_string(),
+        )),
     }
 }
 
 /// Run `future` with an optional timeout. `Err(())` means the timeout elapsed.
+/// An absolute I/O deadline (`None` means unlimited), like Go's `SetReadDeadline`.
+type IoDeadline = Option<tokio::time::Instant>;
+
+/// Compute a connection deadline from a configured duration (`0` = no deadline).
+fn deadline_after(duration: Duration) -> IoDeadline {
+    (!duration.is_zero()).then(|| tokio::time::Instant::now() + duration)
+}
+
 async fn timeout_or_none<F: std::future::Future>(
-    timeout: Duration,
+    deadline: IoDeadline,
     future: F,
 ) -> Result<F::Output, ()> {
-    if timeout.is_zero() {
-        Ok(future.await)
-    } else {
-        tokio::time::timeout(timeout, future).await.map_err(|_| ())
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, future)
+            .await
+            .map_err(|_| ()),
+        None => Ok(future.await),
     }
+}
+
+/// Caddy's `bodyAllowed` rule (net/http response body rules).
+fn fastcgi_body_allowed(method: &str, status: StatusCode) -> bool {
+    method != "HEAD"
+        && !(status.as_u16() >= 100 && status.as_u16() <= 199)
+        && status != StatusCode::NO_CONTENT
+        && status != StatusCode::NOT_MODIFIED
 }
 
 /// Encode a name/value pair using FastCGI's 1-or-4-byte length encoding.
@@ -830,27 +887,78 @@ fn find_cgi_header_end(buffer: &[u8]) -> Option<(usize, usize)> {
     None
 }
 
-/// Parse the CGI response head: a `Status:` header (or leading HTTP status line) and headers.
+/// Caddy's `caddyhttp.NormalizedPath` for CGI path derivation: decode the URI path, reject NUL
+/// bytes, then clean `.`/`..`/duplicate slashes while preserving a trailing slash.
+fn normalized_script_path(raw: &str) -> Result<String, FastCgiError> {
+    if raw.contains('\0') {
+        return Err(FastCgiError::Request("invalid request path".to_string()));
+    }
+    let decoded = percent_decode_path(raw)
+        .ok_or_else(|| FastCgiError::Request("invalid request path".to_string()))?;
+    if decoded.contains('\0') {
+        return Err(FastCgiError::Request("invalid request path".to_string()));
+    }
+    let cleaned = normalize_slash_path(&decoded);
+    if cleaned.is_empty() {
+        if decoded.is_empty() {
+            Ok(String::new())
+        } else {
+            Ok("/".to_string())
+        }
+    } else {
+        Ok(cleaned)
+    }
+}
+
+/// Percent-decode a URI path (Caddy's `r.URL.Path` is decoded by net/http; `+` is literal here).
+fn percent_decode_path(path: &str) -> Option<String> {
+    if !path.contains('%') {
+        return Some(path.to_string());
+    }
+    let bytes = path.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hex = path.get(index + 1..index + 3)?;
+            decoded.push(u8::from_str_radix(hex, 16).ok()?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+/// Trim one response-body chunk to the declared Content-Length; surplus bytes are discarded (the
+/// FastCGI stream is still drained to END_REQUEST, matching Caddy's `declaredBody`).
+fn bounded_body_chunk(data: Bytes, remaining: &mut Option<u64>) -> Option<Bytes> {
+    match remaining {
+        None => Some(data),
+        Some(left) if *left == 0 => None,
+        Some(left) => {
+            let allowed = usize::try_from(*left).unwrap_or(usize::MAX).min(data.len());
+            *left -= allowed as u64;
+            Some(data.slice(..allowed))
+        }
+    }
+}
+
+/// Parse the CGI response head: CGI headers (including `Status:`) terminated by a blank line.
 fn parse_cgi_head(bytes: &[u8]) -> Result<(StatusCode, HeaderMap), FastCgiError> {
     let text = std::str::from_utf8(bytes)
         .map_err(|error| FastCgiError::Protocol(format!("CGI headers are not UTF-8: {error}")))?;
     let mut status = StatusCode::OK;
+    let mut status_seen = false;
     let mut headers = HeaderMap::new();
-    let mut first_line = true;
     for line in text.split('\n') {
         let line = line.trim_end_matches('\r');
         if line.is_empty() {
             continue;
         }
-        // Some FastCGI applications emit an HTTP status line instead of `Status:`.
-        if first_line && line.starts_with("HTTP/") {
-            if let Some(code) = line.split_whitespace().nth(1) {
-                status = parse_status_code(code)?;
-            }
-            first_line = false;
-            continue;
-        }
-        first_line = false;
+        // Caddy parses these with Go's MIME header reader: every line must be a header, so an
+        // HTTP status line or any other colon-less line is a protocol error (502).
         let Some((name, value)) = line.split_once(':') else {
             return Err(FastCgiError::Protocol(format!(
                 "malformed CGI header line `{line}`"
@@ -863,6 +971,7 @@ fn parse_cgi_head(bytes: &[u8]) -> Result<(StatusCode, HeaderMap), FastCgiError>
                 .next()
                 .ok_or_else(|| FastCgiError::Protocol("empty Status header".to_string()))?;
             status = parse_status_code(code)?;
+            status_seen = true;
             continue;
         }
         let header_name = HeaderName::from_bytes(name.trim().as_bytes()).map_err(|error| {
@@ -872,6 +981,10 @@ fn parse_cgi_head(bytes: &[u8]) -> Result<(StatusCode, HeaderMap), FastCgiError>
             FastCgiError::Protocol(format!("invalid CGI header value for `{name}`: {error}"))
         })?;
         headers.append(header_name, header_value);
+    }
+    // Caddy: without a `Status` header a response with a Location header is a 302.
+    if !status_seen && headers.contains_key(http::header::LOCATION) {
+        status = StatusCode::FOUND;
     }
     Ok((status, headers))
 }
@@ -893,17 +1006,24 @@ async fn stream_response_body<R: AsyncRead + Unpin>(
     sender: mpsc::Sender<std::result::Result<Bytes, BodyError>>,
     capture_stderr: bool,
     status: StatusCode,
-    read_timeout: Duration,
+    body_allowed: bool,
+    declared_length: Option<u64>,
+    read_deadline: IoDeadline,
 ) {
     let mut stderr = BytesMut::new();
     let mut decoder = ChunkedDecoder::default();
+    let mut remaining = declared_length;
     if chunked {
         decoder.feed(&leftover);
-    } else if !leftover.is_empty() && sender.send(Ok(leftover)).await.is_err() {
-        return;
+    } else if body_allowed {
+        if let Some(data) = bounded_body_chunk(leftover, &mut remaining) {
+            if !data.is_empty() && sender.send(Ok(data)).await.is_err() {
+                return;
+            }
+        }
     }
     loop {
-        let record = match read_record(&mut reader, read_timeout).await {
+        let record = match read_record(&mut reader, read_deadline).await {
             Ok(record) => record,
             Err(error) => {
                 if capture_stderr {
@@ -936,10 +1056,12 @@ async fn stream_response_body<R: AsyncRead + Unpin>(
                             }
                         }
                     }
-                } else if !record.content.is_empty()
-                    && sender.send(Ok(record.content)).await.is_err()
-                {
-                    return;
+                } else if body_allowed {
+                    if let Some(data) = bounded_body_chunk(record.content, &mut remaining) {
+                        if !data.is_empty() && sender.send(Ok(data)).await.is_err() {
+                            return;
+                        }
+                    }
                 }
             }
             FCGI_STDERR => stderr.extend_from_slice(&record.content),
@@ -1001,7 +1123,8 @@ fn log_stderr(stderr: &[u8], status: StatusCode) {
     if stderr.is_empty() {
         return;
     }
-    let level = if status.is_server_error() {
+    // Caddy logs stderr at WARN by default and ERROR for 4xx and 5xx responses.
+    let level = if status.is_client_error() || status.is_server_error() {
         "error"
     } else {
         "warn"
@@ -1326,6 +1449,14 @@ mod tests {
         },
         /// Accept the request and never answer (timeout tests).
         Silent,
+        /// Raw FastCGI bytes written verbatim (malformed-protocol tests).
+        Raw { bytes: Vec<u8>, keep_open: bool },
+        /// Several STDOUT records with a delay between them (absolute read-deadline tests).
+        SlowRecords {
+            headers: &'static str,
+            chunks: Vec<&'static [u8]>,
+            gap: TokioDuration,
+        },
     }
 
     impl Behavior {
@@ -1349,7 +1480,7 @@ mod tests {
         let mut stdin = Vec::new();
         let mut params_done = false;
         loop {
-            let record = read_record(reader, Duration::ZERO)
+            let record = read_record(reader, None)
                 .await
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
             match record.kind {
@@ -1429,28 +1560,43 @@ mod tests {
                 application_status,
                 protocol_status,
             } => {
-                let _ = write_record(&mut stream, FCGI_STDOUT, headers.as_bytes(), Duration::ZERO)
-                    .await;
+                let _ = write_record(&mut stream, FCGI_STDOUT, headers.as_bytes(), None).await;
                 if !body.is_empty() {
-                    let _ = write_record(&mut stream, FCGI_STDOUT, body, Duration::ZERO).await;
+                    let _ = write_record(&mut stream, FCGI_STDOUT, body, None).await;
                 }
-                let _ = write_record(&mut stream, FCGI_STDOUT, &[], Duration::ZERO).await;
+                let _ = write_record(&mut stream, FCGI_STDOUT, &[], None).await;
                 if !stderr.is_empty() {
-                    let _ = write_record(&mut stream, FCGI_STDERR, stderr, Duration::ZERO).await;
+                    let _ = write_record(&mut stream, FCGI_STDERR, stderr, None).await;
                 }
                 write_end_request(&mut stream, application_status, protocol_status).await;
             }
             Behavior::Chunked { headers, chunks } => {
-                let _ = write_record(&mut stream, FCGI_STDOUT, headers.as_bytes(), Duration::ZERO)
-                    .await;
+                let _ = write_record(&mut stream, FCGI_STDOUT, headers.as_bytes(), None).await;
                 for chunk in chunks {
                     let encoded = format!("{:x}\r\n{chunk}\r\n", chunk.len());
-                    let _ =
-                        write_record(&mut stream, FCGI_STDOUT, encoded.as_bytes(), Duration::ZERO)
-                            .await;
+                    let _ = write_record(&mut stream, FCGI_STDOUT, encoded.as_bytes(), None).await;
                 }
-                let _ = write_record(&mut stream, FCGI_STDOUT, b"0\r\n\r\n", Duration::ZERO).await;
-                let _ = write_record(&mut stream, FCGI_STDOUT, &[], Duration::ZERO).await;
+                let _ = write_record(&mut stream, FCGI_STDOUT, b"0\r\n\r\n", None).await;
+                let _ = write_record(&mut stream, FCGI_STDOUT, &[], None).await;
+                write_end_request(&mut stream, 0, FCGI_REQUEST_COMPLETE).await;
+            }
+            Behavior::Raw { bytes, keep_open } => {
+                let _ = stream.write_all(&bytes).await;
+                if keep_open {
+                    tokio::time::sleep(TokioDuration::from_secs(10)).await;
+                }
+            }
+            Behavior::SlowRecords {
+                headers,
+                chunks,
+                gap,
+            } => {
+                let _ = write_record(&mut stream, FCGI_STDOUT, headers.as_bytes(), None).await;
+                for chunk in chunks {
+                    tokio::time::sleep(gap).await;
+                    let _ = write_record(&mut stream, FCGI_STDOUT, chunk, None).await;
+                }
+                let _ = write_record(&mut stream, FCGI_STDOUT, &[], None).await;
                 write_end_request(&mut stream, 0, FCGI_REQUEST_COMPLETE).await;
             }
             Behavior::SlowBody {
@@ -1459,12 +1605,11 @@ mod tests {
                 rest,
                 delay,
             } => {
-                let _ = write_record(&mut stream, FCGI_STDOUT, headers.as_bytes(), Duration::ZERO)
-                    .await;
-                let _ = write_record(&mut stream, FCGI_STDOUT, first, Duration::ZERO).await;
+                let _ = write_record(&mut stream, FCGI_STDOUT, headers.as_bytes(), None).await;
+                let _ = write_record(&mut stream, FCGI_STDOUT, first, None).await;
                 tokio::time::sleep(delay).await;
-                let _ = write_record(&mut stream, FCGI_STDOUT, rest, Duration::ZERO).await;
-                let _ = write_record(&mut stream, FCGI_STDOUT, &[], Duration::ZERO).await;
+                let _ = write_record(&mut stream, FCGI_STDOUT, rest, None).await;
+                let _ = write_record(&mut stream, FCGI_STDOUT, &[], None).await;
                 write_end_request(&mut stream, 0, FCGI_REQUEST_COMPLETE).await;
             }
         }
@@ -1478,7 +1623,7 @@ mod tests {
         let mut content = [0_u8; 8];
         content[..4].copy_from_slice(&application_status.to_be_bytes());
         content[4] = protocol_status;
-        let _ = write_record(stream, FCGI_END_REQUEST, &content, Duration::ZERO).await;
+        let _ = write_record(stream, FCGI_END_REQUEST, &content, None).await;
     }
 
     async fn spawn_tcp_mock(behavior: Behavior) -> (String, Captured) {
@@ -1946,6 +2091,313 @@ mod tests {
         assert_eq!(
             split_host_port("[::1]:8080"),
             ("::1".to_string(), "8080".to_string())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fastcgi_server_protocol_and_unix_remote_match_caddy() {
+        let (dial, captured) = spawn_tcp_mock(Behavior::responds(0)).await;
+        let handler = build_handler(&dial, transport_json(serde_json::json!({})));
+        let mut request = request(Method::GET, "/protocol");
+        request.version = http::Version::HTTP_2;
+        request.remote_addr = None;
+        assert_eq!(respond(&handler, request).status, StatusCode::OK);
+        let captured = captured.lock().unwrap();
+        let captured = captured.as_ref().expect("mock captured the request");
+        assert_eq!(
+            captured.params.get("SERVER_PROTOCOL").map(String::as_str),
+            Some("HTTP/2.0")
+        );
+        assert_eq!(
+            captured.params.get("REMOTE_ADDR").map(String::as_str),
+            Some("@")
+        );
+        assert_eq!(
+            captured.params.get("REMOTE_PORT").map(String::as_str),
+            Some("")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fastcgi_rejects_http_status_lines_like_caddys_mime_parser() {
+        // Caddy parses CGI headers with Go's MIME reader: a bare `HTTP/1.1 200 OK` line has no
+        // colon and is a protocol error (502), not a status shortcut.
+        let (dial, _captured) = spawn_tcp_mock(Behavior::Respond {
+            headers: "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n",
+            body: b"ok",
+            stderr: b"",
+            application_status: 0,
+            protocol_status: FCGI_REQUEST_COMPLETE,
+        })
+        .await;
+        let handler = build_handler(&dial, transport_json(serde_json::json!({})));
+        assert_eq!(
+            respond(&handler, request(Method::GET, "/status-line")).status,
+            StatusCode::BAD_GATEWAY
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fastcgi_chunked_takes_precedence_over_content_length() {
+        // Caddy's `chunked(te)` wins over Content-Length; the decoded body is sent and the
+        // mismatched CGI Content-Length is dropped.
+        let (dial, _captured) = spawn_tcp_mock(Behavior::Chunked {
+            headers: "Content-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\
+                      Content-Length: 999\r\n\r\n",
+            chunks: vec!["hello"],
+        })
+        .await;
+        let handler = build_handler(&dial, transport_json(serde_json::json!({})));
+        let response = respond(&handler, request(Method::GET, "/chunked"));
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(body_string(&response), "hello");
+        assert!(
+            !response.headers.contains_key(http::header::CONTENT_LENGTH),
+            "chunked responses must not keep the CGI Content-Length"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fastcgi_location_without_status_is_a_302() {
+        // Caddy: no `Status:` header but a `Location` header implies 302 Found.
+        let (dial, _captured) = spawn_tcp_mock(Behavior::Respond {
+            headers: "Location: /next\r\nContent-Type: text/plain\r\n\r\n",
+            body: b"",
+            stderr: b"",
+            application_status: 0,
+            protocol_status: FCGI_REQUEST_COMPLETE,
+        })
+        .await;
+        let handler = build_handler(&dial, transport_json(serde_json::json!({})));
+        let response = respond(&handler, request(Method::GET, "/redirect"));
+        assert_eq!(response.status, StatusCode::FOUND);
+        assert_eq!(response.headers[http::header::LOCATION], "/next");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fastcgi_response_body_is_bounded_by_declared_content_length() {
+        // Caddy's `declaredBody` truncates the FastCGI STDOUT stream to the parsed
+        // Content-Length and discards surplus bytes while still draining to END_REQUEST.
+        let (dial, _captured) = spawn_tcp_mock(Behavior::Respond {
+            headers: "Content-Type: text/plain\r\nContent-Length: 5\r\n\r\n",
+            body: b"hello-world",
+            stderr: b"",
+            application_status: 0,
+            protocol_status: FCGI_REQUEST_COMPLETE,
+        })
+        .await;
+        let handler = build_handler(&dial, transport_json(serde_json::json!({})));
+        let response = respond(&handler, request(Method::GET, "/bounded"));
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.headers[http::header::CONTENT_LENGTH], "5");
+        assert_eq!(
+            body_string(&response),
+            "hello",
+            "surplus body bytes are discarded"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fastcgi_body_is_suppressed_for_no_body_statuses_and_head() {
+        let (dial, _captured) = spawn_tcp_mock(Behavior::Respond {
+            headers: "Status: 204 No Content\r\n\r\n",
+            body: b"should-not-appear",
+            stderr: b"",
+            application_status: 0,
+            protocol_status: FCGI_REQUEST_COMPLETE,
+        })
+        .await;
+        let handler = build_handler(&dial, transport_json(serde_json::json!({})));
+        let response = respond(&handler, request(Method::GET, "/no-content"));
+        assert_eq!(response.status, StatusCode::NO_CONTENT);
+        assert!(response.body.is_empty(), "204 responses carry no body");
+
+        // HEAD responses must not carry a body either (Caddy's bodyAllowed rule).
+        let (dial, _captured) = spawn_tcp_mock(Behavior::responds(0)).await;
+        let handler = build_handler(&dial, transport_json(serde_json::json!({})));
+        let response = respond(&handler, request(Method::HEAD, "/head"));
+        assert_eq!(response.status, StatusCode::OK);
+        assert!(response.body.is_empty(), "HEAD responses carry no body");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fastcgi_configured_env_wins_over_client_headers_and_duplicates_join() {
+        let (dial, captured) = spawn_tcp_mock(Behavior::responds(0)).await;
+        let handler = build_handler(
+            &dial,
+            transport_json(serde_json::json!({"env": {"HTTP_X_FOO": "configured"}})),
+        );
+        let mut request = request(Method::GET, "/env");
+        request
+            .headers
+            .insert("x-foo", "from-client".parse().unwrap());
+        request.headers.append("x-multi", "a".parse().unwrap());
+        request.headers.append("x-multi", "b".parse().unwrap());
+        assert_eq!(respond(&handler, request).status, StatusCode::OK);
+        let captured = captured.lock().unwrap();
+        let captured = captured.as_ref().expect("mock captured the request");
+        assert_eq!(
+            captured.params.get("HTTP_X_FOO").map(String::as_str),
+            Some("configured"),
+            "configured env is applied after headers so a client cannot override it"
+        );
+        assert_eq!(
+            captured.params.get("HTTP_X_MULTI").map(String::as_str),
+            Some("a, b")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fastcgi_script_variables_use_the_decoded_cleaned_path() {
+        // Caddy derives SCRIPT_NAME/DOCUMENT_URI/PATH_INFO from `NormalizedPath(r.URL.Path)`:
+        // percent-decoded, `.`/`..`/duplicate slashes cleaned.
+        let (dial, captured) = spawn_tcp_mock(Behavior::responds(0)).await;
+        let handler = build_handler(
+            &dial,
+            transport_json(serde_json::json!({
+                "root": "/srv/www",
+                "split_path": [".php"]
+            })),
+        );
+        let request = request(Method::GET, "/dir%20name/a/../script.php/more?x=1");
+        assert_eq!(respond(&handler, request).status, StatusCode::OK);
+        let captured = captured.lock().unwrap();
+        let captured = captured.as_ref().expect("mock captured the request");
+        for (key, expected) in [
+            ("SCRIPT_NAME", "/dir name/script.php"),
+            ("DOCUMENT_URI", "/dir name/script.php"),
+            ("PATH_INFO", "/more"),
+            ("SCRIPT_FILENAME", "/srv/www/dir name/script.php"),
+            ("QUERY_STRING", "x=1"),
+            // REQUEST_URI stays the original (encoded) client URI, like Caddy's OriginalRequest.
+            ("REQUEST_URI", "/dir%20name/a/../script.php/more?x=1"),
+        ] {
+            assert_eq!(
+                captured.params.get(key).map(String::as_str),
+                Some(expected),
+                "{key}: {captured:?}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fastcgi_null_byte_path_is_rejected_with_400() {
+        // Caddy rejects NUL bytes in the request path with 400 before dialing (PHP may execute a
+        // non-PHP file as code otherwise, Caddy #4574).
+        let (dial, captured) = spawn_tcp_mock(Behavior::responds(0)).await;
+        let handler = build_handler(
+            &dial,
+            transport_json(serde_json::json!({"split_path": [".php"]})),
+        );
+        let response = respond(&handler, request(Method::GET, "/evil%00.php"));
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        assert!(
+            captured.lock().unwrap().is_none(),
+            "a NUL path must be rejected before connecting to the upstream"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fastcgi_server_addr_comes_from_the_local_address() {
+        let (dial, captured) = spawn_tcp_mock(Behavior::responds(0)).await;
+        let handler = build_handler(&dial, transport_json(serde_json::json!({})));
+        let mut request = request(Method::GET, "/addr");
+        request.vars.insert(
+            "http.request.local.host".to_string(),
+            "127.0.0.1".to_string(),
+        );
+        assert_eq!(respond(&handler, request).status, StatusCode::OK);
+        let captured = captured.lock().unwrap();
+        assert_eq!(
+            captured
+                .as_ref()
+                .expect("mock captured the request")
+                .params
+                .get("SERVER_ADDR")
+                .map(String::as_str),
+            Some("127.0.0.1")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fastcgi_read_timeout_is_an_absolute_connection_deadline() {
+        // Caddy sets one read deadline after dialing, so several short gaps still exceed the
+        // configured timeout in total; a per-operation timeout would incorrectly succeed.
+        let (dial, _captured) = spawn_tcp_mock(Behavior::SlowRecords {
+            headers: "Content-Type: text/plain\r\n\r\n",
+            chunks: vec![b"a", b"b", b"c", b"d", b"e"],
+            gap: TokioDuration::from_millis(50),
+        })
+        .await;
+        let handler = build_handler(
+            &dial,
+            transport_json(serde_json::json!({"read_timeout": 150_000_000u64})),
+        );
+        let response = respond(&handler, request(Method::GET, "/slow"));
+        assert_eq!(
+            response.status,
+            StatusCode::BAD_GATEWAY,
+            "the absolute read deadline must fail the response body"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fastcgi_malformed_records_are_rejected() {
+        // Wrong FastCGI version: header 8 bytes with version 2.
+        let (dial, _captured) = spawn_tcp_mock(Behavior::Raw {
+            bytes: vec![2, FCGI_STDOUT, 0, 1, 0, 0, 0, 0],
+            keep_open: true,
+        })
+        .await;
+        let handler = build_handler(&dial, transport_json(serde_json::json!({})));
+        assert_eq!(
+            respond(&handler, request(Method::GET, "/bad-version")).status,
+            StatusCode::BAD_GATEWAY
+        );
+
+        // Wrong request id for a valid version-1 record.
+        let (dial, _captured) = spawn_tcp_mock(Behavior::Raw {
+            bytes: vec![FCGI_VERSION_1, FCGI_STDOUT, 0, 9, 0, 0, 0, 0],
+            keep_open: true,
+        })
+        .await;
+        let handler = build_handler(&dial, transport_json(serde_json::json!({})));
+        assert_eq!(
+            respond(&handler, request(Method::GET, "/bad-id")).status,
+            StatusCode::BAD_GATEWAY
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fastcgi_resolve_root_symlink_canonicalizes_document_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let real_root = directory.path().join("real-root");
+        std::fs::create_dir(&real_root).unwrap();
+        let link = directory.path().join("link-root");
+        std::os::unix::fs::symlink(&real_root, &link).unwrap();
+        let (dial, captured) = spawn_tcp_mock(Behavior::responds(0)).await;
+        let handler = build_handler(
+            &dial,
+            transport_json(serde_json::json!({
+                "root": link.display().to_string(),
+                "resolve_root_symlink": true
+            })),
+        );
+        assert_eq!(
+            respond(&handler, request(Method::GET, "/x")).status,
+            StatusCode::OK
+        );
+        let captured = captured.lock().unwrap();
+        let canonical = std::fs::canonicalize(&real_root).unwrap();
+        assert_eq!(
+            captured
+                .as_ref()
+                .expect("mock captured the request")
+                .params
+                .get("DOCUMENT_ROOT")
+                .map(String::as_str),
+            Some(canonical.to_string_lossy().as_ref())
         );
     }
 }
