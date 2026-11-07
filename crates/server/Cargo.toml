@@ -15,11 +15,14 @@ caddy-rs-core = { workspace = true }
 caddy-rs-http = { workspace = true }
 caddy-rs-proxy = { workspace = true }
 caddy-rs-tls = { workspace = true }
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
 http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 libc = "0.2.189"
+quinn = "0.11"
 rustls = { version = "0.23.45", default-features = false, features = ["std", "ring", "tls12", "logging"] }
 serde_json = { workspace = true }
 socket2 = "0.6.5"
