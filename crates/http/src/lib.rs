@@ -12,7 +12,7 @@ pub mod file_server;
 pub mod handlers;
 pub mod matchers;
 pub mod placeholders;
-pub(crate) mod regex_lite;
+pub mod regex_lite;
 pub mod router;
 pub mod types;
 pub mod upgrade;
