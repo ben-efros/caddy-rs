@@ -1,7 +1,8 @@
 <div align="center">
-![Caddy-rs](docs/images/top.webp)
 
 # caddy-rs
+
+![Caddy-rs](docs/images/top.webp)
 
 **A Caddy-compatible web server, reverse proxy and TLS automation engine, written in Rust.**
 
@@ -10,7 +11,6 @@ Caddy, or fails at load with an error naming the construct.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 ![Baseline](https://img.shields.io/badge/Caddy%20baseline-v2.11.9-informational)
-![Status](https://img.shields.io/badge/release-0.1.0--trial.1-orange)
 
 </div>
 
