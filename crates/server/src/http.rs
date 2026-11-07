@@ -153,6 +153,7 @@ pub(crate) async fn serve_request_with_automatic(
         Arc::new(ServerTrustedProxies::default()),
         None,
         None,
+        &[],
     )
     .await
     {
@@ -289,6 +290,7 @@ pub(crate) async fn serve_request_with_automatic_upgradable(
     trusted_proxies: Arc<ServerTrustedProxies>,
     client_certificate: Option<HttpClientCertificate>,
     tls_connection: Option<caddy_rs_http::TlsConnection>,
+    proxy_vars: &[(String, String)],
 ) -> ServedResponse {
     if !tls {
         if let Some(automatic) = &automatic {
@@ -404,6 +406,12 @@ pub(crate) async fn serve_request_with_automatic_upgradable(
     internal.tls = tls;
     internal.tls_connection = tls_connection;
     internal.client_certificate = client_certificate;
+    for (key, value) in proxy_vars {
+        if key == "proxy_protocol.unix.remote" {
+            internal.remote_addr_text = Some(value.clone());
+        }
+        internal.vars.insert(key.clone(), value.clone());
+    }
     if let Some(local) = local_addr {
         // Caddy exposes `{http.request.local.*}`; the placeholder subset in `caddy-rs-http` does
         // not cover local addresses yet, so the server exposes them as request variables until

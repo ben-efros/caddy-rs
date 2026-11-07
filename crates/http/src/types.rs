@@ -275,6 +275,9 @@ pub struct Request {
     matcher_error: Option<MatcherError>,
     /// Peer address, when known.
     pub remote_addr: Option<SocketAddr>,
+    /// Textual peer address override for transports without a `SocketAddr` (for example a PROXY
+    /// protocol v2 `AF_UNIX` source), used by the `{http.request.remote.*}` placeholders.
+    pub remote_addr_text: Option<String>,
     /// Whether the connection is TLS.
     pub tls: bool,
     /// Negotiated TLS protocol version and cipher suite, when the connection terminated TLS.
@@ -325,6 +328,7 @@ impl Request {
             body_limit: None,
             matcher_error: None,
             remote_addr: None,
+            remote_addr_text: None,
             tls: false,
             tls_connection: None,
             client_certificate: None,
@@ -611,6 +615,7 @@ impl Clone for Request {
             body_limit: self.body_limit,
             matcher_error: self.matcher_error.clone(),
             remote_addr: self.remote_addr,
+            remote_addr_text: self.remote_addr_text.clone(),
             tls: self.tls,
             tls_connection: self.tls_connection.clone(),
             client_certificate: self.client_certificate.clone(),

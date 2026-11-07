@@ -37,6 +37,10 @@ use caddy_rs_core::{ProxyProtocolConfig, ProxyProtocolPolicy};
 const V1_MAX_LEN: usize = 107;
 
 /// PROXY protocol v2 signature.
+/// go-proxyproto's default `MaxV2HeaderSize` (Caddy v2.11.9 dependency v0.15.0); headers with a
+/// larger 16-bit length are rejected by the library Caddy uses.
+const MAX_V2_HEADER_SIZE: usize = 4096;
+
 const V2_SIGNATURE: &[u8; 12] = b"\r\n\r\n\0\r\nQUIT\n";
 
 /// A parsed CIDR range.
@@ -251,8 +255,170 @@ pub(crate) struct ProxyAddresses {
     pub(crate) destination: Option<SocketAddr>,
     /// Whether the v2 header used the `LOCAL` command (no address information).
     pub(crate) local: bool,
-    /// v2 TLVs (`(type, value)` pairs), in order.
-    pub(crate) tlvs: Vec<(u8, Vec<u8>)>,
+    /// v2 `AF_UNIX` source name (Caddy/go-proxyproto `net.UnixAddr.String()`; empty names become `@`).
+    pub(crate) unix_source: Option<String>,
+    /// v2 `AF_UNIX` destination name.
+    pub(crate) unix_destination: Option<String>,
+    /// Parsed v2 TLVs. Caddy does not expose TLVs today; caddy-rs surfaces them as an extension
+    /// through request variables (see [`ProxyTlvs::vars`]).
+    pub(crate) tlvs: ProxyTlvs,
+}
+
+/// Parsed v2 Type-Length-Value records.
+///
+/// Caddy v2.11.9 wraps the listener with `pires/go-proxyproto`, whose `parseVersion2` copies the
+/// raw TLV vector into `Header.rawTLVs`; Caddy never calls `Header.TLVs()` and exposes no TLV
+/// data to handlers. caddy-rs parses the spec-defined records into typed values and exposes them
+/// as a clearly-marked extension under `{http.vars.proxy_protocol.*}`. It deliberately does not
+/// reject a bad CRC32C because Caddy's wrapper never validates one either (the checksum is
+/// surfaced with a validity flag instead).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ProxyTlvs {
+    /// `PP2_TYPE_ALPN` (0x01).
+    pub(crate) alpn: Option<String>,
+    /// `PP2_TYPE_AUTHORITY` (0x02).
+    pub(crate) authority: Option<String>,
+    /// `PP2_TYPE_CRC32C` (0x03): the received checksum and whether it matches the header.
+    pub(crate) crc32c: Option<ProxyCrc32c>,
+    /// `PP2_TYPE_UNIQUE_ID` (0x05), lowercase hex.
+    pub(crate) unique_id: Option<String>,
+    /// `PP2_TYPE_SSL` (0x20) typed sub-TLVs.
+    pub(crate) ssl: Option<ProxySslTlv>,
+    /// `PP2_TYPE_NETNS` (0x30).
+    pub(crate) netns: Option<String>,
+    /// Unknown/registered records (including NOOP), kept for diagnostics.
+    pub(crate) unknown: Vec<(u8, Vec<u8>)>,
+}
+
+/// Parsed `PP2_TYPE_SSL` value (client flags, verify result and spec sub-TLVs).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ProxySslTlv {
+    /// Client bit field (`PP2_BITFIELD_CLIENT_*`).
+    pub(crate) client: u8,
+    /// Verification result (0 means the client certificate verified successfully).
+    pub(crate) verify: u32,
+    /// `PP2_SUBTYPE_SSL_VERSION` (0x21).
+    pub(crate) version: Option<String>,
+    /// `PP2_SUBTYPE_SSL_CN` (0x22).
+    pub(crate) cn: Option<String>,
+    /// `PP2_SUBTYPE_SSL_CIPHER` (0x23).
+    pub(crate) cipher: Option<String>,
+    /// `PP2_SUBTYPE_SSL_SIG_ALG` (0x24).
+    pub(crate) sig_alg: Option<String>,
+    /// `PP2_SUBTYPE_SSL_KEY_ALG` (0x25).
+    pub(crate) key_alg: Option<String>,
+    /// `PP2_SUBTYPE_SSL_GROUP` (0x26).
+    pub(crate) group: Option<String>,
+    /// `PP2_SUBTYPE_SSL_SIG_SCHEME` (0x27).
+    pub(crate) sig_scheme: Option<String>,
+    /// `PP2_SUBTYPE_SSL_CLIENT_CERT` (0x28), raw DER.
+    pub(crate) client_cert: Option<Vec<u8>>,
+}
+
+/// A received `PP2_TYPE_CRC32C` checksum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProxyCrc32c {
+    /// Checksum carried by the header.
+    pub(crate) checksum: u32,
+    /// Whether it matches the CRC32C of the header with the checksum field zeroed.
+    pub(crate) valid: bool,
+}
+
+impl ProxyTlvs {
+    /// Request variables exposed as a caddy-rs extension (`{http.vars.<key>}` / `{vars.<key>}`).
+    ///
+    /// Caddy currently has no equivalent surface, so every key uses the `proxy_protocol.` prefix.
+    pub(crate) fn vars(&self) -> Vec<(String, String)> {
+        let mut vars = Vec::new();
+        let mut push = |key: &str, value: String| {
+            vars.push((format!("proxy_protocol.tlv.{key}"), value));
+        };
+        if let Some(value) = &self.alpn {
+            push("alpn", value.clone());
+        }
+        if let Some(value) = &self.authority {
+            push("authority", value.clone());
+        }
+        if let Some(value) = &self.unique_id {
+            push("unique_id", value.clone());
+        }
+        if let Some(value) = &self.netns {
+            push("netns", value.clone());
+        }
+        if let Some(crc) = &self.crc32c {
+            push("crc32c", format!("{:08x}", crc.checksum));
+            push("crc32c_valid", crc.valid.to_string());
+        }
+        if let Some(ssl) = &self.ssl {
+            push("ssl.client", ssl.client.to_string());
+            push("ssl.verify", ssl.verify.to_string());
+            if let Some(value) = &ssl.version {
+                push("ssl.version", value.clone());
+            }
+            if let Some(value) = &ssl.cn {
+                push("ssl.cn", value.clone());
+            }
+            if let Some(value) = &ssl.cipher {
+                push("ssl.cipher", value.clone());
+            }
+            if let Some(value) = &ssl.sig_alg {
+                push("ssl.sig_alg", value.clone());
+            }
+            if let Some(value) = &ssl.key_alg {
+                push("ssl.key_alg", value.clone());
+            }
+            if let Some(value) = &ssl.group {
+                push("ssl.group", value.clone());
+            }
+            if let Some(value) = &ssl.sig_scheme {
+                push("ssl.sig_scheme", value.clone());
+            }
+            if let Some(value) = &ssl.client_cert {
+                push("ssl.client_cert", hex_encode(value));
+            }
+        }
+        vars
+    }
+
+    /// Variables for a v2 `AF_UNIX` address block (Caddy's `net.UnixAddr.String()` values).
+    pub(crate) fn unix_vars(
+        source: Option<&str>,
+        destination: Option<&str>,
+    ) -> Vec<(String, String)> {
+        let mut vars = Vec::new();
+        if let Some(source) = source {
+            vars.push(("proxy_protocol.unix.remote".to_string(), source.to_string()));
+        }
+        if let Some(destination) = destination {
+            vars.push((
+                "proxy_protocol.unix.local".to_string(),
+                destination.to_string(),
+            ));
+        }
+        vars
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut text = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write;
+        let _ = write!(text, "{byte:02x}");
+    }
+    text
+}
+
+/// CRC32C (Castagnoli) as used by `PP2_TYPE_CRC32C`.
+fn crc32c(bytes: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFF_u32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            let mask = 0_u32.wrapping_sub(crc & 1);
+            crc = (crc >> 1) ^ (0x82F6_3B78 & mask);
+        }
+    }
+    !crc
 }
 
 /// A wrapper stream that replays bytes read past the PROXY header before delegating to the inner
@@ -325,13 +491,26 @@ pub(crate) async fn wrap<S>(
     peer: Option<SocketAddr>,
     _local: Option<SocketAddr>,
     settings: &ProxyProtocolSettings,
-) -> Result<(PrefixedStream<S>, Option<SocketAddr>, Option<SocketAddr>), ProxyProtocolError>
+) -> Result<
+    (
+        PrefixedStream<S>,
+        Option<SocketAddr>,
+        Option<SocketAddr>,
+        Vec<(String, String)>,
+    ),
+    ProxyProtocolError,
+>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let policy = settings.effective_policy(peer.map(|peer| peer.ip()));
     if policy == EffectivePolicy::Skip {
-        return Ok((PrefixedStream::new(stream, Vec::new()), None, None));
+        return Ok((
+            PrefixedStream::new(stream, Vec::new()),
+            None,
+            None,
+            Vec::new(),
+        ));
     }
 
     let mut stream = stream;
@@ -341,17 +520,23 @@ where
         None => match policy {
             EffectivePolicy::Required => return Err(ProxyProtocolError::Missing),
             _ => {
-                return Ok((PrefixedStream::new(stream, prefix), None, None));
+                return Ok((PrefixedStream::new(stream, prefix), None, None, Vec::new()));
             }
         },
     };
     if policy == EffectivePolicy::RejectHeader {
         return Err(ProxyProtocolError::Rejected);
     }
+    let mut vars = header.tlvs.vars();
+    vars.extend(ProxyTlvs::unix_vars(
+        header.unix_source.as_deref(),
+        header.unix_destination.as_deref(),
+    ));
     Ok((
         PrefixedStream::new(stream, prefix),
         header.source,
         header.destination,
+        vars,
     ))
 }
 
@@ -520,6 +705,11 @@ where
     let version_command = buffer[12];
     let family_protocol = buffer[13];
     let payload_len = u16::from_be_bytes([buffer[14], buffer[15]]) as usize;
+    if payload_len > MAX_V2_HEADER_SIZE {
+        return Err(ProxyProtocolError::Malformed(format!(
+            "PROXY protocol v2 payload length {payload_len} exceeds {MAX_V2_HEADER_SIZE}"
+        )));
+    }
     if version_command >> 4 != 2 {
         return Err(ProxyProtocolError::Malformed(format!(
             "unsupported PROXY protocol version {}",
@@ -600,21 +790,29 @@ where
             ));
             36
         }
-        // AF_UNIX: 108-byte source + 108-byte destination. Unix addresses are not SocketAddrs;
-        // keep the transport addresses for routing/logging.
+        // AF_UNIX: 108-byte source + 108-byte destination. These are not SocketAddrs, so the
+        // transport addresses stay in effect (Caddy replaces the connection's net.UnixAddr with
+        // the header names, whose string form is `@` for an empty name); the header names are
+        // exposed through `proxy_protocol.unix.*` request variables instead.
         3 => {
             if payload.len() < 216 {
                 return Err(ProxyProtocolError::Malformed(
                     "truncated PROXY protocol v2 Unix address block".to_string(),
                 ));
             }
+            addresses.unix_source = Some(unix_name(&payload[0..108]));
+            addresses.unix_destination = Some(unix_name(&payload[108..216]));
             216
         }
         _ => unreachable!("family validated above"),
     };
 
-    // TLVs follow the address block; validate their framing so malformed headers are loud.
+    // TLVs follow the address block. Caddy's go-proxyproto only splits the raw vector, and Caddy
+    // never inspects it; caddy-rs validates framing (loud on truncation) and decodes the
+    // spec-defined records into typed request variables. A bad CRC32C does not reject the
+    // connection (Caddy does not validate it) but is surfaced with a validity flag.
     let mut position = tlv_start;
+    let mut crc_value_position: Option<usize> = None;
     while position < payload.len() {
         if payload.len() - position < 3 {
             return Err(ProxyProtocolError::Malformed(
@@ -629,13 +827,108 @@ where
                 "truncated PROXY protocol v2 TLV value".to_string(),
             ));
         }
-        addresses
-            .tlvs
-            .push((tlv_type, payload[position..position + tlv_len].to_vec()));
+        let value = &payload[position..position + tlv_len];
+        match tlv_type {
+            0x01 => addresses.tlvs.alpn = Some(utf8_tlv_value("ALPN", value)?),
+            0x02 => addresses.tlvs.authority = Some(utf8_tlv_value("AUTHORITY", value)?),
+            0x03 => {
+                if value.len() != 4 {
+                    return Err(ProxyProtocolError::Malformed(
+                        "PROXY protocol v2 CRC32C TLV is not 4 bytes".to_string(),
+                    ));
+                }
+                let checksum = u32::from_be_bytes([value[0], value[1], value[2], value[3]]);
+                // The checksum field itself is zeroed while computing the CRC over the header.
+                crc_value_position = Some(16 + position);
+                addresses.tlvs.crc32c = Some(ProxyCrc32c {
+                    checksum,
+                    valid: false,
+                });
+            }
+            0x05 => addresses.tlvs.unique_id = Some(hex_encode(value)),
+            0x20 => addresses.tlvs.ssl = Some(parse_ssl_tlv(value)?),
+            0x30 => addresses.tlvs.netns = Some(utf8_tlv_value("NETNS", value)?),
+            other => addresses.tlvs.unknown.push((other, value.to_vec())),
+        }
         position += tlv_len;
     }
 
+    if let (Some(crc), Some(value_position)) = (addresses.tlvs.crc32c.as_mut(), crc_value_position)
+    {
+        let mut header = buffer[..16 + payload_len].to_vec();
+        for byte in &mut header[value_position..value_position + 4] {
+            *byte = 0;
+        }
+        crc.valid = crc32c(&header) == crc.checksum;
+    }
+
     Ok((Some(addresses), Vec::new()))
+}
+
+/// Decode a 108-byte `AF_UNIX` name field the way go-proxyproto's `parseUnixName` does: cut at the
+/// first NUL; `net.UnixAddr.String()` renders an empty name as `@`.
+fn unix_name(bytes: &[u8]) -> String {
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    let name = String::from_utf8_lossy(&bytes[..end]).into_owned();
+    if name.is_empty() {
+        "@".to_string()
+    } else {
+        name
+    }
+}
+
+fn utf8_tlv_value(name: &str, value: &[u8]) -> Result<String, ProxyProtocolError> {
+    std::str::from_utf8(value).map(str::to_string).map_err(|_| {
+        ProxyProtocolError::Malformed(format!("PROXY protocol v2 {name} TLV is not valid UTF-8"))
+    })
+}
+
+/// Parse `PP2_TYPE_SSL`: one client-flags byte, a big-endian u32 verification result, then nested
+/// spec sub-TLVs (the layout used by go-proxyproto's `tlvparse.PP2SSL`).
+fn parse_ssl_tlv(value: &[u8]) -> Result<ProxySslTlv, ProxyProtocolError> {
+    if value.len() < 5 {
+        return Err(ProxyProtocolError::Malformed(
+            "PROXY protocol v2 SSL TLV is shorter than 5 bytes".to_string(),
+        ));
+    }
+    let mut ssl = ProxySslTlv {
+        client: value[0],
+        verify: u32::from_be_bytes([value[1], value[2], value[3], value[4]]),
+        ..ProxySslTlv::default()
+    };
+    let mut position = 5;
+    while position < value.len() {
+        if value.len() - position < 3 {
+            return Err(ProxyProtocolError::Malformed(
+                "truncated PROXY protocol v2 SSL sub-TLV header".to_string(),
+            ));
+        }
+        let sub_type = value[position];
+        let sub_len = u16::from_be_bytes([value[position + 1], value[position + 2]]) as usize;
+        position += 3;
+        if value.len() - position < sub_len {
+            return Err(ProxyProtocolError::Malformed(
+                "truncated PROXY protocol v2 SSL sub-TLV value".to_string(),
+            ));
+        }
+        let sub_value = &value[position..position + sub_len];
+        match sub_type {
+            0x21 => ssl.version = Some(utf8_tlv_value("SSL version", sub_value)?),
+            0x22 => ssl.cn = Some(utf8_tlv_value("SSL CN", sub_value)?),
+            0x23 => ssl.cipher = Some(utf8_tlv_value("SSL cipher", sub_value)?),
+            0x24 => ssl.sig_alg = Some(utf8_tlv_value("SSL sig_alg", sub_value)?),
+            0x25 => ssl.key_alg = Some(utf8_tlv_value("SSL key_alg", sub_value)?),
+            0x26 => ssl.group = Some(utf8_tlv_value("SSL group", sub_value)?),
+            0x27 => ssl.sig_scheme = Some(utf8_tlv_value("SSL sig_scheme", sub_value)?),
+            0x28 => ssl.client_cert = Some(sub_value.to_vec()),
+            _ => {}
+        }
+        position += sub_len;
+    }
+    Ok(ssl)
 }
 
 #[cfg(test)]
@@ -662,7 +955,7 @@ mod tests {
         let (mut writer, reader) = tokio::io::duplex(4096);
         writer.write_all(&bytes).await.unwrap();
         drop(writer);
-        let (_stream, source, _destination) =
+        let (_stream, source, _destination, _vars) =
             wrap(reader, Some(peer), Some(local), &settings(policy)).await?;
         Ok(ProxyAddresses {
             source,
@@ -698,6 +991,199 @@ mod tests {
             .await
             .expect("v2 parses");
         assert_eq!(addresses.source, Some("192.0.2.10:50000".parse().unwrap()));
+    }
+
+    async fn parse_v2_addresses(bytes: Vec<u8>) -> Result<ProxyAddresses, ProxyProtocolError> {
+        assert_eq!(&bytes[..12], V2_SIGNATURE, "test header signature");
+        // `read_header` has already consumed the 12-byte signature before `parse_v2` runs.
+        let buffer = bytes[..12].to_vec();
+        let (mut writer, mut reader) = tokio::io::duplex(8192);
+        writer.write_all(&bytes[12..]).await.unwrap();
+        drop(writer);
+        let (addresses, _leftover) =
+            parse_v2(&mut reader, buffer, Some(Duration::from_secs(2))).await?;
+        Ok(addresses.expect("v2 PROXY header carries addresses"))
+    }
+
+    fn ipv4_payload() -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[192, 0, 2, 10, 198, 51, 100, 1]);
+        payload.extend_from_slice(&50000_u16.to_be_bytes());
+        payload.extend_from_slice(&443_u16.to_be_bytes());
+        payload
+    }
+
+    fn header_v2(family_protocol: u8, payload: &[u8]) -> Vec<u8> {
+        let mut header = V2_SIGNATURE.to_vec();
+        header.push(0x21);
+        header.push(family_protocol);
+        header.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        header.extend_from_slice(payload);
+        header
+    }
+
+    fn push_tlv(bytes: &mut Vec<u8>, kind: u8, value: &[u8]) {
+        bytes.push(kind);
+        bytes.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(value);
+    }
+
+    fn ssl_tlv() -> Vec<u8> {
+        let mut ssl = vec![0x01, 0, 0, 0, 0];
+        push_tlv(&mut ssl, 0x21, b"TLSv1.3");
+        push_tlv(&mut ssl, 0x22, b"client.example");
+        push_tlv(&mut ssl, 0x23, b"TLS_AES_128_GCM_SHA256");
+        push_tlv(&mut ssl, 0x24, b"RSA-SHA256");
+        push_tlv(&mut ssl, 0x25, b"RSA2048");
+        push_tlv(&mut ssl, 0x26, b"x25519");
+        push_tlv(&mut ssl, 0x27, b"rsa_pss_rsae_sha256");
+        push_tlv(&mut ssl, 0x28, &[0x30, 0x82, 0x01, 0x00]);
+        ssl
+    }
+
+    #[tokio::test]
+    async fn parses_typed_v2_tlvs_and_crc32c() {
+        let mut payload = ipv4_payload();
+        push_tlv(&mut payload, 0x01, b"h2");
+        push_tlv(&mut payload, 0x02, b"example.com");
+        push_tlv(&mut payload, 0x05, &[0xde, 0xad, 0xbe, 0xef]);
+        push_tlv(&mut payload, 0x30, b"netns0");
+        push_tlv(&mut payload, 0x20, &ssl_tlv());
+        push_tlv(&mut payload, 0x04, b"pad"); // NOOP, kept as unknown
+                                              // CRC32C placeholder (zero checksum) so the header can be checksummed.
+        push_tlv(&mut payload, 0x03, &[0, 0, 0, 0]);
+        let mut header = header_v2(0x11, &payload);
+        // The CRC covers the header with its checksum field zeroed, which is the current state.
+        let checksum = crc32c(&header);
+        let crc_offset = 16 + payload.len() - 4;
+        header[crc_offset..crc_offset + 4].copy_from_slice(&checksum.to_be_bytes());
+        let mut bad = header.clone();
+        bad[crc_offset] ^= 0xff;
+        let addresses = parse_v2_addresses(header).await.expect("typed TLVs parse");
+        let tlvs = &addresses.tlvs;
+        assert_eq!(tlvs.alpn.as_deref(), Some("h2"));
+        assert_eq!(tlvs.authority.as_deref(), Some("example.com"));
+        assert_eq!(tlvs.unique_id.as_deref(), Some("deadbeef"));
+        assert_eq!(tlvs.netns.as_deref(), Some("netns0"));
+        let crc = tlvs.crc32c.expect("CRC32C parsed");
+        assert_eq!(crc.checksum, checksum);
+        assert!(crc.valid, "checksum must match the header");
+        assert!(tlvs
+            .unknown
+            .iter()
+            .any(|(kind, value)| *kind == 0x04 && value == b"pad"));
+        let ssl = tlvs.ssl.as_ref().expect("SSL TLV parsed");
+        assert_eq!(ssl.client, 0x01);
+        assert_eq!(ssl.verify, 0);
+        assert_eq!(ssl.version.as_deref(), Some("TLSv1.3"));
+        assert_eq!(ssl.cn.as_deref(), Some("client.example"));
+        assert_eq!(ssl.cipher.as_deref(), Some("TLS_AES_128_GCM_SHA256"));
+        assert_eq!(ssl.sig_alg.as_deref(), Some("RSA-SHA256"));
+        assert_eq!(ssl.key_alg.as_deref(), Some("RSA2048"));
+        assert_eq!(ssl.group.as_deref(), Some("x25519"));
+        assert_eq!(ssl.sig_scheme.as_deref(), Some("rsa_pss_rsae_sha256"));
+        assert_eq!(
+            ssl.client_cert.as_deref(),
+            Some(&[0x30, 0x82, 0x01, 0x00][..])
+        );
+
+        let vars: std::collections::HashMap<_, _> = tlvs.vars().into_iter().collect();
+        assert_eq!(
+            vars.get("proxy_protocol.tlv.alpn").map(String::as_str),
+            Some("h2")
+        );
+        assert_eq!(
+            vars.get("proxy_protocol.tlv.unique_id").map(String::as_str),
+            Some("deadbeef")
+        );
+        assert_eq!(
+            vars.get("proxy_protocol.tlv.crc32c_valid")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            vars.get("proxy_protocol.tlv.ssl.cipher")
+                .map(String::as_str),
+            Some("TLS_AES_128_GCM_SHA256")
+        );
+
+        // A corrupted checksum is surfaced, not rejected (Caddy never validates it).
+        let addresses = parse_v2_addresses(bad).await.expect("bad CRC still parses");
+        let crc = addresses.tlvs.crc32c.expect("CRC parsed");
+        assert!(!crc.valid);
+    }
+
+    #[tokio::test]
+    async fn rejects_malformed_tlvs_and_oversized_v2_headers() {
+        // Truncated TLV value.
+        let mut payload = ipv4_payload();
+        push_tlv(&mut payload, 0x01, b"h2");
+        payload.extend_from_slice(&[0x01, 0x00, 0x10, b'x']); // claims 16, carries 1
+        let error = parse_v2_addresses(header_v2(0x11, &payload))
+            .await
+            .expect_err("truncated TLV");
+        assert!(matches!(error, ProxyProtocolError::Malformed(_)), "{error}");
+
+        // CRC32C must be exactly 4 bytes.
+        let mut payload = ipv4_payload();
+        push_tlv(&mut payload, 0x03, &[0, 0, 0]);
+        let error = parse_v2_addresses(header_v2(0x11, &payload))
+            .await
+            .expect_err("short CRC");
+        assert!(matches!(error, ProxyProtocolError::Malformed(_)), "{error}");
+
+        // SSL TLV needs at least the 5-byte fixed header.
+        let mut payload = ipv4_payload();
+        push_tlv(&mut payload, 0x20, &[0x01, 0, 0, 0]);
+        let error = parse_v2_addresses(header_v2(0x11, &payload))
+            .await
+            .expect_err("short SSL TLV");
+        assert!(matches!(error, ProxyProtocolError::Malformed(_)), "{error}");
+
+        // Known text TLVs must be UTF-8.
+        let mut payload = ipv4_payload();
+        push_tlv(&mut payload, 0x01, &[0xff]);
+        let error = parse_v2_addresses(header_v2(0x11, &payload))
+            .await
+            .expect_err("invalid UTF-8 ALPN");
+        assert!(matches!(error, ProxyProtocolError::Malformed(_)), "{error}");
+
+        // Caddy's go-proxyproto caps the v2 payload at 4096 bytes.
+        let mut header = V2_SIGNATURE.to_vec();
+        header.extend_from_slice(&[0x21, 0x11, 0x10, 0x01]); // 4097
+        let error = parse_v2_addresses(header)
+            .await
+            .expect_err("oversized v2 payload");
+        assert!(matches!(error, ProxyProtocolError::Malformed(_)), "{error}");
+    }
+
+    #[tokio::test]
+    async fn accepts_v2_af_unix_and_exposes_unix_names() {
+        let mut payload = vec![0_u8; 216];
+        payload[..b"/run/source.sock".len()].copy_from_slice(b"/run/source.sock");
+        // Destination stays empty, which Caddy's net.UnixAddr.String() renders as "@".
+        push_tlv(&mut payload, 0x01, b"h2");
+        let addresses = parse_v2_addresses(header_v2(0x31, &payload))
+            .await
+            .expect("AF_UNIX header accepted");
+        assert_eq!(addresses.source, None);
+        assert_eq!(addresses.destination, None);
+        assert_eq!(addresses.unix_source.as_deref(), Some("/run/source.sock"));
+        assert_eq!(addresses.unix_destination.as_deref(), Some("@"));
+        let vars: std::collections::HashMap<_, _> = ProxyTlvs::unix_vars(
+            addresses.unix_source.as_deref(),
+            addresses.unix_destination.as_deref(),
+        )
+        .into_iter()
+        .collect();
+        assert_eq!(
+            vars.get("proxy_protocol.unix.remote").map(String::as_str),
+            Some("/run/source.sock")
+        );
+        assert_eq!(
+            vars.get("proxy_protocol.unix.local").map(String::as_str),
+            Some("@")
+        );
     }
 
     #[tokio::test]
