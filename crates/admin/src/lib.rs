@@ -17,6 +17,8 @@
 //! | `POST /load` | Validate, provision, and atomically activate a configuration |
 //! | `POST /stop` | Deactivate the running configuration; in the CLI `run` process this terminates the process, like Caddy |
 //! | `GET /metrics` | Prometheus text format (v0.0.4) rendered from the shared [`MetricsRegistry`]; empty until the runtime populates it |
+//! | `GET /debug/pprof/` (+ `cmdline`/`profile`/`symbol`/`trace`) | Caddy registers Go pprof debugging; caddy-rs answers a located, documented `501` (T-ADMIN-022, DIV-0006) |
+//! | `GET /debug/vars` | Caddy registers Go expvar; caddy-rs answers a located, documented `501` (T-ADMIN-022, DIV-0006) |
 //! | `GET /pki/ca/<id>` | Caddy-compatible metadata for a provisioned local CA (`caInfo` JSON) |
 //! | `GET /pki/ca/<id>/certificates` | PEM certificate chain: intermediate(s) then root |
 //! | `GET /pki/ca/<id>/certificates/<name>` | One PEM file from the CA directory (`root.crt`/`intermediate.crt`, caddy-rs extension) |
@@ -121,6 +123,10 @@
 //!   request path, so `@id` values and object keys containing reserved characters need literal
 //!   segments.
 //! - `GET /id/<id>` returns `404` for unknown ids as required by the admin contract.
+//! - Caddy's admin mux always registers the Go debugging endpoints `/debug/pprof/` (and its
+//!   sub-handlers) and `/debug/vars`; caddy-rs has no Go runtime to introspect, so they answer with
+//!   a located, documented `501 Not Implemented` (T-ADMIN-022, DIV-0006) instead of fabricating
+//!   pprof/expvar data. The bare `/debug/pprof` path 307-redirects like Caddy's ServeMux.
 //! - Origin policy derives implicit origins from a non-empty `admin.origins`; the shared core
 //!   model cannot distinguish `origins: null` (derive) from `origins: []` (allow none), so an
 //!   explicit empty list derives the defaults instead of blocking the endpoint.
@@ -168,6 +174,7 @@ pub mod pki;
 pub mod recorder;
 mod regex_lite;
 pub mod sink;
+pub mod tracing_config;
 pub mod trust;
 
 use std::collections::BTreeSet;
@@ -210,6 +217,10 @@ pub use recorder::{
 pub use sink::{
     AccessLogEncoder, AccessLogOutput, AccessLogSink, AccessLogSinkConfig, AccessLogSinkStats,
     EmitOutcome, DEFAULT_ACCESS_LOG_BUFFER_BYTES,
+};
+pub use tracing_config::{
+    TracingConfig, TracingConfigError, DEFAULT_TRACING_SPAN_NAME, SERVER_LEVEL_TRACING_NOTE,
+    TRACING_HANDLER_CONFIG_PATH, TRACING_TRACKING_ID,
 };
 pub use trust::{
     discover_java_keystores, discover_nss_databases, TrustEnvironment, TrustPlan, TrustPlatform,
@@ -793,6 +804,33 @@ impl AdminApi {
 
     async fn dispatch(&self, path: &str, request: &AdminRequest) -> AdminResponse {
         let method = request.method.as_str();
+
+        // Caddy's admin mux always registers `/debug/pprof/`, its sub-handlers and `/debug/vars`
+        // (admin.go `register debugging endpoints`); they are not gated by configuration, only by
+        // where the admin listener is reachable. caddy-rs has no Go runtime to introspect, so the
+        // endpoints exist but answer with a located, documented 501 instead of faking data.
+        if path == "/debug/pprof" {
+            let mut response = AdminResponse::empty(StatusCode::TEMPORARY_REDIRECT);
+            response.headers.insert(
+                http::header::LOCATION,
+                HeaderValue::from_static("/debug/pprof/"),
+            );
+            return response;
+        }
+        if path == "/debug/vars" || path == "/debug/pprof/" || path.starts_with("/debug/pprof/") {
+            if method != "GET" {
+                return AdminResponse::api_error(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    format!("method not allowed: {method}"),
+                );
+            }
+            return AdminResponse::api_error(
+                StatusCode::NOT_IMPLEMENTED,
+                format!(
+                    "debug endpoint `{path}` is not implemented: Caddy serves Go runtime pprof/expvar data                      here, and caddy-rs has no Go runtime to introspect (T-ADMIN-022; DIV-0006)"
+                ),
+            );
+        }
 
         // Caddy's ServeMux redirects the bare `/pki` path to `/pki/` (307) for every method.
         if path == "/pki" {
@@ -3106,6 +3144,53 @@ mod tests {
         let after = body_string(&admin.handle(request("GET", "/metrics", "")).await);
         assert!(
             after.contains("caddy_http_requests_in_flight{handler=\"route0\",server=\"srv0\"} 0")
+        );
+    }
+
+    // -- Debug endpoints (Caddy admin /debug/pprof, /debug/vars) ----------------------------
+
+    #[tokio::test]
+    async fn debug_endpoints_are_located_documented_501s_not_fake_data() {
+        let admin = admin();
+        for path in [
+            "/debug/vars",
+            "/debug/pprof/",
+            "/debug/pprof/cmdline",
+            "/debug/pprof/profile",
+            "/debug/pprof/symbol",
+            "/debug/pprof/trace",
+        ] {
+            let response = admin.handle(request("GET", path, "")).await;
+            assert_eq!(response.status, StatusCode::NOT_IMPLEMENTED, "{path}");
+            assert_eq!(
+                response
+                    .headers
+                    .get(http::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("application/json"),
+                "{path}"
+            );
+            let body: Value = serde_json::from_slice(&response.body).expect("APIError JSON");
+            let error = body["error"].as_str().expect("error string");
+            assert!(error.contains("not implemented"), "{path}: {error}");
+            assert!(error.contains("Go runtime"), "{path}: {error}");
+            assert!(error.contains("T-ADMIN-022"), "{path}: {error}");
+            assert!(error.contains("DIV-0006"), "{path}: {error}");
+        }
+
+        // A non-GET request is a method error, matching the endpoints' GET-only contract.
+        let response = admin.handle(request("POST", "/debug/vars", "{}")).await;
+        assert_eq!(response.status, StatusCode::METHOD_NOT_ALLOWED);
+
+        // Caddy's ServeMux redirects the bare pprof path to the tree root.
+        let response = admin.handle(request("GET", "/debug/pprof", "")).await;
+        assert_eq!(response.status, StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            response
+                .headers
+                .get(http::header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("/debug/pprof/")
         );
     }
 

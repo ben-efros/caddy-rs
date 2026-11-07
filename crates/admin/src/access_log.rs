@@ -37,6 +37,21 @@
 //!   `filter` encoder modules (`caddy.logging.encoders.filter`) applied to zap fields. The four
 //!   fields zap itself owns (`ts`, `level`, `logger`, `msg`) cannot be filtered, matching Caddy's
 //!   `FilterEncoder` documentation.
+//!
+//! ## Request correlation and tracing (T-ADMIN-022)
+//!
+//! Caddy's `{http.request.uuid}` placeholder (`modules/caddyhttp/replacer.go`) lazily generates a
+//! random UUIDv4 for the request, caches it for the request's lifetime and, on first access, adds a
+//! top-level access-log field named `uuid` through `ExtraLogFields` (log-only; it is never injected
+//! into request/response headers). Caddy's OpenTelemetry tracing handler
+//! (`modules/caddyhttp/tracing/tracer.go`) adds top-level fields `traceID` and `spanID` when a
+//! valid span context exists. [`RequestUuid`] reproduces the lazy/cached UUID value and
+//! [`AccessLogEntry`] models all three fields with Caddy's exact names.
+//!
+//! The placeholder itself is expanded by `crates/http`'s replacer; wiring `{http.request.uuid}`
+//! into that replacer, generating the id only when a placeholder/access-log config asks for it, and
+//! populating the fields from the server request path are server/http hooks reported with
+//! T-ADMIN-022 (this crate provides the id generation and log model).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -45,6 +60,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use http::{HeaderMap, HeaderName};
+use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Default access logger name, matching Caddy's `http.log.access`.
@@ -297,6 +313,16 @@ pub struct AccessLogEntry {
     /// caddy-rs extension: proxy upstream details.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream: Option<AccessLogUpstream>,
+    /// Per-request correlation id from `{http.request.uuid}` (Caddy's extra log field `uuid`,
+    /// log-only and only present when the request accessed the placeholder).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uuid: Option<String>,
+    /// OpenTelemetry trace id from Caddy's tracing handler (extra log field `traceID`).
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "traceID")]
+    pub trace_id: Option<String>,
+    /// OpenTelemetry span id from Caddy's tracing handler (extra log field `spanID`).
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "spanID")]
+    pub span_id: Option<String>,
 }
 
 impl Default for AccessLogEntry {
@@ -315,6 +341,9 @@ impl Default for AccessLogEntry {
             resp_headers: BTreeMap::new(),
             write_error: None,
             upstream: None,
+            uuid: None,
+            trace_id: None,
+            span_id: None,
         }
     }
 }
@@ -331,6 +360,23 @@ impl AccessLogEntry {
     /// Set the timestamp.
     pub fn with_timestamp(mut self, timestamp: SystemTime) -> Self {
         self.timestamp = timestamp;
+        self
+    }
+
+    /// Attach the per-request correlation id (`{http.request.uuid}` / extra field `uuid`).
+    pub fn with_uuid(mut self, uuid: impl Into<String>) -> Self {
+        self.uuid = Some(uuid.into());
+        self
+    }
+
+    /// Attach OpenTelemetry trace/span ids (Caddy's `traceID`/`spanID` extra fields).
+    pub fn with_trace_context(
+        mut self,
+        trace_id: impl Into<String>,
+        span_id: impl Into<String>,
+    ) -> Self {
+        self.trace_id = Some(trace_id.into());
+        self.span_id = Some(span_id.into());
         self
     }
 
@@ -474,6 +520,12 @@ pub enum AccessLogField {
     WriteError,
     /// `upstream` (caddy-rs extension)
     Upstream,
+    /// `uuid` (`{http.request.uuid}` correlation id, Caddy extra log field)
+    Uuid,
+    /// `traceID` (OpenTelemetry trace id, Caddy tracing extra log field)
+    TraceId,
+    /// `spanID` (OpenTelemetry span id, Caddy tracing extra log field)
+    SpanId,
 }
 
 impl AccessLogField {
@@ -493,6 +545,9 @@ impl AccessLogField {
             AccessLogField::RespHeaders => "resp_headers",
             AccessLogField::WriteError => "write_error",
             AccessLogField::Upstream => "upstream",
+            AccessLogField::Uuid => "uuid",
+            AccessLogField::TraceId => "traceID",
+            AccessLogField::SpanId => "spanID",
         }
     }
 
@@ -1389,6 +1444,63 @@ fn apply_to_value(value: &mut serde_json::Value, transform: &impl Fn(&str) -> Op
     }
 }
 
+/// Lazily generated, cached per-request UUID matching `{http.request.uuid}` semantics.
+///
+/// Caddy generates the UUID on first placeholder access so requests that never reference it pay no
+/// allocation, and reuses the same value for every later reference in the request. Call
+/// [`RequestUuid::evaluate`] wherever the placeholder is expanded, and
+/// [`RequestUuid::apply_to_entry`] when building the access entry (the value is only present in the
+/// log if the placeholder was accessed).
+#[derive(Debug, Default, Clone)]
+pub struct RequestUuid {
+    value: Option<String>,
+}
+
+impl RequestUuid {
+    /// A request with no UUID generated yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The request's UUID, generating and caching a random UUIDv4 on first access.
+    ///
+    /// Returns `None` only if the operating system random source fails (never in normal operation);
+    /// Caddy's `requestID.String` returns an empty string in that case.
+    pub fn evaluate(&mut self) -> Option<&str> {
+        if self.value.is_none() {
+            self.value = generate_uuid_v4();
+        }
+        self.value.as_deref()
+    }
+
+    /// The already-generated UUID, if any (does not generate).
+    pub fn value(&self) -> Option<&str> {
+        self.value.as_deref()
+    }
+
+    /// Copy the generated UUID into `entry` when it was generated for this request.
+    pub fn apply_to_entry(&self, entry: &mut AccessLogEntry) {
+        if let Some(value) = &self.value {
+            entry.uuid = Some(value.clone());
+        }
+    }
+}
+
+/// Generate a random UUIDv4 string (`8-4-4-4-12` lowercase hex), matching `google/uuid`'s
+/// `NewRandom` layout used by Caddy's `{http.request.uuid}`.
+pub fn generate_uuid_v4() -> Option<String> {
+    let mut bytes = [0u8; 16];
+    SystemRandom::new().fill(&mut bytes).ok()?;
+    // RFC 4122 version 4 / variant 10xx, matching google/uuid's random UUID.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Some(format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+    ))
+}
+
 /// Field selection and redaction configuration for one access-log sink.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AccessLogConfig {
@@ -2196,6 +2308,88 @@ mod tests {
                 "status": 200,
             })
         );
+    }
+
+    #[test]
+    fn correlation_and_trace_fields_use_caddy_names() {
+        let mut entry = AccessLogEntry::new(AccessLogRequest::new("GET", "example.com", "/"));
+        assert_eq!(entry.to_json_value().unwrap().get("uuid"), None);
+        assert_eq!(entry.to_json_value().unwrap().get("traceID"), None);
+        assert_eq!(entry.to_json_value().unwrap().get("spanID"), None);
+
+        let mut request_uuid = RequestUuid::new();
+        assert!(
+            request_uuid.value().is_none(),
+            "no generation before access"
+        );
+        let generated = request_uuid.evaluate().expect("uuid").to_string();
+        request_uuid.apply_to_entry(&mut entry);
+        entry = entry.with_trace_context("4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7");
+
+        let value = entry.to_json_value().unwrap();
+        // Caddy's ExtraLogFields use the zap keys `uuid`, `traceID` and `spanID`.
+        assert_eq!(value["uuid"], generated);
+        assert_eq!(value["traceID"], "4bf92f3577b34da6a3ce929d0e0e4736");
+        assert_eq!(value["spanID"], "00f067aa0ba902b7");
+
+        // Round-trips with the exact field names too.
+        let text = serde_json::to_string(&entry).unwrap();
+        let decoded: AccessLogEntry = serde_json::from_str(&text).unwrap();
+        assert_eq!(decoded.uuid, Some(generated));
+        assert_eq!(
+            decoded.trace_id.as_deref(),
+            Some("4bf92f3577b34da6a3ce929d0e0e4736")
+        );
+        assert_eq!(decoded.span_id.as_deref(), Some("00f067aa0ba902b7"));
+    }
+
+    #[test]
+    fn request_uuid_is_lazy_cached_unique_and_uuid_v4_shaped() {
+        let mut first = RequestUuid::new();
+        assert!(first.value().is_none(), "UUID must be generated lazily");
+        let generated = first.evaluate().expect("uuid").to_string();
+        assert_eq!(
+            first.evaluate(),
+            Some(generated.as_str()),
+            "cached per request"
+        );
+        assert_eq!(first.value(), Some(generated.as_str()));
+
+        // UUIDv4 layout: 36 chars, version nibble `4`, variant nibble in 8..b.
+        assert_eq!(generated.len(), 36, "{generated}");
+        let bytes = generated.as_bytes();
+        assert_eq!(bytes[8], b'-');
+        assert_eq!(bytes[13], b'-');
+        assert_eq!(bytes[18], b'-');
+        assert_eq!(bytes[23], b'-');
+        assert_eq!(bytes[14], b'4', "version 4: {generated}");
+        let variant = generated.as_bytes()[19];
+        assert!(
+            matches!(variant, b'8' | b'9' | b'a' | b'b'),
+            "RFC 4122 variant 10xx: {generated}"
+        );
+
+        let mut second = RequestUuid::new();
+        assert_ne!(second.evaluate(), Some(generated.as_str()));
+    }
+
+    #[test]
+    fn correlation_ids_are_unique_per_request_in_rendered_entries() {
+        let mut seen = std::collections::BTreeSet::new();
+        for index in 0..16 {
+            let mut request_uuid = RequestUuid::new();
+            let mut entry = AccessLogEntry::new(AccessLogRequest::new("GET", "example.com", "/"));
+            request_uuid.apply_to_entry(&mut entry);
+            assert_eq!(entry.uuid, None, "entry before placeholder access");
+            request_uuid.evaluate().expect("uuid");
+            request_uuid.apply_to_entry(&mut entry);
+            let rendered = entry.render_default().unwrap();
+            let uuid = rendered["uuid"]
+                .as_str()
+                .unwrap_or_else(|| panic!("entry {index} has no uuid: {rendered}"));
+            assert!(seen.insert(uuid.to_string()), "duplicate uuid {uuid}");
+        }
+        assert_eq!(seen.len(), 16);
     }
 
     #[test]
