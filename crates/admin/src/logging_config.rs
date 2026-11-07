@@ -257,6 +257,16 @@ impl LoggingConfig {
         Ok(Self { targets })
     }
 
+    /// Validate the logging section of a decoded configuration without opening any sink.
+    ///
+    /// This is the hook the core/CLI configuration validation path should call (it applies the
+    /// same checks and located errors as [`LoggingConfig::from_config`], notably Caddy's
+    /// include/exclude contradiction rules). Keeping it separate lets the validator reject an
+    /// adapted JSON document before any writer is opened.
+    pub fn validate_config(config: &Config) -> Result<(), LoggingConfigError> {
+        Self::from_config(config).map(|_| ())
+    }
+
     /// Map a Caddy `logging` JSON object (the value of the top-level `logging` field).
     pub fn from_json(value: &Value) -> Result<Self, LoggingConfigError> {
         if value.is_null() {
@@ -359,6 +369,15 @@ fn validate_custom_log(name: &str, log: &CustomLog) -> Result<(), LoggingConfigE
     Ok(())
 }
 
+/// Render a name list for located validation messages (backticked, comma-separated).
+fn quote_list(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn validate_logger_filters(
     path: &str,
     include: &[String],
@@ -377,25 +396,34 @@ fn validate_logger_filters(
     if include.is_empty() || exclude.is_empty() {
         return Ok(());
     }
-    // Port of Caddy's `CustomLog.provision` contradiction checks.
-    for allowed in include {
+    // Port of Caddy's `CustomLog.provision` contradiction checks. The located error names the
+    // offending include entry (Caddy's message does not carry a JSON path) and, for the nesting
+    // rule, the whole exclude list so both conflicting rules are visible.
+    for (index, allowed) in include.iter().enumerate() {
         if exclude.contains(allowed) {
             return Err(LoggingConfigError::new(
-                format!("{path}.include"),
-                format!("include and exclude must not intersect, but found `{allowed}` in both"),
+                format!("{path}.include[{index}]"),
+                format!(
+                    "include and exclude must not intersect, but found `{allowed}` in both lists \
+                     (exclude: {})",
+                    quote_list(exclude)
+                ),
             ));
         }
     }
-    for allowed in include {
+    for (index, allowed) in include.iter().enumerate() {
         let nested = exclude.iter().any(|denied| {
             allowed.starts_with(&format!("{denied}.")) || denied.starts_with(&format!("{allowed}."))
         });
         if !nested {
             return Err(LoggingConfigError::new(
-                format!("{path}.include"),
+                format!("{path}.include[{index}]"),
                 format!(
                     "when both include and exclude are populated, each element must be a \
-                     superspace or subspace of one in the other list; check `{allowed}`"
+                     superspace or subspace of one in the other list; check `{allowed}` in \
+                     include against exclude {} (neither list entry is a parent or child \
+                     namespace of it)",
+                    quote_list(exclude)
                 ),
             ));
         }
@@ -2232,6 +2260,94 @@ mod tests {
         }))
         .expect_err("empty filter");
         assert!(empty.path().contains("include[0]"), "{empty}");
+    }
+
+    /// The adapted JSON from Caddy's `caddyfile_adapt/global_options_log_and_site.caddyfiletest`
+    /// (DIV-0053). Caddy's validator rejects it because the `default` log's only include entry
+    /// (`some-log-source`) is not a parent/child namespace of any exclude entry, so it is neither
+    /// a rule nor an exception. caddy-rs's logging mapping rejects it with a located error.
+    const GLOBAL_OPTIONS_LOG_AND_SITE_ADAPTED: &str = r#"{
+        "logging": {
+            "logs": {
+                "custom-logger": {
+                    "writer": {"filename": "caddy.log", "output": "file"},
+                    "level": "WARN",
+                    "include": ["custom-log-source"]
+                },
+                "default": {
+                    "writer": {"filename": "caddy.log", "output": "file"},
+                    "include": ["some-log-source"],
+                    "exclude": ["admin.api", "admin2.api", "custom-log-source", "http.log.access.log0"]
+                },
+                "log0": {
+                    "writer": {"filename": "access.log", "output": "file"},
+                    "encoder": {"format": "json"},
+                    "include": ["http.log.access.log0"]
+                }
+            }
+        },
+        "apps": {
+            "http": {
+                "servers": {
+                    "srv0": {
+                        "listen": [":8884"],
+                        "logs": {"default_logger_name": "log0"}
+                    }
+                }
+            }
+        }
+    }"#;
+
+    #[test]
+    fn adapted_global_options_log_and_site_fixture_is_rejected_like_caddy() {
+        let value: serde_json::Value =
+            serde_json::from_str(GLOBAL_OPTIONS_LOG_AND_SITE_ADAPTED).expect("fixture JSON");
+        let config = Config::from_value(value).expect("core config model decodes the fixture");
+        let error = LoggingConfig::validate_config(&config)
+            .expect_err("Caddy rejects this include/exclude combination");
+        assert_eq!(error.path(), "logging.logs.default.include[0]");
+        assert!(error.message().contains("some-log-source"), "{error}");
+        assert!(
+            error.message().contains("superspace or subspace"),
+            "{error}"
+        );
+        // Both conflicting rule sets are named: the include entry and the exclude list.
+        assert!(error.message().contains("admin.api"), "{error}");
+        assert!(error.message().contains("custom-log-source"), "{error}");
+        assert!(error.message().contains("http.log.access.log0"), "{error}");
+    }
+
+    #[test]
+    fn compatible_include_exclude_nesting_permutations_validate() {
+        // Caddy only requires every include entry to be a parent or child namespace of some
+        // exclude entry; both directions are valid.
+        for (include, exclude) in [
+            (vec!["http"], vec!["http.log"]),
+            (vec!["http.log"], vec!["http"]),
+            (vec!["http.log.access"], vec!["http"]),
+        ] {
+            let value = json!({
+                "logging": {"logs": {"default": {
+                    "include": include,
+                    "exclude": exclude
+                }}}
+            });
+            let config = Config::from_value(value).expect("config decodes");
+            LoggingConfig::validate_config(&config)
+                .unwrap_or_else(|error| panic!("compatible rules rejected: {error}"));
+        }
+
+        // A single unrelated include entry is rejected wherever it appears in the list.
+        let value = json!({
+            "logging": {"logs": {"default": {
+                "include": ["http.log.access", "some-log-source"],
+                "exclude": ["http.log"]
+            }}}
+        });
+        let config = Config::from_value(value).expect("config decodes");
+        let error = LoggingConfig::validate_config(&config).expect_err("unrelated include entry");
+        assert_eq!(error.path(), "logging.logs.default.include[1]");
+        assert!(error.message().contains("some-log-source"), "{error}");
     }
 
     #[test]
