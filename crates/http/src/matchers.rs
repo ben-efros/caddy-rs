@@ -494,12 +494,17 @@ impl FileMatcher {
     /// only; a glob pattern with a trailing separator matches nothing).
     fn candidates(&self, root: &str, request: &Request, pattern: &str) -> Vec<FileCandidate> {
         let expanded = expand_glob_safe(request, pattern);
-        let cleaned = path_clean(&expanded);
-        let (mut before_split, remainder) = first_split(&cleaned, &self.split_path);
-        // Caddy restores the trailing slash from the *original* pattern after cleaning/splitting so
-        // directories can be matched by convention.
-        if pattern.ends_with('/') {
-            before_split.push('/');
+        // Caddy cleans the *expanded* path and restores its trailing slash before splitting and
+        // joining under the root (so `{path}` for `/dir/` still identifies a directory), then
+        // rejects directory candidates whose pattern did not end in `/` (so `/dir/` falls through
+        // to a later `{path}/index.php` entry).
+        let mut cleaned = path_clean(&expanded);
+        if expanded.ends_with('/') && !cleaned.ends_with('/') {
+            cleaned.push('/');
+        }
+        let (before_split, remainder) = first_split(&cleaned, &self.split_path);
+        if before_split != "/" && before_split.ends_with('/') && !pattern.ends_with('/') {
+            return Vec::new();
         }
         let fullpath = sanitized_join(root, &before_split);
         let trailing = fullpath.ends_with('/');
@@ -539,6 +544,28 @@ impl FileMatcher {
             .collect()
     }
 
+    /// Caddy's `makeLiteralCandidate`: the final `first_exist_fallback` entry matches
+    /// unconditionally, even when the file (or glob) does not exist. It does not glob or escape
+    /// placeholder values.
+    fn literal_candidate(&self, root: &str, request: &Request, pattern: &str) -> FileCandidate {
+        let expanded = expand_placeholders_raw(request, pattern);
+        let cleaned = path_clean(&expanded);
+        let (mut before_split, remainder) = first_split(&cleaned, &self.split_path);
+        if pattern.ends_with('/') {
+            before_split.push('/');
+        }
+        let fullpath = sanitized_join(root, &before_split);
+        let relative = fullpath
+            .strip_prefix(root)
+            .map(str::to_string)
+            .unwrap_or_else(|| fullpath.clone());
+        FileCandidate {
+            fullpath,
+            relative,
+            remainder,
+        }
+    }
+
     fn select(&self, request: &Request) -> std::result::Result<Option<SelectedFile>, MatcherError> {
         let root = self.expanded_root(request);
         match self.try_policy {
@@ -550,18 +577,23 @@ impl FileMatcher {
                 };
                 for (index, pattern) in self.try_files.iter().enumerate() {
                     // A `=NNN` candidate is Caddy's error fallback: it aborts route evaluation and
-                    // responds with that status instead of matching a file.
+                    // responds with that status instead of matching a file. Caddy's error message
+                    // is the status digits (`fmt.Errorf("%s", input[1:])`).
                     if let Some(status) = parse_error_code(pattern) {
                         return Err(MatcherError {
                             status,
-                            message: format!("file matcher fallback {pattern}"),
+                            message: pattern[1..].to_string(),
                         });
                     }
-                    for candidate in self.candidates(&root, request, pattern) {
-                        if Some(index) == fallback_index {
-                            // The last candidate that glob produced always matches under
-                            // `first_exist_fallback` (nonexistent literal patterns produce no
-                            // candidates, matching Go's `filepath.Glob`).
+                    let mut candidates = self.candidates(&root, request, pattern);
+                    let is_fallback = Some(index) == fallback_index;
+                    if is_fallback && candidates.is_empty() {
+                        // Caddy's last `first_exist_fallback` entry is a literal fallback that
+                        // matches even when the file is absent.
+                        candidates.push(self.literal_candidate(&root, request, pattern));
+                    }
+                    for candidate in candidates {
+                        if is_fallback {
                             return Ok(Some(SelectedFile {
                                 candidate,
                                 is_dir: false,
@@ -1232,6 +1264,35 @@ fn expand_glob_safe(request: &Request, pattern: &str) -> String {
     output
 }
 
+/// Expand placeholders without escaping glob metacharacters (Caddy's `makeLiteralCandidate`).
+fn expand_placeholders_raw(request: &Request, pattern: &str) -> String {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut output = String::with_capacity(pattern.len());
+    let mut index = 0;
+    while index < chars.len() {
+        let current = chars[index];
+        if current == '\\'
+            && index + 1 < chars.len()
+            && (chars[index + 1] == '{' || chars[index + 1] == '}')
+        {
+            output.push(chars[index + 1]);
+            index += 2;
+            continue;
+        }
+        if current == '{' {
+            if let Some(offset) = chars[index + 1..].iter().position(|c| *c == '}') {
+                let name: String = chars[index + 1..index + 1 + offset].iter().collect();
+                output.push_str(&request.get_placeholder(&name).unwrap_or_default());
+                index += offset + 2;
+                continue;
+            }
+        }
+        output.push(current);
+        index += 1;
+    }
+    output
+}
+
 fn escape_glob_metacharacters(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for character in value.chars() {
@@ -1858,14 +1919,27 @@ mod tests {
             Some("/index.html")
         );
 
-        // A nonexistent literal last candidate yields no glob results (Go's filepath.Glob
-        // returns nothing for a missing literal path), so even the fallback does not match.
+        // Caddy v2.11.9's `makeLiteralCandidate`: the final `first_exist_fallback` entry matches
+        // unconditionally even when its file is absent, so routing still reaches the fallback
+        // handler (for example a rewrite to an SPA index).
         let fallback_missing = file_matcher(serde_json::json!({
             "root": directory.path().to_string_lossy(),
             "try_files": ["/missing.txt", "/also-missing.html"],
             "try_policy": "first_exist_fallback"
         }));
-        assert!(!fallback_missing.matches(&file_request("/anything", directory.path())));
+        let mut request = file_request("/anything", directory.path());
+        assert!(fallback_missing.matches_mut(&mut request));
+        assert_eq!(
+            request
+                .vars
+                .get("matchers.file.relative")
+                .map(String::as_str),
+            Some("/also-missing.html")
+        );
+        assert_eq!(
+            request.vars.get("matchers.file.type").map(String::as_str),
+            Some("file")
+        );
         let first_exist = file_matcher(serde_json::json!({
             "root": directory.path().to_string_lossy(),
             "try_files": ["/missing.txt", "/also-missing.html"]
@@ -1951,13 +2025,14 @@ mod tests {
                 .map(String::as_str),
             Some("/remote.php")
         );
-        // Caddy splits `path.Clean("/remote.php/dav/")`, which drops the trailing slash.
+        // Caddy v2.11.9 restores the trailing slash from the expanded pattern before splitting,
+        // so the remainder preserves it (v2.11.7 dropped it before the split).
         assert_eq!(
             request
                 .vars
                 .get("matchers.file.remainder")
                 .map(String::as_str),
-            Some("/dav")
+            Some("/dav/")
         );
     }
 
@@ -2061,6 +2136,99 @@ mod tests {
         let response = router.handle(request).await.expect("handled");
         assert_eq!(response.status, http::StatusCode::OK);
         assert_eq!(response.body, Bytes::from_static(b"body{}"));
+    }
+
+    #[test]
+    fn file_matcher_placeholder_directory_trailing_slash_falls_through_to_index() {
+        // Caddy v2.11.9 restores the expanded trailing slash, then rejects a directory candidate
+        // when the *pattern* did not end in `/`, so `/sub/` falls through to `{path}/index.html`.
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("sub")).unwrap();
+        std::fs::write(directory.path().join("sub").join("index.html"), b"index").unwrap();
+        let matcher = file_matcher(serde_json::json!({
+            "root": directory.path().to_string_lossy(),
+            "try_files": [
+                "{http.request.uri.path}",
+                "{http.request.uri.path}/index.html"
+            ]
+        }));
+        let mut request = file_request("/sub/", directory.path());
+        assert!(matcher.matches_mut(&mut request));
+        assert_eq!(
+            request
+                .vars
+                .get("matchers.file.relative")
+                .map(String::as_str),
+            Some("/sub/index.html")
+        );
+        // A literal pattern ending in `/` still matches the directory itself.
+        let directory_matcher = file_matcher(serde_json::json!({
+            "root": directory.path().to_string_lossy(),
+            "try_files": ["/sub/"]
+        }));
+        let mut request = file_request("/anything", directory.path());
+        assert!(directory_matcher.matches_mut(&mut request));
+        assert_eq!(
+            request.vars.get("matchers.file.type").map(String::as_str),
+            Some("directory")
+        );
+    }
+
+    #[test]
+    fn file_matcher_glob_fallback_with_missing_entries_uses_literal_candidate() {
+        // The final `first_exist_fallback` entry is literal (no glob expansion), matching Caddy's
+        // `makeLiteralCandidate`; placeholders in it are not glob-escaped.
+        let directory = tempfile::tempdir().unwrap();
+        let matcher = file_matcher(serde_json::json!({
+            "root": directory.path().to_string_lossy(),
+            "try_files": ["/missing-*.txt", "/fallback/{http.request.uri.path}"],
+            "try_policy": "first_exist_fallback"
+        }));
+        let mut request = file_request("/spa", directory.path());
+        assert!(matcher.matches_mut(&mut request));
+        assert_eq!(
+            request
+                .vars
+                .get("matchers.file.relative")
+                .map(String::as_str),
+            Some("/fallback/spa")
+        );
+    }
+
+    #[tokio::test]
+    async fn file_matcher_error_code_reaches_error_routes_with_caddy_message() {
+        use crate::router::RouterBuilder;
+        use http::Method;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_string_lossy().to_string();
+        let error_routes = serde_json::json!({
+            "routes": [{
+                "handle": [{
+                    "handler": "static_response",
+                    "status_code": 404,
+                    "body": "status={http.error.status_code} message={http.error.message}"
+                }]
+            }]
+        });
+        let router = RouterBuilder::new()
+            .with_error_routes(Some(&error_routes), "errors")
+            .expect("error routes build")
+            .build(&[serde_json::json!({
+                "match": [{"file": {"root": root, "try_files": ["=404"]}}],
+                "handle": [{"handler": "static_response", "body": "should not run"}]
+            })])
+            .expect("router builds");
+        let mut request = Request::new(Method::GET, "/anything".parse().unwrap());
+        request
+            .headers
+            .insert(http::header::HOST, "example.com".parse().unwrap());
+        let response = router.handle(request).await.expect("handled");
+        assert_eq!(response.status, http::StatusCode::NOT_FOUND);
+        assert_eq!(
+            String::from_utf8_lossy(&response.body),
+            "status=404 message=404"
+        );
     }
 
     fn glob_fixture() -> tempfile::TempDir {
@@ -2238,6 +2406,10 @@ mod tests {
             .take_matcher_error()
             .expect("=404 records a matcher error");
         assert_eq!(error.status, http::StatusCode::NOT_FOUND);
+        assert_eq!(
+            error.message, "404",
+            "Caddy's matcher error message is the status digits (fmt.Errorf(\"%s\", input[1:]))"
+        );
 
         // `=1000` is not a valid status-code fallback; it is an ordinary literal candidate.
         let literal = file_matcher(serde_json::json!({
