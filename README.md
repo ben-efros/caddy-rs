@@ -11,10 +11,21 @@ Caddy, or fails at load with an error naming the construct.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 ![Baseline](https://img.shields.io/badge/Caddy%20baseline-v2.11.9-informational)
+[![ci](https://github.com/ben-efros/caddy-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/ben-efros/caddy-rs/actions/workflows/ci.yml)
+[![security](https://github.com/ben-efros/caddy-rs/actions/workflows/security.yml/badge.svg)](https://github.com/ben-efros/caddy-rs/actions/workflows/security.yml)
+[![MSRV](https://img.shields.io/badge/rust-1.98.1-informational)](rust-toolchain.toml)
+[![status](https://img.shields.io/badge/status-trial%20release-orange)](docs/REVIEW-PROCESS.md)
 
 </div>
 
 ---
+
+## Project status
+
+This is a **trial release**: suitable for single-node pilots and internal deployments, with the
+limitations listed in the release notes of the program repository. Pull requests are reviewed under
+[`docs/REVIEW-PROCESS.md`](docs/REVIEW-PROCESS.md); vulnerabilities go through
+[`SECURITY.md`](SECURITY.md), never a public issue.
 
 ## What this is
 

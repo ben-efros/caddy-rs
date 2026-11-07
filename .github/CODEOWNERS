@@ -1,0 +1,10 @@
+# Every change needs a maintainer review; security-sensitive paths need it explicitly.
+*                       @ben-efros
+
+# Trust boundaries and secret handling: review by a maintainer who is not the author.
+/crates/tls/            @ben-efros
+/crates/admin/src/trust.rs  @ben-efros
+/crates/admin/src/origin.rs @ben-efros
+/crates/plug/           @ben-efros
+/.github/workflows/     @ben-efros
+/SECURITY.md            @ben-efros

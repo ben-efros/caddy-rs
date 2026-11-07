@@ -1,0 +1,24 @@
+name: Feature request
+description: Ask for a Caddy feature that is missing or only partially supported.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: feature
+    attributes:
+      label: What should work
+      description: The directive, handler or behaviour, with a small example.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: caddy
+    attributes:
+      label: How Caddy behaves
+      description: Expected JSON/behaviour, ideally from `caddy adapt` on a real Caddy build.
+  - type: checkboxes
+    id: contract
+    attributes:
+      label: Compatibility contract
+      options:
+        - label: I understand unsupported configuration fails loudly rather than being approximated
+          required: true

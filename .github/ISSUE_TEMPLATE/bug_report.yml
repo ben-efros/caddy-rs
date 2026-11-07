@@ -1,0 +1,40 @@
+name: Bug report
+description: Something behaves differently than documented, or the server misbehaves.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please do not report security vulnerabilities here — see [SECURITY.md](../../SECURITY.md).
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: Include the exact error, log line, or status code.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      description: If this is Caddy parity, say what Caddy does and, if you can, paste the Caddy version.
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Minimal configuration
+      description: The smallest Caddyfile or JSON that reproduces it. Remove hostnames and secrets.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `caddy-rs version`.
+    validations:
+      required: true
+  - type: dropdown
+    id: profile
+    attributes:
+      label: Build profile
+      options: ["standard (default)", "minimal", "custom features", "not sure"]

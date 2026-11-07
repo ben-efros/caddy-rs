@@ -1,0 +1,7 @@
+# Normalise line endings in text files, keep test fixtures byte-exact.
+* text=auto eol=lf
+*.pem text eol=lf
+*.der binary
+*.webp binary
+*.png binary
+Cargo.lock text eol=lf linguist-generated
