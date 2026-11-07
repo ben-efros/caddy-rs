@@ -814,6 +814,7 @@ async fn serve_h3_connection(
                             Some("h3"),
                             Arc::clone(&context.trusted_proxies),
                             None,
+                            request_tls_connection(Some(&tls_info)),
                         )
                         .await;
                         let hyper_response = match served {
@@ -939,6 +940,12 @@ fn h3_tls_info(connection: &quinn::Connection) -> TlsLogInfo {
         server_name,
         ech: false,
     }
+}
+
+/// Typed TLS session metadata for the internal request (Caddy's `r.TLS` version/cipher fields).
+fn request_tls_connection(tls_info: Option<&TlsLogInfo>) -> Option<caddy_rs_http::TlsConnection> {
+    let info = tls_info?;
+    caddy_rs_http::TlsConnection::from_iana(info.version, info.cipher_suite)
 }
 
 /// State captured for one accepted connection.
@@ -1510,6 +1517,7 @@ async fn serve_one_request(
         on_upgrade,
         Arc::clone(&context.trusted_proxies),
         context.client_certificate.clone(),
+        request_tls_connection(context.tls_info.as_ref()),
     )
     .await;
 
