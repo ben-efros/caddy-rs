@@ -500,3 +500,592 @@ mod tests {
         assert!(error.to_string().contains("malformed"), "{error}");
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Client-authentication CA pool sources (`tls.ca_pool.source.*`, T-TLS-079)
+// ---------------------------------------------------------------------------------------------
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+use crate::Error;
+
+/// External material needed to load a configured CA pool source.
+///
+/// Caddy's pool source modules are provisioned with the running app context; caddy-rs keeps the
+/// loading logic in this module (per the T-TLS-079 scope) and takes the available context
+/// explicitly so the `tls_server` connection-policy parser can delegate to it without owning the
+/// PKI/storage/http plumbing:
+///
+/// * `pki_authorities`: configured `apps.pki` CA id → authority directory (the directory holding
+///   `root.crt`/`intermediate.crt`, caddy-rs's data-directory layout).
+/// * `storage_root`: root of the configured `file_system` storage (Caddy's default storage), used
+///   to resolve `storage.pem_keys`.
+/// * `system_roots`: platform roots override for tests/embedders; `None` loads the real platform
+///   bundle via the ACME transport's bundle discovery.
+/// * `http_timeout`: timeout for each `http` source URL.
+#[derive(Debug, Clone, Default)]
+pub struct CaPoolContext {
+    /// Configured `apps.pki` CA id → authority directory (`pki/authorities/<id>`).
+    pub pki_authorities: BTreeMap<String, PathBuf>,
+    /// Root directory of the `file_system` storage backend used for `storage` pool sources.
+    pub storage_root: Option<PathBuf>,
+    /// Platform roots override; `None` loads the host CA bundle.
+    pub system_roots: Option<Vec<CertificateDer<'static>>>,
+    /// Per-URL timeout for `http` pool sources.
+    pub http_timeout: Duration,
+}
+
+impl CaPoolContext {
+    /// Default HTTP timeout (10s), matching Caddy's HTTP client timeout.
+    pub fn new() -> Self {
+        Self {
+            http_timeout: Duration::from_secs(10),
+            ..Self::default()
+        }
+    }
+}
+
+/// Load one `tls.ca_pool.source.*` provider value (Caddy `modules/caddytls/capools.go`).
+///
+/// Supports `inline`, `file`, `system`, `pki_root`, `pki_intermediate`, `storage` (file_system
+/// storage), `http` (`http://` endpoints; https needs an HTTP client hook) and `combined`.
+/// Unknown providers and missing material are located errors; nothing silently falls back.
+pub fn load_ca_pool_source(
+    value: &serde_json::Value,
+    path: &str,
+    context: &CaPoolContext,
+) -> Result<Vec<CertificateDer<'static>>, Error> {
+    let object = value.as_object().ok_or_else(|| Error::TlsConfig {
+        path: path.to_string(),
+        message: "CA pool source must be an object".to_string(),
+    })?;
+    let provider = object
+        .get("provider")
+        .or_else(|| object.get("module"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| Error::TlsConfig {
+            path: path.to_string(),
+            message: "CA pool source must name a `provider`".to_string(),
+        })?;
+    let provider = provider
+        .strip_prefix("tls.ca_pool.source.")
+        .unwrap_or(provider);
+    let field_path = |name: &str| format!("{path}.{name}");
+    let strings = |field: &str| -> Result<Vec<String>, Error> {
+        match object.get(field) {
+            None => Ok(Vec::new()),
+            Some(serde_json::Value::Array(items)) => {
+                let mut values = Vec::with_capacity(items.len());
+                for (index, item) in items.iter().enumerate() {
+                    let value = item.as_str().ok_or_else(|| Error::TlsConfig {
+                        path: format!("{}.{field}[{index}]", path),
+                        message: "must be a string".to_string(),
+                    })?;
+                    values.push(value.to_string());
+                }
+                Ok(values)
+            }
+            Some(serde_json::Value::String(value)) => Ok(vec![value.clone()]),
+            Some(_) => Err(Error::TlsConfig {
+                path: field_path(field),
+                message: "must be an array of strings".to_string(),
+            }),
+        }
+    };
+    match provider {
+        "inline" => {
+            let mut certificates = Vec::new();
+            for key in ["trusted_ca_certs", "trusted_ca_pool"] {
+                if let Some(values) = object.get(key) {
+                    certificates.extend(parse_base64_der_certificates(
+                        values,
+                        &field_path(key),
+                    )?);
+                }
+            }
+            if certificates.is_empty() {
+                return Err(Error::TlsConfig {
+                    path: path.to_string(),
+                    message: "inline CA pool source requires `trusted_ca_certs`".to_string(),
+                });
+            }
+            Ok(certificates)
+        }
+        "file" => {
+            let mut paths = Vec::new();
+            for key in [
+                "pem_files",
+                "trusted_ca_pem_files",
+                "trusted_ca_certs_pem_files",
+            ] {
+                let values = strings(key)?;
+                if !values.is_empty() {
+                    paths.extend(values);
+                }
+            }
+            if paths.is_empty() {
+                return Err(Error::TlsConfig {
+                    path: path.to_string(),
+                    message: "file CA pool source requires `pem_files`".to_string(),
+                });
+            }
+            let mut certificates = Vec::new();
+            for file in paths {
+                let pem = std::fs::read_to_string(&file).map_err(|error| Error::TlsConfig {
+                    path: path.to_string(),
+                    message: format!("reading CA pool PEM file `{file}`: {error}"),
+                })?;
+                certificates.extend(crate::tls_server::certificates_from_pem(&pem).map_err(
+                    |error| Error::TlsConfig {
+                        path: path.to_string(),
+                        message: format!("parsing CA pool PEM file `{file}`: {error}"),
+                    },
+                )?);
+            }
+            Ok(certificates)
+        }
+        "system" => match &context.system_roots {
+            Some(roots) if !roots.is_empty() => Ok(roots.clone()),
+            Some(_) => Err(Error::TlsConfig {
+                path: path.to_string(),
+                message: "system CA pool has no roots".to_string(),
+            }),
+            None => crate::acme::transport::load_system_root_certificates().map_err(|error| {
+                Error::TlsConfig {
+                    path: path.to_string(),
+                    message: format!("loading system CA pool: {error}"),
+                }
+            }),
+        },
+        "pki_root" | "pki_intermediate" => {
+            let authorities = strings("authority")?;
+            if authorities.is_empty() {
+                return Err(Error::TlsConfig {
+                    path: path.to_string(),
+                    message: format!("{provider} CA pool source requires `authority`"),
+                });
+            }
+            let mut certificates = Vec::new();
+            for authority in authorities {
+                let directory =
+                    context
+                        .pki_authorities
+                        .get(&authority)
+                        .ok_or_else(|| Error::TlsConfig {
+                            path: field_path("authority"),
+                            message: format!(
+                                "PKI authority `{authority}` is not configured in apps.pki"
+                            ),
+                        })?;
+                let file = if provider == "pki_root" {
+                    "root.crt"
+                } else {
+                    "intermediate.crt"
+                };
+                let pem_path = directory.join(file);
+                let pem = std::fs::read_to_string(&pem_path).map_err(|error| {
+                    Error::TlsConfig {
+                        path: path.to_string(),
+                        message: format!(
+                            "reading {provider} certificate for authority `{authority}` from `{}`: {error}",
+                            pem_path.display()
+                        ),
+                    }
+                })?;
+                certificates.extend(crate::tls_server::certificates_from_pem(&pem).map_err(
+                    |error| Error::TlsConfig {
+                        path: path.to_string(),
+                        message: format!(
+                            "parsing {provider} certificate for authority `{authority}`: {error}"
+                        ),
+                    },
+                )?);
+            }
+            Ok(certificates)
+        }
+        "storage" => {
+            let keys = strings("pem_keys")?;
+            if keys.is_empty() {
+                return Err(Error::TlsConfig {
+                    path: path.to_string(),
+                    message: "storage CA pool source requires `pem_keys`".to_string(),
+                });
+            }
+            let root = context.storage_root.as_ref().ok_or_else(|| Error::Unsupported {
+                path: path.to_string(),
+                feature: "storage CA pool source without a configured file_system storage root"
+                    .to_string(),
+                tracking_id: "T-TLS-079",
+            })?;
+            let mut certificates = Vec::new();
+            for key in keys {
+                let file = root.join(&key);
+                let pem = std::fs::read_to_string(&file).map_err(|error| Error::TlsConfig {
+                    path: field_path("pem_keys"),
+                    message: format!("reading storage PEM key `{key}` from `{}`: {error}", file.display()),
+                })?;
+                certificates.extend(crate::tls_server::certificates_from_pem(&pem).map_err(
+                    |error| Error::TlsConfig {
+                        path: field_path("pem_keys"),
+                        message: format!("parsing storage PEM key `{key}`: {error}"),
+                    },
+                )?);
+            }
+            Ok(certificates)
+        }
+        "http" => {
+            let endpoints = strings("endpoints")?;
+            if endpoints.is_empty() {
+                return Err(Error::TlsConfig {
+                    path: path.to_string(),
+                    message: "http CA pool source requires `endpoints`".to_string(),
+                });
+            }
+            let mut certificates = Vec::new();
+            for endpoint in endpoints {
+                if !endpoint.starts_with("http://") {
+                    return Err(Error::Unsupported {
+                        path: field_path("endpoints"),
+                        feature: format!(
+                            "https CA pool endpoint `{endpoint}` (an HTTP client hook is needed; only http:// endpoints are loaded in-process)"
+                        ),
+                        tracking_id: "T-TLS-079",
+                    });
+                }
+                let body = http_get(&endpoint, context.http_timeout)?;
+                certificates.extend(crate::tls_server::certificates_from_pem(&body).map_err(
+                    |error| Error::TlsConfig {
+                        path: field_path("endpoints"),
+                        message: format!("parsing CA pool PEM from `{endpoint}`: {error}"),
+                    },
+                )?);
+            }
+            Ok(certificates)
+        }
+        "combined" => {
+            let sources = object
+                .get("sources")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| Error::TlsConfig {
+                    path: path.to_string(),
+                    message: "combined CA pool source requires a non-empty `sources` array"
+                        .to_string(),
+                })?;
+            if sources.is_empty() {
+                return Err(Error::TlsConfig {
+                    path: path.to_string(),
+                    message: "no sources specified for combined CA pool".to_string(),
+                });
+            }
+            let mut certificates = Vec::new();
+            for (index, source) in sources.iter().enumerate() {
+                let source_path = format!("{}.sources[{index}]", path);
+                // Caddy's SystemCAPool does not implement CertificateProvider, so it cannot be a
+                // `combined` source; reject it with a located error instead of silently merging.
+                if source
+                    .get("provider")
+                    .or_else(|| source.get("module"))
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|provider| provider.trim_end_matches('.').ends_with("system")) {
+                    return Err(Error::Unsupported {
+                        path: source_path,
+                        feature: "system CA pool source inside `combined` (Caddy's SystemCAPool cannot provide its certificate list)"
+                            .to_string(),
+                        tracking_id: "T-TLS-079",
+                    });
+                }
+                certificates.extend(load_ca_pool_source(source, &source_path, context)?);
+            }
+            Ok(certificates)
+        }
+        other => Err(Error::Unsupported {
+            path: path.to_string(),
+            feature: format!(
+                "client authentication CA pool provider `{other}` (supported: inline, file, system, pki_root, pki_intermediate, storage, http, combined)"
+            ),
+            tracking_id: "T-TLS-079",
+        }),
+    }
+}
+
+fn parse_base64_der_certificates(
+    value: &serde_json::Value,
+    path: &str,
+) -> Result<Vec<CertificateDer<'static>>, Error> {
+    use base64::Engine as _;
+    let values: Vec<&serde_json::Value> = match value {
+        serde_json::Value::Array(items) => items.iter().collect(),
+        serde_json::Value::String(_) => vec![value],
+        _ => {
+            return Err(Error::TlsConfig {
+                path: path.to_string(),
+                message: "must be an array of base64 DER certificates".to_string(),
+            })
+        }
+    };
+    let mut certificates = Vec::with_capacity(values.len());
+    for (index, item) in values.iter().enumerate() {
+        let encoded = item.as_str().ok_or_else(|| Error::TlsConfig {
+            path: format!("{path}[{index}]"),
+            message: "certificate must be a base64 DER string".to_string(),
+        })?;
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|error| Error::TlsConfig {
+                path: format!("{path}[{index}]"),
+                message: format!("invalid base64 DER certificate: {error}"),
+            })?;
+        if der.is_empty() {
+            return Err(Error::TlsConfig {
+                path: format!("{path}[{index}]"),
+                message: "certificate is empty".to_string(),
+            });
+        }
+        certificates.push(CertificateDer::from(der));
+    }
+    Ok(certificates)
+}
+
+/// Minimal blocking `http://` GET used for `tls.ca_pool.source.http` (Caddy supports https too;
+/// caddy-rs reports the HTTP-client hook for those rather than silently skipping them).
+fn http_get(url: &str, timeout: Duration) -> Result<String, Error> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or_else(|| Error::TlsConfig {
+            path: "tls.ca_pool.source.http.endpoints".to_string(),
+            message: format!("unsupported CA pool URL `{url}`"),
+        })?;
+    let (authority, target) = match rest.split_once('/') {
+        Some((authority, path)) => (authority, format!("/{path}")),
+        None => (rest, "/".to_string()),
+    };
+    let mut stream = TcpStream::connect(authority).map_err(|error| Error::TlsConfig {
+        path: "tls.ca_pool.source.http.endpoints".to_string(),
+        message: format!("connecting to CA pool URL `{url}`: {error}"),
+    })?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|error| Error::TlsConfig {
+            path: "tls.ca_pool.source.http.endpoints".to_string(),
+            message: format!("setting timeout for CA pool URL `{url}`: {error}"),
+        })?;
+    let request =
+        format!("GET {target} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| Error::TlsConfig {
+            path: "tls.ca_pool.source.http.endpoints".to_string(),
+            message: format!("requesting CA pool URL `{url}`: {error}"),
+        })?;
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .map_err(|error| Error::TlsConfig {
+            path: "tls.ca_pool.source.http.endpoints".to_string(),
+            message: format!("reading CA pool URL `{url}`: {error}"),
+        })?;
+    let text = String::from_utf8_lossy(&response);
+    let (head, body) = text
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| Error::TlsConfig {
+            path: "tls.ca_pool.source.http.endpoints".to_string(),
+            message: format!("malformed HTTP response from CA pool URL `{url}`"),
+        })?;
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or(0);
+    if status != 200 {
+        return Err(Error::TlsConfig {
+            path: "tls.ca_pool.source.http.endpoints".to_string(),
+            message: format!("CA pool URL `{url}` returned HTTP {status}"),
+        });
+    }
+    Ok(body.to_string())
+}
+
+#[cfg(test)]
+mod ca_pool_tests {
+    use super::*;
+    use base64::Engine as _;
+    use serde_json::json;
+    use std::io::{Read, Write};
+
+    const CERT: &str = include_str!("../testdata/https/example.com.pem");
+    const OTHER: &str = include_str!("../testdata/https/other.example.pem");
+
+    fn certs(pem: &str) -> Vec<CertificateDer<'static>> {
+        crate::tls_server::certificates_from_pem(pem).expect("fixture parses")
+    }
+
+    fn default_context() -> CaPoolContext {
+        CaPoolContext::new()
+    }
+
+    #[test]
+    fn loads_inline_and_file_sources() {
+        let inline = json!({"provider": "inline", "trusted_ca_certs": [base64::engine::general_purpose::STANDARD.encode(certs(CERT)[0].as_ref())]});
+        assert_eq!(
+            load_ca_pool_source(&inline, "ca", &default_context())
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ca.pem");
+        std::fs::write(&file, CERT).unwrap();
+        let file_source = json!({"provider": "file", "pem_files": [file]});
+        assert_eq!(
+            load_ca_pool_source(&file_source, "ca", &default_context())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn loads_system_roots_from_injected_or_platform_bundle() {
+        let mut context = default_context();
+        context.system_roots = Some(certs(CERT));
+        assert_eq!(
+            load_ca_pool_source(&json!({"provider": "system"}), "ca", &context)
+                .unwrap()
+                .len(),
+            1
+        );
+        // The real platform bundle is used when no override is supplied; it must either load
+        // roots or produce a located error, never silently return an empty pool.
+        match load_ca_pool_source(&json!({"provider": "system"}), "ca", &default_context()) {
+            Ok(roots) => assert!(!roots.is_empty()),
+            Err(Error::TlsConfig { .. }) => {}
+            Err(other) => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn loads_pki_root_and_intermediate_from_authority_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("local");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(local.join("root.crt"), CERT).unwrap();
+        std::fs::write(local.join("intermediate.crt"), OTHER).unwrap();
+        let mut context = default_context();
+        context.pki_authorities.insert("local".to_string(), local);
+
+        let root = load_ca_pool_source(
+            &json!({"provider": "pki_root", "authority": ["local"]}),
+            "ca",
+            &context,
+        )
+        .unwrap();
+        assert_eq!(root, certs(CERT));
+        let intermediate = load_ca_pool_source(
+            &json!({"provider": "pki_intermediate", "authority": ["local"]}),
+            "ca",
+            &context,
+        )
+        .unwrap();
+        assert_eq!(intermediate, certs(OTHER));
+
+        let missing = load_ca_pool_source(
+            &json!({"provider": "pki_root", "authority": ["nope"]}),
+            "ca",
+            &context,
+        )
+        .unwrap_err();
+        assert!(
+            missing.to_string().contains("not configured in apps.pki"),
+            "{missing}"
+        );
+    }
+
+    #[test]
+    fn loads_storage_backed_and_combined_sources_and_rejects_system_in_combined() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ca.pem"), CERT).unwrap();
+        let mut context = default_context();
+        context.storage_root = Some(dir.path().to_path_buf());
+        let storage = json!({"provider": "storage", "pem_keys": ["ca.pem"]});
+        assert_eq!(
+            load_ca_pool_source(&storage, "ca", &context).unwrap().len(),
+            1
+        );
+
+        let inline = json!({"provider": "inline", "trusted_ca_certs": [base64::engine::general_purpose::STANDARD.encode(certs(OTHER)[0].as_ref())]});
+        let combined = json!({"provider": "combined", "sources": [inline, storage]});
+        assert_eq!(
+            load_ca_pool_source(&combined, "ca", &context)
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let system_combined =
+            json!({"provider": "combined", "sources": [{"provider": "system"}, inline]});
+        let error = load_ca_pool_source(&system_combined, "ca", &context).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot provide its certificate list"),
+            "{error}"
+        );
+
+        let missing_key = load_ca_pool_source(
+            &json!({"provider": "storage", "pem_keys": ["missing.pem"]}),
+            "ca",
+            &context,
+        )
+        .unwrap_err();
+        assert!(
+            missing_key.to_string().contains("missing.pem"),
+            "{missing_key}"
+        );
+    }
+
+    #[test]
+    fn loads_http_backed_pem_and_rejects_https_and_unknown_providers() {
+        // Local plain-HTTP test server (one request, direct PEM response).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0u8; 1024];
+            let _ = stream.read(&mut buffer);
+            let body = CERT.as_bytes();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(body).unwrap();
+        });
+        let source = json!({"provider": "http", "endpoints": [format!("http://{address}/ca.pem")]});
+        assert_eq!(
+            load_ca_pool_source(&source, "ca", &default_context())
+                .unwrap()
+                .len(),
+            1
+        );
+        server.join().unwrap();
+
+        let https = json!({"provider": "http", "endpoints": ["https://example.com/ca.pem"]});
+        let error = load_ca_pool_source(&https, "ca", &default_context()).unwrap_err();
+        assert!(error.to_string().contains("HTTP client hook"), "{error}");
+
+        let unknown = json!({"provider": "vault"});
+        let error = load_ca_pool_source(&unknown, "ca", &default_context()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("supported: inline, file, system"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("T-TLS-079"), "{error}");
+    }
+}
