@@ -1469,7 +1469,7 @@ async fn serve_one_request(
             0,
             &headers,
         );
-        return Ok(error_response());
+        return Ok(with_alt_svc(error_response(), context.alt_svc.as_ref()));
     };
 
     // Cleartext HTTP/2 upgrade (RFC 7540 §3.2): answer with 101 + Upgrade headers and serve
@@ -1499,6 +1499,7 @@ async fn serve_one_request(
                 error_response()
             });
         *response.headers_mut() = caddy_rs_http::h2c_upgrade_headers();
+        let response = with_alt_svc(response, context.alt_svc.as_ref());
         observe_request(
             &context.recorder,
             &context.access_log,
@@ -2041,6 +2042,23 @@ impl<I: AsyncWrite + Unpin> AsyncWrite for TimedIo<I> {
         let result = Pin::new(&mut this.inner).poll_shutdown(cx);
         apply_io_timeout(&mut this.write_timer, this.write_timeout, cx, result)
     }
+}
+
+/// Add the server's HTTP/3 advertisement to a response, like Caddy inserting Alt-Svc at the top of
+/// `ServeHTTP` so *every* HTTP/1.1/HTTP/2 response carries it — including the h2c upgrade `101`
+/// and the missing-router `503` that never reach the normal response path.
+fn with_alt_svc(
+    mut response: hyper::Response<Body>,
+    alt_svc: Option<&String>,
+) -> hyper::Response<Body> {
+    if let Some(alt_svc) = alt_svc {
+        if let Ok(value) = http::HeaderValue::from_str(alt_svc) {
+            if !response.headers().contains_key(http::header::ALT_SVC) {
+                response.headers_mut().insert(http::header::ALT_SVC, value);
+            }
+        }
+    }
+    response
 }
 
 fn error_response() -> hyper::Response<Body> {
