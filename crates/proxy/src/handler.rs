@@ -47,7 +47,10 @@ use caddy_rs_http::{
 };
 
 use crate::balancer::{self, Balancer};
-use crate::client::{build_upstream_client, build_upstream_client_for, UpstreamClient};
+use crate::client::{
+    build_upstream_client_for, build_upstream_client_with_proxy_protocol, proxy_protocol_authority,
+    ProxyProtocolVersion, UpstreamClient,
+};
 use crate::fastcgi::{FastCgiError, FastCgiTransport};
 use crate::forward_auth::{HandleResponse, HandleResponseResult, RequestRewrite};
 use crate::health::{HealthCheck, HealthCheckScheduler};
@@ -500,6 +503,20 @@ impl ReverseProxyHandler {
                 tracking_id: "PROXY-DYNAMIC-UPSTREAM-HEALTH",
             });
         }
+        if transport.proxy_protocol.is_some()
+            && upstreams.iter().any(|upstream| {
+                matches!(
+                    upstream.transport(),
+                    Some(crate::upstream::Transport::Unix { .. })
+                )
+            })
+        {
+            return Err(invalid(
+                &format!("{path}.transport.proxy_protocol"),
+                "PROXY protocol is not supported for Unix-socket upstreams (Caddy writes the \
+                 header over the socket; caddy-rs rejects the combination loudly)",
+            ));
+        }
         if transport.fastcgi.is_some() && health_check.is_some() {
             return Err(HttpError::NotImplemented {
                 feature:
@@ -628,6 +645,7 @@ impl ReverseProxyHandler {
             }));
         }
         let mut headers = self.outbound_headers(request, upstream)?;
+        let proxy_source = self.proxy_protocol_source(request)?;
         let url = if self.upstream_h2_capable(upstream) {
             // HTTP/2 `:authority` parity with Caddy/Go: use the original request Host (or a
             // header_up Host override) as the URI authority; the bound per-upstream connector
@@ -640,9 +658,38 @@ impl ReverseProxyHandler {
                 .unwrap_or_else(|| upstream.fallback_host().to_string());
             headers.remove(http::header::HOST);
             let scheme = if upstream.tls { "https" } else { "http" };
-            format!("{scheme}://{host}{path_and_query}")
+            match proxy_source {
+                // Caddy encodes `clientAddrPort->reqHost` into the URL host so HTTP/2 pools
+                // connections per client (`httptransport.go`/`reverseProxy`).
+                Some(source) => {
+                    format!(
+                        "{scheme}://{}{path_and_query}",
+                        proxy_protocol_authority(source, &host)
+                    )
+                }
+                None => format!("{scheme}://{host}{path_and_query}"),
+            }
         } else {
-            upstream.url(&path_and_query)
+            let base = upstream.url(&path_and_query);
+            match proxy_source {
+                Some(source) => {
+                    // Carry the client address in the authority; the fixed connector dials its
+                    // bound target regardless and writes the header from the marker.
+                    let uri: http::Uri = base.parse().map_err(|error: http::uri::InvalidUri| {
+                        ProxyError::Request(format!("invalid upstream URL `{base}`: {error}"))
+                    })?;
+                    let dial_authority = uri
+                        .authority()
+                        .map(|authority| authority.as_str())
+                        .unwrap_or_default();
+                    format!(
+                        "{}://{}{path_and_query}",
+                        uri.scheme_str().unwrap_or("http"),
+                        proxy_protocol_authority(source, dial_authority)
+                    )
+                }
+                None => base,
+            }
         };
 
         let mut outbound = hyper::Request::builder()
@@ -833,13 +880,19 @@ impl ReverseProxyHandler {
             None
         };
         let build = |http1_only: bool| {
-            build_upstream_client_for(transport, tls.clone(), self.transport.h2c, http1_only)
-                .map_err(|message| {
-                    ProxyError::Request(format!(
-                        "upstream `{}`: cannot build client for expanded dial `{expanded}`: {message}",
-                        resolved.dial
-                    ))
-                })
+            build_upstream_client_for(
+                transport,
+                tls.clone(),
+                self.transport.h2c,
+                http1_only,
+                self.transport.proxy_protocol,
+            )
+            .map_err(|message| {
+                ProxyError::Request(format!(
+                    "upstream `{}`: cannot build client for expanded dial `{expanded}`: {message}",
+                    resolved.dial
+                ))
+            })
         };
         let main = build(false)?;
         let upgrade = if self.transport.alpn_h2 || self.transport.h2c {
@@ -885,6 +938,35 @@ impl ReverseProxyHandler {
     }
 
     /// Build the headers sent to the upstream, following Caddy's `prepareRequest`.
+    /// The PROXY-protocol source address for this request, if `transport.proxy_protocol` is set.
+    ///
+    /// Caddy uses the resolved `client_ip` request variable (trusted-proxy aware, IP without a
+    /// port) and falls back to parsing `RemoteAddr`; a request with no usable client address is a
+    /// located per-request error, matching Caddy's dial-time "failed to get proxy protocol info
+    /// from context".
+    fn proxy_protocol_source(
+        &self,
+        request: &Request,
+    ) -> Result<Option<std::net::IpAddr>, ProxyError> {
+        if self.transport.proxy_protocol.is_none() {
+            return Ok(None);
+        }
+        if let Some(value) = request.vars.get("client_ip") {
+            if let Ok(address) = value.parse::<std::net::IpAddr>() {
+                return Ok(Some(address));
+            }
+            if let Ok(address) = value.parse::<std::net::SocketAddr>() {
+                return Ok(Some(address.ip()));
+            }
+        }
+        if let Some(remote) = request.remote_addr {
+            return Ok(Some(remote.ip()));
+        }
+        Err(ProxyError::Request(
+            "failed to get proxy protocol info from request context".to_string(),
+        ))
+    }
+
     fn outbound_headers(
         &self,
         request: &Request,
@@ -1926,6 +2008,8 @@ struct TransportConfig {
     alpn_h2: bool,
     /// FastCGI transport configuration when `protocol` is `"fastcgi"`.
     fastcgi: Option<Arc<FastCgiTransport>>,
+    /// Send a PROXY protocol header (`v1`/`v2`) on new upstream connections.
+    proxy_protocol: Option<ProxyProtocolVersion>,
 }
 
 /// TCP port of a `host:port` dial, if any (Unix-socket dials have no port).
@@ -1956,11 +2040,12 @@ fn build_upstream_clients(
             if upstream.is_dynamic() {
                 return Ok(None);
             }
-            build_upstream_client(
+            build_upstream_client_with_proxy_protocol(
                 upstream,
                 upstream_tls(upstream, transport),
                 transport.h2c,
                 false,
+                transport.proxy_protocol,
             )
             .map(Some)
             .map_err(|message| invalid(&format!("{path}.transport"), message))
@@ -1990,11 +2075,12 @@ fn build_upgrade_clients(
             if upstream.is_dynamic() {
                 return Ok(None);
             }
-            build_upstream_client(
+            build_upstream_client_with_proxy_protocol(
                 upstream,
                 upstream_tls(upstream, transport),
                 transport.h2c,
                 true,
+                transport.proxy_protocol,
             )
             .map(Some)
             .map_err(|message| invalid(&format!("{path}.transport"), message))
@@ -2028,6 +2114,12 @@ fn parse_transport(value: Option<&Value>, path: &str) -> HttpResult<TransportCon
         .and_then(Value::as_str)
         .unwrap_or("http");
     if protocol == "fastcgi" {
+        if object.get("proxy_protocol").is_some() {
+            return Err(invalid(
+                &format!("{transport_path}.proxy_protocol"),
+                "`proxy_protocol` is only supported for the HTTP transport, not FastCGI",
+            ));
+        }
         // Caddy's FastCGI transport has its own module shape; `from_json` rejects any HTTP
         // transport field (`tls`, `versions`, ...) instead of silently ignoring it.
         let fastcgi = FastCgiTransport::from_json(value, &transport_path)?;
@@ -2143,11 +2235,6 @@ fn parse_transport(value: Option<&Value>, path: &str) -> HttpResult<TransportCon
             "PROXY-TRANSPORT-MAX-CONNS",
             "HTTP transport connection limits",
         ),
-        (
-            "proxy_protocol",
-            "PROXY-TRANSPORT-PROXY-PROTOCOL",
-            "PROXY protocol to upstreams",
-        ),
     ];
     for (field, tracking_id, feature) in UNSUPPORTED_TRANSPORT_OPTIONS {
         if object.get(*field).is_some() {
@@ -2157,6 +2244,26 @@ fn parse_transport(value: Option<&Value>, path: &str) -> HttpResult<TransportCon
             });
         }
     }
+
+    // Caddy `transport.proxy_protocol`: "v1" or "v2"; anything else is rejected with the
+    // offending path instead of silently disabling the header.
+    let proxy_protocol = match object.get("proxy_protocol") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let value = value.as_str().ok_or_else(|| {
+                invalid(
+                    &format!("{transport_path}.proxy_protocol"),
+                    "`proxy_protocol` must be a string (`v1` or `v2`)",
+                )
+            })?;
+            Some(ProxyProtocolVersion::parse(value).ok_or_else(|| {
+                invalid(
+                    &format!("{transport_path}.proxy_protocol"),
+                    format!("unsupported PROXY protocol version `{value}` (supported: v1, v2)"),
+                )
+            })?)
+        }
+    };
 
     let tls_present = object.get("tls").is_some();
     let tls = match object.get("tls") {
@@ -2187,6 +2294,7 @@ fn parse_transport(value: Option<&Value>, path: &str) -> HttpResult<TransportCon
         h2c,
         alpn_h2,
         fastcgi: None,
+        proxy_protocol,
     })
 }
 
