@@ -70,9 +70,9 @@ pub use issuer::{
 };
 pub use ocsp::{
     build_ocsp_request, parse_ocsp_response, staple_for_certificate, DenyOcspTransport,
-    OcspCertStatus, OcspError, OcspPolicy, OcspRequest, OcspResponse, OcspStapler, OcspTransport,
-    ParsedCertificate, SharedOcspStapler, Staple, StapleOutcome, DEFAULT_OCSP_CHECK_INTERVAL,
-    INITIAL_OCSP_RETRY_DELAY, MAX_OCSP_RETRY_DELAY,
+    HyperOcspTransport, OcspCertStatus, OcspError, OcspPolicy, OcspRequest, OcspResponse,
+    OcspStapler, OcspTransport, ParsedCertificate, SharedOcspStapler, Staple, StapleOutcome,
+    DEFAULT_OCSP_CHECK_INTERVAL, INITIAL_OCSP_RETRY_DELAY, MAX_OCSP_RETRY_DELAY,
 };
 pub use propagation::{
     txt_data_matches, DohPropagationChecker, PropagationChecker, CLOUDFLARE_DOH_ENDPOINT,

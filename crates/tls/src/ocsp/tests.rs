@@ -513,3 +513,79 @@ fn responder_failure_status_is_loud() {
     let error = parse_ocsp_response(&failing).expect_err("failure status must error");
     assert_eq!(error, OcspError::ResponderStatus(3));
 }
+struct RecordingTransport {
+    requests: Mutex<Vec<crate::acme::HttpRequest>>,
+    status: u16,
+    body: Vec<u8>,
+    delay: Duration,
+}
+
+#[async_trait]
+impl crate::acme::AcmeTransport for RecordingTransport {
+    async fn request(
+        &self,
+        request: crate::acme::HttpRequest,
+    ) -> crate::Result<crate::acme::HttpResponse> {
+        self.requests.lock().unwrap().push(request);
+        if !self.delay.is_zero() {
+            tokio::time::sleep(self.delay).await;
+        }
+        Ok(crate::acme::HttpResponse {
+            status: self.status,
+            headers: Vec::new(),
+            body: self.body.clone(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn live_transport_posts_ocsp_request_to_responder() {
+    let transport = Arc::new(RecordingTransport {
+        requests: Mutex::new(Vec::new()),
+        status: 200,
+        body: b"ocsp-response-der".to_vec(),
+        delay: Duration::ZERO,
+    });
+    let ocsp = HyperOcspTransport::with_transport(transport.clone());
+    let response = ocsp
+        .fetch("http://responder.example.test/ocsp", b"request-der")
+        .await
+        .expect("transport succeeds");
+    assert_eq!(response, b"ocsp-response-der");
+    let requests = transport.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, crate::acme::HttpMethod::Post);
+    assert_eq!(requests[0].url, "http://responder.example.test/ocsp");
+    assert_eq!(requests[0].body, b"request-der");
+    assert!(requests[0].headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("content-type") && value == "application/ocsp-request"
+    }));
+}
+
+#[tokio::test]
+async fn live_transport_reports_http_and_timeout_errors() {
+    let failing = Arc::new(RecordingTransport {
+        requests: Mutex::new(Vec::new()),
+        status: 503,
+        body: Vec::new(),
+        delay: Duration::ZERO,
+    });
+    let error = HyperOcspTransport::with_transport(failing)
+        .fetch("http://responder.example.test/ocsp", b"request")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("503"), "{error}");
+
+    let slow = Arc::new(RecordingTransport {
+        requests: Mutex::new(Vec::new()),
+        status: 200,
+        body: Vec::new(),
+        delay: Duration::from_secs(5),
+    });
+    let error = HyperOcspTransport::with_transport(slow)
+        .with_timeout(Duration::from_millis(100))
+        .fetch("http://responder.example.test/ocsp", b"request")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("timed out"), "{error}");
+}
