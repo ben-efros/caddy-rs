@@ -77,6 +77,10 @@ struct GlobalServerOptions {
     /// listener address (Caddy's `ListenerAddress`).
     listener_address: Option<String>,
     listener_wrappers: Vec<Value>,
+    /// Server-level settings merged into the matching server object, in Caddy's JSON shape
+    /// (`trusted_proxies`, `trusted_proxies_strict`, `trusted_proxies_unix`,
+    /// `client_ip_headers`).
+    settings: Map<String, Value>,
 }
 
 /// Mask one byte span with spaces (keeping newlines) so parser diagnostics keep their line/column.
@@ -342,9 +346,14 @@ impl<'a> ServerBlockCursor<'a> {
 }
 
 /// Parse the contents of a `servers [<addr>] { ... }` block, supporting only `listener_wrappers`.
-fn parse_servers_block(input: &str, start: usize, end: usize) -> caddy_rs_core::Result<Vec<Value>> {
+fn parse_servers_block(
+    input: &str,
+    start: usize,
+    end: usize,
+) -> caddy_rs_core::Result<(Vec<Value>, Map<String, Value>)> {
     let mut cursor = ServerBlockCursor::new(input, start, end);
     let mut wrappers = Vec::new();
+    let mut settings: Map<String, Value> = Map::new();
     loop {
         let Some(token) = cursor.next()? else {
             break;
@@ -371,12 +380,111 @@ fn parse_servers_block(input: &str, start: usize, end: usize) -> caddy_rs_core::
                             wrappers.extend(parse_listener_wrappers_block(input, &mut cursor)?);
                         }
                     }
+                    "trusted_proxies" => {
+                        if has_block {
+                            return Err(adapter_error(
+                                position,
+                                "`trusted_proxies` does not take a block",
+                            ));
+                        }
+                        let Some(source) = arguments.first() else {
+                            return Err(adapter_error(
+                                position,
+                                "trusted_proxies expects an IP range source module name as its first argument",
+                            ));
+                        };
+                        if source != "static" {
+                            return Err(adapter_error(
+                                position,
+                                format!(
+                                    "`trusted_proxies` source `{source}` is not supported by this build; only `static` is available (tracked as T-CONF-051)"
+                                ),
+                            ));
+                        }
+                        let mut ranges = Vec::new();
+                        for argument in &arguments[1..] {
+                            if argument == "private_ranges" {
+                                ranges.extend(
+                                    [
+                                        "192.168.0.0/16",
+                                        "172.16.0.0/12",
+                                        "10.0.0.0/8",
+                                        "127.0.0.1/8",
+                                        "fd00::/8",
+                                        "::1",
+                                    ]
+                                    .iter()
+                                    .map(|range| Value::String((*range).to_string())),
+                                );
+                            } else {
+                                ranges.push(Value::String(argument.clone()));
+                            }
+                        }
+                        if ranges.is_empty() {
+                            return Err(adapter_error(
+                                position,
+                                "trusted_proxies static requires at least one IP range or `private_ranges`",
+                            ));
+                        }
+                        let mut trusted = Map::new();
+                        trusted.insert("source".to_string(), Value::String("static".to_string()));
+                        trusted.insert("ranges".to_string(), Value::Array(ranges));
+                        settings.insert("trusted_proxies".to_string(), Value::Object(trusted));
+                    }
+                    "trusted_proxies_strict" => {
+                        if !arguments.is_empty() || has_block {
+                            return Err(adapter_error(
+                                position,
+                                "`trusted_proxies_strict` does not take arguments",
+                            ));
+                        }
+                        settings.insert("trusted_proxies_strict".to_string(), Value::from(1));
+                    }
+                    "trusted_proxies_unix" => {
+                        if !arguments.is_empty() || has_block {
+                            return Err(adapter_error(
+                                position,
+                                "`trusted_proxies_unix` does not take arguments",
+                            ));
+                        }
+                        settings.insert("trusted_proxies_unix".to_string(), Value::Bool(true));
+                    }
+                    "client_ip_headers" => {
+                        if has_block {
+                            return Err(adapter_error(
+                                position,
+                                "`client_ip_headers` does not take a block",
+                            ));
+                        }
+                        if arguments.is_empty() {
+                            return Err(adapter_error(
+                                position,
+                                "client_ip_headers expects at least one header name",
+                            ));
+                        }
+                        let mut headers: Vec<Value> = Vec::new();
+                        for header in &arguments {
+                            if headers
+                                .iter()
+                                .any(|existing| existing.as_str() == Some(header.as_str()))
+                            {
+                                return Err(adapter_error(
+                                    position.clone(),
+                                    format!("client IP header {header} specified more than once"),
+                                ));
+                            }
+                            headers.push(Value::String(header.clone()));
+                        }
+                        settings.insert("client_ip_headers".to_string(), Value::Array(headers));
+                    }
                     other => {
                         return Err(adapter_error(
                             position,
                             format!(
                                 "`servers` option `{other}` is not supported by this build \
-                                 (tracked as T-CONF-036); supported: listener_wrappers"
+                                 (tracked as T-CONF-036); supported: listener_wrappers, \
+                                 trusted_proxies, trusted_proxies_strict, trusted_proxies_unix, \
+                                 client_ip_headers"
                             ),
                         ))
                     }
@@ -384,7 +492,7 @@ fn parse_servers_block(input: &str, start: usize, end: usize) -> caddy_rs_core::
             }
         }
     }
-    Ok(wrappers)
+    Ok((wrappers, settings))
 }
 
 /// Parse the body of a `listener_wrappers { ... }` block (the opening `{` is already consumed).
@@ -648,9 +756,12 @@ fn extract_global_server_options(
             skip_inline_trivia(bytes, &mut cursor);
         }
         let mut wrappers = Vec::new();
+        let mut settings: Map<String, Value> = Map::new();
         let end = if cursor < close && bytes[cursor] == b'{' {
             let block_end = find_matching_brace(input, cursor)?;
-            wrappers = parse_servers_block(input, cursor + 1, block_end)?;
+            let parsed = parse_servers_block(input, cursor + 1, block_end)?;
+            wrappers = parsed.0;
+            settings = parsed.1;
             block_end + 1
         } else if cursor < close && !matches!(bytes[cursor], b'\n' | b'\r') {
             return Err(adapter_error(
@@ -667,6 +778,7 @@ fn extract_global_server_options(
         options.push(GlobalServerOptions {
             listener_address,
             listener_wrappers: wrappers,
+            settings,
         });
         mask_span(&mut masked, name_start, end);
         index = end;
@@ -719,6 +831,9 @@ fn apply_global_server_options(
             "listener_wrappers".to_string(),
             Value::Array(matching.listener_wrappers.clone()),
         );
+    }
+    for (key, value) in &matching.settings {
+        object.insert(key.clone(), value.clone());
     }
 }
 
