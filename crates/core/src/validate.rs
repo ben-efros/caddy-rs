@@ -902,6 +902,26 @@ impl Validator<'_> {
         for (index, policy) in automation.policies.iter().enumerate() {
             self.tls_policy(policy, &format!("apps.tls.automation.policies[{index}]"))?;
         }
+        // Caddy v2.11.9 `AutomationPolicy.makeCertMagicConfig` (`modules/caddytls/automation.go`):
+        // on-demand TLS without a permission module is only safe for bounded explicit subjects,
+        // policies that use only the internal issuer, or policies with explicitly configured
+        // external managers; otherwise provisioning fails. Reject it at validation time with
+        // Caddy's wording and a located policy path.
+        let on_demand_permission_configured = automation.on_demand.as_ref().is_some_and(|config| {
+            config.permission.is_some()
+                || config
+                    .ask
+                    .as_deref()
+                    .is_some_and(|ask| !ask.trim().is_empty())
+        });
+        for (index, policy) in automation.policies.iter().enumerate() {
+            self.validate_on_demand_policy(
+                policy,
+                index,
+                on_demand_permission_configured,
+                &format!("apps.tls.automation.policies[{index}]"),
+            )?;
+        }
         if let Some(on_demand) = &automation.on_demand {
             if let Some(permission) = &on_demand.permission {
                 let path = "apps.tls.automation.on_demand.permission.module";
@@ -925,6 +945,53 @@ impl Validator<'_> {
             }
         }
         Ok(())
+    }
+
+    /// Caddy v2.11.9 on-demand permission validation for one automation policy.
+    ///
+    /// Port of `AutomationPolicy.makeCertMagicConfig`'s `noProtections` check: a policy that
+    /// enables `on_demand` for default/wildcard subjects with public issuers and no explicit
+    /// `get_certificate` managers requires a permission module (`tls.permission.*` or the
+    /// deprecated `ask` endpoint). Bounded explicit subjects and internal-only issuers are exempt,
+    /// exactly like Caddy.
+    fn validate_on_demand_policy(
+        &self,
+        policy: &AutomationPolicy,
+        index: usize,
+        permission_configured: bool,
+        path: &str,
+    ) -> Result<()> {
+        if !policy.on_demand || permission_configured {
+            return Ok(());
+        }
+        let wildcard_or_default = policy.subjects.is_empty()
+            || policy
+                .subjects
+                .iter()
+                .any(|subject| subject.starts_with('*'));
+        if !wildcard_or_default {
+            return Ok(());
+        }
+        let only_internal_issuer = policy.issuers.len() == 1
+            && policy
+                .issuers
+                .first()
+                .and_then(|issuer| issuer.module.as_deref())
+                == Some("internal");
+        if only_internal_issuer {
+            return Ok(());
+        }
+        let has_explicit_managers = policy
+            .get_certificate
+            .as_ref()
+            .is_some_and(|managers| !managers.is_empty());
+        if has_explicit_managers {
+            return Ok(());
+        }
+        Err(Error::invalid(
+            format!("{path}.on_demand"),
+            "on-demand TLS cannot be enabled without a permission module to prevent abuse; please refer to documentation for details".to_string(),
+        ))
     }
 
     fn tls_policy(&mut self, policy: &AutomationPolicy, path: &str) -> Result<()> {
@@ -1687,6 +1754,122 @@ mod tests {
         assert!(
             message.contains("apps.tls.automation.on_demand.permission.module"),
             "{message}"
+        );
+    }
+
+    /// Adapted JSON from Caddy's
+    /// `caddytest/integration/caddyfile_adapt/tls_automation_policies_5.caddyfiletest`
+    /// (DIV-0055): the second policy enables `on_demand` with default (unbounded) subjects and no
+    /// permission module, which Caddy rejects during provisioning.
+    const TLS_AUTOMATION_POLICIES_5_ADAPTED: &str = r#"{
+        "apps": {
+            "http": {
+                "servers": {
+                    "srv0": {
+                        "listen": [":443"],
+                        "routes": [
+                            {"match": [{"host": ["a.example.com"]}], "terminal": true},
+                            {"match": [{"host": ["b.example.com"]}], "terminal": true}
+                        ]
+                    }
+                }
+            },
+            "tls": {
+                "automation": {
+                    "policies": [
+                        {"subjects": ["a.example.com", "b.example.com"]},
+                        {"on_demand": true}
+                    ]
+                }
+            }
+        }
+    }"#;
+
+    #[test]
+    fn adapted_tls_automation_policies_fixture_rejects_on_demand_without_permission() {
+        let config =
+            Config::from_value(serde_json::from_str(TLS_AUTOMATION_POLICIES_5_ADAPTED).unwrap())
+                .expect("fixture decodes");
+        let error = validate_config(&config, &registry()).expect_err("Caddy rejects this policy");
+        let message = error.to_string();
+        assert!(
+            message.contains("apps.tls.automation.policies[1].on_demand"),
+            "located policy path missing: {message}"
+        );
+        assert!(
+            message.contains("on-demand TLS cannot be enabled without a permission module"),
+            "{message}"
+        );
+        assert!(message.contains("prevent abuse"), "{message}");
+    }
+
+    #[test]
+    fn on_demand_with_permission_module_or_bounded_scope_validates() {
+        // App-level permission module (Caddy's `tls.permission.http`).
+        let config = tls_config(serde_json::json!({
+            "automation": {
+                "on_demand": {"permission": {
+                    "module": "http",
+                    "endpoint": "https://example.com/ask"
+                }},
+                "policies": [{"on_demand": true}]
+            }
+        }));
+        validate_config(&config, &registry()).expect("permission module allows on-demand");
+
+        // Deprecated `ask` endpoint is Caddy's legacy permission mechanism and also counts.
+        let config = tls_config(serde_json::json!({
+            "automation": {
+                "on_demand": {"ask": "https://example.com/ask"},
+                "policies": [{"on_demand": true}]
+            }
+        }));
+        validate_config(&config, &registry()).expect("ask endpoint allows on-demand");
+
+        // Bounded explicit (non-wildcard) subjects need no permission (Caddy exempts them).
+        let config = tls_config(serde_json::json!({
+            "automation": {"policies": [{
+                "subjects": ["example.com", "www.example.com"],
+                "on_demand": true
+            }]}
+        }));
+        validate_config(&config, &registry()).expect("bounded subjects are exempt");
+
+        // Internal-only issuers need no permission (no public PKI pressure).
+        let config = tls_config(serde_json::json!({
+            "automation": {"policies": [{
+                "subjects": ["*.internal.example"],
+                "on_demand": true,
+                "issuers": [{"module": "internal"}]
+            }]}
+        }));
+        validate_config(&config, &registry()).expect("internal issuer is exempt");
+
+        // Explicit external managers allow on-demand even for default subjects.
+        let config = tls_config(serde_json::json!({
+            "automation": {"policies": [{
+                "on_demand": true,
+                "get_certificate": [{"via": "tailscale"}]
+            }]}
+        }));
+        validate_config(&config, &registry()).expect("explicit managers are exempt");
+    }
+
+    #[test]
+    fn wildcard_subject_with_public_issuer_still_requires_permission() {
+        let config = tls_config(serde_json::json!({
+            "automation": {"policies": [{
+                "subjects": ["*.example.com"],
+                "on_demand": true
+            }]}
+        }));
+        let error =
+            validate_config(&config, &registry()).expect_err("wildcard requires permission");
+        assert!(
+            error
+                .to_string()
+                .contains("on-demand TLS cannot be enabled without a permission module"),
+            "{error}"
         );
     }
 
