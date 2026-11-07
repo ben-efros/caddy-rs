@@ -7,13 +7,23 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Defaults are the full handler set. Disabling them removes the `encode`/`templates` handler
+# modules (and their dependencies) from the build; a configuration that still references them is
+# rejected by validation as an unknown handler (see `caddy-rs-core`'s matching features).
+default = ["compression", "templates"]
+# `http.handlers.encode` (gzip via flate2, zstd via the zstd crate).
+compression = ["dep:flate2", "dep:zstd", "caddy-rs-core/compression"]
+# `http.handlers.templates`.
+templates = ["caddy-rs-core/templates"]
+
 [dependencies]
 argon2 = "0.5"
 async-trait = { workspace = true }
 bcrypt = "0.16"
 bytes = { workspace = true }
-caddy-rs-core = { workspace = true }
-flate2 = "1"
+caddy-rs-core = { workspace = true, default-features = false }
+flate2 = { version = "1", optional = true }
 http = { workspace = true }
 http-body = "1.1.0"
 http-body-util = { workspace = true }
@@ -22,7 +32,7 @@ hyper-util = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-zstd = "0.13"
+zstd = { version = "0.13", optional = true }
 
 [dev-dependencies]
 caddy-rs-config = { workspace = true }

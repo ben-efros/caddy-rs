@@ -11,13 +11,26 @@ repository.workspace = true
 name = "caddy-rs"
 path = "src/main.rs"
 
+[features]
+# Full build (behaviour-identical default). Disable with `--no-default-features` for a minimal
+# binary, optionally together with `--features minimal` to make the intent explicit.
+default = ["http3", "compression", "templates"]
+# HTTP/3 over QUIC (server listeners, UDP derivation, Alt-Svc).
+http3 = ["caddy-rs-server/http3"]
+# Response compression handler (`encode`, gzip/zstd).
+compression = ["caddy-rs-server/compression"]
+# Template handler (`templates`).
+templates = ["caddy-rs-server/templates"]
+# Convenience marker for a minimal build: `--no-default-features --features minimal`.
+minimal = []
+
 [dependencies]
 anyhow = { workspace = true }
 bytes = { workspace = true }
-caddy-rs-admin = { workspace = true }
-caddy-rs-config = { workspace = true }
-caddy-rs-core = { workspace = true }
-caddy-rs-server = { workspace = true }
+caddy-rs-admin = { workspace = true, default-features = false }
+caddy-rs-config = { workspace = true, default-features = false }
+caddy-rs-core = { workspace = true, default-features = false }
+caddy-rs-server = { workspace = true, default-features = false }
 clap = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }

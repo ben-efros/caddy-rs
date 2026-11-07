@@ -364,6 +364,7 @@ impl RequestSnapshot {
 
     /// Capture an HTTP/3 request before its body is read/buffered (the `h3` resolver hands out an
     /// `http::Request<()>`; access logging still needs the request fields).
+    #[cfg(feature = "http3")]
     pub(crate) fn capture_http3(
         request: &http::Request<()>,
         remote: Option<SocketAddr>,

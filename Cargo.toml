@@ -21,15 +21,18 @@ repository = "https://github.com/example/caddy-rs"
 authors = ["caddy-rs contributors"]
 
 [workspace.dependencies]
-# Internal crates (path dependencies declared once).
-caddy-rs-core = { path = "crates/core" }
-caddy-rs-config = { path = "crates/config" }
-caddy-rs-http = { path = "crates/http" }
-caddy-rs-proxy = { path = "crates/proxy" }
-caddy-rs-tls = { path = "crates/tls" }
-caddy-rs-admin = { path = "crates/admin" }
-caddy-rs-server = { path = "crates/server" }
-caddy-rs-plug = { path = "crates/plug" }
+# Internal crates (path dependencies declared once). Default features are declared off here so a
+# dependent crate can opt in explicitly (required for `caddy-rs`'s `--no-default-features` to
+# really disable the optional modules; without this, Cargo ignores member-level
+# `default-features = false`).
+caddy-rs-core = { path = "crates/core", default-features = false }
+caddy-rs-config = { path = "crates/config", default-features = false }
+caddy-rs-http = { path = "crates/http", default-features = false }
+caddy-rs-proxy = { path = "crates/proxy", default-features = false }
+caddy-rs-tls = { path = "crates/tls", default-features = false }
+caddy-rs-admin = { path = "crates/admin", default-features = false }
+caddy-rs-server = { path = "crates/server", default-features = false }
+caddy-rs-plug = { path = "crates/plug", default-features = false }
 anyhow = "1.0.104"
 async-trait = "0.1.92"
 bytes = "1.12.1"

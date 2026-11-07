@@ -7,22 +7,34 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Defaults are the full server. `--no-default-features` builds a TCP-only server without the
+# QUIC stack or the optional HTTP handlers; configuration that still asks for HTTP/3, `encode`
+# or `templates` is rejected by validation with a located error.
+default = ["http3", "compression", "templates"]
+# HTTP/3 over QUIC: `quinn`, `h3`, `h3-quinn`, UDP listener supervision, derived `udp/...`
+# listeners and Alt-Svc advertisement.
+http3 = ["dep:quinn", "dep:h3", "dep:h3-quinn", "caddy-rs-core/http3"]
+# Forwarded so the HTTP engine's handler set matches the binary's feature selection.
+compression = ["caddy-rs-http/compression"]
+templates = ["caddy-rs-http/templates"]
+
 [dependencies]
 base64 = "0.22.1"
 bytes = { workspace = true }
-caddy-rs-admin = { workspace = true }
-caddy-rs-core = { workspace = true }
-caddy-rs-http = { workspace = true }
-caddy-rs-proxy = { workspace = true }
-caddy-rs-tls = { workspace = true }
-h3 = "0.0.8"
-h3-quinn = "0.0.10"
+caddy-rs-admin = { workspace = true, default-features = false }
+caddy-rs-core = { workspace = true, default-features = false }
+caddy-rs-http = { workspace = true, default-features = false }
+caddy-rs-proxy = { workspace = true, default-features = false }
+caddy-rs-tls = { workspace = true, default-features = false }
+h3 = { version = "0.0.8", optional = true }
+h3-quinn = { version = "0.0.10", optional = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 libc = "0.2.189"
-quinn = "0.11"
+quinn = { version = "0.11", optional = true }
 rustls = { version = "0.23.45", default-features = false, features = ["std", "ring", "tls12", "logging"] }
 serde_json = { workspace = true }
 socket2 = "0.6.5"

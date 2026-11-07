@@ -10,7 +10,9 @@
 //! mismatch policy. A reload never re-adopts descriptors: sockets are adopted on the first apply,
 //! and listeners added later bind normally.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+#[cfg(feature = "http3")]
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -456,9 +458,19 @@ impl ServerRuntime {
                     has_connection_policies,
                 )?;
                 // Validate the listener's implied TLS policy without requiring certificates.
+                #[cfg(feature = "http3")]
                 let _terminates_tls = if parsed.network == Network::Udp {
                     udp_listener_terminates_tls(listen, https_port, has_connection_policies)
                 } else {
+                    listener_uses_tls(listen, https_port, has_connection_policies)?
+                };
+                // UDP listeners were rejected above: a build without HTTP/3 validates the
+                // TCP/Unix listeners only.
+                #[cfg(not(feature = "http3"))]
+                let _terminates_tls = {
+                    // The parse above already rejected a malformed address; UDP is rejected by
+                    // `validate_udp_listener`, so only TCP/Unix semantics remain here.
+                    let _ = parsed.network;
                     listener_uses_tls(listen, https_port, has_connection_policies)?
                 };
             }
@@ -1582,27 +1594,31 @@ impl ServerRuntime {
                 // Under an automatic-HTTPS plan, a listener is TLS when it has explicit policies
                 // or when the plan derived TLS for its port (implicit HTTPS on a non-standard
                 // port). Without a plan the historical rule applies.
+                #[cfg(feature = "http3")]
                 let terminates_tls = if is_udp {
                     // HTTP/3 requires TLS; `validate_udp_listener` already rejected cleartext UDP
                     // listeners loudly.
                     udp_listener_terminates_tls(listen, https_port, has_connection_policies)
                 } else {
-                    match automatic {
-                        Some(context) => {
-                            let wants_tls = has_connection_policies
-                                || listen_port
-                                    .is_some_and(|port| context.tls_ports.contains(&port));
-                            // Caddy excludes the configured HTTP port from TLS even when the server
-                            // carries explicit TLS connection policies (`app.go`: `useTLS :=
-                            // len(TLSConnPolicies) > 0 && port != http_port`).
-                            // `:0` is an ephemeral listener, not the configured HTTP port: only a
-                            // concrete, configured HTTP port excludes TLS.
-                            let on_http_port =
-                                context.http_port != 0 && listen_port == Some(context.http_port);
-                            wants_tls && !on_http_port
-                        }
-                        None => listener_uses_tls(listen, https_port, has_connection_policies)?,
-                    }
+                    tcp_listener_terminates_tls(
+                        listen,
+                        listen_port,
+                        https_port,
+                        has_connection_policies,
+                        automatic,
+                    )?
+                };
+                #[cfg(not(feature = "http3"))]
+                let terminates_tls = {
+                    // Explicit `udp/...` listeners were rejected by `validate_udp_listener`.
+                    debug_assert!(!is_udp);
+                    tcp_listener_terminates_tls(
+                        listen,
+                        listen_port,
+                        https_port,
+                        has_connection_policies,
+                        automatic,
+                    )?
                 };
                 let tls = if terminates_tls {
                     match automatic {
@@ -1866,6 +1882,7 @@ fn is_udp_listen(listen: &str) -> bool {
 
 /// Whether this server offers HTTP/3: Caddy's default `protocols` are `[h1, h2, h3]`, so an
 /// omitted field enables h3; an explicit list must contain `h3`.
+#[cfg(feature = "http3")]
 fn server_offers_h3(server: &HttpServer) -> bool {
     match server.protocols.as_ref() {
         None => true,
@@ -1873,9 +1890,6 @@ fn server_offers_h3(server: &HttpServer) -> bool {
     }
 }
 
-/// Caddy's `http3.Server.SetQUICHeaders` value for the first concrete UDP listener port of this
-/// server, when the server offers HTTP/3. Ephemeral (`:0`) UDP ports have no known value at plan
-/// time and are advertised as no Alt-Svc (Caddy reports `ErrNoAltSvcPort` in that case).
 /// Effective listen addresses for a server, including the UDP (QUIC) listeners Caddy derives
 /// automatically.
 ///
@@ -1884,6 +1898,7 @@ fn server_offers_h3(server: &HttpServer) -> bool {
 /// caddy-rs used to require the explicit form, which meant a Caddyfile that works on Caddy served
 /// no HTTP/3 here. This returns the configured addresses plus one `udp/<addr>` per TLS TCP address,
 /// skipping any address an explicit `udp/...` already covers so nothing is bound twice.
+#[cfg(feature = "http3")]
 fn effective_listens(
     server: &HttpServer,
     https_port: u16,
@@ -1911,8 +1926,23 @@ fn effective_listens(
     listens
 }
 
-/// Alt-Svc for an explicit listen list (used with [`effective_listens`] so automatically derived
-/// UDP listeners are advertised exactly like configured ones).
+/// A build without HTTP/3 never derives a UDP listener from a TLS TCP one. Explicit `udp/...`
+/// entries stay in the list and are rejected by [`validate_udp_listener`] with a located error.
+#[cfg(not(feature = "http3"))]
+fn effective_listens(
+    server: &HttpServer,
+    _https_port: u16,
+    _has_connection_policies: bool,
+) -> Vec<String> {
+    server.listen.clone()
+}
+
+/// Caddy's `http3.Server.SetQUICHeaders` value for the first concrete UDP listener port of this
+/// server, when the server offers HTTP/3. Ephemeral (`:0`) UDP ports have no known value at plan
+/// time and are advertised as no Alt-Svc (Caddy reports `ErrNoAltSvcPort` in that case). Used with
+/// [`effective_listens`] so automatically derived UDP listeners are advertised exactly like
+/// configured ones.
+#[cfg(feature = "http3")]
 fn alt_svc_for_listens(server: &HttpServer, listens: &[String]) -> Option<String> {
     if !server_offers_h3(server) {
         return None;
@@ -1932,9 +1962,16 @@ fn alt_svc_for_listens(server: &HttpServer, listens: &[String]) -> Option<String
     None
 }
 
+/// Without HTTP/3 there is nothing to advertise, so no `Alt-Svc` header is ever emitted.
+#[cfg(not(feature = "http3"))]
+fn alt_svc_for_listens(_server: &HttpServer, _listens: &[String]) -> Option<String> {
+    None
+}
+
 /// Whether a UDP (QUIC) listener terminates TLS: port 443 (or the configured HTTPS port) or
 /// explicit `tls_connection_policies`, matching the TCP rule. HTTP/3 requires TLS, so a UDP
 /// listener that does not terminate TLS is a configuration error, never a silent UDP sink.
+#[cfg(feature = "http3")]
 fn udp_listener_terminates_tls(
     listen: &str,
     https_port: u16,
@@ -1947,9 +1984,37 @@ fn udp_listener_terminates_tls(
         && (has_connection_policies || address.port() == Some(https_port))
 }
 
-/// Locate a UDP listener that cannot serve HTTP/3 (missing TLS or missing `protocols: ["h3"]`),
-/// returning a located error so the configuration fails at validate/apply instead of binding a
-/// socket that silently drops QUIC traffic.
+/// TCP/Unix listener TLS decision shared by both feature profiles.
+fn tcp_listener_terminates_tls(
+    listen: &str,
+    listen_port: Option<u16>,
+    https_port: u16,
+    has_connection_policies: bool,
+    automatic: Option<&AutomaticHttpsContext<'_>>,
+) -> Result<bool> {
+    match automatic {
+        Some(context) => {
+            let wants_tls = has_connection_policies
+                || listen_port.is_some_and(|port| context.tls_ports.contains(&port));
+            // Caddy excludes the configured HTTP port from TLS even when the server carries
+            // explicit TLS connection policies (`app.go`: `useTLS := len(TLSConnPolicies) > 0 &&
+            // port != http_port`). `:0` is an ephemeral listener, not the configured HTTP port:
+            // only a concrete, configured HTTP port excludes TLS.
+            let on_http_port = context.http_port != 0 && listen_port == Some(context.http_port);
+            Ok(wants_tls && !on_http_port)
+        }
+        None => Ok(listener_uses_tls(
+            listen,
+            https_port,
+            has_connection_policies,
+        )?),
+    }
+}
+
+/// Locate a UDP listener that cannot serve HTTP/3 (missing TLS, missing `protocols: ["h3"]`, or a
+/// build without HTTP/3), returning a located error so the configuration fails at
+/// validate/apply instead of binding a socket that silently drops QUIC traffic.
+#[cfg(feature = "http3")]
 fn validate_udp_listener(
     listen: &str,
     server_name: &str,
@@ -1979,6 +2044,28 @@ fn validate_udp_listener(
         )));
     }
     Ok(())
+}
+
+/// A build without the `http3` feature rejects every explicit `udp/...` listen address with a
+/// located error instead of binding a socket that can never serve a request.
+#[cfg(not(feature = "http3"))]
+fn validate_udp_listener(
+    listen: &str,
+    server_name: &str,
+    _server: &HttpServer,
+    _https_port: u16,
+    _has_connection_policies: bool,
+) -> Result<()> {
+    if !is_udp_listen(listen) {
+        return Ok(());
+    }
+    Err(Error::Config(caddy_rs_core::Error::invalid(
+        format!("apps.http.servers.{server_name}.listen"),
+        format!(
+            "UDP listener `{listen}` cannot be served: HTTP/3 support is not compiled in \
+             (rebuild with the `http3` feature or remove the `udp/...` listener)"
+        ),
+    )))
 }
 
 /// Generation-scoped OCSP refresh task. Dropping this value aborts the task.

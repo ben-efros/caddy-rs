@@ -208,9 +208,20 @@ fn validate_server_limits(server: &HttpServer, path: &str) -> Result<()> {
         for protocol in protocols {
             match protocol.as_str() {
                 "h1" | "h2" | "h2c" => {}
-                // Caddy accepts h3; caddy-rs validates it but does not serve HTTP/3 yet
-                // (tracked as T-HTTP-030/T-HTTP-031), matching Caddy's validation outcome.
-                "h3" => {}
+                // Caddy accepts h3. A build without the `http3` feature must reject it loudly
+                // rather than accept a configuration it cannot serve (HTTP/3 is never silently
+                // downgraded to TCP).
+                "h3" => {
+                    #[cfg(not(feature = "http3"))]
+                    {
+                        return Err(Error::invalid(
+                            format!("{path}.protocols"),
+                            "HTTP/3 support is not compiled in; rebuild with the `http3` feature or \
+                             remove `h3` from `protocols`"
+                                .to_string(),
+                        ));
+                    }
+                }
                 other => {
                     return Err(Error::invalid(
                         format!("{path}.protocols"),
@@ -483,31 +494,47 @@ impl Validator<'_> {
                 let path = format!("{server_path}.listen[{index}]");
                 let parsed = ListenAddr::parse_at(listen, path.clone())?;
                 if parsed.network == crate::Network::Udp {
-                    // HTTP/3 is served over QUIC: a UDP listener needs both explicit h3 and TLS,
-                    // otherwise the socket would silently drop every QUIC packet.
-                    let offers_h3 = match server.protocols.as_ref() {
-                        None => true,
-                        Some(protocols) => protocols.iter().any(|protocol| protocol == "h3"),
-                    };
-                    if !offers_h3 {
-                        return Err(Error::invalid(
-                            path.clone(),
-                            "a UDP listener requires `protocols` to include `h3` (HTTP/3);                              configured protocols do not offer it"
-                                .to_string(),
-                        ));
-                    }
-                    let https_port = http.https_port.unwrap_or(443);
-                    let has_policies = server
-                        .tls_connection_policies
-                        .as_ref()
-                        .is_some_and(|policies| !policies.is_empty());
-                    if !(has_policies || parsed.port() == Some(https_port)) {
+                    #[cfg(not(feature = "http3"))]
+                    {
                         return Err(Error::invalid(
                             path.clone(),
                             format!(
-                                "a UDP listener requires TLS (port {https_port} or                                  `tls_connection_policies`); HTTP/3 is never served cleartext"
+                                "HTTP/3 support is not compiled in; the UDP listener `{listen}` \
+                                 cannot be served (rebuild with the `http3` feature or remove the \
+                                 `udp/...` listener)"
                             ),
                         ));
+                    }
+                    #[cfg(feature = "http3")]
+                    {
+                        // HTTP/3 is served over QUIC: a UDP listener needs both explicit h3 and
+                        // TLS, otherwise the socket would silently drop every QUIC packet.
+                        let offers_h3 = match server.protocols.as_ref() {
+                            None => true,
+                            Some(protocols) => protocols.iter().any(|protocol| protocol == "h3"),
+                        };
+                        if !offers_h3 {
+                            return Err(Error::invalid(
+                                path.clone(),
+                                "a UDP listener requires `protocols` to include `h3` (HTTP/3); \
+                                 configured protocols do not offer it"
+                                    .to_string(),
+                            ));
+                        }
+                        let https_port = http.https_port.unwrap_or(443);
+                        let has_policies = server
+                            .tls_connection_policies
+                            .as_ref()
+                            .is_some_and(|policies| !policies.is_empty());
+                        if !(has_policies || parsed.port() == Some(https_port)) {
+                            return Err(Error::invalid(
+                                path.clone(),
+                                format!(
+                                    "a UDP listener requires TLS (port {https_port} or \
+                                     `tls_connection_policies`); HTTP/3 is never served cleartext"
+                                ),
+                            ));
+                        }
                     }
                 }
                 if let Some(previous) = listeners.insert(listen.as_str(), server_name) {

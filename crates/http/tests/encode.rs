@@ -4,6 +4,8 @@
 //! `:18140 { root * <dir>; encode gzip zstd; file_server }` (see the task report for evidence
 //! paths); the adapted JSON check uses the real Caddy `caddy adapt` output for the encode handler.
 
+#![cfg(feature = "compression")]
+
 use std::io::Read;
 use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};

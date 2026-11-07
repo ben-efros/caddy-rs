@@ -12,6 +12,7 @@ use serde_json::Value;
 
 use crate::auth::{BasicAuthHandler, ForwardAuthHandler};
 use crate::body::StreamingResponse;
+#[cfg(feature = "compression")]
 use crate::encode::EncodeHandler;
 use crate::file_server::FileServerHandler;
 use crate::handlers::{
@@ -20,6 +21,7 @@ use crate::handlers::{
 };
 use crate::matchers::build_matcher_set;
 use crate::rate_limit::RateLimitHandler;
+#[cfg(feature = "templates")]
 use crate::templates::TemplatesHandler;
 use crate::types::{
     Error, Handler, Outcome, Request, Response, ResponseOutcome, Result, SharedHandler,
@@ -653,9 +655,11 @@ impl RouterBuilder {
             "rewrite" => Arc::new(RewriteHandler::from_json(value, path)?),
             "request_body" => Arc::new(RequestBodyHandler::from_json(value, path)?),
             "map" => Arc::new(MapHandler::from_json(value, path)?),
+            #[cfg(feature = "compression")]
             "encode" => Arc::new(EncodeHandler::from_json(value, path)?),
             // caddy-rs extension (not a Caddy v2.11.7 built-in): token-bucket rate limiting.
             "rate_limit" => Arc::new(RateLimitHandler::from_json(value, path)?),
+            #[cfg(feature = "templates")]
             "templates" => Arc::new(TemplatesHandler::from_json(value, path)?),
             "file_server" => Arc::new(FileServerHandler::from_json(value, path)?),
             "forward_auth" => Arc::new(ForwardAuthHandler::from_json(value, path)?),

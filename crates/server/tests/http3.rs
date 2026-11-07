@@ -4,6 +4,8 @@
 //! HTTP/1.1/2, and a real `h3` client (with a real TLS 1.3 handshake) sends requests. The test
 //! certificates are the fixtures used by `http_tls.rs`.
 
+#![cfg(feature = "http3")]
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;

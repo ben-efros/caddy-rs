@@ -578,6 +578,7 @@ pub const BUILTIN_MODULES: &[Module] = &[
         ModuleKind::HttpHandler,
         "Authentication middleware with the HTTP Basic provider (native bcrypt and argon2id password-hash verification, constant-time comparison)",
     ),
+    #[cfg(feature = "templates")]
     Module::new(
         "http.handlers.templates",
         "templates",
@@ -620,6 +621,7 @@ pub const BUILTIN_MODULES: &[Module] = &[
         ModuleKind::HttpHandler,
         "Set request variables consumed by later handlers",
     ),
+    #[cfg(feature = "compression")]
     Module::new(
         "http.handlers.encode",
         "encode",
