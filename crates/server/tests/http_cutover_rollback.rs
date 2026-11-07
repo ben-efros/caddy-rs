@@ -38,11 +38,16 @@ fn static_config(body: &str) -> Config {
 fn tls_without_certificates_config() -> Config {
     Config::from_value(serde_json::json!({
         "admin": {"disabled": true},
-        "apps": {"http": {"servers": {"srv0": {
-            "listen": ["127.0.0.1:0"],
-            "tls_connection_policies": [{}],
-            "routes": [{"handle": [{"handler": "static_response", "body": "new"}]}]
-        }}}}
+        "apps": {"http": {
+            // Keep the derived HTTP (redirect) listener off a privileged port: CI runs unprivileged,
+            // where binding :80 fails with EACCES before the certificate error this test asserts.
+            "http_port": 0,
+            "servers": {"srv0": {
+                "listen": ["127.0.0.1:0"],
+                "tls_connection_policies": [{}],
+                "routes": [{"handle": [{"handler": "static_response", "body": "new"}]}]
+            }}
+        }}
     }))
     .expect("TLS-without-certificates config decodes")
 }
