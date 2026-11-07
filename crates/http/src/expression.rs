@@ -597,7 +597,7 @@ fn lex(input: &str) -> std::result::Result<Vec<Token>, String> {
             (b'-', _) => (TokenKind::Minus, 1),
             (other, _) => {
                 return Err(format!(
-                    "unsupported character `{}` at byte {index}; only the documented expression subset is implemented",
+                    "unexpected character `{}` at byte {index} in the expression (syntax error); only the documented expression subset is implemented",
                     other as char
                 ))
             }

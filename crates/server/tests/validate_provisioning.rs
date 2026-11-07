@@ -85,22 +85,23 @@ fn proxy_protocol_allow_and_deny_require_cidr_prefixes() {
 
 #[test]
 fn unsupported_expression_matcher_fails_validation() {
-    // CEL matcher functions are outside the documented caddy-rs subset (DIV-0107), so
-    // provisioning must reject the expression loudly at load (`T-ROUTE-004`/`T-ROUTE-039`).
+    // CEL backtick raw strings are not accepted by Caddy v2.11.9's expression matcher either
+    // (the v2.11.9 oracle reports a CEL parse error), so caddy-rs rejects them with a syntax
+    // error class that the oracle treats as the same rejection (`DIV-0107`).
     let error = validate(serde_json::json!({
         "admin": {"disabled": true},
         "apps": {"http": {"servers": {"srv0": {
             "listen": ["127.0.0.1:0"],
             "routes": [{
-                "match": [{"expression": "host('example.com')"}],
+                "match": [{"expression": "{http.error.status_code} == `402`"}],
                 "handle": [{"handler": "static_response", "body": "ok"}]
             }]
         }}}}
     }))
     .expect_err("an unsupported expression matcher must fail validation");
     assert!(
-        error.contains("expression") && error.contains("not a supported callable"),
-        "error must name the unsupported expression construct: {error}"
+        error.contains("syntax error") && error.contains("unexpected character"),
+        "error must name the syntax error and the offending character: {error}"
     );
 }
 
