@@ -17,6 +17,7 @@
 
 use std::future::Future;
 use std::io;
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -31,6 +32,7 @@ use hyper_util::client::legacy::connect::{Connected, Connection, HttpConnector};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rustls::pki_types::ServerName;
+use tokio::io::AsyncWriteExt;
 use tokio_rustls::client::TlsStream;
 use tower_service::Service;
 
@@ -50,6 +52,100 @@ pub type HttpClient = Client<UpstreamConnector, ClientBody>;
 /// request URI authority, so the URI authority can carry the client's Host for HTTP/2
 /// `:authority` parity (see `crate::client::FixedUpstreamConnector`).
 pub type UpstreamClient = Client<FixedUpstreamConnector, ClientBody>;
+
+/// Which PROXY protocol header version to send to upstreams (`transport.proxy_protocol`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyProtocolVersion {
+    /// Text header (`PROXY TCP4/TCP6 ...`).
+    V1,
+    /// Binary header (v2 signature + address block, no TLVs).
+    V2,
+}
+
+impl ProxyProtocolVersion {
+    /// Parse Caddy's JSON values (`"v1"` / `"v2"`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "v1" => Some(Self::V1),
+            "v2" => Some(Self::V2),
+            _ => None,
+        }
+    }
+}
+
+/// Encode the per-request client address into a URI authority so the connector can write the
+/// PROXY header for exactly this client.
+///
+/// Caddy encodes `proxyProtocolInfo.AddrPort.String() + "->" + reqHost` with `url.QueryEscape`
+/// (`httptransport.go`/`reverseproxy.go`) so an HTTP/2 connection is never reused for a different
+/// client (Caddy issue #7529). Rust's `http::Uri` rejects percent-encoded authorities, so the same
+/// information is encoded in a plain reg-name token: `pp-<hex client ip>-p<port>.<host>`. The host
+/// part keeps the per-client pool key; the token is what the connector decodes.
+pub(crate) fn proxy_protocol_authority(source: IpAddr, host: &str) -> String {
+    let token = match source {
+        IpAddr::V4(address) => format!("pp-{:08x}-p0", u32::from(address)),
+        IpAddr::V6(address) => format!("pp-{:032x}-p0", u128::from(address)),
+    };
+    format!("{token}.{host}")
+}
+
+/// Recover the PROXY-protocol source address from a request URI authority.
+///
+/// Returns `None` when the authority carries no marker (for example active health-check requests,
+/// which use Caddy's plain default HTTP client and therefore send no PROXY header, like Caddy).
+pub(crate) fn proxy_protocol_source(authority: &str) -> Option<IpAddr> {
+    let marker = authority.strip_prefix("pp-")?;
+    let (hex, rest) = marker.split_once("-p")?;
+    let port_end = rest.find('.').unwrap_or(rest.len());
+    rest[..port_end].parse::<u16>().ok()?;
+    match hex.len() {
+        8 => {
+            let value = u32::from_str_radix(hex, 16).ok()?;
+            Some(IpAddr::V4(std::net::Ipv4Addr::from(value)))
+        }
+        32 => {
+            let value = u128::from_str_radix(hex, 16).ok()?;
+            Some(IpAddr::V6(std::net::Ipv6Addr::from(value)))
+        }
+        _ => None,
+    }
+}
+
+/// Build the PROXY protocol header bytes Caddy's `go-proxyproto` writes for these addresses.
+///
+/// Caddy sets the source to the resolved client address (port 0, because `client_ip` has no port)
+/// and the destination to the all-zero address of the same family, since the original destination
+/// is not knowable (`httptransport.go`, `ProxyProtocolInfo`).
+pub(crate) fn proxy_protocol_header(version: ProxyProtocolVersion, source: IpAddr) -> Vec<u8> {
+    match version {
+        ProxyProtocolVersion::V1 => match source {
+            IpAddr::V4(address) => format!("PROXY TCP4 {address} 0.0.0.0 0 0\r\n").into_bytes(),
+            IpAddr::V6(address) => format!("PROXY TCP6 {address} :: 0 0\r\n").into_bytes(),
+        },
+        ProxyProtocolVersion::V2 => {
+            let mut header = Vec::with_capacity(28);
+            header.extend_from_slice(b"\r\n\r\n\0\r\nQUIT\n");
+            header.push(0x21); // version 2, command PROXY
+            match source {
+                IpAddr::V4(address) => {
+                    header.push(0x11); // AF_INET, STREAM
+                    header.extend_from_slice(&12u16.to_be_bytes());
+                    header.extend_from_slice(&address.octets());
+                    header.extend_from_slice(&[0, 0, 0, 0]);
+                }
+                IpAddr::V6(address) => {
+                    header.push(0x21); // AF_INET6, STREAM
+                    header.extend_from_slice(&36u16.to_be_bytes());
+                    header.extend_from_slice(&address.octets());
+                    header.extend_from_slice(&[0u8; 16]);
+                }
+            }
+            header.extend_from_slice(&0u16.to_be_bytes()); // source port (Caddy: port 0)
+            header.extend_from_slice(&0u16.to_be_bytes()); // destination port
+            header
+        }
+    }
+}
 
 /// Connector supporting TCP, Unix-socket, TLS, HTTP/2-ALPN and cleartext-h2c upstreams.
 #[derive(Clone, Debug)]
@@ -445,6 +541,8 @@ pub struct FixedUpstreamConnector {
     tls: Option<Arc<UpstreamTls>>,
     server_name: Option<ServerName<'static>>,
     h2c: bool,
+    /// Send a PROXY protocol header on every new connection (`transport.proxy_protocol`).
+    proxy_protocol: Option<ProxyProtocolVersion>,
 }
 
 impl Service<Uri> for FixedUpstreamConnector {
@@ -456,13 +554,21 @@ impl Service<Uri> for FixedUpstreamConnector {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, _uri: Uri) -> Self::Future {
+    fn call(&mut self, uri: Uri) -> Self::Future {
         let mut tcp = self.tcp.clone();
         let target = self.target.clone();
         let tls = self.tls.clone();
         let server_name = self.server_name.clone();
         let h2c = self.h2c;
+        let proxy_protocol = self.proxy_protocol;
         Box::pin(async move {
+            // The authority marker carries the PROXY-protocol source address. Health checks build
+            // plain upstream URLs (no marker) and therefore send no header, matching Caddy's
+            // active checker, which uses the default HTTP client instead of the configured
+            // transport.
+            let proxy_source = uri
+                .authority()
+                .and_then(|authority| proxy_protocol_source(authority.as_str()));
             match target {
                 DialTarget::Tcp(address) => {
                     let dial_uri: Uri = format!("http://{address}/").parse().map_err(|error| {
@@ -471,11 +577,19 @@ impl Service<Uri> for FixedUpstreamConnector {
                             format!("invalid upstream dial `{address}`: {error}"),
                         )
                     })?;
-                    let stream = tcp
+                    let mut stream = tcp
                         .call(dial_uri)
                         .await
                         .map_err(io::Error::other)?
                         .into_inner();
+                    // The header is written before the TLS handshake, so a TLS upstream sees the
+                    // PROXY header ahead of the ClientHello (Caddy writes it before wrapping the
+                    // connection in the TLS client).
+                    if let (Some(version), Some(source)) = (proxy_protocol, proxy_source) {
+                        stream
+                            .write_all(&proxy_protocol_header(version, source))
+                            .await?;
+                    }
                     match tls {
                         Some(tls) => {
                             let server_name = server_name.ok_or_else(no_server_name)?;
@@ -487,6 +601,12 @@ impl Service<Uri> for FixedUpstreamConnector {
                 }
                 #[cfg(unix)]
                 DialTarget::Unix(path) => {
+                    if proxy_protocol.is_some() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "PROXY protocol is not supported for Unix-socket upstreams",
+                        ));
+                    }
                     let stream = tokio::net::UnixStream::connect(&path).await?;
                     match tls {
                         Some(tls) => {
@@ -537,7 +657,24 @@ pub fn build_upstream_client(
             upstream.dial
         )
     })?;
-    build_upstream_client_for(transport, tls, h2c, http1_only)
+    build_upstream_client_for(transport, tls, h2c, http1_only, None)
+}
+
+/// Like [`build_upstream_client`] but with a configured PROXY protocol version.
+pub fn build_upstream_client_with_proxy_protocol(
+    upstream: &Upstream,
+    tls: Option<Arc<UpstreamTls>>,
+    h2c: bool,
+    http1_only: bool,
+    proxy_protocol: Option<ProxyProtocolVersion>,
+) -> Result<UpstreamClient, String> {
+    let transport = upstream.transport().ok_or_else(|| {
+        format!(
+            "upstream `{}` has a dynamic dial; build its client from the expanded transport",
+            upstream.dial
+        )
+    })?;
+    build_upstream_client_for(transport, tls, h2c, http1_only, proxy_protocol)
 }
 
 /// Build a client bound to one already-resolved dial transport.
@@ -549,6 +686,7 @@ pub fn build_upstream_client_for(
     tls: Option<Arc<UpstreamTls>>,
     h2c: bool,
     http1_only: bool,
+    proxy_protocol: Option<ProxyProtocolVersion>,
 ) -> Result<UpstreamClient, String> {
     let tls = if http1_only {
         tls.map(|tls| Arc::new(tls.h1_only()))
@@ -576,6 +714,7 @@ pub fn build_upstream_client_for(
             tls,
             server_name,
             h2c,
+            proxy_protocol,
         }),
     )
 }
@@ -674,5 +813,58 @@ mod tests {
             .await
             .expect_err("https without TLS config must fail");
         assert!(error.is_connect(), "expected a connect error, got {error}");
+    }
+
+    #[test]
+    fn proxy_protocol_authority_round_trips_the_source_address() {
+        for source in [
+            "192.0.2.10".parse::<IpAddr>().unwrap(),
+            "2001:db8::1".parse::<IpAddr>().unwrap(),
+        ] {
+            let authority = proxy_protocol_authority(source, "example.com:8080");
+            assert!(
+                authority.parse::<Uri>().is_ok(),
+                "marker authority must be URI-valid: {authority}"
+            );
+            assert_eq!(proxy_protocol_source(&authority), Some(source));
+        }
+        // No marker (health-check request URLs) -> no header.
+        assert_eq!(proxy_protocol_source("127.0.0.1:8080"), None);
+        assert_eq!(proxy_protocol_source("not-a-marker.example"), None);
+    }
+
+    #[test]
+    fn proxy_protocol_headers_match_caddy_address_semantics() {
+        let v4: IpAddr = "192.0.2.10".parse().unwrap();
+        assert_eq!(
+            proxy_protocol_header(ProxyProtocolVersion::V1, v4),
+            b"PROXY TCP4 192.0.2.10 0.0.0.0 0 0\r\n".to_vec()
+        );
+        let v6: IpAddr = "2001:db8::1".parse().unwrap();
+        assert_eq!(
+            proxy_protocol_header(ProxyProtocolVersion::V1, v6),
+            b"PROXY TCP6 2001:db8::1 :: 0 0\r\n".to_vec()
+        );
+
+        let v2 = proxy_protocol_header(ProxyProtocolVersion::V2, v4);
+        assert_eq!(v2.len(), 28, "16-byte prefix + 12-byte IPv4 block");
+        assert_eq!(&v2[..12], b"\r\n\r\n\0\r\nQUIT\n");
+        assert_eq!(&v2[12..14], &[0x21, 0x11]);
+        assert_eq!(u16::from_be_bytes([v2[14], v2[15]]), 12);
+        assert_eq!(&v2[16..20], &[192, 0, 2, 10]);
+        assert_eq!(&v2[20..24], &[0, 0, 0, 0]);
+        assert_eq!(&v2[24..28], &[0, 0, 0, 0]);
+
+        let v2 = proxy_protocol_header(ProxyProtocolVersion::V2, v6);
+        assert_eq!(v2.len(), 52, "16-byte prefix + 36-byte IPv6 block");
+        assert_eq!(&v2[12..14], &[0x21, 0x21]);
+        assert_eq!(u16::from_be_bytes([v2[14], v2[15]]), 36);
+        assert_eq!(
+            &v2[16..32],
+            &v6.to_string()
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets()
+        );
     }
 }
