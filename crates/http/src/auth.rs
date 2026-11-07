@@ -55,17 +55,23 @@
 //!
 //! ## Password hashing support
 //!
-//! Caddy supports the `bcrypt` and `argon2id` password-hash modules. Neither implementation is
-//! available in this offline build (no `bcrypt`/`argon2` crate in the dependency cache), and
-//! hand-rolling bcrypt is not acceptable here, so presenting credentials for those algorithms
-//! returns [`Error::NotImplemented`] (`HTTP-BASICAUTH-HASH`) at request time; the configuration
-//! itself is accepted and an *unauthenticated* request still receives the normal `401` challenge.
+//! Caddy's `bcrypt` (`http.authentication.hashes.bcrypt`) and `argon2id`
+//! (`http.authentication.hashes.argon2id`) password-hash modules are implemented natively:
+//! bcrypt hashes in `$2a$`, `$2b$`, `$2y$` and (for Caddy parity) `$2x$` modular-crypt form are
+//! verified with the `bcrypt` crate (which uses a constant-time digest comparison), and argon2id
+//! PHC strings (`$argon2id$v=19$m=...,t=...,p=...$<salt>$<key>`) are parsed exactly like Caddy's
+//! `DecodeHash` (raw standard base64, strict, parameters in `m,t,p` order, version 19) and verified
+//! with the `argon2` crate using the salt/parameters encoded in the hash and a constant-time key
+//! comparison. Unsupported or malformed hashes are rejected as located configuration errors at
+//! load (Caddy defers some of these to a request-time `401`; this stricter validation is recorded
+//! as a divergence). Unknown usernames still perform a real verification against Caddy's fixed
+//! fake bcrypt/argon2id hashes so account existence is not a timing oracle.
 //!
-//! The only algorithm that can verify a password in this build is the explicit caddy-rs extension
-//! `{"hash": {"algorithm": "plaintext"}}`, where each account's `password` is the literal
-//! plaintext. This is deliberately opt-in and never inferred: a missing `hash` still defaults to
-//! Caddy's `bcrypt`. It exists for local development and tests; it is not valid Caddy
-//! configuration and is registered as a divergence.
+//! The explicit caddy-rs extension `{"hash": {"algorithm": "plaintext"}}` remains available for
+//! local development and tests, where each account's `password` is the literal plaintext. It is
+//! deliberately opt-in and never inferred: a missing `hash` still defaults to Caddy's `bcrypt`.
+//! Clear-text (or base64-of-clear-text) account passwords under bcrypt/argon2id are rejected
+//! loudly at load, because they decode to bytes that are not a valid modular-crypt/PHC hash.
 //!
 //! On success the handler sets the request variable `http.auth.user.id` (exposed as the
 //! `{http.auth.user.id}` placeholder, matching Caddy) and continues; on failure it responds `401`
@@ -76,6 +82,7 @@ use std::io::ErrorKind;
 use std::net::IpAddr;
 use std::time::Duration;
 
+use argon2::{Algorithm, Argon2, Params, Version};
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use http_body_util::{BodyExt, Full};
@@ -670,14 +677,33 @@ enum PasswordAlgorithm {
 pub struct BasicAuthHandler {
     accounts: BTreeMap<String, Account>,
     realm: String,
-    algorithm: PasswordAlgorithm,
+    /// Caddy's fixed fake hashes, verified for unknown usernames to avoid a user-existence timing
+    /// side channel (see `BcryptHash.FakeHash`/`Argon2idHash.FakeHash` upstream).
+    fake_hash: PasswordHash,
 }
 
 #[derive(Debug, Clone)]
 struct Account {
-    /// For bcrypt/argon2id this is the modular-crypt hash bytes (or legacy base64-decoded bytes);
-    /// for `plaintext` it is the literal password.
-    password: Vec<u8>,
+    hash: PasswordHash,
+}
+
+/// A validated account password: the modular-crypt/PHC hash is parsed at configuration load, so
+/// malformed hashes fail loudly instead of turning into request-time 401s.
+#[derive(Debug, Clone)]
+enum PasswordHash {
+    /// `$2a$`/`$2b$`/`$2x$`/`$2y$` modular-crypt bcrypt hash (validated by `bcrypt::HashParts`).
+    Bcrypt(String),
+    /// Argon2id PHC hash with the salt/parameters/key decoded from the encoded hash.
+    Argon2id(Argon2idHash),
+    /// caddy-rs extension: literal plaintext (opt-in only).
+    Plaintext(Vec<u8>),
+}
+
+#[derive(Debug, Clone)]
+struct Argon2idHash {
+    salt: Vec<u8>,
+    key: Vec<u8>,
+    params: Params,
 }
 
 impl BasicAuthHandler {
@@ -722,8 +748,8 @@ impl BasicAuthHandler {
                 return Ok(Self {
                     accounts: BTreeMap::new(),
                     realm: "restricted".to_string(),
-                    algorithm: PasswordAlgorithm::Bcrypt,
-                })
+                    fake_hash: fake_hash(PasswordAlgorithm::Bcrypt),
+                });
             }
             Some(provider) => provider.as_object().ok_or_else(|| {
                 invalid(path, "http_basic provider configuration must be an object")
@@ -811,24 +837,25 @@ impl BasicAuthHandler {
                         decode_base64(password.trim()).ok_or_else(|| {
                             invalid(
                                 format!("{account_path}.password"),
-                                "base64-decoding password failed",
+                                "base64-decoding password failed; clear-text passwords are not \
+                                 accepted for bcrypt/argon2id (use a modular-crypt/PHC hash)",
                             )
                         })?
                     }
                 }
             };
-            accounts.insert(
-                username,
-                Account {
-                    password: password_bytes,
-                },
-            );
+            let hash = parse_password_hash(
+                algorithm,
+                &password_bytes,
+                &format!("{account_path}.password"),
+            )?;
+            accounts.insert(username, Account { hash });
         }
 
         Ok(Self {
             accounts,
             realm,
-            algorithm,
+            fake_hash: fake_hash(algorithm),
         })
     }
 }
@@ -864,6 +891,230 @@ fn parse_algorithm(hash: Option<&serde_json::Value>, path: &str) -> Result<Passw
                  argon2id, and the caddy-rs extension `plaintext`)"
             ),
         )),
+    }
+}
+
+/// Caddy's fixed fake bcrypt hash (cost 14), used for unknown usernames so verification time does
+/// not disclose account existence.
+const BCRYPT_FAKE_HASH: &str = "$2a$14$X3ulqf/iGxnf1k6oMZ.RZeJUoqI9PX2PM4rS5lkIKJXduLGXGPrt6";
+
+/// Caddy's fixed fake Argon2id hash (m=47104,t=1,p=1), used for unknown usernames.
+const ARGON2ID_FAKE_HASH: &str =
+    "$argon2id$v=19$m=47104,t=1,p=1$P2nzckEdTZ3bxCiBCkRTyA$xQL3Z32eo5jKl7u5tcIsnEKObYiyNZQQf5/4sAau6Pg";
+
+fn fake_hash(algorithm: PasswordAlgorithm) -> PasswordHash {
+    match algorithm {
+        PasswordAlgorithm::Bcrypt => PasswordHash::Bcrypt(BCRYPT_FAKE_HASH.to_string()),
+        PasswordAlgorithm::Argon2id => PasswordHash::Argon2id(
+            parse_argon2id_hash(ARGON2ID_FAKE_HASH.as_bytes(), "built-in argon2id fake hash")
+                .expect("built-in argon2id fake hash is valid"),
+        ),
+        PasswordAlgorithm::Plaintext => PasswordHash::Plaintext(b"caddy-rs-fake-password".to_vec()),
+    }
+}
+
+/// Validate and parse an account password at configuration load.
+fn parse_password_hash(
+    algorithm: PasswordAlgorithm,
+    bytes: &[u8],
+    path: &str,
+) -> Result<PasswordHash> {
+    match algorithm {
+        PasswordAlgorithm::Plaintext => Ok(PasswordHash::Plaintext(bytes.to_vec())),
+        PasswordAlgorithm::Bcrypt => {
+            let encoded = std::str::from_utf8(bytes).map_err(|error| {
+                invalid(path, format!("bcrypt hash is not valid UTF-8: {error}"))
+            })?;
+            if !["$2a$", "$2b$", "$2x$", "$2y$"]
+                .iter()
+                .any(|prefix| encoded.starts_with(prefix))
+            {
+                return Err(invalid(
+                    path,
+                    "unsupported bcrypt hash; expected `$2a$`, `$2b$`, `$2x$` or `$2y$` \
+                     modular-crypt format (not a clear-text password)",
+                ));
+            }
+            let parts = encoded
+                .parse::<bcrypt::HashParts>()
+                .map_err(|error| invalid(path, format!("invalid bcrypt hash: {error}")))?;
+            let cost = parts.get_cost();
+            if !(4..=31).contains(&cost) {
+                return Err(invalid(
+                    path,
+                    format!("bcrypt cost {cost} is outside the supported range 4..=31"),
+                ));
+            }
+            Ok(PasswordHash::Bcrypt(encoded.to_string()))
+        }
+        PasswordAlgorithm::Argon2id => {
+            Ok(PasswordHash::Argon2id(parse_argon2id_hash(bytes, path)?))
+        }
+    }
+}
+
+/// Parse an Argon2id PHC string exactly like Caddy v2.11.7's `DecodeHash`:
+/// six `$`-separated fields, variant `argon2id`, `v=19`, three parameters in `m,t,p` order, and
+/// raw standard base64 (strict, unpadded) salt/key. Parameter validity is also checked here so a
+/// malformed hash fails at load rather than on the request path.
+fn parse_argon2id_hash(bytes: &[u8], path: &str) -> Result<Argon2idHash> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|error| invalid(path, format!("argon2id hash is not valid UTF-8: {error}")))?;
+    let parts: Vec<&str> = text.split('$').collect();
+    if parts.len() != 6 || !parts[0].is_empty() {
+        return Err(invalid(
+            path,
+            "invalid argon2id hash format; expected \
+             `$argon2id$v=19$m=<mem>,t=<time>,p=<threads>$<salt>$<key>`",
+        ));
+    }
+    if parts[1] != "argon2id" {
+        return Err(invalid(
+            path,
+            format!(
+                "unsupported argon2 variant `{}`; only `argon2id` is supported",
+                parts[1]
+            ),
+        ));
+    }
+    let version = parts[2]
+        .strip_prefix("v=")
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or_else(|| {
+            invalid(
+                path,
+                format!(
+                    "invalid argon2id version field `{}`; expected `v=19`",
+                    parts[2]
+                ),
+            )
+        })?;
+    if version != 19 {
+        return Err(invalid(
+            path,
+            format!("incompatible argon2id version {version}; expected version 19"),
+        ));
+    }
+    let params: Vec<&str> = parts[3].split(',').collect();
+    if params.len() != 3 {
+        return Err(invalid(
+            path,
+            "invalid argon2id parameters; expected exactly `m=...,t=...,p=...`",
+        ));
+    }
+    let memory = params[0]
+        .strip_prefix("m=")
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or_else(|| {
+            invalid(
+                path,
+                format!(
+                    "invalid argon2id memory parameter `{}`; expected `m=<u32>`",
+                    params[0]
+                ),
+            )
+        })?;
+    let time = params[1]
+        .strip_prefix("t=")
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or_else(|| {
+            invalid(
+                path,
+                format!(
+                    "invalid argon2id iterations parameter `{}`; expected `t=<u32>`",
+                    params[1]
+                ),
+            )
+        })?;
+    let threads = params[2]
+        .strip_prefix("p=")
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or_else(|| {
+            invalid(
+                path,
+                format!(
+                    "invalid argon2id parallelism parameter `{}`; expected `p=<u32>`",
+                    params[2]
+                ),
+            )
+        })?;
+    let salt = decode_base64_raw_std_strict(parts[4])
+        .ok_or_else(|| invalid(path, "argon2id salt is not valid unpadded standard base64"))?;
+    let key = decode_base64_raw_std_strict(parts[5])
+        .ok_or_else(|| invalid(path, "argon2id key is not valid unpadded standard base64"))?;
+    if salt.len() < 8 {
+        return Err(invalid(
+            path,
+            format!(
+                "argon2id salt is {} bytes; at least 8 are required",
+                salt.len()
+            ),
+        ));
+    }
+    let params = Params::new(memory, time, threads, Some(key.len())).map_err(|error| {
+        invalid(
+            path,
+            format!(
+                "invalid argon2id parameters m={memory},t={time},p={threads},\
+                     keylen={}: {error}",
+                key.len()
+            ),
+        )
+    })?;
+    Ok(Argon2idHash { salt, key, params })
+}
+
+/// Decode unpadded standard base64 with Caddy's strict trailing-bit rules
+/// (`base64.RawStdEncoding.Strict()`): no padding, no invalid characters, no non-zero trailing
+/// bits and no dangling one-character group.
+fn decode_base64_raw_std_strict(input: &str) -> Option<Vec<u8>> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    if input.contains('=') || input.len() % 4 == 1 {
+        return None;
+    }
+    let mut lookup = [255u8; 256];
+    for (index, byte) in ALPHABET.iter().enumerate() {
+        lookup[*byte as usize] = index as u8;
+    }
+    let mut output = Vec::with_capacity(input.len() * 3 / 4);
+    let mut buffer: u32 = 0;
+    let mut bits = 0u32;
+    for byte in input.bytes() {
+        let value = lookup[byte as usize];
+        if value == 255 {
+            return None;
+        }
+        buffer = (buffer << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            output.push((buffer >> bits) as u8);
+            buffer &= (1 << bits) - 1;
+        }
+    }
+    if buffer != 0 {
+        return None;
+    }
+    Some(output)
+}
+
+/// Constant-time verification against a parsed hash. bcrypt's crate compares the computed digest
+/// in constant time; argon2id and the plaintext extension use [`constant_time_eq`].
+fn verify_password(hash: &PasswordHash, password: &[u8]) -> bool {
+    match hash {
+        PasswordHash::Bcrypt(encoded) => bcrypt::verify(password, encoded).unwrap_or(false),
+        PasswordHash::Argon2id(hash) => {
+            let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, hash.params.clone());
+            let mut computed = vec![0u8; hash.key.len()];
+            if argon2
+                .hash_password_into(password, &hash.salt, &mut computed)
+                .is_err()
+            {
+                return false;
+            }
+            constant_time_eq(&computed, &hash.key)
+        }
+        PasswordHash::Plaintext(expected) => constant_time_eq(expected, password),
     }
 }
 
@@ -977,23 +1228,12 @@ impl Handler for BasicAuthHandler {
             return Ok(challenge(&self.realm));
         };
 
-        match self.algorithm {
-            PasswordAlgorithm::Plaintext => {}
-            PasswordAlgorithm::Bcrypt | PasswordAlgorithm::Argon2id => {
-                return Err(Error::NotImplemented {
-                    feature: "basic_auth password verification for the bcrypt/argon2id hash \
-                             algorithms (no verifier available in the offline dependency set); \
-                             configure `{\"hash\":{\"algorithm\":\"plaintext\"}}` only for local \
-                             development",
-                    tracking_id: "HTTP-BASICAUTH-HASH",
-                });
-            }
-        }
-
-        let Some(account) = self.accounts.get(&username) else {
-            return Ok(challenge(&self.realm));
-        };
-        if !constant_time_eq(&account.password, password.as_bytes()) {
+        // Verify even for unknown usernames, against Caddy's fixed fake hash for the configured
+        // algorithm, so response timing does not reveal whether the account exists.
+        let account = self.accounts.get(&username);
+        let hash = account.map_or(&self.fake_hash, |account| &account.hash);
+        let matches = verify_password(hash, password.as_bytes());
+        if !matches || account.is_none() {
             return Ok(challenge(&self.realm));
         }
 
@@ -1472,7 +1712,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn basic_auth_bcrypt_credentials_fail_loudly_but_challenge_works() {
+    async fn basic_auth_bcrypt_verifies_credentials_and_sets_identity() {
         let handler = basic_auth_handler(serde_json::json!({
             "handler": "basic_auth",
             "hash": {"algorithm": "bcrypt"},
@@ -1489,18 +1729,326 @@ mod tests {
         };
         assert_eq!(response.status, StatusCode::UNAUTHORIZED);
 
-        // Presenting credentials cannot be verified in this build: fail loudly, do not guess.
+        // Wrong password -> plain 401 challenge.
+        let mut request = base_request();
+        request
+            .headers
+            .insert(header::AUTHORIZATION, authorization("alice", "wrong"));
+        let Outcome::Respond(response) = handler.handle(request).await.unwrap() else {
+            panic!("expected challenge");
+        };
+        assert_eq!(response.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers[header::WWW_AUTHENTICATE],
+            "Basic realm=\"restricted\""
+        );
+
+        // Correct password -> continue and set Caddy's identity placeholder.
         let mut request = base_request();
         request.headers.insert(
             header::AUTHORIZATION,
             authorization("alice", "correct horse"),
         );
-        let error = handler
-            .handle(request)
-            .await
-            .expect_err("bcrypt unsupported");
-        assert!(matches!(error, Error::NotImplemented { .. }), "{error}");
-        assert!(error.to_string().contains("HTTP-BASICAUTH-HASH"), "{error}");
+        let Outcome::Continue(request) = handler.handle(request).await.unwrap() else {
+            panic!("expected continue");
+        };
+        assert_eq!(
+            request.vars.get("http.auth.user.id").map(String::as_str),
+            Some("alice")
+        );
+    }
+
+    /// Oracle-captured bcrypt vectors (Python `bcrypt` for `$2a$`/`$2b$`, prefix-swapped to
+    /// `$2y$`/`$2x$` since those variants share the algorithm) that real Caddy v2.11.7 accepted
+    /// with HTTP 200 (see `.scratch/logs/w16-auth-oracle/`).
+    const ORACLE_BCRYPT_VECTORS: &[(&str, &str)] = &[
+        (
+            "$2a$04$9QlsJIJQgPZUami30idia.XdCzenqBjwJUFXbz7pFAnHxsjGibTKK",
+            "correct horse",
+        ),
+        (
+            "$2b$04$CEH17OA6jMx9./SPzCa5LOPuscyz/cPVUYFoBSp3Y.ZDlRNy8Rc.O",
+            "correct horse",
+        ),
+        (
+            "$2y$04$9QlsJIJQgPZUami30idia.XdCzenqBjwJUFXbz7pFAnHxsjGibTKK",
+            "correct horse",
+        ),
+        (
+            "$2x$04$9QlsJIJQgPZUami30idia.XdCzenqBjwJUFXbz7pFAnHxsjGibTKK",
+            "correct horse",
+        ),
+    ];
+
+    /// Oracle-captured Argon2id PHC vectors generated with the `argon2` CLI and accepted by real
+    /// Caddy v2.11.7 (HTTP 200).
+    const ORACLE_ARGON2_VECTORS: &[(&str, &str)] = &[
+        (
+            "$argon2id$v=19$m=47104,t=2,p=1$c2FsdHNhbHQ$Z8rbAmmUGEG/qPhwSd9oICo6lEK8zJCDzyvsJss2ftE",
+            "correct horse",
+        ),
+        (
+            "$argon2id$v=19$m=19456,t=2,p=2$b3RoZXJzYWx0$hswpKvmAIY0wzaurlWuWHJeNDta45Nkv0CaXhAWMVd8",
+            "correct horse",
+        ),
+        (
+            "$argon2id$v=19$m=8192,t=3,p=1$dGhpcmRzYWx0$Pya7EQ8OExE2d4FJ7G7HZ56Vw2ISN402M/kPKRmFyM0",
+            "another password",
+        ),
+        (
+            "$argon2id$v=19$m=46,t=1,p=1$dW5pY29kZXNhbHQ$qkbmvPvO39xqVfw4T4l952gONQ9818f5Z/smW92Ckso",
+            "correct horse",
+        ),
+    ];
+
+    async fn assert_authorized(handler: &BasicAuthHandler, user: &str, password: &str) -> bool {
+        let mut request = base_request();
+        request
+            .headers
+            .insert(header::AUTHORIZATION, authorization(user, password));
+        match handler.handle(request).await.unwrap() {
+            Outcome::Continue(request) => {
+                assert_eq!(
+                    request.vars.get("http.auth.user.id").map(String::as_str),
+                    Some(user)
+                );
+                true
+            }
+            Outcome::Respond(response) => {
+                assert_eq!(response.status, StatusCode::UNAUTHORIZED);
+                false
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bcrypt_verifies_real_vectors_cost_10_in_all_supported_versions() {
+        use std::str::FromStr;
+        // Cost-10 hash generated by the same bcrypt crate, rendered in each supported version.
+        let parts = bcrypt::hash_with_result("correct horse", 10).expect("hash");
+        for version in [
+            bcrypt::Version::TwoA,
+            bcrypt::Version::TwoB,
+            bcrypt::Version::TwoY,
+            bcrypt::Version::TwoX,
+        ] {
+            let prefix = format!("${}$", version);
+            let encoded = parts.format_for_version(version);
+            assert!(encoded.starts_with(&prefix), "{encoded}");
+            let handler = basic_auth_handler(serde_json::json!({
+                "handler": "basic_auth",
+                "hash": {"algorithm": "bcrypt"},
+                "accounts": [{"username": "alice", "password": encoded}]
+            }));
+            assert!(assert_authorized(&handler, "alice", "correct horse").await);
+            assert!(!assert_authorized(&handler, "alice", "wrong horse").await);
+            // Parsing accepts the exact rendered form (HashParts::from_str is the load validator).
+            assert!(bcrypt::HashParts::from_str(&encoded).is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn bcrypt_accepts_oracle_vectors_and_truncates_like_caddy() {
+        for (hash, password) in ORACLE_BCRYPT_VECTORS {
+            let handler = basic_auth_handler(serde_json::json!({
+                "handler": "basic_auth",
+                "hash": {"algorithm": "bcrypt"},
+                "accounts": [{"username": "alice", "password": hash}]
+            }));
+            assert!(
+                assert_authorized(&handler, "alice", password).await,
+                "oracle bcrypt vector {hash}"
+            );
+            assert!(!assert_authorized(&handler, "alice", "wrong").await);
+        }
+
+        // Real Caddy v2.11.7 accepts a 100-byte password against a hash of its 72-byte prefix
+        // (Go bcrypt truncates); the Rust backend must keep that parity.
+        let hash = "$2b$04$YjOCOcFuLc/FT5P2sHfL3up87G4A5qrzkKlnkc5rQxap1BL0KzAw.";
+        let handler = basic_auth_handler(serde_json::json!({
+            "handler": "basic_auth",
+            "hash": {"algorithm": "bcrypt"},
+            "accounts": [{"username": "alice", "password": hash}]
+        }));
+        assert!(assert_authorized(&handler, "alice", &"a".repeat(72)).await);
+        assert!(assert_authorized(&handler, "alice", &"a".repeat(100)).await);
+    }
+
+    #[tokio::test]
+    async fn argon2id_verifies_oracle_vectors_with_encoded_parameters() {
+        for (hash, password) in ORACLE_ARGON2_VECTORS {
+            let handler = basic_auth_handler(serde_json::json!({
+                "handler": "basic_auth",
+                "hash": {"algorithm": "argon2id"},
+                "accounts": [{"username": "alice", "password": hash}]
+            }));
+            assert!(
+                assert_authorized(&handler, "alice", password).await,
+                "oracle argon2id vector {hash}"
+            );
+            assert!(!assert_authorized(&handler, "alice", "wrong").await);
+        }
+    }
+
+    #[tokio::test]
+    async fn bcrypt_and_argon2id_reject_empty_unicode_and_unknown_credentials() {
+        // Argon2id hash of a unicode password with non-default parameters, generated in-test.
+        let salt = b"unicode-salt-123";
+        let params = Params::new(8192, 2, 1, Some(32)).unwrap();
+        let mut key = [0u8; 32];
+        Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+            .hash_password_into("pässwörd☃".as_bytes(), salt, &mut key)
+            .unwrap();
+        let hash = format!(
+            "$argon2id$v=19$m=8192,t=2,p=1${}${}",
+            base64_encode(salt).trim_end_matches('='),
+            base64_encode(&key).trim_end_matches('=')
+        );
+        let handler = basic_auth_handler(serde_json::json!({
+            "handler": "basic_auth",
+            "hash": {"algorithm": "argon2id"},
+            "accounts": [{"username": "alice", "password": hash}]
+        }));
+        assert!(assert_authorized(&handler, "alice", "pässwörd☃").await);
+        assert!(!assert_authorized(&handler, "alice", "passwörd☃").await);
+        assert!(!assert_authorized(&handler, "alice", "").await);
+        assert!(!assert_authorized(&handler, "nobody", "pässwörd☃").await);
+        // Empty password against a bcrypt account is a plain 401 too.
+        let bcrypt = basic_auth_handler(serde_json::json!({
+            "handler": "basic_auth",
+            "hash": {"algorithm": "bcrypt"},
+            "accounts": [{"username": "alice", "password": ORACLE_BCRYPT_VECTORS[0].0}]
+        }));
+        assert!(!assert_authorized(&bcrypt, "alice", "").await);
+    }
+
+    #[test]
+    fn malformed_and_unsupported_hashes_fail_at_config_load() {
+        let cases = [
+            // Truncated / structurally invalid bcrypt.
+            ("$2b$04$not-a-valid-hash", "bcrypt"),
+            ("$2b$04$", "bcrypt"),
+            (
+                "$2a$03$9QlsJIJQgPZUami30idia.XdCzenqBjwJUFXbz7pFAnHxsjGibTKK",
+                "bcrypt",
+            ),
+            (
+                "$2c$04$9QlsJIJQgPZUami30idia.XdCzenqBjwJUFXbz7pFAnHxsjGibTKK",
+                "bcrypt",
+            ),
+            ("hunter2", "bcrypt"),
+            ("password", "bcrypt"),
+            // Invalid argon2id encodings (variant/version/parameters/base64/salt/key lengths).
+            ("$argon2i$v=19$m=8192,t=1,p=1$c2FsdHNhbHQ$AAAA", "argon2id"),
+            ("$argon2id$v=16$m=8192,t=1,p=1$c2FsdHNhbHQ$AAAA", "argon2id"),
+            ("$argon2id$v=19$t=1,m=8192,p=1$c2FsdHNhbHQ$AAAA", "argon2id"),
+            ("$argon2id$v=19$m=8192,t=1$c2FsdHNhbHQ$AAAA", "argon2id"),
+            (
+                "$argon2id$v=19$m=8192,t=1,p=1$c2FsdHNhbHQ=$AAAA",
+                "argon2id",
+            ),
+            ("$argon2id$v=19$m=8192,t=1,p=1$c2FsdHNhbHQ$AA", "argon2id"),
+            (
+                "$argon2id$v=19$m=1,t=1,p=1$c2FsdHNhbHQ$AAAAAAAA",
+                "argon2id",
+            ),
+            (
+                "$argon2id$v=19$m=8192,t=1,p=0$c2FsdHNhbHQ$AAAAAAAA",
+                "argon2id",
+            ),
+        ];
+        for (hash, algorithm) in cases {
+            let error = BasicAuthHandler::from_json(
+                &serde_json::json!({
+                    "handler": "basic_auth",
+                    "hash": {"algorithm": algorithm},
+                    "accounts": [{"username": "alice", "password": hash}]
+                }),
+                "handler",
+            )
+            .expect_err("malformed hash must fail at load");
+            assert!(
+                error.to_string().contains(".accounts[0].password"),
+                "located error for {hash}: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_authentication_json_verifies_bcrypt_and_argon2id() {
+        // The canonical `authentication` handler shape (what Caddy adapts `basic_auth` to) uses
+        // the same verification path as the caddy-rs `basic_auth` shorthand.
+        let bcrypt = basic_auth_handler(serde_json::json!({
+            "handler": "authentication",
+            "providers": {"http_basic": {
+                "hash": {"algorithm": "bcrypt"},
+                "accounts": [{"username": "alice", "password": ORACLE_BCRYPT_VECTORS[0].0}],
+                "realm": "canonical"
+            }}
+        }));
+        assert!(assert_authorized(&bcrypt, "alice", "correct horse").await);
+        assert!(!assert_authorized(&bcrypt, "alice", "wrong").await);
+        let argon = basic_auth_handler(serde_json::json!({
+            "handler": "authentication",
+            "providers": {"http_basic": {
+                "hash": {"algorithm": "argon2id"},
+                "accounts": [{"username": "alice", "password": ORACLE_ARGON2_VECTORS[0].0}]
+            }}
+        }));
+        assert!(assert_authorized(&argon, "alice", "correct horse").await);
+        assert!(!assert_authorized(&argon, "alice", "wrong").await);
+    }
+
+    #[tokio::test]
+    async fn legacy_base64_encoded_bcrypt_hash_is_accepted() {
+        let hash = ORACLE_BCRYPT_VECTORS[0].0;
+        let encoded = base64_encode(hash.as_bytes());
+        let handler = basic_auth_handler(serde_json::json!({
+            "handler": "basic_auth",
+            "hash": {"algorithm": "bcrypt"},
+            "accounts": [{"username": "alice", "password": encoded}]
+        }));
+        assert!(assert_authorized(&handler, "alice", "correct horse").await);
+        assert!(!assert_authorized(&handler, "alice", "wrong").await);
+    }
+
+    #[tokio::test]
+    async fn verification_time_does_not_depend_on_password_length() {
+        // Coarse timing check (documented design note): bcrypt's work factor is independent of the
+        // supplied password length (only the first 72 bytes are used), and argon2id's cost is
+        // dominated by the memory/iteration parameters. Use a cost-4 hash to keep the test fast;
+        // compare medians with a generous ratio to avoid scheduler noise.
+        use std::time::Instant;
+        let short_password = b"a".to_vec();
+        let long_password = b"a".repeat(64);
+        let short_hash = bcrypt::hash(&short_password, 4).expect("short hash");
+        let long_hash = bcrypt::hash(&long_password, 4).expect("long hash");
+        let mut short_times = Vec::new();
+        let mut long_times = Vec::new();
+        for _ in 0..15 {
+            let started = Instant::now();
+            assert!(verify_password(
+                &parse_password_hash(PasswordAlgorithm::Bcrypt, short_hash.as_bytes(), "test")
+                    .unwrap(),
+                &short_password
+            ));
+            short_times.push(started.elapsed());
+            let started = Instant::now();
+            assert!(verify_password(
+                &parse_password_hash(PasswordAlgorithm::Bcrypt, long_hash.as_bytes(), "test")
+                    .unwrap(),
+                &long_password
+            ));
+            long_times.push(started.elapsed());
+        }
+        short_times.sort();
+        long_times.sort();
+        let short_median = short_times[short_times.len() / 2];
+        let long_median = long_times[long_times.len() / 2];
+        assert!(
+            long_median < short_median * 5,
+            "verification time depends on password length: short={short_median:?} long={long_median:?}"
+        );
     }
 
     #[test]
