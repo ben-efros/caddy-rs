@@ -1624,7 +1624,7 @@ mod tests {
         let transport: Arc<dyn AcmeTransport> = Arc::new(TestTransport::new());
         let config = AcmeIssuerConfig::from_json(&serde_json::json!({
             "module": "acme",
-            "challenges": {"dns": {"provider": {"name": "route53"}}}
+            "challenges": {"dns": {"provider": {"name": "bogus-provider"}}}
         }))
         .unwrap();
         let error = AcmeIssuer::new(
@@ -1636,7 +1636,7 @@ mod tests {
         .with_configured_dns_solver(transport)
         .expect_err("unknown DNS provider must be rejected");
         let message = error.to_string();
-        assert!(message.contains("route53"), "{message}");
+        assert!(message.contains("bogus-provider"), "{message}");
         assert!(message.contains("T-TLS-063"), "{message}");
     }
 
