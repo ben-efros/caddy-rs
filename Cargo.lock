@@ -194,12 +194,14 @@ dependencies = [
  "bytes",
  "caddy-rs-config",
  "caddy-rs-core",
+ "flate2",
  "http",
  "ring",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "zstd",
 ]
 
 [[package]]

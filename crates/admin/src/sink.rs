@@ -25,9 +25,11 @@
 //! File sinks honour Caddy's `mode`/`dir_mode` (Unix), create missing parent directories, and
 //! rotate by size (`roll_size_mb`) and/or time (`roll_interval`, `roll_minutes` UTC minutes,
 //! `roll_at` UTC `HH:MM`), keeping at most `roll_keep` backup files and deleting backups older
-//! than `roll_keep_days`. Rotated files are named `<filename>.<unix-millis>` (a documented
-//! divergence from Caddy's timberjack naming/compression; compression options are rejected by the
-//! configuration mapper).
+//! than `roll_keep_days`. Rotated files are named `<filename>.<unix-millis>` and, when
+//! `roll_compression` is `gzip` or `zstd`, stored as `<filename>.<unix-millis>.gz`/`.zst`
+//! (Caddy's default is gzip; caddy-rs keeps `none` unless configured). `roll_local_time` and a
+//! custom `backup_time_format` remain located errors: this build has no timezone database or Go
+//! time-layout renderer (DIV-0083).
 //!
 //! Net sinks (`net` writer) support TCP, UDP, Unix stream and Unix datagram sockets, connect with
 //! `dial_timeout`, reconnect once and retry a failed line, and with `soft_start` fall back to
@@ -346,11 +348,11 @@ impl AccessLogSinkConfig {
                 ));
             }
             if let Some(compression) = &self.file.roll_compression {
-                if compression != "none" {
+                if !matches!(compression.as_str(), "none" | "gzip" | "zstd") {
                     return Err(AccessLogError::new(
                         "writer.roll_compression",
                         format!(
-                            "compression `{compression}` is not implemented (supported: none; DIV-0083)"
+                            "unknown compression `{compression}` (supported: none, gzip, zstd)"
                         ),
                     ));
                 }
@@ -710,6 +712,11 @@ impl FileSink {
         self.writer.flush()?;
         let backup = unique_backup_path(&self.path);
         std::fs::rename(&self.path, &backup)?;
+        if let Some(compression) = self.options.roll_compression.as_deref() {
+            if compression != "none" {
+                compress_backup(&backup, compression)?;
+            }
+        }
         let file = open_append(&self.path, &self.options)?;
         self.writer = BufWriter::with_capacity(self.capacity, file);
         self.bytes = 0;
@@ -748,6 +755,42 @@ fn create_parent_directories(path: &Path, options: &FileWriterOptions) -> io::Re
         std::fs::set_permissions(parent, std::fs::Permissions::from_mode(dir_mode))?;
     }
     let _ = options;
+    Ok(())
+}
+
+/// Compress one rotated file to `<name>.gz`/`<name>.zst`, removing the uncompressed backup only
+/// after the compressed file was flushed and closed. On error the original backup is kept.
+fn compress_backup(path: &Path, compression: &str) -> io::Result<()> {
+    use std::io::Read;
+    let mut source = File::open(path)?;
+    let target = match compression {
+        "gzip" => path.with_file_name(format!(
+            "{}.gz",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        )),
+        "zstd" => path.with_file_name(format!(
+            "{}.zst",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        )),
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unknown log compression `{other}`"),
+            ))
+        }
+    };
+    let file = File::create(&target)?;
+    if compression == "gzip" {
+        let mut encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        io::copy(&mut source, &mut encoder)?;
+        encoder.finish()?;
+    } else {
+        let mut encoder = zstd::stream::write::Encoder::new(file, 3)?;
+        io::copy(&mut source, &mut encoder)?;
+        encoder.finish()?;
+    }
+    drop(source);
+    std::fs::remove_file(path)?;
     Ok(())
 }
 
@@ -2078,21 +2121,26 @@ mod tests {
             "{error}"
         );
 
-        let gzip = base(FileWriterOptions {
-            roll_compression: Some("gzip".to_string()),
+        // gzip/zstd/none are implemented (DIV-0083); only unknown names are rejected.
+        for compression in ["none", "gzip", "zstd"] {
+            let accepted = base(FileWriterOptions {
+                roll_compression: Some(compression.to_string()),
+                ..FileWriterOptions::default()
+            });
+            accepted
+                .validate()
+                .unwrap_or_else(|error| panic!("{compression} must validate: {error}"));
+        }
+        let bogus = base(FileWriterOptions {
+            roll_compression: Some("brotli".to_string()),
             ..FileWriterOptions::default()
         });
-        let error = gzip.validate().expect_err("gzip");
+        let error = bogus.validate().expect_err("unknown compression");
         assert!(
-            error.to_string().contains("writer.roll_compression"),
+            error.to_string().contains("writer.roll_compression")
+                && error.to_string().contains("brotli"),
             "{error}"
         );
-
-        let none = base(FileWriterOptions {
-            roll_compression: Some("none".to_string()),
-            ..FileWriterOptions::default()
-        });
-        none.validate().expect("none compression accepted");
 
         let custom = base(FileWriterOptions {
             backup_time_format: Some("2006-01-02".to_string()),
@@ -2103,5 +2151,81 @@ mod tests {
             error.to_string().contains("writer.backup_time_format"),
             "{error}"
         );
+    }
+    #[test]
+    fn gzip_and_zstd_rotation_produce_readable_archives() {
+        for (compression, suffix) in [("gzip", "gz"), ("zstd", "zst")] {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let path = directory.path().join("access.log");
+            let sink = AccessLogSink::from_config(&AccessLogSinkConfig {
+                output: AccessLogOutput::File,
+                filename: Some(path.clone()),
+                file: FileWriterOptions {
+                    roll: true,
+                    roll_size_mb: Some(1),
+                    roll_keep: 2,
+                    roll_compression: Some(compression.to_string()),
+                    ..FileWriterOptions::default()
+                },
+                encoder: AccessLogConfig {
+                    exclude: vec![],
+                    ..AccessLogConfig::default()
+                },
+                ..AccessLogSinkConfig::default()
+            })
+            .expect("rotating sink");
+            let line_padding = "x".repeat(256);
+            let large = AccessLogEntry {
+                user_id: line_padding,
+                ..entry("compressed-rotation", 200)
+            };
+            for _ in 0..14_000 {
+                sink.emit(&large).expect("emit");
+            }
+            sink.close().expect("close");
+
+            let archive = std::fs::read_dir(directory.path())
+                .expect("dir")
+                .filter_map(|item| item.ok())
+                .map(|item| item.path())
+                .find(|path| {
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().ends_with(&format!(".{suffix}")))
+                        .unwrap_or(false)
+                })
+                .unwrap_or_else(|| panic!("{compression} rotation must leave a .{suffix} archive"));
+            let bytes = std::fs::read(&archive).expect("read archive");
+            let mut decoded = String::new();
+            if compression == "gzip" {
+                use std::io::Read;
+                let mut decoder = flate2::read::GzDecoder::new(&bytes[..]);
+                decoder.read_to_string(&mut decoded).expect("gunzip");
+            } else {
+                let raw = zstd::stream::decode_all(&bytes[..]).expect("unzstd");
+                decoded = String::from_utf8(raw).expect("utf8");
+            }
+            assert!(
+                decoded.contains("\"logger\":\"http.log.access\""),
+                "{compression} archive must contain the access-log lines"
+            );
+            let first = decoded.lines().next().unwrap_or_default();
+            assert!(
+                serde_json::from_str::<serde_json::Value>(first).is_ok(),
+                "{compression} archive lines must stay valid JSON: {first}"
+            );
+            // The uncompressed backup is replaced, not duplicated.
+            assert!(
+                !std::fs::read_dir(directory.path())
+                    .expect("dir")
+                    .filter_map(|item| item.ok())
+                    .any(|item| {
+                        let name = item.file_name().to_string_lossy().to_string();
+                        name.starts_with("access.log.")
+                            && !name.ends_with(&format!(".{suffix}"))
+                            && name != "access.log"
+                    }),
+                "{compression} rotation must not keep uncompressed backups"
+            );
+        }
     }
 }
