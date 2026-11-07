@@ -579,6 +579,12 @@ pub const BUILTIN_MODULES: &[Module] = &[
         "Authentication middleware with the HTTP Basic provider (native bcrypt and argon2id password-hash verification, constant-time comparison)",
     ),
     Module::new(
+        "http.handlers.rate_limit",
+        "rate_limit",
+        ModuleKind::HttpHandler,
+        "Token-bucket rate limiting (caddy-rs extension; Caddy has no built-in rate-limit handler)",
+    ),
+    Module::new(
         "http.handlers.basic_auth",
         "basic_auth",
         ModuleKind::HttpHandler,
