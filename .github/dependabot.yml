@@ -18,3 +18,6 @@ updates:
     commit-message:
       prefix: "ci"
     labels: ["dependencies", "ci"]
+    ignore:
+      # The toolchain version lives in rust-toolchain.toml; the action only needs a stable ref.
+      - dependency-name: "dtolnay/rust-toolchain"
