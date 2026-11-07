@@ -94,7 +94,6 @@ jobs:
           tar -czf "dist/${name}.tar.gz" -C dist "$name"
           rm -rf "$dir"
           ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
-          cat "dist/${name}.tar.gz.sha256" >> dist/SHA256SUMS
 
       - name: Upload artifact
         uses: actions/upload-artifact@v5
@@ -111,6 +110,9 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+
+      - name: Combine checksums
+        run: cat dist/*.sha256 > dist/SHA256SUMS
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
