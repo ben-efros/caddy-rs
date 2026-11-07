@@ -38,7 +38,7 @@ fn php_fastcgi_default_expansion_matches_caddy_shape() {
         inner[0]["handle"][0],
         json!({
             "handler": "static_response",
-            "headers": {"Location": ["{http.request.orig_uri.path}/{http.request.orig_uri.prefixed_query}"]},
+            "headers": {"Location": ["./{http.request.orig_uri.path.file_escaped}/{http.request.orig_uri.prefixed_query}"]},
             "status_code": 308,
         })
     );

@@ -4644,24 +4644,15 @@ fn build_routes(
             if left_position != right_position {
                 return left_position.cmp(&right_position);
             }
-            route_path_order(&left.1, &right.1)
+            // Caddy's `sortRoutes` swaps i/j for the directives whose values overwrite each other
+            // (`vars`, `log_level`), so the least-specific matcher runs first and the last match
+            // wins. This only affects path-length ordering; non-path matchers keep source order.
+            if matches!(left.0, "vars" | "log_level") {
+                route_path_order(&right.1, &left.1)
+            } else {
+                route_path_order(&left.1, &right.1)
+            }
         });
-        // Caddy's `sortRoutes` special-cases `vars`: it reverses the (most-specific-first) order
-        // so the least-specific matcher runs first and the last matching `vars` wins. Since
-        // several `vars` routes share one directive slot they form one contiguous run.
-        let mut start = 0;
-        while start < entries.len() {
-            if entries[start].0 != "vars" {
-                start += 1;
-                continue;
-            }
-            let mut end = start + 1;
-            while end < entries.len() && entries[end].0 == "vars" {
-                end += 1;
-            }
-            entries[start..end].reverse();
-            start = end;
-        }
     }
 
     Ok(consolidate_routes(
@@ -5160,7 +5151,7 @@ fn build_php_fastcgi_routes(
                     "handler": "static_response",
                     "headers": {
                         "Location": [
-                            "{http.request.orig_uri.path}/{http.request.orig_uri.prefixed_query}"
+                            "./{http.request.orig_uri.path.file_escaped}/{http.request.orig_uri.prefixed_query}"
                         ],
                     },
                     "status_code": 308,
@@ -5557,8 +5548,7 @@ fn build_error_routes(
             without_matchers.push(Value::Object(wrapper));
         }
     }
-    with_matchers.reverse();
-    without_matchers.reverse();
+    // `sort.SliceStable` with "matcher first" keeps declaration order inside each group.
     with_matchers.extend(without_matchers);
     Ok(with_matchers)
 }
