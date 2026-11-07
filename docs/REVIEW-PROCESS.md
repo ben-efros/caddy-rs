@@ -5,7 +5,7 @@ approve, and it is a human.
 
 ## 1. CI (blocking)
 
-`main` is protected: a pull request is required, and the following checks must pass before merge.
+`master` is protected: a pull request is required, and the following checks must pass before merge.
 
 | Check | What it proves |
 |---|---|
@@ -14,7 +14,7 @@ approve, and it is a human.
 | `audit` | no known advisory in the dependency graph (RustSec) |
 | `release` | on tags only: reproducible build + SBOM |
 
-A failing or missing check cannot be merged. Force-pushes and branch deletion on `main` are
+A failing or missing check cannot be merged. Force-pushes and branch deletion on `master` are
 disabled, history is linear, and review conversations must be resolved.
 
 ## 2. Advisory LLM review (non-blocking)
