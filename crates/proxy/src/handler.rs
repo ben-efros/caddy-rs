@@ -26,7 +26,7 @@
 //! HTTP/2 `:authority` matches Caddy/Go) while a per-upstream client connector still dials the
 //! configured upstream target; no separate `Host` field is forwarded on h2.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -51,6 +51,8 @@ use crate::client::{
     build_upstream_client_for, build_upstream_client_with_proxy_protocol, proxy_protocol_authority,
     ProxyProtocolVersion, UpstreamClient,
 };
+use crate::dns::{DnsResolver, SystemDnsResolver};
+use crate::dynamic_upstreams::{DynamicUpstreamSource, DynamicUpstreams};
 use crate::fastcgi::{FastCgiError, FastCgiTransport};
 use crate::forward_auth::{HandleResponse, HandleResponseResult, RequestRewrite};
 use crate::health::{HealthCheck, HealthCheckScheduler};
@@ -359,6 +361,12 @@ pub struct ReverseProxyHandler {
     /// Lazily built clients for dynamic (placeholder) upstream dials, keyed by the expanded dial
     /// address (Caddy pools per resolved address too).
     dynamic_clients: Mutex<HashMap<String, Arc<DynamicClients>>>,
+    /// Configured `dynamic_upstreams` source, when present.
+    dynamic: Option<Arc<dyn DynamicUpstreamSource>>,
+    /// Upstream states provisioned from dynamic discovery, keyed by dial address. Reusing the
+    /// same `Arc<Upstream>` keeps counters, active/passive health and the admin status stable
+    /// across refreshes (Caddy's `dynamicHosts`).
+    dynamic_hosts: Mutex<BTreeMap<String, Arc<Upstream>>>,
     /// Parsed transport configuration (TLS client config and HTTP version policy).
     transport: TransportConfig,
     upstreams: Vec<Arc<Upstream>>,
@@ -378,8 +386,18 @@ pub struct ReverseProxyHandler {
 }
 
 impl ReverseProxyHandler {
-    /// Build from Caddy JSON.
+    /// Build from Caddy JSON using the system DNS resolver for dynamic upstreams.
     pub fn from_json(value: &Value, path: &str) -> HttpResult<Self> {
+        Self::from_json_with_resolver(value, path, Arc::new(SystemDnsResolver))
+    }
+
+    /// Build from Caddy JSON with an injected DNS resolver for `dynamic_upstreams` (tests and
+    /// embedders; production uses [`Self::from_json`] and the system resolver).
+    pub fn from_json_with_resolver(
+        value: &Value,
+        path: &str,
+        resolver: Arc<dyn DnsResolver>,
+    ) -> HttpResult<Self> {
         let object = value
             .as_object()
             .ok_or_else(|| invalid(path, "reverse_proxy handler must be an object"))?;
@@ -394,10 +412,29 @@ impl ReverseProxyHandler {
         let transport = parse_transport(object.get("transport"), path)?;
         let tls = transport.tls.clone();
 
-        let upstreams_value = object
-            .get("upstreams")
-            .and_then(Value::as_array)
-            .ok_or_else(|| invalid(path, "reverse_proxy requires an `upstreams` array"))?;
+        // Caddy's `dynamic_upstreams`: a `http.reverse_proxy.upstreams.*` source consulted inside
+        // the proxy loop. It replaces the static pool on success and falls back to it on error.
+        let dynamic = match object.get("dynamic_upstreams") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(Arc::new(DynamicUpstreams::from_json_with_resolver(
+                value,
+                &format!("{path}.dynamic_upstreams"),
+                Arc::clone(&resolver),
+            )?) as Arc<dyn DynamicUpstreamSource>),
+        };
+        let upstreams_value: Vec<Value> = match object.get("upstreams") {
+            Some(value) => value
+                .as_array()
+                .ok_or_else(|| invalid(path, "`upstreams` must be an array"))?
+                .clone(),
+            None if dynamic.is_some() => Vec::new(),
+            None => {
+                return Err(invalid(
+                    path,
+                    "reverse_proxy requires an `upstreams` array or `dynamic_upstreams`",
+                ))
+            }
+        };
         let mut upstreams = Vec::new();
         for (index, upstream) in upstreams_value.iter().enumerate() {
             let upstream_path = format!("{path}.upstreams[{index}]");
@@ -496,10 +533,12 @@ impl ReverseProxyHandler {
                 tracking_id: "PROXY-FASTCGI-DYNAMIC-DIAL",
             });
         }
-        if has_dynamic_dial && health_check.is_some() {
+        if (has_dynamic_dial || dynamic.is_some()) && health_check.is_some() {
+            // Caddy does not run active health checks against dynamic upstreams (they are not in
+            // the static pool the checker walks); caddy-rs rejects the combination loudly instead
+            // of silently checking nothing.
             return Err(HttpError::NotImplemented {
-                feature:
-                    "active health checks for upstreams with placeholder (dynamic) dial addresses",
+                feature: "active health checks for dynamic upstreams (placeholder dials or `dynamic_upstreams`)",
                 tracking_id: "PROXY-DYNAMIC-UPSTREAM-HEALTH",
             });
         }
@@ -534,6 +573,8 @@ impl ReverseProxyHandler {
             clients,
             upgrade_clients,
             dynamic_clients: Mutex::new(HashMap::new()),
+            dynamic,
+            dynamic_hosts: Mutex::new(BTreeMap::new()),
             transport,
             upstreams,
             balancer,
@@ -785,14 +826,109 @@ impl ReverseProxyHandler {
 
     /// Live per-upstream counters (used by the admin `/reverse_proxy/upstreams` endpoint).
     pub fn upstream_statuses(&self) -> Vec<UpstreamStatus> {
-        self.upstreams
+        let mut statuses: Vec<UpstreamStatus> = self
+            .upstreams
             .iter()
             .map(|upstream| UpstreamStatus {
                 address: upstream.dial.clone(),
                 num_requests: upstream.num_requests(),
                 fails: upstream.fails(),
             })
-            .collect()
+            .collect();
+        // Caddy's admin endpoint also reports the dynamic hosts it has provisioned.
+        if self.dynamic.is_some() {
+            let hosts = self
+                .dynamic_hosts
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for (dial, upstream) in hosts.iter() {
+                if self
+                    .upstreams
+                    .iter()
+                    .any(|static_upstream| static_upstream.dial == *dial)
+                {
+                    continue;
+                }
+                statuses.push(UpstreamStatus {
+                    address: dial.clone(),
+                    num_requests: upstream.num_requests(),
+                    fails: upstream.fails(),
+                });
+            }
+        }
+        statuses
+    }
+
+    /// Replace the configured dynamic upstream source (embedders/tests; Caddy's
+    /// `dynamic_upstreams` JSON is parsed by [`Self::from_json`]).
+    pub fn with_dynamic_source(mut self, dynamic: Arc<dyn DynamicUpstreamSource>) -> Self {
+        self.dynamic = Some(dynamic);
+        self
+    }
+
+    /// Upstreams to select from for one proxy-loop iteration.
+    ///
+    /// With `dynamic_upstreams` Caddy asks the source each iteration: a successful lookup replaces
+    /// the static pool (even when it returns no upstreams), a failed lookup keeps the static pool,
+    /// and retries reset caching sources first so bad backends are re-resolved.
+    async fn request_upstreams(&self, request: &Request, attempts: u32) -> Vec<Arc<Upstream>> {
+        let Some(dynamic) = &self.dynamic else {
+            return self.upstreams.clone();
+        };
+        if attempts > 0 {
+            dynamic.reset_cache(request);
+        }
+        match dynamic.get_upstreams(request).await {
+            Ok(dials) => {
+                if dials.is_empty() {
+                    eprintln!(
+                        "caddy-rs: dynamic upstreams `{}` returned no upstreams;                          responding 503",
+                        dynamic.describe()
+                    );
+                    return Vec::new();
+                }
+                self.provision_dynamic_hosts(&dials)
+            }
+            Err(error) => {
+                eprintln!(
+                    "caddy-rs: dynamic upstreams `{}` failed: {error}; falling back to static                      upstreams",
+                    dynamic.describe()
+                );
+                self.upstreams.clone()
+            }
+        }
+    }
+
+    /// Map discovered dial addresses to stable [`Upstream`] states (counters/health survive
+    /// refreshes, like Caddy's `dynamicHosts`). Invalid dials are reported and skipped.
+    fn provision_dynamic_hosts(&self, dials: &[String]) -> Vec<Arc<Upstream>> {
+        let mut provisioned = Vec::with_capacity(dials.len());
+        let mut hosts = self
+            .dynamic_hosts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for dial in dials {
+            if let Some(upstream) = hosts.get(dial) {
+                provisioned.push(Arc::clone(upstream));
+                continue;
+            }
+            let tls = self
+                .transport
+                .tls
+                .as_ref()
+                .is_some_and(|tls| tls.should_use_tls(dial_port(dial)));
+            match Upstream::parse_dial(dial, tls) {
+                Ok(upstream) => {
+                    let upstream = Arc::new(upstream);
+                    hosts.insert(dial.clone(), Arc::clone(&upstream));
+                    provisioned.push(upstream);
+                }
+                Err(message) => {
+                    eprintln!("caddy-rs: dynamic upstream `{dial}` is invalid: {message}");
+                }
+            }
+        }
+        provisioned
     }
 
     /// Resolve one selected upstream for this request.
@@ -807,29 +943,31 @@ impl ReverseProxyHandler {
         request: &Request,
     ) -> Result<(Arc<Upstream>, UpstreamClient, Option<UpstreamClient>), ProxyError> {
         if !upstream.is_dynamic() {
-            let Some(index) = self
+            if let Some(index) = self
                 .upstreams
                 .iter()
                 .position(|candidate| Arc::ptr_eq(candidate, upstream))
-            else {
-                return Err(ProxyError::Request(format!(
-                    "upstream `{}`: not part of this handler's pool",
-                    upstream.dial
-                )));
-            };
-            let main = self.clients[index]
-                .as_ref()
-                .expect("fixed upstream has a client")
-                .clone();
-            let upgrade = self.upgrade_clients.as_ref().map(|clients| {
-                clients[index]
+            {
+                let main = self.clients[index]
                     .as_ref()
-                    .expect("fixed upstream has an upgrade client")
-                    .clone()
-            });
-            return Ok((Arc::clone(upstream), main, upgrade));
+                    .expect("fixed upstream has a client")
+                    .clone();
+                let upgrade = self.upgrade_clients.as_ref().map(|clients| {
+                    clients[index]
+                        .as_ref()
+                        .expect("fixed upstream has an upgrade client")
+                        .clone()
+                });
+                return Ok((Arc::clone(upstream), main, upgrade));
+            }
+            // A dynamic-discovery host: concrete dial, clients are built per resolved address
+            // below (the same path as placeholder dials).
         }
-        let expanded = request.replace_all(&upstream.dial);
+        let expanded = if upstream.dial.contains('{') {
+            request.replace_all(&upstream.dial)
+        } else {
+            upstream.dial.clone()
+        };
         if expanded.trim().is_empty() {
             return Err(ProxyError::Request(format!(
                 "upstream `{}`: dial address is empty after placeholder expansion",
@@ -1221,10 +1359,6 @@ fn audit_unsupported_handler_fields(
             "reverse_proxy `circuit_breaker` (circuit breakers are not implemented)",
         ),
         (
-            "dynamic_upstreams",
-            "reverse_proxy `dynamic_upstreams` (dynamic upstream discovery is not implemented)",
-        ),
-        (
             "proxy_status_name",
             "reverse_proxy `proxy_status_name` (Proxy-Status headers are not implemented)",
         ),
@@ -1347,10 +1481,10 @@ impl Handler for ReverseProxyHandler {
             // selection until their failure window expires (Caddy's `Upstream.Available()`).
             let now = std::time::Instant::now();
             let candidates: Vec<Arc<Upstream>> = self
-                .upstreams
-                .iter()
+                .request_upstreams(&request, attempts)
+                .await
+                .into_iter()
                 .filter(|upstream| self.upstream_available(upstream, now))
-                .cloned()
                 .collect();
             let Some(upstream) = self.balancer.select(&candidates, &request, &mut selection) else {
                 // No upstream is available. Caddy retries this state (an upstream may recover)
@@ -1555,10 +1689,10 @@ impl Handler for ReverseProxyHandler {
         loop {
             let now = std::time::Instant::now();
             let candidates: Vec<Arc<Upstream>> = self
-                .upstreams
-                .iter()
+                .request_upstreams(&request, attempts)
+                .await
+                .into_iter()
                 .filter(|upstream| self.upstream_available(upstream, now))
-                .cloned()
                 .collect();
             let Some(upstream) = self.balancer.select(&candidates, &request, &mut selection) else {
                 if !self.retry_allowed(attempts, deadline) {
@@ -4870,7 +5004,6 @@ mod tests {
     fn rejects_unsupported_security_relevant_handler_fields() {
         for (field, value) in [
             ("circuit_breaker", serde_json::json!({"type": "x"})),
-            ("dynamic_upstreams", serde_json::json!({"source": "x"})),
             ("proxy_status_name", serde_json::json!("caddy")),
             ("stream_timeout", serde_json::json!(1000)),
             ("stream_buffer_size", serde_json::json!(1024)),
@@ -4924,6 +5057,278 @@ mod tests {
             .err()
             .expect("unsupported handle_response must be rejected");
         assert!(error.to_string().contains("T-PROXY-037"), "{error}");
+    }
+
+    #[derive(Debug)]
+    struct DynamicTestResolver {
+        srv: std::sync::Mutex<
+            std::collections::VecDeque<Result<Vec<crate::dns::SrvRecord>, String>>,
+        >,
+        lookups: std::sync::atomic::AtomicUsize,
+    }
+
+    impl DynamicTestResolver {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                srv: std::sync::Mutex::new(std::collections::VecDeque::new()),
+                lookups: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        fn push_srv(&self, result: Result<Vec<crate::dns::SrvRecord>, String>) {
+            self.srv.lock().unwrap().push_back(result);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::dns::DnsResolver for DynamicTestResolver {
+        async fn lookup_ip(
+            &self,
+            _name: &str,
+            _version: crate::dns::IpVersion,
+            _resolvers: &[crate::dns::ResolverAddress],
+            _timeout: std::time::Duration,
+        ) -> Result<Vec<std::net::IpAddr>, String> {
+            Err("IP lookup not scripted in this test".to_string())
+        }
+
+        async fn lookup_srv(
+            &self,
+            _name: &str,
+            _resolvers: &[crate::dns::ResolverAddress],
+            _timeout: std::time::Duration,
+        ) -> Result<Vec<crate::dns::SrvRecord>, String> {
+            self.lookups
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.srv
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Err("no scripted SRV result".to_string()))
+        }
+    }
+
+    fn srv_address(dial: &str) -> crate::dns::SrvRecord {
+        let (host, port) = dial.rsplit_once(':').expect("test dial has a port");
+        crate::dns::SrvRecord {
+            target: host.to_string(),
+            port: port.parse().expect("test dial port"),
+            priority: 10,
+            weight: 1,
+        }
+    }
+
+    fn spawn_label_upstream(label: &'static str) -> impl std::future::Future<Output = String> {
+        spawn_upstream(
+            move |_request: hyper::Request<hyper::body::Incoming>| async move {
+                Ok::<_, Infallible>(
+                    hyper::Response::builder()
+                        .status(200)
+                        .body(Full::new(Bytes::from_static(label.as_bytes())))
+                        .expect("response"),
+                )
+            },
+        )
+    }
+
+    fn build_dynamic_handler(
+        value: Value,
+        resolver: Arc<dyn crate::dns::DnsResolver>,
+    ) -> ReverseProxyHandler {
+        ReverseProxyHandler::from_json_with_resolver(&value, "handler", resolver)
+            .expect("dynamic handler builds")
+    }
+
+    fn respond_dynamic(handler: &ReverseProxyHandler, request: Request) -> Response {
+        let outcome = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(handler.handle(request))
+        })
+        .expect("handler runs");
+        let Outcome::Respond(response) = outcome else {
+            panic!("expected a response");
+        };
+        response
+    }
+
+    fn dynamic_upstreams_config(extra: Value) -> Value {
+        let mut dynamic = serde_json::json!({
+            "source": "srv",
+            "name": "backend.example",
+            "refresh": 50_000_000u64
+        });
+        if let (Some(dynamic), Value::Object(extra)) = (dynamic.as_object_mut(), extra) {
+            dynamic.extend(extra);
+        }
+        serde_json::json!({
+            "handler": "reverse_proxy",
+            "dynamic_upstreams": dynamic
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dynamic_upstreams_serve_refresh_and_report_in_admin_statuses() {
+        let first = spawn_label_upstream("served-first").await;
+        let second = spawn_label_upstream("served-second").await;
+        let resolver = DynamicTestResolver::new();
+        resolver.push_srv(Ok(vec![srv_address(&first)]));
+        resolver.push_srv(Ok(vec![srv_address(&second)]));
+        let handler = build_dynamic_handler(
+            dynamic_upstreams_config(serde_json::json!({})),
+            Arc::clone(&resolver) as Arc<dyn crate::dns::DnsResolver>,
+        );
+        assert!(
+            handler.upstreams().is_empty(),
+            "dynamic-only handler has no static pool"
+        );
+
+        assert_eq!(
+            body_text(&respond_dynamic(
+                &handler,
+                get_request("/first", Some("203.0.113.7:5555"))
+            )),
+            "served-first"
+        );
+        assert!(
+            handler
+                .upstream_statuses()
+                .iter()
+                .any(|status| status.address == first),
+            "admin statuses include the discovered upstream: {:?}",
+            handler.upstream_statuses()
+        );
+
+        // After the refresh interval the source is queried again and the pool follows it.
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert_eq!(
+            body_text(&respond_dynamic(
+                &handler,
+                get_request("/second", Some("203.0.113.7:5555"))
+            )),
+            "served-second"
+        );
+        assert_eq!(
+            resolver.lookups.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        assert!(handler
+            .upstream_statuses()
+            .iter()
+            .any(|status| status.address == second));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dynamic_upstreams_lookup_error_falls_back_to_static_pool() {
+        let static_upstream = spawn_label_upstream("static-fallback").await;
+        let resolver = DynamicTestResolver::new();
+        resolver.push_srv(Err("dns down".to_string()));
+        let mut config = dynamic_upstreams_config(serde_json::json!({}));
+        config["upstreams"] = serde_json::json!([{"dial": static_upstream}]);
+        let handler = build_dynamic_handler(
+            config,
+            Arc::clone(&resolver) as Arc<dyn crate::dns::DnsResolver>,
+        );
+        assert_eq!(
+            body_text(&respond_dynamic(
+                &handler,
+                get_request("/fb", Some("203.0.113.7:5555"))
+            )),
+            "static-fallback",
+            "Caddy falls back to the static upstreams on a dynamic lookup error"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dynamic_upstreams_empty_lookup_returns_503() {
+        let resolver = DynamicTestResolver::new();
+        resolver.push_srv(Ok(Vec::new()));
+        let handler = build_dynamic_handler(
+            dynamic_upstreams_config(serde_json::json!({})),
+            Arc::clone(&resolver) as Arc<dyn crate::dns::DnsResolver>,
+        );
+        let response = respond_dynamic(&handler, get_request("/empty", Some("203.0.113.7:5555")));
+        assert_eq!(response.status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dynamic_upstreams_retry_resets_the_source_cache() {
+        let live = spawn_label_upstream("after-retry").await;
+        // Reserve then release a port so the first resolved upstream is a real dial failure.
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_address = dead.local_addr().unwrap();
+        drop(dead);
+        let dead_dial = dead_address.to_string();
+
+        let resolver = DynamicTestResolver::new();
+        resolver.push_srv(Ok(vec![srv_address(&dead_dial)]));
+        resolver.push_srv(Ok(vec![srv_address(&live)]));
+        let mut config = dynamic_upstreams_config(serde_json::json!({}));
+        config["load_balancing"] = serde_json::json!({"retries": 1, "try_interval": 1_000_000u64});
+        let handler = build_dynamic_handler(
+            config,
+            Arc::clone(&resolver) as Arc<dyn crate::dns::DnsResolver>,
+        );
+        assert_eq!(
+            body_text(&respond_dynamic(
+                &handler,
+                get_request("/retry", Some("203.0.113.7:5555"))
+            )),
+            "after-retry",
+            "retrying resets the source cache and re-resolves to the live upstream"
+        );
+        assert_eq!(
+            resolver.lookups.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+    }
+
+    #[test]
+    fn dynamic_upstreams_reject_active_health_checks_loudly() {
+        let error = ReverseProxyHandler::from_json(
+            &serde_json::json!({
+                "handler": "reverse_proxy",
+                "dynamic_upstreams": {"source": "srv", "name": "backend.example"},
+                "health_checks": {"active": {"uri": "/health"}}
+            }),
+            "handler",
+        )
+        .err()
+        .expect("active health checks with dynamic upstreams must be rejected");
+        assert!(
+            error.to_string().contains("PROXY-DYNAMIC-UPSTREAM-HEALTH"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handler_accepts_a_pluggable_dynamic_source() {
+        #[derive(Debug)]
+        struct FixedSource(String);
+        #[async_trait::async_trait]
+        impl crate::dynamic_upstreams::DynamicUpstreamSource for FixedSource {
+            async fn get_upstreams(
+                &self,
+                _request: &caddy_rs_http::Request,
+            ) -> Result<Vec<String>, String> {
+                Ok(vec![self.0.clone()])
+            }
+            fn reset_cache(&self, _request: &caddy_rs_http::Request) {}
+            fn describe(&self) -> String {
+                "fixed test source".to_string()
+            }
+        }
+        let upstream = spawn_label_upstream("from-custom-source").await;
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": []
+        }))
+        .with_dynamic_source(Arc::new(FixedSource(upstream)));
+        assert_eq!(
+            body_text(&respond_dynamic(
+                &handler,
+                get_request("/custom", Some("203.0.113.7:5555"))
+            )),
+            "from-custom-source"
+        );
     }
 
     #[test]
