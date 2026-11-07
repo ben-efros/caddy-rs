@@ -200,13 +200,8 @@ fn expression_matcher_supports_handle_errors_status_filters() {
     }
     // Other expressions are loudly unsupported (located config errors) rather than silently
     // non-matching: full CEL matcher functions are not implemented by the documented subset.
-    for expression in [
-        "method('GET')",
-        // Caddy CEL that the status subset cannot evaluate: a backticked literal that real Caddy
-        // itself fails to compile must not validate or silently never match here.
-        "{http.error.status_code} == `402`",
-        "{http.error.status_code} in [`402`]",
-    ] {
+    // CEL backtick raw strings are accepted (T-ROUTE-039), so they are no longer in this list.
+    for expression in ["method('GET')"] {
         let error = match caddy_rs_http::matchers::build_matcher_set(
             &json!({"expression": {"expr": expression}}),
         ) {
