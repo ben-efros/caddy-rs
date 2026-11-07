@@ -1443,3 +1443,25 @@ fn flush_interval_adapts_like_caddy() {
         );
     }
 }
+
+#[test]
+fn dial_timeout_in_transport_adapts_like_caddy() {
+    // Golden from `caddy adapt` v2.11.9: a duration becomes `caddy.Duration` nanoseconds.
+    let adapted = adapt(
+        ":8080 {\n\treverse_proxy 127.0.0.1:9000 {\n\t\ttransport http {\n\t\t\tdial_timeout 5s\n\t\t}\n\t}\n}\n",
+    )
+    .expect("adapt dial_timeout");
+    let transport =
+        &adapted.config["apps"]["http"]["servers"]["srv0"]["routes"][0]["handle"][0]["transport"];
+    assert_eq!(transport["dial_timeout"], json!(5_000_000_000_i64));
+    assert_eq!(transport["protocol"], json!("http"));
+
+    let error = adapt(
+        ":8080 {\n\treverse_proxy 127.0.0.1:9000 {\n\t\ttransport http {\n\t\t\tdial_timeout\n\t\t}\n\t}\n}\n",
+    )
+    .expect_err("missing value must be located");
+    assert!(
+        error.to_string().contains("requires a value"),
+        "unexpected error: {error}"
+    );
+}

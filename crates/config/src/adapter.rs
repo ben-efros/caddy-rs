@@ -8290,7 +8290,8 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
                                         Ok(raw) => raw,
                                         Err(_) => parse_duration(value).map_err(|message| {
                                             adapter_error(option.position.clone(), message)
-                                        })? as i64,
+                                        })?
+                                            as i64,
                                     };
                                     extra_transport
                                         .insert("dial_timeout".to_string(), json!(nanos));

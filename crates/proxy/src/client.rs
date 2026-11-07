@@ -20,8 +20,8 @@ use std::io;
 use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 #[cfg(test)]
 use bytes::Bytes;
@@ -623,7 +623,9 @@ impl Service<Uri> for FixedUpstreamConnector {
                     let stream = match dial_timeout {
                         Some(limit) => match tokio::time::timeout(limit, connect).await {
                             Ok(result) => result?,
-                            Err(_) => return Err(dial_timed_out(&path.display().to_string(), limit)),
+                            Err(_) => {
+                                return Err(dial_timed_out(&path.display().to_string(), limit))
+                            }
                         },
                         None => connect.await?,
                     };
