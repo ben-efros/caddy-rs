@@ -7019,15 +7019,336 @@ fn templates_handler(directive: &Directive) -> caddy_rs_core::Result<Value> {
     Ok(Value::Object(object))
 }
 
-fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_core::Result<Value> {
-    if args.is_empty() {
-        if let Some(dynamic) = directive.block.iter().find(|item| item.name == "dynamic") {
-            return Err(adapter_error(
-                dynamic.position.clone(),
-                "`reverse_proxy` dynamic upstreams are not supported by this build \
-                 (tracked as T-PROXY-036); use static upstreams",
-            ));
+/// Parse one `dynamic <source> [args...] { ... }` reverse_proxy option. Mirrors Caddy v2.11.9's
+/// `upstreams.go` `UnmarshalCaddyfile` methods: the adapter emits exactly the JSON those methods
+/// produce; runtime provisioning rejects unsupported runtime values later, not the adapter.
+fn parse_dynamic_upstream(item: &Directive) -> caddy_rs_core::Result<Value> {
+    let Some(source) = item.args.first() else {
+        return Err(adapter_error(
+            item.position.clone(),
+            "`dynamic` requires an upstream source (`srv`, `a` or `multi`)",
+        ));
+    };
+    let source_args = &item.args[1..];
+    parse_named_dynamic_source(source, source_args, &item.block, item.position.clone())
+}
+
+fn parse_named_dynamic_source(
+    source: &str,
+    args: &[String],
+    block: &[Directive],
+    position: Position,
+) -> caddy_rs_core::Result<Value> {
+    match source {
+        "srv" => parse_srv_source(args, block, position),
+        "a" => parse_a_source(args, block, position),
+        "multi" => parse_multi_source(args, block, position),
+        other => Err(adapter_error(
+            position,
+            format!("unrecognized dynamic upstream source `{other}`"),
+        )),
+    }
+}
+
+fn dynamic_source_object(source: &str) -> Map<String, Value> {
+    let mut object = Map::new();
+    object.insert("source".to_string(), json!(source));
+    object
+}
+
+fn ensure_no_inline_args(item: &Directive, option: &str) -> caddy_rs_core::Result<()> {
+    if !item.block.is_empty() {
+        return Err(adapter_error(
+            item.position.clone(),
+            format!("`{option}` does not take a block"),
+        ));
+    }
+    Ok(())
+}
+
+fn dynamic_string_option(item: &Directive, option: &str) -> caddy_rs_core::Result<String> {
+    ensure_no_inline_args(item, option)?;
+    let Some(value) = item.args.first() else {
+        return Err(adapter_error(
+            item.position.clone(),
+            format!("`{option}` requires a value"),
+        ));
+    };
+    if item.args.len() > 1 {
+        return Err(adapter_error(
+            item.position.clone(),
+            format!("`{option}` takes exactly one value"),
+        ));
+    }
+    Ok(value.clone())
+}
+
+fn dynamic_duration_option(item: &Directive, option: &str) -> caddy_rs_core::Result<i64> {
+    ensure_no_inline_args(item, option)?;
+    let Some(value) = item.args.first() else {
+        return Err(adapter_error(
+            item.position.clone(),
+            format!("`{option}` requires a duration"),
+        ));
+    };
+    if item.args.len() > 1 {
+        return Err(adapter_error(
+            item.position.clone(),
+            format!("`{option}` takes exactly one duration"),
+        ));
+    }
+    parse_dynamic_duration(value).map_err(|reason| adapter_error(item.position.clone(), reason))
+}
+
+/// Caddy durations allow a leading `-` (notably for `dial_fallback_delay`); the shared
+/// unsigned parser is used for the magnitude so the accepted grammar stays identical.
+fn parse_dynamic_duration(value: &str) -> Result<i64, String> {
+    if let Some(rest) = value.strip_prefix('-') {
+        let magnitude = parse_duration(rest)?;
+        let magnitude =
+            i64::try_from(magnitude).map_err(|_| format!("duration `{value}` overflows"))?;
+        Ok(-magnitude)
+    } else {
+        let magnitude = parse_duration(value)?;
+        i64::try_from(magnitude).map_err(|_| format!("duration `{value}` overflows"))
+    }
+}
+
+fn parse_srv_source(
+    args: &[String],
+    block: &[Directive],
+    position: Position,
+) -> caddy_rs_core::Result<Value> {
+    if args.len() > 1 {
+        return Err(adapter_error(
+            position,
+            "`dynamic srv` takes at most one name argument",
+        ));
+    }
+    let mut object = dynamic_source_object("srv");
+    if let Some(name) = args.first() {
+        object.insert("name".to_string(), json!(name));
+    }
+    for item in block {
+        match item.name.as_str() {
+            "service" => {
+                if object.contains_key("service") {
+                    return Err(adapter_error(
+                        item.position.clone(),
+                        "srv service has already been specified",
+                    ));
+                }
+                object.insert(
+                    "service".to_string(),
+                    json!(dynamic_string_option(item, "service")?),
+                );
+            }
+            "proto" => {
+                if object.contains_key("proto") {
+                    return Err(adapter_error(
+                        item.position.clone(),
+                        "srv proto has already been specified",
+                    ));
+                }
+                object.insert(
+                    "proto".to_string(),
+                    json!(dynamic_string_option(item, "proto")?),
+                );
+            }
+            "name" => {
+                if object.contains_key("name") {
+                    return Err(adapter_error(
+                        item.position.clone(),
+                        "srv name has already been specified",
+                    ));
+                }
+                object.insert(
+                    "name".to_string(),
+                    json!(dynamic_string_option(item, "name")?),
+                );
+            }
+            "refresh" => {
+                object.insert(
+                    "refresh".to_string(),
+                    json!(dynamic_duration_option(item, "refresh")?),
+                );
+            }
+            "grace_period" => {
+                object.insert(
+                    "grace_period".to_string(),
+                    json!(dynamic_duration_option(item, "grace_period")?),
+                );
+            }
+            "resolvers" => {
+                ensure_no_inline_args(item, "resolvers")?;
+                if item.args.is_empty() {
+                    return Err(adapter_error(
+                        item.position.clone(),
+                        "must specify at least one resolver address",
+                    ));
+                }
+                let resolver = object
+                    .entry("resolver".to_string())
+                    .or_insert_with(|| json!({}));
+                resolver["addresses"] = json!(item.args);
+            }
+            "dial_timeout" => {
+                object.insert(
+                    "dial_timeout".to_string(),
+                    json!(dynamic_duration_option(item, "dial_timeout")?),
+                );
+            }
+            "dial_fallback_delay" => {
+                object.insert(
+                    "dial_fallback_delay".to_string(),
+                    json!(dynamic_duration_option(item, "dial_fallback_delay")?),
+                );
+            }
+            other => {
+                return Err(adapter_error(
+                    item.position.clone(),
+                    format!("unrecognized srv option `{other}`"),
+                ));
+            }
         }
+    }
+    Ok(Value::Object(object))
+}
+
+fn parse_a_source(
+    args: &[String],
+    block: &[Directive],
+    position: Position,
+) -> caddy_rs_core::Result<Value> {
+    if args.len() > 2 {
+        return Err(adapter_error(
+            position,
+            "`dynamic a` takes at most a name and a port argument",
+        ));
+    }
+    let mut object = dynamic_source_object("a");
+    if let Some(name) = args.first() {
+        object.insert("name".to_string(), json!(name));
+    }
+    if let Some(port) = args.get(1) {
+        object.insert("port".to_string(), json!(port));
+    }
+    for item in block {
+        match item.name.as_str() {
+            "name" => {
+                if object.contains_key("name") {
+                    return Err(adapter_error(
+                        item.position.clone(),
+                        "a name has already been specified",
+                    ));
+                }
+                object.insert(
+                    "name".to_string(),
+                    json!(dynamic_string_option(item, "name")?),
+                );
+            }
+            "port" => {
+                if object.contains_key("port") {
+                    return Err(adapter_error(
+                        item.position.clone(),
+                        "a port has already been specified",
+                    ));
+                }
+                object.insert(
+                    "port".to_string(),
+                    json!(dynamic_string_option(item, "port")?),
+                );
+            }
+            "refresh" => {
+                object.insert(
+                    "refresh".to_string(),
+                    json!(dynamic_duration_option(item, "refresh")?),
+                );
+            }
+            "resolvers" => {
+                ensure_no_inline_args(item, "resolvers")?;
+                if item.args.is_empty() {
+                    return Err(adapter_error(
+                        item.position.clone(),
+                        "must specify at least one resolver address",
+                    ));
+                }
+                let resolver = object
+                    .entry("resolver".to_string())
+                    .or_insert_with(|| json!({}));
+                resolver["addresses"] = json!(item.args);
+            }
+            "dial_timeout" => {
+                object.insert(
+                    "dial_timeout".to_string(),
+                    json!(dynamic_duration_option(item, "dial_timeout")?),
+                );
+            }
+            "dial_fallback_delay" => {
+                object.insert(
+                    "dial_fallback_delay".to_string(),
+                    json!(dynamic_duration_option(item, "dial_fallback_delay")?),
+                );
+            }
+            "versions" => {
+                ensure_no_inline_args(item, "versions")?;
+                if item.args.is_empty() {
+                    return Err(adapter_error(
+                        item.position.clone(),
+                        "must specify at least one version",
+                    ));
+                }
+                let versions = object
+                    .entry("versions".to_string())
+                    .or_insert_with(|| json!({}));
+                for version in &item.args {
+                    match version.as_str() {
+                        "ipv4" => versions["ipv4"] = json!(true),
+                        "ipv6" => versions["ipv6"] = json!(true),
+                        other => {
+                            return Err(adapter_error(
+                                item.position.clone(),
+                                format!("unsupported version: `{other}`"),
+                            ))
+                        }
+                    }
+                }
+            }
+            other => {
+                return Err(adapter_error(
+                    item.position.clone(),
+                    format!("unrecognized a option `{other}`"),
+                ));
+            }
+        }
+    }
+    Ok(Value::Object(object))
+}
+
+fn parse_multi_source(
+    args: &[String],
+    block: &[Directive],
+    position: Position,
+) -> caddy_rs_core::Result<Value> {
+    if !args.is_empty() {
+        return Err(adapter_error(
+            position,
+            "`dynamic multi` does not take arguments",
+        ));
+    }
+    let mut sources = Vec::new();
+    for item in block {
+        let value =
+            parse_named_dynamic_source(&item.name, &item.args, &item.block, item.position.clone())?;
+        sources.push(value);
+    }
+    let mut object = dynamic_source_object("multi");
+    object.insert("sources".to_string(), Value::Array(sources));
+    Ok(Value::Object(object))
+}
+
+fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_core::Result<Value> {
+    if args.is_empty() && !directive.block.iter().any(|item| item.name == "dynamic") {
         return Err(adapter_error(
             directive.position.clone(),
             "`reverse_proxy` requires at least one upstream",
@@ -7054,7 +7375,9 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
 
     let mut object = Map::new();
     object.insert("handler".to_string(), json!("reverse_proxy"));
-    object.insert("upstreams".to_string(), Value::Array(upstreams));
+    if !upstreams.is_empty() {
+        object.insert("upstreams".to_string(), Value::Array(upstreams));
+    }
 
     let mut load_balancing = Map::new();
     let mut request_headers = Map::new();
@@ -7077,6 +7400,16 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
             continue;
         }
         match item.name.as_str() {
+            "dynamic" => {
+                if object.contains_key("dynamic_upstreams") {
+                    return Err(adapter_error(
+                        item.position.clone(),
+                        "dynamic upstreams already specified",
+                    ));
+                }
+                let dynamic = parse_dynamic_upstream(item)?;
+                object.insert("dynamic_upstreams".to_string(), dynamic);
+            }
             "handle_response" => {
                 if item.args.len() > 1 {
                     return Err(adapter_error(

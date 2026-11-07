@@ -1,0 +1,39 @@
+{
+  "apps": {
+    "http": {
+      "servers": {
+        "srv0": {
+          "listen": [
+            ":8080"
+          ],
+          "routes": [
+            {
+              "handle": [
+                {
+                  "dynamic_upstreams": {
+                    "source": "multi",
+                    "sources": [
+                      {
+                        "name": "backend.example",
+                        "port": "8080",
+                        "source": "a"
+                      },
+                      {
+                        "name": "example.com",
+                        "proto": "tcp",
+                        "refresh": 300000000000,
+                        "service": "api",
+                        "source": "srv"
+                      }
+                    ]
+                  },
+                  "handler": "reverse_proxy"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

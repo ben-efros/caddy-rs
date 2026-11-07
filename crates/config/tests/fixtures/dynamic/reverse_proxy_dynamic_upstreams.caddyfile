@@ -1,0 +1,35 @@
+:8884 {
+	reverse_proxy {
+		dynamic a foo 9000
+	}
+
+	reverse_proxy {
+		dynamic a {
+			name foo
+			port 9000
+			refresh 5m
+			resolvers 8.8.8.8 8.8.4.4
+			dial_timeout 2s
+			dial_fallback_delay 300ms
+			versions ipv6
+		}
+	}
+}
+
+:8885 {
+	reverse_proxy {
+		dynamic srv _api._tcp.example.com
+	}
+
+	reverse_proxy {
+		dynamic srv {
+			service api
+			proto tcp
+			name example.com
+			refresh 5m
+			resolvers 8.8.8.8 8.8.4.4
+			dial_timeout 1s
+			dial_fallback_delay -1s
+		}
+	}
+}
