@@ -379,6 +379,18 @@ impl TlsServerOptions {
     /// being silently ignored, so a configuration that asks for behaviour this build does not
     /// implement never appears to work.
     pub fn from_connection_policies(policies: Option<&[Value]>) -> Result<Self> {
+        Self::from_connection_policies_with_ca_pool(
+            policies,
+            &crate::client_auth::CaPoolContext::new(),
+        )
+    }
+
+    /// Like [`Self::from_connection_policies`], with the runtime context needed to load
+    /// client-auth CA pools from `apps.pki` authorities and the configured storage root.
+    pub fn from_connection_policies_with_ca_pool(
+        policies: Option<&[Value]>,
+        ca_pool: &crate::client_auth::CaPoolContext,
+    ) -> Result<Self> {
         let Some(policies) = policies else {
             return Ok(Self::default());
         };
@@ -513,7 +525,7 @@ impl TlsServerOptions {
             options.cipher_suites = parsed;
         }
         if let Some(client_authentication) = policy.get("client_authentication") {
-            let parsed = parse_client_authentication(client_authentication)?;
+            let parsed = parse_client_authentication(client_authentication, ca_pool)?;
             options.client_auth_configured = true;
             options.client_auth = parsed.mode;
             options.client_auth_roots = parsed.roots;
@@ -1593,7 +1605,10 @@ struct ParsedClientAuthentication {
 /// deprecated direct trust fields (`trusted_ca_certs`, `trusted_ca_certs_pem_files`,
 /// `trusted_leaf_certs`) and the task-facing aliases (`trusted_ca_pool`, `trusted_ca_pem_files`,
 /// `trusted_leaf_cert_file`). Unsupported verifier modules and unknown fields fail loudly.
-fn parse_client_authentication(value: &Value) -> Result<ParsedClientAuthentication> {
+fn parse_client_authentication(
+    value: &Value,
+    ca_pool: &crate::client_auth::CaPoolContext,
+) -> Result<ParsedClientAuthentication> {
     let object = value.as_object().ok_or_else(|| Error::TlsConfig {
         path: CLIENT_AUTH_PATH.to_string(),
         message: "must be an object".to_string(),
@@ -1614,11 +1629,11 @@ fn parse_client_authentication(value: &Value) -> Result<ParsedClientAuthenticati
             }
             "ca" => {
                 saw_ca_module = true;
-                parse_client_auth_ca_pool(field, &path, &mut parsed.roots)?;
+                parse_client_auth_ca_pool(field, &path, &mut parsed.roots, ca_pool)?;
             }
             "trusted_ca_pool" => {
                 saw_direct_roots = true;
-                parse_client_auth_ca_pool(field, &path, &mut parsed.roots)?;
+                parse_client_auth_ca_pool(field, &path, &mut parsed.roots, ca_pool)?;
             }
             "trusted_ca_certs" | "trusted_ca_cert" => {
                 saw_direct_roots = true;
@@ -1806,6 +1821,7 @@ fn parse_client_auth_ca_pool(
     value: &Value,
     path: &str,
     roots: &mut Vec<CertificateDer<'static>>,
+    ca_pool: &crate::client_auth::CaPoolContext,
 ) -> Result<()> {
     match value {
         // The task-facing alias also accepts a bare array of base64 DER certificates.
@@ -1849,18 +1865,14 @@ fn parse_client_auth_ca_pool(
                         match key.as_str() {
                             "provider" | "module" => {}
                             "trusted_ca_certs" | "trusted_ca_pool" => roots.extend(
-                                parse_base64_der_cert_list(
+                                parse_base64_der_cert_list(value, &format!("{path}.{key}"))?,
+                            ),
+                            "pem_files" | "trusted_ca_pem_files" | "trusted_ca_certs_pem_files" => {
+                                roots.extend(parse_client_auth_pem_files(
                                     value,
                                     &format!("{path}.{key}"),
-                                )?,
-                            ),
-                            "pem_files" | "trusted_ca_pem_files"
-                            | "trusted_ca_certs_pem_files" => roots.extend(
-                                parse_client_auth_pem_files(
-                                    value,
-                                    &format!("{path}.{key}"),
-                                )?,
-                            ),
+                                )?)
+                            }
                             other => {
                                 return Err(Error::Unsupported {
                                     path: format!("{path}.{other}"),
@@ -1876,8 +1888,7 @@ fn parse_client_auth_ca_pool(
                     for (key, value) in object {
                         match key.as_str() {
                             "provider" | "module" => {}
-                            "pem_files" | "trusted_ca_pem_files"
-                            | "trusted_ca_certs_pem_files" => {
+                            "pem_files" | "trusted_ca_pem_files" | "trusted_ca_certs_pem_files" => {
                                 saw_files = true;
                                 roots.extend(parse_client_auth_pem_files(
                                     value,
@@ -1900,14 +1911,14 @@ fn parse_client_auth_ca_pool(
                         });
                     }
                 }
-                other => {
-                    return Err(Error::Unsupported {
-                        path: path.to_string(),
-                        feature: format!(
-                            "client authentication CA pool provider `{other}` (supported: inline, file)"
-                        ),
-                        tracking_id: "TLS-CLIENT-AUTH",
-                    })
+                // Remaining Caddy providers (`system`, `pki_root`, `pki_intermediate`,
+                // `storage`, `http`, `combined`) are loaded by the shared client-auth
+                // CA-pool loader, which reports located errors for missing authorities,
+                // storage roots or unsupported endpoints.
+                _ => {
+                    roots.extend(crate::client_auth::load_ca_pool_source(
+                        value, path, ca_pool,
+                    )?);
                 }
             }
         }
@@ -2847,15 +2858,34 @@ mod tests {
             "{error}"
         );
 
-        let error = TlsServerOptions::from_connection_policies(Some(&[
+        // `system` is now supported by the shared CA-pool loader (T-TLS-079), so it either loads
+        // the platform bundle or fails with a located error — never silently ignores the source.
+        let system = TlsServerOptions::from_connection_policies(Some(&[
             serde_json::json!({"client_authentication": {
                 "ca": {"provider": "system"}
+            }}),
+        ]));
+        match system {
+            Ok(options) => assert!(
+                !options.client_auth_roots.is_empty(),
+                "system CA pool must load platform roots"
+            ),
+            Err(error) => assert!(
+                error.to_string().contains("platform") || error.to_string().contains("root"),
+                "system CA pool error must be located: {error}"
+            ),
+        }
+
+        // An unknown provider is still rejected with the supported-source list.
+        let error = TlsServerOptions::from_connection_policies(Some(&[
+            serde_json::json!({"client_authentication": {
+                "ca": {"provider": "bogus"}
             }}),
         ]))
         .unwrap_err();
         assert!(
-            error.to_string().contains("supported: inline, file"),
-            "{error}"
+            error.to_string().contains("bogus"),
+            "unknown provider must be named: {error}"
         );
 
         // The Caddy leaf verifier module is supported with its loaders; unknown verifier modules

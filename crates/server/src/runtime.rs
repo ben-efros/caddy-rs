@@ -267,6 +267,36 @@ enum ActivationState {
     Failed { path: String, message: String },
 }
 
+/// Build the CA-pool loading context for client authentication.
+///
+/// `apps.pki.certificate_authorities` ids map to `<data-dir>/pki/authorities/<id>` (the layout the
+/// runtime provisions), and `storage` pool sources read from the configured file-system root.
+fn client_auth_ca_pool_context(
+    config: &caddy_rs_core::Config,
+    data_root: Option<&std::path::Path>,
+) -> caddy_rs_tls::client_auth::CaPoolContext {
+    let mut context = caddy_rs_tls::client_auth::CaPoolContext::new();
+    let default_root = data_root.map(std::path::Path::to_path_buf);
+    if let Some(root) = config
+        .storage()
+        .and_then(|storage| storage.root())
+        .map(std::path::PathBuf::from)
+        .or_else(|| default_root.clone())
+    {
+        context.storage_root = Some(root.clone());
+        if let Some(pki) = config.apps.as_ref().and_then(|apps| apps.pki.as_ref()) {
+            if let Some(authorities) = pki.certificate_authorities.as_ref() {
+                for id in authorities.keys() {
+                    context
+                        .pki_authorities
+                        .insert(id.clone(), root.join("pki").join("authorities").join(id));
+                }
+            }
+        }
+    }
+    context
+}
+
 impl ServerRuntime {
     /// Create a runtime for a generation store.
     pub fn new(store: Arc<GenerationStore>) -> Self {
@@ -403,7 +433,10 @@ impl ServerRuntime {
                     tracking_id: "TLS-STRICT-SNI",
                 });
             }
-            let _tls_options = TlsServerOptions::from_connection_policies(policies)?;
+            let _tls_options = TlsServerOptions::from_connection_policies_with_ca_pool(
+                policies,
+                &client_auth_ca_pool_context(generation.config(), self.data_root.as_deref()),
+            )?;
             let _router = Self::build_router(server_name, server, &status_sink)?;
             for listen in &server.listen {
                 let parsed = match caddy_rs_core::ListenAddr::parse(listen) {
@@ -1294,6 +1327,7 @@ impl ServerRuntime {
     /// The returned issuer's TLS-ALPN-01 token store is captured here: the bootstrap listener
     /// states must already share it before provisioning runs, otherwise `acme-tls/1` handshakes
     /// cannot be answered while the CA validates the order.
+
     fn prepare_automatic_https(
         &mut self,
         generation: &Generation,
@@ -1508,7 +1542,10 @@ impl ServerRuntime {
                     tracking_id: "TLS-STRICT-SNI",
                 });
             }
-            let tls_options = TlsServerOptions::from_connection_policies(policies)?;
+            let tls_options = TlsServerOptions::from_connection_policies_with_ca_pool(
+                policies,
+                &client_auth_ca_pool_context(generation.config(), self.data_root.as_deref()),
+            )?;
             let router = Self::build_router(server_name, server, status_sink)?;
             // HTTP/3 Alt-Svc advertisement (h1/h2 responses only), when this server offers h3 on a
             // concrete UDP port. During the automatic-HTTPS bootstrap phase there is no final
