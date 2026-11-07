@@ -85,23 +85,22 @@ fn proxy_protocol_allow_and_deny_require_cidr_prefixes() {
 
 #[test]
 fn unsupported_expression_matcher_fails_validation() {
-    // Caddy's own adapter emits this CEL expression for `expression` matchers; the backticked
-    // status literal is outside the documented caddy-rs CEL subset (DIV-0107), so provisioning
-    // must reject it loudly (`T-ROUTE-004`).
+    // CEL matcher functions are outside the documented caddy-rs subset (DIV-0107), so
+    // provisioning must reject the expression loudly at load (`T-ROUTE-004`/`T-ROUTE-039`).
     let error = validate(serde_json::json!({
         "admin": {"disabled": true},
         "apps": {"http": {"servers": {"srv0": {
             "listen": ["127.0.0.1:0"],
             "routes": [{
-                "match": [{"expression": "{http.error.status_code} == `402`"}],
+                "match": [{"expression": "host('example.com')"}],
                 "handle": [{"handler": "static_response", "body": "ok"}]
             }]
         }}}}
     }))
     .expect_err("an unsupported expression matcher must fail validation");
     assert!(
-        error.contains("expression subset") && error.contains("unsupported character"),
-        "error must name the unsupported expression subset and character: {error}"
+        error.contains("expression") && error.contains("not a supported callable"),
+        "error must name the unsupported expression construct: {error}"
     );
 }
 
