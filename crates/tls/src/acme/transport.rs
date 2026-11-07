@@ -14,8 +14,13 @@
 //! certificates from disk but never contacts the network.
 
 use std::fs;
+use std::future::Future;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD;
@@ -24,10 +29,15 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::Request;
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
+use hyper_util::client::legacy::connect::{Connected, Connection};
 use hyper_util::client::legacy::Client;
-use hyper_util::rt::TokioExecutor;
-use rustls::pki_types::CertificateDer;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
+use tower_service::Service;
 
 use super::{AcmeError, AcmeTransport, HttpMethod, HttpRequest, HttpResponse};
 use crate::{Error, Result};
@@ -46,12 +56,49 @@ pub const SYSTEM_CA_BUNDLES: &[&str] = &[
 
 type HyperClient =
     Client<HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>, Full<Bytes>>;
+type ProxyClient = Client<ProxyConnector, Full<Bytes>>;
+
+#[derive(Clone)]
+enum ClientKind {
+    Direct(HyperClient),
+    Proxied(ProxyClient),
+}
 
 /// Production [`AcmeTransport`] backed by hyper and rustls.
-#[derive(Debug, Clone)]
+///
+/// Supports HTTP/2 via ALPN (hyper-rustls negotiates the highest configured version), Caddy's
+/// `acme_timeout` (applied per request) and `network_proxy` (a forward HTTP proxy: HTTPS targets
+/// are tunnelled with `CONNECT` and then TLS-upgraded; Caddy's `caddy.network_proxy.url` module).
 pub struct HyperTransport {
-    client: HyperClient,
+    client: ClientKind,
     user_agent: String,
+    roots: Vec<CertificateDer<'static>>,
+    timeout: Option<Duration>,
+    proxy: Option<String>,
+}
+
+impl std::fmt::Debug for HyperTransport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HyperTransport")
+            .field("user_agent", &self.user_agent)
+            .field("has_trusted_roots", &!self.roots.is_empty())
+            .field("timeout", &self.timeout)
+            .field("network_proxy", &self.proxy)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Clone for HyperTransport {
+    fn clone(&self) -> Self {
+        Self::from_parts(
+            self.roots.clone(),
+            self.timeout,
+            self.proxy.clone(),
+            self.user_agent.clone(),
+        )
+        .expect("cloning a configured HyperTransport cannot fail")
+    }
 }
 
 impl HyperTransport {
@@ -65,6 +112,15 @@ impl HyperTransport {
     /// This is the entry point for tests, private CAs configured through
     /// `trusted_roots_pem_files`, and environments without a detectable system bundle.
     pub fn with_root_certificates(roots: Vec<CertificateDer<'static>>) -> Result<Self> {
+        Self::from_parts(roots, None, None, DEFAULT_USER_AGENT.to_string())
+    }
+
+    fn from_parts(
+        roots: Vec<CertificateDer<'static>>,
+        timeout: Option<Duration>,
+        proxy: Option<String>,
+        user_agent: String,
+    ) -> Result<Self> {
         if roots.is_empty() {
             return Err(AcmeError::Transport {
                 url: "https://".to_string(),
@@ -72,33 +128,29 @@ impl HyperTransport {
             }
             .into());
         }
-        let mut store = RootCertStore::empty();
-        for certificate in roots {
-            store
-                .add(certificate)
-                .map_err(|error| AcmeError::Transport {
-                    url: "https://".to_string(),
-                    reason: format!("invalid trust root: {error}"),
-                })?;
-        }
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let tls = ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .map_err(|error| AcmeError::Transport {
-                url: "https://".to_string(),
-                reason: format!("rustls protocol configuration failed: {error}"),
-            })?
-            .with_root_certificates(store)
-            .with_no_client_auth();
-        let connector = HttpsConnectorBuilder::new()
-            .with_tls_config(tls)
-            .https_or_http()
-            .enable_http1()
-            .build();
-        let client = Client::builder(TokioExecutor::new()).build(connector);
+        let tls = Arc::new(client_config(&roots, false)?);
+        let client = match &proxy {
+            Some(proxy) => {
+                let proxy_tls = Arc::new(client_config(&roots, true)?);
+                let connector = ProxyConnector::parse(proxy, proxy_tls)?;
+                ClientKind::Proxied(Client::builder(TokioExecutor::new()).build(connector))
+            }
+            None => {
+                let connector = HttpsConnectorBuilder::new()
+                    .with_tls_config((*tls).clone())
+                    .https_or_http()
+                    .enable_http1()
+                    .enable_http2()
+                    .build();
+                ClientKind::Direct(Client::builder(TokioExecutor::new()).build(connector))
+            }
+        };
         Ok(Self {
             client,
-            user_agent: DEFAULT_USER_AGENT.to_string(),
+            user_agent,
+            roots,
+            timeout,
+            proxy,
         })
     }
 
@@ -124,11 +176,263 @@ impl HyperTransport {
     pub fn user_agent(&self) -> &str {
         &self.user_agent
     }
+
+    /// Apply Caddy's `acme_timeout` per ACME HTTP request.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// Route ACME HTTP requests through an `http://` forward proxy (Caddy `network_proxy`).
+    pub fn with_proxy(mut self, proxy: impl Into<String>) -> Result<Self> {
+        let proxy = proxy.into();
+        Self::from_parts(
+            self.roots.clone(),
+            self.timeout,
+            Some(proxy),
+            self.user_agent.clone(),
+        )
+    }
+}
+
+fn client_config(roots: &[CertificateDer<'static>], set_alpn: bool) -> Result<ClientConfig> {
+    let mut store = RootCertStore::empty();
+    for certificate in roots {
+        store
+            .add(certificate.clone())
+            .map_err(|error| AcmeError::Transport {
+                url: "https://".to_string(),
+                reason: format!("invalid trust root: {error}"),
+            })?;
+    }
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut config = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|error| AcmeError::Transport {
+            url: "https://".to_string(),
+            reason: format!("rustls protocol configuration failed: {error}"),
+        })?
+        .with_root_certificates(store)
+        .with_no_client_auth();
+    if set_alpn {
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    }
+    Ok(config)
+}
+
+// ---- network_proxy (Caddy caddy.network_proxy.url) ------------------------------------------
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
+
+struct ProxyIo {
+    inner: TokioIo<Box<dyn AsyncReadWrite>>,
+    http2: bool,
+}
+
+impl hyper::rt::Read for ProxyIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: hyper::rt::ReadBufCursor<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl hyper::rt::Write for ProxyIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+impl Connection for ProxyIo {
+    fn connected(&self) -> Connected {
+        if self.http2 {
+            Connected::new().negotiated_h2()
+        } else {
+            Connected::new()
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ProxyConnector {
+    host: String,
+    port: u16,
+    tls: Arc<ClientConfig>,
+}
+
+impl ProxyConnector {
+    fn parse(url: &str, tls: Arc<ClientConfig>) -> Result<Self> {
+        let rest = url.strip_prefix("http://").ok_or_else(|| AcmeError::Transport {
+            url: url.to_string(),
+            reason: "network_proxy must be an `http://host:port` URL (https/socks proxies are not implemented)"
+                .to_string(),
+        })?;
+        let authority = rest.split('/').next().unwrap_or(rest);
+        let (host, port) = match authority.rsplit_once(':') {
+            Some((host, port)) => {
+                let port = port.parse::<u16>().map_err(|_| AcmeError::Transport {
+                    url: url.to_string(),
+                    reason: format!("network_proxy has an invalid port `{port}`"),
+                })?;
+                (host.to_string(), port)
+            }
+            None => (authority.to_string(), 80),
+        };
+        if host.is_empty() {
+            return Err(AcmeError::Transport {
+                url: url.to_string(),
+                reason: "network_proxy URL is missing a host".to_string(),
+            }
+            .into());
+        }
+        Ok(Self { host, port, tls })
+    }
+}
+
+impl Service<hyper::Uri> for ProxyConnector {
+    type Response = ProxyIo;
+    type Error = BoxError;
+    type Future = Pin<Box<dyn Future<Output = std::result::Result<ProxyIo, BoxError>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), BoxError>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, uri: hyper::Uri) -> Self::Future {
+        let host = self.host.clone();
+        let port = self.port;
+        let tls = Arc::clone(&self.tls);
+        Box::pin(async move {
+            let mut stream = TcpStream::connect((host.as_str(), port)).await?;
+            let target_host = uri
+                .host()
+                .ok_or("proxy request URI has no host")?
+                .to_string();
+            let target_port = uri
+                .port_u16()
+                .unwrap_or(if uri.scheme_str() == Some("https") {
+                    443
+                } else {
+                    80
+                });
+            let authority = format!("{target_host}:{target_port}");
+            stream
+                .write_all(
+                    format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes(),
+                )
+                .await?;
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                stream.read_exact(&mut byte).await?;
+                head.push(byte[0]);
+                if head.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+                if head.len() > 16 * 1024 {
+                    return Err("proxy CONNECT response header too large".into());
+                }
+            }
+            let head_text = String::from_utf8_lossy(&head);
+            let status = head_text
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .and_then(|status| status.parse::<u16>().ok())
+                .unwrap_or(0);
+            if status != 200 {
+                return Err(format!("proxy CONNECT failed with status {status}").into());
+            }
+            if uri.scheme_str() == Some("https") {
+                let server_name = ServerName::try_from(target_host)?;
+                let stream = TlsConnector::from(tls).connect(server_name, stream).await?;
+                let http2 = stream.get_ref().1.alpn_protocol() == Some(b"h2");
+                Ok(ProxyIo {
+                    inner: TokioIo::new(Box::new(stream) as Box<dyn AsyncReadWrite>),
+                    http2,
+                })
+            } else {
+                Ok(ProxyIo {
+                    inner: TokioIo::new(Box::new(stream) as Box<dyn AsyncReadWrite>),
+                    http2: false,
+                })
+            }
+        })
+    }
 }
 
 #[async_trait]
 impl AcmeTransport for HyperTransport {
     async fn request(&self, request: HttpRequest) -> Result<HttpResponse> {
+        match self.timeout {
+            None => self.perform(request).await,
+            Some(timeout) => {
+                let url = request.url.clone();
+                tokio::time::timeout(timeout, self.perform(request))
+                    .await
+                    .map_err(|_| {
+                        crate::Error::Acme(Box::new(AcmeError::Transport {
+                            url,
+                            reason: format!(
+                                "ACME request timed out after {}ms (acme_timeout)",
+                                timeout.as_millis()
+                            ),
+                        }))
+                    })?
+            }
+        }
+    }
+
+    fn with_trusted_roots(
+        &self,
+        roots: Vec<CertificateDer<'static>>,
+    ) -> Result<Arc<dyn AcmeTransport>> {
+        Ok(Arc::new(Self::from_parts(
+            roots,
+            self.timeout,
+            self.proxy.clone(),
+            self.user_agent.clone(),
+        )?))
+    }
+
+    fn with_network_proxy(&self, proxy: &str) -> Result<Arc<dyn AcmeTransport>> {
+        Ok(Arc::new(Self::from_parts(
+            self.roots.clone(),
+            self.timeout,
+            Some(proxy.to_string()),
+            self.user_agent.clone(),
+        )?))
+    }
+
+    fn with_request_timeout(&self, timeout: Duration) -> Result<Arc<dyn AcmeTransport>> {
+        Ok(Arc::new(Self::from_parts(
+            self.roots.clone(),
+            Some(timeout),
+            self.proxy.clone(),
+            self.user_agent.clone(),
+        )?))
+    }
+}
+
+impl HyperTransport {
+    async fn perform(&self, request: HttpRequest) -> Result<HttpResponse> {
         let url = request.url.clone();
         let uri: hyper::Uri = url.parse().map_err(|error| AcmeError::Transport {
             url: url.clone(),
@@ -156,14 +460,14 @@ impl AcmeTransport for HyperTransport {
                     reason: format!("cannot build request: {error}"),
                 })?;
 
-        let response =
-            self.client
-                .request(hyper_request)
-                .await
-                .map_err(|error| AcmeError::Transport {
-                    url: url.clone(),
-                    reason: describe_error(&error),
-                })?;
+        let response = match &self.client {
+            ClientKind::Direct(client) => client.request(hyper_request).await,
+            ClientKind::Proxied(client) => client.request(hyper_request).await,
+        }
+        .map_err(|error| AcmeError::Transport {
+            url: url.clone(),
+            reason: describe_error(&error),
+        })?;
         let status = response.status().as_u16();
         let headers = response
             .headers()
@@ -190,15 +494,6 @@ impl AcmeTransport for HyperTransport {
             headers,
             body,
         })
-    }
-
-    fn with_trusted_roots(
-        &self,
-        roots: Vec<CertificateDer<'static>>,
-    ) -> Result<Arc<dyn AcmeTransport>> {
-        let mut transport = HyperTransport::with_root_certificates(roots)?;
-        transport.user_agent = self.user_agent.clone();
-        Ok(Arc::new(transport))
     }
 }
 
@@ -860,6 +1155,201 @@ mod tests {
         assert!(
             error.contains("does not support explicit trusted roots"),
             "expected a loud unsupported-transport error, got: {error}"
+        );
+    }
+
+    /// Serve HTTPS with ALPN forced to `h2` and a hyper HTTP/2 server.
+    fn spawn_h2_server(
+        replies: Replies,
+        recorder: Recorder,
+    ) -> (u16, Vec<CertificateDer<'static>>) {
+        let certificates = parse_pem_certificates(TEST_CERT_PEM.as_bytes()).unwrap();
+        let key = pem_block_der(TEST_KEY_PEM, "PRIVATE KEY");
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                certificates.clone(),
+                rustls::pki_types::PrivatePkcs8KeyDer::from(key).into(),
+            )
+            .unwrap();
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let listener = TcpListener::from_std(listener).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let replies = replies.clone();
+                let recorder = recorder.clone();
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(tls) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let service = service_fn(move |request| {
+                        reply_service(request, replies.clone(), recorder.clone())
+                    });
+                    let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(tls), service)
+                        .await;
+                });
+            }
+        });
+        (port, certificates)
+    }
+
+    #[tokio::test]
+    async fn negotiates_http2_via_alpn() {
+        let replies: Replies = Arc::default();
+        let recorder: Recorder = Arc::default();
+        let (port, roots) = spawn_h2_server(replies.clone(), recorder.clone());
+        replay(
+            &replies,
+            ScriptedReply {
+                status: 200,
+                headers: Vec::new(),
+                body: b"h2-ok".to_vec(),
+            },
+        );
+        let transport = HyperTransport::with_root_certificates(roots).unwrap();
+        // The local server only serves HTTP/2 (ALPN h2), so a successful request proves the
+        // transport negotiated HTTP/2.
+        let response = transport
+            .request(HttpRequest::get(format!(
+                "https://127.0.0.1:{port}/directory"
+            )))
+            .await
+            .expect("HTTP/2 request through ALPN");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"h2-ok");
+        // `hyper::server` lowercases the HTTP/2 pseudo-headers into `:path`; the recorded URI
+        // still carries the path.
+        assert_eq!(recorder.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn network_proxy_tunnels_every_https_request() {
+        let replies: Replies = Arc::default();
+        let recorder: Recorder = Arc::default();
+        let (origin_port, roots) = spawn_h2_server(replies.clone(), recorder.clone());
+        for _ in 0..4 {
+            replay(
+                &replies,
+                ScriptedReply {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: b"via-proxy".to_vec(),
+                },
+            );
+        }
+
+        // A minimal CONNECT proxy that records the tunnel target and pipes bytes to the origin.
+        let proxy_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        proxy_listener.set_nonblocking(true).unwrap();
+        let proxy_port = proxy_listener.local_addr().unwrap().port();
+        let proxy_listener = TcpListener::from_std(proxy_listener).unwrap();
+        let connects: Arc<Mutex<Vec<String>>> = Arc::default();
+        let seen = Arc::clone(&connects);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut client, _)) = proxy_listener.accept().await else {
+                    break;
+                };
+                let seen = Arc::clone(&seen);
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        if client.read_exact(&mut byte).await.is_err() {
+                            return;
+                        }
+                        head.push(byte[0]);
+                    }
+                    let head = String::from_utf8_lossy(&head);
+                    let authority = head
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("")
+                        .to_string();
+                    seen.lock().unwrap().push(authority.clone());
+                    let mut origin = match TcpStream::connect(authority.as_str()).await {
+                        Ok(stream) => stream,
+                        Err(_) => return,
+                    };
+                    let _ = client
+                        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                        .await;
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut origin).await;
+                });
+            }
+        });
+
+        let transport = HyperTransport::with_root_certificates(roots)
+            .unwrap()
+            .with_proxy(format!("http://127.0.0.1:{proxy_port}"))
+            .unwrap();
+        for path in ["/directory", "/new-nonce", "/order/1", "/cert/1"] {
+            let response = transport
+                .request(HttpRequest::get(format!(
+                    "https://127.0.0.1:{origin_port}{path}"
+                )))
+                .await
+                .expect("proxied HTTPS ACME request");
+            assert_eq!(response.status, 200, "{path}");
+        }
+        let connects = connects.lock().unwrap();
+        assert!(
+            !connects.is_empty(),
+            "proxied transport must use a proxy tunnel"
+        );
+        // The hyper client pools the HTTPS connection, so several requests can reuse one CONNECT
+        // tunnel; when network_proxy is set there is no direct connector at all.
+        assert!(
+            connects
+                .iter()
+                .all(|authority| authority == &format!("127.0.0.1:{origin_port}")),
+            "{connects:?}"
+        );
+        assert!(connects.len() <= 4, "{connects:?}");
+    }
+
+    #[tokio::test]
+    async fn acme_timeout_bounds_slow_requests() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let listener = TcpListener::from_std(listener).unwrap();
+        tokio::spawn(async move {
+            let Ok((_stream, _)) = listener.accept().await else {
+                return;
+            };
+            // Never respond: the request must time out.
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+        let roots = parse_pem_certificates(TEST_CERT_PEM.as_bytes()).unwrap();
+        let transport = HyperTransport::with_root_certificates(roots)
+            .unwrap()
+            .with_timeout(Duration::from_millis(150));
+        let started = std::time::Instant::now();
+        let error = transport
+            .request(HttpRequest::get(format!("http://127.0.0.1:{port}/slow")))
+            .await
+            .expect_err("slow ACME request must time out");
+        assert!(
+            error.to_string().contains("timed out"),
+            "expected a typed timeout error, got: {error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "timeout must not hang"
         );
     }
 }

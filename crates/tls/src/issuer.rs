@@ -135,6 +135,11 @@ pub struct AcmeIssuerConfig {
     pub tls_alpn_challenge_disabled: bool,
     /// Renewal window override.
     pub renewal_window: Option<Duration>,
+    /// Caddy's `acme_timeout`: per-request timeout for ACME HTTP traffic (default: none).
+    pub acme_timeout: Option<Duration>,
+    /// Caddy's `network_proxy` module URL (`caddy.network_proxy.url`): route ACME HTTP traffic
+    /// through an `http://host:port` forward proxy.
+    pub network_proxy: Option<String>,
 }
 
 impl Default for AcmeIssuerConfig {
@@ -152,7 +157,59 @@ impl Default for AcmeIssuerConfig {
             http_challenge_disabled: false,
             tls_alpn_challenge_disabled: false,
             renewal_window: None,
+            acme_timeout: None,
+            network_proxy: None,
         }
+    }
+}
+
+/// Parse Caddy's `network_proxy` module object (`{"from":"url","url":"http://host:port"}` or
+/// `{"from":"none"}`). Only the `url` source with an `http://` proxy is implemented; the `none`
+/// source disables proxying. Malformed/unsupported forms are located errors (T-TLS-070).
+fn parse_network_proxy(value: Option<&serde_json::Value>) -> Result<Option<String>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let object = value.as_object().ok_or_else(|| {
+        Error::Issuer(
+            "invalid `network_proxy`: expected a caddy.network_proxy module object".to_string(),
+        )
+    })?;
+    let from = object
+        .get("from")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            Error::Issuer("invalid `network_proxy`: missing `from` module field".to_string())
+        })?;
+    match from {
+        "none" => Ok(None),
+        "url" => {
+            let url = object
+                .get("url")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    Error::Issuer("invalid `network_proxy.url`: missing URL".to_string())
+                })?;
+            let Some(rest) = url.strip_prefix("http://") else {
+                return Err(Error::Unsupported {
+                    path: "apps.tls.automation.policies[].issuers[].network_proxy.url".to_string(),
+                    feature: "network_proxy schemes other than http:// (https/socks5 proxies)"
+                        .to_string(),
+                    tracking_id: "T-TLS-070",
+                });
+            };
+            if rest.is_empty() || rest.starts_with('/') {
+                return Err(Error::Issuer(
+                    "invalid `network_proxy.url`: missing host".to_string(),
+                ));
+            }
+            Ok(Some(url.to_string()))
+        }
+        other => Err(Error::Unsupported {
+            path: "apps.tls.automation.policies[].issuers[].network_proxy.from".to_string(),
+            feature: format!("network_proxy source module `{other}`"),
+            tracking_id: "T-TLS-070",
+        }),
     }
 }
 
@@ -276,6 +333,22 @@ impl AcmeIssuerConfig {
                 })?;
             config.renewal_window = Some(duration.as_duration());
         }
+        config.acme_timeout = match object.get("acme_timeout") {
+            None => None,
+            Some(value) => {
+                let duration =
+                    serde_json::from_value::<CaddyDuration>(value.clone()).map_err(|error| {
+                        Error::Issuer(format!("invalid `acme_timeout` configuration: {error}"))
+                    })?;
+                if duration.as_nanos() == 0 {
+                    return Err(Error::Issuer(
+                        "invalid `acme_timeout`: must be greater than zero".to_string(),
+                    ));
+                }
+                Some(duration.as_duration())
+            }
+        };
+        config.network_proxy = parse_network_proxy(object.get("network_proxy"))?;
         Ok(config)
     }
 
@@ -2519,5 +2592,55 @@ mod tests {
         };
         let roots = config.read_trusted_roots().unwrap();
         assert_eq!(roots.len(), 1);
+    }
+
+    #[test]
+    fn acme_config_decodes_timeout_and_network_proxy() {
+        let config = AcmeIssuerConfig::from_json(&serde_json::json!({
+            "acme_timeout": "2m",
+            "network_proxy": {"from": "url", "url": "http://proxy.example.test:3128"}
+        }))
+        .unwrap();
+        assert_eq!(config.acme_timeout, Some(Duration::from_secs(120)));
+        assert_eq!(
+            config.network_proxy.as_deref(),
+            Some("http://proxy.example.test:3128")
+        );
+
+        let none = AcmeIssuerConfig::from_json(&serde_json::json!({
+            "network_proxy": {"from": "none"}
+        }))
+        .unwrap();
+        assert_eq!(none.network_proxy, None);
+    }
+
+    #[test]
+    fn acme_timeout_and_network_proxy_errors_are_located() {
+        let error = AcmeIssuerConfig::from_json(&serde_json::json!({"acme_timeout": 0}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("acme_timeout"), "{error}");
+        let error = AcmeIssuerConfig::from_json(&serde_json::json!({"acme_timeout": "soon"}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("acme_timeout"), "{error}");
+        let error = AcmeIssuerConfig::from_json(&serde_json::json!({
+            "network_proxy": {"from": "url", "url": "https://proxy.example.test:3128"}
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("T-TLS-070"), "{error}");
+        let error = AcmeIssuerConfig::from_json(&serde_json::json!({
+            "network_proxy": {"from": "url", "url": "http://"}
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("network_proxy"), "{error}");
+        let error = AcmeIssuerConfig::from_json(&serde_json::json!({
+            "network_proxy": {"from": "socks"}
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("T-TLS-070"), "{error}");
     }
 }

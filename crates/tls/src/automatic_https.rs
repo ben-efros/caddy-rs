@@ -1565,16 +1565,34 @@ fn acme_transport_for_config(
     config: &AcmeIssuerConfig,
     transport: &Arc<dyn AcmeTransport>,
 ) -> Result<Arc<dyn AcmeTransport>> {
-    if !config.has_trusted_roots() {
-        return Ok(Arc::clone(transport));
+    let mut effective = if config.has_trusted_roots() {
+        let roots = config.read_trusted_roots()?;
+        transport.with_trusted_roots(roots).map_err(|error| {
+            Error::Issuer(format!(
+                "automatic HTTPS: cannot apply trusted roots for ACME CA `{}`: {error}",
+                config.ca
+            ))
+        })?
+    } else {
+        Arc::clone(transport)
+    };
+    if let Some(timeout) = config.acme_timeout {
+        effective = effective.with_request_timeout(timeout).map_err(|error| {
+            Error::Issuer(format!(
+                "automatic HTTPS: cannot apply `acme_timeout` for ACME CA `{}`: {error}",
+                config.ca
+            ))
+        })?;
     }
-    let roots = config.read_trusted_roots()?;
-    transport.with_trusted_roots(roots).map_err(|error| {
-        Error::Issuer(format!(
-            "automatic HTTPS: cannot apply trusted roots for ACME CA `{}`: {error}",
-            config.ca
-        ))
-    })
+    if let Some(proxy) = &config.network_proxy {
+        effective = effective.with_network_proxy(proxy).map_err(|error| {
+            Error::Issuer(format!(
+                "automatic HTTPS: cannot apply `network_proxy` for ACME CA `{}`: {error}",
+                config.ca
+            ))
+        })?;
+    }
+    Ok(effective)
 }
 
 #[allow(clippy::too_many_arguments)]
