@@ -149,6 +149,24 @@ pub struct FileWriterOptions {
     /// Rotate at these UTC `HH:MM` times once per day (Caddy `roll_at`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roll_at: Option<Vec<String>>,
+    /// Use local timestamps in rotated filenames (Caddy `roll_local_time`, default false).
+    ///
+    /// Kept as a validated field for Caddy config compatibility (DIV-0083): the offline build has
+    /// no timezone database, so `true` is a located error rather than a silent UTC approximation.
+    #[serde(default)]
+    pub roll_local_time: bool,
+    /// Compression for rolled files (Caddy `roll_compression`: `none`, `gzip`, `zstd`).
+    ///
+    /// Only `none` is implemented; `gzip`/`zstd` are located errors (DIV-0083), not silently
+    /// stored uncompressed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roll_compression: Option<String>,
+    /// Custom Go time layout for rotated filenames (Caddy `backup_time_format`).
+    ///
+    /// Go layouts are not reproducible here; rotated files keep the documented
+    /// `<filename>.<unix-millis>` naming, and a custom value is a located error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_time_format: Option<String>,
 }
 
 fn default_roll() -> bool {
@@ -171,6 +189,9 @@ impl Default for FileWriterOptions {
             roll_interval_ns: None,
             roll_minutes: None,
             roll_at: None,
+            roll_local_time: false,
+            roll_compression: None,
+            backup_time_format: None,
         }
     }
 }
@@ -317,6 +338,30 @@ impl AccessLogSinkConfig {
                     "writer.roll_keep_days",
                     "must be greater than zero",
                 ));
+            }
+            if self.file.roll_local_time {
+                return Err(AccessLogError::new(
+                    "writer.roll_local_time",
+                    "local-time rotated filenames are not reproducible in this build (no timezone database; rotated files use UTC unix-millisecond names, DIV-0083)",
+                ));
+            }
+            if let Some(compression) = &self.file.roll_compression {
+                if compression != "none" {
+                    return Err(AccessLogError::new(
+                        "writer.roll_compression",
+                        format!(
+                            "compression `{compression}` is not implemented (supported: none; DIV-0083)"
+                        ),
+                    ));
+                }
+            }
+            if let Some(format) = &self.file.backup_time_format {
+                if !format.trim().is_empty() {
+                    return Err(AccessLogError::new(
+                        "writer.backup_time_format",
+                        "custom Go time layouts are not reproducible; rotated files use <filename>.<unix-millis> (DIV-0083)",
+                    ));
+                }
             }
             if let Some(mode) = self.file.mode {
                 if mode > 0o7777 {
@@ -506,7 +551,17 @@ fn encode_console_line(
     let object = rendered
         .as_object()
         .ok_or_else(|| AccessLogError::new("entry", "console encoding requires an entry object"))?;
-    let timestamp = match object.get("ts") {
+    fn key<'a>(option: &'a Option<String>, default: &'a str) -> &'a str {
+        option
+            .as_deref()
+            .filter(|key| !key.is_empty())
+            .unwrap_or(default)
+    }
+    let time_key = key(&config.time_key, "ts");
+    let level_key = key(&config.level_key, "level");
+    let message_key = key(&config.message_key, "msg");
+    let name_key = key(&config.name_key, "logger");
+    let timestamp = match object.get(time_key) {
         Some(serde_json::Value::String(rendered)) => rendered.clone(),
         Some(serde_json::Value::Number(number)) => {
             format_wall_milli(number.as_f64().unwrap_or(0.0))
@@ -514,19 +569,19 @@ fn encode_console_line(
         _ => format_wall_milli(0.0),
     };
     let level = object
-        .get("level")
+        .get(level_key)
         .and_then(serde_json::Value::as_str)
         .unwrap_or("info");
     let logger = object
-        .get("logger")
+        .get(name_key)
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
     let message = object
-        .get("msg")
+        .get(message_key)
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
     let mut fields = object.clone();
-    for fundamental in ["ts", "level", "logger", "msg"] {
+    for fundamental in [time_key, level_key, name_key, message_key] {
         fields.remove(fundamental);
     }
     let fields = spaced_json(&serde_json::Value::Object(fields));
@@ -534,12 +589,14 @@ fn encode_console_line(
     let level = match config.level_format.as_deref() {
         Some("upper") => level.to_ascii_uppercase(),
         Some("lower") => level.to_ascii_lowercase(),
-        _ => colored_level(level),
+        Some("color") | None => colored_level(level),
+        Some(_) => colored_level(level),
     };
+    let line_ending = config.line_ending.as_deref().unwrap_or("\n");
     let text = if logger.is_empty() {
-        format!("{time}\t{level}\t{message}\t{fields}\n")
+        format!("{time}\t{level}\t{message}\t{fields}{line_ending}")
     } else {
-        format!("{time}\t{level}\t{logger}\t{message}\t{fields}\n")
+        format!("{time}\t{level}\t{logger}\t{message}\t{fields}{line_ending}")
     };
     Ok(text.into_bytes())
 }
@@ -1957,6 +2014,94 @@ mod tests {
         assert!(
             !line.contains('\u{1b}'),
             "no ANSI color when level_format=upper"
+        );
+    }
+
+    #[test]
+    fn console_encoder_honors_level_key_and_timestamp_options() {
+        let mut config = AccessLogConfig {
+            level_format: Some("upper".to_string()),
+            time_format: Some("wall".to_string()),
+            ..AccessLogConfig::default()
+        };
+        let encoder = AccessLogEncoder::with_format(config.clone(), AccessLogFormat::Console)
+            .expect("console encoder");
+        let line = String::from_utf8(
+            encoder
+                .encode_line(&entry("console", 200))
+                .expect("encode console"),
+        )
+        .expect("utf8");
+        assert!(line.contains("\tINFO\thttp.log.access\t"), "{line:?}");
+        assert!(line.contains("handled request"), "{line:?}");
+        assert!(line.contains("request"), "fields are kept: {line:?}");
+
+        config.message_key = Some("message".to_string());
+        config.level_key = Some("severity".to_string());
+        config.time_key = Some("timestamp".to_string());
+        config.name_key = Some("log".to_string());
+        config.level_format = Some("lower".to_string());
+        config.line_ending = Some("\r\n".to_string());
+        let encoder = AccessLogEncoder::with_format(config, AccessLogFormat::Console)
+            .expect("renamed console encoder");
+        let line = String::from_utf8(
+            encoder
+                .encode_line(&entry("renamed", 200))
+                .expect("encode renamed console"),
+        )
+        .expect("utf8");
+        assert!(line.contains("\tinfo\thttp.log.access\t"), "{line:?}");
+        assert!(line.contains("handled request"), "{line:?}");
+        assert!(line.ends_with("\r\n"), "line ending honored: {line:?}");
+        assert!(
+            !line.contains("\"ts\""),
+            "renamed time key removed: {line:?}"
+        );
+    }
+
+    #[test]
+    fn unsupported_rotation_options_are_located_errors() {
+        let base = |file: FileWriterOptions| AccessLogSinkConfig {
+            output: AccessLogOutput::File,
+            filename: Some(std::path::PathBuf::from("/var/log/caddy/access.log")),
+            file,
+            ..AccessLogSinkConfig::default()
+        };
+
+        let local = base(FileWriterOptions {
+            roll_local_time: true,
+            ..FileWriterOptions::default()
+        });
+        let error = local.validate().expect_err("local time");
+        assert!(
+            error.to_string().contains("writer.roll_local_time"),
+            "{error}"
+        );
+
+        let gzip = base(FileWriterOptions {
+            roll_compression: Some("gzip".to_string()),
+            ..FileWriterOptions::default()
+        });
+        let error = gzip.validate().expect_err("gzip");
+        assert!(
+            error.to_string().contains("writer.roll_compression"),
+            "{error}"
+        );
+
+        let none = base(FileWriterOptions {
+            roll_compression: Some("none".to_string()),
+            ..FileWriterOptions::default()
+        });
+        none.validate().expect("none compression accepted");
+
+        let custom = base(FileWriterOptions {
+            backup_time_format: Some("2006-01-02".to_string()),
+            ..FileWriterOptions::default()
+        });
+        let error = custom.validate().expect_err("custom format");
+        assert!(
+            error.to_string().contains("writer.backup_time_format"),
+            "{error}"
         );
     }
 }
