@@ -275,6 +275,9 @@ pub struct TlsServerOptions {
     pub cipher_suites: Vec<Tls12CipherSuite>,
     /// Client certificate authentication mode.
     pub client_auth: ClientAuthMode,
+    /// Whether the policy contained a `client_authentication` object at all (Caddy disables
+    /// session tickets when `ClientAuthentication != nil`, even if it is empty/inactive).
+    pub client_auth_configured: bool,
     /// Trust anchors used to verify client certificates (`client_authentication.ca` /
     /// deprecated PEM fields). Parsed eagerly so invalid pools fail the configuration.
     pub client_auth_roots: Vec<CertificateDer<'static>>,
@@ -340,6 +343,7 @@ impl Default for TlsServerOptions {
             curves: Vec::new(),
             cipher_suites: Vec::new(),
             client_auth: ClientAuthMode::None,
+            client_auth_configured: false,
             client_auth_roots: Vec::new(),
             client_auth_leaf_certs: Vec::new(),
             client_auth_roots_pem: None,
@@ -510,6 +514,7 @@ impl TlsServerOptions {
         }
         if let Some(client_authentication) = policy.get("client_authentication") {
             let parsed = parse_client_authentication(client_authentication)?;
+            options.client_auth_configured = true;
             options.client_auth = parsed.mode;
             options.client_auth_roots = parsed.roots;
             options.client_auth_leaf_certs = parsed.leaf_certs;
@@ -1364,6 +1369,15 @@ pub fn build_server_config_with_cert_resolver(
     };
     let mut config = builder.with_cert_resolver(resolver);
     config.alpn_protocols = options.alpn.clone();
+    // Caddy disables TLS session tickets whenever a client-authentication policy is configured
+    // (`external/caddy/modules/caddytls/connpolicy.go:403-424`): a session authenticated in one
+    // configuration must not be resumed under another, and client auth on a resumed handshake is
+    // not re-run. rustls: no stateful session storage, no TLS 1.3 tickets (the default ticketer
+    // never produces tickets, and send_tls13_tickets=0 suppresses issuance entirely).
+    if options.client_auth_configured || options.client_auth != ClientAuthMode::None {
+        config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+        config.send_tls13_tickets = 0;
+    }
     Ok(Arc::new(config))
 }
 
@@ -3879,5 +3893,113 @@ mod tests {
             .insert(sources[0].clone().with_ocsp_staple(Some(vec![0x30, 0x01])))
             .expect("reinsert");
         assert_eq!(resolver.certificates().len(), 1);
+    }
+
+    fn resumption_server(mode: ClientAuthMode, roots_pem: Option<&str>) -> Arc<ServerConfig> {
+        let resolver =
+            Arc::new(CertificateResolver::from_certificates([example()]).expect("resolver builds"));
+        let mut options = TlsServerOptions {
+            versions: TlsVersions::Tls12Only,
+            client_auth: mode,
+            ..TlsServerOptions::default()
+        };
+        if let Some(pem) = roots_pem {
+            options.client_auth_roots =
+                certificate_chain_from_pem(pem).expect("client CA fixture parses");
+        }
+        build_server_config(resolver, &options).expect("resumption server config builds")
+    }
+
+    /// Run one TLS 1.2 handshake with a reusable client config and return the server-side
+    /// handshake kind (Full or Resumed).
+    async fn handshake_kind(
+        server_config: Arc<ServerConfig>,
+        client_config: Arc<rustls::ClientConfig>,
+    ) -> std::result::Result<rustls::HandshakeKind, String> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|error| error.to_string())?;
+        let address = listener.local_addr().map_err(|error| error.to_string())?;
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.map_err(|error| error.to_string())?;
+            let stream = acceptor
+                .accept(stream)
+                .await
+                .map_err(|error| format!("server handshake: {error}"))?;
+            stream
+                .get_ref()
+                .1
+                .handshake_kind()
+                .ok_or_else(|| "server handshake kind unavailable".to_string())
+        });
+        let connector = tokio_rustls::TlsConnector::from(client_config);
+        let stream = tokio::net::TcpStream::connect(address)
+            .await
+            .map_err(|error| error.to_string())?;
+        let server_name = rustls::pki_types::ServerName::try_from("example.com").unwrap();
+        connector
+            .connect(server_name, stream)
+            .await
+            .map_err(|error| format!("client handshake: {error}"))?;
+        server.await.map_err(|error| error.to_string())?
+    }
+
+    fn resumption_client(identity: Option<(&str, &str)>) -> Arc<rustls::ClientConfig> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(TLS12_ONLY)
+            .expect("TLS 1.2 client config")
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyCertificate(provider)));
+        let mut client = match identity {
+            Some((certificate, key)) => builder
+                .with_client_auth_cert(
+                    certificate_chain_from_pem(certificate).expect("client cert parses"),
+                    private_key_from_pem(key).expect("client key parses"),
+                )
+                .expect("client identity"),
+            None => builder.with_no_client_auth(),
+        };
+        client.alpn_protocols = vec![b"http/1.1".to_vec()];
+        Arc::new(client)
+    }
+
+    #[tokio::test]
+    async fn listener_without_client_auth_resumes_sessions() {
+        let server = resumption_server(ClientAuthMode::None, None);
+        let client = resumption_client(None);
+        assert_eq!(
+            handshake_kind(Arc::clone(&server), Arc::clone(&client))
+                .await
+                .expect("first handshake"),
+            rustls::HandshakeKind::Full
+        );
+        assert_eq!(
+            handshake_kind(server, client)
+                .await
+                .expect("resumed handshake"),
+            rustls::HandshakeKind::Resumed,
+            "a listener without client auth must keep TLS session resumption"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_auth_listener_never_resumes_sessions() {
+        let server = resumption_server(ClientAuthMode::RequireAndVerify, Some(CLIENT_CA_CERT));
+        let client = resumption_client(Some((CLIENT_CERT, CLIENT_KEY)));
+        assert_eq!(
+            handshake_kind(Arc::clone(&server), Arc::clone(&client))
+                .await
+                .expect("first handshake"),
+            rustls::HandshakeKind::Full
+        );
+        assert_eq!(
+            handshake_kind(server, client)
+                .await
+                .expect("second handshake"),
+            rustls::HandshakeKind::Full,
+            "a client-auth listener must disable ticket issuance/acceptance"
+        );
     }
 }
