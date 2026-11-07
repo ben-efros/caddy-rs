@@ -10,7 +10,7 @@
 //! mismatch policy. A reload never re-adopts descriptors: sockets are adopted on the first apply,
 //! and listeners added later bind normally.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -1551,12 +1551,13 @@ impl ServerRuntime {
             // concrete UDP port. During the automatic-HTTPS bootstrap phase there is no final
             // resolver yet, so h3 is neither bound nor advertised until phase 2.
             let bootstrap_phase = automatic.is_some_and(|context| context.bootstrap);
+            let listens = effective_listens(server, https_port, has_connection_policies);
             let alt_svc = if bootstrap_phase {
                 None
             } else {
-                alt_svc_for_server(server)
+                alt_svc_for_listens(server, &listens)
             };
-            for listen in &server.listen {
+            for listen in &listens {
                 let parsed_listen = caddy_rs_core::ListenAddr::parse(listen).map_err(|reason| {
                     Error::Config(caddy_rs_core::Error::invalid(
                         format!("apps.http.servers.{server_name}.listen"),
@@ -1875,11 +1876,52 @@ fn server_offers_h3(server: &HttpServer) -> bool {
 /// Caddy's `http3.Server.SetQUICHeaders` value for the first concrete UDP listener port of this
 /// server, when the server offers HTTP/3. Ephemeral (`:0`) UDP ports have no known value at plan
 /// time and are advertised as no Alt-Svc (Caddy reports `ErrNoAltSvcPort` in that case).
+/// Effective listen addresses for a server, including the UDP (QUIC) listeners Caddy derives
+/// automatically.
+///
+/// Caddy binds a UDP socket for every TLS TCP `listen` address when the server offers HTTP/3
+/// (`modules/caddyhttp/app.go`, `makeHTTP3Server`); operators do not spell `udp/...` out.
+/// caddy-rs used to require the explicit form, which meant a Caddyfile that works on Caddy served
+/// no HTTP/3 here. This returns the configured addresses plus one `udp/<addr>` per TLS TCP address,
+/// skipping any address an explicit `udp/...` already covers so nothing is bound twice.
+fn effective_listens(
+    server: &HttpServer,
+    https_port: u16,
+    has_connection_policies: bool,
+) -> Vec<String> {
+    let mut listens = server.listen.clone();
+    if !server_offers_h3(server) {
+        return listens;
+    }
+    let explicit: BTreeSet<String> = listens
+        .iter()
+        .filter_map(|listen| ListenAddr::parse(listen).ok())
+        .filter(|address| address.network == Network::Udp)
+        .map(|address| address.address)
+        .collect();
+    let derived: Vec<String> = listens
+        .iter()
+        .filter_map(|listen| ListenAddr::parse(listen).ok())
+        .filter(|address| address.network == Network::Tcp)
+        .filter(|address| address.port() == Some(https_port) || has_connection_policies)
+        .filter(|address| !explicit.contains(&address.address))
+        .map(|address| format!("udp/{}", address.address))
+        .collect();
+    listens.extend(derived);
+    listens
+}
+
 fn alt_svc_for_server(server: &HttpServer) -> Option<String> {
+    alt_svc_for_listens(server, &server.listen)
+}
+
+/// Alt-Svc for an explicit listen list (used with [`effective_listens`] so automatically derived
+/// UDP listeners are advertised exactly like configured ones).
+fn alt_svc_for_listens(server: &HttpServer, listens: &[String]) -> Option<String> {
     if !server_offers_h3(server) {
         return None;
     }
-    for listen in &server.listen {
+    for listen in listens {
         let Ok(address) = ListenAddr::parse(listen) else {
             continue;
         };

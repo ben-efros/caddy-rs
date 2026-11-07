@@ -383,7 +383,8 @@ async fn alt_svc_is_only_advertised_when_h3_is_enabled() {
     );
     runtime.shutdown().await;
 
-    // h3 enabled but no UDP listener configured: nothing to advertise (and no silent UDP bind).
+    // h3 enabled on a TLS listener with no explicit `udp/...`: Caddy derives the UDP listener
+    // automatically, so the same port must serve QUIC and be advertised (T-HTTP-046).
     let tcp = free_port();
     let (runtime, status) = start(config(
         tcp,
@@ -394,9 +395,24 @@ async fn alt_svc_is_only_advertised_when_h3_is_enabled() {
     .await;
     let (status_code, headers, _) = h1_request(tcp_address(&status, tcp), "/").await;
     assert_eq!(status_code, 200);
-    assert!(
-        !headers.contains_key(http::header::ALT_SVC),
-        "Alt-Svc requires a bound UDP listener"
+    let alt_svc = headers
+        .get(http::header::ALT_SVC)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    assert_eq!(
+        alt_svc,
+        Some(format!("h3=\":{tcp}\"; ma=2592000")),
+        "the derived UDP listener must be advertised on h1 responses"
+    );
+    let response = h3_request(udp_address(&status, tcp), "GET", "/derived", None)
+        .await
+        .expect("HTTP/3 request on the automatically derived UDP listener");
+    assert_eq!(response.status, 200);
+    // `BODY` expands the request placeholders, so the derived listener serving the router is
+    // proven by the expanded path rather than by the raw template.
+    assert_eq!(
+        String::from_utf8_lossy(&response.body),
+        "hello h3 https /derived"
     );
     runtime.shutdown().await;
 }
