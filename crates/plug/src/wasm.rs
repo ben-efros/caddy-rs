@@ -39,6 +39,39 @@
 //! `/dev/urandom` for random on Unix, and reports `http_client` as a typed host failure (a host
 //! embedding the runtime should inject a generation-scoped HTTP client).
 
+//! # Performance, caching and pooling (T-PLUG-012)
+//!
+//! The offline harness in `tests/bench.rs` (run with
+//! `cargo test --offline --locked -p caddy-rs-plug --test bench -- --nocapture`) measures the two
+//! plugin paths on a development machine. Representative medians / p95 from the recorded run:
+//!
+//! | operation | median | p95 |
+//! |---|---:|---:|
+//! | in-process module compile (WAT -> native) | 5.75 ms | 11.6 ms |
+//! | fresh Store/instance | 122 us | 142 us |
+//! | request on a reused instance (incl. per-request watchdog) | 82 us | 121 us |
+//! | request with instantiate + handle | 273 us | 360 us |
+//! | external process spawn + handshake | 6.2 ms | 6.7 ms |
+//! | external frame round-trip | 25 us | 47 us |
+//!
+//! Module compilation and process handshakes dominate, so the supported caching contract is:
+//! **compile once, reuse the [`WasmRuntime`] for the plugin/generation lifetime**, and spawn one
+//! external [`crate::host::HostService`] per generation — never compile per request. The runtime
+//! owns the compiled [`Module`] and a deterministic [`Engine`], so instantiate-only setup costs
+//! ~0.1 ms. Instance pooling was deliberately **not** added: a pooled checkout must start from a
+//! clean Store/instance (linear memory, globals, fuel and host-call budget are all request state),
+//! and re-instantiating is already the reset; the measured ~45% saving does not justify the
+//! state-leak risk. Callers that need a long-lived instance must still treat each
+//! [`WasmPlugin::handle_request`] as isolated host-side: the host never reuses guest memory, fuel
+//! or host-call budgets across requests, and resets fuel/epoch before every call.
+//!
+//! Hardening is enforced per request: fuel budget, wall-clock epoch watchdog (a joined thread per
+//! timed request, so no timer task leaks), `StoreLimits` memory/instance caps, host-call budget,
+//! bounded request/response sizes and typed trap/error mapping. A blocking *host-call
+//! implementation* is trusted host code and cannot be pre-empted by the synchronous
+//! [`crate::hostcall::HostCallProvider`] trait; guest-side loops between host calls are still
+//! stopped by fuel/epoch. See `tests/hardening.rs` for the pathological-guest matrix.
+
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
