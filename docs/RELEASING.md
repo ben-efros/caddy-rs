@@ -13,7 +13,6 @@ Each release publishes one archive per platform, plus a checksum file:
 | `caddy-rs-<version>-aarch64-unknown-linux-gnu.tar.gz` | Linux arm64 | glibc, dynamically linked |
 | `caddy-rs-<version>-x86_64-unknown-linux-musl.tar.gz` | Linux x86_64 | **fully static**, size-optimised |
 | `caddy-rs-<version>-aarch64-unknown-linux-musl.tar.gz` | Linux arm64 | **fully static**, size-optimised |
-| `caddy-rs-<version>-x86_64-apple-darwin.tar.gz` | macOS x86_64 | dynamic |
 | `caddy-rs-<version>-aarch64-apple-darwin.tar.gz` | macOS arm64 | dynamic |
 
 Every archive contains the `caddy-rs` binary, `LICENSE`, `NOTICE.md` and `README.md`.
@@ -64,7 +63,7 @@ version string, which builds the same artefacts without creating a tag.
    git push origin v0.1.0
    ```
 
-5. **Watch the run.** `.github/workflows/release.yml` builds all six targets, packages each one,
+5. **Watch the run.** `.github/workflows/release.yml` builds all five targets, packages each one,
    appends to `SHA256SUMS`, and publishes a GitHub release with the archives attached.
 
    ```sh
@@ -118,6 +117,6 @@ distroless or `scratch` base image.
 - [ ] Workspace version and `Cargo.lock` updated together.
 - [ ] `caddy-rs version` reports the release version and the Caddy baseline.
 - [ ] At least one archive built and smoke-tested locally.
-- [ ] Tag pushed; workflow green on all six targets.
+- [ ] Tag pushed; workflow green on all five targets.
 - [ ] `SHA256SUMS` verified against a downloaded archive.
 - [ ] Release notes mention any behaviour change since the previous tag.
