@@ -1,13 +1,14 @@
-//! Caddy metrics configuration parsing and validation (T-ADMIN-031).
+//! Caddy metrics configuration parsing and validation (T-ADMIN-031, T-ADMIN-042).
 //!
-//! Caddy v2.11.7 has two independent metrics knobs that this crate models:
+//! Caddy v2.11.9 has two independent metrics knobs that this crate models:
 //!
 //! * `apps.http.metrics` — the experimental HTTP observation config
 //!   (`modules/caddyhttp/metrics.go`, `type Metrics`). Its JSON fields are `per_host`,
 //!   `observe_catchall_hosts` and `otlp`. Caddy emits the `caddy_http_*` series only when this
-//!   object is present; `per_host` adds a bounded `host` label (with `_other` for catch-all hosts)
-//!   and `otlp` additionally pushes the same series over OTLP. Caddy's per-server
-//!   `apps.http.servers.<name>.metrics` is the deprecated spelling of the same shape.
+//!   object is present (`modules/caddyhttp/app.go:216-222`); `per_host` adds a bounded `host` label
+//!   (with `_other` for catch-all hosts) and `otlp` additionally pushes the same series over OTLP.
+//!   Caddy's per-server `apps.http.servers.<name>.metrics` is the deprecated spelling of the same
+//!   shape; it enables recording but only its `per_host` is merged (`app.go:235-241`).
 //! * `http.handlers.metrics` — the `metrics` HTTP handler that serves a `/metrics` endpoint
 //!   (`modules/metrics/metrics.go`). Its only JSON field is `disable_openmetrics`.
 //!
@@ -15,24 +16,46 @@
 //! type-checks each field, and reports unsupported *behaviour* loudly with the tracking id instead
 //! of silently accepting a configuration whose observable output would differ:
 //!
-//! * `otlp: true` — no OTLP exporter is implemented in this build.
-//! * `per_host: true` — [`HttpMetrics`] can label series by host, but the router/runtime does not
-//!   pass a host label yet, so accepting it would silently drop Caddy's `host` label.
-//! * `observe_catchall_hosts: true` is accepted (like Caddy) but has no effect while `per_host` is
-//!   off, which is Caddy's own behaviour for that combination.
+//! * `otlp: true` — no OTLP exporter is implemented in this build: the offline cargo cache has no
+//!   `opentelemetry`/`opentelemetry-otlp` crate. Accepting the flag would advertise an export that
+//!   never happens, so it is a located config error (`apps.http.metrics.otlp`,
+//!   [`METRICS_CONFIG_TRACKING_ID`]) rather than a silent no-op. Registering a working exporter is
+//!   DIV-0006's residual; the error message names it.
+//! * `observe_catchall_hosts: true` is accepted (like Caddy) and only affects labels while
+//!   `per_host` is on, which is Caddy's own behaviour for that combination.
 //! * `disable_openmetrics: true` is accepted: the admin `/metrics` endpoint always serves the
 //!   Prometheus text format and never negotiates OpenMetrics, which is compatible with the
 //!   disabled setting. With it omitted/false Caddy would negotiate OpenMetrics for clients that
 //!   request it; caddy-rs does not (DIV-0006).
 //!
-//! Wiring: the core configuration model must keep `apps.http.metrics` (currently it lands in
-//! `HttpApp::extra` and `core::validate` rejects it as an unknown HTTP app field), call
-//! [`HttpMetricsConfig::from_json`] during validation, and the server runtime must pass the parsed
-//! enable/per-host policy into [`crate::HttpMetrics`] (and only record HTTP metrics when enabled,
-//! like Caddy). Until then caddy-rs always records the HTTP series (DIV-0033) and any configuration
-//! containing these objects is rejected loudly by the core validator.
+//! ## Runtime gate and `per_host`
+//!
+//! [`http_metrics_policy`] is Caddy's opt-in gate: no `apps.http.metrics` (and no deprecated
+//! per-server object) returns [`HttpMetricsPolicy::Disabled`], which makes the [`HttpMetrics`]
+//! handle record no `caddy_http_*` families. An empty object (`"metrics": {}`, the Caddyfile
+//! `metrics` global option with no block) opts in and records the families without a `host` label.
+//! With `per_host`, [`HttpMetricsConfig::host_label_policy`] scans the configuration exactly like
+//! `Metrics.scanConfigForHosts` (`modules/caddyhttp/metrics.go:232-263`): only non-fuzzy host
+//! matcher values (`MatchHost.fuzzy`, `matchers.go:395`, treats any host containing `{` or `*` as
+//! fuzzy) are allow-listed, and a server with non-empty `tls_connection_policies` marks the config
+//! as HTTPS. Unknown hosts therefore collapse under `_other` unless `observe_catchall_hosts` is
+//! set or the request arrived over HTTPS on such a server.
+//!
+//! Wiring: the core configuration model keeps `apps.http.metrics` (`HttpApp::metrics`), but
+//! `core::validate` still rejects `per_host` (`MetricsApp::unsupported_field`, T-ADMIN-031) and
+//! the server runtime still builds its recorder with the always-on
+//! `AdminApi::request_recorder()`. The core validator must stop rejecting `per_host`, and the
+//! server runtime must build the recorder with
+//! [`http_metrics_for_config`] and call the host-aware recorder methods. Until then, runtime
+//! recording remains unconditional and `per_host` configurations are rejected by the core
+//! validator (DIV-0006).
 
+use std::collections::BTreeSet;
+
+use caddy_rs_core::Config;
 use serde_json::Value;
+
+use crate::metrics::{HostLabelPolicy, HttpMetrics, HttpMetricsPolicy, MetricsRegistry};
 
 /// Default JSON location of the HTTP app metrics config.
 pub const HTTP_METRICS_CONFIG_PATH: &str = "apps.http.metrics";

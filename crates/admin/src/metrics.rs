@@ -21,24 +21,40 @@
 //!
 //! ## Caddy compatibility
 //!
-//! The `caddy_http_*` series mirror Caddy v2.11.7's `modules/caddyhttp/metrics.go` names, help
+//! The `caddy_http_*` series mirror Caddy v2.11.9's `modules/caddyhttp/metrics.go` names, help
 //! text, label names and bucket choices (`caddy_http_requests_total`,
-//! `caddy_http_request_duration_seconds`, …). Caddy only emits them when `apps.http.metrics` is
-//! enabled; caddy-rs exposes the primitives unconditionally and the server runtime decides when to
-//! populate them. Proxy and certificate series (`caddy_rs_proxy_*`, `caddy_rs_tls_*`) are caddy-rs
-//! extensions because Caddy v2.11.7 does not publish them; see
-//! `docs/compatibility/BEHAVIOR-DIVERGENCES.md` DIV-0033.
+//! `caddy_http_request_duration_seconds`, …).
+//!
+//! Caddy only emits them when `apps.http.metrics` is present; [`HttpMetricsPolicy`] is that gate.
+//! [`HttpMetricsPolicy::Disabled`] makes every `caddy_http_*` recording method a no-op, so a
+//! configuration without the object never registers a family (the admin `/metrics` endpoint keeps
+//! serving whatever the registry holds, exactly like Caddy's admin handler keeps serving the
+//! process registry). [`HttpMetrics::new`] keeps the historical always-on policy for callers that
+//! are not driven by a configuration; configuration-driven runtimes use
+//! [`crate::metrics_config::http_metrics_for_config`].
+//!
+//! With `per_host` configured, [`HostLabelPolicy`] adds Caddy's bounded `host` label: only hosts
+//! named by a non-fuzzy host matcher are individually labelled, unknown hosts aggregate under
+//! [`CATCHALL_HOST_LABEL`] (`_other`), and `observe_catchall_hosts` (or an HTTPS request on a
+//! server with TLS connection policies) lets a catch-all host keep its own label. The scan and the
+//! rules mirror `scanConfigForHosts`/`shouldAllowHostMetrics` (metrics.go:232-285) and
+//! `MatchHost.fuzzy` (`matchers.go:395`).
+//!
+//! Proxy and certificate series (`caddy_rs_proxy_*`, `caddy_rs_tls_*`) are caddy-rs extensions
+//! because Caddy v2.11.9 does not publish them; they stay available regardless of the HTTP
+//! metrics gate. See `docs/compatibility/BEHAVIOR-DIVERGENCES.md` DIV-0033/DIV-0052.
 //!
 //! ## Cardinality
 //!
 //! The registry accepts arbitrary label sets, but the typed [`HttpMetrics`] layer only uses
 //! bounded labels: server name, handler name, HTTP method (sanitized), status code, upstream dial
-//! address, certificate issuer/subject and renewal result. Host, URI, peer IP and user IDs are
-//! deliberately never used as labels.
+//! address, certificate issuer/subject and renewal result. The only request-controlled label is
+//! `host`, and only when `per_host` is configured and Caddy's allow-list/catch-all rule permits it;
+//! URI, peer IP and user IDs are deliberately never used as labels.
 //!
 //! [format]: https://prometheus.io/docs/instrumenting/exposition_formats/
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -77,6 +93,12 @@ pub const HTTP_REQUEST_SIZE_BYTES: &str = "caddy_http_request_size_bytes";
 pub const HTTP_RESPONSE_SIZE_BYTES: &str = "caddy_http_response_size_bytes";
 /// Histogram of times to first byte in response bodies (Caddy-compatible name).
 pub const HTTP_RESPONSE_DURATION_SECONDS: &str = "caddy_http_response_duration_seconds";
+
+/// Label value Caddy uses for every host without its own allowed label.
+///
+/// `shouldAllowHostMetrics`/`ServeHTTP` collapse unknown hosts into `_other`
+/// (`modules/caddyhttp/metrics.go:331-334`) to bound cardinality.
+pub const CATCHALL_HOST_LABEL: &str = "_other";
 
 /// caddy-rs extension: proxy requests per upstream.
 pub const PROXY_REQUESTS_TOTAL: &str = "caddy_rs_proxy_requests_total";
@@ -886,19 +908,152 @@ pub struct ProxyObservation<'a> {
     pub success: bool,
 }
 
+/// Caddy's bounded `host` label policy (`per_host`).
+///
+/// Mirrors `Metrics.shouldAllowHostMetrics` (`modules/caddyhttp/metrics.go:270-285`): a request host
+/// is individually labelled when it names an explicitly configured host matcher, when
+/// `observe_catchall_hosts` is set, or when it arrives over HTTPS and the configuration has at
+/// least one server with TLS connection policies. Everything else is labelled
+/// [`CATCHALL_HOST_LABEL`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostLabelPolicy {
+    allowed_hosts: BTreeSet<String>,
+    has_https_server: bool,
+    observe_catchall_hosts: bool,
+}
+
+impl HostLabelPolicy {
+    /// Build a policy from Caddy's scanned state (`scanConfigForHosts`, metrics.go:232-263).
+    ///
+    /// `allowed_hosts` are the non-fuzzy matcher hosts already lowercased by the scanner;
+    /// `has_https_server` is true when any server has a non-empty `tls_connection_policies` list.
+    pub fn new(
+        allowed_hosts: impl IntoIterator<Item = impl Into<String>>,
+        has_https_server: bool,
+        observe_catchall_hosts: bool,
+    ) -> Self {
+        Self {
+            allowed_hosts: allowed_hosts.into_iter().map(Into::into).collect(),
+            has_https_server,
+            observe_catchall_hosts,
+        }
+    }
+
+    /// The explicitly allowed (non-fuzzy, lowercased) host matcher values.
+    pub fn allowed_hosts(&self) -> &BTreeSet<String> {
+        &self.allowed_hosts
+    }
+
+    /// Whether any server has TLS connection policies (Caddy's `hasHTTPSServer`).
+    pub fn has_https_server(&self) -> bool {
+        self.has_https_server
+    }
+
+    /// Whether catch-all hosts get their own label (`observe_catchall_hosts`).
+    pub fn observe_catchall_hosts(&self) -> bool {
+        self.observe_catchall_hosts
+    }
+
+    /// Whether `host` keeps its own label instead of aggregating under `_other`.
+    ///
+    /// `is_https` is Caddy's `r.TLS != nil` test.
+    pub fn should_label(&self, host: &str, is_https: bool) -> bool {
+        if self.allowed_hosts.contains(&host.to_lowercase()) {
+            return true;
+        }
+        self.observe_catchall_hosts || (is_https && self.has_https_server)
+    }
+
+    /// The `host` label value: the lowercased request host, or `_other` when it is not allowed.
+    pub fn label_for(&self, host: &str, is_https: bool) -> String {
+        if self.should_label(host, is_https) {
+            host.to_lowercase()
+        } else {
+            CATCHALL_HOST_LABEL.to_string()
+        }
+    }
+}
+
+/// Caddy's `apps.http.metrics` runtime gate and per-host policy.
+///
+/// Caddy registers and records the `caddy_http_*` families only when the object is present
+/// (`modules/caddyhttp/app.go:216-222`); [`Disabled`](Self::Disabled) reproduces the absent case as
+/// a no-op. [`Enabled`](Self::Enabled) records the families and adds the `host` label only when a
+/// [`HostLabelPolicy`] is supplied (`per_host: true`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum HttpMetricsPolicy {
+    /// `apps.http.metrics` absent: every `caddy_http_*` recording method is a no-op.
+    #[default]
+    Disabled,
+    /// `apps.http.metrics` present; `per_host` is `Some` only when host labels are configured.
+    Enabled {
+        /// Host-label cardinality policy, `None` when `per_host` is off (Caddy's default).
+        per_host: Option<HostLabelPolicy>,
+    },
+}
+
+impl HttpMetricsPolicy {
+    /// The policy for a present `apps.http.metrics` object without `per_host`.
+    pub fn enabled() -> Self {
+        Self::Enabled { per_host: None }
+    }
+
+    /// The policy for a present `apps.http.metrics` object with `per_host`.
+    pub fn with_per_host(policy: HostLabelPolicy) -> Self {
+        Self::Enabled {
+            per_host: Some(policy),
+        }
+    }
+
+    /// Whether the `caddy_http_*` families are recorded at all.
+    pub fn is_enabled(&self) -> bool {
+        matches!(self, Self::Enabled { .. })
+    }
+
+    /// The per-host policy, or `None` when `per_host` is off (or metrics are disabled).
+    pub fn per_host(&self) -> Option<&HostLabelPolicy> {
+        match self {
+            Self::Enabled { per_host } => per_host.as_ref(),
+            Self::Disabled => None,
+        }
+    }
+}
+
 /// Typed Caddy HTTP metrics, plus caddy-rs proxy and certificate extensions.
 ///
 /// The typed layer owns no state: it borrows a [`MetricsRegistry`], so the admin API can render
-/// exactly the series the server records.
+/// exactly the series the server records. `caddy_http_*` recording obeys [`HttpMetricsPolicy`];
+/// the caddy-rs proxy/certificate extensions are always recorded.
 #[derive(Debug, Clone)]
 pub struct HttpMetrics {
     registry: MetricsRegistry,
+    policy: HttpMetricsPolicy,
 }
 
 impl HttpMetrics {
-    /// Instrument a registry.
+    /// Instrument a registry with the historical always-on policy (no `host` label).
+    ///
+    /// Configuration-driven runtimes should build the handle with
+    /// [`crate::metrics_config::http_metrics_for_config`] so an absent `apps.http.metrics` object
+    /// leaves the `caddy_http_*` families unregistered.
     pub fn new(registry: MetricsRegistry) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            policy: HttpMetricsPolicy::enabled(),
+        }
+    }
+
+    /// Instrument a registry with Caddy's opt-in gate, recording no `caddy_http_*` series.
+    pub fn disabled(registry: MetricsRegistry) -> Self {
+        Self {
+            registry,
+            policy: HttpMetricsPolicy::Disabled,
+        }
+    }
+
+    /// Instrument a registry with an explicit policy.
+    pub fn with_policy(registry: MetricsRegistry, policy: HttpMetricsPolicy) -> Self {
+        Self { registry, policy }
     }
 
     /// The underlying registry.
@@ -906,48 +1061,132 @@ impl HttpMetrics {
         &self.registry
     }
 
-    fn basic_labels<'a>(server: &'a str, handler: &'a str) -> [(&'a str, &'a str); 2] {
-        [("server", server), ("handler", handler)]
+    /// The active gate/per-host policy.
+    pub fn policy(&self) -> &HttpMetricsPolicy {
+        &self.policy
+    }
+
+    /// Whether `caddy_http_*` families are recorded (Caddy's `apps.http.metrics` gate).
+    pub fn is_http_recording(&self) -> bool {
+        self.policy.is_enabled()
+    }
+
+    /// Whether the `host` label is added to `caddy_http_*` series (`per_host`).
+    pub fn is_per_host(&self) -> bool {
+        self.policy.per_host().is_some()
+    }
+
+    fn host_label(&self, host: &str, is_https: bool) -> Option<String> {
+        self.policy
+            .per_host()
+            .map(|policy| policy.label_for(host, is_https))
+    }
+
+    fn basic_labels<'a>(
+        &self,
+        server: &'a str,
+        handler: &'a str,
+        host_label: Option<&'a str>,
+    ) -> Vec<(&'a str, &'a str)> {
+        let mut labels = vec![("server", server), ("handler", handler)];
+        if let Some(host) = host_label {
+            labels.push(("host", host));
+        }
+        labels
     }
 
     fn status_labels<'a>(
+        &self,
         server: &'a str,
         handler: &'a str,
         code: &'a str,
         method: &'a str,
-    ) -> [(&'a str, &'a str); 4] {
-        [
+        host_label: Option<&'a str>,
+    ) -> Vec<(&'a str, &'a str)> {
+        let mut labels = vec![
             ("server", server),
             ("handler", handler),
             ("code", code),
             ("method", method),
-        ]
+        ];
+        if let Some(host) = host_label {
+            labels.push(("host", host));
+        }
+        labels
     }
 
     /// Mark one request as in flight. The returned guard decrements the gauge when dropped.
+    ///
+    /// Without a host this records `host="_other"` when `per_host` is enabled; the server seam
+    /// should call [`request_started_for_host`](Self::request_started_for_host).
     pub fn request_started(
         &self,
         server: &str,
         handler: &str,
     ) -> Result<InFlightGuard, MetricsError> {
+        self.request_started_for_host(server, handler, "", false)
+    }
+
+    /// Mark one request as in flight, including the bounded `host` label when `per_host` is on.
+    pub fn request_started_for_host(
+        &self,
+        server: &str,
+        handler: &str,
+        host: &str,
+        is_https: bool,
+    ) -> Result<InFlightGuard, MetricsError> {
+        if !self.is_http_recording() {
+            return Ok(InFlightGuard::noop());
+        }
+        let host_label = self.host_label(host, is_https);
+        let labels = self.basic_labels(server, handler, host_label.as_deref());
         let gauge = self.registry.gauge(
             HTTP_REQUESTS_IN_FLIGHT,
             "Number of requests currently handled by this server.",
-            &Self::basic_labels(server, handler),
+            &labels,
         )?;
         gauge.inc()?;
-        Ok(InFlightGuard { gauge })
+        Ok(InFlightGuard {
+            gauge: Some(gauge),
+        })
     }
 
     /// Record one completed request: counters, error counter and the latency/size histograms.
+    ///
+    /// Without a host this records `host="_other"` when `per_host` is enabled; the server seam
+    /// should call [`request_finished_for_host`](Self::request_finished_for_host).
     pub fn request_finished(
         &self,
         observation: &RequestObservation<'_>,
     ) -> Result<(), MetricsError> {
+        self.request_finished_for_host(observation, "", false)
+    }
+
+    /// Record one completed request, including the bounded `host` label when `per_host` is on.
+    pub fn request_finished_for_host(
+        &self,
+        observation: &RequestObservation<'_>,
+        host: &str,
+        is_https: bool,
+    ) -> Result<(), MetricsError> {
+        if !self.is_http_recording() {
+            return Ok(());
+        }
         let code = sanitize_status_code(observation.status);
         let method = sanitize_method(observation.method);
-        let basic = Self::basic_labels(observation.server, observation.handler);
-        let status = Self::status_labels(observation.server, observation.handler, &code, &method);
+        let host_label = self.host_label(host, is_https);
+        let basic = self.basic_labels(
+            observation.server,
+            observation.handler,
+            host_label.as_deref(),
+        );
+        let status = self.status_labels(
+            observation.server,
+            observation.handler,
+            &code,
+            &method,
+            host_label.as_deref(),
+        );
 
         self.registry
             .counter(
@@ -1108,16 +1347,33 @@ fn duration_seconds(duration: Duration) -> f64 {
 }
 
 /// Keeps one [`HTTP_REQUESTS_IN_FLIGHT`] series incremented until dropped.
+///
+/// A guard created while the `apps.http.metrics` gate is off ([`InFlightGuard::noop`]) holds no
+/// series and is inert.
 #[derive(Debug)]
 pub struct InFlightGuard {
-    gauge: Gauge,
+    gauge: Option<Gauge>,
+}
+
+impl InFlightGuard {
+    /// An inert guard that does not touch any metric (the recording gate is off).
+    pub fn noop() -> Self {
+        Self { gauge: None }
+    }
+
+    /// Whether dropping this guard will decrement an in-flight gauge.
+    pub fn is_instrumented(&self) -> bool {
+        self.gauge.is_some()
+    }
 }
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         // A failing decrement would mean the gauge series vanished from the shared registry, which
         // cannot happen while this guard holds a clone. Ignore the result rather than panic in Drop.
-        let _ = self.gauge.dec();
+        if let Some(gauge) = &self.gauge {
+            let _ = gauge.dec();
+        }
     }
 }
 
