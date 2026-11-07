@@ -165,6 +165,100 @@ pub(crate) async fn serve_request_with_automatic(
     }
 }
 
+/// Serve one already-buffered request through the router (the HTTP/3 path).
+///
+/// HTTP/3 requests arrive through `h3` as `http::Request<()>` plus a stream; the server collects
+/// the request body first (bounded by the server's `max_request_body_size`, matching the buffered
+/// HTTP/1.1 path) and then runs the exact same internal [`caddy_rs_http::Request`] pipeline as
+/// HTTP/1.1/HTTP/2: server-level trusted-proxy resolution, `tls.alpn`, local-address variables and
+/// [`caddy_rs_http::Router::handle_upgradable`]. Protocol upgrades (WebSocket/WebTransport) are not
+/// supported over HTTP/3 and are reported as `501 Not Implemented` instead of a silent downgrade.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn serve_internal_buffered(
+    limits: &ServerLimits,
+    router: Arc<Router>,
+    parts: http::request::Parts,
+    body: Bytes,
+    remote_addr: Option<SocketAddr>,
+    local_addr: Option<SocketAddr>,
+    tls: bool,
+    tls_alpn: Option<&str>,
+    trusted_proxies: Arc<ServerTrustedProxies>,
+) -> ServedResponse {
+    let limit = limits.max_request_body_size;
+    let path = parts.uri.path().to_string();
+    let declared_length = declared_content_length(&parts.headers);
+    if let (Some(limit), Some(declared)) = (limit, declared_length) {
+        if declared > limit {
+            tracing::debug!(
+                limit,
+                declared,
+                path = %path,
+                "request body exceeds max_request_body_size"
+            );
+            return ServedResponse::Response(status_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "413 Request Entity Too Large",
+            ));
+        }
+    }
+    if let Some(limit) = limit {
+        if body.len() as u64 > limit {
+            return ServedResponse::Response(status_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "413 Request Entity Too Large",
+            ));
+        }
+    }
+    let mut internal = Request::new(parts.method, parts.uri);
+    internal.version = parts.version;
+    internal.headers = parts.headers;
+    internal.remote_addr = remote_addr;
+    internal.tls = tls;
+    internal.body = body;
+    if let Some(local) = local_addr {
+        internal
+            .vars
+            .insert("http.request.local".to_string(), local.to_string());
+        internal.vars.insert(
+            "http.request.local.host".to_string(),
+            local.ip().to_string(),
+        );
+        internal.vars.insert(
+            "http.request.local.port".to_string(),
+            local.port().to_string(),
+        );
+    }
+    if let Some(alpn) = tls_alpn {
+        internal
+            .vars
+            .insert("tls.alpn".to_string(), alpn.to_string());
+    }
+    trusted_proxies.apply(&mut internal);
+    match router.handle_upgradable(internal).await {
+        Ok(ResponseOutcome::Response(response)) => {
+            ServedResponse::Response(to_hyper_streaming(response))
+        }
+        Ok(ResponseOutcome::Upgrade(_)) => ServedResponse::Response(status_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "501 Not Implemented: protocol upgrades are not supported over HTTP/3",
+        )),
+        Err(error) => match error.handler_status() {
+            Some(status) => ServedResponse::Response(status_response(
+                status,
+                status.canonical_reason().unwrap_or("error"),
+            )),
+            None => {
+                eprintln!("caddy-rs: handler error: {error}");
+                ServedResponse::Response(status_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "500 Internal Server Error",
+                ))
+            }
+        },
+    }
+}
+
 /// Serve one request, preserving protocol upgrades when `on_upgrade` is supplied.
 ///
 /// `on_upgrade` must have been obtained from the request (via `hyper::upgrade::on(&mut request)`)

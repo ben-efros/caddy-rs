@@ -28,14 +28,14 @@ use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes, BytesMut};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::{TcpListener, UnixListener};
+use tokio::net::{TcpListener, UdpSocket, UnixListener};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
@@ -88,6 +88,11 @@ pub(crate) struct ListenerState {
     /// Whether this listener may switch HTTP/1.1 to HTTP/2 via the cleartext `Upgrade: h2c`
     /// handshake (Caddy `protocols` includes `h2c`; the default offers no h2c Upgrade).
     pub(crate) h2c_upgrade: bool,
+    /// `Alt-Svc` value advertising HTTP/3 on this server's UDP listener, when the server's
+    /// `protocols` include `h3` and a UDP listener has a concrete port (Caddy's
+    /// `http3.Server.SetQUICHeaders`: `h3=":<port>"; ma=2592000`). `None` when HTTP/3 is not
+    /// offered (or the UDP listener port is ephemeral and therefore unknown at plan time).
+    pub(crate) alt_svc: Option<String>,
 }
 
 /// Listener state shared with accept loops, keyed by configured listen address.
@@ -319,10 +324,74 @@ pub(crate) async fn bind(
                 socket_addr: None,
             })
         }
-        Network::Udp => Err(Error::NotImplemented {
-            feature: "UDP listeners (HTTP/3)",
-            tracking_id: "HTTP3-UDP",
-        }),
+        Network::Udp => {
+            if inherited.is_some() {
+                return Err(Error::Listen {
+                    listen: configured.to_string(),
+                    reason: "UDP listeners cannot adopt inherited stream sockets".to_string(),
+                });
+            }
+            let state = listeners
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(configured)
+                .cloned()
+                .ok_or_else(|| Error::Listen {
+                    listen: configured.to_string(),
+                    reason: "UDP listener state is missing".to_string(),
+                })?;
+            let Some(tls) = state.tls.clone() else {
+                return Err(Error::Config(caddy_rs_core::Error::invalid(
+                    "listen",
+                    format!(
+                        "UDP listener `{configured}` requires TLS (HTTP/3 is never served cleartext)"
+                    ),
+                )));
+            };
+            let socket = bind_configured_udp(configured, &address).await?;
+            let socket_addr = socket
+                .local_addr()
+                .map_err(|error| Error::bind(configured, error))?;
+            let std_socket = socket
+                .into_std()
+                .map_err(|error| Error::bind(configured, error))?;
+            let server_config =
+                quic_server_config(configured, tls).map_err(|reason| Error::Listen {
+                    listen: configured.to_string(),
+                    reason,
+                })?;
+            let endpoint = quinn::Endpoint::new(
+                quinn::EndpointConfig::default(),
+                Some(server_config),
+                std_socket,
+                Arc::new(quinn::TokioRuntime),
+            )
+            .map_err(|error| Error::bind(configured, error))?;
+            let local_addr = endpoint
+                .local_addr()
+                .map_err(|error| Error::bind(configured, error))?;
+            let (shutdown, receiver) = watch::channel(false);
+            let (force, force_receiver) = watch::channel(false);
+            let tracker = Arc::new(ConnectionTracker::default());
+            let task = spawn_udp_accept_loop(
+                endpoint,
+                configured.to_string(),
+                listeners,
+                store,
+                local_addr,
+                receiver,
+                force_receiver,
+                Arc::clone(&tracker),
+            );
+            Ok(ListenerHandle {
+                shutdown,
+                force,
+                tracker,
+                task,
+                bound: socket_addr.to_string(),
+                socket_addr: Some(socket_addr),
+            })
+        }
     }
 }
 
@@ -398,7 +467,378 @@ fn ipv6_wildcard_unavailable(error: &io::Error) -> bool {
     )
 }
 
+/// Bind a UDP socket for a configured Caddy listen address (`udp/...`, HTTP/3).
+///
+/// Hostless addresses (`udp/:443`) request the dual-stack IPv6 wildcard like Caddy's
+/// `net.ListenPacket("udp", ":port")`; IP literals and hostnames bind/resolve like the TCP path.
+async fn bind_configured_udp(configured: &str, address: &ListenAddr) -> Result<UdpSocket, Error> {
+    if address.host().is_empty() {
+        let port = address.port().ok_or_else(|| Error::Listen {
+            listen: configured.to_string(),
+            reason: "expected `host:port`; a hostless address needs a numeric port".to_string(),
+        })?;
+        match wildcard_dual_stack_udp(port) {
+            Ok(socket) => return Ok(socket),
+            Err(error) if ipv6_wildcard_unavailable(&error) => {
+                tracing::debug!(
+                    listen = configured,
+                    %error,
+                    "IPv6 wildcard UDP socket unavailable; binding the IPv4 wildcard"
+                );
+            }
+            Err(error) => return Err(Error::bind(configured, error)),
+        }
+        let socket = std::net::UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)))
+            .map_err(|error| Error::bind(configured, error))?;
+        socket
+            .set_nonblocking(true)
+            .map_err(|error| Error::bind(configured, error))?;
+        return UdpSocket::from_std(socket).map_err(|error| Error::bind(configured, error));
+    }
+    match address.socket_addr() {
+        Some(socket_addr) => UdpSocket::bind(socket_addr)
+            .await
+            .map_err(|error| Error::bind(configured, error)),
+        None => UdpSocket::bind(&address.address)
+            .await
+            .map_err(|error| Error::bind(configured, error)),
+    }
+}
+
+/// A dual-stack (`IPv6` wildcard with `IPV6_V6ONLY=0`) UDP socket for a hostless address.
+fn wildcard_dual_stack_udp(port: u16) -> io::Result<UdpSocket> {
+    let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_only_v6(false)?;
+    socket.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)).into())?;
+    socket.set_nonblocking(true)?;
+    UdpSocket::from_std(socket.into())
+}
+
+/// Build a QUIC server configuration from the listener's rustls configuration (Caddy's
+/// `http3.Server` shares the TLS connection policy but negotiates only `h3` over QUIC).
+fn quic_server_config(
+    configured: &str,
+    tls: Arc<rustls::ServerConfig>,
+) -> std::result::Result<quinn::ServerConfig, String> {
+    let mut tls = (*tls).clone();
+    // QUIC requires TLS 1.3 and the HTTP/3 ALPN token. Caddy's `http3.Server` configures its own
+    // TLS config for QUIC, so the TCP listener keeps its h2/http1 ALPN list.
+    tls.alpn_protocols = vec![b"h3".to_vec()];
+    let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls).map_err(|error| {
+        format!("listener `{configured}` cannot be used for QUIC: {error} (TLS 1.3 required)")
+    })?;
+    Ok(quinn::ServerConfig::with_crypto(Arc::new(crypto)))
+}
+
+/// Accept QUIC connections on one UDP listener and serve HTTP/3 through the shared routers.
+fn spawn_udp_accept_loop(
+    endpoint: quinn::Endpoint,
+    listen_key: String,
+    listeners: SharedListeners,
+    store: Arc<GenerationStore>,
+    local_addr: SocketAddr,
+    mut shutdown: watch::Receiver<bool>,
+    mut force: watch::Receiver<bool>,
+    tracker: Arc<ConnectionTracker>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let active = Arc::new(AtomicUsize::new(0));
+        loop {
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+                changed = force.changed() => {
+                    if changed.is_err() || *force.borrow() {
+                        break;
+                    }
+                }
+                incoming = endpoint.accept() => {
+                    let Some(incoming) = incoming else { break };
+                    let Some((context, permit)) = admit_connection(&listeners, &listen_key, &active) else {
+                        tracing::debug!(listen = %listen_key, "QUIC connection refused: max_connections reached");
+                        incoming.refuse();
+                        continue;
+                    };
+                    // The generation guard, connection permit and tracker are held by the
+                    // connection task for its lifetime.
+                    let generation = store.acquire();
+                    let Ok(connection) = incoming.await else {
+                        drop(permit);
+                        continue;
+                    };
+                    let remote_addr = connection.remote_address();
+                    let shutdown = shutdown.clone();
+                    let force = force.clone();
+                    let tracked = tracker.guard();
+                    tokio::spawn(serve_h3_connection(
+                        connection,
+                        context,
+                        permit,
+                        generation,
+                        remote_addr,
+                        local_addr,
+                        shutdown,
+                        force,
+                        tracked,
+                    ));
+                }
+            }
+        }
+        // Close the endpoint and all its connections (removal/reload); the per-connection tasks
+        // observe the closed connections and end, releasing their permits and trackers.
+        endpoint.close(0u32.into(), b"listener closed");
+        let _ = tokio::time::timeout(Duration::from_secs(1), endpoint.wait_idle()).await;
+    })
+}
+
+/// Serve HTTP/3 on one QUIC connection through the same router pipeline as HTTP/1.1/2.
+#[allow(clippy::too_many_arguments)]
+async fn serve_h3_connection(
+    connection: quinn::Connection,
+    context: ConnectionContext,
+    permit: ConnectionPermit,
+    generation: Option<Arc<Generation>>,
+    remote_addr: SocketAddr,
+    local_addr: SocketAddr,
+    mut shutdown: watch::Receiver<bool>,
+    mut force: watch::Receiver<bool>,
+    tracked: TrackedConnection,
+) {
+    let _permit = permit;
+    let _generation = generation;
+    let _tracked = tracked;
+    let _tls_info = h3_tls_info(&connection);
+    let mut h3_connection =
+        match h3::server::Connection::new(h3_quinn::Connection::new(connection.clone())).await {
+            Ok(connection) => connection,
+            Err(error) => {
+                tracing::debug!(%error, "HTTP/3 connection setup failed");
+                connection.close(0u32.into(), b"");
+                return;
+            }
+        };
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    connection.close(0u32.into(), b"");
+                    break;
+                }
+            }
+            changed = force.changed() => {
+                if changed.is_err() || *force.borrow() {
+                    connection.close(0u32.into(), b"");
+                    break;
+                }
+            }
+            accepted = h3_connection.accept() => {
+                match accepted {
+                    Ok(Some(resolver)) => {
+                        let (mut request, mut stream) = match resolver.resolve_request().await {
+                            Ok(pair) => pair,
+                            Err(error) => {
+                                tracing::debug!(%error, "HTTP/3 request resolution failed");
+                                continue;
+                            }
+                        };
+                        let started = std::time::Instant::now();
+                        let method = request.method().as_str().to_string();
+                        let _request_guard =
+                            request_started(&context.recorder, &context.server_name);
+                        let limit = context.limits.max_request_body_size;
+                        let mut body = BytesMut::new();
+                        let mut too_large = false;
+                        loop {
+                            match stream.recv_data().await {
+                                Ok(Some(mut chunk)) => {
+                                    let chunk = chunk.copy_to_bytes(chunk.remaining());
+                                    if let Some(limit) = limit {
+                                        if body.len() as u64 + chunk.len() as u64 > limit {
+                                            too_large = true;
+                                            break;
+                                        }
+                                    }
+                                    body.extend_from_slice(&chunk);
+                                }
+                                Ok(None) => break,
+                                Err(error) => {
+                                    tracing::debug!(%error, "HTTP/3 request body read failed");
+                                    break;
+                                }
+                            }
+                        }
+                        if too_large {
+                            let response = http::Response::builder()
+                                .status(http::StatusCode::PAYLOAD_TOO_LARGE)
+                                .body(())
+                                .unwrap_or_else(|_| http::Response::new(()));
+                            let _ = stream.send_response(response).await;
+                            let _ = stream
+                                .send_data(Bytes::from_static(b"413 Request Entity Too Large"))
+                                .await;
+                            let _ = stream.finish().await;
+                            observe_request(
+                                &context.recorder,
+                                &context.access_log,
+                                &context.access_log_policy,
+                                &context.server_name,
+                                &method,
+                                None,
+                                started,
+                                413,
+                                0,
+                                &http::HeaderMap::new(),
+                            );
+                            continue;
+                        }
+                        // HTTP/3 carries `:authority` in the request URI; synthesize the Host
+                        // header so Caddy host matching/placeholders behave like h1/h2.
+                        if !request.headers().contains_key(http::header::HOST) {
+                            if let Some(authority) = request.uri().authority() {
+                                if let Ok(value) = http::HeaderValue::from_str(authority.as_str()) {
+                                    request
+                                        .headers_mut()
+                                        .insert(http::header::HOST, value);
+                                }
+                            }
+                        }
+                        let (mut parts, ()) = request.into_parts();
+                        parts.version = http::Version::HTTP_3;
+                        let Some(router) = context.router.clone() else {
+                            let headers = http::HeaderMap::new();
+                            observe_request(
+                                &context.recorder,
+                                &context.access_log,
+                                &context.access_log_policy,
+                                &context.server_name,
+                                &method,
+                                None,
+                                started,
+                                503,
+                                0,
+                                &headers,
+                            );
+                            let response = http::Response::builder()
+                                .status(http::StatusCode::SERVICE_UNAVAILABLE)
+                                .body(())
+                                .unwrap_or_else(|_| http::Response::new(()));
+                            let _ = stream.send_response(response).await;
+                            let _ = stream.finish().await;
+                            continue;
+                        };
+                        let served = crate::http::serve_internal_buffered(
+                            &context.limits,
+                            router,
+                            parts,
+                            body.freeze(),
+                            Some(remote_addr),
+                            Some(local_addr),
+                            true,
+                            Some("h3"),
+                            Arc::clone(&context.trusted_proxies),
+                        )
+                        .await;
+                        let hyper_response = match served {
+                            ServedResponse::Response(response) => response,
+                            ServedResponse::Upgraded { response, .. } => response,
+                        };
+                        let (response_parts, response_body) = hyper_response.into_parts();
+                        let mut response_headers = response_parts.headers;
+                        let response_bytes = BodyExt::collect(response_body)
+                            .await
+                            .map(|collected| collected.to_bytes())
+                            .unwrap_or_default();
+                        // Go's HTTP server sets Content-Length for buffered responses (HTTP/3 has
+                        // no transport-level framing headers), including HEAD.
+                        if !response_headers.contains_key(http::header::CONTENT_LENGTH)
+                            && response_parts.status != http::StatusCode::NO_CONTENT
+                            && response_parts.status != http::StatusCode::NOT_MODIFIED
+                        {
+                            if let Ok(value) =
+                                http::HeaderValue::from_str(&response_bytes.len().to_string())
+                            {
+                                response_headers.insert(http::header::CONTENT_LENGTH, value);
+                            }
+                        }
+                        observe_request(
+                            &context.recorder,
+                            &context.access_log,
+                            &context.access_log_policy,
+                            &context.server_name,
+                            &method,
+                            None,
+                            started,
+                            response_parts.status.as_u16(),
+                            response_bytes.len() as u64,
+                            &response_headers,
+                        );
+                        let mut response = http::Response::builder()
+                            .status(response_parts.status)
+                            .body(())
+                            .unwrap_or_else(|_| http::Response::new(()));
+                        for (name, value) in &response_headers {
+                            response.headers_mut().append(name.clone(), value.clone());
+                        }
+                        if let Err(error) = stream.send_response(response).await {
+                            tracing::debug!(%error, "HTTP/3 response headers failed");
+                            continue;
+                        }
+                        if method != "HEAD" && !response_bytes.is_empty() {
+                            if let Err(error) = stream.send_data(response_bytes).await {
+                                tracing::debug!(%error, "HTTP/3 response body failed");
+                                continue;
+                            }
+                        }
+                        if let Err(error) = stream.finish().await {
+                            tracing::debug!(%error, "HTTP/3 response finish failed");
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        tracing::debug!(%error, "HTTP/3 connection closed");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Best-effort TLS metadata for access logs on an HTTP/3 connection.
+///
+/// quinn exposes the rustls handshake data (ALPN, SNI, resumption) but not the negotiated cipher
+/// suite; HTTP/3 is always TLS 1.3. See the compatibility divergence note.
+fn h3_tls_info(connection: &quinn::Connection) -> TlsLogInfo {
+    let handshake = connection
+        .handshake_data()
+        .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok());
+    let (server_name, proto) = match handshake {
+        Some(data) => (
+            data.server_name.clone().unwrap_or_default(),
+            data.protocol
+                .as_ref()
+                .map(|protocol| String::from_utf8_lossy(protocol).into_owned())
+                .unwrap_or_else(|| "h3".to_string()),
+        ),
+        None => (String::new(), "h3".to_string()),
+    };
+    TlsLogInfo {
+        // quinn-proto's rustls HandshakeData does not expose the resumption flag; HTTP/3 access
+        // log TLS metadata is therefore approximate (DIV note).
+        resumed: false,
+        version: u16::from(rustls::ProtocolVersion::TLSv1_3),
+        cipher_suite: 0,
+        proto,
+        server_name,
+        ech: false,
+    }
+}
+
 /// State captured for one accepted connection.
+#[derive(Clone)]
 struct ConnectionContext {
     /// Router to serve, or `None` while the listener is being retired (responds 503).
     router: Option<Arc<Router>>,
@@ -421,6 +861,8 @@ struct ConnectionContext {
     wrappers: Arc<ListenerWrappers>,
     /// Whether cleartext h2c Upgrade is enabled for this listener (`protocols` includes h2c).
     h2c_upgrade: bool,
+    /// `Alt-Svc` value advertising HTTP/3 on the h1/h2 response for this listener.
+    alt_svc: Option<String>,
 }
 
 /// Look up the state of an accepted connection and acquire a connection slot.
@@ -450,6 +892,7 @@ fn admit_connection(
             access_log_policy: Arc::clone(&state.access_log_policy),
             wrappers: Arc::clone(&state.wrappers),
             h2c_upgrade: state.h2c_upgrade,
+            alt_svc: state.alt_svc.clone(),
         },
         None => ConnectionContext {
             router: None,
@@ -463,6 +906,7 @@ fn admit_connection(
             access_log_policy: Arc::new(ServerAccessLogPolicy::default()),
             wrappers: Arc::new(ListenerWrappers::default()),
             h2c_upgrade: false,
+            alt_svc: None,
         },
     };
     let permit = ConnectionPermit::try_acquire(Arc::clone(active), context.limits.max_connections)?;
@@ -725,6 +1169,7 @@ async fn serve_accepted<I>(
             force.clone(),
             Arc::clone(&tracked),
             false,
+            context.alt_svc.clone(),
         );
         serve_connection(tls_stream, service, shutdown, force, limits, activity).await;
     } else {
@@ -748,6 +1193,7 @@ async fn serve_accepted<I>(
             force.clone(),
             Arc::clone(&tracked),
             context.h2c_upgrade,
+            context.alt_svc.clone(),
         );
         serve_connection(stream, service, shutdown, force, limits, activity).await;
     }
@@ -776,6 +1222,8 @@ struct RequestContext {
     tracked: Arc<TrackedConnection>,
     /// Cleartext h2c Upgrade enabled (`protocols` includes h2c).
     h2c_upgrade: bool,
+    /// `Alt-Svc` value advertising HTTP/3 on h1/h2 responses.
+    alt_svc: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -799,6 +1247,7 @@ fn connection_service(
     force: watch::Receiver<bool>,
     tracked: Arc<TrackedConnection>,
     h2c_upgrade: bool,
+    alt_svc: Option<String>,
 ) -> impl hyper::service::Service<
     hyper::Request<Incoming>,
     Response = hyper::Response<Body>,
@@ -826,6 +1275,7 @@ fn connection_service(
         force,
         tracked,
         h2c_upgrade,
+        alt_svc,
     })
 }
 
@@ -943,6 +1393,21 @@ async fn serve_one_request(
     )
     .await;
 
+    // Caddy advertises HTTP/3 on HTTP/1.1 and HTTP/2 responses (`http3.Server.SetQUICHeaders`)
+    // only when the server offers HTTP/3; h3 responses never advertise Alt-Svc themselves.
+    let mut served = served;
+    if let Some(alt_svc) = &context.alt_svc {
+        if let Ok(value) = http::HeaderValue::from_str(alt_svc) {
+            match &mut served {
+                ServedResponse::Response(response) => {
+                    response.headers_mut().insert(http::header::ALT_SVC, value);
+                }
+                ServedResponse::Upgraded { response, .. } => {
+                    response.headers_mut().insert(http::header::ALT_SVC, value);
+                }
+            }
+        }
+    }
     let (status, response_size, response_headers) = match &served {
         ServedResponse::Response(response) => (
             response.status().as_u16(),

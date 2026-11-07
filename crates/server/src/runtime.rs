@@ -19,7 +19,7 @@ use caddy_rs_admin::{
     AdminApi, CertificateMetrics, LoggingConfig, MetricsRegistry, SharedRequestRecorder,
     UpstreamStatusSource,
 };
-use caddy_rs_core::{Generation, GenerationStore};
+use caddy_rs_core::{Generation, GenerationStore, HttpServer, ListenAddr, Network};
 use caddy_rs_http::RouterBuilder;
 use caddy_rs_proxy::{handler_factory_with_status_sink, UpstreamStatusSink};
 use caddy_rs_tls::{
@@ -369,15 +369,28 @@ impl ServerRuntime {
             let _tls_options = TlsServerOptions::from_connection_policies(policies)?;
             let _router = Self::build_router(server_name, server, &status_sink)?;
             for listen in &server.listen {
-                if let Err(reason) = caddy_rs_core::ListenAddr::parse(listen) {
-                    return Err(Error::Config(caddy_rs_core::Error::invalid(
-                        format!("apps.http.servers.{server_name}.listen"),
-                        format!("invalid listen address `{listen}`: {reason}"),
-                    )));
-                }
+                let parsed = match caddy_rs_core::ListenAddr::parse(listen) {
+                    Ok(parsed) => parsed,
+                    Err(reason) => {
+                        return Err(Error::Config(caddy_rs_core::Error::invalid(
+                            format!("apps.http.servers.{server_name}.listen"),
+                            format!("invalid listen address `{listen}`: {reason}"),
+                        )))
+                    }
+                };
+                validate_udp_listener(
+                    listen,
+                    server_name,
+                    server,
+                    https_port,
+                    has_connection_policies,
+                )?;
                 // Validate the listener's implied TLS policy without requiring certificates.
-                let _terminates_tls =
-                    listener_uses_tls(listen, https_port, has_connection_policies)?;
+                let _terminates_tls = if parsed.network == Network::Udp {
+                    udp_listener_terminates_tls(listen, https_port, has_connection_policies)
+                } else {
+                    listener_uses_tls(listen, https_port, has_connection_policies)?
+                };
             }
             let _wrappers = ListenerWrappers::from_server(server)?;
         }
@@ -1225,27 +1238,61 @@ impl ServerRuntime {
             }
             let tls_options = TlsServerOptions::from_connection_policies(policies)?;
             let router = Self::build_router(server_name, server, status_sink)?;
+            // HTTP/3 Alt-Svc advertisement (h1/h2 responses only), when this server offers h3 on a
+            // concrete UDP port. During the automatic-HTTPS bootstrap phase there is no final
+            // resolver yet, so h3 is neither bound nor advertised until phase 2.
+            let bootstrap_phase = automatic.is_some_and(|context| context.bootstrap);
+            let alt_svc = if bootstrap_phase {
+                None
+            } else {
+                alt_svc_for_server(server)
+            };
             for listen in &server.listen {
-                let listen_port = caddy_rs_core::ListenAddr::parse(listen)
-                    .ok()
-                    .and_then(|address| address.port());
+                let parsed_listen = caddy_rs_core::ListenAddr::parse(listen).map_err(|reason| {
+                    Error::Config(caddy_rs_core::Error::invalid(
+                        format!("apps.http.servers.{server_name}.listen"),
+                        format!("invalid listen address `{listen}`: {reason}"),
+                    ))
+                })?;
+                let is_udp = parsed_listen.network == Network::Udp;
+                validate_udp_listener(
+                    listen,
+                    server_name,
+                    server,
+                    https_port,
+                    has_connection_policies,
+                )?;
+                if is_udp && bootstrap_phase {
+                    // Bind HTTP/3 only after certificates are provisioned: a QUIC endpoint's TLS
+                    // configuration is fixed at bind time, so a bootstrap endpoint could keep an
+                    // empty challenge resolver after issuance completes.
+                    continue;
+                }
+                let listen_port = parsed_listen.port();
                 // Under an automatic-HTTPS plan, a listener is TLS when it has explicit policies
                 // or when the plan derived TLS for its port (implicit HTTPS on a non-standard
                 // port). Without a plan the historical rule applies.
-                let terminates_tls = match automatic {
-                    Some(context) => {
-                        let wants_tls = has_connection_policies
-                            || listen_port.is_some_and(|port| context.tls_ports.contains(&port));
-                        // Caddy excludes the configured HTTP port from TLS even when the server
-                        // carries explicit TLS connection policies (`app.go`: `useTLS :=
-                        // len(TLSConnPolicies) > 0 && port != http_port`).
-                        // `:0` is an ephemeral listener, not the configured HTTP port: only a
-                        // concrete, configured HTTP port excludes TLS.
-                        let on_http_port =
-                            context.http_port != 0 && listen_port == Some(context.http_port);
-                        wants_tls && !on_http_port
+                let terminates_tls = if is_udp {
+                    // HTTP/3 requires TLS; `validate_udp_listener` already rejected cleartext UDP
+                    // listeners loudly.
+                    udp_listener_terminates_tls(listen, https_port, has_connection_policies)
+                } else {
+                    match automatic {
+                        Some(context) => {
+                            let wants_tls = has_connection_policies
+                                || listen_port
+                                    .is_some_and(|port| context.tls_ports.contains(&port));
+                            // Caddy excludes the configured HTTP port from TLS even when the server
+                            // carries explicit TLS connection policies (`app.go`: `useTLS :=
+                            // len(TLSConnPolicies) > 0 && port != http_port`).
+                            // `:0` is an ephemeral listener, not the configured HTTP port: only a
+                            // concrete, configured HTTP port excludes TLS.
+                            let on_http_port =
+                                context.http_port != 0 && listen_port == Some(context.http_port);
+                            wants_tls && !on_http_port
+                        }
+                        None => listener_uses_tls(listen, https_port, has_connection_policies)?,
                     }
-                    None => listener_uses_tls(listen, https_port, has_connection_policies)?,
                 };
                 let tls = if terminates_tls {
                     match automatic {
@@ -1265,12 +1312,21 @@ impl ServerRuntime {
                                     ))
                                 }
                             };
-                            let overlay = Arc::new(AcmeTlsAlpnResolver::new(
-                                fallback,
-                                Arc::clone(context.tokens),
-                            ));
-                            let options = tls_options.clone().with_acme_tls_alpn();
-                            Some(build_server_config_with_cert_resolver(overlay, &options)?)
+                            if is_udp {
+                                // QUIC's TLS config is derived from this one by overriding the
+                                // ALPN to `h3`; the ACME TLS-ALPN-01 overlay is TCP-only.
+                                Some(build_server_config_with_cert_resolver(
+                                    fallback,
+                                    &tls_options,
+                                )?)
+                            } else {
+                                let overlay = Arc::new(AcmeTlsAlpnResolver::new(
+                                    fallback,
+                                    Arc::clone(context.tokens),
+                                ));
+                                let options = tls_options.clone().with_acme_tls_alpn();
+                                Some(build_server_config_with_cert_resolver(overlay, &options)?)
+                            }
                         }
                         None => {
                             let resolver = manual_resolver
@@ -1314,6 +1370,7 @@ impl ServerRuntime {
                         )),
                         wrappers: Arc::new(ListenerWrappers::from_server(server)?),
                         h2c_upgrade: h2c_upgrade_enabled(server),
+                        alt_svc: alt_svc.clone(),
                     }),
                 );
             }
@@ -1345,6 +1402,7 @@ impl ServerRuntime {
                             access_log_policy: Arc::new(ServerAccessLogPolicy::default()),
                             wrappers: Arc::new(ListenerWrappers::default()),
                             h2c_upgrade: false,
+                            alt_svc: None,
                         }),
                     );
                 }
@@ -1442,4 +1500,91 @@ async fn wait_for_trackers(
         _ = force_requested(force) => false,
         _ = tokio::time::sleep(remaining) => false,
     }
+}
+
+/// Whether one configured listen address uses the UDP network (`udp/...`).
+fn is_udp_listen(listen: &str) -> bool {
+    ListenAddr::parse(listen)
+        .map(|address| address.network == Network::Udp)
+        .unwrap_or(false)
+}
+
+/// Whether this server offers HTTP/3: Caddy's default `protocols` are `[h1, h2, h3]`, so an
+/// omitted field enables h3; an explicit list must contain `h3`.
+fn server_offers_h3(server: &HttpServer) -> bool {
+    match server.protocols.as_ref() {
+        None => true,
+        Some(protocols) => protocols.iter().any(|protocol| protocol == "h3"),
+    }
+}
+
+/// Caddy's `http3.Server.SetQUICHeaders` value for the first concrete UDP listener port of this
+/// server, when the server offers HTTP/3. Ephemeral (`:0`) UDP ports have no known value at plan
+/// time and are advertised as no Alt-Svc (Caddy reports `ErrNoAltSvcPort` in that case).
+fn alt_svc_for_server(server: &HttpServer) -> Option<String> {
+    if !server_offers_h3(server) {
+        return None;
+    }
+    for listen in &server.listen {
+        let Ok(address) = ListenAddr::parse(listen) else {
+            continue;
+        };
+        if address.network != Network::Udp {
+            continue;
+        }
+        match address.port() {
+            Some(port) if port != 0 => return Some(format!("h3=\":{port}\"; ma=2592000")),
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Whether a UDP (QUIC) listener terminates TLS: port 443 (or the configured HTTPS port) or
+/// explicit `tls_connection_policies`, matching the TCP rule. HTTP/3 requires TLS, so a UDP
+/// listener that does not terminate TLS is a configuration error, never a silent UDP sink.
+fn udp_listener_terminates_tls(
+    listen: &str,
+    https_port: u16,
+    has_connection_policies: bool,
+) -> bool {
+    let Ok(address) = ListenAddr::parse(listen) else {
+        return false;
+    };
+    address.network == Network::Udp
+        && (has_connection_policies || address.port() == Some(https_port))
+}
+
+/// Locate a UDP listener that cannot serve HTTP/3 (missing TLS or missing `protocols: ["h3"]`),
+/// returning a located error so the configuration fails at validate/apply instead of binding a
+/// socket that silently drops QUIC traffic.
+fn validate_udp_listener(
+    listen: &str,
+    server_name: &str,
+    server: &HttpServer,
+    https_port: u16,
+    has_connection_policies: bool,
+) -> Result<()> {
+    if !is_udp_listen(listen) {
+        return Ok(());
+    }
+    if !server_offers_h3(server) {
+        return Err(Error::Config(caddy_rs_core::Error::invalid(
+            format!("apps.http.servers.{server_name}.listen"),
+            format!(
+                "UDP listener `{listen}` requires the server's `protocols` to include `h3`; \
+                 otherwise the socket would silently drop QUIC traffic"
+            ),
+        )));
+    }
+    if !udp_listener_terminates_tls(listen, https_port, has_connection_policies) {
+        return Err(Error::Config(caddy_rs_core::Error::invalid(
+            format!("apps.http.servers.{server_name}.listen"),
+            format!(
+                "UDP listener `{listen}` requires TLS (HTTPS port {https_port} or \
+                 `tls_connection_policies`); HTTP/3 is never served cleartext"
+            ),
+        )));
+    }
+    Ok(())
 }
