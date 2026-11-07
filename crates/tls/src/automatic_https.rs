@@ -96,7 +96,7 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -136,6 +136,10 @@ pub struct AutomaticHttpsPolicy {
     pub on_demand: bool,
     /// Certificate key type from Caddy's automation policy `key_type` (default P-256).
     pub key_type: CertificateKeyType,
+    /// Caddy's policy-level `disable_ocsp_stapling` (T-TLS-051).
+    pub disable_ocsp_stapling: bool,
+    /// Caddy's policy-level `must_staple` (requires a staple; validated by the OCSP stapler).
+    pub must_staple: bool,
 }
 
 /// The issuer selected by an automation policy.
@@ -188,6 +192,10 @@ pub struct AutomaticHttpsPlan {
     pub force_reissue: Vec<String>,
     /// Automation policies in evaluation order.
     pub policies: Vec<AutomaticHttpsPolicy>,
+    /// OCSP freshness scan interval from `apps.tls.automation.ocsp_interval` (default 1h).
+    pub ocsp_check_interval: Duration,
+    /// `apps.tls.disable_ocsp_stapling`: disables stapling for manually-managed certificates.
+    pub manual_disable_ocsp_stapling: bool,
 }
 
 impl AutomaticHttpsPlan {
@@ -196,6 +204,25 @@ impl AutomaticHttpsPlan {
         self.policies
             .iter()
             .find(|policy| policy_matches(&policy.subjects, subject))
+    }
+
+    /// The effective OCSP policy for a managed `subject` (T-TLS-051).
+    ///
+    /// Manual certificates loaded from `apps.tls.certificates` use
+    /// `apps.tls.disable_ocsp_stapling` instead of the automation policy.
+    pub fn ocsp_policy_for(&self, subject: &str) -> crate::ocsp::OcspPolicy {
+        match self.policy_for(subject) {
+            Some(policy) => crate::ocsp::OcspPolicy {
+                enabled: !policy.disable_ocsp_stapling,
+                must_staple: policy.must_staple,
+                check_interval: self.ocsp_check_interval,
+            },
+            None => crate::ocsp::OcspPolicy {
+                enabled: !self.manual_disable_ocsp_stapling,
+                must_staple: false,
+                check_interval: self.ocsp_check_interval,
+            },
+        }
     }
 
     /// Whether `host` should be redirected from HTTP to HTTPS.
@@ -518,6 +545,8 @@ pub fn plan(config: &Config) -> Result<Option<AutomaticHttpsPlan>> {
             issuer: AutomaticHttpsIssuer::Internal,
             on_demand: false,
             key_type: CertificateKeyType::P256,
+            disable_ocsp_stapling: false,
+            must_staple: false,
         });
     }
     let needs_default_acme = !policies.iter().any(|policy| policy.subjects.is_empty())
@@ -529,6 +558,8 @@ pub fn plan(config: &Config) -> Result<Option<AutomaticHttpsPlan>> {
             issuer: AutomaticHttpsIssuer::Acme(Box::default()),
             on_demand: false,
             key_type: CertificateKeyType::P256,
+            disable_ocsp_stapling: false,
+            must_staple: false,
         });
     }
 
@@ -567,6 +598,10 @@ pub fn plan(config: &Config) -> Result<Option<AutomaticHttpsPlan>> {
         && !has_http_listener
         && http_port != https_port;
 
+    let ocsp_interval = match tls {
+        Some(tls) => ocsp_check_interval(tls)?,
+        None => crate::ocsp::DEFAULT_OCSP_CHECK_INTERVAL,
+    };
     Ok(Some(AutomaticHttpsPlan {
         http_port,
         https_port,
@@ -580,6 +615,8 @@ pub fn plan(config: &Config) -> Result<Option<AutomaticHttpsPlan>> {
         redirect_all_port,
         force_reissue,
         policies,
+        ocsp_check_interval: ocsp_interval,
+        manual_disable_ocsp_stapling: tls.map(|tls| tls.disable_ocsp_stapling).unwrap_or(false),
     }))
 }
 
@@ -648,15 +685,64 @@ fn tls_automate(tls: &TlsApp) -> Option<&Vec<String>> {
 }
 
 fn parse_policies(tls: &TlsApp) -> Result<Vec<AutomaticHttpsPolicy>> {
+    let check_interval = ocsp_check_interval(tls)?;
     let mut policies = Vec::new();
     for (index, policy) in tls.automation_policies().iter().enumerate() {
-        policies.push(parse_policy(policy, index)?);
+        policies.push(parse_policy(policy, index, check_interval)?);
     }
     Ok(policies)
 }
 
-fn parse_policy(policy: &AutomationPolicy, index: usize) -> Result<AutomaticHttpsPolicy> {
+/// Parse `apps.tls.automation.ocsp_interval` (Caddy `caddy.Duration`): integer nanoseconds or a
+/// Go duration string; defaults to one hour and rejects invalid values loudly.
+fn ocsp_check_interval(tls: &TlsApp) -> Result<Duration> {
+    let Some(raw) = tls
+        .automation
+        .as_ref()
+        .and_then(|automation| automation.ocsp_interval.as_ref())
+    else {
+        return Ok(crate::ocsp::DEFAULT_OCSP_CHECK_INTERVAL);
+    };
+    let duration = match raw {
+        serde_json::Value::Number(number) => {
+            number.as_u64().map(Duration::from_nanos).ok_or_else(|| {
+                Error::Issuer("apps.tls.automation.ocsp_interval: invalid duration".to_string())
+            })?
+        }
+        serde_json::Value::String(text) => caddy_rs_core::parse_caddy_duration(text)
+            .map(|duration| duration.as_duration())
+            .map_err(|error| {
+                Error::Issuer(format!("apps.tls.automation.ocsp_interval: {error}"))
+            })?,
+        _ => return Err(Error::Issuer(
+            "apps.tls.automation.ocsp_interval: expected integer nanoseconds or a duration string"
+                .to_string(),
+        )),
+    };
+    if duration.is_zero() {
+        return Ok(crate::ocsp::DEFAULT_OCSP_CHECK_INTERVAL);
+    }
+    Ok(duration)
+}
+
+fn parse_policy(
+    policy: &AutomationPolicy,
+    index: usize,
+    check_interval: Duration,
+) -> Result<AutomaticHttpsPolicy> {
     let path = format!("apps.tls.automation.policies[{index}]");
+    // OCSP experimental knobs either map to explicit policy flags or fail loudly; responder URL
+    // overrides are not implemented and must never be dropped silently (T-TLS-051).
+    let ocsp_policy = crate::ocsp::OcspPolicy::for_managed(policy, check_interval).map_err(
+        |error| match error {
+            crate::ocsp::OcspError::Unsupported(_message) => Error::Unsupported {
+                path: format!("{path}.ocsp_overrides"),
+                feature: "OCSP responder URL overrides (`ocsp_overrides`)".to_string(),
+                tracking_id: "T-TLS-051",
+            },
+            other => Error::Issuer(format!("{path}: {other}")),
+        },
+    )?;
     if policy.get_certificate.is_some() {
         return Err(Error::Issuer(format!(
             "{path}.get_certificate module certificates are not implemented (AUTO-HTTPS-GET-CERT)"
@@ -717,6 +803,8 @@ fn parse_policy(policy: &AutomationPolicy, index: usize) -> Result<AutomaticHttp
         issuer,
         on_demand: policy.on_demand,
         key_type,
+        disable_ocsp_stapling: !ocsp_policy.enabled,
+        must_staple: ocsp_policy.must_staple,
     })
 }
 
@@ -3017,6 +3105,7 @@ mod tests {
             redirect_all_port: 443,
             force_reissue: Vec::new(),
             policies: Vec::new(),
+            ..AutomaticHttpsPlan::default()
         };
         let provisioner = AutomaticHttpsProvisioner::new(
             Arc::new(FakeAcme::default()),
@@ -3629,5 +3718,98 @@ mod tests {
             fake.inner.requests.lock().unwrap().is_empty(),
             "no ACME request may be attempted when explicit roots cannot be loaded"
         );
+    }
+    fn implicit_https_config_with_tls(tls: serde_json::Value) -> Config {
+        Config::from_value(serde_json::json!({
+            "apps": {
+                "http": {"servers": {"srv0": {
+                    "listen": [":443"],
+                    "routes": [{
+                        "match": [{"host": ["example.com"]}],
+                        "handle": [{"handler": "static_response", "body": "ok"}]
+                    }]
+                }}},
+                "tls": tls
+            }
+        }))
+        .expect("test config decodes")
+    }
+
+    #[test]
+    fn ocsp_policy_flags_and_interval_are_typed_into_the_plan() {
+        let config = implicit_https_config_with_tls(serde_json::json!({
+            "automation": {
+                "ocsp_interval": 7_200_000_000_000_i64,
+                "policies": [{
+                    "subjects": ["example.com"],
+                    "disable_ocsp_stapling": true,
+                    "must_staple": true
+                }]
+            }
+        }));
+        let plan = plan(&config).unwrap().unwrap();
+        assert_eq!(
+            plan.ocsp_check_interval,
+            std::time::Duration::from_secs(2 * 60 * 60)
+        );
+        let configured = plan
+            .policies
+            .iter()
+            .find(|policy| {
+                policy
+                    .subjects
+                    .iter()
+                    .any(|subject| subject == "example.com")
+            })
+            .expect("configured policy is planned");
+        assert!(configured.disable_ocsp_stapling);
+        assert!(configured.must_staple);
+        let policy = plan.ocsp_policy_for("example.com");
+        assert!(!policy.enabled);
+        assert!(policy.must_staple);
+        assert_eq!(
+            policy.check_interval,
+            std::time::Duration::from_secs(2 * 60 * 60)
+        );
+        // Must-Staple + disabled stapling is a loud configuration state.
+        assert!(matches!(
+            policy.validate_requirements(),
+            Err(crate::ocsp::OcspError::MustStapleDisabled)
+        ));
+    }
+
+    #[test]
+    fn manual_certificate_ocsp_toggle_is_typed() {
+        let config = implicit_https_config_with_tls(serde_json::json!({
+            "disable_ocsp_stapling": true
+        }));
+        let plan = plan(&config).unwrap().unwrap();
+        assert!(plan.manual_disable_ocsp_stapling);
+        let tls = config.tls().expect("tls app configured");
+        let policy = crate::ocsp::OcspPolicy::for_manual(tls, plan.ocsp_check_interval);
+        assert!(!policy.enabled);
+        assert!(!policy.must_staple);
+    }
+
+    #[test]
+    fn ocsp_responder_overrides_are_rejected_loudly() {
+        let config = implicit_https_config_with_tls(serde_json::json!({
+            "automation": {
+                "policies": [{
+                    "subjects": ["example.com"],
+                    "ocsp_overrides": {
+                        "http://ocsp.example.test": "http://ocsp2.example.test"
+                    }
+                }]
+            }
+        }));
+        let error = plan(&config).expect_err("ocsp_overrides must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("ocsp_overrides"),
+            "error must name the unsupported field: {message}"
+        );
+        assert!(message.contains("T-TLS-051"), "{message}");
+        assert!(matches!(error, Error::Unsupported { .. }), "{error:?}");
     }
 }
