@@ -24,7 +24,8 @@ The **minimal** archives are built from the same targets with `--no-default-feat
 out HTTP/3, the compression handler and the templates handler — a 6.5 MiB binary instead of 19.7 MiB.
 A configuration that asks for one of those features is still rejected with a located error naming the
 feature, so a minimal build cannot silently accept a configuration it cannot serve.
- (`opt-level = "z"`, fat LTO,
+
+The static archives are built with the `release-minimal` profile (`opt-level = "z"`, fat LTO,
 `panic = "abort"`, stripped symbols), so they are the smallest binaries produced. They have no libc
 dependency: they run on any Linux kernel of the target architecture, including Alpine and minimal
 container images.
