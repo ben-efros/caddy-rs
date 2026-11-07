@@ -53,4 +53,4 @@ pub use validate::{validate_config, ValidationReport};
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The Caddy release whose configuration contract this build targets.
-pub const CADDY_COMPAT_BASELINE: &str = "v2.11.7";
+pub const CADDY_COMPAT_BASELINE: &str = "v2.11.9";

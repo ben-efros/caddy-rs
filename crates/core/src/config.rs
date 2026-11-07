@@ -2,7 +2,7 @@
 //!
 //! The model is deliberately *incomplete but faithful*: every field this project understands is
 //! typed, and every field it does not understand is preserved verbatim in an `extra` map so that
-//! [`Config`] round-trips without losing configuration. Compatibility target: Caddy v2.11.7
+//! [`Config`] round-trips without losing configuration. Compatibility target: Caddy v2.11.9
 //! (`external/caddy`, pinned by the program repository). See
 //! `docs/compatibility/CONFIGURATION.md` for the coverage matrix and known divergences.
 
@@ -286,7 +286,7 @@ pub struct HttpApp {
 
     /// Experimental HTTP metrics configuration (`apps.http.metrics`).
     ///
-    /// Caddy v2.11.7 gates the `caddy_http_*` metric families behind this object; caddy-rs records
+    /// Caddy v2.11.9 gates the `caddy_http_*` metric families behind this object; caddy-rs records
     /// them unconditionally but validates the shape so a configuration that Caddy accepts is not
     /// rejected as an unknown app field, and so the unsupported behaviours (`per_host`, `otlp`) are
     /// named loudly instead of silently ignored.

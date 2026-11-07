@@ -455,7 +455,7 @@ impl Validator<'_> {
                 return Err(Error::invalid(
                     "apps.http.metrics",
                     format!(
-                        "unknown experimental metrics field(s): {} (Caddy v2.11.7 accepts \
+                        "unknown experimental metrics field(s): {} (Caddy v2.11.9 accepts \
                          `per_host`, `observe_catchall_hosts` and `otlp`)",
                         fields.join(", ")
                     ),

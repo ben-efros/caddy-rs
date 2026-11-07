@@ -1258,6 +1258,16 @@ pub fn adapt_with_source(
     }
 
     let mut config = Map::new();
+    if let Some(admin) = &options.admin {
+        let mut admin_object = Map::new();
+        if admin.disabled {
+            admin_object.insert("disabled".to_string(), json!(true));
+        }
+        if let Some(listen) = &admin.listen {
+            admin_object.insert("listen".to_string(), json!(listen));
+        }
+        config.insert("admin".to_string(), Value::Object(admin_object));
+    }
     if !apps.is_empty() {
         config.insert("apps".to_string(), Value::Object(apps));
     }

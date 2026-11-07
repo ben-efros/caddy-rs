@@ -69,7 +69,7 @@ const REQUEST_ID: u16 = 1;
 /// Caddy's default dial timeout for FastCGI.
 const DEFAULT_DIAL_TIMEOUT: Duration = Duration::from_secs(3);
 /// Caddy compatibility baseline reported in `SERVER_SOFTWARE` (see `CADDY_COMPAT_BASELINE`).
-const CADDY_COMPAT_VERSION: &str = "2.11.7";
+const CADDY_COMPAT_VERSION: &str = "2.11.9";
 
 /// FastCGI transport errors.
 #[derive(Debug, thiserror::Error)]
@@ -1758,7 +1758,7 @@ mod tests {
         assert_eq!(params["REQUEST_METHOD"], "POST");
         assert_eq!(params["REQUEST_SCHEME"], "http");
         assert_eq!(params["SERVER_PROTOCOL"], "HTTP/1.1");
-        assert_eq!(params["SERVER_SOFTWARE"], "Caddy/2.11.7");
+        assert_eq!(params["SERVER_SOFTWARE"], "Caddy/2.11.9");
         assert_eq!(params["SERVER_NAME"], "app.example.com");
         assert_eq!(params["SERVER_PORT"], "80");
         assert_eq!(params["DOCUMENT_ROOT"], "/srv/www");

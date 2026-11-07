@@ -77,12 +77,23 @@ pub struct GlobalOptions {
     pub logs: Vec<Directive>,
     /// Raw global `metrics` option. The adapter turns it into `apps.http.metrics`.
     pub metrics: Option<Directive>,
+    /// Global `admin` option: `admin off` disables the endpoint, `admin <address>` moves it.
+    pub admin: Option<AdminOptions>,
     /// Caddy's global `debug` option. Caddy's adapter uses it to set custom loggers to DEBUG and to
     /// add an implicit DEBUG default logger; it is otherwise informational.
     pub debug: bool,
     /// Non-fatal notes produced while preprocessing the Caddyfile (environment-placeholder
     /// expansion) and while reading options. Adapters surface these to callers.
     pub warnings: Vec<String>,
+}
+
+/// Caddy's global `admin` option (`admin off` or `admin <address>`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AdminOptions {
+    /// `admin off`: the endpoint is not started.
+    pub disabled: bool,
+    /// `admin <address>`: the listen address (Caddy's default is `localhost:2019`).
+    pub listen: Option<String>,
 }
 
 /// A DNS-challenge provider referenced by `acme_dns` or `tls { dns ... }`:
@@ -1806,6 +1817,32 @@ fn read_global_options(directives: Vec<Directive>) -> Result<GlobalOptions, Pars
                 }
                 // Repeated global option lines replace each other, matching Caddy's options map.
                 options.auto_https = modes;
+            }
+            "admin" => {
+                if !directive.block.is_empty() {
+                    return Err(ParseError::syntax(
+                        directive.position.clone(),
+                        "global option `admin` blocks are not supported by this build; use                          `admin off` or `admin <address>`",
+                    ));
+                }
+                if directive.args.len() != 1 {
+                    return Err(ParseError::syntax(
+                        directive.position.clone(),
+                        "wrong argument count or unexpected line ending after `admin`",
+                    ));
+                }
+                let value = &directive.args[0];
+                options.admin = Some(if value == "off" {
+                    AdminOptions {
+                        disabled: true,
+                        listen: None,
+                    }
+                } else {
+                    AdminOptions {
+                        disabled: false,
+                        listen: Some(value.clone()),
+                    }
+                });
             }
             "http_port" => {
                 options.http_port = Some(global_port(&directive)?);

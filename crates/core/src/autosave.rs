@@ -2,7 +2,7 @@
 //!
 //! Caddy persists the last *successfully loaded* configuration to an `autosave.json` file after
 //! every config transition (CLI `run` and admin-driven loads alike) unless `admin.config.persist`
-//! is `false` ([`caddy.go`](https://github.com/caddyserver/caddy/blob/v2.11.7/caddy.go) ~line 377,
+//! is `false` ([`caddy.go`](https://github.com/caddyserver/caddy/blob/v2.11.9/caddy.go) ~line 377,
 //! `unsyncedDecodeAndRun`). The `--resume` startup flag then loads that file in preference to
 //! `--config` (`cmd/commandfuncs.go`, run command).
 //!
