@@ -1595,10 +1595,7 @@ fn parse_client_authentication(value: &Value) -> Result<ParsedClientAuthenticati
                     .extend(parse_client_auth_pem_files(field, &path)?);
             }
             "verifiers" => {
-                return Err(Error::NotImplemented {
-                    feature: "custom client-certificate verifiers (`client_authentication.verifiers`, e.g. CRL/OCSP)",
-                    tracking_id: "TLS-CLIENT-AUTH",
-                })
+                parse_client_auth_verifiers(field, &path, &mut parsed.leaf_certs)?;
             }
             other => {
                 return Err(Error::Unsupported {
@@ -1628,6 +1625,132 @@ fn parse_client_authentication(value: &Value) -> Result<ParsedClientAuthenticati
         ClientAuthMode::RequireAndVerify
     });
     Ok(parsed)
+}
+
+/// Parse Caddy's `client_authentication.verifiers` modules.
+///
+/// Caddy v2.11.9 registers only `tls.client_auth.verifier.leaf`, which enforces an exact leaf
+/// allowlist loaded by `tls.leaf_cert_loader.pem` / `.file` loaders. The allowlist is merged into
+/// the same exact-DER leaf list this crate already enforces after chain verification. Other
+/// verifier modules (for example custom CRL/OCSP verifiers) fail loudly.
+fn parse_client_auth_verifiers(
+    value: &Value,
+    path: &str,
+    leaf_certs: &mut Vec<CertificateDer<'static>>,
+) -> Result<()> {
+    let verifiers = value.as_array().ok_or_else(|| Error::TlsConfig {
+        path: path.to_string(),
+        message: "verifiers must be an array".to_string(),
+    })?;
+    for (index, verifier) in verifiers.iter().enumerate() {
+        let verifier_path = format!("{path}[{index}]");
+        let object = verifier.as_object().ok_or_else(|| Error::TlsConfig {
+            path: verifier_path.clone(),
+            message: "verifier must be an object".to_string(),
+        })?;
+        let name = object
+            .get("verifier")
+            .or_else(|| object.get("module"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::TlsConfig {
+                path: verifier_path.clone(),
+                message: "verifier module is missing its `verifier` field".to_string(),
+            })?;
+        let name = name
+            .strip_prefix("tls.client_auth.verifier.")
+            .unwrap_or(name);
+        if name != "leaf" {
+            return Err(Error::Unsupported {
+                path: verifier_path,
+                feature: format!("client authentication verifier module `{name}`"),
+                tracking_id: "T-TLS-072",
+            });
+        }
+        let loaders = object
+            .get("leaf_certs_loaders")
+            .ok_or_else(|| Error::TlsConfig {
+                path: verifier_path.clone(),
+                message: "leaf verifier requires `leaf_certs_loaders`".to_string(),
+            })?;
+        let loaders = loaders.as_array().ok_or_else(|| Error::TlsConfig {
+            path: format!("{verifier_path}.leaf_certs_loaders"),
+            message: "leaf_certs_loaders must be an array".to_string(),
+        })?;
+        if loaders.is_empty() {
+            return Err(Error::TlsConfig {
+                path: format!("{verifier_path}.leaf_certs_loaders"),
+                message: "leaf verifier requires at least one certificate loader".to_string(),
+            });
+        }
+        for (loader_index, loader) in loaders.iter().enumerate() {
+            let loader_path = format!("{verifier_path}.leaf_certs_loaders[{loader_index}]");
+            let loader_object = loader.as_object().ok_or_else(|| Error::TlsConfig {
+                path: loader_path.clone(),
+                message: "leaf certificate loader must be an object".to_string(),
+            })?;
+            let loader_name = loader_object
+                .get("loader")
+                .or_else(|| loader_object.get("module"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::TlsConfig {
+                    path: loader_path.clone(),
+                    message: "leaf certificate loader is missing its `loader` field".to_string(),
+                })?;
+            let loader_name = loader_name
+                .strip_prefix("tls.leaf_cert_loader.")
+                .unwrap_or(loader_name);
+            match loader_name {
+                "pem" => {
+                    let certificates = loader_object
+                        .get("certificates")
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| Error::TlsConfig {
+                            path: format!("{loader_path}.certificates"),
+                            message: "pem loader requires a `certificates` array".to_string(),
+                        })?;
+                    for (certificate_index, certificate) in certificates.iter().enumerate() {
+                        let pem = certificate.as_str().ok_or_else(|| Error::TlsConfig {
+                            path: format!("{loader_path}.certificates[{certificate_index}]"),
+                            message: "pem loader entries must be PEM strings".to_string(),
+                        })?;
+                        leaf_certs.extend(certificate_chain_from_pem(pem)?);
+                    }
+                }
+                "file" => {
+                    let files = loader_object
+                        .get("files")
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| Error::TlsConfig {
+                            path: format!("{loader_path}.files"),
+                            message: "file loader requires a `files` array".to_string(),
+                        })?;
+                    for (file_index, file) in files.iter().enumerate() {
+                        let file_path = file.as_str().ok_or_else(|| Error::TlsConfig {
+                            path: format!("{loader_path}.files[{file_index}]"),
+                            message: "file loader entries must be paths".to_string(),
+                        })?;
+                        let pem = std::fs::read_to_string(file_path).map_err(|error| {
+                            Error::TlsConfig {
+                                path: format!("{loader_path}.files[{file_index}]"),
+                                message: format!(
+                                    "cannot read client leaf certificate file `{file_path}`: {error}"
+                                ),
+                            }
+                        })?;
+                        leaf_certs.extend(certificate_chain_from_pem(&pem)?);
+                    }
+                }
+                other => {
+                    return Err(Error::Unsupported {
+                        path: loader_path,
+                        feature: format!("leaf certificate loader module `{other}`"),
+                        tracking_id: "T-TLS-072",
+                    })
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Parse one CA pool source (`ca` module or the `trusted_ca_pool` alias).
@@ -2215,6 +2338,8 @@ mod tests {
     const UNTRUSTED_CLIENT_CERT: &str =
         include_str!("../testdata/client-auth/untrusted-client.pem");
     const UNTRUSTED_CLIENT_KEY: &str = include_str!("../testdata/client-auth/untrusted-client.key");
+    const EXPIRED_CLIENT_CERT: &str = include_str!("../testdata/client-auth/expired-client.pem");
+    const EXPIRED_CLIENT_KEY: &str = include_str!("../testdata/client-auth/expired-client.key");
 
     fn client_auth_server(
         mode: ClientAuthMode,
@@ -2685,18 +2810,32 @@ mod tests {
             "{error}"
         );
 
+        // The Caddy leaf verifier module is supported with its loaders; unknown verifier modules
+        // and empty loader lists fail loudly.
         let error = TlsServerOptions::from_connection_policies(Some(&[
             serde_json::json!({"client_authentication": {
                 "verifiers": [{"verifier": "leaf"}]
             }}),
         ]))
         .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("custom client-certificate verifiers"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("leaf_certs_loaders"), "{error}");
+        let options = TlsServerOptions::from_connection_policies(Some(&[
+            serde_json::json!({"client_authentication": {
+                "verifiers": [{
+                    "verifier": "leaf",
+                    "leaf_certs_loaders": [{"loader": "pem", "certificates": [CLIENT_CERT]}]
+                }]
+            }}),
+        ]))
+        .expect("leaf verifier with a pem loader is supported");
+        assert_eq!(options.client_auth_leaf_certs.len(), 1);
+        let error = TlsServerOptions::from_connection_policies(Some(&[
+            serde_json::json!({"client_authentication": {
+                "verifiers": [{"verifier": "custom-revocation"}]
+            }}),
+        ]))
+        .unwrap_err();
+        assert!(error.to_string().contains("T-TLS-072"), "{error}");
 
         let encoded = client_ca_der_base64();
         let error = TlsServerOptions::from_connection_policies(Some(&[
@@ -2929,6 +3068,55 @@ mod tests {
             .await
             .is_err(),
             "non-allowlisted leaf must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_auth_require_and_verify_rejects_expired_client_certificate() {
+        // The fixture is signed by the trusted client CA but valid 2020-01-01..2021-01-01.
+        let server =
+            client_auth_server(ClientAuthMode::RequireAndVerify, Some(CLIENT_CA_CERT), &[]);
+        assert!(
+            handshake_with_client_auth(
+                server,
+                Some((EXPIRED_CLIENT_CERT, EXPIRED_CLIENT_KEY)),
+                TLS12_AND_13,
+            )
+            .await
+            .is_err(),
+            "an expired client certificate must be rejected with a TLS alert"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_auth_require_accepts_expired_certificate_without_verification() {
+        // Caddy's `require` mode requires a certificate but does not verify the chain/validity;
+        // only `verify_if_given`/`require_and_verify` reject the expired fixture.
+        let server = client_auth_server(ClientAuthMode::Require, Some(CLIENT_CA_CERT), &[]);
+        handshake_with_client_auth(
+            server,
+            Some((EXPIRED_CLIENT_CERT, EXPIRED_CLIENT_KEY)),
+            TLS12_AND_13,
+        )
+        .await
+        .expect("require mode accepts a presented (unverified) expired certificate");
+    }
+
+    #[tokio::test]
+    async fn client_auth_verify_if_given_rejects_expired_when_present() {
+        let server = client_auth_server(ClientAuthMode::VerifyIfGiven, Some(CLIENT_CA_CERT), &[]);
+        handshake_with_client_auth(Arc::clone(&server), None, TLS12_AND_13)
+            .await
+            .expect("verify_if_given allows a missing certificate");
+        assert!(
+            handshake_with_client_auth(
+                server,
+                Some((EXPIRED_CLIENT_CERT, EXPIRED_CLIENT_KEY)),
+                TLS12_AND_13,
+            )
+            .await
+            .is_err(),
+            "an expired presented certificate must be rejected when verifying"
         );
     }
 

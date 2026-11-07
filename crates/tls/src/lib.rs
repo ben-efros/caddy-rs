@@ -11,6 +11,7 @@
 pub mod acme;
 pub mod automatic_https;
 pub mod certificate;
+pub mod client_auth;
 pub mod cloudflare;
 pub mod digitalocean;
 pub mod dns;
@@ -44,6 +45,9 @@ pub use automatic_https::{
     AutomaticHttpsProvisioner, AutomaticHttpsRenewals, ProvisionedCertificates, DEFAULT_HTTP_PORT,
 };
 pub use certificate::{renewal_queue, Certificate, CertificateCache, RenewalItem};
+pub use client_auth::{
+    client_certificate_infos, ClientCertificateInfo, ClientCertificateInfoError,
+};
 pub use cloudflare::{
     resolve_env_placeholders, CloudflareConfig, CloudflareProvider, CLOUDFLARE_API_BASE,
     CLOUDFLARE_MIN_TTL_SECONDS, CLOUDFLARE_PROVIDER_NAME,

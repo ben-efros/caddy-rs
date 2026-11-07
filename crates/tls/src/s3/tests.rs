@@ -435,47 +435,47 @@ fn sigv4_signing_is_used_for_s3_requests() {
             .1,
         "20231114T221320Z"
     );
+}
 
-    #[tokio::test]
-    async fn virtual_host_addressing_uses_bucket_host_and_signs_it() {
-        let mock = Arc::new(MockS3::new());
-        mock.expect(
-            HttpMethod::Get,
-            "/key.bin",
-            HttpResponse::new(200).with_body(b"value".to_vec()),
-        );
-        let mut settings = settings();
-        settings.path_style = false;
-        let client = S3Client::with_clock(settings, mock.clone(), clock());
-        assert_eq!(
-            client.get("key.bin").await.unwrap(),
-            Some(b"value".to_vec())
-        );
-        let request = mock.requests.lock().unwrap()[0].clone();
-        assert!(
-            request.url.starts_with("https://certs.s3.example.test/"),
-            "virtual-host URL: {}",
-            request.url
-        );
-        assert!(mock.last_authorization().is_some());
-    }
+#[tokio::test]
+async fn virtual_host_addressing_uses_bucket_host_and_signs_it() {
+    let mock = Arc::new(MockS3::new());
+    mock.expect(
+        HttpMethod::Get,
+        "/key.bin",
+        HttpResponse::new(200).with_body(b"value".to_vec()),
+    );
+    let mut settings = settings();
+    settings.path_style = false;
+    let client = S3Client::with_clock(settings, mock.clone(), clock());
+    assert_eq!(
+        client.get("key.bin").await.unwrap(),
+        Some(b"value".to_vec())
+    );
+    let request = mock.requests.lock().unwrap()[0].clone();
+    assert!(
+        request.url.starts_with("https://certs.s3.example.test/"),
+        "virtual-host URL: {}",
+        request.url
+    );
+    assert!(mock.last_authorization().is_some());
+}
 
-    #[test]
-    fn path_style_and_virtual_host_targets() {
-        let mock = Arc::new(MockS3::new());
-        let mut settings = settings();
-        settings.path_style = true;
-        let client = S3Client::with_clock(settings.clone(), mock, clock());
-        let (url, host, path) = client.request_target("key.bin", &[]).unwrap();
-        assert_eq!(url, "https://s3.example.test/certs/key.bin");
-        assert_eq!(host, "s3.example.test");
-        assert_eq!(path, "/certs/key.bin");
+#[test]
+fn path_style_and_virtual_host_targets() {
+    let mock = Arc::new(MockS3::new());
+    let mut settings = settings();
+    settings.path_style = true;
+    let client = S3Client::with_clock(settings.clone(), mock, clock());
+    let (url, host, path) = client.request_target("key.bin", &[]).unwrap();
+    assert_eq!(url, "https://s3.example.test/certs/key.bin");
+    assert_eq!(host, "s3.example.test");
+    assert_eq!(path, "/certs/key.bin");
 
-        settings.path_style = false;
-        let client = S3Client::with_clock(settings, Arc::new(MockS3::new()), clock());
-        let (url, host, path) = client.request_target("key.bin", &[]).unwrap();
-        assert_eq!(url, "https://certs.s3.example.test/key.bin");
-        assert_eq!(host, "certs.s3.example.test");
-        assert_eq!(path, "/key.bin");
-    }
+    settings.path_style = false;
+    let client = S3Client::with_clock(settings, Arc::new(MockS3::new()), clock());
+    let (url, host, path) = client.request_target("key.bin", &[]).unwrap();
+    assert_eq!(url, "https://certs.s3.example.test/key.bin");
+    assert_eq!(host, "certs.s3.example.test");
+    assert_eq!(path, "/key.bin");
 }

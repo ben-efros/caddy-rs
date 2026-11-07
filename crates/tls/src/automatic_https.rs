@@ -116,7 +116,7 @@ use crate::renewal::{
 };
 use crate::solver::Http01TokenStore;
 use crate::solver::{Http01Solver, TlsAlpn01Solver};
-use crate::storage::{CertificateStorage, FileStorage, SelectedStorage, StoredCertificate};
+use crate::storage::{CertificateStorage, SelectedStorage, StoredCertificate};
 use crate::tls_alpn::TlsAlpn01TokenStore;
 use crate::tls_server::{CertificateResolver, TlsCertificate};
 use crate::{Error, Result};
@@ -1751,6 +1751,7 @@ mod tests {
     };
     use crate::renewal::ManualClock;
     use crate::solver::Http01TokenStore;
+    use crate::storage::FileStorage;
     use async_trait::async_trait;
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine as _;
