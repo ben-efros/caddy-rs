@@ -9,6 +9,7 @@
 pub mod auth;
 pub mod body;
 pub mod encode;
+mod expression;
 pub mod file_server;
 pub mod handlers;
 pub mod matchers;

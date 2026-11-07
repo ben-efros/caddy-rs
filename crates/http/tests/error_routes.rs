@@ -198,7 +198,8 @@ fn expression_matcher_supports_handle_errors_status_filters() {
         .unwrap_or_else(|error| panic!("{expression}: {error}"));
         assert_eq!(matcher.len(), 1);
     }
-    // Other expressions are loudly unsupported rather than silently non-matching.
+    // Other expressions are loudly unsupported (located config errors) rather than silently
+    // non-matching: full CEL matcher functions are not implemented by the documented subset.
     for expression in [
         "method('GET')",
         // Caddy CEL that the status subset cannot evaluate: a backticked literal that real Caddy
@@ -213,7 +214,7 @@ fn expression_matcher_supports_handle_errors_status_filters() {
             Err(error) => error,
         };
         assert!(
-            matches!(error, Error::NotImplemented { .. }),
+            matches!(error, Error::InvalidConfig { .. }),
             "{expression}: {error}"
         );
     }
