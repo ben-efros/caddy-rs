@@ -2153,6 +2153,8 @@ struct SiteTls {
     key_type: Option<String>,
     /// `tls { issuer internal { ... } }` options (in addition to the `tls internal` shorthand).
     internal: Option<InternalIssuerOptions>,
+    /// `tls { issuer acme <ca?> { ... } }` options.
+    acme: Option<AcmeIssuerOptions>,
     /// `tls { client_auth { ... } }` canonical `client_authentication` JSON.
     client_auth: Option<Value>,
     /// `tls { alpn <protocols...> }`.
@@ -2200,6 +2202,19 @@ enum TlsIssuer {
     Internal,
     /// `tls <email>`.
     Email(String),
+}
+
+/// Options of `tls { issuer acme ... { ... } }` (Caddy's `tls.issuance.acme`), restricted to the
+/// fields the caddy-rs runtime honours.
+#[derive(Clone, Debug, Default)]
+struct AcmeIssuerOptions {
+    ca: Option<String>,
+    email: Option<String>,
+    acme_timeout_ns: Option<i64>,
+    http_challenge_disabled: bool,
+    tls_alpn_challenge_disabled: bool,
+    trusted_roots_pem_files: Vec<String>,
+    external_account: Option<(String, String)>,
 }
 
 /// One Caddy automation policy, in the subset this adapter builds.
@@ -2397,6 +2412,182 @@ fn validate_curve(name: &str, position: Position) -> caddy_rs_core::Result<Strin
 
 /// Parse the `tls` directive of a site block. Only the documented subset is implemented; other
 /// forms fail loudly.
+/// Parse one `tls { issuer internal { ... } }` block into the internal-issuer options.
+fn parse_internal_issuer_block(
+    option: &Directive,
+    config: &mut SiteTls,
+) -> caddy_rs_core::Result<()> {
+    let mut internal = InternalIssuerOptions::default();
+    for sub in &option.block {
+        match sub.name.as_str() {
+            "ca" => {
+                if sub.args.len() != 1 || !sub.block.is_empty() {
+                    return Err(adapter_error(
+                        sub.position.clone(),
+                        "`issuer internal ca` requires exactly one CA ID",
+                    ));
+                }
+                if sub.args[0].trim().is_empty() {
+                    return Err(adapter_error(
+                        sub.position.clone(),
+                        "`issuer internal ca` requires a non-empty CA ID",
+                    ));
+                }
+                internal.ca = Some(sub.args[0].clone());
+            }
+            "lifetime" => {
+                if sub.args.len() != 1 || !sub.block.is_empty() {
+                    return Err(adapter_error(
+                        sub.position.clone(),
+                        "`issuer internal lifetime` requires exactly one duration",
+                    ));
+                }
+                let nanoseconds =
+                    crate::parser::parse_duration_ns(&sub.args[0]).map_err(|reason| {
+                        adapter_error(
+                            sub.position.clone(),
+                            format!(
+                                "invalid `issuer internal lifetime` `{}`: {reason}",
+                                sub.args[0]
+                            ),
+                        )
+                    })?;
+                if nanoseconds <= 0 {
+                    return Err(adapter_error(
+                        sub.position.clone(),
+                        "`issuer internal lifetime` must be positive",
+                    ));
+                }
+                internal.lifetime_ns = Some(nanoseconds);
+            }
+            "sign_with_root" => {
+                if !sub.args.is_empty() || !sub.block.is_empty() {
+                    return Err(adapter_error(
+                        sub.position.clone(),
+                        "`issuer internal sign_with_root` does not take arguments",
+                    ));
+                }
+                internal.sign_with_root = true;
+            }
+            other => {
+                return Err(adapter_error(
+                    sub.position.clone(),
+                    format!("`issuer internal` option `{other}` is not supported by this build"),
+                ))
+            }
+        }
+    }
+    config.internal = Some(internal);
+    Ok(())
+}
+
+/// Parse `tls { issuer acme [<ca>] { ... } }` for the ACME options the caddy-rs runtime honours.
+/// Unsupported Caddy ACME options stay located errors instead of being emitted for the runtime to
+/// ignore.
+fn parse_acme_issuer_options(option: &Directive) -> caddy_rs_core::Result<AcmeIssuerOptions> {
+    let mut acme = AcmeIssuerOptions::default();
+    match option.args.len() {
+        1 => {}
+        2 => {
+            acme.ca = Some(option.args[1].clone());
+        }
+        _ => {
+            return Err(adapter_error(
+                option.position.clone(),
+                "`issuer acme` takes at most one CA directory argument",
+            ))
+        }
+    }
+    for sub in &option.block {
+        match sub.name.as_str() {
+            "timeout" => {
+                if sub.args.len() != 1 || !sub.block.is_empty() {
+                    return Err(adapter_error(
+                        sub.position.clone(),
+                        "`issuer acme timeout` requires exactly one duration",
+                    ));
+                }
+                let nanos = crate::parser::parse_duration_ns(&sub.args[0]).map_err(|reason| {
+                    adapter_error(
+                        sub.position.clone(),
+                        format!("invalid `issuer acme timeout` `{}`: {reason}", sub.args[0]),
+                    )
+                })?;
+                acme.acme_timeout_ns = Some(nanos);
+            }
+            "dir" => {
+                if sub.args.len() != 1 || !sub.block.is_empty() {
+                    return Err(adapter_error(
+                        sub.position.clone(),
+                        "`issuer acme dir` requires exactly one directory URL",
+                    ));
+                }
+                if acme.ca.is_some() {
+                    return Err(adapter_error(
+                        sub.position.clone(),
+                        "directory is already specified",
+                    ));
+                }
+                acme.ca = Some(sub.args[0].clone());
+            }
+            "email" => {
+                if sub.args.len() != 1 || !sub.block.is_empty() {
+                    return Err(adapter_error(
+                        sub.position.clone(),
+                        "`issuer acme email` requires exactly one address",
+                    ));
+                }
+                acme.email = Some(sub.args[0].clone());
+            }
+            "disable_http_challenge" => {
+                if !sub.args.is_empty() || !sub.block.is_empty() {
+                    return Err(adapter_error(
+                        sub.position.clone(),
+                        "`issuer acme disable_http_challenge` does not take arguments",
+                    ));
+                }
+                acme.http_challenge_disabled = true;
+            }
+            "disable_tlsalpn_challenge" => {
+                if !sub.args.is_empty() || !sub.block.is_empty() {
+                    return Err(adapter_error(
+                        sub.position.clone(),
+                        "`issuer acme disable_tlsalpn_challenge` does not take arguments",
+                    ));
+                }
+                acme.tls_alpn_challenge_disabled = true;
+            }
+            "trusted_roots" => {
+                if !sub.block.is_empty() {
+                    return Err(adapter_error(
+                        sub.position.clone(),
+                        "`issuer acme trusted_roots` does not take a block",
+                    ));
+                }
+                acme.trusted_roots_pem_files = sub.args.clone();
+            }
+            "eab" => {
+                if sub.args.len() != 2 || !sub.block.is_empty() {
+                    return Err(adapter_error(
+                        sub.position.clone(),
+                        "`issuer acme eab` requires exactly a key ID and an HMAC key",
+                    ));
+                }
+                acme.external_account = Some((sub.args[0].clone(), sub.args[1].clone()));
+            }
+            other => {
+                return Err(adapter_error(
+                    sub.position.clone(),
+                    format!(
+                        "`issuer acme` option `{other}` is not supported by this build                          (the caddy-rs runtime cannot honour it)"
+                    ),
+                ))
+            }
+        }
+    }
+    Ok(acme)
+}
+
 fn parse_site_tls(
     site: &SiteBlock,
     source: Option<&std::path::Path>,
@@ -2496,83 +2687,39 @@ fn parse_site_tls(
                 config.key_type = Some(option.args[0].clone());
             }
             "issuer" => {
-                if option.args.as_slice() != ["internal"] {
+                if config.issuer.is_some() || config.internal.is_some() || config.acme.is_some() {
                     return Err(adapter_error(
                         option.position.clone(),
-                        "`tls` option `issuer` only supports `internal`; ACME issuer \
-                         configuration is not supported by this build",
+                        "cannot specify multiple `tls` issuers",
                     ));
                 }
-                if config.issuer.is_some() {
-                    return Err(adapter_error(
-                        option.position.clone(),
-                        "cannot specify both `tls internal` and a `tls { issuer ... }` block",
-                    ));
-                }
-                let mut internal = InternalIssuerOptions::default();
-                for sub in &option.block {
-                    match sub.name.as_str() {
-                        "ca" => {
-                            if sub.args.len() != 1 || !sub.block.is_empty() {
-                                return Err(adapter_error(
-                                    sub.position.clone(),
-                                    "`issuer internal ca` requires exactly one CA ID",
-                                ));
-                            }
-                            if sub.args[0].trim().is_empty() {
-                                return Err(adapter_error(
-                                    sub.position.clone(),
-                                    "`issuer internal ca` requires a non-empty CA ID",
-                                ));
-                            }
-                            internal.ca = Some(sub.args[0].clone());
-                        }
-                        "lifetime" => {
-                            if sub.args.len() != 1 || !sub.block.is_empty() {
-                                return Err(adapter_error(
-                                    sub.position.clone(),
-                                    "`issuer internal lifetime` requires exactly one duration",
-                                ));
-                            }
-                            let nanoseconds = crate::parser::parse_duration_ns(&sub.args[0])
-                                .map_err(|reason| {
-                                    adapter_error(
-                                        sub.position.clone(),
-                                        format!(
-                                            "invalid `issuer internal lifetime` \
-                                             `{}`: {reason}",
-                                            sub.args[0]
-                                        ),
-                                    )
-                                })?;
-                            if nanoseconds <= 0 {
-                                return Err(adapter_error(
-                                    sub.position.clone(),
-                                    "`issuer internal lifetime` must be positive",
-                                ));
-                            }
-                            internal.lifetime_ns = Some(nanoseconds);
-                        }
-                        "sign_with_root" => {
-                            if !sub.args.is_empty() || !sub.block.is_empty() {
-                                return Err(adapter_error(
-                                    sub.position.clone(),
-                                    "`issuer internal sign_with_root` does not take arguments",
-                                ));
-                            }
-                            internal.sign_with_root = true;
-                        }
-                        other => {
+                match option.args.first().map(String::as_str) {
+                    Some("internal") => {
+                        if option.args.len() != 1 {
                             return Err(adapter_error(
-                                sub.position.clone(),
-                                format!(
-                                "`issuer internal` option `{other}` is not supported by this build"
-                            ),
-                            ))
+                                option.position.clone(),
+                                "`issuer internal` takes at most a `ca` block, not arguments",
+                            ));
                         }
+                        parse_internal_issuer_block(option, &mut config)?
+                    }
+                    Some("acme") => {
+                        if config.issuer.is_some() || config.internal.is_some() {
+                            return Err(adapter_error(
+                                option.position.clone(),
+                                "cannot specify multiple `tls` issuers",
+                            ));
+                        }
+                        let acme = parse_acme_issuer_options(option)?;
+                        config.acme = Some(acme);
+                    }
+                    _ => {
+                        return Err(adapter_error(
+                            option.position.clone(),
+                            "`tls` option `issuer` supports `internal` and `acme`",
+                        ))
                     }
                 }
-                config.internal = Some(internal);
             }
             "client_auth" => {
                 if config.client_auth.is_some() {
@@ -2703,6 +2850,14 @@ fn parse_site_tls(
             "`client_auth` on wildcard hostnames requires Caddy's TLS shield-policy hoisting, \
              which is not supported by this build (tracked as TLS-CLIENT-AUTH); use explicit \
              hostnames",
+        ));
+    }
+    if config.acme.is_some()
+        && (config.internal_options().is_some() || config.ca.is_some() || config.dns.is_some())
+    {
+        return Err(adapter_error(
+            position,
+            "cannot mix `issuer acme` with other certificate issuers",
         ));
     }
     if config.internal_options().is_some() && (config.ca.is_some() || config.dns.is_some()) {
@@ -3118,6 +3273,48 @@ fn dns_provider_json(
 }
 
 /// Issuers Caddy creates for the implicit ACME shortcuts (`tls <email>`, `ca`, `dns`).
+/// Encode an explicit `issuer acme` block (Caddy's `tls.issuance.acme` JSON).
+fn explicit_acme_issuer_json(acme: &AcmeIssuerOptions) -> Value {
+    let mut object = Map::new();
+    object.insert("module".to_string(), json!("acme"));
+    if let Some(ca) = &acme.ca {
+        object.insert("ca".to_string(), json!(ca));
+    }
+    if let Some(email) = &acme.email {
+        object.insert("email".to_string(), json!(email));
+    }
+    if let Some(timeout) = acme.acme_timeout_ns {
+        // Caddy's `omitempty` omits a zero duration; negative values are emitted and rejected by
+        // the runtime (which requires a positive timeout), matching Caddy's adapt/validate split.
+        if timeout != 0 {
+            object.insert("acme_timeout".to_string(), json!(timeout));
+        }
+    }
+    if !acme.trusted_roots_pem_files.is_empty() {
+        object.insert(
+            "trusted_roots_pem_files".to_string(),
+            json!(acme.trusted_roots_pem_files),
+        );
+    }
+    if let Some((key_id, mac_key)) = &acme.external_account {
+        object.insert(
+            "external_account".to_string(),
+            json!({"key_id": key_id, "mac_key": mac_key}),
+        );
+    }
+    if acme.http_challenge_disabled || acme.tls_alpn_challenge_disabled {
+        let mut challenges = Map::new();
+        if acme.http_challenge_disabled {
+            challenges.insert("http".to_string(), json!({"disabled": true}));
+        }
+        if acme.tls_alpn_challenge_disabled {
+            challenges.insert("tls-alpn".to_string(), json!({"disabled": true}));
+        }
+        object.insert("challenges".to_string(), Value::Object(challenges));
+    }
+    Value::Object(object)
+}
+
 fn implicit_acme_issuers(tls: &SiteTls, position: Position) -> caddy_rs_core::Result<Vec<Value>> {
     let email = match &tls.issuer {
         Some(TlsIssuer::Email(email)) => Some(email.clone()),
@@ -3623,7 +3820,9 @@ fn build_tls_plan(
                     policy.key_type = tls.key_type.clone();
                 }
                 if tls.cert_key.is_none() {
-                    if let Some(internal) = tls.internal_options() {
+                    if let Some(acme) = &tls.acme {
+                        policy.issuers = vec![explicit_acme_issuer_json(acme)];
+                    } else if let Some(internal) = tls.internal_options() {
                         policy.issuers = vec![internal_issuer_json(&internal)];
                     } else if tls.issuer.is_some() || tls.ca.is_some() || tls.dns.is_some() {
                         policy.issuers = implicit_acme_issuers(tls, site.position.clone())?;

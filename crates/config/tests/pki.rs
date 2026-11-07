@@ -192,8 +192,8 @@ fn pki_syntax_errors_are_loud() {
             "unrecognized pki ca root option",
         ),
         (
-            "a.example.com {\n tls {\n  issuer acme\n }\n}\n",
-            "only supports `internal`",
+            "a.example.com {\n tls {\n  issuer zerossl\n }\n}\n",
+            "supports `internal` and `acme`",
         ),
     ] {
         let error = adapt(caddyfile).expect_err("must be rejected");
