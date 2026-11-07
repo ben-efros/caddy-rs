@@ -11,6 +11,7 @@ repository.workspace = true
 async-trait = { workspace = true }
 bytes = { workspace = true }
 caddy-rs-core = { workspace = true }
+flate2 = "1"
 http = { workspace = true }
 http-body = "1.1.0"
 http-body-util = { workspace = true }
@@ -19,6 +20,7 @@ hyper-util = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+zstd = "0.13"
 
 [dev-dependencies]
 caddy-rs-config = { workspace = true }
