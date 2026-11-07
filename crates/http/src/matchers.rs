@@ -479,11 +479,12 @@ impl FileMatcher {
     }
 
     fn expanded_root(&self, request: &Request) -> String {
-        // Caddy: filepath.Clean(repl.ReplaceAll(root, ".")) — an empty placeholder value becomes
-        // ".", and the result is lexically cleaned.
-        let expanded = request.replace_all(&self.root);
-        let expanded = if expanded.is_empty() { "." } else { &expanded };
-        path_clean(expanded)
+        // Caddy: filepath.Clean(repl.ReplaceAll(root, ".")). `ReplaceAll` substitutes "."
+        // for every *empty* replacement value (including unknown placeholders, whose value is
+        // nil/empty), then the root is lexically cleaned. This matters for roots such as
+        // `{unknown}/sub`: Caddy cleans `./sub` to `sub`, whereas replacing the placeholder with
+        // nothing would produce an absolute `/sub`.
+        path_clean(&expand_root_placeholders(request, &self.root))
     }
 
     /// Expand and clean one `try_files` pattern into candidate file paths.
@@ -1502,6 +1503,41 @@ fn parse_glob_class(pattern: &[char], name: char) -> Option<(bool, usize)> {
     None
 }
 
+/// Expand placeholders in a file-matcher root with Caddy's `Replacer.ReplaceAll(root, ".")`
+/// fallback: every empty value (unknown or known-empty) is replaced with ".".
+fn expand_root_placeholders(request: &Request, root: &str) -> String {
+    let chars: Vec<char> = root.chars().collect();
+    let mut output = String::with_capacity(root.len());
+    let mut index = 0usize;
+    while index < chars.len() {
+        let current = chars[index];
+        if current == '\\'
+            && index + 1 < chars.len()
+            && (chars[index + 1] == '{' || chars[index + 1] == '}')
+        {
+            output.push(chars[index + 1]);
+            index += 2;
+            continue;
+        }
+        if current == '{' {
+            if let Some(offset) = chars[index + 1..].iter().position(|c| *c == '}') {
+                let name: String = chars[index + 1..index + 1 + offset].iter().collect();
+                let value = request.get_placeholder(&name).unwrap_or_default();
+                if value.is_empty() {
+                    output.push('.');
+                } else {
+                    output.push_str(&value);
+                }
+                index += offset + 2;
+                continue;
+            }
+        }
+        output.push(current);
+        index += 1;
+    }
+    output
+}
+
 /// A lexical `path.Clean` for slash-separated paths (Go's `path.Clean` semantics).
 fn path_clean(path: &str) -> String {
     if path.is_empty() {
@@ -1513,7 +1549,11 @@ fn path_clean(path: &str) -> String {
         match part {
             "" | "." => {}
             ".." => {
-                parts.pop();
+                if parts.last().is_some_and(|last| *last != "..") {
+                    parts.pop();
+                } else if !rooted {
+                    parts.push("..");
+                }
             }
             other => parts.push(other),
         }
@@ -2053,6 +2093,147 @@ mod tests {
             .vars
             .insert("attempt".to_string(), "../secret.txt".to_string());
         assert!(!matcher.matches(&request));
+    }
+
+    #[test]
+    fn file_matcher_expands_root_placeholders_per_request() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        std::fs::write(first.path().join("index.html"), "first").unwrap();
+        std::fs::write(second.path().join("index.html"), "second").unwrap();
+        let matcher = file_matcher(serde_json::json!({
+            "root": "{http.vars.root}",
+            "try_files": ["{http.request.uri.path}"]
+        }));
+        let mut request = file_request("/index.html", first.path());
+        assert!(matcher.matches_mut(&mut request));
+        assert_eq!(
+            request
+                .vars
+                .get("matchers.file.absolute")
+                .map(String::as_str),
+            Some(first.path().join("index.html").to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            request
+                .vars
+                .get("matchers.file.relative")
+                .map(String::as_str),
+            Some("/index.html")
+        );
+        // The same configured root expression switches to the second directory for this request.
+        let mut request = file_request("/index.html", second.path());
+        assert!(matcher.matches_mut(&mut request));
+        assert_eq!(
+            request
+                .vars
+                .get("matchers.file.absolute")
+                .map(String::as_str),
+            Some(second.path().join("index.html").to_string_lossy().as_ref())
+        );
+
+        // `{http.request.uri.path}` is expanded into the root too.
+        let nested = tempfile::tempdir().unwrap();
+        std::fs::create_dir(nested.path().join("site")).unwrap();
+        std::fs::write(nested.path().join("site/index.html"), "nested").unwrap();
+        let matcher = file_matcher(serde_json::json!({
+            "root": format!("{}{{http.request.uri.path}}", nested.path().to_string_lossy()),
+            "try_files": ["/index.html"]
+        }));
+        let mut request = file_request("/site", nested.path());
+        assert!(matcher.matches_mut(&mut request));
+        assert_eq!(
+            request
+                .vars
+                .get("matchers.file.absolute")
+                .map(String::as_str),
+            Some(
+                nested
+                    .path()
+                    .join("site/index.html")
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+    }
+
+    #[test]
+    fn file_matcher_root_expansion_uses_caddy_empty_fallback() {
+        let request = file_request("/", std::path::Path::new("."));
+        let matcher = file_matcher(serde_json::json!({
+            "root": "{unknown.root.placeholder}/sub",
+            "try_files": ["/x"]
+        }));
+        // Caddy's ReplaceAll(root, ".") turns the empty/unknown placeholder into `.`, so the
+        // cleaned root is relative `sub`, not absolute `/sub`.
+        assert_eq!(matcher.expanded_root(&request), "sub");
+
+        let matcher = file_matcher(serde_json::json!({
+            "root": "{unknown.root.placeholder}",
+            "try_files": ["/x"]
+        }));
+        assert_eq!(matcher.expanded_root(&request), ".");
+    }
+
+    #[test]
+    fn file_matcher_expands_environment_roots() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("env.txt"), "env").unwrap();
+        let variable = format!("CADDY_RS_W23_ROOT_{}", std::process::id());
+        std::env::set_var(&variable, directory.path());
+        let matcher = file_matcher(serde_json::json!({
+            "root": format!("{{env.{variable}}}"),
+            "try_files": ["/env.txt"]
+        }));
+        let mut request = file_request("/env.txt", directory.path());
+        let matches = matcher.matches_mut(&mut request);
+        std::env::remove_var(&variable);
+        assert!(matches);
+        assert_eq!(
+            request
+                .vars
+                .get("matchers.file.absolute")
+                .map(String::as_str),
+            Some(directory.path().join("env.txt").to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn file_matcher_expanded_root_still_contains_try_files() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(parent.path().join("secret.txt"), "secret").unwrap();
+        let matcher = file_matcher(serde_json::json!({
+            "root": "{http.vars.root}",
+            "try_files": ["/../secret.txt", "{http.vars.attempt}"]
+        }));
+        let mut request = file_request("/../secret.txt", &root);
+        assert!(!matcher.matches_mut(&mut request));
+        let mut request = file_request("/attempt", &root);
+        request
+            .vars
+            .insert("attempt".to_string(), "../secret.txt".to_string());
+        assert!(!matcher.matches_mut(&mut request));
+    }
+
+    #[test]
+    fn file_matcher_unknown_try_files_placeholder_falls_through() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("index.html"), "index").unwrap();
+        let matcher = file_matcher(serde_json::json!({
+            "root": directory.path().to_string_lossy(),
+            "try_files": ["{unknown.try.files.placeholder}", "/index.html"]
+        }));
+        let mut request = file_request("/", directory.path());
+        assert!(matcher.matches_mut(&mut request));
+        assert_eq!(
+            request
+                .vars
+                .get("matchers.file.relative")
+                .map(String::as_str),
+            Some("/index.html")
+        );
     }
 
     #[test]
