@@ -22,12 +22,29 @@ const EXAMPLE_CERT: &str = include_str!("../../tls/testdata/https/example.com.pe
 const EXAMPLE_KEY: &str = include_str!("../../tls/testdata/https/example.com.key");
 const BODY: &str = "hello {http.vars.tls.alpn} {http.request.scheme} {http.request.uri.path}";
 
+/// Hand out an ephemeral port that no other test in this process has taken.
+///
+/// Binding `:0` and dropping the socket is a time-of-check/time-of-use race: a parallel test can
+/// claim the same number between the probe and the runtime's real bind (this showed up as a
+/// sporadic `AddrInUse`). Recording every handed-out port makes intra-process reuse impossible;
+/// the underlying TCP+UDP listeners then bind the same number in the two protocol spaces.
 fn free_port() -> u16 {
-    std::net::TcpListener::bind(("127.0.0.1", 0))
-        .expect("bind ephemeral port")
-        .local_addr()
-        .expect("local addr")
-        .port()
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    static ISSUED: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+    let issued = ISSUED.get_or_init(|| Mutex::new(HashSet::new()));
+    loop {
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("bind ephemeral port")
+            .local_addr()
+            .expect("local addr")
+            .port();
+        let mut guard = issued.lock().expect("port registry");
+        if guard.insert(port) {
+            return port;
+        }
+    }
 }
 
 /// Configuration with TLS material and optional UDP (HTTP/3) listener.
