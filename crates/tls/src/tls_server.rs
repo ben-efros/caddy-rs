@@ -674,6 +674,8 @@ pub struct TlsCertificate {
     tags: Vec<String>,
     chain: Vec<CertificateDer<'static>>,
     private_key: PrivateKeyDer<'static>,
+    /// DER-encoded OCSP response to staple with this certificate (T-TLS-051).
+    ocsp_staple: Option<Vec<u8>>,
 }
 
 impl TlsCertificate {
@@ -692,6 +694,7 @@ impl TlsCertificate {
             tags: Vec::new(),
             chain,
             private_key,
+            ocsp_staple: None,
         })
     }
 
@@ -718,6 +721,7 @@ impl TlsCertificate {
             tags: Vec::new(),
             chain: chain_der.into_iter().map(CertificateDer::from).collect(),
             private_key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(private_key_der)),
+            ocsp_staple: None,
         })
     }
 
@@ -739,6 +743,7 @@ impl TlsCertificate {
             tags: Vec::new(),
             chain: chain_der.into_iter().map(CertificateDer::from).collect(),
             private_key,
+            ocsp_staple: None,
         })
     }
 
@@ -779,6 +784,20 @@ impl TlsCertificate {
         self
     }
 
+    /// Attach a DER-encoded OCSP response to staple with this certificate (T-TLS-051).
+    ///
+    /// The server hook obtains the response through the [`crate::ocsp::OcspStapler`] and rebuilds
+    /// the resolver-inserted certificate with the returned staple. `None` clears it.
+    pub fn with_ocsp_staple(mut self, staple: Option<Vec<u8>>) -> Self {
+        self.ocsp_staple = staple;
+        self
+    }
+
+    /// The attached OCSP staple, if any.
+    pub fn ocsp_staple(&self) -> Option<&[u8]> {
+        self.ocsp_staple.as_deref()
+    }
+
     /// The DER certificate chain, leaf first.
     pub fn chain(&self) -> &[CertificateDer<'static>] {
         &self.chain
@@ -801,7 +820,7 @@ impl TlsCertificate {
         Ok(CertifiedKey {
             cert: self.chain.clone(),
             key: signing_key,
-            ocsp: None,
+            ocsp: self.ocsp_staple.clone(),
         })
     }
 }

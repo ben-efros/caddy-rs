@@ -16,6 +16,7 @@ pub mod dns;
 pub mod dns_providers;
 pub mod internal_ca;
 pub mod issuer;
+pub mod ocsp;
 pub mod propagation;
 pub mod renewal;
 pub mod solver;
@@ -58,6 +59,12 @@ pub use internal_ca::{
 pub use issuer::{
     within_renewal_window, AcmeIssuer, AcmeIssuerConfig, CertificateIssuer, InternalIssuer,
     IssuanceRequest, ProductionAcmeIssuer,
+};
+pub use ocsp::{
+    build_ocsp_request, parse_ocsp_response, staple_for_certificate, DenyOcspTransport,
+    OcspCertStatus, OcspError, OcspPolicy, OcspRequest, OcspResponse, OcspStapler, OcspTransport,
+    ParsedCertificate, SharedOcspStapler, Staple, StapleOutcome, DEFAULT_OCSP_CHECK_INTERVAL,
+    INITIAL_OCSP_RETRY_DELAY, MAX_OCSP_RETRY_DELAY,
 };
 pub use propagation::{
     txt_data_matches, DohPropagationChecker, PropagationChecker, CLOUDFLARE_DOH_ENDPOINT,
