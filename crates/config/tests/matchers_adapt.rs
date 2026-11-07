@@ -170,3 +170,49 @@ fn adapted_matchers_validate_with_the_builtin_registry() {
         "all six adapted matchers are counted by validation"
     );
 }
+
+#[test]
+fn file_matcher_block_forms_and_errors() {
+    // Caddy's `file` matcher: inline arguments and the block's root/try_files/try_policy/
+    // split_path (T-CONF-013). Shorthand placeholders are expanded before parsing.
+    let adapted = adapt(
+        ":8080 {\n\t@php {\n\t\tfile {\n\t\t\ttry_files {path} {path}/index.php index.php\n\t\t\tsplit_path .php\n\t\t\ttry_policy first_exist_fallback\n\t\t}\n\t}\n\trespond @php \"php\"\n}\n",
+    )
+    .expect("file matcher adapts");
+    let routes = adapted.config["apps"]["http"]["servers"]["srv0"]["routes"]
+        .as_array()
+        .expect("routes");
+    assert_eq!(
+        routes[0]["match"][0]["file"],
+        json!({
+            "try_files": [
+                "{http.request.uri.path}",
+                "{http.request.uri.path}/index.php",
+                "index.php",
+            ],
+            "split_path": [".php"],
+            "try_policy": "first_exist_fallback",
+        })
+    );
+
+    for (caddyfile, expected) in [
+        (
+            ":8080 {\n\t@f {\n\t\tfile {\n\t\t\tbogus x\n\t\t}\n\t}\n\trespond @f x\n}\n",
+            "unrecognized `file` matcher subdirective: bogus",
+        ),
+        (
+            ":8080 {\n\t@f {\n\t\tfile {\n\t\t\ttry_files\n\t\t}\n\t}\n\trespond @f x\n}\n",
+            "requires at least one file argument",
+        ),
+        (
+            ":8080 {\n\t@f {\n\t\tfile {\n\t\t\tsplit_path\n\t\t}\n\t}\n\trespond @f x\n}\n",
+            "requires at least one suffix",
+        ),
+    ] {
+        let error = adapt(caddyfile).expect_err("invalid file matcher must fail loudly");
+        assert!(
+            error.to_string().contains(expected),
+            "expected {expected:?} in: {error}"
+        );
+    }
+}

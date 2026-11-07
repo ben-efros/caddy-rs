@@ -4089,13 +4089,14 @@ fn matcher_from_inline_args(args: &[String], position: Position) -> caddy_rs_cor
         "tls",
         "vars",
         "vars_regexp",
+        "file",
     ];
     if args.len() == 1 && !KNOWN_MATCHERS.contains(&name.as_str()) {
         // Caddy treats a lone quoted argument that is not a known matcher name as an inline
         // CEL expression matcher (`path('/foo*') && method('GET')`).
         return Ok(json!({"expression": {"expr": name}}));
     }
-    matcher_from_directive(name, &args[1..], position)
+    matcher_from_directive(name, &args[1..], &[], position)
 }
 
 fn matcher_from_directives(directives: &[Directive]) -> caddy_rs_core::Result<Value> {
@@ -4114,8 +4115,12 @@ fn matcher_from_directives(directives: &[Directive]) -> caddy_rs_core::Result<Va
             )?;
             continue;
         }
-        let value =
-            matcher_from_directive(&directive.name, &directive.args, directive.position.clone())?;
+        let value = matcher_from_directive(
+            &directive.name,
+            &directive.args,
+            &directive.block,
+            directive.position.clone(),
+        )?;
         merge_matcher(&mut object, value, directive.position.clone())?;
     }
     Ok(Value::Object(object))
@@ -4124,6 +4129,7 @@ fn matcher_from_directives(directives: &[Directive]) -> caddy_rs_core::Result<Va
 fn matcher_from_directive(
     name: &str,
     args: &[String],
+    block: &[Directive],
     position: Position,
 ) -> caddy_rs_core::Result<Value> {
     match name {
@@ -4244,7 +4250,7 @@ fn matcher_from_directive(
             if args.is_empty() {
                 return Err(adapter_error(position, "matcher `not` requires a matcher"));
             }
-            let inner = matcher_from_directive(&args[0], &args[1..], position)?;
+            let inner = matcher_from_directive(&args[0], &args[1..], block, position)?;
             Ok(json!({"not": [inner]}))
         }
         // `local_ip` is a caddy-rs extension: Caddy v2.11.7 has no HTTP `local_ip` matcher (the
@@ -4315,6 +4321,74 @@ fn matcher_from_directive(
                 ),
             )),
         },
+        // Caddy's `file` matcher: inline arguments are `try_files` entries; the block supports
+        // root/try_files/try_policy/split_path. The runtime registers `http.matchers.file`.
+        "file" => {
+            let mut try_files: Vec<String> = args.to_vec();
+            let mut root: Option<String> = None;
+            let mut try_policy: Option<String> = None;
+            let mut split_path: Vec<String> = Vec::new();
+            for option in block {
+                match option.name.as_str() {
+                    "root" => {
+                        if option.args.len() != 1 || !option.block.is_empty() {
+                            return Err(adapter_error(
+                                option.position.clone(),
+                                "`file root` requires exactly one path",
+                            ));
+                        }
+                        root = Some(option.args[0].clone());
+                    }
+                    "try_files" => {
+                        if option.args.is_empty() || !option.block.is_empty() {
+                            return Err(adapter_error(
+                                option.position.clone(),
+                                "`file try_files` requires at least one file argument",
+                            ));
+                        }
+                        try_files.extend(option.args.iter().cloned());
+                    }
+                    "try_policy" => {
+                        if option.args.len() != 1 || !option.block.is_empty() {
+                            return Err(adapter_error(
+                                option.position.clone(),
+                                "`file try_policy` requires exactly one policy name",
+                            ));
+                        }
+                        try_policy = Some(option.args[0].clone());
+                    }
+                    "split_path" => {
+                        if option.args.is_empty() || !option.block.is_empty() {
+                            return Err(adapter_error(
+                                option.position.clone(),
+                                "`file split_path` requires at least one suffix",
+                            ));
+                        }
+                        split_path.extend(option.args.iter().cloned());
+                    }
+                    other => {
+                        return Err(adapter_error(
+                            option.position.clone(),
+                            format!("unrecognized `file` matcher subdirective: {other}"),
+                        ))
+                    }
+                }
+            }
+            let mut object = Map::new();
+            if !try_files.is_empty() {
+                object.insert("try_files".to_string(), json!(try_files));
+            }
+            if let Some(root) = root {
+                object.insert("root".to_string(), json!(root));
+            }
+            if let Some(try_policy) = try_policy {
+                object.insert("try_policy".to_string(), json!(try_policy));
+            }
+            if !split_path.is_empty() {
+                object.insert("split_path".to_string(), json!(split_path));
+            }
+            Ok(json!({"file": Value::Object(object)}))
+        }
         other => Err(adapter_error(
             position,
             format!("matcher `{other}` is not supported by this build"),
@@ -4439,6 +4513,15 @@ fn build_routes(
                     "directive `{}` can only be used directly in a site block",
                     directive.name
                 ),
+            ));
+        }
+        if directive.name == "acme_server" {
+            // Named explicitly rather than falling through: the limitation is at the runtime layer
+            // (no `http.handlers.acme_server` module), so a Caddyfile that uses it can never run,
+            // even though the JSON shape is known.
+            return Err(adapter_error(
+                directive.position.clone(),
+                "directive `acme_server` is not supported by this build: the runtime has no                  `http.handlers.acme_server` module (ACME server is not implemented; tracked as                  T-CONF-013, owner T-TLS/T-ADMIN)",
             ));
         }
         if !DIRECTIVE_ORDER.contains(&directive.name.as_str()) {
@@ -5002,20 +5085,11 @@ fn build_php_fastcgi_routes(
                     "`php_fastcgi` does not accept a `transport` override",
                 ))
             }
-            "handle_response" => {
-                return Err(adapter_error(
-                    option.position.clone(),
-                    "`php_fastcgi` handle_response blocks are not supported by this build (they need reverse_proxy response matchers)",
-                ))
-            }
-            name if name.starts_with('@') => {
-                return Err(adapter_error(
-                    option.position.clone(),
-                    format!(
-                        "`php_fastcgi` response matcher `{name}` is not supported by this build"
-                    ),
-                ))
-            }
+            // Response matchers (`@name ...`) and `handle_response` are reverse_proxy
+            // semantics; the synthetic reverse_proxy directive below consumes them exactly as
+            // Caddy's php_fastcgi expansion does.
+            "handle_response" => passthrough.push(option.clone()),
+            name if name.starts_with('@') => passthrough.push(option.clone()),
             "root"
             | "env"
             | "resolve_root_symlink"
@@ -5864,17 +5938,6 @@ fn map_handler(directive: &Directive, args: &[String]) -> caddy_rs_core::Result<
             directive.position.clone(),
             "missing destination argument(s)",
         ));
-    }
-    for destination in &destinations {
-        let qualified = qualify_placeholders(destination);
-        if qualified != *destination {
-            return Err(adapter_error(
-                directive.position.clone(),
-                format!(
-                    "destination {destination} conflicts with a Caddyfile placeholder shorthand"
-                ),
-            ));
-        }
     }
     let mut mappings: Vec<Value> = Vec::new();
     let mut defaults: Option<Vec<Value>> = None;
@@ -6937,7 +7000,12 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
                             "`lb_retry_match` requires a matcher",
                         ));
                     };
-                    matcher_from_directive(name, &item.args[1..], item.position.clone())?
+                    matcher_from_directive(
+                        name,
+                        &item.args[1..],
+                        &item.block,
+                        item.position.clone(),
+                    )?
                 } else {
                     matcher_from_directives(&item.block)?
                 };

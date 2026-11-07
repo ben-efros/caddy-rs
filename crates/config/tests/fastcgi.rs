@@ -130,14 +130,6 @@ fn php_fastcgi_unsupported_forms_fail_loudly() {
             "bogus_option",
         ),
         (
-            "example.com {\n\tphp_fastcgi localhost:9000 {\n\t\t@error status 4xx\n\t}\n}\n",
-            "response matcher `@error` is not supported",
-        ),
-        (
-            "example.com {\n\tphp_fastcgi localhost:9000 {\n\t\thandle_response @error {\n\t\t\trespond 500\n\t\t}\n\t}\n}\n",
-            "handle_response blocks are not supported",
-        ),
-        (
             "example.com {\n\tphp_fastcgi localhost:9000 {\n\t\tdial_timeout nope\n\t}\n}\n",
             "bad timeout value",
         ),
@@ -175,17 +167,51 @@ fn fastcgi_transport_unsupported_forms_fail_loudly() {
 }
 
 #[test]
-fn php_fastcgi_expanded_form_is_deferred_on_the_file_matcher() {
-    // The upstream expanded-form fixture defines `file` matchers by hand; the adapter does not
-    // parse the `file` request matcher yet (T-ROUTE-027). It must fail loudly, not approximate.
-    let error = adapt(
-        ":8886\n\nroute {\n\t@indexFiles {\n\t\tfile {\n\t\t\ttry_files {path} {path}/index.php index.php\n\t\t\tsplit_path .php\n\t\t}\n\t}\n\trewrite @indexFiles {file_match.relative}\n}\n",
+fn php_fastcgi_expanded_form_uses_the_file_matcher() {
+    // The upstream expanded-form fixture (T-CONF-013) writes the canonical php_fastcgi expansion
+    // by hand: `file` request matchers, `{file_match.relative}` and `route`. All must adapt to
+    // Caddy's JSON, with shorthand placeholders expanded before parsing.
+    let adapted = adapt(
+        ":8886 {\n\troute {\n\t\t@indexFiles {\n\t\t\tfile {\n\t\t\t\ttry_files {path} {path}/index.php index.php\n\t\t\t\tsplit_path .php\n\t\t\t}\n\t\t}\n\t\trewrite @indexFiles {file_match.relative}\n\t}\n}\n",
     )
-    .expect_err("file matcher is not supported yet");
-    assert!(
-        error
-            .to_string()
-            .contains("matcher `file` is not supported"),
-        "{error}"
+    .expect("expanded form adapts");
+    let routes = adapted.config["apps"]["http"]["servers"]["srv0"]["routes"]
+        .as_array()
+        .expect("routes");
+    let inner = routes[0]["handle"][0]["routes"]
+        .as_array()
+        .expect("subroute routes");
+    assert_eq!(
+        inner[0]["match"][0]["file"],
+        json!({
+            "try_files": ["{http.request.uri.path}", "{http.request.uri.path}/index.php", "index.php"],
+            "split_path": [".php"],
+        }),
+        "{inner:?}"
+    );
+    assert_eq!(
+        inner[0]["handle"][0]["uri"],
+        "{http.matchers.file.relative}"
+    );
+}
+
+#[test]
+fn php_fastcgi_handle_response_is_adapted_like_reverse_proxy() {
+    let adapted = adapt(
+        ":8881 {\n\tphp_fastcgi app:9000 {\n\t\tenv FOO bar\n\t\t@error status 4xx\n\t\thandle_response @error {\n\t\t\trespond 500\n\t\t}\n\t}\n}\n",
+    )
+    .expect("php_fastcgi handle_response adapts");
+    let routes = adapted.config["apps"]["http"]["servers"]["srv0"]["routes"]
+        .as_array()
+        .expect("routes");
+    let handler = &routes[2]["handle"][0];
+    assert_eq!(handler["handler"], "reverse_proxy");
+    assert_eq!(
+        handler["handle_response"][0]["match"],
+        json!({"status_code": [4]})
+    );
+    assert_eq!(
+        handler["transport"],
+        json!({"protocol": "fastcgi", "split_path": [".php"], "env": {"FOO": "bar"}})
     );
 }

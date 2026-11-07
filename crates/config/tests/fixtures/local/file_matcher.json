@@ -1,0 +1,38 @@
+{
+  "apps": {
+    "http": {
+      "servers": {
+        "srv0": {
+          "listen": [
+            ":8080"
+          ],
+          "routes": [
+            {
+              "match": [
+                {
+                  "file": {
+                    "try_files": [
+                      "{http.request.uri.path}",
+                      "{http.request.uri.path}/index.php",
+                      "index.php"
+                    ],
+                    "try_policy": "first_exist_fallback",
+                    "split_path": [
+                      ".php"
+                    ]
+                  }
+                }
+              ],
+              "handle": [
+                {
+                  "body": "php",
+                  "handler": "static_response"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

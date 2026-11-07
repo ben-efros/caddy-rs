@@ -834,10 +834,6 @@ fn map_with_matcher_token_matches_real_caddy_v2_11_7() {
 #[test]
 fn map_invalid_forms_fail_loudly() {
     for (directive, expected) in [
-        (
-            "map {host} {host} {\n\t\tdefault x\n\t}",
-            "conflicts with a Caddyfile placeholder shorthand",
-        ),
         ("map {host} {a} {\n\t\tkey x y\n\t}", "too many outputs"),
         (
             "map {host} {a} {\n\t\tdefault x\n\t\tdefault y\n\t}",

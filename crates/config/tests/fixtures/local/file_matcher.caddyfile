@@ -1,0 +1,10 @@
+:8080 {
+	@php {
+		file {
+			try_files {path} {path}/index.php index.php
+			split_path .php
+			try_policy first_exist_fallback
+		}
+	}
+	respond @php "php"
+}
