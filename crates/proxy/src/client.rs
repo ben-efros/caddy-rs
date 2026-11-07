@@ -531,6 +531,25 @@ pub fn build_upstream_client(
     h2c: bool,
     http1_only: bool,
 ) -> Result<UpstreamClient, String> {
+    let transport = upstream.transport().ok_or_else(|| {
+        format!(
+            "upstream `{}` has a dynamic dial; build its client from the expanded transport",
+            upstream.dial
+        )
+    })?;
+    build_upstream_client_for(transport, tls, h2c, http1_only)
+}
+
+/// Build a client bound to one already-resolved dial transport.
+///
+/// Used for fixed upstreams and for dynamic (placeholder) upstreams after per-request expansion.
+/// TLS server name: explicit `transport.tls.server_name`, else the dial host (Caddy default).
+pub fn build_upstream_client_for(
+    transport: &Transport,
+    tls: Option<Arc<UpstreamTls>>,
+    h2c: bool,
+    http1_only: bool,
+) -> Result<UpstreamClient, String> {
     let tls = if http1_only {
         tls.map(|tls| Arc::new(tls.h1_only()))
     } else {
@@ -538,14 +557,14 @@ pub fn build_upstream_client(
     };
     let h2c = h2c && !http1_only;
     let server_name = match &tls {
-        Some(tls) => Some(match upstream.transport() {
+        Some(tls) => Some(match transport {
             Transport::Tcp { address } => tls.server_name_for(Some(host_without_port(address)))?,
             #[cfg(unix)]
             Transport::Unix { .. } => tls.server_name_for(None)?,
         }),
         None => None,
     };
-    let target = match upstream.transport() {
+    let target = match transport {
         Transport::Tcp { address } => DialTarget::Tcp(address.clone()),
         #[cfg(unix)]
         Transport::Unix { path } => DialTarget::Unix(path.clone()),

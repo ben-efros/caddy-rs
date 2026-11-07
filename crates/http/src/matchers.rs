@@ -151,9 +151,11 @@ impl Matcher for HostMatcher {
         let Some(host) = request.host_without_port() else {
             return false;
         };
-        self.patterns
-            .iter()
-            .any(|pattern| glob_match(&pattern.to_ascii_lowercase(), &host, true))
+        self.patterns.iter().any(|pattern| {
+            // Caddy: `host = repl.ReplaceAll(host, "")` in MatchHost.
+            let pattern = request.replace_all(pattern);
+            glob_match(&pattern.to_ascii_lowercase(), &host, true)
+        })
     }
 
     fn describe(&self) -> String {
@@ -171,9 +173,11 @@ impl Matcher for PathMatcher {
     fn matches(&self, request: &Request) -> bool {
         let path = request.path();
         let escaped = percent_decode(path);
-        self.patterns
-            .iter()
-            .any(|pattern| glob_match(pattern, &escaped, false) || glob_match(pattern, path, false))
+        self.patterns.iter().any(|pattern| {
+            // Caddy: `matchPattern = repl.ReplaceAll(matchPattern, "")` in MatchPath.
+            let pattern = request.replace_all(pattern);
+            glob_match(&pattern, &escaped, false) || glob_match(&pattern, path, false)
+        })
     }
 
     fn describe(&self) -> String {
@@ -221,12 +225,16 @@ impl Matcher for HeaderMatcher {
                 .filter_map(|value| value.to_str().ok())
                 .collect();
             expected.iter().any(|pattern| {
-                if let Some(negated) = pattern.strip_prefix('!') {
+                // Caddy: `allowedFieldVal = repl.ReplaceAll(allowedFieldVal, "")` in matchHeaders.
+                let expanded = request.replace_all(pattern);
+                if let Some(negated) = expanded.strip_prefix('!') {
                     !values.iter().any(|value| glob_match(negated, value, false))
-                } else if pattern == "*" {
+                } else if expanded == "*" {
                     !values.is_empty()
                 } else {
-                    values.iter().any(|value| glob_match(pattern, value, false))
+                    values
+                        .iter()
+                        .any(|value| glob_match(&expanded, value, false))
                 }
             })
         })
@@ -264,8 +272,12 @@ impl Matcher for QueryMatcher {
             })
             .collect();
         self.pairs.iter().all(|(key, value)| {
+            // Caddy: `param = repl.ReplaceAll(param, "")` and the same for each value in
+            // MatchQuery (matchers.go).
+            let key = request.replace_all(key);
+            let value = request.replace_all(value);
             pairs.iter().any(|(actual_key, actual_value)| {
-                glob_match(key, actual_key, false) && glob_match(value, actual_value, false)
+                glob_match(&key, actual_key, false) && glob_match(&value, actual_value, false)
             })
         })
     }
@@ -1810,6 +1822,61 @@ mod tests {
             .headers
             .insert(http::header::HOST, host.parse().unwrap());
         request
+    }
+
+    #[test]
+    fn host_path_header_and_query_patterns_expand_placeholders() {
+        // Caddy v2.11.7 expands matcher patterns with `ReplaceAll`:
+        // MatchHost (matchers.go:344), MatchPath (:441), MatchQuery (:1011/:1017) and the
+        // header matcher's allowed values (:1167). Unknown placeholders expand to "".
+        let mut matcher = HostMatcher {
+            patterns: vec!["{http.vars.allowed_host}".to_string()],
+        };
+        let mut req = request("/", "allowed.example");
+        req.vars
+            .insert("allowed_host".to_string(), "allowed.example".to_string());
+        assert!(matcher.matches(&req));
+        req.vars
+            .insert("allowed_host".to_string(), "other.example".to_string());
+        assert!(!matcher.matches(&req));
+        matcher.patterns = vec!["{http.vars.missing}".to_string()];
+        // Missing var -> ReplaceAll blanks the pattern, which matches the empty host only.
+        assert!(!matcher.matches(&req));
+
+        let path = PathMatcher {
+            patterns: vec!["{http.vars.prefix}/*".to_string()],
+        };
+        let mut req = request("/api/users", "x");
+        req.vars.insert("prefix".to_string(), "/api".to_string());
+        assert!(path.matches(&req));
+        req.vars.insert("prefix".to_string(), "/other".to_string());
+        assert!(!path.matches(&req));
+
+        let header = HeaderMatcher {
+            fields: vec![(
+                "x-session".to_string(),
+                vec!["{http.vars.session}".to_string()],
+            )],
+        };
+        let mut req = request("/", "x");
+        req.headers.insert("x-session", "abc".parse().unwrap());
+        req.vars.insert("session".to_string(), "abc".to_string());
+        assert!(header.matches(&req));
+        req.vars.insert("session".to_string(), "other".to_string());
+        assert!(!header.matches(&req));
+
+        let query = QueryMatcher {
+            pairs: vec![(
+                "{http.vars.key}".to_string(),
+                "{http.vars.value}".to_string(),
+            )],
+        };
+        let mut req = request("/?user=alice", "x");
+        req.vars.insert("key".to_string(), "user".to_string());
+        req.vars.insert("value".to_string(), "alice".to_string());
+        assert!(query.matches(&req));
+        req.vars.insert("value".to_string(), "bob".to_string());
+        assert!(!query.matches(&req));
     }
 
     #[test]
