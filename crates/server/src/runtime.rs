@@ -63,8 +63,12 @@ impl RuntimeStatus {
 struct ShutdownTiming {
     /// Time to keep serving after a shutdown is requested, before initiating the grace period.
     shutdown_delay: Option<Duration>,
-    /// Maximum time to wait for active connections after shutdown is initiated; `None`/zero means
-    /// no grace period (immediate shutdown).
+    /// Maximum time to wait for active ordinary connections after shutdown is initiated.
+    ///
+    /// `None` (absent or zero in the configuration) is Caddy's **eternal grace period**: the
+    /// server waits indefinitely for in-flight requests and idle connection shutdowns. Hijacked
+    /// connections (WebSockets/extended CONNECT) are excluded, matching Go's
+    /// `http.Server.Shutdown`, which neither closes nor waits for them.
     grace_period: Option<Duration>,
 }
 
@@ -750,6 +754,13 @@ impl ServerRuntime {
     }
 
     /// Stop listeners whose address is no longer configured.
+    ///
+    /// Caddy's `App.stop` treats listeners that are closing during a reload like a shutdown: it
+    /// honors `shutdown_delay` (sleeping while the old listener keeps accepting, so a load
+    /// balancer can drain it) and enforces the grace period with a timeout context
+    /// (`modules/caddyhttp/app.go` "listener closing and shutdown delay is configured" and the
+    /// grace-period context). A reload does not block on the grace period, but the closing
+    /// listener's connections must still be force-closed when it expires.
     async fn remove_unconfigured_listeners(
         &mut self,
         states: &std::collections::HashMap<String, Arc<ListenerState>>,
@@ -760,9 +771,32 @@ impl ServerRuntime {
             .filter(|listen| !states.contains_key(*listen))
             .cloned()
             .collect();
+        if removed.is_empty() {
+            return;
+        }
+        let timing = self.shutdown_timing;
+        if let Some(delay) = timing.shutdown_delay {
+            tracing::info!(
+                delay_ms = delay.as_millis() as u64,
+                listeners = removed.len(),
+                "listeners are closing and shutdown_delay is configured; keeping them open"
+            );
+            tokio::time::sleep(delay).await;
+        }
         for listen in removed {
             if let Some(handle) = self.listeners.remove(&listen) {
                 tracing::info!(%listen, "closing listener");
+                handle.begin_graceful();
+                if let Some(grace) = timing.grace_period {
+                    // Bound the drain like Caddy's grace-period context: force-close the closing
+                    // listener's connections when the grace period expires. The reload itself does
+                    // not wait for them (Caddy only waits when the process is exiting).
+                    let force = handle.force.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(grace).await;
+                        let _ = force.send(true);
+                    });
+                }
                 handle.stop().await;
             }
         }
@@ -961,16 +995,7 @@ impl ServerRuntime {
             handle.begin_graceful();
         }
 
-        let trackers: Vec<Arc<crate::listeners::ConnectionTracker>> = self
-            .admin
-            .iter()
-            .map(crate::listeners::ListenerHandle::tracker)
-            .chain(
-                self.listeners
-                    .values()
-                    .map(crate::listeners::ListenerHandle::tracker),
-            )
-            .collect();
+        let trackers = self.trackers();
 
         if let Some(grace) = timing.grace_period {
             tracing::info!(
@@ -987,13 +1012,40 @@ impl ServerRuntime {
                 self.force_all();
             }
         } else {
-            // Caddy without a grace period uses an eternal grace period; caddy-rs keeps the
-            // historical immediate-exit behaviour and closes open connections.
-            tracing::info!("servers shutting down without a grace period");
-            self.force_all();
+            // Caddy without a configured grace period uses an eternal grace period
+            // (modules/caddyhttp/app.go: `case app.GracePeriod > 0 ... else "servers shutting down
+            // with eternal grace period"`, then `server.server.Shutdown(context.Background())`).
+            // Go's Shutdown waits for active requests/idle connections but ignores hijacked
+            // connections, so ordinary connections drain here while upgraded tunnels are ended by
+            // the forced close as shutdown finishes (in Caddy they die with the process).
+            tracing::info!("servers shutting down with eternal grace period");
+            let drained = wait_for_ordinary_trackers(&trackers, &mut force).await;
+            if !drained {
+                tracing::info!("forced shutdown requested; closing connections immediately");
+                self.force_all();
+            } else if trackers.iter().any(|tracker| tracker.active_upgraded() > 0) {
+                tracing::info!(
+                    "ordinary connections drained; closing hijacked/upgraded connections \
+                     (Go's http.Server.Shutdown does not wait for them)"
+                );
+                self.force_all();
+            }
         }
 
         self.stop_all().await;
+    }
+
+    /// Trackers for every current listener and the admin endpoint.
+    fn trackers(&self) -> Vec<Arc<crate::listeners::ConnectionTracker>> {
+        self.admin
+            .iter()
+            .map(crate::listeners::ListenerHandle::tracker)
+            .chain(
+                self.listeners
+                    .values()
+                    .map(crate::listeners::ListenerHandle::tracker),
+            )
+            .collect()
     }
 
     /// Force-close connections on every listener and the admin endpoint.
@@ -1026,6 +1078,18 @@ impl ServerRuntime {
     }
 
     async fn stop_all(&mut self) {
+        // Force-close remaining connections, then give their tasks a bounded moment to observe the
+        // force signal and drop their tracker guards. Go's Shutdown only returns once its
+        // connections are done; without this wait, connection tasks outlive the runtime and leak.
+        let trackers = self.trackers();
+        self.force_all();
+        let remaining = wait_for_trackers_closed(&trackers, Duration::from_secs(2)).await;
+        if remaining > 0 {
+            tracing::warn!(
+                remaining,
+                "connections still active after forced shutdown; listener tasks are detached"
+            );
+        }
         if let Some(admin) = self.admin.take() {
             admin.stop_forcibly().await;
         }
@@ -1578,6 +1642,49 @@ async fn wait_for_trackers(
         drained = drained => drained,
         _ = force_requested(force) => false,
         _ = tokio::time::sleep(remaining) => false,
+    }
+}
+
+/// Wait indefinitely for every ordinary connection to finish, as Caddy's eternal grace period
+/// does; hijacked/upgraded tunnels are excluded (Go's `http.Server.Shutdown` ignores them).
+///
+/// Returns `false` when a forced shutdown was requested while waiting.
+async fn wait_for_ordinary_trackers(
+    trackers: &[Arc<crate::listeners::ConnectionTracker>],
+    force: &mut Option<watch::Receiver<bool>>,
+) -> bool {
+    if trackers
+        .iter()
+        .all(|tracker| tracker.active_ordinary() == 0)
+    {
+        return true;
+    }
+    let drained = async {
+        for tracker in trackers {
+            tracker.wait_ordinary_drained().await;
+        }
+        true
+    };
+    tokio::select! {
+        drained = drained => drained,
+        _ = force_requested(force) => false,
+    }
+}
+
+/// Wait until every tracker reports no active connections, or `timeout` expires; returns the number
+/// of connections still active. Used after a forced close so connection tasks do not outlive the
+/// runtime.
+async fn wait_for_trackers_closed(
+    trackers: &[Arc<crate::listeners::ConnectionTracker>],
+    timeout: Duration,
+) -> usize {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining: usize = trackers.iter().map(|tracker| tracker.active()).sum();
+        if remaining == 0 || Instant::now() >= deadline {
+            return remaining;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
 

@@ -102,6 +102,14 @@ pub(crate) type SharedListeners = Arc<RwLock<HashMap<String, Arc<ListenerState>>
 #[derive(Debug, Default)]
 pub(crate) struct ConnectionTracker {
     active: AtomicUsize,
+    /// Subset of `active` that are hijacked/upgraded tunnels (WebSocket, extended CONNECT).
+    ///
+    /// Go's `http.Server.Shutdown` neither closes nor waits for hijacked connections, so Caddy's
+    /// grace-period drain only waits for ordinary connections; hijacked tunnels die when the
+    /// process exits. caddy-rs keeps them alive through an explicit grace period (the runtime
+    /// force-closes them when the grace expires or, without a grace period, as shutdown finishes),
+    /// but must not let an eternal grace period wait for them forever.
+    upgraded: AtomicUsize,
     notify: tokio::sync::Notify,
 }
 
@@ -117,6 +125,33 @@ impl ConnectionTracker {
     /// Number of active connections.
     pub(crate) fn active(&self) -> usize {
         self.active.load(Ordering::Acquire)
+    }
+
+    /// Number of active connections that are hijacked/upgraded tunnels.
+    pub(crate) fn active_upgraded(&self) -> usize {
+        self.upgraded.load(Ordering::Acquire)
+    }
+
+    /// Number of active ordinary (non-hijacked) connections.
+    pub(crate) fn active_ordinary(&self) -> usize {
+        self.active().saturating_sub(self.active_upgraded())
+    }
+
+    /// Wait until every ordinary connection has finished.
+    ///
+    /// Hijacked/upgraded tunnels are excluded, mirroring Go's `http.Server.Shutdown` (which
+    /// ignores hijacked connections), so an eternal grace period cannot hang on a WebSocket.
+    pub(crate) async fn wait_ordinary_drained(&self) {
+        loop {
+            if self.active_ordinary() == 0 {
+                return;
+            }
+            let notified = self.notify.notified();
+            if self.active_ordinary() == 0 {
+                return;
+            }
+            notified.await;
+        }
     }
 
     /// Wait until no connections are active, or the timeout expires.
@@ -158,9 +193,35 @@ pub(crate) struct TrackedConnection {
     tracker: Arc<ConnectionTracker>,
 }
 
+impl TrackedConnection {
+    /// Mark this connection as an upgraded/hijacked tunnel for the tunnel task's lifetime.
+    ///
+    /// The ordinary connection count stays unchanged (the tunnel still owns its socket); the
+    /// separate upgraded counter lets the shutdown drain exclude hijacked connections.
+    pub(crate) fn upgrade_guard(self: &Arc<Self>) -> TrackedUpgrade {
+        self.tracker.upgraded.fetch_add(1, Ordering::AcqRel);
+        TrackedUpgrade {
+            tracker: Arc::clone(&self.tracker),
+        }
+    }
+}
+
 impl Drop for TrackedConnection {
     fn drop(&mut self) {
         self.tracker.active.fetch_sub(1, Ordering::AcqRel);
+        self.tracker.notify.notify_waiters();
+    }
+}
+
+/// Guards the "hijacked/upgraded tunnel" subset of a tracked connection; dropped when the tunnel
+/// task ends.
+pub(crate) struct TrackedUpgrade {
+    tracker: Arc<ConnectionTracker>,
+}
+
+impl Drop for TrackedUpgrade {
+    fn drop(&mut self) {
+        self.tracker.upgraded.fetch_sub(1, Ordering::AcqRel);
         self.tracker.notify.notify_waiters();
     }
 }
@@ -1567,6 +1628,7 @@ fn spawn_upgraded_tunnel(
     tokio::spawn(async move {
         let _permit = permit;
         let _generation = generation;
+        let _upgraded = tracked.upgrade_guard();
         let _tracked = tracked;
         if *force.borrow() {
             return;
