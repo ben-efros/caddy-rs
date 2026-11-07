@@ -55,8 +55,11 @@ pub fn status_matches(actual: http::StatusCode, configured: u16) -> bool {
 pub struct HealthCheck {
     /// Path and query requested on each upstream (normalized to start with `/`).
     pub uri: String,
-    /// Optional request body.
+    /// Optional request body (raw bytes; `body_template` carries the config placeholder form).
     pub body: Bytes,
+    /// Original configured body string, expanded per probe with Caddy's global `ReplaceKnown`
+    /// placeholders (like Caddy's active health-check body).
+    pub body_template: Option<String>,
     /// Delay between rounds.
     pub interval: Duration,
     /// Per-request timeout.
@@ -82,6 +85,7 @@ impl Default for HealthCheck {
         Self {
             uri: "/".to_string(),
             body: Bytes::new(),
+            body_template: None,
             interval: Duration::from_secs(30),
             timeout: Duration::from_secs(5),
             method: http::Method::GET,
@@ -155,6 +159,7 @@ impl HealthCheck {
 
         if let Some(body) = object.get("body").and_then(Value::as_str) {
             check.body = Bytes::copy_from_slice(body.as_bytes());
+            check.body_template = Some(body.to_string());
         }
         if let Some(interval) = object
             .get("interval")
@@ -231,30 +236,80 @@ impl HealthCheck {
     where
         C: Connect + Clone + Send + Sync + 'static,
     {
-        // Caddy special-cases a configured `Host` header: it sets the request Host rather than
-        // sending a duplicate. Every other configured header is appended (multi-value allowed).
+        // Caddy expands active-check bodies/headers with a replacer that has only global
+        // placeholders (env/system/time), plus `{http.reverse_proxy.active.target_upstream}` in
+        // headers. Bodies and header values use `ReplaceKnown` (unknown `{...}` kept, which
+        // matters for JSON bodies); header names and the special Host value use `ReplaceAll`.
+        let target_upstream = upstream.dial.clone();
+        let body = match &self.body_template {
+            Some(template) => Bytes::from(expand_health_placeholders(
+                template,
+                None,
+                PlaceholderMode::ReplaceKnown,
+            )),
+            None => self.body.clone(),
+        };
+        let mut headers = http::HeaderMap::new();
         let Ok(default_host) = http::HeaderValue::from_str(upstream.fallback_host()) else {
             return false;
         };
-        let mut headers = http::HeaderMap::new();
         headers.insert(http::header::HOST, default_host);
-        for (name, value) in &self.headers {
-            let Ok(name) = name.parse::<http::header::HeaderName>() else {
-                return false;
-            };
-            let Ok(value) = http::HeaderValue::from_str(value) else {
-                return false;
-            };
-            if name == http::header::HOST {
-                headers.insert(http::header::HOST, value);
-            } else {
-                headers.append(name, value);
+        let mut configured_host: Option<String> = None;
+        for (raw_name, raw_value) in &self.headers {
+            let name_text = expand_health_placeholders(
+                raw_name,
+                Some(&target_upstream),
+                PlaceholderMode::ReplaceAll,
+            );
+            if name_text.is_empty() {
+                continue;
             }
+            if name_text.eq_ignore_ascii_case("host") {
+                // Caddy sets `req.Host` (and therefore the HTTP/2 :authority) from this value.
+                configured_host = Some(expand_health_placeholders(
+                    raw_value,
+                    Some(&target_upstream),
+                    PlaceholderMode::ReplaceAll,
+                ));
+                continue;
+            }
+            let Some(name) = name_text.parse::<http::HeaderName>().ok() else {
+                return false;
+            };
+            let value = expand_health_placeholders(
+                raw_value,
+                Some(&target_upstream),
+                PlaceholderMode::ReplaceKnown,
+            );
+            let Ok(value) = http::HeaderValue::from_str(&value) else {
+                return false;
+            };
+            headers.append(name, value);
         }
+        if configured_host
+            .as_deref()
+            .is_some_and(|host| !host.is_empty())
+        {
+            // The URI authority carries the configured Host for both HTTP/1.1 and HTTP/2.
+            headers.remove(http::header::HOST);
+        }
+        let url = match configured_host.as_deref().filter(|host| !host.is_empty()) {
+            Some(host) => match upstream.url(&self.uri).parse::<http::Uri>() {
+                Ok(uri) => format!(
+                    "{}://{host}{}",
+                    uri.scheme_str().unwrap_or("http"),
+                    uri.path_and_query()
+                        .map(|value| value.as_str())
+                        .unwrap_or("/")
+                ),
+                Err(_) => return false,
+            },
+            None => upstream.url(&self.uri),
+        };
         let Ok(mut request) = hyper::Request::builder()
             .method(self.method.clone())
-            .uri(upstream.url(&self.uri))
-            .body(crate::client::ClientBody::buffered(self.body.clone()))
+            .uri(url)
+            .body(crate::client::ClientBody::buffered(body))
         else {
             return false;
         };
@@ -347,6 +402,114 @@ async fn read_body_limited(body: hyper::body::Incoming, max_size: Option<u64>) -
         }
     }
     Some(collected.freeze())
+}
+
+/// How unknown placeholders are treated when expanding health-check values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlaceholderMode {
+    /// Caddy `ReplaceKnown`: unknown placeholders stay verbatim.
+    ReplaceKnown,
+    /// Caddy `ReplaceAll`: unknown/empty placeholders disappear.
+    ReplaceAll,
+}
+
+/// Expand Caddy's global placeholders in an active health-check body/header value.
+///
+/// The request-based replacer is unavailable at health-check time; Caddy's check creates a
+/// `caddy.NewReplacer()` (env/system/time/file placeholders) and optionally exposes
+/// `{http.reverse_proxy.active.target_upstream}` to header expansion. caddy-rs supports the
+/// env/system/time subset here; unsupported global placeholders follow the selected mode's
+/// unknown-placeholder rule (documented in DIV-0101).
+fn expand_health_placeholders(
+    input: &str,
+    target_upstream: Option<&str>,
+    mode: PlaceholderMode,
+) -> String {
+    let mut output = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'{' {
+            if let Some(close) = input[index + 1..].find('}') {
+                let close = index + 1 + close;
+                let token = input[index + 1..close].trim();
+                match resolve_health_placeholder(token, target_upstream) {
+                    Some(value) => {
+                        output.push_str(&value);
+                        index = close + 1;
+                    }
+                    None => match mode {
+                        PlaceholderMode::ReplaceKnown => {
+                            // Caddy's ReplaceKnown leaves the unknown `{` in place and keeps
+                            // scanning, so a known placeholder nested inside JSON braces (for
+                            // example `{"token":"{env.TOKEN}"}`) still expands while the JSON
+                            // braces are preserved.
+                            output.push('{');
+                            index += 1;
+                        }
+                        PlaceholderMode::ReplaceAll => {
+                            index = close + 1;
+                        }
+                    },
+                }
+                continue;
+            }
+        }
+        let ch = input[index..]
+            .chars()
+            .next()
+            .expect("index at char boundary");
+        output.push(ch);
+        index += ch.len_utf8();
+    }
+    output
+}
+
+fn resolve_health_placeholder(token: &str, target_upstream: Option<&str>) -> Option<String> {
+    if let Some(name) = token.strip_prefix("env.") {
+        return Some(std::env::var(name).unwrap_or_default());
+    }
+    if token == "http.reverse_proxy.active.target_upstream" {
+        return target_upstream.map(str::to_string);
+    }
+    match token {
+        "system.hostname" => Some(
+            std::fs::read_to_string("/proc/sys/kernel/hostname")
+                .map(|name| name.trim().to_string())
+                .unwrap_or_default(),
+        ),
+        "system.slash" => Some(std::path::MAIN_SEPARATOR.to_string()),
+        "system.os" => Some(std::env::consts::OS.to_string()),
+        "system.wd" => Some(
+            std::env::current_dir()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        ),
+        "system.arch" => Some(
+            match std::env::consts::ARCH {
+                "x86_64" => "amd64",
+                "aarch64" => "arm64",
+                "x86" => "386",
+                "arm" => "arm",
+                "powerpc64" => "ppc64",
+                other => other,
+            }
+            .to_string(),
+        ),
+        "time.now.unix" => Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs().to_string())
+                .unwrap_or_default(),
+        ),
+        "time.now.unix_ms" => Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_millis().to_string())
+                .unwrap_or_default(),
+        ),
+        _ => None,
+    }
 }
 
 /// Consecutive pass/fail counters for one upstream's active checker.
@@ -444,10 +607,14 @@ fn parse_health_headers(value: &Value, path: &str) -> HttpResult<Vec<(String, St
         .ok_or_else(|| invalid(path, "`headers` must be an object"))?;
     let mut headers = Vec::new();
     for (field, values) in object {
-        // Reject invalid header names eagerly so a bad config fails at load time.
-        let _: http::header::HeaderName = field
-            .parse()
-            .map_err(|error| invalid(path, format!("invalid header name `{field}`: {error}")))?;
+        // Reject invalid header names eagerly so a bad config fails at load time. Placeholder
+        // header names (Caddy expands keys with `ReplaceAll` at probe time) are validated after
+        // expansion instead.
+        if !field.contains('{') {
+            let _: http::header::HeaderName = field.parse().map_err(|error| {
+                invalid(path, format!("invalid header name `{field}`: {error}"))
+            })?;
+        }
         let values = match values {
             Value::String(value) => vec![value.as_str()],
             Value::Array(values) => values
@@ -496,6 +663,11 @@ mod tests {
     use std::convert::Infallible;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    fn health_client(upstream: &Upstream) -> crate::client::UpstreamClient {
+        crate::client::build_upstream_client(upstream, None, false, false)
+            .expect("health-check client builds")
+    }
+
     async fn spawn_health_upstream(status: u16) -> String {
         spawn_upstream(move |_request| async move { status }).await
     }
@@ -538,6 +710,35 @@ mod tests {
     }
 
     /// Upstream that always answers `status` with `body` (for `expect_body` checks).
+    /// Spawn a TCP upstream that builds a complete hyper response (status/headers/body) and can
+    /// capture the probe request.
+    async fn spawn_response_upstream<F, Fut>(respond: F) -> String
+    where
+        F: Fn(hyper::Request<hyper::body::Incoming>) -> Fut + Clone + Send + 'static,
+        Fut: std::future::Future<Output = hyper::Response<Full<Bytes>>> + Send + 'static,
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let respond = respond.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |request| {
+                        let respond = respond.clone();
+                        async move { Ok::<_, Infallible>(respond(request).await) }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        address.to_string()
+    }
+
     async fn spawn_body_upstream(status: u16, body: &'static str) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -591,7 +792,7 @@ mod tests {
     async fn check_once_matches_expect_body_with_max_size_truncation() {
         let matching = spawn_body_upstream(200, "healthy").await;
         let upstream = Arc::new(Upstream::new(matching, false));
-        let client = crate::client::build_client();
+        let client = health_client(&upstream);
         let check = HealthCheck::from_json(
             &serde_json::json!({"uri": "/", "expect_body": "^healthy$"}),
             "health_checks.active",
@@ -603,6 +804,7 @@ mod tests {
         // max_size truncates before matching, like Caddy's `io.LimitReader`.
         let long = spawn_body_upstream(200, "healthy-trailing").await;
         let upstream = Arc::new(Upstream::new(long, false));
+        let client = health_client(&upstream);
         let check = HealthCheck::from_json(
             &serde_json::json!({
                 "uri": "/", "expect_body": "^healthy$", "max_size": 7
@@ -616,6 +818,7 @@ mod tests {
         // A body that does not match is a failed check.
         let mismatch = spawn_body_upstream(200, "unhealthy").await;
         let upstream = Arc::new(Upstream::new(mismatch, false));
+        let client = health_client(&upstream);
         let check = HealthCheck::from_json(
             &serde_json::json!({"uri": "/", "expect_body": "^healthy$"}),
             "health_checks.active",
@@ -778,7 +981,7 @@ mod tests {
         let dial = spawn_health_upstream(200).await;
         let upstream = Arc::new(Upstream::new(dial, false));
         let check = HealthCheck::default();
-        let client = crate::client::build_client();
+        let client = health_client(&upstream);
         assert!(check.check_once(&client, &upstream).await);
     }
 
@@ -787,7 +990,7 @@ mod tests {
         let dial = spawn_health_upstream(500).await;
         let upstream = Arc::new(Upstream::new(dial, false));
         let check = HealthCheck::default();
-        let client = crate::client::build_client();
+        let client = health_client(&upstream);
         assert!(!check.check_once(&client, &upstream).await);
     }
 
@@ -816,7 +1019,7 @@ mod tests {
             expected_status: Some(204),
             ..HealthCheck::default()
         };
-        let client = crate::client::build_client();
+        let client = health_client(&upstream);
         assert!(check.check_once(&client, &upstream).await);
         assert_eq!(*seen_header.lock().unwrap(), "yes");
     }
@@ -843,7 +1046,7 @@ mod tests {
             headers: vec![("Host".to_string(), "probe.example".to_string())],
             ..HealthCheck::default()
         };
-        let client = crate::client::build_client();
+        let client = health_client(&upstream);
         assert!(check.check_once(&client, &upstream).await);
         assert_eq!(*seen_host.lock().unwrap(), "probe.example");
     }
@@ -872,7 +1075,7 @@ mod tests {
             body: Bytes::from_static(b"probe-body"),
             ..HealthCheck::default()
         };
-        let client = crate::client::build_client();
+        let client = health_client(&upstream);
         assert!(check.check_once(&client, &upstream).await);
         assert_eq!(*seen_body.lock().unwrap(), "probe-body");
     }
@@ -889,7 +1092,7 @@ mod tests {
             timeout: Duration::from_millis(20),
             ..HealthCheck::default()
         };
-        let client = crate::client::build_client();
+        let client = health_client(&upstream);
         assert!(!check.check_once(&client, &upstream).await);
     }
 
@@ -1001,7 +1204,7 @@ mod tests {
         let upstream =
             Arc::new(Upstream::parse_dial(&format!("unix/{}", socket.display()), false).unwrap());
         let check = HealthCheck::default();
-        let client = crate::client::build_client();
+        let client = health_client(&upstream);
         assert!(check.check_once(&client, &upstream).await);
     }
 
@@ -1013,7 +1216,248 @@ mod tests {
         let upstream =
             Arc::new(Upstream::parse_dial(&format!("unix/{}", socket.display()), false).unwrap());
         let check = HealthCheck::default();
-        let client = crate::client::build_client();
+        let client = health_client(&upstream);
         assert!(!check.check_once(&client, &upstream).await);
+    }
+
+    #[tokio::test]
+    async fn active_check_sends_configured_body_placeholders_and_content_headers() {
+        std::env::set_var("CADDY_RS_W20_HEALTH_TOKEN", "s3cret");
+        std::env::set_var("CADDY_RS_W20_HEADER", "Suffix");
+        #[derive(Debug, Default)]
+        struct Captured {
+            method: String,
+            body: String,
+            content_length: Option<String>,
+            content_type: Option<String>,
+            token: Option<String>,
+            suffix: Option<String>,
+        }
+        let captured = Arc::new(std::sync::Mutex::new(Captured::default()));
+        let sink = Arc::clone(&captured);
+        let dial =
+            spawn_response_upstream(move |request: hyper::Request<hyper::body::Incoming>| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    let method = request.method().as_str().to_string();
+                    let headers = request.headers().clone();
+                    let body = request
+                        .into_body()
+                        .collect()
+                        .await
+                        .map(|collected| collected.to_bytes())
+                        .unwrap_or_default();
+                    let text = String::from_utf8_lossy(&body).into_owned();
+                    if let Ok(mut captured) = sink.lock() {
+                        *captured = Captured {
+                            method,
+                            body: text,
+                            content_length: headers
+                                .get(http::header::CONTENT_LENGTH)
+                                .and_then(|value| value.to_str().ok())
+                                .map(str::to_string),
+                            content_type: headers
+                                .get(http::header::CONTENT_TYPE)
+                                .and_then(|value| value.to_str().ok())
+                                .map(str::to_string),
+                            token: headers
+                                .get("x-token")
+                                .and_then(|value| value.to_str().ok())
+                                .map(str::to_string),
+                            suffix: headers
+                                .get("x-suffix")
+                                .and_then(|value| value.to_str().ok())
+                                .map(str::to_string),
+                        };
+                    }
+                    hyper::Response::builder()
+                        .status(200)
+                        .body(Full::new(Bytes::new()))
+                        .expect("response")
+                }
+            })
+            .await;
+        let upstream = Arc::new(Upstream::new(dial, false));
+        let check = HealthCheck::from_json(
+            &serde_json::json!({
+                "uri": "/health?probe=1",
+                "method": "POST",
+                // JSON body: known placeholders expand, unknown braces stay verbatim.
+                "body": "{\"token\":\"{env.CADDY_RS_W20_HEALTH_TOKEN}\",\"keep\":\"{literal}\"}",
+                "headers": {
+                    "X-Token": "{env.CADDY_RS_W20_HEALTH_TOKEN}",
+                    // Header names use ReplaceAll, so known env placeholders expand.
+                    "X-{env.CADDY_RS_W20_HEADER}": "yes"
+                }
+            }),
+            "health_checks.active",
+        )
+        .unwrap()
+        .expect("active check enabled");
+        let client = health_client(&upstream);
+        assert!(check.check_once(&client, &upstream).await);
+
+        let captured = captured.lock().unwrap();
+        let expected_body = "{\"token\":\"s3cret\",\"keep\":\"{literal}\"}";
+        assert_eq!(captured.method, "POST");
+        assert_eq!(captured.body, expected_body);
+        assert_eq!(
+            captured.content_length.as_deref(),
+            Some(expected_body.len().to_string().as_str()),
+            "the probe body must carry an accurate Content-Length"
+        );
+        assert_eq!(
+            captured.content_type, None,
+            "Caddy does not set Content-Type on health probes implicitly"
+        );
+        assert_eq!(captured.token.as_deref(), Some("s3cret"));
+        assert_eq!(captured.suffix.as_deref(), Some("yes"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expect_body_failures_respect_the_fails_and_passes_thresholds() {
+        let body = Arc::new(std::sync::Mutex::new("bad".to_string()));
+        let hits = Arc::new(AtomicUsize::new(0));
+        let server_body = Arc::clone(&body);
+        let server_hits = Arc::clone(&hits);
+        let dial = spawn_response_upstream(move |_request| {
+            let body = Arc::clone(&server_body);
+            let hits = Arc::clone(&server_hits);
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                let body = body.lock().unwrap().clone();
+                hyper::Response::builder()
+                    .status(200)
+                    .body(Full::new(Bytes::from(body)))
+                    .expect("response")
+            }
+        })
+        .await;
+        let upstream = Arc::new(Upstream::new(dial, false));
+        let check = Arc::new(
+            HealthCheck::from_json(
+                &serde_json::json!({
+                    "uri": "/", "expect_body": "^ok$", "fails": 2, "passes": 2,
+                    "interval": 1_000_000_000u64
+                }),
+                "health_checks.active",
+            )
+            .unwrap()
+            .unwrap(),
+        );
+        let scheduler = HealthCheckScheduler::spawn(
+            check,
+            vec![(Arc::clone(&upstream), crate::client::build_client())],
+        );
+        wait_until(|| hits.load(Ordering::SeqCst) >= 1).await;
+        assert!(
+            upstream.is_healthy(),
+            "one body mismatch is below the fails=2 threshold"
+        );
+        wait_until(|| hits.load(Ordering::SeqCst) >= 2).await;
+        wait_until(|| !upstream.is_healthy()).await;
+
+        // Recover: two matching bodies satisfy passes=2.
+        *body.lock().unwrap() = "ok".to_string();
+        wait_until(|| upstream.is_healthy()).await;
+        scheduler.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn active_check_evaluates_status_before_the_body() {
+        let status_upstream = |status: u16, body: &'static str| {
+            spawn_response_upstream(move |_request| async move {
+                hyper::Response::builder()
+                    .status(status)
+                    .body(Full::new(Bytes::from_static(body.as_bytes())))
+                    .expect("response")
+            })
+        };
+        let check = HealthCheck::from_json(
+            &serde_json::json!({"uri": "/", "expect_status": 200, "expect_body": "^ok$"}),
+            "health_checks.active",
+        )
+        .unwrap()
+        .unwrap();
+        for (status, body, expected) in [(500, "ok", false), (200, "bad", false), (200, "ok", true)]
+        {
+            let dial = status_upstream(status, body).await;
+            let upstream = Arc::new(Upstream::new(dial, false));
+            let client = health_client(&upstream);
+            assert_eq!(
+                check.check_once(&client, &upstream).await,
+                expected,
+                "status {status} body {body:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn expect_body_max_size_bounds_a_large_body_read() {
+        let huge = {
+            let mut body = b"healthy".to_vec();
+            body.extend(std::iter::repeat_n(b'x', 1_048_576));
+            Bytes::from(body)
+        };
+        let dial = spawn_response_upstream(move |_request| {
+            let huge = huge.clone();
+            async move {
+                hyper::Response::builder()
+                    .status(200)
+                    .body(Full::new(huge))
+                    .expect("response")
+            }
+        })
+        .await;
+        let upstream = Arc::new(Upstream::new(dial, false));
+        let check = HealthCheck::from_json(
+            &serde_json::json!({"uri": "/", "expect_body": "^healthy$", "max_size": 7}),
+            "health_checks.active",
+        )
+        .unwrap()
+        .unwrap();
+        let client = health_client(&upstream);
+        assert!(
+            check.check_once(&client, &upstream).await,
+            "only the first max_size bytes are inspected even for a 1 MiB body"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_check_does_not_follow_redirects_by_default() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let server_hits = Arc::clone(&hits);
+        let dial = spawn_response_upstream(move |_request| {
+            let hits = Arc::clone(&server_hits);
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                hyper::Response::builder()
+                    .status(302)
+                    .header(http::header::LOCATION, "/elsewhere")
+                    .body(Full::new(Bytes::from_static(b"redirect")))
+                    .expect("response")
+            }
+        })
+        .await;
+        let upstream = Arc::new(Upstream::new(dial, false));
+        let client = health_client(&upstream);
+        let accepts_redirect = HealthCheck::from_json(
+            &serde_json::json!({"uri": "/", "expect_status": 302}),
+            "health_checks.active",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(accepts_redirect.check_once(&client, &upstream).await);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "Caddy's default CheckRedirect (ErrUseLastResponse) does not follow the Location"
+        );
+        let rejects_redirect =
+            HealthCheck::from_json(&serde_json::json!({"uri": "/"}), "health_checks.active")
+                .unwrap()
+                .unwrap();
+        assert!(!rejects_redirect.check_once(&client, &upstream).await);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 }
