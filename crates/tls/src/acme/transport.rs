@@ -139,6 +139,7 @@ impl AcmeTransport for HyperTransport {
             HttpMethod::Head => hyper::Method::HEAD,
             HttpMethod::Post => hyper::Method::POST,
             HttpMethod::Delete => hyper::Method::DELETE,
+            HttpMethod::Put => hyper::Method::PUT,
         };
         let mut builder = Request::builder()
             .method(method)

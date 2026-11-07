@@ -21,6 +21,8 @@ pub mod ocsp;
 pub mod propagation;
 pub mod renewal;
 pub mod route53;
+pub mod s3;
+pub mod sigv4;
 pub mod solver;
 pub mod storage;
 pub mod tls_alpn;
@@ -76,6 +78,7 @@ pub use renewal::{
     RenewalScheduler, RenewalSchedulerHandle, SharedCertificateStore, SystemClock,
     DEFAULT_BACKOFF_BASE, DEFAULT_BACKOFF_MAX, DEFAULT_RENEWAL_JITTER, RENEWAL_REMAINING_FRACTION,
 };
+pub use s3::{S3Client, S3Error, S3Settings, S3Storage};
 pub use solver::{
     dns01_record_name, dns01_txt_value, key_authorization, ChallengeHandle, ChallengeSolver,
     Dns01Solver, Http01Solver, Http01Token, Http01TokenStore, SolverRegistry, TlsAlpn01Solver,
