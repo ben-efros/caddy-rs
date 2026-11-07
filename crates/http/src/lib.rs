@@ -8,6 +8,7 @@
 
 pub mod auth;
 pub mod body;
+pub mod encode;
 pub mod file_server;
 pub mod handlers;
 pub mod matchers;
@@ -19,9 +20,10 @@ pub mod upgrade;
 
 pub use auth::{BasicAuthHandler, ForwardAuthHandler};
 pub use body::{Body, BodyError, RequestBody, ResponseBody, StreamingBody, StreamingResponse};
+pub use encode::EncodeHandler;
 pub use handlers::{
-    EncodeHandler, HeadersHandler, MapHandler, RequestBodyHandler, RewriteHandler,
-    StaticResponseHandler, SubrouteHandler, VarsHandler,
+    HeadersHandler, MapHandler, RequestBodyHandler, RewriteHandler, StaticResponseHandler,
+    SubrouteHandler, VarsHandler,
 };
 pub use placeholders::{Replacer, UnknownPlaceholders};
 pub use router::{CustomHandlerFactory, Route, Router, RouterBuilder};
