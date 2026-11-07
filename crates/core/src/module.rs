@@ -691,7 +691,7 @@ pub const BUILTIN_MODULES: &[Module] = &[
         "http.matchers.local_ip",
         "local_ip",
         ModuleKind::HttpMatcher,
-        "Match the local listener IP (caddy-rs extension; Caddy v2.11.7 has no HTTP local_ip matcher)",
+        "Match the local listener IP (caddy-rs extension; Caddy v2.11.9 has no HTTP local_ip matcher)",
     ),
     Module::new(
         "http.matchers.protocol",

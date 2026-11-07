@@ -1,7 +1,7 @@
 //! Structured access-log record model (plan task T-ADMIN-020).
 //!
 //! Caddy emits one structured entry per handled request through its access logger. This module
-//! models that entry as typed Rust values, with the field names and shapes Caddy v2.11.7 uses
+//! models that entry as typed Rust values, with the field names and shapes Caddy's access log uses
 //! (`modules/caddyhttp/marshalers.go` and `server.go::logRequest`):
 //!
 //! ```json
@@ -30,7 +30,7 @@
 //! * Header names are canonicalised (MIME header form) because caddy-rs's `http::HeaderMap` may
 //!   store lowercase names, while Caddy emits canonical Go header names.
 //! * `ts` and `duration` are floating-point seconds (zap's JSON encoder), not duration strings.
-//! * The `upstream` field is a caddy-rs extension: Caddy v2.11.7 logs upstream selection only at
+//! * The `upstream` field is a caddy-rs extension: Caddy logs upstream selection only at
 //!   DEBUG level via the proxy module, not in the access entry. See
 //!   `docs/compatibility/BEHAVIOR-DIVERGENCES.md` DIV-0034.
 //! * Field selection is a crate-level primitive; Caddy configures the same idea through
@@ -249,7 +249,7 @@ impl AccessLogRequest {
 
 /// The caddy-rs `upstream` extension object of an access entry.
 ///
-/// Caddy v2.11.7 does not put upstream selection in access entries; caddy-rs adds it so a proxy
+/// Caddy does not put upstream selection in access entries; caddy-rs adds it so a proxy
 /// deployment can be diagnosed from its access log. Only bounded configuration values (the dial
 /// address) are logged, never arbitrary peer addresses.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
