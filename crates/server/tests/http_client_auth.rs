@@ -188,3 +188,68 @@ async fn require_mode_exposes_unverified_certificate_fields() {
     assert!(body.contains("issuer=[CN=untrusted.example.com]"), "{body}");
     assert!(body.contains("san0=[untrusted.example.com]"), "{body}");
 }
+
+/// Caddy provisions a default `local` PKI authority when `apps.pki` declares none, so a client-auth
+/// pool may reference `pki_root`/`pki_intermediate` with `authority` `local` without configuring the
+/// PKI app. caddy-rs resolved only explicitly declared authorities and rejected the config
+/// (DIV-0085 residual, T-TLS-083).
+#[test]
+fn implicit_local_ca_authority_resolves_for_client_auth_pools() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let authority = directory
+        .path()
+        .join("pki")
+        .join("authorities")
+        .join("local");
+    std::fs::create_dir_all(&authority).expect("authority dir");
+    std::fs::write(authority.join("root.crt"), CLIENT_CA).expect("root.crt");
+
+    let store = Arc::new(GenerationStore::with_builtin_registry());
+    store
+        .load(implicit_local_ca_config())
+        .expect("config decodes");
+    let runtime = ServerRuntime::new(store).with_data_root(directory.path());
+    runtime
+        .validate_provisioning()
+        .expect("implicit local authority must resolve like Caddy");
+
+    // Without the on-disk material the failure stays loud and names the authority/file.
+    let empty = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(GenerationStore::with_builtin_registry());
+    store
+        .load(implicit_local_ca_config())
+        .expect("config decodes");
+    let runtime = ServerRuntime::new(store).with_data_root(empty.path());
+    let error = runtime
+        .validate_provisioning()
+        .expect_err("missing local CA material must fail");
+    let message = error.to_string();
+    assert!(
+        message.contains("local") && message.contains("root.crt"),
+        "error must name the authority and file: {message}"
+    );
+}
+
+fn implicit_local_ca_config() -> Config {
+    serde_json::from_value(serde_json::json!({
+        "admin": {"disabled": true},
+        "apps": {
+            "tls": {
+                "certificates": {
+                    "load_pem": [{"certificate": SERVER_CERT, "key": SERVER_KEY}]
+                }
+            },
+            "http": {"servers": {"srv0": {
+                "listen": ["127.0.0.1:0"],
+                "tls_connection_policies": [{
+                    "client_authentication": {
+                        "mode": "require_and_verify",
+                        "ca": {"provider": "pki_root", "authority": ["local"]}
+                    }
+                }],
+                "routes": [{"handle": [{"handler": "static_response", "body": "ok"}]}]
+            }}}
+        }
+    }))
+    .expect("implicit local CA config decodes")
+}

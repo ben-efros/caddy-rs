@@ -286,14 +286,26 @@ fn client_auth_ca_pool_context(
         .or_else(|| default_root.clone())
     {
         context.storage_root = Some(root.clone());
+        let mut declares_authorities = false;
         if let Some(pki) = config.apps.as_ref().and_then(|apps| apps.pki.as_ref()) {
             if let Some(authorities) = pki.certificate_authorities.as_ref() {
+                declares_authorities = !authorities.is_empty();
                 for id in authorities.keys() {
                     context
                         .pki_authorities
                         .insert(id.clone(), root.join("pki").join("authorities").join(id));
                 }
             }
+        }
+        // Caddy provisions a default `local` authority whenever `certificate_authorities` is empty
+        // (`modules/caddypki/pki.go`: `ProvisionDefaultCA` runs only when no CA is configured), so a
+        // client-auth pool may reference `local` without declaring `apps.pki` at all. Resolve the
+        // same on-disk location here; the loader still fails loudly when the material is absent.
+        if !declares_authorities {
+            context
+                .pki_authorities
+                .entry("local".to_string())
+                .or_insert_with(|| root.join("pki").join("authorities").join("local"));
         }
     }
     context
