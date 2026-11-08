@@ -22,7 +22,9 @@ use base64::Engine as _;
 use rand::rngs::OsRng;
 use ring::rand::SystemRandom;
 use ring::signature::{
-    EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING, ECDSA_P384_SHA384_ASN1_SIGNING,
+    EcdsaKeyPair, KeyPair, UnparsedPublicKey, ECDSA_P256_SHA256_ASN1,
+    ECDSA_P256_SHA256_ASN1_SIGNING, ECDSA_P384_SHA384_ASN1, ECDSA_P384_SHA384_ASN1_SIGNING,
+    ED25519, RSA_PKCS1_2048_8192_SHA256, RSA_PKCS1_2048_8192_SHA384,
 };
 use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::pkcs8::DecodePrivateKey;
@@ -39,6 +41,8 @@ const OID_ECDSA_WITH_SHA384: &[u64] = &[1, 2, 840, 10045, 4, 3, 3];
 const OID_SECP384R1: &[u64] = &[1, 3, 132, 0, 34];
 const OID_RSA_ENCRYPTION: &[u64] = &[1, 2, 840, 113549, 1, 1, 1];
 const OID_SHA256_WITH_RSA: &[u64] = &[1, 2, 840, 113549, 1, 1, 11];
+const OID_SHA384_WITH_RSA: &[u64] = &[1, 2, 840, 113549, 1, 1, 12];
+const OID_ED25519: &[u64] = &[1, 3, 101, 112];
 const OID_SUBJECT_ALT_NAME: &[u64] = &[2, 5, 29, 17];
 const OID_EXTENSION_REQUEST: &[u64] = &[1, 2, 840, 113549, 1, 9, 14];
 
@@ -475,6 +479,11 @@ fn der_null() -> Vec<u8> {
 }
 
 fn der_oid(arcs: &[u64]) -> Vec<u8> {
+    der_tlv(0x06, &der_oid_content(arcs))
+}
+
+/// The content octets of an OBJECT IDENTIFIER (without tag and length).
+fn der_oid_content(arcs: &[u64]) -> Vec<u8> {
     let mut content = Vec::new();
     if arcs.len() >= 2 {
         content.push((arcs[0] * 40 + arcs[1]) as u8);
@@ -490,7 +499,7 @@ fn der_oid(arcs: &[u64]) -> Vec<u8> {
             content.extend(stack);
         }
     }
-    der_tlv(0x06, &content)
+    content
 }
 
 fn der_octet_string(content: &[u8]) -> Vec<u8> {
@@ -524,10 +533,337 @@ fn pem_encode(label: &str, der: &[u8]) -> String {
     pem
 }
 
+// ---- server-side CSR parsing (ACME finalize) ------------------------------------------------
+
+/// Largest CSR the ACME finalize endpoint accepts.
+pub const MAX_CSR_DER_BYTES: usize = 64 * 1024;
+
+/// A verified PKCS#10 certificate signing request from an ACME finalize request.
+///
+/// The CSR's self-signature has been checked against the public key it carries, so a caller may
+/// safely treat `spki_der` as the certificate key the client proved possession of. Identifiers are
+/// only extracted from the subjectAltName extension (RFC 8555 authorises by SAN); a CSR without
+/// SANs therefore yields an empty `names` list and a caller comparing against the order
+/// identifiers rejects it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedCsr {
+    /// DER-encoded SubjectPublicKeyInfo exactly as it appears in the CSR.
+    pub spki_der: Vec<u8>,
+    /// Normalised `dNSName` and `iPAddress` identifiers from the subjectAltName extension.
+    pub names: Vec<String>,
+    /// Whether the subjectAltName extension carried an entry other than a DNS name or IP address
+    /// (email, URI, ...), which RFC 8555 orders cannot authorise.
+    pub unsupported_names: bool,
+}
+
+/// Parse and verify a DER-encoded PKCS#10 `CertificationRequest`.
+///
+/// Supported signature algorithms are the ones a real ACME client emits: ECDSA P-256/P-384 with
+/// SHA-256/SHA-384, RSA PKCS#1 v1.5 with SHA-256/SHA-384 (2048-8192 bit keys) and Ed25519.
+/// Anything else, a malformed structure, or a bad signature is a located
+/// [`AcmeError::CertificateRequest`] error.
+pub fn parse_csr(der: &[u8]) -> Result<ParsedCsr> {
+    if der.is_empty() {
+        return Err(csr_error("certificate signing request is empty"));
+    }
+    if der.len() > MAX_CSR_DER_BYTES {
+        return Err(csr_error(format!(
+            "certificate signing request is {} bytes, exceeding the {MAX_CSR_DER_BYTES}-byte limit",
+            der.len()
+        )));
+    }
+
+    let (tag, body, consumed) = read_der(der)?;
+    if tag != 0x30 || consumed != der.len() {
+        return Err(csr_error(
+            "certificate signing request must be a single DER SEQUENCE",
+        ));
+    }
+
+    // CertificationRequestInfo ::= SEQUENCE { version, subject, subjectPKInfo, attributes }
+    let (info_tag, info, info_len) = read_der(body)?;
+    if info_tag != 0x30 {
+        return Err(csr_error("CertificationRequestInfo must be a SEQUENCE"));
+    }
+    let signature_input = &body[..info_len];
+
+    let (algorithm_tag, algorithm, algorithm_len) = read_der(&body[info_len..])?;
+    if algorithm_tag != 0x30 {
+        return Err(csr_error("signatureAlgorithm must be a SEQUENCE"));
+    }
+    let (signature_tag, signature_bits, _) = read_der(&body[info_len + algorithm_len..])?;
+    if signature_tag != 0x03 || signature_bits.len() < 2 || signature_bits[0] != 0 {
+        return Err(csr_error("CSR signature must be a DER BIT STRING"));
+    }
+    let signature = &signature_bits[1..];
+
+    let mut offset = 0usize;
+    let (version_tag, version, version_len) = read_der(info)?;
+    if version_tag != 0x02 || version != [0u8].as_slice() {
+        return Err(csr_error("CSR version must be INTEGER 0"));
+    }
+    offset += version_len;
+    let (subject_tag, _subject, subject_len) = read_der(&info[offset..])?;
+    if subject_tag != 0x30 {
+        return Err(csr_error("CSR subject must be a SEQUENCE"));
+    }
+    offset += subject_len;
+    let (spki_tag, _spki, spki_len) = read_der(&info[offset..])?;
+    if spki_tag != 0x30 {
+        return Err(csr_error("CSR subjectPKInfo must be a SEQUENCE"));
+    }
+    let spki_der = info[offset..offset + spki_len].to_vec();
+    offset += spki_len;
+
+    let mut names = Vec::new();
+    let mut unsupported_names = false;
+    if offset < info.len() {
+        let (attributes_tag, attributes, _) = read_der(&info[offset..])?;
+        if attributes_tag != 0xA0 {
+            return Err(csr_error("CSR attributes must be a [0] IMPLICIT SET"));
+        }
+        parse_csr_attributes(attributes, &mut names, &mut unsupported_names)?;
+    }
+
+    verify_csr_signature(algorithm, &spki_der, signature_input, signature)?;
+
+    Ok(ParsedCsr {
+        spki_der,
+        names,
+        unsupported_names,
+    })
+}
+
+fn csr_error(message: impl Into<String>) -> crate::Error {
+    AcmeError::CertificateRequest(message.into()).into()
+}
+
+/// Read one DER TLV. Returns `(tag, content, consumed)`; `consumed` includes the header so callers
+/// can splice the exact original bytes back out.
+fn read_der(input: &[u8]) -> Result<(u8, &[u8], usize)> {
+    let tag = *input
+        .first()
+        .ok_or_else(|| csr_error("truncated DER: missing tag"))?;
+    let first = *input
+        .get(1)
+        .ok_or_else(|| csr_error("truncated DER: missing length"))?;
+    let (length, header) = if first & 0x80 == 0 {
+        (first as usize, 2)
+    } else {
+        let count = (first & 0x7f) as usize;
+        if count == 0 || count > 4 {
+            return Err(csr_error("invalid DER length encoding"));
+        }
+        if input.len() < 2 + count {
+            return Err(csr_error("truncated DER length"));
+        }
+        let mut length = 0usize;
+        for byte in &input[2..2 + count] {
+            length = (length << 8) | *byte as usize;
+        }
+        (length, 2 + count)
+    };
+    let end = header
+        .checked_add(length)
+        .ok_or_else(|| csr_error("DER length overflow"))?;
+    if input.len() < end {
+        return Err(csr_error("truncated DER content"));
+    }
+    Ok((tag, &input[header..end], end))
+}
+
+/// Parse `attributes [0] IMPLICIT SET OF Attribute` looking for the PKCS#9 extensionRequest.
+fn parse_csr_attributes(
+    attributes: &[u8],
+    names: &mut Vec<String>,
+    unsupported_names: &mut bool,
+) -> Result<()> {
+    let mut rest = attributes;
+    while !rest.is_empty() {
+        let (tag, attribute, consumed) = read_der(rest)?;
+        if tag != 0x30 {
+            return Err(csr_error("CSR attribute must be a SEQUENCE"));
+        }
+        let (oid_tag, oid, oid_len) = read_der(attribute)?;
+        if oid_tag != 0x06 {
+            return Err(csr_error("CSR attribute type must be an OBJECT IDENTIFIER"));
+        }
+        let (values_tag, values, _) = read_der(&attribute[oid_len..])?;
+        if values_tag != 0x31 {
+            return Err(csr_error("CSR attribute values must be a SET"));
+        }
+        if oid == der_oid_content(OID_EXTENSION_REQUEST) {
+            let (extensions_tag, extensions, _) = read_der(values)?;
+            if extensions_tag != 0x30 {
+                return Err(csr_error(
+                    "extensionRequest must wrap an Extensions SEQUENCE",
+                ));
+            }
+            parse_csr_extensions(extensions, names, unsupported_names)?;
+        }
+        rest = &rest[consumed..];
+    }
+    Ok(())
+}
+
+/// Parse `Extensions ::= SEQUENCE OF Extension` and collect subjectAltName entries.
+fn parse_csr_extensions(
+    mut extensions: &[u8],
+    names: &mut Vec<String>,
+    unsupported_names: &mut bool,
+) -> Result<()> {
+    while !extensions.is_empty() {
+        let (tag, extension, consumed) = read_der(extensions)?;
+        if tag != 0x30 {
+            return Err(csr_error("X.509 extension must be a SEQUENCE"));
+        }
+        let (oid_tag, oid, oid_len) = read_der(extension)?;
+        if oid_tag != 0x06 {
+            return Err(csr_error("X.509 extension id must be an OBJECT IDENTIFIER"));
+        }
+        let mut offset = oid_len;
+        let (value_tag, _value, value_len) = read_der(&extension[offset..])?;
+        if value_tag == 0x01 {
+            // critical BOOLEAN DEFAULT FALSE
+            offset += value_len;
+        }
+        let (octets_tag, octets, _) = read_der(&extension[offset..])?;
+        if octets_tag != 0x04 {
+            return Err(csr_error("X.509 extension value must be an OCTET STRING"));
+        }
+        if oid == der_oid_content(OID_SUBJECT_ALT_NAME) {
+            parse_subject_alt_name(octets, names, unsupported_names)?;
+        }
+        extensions = &extensions[consumed..];
+    }
+    Ok(())
+}
+
+fn parse_subject_alt_name(
+    der: &[u8],
+    names: &mut Vec<String>,
+    unsupported_names: &mut bool,
+) -> Result<()> {
+    let (tag, general_names, consumed) = read_der(der)?;
+    if tag != 0x30 || consumed != der.len() {
+        return Err(csr_error("subjectAltName must be a single SEQUENCE"));
+    }
+    let mut rest = general_names;
+    while !rest.is_empty() {
+        let (name_tag, content, consumed) = read_der(rest)?;
+        match name_tag {
+            // dNSName [2] IA5String
+            0x82 => {
+                let name = std::str::from_utf8(content)
+                    .map_err(|_| csr_error("subjectAltName dNSName is not valid ASCII"))?;
+                let name = name.trim().trim_end_matches('.').to_ascii_lowercase();
+                if !name.is_empty() && !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+            // iPAddress [7] OCTET STRING
+            0x87 => {
+                let address = match content.len() {
+                    4 => std::net::Ipv4Addr::new(content[0], content[1], content[2], content[3])
+                        .to_string(),
+                    16 => {
+                        let mut octets = [0u8; 16];
+                        octets.copy_from_slice(content);
+                        std::net::Ipv6Addr::from(octets).to_string()
+                    }
+                    _ => return Err(csr_error("subjectAltName iPAddress must be 4 or 16 bytes")),
+                };
+                if !names.contains(&address) {
+                    names.push(address);
+                }
+            }
+            // Other GeneralName forms (email, URI, ...) are not ACME identifiers; the caller
+            // rejects such a CSR (smallstep's `Order.sans` does the same).
+            _ => *unsupported_names = true,
+        }
+        rest = &rest[consumed..];
+    }
+    Ok(())
+}
+
+/// Verify the CSR self-signature with the public key carried inside the CSR.
+fn verify_csr_signature(
+    algorithm: &[u8],
+    spki_der: &[u8],
+    message: &[u8],
+    signature: &[u8],
+) -> Result<()> {
+    let (oid_tag, oid, oid_len) = read_der(algorithm)?;
+    if oid_tag != 0x06 {
+        return Err(csr_error(
+            "CSR signature algorithm must be an OBJECT IDENTIFIER",
+        ));
+    }
+    if oid_len != algorithm.len() {
+        // Parameters are allowed (RSA NULL, ECDSA absent); ignore them only when present.
+        let (parameters_tag, _, _) = read_der(&algorithm[oid_len..])?;
+        if parameters_tag != 0x05 && parameters_tag != 0x30 {
+            return Err(csr_error("unexpected CSR signature algorithm parameters"));
+        }
+    }
+
+    let public_key = subject_public_key_bytes(spki_der)?;
+    let verified = if oid == der_oid_content(OID_ECDSA_WITH_SHA256) {
+        UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, public_key)
+            .verify(message, signature)
+            .is_ok()
+    } else if oid == der_oid_content(OID_ECDSA_WITH_SHA384) {
+        UnparsedPublicKey::new(&ECDSA_P384_SHA384_ASN1, public_key)
+            .verify(message, signature)
+            .is_ok()
+    } else if oid == der_oid_content(OID_SHA256_WITH_RSA) {
+        UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, public_key)
+            .verify(message, signature)
+            .is_ok()
+    } else if oid == der_oid_content(OID_SHA384_WITH_RSA) {
+        UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA384, public_key)
+            .verify(message, signature)
+            .is_ok()
+    } else if oid == der_oid_content(OID_ED25519) {
+        UnparsedPublicKey::new(&ED25519, public_key)
+            .verify(message, signature)
+            .is_ok()
+    } else {
+        return Err(csr_error(
+            "unsupported CSR signature algorithm (expected ECDSA-SHA256/SHA384, RSA-SHA256/SHA384 or Ed25519)",
+        ));
+    };
+    if !verified {
+        return Err(csr_error("CSR signature verification failed"));
+    }
+    Ok(())
+}
+
+/// Extract the key bit string from a SubjectPublicKeyInfo.
+fn subject_public_key_bytes(spki_der: &[u8]) -> Result<&[u8]> {
+    let (tag, body, consumed) = read_der(spki_der)?;
+    if tag != 0x30 || consumed != spki_der.len() {
+        return Err(csr_error("SubjectPublicKeyInfo must be a SEQUENCE"));
+    }
+    let (algorithm_tag, _algorithm, algorithm_len) = read_der(body)?;
+    if algorithm_tag != 0x30 {
+        return Err(csr_error(
+            "SubjectPublicKeyInfo algorithm must be a SEQUENCE",
+        ));
+    }
+    let (bits_tag, bits, _) = read_der(&body[algorithm_len..])?;
+    if bits_tag != 0x03 || bits.len() < 2 || bits[0] != 0 {
+        return Err(csr_error(
+            "SubjectPublicKeyInfo must carry a BIT STRING key",
+        ));
+    }
+    Ok(&bits[1..])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_ASN1, ECDSA_P384_SHA384_ASN1};
+    use ring::signature::UnparsedPublicKey;
 
     const RSA_4096_CERT_KEY_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
 MIIJQgIBADANBgkqhkiG9w0BAQEFAASCCSwwggkoAgEAAoICAQCh1JZxoHuUBRPg
@@ -797,6 +1133,73 @@ EVdZ8IcAQzAPk1jBxj0YDC0rR5d09Q==
         expected.extend(ipv6);
         assert!(lookup(csr.der(), &expected).is_some());
         assert!(verify_csr(&csr));
+    }
+
+    #[test]
+    fn parses_and_verifies_generated_csrs() {
+        let csr = CertificateRequest::generate(&[
+            "Example.COM.".to_string(),
+            "www.example.com".to_string(),
+            "127.0.0.1".to_string(),
+        ])
+        .unwrap();
+        let parsed = parse_csr(csr.der()).expect("valid CSR parses");
+        assert_eq!(
+            parsed.names,
+            vec![
+                "example.com".to_string(),
+                "www.example.com".to_string(),
+                "127.0.0.1".to_string()
+            ]
+        );
+        assert!(!parsed.spki_der.is_empty());
+        // The extracted SPKI is the key the CA signs for, so its BIT STRING wraps the same key.
+        assert_eq!(
+            subject_public_key_bytes(&parsed.spki_der).unwrap(),
+            csr.public_key_bytes()
+        );
+
+        let ipv6 = CertificateRequest::generate(&["::1".to_string()]).unwrap();
+        let parsed = parse_csr(ipv6.der()).unwrap();
+        assert_eq!(parsed.names, vec!["::1".to_string()]);
+    }
+
+    #[test]
+    fn parses_csrs_for_each_supported_key_type() {
+        for key_type in [
+            CertificateKeyType::P256,
+            CertificateKeyType::P384,
+            CertificateKeyType::Rsa2048,
+        ] {
+            let csr =
+                CertificateRequest::generate_with_key_type(&["key.example".to_string()], key_type)
+                    .unwrap();
+            let parsed = parse_csr(csr.der())
+                .unwrap_or_else(|error| panic!("{key_type:?} CSR rejected: {error}"));
+            assert_eq!(parsed.names, vec!["key.example".to_string()]);
+        }
+    }
+
+    #[test]
+    fn rejects_csr_with_bad_signature_or_structure() {
+        let mut csr = CertificateRequest::generate(&["tampered.example".to_string()]).unwrap();
+        let last = csr.der.len() - 1;
+        csr.der[last] ^= 0x01;
+        let error = parse_csr(csr.der()).expect_err("tampered signature must be rejected");
+        assert!(
+            error.to_string().contains("signature verification failed"),
+            "{error}"
+        );
+
+        let mut truncated = CertificateRequest::generate(&["short.example".to_string()]).unwrap();
+        truncated.der.truncate(truncated.der.len() / 2);
+        assert!(parse_csr(&truncated.der).is_err());
+
+        let error = parse_csr(&[]).expect_err("empty CSR must be rejected");
+        assert!(error.to_string().contains("empty"), "{error}");
+        let oversized = vec![0x30; MAX_CSR_DER_BYTES + 1];
+        let error = parse_csr(&oversized).expect_err("oversized CSR must be rejected");
+        assert!(error.to_string().contains("exceeding"), "{error}");
     }
 
     #[test]

@@ -267,7 +267,8 @@ pub struct CaCertificates {
 pub struct SignedExternalCertificate {
     /// DER-encoded leaf certificate.
     pub leaf_der: Vec<u8>,
-    /// DER-encoded issuer chain (intermediate first; the ACME client already trusts the root).
+    /// DER-encoded issuer chain in leaf-to-trust-anchor order (`[intermediate, root]`, or `[root]`
+    /// when signing with the root), matching Caddy's ACME certificate chain.
     pub chain_der: Vec<Vec<u8>>,
     /// Leaf validity start.
     pub not_before: SystemTime,
@@ -284,6 +285,7 @@ pub struct LocalCa {
     intermediate_certificate_der: Vec<u8>,
     root: ParsedCertificate,
     intermediate: ParsedCertificate,
+    root_key: EcdsaKeyPair,
     intermediate_key: EcdsaKeyPair,
 }
 
@@ -484,13 +486,30 @@ impl InternalIssuer {
     /// Sign an externally supplied SubjectPublicKeyInfo (an ACME CSR's key).
     ///
     /// Used by the caddy-rs ACME server handler: the CA issues a leaf for the CSR key without
-    /// generating or storing a private key. `sign_with_root` is not implemented (the persisted
-    /// root key is not loaded into [`LocalCa`]); callers must reject it loudly.
+    /// generating or storing a private key. `sign_with_root` is handled by
+    /// [`Self::sign_external_spki_with`].
     pub async fn sign_external_spki(
         &self,
         spki_der: &[u8],
         domains: &[String],
         lifetime: std::time::Duration,
+    ) -> Result<crate::internal_ca::SignedExternalCertificate> {
+        self.sign_external_spki_with(spki_der, domains, lifetime, false)
+            .await
+    }
+
+    /// Sign an externally supplied SubjectPublicKeyInfo, optionally with the CA's root.
+    ///
+    /// `sign_with_root` mirrors Caddy's `sign_with_root` option (the root certificate is the issuer
+    /// instead of the intermediate). The returned `chain_der` is the issuer chain in
+    /// leaf-to-trust-anchor order (`[intermediate, root]`, or `[root]` when signing with the
+    /// root), matching the chain Caddy's ACME server returns.
+    pub async fn sign_external_spki_with(
+        &self,
+        spki_der: &[u8],
+        domains: &[String],
+        lifetime: std::time::Duration,
+        sign_with_root: bool,
     ) -> Result<crate::internal_ca::SignedExternalCertificate> {
         if spki_der.is_empty() {
             return Err(Error::Issuer(
@@ -501,16 +520,21 @@ impl InternalIssuer {
         let ca = self.load_ca().await?;
         let now = self.clock.now();
         let not_before = now - self.lifetimes.backdate;
+        let (issuer, signer) = if sign_with_root {
+            (&ca.root, &ca.root_key)
+        } else {
+            (&ca.intermediate, &ca.intermediate_key)
+        };
         let mut not_after = not_before + lifetime;
-        if not_after > ca.intermediate.not_after {
-            not_after = ca.intermediate.not_after;
+        if not_after > issuer.not_after {
+            not_after = issuer.not_after;
         }
         let subject_key_id = key_identifier(spki_der);
-        let issuer_key_id = issuer_key_identifier(&ca.intermediate);
+        let issuer_key_id = issuer_key_identifier(issuer);
         let der = create_certificate(
             &CertSpec {
                 serial: &random_serial()?,
-                issuer_subject: &ca.intermediate.subject_der,
+                issuer_subject: &issuer.subject_der,
                 subject: &subject_name(&domains[0]),
                 spki: spki_der,
                 not_before,
@@ -523,11 +547,19 @@ impl InternalIssuer {
                 subject_key_id: Some(&subject_key_id),
                 authority_key_id: Some(&issuer_key_id),
             },
-            &ca.intermediate_key,
+            signer,
         )?;
+        let chain_der = if sign_with_root {
+            vec![ca.root_certificate_der.clone()]
+        } else {
+            vec![
+                ca.intermediate_certificate_der.clone(),
+                ca.root_certificate_der.clone(),
+            ]
+        };
         Ok(SignedExternalCertificate {
             leaf_der: der,
-            chain_der: vec![ca.intermediate_certificate_der.clone()],
+            chain_der,
             not_before,
             not_after,
         })
@@ -551,6 +583,7 @@ impl InternalIssuer {
             intermediate_certificate_pem: intermediate.0,
             intermediate_certificate_der: intermediate.1,
             intermediate: intermediate.2,
+            root_key: root.3,
             intermediate_key: intermediate.3,
         })
     }
@@ -2500,5 +2533,64 @@ mod tests {
                 panic!("{key_type:?} leaf must verify against the local CA: {error}")
             });
         }
+    }
+
+    #[tokio::test]
+    async fn acme_signing_uses_intermediate_or_root_and_returns_the_chain() {
+        use crate::acme::csr::{parse_csr, CertificateRequest};
+        let clock = Arc::new(ManualClock::new(at(Duration::ZERO)));
+        let (issuer, _, _) = memory_issuer(Arc::clone(&clock)).await;
+        let csr = CertificateRequest::generate(&["acme.example".to_string()]).unwrap();
+        let parsed = parse_csr(csr.der()).unwrap();
+        let domains = vec!["acme.example".to_string()];
+        let lifetime = Duration::from_secs(6 * 60 * 60);
+        let ca = issuer.load_ca().await.unwrap();
+        let intermediate = parse_certificate(ca.intermediate_certificate_der()).unwrap();
+        let root = parse_certificate(ca.root_certificate_der()).unwrap();
+
+        let signed = issuer
+            .sign_external_spki_with(&parsed.spki_der, &domains, lifetime, false)
+            .await
+            .expect("intermediate signing");
+        assert_eq!(
+            signed.chain_der,
+            vec![
+                ca.intermediate_certificate_der().to_vec(),
+                ca.root_certificate_der().to_vec()
+            ],
+            "the ACME chain must include the intermediate and the root, like Caddy"
+        );
+        let leaf = parse_certificate(&signed.leaf_der).unwrap();
+        assert_eq!(
+            leaf.authority_key_identifier.as_deref(),
+            intermediate.subject_key_identifier.as_deref()
+        );
+        assert_eq!(
+            leaf.subject_key_identifier,
+            Some(key_identifier(&parsed.spki_der))
+        );
+        assert!(signed.not_after <= intermediate.not_after);
+
+        let with_root = issuer
+            .sign_external_spki_with(&parsed.spki_der, &domains, lifetime, true)
+            .await
+            .expect("root signing");
+        assert_eq!(
+            with_root.chain_der,
+            vec![ca.root_certificate_der().to_vec()],
+            "sign_with_root returns the root as the issuer chain"
+        );
+        let leaf = parse_certificate(&with_root.leaf_der).unwrap();
+        assert_eq!(
+            leaf.authority_key_identifier.as_deref(),
+            root.subject_key_identifier.as_deref()
+        );
+
+        // The existing entry point keeps signing with the intermediate.
+        let default = issuer
+            .sign_external_spki(&parsed.spki_der, &domains, lifetime)
+            .await
+            .unwrap();
+        assert_eq!(default.chain_der, signed.chain_der);
     }
 }
