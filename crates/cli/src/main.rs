@@ -161,6 +161,15 @@ enum PkiCommand {
     },
 }
 
+/// The module registry for the compiled profile.
+///
+/// `--no-default-features --features minimal` builds the minimal profile (ADR-0008), whose registry
+/// omits every module the profile does not compile: proxying, authentication, templates, encoding,
+/// rate limiting and variable maps fail closed at configuration load instead of silently working.
+fn builtin_module_registry() -> caddy_rs_core::ModuleRegistry {
+    caddy_rs_core::ModuleRegistry::builtin_for_profile(cfg!(feature = "minimal"))
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -207,7 +216,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
             }
         }
         Command::ListModules { json } => {
-            let registry = ModuleRegistry::builtin();
+            let registry = builtin_module_registry();
             if json {
                 let modules: Vec<_> = registry
                     .modules()
@@ -261,7 +270,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
             // serving generation here (without binding sockets or obtaining certificates) so a
             // configuration cannot validate and then fail at `run`.
             let store = std::sync::Arc::new(GenerationStore::new(std::sync::Arc::new(
-                ModuleRegistry::builtin(),
+                builtin_module_registry(),
             )));
             store
                 .load(loaded.model)
@@ -351,7 +360,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
             for warning in warnings {
                 eprintln!("warning: {warning}");
             }
-            let store = Arc::new(GenerationStore::new(Arc::new(ModuleRegistry::builtin())));
+            let store = Arc::new(GenerationStore::new(Arc::new(builtin_module_registry())));
             let activated = store.load(model).context("cannot activate configuration")?;
             let mut runtime = ServerRuntime::new(Arc::clone(&store));
             let status = runtime.apply().await.context("cannot start listeners")?;
@@ -464,7 +473,7 @@ impl LoadedConfig {
                 path.display()
             )
         })?;
-        let registry = ModuleRegistry::builtin();
+        let registry = builtin_module_registry();
         caddy_rs_core::validate_config(&model, &registry).with_context(|| {
             format!("autosave `{}` is not a valid configuration", path.display())
         })?;
@@ -512,7 +521,7 @@ fn load_validated(config: &Path, adapter: Option<&str>) -> anyhow::Result<Loaded
             config.display()
         )
     })?;
-    let registry = ModuleRegistry::builtin();
+    let registry = builtin_module_registry();
     caddy_rs_core::validate_config(&model, &registry)
         .with_context(|| format!("`{}` is not a valid configuration", config.display()))?;
     Ok(LoadedConfig {

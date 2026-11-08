@@ -200,6 +200,18 @@ pub struct ModuleRegistry {
     by_key: BTreeMap<(&'static str, &'static str), &'static str>,
 }
 
+/// Modules the `minimal` profile removes from the registry (ADR-0008).
+pub const MINIMAL_EXCLUDED_MODULES: &[&str] = &[
+    "http.handlers.reverse_proxy",
+    "http.handlers.forward_auth",
+    "http.handlers.authentication",
+    "http.handlers.basic_auth",
+    "http.handlers.rate_limit",
+    "http.handlers.templates",
+    "http.handlers.encode",
+    "http.handlers.map",
+];
+
 /// A shared, immutable module registry (what the generation store and runtimes hold).
 pub type SharedModuleRegistry = Arc<ModuleRegistry>;
 
@@ -222,6 +234,23 @@ impl ModuleRegistry {
             registry
                 .register(module.clone())
                 .expect("built-in module table has no duplicate ids");
+        }
+        registry
+    }
+
+    /// Registry for the `minimal` build profile (ADR-0008).
+    ///
+    /// The minimal profile is "a secure web server, nothing more": everything that proxies, executes
+    /// templates, authenticates users, applies rate limits, rewrites variables or serves ACME is
+    /// removed from the registry so a configuration naming it fails closed with a located
+    /// unknown-module error instead of silently gaining capability the operator did not ask for.
+    pub fn builtin_for_profile(minimal: bool) -> Self {
+        let mut registry = Self::builtin();
+        if minimal {
+            let removed: std::collections::BTreeSet<&'static str> =
+                MINIMAL_EXCLUDED_MODULES.iter().copied().collect();
+            registry.by_id.retain(|id, _| !removed.contains(id));
+            registry.by_key.retain(|_, id| !removed.contains(id));
         }
         registry
     }
@@ -867,6 +896,35 @@ pub const BUILTIN_MODULES: &[Module] = &[
         "Test log core (config only)",
     ),
 ];
+
+#[cfg(test)]
+mod profile_tests {
+    use super::ModuleRegistry;
+
+    #[test]
+    fn minimal_profile_fails_closed_for_excluded_modules() {
+        let full = ModuleRegistry::builtin();
+        let minimal = ModuleRegistry::builtin_for_profile(true);
+        for id in super::MINIMAL_EXCLUDED_MODULES {
+            assert!(full.get(id).is_some(), "default build must register {id}");
+            assert!(
+                minimal.get(id).is_none(),
+                "minimal build must not register {id}"
+            );
+        }
+        assert!(minimal.get("http.handlers.file_server").is_some());
+        assert!(minimal.get("http.handlers.static_response").is_some());
+        // Short JSON keys must disappear with their modules.
+        assert!(minimal.resolve_handler("reverse_proxy").is_none());
+        assert!(minimal.resolve_handler("file_server").is_some());
+        assert_eq!(
+            ModuleRegistry::builtin_for_profile(false)
+                .get("http.handlers.reverse_proxy")
+                .is_some(),
+            true
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {
