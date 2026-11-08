@@ -44,6 +44,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 
+use caddy_rs_admin::access_log::AccessLogContext;
 use caddy_rs_admin::{AdminApi, AdminRequest, SharedRequestRecorder};
 use caddy_rs_core::{Generation, GenerationStore, ListenAddr, Network};
 use caddy_rs_http::{Body, Router};
@@ -55,8 +56,8 @@ use crate::error::Error;
 use crate::http::{serve_request_with_automatic_upgradable, ServedResponse};
 use crate::limits::ServerLimits;
 use crate::observability::{
-    body_len, observe_request, request_started, AccessLogRuntime, RequestSnapshot,
-    ServerAccessLogPolicy, TlsLogInfo,
+    body_len, observe_request, request_started, AccessLogRuntime, PendingObservation,
+    RequestSnapshot, ServerAccessLogPolicy, TlsLogInfo,
 };
 use crate::proxy_protocol::{ListenerWrappers, PrefixedStream};
 
@@ -736,6 +737,13 @@ async fn serve_h3_connection(
                         if let Some(snapshot) = snapshot.as_mut() {
                             snapshot.resolve_client_ip(&context.trusted_proxies);
                         }
+                        // One access-log context per request when logging is enabled; the same
+                        // clock covers the buffered body read and the response write below.
+                        let access_log_context = context.access_log.is_enabled().then(|| {
+                            let access_log = Arc::new(AccessLogContext::new());
+                            access_log.start(started);
+                            access_log
+                        });
                         let _request_guard =
                             request_started(&context.recorder, &context.server_name);
                         let limit = context.limits.max_request_body_size;
@@ -760,6 +768,11 @@ async fn serve_h3_connection(
                                 }
                             }
                         }
+                        if let Some(access_log_context) = &access_log_context {
+                            // The HTTP/3 path buffers the request body here; report the bytes
+                            // actually read from the transport (Caddy's `bytes_read`).
+                            access_log_context.request_bytes().set(body.len() as u64);
+                        }
                         if too_large {
                             let response = http::Response::builder()
                                 .status(http::StatusCode::PAYLOAD_TOO_LARGE)
@@ -781,6 +794,8 @@ async fn serve_h3_connection(
                                 413,
                                 0,
                                 &http::HeaderMap::new(),
+                                access_log_context.as_ref(),
+                                None,
                             );
                             continue;
                         }
@@ -810,6 +825,8 @@ async fn serve_h3_connection(
                                 503,
                                 0,
                                 &headers,
+                                access_log_context.as_ref(),
+                                None,
                             );
                             let response = http::Response::builder()
                                 .status(http::StatusCode::SERVICE_UNAVAILABLE)
@@ -831,6 +848,7 @@ async fn serve_h3_connection(
                             Arc::clone(&context.trusted_proxies),
                             None,
                             request_tls_connection(Some(&tls_info)),
+                            access_log_context.clone(),
                         )
                         .await;
                         let hyper_response = match served {
@@ -886,6 +904,8 @@ async fn serve_h3_connection(
                             }
                         }
                         let _ = stream.finish().await;
+                        let write_error = failed
+                            .then(|| format!("response body write failed after {sent} bytes"));
                         observe_request(
                             &context.recorder,
                             &context.access_log,
@@ -897,6 +917,8 @@ async fn serve_h3_connection(
                             response_parts.status.as_u16(),
                             sent,
                             &response_headers,
+                            access_log_context.as_ref(),
+                            write_error.as_deref(),
                         );
                         if failed {
                             continue;
@@ -1481,6 +1503,13 @@ async fn serve_one_request(
     if let Some(snapshot) = snapshot.as_mut() {
         snapshot.resolve_client_ip(&context.trusted_proxies);
     }
+    // One access-log context per request when logging is enabled. Handlers publish observations
+    // into it; the server applies it to the entry when the response body completes.
+    let access_log_context = context.access_log.is_enabled().then(|| {
+        let access_log = Arc::new(AccessLogContext::new());
+        access_log.start(started);
+        access_log
+    });
     let _request_guard = request_started(&context.recorder, &context.server_name);
     // Decide once, before the request is consumed, whether this is a real WebSocket handshake
     // offer. The response side (Sec-WebSocket-Accept) is checked when the 101 is returned; only a
@@ -1488,7 +1517,7 @@ async fn serve_one_request(
     let websocket_request = caddy_rs_proxy::websocket::request_is_websocket(request.headers());
 
     let Some(router) = context.router.clone() else {
-        let headers = http::HeaderMap::new();
+        let response = with_alt_svc(error_response(), context.alt_svc.as_ref());
         observe_request(
             &context.recorder,
             &context.access_log,
@@ -1498,10 +1527,12 @@ async fn serve_one_request(
             snapshot.as_ref(),
             started,
             503,
-            0,
-            &headers,
+            body_len(response.body()),
+            response.headers(),
+            access_log_context.as_ref(),
+            None,
         );
-        return Ok(with_alt_svc(error_response(), context.alt_svc.as_ref()));
+        return Ok(response);
     };
 
     // Cleartext HTTP/2 upgrade (RFC 7540 §3.2): answer with 101 + Upgrade headers and serve
@@ -1541,8 +1572,10 @@ async fn serve_one_request(
             snapshot.as_ref(),
             started,
             101,
-            0,
+            body_len(response.body()),
             response.headers(),
+            access_log_context.as_ref(),
+            None,
         );
         return Ok(response);
     }
@@ -1568,6 +1601,7 @@ async fn serve_one_request(
         context.client_certificate.clone(),
         request_tls_connection(context.tls_info.as_ref()),
         &context.proxy_vars,
+        access_log_context.clone(),
     )
     .await;
 
@@ -1586,37 +1620,45 @@ async fn serve_one_request(
             }
         }
     }
-    let (status, response_size, response_headers) = match &served {
-        ServedResponse::Response(response) => (
-            response.status().as_u16(),
-            body_len(response.body()),
-            response.headers().clone(),
-        ),
+    let (status, response_headers) = match &served {
+        ServedResponse::Response(response) => {
+            (response.status().as_u16(), response.headers().clone())
+        }
         ServedResponse::Upgraded { response, .. } => {
-            (response.status().as_u16(), 0, response.headers().clone())
+            (response.status().as_u16(), response.headers().clone())
         }
     };
-    observe_request(
+    let observation = PendingObservation::new(
         &context.recorder,
         &context.access_log,
         &context.access_log_policy,
         &context.server_name,
         &method,
-        snapshot.as_ref(),
+        snapshot,
         started,
         status,
-        response_size,
-        &response_headers,
+        response_headers,
+        access_log_context,
     );
 
     match served {
-        ServedResponse::Response(response) => Ok::<_, std::convert::Infallible>(response),
+        ServedResponse::Response(mut response) => {
+            // Defer the access entry (and the finished-request metrics) to body completion: hyper
+            // owns the body after this return, and Caddy's `duration`/`size` describe the last
+            // byte, not the headers.
+            let body = std::mem::replace(response.body_mut(), Body::empty());
+            *response.body_mut() = body.observe(Arc::new(observation));
+            Ok::<_, std::convert::Infallible>(response)
+        }
         ServedResponse::Upgraded {
             response,
             tunnel,
             on_upgrade,
             extended_connect,
         } => {
+            // A protocol switch has no response body: the access entry is rendered here (Caddy
+            // renders an upgraded request when the handler returns, not when the tunnel closes).
+            observation.finish_now(0, None);
             // An h2 extended CONNECT is a WebSocket-over-HTTP/2 tunnel even though the original
             // request has no `Upgrade` header: treat it as a WebSocket connection so the existing
             // close-frame handshake applies to the h2 stream too.

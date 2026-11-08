@@ -12,6 +12,12 @@ use thiserror::Error;
 use crate::body::{BodyError, RequestBody, StreamingResponse};
 use crate::upgrade::UpgradedResponse;
 
+/// Per-request access-log carrier shared with the server and the handler pipeline.
+///
+/// Re-exported from `caddy-rs-admin`, which owns the Caddy-compatible access-entry model; handlers
+/// only need the request-scoped context.
+pub use caddy_rs_admin::access_log::{AccessLogContext, AccessLogUpstream, BodyBytes};
+
 /// Errors raised while building or executing handlers.
 #[derive(Debug, Error)]
 pub enum Error {
@@ -300,6 +306,13 @@ pub struct Request {
     /// Shared across request clones so a transform registered before a nested subroute is applied
     /// exactly once: the router drains the stack at the point a handler produces the response.
     response_transforms: Arc<std::sync::Mutex<ResponseTransformList>>,
+    /// Per-request access-log context (Caddy's request-scoped `ExtraLogFields` + observed values).
+    ///
+    /// The server creates it when access logging is enabled; authentication handlers publish the
+    /// authenticated user id and `reverse_proxy` publishes the upstream attempt into it. The server
+    /// applies it to the emitted entry after the response body completes. `None` when access
+    /// logging is disabled, so the common path pays nothing.
+    access_log: Option<Arc<AccessLogContext>>,
 }
 
 /// Registered response transforms; `Debug` prints only the count (the trait objects are not
@@ -336,6 +349,7 @@ impl Request {
             vars: BTreeMap::new(),
             pending_response_headers: HeaderMap::new(),
             response_transforms: Arc::new(std::sync::Mutex::new(ResponseTransformList::default())),
+            access_log: None,
         }
     }
 
@@ -345,6 +359,52 @@ impl Request {
         self.body_stream = Some(std::sync::Mutex::new(body));
         self.body = Bytes::new();
         self
+    }
+
+    /// Attach the per-request access-log context (server adapter).
+    ///
+    /// The server creates one context per request when access logging is enabled; handlers publish
+    /// observations into it and the server applies it to the emitted entry once the response body
+    /// has completed.
+    pub fn with_access_log(mut self, context: Arc<AccessLogContext>) -> Self {
+        self.access_log = Some(context);
+        self
+    }
+
+    /// The per-request access-log context, when access logging is enabled.
+    pub fn access_log(&self) -> Option<&Arc<AccessLogContext>> {
+        self.access_log.as_ref()
+    }
+
+    /// Publish the authenticated user id into the access-log context (Caddy's `user_id`).
+    ///
+    /// Authentication handlers call this after a successful credential check; it is a no-op when
+    /// access logging is disabled. Caddy's entry always carries `user_id` (empty for anonymous
+    /// requests), so only the observed value is published here.
+    pub fn record_access_log_user_id(&self, user_id: impl Into<String>) {
+        if let Some(context) = &self.access_log {
+            context.set_user_id(user_id);
+        }
+    }
+
+    /// Publish the proxy upstream attempt into the access-log context (caddy-rs `upstream`).
+    ///
+    /// `reverse_proxy` calls this for every attempt that received an upstream response; it is a
+    /// no-op when access logging is disabled.
+    pub fn record_access_log_upstream(&self, upstream: AccessLogUpstream) {
+        if let Some(context) = &self.access_log {
+            context.set_upstream(upstream);
+        }
+    }
+
+    /// Request-body byte counter when the server is counting it (access logging enabled).
+    ///
+    /// The server attaches this handle to streamed request bodies so [`RequestBody`] reads feed
+    /// Caddy's actual `bytes_read`; buffered bodies are counted by the server directly.
+    pub fn access_log_request_bytes(&self) -> Option<BodyBytes> {
+        self.access_log
+            .as_ref()
+            .map(|context| context.request_bytes())
     }
 
     /// Whether the request body is streamed rather than buffered.
@@ -623,6 +683,7 @@ impl Clone for Request {
             vars: self.vars.clone(),
             pending_response_headers: self.pending_response_headers.clone(),
             response_transforms: Arc::clone(&self.response_transforms),
+            access_log: self.access_log.clone(),
         }
     }
 }

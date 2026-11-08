@@ -44,6 +44,7 @@ use http_body_util::{BodyExt, LengthLimitError, Limited};
 use hyper::body::Incoming;
 use hyper::upgrade::OnUpgrade;
 
+use caddy_rs_admin::access_log::AccessLogContext;
 use caddy_rs_http::{
     Body, ClientCertificate as HttpClientCertificate, Request, RequestBody, Response,
     ResponseOutcome, Router, StreamingBody, StreamingResponse, Tunnel,
@@ -154,6 +155,7 @@ pub(crate) async fn serve_request_with_automatic(
         None,
         None,
         &[],
+        None,
     )
     .await
     {
@@ -190,6 +192,7 @@ pub(crate) async fn serve_internal_buffered(
     trusted_proxies: Arc<ServerTrustedProxies>,
     client_certificate: Option<HttpClientCertificate>,
     tls_connection: Option<caddy_rs_http::TlsConnection>,
+    access_log: Option<Arc<AccessLogContext>>,
 ) -> ServedResponse {
     let limit = limits.max_request_body_size;
     let path = parts.uri.path().to_string();
@@ -223,6 +226,9 @@ pub(crate) async fn serve_internal_buffered(
     internal.tls = tls;
     internal.tls_connection = tls_connection;
     internal.client_certificate = client_certificate;
+    if let Some(access_log) = access_log {
+        internal = internal.with_access_log(access_log);
+    }
     internal.body = body;
     if let Some(local) = local_addr {
         internal
@@ -292,6 +298,7 @@ pub(crate) async fn serve_request_with_automatic_upgradable(
     client_certificate: Option<HttpClientCertificate>,
     tls_connection: Option<caddy_rs_http::TlsConnection>,
     proxy_vars: &[(String, String)],
+    access_log: Option<Arc<AccessLogContext>>,
 ) -> ServedResponse {
     if !tls {
         if let Some(automatic) = &automatic {
@@ -407,6 +414,9 @@ pub(crate) async fn serve_request_with_automatic_upgradable(
     internal.tls = tls;
     internal.tls_connection = tls_connection;
     internal.client_certificate = client_certificate;
+    if let Some(access_log) = &access_log {
+        internal = internal.with_access_log(Arc::clone(access_log));
+    }
     for (key, value) in proxy_vars {
         if key == "proxy_protocol.unix.remote" {
             internal.remote_addr_text = Some(value.clone());
@@ -464,12 +474,21 @@ pub(crate) async fn serve_request_with_automatic_upgradable(
                 ));
             }
         };
+        // Caddy's `bytes_read` is the actual bytes read from the transport: a buffered body was
+        // read in full here, so count exactly its length.
+        if let Some(access_log) = &access_log {
+            access_log.request_bytes().set(body.len() as u64);
+        }
         internal.body = body;
     } else {
         // Streaming path: the engine receives hyper's `Incoming` as a chunk stream and the server
-        // never collects it. The limit is applied lazily by `RequestBody::with_limit`, and the
-        // request size is the declared Content-Length when present (0 when chunked/unknown).
-        let body = RequestBody::streaming(StreamingBody::from_hyper(body)).with_limit(limit);
+        // never collects it. The limit is applied lazily by `RequestBody::with_limit`; the shared
+        // byte counter records the actual bytes the handlers read.
+        let mut stream = StreamingBody::from_hyper(body);
+        if let Some(access_log) = &access_log {
+            stream = stream.with_counter(access_log.request_bytes());
+        }
+        let body = RequestBody::streaming(stream).with_limit(limit);
         internal = internal.with_streaming_body(body);
     }
     if let Some(alpn) = tls_alpn {

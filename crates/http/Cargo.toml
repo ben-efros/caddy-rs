@@ -22,6 +22,10 @@ argon2 = "0.5"
 async-trait = { workspace = true }
 bcrypt = "0.16"
 bytes = { workspace = true }
+# The request-scoped access-log carrier (`AccessLogContext`) is owned by the admin crate, which the
+# server also uses to render entries. `caddy-rs-http` only depends on the model, never on the
+# runtime/admin API, and the dependency is acyclic (admin -> config/core, not http).
+caddy-rs-admin = { workspace = true, default-features = false }
 caddy-rs-core = { workspace = true, default-features = false }
 flate2 = { version = "1", optional = true }
 http = { workspace = true }

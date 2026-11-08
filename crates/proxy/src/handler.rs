@@ -42,8 +42,9 @@ use hyper_util::rt::TokioIo;
 
 use caddy_rs_http::{
     body::{Body, RequestBody, StreamingBody, StreamingResponse},
-    requested_upgrade_type, CustomHandlerFactory, Error as HttpError, Handler, Outcome, Request,
-    Response, Result as HttpResult, SharedHandler, StreamingOutcome, Tunnel, UpgradedResponse,
+    requested_upgrade_type, AccessLogUpstream, CustomHandlerFactory, Error as HttpError, Handler,
+    Outcome, Request, Response, Result as HttpResult, SharedHandler, StreamingOutcome, Tunnel,
+    UpgradedResponse,
 };
 
 use crate::balancer::{self, Balancer};
@@ -1532,6 +1533,12 @@ impl Handler for ReverseProxyHandler {
             };
             match self.forward(&target, client, &request, body).await {
                 Ok(forwarded) => {
+                    record_access_log_upstream(
+                        &request,
+                        &upstream,
+                        forwarded.status,
+                        forwarded.latency,
+                    );
                     // Caddy applies passive response checks before deciding on retry_match, so an
                     // unhealthy_status strike is recorded even when the response is retried.
                     if let Some(passive) = &self.passive {
@@ -1750,6 +1757,12 @@ impl Handler for ReverseProxyHandler {
                 .await
             {
                 Ok(Forwarded::Upgrade(mut forwarded)) => {
+                    record_access_log_upstream(
+                        &request,
+                        &upstream,
+                        forwarded.status,
+                        forwarded.latency,
+                    );
                     if let Some(passive) = &self.passive {
                         let strikes = passive.record_response(
                             &upstream.dial,
@@ -1786,6 +1799,12 @@ impl Handler for ReverseProxyHandler {
                     )));
                 }
                 Ok(Forwarded::Streaming(forwarded)) => {
+                    record_access_log_upstream(
+                        &request,
+                        &upstream,
+                        forwarded.status,
+                        forwarded.latency,
+                    );
                     if let Some(passive) = &self.passive {
                         let strikes = passive.record_response(
                             &upstream.dial,
@@ -2160,6 +2179,49 @@ struct TransportConfig {
     proxy_protocol: Option<ProxyProtocolVersion>,
     /// `transport.dial_timeout`: cap on establishing the upstream connection.
     dial_timeout: Option<Duration>,
+}
+
+/// Publish one upstream attempt into the request's access-log context (caddy-rs `upstream`).
+///
+/// Caddy logs upstream selection only at DEBUG level (`reverseproxy.go:1125-1127`); this is a
+/// caddy-rs access-entry extension documented in DIV-0069. `latency` is the time until the
+/// upstream's response headers arrived (Caddy's roundtrip duration). A retried request overwrites
+/// the previous attempt, so the entry describes the attempt whose response was served.
+fn record_access_log_upstream(
+    request: &Request,
+    upstream: &Upstream,
+    status: StatusCode,
+    latency: Duration,
+) {
+    let (remote_ip, remote_port) = access_log_upstream_address(&upstream.dial);
+    request.record_access_log_upstream(AccessLogUpstream {
+        dial: upstream.dial.clone(),
+        remote_ip,
+        remote_port,
+        duration: latency,
+        status: Some(status.as_u16()),
+    });
+}
+
+/// Split a dial into Caddy's `upstream.remote_ip`/`remote_port` fields.
+///
+/// Only a literal IP address becomes `remote_ip`: a hostname stays unresolved here because the
+/// access entry must not fake a value the proxy did not observe. Unix-socket dials have neither.
+fn access_log_upstream_address(dial: &str) -> (Option<String>, Option<String>) {
+    if dial == "unix" || dial.starts_with("unix/") {
+        return (None, None);
+    }
+    let host = if dial.starts_with('[') {
+        dial.strip_prefix('[')
+            .and_then(|rest| rest.split_once(']'))
+            .map(|(host, _)| host)
+    } else {
+        dial.rsplit_once(':').map(|(host, _)| host)
+    };
+    let remote_ip = host
+        .filter(|host| host.parse::<std::net::IpAddr>().is_ok())
+        .map(str::to_string);
+    (remote_ip, dial_port(dial).map(|port| port.to_string()))
 }
 
 /// TCP port of a `host:port` dial, if any (Unix-socket dials have no port).
@@ -4422,6 +4484,31 @@ mod tests {
             .await
             .expect("end timeout")
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn records_upstream_attempt_in_the_access_log_context() {
+        let (dial, sender) = spawn_channel_upstream(200, &[("content-type", "text/plain")]).await;
+        let handler = handler(&dial);
+        let context = Arc::new(caddy_rs_http::AccessLogContext::new());
+        let request = get_request("/proxied", None).with_access_log(Arc::clone(&context));
+
+        let StreamingOutcome::Respond(response) = handler.handle_streaming(request).await.unwrap()
+        else {
+            panic!("expected a proxied response");
+        };
+        assert_eq!(response.status, StatusCode::OK);
+
+        let upstream = context.upstream().expect("upstream attempt recorded");
+        assert_eq!(upstream.dial, dial);
+        assert_eq!(upstream.status, Some(200));
+        assert_eq!(upstream.remote_ip.as_deref(), Some("127.0.0.1"));
+        let (_, port) = dial.rsplit_once(':').expect("test dial has a port");
+        assert_eq!(upstream.remote_port.as_deref(), Some(port));
+        assert!(upstream.duration >= Duration::ZERO);
+
+        drop(response);
+        drop(sender);
     }
 
     #[tokio::test]

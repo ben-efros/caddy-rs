@@ -12,9 +12,11 @@
 //! * [`RequestSnapshot`] captures the access-log-relevant request fields *before* the request is
 //!   consumed by the router (method, host, URI, headers, peer, TLS handshake details).
 //! * [`TlsLogInfo`] carries the rustls handshake metadata needed for Caddy's `request.tls` object.
-//! * [`observe_request`] records the finished-request metric observation and emits the access
-//!   entry, with errors logged but never propagated into the request path ("best-effort
-//!   observability never breaks serving").
+//! * [`PendingObservation`] renders the metrics observation and the access entry when the response
+//!   body completes (attached through `caddy_rs_http::Body::observe`), so `duration` is
+//!   time-to-last-byte and `size` is the actual response body length. [`observe_request`] is the
+//!   immediate variant for responses whose body is not observed (protocol upgrades and synthetic
+//!   error bodies).
 //!
 //! Metrics are always recorded (the recorder is cheap; with no active sinks the access-log half is
 //! skipped), matching caddy-rs's documented always-on metrics extension (DIV-0033). Access-log
@@ -22,24 +24,37 @@
 //! sink from the implicit Caddy default would otherwise write every request to stderr even though
 //! the operator never configured access logging.
 //!
-//! Gaps (reported with T-ADMIN-024): proxy upstream observations need a recorder handle inside
-//! `caddy-rs-proxy` (not reachable from this crate); certificate metrics are recorded as a snapshot
-//! at generation apply time (ongoing renewal outcomes are picked up on the next apply, which the
-//! supervisor performs every poll interval); streaming response sizes are only known when the
-//! response body reports an exact size, and request `bytes_read`/`request_size` uses the declared
-//! `Content-Length` (0 for chunked/licence-unknown bodies).
+//! ## Access-log field population (T-ADMIN-045)
+//!
+//! The server creates one `caddy_rs_admin::access_log::AccessLogContext` per request when logging
+//! is enabled and attaches it to the internal request. Authentication handlers publish `user_id`,
+//! `reverse_proxy` publishes the caddy-rs `upstream` extension, the server attaches the request
+//! body byte counter (actual bytes read) and the response body observer (actual bytes written,
+//! body-end `duration`), and a write that cannot be completed records `write_error`. The entry is
+//! rendered from the context after the body completes; anonymous requests still emit `user_id: ""`
+//! and successful writes omit `write_error`.
+//!
+//! Remaining gaps: the transport does not expose the underlying socket write error, so a
+//! `write_error` records the observable fact (body error text, or the bytes written before the
+//! connection closed) rather than Go's `write tcp ...: broken pipe`; certificate metrics are
+//! recorded as a snapshot at generation apply time (ongoing renewal outcomes are picked up on the
+//! next apply, which the supervisor performs every poll interval); and HTTP/3 write failures are
+//! detected from `send_data` errors while the entry is rendered after the body is sent.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use http::HeaderMap;
 
+use caddy_rs_admin::access_log::AccessLogContext;
 use caddy_rs_admin::{
     AccessLogEntry, AccessLogRequest, AccessLogTls, BuiltAccessLogSink, CertificateMetrics,
     LoggingConfig, LoggingConfigError, RequestObservation, SharedRequestRecorder,
     ACCESS_LOG_LOGGER,
 };
+use caddy_rs_http::body::{BodyCompletion, BodyStatus, ResponseBodyObserver};
 use hyper::body::Incoming;
 
 /// Access-log sinks active for one configuration generation.
@@ -323,7 +338,7 @@ impl TlsLogInfo {
 }
 
 /// The request fields captured before the request is consumed by the router.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct RequestSnapshot {
     method: String,
     host: String,
@@ -335,9 +350,10 @@ pub(crate) struct RequestSnapshot {
     timestamp: SystemTime,
     /// Declared request body size (`Content-Length`), 0 when the body is chunked/unknown.
     ///
-    /// caddy-rs streams request bodies for handlers that do not need them buffered, so the exact
-    /// bytes-read count is not known at logging time; the declared size is the compatible
-    /// approximation Caddy reports for `request_size`/`bytes_read` when a length was declared.
+    /// Caddy's `bytes_read` is the *actual* bytes read, which the request-scoped byte counter
+    /// reports while a streamed body is consumed (and which the server sets in one step for a
+    /// buffered body). This declared value is only the fallback for a caller that renders a
+    /// snapshot without an `AccessLogContext` (it also feeds the metrics request size fallback).
     content_length: u64,
     /// Caddy's `client_ip` request variable: the trusted-proxy-resolved client IP (bare address,
     /// never a port). `None` until [`RequestSnapshot::resolve_client_ip`] runs; Caddy resolves it
@@ -456,16 +472,20 @@ impl RequestSnapshot {
         request.client_ip = self.resolved_client_ip.clone();
         request.proto = self.proto.clone();
         request.tls = self.tls.as_ref().map(TlsLogInfo::to_access_tls);
-        let mut entry = AccessLogEntry::new(request)
+        AccessLogEntry::new(request)
             .with_timestamp(self.timestamp)
             .with_status(status)
             .with_duration(duration)
             .with_size(size)
-            .with_response_headers(response_headers);
-        // Caddy's `bytes_read` is the request body bytes read; for streamed or unread bodies
-        // caddy-rs reports the declared Content-Length (0 when unknown/chunked).
-        entry.bytes_read = self.content_length;
-        entry
+            .with_response_headers(response_headers)
+    }
+
+    /// Caddy's `bytes_read` fallback when no per-request access-log context is available.
+    ///
+    /// The live server always attaches a context (so the actual bytes are reported); this
+    /// declared-length value is only used by callers that render a snapshot without one.
+    fn declared_bytes_read(&self) -> u64 {
+        self.content_length
     }
 }
 
@@ -494,17 +514,187 @@ pub(crate) fn request_started(
         })
 }
 
-/// Record the finished request and emit its access-log entry (when access logging is enabled).
+/// One request observation, finished when the response body completes.
 ///
-/// Best-effort: metric/encoding failures are printed and swallowed so observability can never
-/// change the served response. `handler` is currently always empty because the router does not
-/// expose the matched route id at the connection boundary.
-#[allow(clippy::too_many_arguments)]
+/// The connection boundary hands the response body to hyper and returns, so it cannot render the
+/// access entry there: Caddy measures `duration` at the last byte and counts the bytes actually
+/// handed to the transport (`modules/caddyhttp/server.go:710-715`,
+/// `responsewriter.go:185-210`). The server attaches this observer to the final response body
+/// (`Body::observe`); hyper calls it exactly once when the body ends, fails, or is dropped.
+///
+/// Metrics are recorded at the same body-end boundary, so `response_duration`/`response_size`
+/// describe the complete response.
+pub(crate) struct PendingObservation {
+    recorder: SharedRequestRecorder,
+    access_log: Arc<AccessLogRuntime>,
+    policy: Arc<ServerAccessLogPolicy>,
+    server_name: String,
+    method: String,
+    snapshot: Option<RequestSnapshot>,
+    started: Instant,
+    status: u16,
+    response_headers: HeaderMap,
+    context: Option<Arc<AccessLogContext>>,
+    completed: AtomicBool,
+}
+
+impl PendingObservation {
+    /// Capture the observation for one response.
+    ///
+    /// `snapshot` is only present when access logging is enabled; the metrics half works without
+    /// it (falling back to the declared request size).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        recorder: &SharedRequestRecorder,
+        access_log: &Arc<AccessLogRuntime>,
+        policy: &Arc<ServerAccessLogPolicy>,
+        server_name: &str,
+        method: &str,
+        snapshot: Option<RequestSnapshot>,
+        started: Instant,
+        status: u16,
+        response_headers: HeaderMap,
+        context: Option<Arc<AccessLogContext>>,
+    ) -> Self {
+        Self {
+            recorder: Arc::clone(recorder),
+            access_log: Arc::clone(access_log),
+            policy: Arc::clone(policy),
+            server_name: server_name.to_string(),
+            method: method.to_string(),
+            snapshot,
+            started,
+            status,
+            response_headers,
+            context,
+            completed: AtomicBool::new(false),
+        }
+    }
+
+    /// Finish immediately for a response whose body is not observed by the server (an upgraded
+    /// connection or a small synthetic error body).
+    pub(crate) fn finish_now(&self, response_size: u64, write_error: Option<&str>) {
+        self.finish(response_size, write_error);
+    }
+
+    /// Derive Caddy's `write_error` from how the observed body stopped.
+    ///
+    /// * an error frame is a failed write (the response could not be completed),
+    /// * a drop after every advertised byte was written is a normal fixed-length completion; hyper
+    ///   drops such bodies after the last frame instead of polling an extra end-of-stream,
+    /// * `HEAD`/`1xx`/`204`/`304` responses never carry a body, so a drop is not an error,
+    /// * a drop after some bytes were polled is a truncated response (usually a client disconnect).
+    ///
+    /// The transport does not expose the underlying socket error, so the message records the
+    /// observable fact (bytes written and the body's error, when any) rather than inventing one.
+    fn write_error_for(&self, completion: &BodyCompletion) -> Option<String> {
+        match &completion.status {
+            BodyStatus::Ended => None,
+            BodyStatus::Failed(error) => Some(format!(
+                "response body ended with an error after {} bytes: {error}",
+                completion.bytes
+            )),
+            BodyStatus::Dropped => {
+                if completion.expected == Some(completion.bytes) {
+                    return None;
+                }
+                if self.method == "HEAD" || matches!(self.status, 100..=199 | 204 | 304) {
+                    return None;
+                }
+                if !completion.polled {
+                    return None;
+                }
+                let expected = completion
+                    .expected
+                    .map_or_else(String::new, |expected| format!(" of {expected}"));
+                Some(format!(
+                    "response body was not fully written: connection closed after {} bytes{expected}",
+                    completion.bytes
+                ))
+            }
+        }
+    }
+
+    /// Record metrics and emit the access entry exactly once.
+    fn finish(&self, response_size: u64, write_error: Option<&str>) {
+        if self.completed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let duration = self.started.elapsed();
+        let request_size = self.context.as_ref().map_or_else(
+            || {
+                self.snapshot
+                    .as_ref()
+                    .map_or(0, RequestSnapshot::declared_bytes_read)
+            },
+            |context| context.request_bytes().get(),
+        );
+        if let Err(error) = self.recorder.request_finished(&RequestObservation {
+            server: &self.server_name,
+            handler: "",
+            method: &self.method,
+            status: self.status,
+            duration,
+            request_size,
+            response_size,
+            response_duration: duration,
+            // Handler errors are mapped to 500 by the connection boundary; counting those as
+            // errors matches Caddy's `request_errors_total` intent closely enough for alerting.
+            error: self.status >= 500,
+        }) {
+            eprintln!("caddy-rs: cannot record request metrics: {error}");
+        }
+
+        if !self.access_log.is_enabled() {
+            return;
+        }
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        if let Some(context) = &self.context {
+            // `apply_to` reads the shared counters; finish the clock first so the entry's
+            // `duration` is time-to-last-byte, not time-to-headers.
+            context.response_bytes().set(response_size);
+            context.finish();
+        }
+        let AccessLogRoute::Loggers(loggers) = self.policy.route(&snapshot.host) else {
+            return;
+        };
+        for component in loggers {
+            let mut entry =
+                snapshot.access_entry(self.status, duration, response_size, &self.response_headers);
+            if let Some(context) = &self.context {
+                context.apply_to(&mut entry);
+            } else {
+                entry.bytes_read = snapshot.declared_bytes_read();
+            }
+            if let Some(error) = write_error {
+                entry.write_error = Some(error.to_string());
+            }
+            entry.logger = logger_name(&component);
+            self.access_log.emit(&entry);
+        }
+    }
+}
+
+impl ResponseBodyObserver for PendingObservation {
+    fn complete(&self, completion: BodyCompletion) {
+        let write_error = self.write_error_for(&completion);
+        self.finish(completion.bytes, write_error.as_deref());
+    }
+}
+
+/// Record the finished request and emit its access-log entry immediately.
+///
+/// Used for responses whose body the server does not observe (protocol upgrades and small
+/// synthetic error responses). Normal responses use [`PendingObservation`] attached to the body,
+/// so `duration`/`size` cover the complete response body. Metric/encoding failures are best-effort:
+/// printed and swallowed so observability never changes the served response.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn observe_request(
     recorder: &SharedRequestRecorder,
-    access_log: &AccessLogRuntime,
-    policy: &ServerAccessLogPolicy,
+    access_log: &Arc<AccessLogRuntime>,
+    policy: &Arc<ServerAccessLogPolicy>,
     server_name: &str,
     method: &str,
     snapshot: Option<&RequestSnapshot>,
@@ -512,42 +702,22 @@ pub(crate) fn observe_request(
     status: u16,
     response_size: u64,
     response_headers: &HeaderMap,
+    context: Option<&Arc<AccessLogContext>>,
+    write_error: Option<&str>,
 ) {
-    let duration = started.elapsed();
-    // Request-body accounting: declared Content-Length when present (streaming/unread bodies are
-    // not counted); see `RequestSnapshot::content_length` and the T-PROXY-039 notes.
-    let request_size = snapshot.map_or(0, |snapshot| snapshot.content_length);
-    if let Err(error) = recorder.request_finished(&RequestObservation {
-        server: server_name,
-        handler: "",
+    PendingObservation::new(
+        recorder,
+        access_log,
+        policy,
+        server_name,
         method,
+        snapshot.cloned(),
+        started,
         status,
-        duration,
-        request_size,
-        response_size,
-        response_duration: duration,
-        // Handler errors are mapped to 500 by the connection boundary; counting those as errors
-        // matches Caddy's `request_errors_total` intent closely enough for alerting.
-        error: status >= 500,
-    }) {
-        eprintln!("caddy-rs: cannot record request metrics: {error}");
-    }
-
-    if !access_log.is_enabled() {
-        return;
-    }
-    let Some(snapshot) = snapshot else {
-        return;
-    };
-    let route = policy.route(&snapshot.host);
-    let AccessLogRoute::Loggers(loggers) = route else {
-        return;
-    };
-    for component in loggers {
-        let mut entry = snapshot.access_entry(status, duration, response_size, response_headers);
-        entry.logger = logger_name(&component);
-        access_log.emit(&entry);
-    }
+        response_headers.clone(),
+        context.cloned(),
+    )
+    .finish_now(response_size, write_error);
 }
 
 /// Content length of a buffered body, if known.
@@ -591,4 +761,97 @@ pub(crate) fn record_certificate_metrics(
         let _ = metrics.certificate_renewal("", &subject, success, Duration::ZERO);
     }
     *seen_renewals = history.len();
+}
+
+#[cfg(test)]
+mod write_error_tests {
+    use super::*;
+
+    fn pending_observation(method: &str, status: u16) -> PendingObservation {
+        PendingObservation::new(
+            &caddy_rs_admin::noop_recorder(),
+            &AccessLogRuntime::disabled(),
+            &Arc::new(ServerAccessLogPolicy::default()),
+            "srv0",
+            method,
+            None,
+            Instant::now(),
+            status,
+            HeaderMap::new(),
+            None,
+        )
+    }
+
+    fn completion(
+        bytes: u64,
+        expected: Option<u64>,
+        polled: bool,
+        status: BodyStatus,
+    ) -> BodyCompletion {
+        BodyCompletion {
+            bytes,
+            expected,
+            polled,
+            status,
+        }
+    }
+
+    #[test]
+    fn successful_bodies_omit_write_error() {
+        let observation = pending_observation("GET", 200);
+        // A streamed body that reaches end of stream.
+        assert_eq!(
+            observation.write_error_for(&completion(12, None, true, BodyStatus::Ended)),
+            None
+        );
+        // hyper drops fixed-length bodies right after the last data frame instead of polling an
+        // extra end-of-stream; every advertised byte was written, so this is still a success.
+        assert_eq!(
+            observation.write_error_for(&completion(12, Some(12), true, BodyStatus::Dropped)),
+            None
+        );
+        // Bodies the transport must not send (HEAD, 1xx, 204, 304) are dropped unread.
+        assert_eq!(
+            observation.write_error_for(&completion(0, Some(5), false, BodyStatus::Dropped)),
+            None
+        );
+        assert_eq!(
+            pending_observation("HEAD", 200).write_error_for(&completion(
+                0,
+                Some(5),
+                false,
+                BodyStatus::Dropped
+            )),
+            None
+        );
+        assert_eq!(
+            pending_observation("GET", 204).write_error_for(&completion(
+                0,
+                None,
+                false,
+                BodyStatus::Dropped
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn failed_and_truncated_bodies_record_write_error() {
+        let observation = pending_observation("GET", 200);
+        let failed = observation
+            .write_error_for(&completion(
+                3,
+                None,
+                true,
+                BodyStatus::Failed("body stream was cancelled".to_string()),
+            ))
+            .expect("an errored body is a failed write");
+        assert!(failed.contains("body stream was cancelled"), "{failed}");
+
+        let truncated = observation
+            .write_error_for(&completion(3, Some(10), true, BodyStatus::Dropped))
+            .expect("a truncated body is a failed write");
+        assert!(truncated.contains("3 bytes"), "{truncated}");
+        assert!(truncated.contains("of 10"), "{truncated}");
+    }
 }
