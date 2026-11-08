@@ -29,8 +29,8 @@
 //! (`trusted_proxy` request variable), the client-facing scheme and host replace the listener's
 //! connection scheme and request `Host`. They affect URL construction only (the JWS `url` binding
 //! uses the same origin); routing, certificate identifiers and the `http-01` fetch target never
-//! read them. Without a trusted peer the headers are validated but ignored, so a direct client
-//! cannot spoof the external origin.
+//! read them. Valid values from an untrusted peer are ignored (malformed ones are rejected), so a
+//! direct client cannot spoof the external origin.
 //!
 //! Security-relevant properties:
 //!
@@ -1557,8 +1557,8 @@ impl AcmeServerHandler {
     /// headers were honoured. `X-Forwarded-Proto` / `X-Forwarded-Host` are used only when the
     /// server's trusted-proxy policy sets `trusted_proxy=true` for the peer (the same signal
     /// `reverse_proxy` and `forward_auth` consume). Without that signal the headers are parsed and
-    /// validated (a malformed value is still a loud `malformed` problem) but never influence the
-    /// origin, so an arbitrary client cannot choose the external URL.
+    /// validated (a malformed value is still a loud `malformed` problem) but valid values never
+    /// influence the origin, so an arbitrary client cannot choose the external URL.
     ///
     /// Security note: a forwarded origin changes only the strings this handler advertises and
     /// compares in the JWS protected `url` header. It does not affect routing, account or order
