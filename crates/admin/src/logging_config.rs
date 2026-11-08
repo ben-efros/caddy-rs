@@ -59,8 +59,10 @@
 //!   operations map to [`AccessLogConfig::filters`](crate::AccessLogConfig). `hash` is Caddy's
 //!   SHA-256 first-4-bytes filter; `ip_mask` supports `ipv4_cidr`/`ipv6_cidr`; `query`/`cookie`/
 //!   `set_cookie` apply replace/hash/delete actions; `regexp`/`multi_regexp` use the shared
-//!   linear-time `regex` engine (see [`caddy_rs_core::regex`]) with Go-style `$N` expansion —
-//!   unsupported regexp constructs fail loudly.
+//!   linear-time `regex` engine (see [`caddy_rs_core::regex`]) with Go-style `$N` expansion and
+//!   Go's `Regexp.ReplaceAllString` zero-length-match rules (advance one UTF-8 code point, skip
+//!   an empty match immediately after a non-empty one), so `a*`, `^` and `(?:)` terminate and
+//!   produce Caddy's output — unsupported regexp constructs fail loudly.
 //!   Nested filter encoders are rejected loudly.
 //! * `level`: `DEBUG`/`INFO`/`WARN`/`ERROR`/`PANIC`/`FATAL`, case-insensitive. The threshold is
 //!   enforced by the sink ([`AccessLogSink::emit`](crate::AccessLogSink::emit) returns

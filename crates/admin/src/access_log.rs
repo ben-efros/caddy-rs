@@ -1391,32 +1391,19 @@ fn compiled_regex(pattern: &str) -> Option<caddy_rs_core::regex::Regex> {
 }
 
 /// Replace all regexp matches in `input` using Go-style capture expansion.
+///
+/// Delegates to [`caddy_rs_core::regex::Regex::replace_all`], whose match iterator follows Go's
+/// `Regexp.ReplaceAllString` (`src/regexp/regexp.go`, `replaceAll`): it advances one UTF-8 code
+/// point after a zero-length match and skips an empty match that immediately follows a non-empty
+/// one. Re-running [`caddy_rs_core::regex::Regex::captures`] on the remaining suffix, as an earlier
+/// implementation did, re-anchored `^`/`$` to every suffix and looped forever once a pattern that
+/// can match the empty string (`a*`, `^`, `(?:)`) met an exhausted suffix; the `regex` crate
+/// iterator guarantees forward progress, so there is no loop to bound here.
 fn regexp_replace_all(pattern: &str, replacement: &str, input: &str) -> String {
     let Some(regex) = compiled_regex(pattern) else {
         return input.to_string();
     };
-    let mut output = String::with_capacity(input.len());
-    let mut rest = input;
-    while let Some(captures) = regex.captures(rest) {
-        let (start, end) = captures.group(0).expect("whole match is always captured");
-        output.push_str(&rest[..start]);
-        output.push_str(&regex.expand(replacement, rest, &captures));
-        let matched = &rest[start..end];
-        if matched.is_empty() {
-            // Zero-length match: copy one char and advance to avoid looping forever.
-            if let Some(character) = rest[start..].chars().next() {
-                output.push(character);
-                let advance = start + character.len_utf8();
-                rest = &rest[advance..];
-            } else {
-                rest = "";
-            }
-        } else {
-            rest = &rest[end..];
-        }
-    }
-    output.push_str(rest);
-    output
+    regex.replace_all(input, replacement)
 }
 
 /// Convert days since 1970-01-01 to (year, month, day) (Howard Hinnant's algorithm).
@@ -3172,6 +3159,88 @@ mod tests {
         );
         assert_eq!(rendered["user_id"], "user_role");
         assert_eq!(rendered["request"]["host"], "AB.exAmple");
+    }
+
+    // ---- T-ADMIN-048: zero-length regexp-filter matches ---------------------------------------
+
+    #[test]
+    fn regexp_filter_zero_length_matches_match_go() {
+        // Go's `Regexp.ReplaceAllString` copies the input between matches, advances one UTF-8
+        // code point after a zero-length match and skips an empty match that immediately follows
+        // a non-empty one (Go `src/regexp/regexp.go`, `replaceAll`). Caddy's `regexp` filter
+        // delegates to that function, so these outputs are the reference behaviour; they were
+        // computed with Go 1.26.4 (`regexp.MustCompile(...).ReplaceAllString`).
+        assert_eq!(regexp_replace_all("a*", "X", "bbb"), "XbXbXbX");
+        assert_eq!(regexp_replace_all("a*", "X", "aaa"), "X");
+        assert_eq!(regexp_replace_all("a*", "X", ""), "X");
+        assert_eq!(regexp_replace_all("(?:)", "X", "abc"), "XaXbXcX");
+        assert_eq!(regexp_replace_all("(?:)", ".", "ab"), ".a.b.");
+        // Empty matches iterate by UTF-8 code point, not byte (Go advances one rune).
+        assert_eq!(regexp_replace_all("(?:)", "X", "é"), "XéX");
+        // Anchors apply to the whole input: rerunning the pattern on each remaining suffix
+        // would re-anchor `^`/`$` at every position.
+        assert_eq!(regexp_replace_all("^", "X", "abc"), "Xabc");
+        assert_eq!(regexp_replace_all("$", "X", "abc"), "abcX");
+        assert_eq!(regexp_replace_all("^$", "X", ""), "X");
+        assert_eq!(regexp_replace_all("^$", "X", "abc"), "abc");
+        // Capture expansion still works when the only match is empty.
+        assert_eq!(regexp_replace_all("(a*)", "[$1]", "b"), "[]b[]");
+    }
+
+    #[test]
+    fn regexp_filter_zero_length_match_terminates() {
+        // The previous manual loop reset `rest` to "" after a trailing empty match but kept
+        // re-running the regex on "", so `^`, `a*` and `(?:)` never terminated. Run the calls on
+        // a worker thread so a regression fails this test by name instead of hanging the test
+        // binary. The leaked worker is harmless once the test process exits.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send((
+                regexp_replace_all("^", "X", "abc"),
+                regexp_replace_all("a*", "X", ""),
+                regexp_replace_all("(?:)", "X", "b"),
+            ));
+        });
+        let result = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("zero-length regexp matches must terminate");
+        assert_eq!(
+            result,
+            ("Xabc".to_string(), "X".to_string(), "XbX".to_string())
+        );
+    }
+
+    #[test]
+    fn regexp_and_multi_regexp_filters_handle_zero_length_matches() {
+        let config = AccessLogConfig {
+            filters: vec![
+                FieldFilter {
+                    path: vec!["request".to_string(), "uri".to_string()],
+                    operation: FieldFilterOperation::Regexp {
+                        pattern: "a*".to_string(),
+                        replacement: "X".to_string(),
+                    },
+                },
+                FieldFilter {
+                    path: vec!["request".to_string(), "host".to_string()],
+                    operation: FieldFilterOperation::MultiRegexp {
+                        operations: vec![RegexpOperation {
+                            pattern: "(?:)".to_string(),
+                            replacement: ".".to_string(),
+                        }],
+                    },
+                },
+            ],
+            ..AccessLogConfig::default()
+        };
+        let mut entry = AccessLogEntry::new(AccessLogRequest::default());
+        entry.request.uri = "banana".to_string();
+        entry.request.host = "ab".to_string();
+        let rendered = entry.render(&config).expect("render");
+        // Go: `a*` over "banana" replaces the leading empty match and each `a`, but not the empty
+        // match immediately following an `a`.
+        assert_eq!(rendered["request"]["uri"], "XbXnXnX");
+        assert_eq!(rendered["request"]["host"], ".a.b.");
     }
 
     #[test]
