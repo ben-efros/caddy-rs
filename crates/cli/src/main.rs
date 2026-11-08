@@ -340,6 +340,14 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 warnings,
                 json,
             } = loaded;
+            // Caddy gates autosave on `admin.config.persist`: an explicit false means the
+            // operator does not want the (secret-bearing) config written to disk. Compute it
+            // before the model moves into the generation store.
+            let persist_config = model
+                .admin
+                .as_ref()
+                .map(|admin| admin.persist_config())
+                .unwrap_or(true);
             for warning in warnings {
                 eprintln!("warning: {warning}");
             }
@@ -347,18 +355,26 @@ async fn run(command: Command) -> anyhow::Result<()> {
             let activated = store.load(model).context("cannot activate configuration")?;
             let mut runtime = ServerRuntime::new(Arc::clone(&store));
             let status = runtime.apply().await.context("cannot start listeners")?;
-            // Caddy autosaves the exact bytes of the successfully loaded config after the config
-            // transition completes (caddy.go, unsyncedDecodeAndRun); a failure to autosave is
-            // logged but never aborts the server.
-            match caddy_rs_core::autosave::autosave(&json, &autosave_path) {
-                Ok(()) => eprintln!(
-                    "caddy-rs: autosaved config (load with --resume flag) `{}`",
+            if persist_config {
+                // Caddy autosaves the exact bytes of the successfully loaded config after the
+                // config transition completes (caddy.go, unsyncedDecodeAndRun); a failure to
+                // autosave is logged but never aborts the server.
+                match caddy_rs_core::autosave::autosave(&json, &autosave_path) {
+                    Ok(()) => eprintln!(
+                        "caddy-rs: autosaved config (load with --resume flag) `{}`",
+                        autosave_path.display()
+                    ),
+                    Err(error) => eprintln!(
+                        "caddy-rs: unable to autosave config `{}`: {error}",
+                        autosave_path.display()
+                    ),
+                }
+            } else {
+                eprintln!(
+                    "caddy-rs: config persistence disabled (admin.config.persist=false); \
+                     not autosaving `{}`",
                     autosave_path.display()
-                ),
-                Err(error) => eprintln!(
-                    "caddy-rs: unable to autosave config `{}`: {error}",
-                    autosave_path.display()
-                ),
+                );
             }
             eprintln!(
                 "caddy-rs: configuration active (generation {})",

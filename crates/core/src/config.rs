@@ -140,6 +140,22 @@ impl AdminConfig {
     pub fn listen_addr(&self) -> &str {
         self.listen.as_deref().unwrap_or("localhost:2019")
     }
+
+    /// Whether configuration changes should be autosaved (`admin.config.persist`).
+    ///
+    /// Caddy's default is `true`; an explicit `false` disables autosave. The nested `config`
+    /// object is preserved in [`AdminConfig::extra`] so it round-trips without a typed field; this
+    /// accessor is the single place the persistence gate is interpreted. A malformed `persist`
+    /// value is treated as the default (`true`), matching the conservative "do not silently drop
+    /// persistence" choice.
+    pub fn persist_config(&self) -> bool {
+        self.extra
+            .get("config")
+            .and_then(Value::as_object)
+            .and_then(|config| config.get("persist"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+    }
 }
 
 /// The applications section of a configuration document.
@@ -1381,6 +1397,27 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(custom.listen_addr(), "127.0.0.1:2999");
+    }
+
+    #[test]
+    fn admin_persist_config_defaults_true_and_honours_false() {
+        let default = Config::from_value(serde_json::json!({"admin": {}})).expect("decodes");
+        assert!(default.admin.as_ref().expect("admin").persist_config());
+
+        let disabled =
+            Config::from_value(serde_json::json!({"admin": {"config": {"persist": false}}}))
+                .expect("decodes");
+        assert!(!disabled.admin.as_ref().expect("admin").persist_config());
+        // The nested object round-trips unchanged (no typed field was added).
+        assert_eq!(
+            disabled.to_value().expect("serializes")["admin"]["config"]["persist"],
+            serde_json::json!(false)
+        );
+
+        let enabled =
+            Config::from_value(serde_json::json!({"admin": {"config": {"persist": true}}}))
+                .expect("decodes");
+        assert!(enabled.admin.as_ref().expect("admin").persist_config());
     }
 
     /// Representative upstream-shaped JSON: every object below is either copied from a Caddy

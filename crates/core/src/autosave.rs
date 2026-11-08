@@ -21,9 +21,26 @@
 //! This module is `std`-only.
 
 use std::fs::OpenOptions;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Upper bound for an autosave document read by `--resume`.
+///
+/// The autosave is a complete Caddy config; 16 MiB is far above any realistic document while
+/// keeping a corrupted or attacker-grown file from exhausting memory before JSON parsing rejects
+/// it. Caddy's `os.ReadFile` has no such cap.
+const MAX_AUTOSAVE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// `O_NOFOLLOW | O_CLOEXEC` for the platforms this project ships on. `O_NOFOLLOW` closes the
+/// symlink race between the `symlink_metadata` check and the `open`; `O_CLOEXEC` keeps the
+/// descriptor out of child processes.
+#[cfg(target_os = "linux")]
+const OPEN_NOFOLLOW_CLOEXEC: i32 = 0o400000 | 0o2000000;
+#[cfg(target_os = "macos")]
+const OPEN_NOFOLLOW_CLOEXEC: i32 = 0x0100 | 0x1000000;
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+const OPEN_NOFOLLOW_CLOEXEC: i32 = 0;
 
 /// The autosave file name, matching Caddy's `autosave.json` under the config directory.
 pub const AUTOSAVE_FILE_NAME: &str = "autosave.json";
@@ -84,10 +101,12 @@ pub fn autosave(config_json: &[u8], path: &Path) -> io::Result<()> {
     let directory = parent_directory(path);
 
     create_dir_private(&directory)?;
+    check_private_directory(&directory)?;
 
     let temp_path = temporary_path(path);
-    let result =
-        write_temp(&temp_path, config_json).and_then(|()| std::fs::rename(&temp_path, path));
+    let result = write_temp(&temp_path, config_json)
+        .and_then(|()| std::fs::rename(&temp_path, path))
+        .and_then(|()| sync_directory(&directory));
     if result.is_err() {
         // Best effort: never leave a half-written temp file behind.
         let _ = std::fs::remove_file(&temp_path);
@@ -100,12 +119,87 @@ pub fn autosave(config_json: &[u8], path: &Path) -> io::Result<()> {
 /// Returns `Ok(None)` when the file does not exist (the `--resume` fall-through case) and
 /// `Ok(Some(bytes))` when it does. Any other I/O failure is returned as `Err`, which callers treat
 /// as fatal, exactly like Caddy's run command.
+///
+/// Security: the final path component must be a regular file, not a symlink, and must not be
+/// group/world-writable; the open uses `O_NOFOLLOW` so a symlink swapped in after the check is
+/// still refused. The read is capped at [`MAX_AUTOSAVE_BYTES`].
 pub fn load_autosave(path: &Path) -> io::Result<Option<Vec<u8>>> {
-    match std::fs::read(path) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "autosave path is a symbolic link; refusing to follow it",
+        ));
     }
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "autosave path is not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o022 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "autosave file is group/world-writable; refusing to load it",
+            ));
+        }
+    }
+    if metadata.len() > MAX_AUTOSAVE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("autosave file is larger than {MAX_AUTOSAVE_BYTES} bytes"),
+        ));
+    }
+    check_owner(&metadata, "autosave file")?;
+    // A file in a group/world-writable directory can be replaced by another local user between
+    // runs even when the file itself is 0600, so refuse to load from such a directory.
+    check_private_directory(&parent_directory(path))?;
+
+    let file = open_nofollow(path)?;
+    // Re-check the opened descriptor: the path could have been replaced between the metadata
+    // check and the open (the O_NOFOLLOW flag only covers symlinks, not a regular-file swap).
+    let opened = file.metadata()?;
+    if !opened.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "autosave path is not a regular file",
+        ));
+    }
+    if opened.len() > MAX_AUTOSAVE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("autosave file is larger than {MAX_AUTOSAVE_BYTES} bytes"),
+        ));
+    }
+
+    let mut bytes = Vec::with_capacity(opened.len() as usize);
+    file.take(MAX_AUTOSAVE_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_AUTOSAVE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("autosave file is larger than {MAX_AUTOSAVE_BYTES} bytes"),
+        ));
+    }
+    Ok(Some(bytes))
+}
+
+/// Open `path` read-only with `O_NOFOLLOW` (where available) and `O_CLOEXEC`.
+fn open_nofollow(path: &Path) -> io::Result<std::fs::File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(OPEN_NOFOLLOW_CLOEXEC);
+    }
+    options.open(path)
 }
 
 /// The directory holding `path`, with `..` elements resolved against the current directory so
@@ -134,6 +228,74 @@ fn create_dir_private(directory: &Path) -> io::Result<()> {
     }
 }
 
+/// Refuse to write secrets into a directory that another local user can replace entries in.
+///
+/// `create_dir_all` follows an existing symlink; checking the leaf after creation closes that
+/// hole. An existing directory is accepted when it is a real directory and not group/world-
+/// writable (a common `0755` personal config directory is fine).
+fn check_private_directory(directory: &Path) -> io::Result<()> {
+    let metadata = std::fs::symlink_metadata(directory)?;
+    if metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "autosave directory is a symbolic link; refusing to write through it",
+        ));
+    }
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            "autosave parent is not a directory",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o022 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "autosave directory is group/world-writable; refusing to write secrets into it",
+            ));
+        }
+    }
+    check_owner(&metadata, "autosave directory")?;
+    Ok(())
+}
+
+/// `fsync` the directory entry after `rename` so the replacement survives a crash.
+#[cfg(unix)]
+fn sync_directory(directory: &Path) -> io::Result<()> {
+    std::fs::File::open(directory)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_directory: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+/// Require the autosave artifact to be owned by the current process.
+///
+/// On Linux `/proc/self` is owned by the process's UID, which gives the effective-UID check
+/// without a libc dependency. On platforms without that probe the ownership check is skipped
+/// rather than guessed; the symlink/regular-file/mode checks still apply.
+#[cfg(target_os = "linux")]
+fn check_owner(metadata: &std::fs::Metadata, what: &str) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    if let Ok(process) = std::fs::metadata("/proc/self") {
+        if metadata.uid() != process.uid() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{what} is owned by another user; refusing to use it"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn check_owner(_metadata: &std::fs::Metadata, _what: &str) -> io::Result<()> {
+    Ok(())
+}
+
 /// A unique temporary-file path in the same directory as `path`, named after it but clearly
 /// temporary (`<name>.tmp.<pid>.<counter>`). `create_new` in [`write_temp`] guarantees no other
 /// writer can collide with it.
@@ -159,8 +321,16 @@ fn write_temp(temp_path: &Path, bytes: &[u8]) -> io::Result<()> {
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
+        options.custom_flags(OPEN_NOFOLLOW_CLOEXEC);
     }
     let mut file = options.open(temp_path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "autosave temporary path is not a regular file",
+        ));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -401,5 +571,95 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp."))
             .collect();
         assert!(stray.is_empty(), "temp files left behind: {stray:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_autosave_refuses_symlinks() {
+        let dir = TestDir::new("symlink");
+        let target = dir.path().join("target.json");
+        std::fs::write(&target, b"{}").expect("write target");
+        let link = dir.path().join("autosave.json");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        let error = load_autosave(&link).expect_err("symlink must be refused");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+        assert!(error.to_string().contains("symbolic link"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_autosave_refuses_group_or_world_writable_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TestDir::new("writable");
+        let path = dir.path().join("autosave.json");
+        std::fs::write(&path, b"{}").expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).expect("chmod");
+
+        let error = load_autosave(&path).expect_err("writable file must be refused");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+    }
+
+    #[test]
+    fn load_autosave_refuses_oversized_files() {
+        let dir = TestDir::new("oversized");
+        let path = dir.path().join("autosave.json");
+        let file = std::fs::File::create(&path).expect("create");
+        file.set_len(MAX_AUTOSAVE_BYTES + 1).expect("set_len");
+
+        let error = load_autosave(&path).expect_err("oversized file must be refused");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+        assert!(error.to_string().contains("larger than"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn autosave_refuses_group_or_world_writable_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TestDir::new("insecure-dir");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777))
+            .expect("chmod");
+
+        let error = autosave(b"{}", &dir.path().join("autosave.json"))
+            .expect_err("insecure directory must be refused");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        assert!(
+            !dir.path().join("autosave.json").exists(),
+            "no autosave may be written into an insecure directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn autosave_refuses_a_symlinked_directory() {
+        let dir = TestDir::new("symlink-dir");
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).expect("create real");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        let error = autosave(b"{}", &link.join("autosave.json"))
+            .expect_err("symlinked directory must be refused");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn load_autosave_refuses_a_file_owned_by_another_user() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TestDir::new("foreign-owner");
+        let path = dir.path().join("autosave.json");
+        std::fs::write(&path, b"{}").expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        // The ownership boundary only exists when running as root; unprivileged CI skips it.
+        if std::os::unix::fs::chown(&path, Some(65534), Some(65534)).is_err() {
+            return;
+        }
+
+        let error = load_autosave(&path).expect_err("foreign-owned file must be refused");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
     }
 }
