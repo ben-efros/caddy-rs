@@ -1203,6 +1203,32 @@ EVdZ8IcAQzAPk1jBxj0YDC0rR5d09Q==
     }
 
     #[test]
+    fn flags_subject_alt_name_entries_that_are_not_dns_or_ip() {
+        // GeneralName email [1] is not an ACME identifier; the parser must flag it so finalize
+        // rejects the CSR instead of silently issuing without the requested name.
+        let san = der_sequence(&[
+            der_tlv(0x81, b"user@example.com"),
+            der_tlv(0x82, b"example.com"),
+        ]);
+        let mut names = Vec::new();
+        let mut unsupported = false;
+        parse_subject_alt_name(&san, &mut names, &mut unsupported).expect("SAN parses");
+        assert_eq!(names, vec!["example.com".to_string()]);
+        assert!(unsupported, "email SAN must be flagged as unsupported");
+
+        let mut names = Vec::new();
+        let mut unsupported = false;
+        parse_subject_alt_name(
+            &der_sequence(&[der_tlv(0x82, b"example.com")]),
+            &mut names,
+            &mut unsupported,
+        )
+        .expect("DNS-only SAN parses");
+        assert_eq!(names, vec!["example.com".to_string()]);
+        assert!(!unsupported);
+    }
+
+    #[test]
     fn rejects_empty_and_duplicate_domains() {
         let error = CertificateRequest::generate(&[]).unwrap_err();
         assert!(error.to_string().contains("at least one domain"), "{error}");

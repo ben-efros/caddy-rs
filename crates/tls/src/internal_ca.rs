@@ -267,8 +267,10 @@ pub struct CaCertificates {
 pub struct SignedExternalCertificate {
     /// DER-encoded leaf certificate.
     pub leaf_der: Vec<u8>,
-    /// DER-encoded issuer chain in leaf-to-trust-anchor order (`[intermediate, root]`, or `[root]`
-    /// when signing with the root), matching Caddy's ACME certificate chain.
+    /// DER-encoded issuer chain in leaf-to-trust-anchor order, matching Caddy's ACME certificate
+    /// response: `[intermediate]` for the default issuer and `[root]` with `sign_with_root`. Caddy
+    /// (smallstep) omits the root when the intermediate signs, because the ACME client already
+    /// trusts the root.
     pub chain_der: Vec<Vec<u8>>,
     /// Leaf validity start.
     pub not_before: SystemTime,
@@ -502,8 +504,8 @@ impl InternalIssuer {
     ///
     /// `sign_with_root` mirrors Caddy's `sign_with_root` option (the root certificate is the issuer
     /// instead of the intermediate). The returned `chain_der` is the issuer chain in
-    /// leaf-to-trust-anchor order (`[intermediate, root]`, or `[root]` when signing with the
-    /// root), matching the chain Caddy's ACME server returns.
+    /// leaf-to-trust-anchor order: `[intermediate]` for the default case and `[root]` with
+    /// `sign_with_root`, exactly the two-certificate chain Caddy's ACME server returns.
     pub async fn sign_external_spki_with(
         &self,
         spki_der: &[u8],
@@ -552,10 +554,7 @@ impl InternalIssuer {
         let chain_der = if sign_with_root {
             vec![ca.root_certificate_der.clone()]
         } else {
-            vec![
-                ca.intermediate_certificate_der.clone(),
-                ca.root_certificate_der.clone(),
-            ]
+            vec![ca.intermediate_certificate_der.clone()]
         };
         Ok(SignedExternalCertificate {
             leaf_der: der,
@@ -2554,11 +2553,8 @@ mod tests {
             .expect("intermediate signing");
         assert_eq!(
             signed.chain_der,
-            vec![
-                ca.intermediate_certificate_der().to_vec(),
-                ca.root_certificate_der().to_vec()
-            ],
-            "the ACME chain must include the intermediate and the root, like Caddy"
+            vec![ca.intermediate_certificate_der().to_vec()],
+            "the default ACME chain is leaf + intermediate; the root is the client trust anchor"
         );
         let leaf = parse_certificate(&signed.leaf_der).unwrap();
         assert_eq!(
