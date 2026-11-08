@@ -62,6 +62,7 @@
 use std::error::Error as StdError;
 use std::fmt;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
@@ -69,6 +70,8 @@ use http::{HeaderMap, StatusCode};
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use http_body_util::BodyExt;
 use tokio::sync::mpsc;
+
+use caddy_rs_admin::access_log::BodyBytes;
 
 use crate::types::Response;
 
@@ -156,12 +159,68 @@ enum Inner {
     Boxed(BoxedBody),
 }
 
+/// How an observed response body finished.
+///
+/// The server attaches a [`ResponseBodyObserver`] to the final response body so it can emit the
+/// access entry (and finish the request clock) when the *body* is done, not when the headers are
+/// ready. Hyper owns the body after the service returns, so the completion callback is the only
+/// reliable body-end signal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BodyCompletion {
+    /// Total data bytes polled from the body (what was handed to the transport).
+    pub bytes: u64,
+    /// Exact body length the body advertised, when it did (buffered bodies and fixed-length
+    /// streams). Used to distinguish "all advertised bytes were written" from an aborted write.
+    pub expected: Option<u64>,
+    /// Whether the transport polled at least one frame.
+    pub polled: bool,
+    /// Why the body stopped.
+    pub status: BodyStatus,
+}
+
+/// Why an observed response body stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BodyStatus {
+    /// The body signalled end of stream.
+    Ended,
+    /// The body yielded an error (an upstream read failure or an aborted write through the body).
+    Failed(String),
+    /// The body was dropped before it signalled end of stream (for example the client went away,
+    /// or the transport never polls a body it is not going to send, like `HEAD`/`204`).
+    Dropped,
+}
+
+/// Receives the one-shot completion of an observed response body.
+///
+/// See [`Body::observe`]. The callback runs synchronously when the body ends, fails or is dropped;
+/// implementations must be cheap and must never panic.
+pub trait ResponseBodyObserver: Send + Sync {
+    /// Called exactly once per observed body.
+    fn complete(&self, completion: BodyCompletion);
+}
+
+/// Bookkeeping for one observed body; dropped together with the body.
+struct BodyObservation {
+    observer: Arc<dyn ResponseBodyObserver>,
+    expected: Option<u64>,
+    bytes: u64,
+    polled: bool,
+}
+
 /// A streaming body: an ordered sequence of data frames, optional trailers, then end-of-stream.
 ///
 /// `StreamingBody` implements [`http_body::Body`] with `Data = Bytes` and [`BodyError`] as the
 /// error type, so it can be handed to hyper (server or client) without an adapter.
+///
+/// A body may additionally carry a [`BodyBytes`] counter (used to report Caddy's actual
+/// `bytes_read` for streamed request bodies) and a [`ResponseBodyObserver`] (used by the server to
+/// emit the access entry at body end). Both are optional and transparent to the transport.
 pub struct StreamingBody {
     inner: Inner,
+    /// Shared actual-byte counter, when the caller wants streamed bytes reported.
+    counter: Option<BodyBytes>,
+    /// One-shot end-of-body callback, when the body is observed.
+    observation: Option<BodyObservation>,
 }
 
 impl fmt::Debug for StreamingBody {
@@ -185,6 +244,8 @@ impl StreamingBody {
     pub fn from_bytes(bytes: impl Into<Bytes>) -> Self {
         Self {
             inner: Inner::Bytes(Some(bytes.into())),
+            counter: None,
+            observation: None,
         }
     }
 
@@ -194,6 +255,8 @@ impl StreamingBody {
     pub fn from_chunks(receiver: mpsc::Receiver<Result<Bytes, BodyError>>) -> Self {
         Self {
             inner: Inner::Boxed(Box::pin(ChunkReceiver { receiver })),
+            counter: None,
+            observation: None,
         }
     }
 
@@ -201,6 +264,8 @@ impl StreamingBody {
     pub fn from_frames(receiver: mpsc::Receiver<Result<Frame<Bytes>, BodyError>>) -> Self {
         Self {
             inner: Inner::Boxed(Box::pin(FrameReceiver { receiver })),
+            counter: None,
+            observation: None,
         }
     }
 
@@ -216,6 +281,8 @@ impl StreamingBody {
         let mapped = body.map_err(BodyError::upstream);
         Self {
             inner: Inner::Boxed(Box::pin(mapped)),
+            counter: None,
+            observation: None,
         }
     }
 
@@ -227,6 +294,76 @@ impl StreamingBody {
     /// Size hint of the body (`Bytes` bodies are exact; streams are usually unknown).
     pub fn size_hint(&self) -> SizeHint {
         HttpBody::size_hint(self)
+    }
+
+    /// Count every data byte polled from this body into `counter`.
+    ///
+    /// The server attaches the per-request [`BodyBytes`] handle to streamed request bodies so the
+    /// access entry reports Caddy's actual `bytes_read` rather than the declared
+    /// `Content-Length`.
+    pub fn with_counter(mut self, counter: BodyBytes) -> Self {
+        self.counter = Some(counter);
+        self
+    }
+
+    /// Notify `observer` exactly once when this body ends, fails, or is dropped.
+    ///
+    /// The exact length advertised by the body (if any) is captured now, before any frame is
+    /// polled, so a completion can distinguish all-advertised-bytes-written from an aborted write.
+    pub fn with_observer(mut self, observer: Arc<dyn ResponseBodyObserver>) -> Self {
+        let expected = self.size_hint().exact();
+        self.observation = Some(BodyObservation {
+            observer,
+            expected,
+            bytes: 0,
+            polled: false,
+        });
+        self
+    }
+
+    /// Complete the observation, if there is one, with `status`.
+    fn finish_observation(&mut self, status: BodyStatus) {
+        if let Some(observation) = self.observation.take() {
+            observation.observer.complete(BodyCompletion {
+                bytes: observation.bytes,
+                expected: observation.expected,
+                polled: observation.polled,
+                status,
+            });
+        }
+    }
+
+    /// Account for one polled frame and complete the observation when the frame ends the body.
+    fn record_poll(&mut self, poll: &Poll<Option<Result<Frame<Bytes>, BodyError>>>) {
+        match poll {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(observation) = self.observation.as_mut() {
+                    observation.polled = true;
+                }
+                if let Some(data) = frame.data_ref() {
+                    let bytes = data.len() as u64;
+                    if let Some(counter) = &self.counter {
+                        counter.add(bytes);
+                    }
+                    if let Some(observation) = self.observation.as_mut() {
+                        observation.bytes = observation.bytes.saturating_add(bytes);
+                    }
+                }
+            }
+            Poll::Ready(Some(Err(error))) => {
+                if let Some(observation) = self.observation.as_mut() {
+                    observation.polled = true;
+                }
+                self.finish_observation(BodyStatus::Failed(error.to_string()));
+            }
+            Poll::Ready(None) => {
+                if let Some(observation) = self.observation.as_mut() {
+                    observation.polled = true;
+                }
+                self.finish_observation(BodyStatus::Ended);
+            }
+            Poll::Pending => {}
+        }
     }
 
     /// Collect the whole body into bytes (buffered compatibility path).
@@ -244,14 +381,17 @@ impl HttpBody for StreamingBody {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
-        match &mut self.get_mut().inner {
+        let this = self.get_mut();
+        let poll = match &mut this.inner {
             Inner::Bytes(slot) => match slot.take() {
                 Some(bytes) if bytes.is_empty() => Poll::Ready(None),
                 Some(bytes) => Poll::Ready(Some(Ok(Frame::data(bytes)))),
                 None => Poll::Ready(None),
             },
             Inner::Boxed(body) => body.as_mut().poll_frame(cx),
-        }
+        };
+        this.record_poll(&poll);
+        poll
     }
 
     fn is_end_stream(&self) -> bool {
@@ -269,6 +409,15 @@ impl HttpBody for StreamingBody {
             }
             Inner::Boxed(body) => body.size_hint(),
         }
+    }
+}
+
+impl Drop for StreamingBody {
+    fn drop(&mut self) {
+        // A body dropped before its end-of-stream frame was polled (client disconnect, transport
+        // skipping a body it must not send, or a mid-stream error) still completes the
+        // observation. Exactly-once is guaranteed by taking the observation.
+        self.finish_observation(BodyStatus::Dropped);
     }
 }
 
@@ -302,6 +451,21 @@ impl Body {
     /// A streaming body.
     pub fn from_stream(stream: StreamingBody) -> Self {
         Body::Stream(stream)
+    }
+
+    /// Notify `observer` exactly once when this body ends, fails, or is dropped.
+    ///
+    /// The server attaches the per-request access-log observation here so the entry is rendered
+    /// after the response body has been handed to the transport (Caddy's time-to-last-byte
+    /// `duration` and actual `size`), not when the handler returns headers. Buffered bodies become
+    /// a one-frame streaming body; their exact size is preserved for framing.
+    pub fn observe(self, observer: Arc<dyn ResponseBodyObserver>) -> Self {
+        match self {
+            Body::Bytes(bytes) => {
+                Body::Stream(StreamingBody::from_bytes(bytes).with_observer(observer))
+            }
+            Body::Stream(stream) => Body::Stream(stream.with_observer(observer)),
+        }
     }
 
     /// Whether this body streams (chunked) instead of being fully buffered.
@@ -1034,5 +1198,130 @@ mod tests {
             Bytes::new()
         );
         assert_eq!(collected.to_bytes(), Bytes::from_static(b"data"));
+    }
+}
+
+#[cfg(test)]
+mod access_log_observation_tests {
+    use super::*;
+    use http_body_util::BodyExt;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct RecordingObserver {
+        completions: Mutex<Vec<BodyCompletion>>,
+    }
+
+    impl RecordingObserver {
+        fn take(&self) -> Vec<BodyCompletion> {
+            std::mem::take(
+                &mut *self
+                    .completions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            )
+        }
+    }
+
+    impl ResponseBodyObserver for RecordingObserver {
+        fn complete(&self, completion: BodyCompletion) {
+            self.completions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(completion);
+        }
+    }
+
+    #[tokio::test]
+    async fn observed_body_reports_actual_bytes_at_end() {
+        let observer = Arc::new(RecordingObserver::default());
+        let mut body = Body::from_bytes(Bytes::from_static(b"hello")).observe(observer.clone());
+
+        let frame = body.frame().await.expect("frame").expect("data frame");
+        assert_eq!(
+            frame.into_data().expect("data"),
+            Bytes::from_static(b"hello")
+        );
+        assert!(body.frame().await.is_none());
+
+        let completions = observer.take();
+        assert_eq!(completions.len(), 1, "completion runs exactly once");
+        assert_eq!(completions[0].bytes, 5);
+        assert_eq!(completions[0].expected, Some(5));
+        assert!(completions[0].polled);
+        assert_eq!(completions[0].status, BodyStatus::Ended);
+    }
+
+    #[tokio::test]
+    async fn dropped_observed_body_reports_partial_progress() {
+        let observer = Arc::new(RecordingObserver::default());
+        let mut body = Body::from_bytes(Bytes::from_static(b"hello")).observe(observer.clone());
+        let frame = body.frame().await.expect("frame").expect("data frame");
+        assert_eq!(frame.into_data().expect("data").len(), 5);
+        drop(body);
+
+        let completions = observer.take();
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].bytes, 5);
+        assert_eq!(completions[0].expected, Some(5));
+        assert!(completions[0].polled);
+        assert_eq!(completions[0].status, BodyStatus::Dropped);
+    }
+
+    #[tokio::test]
+    async fn observed_body_error_reports_failure_with_partial_bytes() {
+        let observer = Arc::new(RecordingObserver::default());
+        let (sender, receiver) = mpsc::channel(4);
+        sender
+            .send(Ok(Bytes::from_static(b"part")))
+            .await
+            .expect("first chunk");
+        sender
+            .send(Err(BodyError::Cancelled))
+            .await
+            .expect("error chunk");
+        drop(sender);
+        let mut body =
+            Body::from_stream(StreamingBody::from_chunks(receiver)).observe(observer.clone());
+
+        let frame = body.frame().await.expect("frame").expect("data frame");
+        assert_eq!(
+            frame.into_data().expect("data"),
+            Bytes::from_static(b"part")
+        );
+        assert!(body.frame().await.expect("error frame").is_err());
+
+        let completions = observer.take();
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].bytes, 4);
+        assert_eq!(
+            completions[0].status,
+            BodyStatus::Failed("body stream was cancelled".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_body_counter_tracks_actual_bytes_read() {
+        let counter = BodyBytes::new();
+        let (sender, receiver) = mpsc::channel(4);
+        sender
+            .send(Ok(Bytes::from_static(b"abc")))
+            .await
+            .expect("first chunk");
+        sender
+            .send(Ok(Bytes::from_static(b"de")))
+            .await
+            .expect("second chunk");
+        drop(sender);
+        let mut body = RequestBody::streaming(
+            StreamingBody::from_chunks(receiver).with_counter(counter.clone()),
+        );
+
+        let mut total = 0_usize;
+        while let Some(frame) = body.next_frame().await {
+            total += frame.expect("frame").into_data().expect("data").len();
+        }
+        assert_eq!(total, 5);
+        assert_eq!(counter.get(), 5, "counter reports actual bytes, not a hint");
     }
 }

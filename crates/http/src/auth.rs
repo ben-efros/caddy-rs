@@ -75,7 +75,9 @@
 //!
 //! On success the handler sets the request variable `http.auth.user.id` (exposed as the
 //! `{http.auth.user.id}` placeholder, matching Caddy) and continues; on failure it responds `401`
-//! with `WWW-Authenticate: Basic realm="..."`.
+//! with `WWW-Authenticate: Basic realm="..."`. When the server enabled access logging, the same
+//! username is published into the per-request `AccessLogContext` so the access entry carries
+//! Caddy's `user_id` (Caddy reads `http.auth.user.id` at log time, `server.go:1289-1290`).
 
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
@@ -1239,6 +1241,7 @@ impl Handler for BasicAuthHandler {
 
         // Same placeholder Caddy sets after successful authentication, so later handlers
         // (`headers`, `reverse_proxy` header_up, logs) can forward the identity.
+        request.record_access_log_user_id(username.clone());
         request
             .vars
             .insert("http.auth.user.id".to_string(), username);
@@ -1675,6 +1678,8 @@ mod tests {
 
         // Wrong password -> 401.
         let mut request = base_request();
+        let failed_context = Arc::new(caddy_rs_admin::access_log::AccessLogContext::new());
+        request = request.with_access_log(Arc::clone(&failed_context));
         request
             .headers
             .insert(header::AUTHORIZATION, authorization("alice", "wrong"));
@@ -1682,6 +1687,11 @@ mod tests {
             panic!("expected challenge");
         };
         assert_eq!(response.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            failed_context.user_id(),
+            None,
+            "a rejected credential must not publish a user id"
+        );
 
         // Unknown user -> 401.
         let mut request = base_request();
@@ -1695,6 +1705,8 @@ mod tests {
 
         // Correct credentials -> continue with the Caddy identity placeholder variable set.
         let mut request = base_request();
+        let access_log_context = Arc::new(caddy_rs_admin::access_log::AccessLogContext::new());
+        request = request.with_access_log(Arc::clone(&access_log_context));
         request
             .headers
             .insert(header::AUTHORIZATION, authorization("alice", "s3cret"));
@@ -1708,6 +1720,11 @@ mod tests {
         assert_eq!(
             request.get_placeholder("http.auth.user.id").as_deref(),
             Some("alice")
+        );
+        assert_eq!(
+            access_log_context.user_id().as_deref(),
+            Some("alice"),
+            "the access entry must carry the authenticated user"
         );
     }
 

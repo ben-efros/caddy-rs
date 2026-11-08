@@ -232,6 +232,7 @@ dependencies = [
  "async-trait",
  "bcrypt",
  "bytes",
+ "caddy-rs-admin",
  "caddy-rs-config",
  "caddy-rs-core",
  "flate2",

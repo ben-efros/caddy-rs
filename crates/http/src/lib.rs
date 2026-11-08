@@ -24,7 +24,10 @@ pub mod types;
 pub mod upgrade;
 
 pub use auth::{BasicAuthHandler, ForwardAuthHandler};
-pub use body::{Body, BodyError, RequestBody, ResponseBody, StreamingBody, StreamingResponse};
+pub use body::{
+    Body, BodyCompletion, BodyError, BodyStatus, RequestBody, ResponseBody, ResponseBodyObserver,
+    StreamingBody, StreamingResponse,
+};
 #[cfg(feature = "compression")]
 pub use encode::EncodeHandler;
 pub use handlers::{
@@ -37,9 +40,9 @@ pub use router::{CustomHandlerFactory, Route, Router, RouterBuilder};
 #[cfg(feature = "templates")]
 pub use templates::TemplatesHandler;
 pub use types::{
-    cipher_suite_name, ClientCertificate, Error, Handler, Matcher, MatcherError, Outcome, Request,
-    Response, ResponseOutcome, Result, SharedHandler, SharedMatcher, StreamingOutcome,
-    TlsConnection, TlsVersion,
+    cipher_suite_name, AccessLogContext, AccessLogUpstream, BodyBytes, ClientCertificate, Error,
+    Handler, Matcher, MatcherError, Outcome, Request, Response, ResponseOutcome, Result,
+    SharedHandler, SharedMatcher, StreamingOutcome, TlsConnection, TlsVersion,
 };
 pub use upgrade::{
     h2c_upgrade_headers, h2c_upgrade_settings, is_h2c_upgrade, requested_upgrade_type,
