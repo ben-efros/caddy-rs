@@ -829,7 +829,7 @@ async fn serve_h3_connection(
                             true,
                             Some("h3"),
                             Arc::clone(&context.trusted_proxies),
-                            None,
+                            h3_client_certificate(&connection, context.client_auth_verified),
                             request_tls_connection(Some(&tls_info)),
                         )
                         .await;
@@ -927,7 +927,18 @@ fn client_certificate_for_request(
     verified: bool,
 ) -> Option<caddy_rs_http::ClientCertificate> {
     let der = connection.peer_certificates()?.first()?;
-    let info = caddy_rs_tls::ClientCertificateInfo::parse(der.as_ref(), verified).ok()?;
+    client_certificate_from_der(der.as_ref(), verified)
+}
+
+/// Build the placeholder representation from a DER-encoded leaf certificate.
+///
+/// Shared by the TCP and QUIC paths: rustls exposes the chain for a TCP listener and quinn's
+/// `peer_identity` exposes it for a QUIC connection; both end up here.
+fn client_certificate_from_der(
+    der: &[u8],
+    verified: bool,
+) -> Option<caddy_rs_http::ClientCertificate> {
+    let info = caddy_rs_tls::ClientCertificateInfo::parse(der, verified).ok()?;
     let certificate_pem = info.certificate_pem();
     let certificate_der_base64 = info.certificate_der_base64();
     Some(caddy_rs_http::ClientCertificate {
@@ -945,6 +956,23 @@ fn client_certificate_for_request(
         uris: info.uris,
         verified: info.verified,
     })
+}
+
+/// Client certificate presented on an HTTP/3 connection.
+///
+/// quinn exposes the verified peer chain through `peer_identity` as rustls `CertificateDer`
+/// values, so HTTP/3 client authentication reaches the same placeholders as a TCP listener
+/// (Caddy reads the certificate from TLS state regardless of transport).
+#[cfg(feature = "http3")]
+fn h3_client_certificate(
+    connection: &quinn::Connection,
+    verified: bool,
+) -> Option<caddy_rs_http::ClientCertificate> {
+    let identity = connection.peer_identity()?;
+    let chain = identity
+        .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+        .ok()?;
+    client_certificate_from_der(chain.first()?.as_ref(), verified)
 }
 
 #[cfg(feature = "http3")]
@@ -2200,4 +2228,31 @@ pub(crate) async fn bind_admin(configured: &str, api: AdminApi) -> Result<Listen
         bound: socket_addr.to_string(),
         socket_addr: Some(socket_addr),
     })
+}
+
+#[cfg(test)]
+mod client_certificate_tests {
+    use super::client_certificate_from_der;
+
+    const CLIENT_PEM: &str = include_str!("../../tls/testdata/client-auth/client.pem");
+
+    /// The QUIC path shares this conversion with the TCP path, so proving it here proves the
+    /// HTTP/3 placeholders carry the same data (DIV-0004 residual, T-HTTP-048).
+    #[test]
+    fn derives_placeholders_from_a_presented_leaf_certificate() {
+        let chain =
+            caddy_rs_tls::tls_server::certificates_from_pem(CLIENT_PEM).expect("client PEM");
+        let leaf = chain.first().expect("leaf certificate");
+        let certificate = client_certificate_from_der(leaf, true).expect("derived certificate");
+        assert!(!certificate.subject.is_empty(), "subject must be populated");
+        assert!(certificate.verified, "verification flag must be carried");
+        assert!(!certificate.certificate_pem.is_empty());
+        assert!(!certificate.fingerprint.is_empty());
+
+        let unverified = client_certificate_from_der(leaf, false).expect("derived certificate");
+        assert!(
+            !unverified.verified,
+            "an unverified listener must not claim verification"
+        );
+    }
 }
