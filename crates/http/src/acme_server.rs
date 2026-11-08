@@ -24,6 +24,14 @@
 //! ID (`local` by default), so the default directory URL is
 //! `https://<host>/acme/local/directory` exactly like Caddy.
 //!
+//! `X-Forwarded-Proto` and `X-Forwarded-Host` are honoured as a caddy-rs extension for a
+//! TLS-terminating reverse proxy: when the server's trusted-proxy policy marks the peer trusted
+//! (`trusted_proxy` request variable), the client-facing scheme and host replace the listener's
+//! connection scheme and request `Host`. They affect URL construction only (the JWS `url` binding
+//! uses the same origin); routing, certificate identifiers and the `http-01` fetch target never
+//! read them. Without a trusted peer the headers are validated but ignored, so a direct client
+//! cannot spoof the external origin.
+//!
 //! Security-relevant properties:
 //!
 //! * flattened JWS only (RS256/ES256), with the unprotected header forbidden, the `nonce`
@@ -99,6 +107,14 @@ const MAX_JWS_BODY: usize = 64 * 1024;
 const MAX_CHALLENGE_BODY: usize = 8 * 1024;
 /// Timeout for one http-01 validation GET.
 const HTTP01_TIMEOUT: Duration = Duration::from_secs(10);
+/// Maximum accepted length of an external host authority (`host` or `host:port`).
+const MAX_EXTERNAL_HOST_LEN: usize = 512;
+/// Header carrying the scheme through which the client reached the reverse proxy.
+const FORWARDED_PROTO_HEADER: &str = "x-forwarded-proto";
+/// Header carrying the host through which the client reached the reverse proxy.
+const FORWARDED_HOST_HEADER: &str = "x-forwarded-host";
+/// Request variable the server runtime sets from `apps.http.servers.<name>.trusted_proxies`.
+const TRUSTED_PROXY_VAR: &str = "trusted_proxy";
 
 /// ACME order lifetime (smallstep's `defaultOrderExpiry`).
 const ORDER_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
@@ -1328,6 +1344,167 @@ impl std::fmt::Debug for AcmeServerHandler {
     }
 }
 
+/// External origin (`scheme://host`) advertised in the URLs for one request.
+struct ExternalOrigin {
+    scheme: &'static str,
+    host: String,
+}
+
+/// Read one forwarded header, rejecting duplicate field lines.
+///
+/// A duplicated `X-Forwarded-*` header has no safe "first value" interpretation (a proxy may
+/// append while a client prepends), so it is a malformed request rather than a guess.
+fn forwarded_header(
+    request: &Request,
+    name: &'static str,
+) -> std::result::Result<Option<String>, Problem> {
+    let header_name = HeaderName::from_static(name);
+    let mut values = request.headers.get_all(&header_name).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(Problem::malformed(format!(
+            "multiple `{name}` headers are not allowed; refusing to guess the external URL"
+        )));
+    }
+    let value = value.to_str().map_err(|_| {
+        Problem::malformed(format!(
+            "`{name}` is not valid visible ASCII; refusing to construct an external URL from it"
+        ))
+    })?;
+    Ok(Some(value.to_string()))
+}
+
+/// Parse `X-Forwarded-Proto`: exactly `http` or `https`, case-insensitively and with surrounding
+/// ASCII whitespace ignored. Lists (`https,http`) and every other scheme are malformed.
+fn parse_forwarded_scheme(raw: &str) -> std::result::Result<&'static str, Problem> {
+    let scheme = raw.trim_matches(|character: char| character.is_ascii_whitespace());
+    if scheme.eq_ignore_ascii_case("https") {
+        Ok("https")
+    } else if scheme.eq_ignore_ascii_case("http") {
+        Ok("http")
+    } else {
+        Err(Problem::malformed(
+            "`X-Forwarded-Proto` must be exactly `http` or `https`",
+        ))
+    }
+}
+
+/// Validate a `host` or `host:port` authority and return it unchanged.
+///
+/// This deliberately accepts a narrow grammar: ASCII letters, digits, `.`, `-`, `_`, and a single
+/// trailing numeric port; IPv6 literals only in brackets. Scheme separators, paths, queries,
+/// fragments, userinfo, whitespace, control bytes, commas/lists and percent-encoding are all
+/// rejected, so the value cannot smuggle a second authority or a URL component into the origin.
+fn parse_external_host(raw: &str, source: &str) -> std::result::Result<String, Problem> {
+    let invalid = |reason: &str| {
+        Problem::malformed(format!(
+            "`{source}` is not a valid host or host:port ({reason}); refusing to construct an \
+             external URL from it"
+        ))
+    };
+    if raw.is_empty() {
+        return Err(invalid("empty value"));
+    }
+    if raw.len() > MAX_EXTERNAL_HOST_LEN {
+        return Err(invalid("value is longer than the allowed maximum"));
+    }
+    if !raw.is_ascii() {
+        return Err(invalid("value is not ASCII"));
+    }
+    if raw
+        .bytes()
+        .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err(invalid("value contains whitespace or a control character"));
+    }
+
+    if let Some(rest) = raw.strip_prefix('[') {
+        let Some((address, after)) = rest.split_once(']') else {
+            return Err(invalid("unterminated IPv6 literal"));
+        };
+        if address.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err(invalid("invalid IPv6 literal"));
+        }
+        if after.is_empty() {
+            return Ok(raw.to_string());
+        }
+        let Some(port) = after.strip_prefix(':') else {
+            return Err(invalid("unexpected characters after the IPv6 literal"));
+        };
+        if !valid_port(port) {
+            return Err(invalid("port is not a decimal number in 0..=65535"));
+        }
+        return Ok(raw.to_string());
+    }
+    if raw.contains('[') || raw.contains(']') {
+        return Err(invalid("brackets are only allowed around an IPv6 literal"));
+    }
+
+    let mut parts = raw.split(':');
+    let host = parts.next().unwrap_or_default();
+    let port = parts.next();
+    if parts.next().is_some() {
+        return Err(invalid("IPv6 literals must be bracketed"));
+    }
+    if let Some(port) = port {
+        if !valid_port(port) {
+            return Err(invalid("port is not a decimal number in 0..=65535"));
+        }
+    }
+    if host.is_empty() {
+        return Err(invalid("empty host"));
+    }
+    if host.len() > 253 {
+        return Err(invalid("host is longer than 253 bytes"));
+    }
+    for label in host.split('.') {
+        if label.is_empty() {
+            return Err(invalid("empty host label"));
+        }
+        if label.len() > 63 {
+            return Err(invalid("host label is longer than 63 bytes"));
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(invalid("host label begins or ends with `-`"));
+        }
+        if !label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            return Err(invalid("host contains a character that is not allowed"));
+        }
+    }
+    Ok(raw.to_string())
+}
+
+/// Whether `port` is a non-empty decimal `u16`.
+fn valid_port(port: &str) -> bool {
+    !port.is_empty()
+        && port.bytes().all(|byte| byte.is_ascii_digit())
+        && port.parse::<u16>().is_ok()
+}
+
+/// Scheme of the connection that reached this handler (not the client-facing scheme).
+fn connection_scheme(request: &Request) -> &'static str {
+    if request.tls {
+        "https"
+    } else {
+        "http"
+    }
+}
+
+/// The request's own authority (`Host`, else the URI authority), validated like a forwarded host.
+fn request_authority(request: &Request) -> std::result::Result<String, Problem> {
+    let host = request.host().ok_or_else(|| {
+        Problem::malformed(
+            "request has no Host header or URI authority; cannot construct the external ACME URL",
+        )
+    })?;
+    parse_external_host(host, "Host")
+}
+
 impl AcmeServerHandler {
     /// Build the handler from its Caddy JSON, persisting CA material under `data_root`
     /// (`<data_root>/pki/authorities/<ca>/...`).
@@ -1373,39 +1550,88 @@ impl AcmeServerHandler {
         format!("{base}/directory")
     }
 
-    /// `https://<host>/<prefix>/<ca>` (Caddy always advertises `https` URLs).
-    fn base_url(&self, request: &Request) -> std::result::Result<String, Problem> {
-        let host = match &self.config.host {
-            Some(host) => host.clone(),
+    /// Resolve the external origin (`scheme` and `host`) for one request.
+    ///
+    /// Direct requests keep the historical behaviour: `https` plus the request `Host` (or the
+    /// configured `host`), byte-identical to the URLs this handler produced before forwarded
+    /// headers were honoured. `X-Forwarded-Proto` / `X-Forwarded-Host` are used only when the
+    /// server's trusted-proxy policy sets `trusted_proxy=true` for the peer (the same signal
+    /// `reverse_proxy` and `forward_auth` consume). Without that signal the headers are parsed and
+    /// validated (a malformed value is still a loud `malformed` problem) but never influence the
+    /// origin, so an arbitrary client cannot choose the external URL.
+    ///
+    /// Security note: a forwarded origin changes only the strings this handler advertises and
+    /// compares in the JWS protected `url` header. It does not affect routing, account or order
+    /// ownership, certificate identifiers, or the `http-01` fetch target (which is built from the
+    /// identifier alone). Because [`Self::request_url`] resolves the origin with this same
+    /// function, a trusted proxy that forwards a *client-supplied* `X-Forwarded-Host` makes the
+    /// binding self-consistent for that client: the client can sign the host it supplied, so the
+    /// binding still proves possession of the account key and knowledge of the endpoint path, but
+    /// it no longer proves the request was addressed to the proxy's canonical hostname. The trust
+    /// gate, not the JWS binding, is the security boundary for that property.
+    fn external_origin(&self, request: &Request) -> std::result::Result<ExternalOrigin, Problem> {
+        let forwarded_proto = forwarded_header(request, FORWARDED_PROTO_HEADER)?;
+        let forwarded_host = forwarded_header(request, FORWARDED_HOST_HEADER)?;
+        let forwarded_scheme = forwarded_proto
+            .as_deref()
+            .map(parse_forwarded_scheme)
+            .transpose()?;
+        let forwarded_host = forwarded_host
+            .as_deref()
+            .map(|host| parse_external_host(host, "X-Forwarded-Host"))
+            .transpose()?;
+
+        let trusted = request
+            .vars
+            .get(TRUSTED_PROXY_VAR)
+            .is_some_and(|value| value == "true");
+        let use_forwarded = trusted && (forwarded_scheme.is_some() || forwarded_host.is_some());
+        let scheme = if use_forwarded {
+            forwarded_scheme.unwrap_or_else(|| connection_scheme(request))
+        } else {
+            // The pre-T-TLS-086 direct path always advertised `https`, including on plain HTTP
+            // listeners; T-TLS-086 must not change those URLs.
+            "https"
+        };
+        let host = match (&self.config.host, use_forwarded, forwarded_host) {
+            // An operator-configured `host` is authoritative, as it was before this change.
+            (Some(configured), _, _) => configured.clone(),
+            (None, true, Some(forwarded_host)) => forwarded_host,
             // HTTP/2 carries the authority on the URI, not always as a `Host` header; `host()`
             // checks both, like Caddy's `r.Host`.
-            None => request
-                .host()
-                .map(str::to_string)
-                .ok_or_else(|| {
-                    Problem::malformed(
-                        "request has no Host header or URI authority; cannot construct ACME resource URLs",
-                    )
-                })?,
+            _ => request_authority(request)?,
         };
+        Ok(ExternalOrigin { scheme, host })
+    }
+
+    /// `<scheme>://<host>/<prefix>/<ca>`, using the external origin for this request.
+    fn base_url(&self, request: &Request) -> std::result::Result<String, Problem> {
+        let origin = self.external_origin(request)?;
         let prefix = self.config.path_prefix.trim_matches('/');
         let base = if prefix.is_empty() {
-            format!("https://{host}/{}", self.config.ca)
+            format!("{}://{}/{}", origin.scheme, origin.host, self.config.ca)
         } else {
-            format!("https://{host}/{prefix}/{}", self.config.ca)
+            format!(
+                "{}://{}/{prefix}/{}",
+                origin.scheme, origin.host, self.config.ca
+            )
         };
         Ok(base)
     }
 
-    /// URL the JWS protected `url` header must equal (Caddy builds it with `https` and the Host
-    /// header, ignoring the query string).
+    /// URL the JWS protected `url` header must equal.
+    ///
+    /// Built from the same external origin as [`Self::base_url`] (ignoring the query string), so
+    /// forwarding `X-Forwarded-Proto` / `X-Forwarded-Host` changes what the client must sign
+    /// rather than letting it bypass the binding check.
     fn request_url(&self, request: &Request) -> std::result::Result<String, Problem> {
-        let host = request.host().map(str::to_string).ok_or_else(|| {
-            Problem::malformed(
-                "request has no Host header or URI authority; cannot validate the JWS url",
-            )
-        })?;
-        Ok(format!("https://{host}{}", request.uri.path()))
+        let origin = self.external_origin(request)?;
+        Ok(format!(
+            "{}://{}{}",
+            origin.scheme,
+            origin.host,
+            request.uri.path()
+        ))
     }
 
     async fn serve(&self, request: &Request) -> Response {
@@ -3372,6 +3598,44 @@ mod tests {
         send(handler, request(Method::GET, path)).await
     }
 
+    /// Build a request with an explicit `Host` and optional forwarded headers.
+    fn forwarded_request(
+        method: Method,
+        path: &str,
+        host: &str,
+        forwarded_proto: Option<&str>,
+        forwarded_host: Option<&str>,
+        trusted: bool,
+    ) -> Request {
+        let mut request = request(method, path);
+        request.headers.insert(
+            header::HOST,
+            host.parse::<HeaderValue>().expect("Host header value"),
+        );
+        if let Some(value) = forwarded_proto {
+            request.headers.insert(
+                HeaderName::from_static(FORWARDED_PROTO_HEADER),
+                value
+                    .parse::<HeaderValue>()
+                    .expect("X-Forwarded-Proto value"),
+            );
+        }
+        if let Some(value) = forwarded_host {
+            request.headers.insert(
+                HeaderName::from_static(FORWARDED_HOST_HEADER),
+                value
+                    .parse::<HeaderValue>()
+                    .expect("X-Forwarded-Host value"),
+            );
+        }
+        if trusted {
+            request
+                .vars
+                .insert(TRUSTED_PROXY_VAR.to_string(), "true".to_string());
+        }
+        request
+    }
+
     fn header_value(response: &Response, name: HeaderName) -> Option<String> {
         response
             .headers
@@ -3394,9 +3658,15 @@ mod tests {
     }
 
     fn path_of(url: &str) -> String {
-        url.strip_prefix("https://acme.test")
-            .unwrap_or_else(|| panic!("unexpected URL {url}"))
-            .to_string()
+        let Some((_scheme, rest)) = url.split_once("://") else {
+            panic!("unexpected URL {url}");
+        };
+        let Some(index) = rest.find('/') else {
+            panic!("unexpected URL {url}");
+        };
+        let path = &rest[index..];
+        assert!(path.starts_with("/acme/local"), "unexpected ACME URL {url}");
+        path.to_string()
     }
 
     struct TestClient<'a> {
@@ -3404,6 +3674,13 @@ mod tests {
         key: AccountKey,
         kid: Option<String>,
         nonce: Option<String>,
+        /// Origin the client was advertised and signs for.
+        base: String,
+        /// Host the client actually connects to (the listener behind a proxy).
+        request_host: String,
+        forwarded_proto: Option<String>,
+        forwarded_host: Option<String>,
+        trusted: bool,
     }
 
     impl<'a> TestClient<'a> {
@@ -3413,6 +3690,11 @@ mod tests {
                 key: AccountKey::generate().expect("account key"),
                 kid: None,
                 nonce: None,
+                base: "https://acme.test".to_string(),
+                request_host: "acme.test".to_string(),
+                forwarded_proto: None,
+                forwarded_host: None,
+                trusted: false,
             };
             client.refresh_nonce().await;
             client
@@ -3424,13 +3706,60 @@ mod tests {
                 key,
                 kid: None,
                 nonce: None,
+                base: "https://acme.test".to_string(),
+                request_host: "acme.test".to_string(),
+                forwarded_proto: None,
+                forwarded_host: None,
+                trusted: false,
             };
             client.refresh_nonce().await;
             client
         }
 
+        /// Make the client sign the given external origin while connecting to `request_host`.
+        fn with_forwarded_origin(
+            mut self,
+            base: &str,
+            request_host: &str,
+            forwarded_proto: &str,
+            forwarded_host: &str,
+        ) -> Self {
+            self.base = base.to_string();
+            self.request_host = request_host.to_string();
+            self.forwarded_proto = Some(forwarded_proto.to_string());
+            self.forwarded_host = Some(forwarded_host.to_string());
+            self.trusted = true;
+            self
+        }
+
+        fn apply_origin(&self, request: &mut Request) {
+            request.headers.insert(
+                header::HOST,
+                self.request_host.parse().expect("request Host"),
+            );
+            if let Some(value) = &self.forwarded_proto {
+                request.headers.insert(
+                    HeaderName::from_static(FORWARDED_PROTO_HEADER),
+                    value.parse().expect("X-Forwarded-Proto"),
+                );
+            }
+            if let Some(value) = &self.forwarded_host {
+                request.headers.insert(
+                    HeaderName::from_static(FORWARDED_HOST_HEADER),
+                    value.parse().expect("X-Forwarded-Host"),
+                );
+            }
+            if self.trusted {
+                request
+                    .vars
+                    .insert(TRUSTED_PROXY_VAR.to_string(), "true".to_string());
+            }
+        }
+
         async fn refresh_nonce(&mut self) {
-            let response = get(self.handler, "/acme/local/new-nonce").await;
+            let mut request = request(Method::GET, "/acme/local/new-nonce");
+            self.apply_origin(&mut request);
+            let response = send(self.handler, request).await;
             self.nonce = header_value(&response, replay_nonce_header());
             assert!(self.nonce.is_some(), "new-nonce must return Replay-Nonce");
         }
@@ -3445,7 +3774,7 @@ mod tests {
                 &self.key,
                 self.kid.as_deref(),
                 Some(&nonce),
-                &format!("https://acme.test{path}"),
+                &format!("{}{path}", self.base),
                 payload,
             )
             .expect("sign JWS")
@@ -3453,6 +3782,7 @@ mod tests {
 
         async fn post_raw(&mut self, path: &str, body: String) -> Response {
             let mut request = request(Method::POST, path);
+            self.apply_origin(&mut request);
             request.headers.insert(
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("application/jose+json"),
@@ -3771,6 +4101,659 @@ mod tests {
             .await
             .expect("passes through");
         assert!(matches!(outcome, Outcome::Continue(_)));
+    }
+
+    // ---- forwarded external origin (T-TLS-086) ---------------------------------------------
+
+    #[tokio::test]
+    async fn forwarded_proto_selects_the_external_scheme() {
+        let handler = test_handler(
+            ScriptedTransport::success(),
+            json!({"handler": "acme_server"}),
+        );
+
+        let response = send(
+            &handler,
+            forwarded_request(
+                Method::GET,
+                "/acme/local/directory",
+                "acme.test",
+                Some("http"),
+                None,
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK, "{}", body_text(&response));
+        let directory = body_json(&response);
+        assert_eq!(
+            directory["newNonce"],
+            "http://acme.test/acme/local/new-nonce"
+        );
+        assert_eq!(
+            directory["newOrder"],
+            "http://acme.test/acme/local/new-order"
+        );
+
+        // Case-insensitive and surrounding optional whitespace is trimmed.
+        let response = send(
+            &handler,
+            forwarded_request(
+                Method::GET,
+                "/acme/local/directory",
+                "acme.test",
+                Some(" \tHTTPS\t "),
+                None,
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK, "{}", body_text(&response));
+        assert_eq!(
+            body_json(&response)["newNonce"],
+            "https://acme.test/acme/local/new-nonce"
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarded_host_without_proto_uses_the_connection_scheme() {
+        let handler = test_handler(
+            ScriptedTransport::success(),
+            json!({"handler": "acme_server"}),
+        );
+
+        let response = send(
+            &handler,
+            forwarded_request(
+                Method::GET,
+                "/acme/local/directory",
+                "internal:8080",
+                None,
+                Some("public.example"),
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK, "{}", body_text(&response));
+        assert_eq!(
+            body_json(&response)["newNonce"],
+            "http://public.example/acme/local/new-nonce",
+            "a plain connection behind the proxy falls back to http"
+        );
+
+        let mut request = forwarded_request(
+            Method::GET,
+            "/acme/local/directory",
+            "internal:8080",
+            None,
+            Some("public.example"),
+            true,
+        );
+        request.tls = true;
+        let response = send(&handler, request).await;
+        assert_eq!(response.status, StatusCode::OK, "{}", body_text(&response));
+        assert_eq!(
+            body_json(&response)["newNonce"],
+            "https://public.example/acme/local/new-nonce",
+            "a TLS connection behind the proxy falls back to https"
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarded_proto_and_host_replace_the_listener_origin() {
+        let handler = test_handler(
+            ScriptedTransport::success(),
+            json!({"handler": "acme_server"}),
+        );
+
+        let response = send(
+            &handler,
+            forwarded_request(
+                Method::GET,
+                "/acme/local/directory",
+                "internal:8080",
+                Some("https"),
+                Some("public.example"),
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK, "{}", body_text(&response));
+        assert_eq!(
+            body_json(&response),
+            json!({
+                "newNonce": "https://public.example/acme/local/new-nonce",
+                "newAccount": "https://public.example/acme/local/new-account",
+                "newOrder": "https://public.example/acme/local/new-order",
+                "revokeCert": "https://public.example/acme/local/revoke-cert",
+                "keyChange": "https://public.example/acme/local/key-change",
+            }),
+            "the forwarded origin must replace the listener origin in every URL"
+        );
+        let body = body_text(&response);
+        assert!(!body.contains("internal"), "{body}");
+        assert!(
+            !body.contains(":8080"),
+            "the internal listener port leaked: {body}"
+        );
+
+        let response = send(
+            &handler,
+            forwarded_request(
+                Method::GET,
+                "/acme/local/new-nonce",
+                "internal:8080",
+                Some("https"),
+                Some("public.example"),
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(
+            header_value(&response, header::LINK).as_deref(),
+            Some("<https://public.example/acme/local/directory>;rel=\"index\"")
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarded_host_preserves_an_explicit_port() {
+        let handler = test_handler(
+            ScriptedTransport::success(),
+            json!({"handler": "acme_server"}),
+        );
+
+        let response = send(
+            &handler,
+            forwarded_request(
+                Method::GET,
+                "/acme/local/directory",
+                "internal:8080",
+                Some("https"),
+                Some("public.example:8443"),
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK, "{}", body_text(&response));
+        let directory = body_json(&response);
+        assert_eq!(
+            directory["newNonce"],
+            "https://public.example:8443/acme/local/new-nonce"
+        );
+        assert_eq!(
+            directory["keyChange"],
+            "https://public.example:8443/acme/local/key-change"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_host_remains_authoritative_over_forwarded_host() {
+        let handler = test_handler(
+            ScriptedTransport::success(),
+            json!({"handler": "acme_server", "host": "configured.example"}),
+        );
+
+        let response = send(
+            &handler,
+            forwarded_request(
+                Method::GET,
+                "/acme/local/directory",
+                "internal:8080",
+                Some("https"),
+                Some("public.example"),
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK, "{}", body_text(&response));
+        let directory = body_json(&response);
+        assert_eq!(
+            directory["newNonce"], "https://configured.example/acme/local/new-nonce",
+            "an operator-configured `host` overrides the request and forwarded hosts"
+        );
+        assert_eq!(
+            directory["newOrder"],
+            "https://configured.example/acme/local/new-order"
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarded_origin_requires_the_trusted_proxy_signal() {
+        let handler = test_handler(
+            ScriptedTransport::success(),
+            json!({"handler": "acme_server"}),
+        );
+
+        // No `trusted_proxy` variable (for example a direct router call or an embedder): the
+        // headers must not influence the origin.
+        let response = send(
+            &handler,
+            forwarded_request(
+                Method::GET,
+                "/acme/local/directory",
+                "acme.test",
+                Some("https"),
+                Some("public.example"),
+                false,
+            ),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK, "{}", body_text(&response));
+        assert_eq!(
+            body_json(&response)["newNonce"],
+            "https://acme.test/acme/local/new-nonce",
+            "forwarded headers from an untrusted peer must be ignored"
+        );
+
+        // An explicit `trusted_proxy=false` is equally untrusted.
+        let mut request = forwarded_request(
+            Method::GET,
+            "/acme/local/directory",
+            "acme.test",
+            Some("http"),
+            Some("public.example"),
+            false,
+        );
+        request
+            .vars
+            .insert(TRUSTED_PROXY_VAR.to_string(), "false".to_string());
+        let response = send(&handler, request).await;
+        assert_eq!(response.status, StatusCode::OK, "{}", body_text(&response));
+        assert_eq!(
+            body_json(&response)["newNonce"],
+            "https://acme.test/acme/local/new-nonce",
+            "a spoofed forwarded scheme must not change a direct connection's URLs"
+        );
+
+        // The same request from a trusted peer is honoured.
+        let response = send(
+            &handler,
+            forwarded_request(
+                Method::GET,
+                "/acme/local/directory",
+                "acme.test",
+                Some("https"),
+                Some("public.example"),
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(
+            body_json(&response)["newNonce"],
+            "https://public.example/acme/local/new-nonce"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_forwarded_proto_is_rejected() {
+        let handler = test_handler(
+            ScriptedTransport::success(),
+            json!({"handler": "acme_server"}),
+        );
+
+        for proto in ["ftp", "", "https,http", "ws", "https://"] {
+            let response = send(
+                &handler,
+                forwarded_request(
+                    Method::GET,
+                    "/acme/local/directory",
+                    "acme.test",
+                    Some(proto),
+                    Some("public.example"),
+                    true,
+                ),
+            )
+            .await;
+            assert_eq!(
+                response.status,
+                StatusCode::BAD_REQUEST,
+                "`X-Forwarded-Proto: {proto}` must be rejected"
+            );
+            let problem = body_json(&response);
+            assert_eq!(problem["type"], PROBLEM_MALFORMED, "{proto}");
+            assert!(
+                problem["detail"]
+                    .as_str()
+                    .expect("detail")
+                    .contains("X-Forwarded-Proto"),
+                "{problem}"
+            );
+        }
+
+        // A malformed value is loud even when the peer is untrusted: it is never silently used.
+        let response = send(
+            &handler,
+            forwarded_request(
+                Method::GET,
+                "/acme/local/directory",
+                "acme.test",
+                Some("ftp"),
+                None,
+                false,
+            ),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(&response)["type"], PROBLEM_MALFORMED);
+    }
+
+    #[tokio::test]
+    async fn malformed_forwarded_host_is_rejected() {
+        let handler = test_handler(
+            ScriptedTransport::success(),
+            json!({"handler": "acme_server"}),
+        );
+
+        for host in [
+            "https://evil.example",
+            "evil.example/path",
+            "evil example",
+            "user@evil.example",
+            "evil.example?x=1",
+            "evil.example#frag",
+            "evil.example:bad",
+            "evil.example:",
+            ":8080",
+            "[::1",
+            "a..b",
+            "evil\\example",
+            "evil.example,other.example",
+            "evil.example:80:90",
+            "*.example",
+        ] {
+            let response = send(
+                &handler,
+                forwarded_request(
+                    Method::GET,
+                    "/acme/local/directory",
+                    "acme.test",
+                    Some("https"),
+                    Some(host),
+                    true,
+                ),
+            )
+            .await;
+            assert_eq!(
+                response.status,
+                StatusCode::BAD_REQUEST,
+                "`X-Forwarded-Host: {host}` must be rejected"
+            );
+            let problem = body_json(&response);
+            assert_eq!(problem["type"], PROBLEM_MALFORMED, "{host}");
+            assert!(
+                problem["detail"]
+                    .as_str()
+                    .expect("detail")
+                    .contains("X-Forwarded-Host"),
+                "{problem}"
+            );
+        }
+    }
+
+    #[test]
+    fn forwarded_host_parser_rejects_control_characters_and_unbounded_values() {
+        for host in [
+            "evil\u{0}.example",
+            "evil\r.example",
+            "evil\n.example",
+            "evil\t.example",
+            "evil\u{7f}.example",
+            "evil.example\u{1}",
+        ] {
+            let error = parse_external_host(host, "X-Forwarded-Host")
+                .expect_err("control characters are not valid in an authority");
+            assert_eq!(error.problem_type, PROBLEM_MALFORMED, "{host:?}");
+            assert!(error.detail.contains("X-Forwarded-Host"), "{error:?}");
+        }
+
+        let long = format!("{}.example", "a".repeat(MAX_EXTERNAL_HOST_LEN));
+        assert!(
+            parse_external_host(&long, "X-Forwarded-Host").is_err(),
+            "an unbounded authority must be rejected"
+        );
+        assert!(
+            parse_external_host("exämple.com", "X-Forwarded-Host").is_err(),
+            "non-ASCII authorities must be rejected"
+        );
+
+        for valid in [
+            "acme.test",
+            "acme.test:8080",
+            "127.0.0.1:443",
+            "[::1]",
+            "[::1]:8443",
+        ] {
+            assert_eq!(
+                parse_external_host(valid, "X-Forwarded-Host").expect("valid authority"),
+                valid
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_forwarded_headers_are_rejected() {
+        let handler = test_handler(
+            ScriptedTransport::success(),
+            json!({"handler": "acme_server"}),
+        );
+
+        let mut request = forwarded_request(
+            Method::GET,
+            "/acme/local/directory",
+            "acme.test",
+            Some("https"),
+            Some("public.example"),
+            true,
+        );
+        request.headers.append(
+            HeaderName::from_static(FORWARDED_PROTO_HEADER),
+            HeaderValue::from_static("https"),
+        );
+        let response = send(&handler, request).await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        let problem = body_json(&response);
+        assert_eq!(problem["type"], PROBLEM_MALFORMED);
+        assert!(
+            problem["detail"]
+                .as_str()
+                .expect("detail")
+                .contains("multiple `x-forwarded-proto`"),
+            "{problem}"
+        );
+
+        let mut request = forwarded_request(
+            Method::GET,
+            "/acme/local/directory",
+            "acme.test",
+            Some("https"),
+            Some("public.example"),
+            true,
+        );
+        request.headers.append(
+            HeaderName::from_static(FORWARDED_HOST_HEADER),
+            HeaderValue::from_static("other.example"),
+        );
+        let response = send(&handler, request).await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        let problem = body_json(&response);
+        assert_eq!(problem["type"], PROBLEM_MALFORMED);
+        assert!(
+            problem["detail"]
+                .as_str()
+                .expect("detail")
+                .contains("multiple `x-forwarded-host`"),
+            "{problem}"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_connection_urls_are_byte_identical() {
+        let handler = test_handler(
+            ScriptedTransport::success(),
+            json!({"handler": "acme_server"}),
+        );
+        let expected = json!({
+            "newNonce": "https://acme.test/acme/local/new-nonce",
+            "newAccount": "https://acme.test/acme/local/new-account",
+            "newOrder": "https://acme.test/acme/local/new-order",
+            "revokeCert": "https://acme.test/acme/local/revoke-cert",
+            "keyChange": "https://acme.test/acme/local/key-change",
+        });
+
+        // The historical direct path advertises https on both plain and TLS connections.
+        for tls in [false, true] {
+            let mut directory_request = request(Method::GET, "/acme/local/directory");
+            directory_request.tls = tls;
+            let response = send(&handler, directory_request).await;
+            assert_eq!(response.status, StatusCode::OK, "tls={tls}");
+            assert_eq!(body_json(&response), expected, "tls={tls}");
+
+            let mut nonce_request = request(Method::GET, "/acme/local/new-nonce");
+            nonce_request.tls = tls;
+            let response = send(&handler, nonce_request).await;
+            assert_eq!(
+                header_value(&response, header::LINK).as_deref(),
+                Some("<https://acme.test/acme/local/directory>;rel=\"index\""),
+                "tls={tls}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn forwarded_origin_binds_the_jws_url_to_the_constructed_url() {
+        let handler = test_handler(
+            ScriptedTransport::success(),
+            json!({"handler": "acme_server"}),
+        );
+        let key = AccountKey::generate().expect("account key");
+        let payload = serde_json::to_vec(&json!({"termsOfServiceAgreed": true})).expect("payload");
+
+        let response = send(
+            &handler,
+            forwarded_request(
+                Method::GET,
+                "/acme/local/new-nonce",
+                "internal:8080",
+                Some("https"),
+                Some("public.example"),
+                true,
+            ),
+        )
+        .await;
+        let nonce = header_value(&response, replay_nonce_header()).expect("nonce");
+
+        // The client signs the URL it was advertised (the forwarded origin), not the listener.
+        let mut request = forwarded_request(
+            Method::POST,
+            "/acme/local/new-account",
+            "internal:8080",
+            Some("https"),
+            Some("public.example"),
+            true,
+        );
+        request.headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/jose+json"),
+        );
+        request.body = Bytes::from(
+            sign_jws(
+                &key,
+                None,
+                Some(&nonce),
+                "https://public.example/acme/local/new-account",
+                &payload,
+            )
+            .expect("sign JWS"),
+        );
+        let response = send(&handler, request).await;
+        assert_eq!(
+            response.status,
+            StatusCode::CREATED,
+            "{}",
+            body_text(&response)
+        );
+        let location = header_value(&response, header::LOCATION).expect("account location");
+        assert!(
+            location.starts_with("https://public.example/acme/local/account/"),
+            "{location}"
+        );
+        let nonce = header_value(&response, replay_nonce_header()).expect("replay nonce");
+
+        // Signing the internal listener URL does not satisfy the binding for the forwarded
+        // request: the binding compares against the same constructed URL the client was given.
+        let mut request = forwarded_request(
+            Method::POST,
+            "/acme/local/new-account",
+            "internal:8080",
+            Some("https"),
+            Some("public.example"),
+            true,
+        );
+        request.headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/jose+json"),
+        );
+        request.body = Bytes::from(
+            sign_jws(
+                &key,
+                None,
+                Some(&nonce),
+                "https://internal:8080/acme/local/new-account",
+                &payload,
+            )
+            .expect("sign JWS"),
+        );
+        let response = send(&handler, request).await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        let problem = body_json(&response);
+        assert_eq!(problem["type"], PROBLEM_MALFORMED);
+        assert!(
+            problem["detail"]
+                .as_str()
+                .expect("detail")
+                .contains("does not match request url"),
+            "{problem}"
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarded_origin_does_not_change_the_http01_fetch_target() {
+        let transport = ScriptedTransport::success();
+        let handler = test_handler(
+            Arc::clone(&transport) as Arc<dyn Http01Transport>,
+            json!({"handler": "acme_server"}),
+        );
+        let mut client = TestClient::new(&handler).await.with_forwarded_origin(
+            "https://public.example",
+            "internal:8080",
+            "https",
+            "public.example",
+        );
+        let response = client.register().await;
+        assert_eq!(
+            response.status,
+            StatusCode::CREATED,
+            "{}",
+            body_text(&response)
+        );
+        assert!(header_value(&response, header::LOCATION)
+            .expect("account location")
+            .starts_with("https://public.example/acme/local/account/"));
+
+        // The whole order flow succeeds while signing the forwarded origin, and the http-01
+        // validation still targets the order identifier, never the forwarded host.
+        let ready = ready_order(&mut client, &transport, "challenge.example").await;
+        assert!(ready.order_path.starts_with("/acme/local/order/"));
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert!(
+            requests[0].starts_with("http://challenge.example/.well-known/acme-challenge/"),
+            "the http-01 target must come from the identifier: {requests:?}"
+        );
+        assert!(
+            !requests[0].contains("public.example") && !requests[0].contains("internal"),
+            "forwarded headers must not reach the http-01 target: {requests:?}"
+        );
     }
 
     #[test]
