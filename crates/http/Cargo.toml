@@ -20,15 +20,18 @@ templates = ["caddy-rs-core/templates"]
 [dependencies]
 argon2 = "0.5"
 async-trait = { workspace = true }
+base64 = "0.22.1"
 bcrypt = "0.16"
 bytes = { workspace = true }
 caddy-rs-core = { workspace = true, default-features = false }
+caddy-rs-tls = { workspace = true, default-features = false }
 flate2 = { version = "1", optional = true }
 http = { workspace = true }
 http-body = "1.1.0"
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
+ring = "0.17.14"
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

@@ -210,6 +210,7 @@ pub const MINIMAL_EXCLUDED_MODULES: &[&str] = &[
     "http.handlers.templates",
     "http.handlers.encode",
     "http.handlers.map",
+    "http.handlers.acme_server",
 ];
 
 /// A shared, immutable module registry (what the generation store and runtimes hold).
@@ -588,6 +589,12 @@ pub const BUILTIN_MODULES: &[Module] = &[
         "file_server",
         ModuleKind::HttpHandler,
         "Serve static files from a root directory",
+    ),
+    Module::new(
+        "http.handlers.acme_server",
+        "acme_server",
+        ModuleKind::HttpHandler,
+        "ACME (RFC 8555) certificate authority backed by the internal CA (http-01 challenges)",
     ),
     Module::new(
         "http.handlers.reverse_proxy",

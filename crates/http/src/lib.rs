@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod acme_server;
 pub mod auth;
 pub mod body;
 #[cfg(feature = "compression")]
@@ -23,6 +24,7 @@ pub mod templates;
 pub mod types;
 pub mod upgrade;
 
+pub use acme_server::{AcmeServerHandler, Http01Fetch, Http01Transport, HyperHttp01Transport};
 pub use auth::{BasicAuthHandler, ForwardAuthHandler};
 pub use body::{Body, BodyError, RequestBody, ResponseBody, StreamingBody, StreamingResponse};
 #[cfg(feature = "compression")]

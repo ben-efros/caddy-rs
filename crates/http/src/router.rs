@@ -5,11 +5,13 @@
 //! the same evaluation model Caddy uses for the HTTP app's `routes`.
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
 
+use crate::acme_server::AcmeServerHandler;
 use crate::auth::{BasicAuthHandler, ForwardAuthHandler};
 use crate::body::StreamingResponse;
 #[cfg(feature = "compression")]
@@ -488,6 +490,11 @@ fn apply_pending_headers(headers: &mut http::HeaderMap, request: &Request) {
 pub struct RouterBuilder {
     custom: Option<CustomHandlerFactory>,
     error_routes: Option<Vec<Value>>,
+    /// Caddy data directory used by `http.handlers.acme_server` to persist its internal CA
+    /// (`<root>/pki/authorities/<ca>/...`). The server runtime sets this per generation; when it
+    /// is absent a configuration that uses `acme_server` fails with a located error instead of
+    /// writing CA material into the process working directory.
+    acme_server_data_root: Option<PathBuf>,
 }
 
 impl Default for RouterBuilder {
@@ -502,6 +509,7 @@ impl RouterBuilder {
         Self {
             custom: None,
             error_routes: None,
+            acme_server_data_root: None,
         }
     }
 
@@ -535,6 +543,15 @@ impl RouterBuilder {
     /// Register a factory for handler modules owned by another crate.
     pub fn with_custom_handler(mut self, factory: CustomHandlerFactory) -> Self {
         self.custom = Some(factory);
+        self
+    }
+
+    /// Set the Caddy data directory used by `http.handlers.acme_server` for internal-CA material.
+    ///
+    /// The runtime passes the generation's effective data/storage root (the same root automatic
+    /// HTTPS uses). Without it, building a router that contains `acme_server` fails closed.
+    pub fn with_acme_server_data_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.acme_server_data_root = Some(root.into());
         self
     }
 
@@ -659,6 +676,16 @@ impl RouterBuilder {
             "encode" => Arc::new(EncodeHandler::from_json(value, path)?),
             // caddy-rs extension (not a Caddy v2.11.7 built-in): token-bucket rate limiting.
             "rate_limit" => Arc::new(RateLimitHandler::from_json(value, path)?),
+            "acme_server" => {
+                let root = self.acme_server_data_root.as_deref().ok_or_else(|| {
+                    Error::InvalidConfig {
+                        path: path.to_string(),
+                        message: "`acme_server` requires a Caddy data directory for its internal                                   CA; this router was built without one"
+                            .to_string(),
+                    }
+                })?;
+                Arc::new(AcmeServerHandler::from_json(value, path, root)?)
+            }
             #[cfg(feature = "templates")]
             "templates" => Arc::new(TemplatesHandler::from_json(value, path)?),
             "file_server" => Arc::new(FileServerHandler::from_json(value, path)?),

@@ -438,6 +438,7 @@ impl ServerRuntime {
         };
         let https_port = http.https_port.unwrap_or(DEFAULT_HTTPS_PORT);
         let status_sink = UpstreamStatusSink::new();
+        let acme_server_data_root = self.acme_server_data_root(generation.config())?;
         for (server_name, server) in &http.servers {
             let _limits = ServerLimits::from_http_server(server_name, server)?;
             let _trusted_proxies = parse_server_trusted_proxies(server, server_name)?;
@@ -453,7 +454,8 @@ impl ServerRuntime {
                 policies,
                 &client_auth_ca_pool_context(generation.config(), self.data_root.as_deref()),
             )?;
-            let _router = Self::build_router(server_name, server, &status_sink)?;
+            let _router =
+                Self::build_router(server_name, server, &status_sink, &acme_server_data_root)?;
             for listen in &server.listen {
                 let parsed = match caddy_rs_core::ListenAddr::parse(listen) {
                     Ok(parsed) => parsed,
@@ -1476,6 +1478,27 @@ impl ServerRuntime {
         self.build_listener_states(generation, Some(&context), access_log, status_sink)
     }
 
+    /// Effective Caddy data directory for handlers that persist material (the ACME server's
+    /// internal CA). Mirrors the automatic-HTTPS storage selection: `--data` root, then the
+    /// configured `storage` root, then Caddy's `.caddy-rs` default.
+    fn acme_server_data_root(&self, config: &caddy_rs_core::Config) -> Result<std::path::PathBuf> {
+        let default_root = self
+            .data_root
+            .clone()
+            .or_else(|| {
+                config
+                    .storage()
+                    .and_then(|storage| storage.root())
+                    .map(std::path::PathBuf::from)
+            })
+            .unwrap_or_else(|| std::path::PathBuf::from(".caddy-rs"));
+        let selected = caddy_rs_tls::SelectedStorage::from_config(config, Some(&default_root))?;
+        Ok(selected
+            .root()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or(default_root))
+    }
+
     /// Build one HTTP server's router (error routes + normal routes).
     ///
     /// The router builder consumes the raw Caddy JSON route shape. The typed config model preserves
@@ -1486,6 +1509,7 @@ impl ServerRuntime {
         server_name: &str,
         server: &caddy_rs_core::HttpServer,
         status_sink: &Arc<UpstreamStatusSink>,
+        acme_server_data_root: &std::path::Path,
     ) -> Result<Arc<caddy_rs_http::Router>> {
         let routes_value = serde_json::to_value(&server.routes).map_err(|error| {
             Error::Config(caddy_rs_core::Error::invalid(
@@ -1508,7 +1532,8 @@ impl ServerRuntime {
                 ))
             })?;
         let router_builder = RouterBuilder::new()
-            .with_custom_handler(handler_factory_with_status_sink(Arc::clone(status_sink)));
+            .with_custom_handler(handler_factory_with_status_sink(Arc::clone(status_sink)))
+            .with_acme_server_data_root(acme_server_data_root);
         let router_builder = router_builder
             .with_error_routes(
                 errors_value.as_ref(),
@@ -1557,6 +1582,7 @@ impl ServerRuntime {
             None
         };
         let http_port = http.http_port.unwrap_or(caddy_rs_tls::DEFAULT_HTTP_PORT);
+        let acme_server_data_root = self.acme_server_data_root(generation.config())?;
         for (server_name, server) in &http.servers {
             let limits = Arc::new(ServerLimits::from_http_server(server_name, server)?);
             let trusted_proxies = parse_server_trusted_proxies(server, server_name)?;
@@ -1572,7 +1598,8 @@ impl ServerRuntime {
                 policies,
                 &client_auth_ca_pool_context(generation.config(), self.data_root.as_deref()),
             )?;
-            let router = Self::build_router(server_name, server, status_sink)?;
+            let router =
+                Self::build_router(server_name, server, status_sink, &acme_server_data_root)?;
             // HTTP/3 Alt-Svc advertisement (h1/h2 responses only), when this server offers h3 on a
             // concrete UDP port. During the automatic-HTTPS bootstrap phase there is no final
             // resolver yet, so h3 is neither bound nor advertised until phase 2.
