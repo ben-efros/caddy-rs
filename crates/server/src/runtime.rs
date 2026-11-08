@@ -1560,6 +1560,7 @@ impl ServerRuntime {
         for (server_name, server) in &http.servers {
             let limits = Arc::new(ServerLimits::from_http_server(server_name, server)?);
             let trusted_proxies = parse_server_trusted_proxies(server, server_name)?;
+            let allow_0rtt = allow_0rtt_enabled(server, server_name)?;
             let policies = server.tls_connection_policies.as_deref();
             let has_connection_policies = policies.is_some_and(|policies| !policies.is_empty());
             if strict_sni_host_enabled(server.strict_sni_host.as_ref()) {
@@ -1702,6 +1703,7 @@ impl ServerRuntime {
                         trusted_proxies: Arc::clone(&trusted_proxies),
                         tls,
                         client_auth_verified: tls_options.client_auth.verifies(),
+                        allow_0rtt,
                         automatic: automatic_serving,
                         server_name: server_name.clone(),
                         recorder: Arc::clone(&self.recorder),
@@ -1737,6 +1739,7 @@ impl ServerRuntime {
                             ),
                             tls: None,
                             client_auth_verified: false,
+                            allow_0rtt: true,
                             automatic: Some(Arc::clone(context.serving)),
                             server_name: String::new(),
                             recorder: Arc::clone(&self.recorder),
@@ -1751,6 +1754,26 @@ impl ServerRuntime {
             }
         }
         Ok(states)
+    }
+}
+
+/// Parse Caddy's `apps.http.servers.<name>.allow_0rtt` QUIC early-data switch.
+///
+/// Caddy declares the field as `Allow0RTT *bool` (`modules/caddyhttp/server.go`), so an absent
+/// field means "use the default" and the default is **allowed** (`listeners.go`:
+/// `allow0rtt := true; if allow0rttconf != nil { allow0rtt = *allow0rttconf }`). A non-boolean
+/// value is rejected with the same located path idiom as the other preserved server settings.
+fn allow_0rtt_enabled(
+    server: &caddy_rs_core::config::HttpServer,
+    server_name: &str,
+) -> Result<bool> {
+    match server.extra.get("allow_0rtt") {
+        None => Ok(true),
+        Some(serde_json::Value::Bool(allowed)) => Ok(*allowed),
+        Some(value) => Err(Error::Config(caddy_rs_core::Error::invalid(
+            format!("apps.http.servers.{server_name}.allow_0rtt"),
+            format!("`allow_0rtt` must be a boolean, got {value}"),
+        ))),
     }
 }
 

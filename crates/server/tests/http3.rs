@@ -22,7 +22,14 @@ use tokio_rustls::TlsConnector;
 
 const EXAMPLE_CERT: &str = include_str!("../../tls/testdata/https/example.com.pem");
 const EXAMPLE_KEY: &str = include_str!("../../tls/testdata/https/example.com.key");
+const CLIENT_CA: &str = include_str!("../../tls/testdata/auto-https/ca.pem");
+const CLIENT_CERT: &str = include_str!("../../tls/testdata/client-auth/client.pem");
+const CLIENT_KEY: &str = include_str!("../../tls/testdata/client-auth/client.key");
 const BODY: &str = "hello {http.vars.tls.alpn} {http.request.scheme} {http.request.uri.path}";
+const CLIENT_CERT_BODY: &str =
+    "subject=[{http.request.tls.client.subject}] issuer=[{http.request.tls.client.issuer}] \
+     serial=[{http.request.tls.client.serial}] fingerprint=[{http.request.tls.client.fingerprint}] \
+     san=[{http.request.tls.client.san.dns_names}] pem=[{http.request.tls.client.certificate_pem}]";
 
 /// Hand out an ephemeral port that no other test in this process has taken.
 ///
@@ -56,6 +63,18 @@ fn config(
     protocols: Option<&[&str]>,
     routes: serde_json::Value,
 ) -> Config {
+    config_with_options(tcp_port, udp_port, protocols, routes, serde_json::json!({}))
+}
+
+/// Like [`config`], but merges extra fields into the `srv0` server object (for example
+/// `allow_0rtt` or an mTLS `tls_connection_policies` override).
+fn config_with_options(
+    tcp_port: u16,
+    udp_port: Option<u16>,
+    protocols: Option<&[&str]>,
+    routes: serde_json::Value,
+    server_options: serde_json::Value,
+) -> Config {
     let mut listen = vec![format!("127.0.0.1:{tcp_port}")];
     if let Some(udp_port) = udp_port {
         listen.push(format!("udp/127.0.0.1:{udp_port}"));
@@ -67,6 +86,11 @@ fn config(
     });
     if let Some(protocols) = protocols {
         server["protocols"] = serde_json::json!(protocols);
+    }
+    if let Some(options) = server_options.as_object() {
+        for (key, value) in options {
+            server[key] = value.clone();
+        }
     }
     Config::from_value(serde_json::json!({
         "admin": {"disabled": true},
@@ -84,6 +108,32 @@ fn config(
     .expect("test config decodes")
 }
 
+/// Client-auth server configuration: `mode` against the fixture client CA, mirroring
+/// `http_client_auth.rs` so the h3 assertions can be compared with the h1/h2 path.
+fn mtls_config(tcp_port: u16, udp_port: u16, mode: &str, routes: serde_json::Value) -> Config {
+    let client_authentication = serde_json::json!({
+        "mode": mode,
+        "ca": {"provider": "inline", "trusted_ca_certs": [client_ca_base64()]}
+    });
+    config_with_options(
+        tcp_port,
+        Some(udp_port),
+        Some(&["h1", "h2", "h3"]),
+        routes,
+        serde_json::json!({
+            "tls_connection_policies": [{"client_authentication": client_authentication}]
+        }),
+    )
+}
+
+fn client_ca_base64() -> String {
+    use base64::Engine as _;
+    let der = caddy_rs_tls::certificates_from_pem(CLIENT_CA)
+        .expect("client CA parses")
+        .remove(0);
+    base64::engine::general_purpose::STANDARD.encode(der.as_ref())
+}
+
 fn static_routes() -> serde_json::Value {
     serde_json::json!([{"handle": [{"handler": "static_response", "body": BODY}]}])
 }
@@ -97,18 +147,66 @@ async fn start(config: Config) -> (ServerRuntime, caddy_rs_server::RuntimeStatus
 }
 
 fn client_config(alpn: Vec<Vec<u8>>) -> Arc<ClientConfig> {
+    client_config_with(alpn, None, false)
+}
+
+/// Build a QUIC client TLS configuration, optionally with a client identity and 0-RTT enabled.
+///
+/// `enable_early_data` is a rustls client switch: without it the client never offers 0-RTT even
+/// when the server's session ticket allows it (quinn's own default client config sets it).
+fn client_config_with(
+    alpn: Vec<Vec<u8>>,
+    identity: Option<(&str, &str)>,
+    enable_early_data: bool,
+) -> Arc<ClientConfig> {
     let mut roots = RootCertStore::empty();
     for certificate in caddy_rs_tls::certificates_from_pem(EXAMPLE_CERT).expect("fixture parses") {
         roots.add(certificate).expect("fixture is a valid root");
     }
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut config = ClientConfig::builder_with_provider(provider)
+    let builder = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .expect("safe protocol versions")
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+        .with_root_certificates(roots);
+    let mut config = match identity {
+        Some((certificate, key)) => {
+            let chain = caddy_rs_tls::certificates_from_pem(certificate).expect("client cert");
+            let key = caddy_rs_tls::TlsCertificate::from_pem(certificate, key)
+                .expect("client key")
+                .private_key()
+                .clone_key();
+            builder
+                .with_client_auth_cert(chain, key)
+                .expect("client identity")
+        }
+        None => builder.with_no_client_auth(),
+    };
     config.alpn_protocols = alpn;
+    config.enable_early_data = enable_early_data;
     Arc::new(config)
+}
+
+/// A QUIC client endpoint using `config` (HTTP/3 ALPN expected).
+fn quic_endpoint(config: Arc<ClientConfig>) -> quinn::Endpoint {
+    let quic = quinn::crypto::rustls::QuicClientConfig::try_from((*config).clone())
+        .expect("QUIC client config");
+    let mut endpoint =
+        quinn::Endpoint::client("127.0.0.1:0".parse().expect("local addr")).expect("QUIC endpoint");
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic)));
+    endpoint
+}
+
+async fn connect(
+    endpoint: &quinn::Endpoint,
+    address: SocketAddr,
+) -> Result<quinn::Connection, String> {
+    let connecting = endpoint
+        .connect(address, "example.com")
+        .map_err(|error| format!("QUIC connect: {error}"))?;
+    tokio::time::timeout(Duration::from_secs(5), connecting)
+        .await
+        .map_err(|_| "QUIC handshake timed out".to_string())?
+        .map_err(|error| format!("QUIC handshake: {error}"))
 }
 
 struct Http3Response {
@@ -124,28 +222,44 @@ async fn h3_request(
     path: &str,
     body: Option<&str>,
 ) -> Result<Http3Response, String> {
-    let client_config = client_config(vec![b"h3".to_vec()]);
-    let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from((*client_config).clone())
-        .map_err(|error| format!("QUIC client config: {error}"))?;
-    let quic_client = quinn::ClientConfig::new(Arc::new(quic_client));
-    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().expect("local addr"))
-        .map_err(|error| format!("QUIC endpoint: {error}"))?;
-    endpoint.set_default_client_config(quic_client);
-    let connecting = endpoint
-        .connect(address, "example.com")
-        .map_err(|error| format!("QUIC connect: {error}"))?;
-    let connection = tokio::time::timeout(Duration::from_secs(5), connecting)
-        .await
-        .map_err(|_| "QUIC handshake timed out".to_string())?
-        .map_err(|error| format!("QUIC handshake: {error}"))?;
-    let (mut driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(connection))
+    let endpoint = quic_endpoint(client_config(vec![b"h3".to_vec()]));
+    let connection = connect(&endpoint, address).await?;
+    h3_request_on(
+        &connection,
+        method,
+        &format!("https://example.com{path}"),
+        &[],
+        body,
+        None,
+    )
+    .await
+}
+
+/// Send one HTTP/3 request on an existing QUIC connection.
+///
+/// `headers` are regular request headers; `protocol` inserts the RFC 8441 `:protocol`
+/// pseudo-header (`h3` surfaces it as a request extension).
+async fn h3_request_on(
+    connection: &quinn::Connection,
+    method: &str,
+    uri: &str,
+    headers: &[(&str, &str)],
+    body: Option<&str>,
+    protocol: Option<h3::ext::Protocol>,
+) -> Result<Http3Response, String> {
+    let (driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(connection.clone()))
         .await
         .map_err(|error| format!("HTTP/3 client: {error}"))?;
-    let request = http::Request::builder()
-        .method(method)
-        .uri(format!("https://example.com{path}"))
+    let mut builder = http::Request::builder().method(method).uri(uri);
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let mut request = builder
         .body(())
         .map_err(|error| format!("request: {error}"))?;
+    if let Some(protocol) = protocol {
+        request.extensions_mut().insert(protocol);
+    }
     let mut stream = send_request
         .send_request(request)
         .await
@@ -167,7 +281,7 @@ async fn h3_request(
     let status = response.status().as_u16();
     let headers = response.headers().clone();
     let mut collected = BytesMut::new();
-    while let Some(mut chunk) = stream
+    while let Some(chunk) = stream
         .recv_data()
         .await
         .map_err(|error| format!("recv_data: {error}"))?
@@ -651,14 +765,12 @@ fn udp_listener_configuration_is_validated_loudly() {
 
     // Malformed `udp/` address.
     let mut malformed = config(tcp, None, Some(&["h1", "h2", "h3"]), static_routes());
-    if let caddy_rs_core::HttpApp { servers, .. } = malformed
+    let caddy_rs_core::HttpApp { servers, .. } = malformed
         .apps
         .as_mut()
         .and_then(|apps| apps.http.as_mut())
-        .unwrap()
-    {
-        servers.get_mut("srv0").unwrap().listen = vec!["udp/127.0.0.1".to_string()];
-    }
+        .unwrap();
+    servers.get_mut("srv0").unwrap().listen = vec!["udp/127.0.0.1".to_string()];
     let error = store.load(malformed).expect_err("malformed udp address");
     assert!(
         error.to_string().contains("invalid listen address")
@@ -688,4 +800,328 @@ fn udp_listener_configuration_is_validated_loudly() {
         .load(Config::from_value(config_cleartext.take()).expect("decodes"))
         .expect_err("udp without TLS");
     assert!(error.to_string().contains("requires TLS"), "{error}");
+}
+
+// ---------------------------------------------------------------------------
+// T-HTTP-048: client certificates, 0-RTT and upgrade responses over HTTP/3.
+// ---------------------------------------------------------------------------
+
+/// The 501 body shared with the buffered router path (`serve_internal_buffered`).
+const H3_UPGRADE_BODY: &str =
+    "501 Not Implemented: protocol upgrades are not supported over HTTP/3";
+
+#[tokio::test]
+async fn http3_client_certificate_placeholders_match_http1() {
+    let tcp = free_port();
+    let udp = free_port();
+    let routes = serde_json::json!([{
+        "handle": [{"handler": "static_response", "body": CLIENT_CERT_BODY}]
+    }]);
+    let (runtime, status) = start(mtls_config(tcp, udp, "require_and_verify", routes)).await;
+    let address = udp_address(&status, udp);
+    let endpoint = quic_endpoint(client_config_with(
+        vec![b"h3".to_vec()],
+        Some((CLIENT_CERT, CLIENT_KEY)),
+        false,
+    ));
+    let connection = connect(&endpoint, address).await.expect("QUIC connect");
+    let response = h3_request_on(
+        &connection,
+        "GET",
+        "https://example.com/cert",
+        &[],
+        None,
+        None,
+    )
+    .await
+    .expect("HTTP/3 mTLS request");
+    assert_eq!(response.status, 200);
+    let body = String::from_utf8_lossy(&response.body);
+    assert!(body.contains("subject=[CN=client.example.com]"), "{body}");
+    assert!(
+        body.contains("issuer=[CN=caddy-rs auto-HTTPS test CA]"),
+        "{body}"
+    );
+    assert!(
+        body.contains("serial=[") && !body.contains("serial=[]"),
+        "serial placeholder must be populated: {body}"
+    );
+    assert!(
+        body.contains("fingerprint=[") && !body.contains("fingerprint=[]"),
+        "fingerprint placeholder must be populated: {body}"
+    );
+    assert!(body.contains("san=[client.example.com]"), "{body}");
+    assert!(
+        body.contains("pem=[-----BEGIN CERTIFICATE-----"),
+        "PEM placeholder must be populated: {body}"
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn http3_request_mode_without_client_certificate_expands_empty() {
+    let tcp = free_port();
+    let udp = free_port();
+    let routes = serde_json::json!([{
+        "handle": [{"handler": "static_response", "body": CLIENT_CERT_BODY}]
+    }]);
+    let (runtime, status) = start(mtls_config(tcp, udp, "request", routes)).await;
+    let response = h3_request(udp_address(&status, udp), "GET", "/no-cert", None)
+        .await
+        .expect("HTTP/3 request without a client certificate");
+    assert_eq!(response.status, 200);
+    let body = String::from_utf8_lossy(&response.body);
+    for empty in [
+        "subject=[]",
+        "issuer=[]",
+        "serial=[]",
+        "fingerprint=[]",
+        "san=[]",
+        "pem=[]",
+    ] {
+        assert!(
+            body.contains(empty),
+            "missing dummy-empty placeholder `{empty}`: {body}"
+        );
+    }
+    runtime.shutdown().await;
+}
+
+/// Complete one HTTP/3 request and let rustls receive the server's TLS 1.3 session ticket, so a
+/// following connection can attempt 0-RTT resumption.
+async fn warm_up_for_0rtt(endpoint: &quinn::Endpoint, address: SocketAddr) {
+    let connection = connect(endpoint, address).await.expect("warm-up connect");
+    let response = h3_request_on(
+        &connection,
+        "GET",
+        "https://example.com/warm-up",
+        &[],
+        None,
+        None,
+    )
+    .await
+    .expect("warm-up request");
+    assert_eq!(response.status, 200, "warm-up request must succeed");
+    drop(connection);
+    // The NewSessionTicket arrives after the handshake; give the client a moment to store it.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+}
+
+#[tokio::test]
+async fn http3_accepts_0rtt_by_default_like_caddy() {
+    let tcp = free_port();
+    let udp = free_port();
+    let (runtime, status) = start(config(
+        tcp,
+        Some(udp),
+        Some(&["h1", "h2", "h3"]),
+        static_routes(),
+    ))
+    .await;
+    let address = udp_address(&status, udp);
+    let endpoint = quic_endpoint(client_config_with(vec![b"h3".to_vec()], None, true));
+    warm_up_for_0rtt(&endpoint, address).await;
+
+    let connecting = endpoint
+        .connect(address, "example.com")
+        .expect("QUIC connect");
+    let (connection, zero_rtt) = connecting
+        .into_0rtt()
+        .expect("Caddy's default allow_0rtt behaviour must issue 0-RTT-capable tickets");
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        h3_request_on(
+            &connection,
+            "GET",
+            "https://example.com/zero-rtt",
+            &[],
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("0-RTT request timed out")
+    .expect("0-RTT request");
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        String::from_utf8_lossy(&response.body),
+        "hello h3 https /zero-rtt"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), zero_rtt)
+            .await
+            .expect("handshake did not complete"),
+        "the default HTTP/3 listener must accept early data (Caddy `allow0rtt := true`)"
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn http3_allow_0rtt_false_disables_early_data() {
+    let tcp = free_port();
+    let udp = free_port();
+    let (runtime, status) = start(config_with_options(
+        tcp,
+        Some(udp),
+        Some(&["h1", "h2", "h3"]),
+        static_routes(),
+        serde_json::json!({"allow_0rtt": false}),
+    ))
+    .await;
+    let address = udp_address(&status, udp);
+    let endpoint = quic_endpoint(client_config_with(vec![b"h3".to_vec()], None, true));
+    warm_up_for_0rtt(&endpoint, address).await;
+
+    // The server's ticket must not advertise early data; if a client still attempts 0-RTT (with
+    // keys cached from an earlier configuration), the server must not accept it.
+    let connecting = endpoint
+        .connect(address, "example.com")
+        .expect("QUIC connect");
+    match connecting.into_0rtt() {
+        Ok((connection, zero_rtt)) => {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(2),
+                h3_request_on(
+                    &connection,
+                    "GET",
+                    "https://example.com/early-data",
+                    &[],
+                    None,
+                    None,
+                ),
+            )
+            .await;
+            let accepted = tokio::time::timeout(Duration::from_secs(5), zero_rtt)
+                .await
+                .expect("handshake did not complete");
+            assert!(
+                !accepted,
+                "`allow_0rtt: false` must reject early data, but the server accepted it"
+            );
+        }
+        Err(_connecting) => {
+            // Expected with a fresh ticket cache: the server did not allow early data at all.
+        }
+    }
+
+    // Ordinary 1-RTT service still works on the same listener.
+    let response = h3_request(address, "GET", "/after-0rtt", None)
+        .await
+        .expect("1-RTT request after a disabled-0-RTT handshake");
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        String::from_utf8_lossy(&response.body),
+        "hello h3 https /after-0rtt"
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn http3_allow_0rtt_must_be_a_boolean() {
+    let store = Arc::new(GenerationStore::with_builtin_registry());
+    let mut malformed = config(
+        free_port(),
+        Some(free_port()),
+        Some(&["h1", "h2", "h3"]),
+        static_routes(),
+    );
+    let caddy_rs_core::HttpApp { servers, .. } = malformed
+        .apps
+        .as_mut()
+        .and_then(|apps| apps.http.as_mut())
+        .unwrap();
+    servers
+        .get_mut("srv0")
+        .unwrap()
+        .extra
+        .insert("allow_0rtt".to_string(), serde_json::json!("off"));
+    store
+        .load(malformed)
+        .expect("unknown server fields are preserved for apply-time validation");
+    let mut runtime = ServerRuntime::new(store);
+    let error = runtime
+        .apply()
+        .await
+        .expect_err("a non-boolean allow_0rtt must fail loudly");
+    let message = error.to_string();
+    assert!(
+        message.contains("apps.http.servers.srv0.allow_0rtt"),
+        "error must name the field path: {message}"
+    );
+    assert!(
+        message.contains("boolean"),
+        "error must explain the expected type: {message}"
+    );
+}
+
+#[tokio::test]
+async fn http3_websocket_upgrade_is_loudly_rejected() {
+    let tcp = free_port();
+    let udp = free_port();
+    let (runtime, status) = start(config(
+        tcp,
+        Some(udp),
+        Some(&["h1", "h2", "h3"]),
+        static_routes(),
+    ))
+    .await;
+    let endpoint = quic_endpoint(client_config(vec![b"h3".to_vec()]));
+    let connection = connect(&endpoint, udp_address(&status, udp))
+        .await
+        .expect("QUIC connect");
+    let response = h3_request_on(
+        &connection,
+        "GET",
+        "https://example.com/ws",
+        &[
+            ("upgrade", "websocket"),
+            ("connection", "Upgrade"),
+            ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+            ("sec-websocket-version", "13"),
+        ],
+        None,
+        None,
+    )
+    .await
+    .expect("HTTP/3 upgrade response");
+    assert_eq!(response.status, http::StatusCode::NOT_IMPLEMENTED.as_u16());
+    assert_eq!(
+        response
+            .headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/plain; charset=utf-8")
+    );
+    assert_eq!(String::from_utf8_lossy(&response.body), H3_UPGRADE_BODY);
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn http3_extended_connect_is_loudly_rejected() {
+    let tcp = free_port();
+    let udp = free_port();
+    let (runtime, status) = start(config(
+        tcp,
+        Some(udp),
+        Some(&["h1", "h2", "h3"]),
+        static_routes(),
+    ))
+    .await;
+    let endpoint = quic_endpoint(client_config(vec![b"h3".to_vec()]));
+    let connection = connect(&endpoint, udp_address(&status, udp))
+        .await
+        .expect("QUIC connect");
+    let response = h3_request_on(
+        &connection,
+        "CONNECT",
+        "https://example.com/tunnel",
+        &[],
+        None,
+        Some(h3::ext::Protocol::WEB_TRANSPORT),
+    )
+    .await
+    .expect("HTTP/3 extended CONNECT response");
+    assert_eq!(response.status, http::StatusCode::NOT_IMPLEMENTED.as_u16());
+    assert_eq!(String::from_utf8_lossy(&response.body), H3_UPGRADE_BODY);
+    runtime.shutdown().await;
 }

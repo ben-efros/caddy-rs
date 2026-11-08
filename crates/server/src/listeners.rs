@@ -79,6 +79,9 @@ pub(crate) struct ListenerState {
     /// Whether the listener's client-auth mode verifies client certificates (Caddy
     /// `require_and_verify`/`verify_if_given`); used for `{http.request.tls.client.*}`.
     pub(crate) client_auth_verified: bool,
+    /// Whether the QUIC listener accepts 0-RTT early data (Caddy `allow_0rtt`). Caddy's default
+    /// when the field is absent is "allowed"; only an explicit `false` disables it.
+    pub(crate) allow_0rtt: bool,
     /// Automatic-HTTPS pre-routing (challenge responses, HTTP→HTTPS redirects) for cleartext
     /// listeners; `None` when automatic HTTPS is not active for this generation.
     pub(crate) automatic: Option<Arc<AutomaticHttpsServing>>,
@@ -426,9 +429,11 @@ pub(crate) async fn bind(
                 .into_std()
                 .map_err(|error| Error::bind(configured, error))?;
             let server_config =
-                quic_server_config(configured, tls).map_err(|reason| Error::Listen {
-                    listen: configured.to_string(),
-                    reason,
+                quic_server_config(configured, tls, state.allow_0rtt).map_err(|reason| {
+                    Error::Listen {
+                        listen: configured.to_string(),
+                        reason,
+                    }
                 })?;
             let endpoint = quinn::Endpoint::new(
                 quinn::EndpointConfig::default(),
@@ -594,15 +599,22 @@ fn wildcard_dual_stack_udp(port: u16) -> io::Result<UdpSocket> {
 
 /// Build a QUIC server configuration from the listener's rustls configuration (Caddy's
 /// `http3.Server` shares the TLS connection policy but negotiates only `h3` over QUIC).
+///
+/// `allow_0rtt` mirrors Caddy's `apps.http.servers.*.allow_0rtt`: quinn/rustls accept early data
+/// only when the TLS configuration advertises a non-zero `max_early_data_size` (QUIC permits only
+/// `u32::MAX`), so an explicit `false` leaves it at zero and the TLS stack rejects 0-RTT. Caddy
+/// passes the same flag to `quic-go`'s `ListenEarly`; the default (field absent) is "allowed".
 #[cfg(feature = "http3")]
 fn quic_server_config(
     configured: &str,
     tls: Arc<rustls::ServerConfig>,
+    allow_0rtt: bool,
 ) -> std::result::Result<quinn::ServerConfig, String> {
     let mut tls = (*tls).clone();
     // QUIC requires TLS 1.3 and the HTTP/3 ALPN token. Caddy's `http3.Server` configures its own
     // TLS config for QUIC, so the TCP listener keeps its h2/http1 ALPN list.
     tls.alpn_protocols = vec![b"h3".to_vec()];
+    tls.max_early_data_size = if allow_0rtt { u32::MAX } else { 0 };
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls).map_err(|error| {
         format!("listener `{configured}` cannot be used for QUIC: {error} (TLS 1.3 required)")
     })?;
@@ -746,6 +758,49 @@ async fn serve_h3_connection(
                         });
                         let _request_guard =
                             request_started(&context.recorder, &context.server_name);
+                        // RFC 9114 has no HTTP/1.1-style `Upgrade`, and caddy-rs has no HTTP/3
+                        // request-stream tunnel for RFC 8441 extended CONNECT. Reject every
+                        // upgrade-style request before routing so a WebSocket/extended-CONNECT
+                        // request can never be silently served as an ordinary request. Caddy
+                        // v2.11.9: quic-go rejects a plain `Upgrade` header with H3_MESSAGE_ERROR
+                        // (no HTTP response) and its reverse_proxy tunnels extended CONNECT; this
+                        // build's loud 501 is the documented divergence (DIV-0004).
+                        if h3_upgrade_request(&request) {
+                            let mut headers = http::HeaderMap::new();
+                            headers.insert(
+                                http::header::CONTENT_TYPE,
+                                http::HeaderValue::from_static("text/plain; charset=utf-8"),
+                            );
+                            let response = http::Response::builder()
+                                .status(http::StatusCode::NOT_IMPLEMENTED)
+                                .header(
+                                    http::header::CONTENT_TYPE,
+                                    "text/plain; charset=utf-8",
+                                )
+                                .body(())
+                                .unwrap_or_else(|_| http::Response::new(()));
+                            let _ = stream.send_response(response).await;
+                            let body = H3_UPGRADE_UNSUPPORTED_BODY;
+                            let _ = stream.send_data(Bytes::from_static(body.as_bytes())).await;
+                            let _ = stream.finish().await;
+                            observe_request(
+                                &context.recorder,
+                                &context.access_log,
+                                &context.access_log_policy,
+                                &context.server_name,
+                                &method,
+                                snapshot.as_ref(),
+                                started,
+                                501,
+                                body.len() as u64,
+                                &headers,
+                                // Rejected before the request pipeline exists, so there is no
+                                // per-request access-log context and no body write to report.
+                                None,
+                                None,
+                            );
+                            continue;
+                        }
                         let limit = context.limits.max_request_body_size;
                         let mut body = BytesMut::new();
                         let mut too_large = false;
@@ -846,7 +901,7 @@ async fn serve_h3_connection(
                             true,
                             Some("h3"),
                             Arc::clone(&context.trusted_proxies),
-                            None,
+                            h3_client_certificate(&connection, context.client_auth_verified),
                             request_tls_connection(Some(&tls_info)),
                             access_log_context.clone(),
                         )
@@ -936,10 +991,28 @@ async fn serve_h3_connection(
     }
 }
 
-/// Best-effort TLS metadata for access logs on an HTTP/3 connection.
+/// Body returned for an HTTP/3 protocol-upgrade attempt.
 ///
-/// quinn exposes the rustls handshake data (ALPN, SNI, resumption) but not the negotiated cipher
-/// suite; HTTP/3 is always TLS 1.3. See the compatibility divergence note.
+/// Shared with the buffered router path so a handler that reports an upgrade (for example a
+/// `reverse_proxy` upstream switching protocols) produces exactly the same response.
+#[cfg(feature = "http3")]
+pub(crate) const H3_UPGRADE_UNSUPPORTED_BODY: &str =
+    "501 Not Implemented: protocol upgrades are not supported over HTTP/3";
+
+/// Whether an HTTP/3 request asks for a protocol upgrade this build cannot serve.
+///
+/// HTTP/3 (RFC 9114) has no HTTP/1.1 `Upgrade` mechanism: a request that carries `Upgrade` is a
+/// WebSocket/other-upgrade attempt that quic-go would reject as malformed. RFC 8441 extended
+/// CONNECT is a `CONNECT` request with a `:protocol` pseudo-header, which `h3` surfaces as an
+/// extension. caddy-rs buffers HTTP/3 requests and has no request-stream tunnel, so both forms are
+/// rejected loudly instead of being handed to the router as ordinary requests. A plain `CONNECT`
+/// without `:protocol` is not an upgrade and keeps the existing routing behaviour.
+#[cfg(feature = "http3")]
+fn h3_upgrade_request(request: &http::Request<()>) -> bool {
+    request.headers().contains_key(http::header::UPGRADE)
+        || request.extensions().get::<h3::ext::Protocol>().is_some()
+}
+
 /// Map the first presented client certificate to Caddy's HTTP placeholder representation.
 ///
 /// `verified` comes from the listener's client-auth mode: Caddy's `require_and_verify` and
@@ -949,7 +1022,18 @@ fn client_certificate_for_request(
     verified: bool,
 ) -> Option<caddy_rs_http::ClientCertificate> {
     let der = connection.peer_certificates()?.first()?;
-    let info = caddy_rs_tls::ClientCertificateInfo::parse(der.as_ref(), verified).ok()?;
+    client_certificate_from_der(der.as_ref(), verified)
+}
+
+/// Build the placeholder representation from a DER-encoded leaf certificate.
+///
+/// Shared by the TCP and QUIC paths: rustls exposes the chain for a TCP listener and quinn's
+/// `peer_identity` exposes it for a QUIC connection; both end up here.
+fn client_certificate_from_der(
+    der: &[u8],
+    verified: bool,
+) -> Option<caddy_rs_http::ClientCertificate> {
+    let info = caddy_rs_tls::ClientCertificateInfo::parse(der, verified).ok()?;
     let certificate_pem = info.certificate_pem();
     let certificate_der_base64 = info.certificate_der_base64();
     Some(caddy_rs_http::ClientCertificate {
@@ -969,6 +1053,27 @@ fn client_certificate_for_request(
     })
 }
 
+/// Client certificate presented on an HTTP/3 connection.
+///
+/// quinn exposes the verified peer chain through `peer_identity` as rustls `CertificateDer`
+/// values, so HTTP/3 client authentication reaches the same placeholders as a TCP listener
+/// (Caddy reads the certificate from TLS state regardless of transport).
+#[cfg(feature = "http3")]
+fn h3_client_certificate(
+    connection: &quinn::Connection,
+    verified: bool,
+) -> Option<caddy_rs_http::ClientCertificate> {
+    let identity = connection.peer_identity()?;
+    let chain = identity
+        .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+        .ok()?;
+    client_certificate_from_der(chain.first()?.as_ref(), verified)
+}
+
+/// Best-effort TLS metadata for access logs on an HTTP/3 connection.
+///
+/// quinn exposes the rustls handshake data (ALPN, SNI, resumption) but not the negotiated cipher
+/// suite; HTTP/3 is always TLS 1.3. See the compatibility divergence note.
 #[cfg(feature = "http3")]
 fn h3_tls_info(connection: &quinn::Connection) -> TlsLogInfo {
     let handshake = connection
@@ -2242,4 +2347,31 @@ pub(crate) async fn bind_admin(configured: &str, api: AdminApi) -> Result<Listen
         bound: socket_addr.to_string(),
         socket_addr: Some(socket_addr),
     })
+}
+
+#[cfg(test)]
+mod client_certificate_tests {
+    use super::client_certificate_from_der;
+
+    const CLIENT_PEM: &str = include_str!("../../tls/testdata/client-auth/client.pem");
+
+    /// The QUIC path shares this conversion with the TCP path, so proving it here proves the
+    /// HTTP/3 placeholders carry the same data (DIV-0004 residual, T-HTTP-048).
+    #[test]
+    fn derives_placeholders_from_a_presented_leaf_certificate() {
+        let chain =
+            caddy_rs_tls::tls_server::certificates_from_pem(CLIENT_PEM).expect("client PEM");
+        let leaf = chain.first().expect("leaf certificate");
+        let certificate = client_certificate_from_der(leaf, true).expect("derived certificate");
+        assert!(!certificate.subject.is_empty(), "subject must be populated");
+        assert!(certificate.verified, "verification flag must be carried");
+        assert!(!certificate.certificate_pem.is_empty());
+        assert!(!certificate.fingerprint.is_empty());
+
+        let unverified = client_certificate_from_der(leaf, false).expect("derived certificate");
+        assert!(
+            !unverified.verified,
+            "an unverified listener must not claim verification"
+        );
+    }
 }
