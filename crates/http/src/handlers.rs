@@ -681,7 +681,7 @@ fn parse_path_regexp(
         let regex = Regex::new(&find).map_err(|error| match error {
             Error::InvalidConfig { message, .. } => Error::InvalidConfig {
                 path: format!("{item_path}.find"),
-                message,
+                message: format!("path_regexp `{find}`: {message}"),
             },
             other => other,
         })?;
@@ -3026,7 +3026,7 @@ mod tests {
             serde_json::json!({"handler":"map","destinations":["{a}"],
                 "mappings":[{"input_regexp":"(","outputs":["1"]}]}),
             serde_json::json!({"handler":"map","destinations":["{a}"],
-                "mappings":[{"input_regexp":"\\bword","outputs":["1"]}]}),
+                "mappings":[{"input_regexp":"(?=word)","outputs":["1"]}]}),
             // Non-scalar outputs and unknown fields are rejected loudly.
             serde_json::json!({"handler":"map","destinations":["{a}"],
                 "mappings":[{"input":"x","outputs":[["nested"]]}]}),

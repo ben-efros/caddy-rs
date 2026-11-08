@@ -105,6 +105,23 @@ async fn strip_suffix_is_escape_aware_and_preserves_query() {
 }
 
 #[tokio::test]
+async fn path_regexp_rewrite_supports_named_and_numeric_captures() {
+    let router = build_router(json!({
+        "handler": "rewrite",
+        "path_regexp": [
+            {"find": "^/users/(?P<id>[0-9]+)$", "replace": "/accounts/$id"}
+        ]
+    }));
+    assert_eq!(rewritten(&router, "/users/42").await, "/accounts/42");
+
+    let router = build_router(json!({
+        "handler": "rewrite",
+        "path_regexp": [{"find": "^/old/(.*)$", "replace": "/new/$1"}]
+    }));
+    assert_eq!(rewritten(&router, "/old/x").await, "/new/x");
+}
+
+#[tokio::test]
 async fn substring_cleans_the_path_and_handles_repeated_slashes() {
     let router = build_router(json!({
         "handler": "rewrite",
