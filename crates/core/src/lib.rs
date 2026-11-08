@@ -37,7 +37,9 @@ pub use config::{
     ProxyProtocolPolicy, Route, ServerLogConfig, SessionTicketService, SinkLog, StorageConfig,
     StringList, TlsApp, TlsAutomation,
 };
-pub use duration::{parse_caddy_duration, CaddyDuration};
+pub use duration::{
+    parse_caddy_duration, parse_caddy_signed_duration, CaddyDuration, CaddySignedDuration,
+};
 pub use error::{Error, Result};
 pub use generation::{
     drain, DrainOutcome, Generation, GenerationStore, LifecycleState, LoadResult, StopResult,

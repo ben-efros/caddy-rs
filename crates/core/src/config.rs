@@ -12,7 +12,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::duration::CaddyDuration;
+use crate::duration::{CaddyDuration, CaddySignedDuration};
 use crate::error::{Error, Result};
 
 /// The root of a Caddy configuration document.
@@ -293,12 +293,12 @@ pub struct HttpApp {
     /// Grace period for graceful shutdown. Caddy serializes `caddy.Duration` as integer
     /// nanoseconds and accepts Go duration strings (`"5s"`) on input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub grace_period: Option<CaddyDuration>,
+    pub grace_period: Option<CaddySignedDuration>,
 
     /// How long to keep serving after a shutdown is scheduled, before initiating the grace period
     /// (`apps.http.shutdown_delay`, Caddy's `caddy.Duration`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub shutdown_delay: Option<CaddyDuration>,
+    pub shutdown_delay: Option<CaddySignedDuration>,
 
     /// Experimental HTTP metrics configuration (`apps.http.metrics`).
     ///
@@ -1709,10 +1709,13 @@ mod tests {
         }))
         .expect("typed shutdown timing decodes");
         let http = config.http().expect("http app");
-        assert_eq!(http.grace_period.map(|d| d.as_nanos()), Some(5_000_000_000));
+        assert_eq!(
+            http.grace_period.map(|d| d.as_nanos()),
+            Some(5_000_000_000_i64)
+        );
         assert_eq!(
             http.shutdown_delay.map(|d| d.as_nanos()),
-            Some(1_500_000_000)
+            Some(1_500_000_000_i64)
         );
         // Caddy marshals caddy.Duration as integer nanoseconds.
         let value = config.to_value().expect("serializes");
@@ -1725,12 +1728,23 @@ mod tests {
             serde_json::json!(1_500_000_000_u64)
         );
 
-        // Invalid durations and negative numbers fail configuration decoding (Caddy rejects them
-        // while unmarshalling too) instead of being preserved as opaque JSON.
+        // Caddy accepts negative durations (its runtime treats any value <= 0 as "no limit").
+        let negative = Config::from_value(serde_json::json!({
+            "apps": {"http": {"grace_period": -1, "servers": {}}}
+        }))
+        .expect("negative grace period decodes like Caddy");
+        assert_eq!(
+            negative
+                .http()
+                .and_then(|http| http.grace_period)
+                .map(|d| d.as_nanos()),
+            Some(-1)
+        );
+
+        // Malformed durations still fail decoding instead of being preserved as opaque JSON.
         for bad in [
             serde_json::json!({"apps": {"http": {"grace_period": "soon"}}}),
             serde_json::json!({"apps": {"http": {"grace_period": "5"}}}),
-            serde_json::json!({"apps": {"http": {"shutdown_delay": -5}}}),
         ] {
             assert!(
                 Config::from_value(bad.clone()).is_err(),

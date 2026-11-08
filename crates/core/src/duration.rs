@@ -102,6 +102,91 @@ impl<'de> Deserialize<'de> for CaddyDuration {
     }
 }
 
+/// A Caddy `Duration` that may be negative.
+///
+/// Caddy's `grace_period` and `shutdown_delay` are plain `caddy.Duration` values, and its runtime
+/// tests them with `> 0`, so a negative value is accepted and means "no limit" — an eternal grace
+/// period or no shutdown delay (`modules/caddyhttp/app.go` 731, 757). [`CaddyDuration`] cannot
+/// represent that, so those two fields use this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct CaddySignedDuration(i64);
+
+impl CaddySignedDuration {
+    /// Construct from a number of nanoseconds, which may be negative.
+    pub const fn from_nanos(nanos: i64) -> Self {
+        Self(nanos)
+    }
+
+    /// The value in nanoseconds (may be negative).
+    pub const fn as_nanos(self) -> i64 {
+        self.0
+    }
+
+    /// Caddy's runtime treats any non-positive value as "unset".
+    pub const fn is_positive(self) -> bool {
+        self.0 > 0
+    }
+}
+
+impl std::fmt::Display for CaddySignedDuration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}ns", self.0)
+    }
+}
+
+impl Serialize for CaddySignedDuration {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_i64(self.0)
+    }
+}
+
+struct CaddySignedDurationVisitor;
+
+impl<'de> Visitor<'de> for CaddySignedDurationVisitor {
+    type Value = CaddySignedDuration;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a Caddy duration string (for example \"-1s\") or integer nanoseconds")
+    }
+
+    fn visit_u64<E: de::Error>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(CaddySignedDuration(value as i64))
+    }
+
+    fn visit_i64<E: de::Error>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(CaddySignedDuration(value))
+    }
+
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        parse_caddy_signed_duration(value).map_err(E::custom)
+    }
+
+    fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
+        self.visit_str(&value)
+    }
+}
+
+impl<'de> Deserialize<'de> for CaddySignedDuration {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(CaddySignedDurationVisitor)
+    }
+}
+
+/// Parse a Go-style duration string that may be negative (`"-1s"`, `"-1"`).
+pub fn parse_caddy_signed_duration(input: &str) -> Result<CaddySignedDuration, String> {
+    let text = input.trim();
+    if let Some(rest) = text.strip_prefix('-') {
+        let inner = parse_caddy_duration(rest)?;
+        let nanos =
+            i64::try_from(inner.as_nanos()).map_err(|_| format!("duration `{input}` overflows"))?;
+        return Ok(CaddySignedDuration(-nanos));
+    }
+    let inner = parse_caddy_duration(text)?;
+    let nanos =
+        i64::try_from(inner.as_nanos()).map_err(|_| format!("duration `{input}` overflows"))?;
+    Ok(CaddySignedDuration(nanos))
+}
+
 /// Parse a Go-style duration string into nanoseconds.
 ///
 /// Supported units: `ns`, `us`, `µs`, `μs`, `ms`, `s`, `m`, `h`. Only non-negative values are

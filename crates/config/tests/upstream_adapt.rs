@@ -1544,3 +1544,28 @@ fn persist_config_off_adapts_like_caddy() {
         );
     }
 }
+
+#[test]
+fn negative_shutdown_durations_adapt_like_caddy() {
+    // Golden from `caddy adapt` v2.11.9: Caddy accepts negative `grace_period`/`shutdown_delay`
+    // and its runtime treats any value <= 0 as "no limit".
+    let adapted = adapt("{\n\tgrace_period -1s\n\tshutdown_delay -1s\n}\n\n:8080 {\n}\n")
+        .expect("negative durations adapt");
+    let http = &adapted.config["apps"]["http"];
+    assert_eq!(http["grace_period"], json!(-1_000_000_000_i64));
+    assert_eq!(http["shutdown_delay"], json!(-1_000_000_000_i64));
+
+    // A bare integer is not a Go duration; Caddy rejects it with the same message.
+    let error = adapt("{\n\tgrace_period -500\n}\n\n:8080 {\n}\n").expect_err("bare integer");
+    assert!(
+        error.to_string().contains("missing unit in duration"),
+        "error must match Caddy: {error}"
+    );
+
+    // Malformed durations stay located errors.
+    let error = adapt("{\n\tgrace_period soon\n}\n\n:8080 {\n}\n").expect_err("malformed");
+    assert!(
+        error.to_string().contains("grace_period"),
+        "error must name the option: {error}"
+    );
+}

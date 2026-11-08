@@ -1207,15 +1207,15 @@ pub fn adapt_with_source(
     if let Some(port) = options.https_port {
         http_app.insert("https_port".to_string(), json!(port));
     }
-    // `caddy.Duration` marshals as integer nanoseconds; zero is omitted (`omitempty`), which the
-    // parser cannot produce differently anyway.
+    // `caddy.Duration` marshals as integer nanoseconds. Zero is omitted (`omitempty`); negative
+    // values are emitted as-is — Caddy's runtime treats any value <= 0 as "no limit".
     if let Some(nanoseconds) = options.grace_period_ns {
-        if nanoseconds > 0 {
+        if nanoseconds != 0 {
             http_app.insert("grace_period".to_string(), json!(nanoseconds));
         }
     }
     if let Some(nanoseconds) = options.shutdown_delay_ns {
-        if nanoseconds > 0 {
+        if nanoseconds != 0 {
             http_app.insert("shutdown_delay".to_string(), json!(nanoseconds));
         }
     }

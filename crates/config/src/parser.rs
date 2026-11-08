@@ -69,9 +69,9 @@ pub struct GlobalOptions {
     /// Certificate authorities defined by the global `pki` option (`apps.pki` in JSON).
     pub pki: Option<PkiOptions>,
     /// Global server grace period (`grace_period`), in nanoseconds (`apps.http.grace_period`).
-    pub grace_period_ns: Option<u64>,
+    pub grace_period_ns: Option<i64>,
     /// Global shutdown delay (`shutdown_delay`), in nanoseconds (`apps.http.shutdown_delay`).
-    pub shutdown_delay_ns: Option<u64>,
+    pub shutdown_delay_ns: Option<i64>,
     /// Raw global `log` options, in source order. The adapter turns them into the top-level
     /// `logging` app; multiple `log [<name>] { ... }` entries are allowed.
     pub logs: Vec<Directive>,
@@ -1966,16 +1966,9 @@ fn read_global_options(directives: Vec<Directive>) -> Result<GlobalOptions, Pars
                         format!("parsing {name}: {reason}"),
                     )
                 })?;
-                if nanoseconds < 0 {
-                    // Caddy's adapter accepts negative durations, but its runtime and the
-                    // caddy-rs typed `CaddyDuration` (u64 ns) treat them as invalid; reject
-                    // loudly instead of emitting a config that cannot be provisioned.
-                    return Err(ParseError::syntax(
-                        directive.position.clone(),
-                        format!("`{name}` must not be negative, got `{value}`"),
-                    ));
-                }
-                let nanoseconds = nanoseconds as u64;
+                // Caddy accepts negative durations and its runtime treats any value <= 0 as
+                // "no limit" (eternal grace period, no shutdown delay). Keep the sign in the
+                // emitted JSON exactly as `caddy adapt` does.
                 let slot = if name == "grace_period" {
                     &mut options.grace_period_ns
                 } else {
@@ -2575,10 +2568,6 @@ mod tests {
                 "missing unit",
             ),
             (
-                "{ grace_period -5s\n}\n:80 {\n respond ok\n}\n",
-                "must not be negative",
-            ),
-            (
                 "{ grace_period 5s\n grace_period 7s\n}\n:80 {\n respond ok\n}\n",
                 "specified more than once",
             ),
@@ -2597,6 +2586,12 @@ mod tests {
                 "expected {expected:?} in {error}"
             );
         }
+
+        // Negative durations are valid Caddy: its runtime treats any value <= 0 as "no limit".
+        let parsed = parse("{ grace_period -5s\n shutdown_delay -2s\n}\n:80 {\n respond ok\n}\n")
+            .expect("negative durations parse");
+        assert_eq!(parsed.options.grace_period_ns, Some(-5_000_000_000));
+        assert_eq!(parsed.options.shutdown_delay_ns, Some(-2_000_000_000));
     }
 
     #[test]

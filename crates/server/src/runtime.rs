@@ -80,14 +80,16 @@ impl ShutdownTiming {
     fn from_config(config: &caddy_rs_core::Config) -> Self {
         let http = config.http();
         Self {
+            // Caddy tests these with `> 0`, so zero and negative values mean "no limit": an
+            // eternal grace period and no shutdown delay (`modules/caddyhttp/app.go` 731, 757).
             shutdown_delay: http
                 .and_then(|http| http.shutdown_delay)
-                .map(caddy_rs_core::CaddyDuration::as_duration)
-                .filter(|duration| !duration.is_zero()),
+                .filter(|duration| duration.is_positive())
+                .map(|duration| std::time::Duration::from_nanos(duration.as_nanos() as u64)),
             grace_period: http
                 .and_then(|http| http.grace_period)
-                .map(caddy_rs_core::CaddyDuration::as_duration)
-                .filter(|duration| !duration.is_zero()),
+                .filter(|duration| duration.is_positive())
+                .map(|duration| std::time::Duration::from_nanos(duration.as_nanos() as u64)),
         }
     }
 }
@@ -2165,4 +2167,41 @@ fn spawn_ocsp_refresh(
         }
     });
     OcspRefresh { handle }
+}
+
+#[cfg(test)]
+mod shutdown_timing_tests {
+    use super::ShutdownTiming;
+    use caddy_rs_core::Config;
+
+    #[test]
+    fn negative_grace_period_and_shutdown_delay_mean_no_limit() {
+        // Caddy's runtime tests both with `> 0` (`modules/caddyhttp/app.go` 731, 757), so a
+        // negative value behaves like zero: eternal grace period, no shutdown delay.
+        let config = Config::from_value(serde_json::json!({
+            "apps": {"http": {"grace_period": -1, "shutdown_delay": -1, "servers": {}}}
+        }))
+        .expect("negative durations decode");
+        let timing = ShutdownTiming::from_config(&config);
+        assert!(
+            timing.grace_period.is_none(),
+            "negative grace period is eternal"
+        );
+        assert!(
+            timing.shutdown_delay.is_none(),
+            "negative delay means no delay"
+        );
+
+        let config = Config::from_value(serde_json::json!({
+            "apps": {"http": {"grace_period": 1_000_000_000_i64,
+                              "shutdown_delay": 2_000_000_000_i64, "servers": {}}}
+        }))
+        .expect("positive durations decode");
+        let timing = ShutdownTiming::from_config(&config);
+        assert_eq!(timing.grace_period, Some(std::time::Duration::from_secs(1)));
+        assert_eq!(
+            timing.shutdown_delay,
+            Some(std::time::Duration::from_secs(2))
+        );
+    }
 }
