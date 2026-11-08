@@ -1,0 +1,53 @@
+name: minimal-profile
+
+# The minimal build profile promises a closed configuration surface (ADR-0008): a module it does not
+# compile must be rejected at load, not silently available. This job keeps that promise from rotting.
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: minimal-profile-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fail-closed:
+    name: minimal fails closed
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build the minimal profile
+        run: |
+          cargo build --locked -p caddy-rs --no-default-features --features minimal
+          cp target/debug/caddy-rs /tmp/caddy-rs-minimal
+      - name: Build the default profile
+        run: cargo build --locked -p caddy-rs
+      - name: Compare the module surfaces
+        run: |
+          set -Eeuo pipefail
+          minimal=$(/tmp/caddy-rs-minimal list-modules | wc -l)
+          default=$(./target/debug/caddy-rs list-modules | wc -l)
+          {
+            echo "minimal modules: $minimal"
+            echo "default modules: $default"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$minimal" -ge "$default" ]; then
+            echo "::error::minimal registers $minimal modules, default $default: the profile excludes nothing"
+            exit 1
+          fi
+      - name: Excluded modules are rejected, baseline modules still work
+        run: |
+          set -Eeuo pipefail
+          printf 'example.com {\n\treverse_proxy 127.0.0.1:9000\n}\n' > /tmp/excluded.Caddyfile
+          if /tmp/caddy-rs-minimal validate --config /tmp/excluded.Caddyfile --adapter caddyfile 2>/tmp/err.txt; then
+            echo "::error::minimal build accepted reverse_proxy, so the profile is not closed"
+            exit 1
+          fi
+          grep -q "module.unknown" /tmp/err.txt
+          printf 'example.com {\n\troot * /tmp\n\tfile_server\n}\n' > /tmp/baseline.Caddyfile
+          /tmp/caddy-rs-minimal validate --config /tmp/baseline.Caddyfile --adapter caddyfile
