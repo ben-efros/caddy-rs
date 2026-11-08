@@ -1262,6 +1262,12 @@ pub fn adapt_with_source(
         if let Some(listen) = &admin.listen {
             admin_object.insert("listen".to_string(), json!(listen));
         }
+        if admin.enforce_origin {
+            admin_object.insert("enforce_origin".to_string(), json!(true));
+        }
+        if !admin.origins.is_empty() {
+            admin_object.insert("origins".to_string(), json!(admin.origins));
+        }
         config.insert("admin".to_string(), Value::Object(admin_object));
     }
     if !apps.is_empty() {
@@ -8687,7 +8693,7 @@ fn parse_error(error: parser::ParseError) -> CoreError {
 /// build intentionally rejects (the same marker the conformance classifier uses). Route those
 /// through `config.unsupported` so a valid Caddyfile is never presented as malformed; the
 /// explanatory suffix and any `(tracked as T-...)` text are preserved. New code should prefer
-/// [`adapter_unsupported`] / [`adapter_unsupported_untracked`].
+/// [`adapter_unsupported`].
 fn adapter_error(position: Position, message: impl Into<String>) -> CoreError {
     let message = message.into();
     match unsupported_construct(&message) {
@@ -8702,10 +8708,6 @@ fn adapter_unsupported(
     tracking_id: &'static str,
 ) -> CoreError {
     CoreError::unsupported(position.label(), feature, tracking_id)
-}
-
-fn adapter_unsupported_untracked(position: Position, feature: impl Into<String>) -> CoreError {
-    CoreError::unsupported_untracked(position.label(), feature)
 }
 
 fn unsupported_construct(message: &str) -> Option<String> {

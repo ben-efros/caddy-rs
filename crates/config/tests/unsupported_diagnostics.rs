@@ -36,18 +36,13 @@ fn persist_config_is_unsupported_with_its_tracking_task() {
 }
 
 #[test]
-fn admin_global_option_block_is_unsupported_with_its_tracking_task() {
-    let error = adapt_error("{\n\tadmin {\n\t\torigins localhost:2019\n\t}\n}\n\n:8080 {\n}\n");
-    let message = error.to_string();
-
-    assert_eq!(error.code(), "config.unsupported", "{message}");
-    assert!(
-        message.contains("`admin` global-option block"),
-        "the error must name the construct: {message}"
-    );
-    assert!(
-        message.contains("tracked as T-CONF-055"),
-        "the error must name the tracking task: {message}"
+fn admin_global_option_block_adapts_like_caddy() {
+    // The block form is implemented (T-CONF-055): only `persist_config` remains unsupported.
+    let adapted = adapt("{\n\tadmin {\n\t\torigins localhost:2019\n\t}\n}\n\n:8080 {\n}\n")
+        .expect("admin block adapts");
+    assert_eq!(
+        adapted.config["admin"],
+        serde_json::json!({"listen": "localhost:2019", "origins": ["localhost:2019"]})
     );
 }
 

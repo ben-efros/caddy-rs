@@ -1465,3 +1465,48 @@ fn dial_timeout_in_transport_adapts_like_caddy() {
         "unexpected error: {error}"
     );
 }
+
+#[test]
+fn admin_global_option_block_adapts_like_caddy() {
+    // Golden from `caddy adapt` v2.11.9: `listen` is filled in whenever the endpoint stays enabled,
+    // and the block carries `enforce_origin`/`origins`.
+    let site = "\n\nlocalhost:8080 {\n\trespond \"ok\"\n}\n";
+    for (option, expected) in [
+        (
+            "{\n\tadmin {\n\t\tenforce_origin\n\t\torigins example.com other.example\n\t}\n}",
+            json!({"listen": "localhost:2019", "enforce_origin": true,
+                   "origins": ["example.com", "other.example"]}),
+        ),
+        ("{\n\tadmin\n}", json!({"listen": "localhost:2019"})),
+        (
+            "{\n\tadmin 127.0.0.1:2020 {\n\t\tenforce_origin\n\t}\n}",
+            json!({"listen": "127.0.0.1:2020", "enforce_origin": true}),
+        ),
+        ("{\n\tadmin off\n}", json!({"disabled": true})),
+    ] {
+        let adapted = adapt(&format!("{option}{site}")).expect("adapt admin option");
+        assert_eq!(adapted.config["admin"], expected, "for option: {option}");
+    }
+
+    for (option, expected) in [
+        (
+            "{\n\tadmin off {\n\t\tenforce_origin\n\t}\n}",
+            "no more options are allowed after `admin off`",
+        ),
+        (
+            "{\n\tadmin {\n\t\tbogus\n\t}\n}",
+            "unrecognized parameter 'bogus'",
+        ),
+        ("{\n\tadmin a:1 b:2\n}", "after `admin`"),
+        (
+            "{\n\tadmin {\n\t\torigins\n\t}\n}",
+            "requires at least one origin",
+        ),
+    ] {
+        let error = adapt(&format!("{option}{site}")).expect_err("invalid admin option");
+        assert!(
+            error.to_string().contains(expected),
+            "expected `{expected}` in: {error}"
+        );
+    }
+}

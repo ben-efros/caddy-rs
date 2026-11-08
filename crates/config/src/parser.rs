@@ -87,13 +87,19 @@ pub struct GlobalOptions {
     pub warnings: Vec<String>,
 }
 
-/// Caddy's global `admin` option (`admin off` or `admin <address>`).
+/// Caddy's global `admin` option: `admin off`, `admin <address>`, or a block with
+/// `enforce_origin` / `origins`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AdminOptions {
     /// `admin off`: the endpoint is not started.
     pub disabled: bool,
-    /// `admin <address>`: the listen address (Caddy's default is `localhost:2019`).
+    /// `admin <address>`: the listen address. Caddy defaults it to `localhost:2019` whenever the
+    /// endpoint is enabled without an explicit address (`parseOptAdmin`).
     pub listen: Option<String>,
+    /// Require the `Origin` header to appear in `origins`.
+    pub enforce_origin: bool,
+    /// Allowed admin API origins (`origins <hosts...>`).
+    pub origins: Vec<String>,
 }
 
 /// A DNS-challenge provider referenced by `acme_dns` or `tls { dns ... }`:
@@ -1855,31 +1861,59 @@ fn read_global_options(directives: Vec<Directive>) -> Result<GlobalOptions, Pars
                 options.auto_https = modes;
             }
             "admin" => {
-                if !directive.block.is_empty() {
-                    return Err(ParseError::unsupported(
-                        directive.position.clone(),
-                        "the `admin` global-option block",
-                        Some("T-CONF-055"),
-                    ));
-                }
-                if directive.args.len() != 1 {
+                if directive.args.len() > 1 {
                     return Err(ParseError::syntax(
                         directive.position.clone(),
                         "wrong argument count or unexpected line ending after `admin`",
                     ));
                 }
-                let value = &directive.args[0];
-                options.admin = Some(if value == "off" {
-                    AdminOptions {
-                        disabled: true,
-                        listen: None,
+                let mut admin = AdminOptions::default();
+                if let Some(value) = directive.args.first() {
+                    if value == "off" {
+                        // Caddy: "No more option is allowed after turning off admin config".
+                        if !directive.block.is_empty() {
+                            return Err(ParseError::syntax(
+                                directive.position.clone(),
+                                "no more options are allowed after `admin off`",
+                            ));
+                        }
+                        admin.disabled = true;
+                    } else {
+                        admin.listen = Some(value.clone());
                     }
-                } else {
-                    AdminOptions {
-                        disabled: false,
-                        listen: Some(value.clone()),
+                }
+                for item in &directive.block {
+                    match item.name.as_str() {
+                        "enforce_origin" => {
+                            if !item.args.is_empty() || !item.block.is_empty() {
+                                return Err(ParseError::syntax(
+                                    item.position.clone(),
+                                    "`enforce_origin` does not take arguments",
+                                ));
+                            }
+                            admin.enforce_origin = true;
+                        }
+                        "origins" => {
+                            if item.args.is_empty() || !item.block.is_empty() {
+                                return Err(ParseError::syntax(
+                                    item.position.clone(),
+                                    "`origins` requires at least one origin",
+                                ));
+                            }
+                            admin.origins = item.args.clone();
+                        }
+                        other => {
+                            return Err(ParseError::syntax(
+                                item.position.clone(),
+                                format!("unrecognized parameter '{other}'"),
+                            ))
+                        }
                     }
-                });
+                }
+                if admin.listen.is_none() && !admin.disabled {
+                    admin.listen = Some("localhost:2019".to_string());
+                }
+                options.admin = Some(admin);
             }
             "http_port" => {
                 options.http_port = Some(global_port(&directive)?);
