@@ -249,7 +249,7 @@ pub(crate) async fn serve_internal_buffered(
         }
         Ok(ResponseOutcome::Upgrade(_)) => ServedResponse::Response(status_response(
             StatusCode::NOT_IMPLEMENTED,
-            "501 Not Implemented: protocol upgrades are not supported over HTTP/3",
+            crate::listeners::H3_UPGRADE_UNSUPPORTED_BODY,
         )),
         Err(error) => match error.handler_status() {
             Some(status) => ServedResponse::Response(status_response(

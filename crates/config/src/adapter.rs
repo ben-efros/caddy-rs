@@ -70,8 +70,9 @@ impl ConfigAdapter for CaddyfileAdapter {
 ///
 /// The shared parser does not model this global option yet and rejects it before the adapter runs,
 /// so the adapter extracts the block from the raw input first (masking it out with spaces to keep
-/// line numbers stable), then applies the parsed options to the generated servers. Only the
-/// `listener_wrappers` subset is implemented; every other `servers` sub-option is a located error.
+/// line numbers stable), then applies the parsed options to the generated servers. The
+/// `listener_wrappers`, trusted-proxy and `0rtt` subsets are implemented; every other `servers`
+/// sub-option is a located error.
 #[derive(Debug, Clone, Default)]
 struct GlobalServerOptions {
     /// `None` applies to every server; otherwise only to servers with an exactly matching
@@ -478,6 +479,30 @@ fn parse_servers_block(
                         }
                         settings.insert("client_ip_headers".to_string(), Value::Array(headers));
                     }
+                    "0rtt" => {
+                        if has_block {
+                            return Err(adapter_error(position, "`0rtt` does not take a block"));
+                        }
+                        match arguments.as_slice() {
+                            [argument] if argument == "off" => {
+                                settings.insert("allow_0rtt".to_string(), Value::Bool(false));
+                            }
+                            [argument] => {
+                                return Err(adapter_error(
+                                    position,
+                                    format!(
+                                        "unsupported 0rtt argument '{argument}' (only 'off' is supported)"
+                                    ),
+                                ))
+                            }
+                            _ => {
+                                return Err(adapter_error(
+                                    position,
+                                    "0rtt expects exactly one argument: `off`",
+                                ))
+                            }
+                        }
+                    }
                     other => {
                         return Err(adapter_error(
                             position,
@@ -485,7 +510,7 @@ fn parse_servers_block(
                                 "`servers` option `{other}` is not supported by this build \
                                  (tracked as T-CONF-036); supported: listener_wrappers, \
                                  trusted_proxies, trusted_proxies_strict, trusted_proxies_unix, \
-                                 client_ip_headers"
+                                 client_ip_headers, 0rtt"
                             ),
                         ))
                     }

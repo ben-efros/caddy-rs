@@ -1569,3 +1569,62 @@ fn negative_shutdown_durations_adapt_like_caddy() {
         "error must name the option: {error}"
     );
 }
+
+#[test]
+fn servers_0rtt_off_matches_real_caddy_v2_11_9() {
+    // Golden from `caddy adapt` v2.11.9: the only accepted form is `0rtt off`, emitted as
+    // `allow_0rtt: false` on the matching server. Absent means Caddy's default (allowed).
+    let adapted = adapt("{\n\tservers {\n\t\t0rtt off\n\t}\n}\n\n:8080 {\n\trespond \"ok\"\n}\n")
+        .expect("adapt servers 0rtt off");
+    assert_eq!(
+        adapted.config["apps"]["http"]["servers"]["srv0"]["allow_0rtt"],
+        json!(false)
+    );
+
+    let plain = adapt(":8080 {\n\trespond \"ok\"\n}\n").expect("adapt plain site");
+    assert!(
+        plain.config["apps"]["http"]["servers"]["srv0"]
+            .get("allow_0rtt")
+            .is_none(),
+        "an absent `0rtt` option must not emit allow_0rtt (Caddy default: allowed)"
+    );
+
+    // Address-scoped options follow the same first-match rule as the other servers options.
+    let scoped = adapt(
+        "{\n\tservers :8080 {\n\t\t0rtt off\n\t}\n}\n\n:8080 {\n\trespond \"a\"\n}\n\n:8081 {\n\trespond \"b\"\n}\n",
+    )
+    .expect("adapt address-scoped 0rtt");
+    assert_eq!(
+        scoped.config["apps"]["http"]["servers"]["srv0"]["allow_0rtt"],
+        json!(false)
+    );
+    assert!(scoped.config["apps"]["http"]["servers"]["srv1"]
+        .get("allow_0rtt")
+        .is_none());
+
+    // Caddy rejects every argument other than `off`; keep the located error.
+    for (caddyfile, expected) in [
+        (
+            "{\n\tservers {\n\t\t0rtt on\n\t}\n}\n\n:8080 {\n\trespond \"ok\"\n}\n",
+            "unsupported 0rtt argument 'on' (only 'off' is supported)",
+        ),
+        (
+            "{\n\tservers {\n\t\t0rtt\n\t}\n}\n\n:8080 {\n\trespond \"ok\"\n}\n",
+            "0rtt expects exactly one argument: `off`",
+        ),
+        (
+            "{\n\tservers {\n\t\t0rtt off on\n\t}\n}\n\n:8080 {\n\trespond \"ok\"\n}\n",
+            "0rtt expects exactly one argument: `off`",
+        ),
+        (
+            "{\n\tservers {\n\t\t0rtt {\n\t\t}\n\t}\n}\n\n:8080 {\n\trespond \"ok\"\n}\n",
+            "does not take a block",
+        ),
+    ] {
+        let error = adapt(caddyfile).expect_err("invalid 0rtt form must be located");
+        assert!(
+            error.to_string().contains(expected),
+            "expected `{expected}` in: {error}"
+        );
+    }
+}
