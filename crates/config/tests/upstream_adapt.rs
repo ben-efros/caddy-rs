@@ -1510,3 +1510,37 @@ fn admin_global_option_block_adapts_like_caddy() {
         );
     }
 }
+
+#[test]
+fn persist_config_off_adapts_like_caddy() {
+    // Golden from `caddy adapt` v2.11.9: the global option lands in `admin.config.persist` and
+    // merges with an `admin` option instead of replacing it.
+    let site = "\n\n:8080 {\n\trespond \"ok\"\n}\n";
+    let adapted =
+        adapt(&format!("{{\n\tpersist_config off\n}}{site}")).expect("adapt persist_config");
+    assert_eq!(
+        adapted.config["admin"],
+        json!({"config": {"persist": false}})
+    );
+
+    let adapted = adapt(&format!(
+        "{{\n\tpersist_config off\n\tadmin 127.0.0.1:2020 {{\n\t\tenforce_origin\n\t}}\n}}{site}"
+    ))
+    .expect("adapt persist_config with admin");
+    assert_eq!(
+        adapted.config["admin"],
+        json!({"listen": "127.0.0.1:2020", "enforce_origin": true,
+               "config": {"persist": false}})
+    );
+
+    for (option, expected) in [
+        ("{\n\tpersist_config on\n}", "persist_config must be 'off'"),
+        ("{\n\tpersist_config\n}", "after `persist_config`"),
+    ] {
+        let error = adapt(&format!("{option}{site}")).expect_err("invalid persist_config");
+        assert!(
+            error.to_string().contains(expected),
+            "expected `{expected}` in: {error}"
+        );
+    }
+}

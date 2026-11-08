@@ -79,6 +79,8 @@ pub struct GlobalOptions {
     pub metrics: Option<Directive>,
     /// Global `admin` option: `admin off` disables the endpoint, `admin <address>` moves it.
     pub admin: Option<AdminOptions>,
+    /// Global `persist_config off`: Caddy sets `admin.config.persist = false`.
+    pub persist_config_off: bool,
     /// Caddy's global `debug` option. Caddy's adapter uses it to set custom loggers to DEBUG and to
     /// add an implicit DEBUG default logger; it is otherwise informational.
     pub debug: bool,
@@ -1915,6 +1917,28 @@ fn read_global_options(directives: Vec<Directive>) -> Result<GlobalOptions, Pars
                 }
                 options.admin = Some(admin);
             }
+            "persist_config" => {
+                // Caddy only accepts `off`; anything else is "persist_config must be 'off'".
+                if !directive.block.is_empty() {
+                    return Err(ParseError::syntax(
+                        directive.position.clone(),
+                        "`persist_config` does not take a block",
+                    ));
+                }
+                if directive.args.len() != 1 {
+                    return Err(ParseError::syntax(
+                        directive.position.clone(),
+                        "wrong argument count or unexpected line ending after `persist_config`",
+                    ));
+                }
+                if directive.args[0] != "off" {
+                    return Err(ParseError::syntax(
+                        directive.position.clone(),
+                        "persist_config must be 'off'",
+                    ));
+                }
+                options.persist_config_off = true;
+            }
             "http_port" => {
                 options.http_port = Some(global_port(&directive)?);
             }
@@ -2102,7 +2126,7 @@ fn is_caddy_global_option(name: &str) -> bool {
 /// omit the `(tracked as ...)` suffix rather than pointing at an unrelated task.
 fn global_option_tracking(name: &str) -> Option<&'static str> {
     match name {
-        "persist_config" => Some("T-CONF-055"),
+        "persist_config" => Some("T-CONF-056"),
         _ => None,
     }
 }

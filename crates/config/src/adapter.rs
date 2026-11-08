@@ -1254,8 +1254,9 @@ pub fn adapt_with_source(
     }
 
     let mut config = Map::new();
-    if let Some(admin) = &options.admin {
+    if options.admin.is_some() || options.persist_config_off {
         let mut admin_object = Map::new();
+        let admin = options.admin.clone().unwrap_or_default();
         if admin.disabled {
             admin_object.insert("disabled".to_string(), json!(true));
         }
@@ -1267,6 +1268,11 @@ pub fn adapt_with_source(
         }
         if !admin.origins.is_empty() {
             admin_object.insert("origins".to_string(), json!(admin.origins));
+        }
+        if options.persist_config_off {
+            // Caddy's `persist_config off` is `admin.config.persist = false`, merged into any
+            // `admin` option rather than replacing it.
+            admin_object.insert("config".to_string(), json!({"persist": false}));
         }
         config.insert("admin".to_string(), Value::Object(admin_object));
     }

@@ -2,7 +2,7 @@
 //! a malformed configuration. A genuine typo must still be `config.invalid`.
 //!
 //! Regression context: `persist_config off` is valid Caddy v2.11.9 (it adapts to
-//! `admin.config.persist = false`, tracked as T-CONF-055) but was reported as
+//! `admin.config.persist = false`, tracked as T-CONF-056) but was reported as
 //! `unrecognized global option`, which suggests the user's Caddyfile is broken.
 
 use caddy_rs_config::adapt;
@@ -12,26 +12,13 @@ fn adapt_error(caddyfile: &str) -> caddy_rs_core::Error {
 }
 
 #[test]
-fn persist_config_is_unsupported_with_its_tracking_task() {
-    let error = adapt_error("{\n\tpersist_config off\n}\n\n:8080 {\n}\n");
-    let message = error.to_string();
-
-    assert_eq!(error.code(), "config.unsupported", "{message}");
-    assert!(
-        message.contains("global option `persist_config`"),
-        "the error must name the option: {message}"
-    );
-    assert!(
-        message.contains("not supported by this build"),
-        "the error must say this build lacks the feature: {message}"
-    );
-    assert!(
-        message.contains("tracked as T-CONF-055"),
-        "the error must name the tracking task: {message}"
-    );
-    assert!(
-        !message.contains("unrecognized") && !message.contains("unknown global option"),
-        "a valid Caddy option must not read as a typo: {message}"
+fn persist_config_off_adapts_to_admin_config_persist() {
+    // Caddy maps the global option to `admin.config.persist = false` (T-CONF-056).
+    let adapted =
+        adapt("{\n\tpersist_config off\n}\n\n:8080 {\n}\n").expect("adapt persist_config");
+    assert_eq!(
+        adapted.config["admin"],
+        serde_json::json!({"config": {"persist": false}})
     );
 }
 
@@ -94,7 +81,6 @@ fn every_recognised_unsupported_global_option_reports_unsupported() {
         "ocsp_stapling",
         "on_demand_tls",
         "order",
-        "persist_config",
         "preferred_chains",
         "renew_interval",
         "renewal_window_ratio",
