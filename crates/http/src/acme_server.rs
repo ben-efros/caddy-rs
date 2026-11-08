@@ -24,13 +24,19 @@
 //! ID (`local` by default), so the default directory URL is
 //! `https://<host>/acme/local/directory` exactly like Caddy.
 //!
-//! `X-Forwarded-Proto` and `X-Forwarded-Host` are honoured as a caddy-rs extension for a
-//! TLS-terminating reverse proxy: when the server's trusted-proxy policy marks the peer trusted
-//! (`trusted_proxy` request variable), the client-facing scheme and host replace the listener's
-//! connection scheme and request `Host`. They affect URL construction only (the JWS `url` binding
-//! uses the same origin); routing, certificate identifiers and the `http-01` fetch target never
-//! read them. Valid values from an untrusted peer are ignored (malformed ones are rejected), so a
-//! direct client cannot spoof the external origin.
+//! `X-Forwarded-Proto` and `X-Forwarded-Host` select the external origin for a TLS-terminating
+//! reverse proxy only when the server's trusted-proxy policy marks the peer trusted
+//! (`trusted_proxy` request variable); the client-facing scheme and host then replace the
+//! listener's connection scheme and request `Host`. Validation applies regardless of that policy:
+//! malformed forwarded values are rejected even from untrusted peers. Valid values from an
+//! untrusted peer are ignored and cannot spoof the origin. The headers affect URL construction
+//! only (the JWS `url` binding uses the same origin); routing, certificate identifiers and the
+//! `http-01` fetch target never read them.
+//!
+//! Direct requests keep the historical `https` scheme, but their authority now goes through the
+//! same strict `host`/`host:port` validation as forwarded headers. An authority outside that
+//! grammar is a deliberate fail-closed `malformed` problem instead of being interpolated raw into
+//! a URL; a valid authority produces the same URL as before.
 //!
 //! Security-relevant properties:
 //!
@@ -1552,13 +1558,27 @@ impl AcmeServerHandler {
 
     /// Resolve the external origin (`scheme` and `host`) for one request.
     ///
-    /// Direct requests keep the historical behaviour: `https` plus the request `Host` (or the
-    /// configured `host`), byte-identical to the URLs this handler produced before forwarded
-    /// headers were honoured. `X-Forwarded-Proto` / `X-Forwarded-Host` are used only when the
-    /// server's trusted-proxy policy sets `trusted_proxy=true` for the peer (the same signal
-    /// `reverse_proxy` and `forward_auth` consume). Without that signal the headers are parsed and
-    /// validated (a malformed value is still a loud `malformed` problem) but valid values never
-    /// influence the origin, so an arbitrary client cannot choose the external URL.
+    /// Direct requests (no trusted forwarded headers) keep the historical `https` scheme and now
+    /// use the validated request `Host` (or the configured `host`). The direct path is therefore
+    /// intentionally fail-closed rather than byte-identical for every input: an authority outside
+    /// the grammar enforced by [`parse_external_host`] (for example a trailing-dot FQDN,
+    /// percent-encoding, userinfo, a path/query/fragment, an empty label, a leading/trailing `-`,
+    /// or an unbracketed IPv6 literal) is a `malformed` problem instead of being interpolated raw
+    /// into a URL. For a valid authority the direct URL is unchanged.
+    ///
+    /// A second deliberate direct-path change: [`Self::request_url`] now builds the JWS binding
+    /// from the same configured-`host`/request-`Host` origin as [`Self::base_url`]. Before
+    /// T-TLS-086 the binding always used the request `Host`, so a configured `host` that differed
+    /// from it advertised a directory the client could not bind to. This matches Caddy/smallstep's
+    /// single-origin behaviour but changes the expected `url` for configurations with `host` set.
+    ///
+    /// Forwarded origin *selection* requires the server's trusted-proxy policy to set
+    /// `trusted_proxy=true` for the peer (the same signal `reverse_proxy` and `forward_auth`
+    /// consume). Without that signal, valid forwarded values are ignored so an arbitrary client
+    /// cannot choose the external URL. Validation is not gated: malformed forwarded values are a
+    /// loud `malformed` problem for trusted and untrusted peers alike. Operator `vars`/`map`
+    /// configuration can also set `trusted_proxy` — the same operator-controlled footgun class as
+    /// Caddy — so the gate is not request-influenceable, but it is not immutable configuration.
     ///
     /// Security note: a forwarded origin changes only the strings this handler advertises and
     /// compares in the JWS protected `url` header. It does not affect routing, account or order
@@ -1581,6 +1601,9 @@ impl AcmeServerHandler {
             .map(|host| parse_external_host(host, "X-Forwarded-Host"))
             .transpose()?;
 
+        // Operator `vars`/`map` configuration can set this variable too (the same
+        // operator-controlled footgun as Caddy); it is not settable by request headers, but it is
+        // not an immutable trust anchor either.
         let trusted = request
             .vars
             .get(TRUSTED_PROXY_VAR)
@@ -1589,8 +1612,8 @@ impl AcmeServerHandler {
         let scheme = if use_forwarded {
             forwarded_scheme.unwrap_or_else(|| connection_scheme(request))
         } else {
-            // The pre-T-TLS-086 direct path always advertised `https`, including on plain HTTP
-            // listeners; T-TLS-086 must not change those URLs.
+            // The direct path keeps advertising `https` (even on plain listeners), as before;
+            // only the authority validation below is new for the direct path.
             "https"
         };
         let host = match (&self.config.host, use_forwarded, forwarded_host) {
@@ -1623,7 +1646,9 @@ impl AcmeServerHandler {
     ///
     /// Built from the same external origin as [`Self::base_url`] (ignoring the query string), so
     /// forwarding `X-Forwarded-Proto` / `X-Forwarded-Host` changes what the client must sign
-    /// rather than letting it bypass the binding check.
+    /// rather than letting it bypass the binding check. When the operator configured `host`, that
+    /// host is used even if the request `Host` differs; before T-TLS-086 this method always used
+    /// the request `Host`, which made a differing configured `host` unbindable.
     fn request_url(&self, request: &Request) -> std::result::Result<String, Problem> {
         let origin = self.external_origin(request)?;
         Ok(format!(
@@ -4318,6 +4343,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configured_host_uses_the_forwarded_scheme() {
+        let handler = test_handler(
+            ScriptedTransport::success(),
+            json!({"handler": "acme_server", "host": "configured.example"}),
+        );
+
+        let response = send(
+            &handler,
+            forwarded_request(
+                Method::GET,
+                "/acme/local/directory",
+                "internal:8080",
+                Some("http"),
+                Some("public.example"),
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK, "{}", body_text(&response));
+        assert_eq!(
+            body_json(&response)["newNonce"],
+            "http://configured.example/acme/local/new-nonce",
+            "a trusted forwarded scheme applies even when `host` supplies the authority"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_host_binds_the_jws_url_even_when_request_host_differs() {
+        let handler = test_handler(
+            ScriptedTransport::success(),
+            json!({"handler": "acme_server", "host": "configured.example"}),
+        );
+        let key = AccountKey::generate().expect("account key");
+        let payload = serde_json::to_vec(&json!({"termsOfServiceAgreed": true})).expect("payload");
+
+        let response = send(
+            &handler,
+            forwarded_request(
+                Method::GET,
+                "/acme/local/new-nonce",
+                "internal:8080",
+                None,
+                None,
+                false,
+            ),
+        )
+        .await;
+        let nonce = header_value(&response, replay_nonce_header()).expect("nonce");
+
+        let mut request = forwarded_request(
+            Method::POST,
+            "/acme/local/new-account",
+            "internal:8080",
+            None,
+            None,
+            false,
+        );
+        request.headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/jose+json"),
+        );
+        request.body = Bytes::from(
+            sign_jws(
+                &key,
+                None,
+                Some(&nonce),
+                "https://configured.example/acme/local/new-account",
+                &payload,
+            )
+            .expect("sign JWS"),
+        );
+        let response = send(&handler, request).await;
+        assert_eq!(
+            response.status,
+            StatusCode::CREATED,
+            "{}",
+            body_text(&response)
+        );
+        assert!(
+            header_value(&response, header::LOCATION)
+                .expect("account location")
+                .starts_with("https://configured.example/acme/local/account/"),
+            "the configured host is the advertised origin"
+        );
+        let nonce = header_value(&response, replay_nonce_header()).expect("replay nonce");
+
+        // The request Host is not the binding origin once `host` is configured.
+        let mut request = forwarded_request(
+            Method::POST,
+            "/acme/local/new-account",
+            "internal:8080",
+            None,
+            None,
+            false,
+        );
+        request.headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/jose+json"),
+        );
+        request.body = Bytes::from(
+            sign_jws(
+                &key,
+                None,
+                Some(&nonce),
+                "https://internal:8080/acme/local/new-account",
+                &payload,
+            )
+            .expect("sign JWS"),
+        );
+        let response = send(&handler, request).await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(&response)["type"], PROBLEM_MALFORMED);
+        assert!(body_json(&response)["detail"]
+            .as_str()
+            .expect("detail")
+            .contains("does not match request url"));
+    }
+
+    #[tokio::test]
     async fn forwarded_origin_requires_the_trusted_proxy_signal() {
         let handler = test_handler(
             ScriptedTransport::success(),
@@ -4445,6 +4589,7 @@ mod tests {
         );
 
         for host in [
+            "",
             "https://evil.example",
             "evil.example/path",
             "evil example",
@@ -4528,6 +4673,41 @@ mod tests {
                 valid
             );
         }
+    }
+
+    #[test]
+    fn forwarded_host_length_boundaries_are_enforced() {
+        let label63 = "a".repeat(63);
+        let label64 = "a".repeat(64);
+
+        // Exactly 253 bytes of hostname (63 + 63 + 63 + 61 + three dots) is accepted.
+        let host253 = format!("{label63}.{label63}.{label63}.{}", "d".repeat(61));
+        assert_eq!(host253.len(), 253);
+        assert_eq!(
+            parse_external_host(&host253, "X-Forwarded-Host").expect("253-byte host"),
+            host253
+        );
+        // A port is not part of the 253-byte hostname bound.
+        assert!(
+            parse_external_host(&format!("{host253}:443"), "X-Forwarded-Host").is_ok(),
+            "an explicit port must not consume the hostname bound"
+        );
+
+        // 254 bytes of hostname is rejected.
+        let host254 = format!("{label63}.{label63}.{label63}.{}", "d".repeat(62));
+        assert_eq!(host254.len(), 254);
+        let error = parse_external_host(&host254, "X-Forwarded-Host")
+            .expect_err("254-byte host must be rejected");
+        assert_eq!(error.problem_type, PROBLEM_MALFORMED);
+
+        // A 63-byte label is accepted; a 64-byte label is rejected.
+        assert!(
+            parse_external_host(&format!("{label63}.com"), "X-Forwarded-Host").is_ok(),
+            "63-byte label must be accepted"
+        );
+        let error = parse_external_host(&format!("{label64}.com"), "X-Forwarded-Host")
+            .expect_err("64-byte label must be rejected");
+        assert_eq!(error.problem_type, PROBLEM_MALFORMED);
     }
 
     #[tokio::test]
@@ -4615,6 +4795,47 @@ mod tests {
                 header_value(&response, header::LINK).as_deref(),
                 Some("<https://acme.test/acme/local/directory>;rel=\"index\""),
                 "tls={tls}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_invalid_host_is_rejected_instead_of_interpolated() {
+        let handler = test_handler(
+            ScriptedTransport::success(),
+            json!({"handler": "acme_server"}),
+        );
+
+        for host in [
+            "a.example.com.",
+            "ex%41mple.com",
+            "user@evil.example",
+            "evil/path",
+            "evil?x=1",
+            "evil#frag",
+            "a..b",
+            "-a.example",
+            "::1",
+        ] {
+            let mut request = request(Method::GET, "/acme/local/directory");
+            request.headers.insert(
+                header::HOST,
+                host.parse::<HeaderValue>().expect("Host header value"),
+            );
+            let response = send(&handler, request).await;
+            assert_eq!(
+                response.status,
+                StatusCode::BAD_REQUEST,
+                "direct `Host: {host}` must be rejected instead of interpolated"
+            );
+            let problem = body_json(&response);
+            assert_eq!(problem["type"], PROBLEM_MALFORMED, "{host}");
+            assert!(
+                problem["detail"]
+                    .as_str()
+                    .expect("detail")
+                    .contains("`Host`"),
+                "{problem}"
             );
         }
     }
