@@ -8709,15 +8709,23 @@ fn adapter_unsupported_untracked(position: Position, feature: impl Into<String>)
 }
 
 fn unsupported_construct(message: &str) -> Option<String> {
-    let (before, after) = message.split_once(" is not supported by this build")?;
+    let marker = "not supported by this build";
+    let marker_at = message.find(marker)?;
+    let mut before = message[..marker_at].trim_end();
+    for copula in [" is", " are", " was", " were"] {
+        if let Some(stripped) = before.strip_suffix(copula) {
+            before = stripped;
+            break;
+        }
+    }
+    let after = message[marker_at + marker.len()..].trim();
     // `this build's ...` needs an explicit `adapter_unsupported*` call: dropping the marker
     // would leave a dangling possessive ("`filter`'s access-log sink").
     if after.starts_with("'s") {
         return None;
     }
-    let after = after.trim();
     Some(if after.is_empty() {
-        before.trim().to_string()
+        before.trim_end().to_string()
     } else if after.starts_with([';', ',', ')']) {
         format!("{}{}", before.trim_end(), after)
     } else {

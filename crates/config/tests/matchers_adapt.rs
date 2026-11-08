@@ -131,10 +131,9 @@ fn tls_matcher_rejects_sni_client_auth_and_blocks_with_located_errors() {
     let error = adapt(":8080 {\n\t@x tls {\n\t\tsni example.com\n\t}\n\trespond @x ok\n}\n")
         .expect_err("tls matcher block form is unsupported");
     let message = error.to_string();
-    assert!(
-        message.contains("matcher `sni` is not supported by this build"),
-        "{message}"
-    );
+    assert_eq!(error.code(), "config.unsupported", "{message}");
+    assert!(message.contains("matcher `sni`"), "{message}");
+    assert!(message.contains("not supported by this build"), "{message}");
 }
 
 #[test]

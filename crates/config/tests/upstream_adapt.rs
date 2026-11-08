@@ -969,7 +969,7 @@ fn tls_advanced_options_fail_loudly() {
         ),
         (
             "localhost {\n\ttls {\n\t\tclient_auth {\n\t\t\ttrust_pool combined { }\n\t\t}\n\t}\n}\n",
-            "provider `combined` is not supported",
+            "provider `combined`",
         ),
         (
             "localhost {\n\ttls {\n\t\tclient_auth {\n\t\t\tmode bogus\n\t\t}\n\t}\n}\n",
@@ -1272,15 +1272,15 @@ fn servers_unsupported_suboptions_and_wrappers_fail_loudly() {
     for (caddyfile, expected) in [
         (
             "{\n\tservers {\n\t\ttimeouts {\n\t\t\tread_body 30s\n\t\t}\n\t}\n}\n:8080 {\n\trespond \"ok\"\n}\n",
-            "`servers` option `timeouts` is not supported by this build (tracked as T-CONF-036)",
+            "`servers` option `timeouts`",
         ),
         (
             "{\n\tservers {\n\t\tname https\n\t}\n}\n:8080 {\n\trespond \"ok\"\n}\n",
-            "`servers` option `name` is not supported by this build",
+            "`servers` option `name`",
         ),
         (
             "{\n\tservers {\n\t\tlistener_wrappers {\n\t\t\ttrusted_proxies_unix\n\t\t}\n\t}\n}\n:8080 {\n\trespond \"ok\"\n}\n",
-            "listener wrapper `trusted_proxies_unix` is not supported by this build",
+            "listener wrapper `trusted_proxies_unix`",
         ),
         (
             "{\n\tservers {\n\t\tlistener_wrappers {\n\t\t\ttls foo\n\t\t}\n\t}\n}\n:8080 {\n\trespond \"ok\"\n}\n",

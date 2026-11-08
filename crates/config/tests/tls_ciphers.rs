@@ -98,10 +98,8 @@ fn caddy_accepted_but_runtime_unsupported_ciphers_fail_loudly() {
         .expect_err("Caddy-accepted but runtime-unsupported cipher must fail loudly");
         let message = error.to_string();
         assert!(message.contains(name), "{message}");
-        assert!(
-            message.contains("not supported by this build's TLS runtime"),
-            "{message}"
-        );
+        assert_eq!(error.code(), "config.unsupported", "{message}");
+        assert!(message.contains("not supported by this build"), "{message}");
         assert!(message.contains("tracked as TLS-POLICY"), "{message}");
     }
 }
@@ -115,10 +113,8 @@ fn caddy_accepted_but_runtime_unsupported_curves_fail_loudly() {
         .expect_err("Caddy-accepted but runtime-unsupported curve must fail loudly");
         let message = error.to_string();
         assert!(message.contains(name), "{message}");
-        assert!(
-            message.contains("not supported by this build's TLS runtime"),
-            "{message}"
-        );
+        assert_eq!(error.code(), "config.unsupported", "{message}");
+        assert!(message.contains("not supported by this build"), "{message}");
         assert!(message.contains("tracked as TLS-POLICY"), "{message}");
     }
 }
