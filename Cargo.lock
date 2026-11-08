@@ -227,6 +227,7 @@ name = "caddy-rs-core"
 version = "0.1.0-trial.2"
 dependencies = [
  "async-trait",
+ "regex",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -252,7 +253,6 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
- "regex",
  "ring",
  "serde_json",
  "tempfile",

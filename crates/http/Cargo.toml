@@ -33,7 +33,6 @@ flate2 = { version = "1", optional = true }
 http = { workspace = true }
 http-body = "1.1.0"
 http-body-util = { workspace = true }
-regex = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 ring = "0.17.14"

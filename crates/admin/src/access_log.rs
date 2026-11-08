@@ -1320,7 +1320,7 @@ pub enum FieldFilterOperation {
     /// Replace regexp matches using Go-style `$N`/`${N}` capture expansion (Caddy's `regexp`
     /// filter).
     Regexp {
-        /// Go/RE2-subset pattern (see [`crate::regex_lite`]).
+        /// RE2-compatible pattern (see [`caddy_rs_core::regex`]).
         pattern: String,
         /// Replacement template.
         replacement: String,
@@ -1370,9 +1370,9 @@ const MAX_REGEXP_OPERATIONS: usize = 50;
 const MAX_REGEXP_PATTERN_LENGTH: usize = 1000;
 
 /// Memoized regex compilation for filter patterns (compiled once per distinct pattern).
-fn compiled_regex(pattern: &str) -> Option<crate::regex_lite::Regex> {
+fn compiled_regex(pattern: &str) -> Option<caddy_rs_core::regex::Regex> {
     use std::sync::{Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<std::collections::BTreeMap<String, crate::regex_lite::Regex>>> =
+    static CACHE: OnceLock<Mutex<std::collections::BTreeMap<String, caddy_rs_core::regex::Regex>>> =
         OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()));
     let mut cache = cache
@@ -1381,7 +1381,7 @@ fn compiled_regex(pattern: &str) -> Option<crate::regex_lite::Regex> {
     if let Some(regex) = cache.get(pattern) {
         return Some(regex.clone());
     }
-    match crate::regex_lite::Regex::new(pattern) {
+    match caddy_rs_core::regex::Regex::new(pattern) {
         Ok(regex) => {
             cache.insert(pattern.to_string(), regex.clone());
             Some(regex)
@@ -1729,7 +1729,7 @@ impl FieldFilter {
                 Ok(())
             }
             FieldFilterOperation::Regexp { pattern, .. } => {
-                crate::regex_lite::Regex::new(pattern).map_err(|error| {
+                caddy_rs_core::regex::Regex::new(pattern).map_err(|error| {
                     AccessLogError::new(
                         format!("filter.{}", self.path.join(">")),
                         format!("invalid regexp filter pattern: {}", error),
@@ -1759,7 +1759,7 @@ impl FieldFilter {
                             "multi_regexp patterns must be non-empty and at most 1000 characters",
                         ));
                     }
-                    crate::regex_lite::Regex::new(&operation.pattern).map_err(|error| {
+                    caddy_rs_core::regex::Regex::new(&operation.pattern).map_err(|error| {
                         AccessLogError::new(
                             format!("filter.{}", self.path.join(">")),
                             format!("invalid multi_regexp pattern: {}", error),

@@ -678,12 +678,9 @@ fn parse_path_regexp(
             ));
         }
         let replace = optional_string(item, "replace", &item_path)?.unwrap_or_default();
-        let regex = Regex::new(&find).map_err(|error| match error {
-            Error::InvalidConfig { message, .. } => Error::InvalidConfig {
-                path: format!("{item_path}.find"),
-                message: format!("path_regexp `{find}`: {message}"),
-            },
-            other => other,
+        let regex = Regex::new(&find).map_err(|error| Error::InvalidConfig {
+            path: format!("{item_path}.find"),
+            message: format!("path_regexp `{find}`: {error}"),
         })?;
         replacements.push(PathRegexp { replace, regex });
     }
@@ -802,12 +799,9 @@ fn parse_query_ops(
             let replace = optional_string(item, "replace", &item_path)?.unwrap_or_default();
             let regex = match search_regexp.as_deref() {
                 Some(pattern) if !pattern.is_empty() => {
-                    Some(Regex::new(pattern).map_err(|error| match error {
-                        Error::InvalidConfig { message, .. } => Error::InvalidConfig {
-                            path: format!("{item_path}.search_regexp"),
-                            message,
-                        },
-                        other => other,
+                    Some(Regex::new(pattern).map_err(|error| Error::InvalidConfig {
+                        path: format!("{item_path}.search_regexp"),
+                        message: format!("query replace regexp `{pattern}`: {error}"),
                     })?)
                 }
                 _ => None,
@@ -2016,12 +2010,9 @@ fn parse_map_mapping(
                     format!("duplicate input_regexp `{pattern}` in map mappings"),
                 ));
             }
-            Some(Regex::new(pattern).map_err(|error| match error {
-                Error::InvalidConfig { message, .. } => Error::InvalidConfig {
-                    path: format!("{path}.input_regexp"),
-                    message,
-                },
-                other => other,
+            Some(Regex::new(pattern).map_err(|error| Error::InvalidConfig {
+                path: format!("{path}.input_regexp"),
+                message: format!("map input_regexp `{pattern}`: {error}"),
             })?)
         }
     };

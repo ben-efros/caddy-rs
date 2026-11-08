@@ -26,6 +26,7 @@ pub mod generation;
 pub mod lifecycle;
 pub mod listen;
 pub mod module;
+pub mod regex;
 pub mod validate;
 
 pub use adapter::{AdaptedConfig, ConfigAdapter};
