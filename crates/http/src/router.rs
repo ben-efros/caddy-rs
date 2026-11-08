@@ -555,6 +555,15 @@ impl RouterBuilder {
         self
     }
 
+    /// Like [`Self::with_acme_server_data_root`], but the caller may have no filesystem root (for
+    /// example a `memory`/`s3` storage backend). `None` keeps the fail-closed behaviour: a router
+    /// containing `acme_server` is rejected with a located error instead of writing CA material to
+    /// a relative working-directory path.
+    pub fn with_optional_acme_server_data_root(mut self, root: Option<PathBuf>) -> Self {
+        self.acme_server_data_root = root;
+        self
+    }
+
     /// Build a router from a `routes` array.
     ///
     /// Error routes are attached to this top-level router only: nested `subroute` routers must not
@@ -677,13 +686,17 @@ impl RouterBuilder {
             // caddy-rs extension (not a Caddy v2.11.7 built-in): token-bucket rate limiting.
             "rate_limit" => Arc::new(RateLimitHandler::from_json(value, path)?),
             "acme_server" => {
-                let root = self.acme_server_data_root.as_deref().ok_or_else(|| {
-                    Error::InvalidConfig {
-                        path: path.to_string(),
-                        message: "`acme_server` requires a Caddy data directory for its internal                                   CA; this router was built without one"
-                            .to_string(),
-                    }
-                })?;
+                let root =
+                    self.acme_server_data_root
+                        .as_deref()
+                        .ok_or_else(|| Error::InvalidConfig {
+                            path: path.to_string(),
+                            message:
+                                "`acme_server` requires a Caddy filesystem data directory for its \
+                                  internal CA; the configured storage backend has no path (or this \
+                                  router was built without one)"
+                                    .to_string(),
+                        })?;
                 Arc::new(AcmeServerHandler::from_json(value, path, root)?)
             }
             #[cfg(feature = "templates")]

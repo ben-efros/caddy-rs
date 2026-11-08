@@ -70,7 +70,8 @@ use caddy_rs_tls::acme::csr::{parse_csr, MAX_CSR_DER_BYTES};
 use caddy_rs_tls::acme::Jwk;
 use caddy_rs_tls::{ca_storage_keys, key_authorization, InternalIssuer};
 
-use crate::types::{Error, Handler, Outcome, Request, Response, Result};
+use crate::body::{BodyError, StreamingResponse};
+use crate::types::{Error, Handler, Outcome, Request, Response, Result, StreamingOutcome};
 
 /// Default path prefix under which the ACME endpoints are served (Caddy's `defaultPathPrefix`).
 pub const DEFAULT_PATH_PREFIX: &str = "/acme/";
@@ -223,11 +224,137 @@ impl Problem {
 
 // ---- configuration ---------------------------------------------------------------------------
 
+/// One DNS domain constraint of an `allow`/`deny` rule set.
+///
+/// Caddy normalises `*.example.com` to a one-label wildcard (smallstep stores the leading-dot
+/// form and matches exactly one extra label); a bare domain matches exactly. Every other form is
+/// rejected at load so a rule can never be silently ineffective.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DomainConstraint {
+    /// `example.com`: exactly this name.
+    Exact(String),
+    /// `*.example.com`: exactly one label before `example.com`.
+    OneLabelWildcard(String),
+}
+
+impl DomainConstraint {
+    /// Parse a rule exactly like smallstep's `normalizeAndValidateDNSDomainConstraint`.
+    fn parse(value: &str) -> std::result::Result<Self, String> {
+        let normalized = value.trim().to_ascii_lowercase();
+        if normalized.is_empty() {
+            return Err("domain constraint cannot be empty or whitespace".to_string());
+        }
+        if normalized.contains("..") {
+            return Err(format!(
+                "domain constraint `{value}` cannot have empty labels"
+            ));
+        }
+        if normalized.starts_with('.') {
+            return Err(format!(
+                "domain constraint `{value}` with wildcard should start with *"
+            ));
+        }
+        if normalized.rfind('*').is_some_and(|index| index > 0) {
+            return Err(format!(
+                "domain constraint `{value}` can only have wildcard as starting character"
+            ));
+        }
+        if normalized == "*" {
+            return Err(format!(
+                "domain constraint `{value}` is not a wildcard rule; use `*.<domain>` to match one \
+                 label, or an exact domain"
+            ));
+        }
+        if normalized.starts_with('*') && !normalized.starts_with("*.") {
+            return Err(format!(
+                "wildcard character in domain constraint `{value}` can only be used to match \
+                 (full) labels"
+            ));
+        }
+        let (wildcard, base) = match normalized.strip_prefix("*.") {
+            Some(base) => (true, base.to_string()),
+            None => (false, normalized),
+        };
+        validate_rule_hostname(&base, value)?;
+        Ok(if wildcard {
+            Self::OneLabelWildcard(base)
+        } else {
+            Self::Exact(base)
+        })
+    }
+
+    fn matches(&self, name: &str) -> bool {
+        let Some(name_labels) = reverse_labels(name) else {
+            return false;
+        };
+        let constraint = match self {
+            Self::Exact(constraint) => constraint,
+            Self::OneLabelWildcard(constraint) => constraint,
+        };
+        let Some(constraint_labels) = reverse_labels(constraint) else {
+            return false;
+        };
+        let expected =
+            constraint_labels.len() + usize::from(matches!(self, Self::OneLabelWildcard(_)));
+        expected == name_labels.len()
+            && constraint_labels
+                .iter()
+                .zip(name_labels.iter())
+                .all(|(constraint, name)| constraint.eq_ignore_ascii_case(name))
+    }
+}
+
+/// Hostname syntax accepted for policy rules and ACME `dns` identifiers.
+///
+/// Deliberately stricter than smallstep's `idna.Lookup.ToASCII` in two places (documented in
+/// DIV-0102): non-ASCII labels are rejected because this build has no IDNA implementation, and
+/// empty labels (`a..example.com`) are rejected even though `idna.Lookup` tolerates them. Both are
+/// fail-closed choices; they cannot turn a deny rule into a fail-open one.
+fn validate_rule_hostname(base: &str, original: &str) -> std::result::Result<(), String> {
+    if !base.is_ascii() {
+        return Err(format!(
+            "domain `{original}` is not ASCII; IDNA names are not implemented by this build"
+        ));
+    }
+    if base.len() > 253 {
+        return Err(format!("domain `{original}` exceeds 253 bytes"));
+    }
+    if base.starts_with('-') || base.ends_with('-') {
+        return Err(format!(
+            "domain `{original}` has a label starting or ending with `-`"
+        ));
+    }
+    for label in base.split('.') {
+        if label.is_empty() {
+            return Err(format!("domain `{original}` has an empty label"));
+        }
+        if label.len() > 63 {
+            return Err(format!(
+                "domain `{original}` has a label longer than 63 bytes"
+            ));
+        }
+        if !label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(format!(
+                "domain `{original}` contains a character that is not allowed in a hostname"
+            ));
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(format!(
+                "domain `{original}` has a label starting or ending with `-`"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// One parsed `allow`/`deny` rule set of the ACME server policy.
 #[derive(Debug, Clone, Default)]
 struct RuleSet {
-    /// X.509 name-constraint style DNS domains (`example.com` exact, `.example.com` one label).
-    domains: Vec<String>,
+    /// Exact and one-label DNS wildcard constraints (`example.com`, `*.example.com`).
+    domains: Vec<DomainConstraint>,
     /// CIDR networks and single IP addresses.
     ip_ranges: Vec<IpRange>,
 }
@@ -240,7 +367,7 @@ impl RuleSet {
     fn allows_dns(&self, name: &str) -> bool {
         self.domains
             .iter()
-            .any(|constraint| domain_matches_constraint(name, constraint))
+            .any(|constraint| constraint.matches(name))
     }
 
     fn allows_ip(&self, address: IpAddr) -> bool {
@@ -578,13 +705,9 @@ fn parse_rule_set(object: &Map<String, Value>, path: &str) -> Result<RuleSet> {
                             "domain rules must be strings",
                         )
                     })?;
-                    if domain.trim().is_empty() {
-                        return Err(invalid(
-                            &format!("{path}.domains[{index}]"),
-                            "domain rules must not be empty",
-                        ));
-                    }
-                    rules.domains.push(domain.trim().to_ascii_lowercase());
+                    let constraint = DomainConstraint::parse(domain)
+                        .map_err(|reason| invalid(&format!("{path}.domains[{index}]"), reason))?;
+                    rules.domains.push(constraint);
                 }
             }
             "ip_ranges" => {
@@ -671,33 +794,7 @@ fn invalid(path: &str, message: impl Into<String>) -> Error {
 
 // ---- domain constraint matching --------------------------------------------------------------
 
-/// Match a DNS name against an X.509 name-constraint style domain (smallstep's
-/// `matchDomainConstraint`): the constraint names a suffix with the same label count, and a
-/// leading `.` requires exactly one extra label.
-fn domain_matches_constraint(domain: &str, constraint: &str) -> bool {
-    if constraint.is_empty() {
-        return true;
-    }
-    let (constraint, needs_subdomain) = match constraint.strip_prefix('.') {
-        Some(rest) => (rest, true),
-        None => (constraint, false),
-    };
-    let Some(domain_labels) = reverse_labels(domain) else {
-        return false;
-    };
-    let Some(constraint_labels) = reverse_labels(constraint) else {
-        return false;
-    };
-    let expected = constraint_labels.len() + usize::from(needs_subdomain);
-    domain_labels.len() == expected
-        && constraint_labels
-            .iter()
-            .zip(domain_labels.iter())
-            .all(|(constraint, domain)| constraint.eq_ignore_ascii_case(domain))
-}
-
 fn reverse_labels(domain: &str) -> Option<Vec<&str>> {
-    let domain = domain.strip_suffix('.').unwrap_or(domain);
     if domain.is_empty() || domain.contains("..") {
         return None;
     }
@@ -1312,12 +1409,21 @@ impl AcmeServerHandler {
     }
 
     async fn serve(&self, request: &Request) -> Response {
+        let method = request.method.clone();
+        let route = self.route(request);
+        // Every endpoint except the directory and new-nonce is POST-only (smallstep's chi routes).
+        // Gate before resolving the request host or parsing a body/JWS so a wrong method gets
+        // Caddy's 405 + Allow, not a malformed-request or missing-Host error.
+        if !matches!(route, Route::Unknown | Route::Directory | Route::NewNonce)
+            && method != Method::POST
+        {
+            return method_not_allowed(&[Method::POST]);
+        }
         let base = match self.base_url(request) {
             Ok(base) => base,
             Err(problem) => return self.problem_response(problem, None),
         };
-        let method = request.method.clone();
-        match self.route(request) {
+        match route {
             Route::Unknown => self.problem_response(
                 Problem::not_found(format!("no ACME resource at `{}`", request.uri.path())),
                 Some(&base),
@@ -2554,13 +2660,10 @@ fn method_not_allowed(allowed: &[Method]) -> Response {
         headers: HeaderMap::new(),
         body: Bytes::new(),
     };
-    let allow = allowed
-        .iter()
-        .map(Method::as_str)
-        .collect::<Vec<_>>()
-        .join(", ");
-    if let Ok(value) = HeaderValue::from_str(&allow) {
-        response.headers.insert(header::ALLOW, value);
+    for method in allowed {
+        if let Ok(value) = HeaderValue::from_str(method.as_str()) {
+            response.headers.append(header::ALLOW, value);
+        }
     }
     response
 }
@@ -2706,37 +2809,18 @@ fn parse_contact(payload: &Map<String, Value>) -> std::result::Result<Vec<String
 }
 
 fn validate_dns_name(value: &str) -> std::result::Result<(), Problem> {
-    if value.is_empty() {
-        return Err(Problem::malformed("dns identifier value cannot be empty"));
-    }
-    if value.len() > 253 {
-        return Err(Problem::malformed(format!(
-            "dns name `{value}` exceeds 253 bytes"
-        )));
-    }
-    if !value.is_ascii() {
-        return Err(Problem::malformed(format!(
-            "invalid DNS name: {value} (non-ASCII names require IDNA, which this build does not implement)"
-        )));
-    }
-    if value
-        .bytes()
-        .any(|byte| byte.is_ascii_whitespace() || byte == b'/' || byte == 0)
-    {
-        return Err(Problem::malformed(format!("invalid DNS name: {value}")));
-    }
-    let labels = value.strip_prefix("*.").unwrap_or(value);
-    if labels.is_empty() || labels.split('.').any(str::is_empty) {
-        return Err(Problem::malformed(format!(
-            "invalid DNS name: {value} (empty label)"
-        )));
-    }
-    if labels.contains('*') {
+    // A wildcard identifier is only legal as the whole first label. The wildcard flag itself is
+    // enforced by the policy, which rejects wildcard identifiers because they need dns-01.
+    let (wildcard, base) = match value.strip_prefix("*.") {
+        Some(base) => (true, base),
+        None => (false, value),
+    };
+    if !wildcard && value.contains('*') {
         return Err(Problem::malformed(format!(
             "invalid DNS name: {value} (wildcard must be the whole first label)"
         )));
     }
-    Ok(())
+    validate_rule_hostname(base, value).map_err(Problem::malformed)
 }
 
 fn challenge_host(value: &str) -> String {
@@ -2813,7 +2897,13 @@ impl Handler for AcmeServerHandler {
     }
 
     fn requires_buffered_request_body(&self) -> bool {
-        // JWS bodies are small and must be parsed whole.
+        // The JWS body is collected by `handle_streaming` with `MAX_JWS_BODY` as its bound, so the
+        // router (and therefore every other route in the same server) does not have to buffer
+        // request bodies on this handler's behalf.
+        false
+    }
+
+    fn consumes_request_body(&self) -> bool {
         true
     }
 
@@ -2822,6 +2912,53 @@ impl Handler for AcmeServerHandler {
             return Ok(Outcome::Continue(request));
         }
         Ok(Outcome::Respond(self.serve(&request).await))
+    }
+
+    async fn handle_streaming(&self, mut request: Request) -> Result<StreamingOutcome> {
+        if !request.uri.path().starts_with(&self.config.path_prefix) {
+            return Ok(StreamingOutcome::Continue(request));
+        }
+        let route = self.route(&request);
+        let needs_body = !matches!(route, Route::Unknown | Route::Directory | Route::NewNonce);
+        if needs_body {
+            // Wrong-method responses must not depend on (or consume) a large request body.
+            if request.method != Method::POST {
+                return Ok(StreamingOutcome::Respond(StreamingResponse::from_buffered(
+                    method_not_allowed(&[Method::POST]),
+                )));
+            }
+            let body = request.take_body();
+            match body.collect(Some(MAX_JWS_BODY as u64)).await {
+                Ok(bytes) => request.body = bytes,
+                Err(BodyError::TooLarge { .. }) => {
+                    let problem = Problem::malformed(format!(
+                        "JWS request body exceeds the {MAX_JWS_BODY}-byte limit"
+                    ));
+                    let directory = self
+                        .base_url(&request)
+                        .ok()
+                        .map(|base| self.directory_url(&base));
+                    return Ok(StreamingOutcome::Respond(StreamingResponse::from_buffered(
+                        self.problem_response(problem, directory.as_deref()),
+                    )));
+                }
+                Err(error) => {
+                    let problem = Problem::malformed(format!(
+                        "cannot read the request body for this ACME endpoint: {error}"
+                    ));
+                    let directory = self
+                        .base_url(&request)
+                        .ok()
+                        .map(|base| self.directory_url(&base));
+                    return Ok(StreamingOutcome::Respond(StreamingResponse::from_buffered(
+                        self.problem_response(problem, directory.as_deref()),
+                    )));
+                }
+            }
+        }
+        Ok(StreamingOutcome::Respond(StreamingResponse::from_buffered(
+            self.serve(&request).await,
+        )))
     }
 }
 
@@ -3078,16 +3215,41 @@ mod tests {
     }
 
     #[test]
-    fn domain_constraints_match_x509_semantics() {
-        assert!(domain_matches_constraint("example.com", "example.com"));
-        assert!(!domain_matches_constraint("www.example.com", "example.com"));
-        assert!(domain_matches_constraint("www.example.com", ".example.com"));
-        assert!(!domain_matches_constraint(
-            "a.b.example.com",
-            ".example.com"
-        ));
-        assert!(domain_matches_constraint("EXAMPLE.COM", "example.com"));
-        assert!(!domain_matches_constraint("other.com", "example.com"));
+    fn domain_constraints_match_exact_names_and_one_label_wildcards() {
+        let exact = DomainConstraint::parse("example.com").expect("exact rule");
+        assert!(exact.matches("example.com"));
+        assert!(exact.matches("EXAMPLE.COM"));
+        assert!(!exact.matches("www.example.com"));
+        assert!(!exact.matches("other.com"));
+
+        let wildcard = DomainConstraint::parse("*.example.com").expect("wildcard rule");
+        assert!(wildcard.matches("a.example.com"));
+        assert!(wildcard.matches("A.EXAMPLE.COM"));
+        assert!(!wildcard.matches("a.b.example.com"));
+        assert!(!wildcard.matches("example.com"));
+        assert!(!wildcard.matches("other.com"));
+
+        // Every unsupported spelling is a located error instead of a silently ineffective rule.
+        for (rule, needle) in [
+            (".example.com", "should start with *"),
+            ("*example.com", "can only be used to match"),
+            ("a*.example.com", "only have wildcard as starting character"),
+            ("*", "is not a wildcard rule"),
+            ("*.", "empty label"),
+            ("*..example.com", "empty labels"),
+            ("a..example.com", "empty labels"),
+            ("_acme.example.com", "not allowed in a hostname"),
+            ("-bad.example.com", "starting or ending with"),
+            ("bad-.example.com", "starting or ending with"),
+            ("münchen.example", "not ASCII"),
+        ] {
+            let error = DomainConstraint::parse(rule)
+                .expect_err(&format!("`{rule}` must be rejected at load"));
+            assert!(
+                error.contains(needle),
+                "`{rule}` error `{error}` must mention `{needle}`"
+            );
+        }
     }
 
     #[test]
@@ -3175,9 +3337,19 @@ mod tests {
         ))
     }
 
+    fn test_handler_with_issuer(
+        transport: Arc<dyn Http01Transport>,
+        config: Value,
+    ) -> (AcmeServerHandler, Arc<InternalIssuer>) {
+        let issuer = memory_issuer();
+        let handler =
+            AcmeServerHandler::from_json_with(&config, "test", Arc::clone(&issuer), transport)
+                .expect("valid acme_server configuration");
+        (handler, issuer)
+    }
+
     fn test_handler(transport: Arc<dyn Http01Transport>, config: Value) -> AcmeServerHandler {
-        AcmeServerHandler::from_json_with(&config, "test", memory_issuer(), transport)
-            .expect("valid acme_server configuration")
+        test_handler_with_issuer(transport, config).0
     }
 
     fn request(method: Method, path: &str) -> Request {
@@ -3357,6 +3529,106 @@ mod tests {
             let csr = URL_SAFE_NO_PAD.encode(csr.der());
             self.post_json(&format!("{order_path}/finalize"), &json!({"csr": csr}))
                 .await
+        }
+    }
+
+    struct ReadyOrder {
+        order_path: String,
+        authorization_path: String,
+        challenge_path: String,
+    }
+
+    /// Drive one order to `ready`: create it, serve the expected key authorization, validate the
+    /// challenge and confirm the order transition.
+    async fn ready_order(
+        client: &mut TestClient<'_>,
+        transport: &ScriptedTransport,
+        domain: &str,
+    ) -> ReadyOrder {
+        let (order_path, order, response) = client
+            .create_order(json!([{"type": "dns", "value": domain}]))
+            .await;
+        assert_eq!(
+            response.status,
+            StatusCode::CREATED,
+            "{}",
+            body_text(&response)
+        );
+        let (authorization_path, authorization) = client.authorization(&order).await;
+        let challenge_url = authorization["challenges"][0]["url"]
+            .as_str()
+            .expect("challenge URL");
+        let challenge_path = path_of(challenge_url);
+        let token = authorization["challenges"][0]["token"]
+            .as_str()
+            .expect("challenge token");
+        transport.set_body(format!("{token}.{}", client.thumbprint()));
+        let response = client.validate_challenge(&authorization).await;
+        assert_eq!(
+            body_json(&response)["status"],
+            "valid",
+            "{}",
+            body_text(&response)
+        );
+        let response = client.post_as_get(&order_path).await;
+        assert_eq!(
+            body_json(&response)["status"],
+            "ready",
+            "{}",
+            body_text(&response)
+        );
+        ReadyOrder {
+            order_path,
+            authorization_path,
+            challenge_path,
+        }
+    }
+
+    struct IssuedFlow {
+        order_path: String,
+        authorization_path: String,
+        challenge_path: String,
+        certificate_path: String,
+        certificate: Response,
+        csr: CertificateRequest,
+    }
+
+    /// Complete an issuance and download the certificate.
+    async fn issue_flow(
+        client: &mut TestClient<'_>,
+        transport: &ScriptedTransport,
+        domain: &str,
+    ) -> IssuedFlow {
+        let ready = ready_order(client, transport, domain).await;
+        let csr = CertificateRequest::generate(&[domain.to_string()]).unwrap();
+        let response = client.finalize(&ready.order_path, &csr).await;
+        assert_eq!(
+            response.status,
+            StatusCode::OK,
+            "finalize failed: {}",
+            body_text(&response)
+        );
+        let order = body_json(&response);
+        assert_eq!(order["status"], "valid");
+        let certificate_url = order["certificate"]
+            .as_str()
+            .expect("certificate URL")
+            .to_string();
+        let certificate_path = path_of(&certificate_url);
+        let certificate = client.post_as_get(&certificate_path).await;
+        assert_eq!(
+            certificate.status,
+            StatusCode::OK,
+            "{}",
+            body_text(&certificate)
+        );
+        IssuedFlow {
+            order_path: ready.order_path,
+            authorization_path: ready.authorization_path,
+            challenge_path: ready.challenge_path,
+            certificate_path,
+            certificate,
+            csr,
         }
     }
 
@@ -3815,52 +4087,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn complete_flow_issues_and_serves_a_certificate_for_the_csr_key() {
+    async fn complete_flow_issues_and_serves_a_two_certificate_chain_for_the_csr_key() {
         let transport = ScriptedTransport::success();
-        let handler = test_handler(transport.clone(), json!({"handler": "acme_server"}));
+        let (handler, issuer) =
+            test_handler_with_issuer(transport.clone(), json!({"handler": "acme_server"}));
         let mut client = TestClient::new(&handler).await;
         assert_eq!(client.register().await.status, StatusCode::CREATED);
-        let (order_path, order, response) = client
-            .create_order(json!([{"type": "dns", "value": "acme.example"}]))
-            .await;
-        assert_eq!(response.status, StatusCode::CREATED);
-        assert_eq!(order["status"], "pending");
+        let flow = issue_flow(&mut client, &transport, "acme.example").await;
 
-        let (_, authorization) = client.authorization(&order).await;
-        let token = authorization["challenges"][0]["token"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        transport.set_body(format!("{token}.{}", client.thumbprint()));
-        let response = client.validate_challenge(&authorization).await;
-        let challenge = body_json(&response);
-        assert_eq!(challenge["status"], "valid", "{}", body_text(&response));
-        assert!(challenge["validated"].is_string());
-
-        let response = client.post_as_get(&order_path).await;
-        let order = body_json(&response);
-        assert_eq!(order["status"], "ready", "{}", body_text(&response));
-
-        let csr = CertificateRequest::generate(&["acme.example".to_string()]).unwrap();
-        let response = client.finalize(&order_path, &csr).await;
-        assert_eq!(response.status, StatusCode::OK, "{}", body_text(&response));
-        let order = body_json(&response);
-        assert_eq!(order["status"], "valid");
-        let certificate_url = order["certificate"].as_str().expect("certificate URL");
-
-        let response = client.post_as_get(&path_of(certificate_url)).await;
-        assert_eq!(response.status, StatusCode::OK, "{}", body_text(&response));
         assert_eq!(
-            header_value(&response, header::CONTENT_TYPE).as_deref(),
+            header_value(&flow.certificate, header::CONTENT_TYPE).as_deref(),
             Some("application/pem-certificate-chain")
         );
-        let blocks = pem_blocks(&response.body);
+        let blocks = pem_blocks(&flow.certificate.body);
         assert_eq!(
             blocks.len(),
-            3,
-            "the chain is leaf + intermediate + root, like Caddy"
+            2,
+            "Caddy returns leaf + intermediate; the root is the client trust anchor"
         );
-        let parsed = parse_csr(csr.der()).unwrap();
+        let ca = issuer.ca_certificates().await.expect("CA certificates");
+        assert_eq!(
+            blocks[1], ca.intermediate_der,
+            "the second PEM block must be the signing intermediate"
+        );
+        let parsed = parse_csr(flow.csr.der()).unwrap();
         assert!(
             contains_subslice(&blocks[0], &parsed.spki_der),
             "the leaf certificate must carry the CSR public key"
@@ -3873,7 +4123,7 @@ mod tests {
         assert_eq!(response.status, StatusCode::OK, "{}", body_text(&response));
         let orders = body_json(&response);
         assert_eq!(orders.as_array().unwrap().len(), 1);
-        assert_eq!(path_of(orders[0].as_str().unwrap()), order_path);
+        assert_eq!(path_of(orders[0].as_str().unwrap()), flow.order_path);
 
         // Revocation by the owning account succeeds once and is then `alreadyRevoked`.
         let payload = json!({"certificate": URL_SAFE_NO_PAD.encode(&blocks[0])});
@@ -3885,6 +4135,25 @@ mod tests {
         // key-change is advertised but not implemented, exactly like Caddy/smallstep.
         let response = client.post_json("/acme/local/key-change", &json!({})).await;
         assert_eq!(response.status, StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn sign_with_root_returns_leaf_and_root() {
+        let transport = ScriptedTransport::success();
+        let (handler, issuer) = test_handler_with_issuer(
+            transport.clone(),
+            json!({"handler": "acme_server", "sign_with_root": true}),
+        );
+        let mut client = TestClient::new(&handler).await;
+        assert_eq!(client.register().await.status, StatusCode::CREATED);
+        let flow = issue_flow(&mut client, &transport, "root.example").await;
+        let blocks = pem_blocks(&flow.certificate.body);
+        assert_eq!(blocks.len(), 2, "sign_with_root returns leaf + root");
+        let ca = issuer.ca_certificates().await.expect("CA certificates");
+        assert_eq!(
+            blocks[1], ca.root_der,
+            "the second PEM block must be the root when sign_with_root is set"
+        );
     }
 
     #[tokio::test]
@@ -3905,6 +4174,353 @@ mod tests {
         let response = client.post_as_get(&certificate_path).await;
         assert_eq!(response.status, StatusCode::BAD_REQUEST);
         assert_eq!(body_json(&response)["type"], PROBLEM_ORDER_NOT_READY);
+    }
+
+    #[tokio::test]
+    async fn wildcard_policy_rules_match_exactly_one_label() {
+        let deny = test_handler(
+            ScriptedTransport::success(),
+            json!({
+                "handler": "acme_server",
+                "policy": {"deny": {"domains": ["*.example.com"]}}
+            }),
+        );
+        let mut client = TestClient::new(&deny).await;
+        assert_eq!(client.register().await.status, StatusCode::CREATED);
+        let (_, _, response) = client
+            .create_order(json!([{"type": "dns", "value": "a.example.com"}]))
+            .await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(&response)["type"], PROBLEM_REJECTED_IDENTIFIER);
+        for allowed in ["a.b.example.com", "example.com"] {
+            let (_, _, response) = client
+                .create_order(json!([{"type": "dns", "value": allowed}]))
+                .await;
+            assert_eq!(
+                response.status,
+                StatusCode::CREATED,
+                "deny *.example.com must not match {allowed}: {}",
+                body_text(&response)
+            );
+        }
+
+        let allow = test_handler(
+            ScriptedTransport::success(),
+            json!({
+                "handler": "acme_server",
+                "policy": {"allow": {"domains": ["*.example.com"]}}
+            }),
+        );
+        let mut client = TestClient::new(&allow).await;
+        assert_eq!(client.register().await.status, StatusCode::CREATED);
+        let (_, _, response) = client
+            .create_order(json!([{"type": "dns", "value": "a.example.com"}]))
+            .await;
+        assert_eq!(
+            response.status,
+            StatusCode::CREATED,
+            "{}",
+            body_text(&response)
+        );
+        for denied in ["a.b.example.com", "example.com"] {
+            let (_, _, response) = client
+                .create_order(json!([{"type": "dns", "value": denied}]))
+                .await;
+            assert_eq!(
+                body_json(&response)["type"],
+                PROBLEM_REJECTED_IDENTIFIER,
+                "allow *.example.com must not permit {denied}"
+            );
+        }
+
+        // Unsupported rule spellings are located load errors, never silently ineffective rules.
+        for (rule, needle) in [
+            (".example.com", "should start with *"),
+            ("*example.com", "can only be used to match"),
+            ("a*.example.com", "only have wildcard as starting character"),
+            ("*", "is not a wildcard rule"),
+            ("a..example.com", "empty labels"),
+        ] {
+            let error = AcmeServerHandler::from_json_with(
+                &json!({"handler": "acme_server", "policy": {"deny": {"domains": [rule]}}}),
+                "test",
+                memory_issuer(),
+                ScriptedTransport::success(),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("`{rule}` must fail at load"));
+            assert!(
+                error.to_string().contains(needle),
+                "`{rule}` error `{error}` must mention `{needle}`"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_dns_identifiers_are_rejected_before_any_fetch() {
+        let transport = ScriptedTransport::success();
+        let handler = test_handler(transport.clone(), json!({"handler": "acme_server"}));
+        let mut client = TestClient::new(&handler).await;
+        assert_eq!(client.register().await.status, StatusCode::CREATED);
+
+        for bad in [
+            "a.example.com:80",
+            "::1",
+            "[::1]",
+            "_x.example.com",
+            "a_b.example.com",
+            "-bad.example.com",
+            "a-.example.com",
+            "a..example.com",
+            "foo.*.example.com",
+            "a/b.example.com",
+            "bad name.example",
+        ] {
+            let (_, _, response) = client
+                .create_order(json!([{"type": "dns", "value": bad}]))
+                .await;
+            assert_eq!(
+                response.status,
+                StatusCode::BAD_REQUEST,
+                "`{bad}` must be rejected: {}",
+                body_text(&response)
+            );
+            assert_eq!(
+                body_json(&response)["type"],
+                PROBLEM_MALFORMED,
+                "`{bad}` must produce a malformed problem"
+            );
+        }
+        assert!(
+            transport.requests().is_empty(),
+            "rejected identifiers must never trigger an http-01 fetch"
+        );
+
+        // Accepted forms that are valid hostnames (the oracle also accepts these).
+        for good in ["localhost", "127.0.0.1", "a.example.com"] {
+            let (_, _, response) = client
+                .create_order(json!([{"type": "dns", "value": good}]))
+                .await;
+            assert_eq!(
+                response.status,
+                StatusCode::CREATED,
+                "`{good}` should be accepted: {}",
+                body_text(&response)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wrong_methods_get_405_with_allow() {
+        let handler = test_handler(
+            ScriptedTransport::success(),
+            json!({"handler": "acme_server"}),
+        );
+        for (method, path, expected) in [
+            (Method::GET, "/acme/local/new-account", vec!["POST"]),
+            (Method::HEAD, "/acme/local/new-order", vec!["POST"]),
+            (Method::GET, "/acme/local/order/deadbeef", vec!["POST"]),
+            (
+                Method::GET,
+                "/acme/local/certificate/deadbeef",
+                vec!["POST"],
+            ),
+            (Method::PUT, "/acme/local/directory", vec!["GET", "HEAD"]),
+            (Method::POST, "/acme/local/directory", vec!["GET", "HEAD"]),
+            (Method::POST, "/acme/local/new-nonce", vec!["GET", "HEAD"]),
+        ] {
+            let response = send(&handler, request(method.clone(), path)).await;
+            assert_eq!(
+                response.status,
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method} {path}"
+            );
+            assert!(response.body.is_empty(), "{method} {path} body");
+            let allow: Vec<String> = response
+                .headers
+                .get_all(header::ALLOW)
+                .iter()
+                .map(|value| value.to_str().unwrap().to_string())
+                .collect();
+            assert_eq!(allow, expected, "{method} {path} Allow");
+            assert!(
+                header_value(&response, replay_nonce_header()).is_none(),
+                "405 responses carry no Replay-Nonce"
+            );
+        }
+
+        // Unknown paths remain 404 regardless of method.
+        let response = send(&handler, request(Method::GET, "/acme/local/bogus")).await;
+        assert_eq!(response.status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn cross_account_access_is_rejected() {
+        let transport = ScriptedTransport::success();
+        let handler = test_handler(transport.clone(), json!({"handler": "acme_server"}));
+        let mut owner = TestClient::new(&handler).await;
+        assert_eq!(owner.register().await.status, StatusCode::CREATED);
+        let owner_kid = owner.kid.clone().expect("owner kid");
+        let flow = issue_flow(&mut owner, &transport, "owned.example").await;
+
+        let mut intruder = TestClient::new(&handler).await;
+        assert_eq!(intruder.register().await.status, StatusCode::CREATED);
+
+        for path in [flow.order_path.as_str(), flow.authorization_path.as_str()] {
+            let response = intruder.post_as_get(path).await;
+            assert_eq!(response.status, StatusCode::UNAUTHORIZED, "{path}");
+            assert_eq!(body_json(&response)["type"], PROBLEM_UNAUTHORIZED, "{path}");
+        }
+        let response = intruder.post_json(&flow.challenge_path, &json!({})).await;
+        assert_eq!(response.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body_json(&response)["type"], PROBLEM_UNAUTHORIZED);
+
+        // A CSR is not needed for the ownership check; the order must be refused first.
+        let csr = CertificateRequest::generate(&["owned.example".to_string()]).unwrap();
+        let response = intruder.finalize(&flow.order_path, &csr).await;
+        assert_eq!(response.status, StatusCode::UNAUTHORIZED);
+
+        let response = intruder.post_as_get(&flow.certificate_path).await;
+        assert_eq!(response.status, StatusCode::UNAUTHORIZED);
+
+        let response = intruder
+            .post_as_get(&format!("{}/orders", path_of(&owner_kid)))
+            .await;
+        assert_eq!(response.status, StatusCode::UNAUTHORIZED);
+
+        let leaf = pem_blocks(&flow.certificate.body)[0].clone();
+        let response = intruder
+            .post_json(
+                "/acme/local/revoke-cert",
+                &json!({"certificate": URL_SAFE_NO_PAD.encode(&leaf)}),
+            )
+            .await;
+        assert_eq!(response.status, StatusCode::FORBIDDEN);
+        assert_eq!(body_json(&response)["type"], PROBLEM_UNAUTHORIZED);
+
+        // The owner still has full access.
+        let response = owner.post_as_get(&flow.order_path).await;
+        assert_eq!(response.status, StatusCode::OK, "{}", body_text(&response));
+    }
+
+    #[tokio::test]
+    async fn finalize_rejects_csr_names_that_do_not_match_the_order() {
+        let transport = ScriptedTransport::success();
+        let handler = test_handler(transport.clone(), json!({"handler": "acme_server"}));
+        let mut client = TestClient::new(&handler).await;
+        assert_eq!(client.register().await.status, StatusCode::CREATED);
+        let ready = ready_order(&mut client, &transport, "ordered.example").await;
+
+        for domains in [
+            vec!["other.example".to_string()],
+            vec!["ordered.example".to_string(), "extra.example".to_string()],
+        ] {
+            let csr = CertificateRequest::generate(&domains).unwrap();
+            let response = client.finalize(&ready.order_path, &csr).await;
+            assert_eq!(
+                response.status,
+                StatusCode::BAD_REQUEST,
+                "{domains:?}: {}",
+                body_text(&response)
+            );
+            assert_eq!(body_json(&response)["type"], PROBLEM_BAD_CSR);
+            assert!(body_json(&response)["detail"]
+                .as_str()
+                .unwrap()
+                .contains("do not match"));
+        }
+
+        // A rejected CSR leaves the order ready, so the correct CSR can still finalize.
+        let response = client.post_as_get(&ready.order_path).await;
+        assert_eq!(body_json(&response)["status"], "ready");
+        let csr = CertificateRequest::generate(&["ordered.example".to_string()]).unwrap();
+        let response = client.finalize(&ready.order_path, &csr).await;
+        assert_eq!(response.status, StatusCode::OK, "{}", body_text(&response));
+        assert_eq!(body_json(&response)["status"], "valid");
+    }
+
+    #[tokio::test]
+    async fn account_only_return_existing_and_deactivation() {
+        let handler = test_handler(
+            ScriptedTransport::success(),
+            json!({"handler": "acme_server"}),
+        );
+        let mut client = TestClient::new(&handler).await;
+        assert_eq!(client.register().await.status, StatusCode::CREATED);
+        let kid = client.kid.clone().expect("kid");
+        let account_path = path_of(&kid);
+
+        // Same key, onlyReturnExisting: returns the existing account with 200.
+        client.kid = None;
+        let response = client
+            .post_json(
+                "/acme/local/new-account",
+                &json!({"onlyReturnExisting": true}),
+            )
+            .await;
+        assert_eq!(response.status, StatusCode::OK, "{}", body_text(&response));
+        assert_eq!(
+            header_value(&response, header::LOCATION).as_deref(),
+            Some(kid.as_str())
+        );
+        client.kid = Some(kid.clone());
+
+        // A different key asking for an existing account gets accountDoesNotExist.
+        let mut other = TestClient::new(&handler).await;
+        let response = other
+            .post_json(
+                "/acme/local/new-account",
+                &json!({"onlyReturnExisting": true}),
+            )
+            .await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(&response)["type"], PROBLEM_ACCOUNT_DOES_NOT_EXIST);
+
+        // Deactivation makes the account unusable for further ACME operations.
+        let response = client
+            .post_json(&account_path, &json!({"status": "deactivated"}))
+            .await;
+        assert_eq!(response.status, StatusCode::OK, "{}", body_text(&response));
+        assert_eq!(body_json(&response)["status"], "deactivated");
+        let response = client
+            .post_json(
+                "/acme/local/new-order",
+                &json!({"identifiers": [{"type": "dns", "value": "after.example"}]}),
+            )
+            .await;
+        assert_eq!(response.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body_json(&response)["type"], PROBLEM_UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn streaming_body_is_bounded_before_parsing() {
+        use crate::body::RequestBody;
+
+        let handler = test_handler(
+            ScriptedTransport::success(),
+            json!({"handler": "acme_server"}),
+        );
+        let mut request = request(Method::POST, "/acme/local/new-account");
+        request = request.with_streaming_body(RequestBody::buffered(vec![b'x'; MAX_JWS_BODY + 1]));
+        match handler
+            .handle_streaming(request)
+            .await
+            .expect("handler serves")
+        {
+            StreamingOutcome::Respond(response) => {
+                let response = response.into_buffered().await.expect("buffered response");
+                assert_eq!(response.status, StatusCode::BAD_REQUEST);
+                assert_eq!(body_json(&response)["type"], PROBLEM_MALFORMED);
+                assert!(body_json(&response)["detail"]
+                    .as_str()
+                    .unwrap()
+                    .contains("exceeds"));
+            }
+            StreamingOutcome::Continue(_) => panic!("ACME path must not pass through"),
+            StreamingOutcome::Upgrade(_) => panic!("ACME never upgrades"),
+        }
+        assert!(!handler.requires_buffered_request_body());
+        assert!(handler.consumes_request_body());
     }
 
     #[test]

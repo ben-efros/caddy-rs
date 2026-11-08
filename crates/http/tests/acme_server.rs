@@ -74,7 +74,7 @@ async fn router_fails_closed_without_a_data_root_or_for_unsupported_challenges()
     assert!(
         error
             .to_string()
-            .contains("requires a Caddy data directory"),
+            .contains("requires a Caddy filesystem data directory"),
         "{error}"
     );
 
@@ -94,4 +94,23 @@ async fn router_fails_closed_without_a_data_root_or_for_unsupported_challenges()
     .err()
     .expect("resolvers only matter for dns-01");
     assert!(error.to_string().contains("dns-01"), "{error}");
+}
+
+#[tokio::test]
+async fn optional_data_root_none_fails_closed_for_non_filesystem_storage() {
+    let error = RouterBuilder::new()
+        .with_optional_acme_server_data_root(None)
+        .build(
+            routes(json!({"handler": "acme_server"}))
+                .as_array()
+                .unwrap(),
+        )
+        .err()
+        .expect("None must not fall back to a relative path");
+    assert!(
+        error
+            .to_string()
+            .contains("requires a Caddy filesystem data directory"),
+        "{error}"
+    );
 }
