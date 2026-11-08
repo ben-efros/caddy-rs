@@ -692,7 +692,7 @@ pub const BUILTIN_MODULES: &[Module] = &[
         "http.matchers.path_regexp",
         "path_regexp",
         ModuleKind::HttpMatcher,
-        "Match request path with a regular expression (config only; runtime not implemented)",
+        "Match request path with an RE2-compatible regular expression",
     ),
     Module::new(
         "http.matchers.method",

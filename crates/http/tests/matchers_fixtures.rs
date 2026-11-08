@@ -176,6 +176,30 @@ async fn adapted_subset_routes_build_and_serve() {
     assert_eq!(response.body, Bytes::from_static(b"local net"));
 }
 
+#[tokio::test]
+async fn named_path_regexp_caddyfile_round_trips_and_serves() {
+    let caddyfile = r#"
+:8080 {
+	@users path_regexp users ^/users/(?P<id>[0-9]+)$
+	respond @users "id={http.regexp.users.id} numeric={http.regexp.users.1} bare={http.regexp.id}"
+}
+"#;
+    let adapted = caddy_rs_config::adapt(caddyfile).expect("named path_regexp adapts");
+    let routes = adapted.config["apps"]["http"]["servers"]["srv0"]["routes"]
+        .as_array()
+        .expect("routes array")
+        .clone();
+    let router = RouterBuilder::new()
+        .build(&routes)
+        .expect("adapted named path_regexp routes construct");
+
+    let response = router.handle(request("/users/42")).await.expect("serves");
+    assert_eq!(
+        response.body,
+        Bytes::from_static(b"id=42 numeric=42 bare=42")
+    );
+}
+
 #[test]
 fn adapted_matcher_configs_validate_with_the_right_registry() {
     // `path_regexp` is already a built-in matcher, so an adapted configuration using it validates

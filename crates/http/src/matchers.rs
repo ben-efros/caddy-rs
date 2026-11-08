@@ -716,9 +716,11 @@ fn caddy_clean_path(path: &str) -> String {
 /// JSON shape: `{"path_regexp": {"name": "optional-name", "pattern": "^/foo(.*)$"}}`. On a match
 /// the capture groups are published like Caddy's `MatchRegexp.Match`:
 /// `{http.regexp.<name>.<index>}` (when a name is configured) and `{http.regexp.<index>}` for every
-/// index (0 = whole match). The pattern is compiled by the crate-internal `regex_lite` engine, so
-/// unsupported RE2 constructs (look-around, named groups, word boundaries, lazy quantifiers,
-/// mid-pattern flags) are rejected loudly at configuration time instead of being approximated.
+/// index (0 = whole match), plus named groups by name (matching Caddy's `MatchRegexp.Match`).
+/// The pattern is compiled with the linear-time `regex` crate (RE2 syntax): look-around and
+/// backreferences are rejected loudly as in Go, while named groups, word boundaries, lazy
+/// quantifiers and inline flags are supported. Unicode-aware `\w`/`\d`/`\s`/`\b` classes are
+/// the documented DIV-0015 residual.
 pub struct PathRegexpMatcher {
     /// Optional capture namespace (Caddy `name`; must be word characters when set).
     pub name: Option<String>,
@@ -765,12 +767,6 @@ impl PathRegexpMatcher {
                 })
             }
         };
-        if pattern.contains("(?P<") || pattern.contains("(?<") {
-            return Err(Error::NotImplemented {
-                feature: "path_regexp named capture groups: only numeric `{http.regexp.N}` placeholders are supported by this build",
-                tracking_id: "CORE-MATCH-REGEXP",
-            });
-        }
         let regex = Regex::new(pattern).map_err(|error| match error {
             Error::InvalidConfig { message, .. } => Error::InvalidConfig {
                 path: format!("{path}.pattern"),
@@ -802,13 +798,31 @@ impl PathRegexpMatcher {
             }
             request.vars.insert(format!("http.regexp.{index}"), value);
         }
+        // Caddy then publishes named groups by name, in both the scoped and unscoped form.
+        for (index, name) in self.regex.capture_names().enumerate() {
+            let Some(name) = name else { continue };
+            if index == 0 {
+                continue;
+            }
+            let value = captures
+                .group(index)
+                .and_then(|(start, end)| cleaned_path.get(start..end))
+                .unwrap_or("")
+                .to_string();
+            if let Some(scope) = &self.name {
+                request
+                    .vars
+                    .insert(format!("http.regexp.{scope}.{name}"), value.clone());
+            }
+            request.vars.insert(format!("http.regexp.{name}"), value);
+        }
     }
 }
 
 impl Matcher for PathRegexpMatcher {
     fn matches(&self, request: &Request) -> bool {
         let path = percent_decode(request.path());
-        self.regex.captures(&caddy_clean_path(&path)).is_some()
+        self.regex.is_match(&caddy_clean_path(&path))
     }
 
     fn matches_mut(&self, request: &mut Request) -> bool {
@@ -2733,18 +2747,94 @@ mod matcher_network_tls_tests {
     }
 
     #[test]
-    fn path_regexp_rejects_unsupported_constructs_loudly() {
-        for pattern in ["(?P<name>a)", "(?=a)", "\\bword\\b", "(?!a)"] {
+    fn path_regexp_publishes_named_captures() {
+        let matcher = build(
+            "path_regexp",
+            serde_json::json!({"name": "re", "pattern": "^/users/(?P<id>[0-9]+)/(?<rest>.*)$"}),
+        )
+        .expect("named captures compile");
+        let mut request = make_request("/users/42/profile");
+        assert!(matcher.matches_mut(&mut request));
+
+        for key in [
+            "http.regexp.re.id",
+            "http.regexp.re.1",
+            "http.regexp.id",
+            "http.regexp.1",
+        ] {
+            assert_eq!(
+                request.vars.get(key).map(String::as_str),
+                Some("42"),
+                "{key}"
+            );
+        }
+        for key in [
+            "http.regexp.re.rest",
+            "http.regexp.re.2",
+            "http.regexp.rest",
+            "http.regexp.2",
+        ] {
+            assert_eq!(
+                request.vars.get(key).map(String::as_str),
+                Some("profile"),
+                "{key}"
+            );
+        }
+        assert_eq!(request.replace_all("{http.regexp.re.id}"), "42");
+        assert_eq!(request.replace_all("{http.regexp.id}"), "42");
+    }
+
+    #[test]
+    fn path_regexp_supports_re2_constructs() {
+        // Word boundaries (now supported by the crate engine).
+        let boundary =
+            build("path_regexp", serde_json::json!({"pattern": "^/foo\\b"})).expect("compiles");
+        assert!(boundary.matches(&make_request("/foo")));
+        assert!(!boundary.matches(&make_request("/foobar")));
+
+        // Lazy quantifiers.
+        let lazy =
+            build("path_regexp", serde_json::json!({"pattern": "^/a+?b"})).expect("compiles");
+        assert!(lazy.matches(&make_request("/aaab")));
+
+        // Mid-pattern inline flags.
+        let flag = build(
+            "path_regexp",
+            serde_json::json!({"pattern": "^/foo(?i)/bar$"}),
+        )
+        .expect("compiles");
+        assert!(flag.matches(&make_request("/foo/BAR")));
+
+        // ASCII names still match; the crate's `\w` is Unicode-aware (DIV-0015 residual).
+        let word =
+            build("path_regexp", serde_json::json!({"pattern": "^/\\w+$"})).expect("compiles");
+        assert!(word.matches(&make_request("/cafe")));
+    }
+
+    #[test]
+    fn path_regexp_rejects_non_re2_constructs_loudly() {
+        // Go's RE2 (and therefore Caddy) does not support look-around or backreferences.
+        for pattern in ["(?=a)", "(?!a)", "(?<=a)", "(a)\\1"] {
             let error = build("path_regexp", serde_json::json!({"pattern": pattern}))
-                .expect_err("unsupported construct must be loud");
+                .expect_err("non-RE2 construct must be loud");
             let message = error.to_string();
             assert!(message.contains("path_regexp"), "{pattern}: {message}");
+            assert!(message.contains(".pattern"), "{pattern}: {message}");
         }
-        // Non-capturing groups and the leading case-insensitive flag are supported.
-        for pattern in ["a(?:b)?", "(?i)^/foo"] {
+
+        // Constructs RE2 does support now compile.
+        for pattern in [
+            "(?P<name>a)",
+            "(?<name>a)",
+            "\\bword\\b",
+            "a+?",
+            "(?i)^/foo",
+            "a(?:b)?",
+        ] {
             build("path_regexp", serde_json::json!({"pattern": pattern}))
                 .unwrap_or_else(|error| panic!("{pattern} should compile: {error}"));
         }
+
         let error = build(
             "path_regexp",
             serde_json::json!({"name": "bad-name", "pattern": "a"}),
