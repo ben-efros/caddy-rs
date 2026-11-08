@@ -58,9 +58,9 @@
 //!   `rename`, `hash`, `ip_mask`, `query`, `cookie`, `set_cookie`, `regexp` and `multi_regexp`
 //!   operations map to [`AccessLogConfig::filters`](crate::AccessLogConfig). `hash` is Caddy's
 //!   SHA-256 first-4-bytes filter; `ip_mask` supports `ipv4_cidr`/`ipv6_cidr`; `query`/`cookie`/
-//!   `set_cookie` apply replace/hash/delete actions; `regexp`/`multi_regexp` use a bundled
-//!   minimal RE2-subset engine (see [`crate::regex_lite`], copied from the HTTP crate with
-//!   attribution) with Go-style `$N` expansion — unsupported regexp constructs fail loudly.
+//!   `set_cookie` apply replace/hash/delete actions; `regexp`/`multi_regexp` use the shared
+//!   linear-time `regex` engine (see [`caddy_rs_core::regex`]) with Go-style `$N` expansion —
+//!   unsupported regexp constructs fail loudly.
 //!   Nested filter encoders are rejected loudly.
 //! * `level`: `DEBUG`/`INFO`/`WARN`/`ERROR`/`PANIC`/`FATAL`, case-insensitive. The threshold is
 //!   enforced by the sink ([`AccessLogSink::emit`](crate::AccessLogSink::emit) returns
@@ -1233,7 +1233,7 @@ fn apply_field_filter(
                 .get("value")
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            crate::regex_lite::Regex::new(pattern).map_err(|error| {
+            caddy_rs_core::regex::Regex::new(pattern).map_err(|error| {
                 LoggingConfigError::new(
                     format!("{filter_path}.regexp"),
                     format!("invalid regexp filter pattern: {error}"),
@@ -1289,7 +1289,7 @@ fn apply_field_filter(
                             "multi_regexp patterns must be at most 1000 characters",
                         ));
                     }
-                    crate::regex_lite::Regex::new(pattern).map_err(|error| {
+                    caddy_rs_core::regex::Regex::new(pattern).map_err(|error| {
                         LoggingConfigError::new(
                             format!("{operation_path}.regexp"),
                             format!("invalid multi_regexp pattern: {error}"),

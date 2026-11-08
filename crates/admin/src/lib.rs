@@ -174,7 +174,6 @@ pub mod metrics_config;
 mod origin;
 pub mod pki;
 pub mod recorder;
-mod regex_lite;
 pub mod sink;
 pub mod tracing_config;
 pub mod trust;

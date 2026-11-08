@@ -767,12 +767,9 @@ impl PathRegexpMatcher {
                 })
             }
         };
-        let regex = Regex::new(pattern).map_err(|error| match error {
-            Error::InvalidConfig { message, .. } => Error::InvalidConfig {
-                path: format!("{path}.pattern"),
-                message: format!("path_regexp `{pattern}`: {message}"),
-            },
-            other => other,
+        let regex = Regex::new(pattern).map_err(|error| Error::InvalidConfig {
+            path: format!("{path}.pattern"),
+            message: format!("path_regexp `{pattern}`: {error}"),
         })?;
         Ok(Self {
             name,
