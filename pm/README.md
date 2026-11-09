@@ -252,7 +252,7 @@ Compile, Config}` and carry the relevant path. No error contains plaintext secre
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/health` | Returns `{ "status": "ok", "setup": true }` |
+| `GET` | `/health` | Returns `{ "status": "ok", "setup": false }`; `setup` stays false until a user store exists |
 | `GET` | `/setup` | Returns `{ "configured": false }` (admin user check deferred to PM-109/CORE-PM-12) |
 | `GET` | `/version` | Returns `{ "version": "<crate version>", "caddy_rs": "<caddy-rs-core VERSION>" }` |
 | `GET` | `/hosts` | Paginated read-only host summaries (`id`, `domains`, `kind`, `enabled`, `revision`, `tlsMode`) |
@@ -272,9 +272,9 @@ Compile, Config}` and carry the relevant path. No error contains plaintext secre
 
 Tests use `axum_test::TestServer` against a real `PmRuntime` backed by a temporary data directory:
 - Health/setup/version return 200 with the documented shapes.
-- `/hosts` paginates, clamps an oversized `limit`, and rejects a non-numeric one with 400.
+- `/hosts` paginates, clamps an oversized `limit`, and returns typed 400 errors for non-numeric or negative ones.
 - `/config` returns a stable weak ETag; `If-None-Match` yields 304, a stale `If-Match` yields 412 with a typed `PRECONDITION_FAILED` body, and `*`/current tags succeed.
-- `If-Match` is evaluated before `If-None-Match`, and a malformed tag fails closed.
+- `If-Match` is evaluated before `If-None-Match`; malformed tags, including a non-UTF-8 header value, fail closed with 412.
 - Mutation-side `require_if_match` rejects missing and stale revisions and accepts current/`*`.
 - Error bodies carry `location` only when a field is at fault.
 

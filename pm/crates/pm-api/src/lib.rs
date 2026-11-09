@@ -46,7 +46,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::{
-    extract::{Query, State},
+    extract::{rejection::QueryRejection, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Json, Response},
@@ -296,13 +296,25 @@ fn normalize_etag_member(member: &str) -> &str {
 }
 
 /// Split a comma-separated ETag header into its members.
-fn etag_members(headers: &HeaderMap, name: header::HeaderName) -> Option<Vec<String>> {
-    let raw = headers.get(name)?.to_str().ok()?;
-    Some(
+///
+/// A header that is present but not valid UTF-8 is an error, not an absent header. Treating it as
+/// absent would make an unparseable `If-Match` succeed, which is the fail-open case a precondition
+/// must never have.
+fn etag_members(
+    headers: &HeaderMap,
+    name: header::HeaderName,
+) -> Result<Option<Vec<String>>, ApiError> {
+    let Some(value) = headers.get(&name) else {
+        return Ok(None);
+    };
+    let raw = value
+        .to_str()
+        .map_err(|_| ApiError::PreconditionFailed(format!("{name} is not a valid header value")))?;
+    Ok(Some(
         raw.split(',')
             .map(|member| normalize_etag_member(member).to_owned())
             .collect(),
-    )
+    ))
 }
 
 fn matches_any(members: &[String], current: &str) -> bool {
@@ -313,31 +325,34 @@ fn matches_any(members: &[String], current: &str) -> bool {
 
 /// Evaluate `If-Match`/`If-None-Match` for a `GET`.
 ///
-/// Returns `Some(response)` when the request must be short-circuited (`304` or `412`), and `None`
-/// when the representation should be served. `If-Match` is evaluated before `If-None-Match`, the
-/// order RFC 9110 requires.
-#[must_use]
-pub fn evaluate_get_preconditions(headers: &HeaderMap, current_etag: &str) -> Option<Response> {
+/// Returns `Ok(Some(response))` when the request must be short-circuited (`304` or `412`),
+/// `Ok(None)` when the representation should be served, and `Err` when a present header value
+/// cannot be parsed (a present but unreadable `If-Match` must fail closed, not look absent).
+/// `If-Match` is evaluated before `If-None-Match`, the order RFC 9110 requires.
+pub fn evaluate_get_preconditions(
+    headers: &HeaderMap,
+    current_etag: &str,
+) -> Result<Option<Response>, ApiError> {
     let current = normalize_etag_member(current_etag).to_owned();
 
-    if let Some(members) = etag_members(headers, header::IF_MATCH) {
+    if let Some(members) = etag_members(headers, header::IF_MATCH)? {
         if !matches_any(&members, &current) {
-            return Some(
+            return Ok(Some(
                 ApiError::PreconditionFailed(format!(
                     "If-Match does not match the current representation ({current_etag})"
                 ))
                 .into_response(),
-            );
+            ));
         }
     }
 
-    if let Some(members) = etag_members(headers, header::IF_NONE_MATCH) {
+    if let Some(members) = etag_members(headers, header::IF_NONE_MATCH)? {
         if matches_any(&members, &current) {
-            return Some(not_modified(current_etag));
+            return Ok(Some(not_modified(current_etag)));
         }
     }
 
-    None
+    Ok(None)
 }
 
 /// Evaluate `If-Match` for an unsafe method that requires one.
@@ -345,7 +360,7 @@ pub fn evaluate_get_preconditions(headers: &HeaderMap, current_etag: &str) -> Op
 /// A missing header is an error here, unlike on `GET`: mutating without an expected revision is
 /// exactly the lost-update race the precondition exists to prevent.
 pub fn require_if_match(headers: &HeaderMap, current_etag: &str) -> Result<(), ApiError> {
-    let members = etag_members(headers, header::IF_MATCH).ok_or_else(|| {
+    let members = etag_members(headers, header::IF_MATCH)?.ok_or_else(|| {
         ApiError::PreconditionFailed(
             "If-Match is required for this request; fetch the resource and send its ETag"
                 .to_owned(),
@@ -434,7 +449,9 @@ pub fn create_router(state: ApiState) -> Router {
 async fn health_handler(State(_state): State<ApiState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok".to_owned(),
-        setup: true,
+        // Keep this consistent with `/setup`: no user store is wired, so the server is not
+        // configured and a client must not skip the setup wizard.
+        setup: false,
     })
 }
 
@@ -455,8 +472,10 @@ async fn version_handler(State(_state): State<ApiState>) -> Json<VersionResponse
 /// `GET /api/v1/hosts` — read-only host summaries.
 async fn hosts_handler(
     State(state): State<ApiState>,
-    Query(params): Query<PaginationParams>,
+    query: Result<Query<PaginationParams>, QueryRejection>,
 ) -> Result<Json<PaginatedResponse<HostSummary>>, ApiError> {
+    let Query(params) =
+        query.map_err(|rejection| ApiError::validation(rejection.body_text(), "limit"))?;
     let stored = state
         .runtime
         .hosts()
@@ -506,7 +525,7 @@ async fn config_handler(
         .map_err(|error| ApiError::Internal(format!("serialize config: {error}")))?;
     let etag = format_weak_etag(&hash_bytes(&bytes));
 
-    if let Some(response) = evaluate_get_preconditions(&headers, &etag) {
+    if let Some(response) = evaluate_get_preconditions(&headers, &etag)? {
         return Ok(response);
     }
 

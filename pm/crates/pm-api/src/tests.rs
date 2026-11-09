@@ -29,7 +29,7 @@ async fn health_reports_ok() {
 
     let body: HealthResponse = response.json();
     assert_eq!(body.status, "ok");
-    assert!(body.setup);
+    assert!(!body.setup, "no user store means setup is not complete");
 }
 
 #[tokio::test]
@@ -85,11 +85,28 @@ async fn hosts_clamps_an_oversized_limit_and_echoes_it() {
 }
 
 #[tokio::test]
-async fn hosts_rejects_a_non_numeric_limit() {
+async fn hosts_rejects_a_non_numeric_limit_with_a_typed_error() {
     let (_dir, server) = server();
     let response = server.get("/api/v1/hosts?limit=abc").await;
-    // Axum's query extractor rejects this before the handler; that is a 400, not a 500.
     assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    assert!(response
+        .header("content-type")
+        .to_str()
+        .expect("ascii")
+        .starts_with("application/json"));
+    let body: ApiErrorResponse = response.json();
+    assert_eq!(body.error.code, ErrorCode::Validation);
+    assert_eq!(body.error.location.as_deref(), Some("limit"));
+}
+
+#[tokio::test]
+async fn hosts_rejects_a_negative_limit_with_a_typed_error() {
+    let (_dir, server) = server();
+    let response = server.get("/api/v1/hosts?limit=-1").await;
+    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    let body: ApiErrorResponse = response.json();
+    assert_eq!(body.error.code, ErrorCode::Validation);
+    assert_eq!(body.error.location.as_deref(), Some("limit"));
 }
 
 #[tokio::test]
@@ -204,6 +221,21 @@ async fn malformed_if_match_fails_closed() {
         .add_header("If-Match", "not an etag at all")
         .await;
     assert_eq!(response.status_code(), StatusCode::PRECONDITION_FAILED);
+}
+
+#[tokio::test]
+async fn non_utf8_if_match_fails_closed_instead_of_being_treated_as_absent() {
+    let (_dir, server) = server();
+    // A header value that is present but not valid UTF-8. Returning 200 here would be the
+    // fail-open path: an unparseable precondition must never mean "no precondition".
+    let value = HeaderValue::from_bytes(b"\xff\xfe").expect("opaque header");
+    let response = server
+        .get("/api/v1/config")
+        .add_header("If-Match", value)
+        .await;
+    assert_eq!(response.status_code(), StatusCode::PRECONDITION_FAILED);
+    let body: ApiErrorResponse = response.json();
+    assert_eq!(body.error.code, ErrorCode::PreconditionFailed);
 }
 
 #[test]
