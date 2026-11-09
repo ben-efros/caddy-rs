@@ -2324,93 +2324,220 @@ pub(crate) fn parse_duration_ns(value: &str) -> Result<i64, String> {
     Ok(total.round() as i64)
 }
 
-/// Parse Caddy's Go-duration syntax into nanoseconds, matching `caddy.ParseDuration`:
-/// `time.ParseDuration` units (`ns`, `us`/`µs`/`μs`, `ms`, `s`, `m`, `h`) plus `d` for 24-hour
-/// days, compound forms (`1h30m`), fractional values (`1.5s`) and a leading sign. Fractional
-/// nanoseconds truncate toward zero (Go's behaviour); an unqualified `0` is valid, other bare
-/// numbers need a unit.
+/// Parse Caddy's Go-duration syntax into nanoseconds, matching `caddy.ParseDuration` exactly.
+///
+/// Caddy first rewrites each `Nd` component (days, 24 h) into hours and then calls Go's
+/// `time.ParseDuration`; both steps are ported faithfully here (including Caddy's rewrite quirks),
+/// so accepted forms and error text match the v2.11.9 oracle. Grammar: an optional sign followed
+/// by either `0` or one or more decimal numbers with a unit. Units are `ns`, `us`/`µs`/`μs`, `ms`,
+/// `s`, `m`, `h` (and the days rewrite). Compound (`1m30s`), fractional (`1.5s`) and
+/// sub-nanosecond values are supported; fractional nanoseconds truncate toward zero.
 pub(crate) fn parse_go_duration_ns(value: &str) -> Result<i64, String> {
     if value.len() > 1024 {
         return Err("parsing duration: input string too long".to_string());
     }
-    // Caddy preprocesses `Nd` components into hours before calling Go's parser.
-    let mut text = value.to_string();
+    // `caddy.ParseDuration`'s day rewrite (caddy.go) walks *bytes*: `s[i] == 'd'`, then
+    // `strconv.ParseFloat(s[start:i])` on the preceding run. Working on bytes matters: a multi-byte
+    // rune such as `µ` can start a run, and Go hands the raw bytes to ParseFloat, which reports them
+    // as `\xb5`. Slicing the Rust `str` at those indices panicked (`not a char boundary`) for input
+    // like `µd`.
+    let mut bytes: Vec<u8> = value.as_bytes().to_vec();
     let mut in_number = false;
     let mut number_start = 0_usize;
     let mut index = 0_usize;
-    while index < text.len() {
-        let byte = text.as_bytes()[index];
+    while index < bytes.len() {
+        let byte = bytes[index];
         if byte == b'd' {
-            let days: f64 = text[number_start..index]
-                .parse()
-                .map_err(|_| format!("time: invalid duration \"{value}\""))?;
+            let days_bytes = &bytes[number_start..index];
+            let days: f64 = match std::str::from_utf8(days_bytes) {
+                Ok(days_text) => days_text.parse().map_err(|_| {
+                    format!(
+                        "strconv.ParseFloat: parsing \"{}\": invalid syntax",
+                        go_quote_bytes(days_bytes)
+                    )
+                })?,
+                Err(_) => {
+                    return Err(format!(
+                        "strconv.ParseFloat: parsing \"{}\": invalid syntax",
+                        go_quote_bytes(days_bytes)
+                    ))
+                }
+            };
             let hours = days * 24.0;
-            // Go's strconv.FormatFloat(hours, 'f', -1, 64): shortest decimal representation.
-            let hours = format!("{hours}");
-            text = format!("{}{}h{}", &text[..number_start], hours, &text[index + 1..]);
-            index = number_start.saturating_sub(1);
-        } else {
-            if !in_number {
-                number_start = index;
-            }
-            in_number = byte.is_ascii_digit() || matches!(byte, b'.' | b'-' | b'+');
+            // Go's `strconv.FormatFloat(hours, 'f', -1, 64)`: shortest decimal representation.
+            let hours_text = format!("{hours}");
+            let mut rebuilt = Vec::with_capacity(bytes.len() + hours_text.len() + 1);
+            rebuilt.extend_from_slice(&bytes[..number_start]);
+            rebuilt.extend_from_slice(hours_text.as_bytes());
+            rebuilt.push(b'h');
+            rebuilt.extend_from_slice(&bytes[index + 1..]);
+            bytes = rebuilt;
+            // Go does `i--; continue`, then the loop's `i++`: the same byte is processed again.
+            continue;
         }
+        if !in_number {
+            number_start = index;
+        }
+        in_number = byte.is_ascii_digit() || matches!(byte, b'.' | b'-' | b'+');
         index += 1;
     }
+    let text = String::from_utf8(bytes).map_err(|_| "duration is not valid UTF-8".to_string())?;
+    parse_go_duration(&text)
+}
 
-    let original = value;
-    let mut rest = text.as_str();
-    let mut sign = 1.0_f64;
-    if let Some(stripped) = rest.strip_prefix('-') {
-        sign = -1.0;
-        rest = stripped;
-    } else if let Some(stripped) = rest.strip_prefix('+') {
-        rest = stripped;
+/// Go's `strconv.Quote` byte escaping for error text: printable ASCII as-is, everything else `\xNN`.
+fn go_quote_bytes(bytes: &[u8]) -> String {
+    let mut quoted = String::new();
+    for byte in bytes {
+        match byte {
+            b'\\' => quoted.push_str("\\\\"),
+            b'"' => quoted.push_str("\\\""),
+            0x20..=0x7e => quoted.push(*byte as char),
+            other => quoted.push_str(&format!("\\x{other:02x}")),
+        }
+    }
+    quoted
+}
+
+/// Go's `time.ParseDuration` for the string Caddy's day rewrite produced.
+fn parse_go_duration(text: &str) -> Result<i64, String> {
+    fn invalid(text: &str) -> String {
+        format!("time: invalid duration \"{text}\"")
+    }
+
+    let mut rest = text;
+    let mut negative = false;
+    if let Some(after) = rest.strip_prefix('-') {
+        negative = true;
+        rest = after;
+    } else if let Some(after) = rest.strip_prefix('+') {
+        rest = after;
     }
     if rest == "0" {
         return Ok(0);
     }
     if rest.is_empty() {
-        return Err(format!("time: invalid duration \"{original}\""));
+        return Err(invalid(text));
     }
-    let mut total = 0.0_f64;
+    let mut total: u64 = 0;
     while !rest.is_empty() {
-        let number_end = rest
-            .find(|character: char| !(character.is_ascii_digit() || character == '.'))
-            .unwrap_or(rest.len());
-        if number_end == 0 {
-            return Err(format!("time: invalid duration \"{original}\""));
+        // The next character must be a digit or a decimal point.
+        let first = rest.as_bytes()[0];
+        if !(first == b'.' || first.is_ascii_digit()) {
+            return Err(invalid(text));
         }
-        let number: f64 = rest[..number_end]
-            .parse()
-            .map_err(|_| format!("time: invalid duration \"{original}\""))?;
-        rest = &rest[number_end..];
-        let unit_end = rest
-            .find(|character: char| character.is_ascii_digit() || character == '.')
-            .unwrap_or(rest.len());
-        let unit = &rest[..unit_end];
-        rest = &rest[unit_end..];
-        let multiplier: f64 = match unit {
-            "ns" => 1.0,
-            "us" | "µs" | "μs" => 1_000.0,
-            "ms" => 1_000_000.0,
-            "s" => 1_000_000_000.0,
-            "m" => 60_000_000_000.0,
-            "h" => 3_600_000_000_000.0,
-            "" => return Err(format!("time: missing unit in duration \"{original}\"")),
-            _ => return Err(format!("time: invalid duration \"{original}\"")),
+        let Some((integer, after_integer, consumed_integer)) = leading_int(rest) else {
+            return Err(invalid(text));
         };
-        total += number * multiplier;
-        if !total.is_finite() {
-            return Err(format!("time: invalid duration \"{original}\""));
+        rest = after_integer;
+        let mut value = integer;
+        let mut fraction: u64 = 0;
+        let mut scale = 1.0_f64;
+        let mut consumed_fraction = false;
+        if let Some(after_dot) = rest.strip_prefix('.') {
+            let (digits, digits_scale, remainder, consumed) = leading_fraction(after_dot);
+            rest = remainder;
+            fraction = digits;
+            scale = digits_scale;
+            consumed_fraction = consumed;
+        }
+        if !consumed_integer && !consumed_fraction {
+            // No digits at all (e.g. `.s` or `-.s`).
+            return Err(invalid(text));
+        }
+        let unit_end = rest
+            .find(|character: char| character == '.' || character.is_ascii_digit())
+            .unwrap_or(rest.len());
+        if unit_end == 0 {
+            return Err(format!("time: missing unit in duration \"{text}\""));
+        }
+        let unit_text = &rest[..unit_end];
+        rest = &rest[unit_end..];
+        let unit: u64 = match unit_text {
+            "ns" => 1,
+            "us" | "µs" | "μs" => 1_000,
+            "ms" => 1_000_000,
+            "s" => 1_000_000_000,
+            "m" => 60_000_000_000,
+            "h" => 3_600_000_000_000,
+            _ => {
+                return Err(format!(
+                    "time: unknown unit \"{unit_text}\" in duration \"{text}\""
+                ))
+            }
+        };
+        if value > (1_u64 << 63) / unit {
+            return Err(invalid(text));
+        }
+        value *= unit;
+        if fraction > 0 {
+            // `float64` keeps fractions of the largest unit (hours) nanosecond-accurate.
+            value += (fraction as f64 * (unit as f64 / scale)) as u64;
+            if value > 1_u64 << 63 {
+                return Err(invalid(text));
+            }
+        }
+        total = total.wrapping_add(value);
+        if total > 1_u64 << 63 {
+            return Err(invalid(text));
         }
     }
-    let total = sign * total;
-    if total > i64::MAX as f64 || total < i64::MIN as f64 {
-        return Err(format!("time: invalid duration \"{original}\""));
+    if negative {
+        // `-Duration(1<<63)` wraps to `i64::MIN`, like Go.
+        return Ok((total as i64).wrapping_neg());
     }
-    // Go truncates sub-nanosecond fractions toward zero.
-    Ok(total.trunc() as i64)
+    if total > (1_u64 << 63) - 1 {
+        return Err(invalid(text));
+    }
+    Ok(total as i64)
+}
+
+/// Go's `leadingInt`: parse the leading digit run, failing beyond `1<<63`.
+fn leading_int(text: &str) -> Option<(u64, &str, bool)> {
+    let mut value: u64 = 0;
+    let mut index = 0_usize;
+    for byte in text.bytes() {
+        if !byte.is_ascii_digit() {
+            break;
+        }
+        if value > (1_u64 << 63) / 10 {
+            return None;
+        }
+        value = value * 10 + u64::from(byte - b'0');
+        if value > 1_u64 << 63 {
+            return None;
+        }
+        index += 1;
+    }
+    Some((value, &text[index..], index > 0))
+}
+
+/// Go's `leadingFraction`: parse the digit run after a decimal point into a fraction and scale.
+fn leading_fraction(text: &str) -> (u64, f64, &str, bool) {
+    let mut value: u64 = 0;
+    let mut scale = 1.0_f64;
+    let mut overflow = false;
+    let mut index = 0_usize;
+    for byte in text.bytes() {
+        if !byte.is_ascii_digit() {
+            break;
+        }
+        if !overflow {
+            if value > ((1_u64 << 63) - 1) / 10 {
+                overflow = true;
+            } else {
+                let next = value * 10 + u64::from(byte - b'0');
+                if next > 1_u64 << 63 {
+                    overflow = true;
+                } else {
+                    value = next;
+                    scale *= 10.0;
+                }
+            }
+        }
+        index += 1;
+    }
+    (value, scale, &text[index..], index > 0)
 }
 
 fn global_string(directive: &Directive, option: &str) -> Result<String, ParseError> {
@@ -2612,6 +2739,17 @@ mod tests {
             ("+5s", 5_000_000_000),
             ("0.5ns", 0),
             ("1s0.5ns", 1_000_000_000),
+            ("1.5s", 1_500_000_000),
+            (".5s", 500_000_000),
+            ("1.s", 1_000_000_000),
+            ("1us", 1_000),
+            ("1µs", 1_000),
+            ("1μs", 1_000),
+            ("1ns", 1),
+            ("100ms", 100_000_000),
+            ("1d0.5h", 88_200_000_000_000),
+            ("1d1d", 172_800_000_000_000),
+            ("0d", 0),
         ] {
             assert_eq!(
                 parse_go_duration_ns(value),
@@ -2623,6 +2761,52 @@ mod tests {
             assert!(
                 parse_go_duration_ns(value).is_err(),
                 "duration `{value}` should fail"
+            );
+        }
+    }
+
+    #[test]
+    fn day_rewrite_is_byte_safe_for_multibyte_prefixes() {
+        // Caddy's day rewrite walks bytes and hands the preceding run to strconv.ParseFloat; a
+        // multi-byte rune before `d` used to slice the Rust `str` at a non-char boundary and panic.
+        // Go reports the raw byte as `\xb5`; verify the message and, above all, that nothing panics.
+        for value in ["\u{b5}d", "1\u{b5}d", "\u{1f600}d"] {
+            let error = parse_go_duration_ns(value).expect_err("a rune is not a number");
+            assert!(
+                error.contains("strconv.ParseFloat: parsing"),
+                "unexpected error for {value:?}: {error}"
+            );
+        }
+        assert_eq!(
+            parse_go_duration_ns("\u{b5}d").unwrap_err(),
+            "strconv.ParseFloat: parsing \"\\xb5\": invalid syntax"
+        );
+        // Valid day forms still rewrite correctly.
+        assert_eq!(parse_go_duration_ns("1d").unwrap(), 86_400_000_000_000);
+        assert_eq!(parse_go_duration_ns("1.5d").unwrap(), 129_600_000_000_000);
+    }
+
+    fn go_duration_parser_error_text_matches_go_and_caddy() {
+        // Exact messages from Go's `time.ParseDuration` (after Caddy's day rewrite), verified
+        // against the v2.11.9 oracle; the adapter adds Caddy's directive prefix on top.
+        for (value, expected) in [
+            ("", "time: invalid duration \"\""),
+            ("1", "time: missing unit in duration \"1\""),
+            ("1x", "time: unknown unit \"x\" in duration \"1x\""),
+            ("abc", "time: invalid duration \"abc\""),
+            ("1..5s", "time: missing unit in duration \"1..5s\""),
+            ("1.5d5", "time: missing unit in duration \"36h5\""),
+            ("1h-1m", "time: unknown unit \"h-\" in duration \"1h-1m\""),
+            (
+                "9223372036854775808ns",
+                "time: invalid duration \"9223372036854775808ns\"",
+            ),
+            ("d", "strconv.ParseFloat: parsing \"\": invalid syntax"),
+        ] {
+            assert_eq!(
+                parse_go_duration_ns(value),
+                Err(expected.to_string()),
+                "duration `{value}`"
             );
         }
     }
