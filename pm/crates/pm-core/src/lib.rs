@@ -791,8 +791,13 @@ pub struct RedirectSpec {
 }
 
 impl RedirectSpec {
+    /// The normalized redirect target used in the emitted `Location` header.
+    pub fn normalized_target(&self) -> Result<String, CoreError> {
+        normalize_domain(&self.target)
+    }
+
     fn validate(&self) -> Result<(), CoreError> {
-        normalize_domain(&self.target)?;
+        self.normalized_target()?;
         if !matches!(self.status, 300 | 301 | 302 | 303 | 307 | 308) {
             return Err(CoreError::Invalid(format!(
                 "redirect status {} is not supported; expected 300, 301, 302, 303, 307 or 308",
@@ -892,6 +897,20 @@ impl Host {
         }
         Ok(normalized)
     }
+}
+
+/// Check that each host id is unique. Duplicate ids would produce duplicate route `@id` values.
+pub fn validate_host_id_uniqueness(hosts: &[Host]) -> Result<(), CoreError> {
+    let mut seen: BTreeMap<u64, HostId> = BTreeMap::new();
+    for host in hosts {
+        if let Some(existing) = seen.insert(host.id.0, host.id) {
+            return Err(CoreError::Invalid(format!(
+                "host id {} is used by more than one host",
+                existing.0
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Check that no domain is claimed by two hosts. A host's own duplicate domains are already
@@ -1523,6 +1542,25 @@ mod tests {
         spec.status = 301;
         spec.target = "*.example.com".to_string();
         assert!(spec.validate().is_err());
+    }
+
+    #[test]
+    fn host_id_uniqueness_rejects_duplicates() {
+        let first = proxy_host_for_tests(1, &["one.example.com"]);
+        let second = proxy_host_for_tests(1, &["two.example.com"]);
+        assert!(validate_host_id_uniqueness(&[first, second]).is_err());
+    }
+
+    #[test]
+    fn redirect_target_is_normalized_for_emission() {
+        let spec = RedirectSpec {
+            scheme: RedirectScheme::Auto,
+            target: " New.Example.COM. ".to_string(),
+            status: 301,
+            preserve_path: true,
+        };
+        spec.validate().expect("valid redirect");
+        assert_eq!(spec.normalized_target().expect("target"), "new.example.com");
     }
 
     #[test]

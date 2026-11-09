@@ -11,7 +11,8 @@
 #![forbid(unsafe_code)]
 
 use caddy_rs_pm_core::{
-    validate_host_domain_uniqueness, Host, HostKind, HostSpec, RedirectScheme, TlsMode,
+    validate_host_domain_uniqueness, validate_host_id_uniqueness, Host, HostKind, HostSpec,
+    RedirectScheme, TlsMode,
 };
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -51,6 +52,7 @@ pub enum CompileError {
 /// always produces the same JSON.
 pub fn compile_routes(hosts: &[Host]) -> Result<CompiledRoutes, CompileError> {
     validate_host_domain_uniqueness(hosts)?;
+    validate_host_id_uniqueness(hosts)?;
 
     let mut prepared: Vec<PreparedHost> = Vec::new();
     for host in hosts {
@@ -165,7 +167,8 @@ fn host_handle(host: &Host, on_https: bool) -> Result<Vec<Value>, CompileError> 
             } else {
                 ""
             };
-            let location = format!("{scheme}://{}{suffix}", spec.target);
+            let target = spec.normalized_target()?;
+            let location = format!("{scheme}://{}{suffix}", target);
             handle.push(json!({
                 "handler": "static_response",
                 "status_code": spec.status,
@@ -317,6 +320,26 @@ mod tests {
     }
 
     #[test]
+    fn redirect_target_is_normalized_in_location() {
+        let host = Host::new(
+            HostId(19),
+            vec!["old.example.com".to_string()],
+            HostTls::disabled(),
+            HostSpec::Redirect(RedirectSpec {
+                scheme: RedirectScheme::Https,
+                target: " New.Example.COM. ".to_string(),
+                status: 302,
+                preserve_path: false,
+            }),
+        );
+        let compiled = compile_routes(&[host]).expect("compile");
+        assert_eq!(
+            compiled.http[0]["handle"][0]["headers"]["Location"][0],
+            "https://new.example.com"
+        );
+    }
+
+    #[test]
     fn dead_host_returns_404() {
         let host = Host::new(
             HostId(6),
@@ -364,6 +387,13 @@ mod tests {
         host.enabled = false;
         let compiled = compile_routes(&[host]).expect("compile");
         assert!(compiled.is_empty());
+    }
+
+    #[test]
+    fn duplicate_host_ids_are_rejected() {
+        let first = proxy_host(18, &["one.example.com"], HostTls::disabled());
+        let second = proxy_host(18, &["two.example.com"], HostTls::disabled());
+        assert!(compile_routes(&[first, second]).is_err());
     }
 
     #[test]
