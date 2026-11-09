@@ -4208,7 +4208,7 @@ mod tests {
     fn tls_acceptor() -> tokio_rustls::TlsAcceptor {
         let certificates = crate::tls::parse_pem_certificates(TLS_CERT_PEM.as_bytes()).unwrap();
         let key = crate::tls::parse_pem_private_key(TLS_KEY_PEM.as_bytes()).unwrap();
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let config = rustls::ServerConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
             .unwrap()
@@ -7060,7 +7060,7 @@ mod h2_tests {
     fn tls_acceptor(alpn: Vec<Vec<u8>>) -> TlsAcceptor {
         let certificates = crate::tls::parse_pem_certificates(CERT.as_bytes()).unwrap();
         let key = crate::tls::parse_pem_private_key(KEY.as_bytes()).unwrap();
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let mut config = rustls::ServerConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
             .unwrap()
@@ -8035,7 +8035,7 @@ mod tls_client_tests {
 
     /// TLS server that requires a client certificate signed by `client-ca-cert.pem`.
     fn mtls_acceptor(alpn: Vec<Vec<u8>>) -> TlsAcceptor {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let mut roots = rustls::RootCertStore::empty();
         for certificate in crate::tls::parse_pem_certificates(CLIENT_CA.as_bytes()).unwrap() {
             roots.add(certificate).unwrap();
@@ -8056,7 +8056,7 @@ mod tls_client_tests {
 
     /// TLS server that does not require a client certificate.
     fn tls_acceptor(alpn: Vec<Vec<u8>>) -> TlsAcceptor {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let (certificates, key) = server_identity();
         let mut config = rustls::ServerConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()

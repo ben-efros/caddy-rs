@@ -1,9 +1,9 @@
 //! `tls { ciphers ...; curves ... }` adaptation to the runtime's connection-policy fields.
 //!
 //! The adapter emits Caddy's `tls_connection_policies[].cipher_suites`/`curves`, restricted to the
-//! suites and groups the caddy-rs rustls terminator can configure. Names Caddy v2.11.7 accepts but
-//! the runtime cannot honour (TLS 1.3 suites, ECDHE CBC suites, secp521r1, x25519mlkem768) fail
-//! loudly with a tracking marker instead of being silently dropped.
+//! suites and groups the caddy-rs rustls terminator can configure. Names Caddy v2.11.9 accepts but
+//! the runtime cannot honour (TLS 1.3 suites, ECDHE CBC suites, secp521r1) fail loudly with a
+//! tracking marker instead of being silently dropped. `x25519mlkem768` is supported by aws-lc-rs.
 
 use caddy_rs_config::adapt;
 use serde_json::{json, Value};
@@ -106,17 +106,30 @@ fn caddy_accepted_but_runtime_unsupported_ciphers_fail_loudly() {
 
 #[test]
 fn caddy_accepted_but_runtime_unsupported_curves_fail_loudly() {
-    for name in ["secp521r1", "x25519mlkem768"] {
-        let error = adapt(&format!(
-            "example.com {{\n\ttls {{\n\t\tcurves {name}\n\t}}\n}}\n"
-        ))
-        .expect_err("Caddy-accepted but runtime-unsupported curve must fail loudly");
-        let message = error.to_string();
-        assert!(message.contains(name), "{message}");
-        assert_eq!(error.code(), "config.unsupported", "{message}");
-        assert!(message.contains("not supported by this build"), "{message}");
-        assert!(message.contains("tracked as TLS-POLICY"), "{message}");
-    }
+    let name = "secp521r1";
+    let error = adapt(&format!(
+        "example.com {{\n\ttls {{\n\t\tcurves {name}\n\t}}\n}}\n"
+    ))
+    .expect_err("Caddy-accepted but runtime-unsupported curve must fail loudly");
+    let message = error.to_string();
+    assert!(message.contains(name), "{message}");
+    assert_eq!(error.code(), "config.unsupported", "{message}");
+    assert!(message.contains("aws-lc-rs"), "{message}");
+    assert!(message.contains("tracked as TLS-POLICY"), "{message}");
+}
+
+#[test]
+fn mlkem_curve_lands_in_the_connection_policy() {
+    let adapted = adapt(
+        "example.com {\n\ttls {\n\t\tcurves x25519mlkem768 x25519 secp256r1 secp384r1\n\t}\n\trespond ok\n}\n",
+    )
+    .expect("x25519mlkem768 is supported by aws-lc-rs");
+    let policies = &adapted.config["apps"]["http"]["servers"]["srv0"]["tls_connection_policies"];
+    assert_eq!(
+        policies[0]["curves"],
+        json!(["x25519mlkem768", "x25519", "secp256r1", "secp384r1"])
+    );
+    validate(&adapted.config).expect("adapted config validates");
 }
 
 #[test]

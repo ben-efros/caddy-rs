@@ -648,6 +648,10 @@ impl ServerRuntime {
     }
 
     async fn apply_inner(&mut self) -> Result<RuntimeStatus> {
+        // rustls must have exactly one process default provider (aws-lc-rs, which implements the
+        // P-521 signature scheme Caddy accepts). Configs built by this runtime pass the provider
+        // explicitly; installing it also covers dependencies that ask rustls for the default.
+        caddy_rs_tls::install_default_crypto_provider();
         let Some(generation) = self.store.current() else {
             self.stop_all().await;
             self.status = RuntimeStatus::default();

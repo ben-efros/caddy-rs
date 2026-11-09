@@ -19,6 +19,7 @@ pub mod dns_providers;
 pub mod go_duration;
 pub mod internal_ca;
 pub mod issuer;
+mod key_type;
 pub mod ocsp;
 pub mod propagation;
 pub mod renewal;
@@ -100,9 +101,10 @@ pub use tls_alpn::{
 };
 pub use tls_server::{
     build_server_config, build_server_config_with_cert_resolver, certificates_from_pem,
-    certificates_from_tls_app, listener_uses_tls, resolver_from_config, CertificatePolicy,
-    CertificateResolver, ClientAuthMode, TaggedCertificateSelector, TlsCertificate, TlsResolver,
-    TlsServerOptions, TlsVersions, DEFAULT_ALPN, DEFAULT_HTTPS_PORT,
+    certificates_from_tls_app, install_default_crypto_provider, listener_uses_tls,
+    resolver_from_config, CertificatePolicy, CertificateResolver, ClientAuthMode,
+    TaggedCertificateSelector, TlsCertificate, TlsResolver, TlsServerOptions, TlsVersions,
+    DEFAULT_ALPN, DEFAULT_HTTPS_PORT,
 };
 
 /// Errors raised by the TLS layer.

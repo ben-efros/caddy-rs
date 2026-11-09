@@ -2588,7 +2588,7 @@ fn pki_key_pair_json(pair: &parser::PkiKeyPairConfig) -> Value {
     Value::Object(object)
 }
 
-/// TLS 1.2 cipher suites the caddy-rs rustls terminator can select (ring provider ECDHE
+/// TLS 1.2 cipher suites the caddy-rs rustls terminator can select (aws-lc-rs provider ECDHE
 /// AES-GCM/ChaCha20 suites). Caddy accepts more Go suite names; those fail loudly below.
 const SUPPORTED_CIPHER_SUITES: &[&str] = &[
     "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
@@ -2599,7 +2599,7 @@ const SUPPORTED_CIPHER_SUITES: &[&str] = &[
     "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
 ];
 
-/// Cipher suite names Caddy v2.11.7 accepts but the rustls ring provider cannot configure:
+/// Cipher suite names Caddy v2.11.9 accepts but the rustls aws-lc-rs provider cannot configure:
 /// TLS 1.3 suites (fixed by both Go and rustls) and ECDHE CBC suites (not implemented by
 /// rustls). These fail loudly instead of being silently dropped from the emitted policy.
 const CADDY_ONLY_CIPHER_SUITES: &[&str] = &[
@@ -2634,11 +2634,11 @@ fn validate_cipher_suite(name: &str, position: Position) -> caddy_rs_core::Resul
     ))
 }
 
-/// TLS key-exchange groups (curves) the rustls ring provider supports.
-const SUPPORTED_CURVES: &[&str] = &["x25519", "secp256r1", "secp384r1"];
+/// TLS key-exchange groups (curves) the rustls aws-lc-rs provider supports.
+const SUPPORTED_CURVES: &[&str] = &["x25519mlkem768", "x25519", "secp256r1", "secp384r1"];
 
-/// Curves Caddy v2.11.7 accepts but the rustls ring provider does not implement.
-const CADDY_ONLY_CURVES: &[&str] = &["secp521r1", "x25519mlkem768"];
+/// Curves Caddy v2.11.9 accepts but the rustls aws-lc-rs provider does not implement.
+const CADDY_ONLY_CURVES: &[&str] = &["secp521r1"];
 
 /// Validate one `tls { curves ... }` name against the runtime subset, failing loudly for names
 /// Caddy accepts but this build cannot honour (no silent dropping).
@@ -2650,8 +2650,8 @@ fn validate_curve(name: &str, position: Position) -> caddy_rs_core::Result<Strin
         return Err(adapter_unsupported(
             position,
             format!(
-                "TLS curve `{name}` accepted by Caddy (the rustls ring provider supports x25519, \
-                 secp256r1 and secp384r1)"
+                "TLS curve `{name}` accepted by Caddy (rustls' aws-lc-rs provider has no P-521 \
+                 key-exchange group; P-521 certificate keys are supported separately)"
             ),
             "TLS-POLICY",
         ));

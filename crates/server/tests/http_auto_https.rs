@@ -490,7 +490,7 @@ fn certificate_public_key(der: &[u8]) -> Vec<u8> {
 /// Connect like an ACME CA: ALPN `acme-tls/1`, accept the self-signed challenge certificate and
 /// return its DER encoding.
 async fn tls_alpn_probe(address: SocketAddr, domain: &str) -> Result<Vec<u8>, String> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let verifier = Arc::new(AcceptAnyCertificate {
         provider: Arc::clone(&provider),
     });
@@ -906,7 +906,7 @@ fn client_config_with_alpn(alpn: &[&[u8]]) -> Arc<rustls::ClientConfig> {
     for certificate in caddy_rs_tls::certificates_from_pem(CA_PEM).expect("CA parses") {
         roots.add(certificate).expect("CA is a valid root");
     }
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let mut config = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .expect("safe protocol versions")

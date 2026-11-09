@@ -1833,7 +1833,7 @@ mod tests {
         roots
             .add(CertificateDer::from(root_der.to_vec()))
             .expect("generated root must parse as a trust anchor");
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let verifier = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
             .build()
             .expect("server verifier");

@@ -124,7 +124,7 @@ impl TlsAlpn01Challenge {
     pub fn certified_key(&self) -> Result<CertifiedKey> {
         let private_key =
             PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(self.private_key_der.clone()));
-        let signing_key = rustls::crypto::ring::sign::any_supported_type(&private_key)
+        let signing_key = rustls::crypto::aws_lc_rs::sign::any_supported_type(&private_key)
             .map_err(|error| issuer_error(format!("challenge private key rejected: {error}")))?;
         Ok(CertifiedKey {
             cert: vec![CertificateDer::from(self.certificate_der.clone())],
@@ -951,7 +951,7 @@ mod tests {
         // The challenge certificate carries a critical id-pe-acmeIdentifier extension that a
         // normal WebPKI client rejects; the ACME CA parses it specially, so the test client uses
         // a verifier that accepts the self-signed challenge certificate.
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let mut client = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
             .with_safe_default_protocol_versions()
             .unwrap()
