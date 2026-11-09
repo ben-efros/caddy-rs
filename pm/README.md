@@ -1,12 +1,13 @@
 # caddy-rs proxy manager — foundation workspace
 
-This is the first code slice of the proxy manager. It is deliberately independent of the
+This is the proxy-manager foundation workspace. It is deliberately independent of the
 `caddy-rs` workspace and of the NPM compatibility adapter.
 
 | Crate | Role |
 |---|---|
 | `caddy-rs-pm-state` | Backend-agnostic durable document state: snapshots, revisions, CAS transactions, one serialized writer. No SQL, C or network dependency. |
-| `caddy-rs-pm-core` | Certificate domain model: explicit vs auto-generated origins, auto-certificate policies, host TLS binding and validation. |
+| `caddy-rs-pm-core` | Certificate and host domain model: certificate origins/policies, host TLS binding, proxy/redirect/dead host validation, domain uniqueness. |
+| `caddy-rs-pm-compiler` | Deterministic Caddy JSON route compiler for proxy/redirect/dead hosts; emits HTTP and HTTPS route lists, HSTS and forced-SSL redirects. No listeners, TLS automation or key material. |
 
 ## Why a nested workspace
 
@@ -55,6 +56,32 @@ attached to an auto policy.
 The certificate types contain **no private-key bytes**. Manual key material belongs in a separate
 secret store; auto/ACME keys stay in core certificate storage.
 
+## `pm-core` host model
+
+`Host` is the managed HTTP host: stable id, normalized domains, one `HostTls` binding and exactly
+one spec (`Proxy`, `Redirect`, `Dead`). Validation is split so the compiler and API can use it
+without loading every certificate:
+
+- `validate_structure` — ids, domains, TLS mode/reference consistency, HSTS/forced-SSL invariants and
+  kind-specific fields (upstream scheme/host/port, redirect status/target, dead host);
+- `validate` — additionally checks the referenced certificate/policy and domain coverage;
+- `validate_host_domain_uniqueness` — rejects a domain claimed by two hosts.
+
+## `pm-compiler`
+
+`compile_routes(&[Host])` returns ordered `http` and `https` route lists:
+
+- proxy → `reverse_proxy` with a `dial` URI; `preserve_host=false` rewrites upstream `Host`;
+- redirect → `static_response` with a `Location` placeholder, `Auto` scheme, optional path preserve;
+- dead → 404;
+- TLS-enabled hosts get an HTTPS route; `ssl_forced` adds a 301 HTTP route; HSTS is added only to the
+  HTTPS route;
+- disabled hosts are omitted; duplicate domains are rejected; output order is deterministic.
+
+The compiler does not yet emit listeners, `tls_connection_policies`, access lists or advanced
+handlers. Those are later slices; the route layer stays independent so those can be added without
+changing host semantics.
+
 ## Commands
 
 ```sh
@@ -67,12 +94,13 @@ CARGO_HOME=/root/caddy-rs/.scratch/cargo-home \
 
 ## Not in this slice
 
-- PM REST API, UI, NPM adapter;
+- PM REST API/UI and the NPM compatibility adapter;
+- host persistence and the API service (this slice is model + compiler only);
 - certificate service/ACME jobs;
 - a durable backend with a journal (redb/SQLite/Postgres);
 - core on-demand TLS manager (tracked separately in
   `docs/research/DYNAMIC-CERTIFICATE-DECISIONS.md`).
 
-The next slices are the certificate policy API, the read-model synchronizer, and the core on-demand
-manager. The taxonomy and invariants are in
+The next slices are host/policy persistence services, the certificate policy API, the read-model
+synchronizer, and the core on-demand manager. The taxonomy and invariants are in
 `docs/research/PROXY-MANAGER-CERTIFICATES.md`.
