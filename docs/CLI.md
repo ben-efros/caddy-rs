@@ -117,6 +117,11 @@ Checks a configuration without starting the server. The command adapts and parse
 validates the result, then builds the serving generation and provisions its modules without binding
 sockets or obtaining certificates. A successful check prints `Valid configuration`.
 
+Like Caddy, `validate` provisions the PKI app: a client-auth CA pool that references the implicit
+default `local` authority creates (or reuses) `<data-dir>/pki/authorities/local` under the resolved
+data directory (`--data-dir`, `storage.root`, `CADDY_RS_DATA_DIR`, or Caddy's XDG data path) even
+though no listener is bound.
+
 Synopsis: `caddy-rs validate [OPTIONS] --config <CONFIG>`
 
 | Option | Description | Default |

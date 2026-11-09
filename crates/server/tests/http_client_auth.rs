@@ -189,45 +189,158 @@ async fn require_mode_exposes_unverified_certificate_fields() {
     assert!(body.contains("san0=[untrusted.example.com]"), "{body}");
 }
 
-/// Caddy provisions a default `local` PKI authority when `apps.pki` declares none, so a client-auth
-/// pool may reference `pki_root`/`pki_intermediate` with `authority` `local` without configuring the
-/// PKI app. caddy-rs resolved only explicitly declared authorities and rejected the config
-/// (DIV-0085 residual, T-TLS-083).
+/// Caddy provisions the default `local` PKI authority on demand (`ProvisionDefaultCA`/`GetCA`), so
+/// a client-auth pool may reference `pki_root`/`pki_intermediate` with `authority` `local` without
+/// configuring the PKI app — including `caddy-rs validate`, which has no storage root.
+/// (DIV-0085, T-TLS-083.)
 #[test]
-fn implicit_local_ca_authority_resolves_for_client_auth_pools() {
+fn implicit_local_ca_authority_is_provisioned_for_client_auth_pools() {
     let directory = tempfile::tempdir().expect("tempdir");
+    let runtime = runtime_with_data_root(directory.path());
+    runtime
+        .validate_provisioning()
+        .expect("the implicit local authority must be provisioned like Caddy");
+
     let authority = directory
         .path()
         .join("pki")
         .join("authorities")
         .join("local");
-    std::fs::create_dir_all(&authority).expect("authority dir");
-    std::fs::write(authority.join("root.crt"), CLIENT_CA).expect("root.crt");
+    let root_pem = std::fs::read_to_string(authority.join("root.crt"))
+        .expect("root.crt was provisioned at the loader's location");
+    let intermediate_pem = std::fs::read_to_string(authority.join("intermediate.crt"))
+        .expect("intermediate.crt was provisioned at the loader's location");
+    assert!(root_pem.contains("BEGIN CERTIFICATE"), "{root_pem}");
+    assert!(
+        intermediate_pem.contains("BEGIN CERTIFICATE"),
+        "{intermediate_pem}"
+    );
+    assert!(authority.join("root.key").is_file());
+    assert!(authority.join("intermediate.key").is_file());
+
+    // A second validate (fresh runtime and store) must reuse the material, not regenerate it.
+    runtime_with_data_root(directory.path())
+        .validate_provisioning()
+        .expect("the provisioned local authority must be reusable");
+    assert_eq!(
+        std::fs::read_to_string(authority.join("root.crt")).expect("root.crt"),
+        root_pem
+    );
+    assert_eq!(
+        std::fs::read_to_string(authority.join("intermediate.crt")).expect("intermediate.crt"),
+        intermediate_pem
+    );
+}
+
+/// `caddy-rs validate` constructs the runtime without `--data-dir`; Caddy still provisions the
+/// implicit `local` CA in its default data directory.
+#[test]
+fn validate_without_a_storage_root_provisions_the_implicit_local_ca() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let directory = tempfile::tempdir().expect("tempdir");
+    let data_home = directory.path().join("data");
+    // Pre-create Caddy's data directory so `resolve_server_data_dir` selects it deterministically:
+    // a legacy `.caddy-rs` left in the package directory by another test binary is only preferred
+    // when the Caddy path does not exist yet.
+    std::fs::create_dir_all(data_home.join("caddy")).expect("Caddy data directory");
+    let _xdg = EnvVarGuard::set("XDG_DATA_HOME", &data_home);
+    let _no_override = EnvVarGuard::remove("CADDY_RS_DATA_DIR");
 
     let store = Arc::new(GenerationStore::with_builtin_registry());
     store
         .load(implicit_local_ca_config())
         .expect("config decodes");
-    let runtime = ServerRuntime::new(store).with_data_root(directory.path());
+    // No `with_data_root`: this is `caddy-rs validate` with no explicit storage.
+    let runtime = ServerRuntime::new(store);
     runtime
         .validate_provisioning()
-        .expect("implicit local authority must resolve like Caddy");
+        .expect("validate with no storage root must accept a pool referencing `local`");
 
-    // Without the on-disk material the failure stays loud and names the authority/file.
-    let empty = tempfile::tempdir().expect("tempdir");
+    // Caddy's drop-in data path is `$XDG_DATA_HOME/caddy`; the loader reads the same directory.
+    let authority = data_home
+        .join("caddy")
+        .join("pki")
+        .join("authorities")
+        .join("local");
+    let root_pem = std::fs::read_to_string(authority.join("root.crt"))
+        .expect("root.crt under the default data directory");
+    let intermediate_pem = std::fs::read_to_string(authority.join("intermediate.crt"))
+        .expect("intermediate.crt under the default data directory");
+
     let store = Arc::new(GenerationStore::with_builtin_registry());
     store
         .load(implicit_local_ca_config())
         .expect("config decodes");
-    let runtime = ServerRuntime::new(store).with_data_root(empty.path());
-    let error = runtime
+    ServerRuntime::new(store)
         .validate_provisioning()
-        .expect_err("missing local CA material must fail");
+        .expect("the second validate must reuse the provisioned CA");
+    assert_eq!(
+        std::fs::read_to_string(authority.join("root.crt")).expect("root.crt"),
+        root_pem
+    );
+    assert_eq!(
+        std::fs::read_to_string(authority.join("intermediate.crt")).expect("intermediate.crt"),
+        intermediate_pem
+    );
+}
+
+/// A storage root that cannot hold the default CA fails loudly with a located provisioning error
+/// instead of silently validating. A regular file as the root is a deterministic `ENOTDIR` even
+/// when the tests run as root (a mode `0555` directory would still be writable for uid 0).
+#[test]
+fn unwritable_storage_root_fails_loudly_for_the_implicit_local_ca() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let not_a_directory = directory.path().join("storage-root-file");
+    std::fs::write(&not_a_directory, b"not a directory").expect("write file");
+    let error = runtime_with_data_root(&not_a_directory)
+        .validate_provisioning()
+        .expect_err("an unwritable storage root must not validate");
     let message = error.to_string();
     assert!(
-        message.contains("local") && message.contains("root.crt"),
-        "error must name the authority and file: {message}"
+        message.contains("implicit default PKI authority `local`")
+            && message.contains("authorities/local"),
+        "error must locate the provisioning failure: {message}"
     );
+}
+
+/// Environment variables are process-global; serialize the one test that resolves the default
+/// data directory and restore whatever the test process had.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+
+    fn remove(key: &'static str) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::remove_var(key);
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
+fn runtime_with_data_root(root: &std::path::Path) -> ServerRuntime {
+    let store = Arc::new(GenerationStore::with_builtin_registry());
+    store
+        .load(implicit_local_ca_config())
+        .expect("config decodes");
+    ServerRuntime::new(store).with_data_root(root)
 }
 
 fn implicit_local_ca_config() -> Config {

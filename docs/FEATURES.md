@@ -409,9 +409,16 @@ the first policy.
 ### Client authentication
 
 `client_authentication.mode` is `request`, `require`, `verify_if_given` or `require_and_verify`.
-Trust anchors come from the `ca` module (`tls.ca_pool.source.inline` or `.file`) or from the
+Trust anchors come from the `ca` module — `tls.ca_pool.source.inline`, `.file`, `.system`,
+`.pki_root`, `.pki_intermediate`, `.storage`, `.http` and `.combined` — or from the
 `trusted_ca_certs`, `trusted_ca_certs_pem_files` and `trusted_leaf_certs` fields. When a trust
 pool or leaf list is configured and no mode is given, the mode is `require_and_verify`.
+
+Caddy's implicit default `local` PKI authority is provisioned on demand (Caddy's
+`ProvisionDefaultCA`/`GetCA`): a `pki_root`/`pki_intermediate` source naming `local` without an
+`apps.pki.certificate_authorities.local` entry generates `<data-dir>/pki/authorities/local` on
+first use and reuses it afterwards. `validate` (which has no `--data-dir` option) creates it under
+the resolved default data directory when the configuration declares no `storage.root`.
 
 ### Session resumption
 
