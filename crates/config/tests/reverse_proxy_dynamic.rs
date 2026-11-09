@@ -160,9 +160,14 @@ fn dynamic_rejects_unknown_options_with_the_source_name() {
 
 #[test]
 fn dynamic_rejects_bad_values_and_duplicates() {
+    // Caddy's dynamic durations use Go's `time.ParseDuration` grammar and Caddy's own prefix.
     assert!(
         adapt_error(":8080 { reverse_proxy { dynamic srv { refresh nope } } }\n")
-            .contains("numeric")
+            .contains("parsing refresh interval duration: time: invalid duration \"nope\"")
+    );
+    assert!(
+        adapt_error(":8080 { reverse_proxy { dynamic srv { dial_timeout 1 } } }\n")
+            .contains("bad timeout value '1': time: missing unit in duration \"1\"")
     );
     assert!(
         adapt_error(":8080 { reverse_proxy { dynamic a { versions ipv5 } } }\n")

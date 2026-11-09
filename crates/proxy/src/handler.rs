@@ -152,15 +152,21 @@ const HEADER_DEADLINE_RECHECK: Duration = Duration::from_millis(5);
 /// Caddy's `transport.response_header_timeout` is Go's `http.Transport.ResponseHeaderTimeout`,
 /// which starts after the request has been written and therefore excludes dialing, waiting for a
 /// connection slot and TLS negotiation. hyper-util's client future covers all of those phases, so
-/// this wrapper pauses the budget whenever the connector reports an in-flight connection attempt
-/// (`connectors_in_flight`); the budget resumes once hyper owns the connection.
+/// this wrapper pauses the budget while *this request's* connector future (or a connection-slot
+/// wait it started) is in flight and resumes it once hyper owns the connection.
+///
+/// The counter is per request: each poll of the wrapped future installs this request's counter in
+/// the [`crate::client::REQUEST_CONNECTOR_ACTIVITY`] task-local, which the connector future
+/// running inside that poll increments. Another request dialing concurrently therefore cannot
+/// pause (and thereby extend) this request's budget.
 ///
 /// Approximation: the budget also covers writing the request, because hyper does not expose the
 /// "request fully written" boundary; Go starts it after the write completes.
 struct ResponseHeaderWait<F> {
     inner: Pin<Box<F>>,
     limit: Duration,
-    connectors_in_flight: Arc<AtomicUsize>,
+    /// Connector activity of the request this wrapper was created for.
+    connector_activity: Arc<AtomicUsize>,
     /// Time spent inside the header budget (excluding paused connector stretches).
     elapsed: Duration,
     /// When the current unpaused stretch started; `None` means the budget is paused.
@@ -170,11 +176,11 @@ struct ResponseHeaderWait<F> {
 }
 
 impl<F> ResponseHeaderWait<F> {
-    fn new(inner: F, limit: Duration, connectors_in_flight: Arc<AtomicUsize>) -> Self {
+    fn new(inner: F, limit: Duration) -> Self {
         Self {
             inner: Box::pin(inner),
             limit,
-            connectors_in_flight,
+            connector_activity: Arc::new(AtomicUsize::new(0)),
             elapsed: Duration::ZERO,
             active_since: None,
             timer: None,
@@ -188,11 +194,14 @@ impl<F: Future> Future for ResponseHeaderWait<F> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         loop {
-            if let Poll::Ready(output) = this.inner.as_mut().poll(cx) {
+            let activity = Arc::clone(&this.connector_activity);
+            let polled = crate::client::REQUEST_CONNECTOR_ACTIVITY
+                .sync_scope(activity, || this.inner.as_mut().poll(cx));
+            if let Poll::Ready(output) = polled {
                 return Poll::Ready(Ok(output));
             }
             let now = tokio::time::Instant::now();
-            if this.connectors_in_flight.load(Ordering::SeqCst) > 0 {
+            if this.connector_activity.load(Ordering::SeqCst) > 0 {
                 if let Some(since) = this.active_since.take() {
                     this.elapsed += now.saturating_duration_since(since);
                     this.timer = None;
@@ -842,17 +851,12 @@ impl ReverseProxyHandler {
         *outbound.headers_mut() = headers;
 
         let started = std::time::Instant::now();
-        // `transport.response_header_timeout` pauses while the connector is dialing or waiting
-        // for a `max_conns_per_host` slot, so only the wait for the response head is bounded.
+        // `transport.response_header_timeout` pauses while this request's connector is dialing or
+        // waiting for a `max_conns_per_host` slot, so only the wait for the response head is
+        // bounded (and another request's dial cannot extend this budget).
         let request_future = client.request(outbound);
         let mut response = match self.transport.tuning.response_header_timeout {
-            Some(limit) => match ResponseHeaderWait::new(
-                request_future,
-                limit,
-                Arc::clone(&self.transport.tuning.connectors_in_flight),
-            )
-            .await
-            {
+            Some(limit) => match ResponseHeaderWait::new(request_future, limit).await {
                 Ok(result) => result?,
                 Err(limit) => {
                     return Err(ProxyError::ResponseTimeout(format!(
@@ -2519,7 +2523,9 @@ fn parse_transport(value: Option<&Value>, path: &str) -> HttpResult<TransportCon
     }
 
     // `dial_timeout` caps how long establishing the upstream connection may take. Caddy stores a
-    // `caddy.Duration`; zero or negative means "no limit" (Go's `Dialer.Timeout`).
+    // `caddy.Duration`; zero means "unset" (Caddy then defaults to 3 s, a caddy-rs divergence).
+    // Approximation: a negative value is treated as "no limit" like zero, whereas Go's
+    // `Dialer.deadline` includes negative timeouts (the deadline is already in the past).
     let dial_timeout = match object.get("dial_timeout") {
         None => None,
         Some(value) => {
@@ -2560,13 +2566,35 @@ fn parse_transport(value: Option<&Value>, path: &str) -> HttpResult<TransportCon
     .filter(|nanos| *nanos > 0)
     .map(|nanos| Duration::from_nanos(nanos as u64));
 
+    // `max_conns_per_host` becomes a Tokio semaphore. `Semaphore::new` panics above
+    // `MAX_PERMITS`, so an accepted-but-unrepresentable value is a located config error instead
+    // of an empty reply at request time. Caddy's matching value is an int, so any value above
+    // Tokio's ceiling is effectively "no limit"; rejecting it is the loud choice.
     let max_conns_per_host = parse_integer(
         object.get("max_conns_per_host"),
         &format!("{transport_path}.max_conns_per_host"),
         "max_conns_per_host",
     )?
     .filter(|count| *count > 0)
-    .map(|count| count as usize);
+    .map(|count| {
+        let limit = usize::try_from(count).map_err(|_| {
+            invalid(
+                &format!("{transport_path}.max_conns_per_host"),
+                format!("`max_conns_per_host` {count} is too large"),
+            )
+        })?;
+        if limit > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(invalid(
+                &format!("{transport_path}.max_conns_per_host"),
+                format!(
+                    "`max_conns_per_host` {count} exceeds this build's maximum of {} concurrent connections",
+                    tokio::sync::Semaphore::MAX_PERMITS
+                ),
+            ));
+        }
+        Ok(limit)
+    })
+    .transpose()?;
 
     let local_address = match object.get("local_address") {
         None | Some(Value::Null) => None,
@@ -2803,8 +2831,15 @@ fn parse_keep_alive(value: &Value, path: &str) -> HttpResult<KeepAliveConfig> {
         &format!("{path}.max_idle_conns"),
         "keep_alive.max_idle_conns",
     )? {
-        // Go: 0 means "no limit"; negative values also behave as no limit.
-        config.max_idle_conns = (count > 0).then_some(count as usize);
+        // Go: 0 means "no limit". A negative value is not "unlimited": Go's check is
+        // `MaxIdleConns != 0 && idleLRU.len() > MaxIdleConns`, which is true even for an empty
+        // pool when the cap is negative, so Caddy keeps no idle connections. `Some(0)` carries
+        // that effective cap (see `KeepAliveConfig::pool_max_idle_per_host`).
+        config.max_idle_conns = match count {
+            0 => None,
+            count if count < 0 => Some(0),
+            count => Some(count as usize),
+        };
     }
     if let Some(count) = parse_integer(
         object.get("max_idle_conns_per_host"),
@@ -5975,6 +6010,9 @@ mod tests {
         let seen_connections = std::sync::Arc::clone(&connections);
         let seen_max = std::sync::Arc::clone(&max_active);
         let seen_peers = std::sync::Arc::clone(&peers);
+        // One shared counter across every accepted connection, so `max_active` measures
+        // simultaneous requests rather than simultaneous requests per connection.
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         tokio::spawn(async move {
             loop {
                 let Ok((stream, peer)) = listener.accept().await else {
@@ -5982,7 +6020,6 @@ mod tests {
                 };
                 seen_connections.fetch_add(1, Ordering::SeqCst);
                 seen_peers.lock().unwrap().push(peer);
-                let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 let max_active = std::sync::Arc::clone(&seen_max);
                 let service_active = std::sync::Arc::clone(&active);
                 let service = service_fn(move |_request: hyper::Request<hyper::body::Incoming>| {
@@ -6204,6 +6241,305 @@ mod tests {
             upstream.connections.load(Ordering::SeqCst),
             2,
             "keep_alive off must open a fresh connection per request"
+        );
+    }
+
+    #[test]
+    fn negative_max_idle_conns_keeps_no_idle_connections() {
+        // Go's check is `MaxIdleConns != 0 && idleLRU.len() > MaxIdleConns`; with a negative cap
+        // even an empty pool satisfies `len() > cap`, so Caddy keeps zero idle connections.
+        let handler = tuned_handler(
+            "127.0.0.1:9",
+            serde_json::json!({"protocol": "http", "keep_alive": {"max_idle_conns": -1}}),
+        );
+        let keep_alive = &handler.transport.tuning.keep_alive;
+        assert_eq!(
+            keep_alive.max_idle_conns,
+            Some(0),
+            "a negative max_idle_conns must carry the effective zero cap, not `no limit`"
+        );
+        assert_eq!(
+            keep_alive.pool_max_idle_per_host(),
+            0,
+            "a negative max_idle_conns must keep no idle connections"
+        );
+    }
+
+    #[tokio::test]
+    async fn negative_max_idle_conns_does_not_reuse_connections() {
+        use std::sync::atomic::Ordering;
+
+        let upstream = spawn_counted_upstream(Duration::ZERO).await;
+        let handler = tuned_handler(
+            &upstream.dial,
+            serde_json::json!({"protocol": "http", "keep_alive": {"max_idle_conns": -1}}),
+        );
+        assert_eq!(respond_status(&handler, "/one").await, StatusCode::OK);
+        assert_eq!(respond_status(&handler, "/two").await, StatusCode::OK);
+        assert_eq!(
+            upstream.connections.load(Ordering::SeqCst),
+            2,
+            "a negative max_idle_conns must keep zero idle connections (Go/Caddy behaviour)"
+        );
+    }
+
+    #[tokio::test]
+    async fn keep_alive_idle_timeout_drops_idle_connections() {
+        use std::sync::atomic::Ordering;
+
+        let upstream = spawn_counted_upstream(Duration::ZERO).await;
+        let handler = tuned_handler(
+            &upstream.dial,
+            serde_json::json!({
+                "protocol": "http",
+                "keep_alive": {"idle_timeout": 100_000_000_u64}
+            }),
+        );
+        assert_eq!(respond_status(&handler, "/one").await, StatusCode::OK);
+        assert_eq!(upstream.connections.load(Ordering::SeqCst), 1);
+        // The connection is idle for longer than `keep_alive.idle_timeout`, so the next request
+        // must dial instead of reusing it.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(respond_status(&handler, "/two").await, StatusCode::OK);
+        assert_eq!(
+            upstream.connections.load(Ordering::SeqCst),
+            2,
+            "an idle connection older than keep_alive.idle_timeout must not be reused"
+        );
+    }
+
+    /// Run three concurrent requests through `handler` and assert all succeed.
+    async fn three_concurrent_successes(handler: &Arc<ReverseProxyHandler>) {
+        let mut tasks = Vec::new();
+        for path in ["/wave-a", "/wave-b", "/wave-c"] {
+            let handler = Arc::clone(handler);
+            tasks.push(tokio::spawn(
+                async move { respond_status(&handler, path).await },
+            ));
+        }
+        for task in tasks {
+            assert_eq!(task.await.unwrap(), StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn keep_alive_max_idle_conns_per_host_caps_each_upstreams_pool() {
+        use std::sync::atomic::Ordering;
+
+        let upstream = spawn_counted_upstream(Duration::from_millis(200)).await;
+        let handler = Arc::new(tuned_handler(
+            &upstream.dial,
+            serde_json::json!({
+                "protocol": "http",
+                "keep_alive": {"max_idle_conns_per_host": 1}
+            }),
+        ));
+
+        // Three concurrent requests need three connections.
+        three_concurrent_successes(&handler).await;
+        assert_eq!(upstream.connections.load(Ordering::SeqCst), 3);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Only one may stay idle: the next wave reuses exactly one and dials two more. Without
+        // `pool_max_idle_per_host` hyper keeps all three (its default is `usize::MAX`).
+        three_concurrent_successes(&handler).await;
+        assert_eq!(
+            upstream.connections.load(Ordering::SeqCst),
+            5,
+            "keep_alive.max_idle_conns_per_host must cap the idle pool at one connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn keep_alive_max_idle_conns_caps_the_pool() {
+        use std::sync::atomic::Ordering;
+
+        let upstream = spawn_counted_upstream(Duration::from_millis(200)).await;
+        let handler = Arc::new(tuned_handler(
+            &upstream.dial,
+            serde_json::json!({
+                "protocol": "http",
+                "keep_alive": {"max_idle_conns": 1}
+            }),
+        ));
+
+        three_concurrent_successes(&handler).await;
+        assert_eq!(upstream.connections.load(Ordering::SeqCst), 3);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        three_concurrent_successes(&handler).await;
+        assert_eq!(
+            upstream.connections.load(Ordering::SeqCst),
+            5,
+            "keep_alive.max_idle_conns must cap the effective idle pool"
+        );
+    }
+
+    /// Minimal DNS response: echoes the question and answers A queries with `address`; AAAA gets
+    /// NOERROR with no answers, which is all `lookup_ip` needs.
+    fn dns_reply(query: &[u8], address: std::net::Ipv4Addr) -> Vec<u8> {
+        let qtype = u16::from_be_bytes([query[query.len() - 4], query[query.len() - 3]]);
+        let mut reply = Vec::new();
+        reply.extend_from_slice(&query[..2]);
+        reply.extend_from_slice(&[0x81, 0x80]);
+        reply.extend_from_slice(&1_u16.to_be_bytes());
+        reply.extend_from_slice(&u16::from(qtype == 1).to_be_bytes());
+        reply.extend_from_slice(&[0, 0, 0, 0]);
+        reply.extend_from_slice(&query[12..]);
+        if qtype == 1 {
+            reply.extend_from_slice(&[0xc0, 12]);
+            reply.extend_from_slice(&1_u16.to_be_bytes());
+            reply.extend_from_slice(&1_u16.to_be_bytes());
+            reply.extend_from_slice(&300_u32.to_be_bytes());
+            reply.extend_from_slice(&4_u16.to_be_bytes());
+            reply.extend_from_slice(&address.octets());
+        }
+        reply
+    }
+
+    /// UDP resolver that holds every reply for `delay`, making every actual dial (not a pooled
+    /// request) slow.
+    async fn spawn_delayed_resolver(delay: Duration) -> SocketAddr {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buffer = [0_u8; 512];
+            loop {
+                let Ok((len, peer)) = socket.recv_from(&mut buffer).await else {
+                    break;
+                };
+                tokio::time::sleep(delay).await;
+                let reply = dns_reply(&buffer[..len], std::net::Ipv4Addr::LOCALHOST);
+                let _ = socket.send_to(&reply, peer).await;
+            }
+        });
+        address
+    }
+
+    #[tokio::test]
+    async fn response_header_timeout_is_not_extended_by_another_requests_dial() {
+        let resolver_delay = Duration::from_millis(300);
+        let resolver = spawn_delayed_resolver(resolver_delay).await;
+        let (upstream_dial, mut slow_request_seen) =
+            spawn_headers_upstream(Duration::from_millis(1_500)).await;
+        let port: u16 = upstream_dial.rsplit_once(':').unwrap().1.parse().unwrap();
+        let handler = Arc::new(tuned_handler(
+            &format!("slow-upstream.test:{port}"),
+            serde_json::json!({
+                "protocol": "http",
+                "resolver": {"addresses": [format!("udp/{resolver}")]},
+                "response_header_timeout": 100_000_000_u64
+            }),
+        ));
+
+        // Warm the pool: one fast request establishes the single idle connection.
+        assert_eq!(respond_status(&handler, "/warm").await, StatusCode::OK);
+
+        // The slow request takes that idle connection (no dial) and waits for its headers.
+        let slow = {
+            let handler = Arc::clone(&handler);
+            tokio::spawn(async move { respond_status(&handler, "/slow").await })
+        };
+        slow_request_seen
+            .recv()
+            .await
+            .expect("the slow request must reach the upstream");
+
+        // An unrelated request now finds no idle connection, so it dials through the delayed
+        // resolver. Its dial is in flight for several hundred milliseconds.
+        let started = std::time::Instant::now();
+        let unrelated = {
+            let handler = Arc::clone(&handler);
+            tokio::spawn(async move { respond_status(&handler, "/other").await })
+        };
+
+        assert_eq!(
+            slow.await.unwrap(),
+            StatusCode::BAD_GATEWAY,
+            "response_header_timeout must fire while the unrelated dial is still running"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < resolver_delay,
+            "an unrelated request's dial must not pause this request's header budget: {elapsed:?}"
+        );
+        assert_eq!(
+            unrelated.await.unwrap(),
+            StatusCode::OK,
+            "the unrelated request must still complete after its slow dial"
+        );
+    }
+
+    /// Upstream whose `/slow` request signals arrival and then delays its response headers.
+    async fn spawn_headers_upstream(
+        slow_headers: Duration,
+    ) -> (String, tokio::sync::mpsc::UnboundedReceiver<()>) {
+        let (seen, received) = tokio::sync::mpsc::unbounded_channel();
+        let dial = spawn_upstream(move |request: hyper::Request<hyper::body::Incoming>| {
+            let seen = seen.clone();
+            async move {
+                if request.uri().path() == "/slow" {
+                    let _ = seen.send(());
+                    tokio::time::sleep(slow_headers).await;
+                }
+                Ok::<_, Infallible>(
+                    hyper::Response::builder()
+                        .status(200)
+                        .body(Full::new(Bytes::from_static(b"ok")))
+                        .expect("response"),
+                )
+            }
+        })
+        .await;
+        (dial, received)
+    }
+
+    #[tokio::test]
+    async fn max_conns_per_host_at_tokio_max_permits_does_not_panic() {
+        use std::sync::atomic::Ordering;
+
+        let max =
+            i64::try_from(tokio::sync::Semaphore::MAX_PERMITS).expect("MAX_PERMITS fits in an i64");
+        let upstream = spawn_counted_upstream(Duration::ZERO).await;
+        let handler = tuned_handler(
+            &upstream.dial,
+            serde_json::json!({"protocol": "http", "max_conns_per_host": max}),
+        );
+        assert_eq!(
+            handler.transport.tuning.max_conns_per_host,
+            Some(tokio::sync::Semaphore::MAX_PERMITS)
+        );
+        assert_eq!(
+            respond_status(&handler, "/boundary").await,
+            StatusCode::OK,
+            "the maximum representable limiter must not panic at request time"
+        );
+        assert_eq!(upstream.connections.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn max_conns_per_host_above_tokio_max_permits_is_a_located_error() {
+        let above = i64::try_from(tokio::sync::Semaphore::MAX_PERMITS)
+            .expect("MAX_PERMITS fits in an i64")
+            + 1;
+        let error = ReverseProxyHandler::from_json(
+            &serde_json::json!({
+                "handler": "reverse_proxy",
+                "upstreams": [{"dial": "127.0.0.1:9"}],
+                "transport": {"protocol": "http", "max_conns_per_host": above}
+            }),
+            "handler",
+        )
+        .err()
+        .expect("a limiter above Tokio's MAX_PERMITS must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("handler.transport.max_conns_per_host"),
+            "the error must name the config path: {message}"
+        );
+        assert!(
+            message.contains("exceeds this build's maximum"),
+            "the error must explain the boundary: {message}"
         );
     }
 

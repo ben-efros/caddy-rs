@@ -5308,32 +5308,28 @@ fn transport_option_value<'a>(option: &'a Directive) -> Result<&'a str, CoreErro
     Ok(value)
 }
 
-/// Parse a `transport http` duration with Go's `time.ParseDuration` grammar as an integer
-/// nanosecond count.
+/// Parse a `transport http` duration with Caddy's `caddy.ParseDuration` grammar as an integer
+/// nanosecond count, prefixing the error the way the directive does in Caddy.
 ///
 /// Caddyfile durations require a unit (the bare string `0` is Go's one exception); a bare integer
 /// such as `dial_fallback_delay 500000000` is rejected with Go's "missing unit in duration"
-/// message. A leading `-` is preserved because Caddy uses negative durations to disable TCP
-/// keep-alive probes and the Fast Fallback delay.
-fn parse_transport_duration(option: &Directive) -> Result<i64, CoreError> {
+/// message inside Caddy's `bad fallback delay value '500000000':` prefix. A leading `-` is
+/// preserved because Caddy uses negative durations to disable TCP keep-alive probes and the Fast
+/// Fallback delay.
+fn parse_transport_duration(option: &Directive, prefix: &str) -> Result<i64, CoreError> {
     let value = transport_option_value(option)?;
-    parse_go_duration_text(value).map_err(|message| adapter_error(option.position.clone(), message))
+    parse_go_duration_text(value).map_err(|message| {
+        adapter_error(
+            option.position.clone(),
+            format!("{prefix} '{value}': {message}"),
+        )
+    })
 }
 
+/// Parse one Caddy duration value exactly like `caddy.ParseDuration` (Go `time.ParseDuration`
+/// plus the day rewrite); error text is Go's, so the caller only adds Caddy's directive prefix.
 fn parse_go_duration_text(value: &str) -> Result<i64, String> {
-    if value == "0" {
-        return Ok(0);
-    }
-    let (negative, magnitude) = match value.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, value.strip_prefix('+').unwrap_or(value)),
-    };
-    if magnitude.is_empty() || magnitude.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(format!("time: missing unit in duration \"{value}\""));
-    }
-    let nanos = parse_duration(magnitude)?;
-    let nanos = i64::try_from(nanos).map_err(|_| format!("duration `{value}` overflows"))?;
-    Ok(if negative { -nanos } else { nanos })
+    crate::parser::parse_go_duration_ns(value)
 }
 
 /// Parse a `transport http` size (humanize byte units) as an integer byte count.
@@ -7671,7 +7667,20 @@ fn dynamic_string_option(item: &Directive, option: &str) -> caddy_rs_core::Resul
     Ok(value.clone())
 }
 
-fn dynamic_duration_option(item: &Directive, option: &str) -> caddy_rs_core::Result<i64> {
+/// How Caddy prefixes a dynamic-upstream duration parse error.
+#[derive(Clone, Copy)]
+enum DynamicDurationPrefix {
+    /// `parsing refresh interval duration: <error>` (no quoted value).
+    Refresh,
+    /// `bad timeout value '<value>': <error>` and the other value-carrying prefixes.
+    Value(&'static str),
+}
+
+fn dynamic_duration_option(
+    item: &Directive,
+    option: &str,
+    prefix: DynamicDurationPrefix,
+) -> caddy_rs_core::Result<i64> {
     ensure_no_inline_args(item, option)?;
     let Some(value) = item.args.first() else {
         return Err(adapter_error(
@@ -7685,7 +7694,15 @@ fn dynamic_duration_option(item: &Directive, option: &str) -> caddy_rs_core::Res
             format!("`{option}` takes exactly one duration"),
         ));
     }
-    parse_dynamic_duration(value).map_err(|reason| adapter_error(item.position.clone(), reason))
+    parse_dynamic_duration(value).map_err(|reason| {
+        let message = match prefix {
+            DynamicDurationPrefix::Refresh => {
+                format!("parsing refresh interval duration: {reason}")
+            }
+            DynamicDurationPrefix::Value(prefix) => format!("{prefix} '{value}': {reason}"),
+        };
+        adapter_error(item.position.clone(), message)
+    })
 }
 
 /// Dynamic-upstream durations use the same Go `time.ParseDuration` grammar as `transport http`
@@ -7750,13 +7767,21 @@ fn parse_srv_source(
             "refresh" => {
                 object.insert(
                     "refresh".to_string(),
-                    json!(dynamic_duration_option(item, "refresh")?),
+                    json!(dynamic_duration_option(
+                        item,
+                        "refresh",
+                        DynamicDurationPrefix::Refresh
+                    )?),
                 );
             }
             "grace_period" => {
                 object.insert(
                     "grace_period".to_string(),
-                    json!(dynamic_duration_option(item, "grace_period")?),
+                    json!(dynamic_duration_option(
+                        item,
+                        "grace_period",
+                        DynamicDurationPrefix::Value("bad grace period value")
+                    )?),
                 );
             }
             "resolvers" => {
@@ -7775,13 +7800,21 @@ fn parse_srv_source(
             "dial_timeout" => {
                 object.insert(
                     "dial_timeout".to_string(),
-                    json!(dynamic_duration_option(item, "dial_timeout")?),
+                    json!(dynamic_duration_option(
+                        item,
+                        "dial_timeout",
+                        DynamicDurationPrefix::Value("bad timeout value")
+                    )?),
                 );
             }
             "dial_fallback_delay" => {
                 object.insert(
                     "dial_fallback_delay".to_string(),
-                    json!(dynamic_duration_option(item, "dial_fallback_delay")?),
+                    json!(dynamic_duration_option(
+                        item,
+                        "dial_fallback_delay",
+                        DynamicDurationPrefix::Value("bad delay value")
+                    )?),
                 );
             }
             other => {
@@ -7842,7 +7875,11 @@ fn parse_a_source(
             "refresh" => {
                 object.insert(
                     "refresh".to_string(),
-                    json!(dynamic_duration_option(item, "refresh")?),
+                    json!(dynamic_duration_option(
+                        item,
+                        "refresh",
+                        DynamicDurationPrefix::Refresh
+                    )?),
                 );
             }
             "resolvers" => {
@@ -7861,13 +7898,21 @@ fn parse_a_source(
             "dial_timeout" => {
                 object.insert(
                     "dial_timeout".to_string(),
-                    json!(dynamic_duration_option(item, "dial_timeout")?),
+                    json!(dynamic_duration_option(
+                        item,
+                        "dial_timeout",
+                        DynamicDurationPrefix::Value("bad timeout value")
+                    )?),
                 );
             }
             "dial_fallback_delay" => {
                 object.insert(
                     "dial_fallback_delay".to_string(),
-                    json!(dynamic_duration_option(item, "dial_fallback_delay")?),
+                    json!(dynamic_duration_option(
+                        item,
+                        "dial_fallback_delay",
+                        DynamicDurationPrefix::Value("bad delay value")
+                    )?),
                 );
             }
             "versions" => {
@@ -8406,11 +8451,15 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
                                 "dial_timeout" => {
                                     // Caddy stores `caddy.Duration` nanoseconds; zero values are
                                     // omitted by `omitempty`.
-                                    let nanos = parse_transport_duration(option)?;
+                                    let nanos =
+                                        parse_transport_duration(option, "bad timeout value")?;
                                     insert_nonzero(&mut extra_transport, "dial_timeout", nanos);
                                 }
                                 "dial_fallback_delay" => {
-                                    let nanos = parse_transport_duration(option)?;
+                                    let nanos = parse_transport_duration(
+                                        option,
+                                        "bad fallback delay value",
+                                    )?;
                                     insert_nonzero(
                                         &mut extra_transport,
                                         "dial_fallback_delay",
@@ -8418,7 +8467,8 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
                                     );
                                 }
                                 "response_header_timeout" => {
-                                    let nanos = parse_transport_duration(option)?;
+                                    let nanos =
+                                        parse_transport_duration(option, "bad timeout value")?;
                                     insert_nonzero(
                                         &mut extra_transport,
                                         "response_header_timeout",
@@ -8426,7 +8476,8 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
                                     );
                                 }
                                 "expect_continue_timeout" => {
-                                    let nanos = parse_transport_duration(option)?;
+                                    let nanos =
+                                        parse_transport_duration(option, "bad timeout value")?;
                                     insert_nonzero(
                                         &mut extra_transport,
                                         "expect_continue_timeout",
@@ -8434,11 +8485,17 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
                                     );
                                 }
                                 "read_timeout" => {
-                                    let nanos = parse_transport_duration(option)?;
+                                    let nanos = parse_transport_duration(
+                                        option,
+                                        "invalid read timeout duration",
+                                    )?;
                                     insert_nonzero(&mut extra_transport, "read_timeout", nanos);
                                 }
                                 "write_timeout" => {
-                                    let nanos = parse_transport_duration(option)?;
+                                    let nanos = parse_transport_duration(
+                                        option,
+                                        "invalid write timeout duration",
+                                    )?;
                                     insert_nonzero(&mut extra_transport, "write_timeout", nanos);
                                 }
                                 "read_buffer" => {
@@ -8485,13 +8542,19 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
                                     } else {
                                         let nanos =
                                             parse_go_duration_text(value).map_err(|message| {
-                                                adapter_error(option.position.clone(), message)
+                                                adapter_error(
+                                                    option.position.clone(),
+                                                    format!(
+                                                        "bad duration value '{value}': {message}"
+                                                    ),
+                                                )
                                             })?;
                                         insert_nonzero(keep_alive, "idle_timeout", nanos);
                                     }
                                 }
                                 "keepalive_interval" => {
-                                    let nanos = parse_transport_duration(option)?;
+                                    let nanos =
+                                        parse_transport_duration(option, "bad interval value")?;
                                     let keep_alive = keep_alive_object(&mut extra_transport);
                                     insert_nonzero(keep_alive, "probe_interval", nanos);
                                 }

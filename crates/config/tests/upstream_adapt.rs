@@ -1738,22 +1738,104 @@ fn transport_extra_arguments_are_rejected_like_caddy() {
 
 #[test]
 fn transport_durations_require_a_unit_like_caddy() {
-    // Go's `time.ParseDuration` rejects a bare integer; Caddy reports the Go message.
-    for subdirective in [
-        "dial_timeout",
-        "dial_fallback_delay",
-        "response_header_timeout",
-        "expect_continue_timeout",
-        "read_timeout",
-        "write_timeout",
-        "keepalive_interval",
-        "keepalive",
+    // Go's `time.ParseDuration` rejects a bare integer; Caddy reports Go's message inside the
+    // directive's own prefix. Prefixes verified against `caddy adapt` v2.11.9.
+    for (subdirective, prefix) in [
+        ("dial_timeout", "bad timeout value"),
+        ("dial_fallback_delay", "bad fallback delay value"),
+        ("response_header_timeout", "bad timeout value"),
+        ("expect_continue_timeout", "bad timeout value"),
+        ("read_timeout", "invalid read timeout duration"),
+        ("write_timeout", "invalid write timeout duration"),
+        ("keepalive_interval", "bad interval value"),
+        ("keepalive", "bad duration value"),
     ] {
         let error = transport_subdirective_error(&format!("{subdirective} 500000000"));
         let message = error.to_string();
         assert!(
-            message.contains("missing unit in duration \"500000000\""),
-            "`{subdirective} 500000000` must be rejected with Go's message: {message}"
+            message.contains(&format!(
+                "{prefix} '500000000': time: missing unit in duration \"500000000\""
+            )),
+            "`{subdirective} 500000000` must carry Caddy's prefix and Go's message: {message}"
         );
     }
+}
+
+#[test]
+fn transport_durations_accept_the_full_go_grammar() {
+    // Golden values from `caddy adapt` v2.11.9: decimal values, compound units, every Go unit,
+    // the day extension and a leading sign.
+    for (line, key, expected) in [
+        ("dial_timeout 1.5s", "dial_timeout", 1_500_000_000_i64),
+        ("dial_timeout 1m30s", "dial_timeout", 90_000_000_000),
+        ("dial_timeout 1h30m", "dial_timeout", 5_400_000_000_000),
+        ("dial_timeout 1d", "dial_timeout", 86_400_000_000_000),
+        ("dial_timeout 1.5d", "dial_timeout", 129_600_000_000_000),
+        ("dial_timeout 100ms", "dial_timeout", 100_000_000),
+        ("dial_timeout 1us", "dial_timeout", 1_000),
+        ("dial_timeout 1µs", "dial_timeout", 1_000),
+        ("dial_timeout 1μs", "dial_timeout", 1_000),
+        ("dial_timeout 1ns", "dial_timeout", 1),
+        ("dial_timeout +1s", "dial_timeout", 1_000_000_000),
+        ("dial_timeout -1.5s", "dial_timeout", -1_500_000_000),
+        ("dial_timeout 2h45m3.5s", "dial_timeout", 9_903_500_000_000),
+        (
+            "dial_fallback_delay 1m30s",
+            "dial_fallback_delay",
+            90_000_000_000,
+        ),
+        (
+            "response_header_timeout 1.5s",
+            "response_header_timeout",
+            1_500_000_000,
+        ),
+    ] {
+        let transport = adapt_transport_subdirectives(&format!("\t\t\t{line}"));
+        assert_eq!(
+            transport[key],
+            serde_json::json!(expected),
+            "`{line}` must adapt to {expected} ns"
+        );
+    }
+
+    // keep_alive subdirectives use the same parser and write into the `keep_alive` object.
+    for (line, key, expected) in [
+        ("keepalive 1m30s", "idle_timeout", 90_000_000_000_i64),
+        ("keepalive_interval 1.5s", "probe_interval", 1_500_000_000),
+    ] {
+        let transport = adapt_transport_subdirectives(&format!("\t\t\t{line}"));
+        assert_eq!(
+            transport["keep_alive"][key],
+            serde_json::json!(expected),
+            "`{line}` must adapt to {expected} ns"
+        );
+    }
+
+    // `0d` is zero, and `caddy.Duration` omits zero values.
+    let transport = adapt_transport_subdirectives("\t\t\tdial_timeout 0d");
+    assert!(
+        transport.get("dial_timeout").is_none(),
+        "a zero duration must be omitted like Caddy's omitempty: {transport}"
+    );
+}
+
+#[test]
+fn transport_durations_still_reject_invalid_go_forms() {
+    for value in ["1..5s", "abc", "1e3s", "0.5.5s", "1h-1m", "s", ".s"] {
+        let error = transport_subdirective_error(&format!("dial_timeout {value}"));
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("bad timeout value '{value}':")),
+            "`dial_timeout {value}` must stay a located Caddy error: {message}"
+        );
+    }
+
+    // The unknown-unit text is Go's, not a generic parse error.
+    let error = transport_subdirective_error("dial_timeout 1x");
+    assert!(
+        error
+            .to_string()
+            .contains("bad timeout value '1x': time: unknown unit \"x\" in duration \"1x\""),
+        "unknown units must use Go's message: {error}"
+    );
 }

@@ -275,15 +275,10 @@ pub struct TransportTuning {
     pub resolver: Option<Arc<TransportResolver>>,
     /// Per-host connection limiters shared by every client this tuning builds.
     ///
-    /// The key is the upstream dial (`host:port`), matching Go's per-`host:port`
+    /// The key is the upstream dial (`host:port`, or `unix:<path>`), matching Go's per-`host:port`
     /// `MaxConnsPerHost` bucket. Sharing the map is what keeps the normal client and the
     /// HTTP/1.1-only upgrade client for one upstream under a single limit.
     pub(crate) conn_limiters: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
-    /// Number of connector futures currently dialing or waiting for a connection limit slot.
-    ///
-    /// The handler's `response_header_timeout` pauses while this is non-zero so that dialing and
-    /// pool/limit waits are not charged against the time-to-headers budget.
-    pub(crate) connectors_in_flight: Arc<AtomicUsize>,
 }
 
 impl Default for TransportTuning {
@@ -296,7 +291,6 @@ impl Default for TransportTuning {
             local_address: None,
             resolver: None,
             conn_limiters: Arc::new(Mutex::new(HashMap::new())),
-            connectors_in_flight: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -305,7 +299,9 @@ impl TransportTuning {
     /// The `max_conns_per_host` limiter for `dial`, created once per dial and shared by every
     /// client built from this tuning (normal and upgrade companions, fixed and dynamic).
     fn connection_limiter(&self, dial: &str) -> Option<Arc<Semaphore>> {
-        let limit = self.max_conns_per_host?;
+        // The config parser rejects values above Tokio's ceiling with a located error; clamping
+        // here as well keeps a directly constructed `TransportTuning` panic-free.
+        let limit = self.max_conns_per_host?.min(Semaphore::MAX_PERMITS);
         let mut limiters = self
             .conn_limiters
             .lock()
@@ -707,19 +703,40 @@ enum DialTarget {
     Unix(std::path::PathBuf),
 }
 
-/// Counts one connector `call()` while it dials (or waits for a `max_conns_per_host` slot).
-struct ConnectorGuard(Arc<AtomicUsize>);
+// Per-request counter of the connections being dialed (or waiting for a `max_conns_per_host`
+// slot) by the request whose future is currently being polled.
+//
+// `crate::handler`'s response-header budget installs a fresh counter around every poll of its own
+// request future, and the connector future for that request is polled inside the same scope. That
+// makes the pause per request: another request dialing concurrently (even one that shares this
+// tuning's clients) cannot extend this request's header budget.
+tokio::task_local! {
+    pub(crate) static REQUEST_CONNECTOR_ACTIVITY: Arc<AtomicUsize>;
+}
+
+/// Marks one connector `call()` as in flight for the request whose future is being polled.
+///
+/// The guard is created and dropped while the request future is polled, so both the increment and
+/// the decrement land inside that request's [`REQUEST_CONNECTOR_ACTIVITY`] scope. A
+/// connection attempt started outside a request scope (hyper-util moves a losing connect future
+/// into a background task) is deliberately not charged to any request.
+struct ConnectorGuard(Option<Arc<AtomicUsize>>);
 
 impl ConnectorGuard {
-    fn new(activity: Arc<AtomicUsize>) -> Self {
-        activity.fetch_add(1, Ordering::SeqCst);
+    fn enter() -> Self {
+        let activity = REQUEST_CONNECTOR_ACTIVITY.try_with(Arc::clone).ok();
+        if let Some(activity) = &activity {
+            activity.fetch_add(1, Ordering::SeqCst);
+        }
         Self(activity)
     }
 }
 
 impl Drop for ConnectorGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        if let Some(activity) = &self.0 {
+            activity.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 }
 
@@ -765,7 +782,7 @@ impl Service<Uri> for FixedUpstreamConnector {
         Box::pin(async move {
             // Any error path drops the guard too, so the handler's header timer resumes after a
             // failed dial just as it does after a successful one.
-            let _connector_guard = ConnectorGuard::new(Arc::clone(&tuning.connectors_in_flight));
+            let _connector_guard = ConnectorGuard::enter();
             // The authority marker carries the PROXY-protocol source address. Health checks build
             // plain upstream URLs (no marker) and therefore send no header, matching Caddy's
             // active checker, which uses the default HTTP client instead of the configured
@@ -779,15 +796,8 @@ impl Service<Uri> for FixedUpstreamConnector {
                     // is Go's `MaxConnsPerHost` accounting. The limiter is looked up by dial
                     // address, so the normal and upgrade clients for one upstream (and clients
                     // rebuilt for a dynamic placeholder) share a single limit.
-                    let permit = match tuning.connection_limiter(&address) {
-                        Some(semaphore) => Some(semaphore.acquire_owned().await.map_err(|_| {
-                            io::Error::new(
-                                io::ErrorKind::BrokenPipe,
-                                "upstream connection limiter closed",
-                            )
-                        })?),
-                        None => None,
-                    };
+                    let permit =
+                        acquire_connection_permit(tuning.connection_limiter(&address)).await?;
                     let dial = dial_tcp(&address, &tuning);
                     let mut stream = match dial_timeout {
                         Some(limit) => match tokio::time::timeout(limit, dial).await {
@@ -832,6 +842,12 @@ impl Service<Uri> for FixedUpstreamConnector {
                             "transport.local_address is not supported for Unix-socket upstreams",
                         ));
                     }
+                    // Go's `MaxConnsPerHost` counts every dialed connection, Unix sockets
+                    // included, so the Unix arm takes a slot exactly like the TCP arm does.
+                    let permit = acquire_connection_permit(
+                        tuning.connection_limiter(&unix_limiter_key(&path)),
+                    )
+                    .await?;
                     let connect = tokio::net::UnixStream::connect(&path);
                     let stream = match dial_timeout {
                         Some(limit) => match tokio::time::timeout(limit, connect).await {
@@ -846,13 +862,42 @@ impl Service<Uri> for FixedUpstreamConnector {
                         Some(tls) => {
                             let server_name = server_name.ok_or_else(no_server_name)?;
                             let stream = connect_tls(&tls, server_name, stream).await?;
-                            Ok(TokioIo::new(UpstreamStream::tls(stream)))
+                            Ok(TokioIo::new(
+                                UpstreamStream::tls(stream).with_permit(permit),
+                            ))
                         }
-                        None => Ok(TokioIo::new(UpstreamStream::plain(stream, h2c))),
+                        None => Ok(TokioIo::new(
+                            UpstreamStream::plain(stream, h2c).with_permit(permit),
+                        )),
                     }
                 }
             }
         })
+    }
+}
+
+/// `max_conns_per_host` bucket key for a Unix-socket dial.
+///
+/// The `unix:` prefix keeps socket paths from colliding with a TCP `host:port` key; like Go's
+/// per-host bucket it is stable for the lifetime of the tuning.
+#[cfg(unix)]
+fn unix_limiter_key(path: &std::path::Path) -> String {
+    format!("unix:{}", path.display())
+}
+
+/// Wait for one `max_conns_per_host` slot; the returned permit is held for the connection's
+/// lifetime (idle or in use), matching Go's `MaxConnsPerHost` accounting.
+async fn acquire_connection_permit(
+    limiter: Option<Arc<Semaphore>>,
+) -> io::Result<Option<OwnedSemaphorePermit>> {
+    match limiter {
+        Some(semaphore) => semaphore.acquire_owned().await.map(Some).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "upstream connection limiter closed",
+            )
+        }),
+        None => Ok(None),
     }
 }
 
@@ -1436,13 +1481,15 @@ mod tests {
         let peers = std::sync::Arc::new(Mutex::new(Vec::new()));
         let seen_max = std::sync::Arc::clone(&max_active);
         let seen_peers = std::sync::Arc::clone(&peers);
+        // One shared counter across every accepted connection, so `max_active` measures
+        // simultaneous requests, not simultaneous requests per connection.
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         tokio::spawn(async move {
             loop {
                 let Ok((stream, peer)) = listener.accept().await else {
                     break;
                 };
                 seen_peers.lock().unwrap().push(peer);
-                let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 let max_active = std::sync::Arc::clone(&seen_max);
                 let service_active = std::sync::Arc::clone(&active);
                 let service = service_fn(move |_request: hyper::Request<hyper::body::Incoming>| {
@@ -1494,6 +1541,11 @@ mod tests {
         assert_eq!(config.pool_max_idle_per_host(), 4);
         config.max_idle_conns = Some(64);
         assert_eq!(config.pool_max_idle_per_host(), 32);
+        // A negative Caddy `max_idle_conns` maps to the effective zero cap (Go keeps no idle
+        // connections), not to "unlimited".
+        config.max_idle_conns = Some(0);
+        assert_eq!(config.pool_max_idle_per_host(), 0);
+        config.max_idle_conns = None;
         config.enabled = false;
         assert_eq!(config.pool_max_idle_per_host(), 0);
     }
@@ -1552,6 +1604,85 @@ mod tests {
             started.elapsed(),
             Duration::from_millis(300),
             "the fallback attempt must start after dial_fallback_delay"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn max_conns_per_host_limits_unix_socket_dials() {
+        use std::sync::atomic::Ordering;
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("limited.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let seen_accepted = Arc::clone(&accepted);
+        let seen_max = Arc::clone(&max_active);
+        let active = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                seen_accepted.fetch_add(1, Ordering::SeqCst);
+                let max_active = Arc::clone(&seen_max);
+                let service_active = Arc::clone(&active);
+                let service = service_fn(move |_request: hyper::Request<hyper::body::Incoming>| {
+                    let active = Arc::clone(&service_active);
+                    let max_active = Arc::clone(&max_active);
+                    async move {
+                        let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        let _ = max_active.fetch_max(now, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        Ok::<_, Infallible>(
+                            hyper::Response::builder()
+                                .status(200)
+                                .body(Full::new(Bytes::from_static(b"ok")))
+                                .unwrap(),
+                        )
+                    }
+                });
+                tokio::spawn(async move {
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+
+        let upstream =
+            crate::upstream::Upstream::parse_dial(&format!("unix/{}", socket.display()), false)
+                .unwrap();
+        let mut tuning = TransportTuning::default();
+        tuning.max_conns_per_host = Some(1);
+        tuning.keep_alive.enabled = false;
+        let client = build_upstream_client_for_tuned(
+            upstream.transport().unwrap(),
+            None,
+            false,
+            false,
+            None,
+            None,
+            &tuning,
+        )
+        .expect("unix client");
+
+        let first = client.request(client_request(&upstream, "/first"));
+        let second = client.request(client_request(&upstream, "/second"));
+        let (first, second) = tokio::join!(first, second);
+        assert_eq!(first.expect("first unix request").status(), 200);
+        assert_eq!(second.expect("second unix request").status(), 200);
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            2,
+            "both requests must have dialed the Unix socket"
+        );
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            1,
+            "Unix-socket dials must honour max_conns_per_host like TCP dials"
         );
     }
 
