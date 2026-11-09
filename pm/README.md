@@ -22,7 +22,7 @@ The store is a namespaced document store, not a relational database:
 - `u64` revision per document; `u64` generation per store;
 - immutable `Snapshot` reads (`Arc`), so readers do not wait for the writer;
 - one `Mutex`-serialized writer per store; no reader/writer lock contention;
-- compare-and-swap preconditions (`check_revision`, `check_missing`);
+- compare-and-swap preconditions (`check_revision`, `check_missing`); a transaction without a check is an unconditional upsert, so callers that need CAS must add the check
 - atomic transactions: a failed precondition or persistence error leaves the store unchanged;
 - `backup()` writes a consistent JSON export.
 

@@ -751,6 +751,27 @@ mod tests {
     }
 
     #[test]
+    fn persistence_failure_leaves_memory_and_snapshot_unchanged() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("state.json");
+        let store = SnapshotStore::open(&path).expect("open");
+        put(&store, "one", json!({"v": 1}));
+        let generation = store.snapshot().expect("snapshot").generation();
+
+        // Make the atomic replace fail: the destination becomes a directory.
+        fs::remove_file(&path).expect("remove state");
+        fs::create_dir(&path).expect("replace with directory");
+
+        let error = store
+            .transact(Transaction::new().put("hosts", "two", json!({"v": 2})))
+            .expect_err("persistence must fail");
+        assert!(matches!(error, StateError::Io(_)));
+        assert_eq!(store.snapshot().expect("snapshot").generation(), generation);
+        assert!(store.get("hosts", "one").expect("read").is_some());
+        assert!(store.get("hosts", "two").expect("read").is_none());
+    }
+
+    #[test]
     fn corrupt_snapshot_fails_closed() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("state.json");
