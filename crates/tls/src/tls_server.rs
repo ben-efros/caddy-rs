@@ -16,12 +16,14 @@
 //!   `certificate_selection.any_tag` for per-connection certificate selection (evaluated by
 //!   [`ConnectionPolicyResolver`] after the ClientHello, in policy order, with `{}` as the
 //!   catch-all fallback);
-//! * [`build_server_config`] assembles the rustls [`ServerConfig`] with the `ring` provider and
-//!   applies `tls_connection_policies[0].curves`/`cipher_suites` to a custom
-//!   [`CryptoProvider`] (Caddy/Go curve names x25519/secp256r1/secp384r1 and the six ECDHE
-//!   AES-GCM/ChaCha20 TLS 1.2 suites). TLS 1.3 cipher suites are fixed by rustls/Go and cannot be
-//!   configured; unsupported curve/cipher names (including secp521r1, x25519mlkem768, RSA
-//!   key-exchange suites and TLS 1.3 suites) fail loudly with TLS-POLICY tracking.
+//! * [`build_server_config`] assembles the rustls [`ServerConfig`] with the aws-lc-rs provider
+//!   and applies `tls_connection_policies[0].curves`/`cipher_suites` to a custom
+//!   [`CryptoProvider`] (Caddy/Go curve names x25519mlkem768/x25519/secp256r1/secp384r1 and the
+//!   six ECDHE AES-GCM/ChaCha20 TLS 1.2 suites). TLS 1.3 cipher suites are fixed by rustls/Go
+//!   and cannot be configured; unsupported curve/cipher names (including secp521r1, RSA
+//!   key-exchange suites and TLS 1.3 suites) fail loudly with TLS-POLICY tracking. P-521
+//!   certificate keys are supported through the provider's signature schemes; only the P-521
+//!   key-exchange group is unavailable.
 //!
 //! Listener policy (documented for the server supervisor, see [`listener_uses_tls`]): a TCP
 //! listener terminates TLS when its server has non-empty `tls_connection_policies`, or when its
@@ -2762,6 +2764,97 @@ mod tests {
         assert!(message.contains("secp256k1"), "{message}");
     }
 
+    /// RSA-1024 is accepted by Caddy (Go's minimum RSA size is 1024 bits) but rejected by
+    /// aws-lc-rs, which requires 2048..=8192 bits (DIV-0114). The failure must stay loud and
+    /// located: a silent accept, a panic, or the provider's generic parse error all fail here.
+    #[test]
+    fn rsa_1024_keys_are_rejected_with_located_errors() {
+        let cert = include_str!("../testdata/key-types/rsa1024.pem");
+        let keys = [
+            ("PKCS#8", include_str!("../testdata/key-types/rsa1024.key")),
+            (
+                "PKCS#1",
+                include_str!("../testdata/key-types/rsa1024-pkcs1.key"),
+            ),
+        ];
+        for (encoding, key) in keys {
+            let error = TlsCertificate::from_pem_with_source(
+                cert,
+                key,
+                Some("apps.tls.certificates.load_files[0]".to_string()),
+            )
+            .unwrap_err();
+            let message = error.to_string();
+            assert!(
+                message.contains("TLS configuration at `certificates`"),
+                "{encoding}: {message}"
+            );
+            assert!(
+                message.contains("apps.tls.certificates.load_files[0]"),
+                "{encoding}: {message}"
+            );
+            assert!(
+                message.contains("DNS names: localhost"),
+                "{encoding}: {message}"
+            );
+            assert!(message.contains("RSA-1024"), "{encoding}: {message}");
+            assert!(message.contains("2048 and 8192"), "{encoding}: {message}");
+            assert!(
+                !message.contains("failed to parse private key as RSA, ECDSA, or EdDSA"),
+                "{encoding}: the provider's opaque parse error must be replaced by the detected size: {message}"
+            );
+        }
+    }
+
+    /// Caddy/Go reject brainpool curves with `x509: unsupported elliptic curve`; caddy-rs must
+    /// reject them at load with the same wording plus the configured entry and DNS names.
+    #[test]
+    fn brainpool_curve_keys_are_rejected_with_located_errors() {
+        let cases = [
+            (
+                "brainpoolP256r1 SEC1",
+                include_str!("../testdata/key-types/brainpool-p256-sec1.pem"),
+                include_str!("../testdata/key-types/brainpool-p256-sec1.key"),
+                "brainpoolP256r1",
+                "1.3.36.3.3.2.8.1.1.7",
+            ),
+            (
+                "brainpoolP384r1 PKCS#8",
+                include_str!("../testdata/key-types/brainpool-p384-pkcs8.pem"),
+                include_str!("../testdata/key-types/brainpool-p384-pkcs8.key"),
+                "brainpoolP384r1",
+                "1.3.36.3.3.2.8.1.1.11",
+            ),
+        ];
+        for (name, cert, key, curve, oid) in cases {
+            let error = TlsCertificate::from_pem_with_source(
+                cert,
+                key,
+                Some("apps.tls.certificates.load_files[2]".to_string()),
+            )
+            .unwrap_err();
+            let message = error.to_string();
+            assert!(
+                message.contains("TLS configuration at `certificates`"),
+                "{name}: {message}"
+            );
+            assert!(
+                message.contains("apps.tls.certificates.load_files[2]"),
+                "{name}: {message}"
+            );
+            assert!(
+                message.contains("DNS names: localhost"),
+                "{name}: {message}"
+            );
+            assert!(message.contains(curve), "{name}: {message}");
+            assert!(message.contains(oid), "{name}: {message}");
+            assert!(
+                message.contains("x509: unsupported elliptic curve"),
+                "{name}: {message}"
+            );
+        }
+    }
+
     #[test]
     fn malformed_private_key_der_names_the_block_label() {
         // DER prefix `30 82 01 00` claims a 256-byte SEQUENCE with no body: truncated.
@@ -4152,6 +4245,69 @@ mod tests {
             .await
             .expect("x25519-only client falls back");
         assert_eq!(group, rustls::NamedGroup::X25519);
+    }
+
+    /// The provider's default key-exchange set must be Caddy's exact default curve list
+    /// (`external/caddy/modules/caddytls/values.go`): `[x25519mlkem768, x25519, secp256r1]`.
+    ///
+    /// This guards the explicit `provider.kx_groups = groups` assignment in `crypto_provider`:
+    /// rustls' aws-lc-rs default is `[X25519, SECP256R1, SECP384R1, X25519MLKEM768]`, which both
+    /// reorders the preference and offers P-384 by default. Removing the assignment, changing
+    /// `DEFAULT_CURVES`, or upgrading to a provider with a different default set must fail here
+    /// rather than silently changing what a listener negotiates.
+    #[test]
+    fn default_provider_kx_groups_are_caddys_default_curves() {
+        assert_eq!(
+            DEFAULT_CURVES
+                .iter()
+                .map(|curve| curve.name())
+                .collect::<Vec<_>>(),
+            vec!["x25519mlkem768", "x25519", "secp256r1"],
+            "DEFAULT_CURVES must stay Caddy's exact default list"
+        );
+
+        let provider = crypto_provider(&TlsServerOptions::default()).expect("default provider");
+        assert_eq!(
+            provider
+                .kx_groups
+                .iter()
+                .map(|group| group.name())
+                .collect::<Vec<_>>(),
+            vec![
+                rustls::NamedGroup::X25519MLKEM768,
+                rustls::NamedGroup::X25519,
+                rustls::NamedGroup::secp256r1,
+            ],
+            "the default provider must install Caddy's exact curve list, in order"
+        );
+        assert!(
+            !provider
+                .kx_groups
+                .iter()
+                .any(|group| group.name() == rustls::NamedGroup::secp384r1),
+            "P-384 must not be offered unless the policy configures it"
+        );
+
+        // P-384 is implemented and selectable, so its absence above is a policy choice rather
+        // than a missing provider group.
+        assert_eq!(
+            TlsCurve::P384.kx_group().expect("P-384 group").name(),
+            rustls::NamedGroup::secp384r1
+        );
+        let configured = TlsServerOptions {
+            curves: vec![TlsCurve::P384],
+            ..TlsServerOptions::default()
+        };
+        let provider = crypto_provider(&configured).expect("configured provider");
+        assert_eq!(
+            provider
+                .kx_groups
+                .iter()
+                .map(|group| group.name())
+                .collect::<Vec<_>>(),
+            vec![rustls::NamedGroup::secp384r1],
+            "an explicit P-384 policy must install only P-384"
+        );
     }
 
     #[tokio::test]
