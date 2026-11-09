@@ -89,6 +89,17 @@ pub fn resolve_server_data_dir_with(
     xdg_data_home: Option<OsString>,
     home: Option<OsString>,
 ) -> ResolvedDataDir {
+    // A configured `storage.root` is the effective certificate/account root: the TLS storage
+    // selector gives it precedence over the CLI data-directory fallback (proved by
+    // `configured_storage_root_wins_over_the_data_directory` in the server tests). Resolve the
+    // same way here so diagnostics/preflight check the root that will actually be written.
+    if let Some(path) = storage_root {
+        return ResolvedDataDir {
+            path,
+            source: DataDirSource::StorageRoot,
+            warnings: Vec::new(),
+        };
+    }
     if let Some(path) = explicit {
         return ResolvedDataDir {
             path,
@@ -100,13 +111,6 @@ pub fn resolve_server_data_dir_with(
         return ResolvedDataDir {
             path,
             source: DataDirSource::Environment,
-            warnings: Vec::new(),
-        };
-    }
-    if let Some(path) = storage_root {
-        return ResolvedDataDir {
-            path,
-            source: DataDirSource::StorageRoot,
             warnings: Vec::new(),
         };
     }
@@ -709,11 +713,25 @@ mod tests {
     }
 
     #[test]
-    fn explicit_and_environment_win() {
+    fn configured_storage_root_wins_over_explicit_and_environment() {
         let resolved = resolve_server_data_dir_with(
             Some(PathBuf::from("/explicit")),
             Some(PathBuf::from("/env")),
             Some(PathBuf::from("/storage")),
+            Path::new("/work"),
+            None,
+            None,
+        );
+        assert_eq!(resolved.path, PathBuf::from("/storage"));
+        assert_eq!(resolved.source, DataDirSource::StorageRoot);
+    }
+
+    #[test]
+    fn explicit_then_environment_apply_when_no_storage_root_is_configured() {
+        let resolved = resolve_server_data_dir_with(
+            Some(PathBuf::from("/explicit")),
+            Some(PathBuf::from("/env")),
+            None,
             Path::new("/work"),
             None,
             None,
@@ -724,7 +742,7 @@ mod tests {
         let resolved = resolve_server_data_dir_with(
             None,
             Some(PathBuf::from("/env")),
-            Some(PathBuf::from("/storage")),
+            None,
             Path::new("/work"),
             None,
             None,
