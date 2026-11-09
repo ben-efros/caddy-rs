@@ -1,0 +1,31 @@
+[package]
+name = "caddy-rs-authn"
+description = "Authentication and authorization service for caddy-rs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# External dependencies
+serde = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+# Crypto and JWT
+argon2 = { version = "0.5", features = ["std", "password-hash"] }
+bcrypt = "0.15"
+jsonwebtoken = "9.3"
+rand = { version = "0.8", features = ["std", "getrandom"] }
+base32 = "0.5"
+totp-lite = "2.0"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.11", features = ["v4", "serde", "fast-rng"] }
+urlencoding = "2.1"
+sha2 = { workspace = true }
+subtle = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+serde_json = { workspace = true }
