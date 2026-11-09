@@ -213,6 +213,16 @@ Preflight, in order:
 5. build one `HostRepository`, one `PolicyRepository`, and `HostService::with_policies` over the
    same store, exposed as `hosts()`, `policies()` and `service()`.
 
+Both `<data_dir>` and `<data_dir>/pm` are inspected with `symlink_metadata`, never an implicitly
+following `stat`. A symlink at either position is refused by default with a located
+`RuntimeError::SymlinkNotAllowed` naming the link and its target. The opt-in
+`RuntimeConfig::allow_symlink_data_dir(true)` canonicalises the link and requires its target to be a
+directory; the canonical target becomes the effective data directory (for the root link) or the
+state directory (for the `pm` link), and the normal checks then run against it. A dangling symlink
+is always a located error (`SymlinkUnresolvable` with the override), is never followed, and cannot
+cause recursive directory creation. `AlreadyExists` from directory creation is resolved by one
+non-recursive inspection.
+
 `status()` returns `data_dir`, `state_path`, `host_count`, `policy_count`,
 `legacy_caddy_detected` and operator `warnings`. Both counts are fresh store reads on every call,
 not cached.
@@ -231,9 +241,9 @@ migration of the data directory.
 
 `compile()` compiles the stored hosts through `pm-compiler`; `assemble(ConfigSettings)` delegates to
 `pm-config`'s `assemble_from_hosts` and returns the assembled Caddy JSON. Errors are
-`RuntimeError::{InvalidDataDir, NotADirectory, DataDirUnreadable, CreateDirectory,
-DataDirNotWritable, State, Service, Compile, Config}` and carry the relevant path. No error contains
-plaintext secrets.
+`RuntimeError::{InvalidDataDir, NotADirectory, SymlinkNotAllowed, SymlinkUnresolvable,
+SymlinkTargetNotDirectory, DataDirUnreadable, CreateDirectory, DataDirNotWritable, State, Service,
+Compile, Config}` and carry the relevant path. No error contains plaintext secrets.
 
 ## `pm-import`
 

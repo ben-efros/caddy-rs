@@ -392,3 +392,236 @@ fn compile_and_assemble_use_the_stored_hosts() {
     assert_eq!(https_routes.len(), 1);
     assert_eq!(https_routes[0]["match"][0]["host"][0], json!("example.com"));
 }
+
+#[cfg(unix)]
+fn symlink(target: &Path, link: &Path) {
+    std::os::unix::fs::symlink(target, link).expect("create symlink");
+}
+
+#[cfg(unix)]
+fn open_allowing_symlinks(data_dir: &Path) -> PmRuntime {
+    PmRuntime::open(RuntimeConfig::new(data_dir).allow_symlink_data_dir(true))
+        .expect("open runtime with symlink override")
+}
+
+#[cfg(unix)]
+fn open_allowing_symlinks_error(data_dir: &Path) -> RuntimeError {
+    match PmRuntime::open(RuntimeConfig::new(data_dir).allow_symlink_data_dir(true)) {
+        Ok(_) => panic!("open unexpectedly succeeded for {}", data_dir.display()),
+        Err(error) => error,
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn dangling_symlink_as_data_dir_is_a_located_error() {
+    let temp = tempfile::tempdir().expect("create temp dir");
+    let data_dir = temp.path().join("data");
+    let target = temp.path().join("missing");
+    symlink(&target, &data_dir);
+
+    let error = open_error(&data_dir);
+    match &error {
+        RuntimeError::SymlinkNotAllowed {
+            path,
+            target: named,
+        } => {
+            assert_eq!(path, &data_dir);
+            assert_eq!(named, &target);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    let rendered = error.to_string();
+    assert!(rendered.contains(&data_dir.display().to_string()));
+    assert!(rendered.contains(&target.display().to_string()));
+    assert!(rendered.contains("allow_symlink_data_dir"));
+    assert!(!target.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn dangling_symlink_as_pm_dir_is_a_located_error() {
+    let (_temp, data_dir) = temp_data_dir();
+    fs::create_dir_all(&data_dir).expect("data dir");
+    let pm_dir = data_dir.join("pm");
+    let target = data_dir.join("missing-pm");
+    symlink(&target, &pm_dir);
+
+    let error = open_error(&data_dir);
+    match &error {
+        RuntimeError::SymlinkNotAllowed {
+            path,
+            target: named,
+        } => {
+            assert_eq!(path, &pm_dir);
+            assert_eq!(named, &target);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    let rendered = error.to_string();
+    assert!(rendered.contains(&pm_dir.display().to_string()));
+    assert!(rendered.contains(&target.display().to_string()));
+    assert!(!target.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_data_dir_is_refused_by_default() {
+    let temp = tempfile::tempdir().expect("create temp dir");
+    let target = temp.path().join("real-data");
+    fs::create_dir_all(&target).expect("target dir");
+    let data_dir = temp.path().join("data");
+    symlink(&target, &data_dir);
+
+    let error = open_error(&data_dir);
+    match &error {
+        RuntimeError::SymlinkNotAllowed {
+            path,
+            target: named,
+        } => {
+            assert_eq!(path, &data_dir);
+            assert_eq!(named, &target);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    assert_eq!(
+        fs::read_dir(&target).expect("read target").count(),
+        0,
+        "refusal must not write through the symlink"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_pm_dir_is_refused_by_default() {
+    let (_temp, data_dir) = temp_data_dir();
+    fs::create_dir_all(&data_dir).expect("data dir");
+    let target = data_dir.join("real-pm");
+    fs::create_dir_all(&target).expect("target dir");
+    let pm_dir = data_dir.join("pm");
+    symlink(&target, &pm_dir);
+
+    let error = open_error(&data_dir);
+    match &error {
+        RuntimeError::SymlinkNotAllowed {
+            path,
+            target: named,
+        } => {
+            assert_eq!(path, &pm_dir);
+            assert_eq!(named, &target);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    assert_eq!(
+        fs::read_dir(&target).expect("read target").count(),
+        0,
+        "refusal must not write through the symlink"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_override_resolves_a_symlinked_data_dir() {
+    let temp = tempfile::tempdir().expect("create temp dir");
+    let target = temp.path().join("real-data");
+    fs::create_dir_all(&target).expect("target dir");
+    let data_dir = temp.path().join("data");
+    symlink(&target, &data_dir);
+
+    let runtime = open_allowing_symlinks(&data_dir);
+    let canonical = fs::canonicalize(&target).expect("canonical target");
+    assert_eq!(runtime.data_dir(), canonical.as_path());
+    assert_eq!(
+        runtime.state_path(),
+        canonical.join("pm").join("state.json")
+    );
+    assert!(canonical.join("pm").join("state.json").is_file());
+    assert_eq!(runtime.status().expect("status").data_dir, canonical);
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_override_resolves_a_symlinked_pm_dir() {
+    let (_temp, data_dir) = temp_data_dir();
+    fs::create_dir_all(&data_dir).expect("data dir");
+    let target = data_dir.join("real-pm");
+    fs::create_dir_all(&target).expect("target dir");
+    let pm_dir = data_dir.join("pm");
+    symlink(&target, &pm_dir);
+
+    let runtime = open_allowing_symlinks(&data_dir);
+    let canonical = fs::canonicalize(&target).expect("canonical target");
+    assert_eq!(runtime.data_dir(), data_dir.as_path());
+    assert_eq!(runtime.state_path(), canonical.join("state.json"));
+    assert!(canonical.join("state.json").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn dangling_symlink_is_located_even_with_the_override() {
+    let temp = tempfile::tempdir().expect("create temp dir");
+
+    let data_dir = temp.path().join("data");
+    let data_target = temp.path().join("missing-data");
+    symlink(&data_target, &data_dir);
+    let error = open_allowing_symlinks_error(&data_dir);
+    match &error {
+        RuntimeError::SymlinkUnresolvable {
+            path,
+            target,
+            source,
+        } => {
+            assert_eq!(path, &data_dir);
+            assert_eq!(target, &data_target);
+            assert_eq!(source.kind(), io::ErrorKind::NotFound);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    let rendered = error.to_string();
+    assert!(rendered.contains(&data_dir.display().to_string()));
+    assert!(rendered.contains(&data_target.display().to_string()));
+    assert!(rendered.contains("cannot be resolved"));
+
+    let pm_data = temp.path().join("pm-data");
+    fs::create_dir_all(&pm_data).expect("pm data dir");
+    let pm_dir = pm_data.join("pm");
+    let pm_target = pm_data.join("missing-pm");
+    symlink(&pm_target, &pm_dir);
+    let error = open_allowing_symlinks_error(&pm_data);
+    match &error {
+        RuntimeError::SymlinkUnresolvable {
+            path,
+            target,
+            source,
+        } => {
+            assert_eq!(path, &pm_dir);
+            assert_eq!(target, &pm_target);
+            assert_eq!(source.kind(), io::ErrorKind::NotFound);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_to_a_file_is_rejected_with_the_override() {
+    let temp = tempfile::tempdir().expect("create temp dir");
+    let target = temp.path().join("not-a-dir");
+    fs::write(&target, b"file").expect("write target");
+    let data_dir = temp.path().join("data");
+    symlink(&target, &data_dir);
+
+    let error = open_allowing_symlinks_error(&data_dir);
+    let canonical = fs::canonicalize(&target).expect("canonical target");
+    match &error {
+        RuntimeError::SymlinkTargetNotDirectory {
+            path,
+            target: named,
+        } => {
+            assert_eq!(path, &data_dir);
+            assert_eq!(named, &canonical);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    assert!(error.to_string().contains("not a directory"));
+}

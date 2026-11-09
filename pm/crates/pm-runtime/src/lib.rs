@@ -28,6 +28,16 @@
 //! [`RuntimeError::DataDirNotWritable`] naming `<data_dir>/pm` and the underlying I/O error. There
 //! is no fallback to the current directory or a temporary directory.
 //!
+//! # Symlinks
+//!
+//! Both `<data_dir>` and `<data_dir>/pm` are inspected with `symlink_metadata`, never with a
+//! following `stat`. A symlink at either position is refused by default with a located
+//! [`RuntimeError::SymlinkNotAllowed`] naming the link and its target. The opt-in
+//! [`RuntimeConfig::allow_symlink_data_dir`] canonicalises the link and requires its target to be a
+//! directory before the normal checks run; the resolved target becomes the effective
+//! [`PmRuntime::data_dir`] or state directory. A dangling symlink is always a located error, with or
+//! without the override, and is never followed or created through.
+//!
 //! # Legacy Caddy data
 //!
 //! A data directory that previously belonged to Caddy may still contain Caddy's certificate
@@ -87,14 +97,36 @@ pub const LEGACY_CADDY_DATABASE_PREFIX: &str = "caddy.db";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeConfig {
     /// Deployment-owned data directory. The runtime only creates and uses its `pm/` child.
+    ///
+    /// When [`RuntimeConfig::allow_symlink_data_dir`] is set and this path is a symlink, the
+    /// runtime replaces it with the canonical target while opening.
     pub data_dir: PathBuf,
+    symlink_data_dir_allowed: bool,
 }
 
 impl RuntimeConfig {
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
         Self {
             data_dir: data_dir.into(),
+            symlink_data_dir_allowed: false,
         }
+    }
+
+    /// Allow a symlinked data directory or `<data_dir>/pm` directory.
+    ///
+    /// The default is `false`: both paths are inspected with `symlink_metadata` and a symlink is
+    /// refused with [`RuntimeError::SymlinkNotAllowed`]. When allowed, each link is canonicalised
+    /// and its target must be a directory; a dangling or non-directory target is a located error.
+    /// The override never follows a symlink during legacy detection or the write probe.
+    #[must_use]
+    pub fn allow_symlink_data_dir(mut self, allow: bool) -> Self {
+        self.symlink_data_dir_allowed = allow;
+        self
+    }
+
+    /// Whether symlinked data and `pm` directories are allowed.
+    pub fn symlink_data_dir_allowed(&self) -> bool {
+        self.symlink_data_dir_allowed
     }
 }
 
@@ -121,6 +153,23 @@ pub enum RuntimeError {
     /// The configured path exists but is not a directory.
     #[error("PM data directory {path} exists but is not a directory")]
     NotADirectory { path: PathBuf },
+    /// A symlinked data or `pm` directory was refused because symlinks are not allowed.
+    #[error(
+        "PM data path {path} is a symlink to {target}; symlinked data directories are refused \
+         unless RuntimeConfig::allow_symlink_data_dir(true) is set"
+    )]
+    SymlinkNotAllowed { path: PathBuf, target: PathBuf },
+    /// A symlink's target could not be resolved.
+    #[error("PM data path {path} is a symlink to {target}, which cannot be resolved: {source}")]
+    SymlinkUnresolvable {
+        path: PathBuf,
+        target: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    /// A symlink's resolved target is not a directory.
+    #[error("PM data path {path} is a symlink to {target}, which is not a directory")]
+    SymlinkTargetNotDirectory { path: PathBuf, target: PathBuf },
     /// A data-directory or `pm` directory could not be inspected.
     #[error("PM data path {path} could not be inspected: {source}")]
     DataDirUnreadable {
@@ -195,20 +244,20 @@ impl PmRuntime {
     }
 
     fn open_inner(
-        config: RuntimeConfig,
+        mut config: RuntimeConfig,
         probe: impl FnOnce(&Path) -> io::Result<()>,
     ) -> Result<Self, RuntimeError> {
-        let data_dir = config.data_dir.clone();
-        if data_dir.as_os_str().is_empty() {
+        let configured = config.data_dir.clone();
+        if configured.as_os_str().is_empty() {
             return Err(RuntimeError::InvalidDataDir {
-                path: data_dir,
+                path: configured,
                 reason: "the data directory path is empty",
             });
         }
 
-        ensure_directory(&data_dir)?;
-        let pm_dir = data_dir.join(PM_DIRECTORY);
-        ensure_directory(&pm_dir)?;
+        let allow_symlinks = config.symlink_data_dir_allowed();
+        let data_dir = resolve_or_create_directory(&configured, allow_symlinks)?;
+        let pm_dir = resolve_or_create_directory(&data_dir.join(PM_DIRECTORY), allow_symlinks)?;
         probe(&pm_dir).map_err(|source| RuntimeError::DataDirNotWritable {
             path: pm_dir.clone(),
             source,
@@ -225,6 +274,10 @@ impl PmRuntime {
         let hosts = HostRepository::new(Arc::clone(&store));
         let policies = PolicyRepository::new(Arc::clone(&store));
         let service = HostService::with_policies(Arc::clone(&store), policies.clone());
+
+        // Keep the effective (canonical, when a symlink override was used) data directory so
+        // `data_dir()` and `status()` describe where state actually lives.
+        config.data_dir = data_dir;
 
         Ok(Self {
             config,
@@ -330,18 +383,12 @@ impl PmRuntime {
     }
 }
 
-fn ensure_directory(path: &Path) -> Result<(), RuntimeError> {
-    match fs::metadata(path) {
-        Ok(metadata) => {
-            if metadata.is_dir() {
-                Ok(())
-            } else {
-                Err(RuntimeError::NotADirectory {
-                    path: path.to_path_buf(),
-                })
-            }
+fn resolve_or_create_directory(path: &Path, allow_symlinks: bool) -> Result<PathBuf, RuntimeError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => resolve_existing_directory(path, &metadata, allow_symlinks),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            create_directory(path, allow_symlinks)
         }
-        Err(source) if source.kind() == io::ErrorKind::NotFound => create_missing_directory(path),
         Err(source) => Err(RuntimeError::DataDirUnreadable {
             path: path.to_path_buf(),
             source,
@@ -349,16 +396,94 @@ fn ensure_directory(path: &Path) -> Result<(), RuntimeError> {
     }
 }
 
-fn create_missing_directory(path: &Path) -> Result<(), RuntimeError> {
+/// Resolve an existing directory without ever following a symlink implicitly.
+///
+/// `metadata` must come from `symlink_metadata`. The returned path is the canonical symlink target
+/// only when the caller opted in to symlinks; otherwise it is the input path.
+fn resolve_existing_directory(
+    path: &Path,
+    metadata: &fs::Metadata,
+    allow_symlinks: bool,
+) -> Result<PathBuf, RuntimeError> {
+    if metadata.file_type().is_symlink() {
+        let target = fs::read_link(path).map_err(|source| RuntimeError::DataDirUnreadable {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if !allow_symlinks {
+            return Err(RuntimeError::SymlinkNotAllowed {
+                path: path.to_path_buf(),
+                target,
+            });
+        }
+        let canonical =
+            fs::canonicalize(path).map_err(|source| RuntimeError::SymlinkUnresolvable {
+                path: path.to_path_buf(),
+                target: target.clone(),
+                source,
+            })?;
+        let resolved =
+            fs::metadata(&canonical).map_err(|source| RuntimeError::DataDirUnreadable {
+                path: canonical.clone(),
+                source,
+            })?;
+        if !resolved.is_dir() {
+            return Err(RuntimeError::SymlinkTargetNotDirectory {
+                path: path.to_path_buf(),
+                target: canonical,
+            });
+        }
+        return Ok(canonical);
+    }
+    if metadata.is_dir() {
+        Ok(path.to_path_buf())
+    } else {
+        Err(RuntimeError::NotADirectory {
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+/// Create a missing directory once and re-inspect on `AlreadyExists`.
+///
+/// The `AlreadyExists` path deliberately does not call this function again: a symlink or a racing
+/// creator is resolved by inspection only, so a dangling link can never cause unbounded recursion.
+fn create_directory(path: &Path, allow_symlinks: bool) -> Result<PathBuf, RuntimeError> {
     match create_single_directory(path) {
-        Ok(()) => secure_directory(path),
-        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => ensure_directory(path),
+        Ok(()) => {
+            secure_directory(path)?;
+            Ok(path.to_path_buf())
+        }
+        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+            match fs::symlink_metadata(path) {
+                Ok(metadata) => resolve_existing_directory(path, &metadata, allow_symlinks),
+                Err(source) => Err(RuntimeError::DataDirUnreadable {
+                    path: path.to_path_buf(),
+                    source,
+                }),
+            }
+        }
         Err(source) if source.kind() == io::ErrorKind::NotFound => {
             fs::create_dir_all(path).map_err(|source| RuntimeError::CreateDirectory {
                 path: path.to_path_buf(),
                 source,
             })?;
-            secure_directory(path)
+            match fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    resolve_existing_directory(path, &metadata, allow_symlinks)
+                }
+                Ok(metadata) if metadata.is_dir() => {
+                    secure_directory(path)?;
+                    Ok(path.to_path_buf())
+                }
+                Ok(_) => Err(RuntimeError::NotADirectory {
+                    path: path.to_path_buf(),
+                }),
+                Err(source) => Err(RuntimeError::DataDirUnreadable {
+                    path: path.to_path_buf(),
+                    source,
+                }),
+            }
         }
         Err(source) => Err(RuntimeError::CreateDirectory {
             path: path.to_path_buf(),
