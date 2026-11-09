@@ -1,0 +1,21 @@
+[package]
+name = "caddy-rs-config-tx"
+description = "Configuration transaction engine for atomic config changes with staging, diff, apply, rollback, and history."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+caddy-rs-core = { path = "../core", default-features = false }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.0", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile = "3.0"
