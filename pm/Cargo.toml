@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/pm-state", "crates/pm-core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/ben-efros/caddy-rs"
+
+[workspace.dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.21"
+tempfile = "3.27.0"
