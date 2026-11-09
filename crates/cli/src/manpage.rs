@@ -15,9 +15,9 @@ use clap::{Arg, ArgAction, Command, CommandFactory};
 use crate::Cli;
 
 /// Write the root page and one page for every visible subcommand.
-pub(crate) fn write(directory: Option<&Path>) -> Result<()> {
+pub(crate) fn write(directory: Option<&str>) -> Result<()> {
     let directory = directory
-        .map(|path| path.to_string_lossy().trim().to_string())
+        .map(str::trim)
         .filter(|path| !path.is_empty())
         .ok_or_else(|| {
             failed_quit(

@@ -28,7 +28,11 @@ pub(crate) fn run(envfiles: &[PathBuf]) -> Result<()> {
 /// are never overwritten.
 fn load_env_file(path: &Path) -> Result<()> {
     let contents = std::fs::read_to_string(path).map_err(|error| {
-        anyhow::anyhow!("reading environment file: open {}: {error}", path.display())
+        anyhow::anyhow!(
+            "reading environment file: open {}: {}",
+            path.display(),
+            io_error_text(&error)
+        )
     })?;
     let variables = parse_env_file(&contents).with_context(|| "parsing environment file")?;
     for (key, value) in variables {
@@ -37,6 +41,15 @@ fn load_env_file(path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Render an I/O error with Go's lowercase wording, keeping the affected path elsewhere.
+fn io_error_text(error: &std::io::Error) -> String {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => "no such file or directory".to_string(),
+        std::io::ErrorKind::PermissionDenied => "permission denied".to_string(),
+        _ => error.to_string(),
+    }
 }
 
 /// Parse Caddy's `KEY=VALUE` environment-file dialect.
@@ -103,7 +116,12 @@ fn parse_env_file(input: &str) -> Result<Vec<(String, String)>> {
             value = value.strip_suffix(quote).unwrap_or(&value).to_string();
         }
 
-        variables.push((key, value));
+        // Caddy parses the file into a map, so a later duplicate key replaces the earlier
+        // value. Keep the first position (deterministic output) but the last value.
+        match variables.iter().position(|(existing, _)| existing == &key) {
+            Some(position) => variables[position].1 = value,
+            None => variables.push((key, value)),
+        }
     }
 
     Ok(variables)
@@ -187,6 +205,16 @@ mod tests {
                 ("PLAIN".to_string(), "value".to_string()),
                 ("QUOTED".to_string(), "line one\nline two".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn parser_last_duplicate_key_wins() {
+        let variables = parse_env_file("DUP=first\nDUP=second\n").expect("parse");
+        assert_eq!(
+            variables,
+            vec![("DUP".to_string(), "second".to_string())],
+            "Caddy parses into a map, so the last duplicate must win"
         );
     }
 

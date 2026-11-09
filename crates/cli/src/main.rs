@@ -147,10 +147,11 @@ enum Command {
     /// The supported shells are `bash`, `zsh`, `fish` and `powershell`, matching Caddy's
     /// `completion <shell>` argument shape. Scripts are generated from this binary's clap command
     /// tree, so every compiled subcommand and flag is covered.
+    #[command(override_usage = "caddy-rs completion [bash|zsh|fish|powershell]")]
     Completion {
         /// Shell to generate completions for (`bash`, `zsh`, `fish` or `powershell`).
         #[arg(value_name = "SHELL")]
-        shell: String,
+        shells: Vec<String>,
     },
     /// Generates the manual pages for caddy-rs commands.
     ///
@@ -159,8 +160,10 @@ enum Command {
     /// `manpage` command.
     Manpage {
         /// The output directory where the manpages are generated.
+        ///
+        /// An empty value is treated as missing, matching Caddy's exit code 3.
         #[arg(short = 'o', long)]
-        directory: Option<PathBuf>,
+        directory: Option<String>,
     },
     /// Inspect and export the local certificate authority material.
     Pki {
@@ -523,9 +526,10 @@ async fn run(command: Command) -> anyhow::Result<()> {
         Command::Environ { envfile } => {
             environ::run(&envfile)?;
         }
-        Command::Completion { shell } => {
-            print!("{}", completion::generate(&shell)?);
-        }
+        Command::Completion { shells } => match shells.as_slice() {
+            [shell] => print!("{}", completion::generate(shell)?),
+            arguments => bail!("accepts 1 arg(s), received {}", arguments.len()),
+        },
         Command::Manpage { directory } => {
             manpage::write(directory.as_deref())?;
         }
