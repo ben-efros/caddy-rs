@@ -449,6 +449,15 @@ impl InternalIssuer {
         self
     }
 
+    /// The intermediate-certificate lifetime this issuer generates with.
+    ///
+    /// Caddy refuses an ACME server leaf lifetime that is not strictly shorter than the managed
+    /// intermediate's lifetime (`modules/caddypki/acmeserver/acmeserver.go`), so the check needs
+    /// the same value the CA is created with.
+    pub fn intermediate_lifetime(&self) -> Duration {
+        self.lifetimes.intermediate
+    }
+
     /// Load the CA certificates, generating/persisting them on first use.
     pub async fn ca_certificates(&self) -> Result<CaCertificates> {
         Ok(self.load_ca().await?.certificates())

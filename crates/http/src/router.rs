@@ -495,6 +495,13 @@ pub struct RouterBuilder {
     /// is absent a configuration that uses `acme_server` fails with a located error instead of
     /// writing CA material into the process working directory.
     acme_server_data_root: Option<PathBuf>,
+    /// Certificate-authority ids declared under `apps.pki.certificate_authorities`.
+    ///
+    /// Caddy's `acme_server` looks its `ca` up in the PKI app and fails with "no certificate
+    /// authority configured with id" when the id is neither declared nor the implicitly
+    /// provisioned `local` authority. `None` means the caller did not supply the PKI app, so
+    /// the lookup is not enforced (unit tests and embedders); the server always supplies it.
+    acme_server_authorities: Option<std::collections::BTreeSet<String>>,
 }
 
 impl Default for RouterBuilder {
@@ -510,6 +517,7 @@ impl RouterBuilder {
             custom: None,
             error_routes: None,
             acme_server_data_root: None,
+            acme_server_authorities: None,
         }
     }
 
@@ -561,6 +569,20 @@ impl RouterBuilder {
     /// a relative working-directory path.
     pub fn with_optional_acme_server_data_root(mut self, root: Option<PathBuf>) -> Self {
         self.acme_server_data_root = root;
+        self
+    }
+
+    /// Declare the PKI authorities the configuration exposes to `acme_server`.
+    ///
+    /// Caddy resolves `acme_server.ca` through the PKI app: `local` is provisioned on demand, any
+    /// other id must appear in `apps.pki.certificate_authorities`, otherwise provisioning fails
+    /// with `no certificate authority configured with id: <id>`. Supplying the declared ids here
+    /// reproduces that rule; without them the lookup is not enforced.
+    pub fn with_acme_server_authorities(
+        mut self,
+        authorities: std::collections::BTreeSet<String>,
+    ) -> Self {
+        self.acme_server_authorities = Some(authorities);
         self
     }
 
@@ -697,6 +719,18 @@ impl RouterBuilder {
                                   router was built without one)"
                                     .to_string(),
                         })?;
+                if let Some(authorities) = &self.acme_server_authorities {
+                    let ca = value
+                        .get("ca")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("local");
+                    if ca != "local" && !authorities.contains(ca) {
+                        return Err(Error::InvalidConfig {
+                            path: format!("{path}.ca"),
+                            message: format!("no certificate authority configured with id: {ca}"),
+                        });
+                    }
+                }
                 Arc::new(AcmeServerHandler::from_json(value, path, root)?)
             }
             #[cfg(feature = "templates")]

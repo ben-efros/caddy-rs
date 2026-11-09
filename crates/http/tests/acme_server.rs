@@ -35,6 +35,43 @@ fn build(routes: &Value, data_root: Option<&Path>) -> caddy_rs_http::Result<Rout
     builder.build(routes.as_array().expect("routes array"))
 }
 
+#[tokio::test]
+async fn undeclared_authority_ids_are_rejected_like_caddy() {
+    // Caddy resolves `acme_server.ca` through the PKI app: `local` is provisioned on demand, any
+    // other id must be declared in `apps.pki.certificate_authorities`, otherwise validation fails
+    // with "no certificate authority configured with id".
+    let directory = tempfile::tempdir().expect("data directory");
+    let declared = |ids: &[&str]| {
+        ids.iter()
+            .map(|id| (*id).to_string())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let build_with = |ca: &str, authorities: std::collections::BTreeSet<String>| {
+        RouterBuilder::new()
+            .with_acme_server_data_root(directory.path())
+            .with_acme_server_authorities(authorities)
+            .build(
+                routes(json!({"handler": "acme_server", "ca": ca}))
+                    .as_array()
+                    .expect("routes array"),
+            )
+    };
+
+    let error = match build_with("nested-ca", declared(&[])) {
+        Ok(_) => panic!("an undeclared authority id must be rejected"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("no certificate authority configured with id: nested-ca"),
+        "{error}"
+    );
+
+    build_with("nested-ca", declared(&["nested-ca"])).expect("a declared authority is accepted");
+    build_with("local", declared(&[])).expect("`local` is always provisioned on demand");
+}
+
 async fn body_text(response: &Response) -> String {
     String::from_utf8_lossy(&response.body).into_owned()
 }

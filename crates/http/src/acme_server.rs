@@ -1534,12 +1534,42 @@ fn request_authority(request: &Request) -> std::result::Result<String, Problem> 
     parse_external_host(host, "Host")
 }
 
+/// Caddy's provision-time lifetime rule for the ACME server.
+///
+/// Caddy refuses a leaf lifetime that is not strictly shorter than the *managed* intermediate
+/// certificate's lifetime (`modules/caddypki/acmeserver/acmeserver.go`: `ash.Lifetime >=
+/// ca.IntermediateLifetime` is an error when the CA has no operator-supplied intermediate). The
+/// issuer here is the authority whose intermediate signs the leaves, so its configured lifetime is
+/// the value to compare; an operator-supplied intermediate is not representable in this build, so
+/// the managed rule applies to every configuration.
+fn check_leaf_lifetime(
+    config: &AcmeServerConfig,
+    issuer: &InternalIssuer,
+    path: &str,
+) -> Result<()> {
+    let lifetime = config.effective_lifetime();
+    let intermediate = issuer.intermediate_lifetime();
+    if lifetime >= intermediate {
+        return Err(invalid(
+            &format!("{path}.lifetime"),
+            format!(
+                "certificate lifetime ({}) should be less than intermediate certificate lifetime \
+                 ({})",
+                caddy_rs_tls::format_go_duration(lifetime),
+                caddy_rs_tls::format_go_duration(intermediate)
+            ),
+        ));
+    }
+    Ok(())
+}
+
 impl AcmeServerHandler {
     /// Build the handler from its Caddy JSON, persisting CA material under `data_root`
     /// (`<data_root>/pki/authorities/<ca>/...`).
     pub fn from_json(value: &Value, path: &str, data_root: &Path) -> Result<Self> {
         let config = AcmeServerConfig::from_json(value, path)?;
         let issuer = InternalIssuer::from_data_directory(data_root).with_name(config.ca.clone());
+        check_leaf_lifetime(&config, &issuer, path)?;
         Ok(Self::new(
             Arc::new(config),
             Arc::new(issuer),
@@ -1558,6 +1588,7 @@ impl AcmeServerHandler {
         transport: Arc<dyn Http01Transport>,
     ) -> Result<Self> {
         let config = AcmeServerConfig::from_json(value, path)?;
+        check_leaf_lifetime(&config, &issuer, path)?;
         Ok(Self::new(Arc::new(config), issuer, transport))
     }
 
@@ -3616,6 +3647,56 @@ mod tests {
             Arc::new(MemoryAcmeStorage::new()),
             Box::new(MemoryStorage::new()),
         ))
+    }
+
+    #[test]
+    fn leaf_lifetime_must_be_strictly_shorter_than_the_intermediate() {
+        // Caddy rejects `lifetime` >= the managed intermediate's lifetime with this exact text;
+        // 7d is also the default local intermediate lifetime, so 7d must fail and 6d must pass.
+        let intermediate = Duration::from_secs(7 * 24 * 60 * 60);
+        let issuer_with = |lifetimes: caddy_rs_tls::CaLifetimes| {
+            Arc::new(
+                InternalIssuer::new(
+                    Arc::new(MemoryAcmeStorage::new()),
+                    Box::new(MemoryStorage::new()),
+                )
+                .with_lifetimes(lifetimes),
+            )
+        };
+        let lifetimes = caddy_rs_tls::CaLifetimes {
+            intermediate,
+            ..Default::default()
+        };
+        let with_lifetime = |seconds: u64| {
+            serde_json::json!({
+                "handler": "acme_server",
+                "lifetime": seconds * 1_000_000_000_u64,
+            })
+        };
+
+        let rejected = AcmeServerHandler::from_json_with(
+            &with_lifetime(intermediate.as_secs()),
+            "test",
+            issuer_with(lifetimes),
+            ScriptedTransport::success(),
+        )
+        .expect_err("a lifetime equal to the intermediate lifetime must be rejected");
+        let message = rejected.to_string();
+        assert!(
+            message.contains(
+                "certificate lifetime (168h0m0s) should be less than intermediate certificate \
+                 lifetime (168h0m0s)"
+            ),
+            "{message}"
+        );
+
+        AcmeServerHandler::from_json_with(
+            &with_lifetime(6 * 24 * 60 * 60),
+            "test",
+            issuer_with(lifetimes),
+            ScriptedTransport::success(),
+        )
+        .expect("a 6d lifetime is shorter than the 7d intermediate");
     }
 
     fn test_handler_with_issuer(

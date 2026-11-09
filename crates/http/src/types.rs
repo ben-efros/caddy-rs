@@ -31,7 +31,7 @@ pub enum Error {
     },
 
     /// A handler's JSON configuration is malformed.
-    #[error("invalid handler configuration at `{path}`: {message}")]
+    #[error("invalid configuration at `{path}`: {message}")]
     InvalidConfig {
         /// JSON path.
         path: String,
