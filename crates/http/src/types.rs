@@ -387,6 +387,28 @@ impl Request {
         }
     }
 
+    /// Record Caddy's `access_logger_names` request variable (the `log_name` directive).
+    ///
+    /// `Some(names)` replaces the server's per-host logger mapping for this request (`""` selects
+    /// the default logger and an empty list selects none); `None` clears a previous assignment
+    /// because Caddy only accepts an array value. No-op when access logging is disabled.
+    pub fn set_access_logger_names(&self, names: Option<Vec<String>>) {
+        if let Some(context) = &self.access_log {
+            context.set_logger_names(names);
+        }
+    }
+
+    /// Record Caddy's `log_level` request variable.
+    ///
+    /// The value is stored verbatim and parsed at emission time, so `None` (a non-string
+    /// assignment) clears a previous value and keeps the status-derived level. No-op when access
+    /// logging is disabled.
+    pub fn set_access_log_level(&self, level: Option<String>) {
+        if let Some(context) = &self.access_log {
+            context.set_log_level(level);
+        }
+    }
+
     /// Publish the authenticated user id into the access-log context (Caddy's `user_id`).
     ///
     /// Authentication handlers call this after a successful credential check; it is a no-op when

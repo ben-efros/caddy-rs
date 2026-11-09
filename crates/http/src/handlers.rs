@@ -433,20 +433,34 @@ pub struct VarsHandler {
 
 /// One configured `vars` value, keeping its JSON type.
 ///
-/// Caddy stores the decoded value in the request context and `log_skip` only takes effect when it
-/// is the boolean `true` (`GetVar(ctx, "log_skip").(bool)`); a string `"true"` must not skip. The
-/// rest of the runtime exposes variables as strings, so the string form is still what
-/// [`Request::vars`] holds — but the original type is preserved here for the access-log check.
+/// Caddy stores the decoded value in the request context. The access logger then reads three
+/// variables with Go type assertions: `log_skip` must be the boolean `true`
+/// (`GetVar(ctx, "log_skip").(bool)`), `access_logger_names` must be a JSON array of strings
+/// (`ServerLogConfig.wrapLogger`), and `log_level` must be a string. A value of the wrong type is
+/// ignored (it still overwrites the previous assignment), so the original type is preserved here.
+/// The rest of the runtime exposes variables as strings, so the string form is still what
+/// [`Request::vars`] holds.
 #[derive(Debug, Clone)]
 enum VarValue {
     String(String),
     Number(String),
     Bool(bool),
-    /// A JSON value caddy-rs does not materialise as a request variable (array, object, null).
+    /// A JSON array of strings: Caddy stores `access_logger_names` verbatim (unlike scalar
+    /// strings, array elements are not placeholder-expanded) and `wrapLogger` uses the list.
+    Names(Vec<String>),
+    /// A JSON value caddy-rs does not materialise as a request variable (object, null, or an
+    /// array this build does not model).
     ///
-    /// Caddy still stores it, so a later non-boolean `log_skip` overwrites an earlier boolean and
-    /// the request is logged. Remembering the assignment restores that overwrite semantics.
+    /// Caddy still stores it, so it overwrites an earlier typed assignment; remembering the
+    /// assignment restores that overwrite semantics for the access-log controls.
     Unsupported,
+}
+
+/// Whether `key` is one of the access logger's request variables.
+fn is_access_log_variable(key: &str) -> bool {
+    key == "log_skip"
+        || key == caddy_rs_admin::ACCESS_LOGGER_NAMES_VAR
+        || key == caddy_rs_admin::LOG_LEVEL_VAR
 }
 
 impl VarsHandler {
@@ -464,8 +478,20 @@ impl VarsHandler {
                 serde_json::Value::String(value) => VarValue::String(value.clone()),
                 serde_json::Value::Number(number) => VarValue::Number(number.to_string()),
                 serde_json::Value::Bool(flag) => VarValue::Bool(*flag),
+                serde_json::Value::Array(items)
+                    if key == caddy_rs_admin::ACCESS_LOGGER_NAMES_VAR
+                        && items.iter().all(serde_json::Value::is_string) =>
+                {
+                    VarValue::Names(
+                        items
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(str::to_string)
+                            .collect(),
+                    )
+                }
                 _ => {
-                    if key == "log_skip" {
+                    if is_access_log_variable(key) {
                         vars.push((key.clone(), VarValue::Unsupported));
                     }
                     continue;
@@ -493,16 +519,32 @@ impl Handler for VarsHandler {
                     VarValue::String(value) => VarValue::String(request.replace_all(value)),
                     VarValue::Number(value) => VarValue::Number(request.replace_all(value)),
                     VarValue::Bool(flag) => VarValue::Bool(*flag),
+                    // Caddy only expands placeholder values that are strings; an array of logger
+                    // names is stored verbatim (`modules/caddyhttp/vars.go`).
+                    VarValue::Names(names) => VarValue::Names(names.clone()),
                     VarValue::Unsupported => VarValue::Unsupported,
                 };
                 (key, value)
             })
             .collect();
         for (key, value) in vars {
-            // Caddy's access logger reads `log_skip` as a bool after the handler chain; assigning
-            // any non-boolean value (or `false`) means the request is logged normally.
+            // The access logger reads these after the handler chain with Go type assertions, so
+            // every assignment updates the request-scoped decision, including one that overwrites
+            // a previous usable value with a value of the wrong type.
             if key == "log_skip" {
                 request.set_log_skip(matches!(value, VarValue::Bool(true)));
+            } else if key == caddy_rs_admin::ACCESS_LOGGER_NAMES_VAR {
+                let names = match &value {
+                    VarValue::Names(names) => Some(names.clone()),
+                    _ => None,
+                };
+                request.set_access_logger_names(names);
+            } else if key == caddy_rs_admin::LOG_LEVEL_VAR {
+                let level = match &value {
+                    VarValue::String(level) => Some(level.clone()),
+                    _ => None,
+                };
+                request.set_access_log_level(level);
             }
             match value {
                 VarValue::String(value) | VarValue::Number(value) => {
@@ -511,7 +553,9 @@ impl Handler for VarsHandler {
                 VarValue::Bool(flag) => {
                     request.vars.insert(key, flag.to_string());
                 }
-                VarValue::Unsupported => {}
+                // Arrays cannot be represented in a string-valued variable map; Caddy keeps them
+                // but only the access logger reads `access_logger_names`.
+                VarValue::Names(_) | VarValue::Unsupported => {}
             }
         }
         Ok(Outcome::Continue(request))
@@ -2323,6 +2367,99 @@ mod tests {
             panic!("expected continue");
         };
         assert_eq!(request.vars.get("root").map(String::as_str), Some("/srv"));
+    }
+
+    fn logged_request(uri: &str) -> (Request, Arc<crate::types::AccessLogContext>) {
+        let context = Arc::new(crate::types::AccessLogContext::new());
+        (
+            test_request(Method::GET, uri).with_access_log(Arc::clone(&context)),
+            context,
+        )
+    }
+
+    #[tokio::test]
+    async fn vars_handler_publishes_request_scoped_access_log_controls() {
+        let handler = VarsHandler::from_json(
+            &serde_json::json!({
+                "handler": "vars",
+                "log_skip": true,
+                "access_logger_names": ["access", "admin"],
+                "log_level": "WARN"
+            }),
+            "handler",
+        )
+        .unwrap();
+        let (request, context) = logged_request("/logged");
+        let Outcome::Continue(request) = handler.handle(request).await.unwrap() else {
+            panic!("expected continue");
+        };
+        assert!(context.log_skip());
+        assert_eq!(
+            context.logger_names(),
+            Some(vec!["access".to_string(), "admin".to_string()])
+        );
+        assert_eq!(context.log_level().as_deref(), Some("WARN"));
+        // Caddy stores the variables as well; the scalar forms remain readable through
+        // `{http.vars.*}`. Arrays are not representable in caddy-rs's string-valued map.
+        assert_eq!(
+            request.vars.get("log_skip").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            request.vars.get("log_level").map(String::as_str),
+            Some("WARN")
+        );
+        assert!(!request.vars.contains_key("access_logger_names"));
+    }
+
+    #[tokio::test]
+    async fn vars_handler_empty_logger_names_select_no_logger() {
+        // Caddy accepts an empty `access_logger_names` array and then builds zero loggers, so the
+        // entry is suppressed even though the request is otherwise logged.
+        let handler = VarsHandler::from_json(
+            &serde_json::json!({"handler": "vars", "access_logger_names": []}),
+            "handler",
+        )
+        .unwrap();
+        let (request, context) = logged_request("/logged");
+        let _ = handler.handle(request).await.unwrap();
+        assert_eq!(context.logger_names(), Some(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn vars_handler_wrong_types_overwrite_access_log_controls() {
+        // Caddy's access logger type-asserts each variable; a later assignment of the wrong type
+        // still overwrites the earlier usable value and leaves the default behaviour.
+        let first = VarsHandler::from_json(
+            &serde_json::json!({
+                "handler": "vars",
+                "log_skip": true,
+                "access_logger_names": ["access"],
+                "log_level": "error"
+            }),
+            "handler",
+        )
+        .unwrap();
+        let second = VarsHandler::from_json(
+            &serde_json::json!({
+                "handler": "vars",
+                "log_skip": "true",
+                "access_logger_names": "access",
+                "log_level": 42
+            }),
+            "handler",
+        )
+        .unwrap();
+        let (request, context) = logged_request("/logged");
+        let Outcome::Continue(request) = first.handle(request).await.unwrap() else {
+            panic!("expected continue");
+        };
+        let Outcome::Continue(_) = second.handle(request).await.unwrap() else {
+            panic!("expected continue");
+        };
+        assert!(!context.log_skip(), "a string \"true\" must not skip");
+        assert_eq!(context.logger_names(), None, "a non-array clears the list");
+        assert_eq!(context.log_level(), None, "a non-string clears the level");
     }
 
     async fn static_response(body: serde_json::Value) -> Response {
