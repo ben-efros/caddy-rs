@@ -1257,3 +1257,329 @@ fn adapt_help_documents_adapt_mode() {
     assert!(stdout.contains("compatible"), "{stdout}");
     assert!(stdout.contains("strict"), "{stdout}");
 }
+
+#[test]
+fn build_info_reports_the_rust_toolchain_and_build_settings() {
+    let (code, stdout, stderr) = run(&["build-info"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.starts_with("rustc\t"), "{stdout}");
+    assert!(stdout.contains("\npath\tcaddy-rs\n"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("\nmod\tcaddy-rs\t{}\t", env!("CARGO_PKG_VERSION"))),
+        "{stdout}"
+    );
+
+    let profile = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("build\t-profile="))
+        .expect("profile build setting");
+    assert!(
+        matches!(profile, "debug" | "release"),
+        "unexpected build profile {profile}"
+    );
+
+    let target = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("build\t-target="))
+        .expect("target build setting");
+    assert!(!target.is_empty(), "empty target triple");
+    let host_arch = match std::env::consts::ARCH {
+        "x86" => "i686",
+        other => other,
+    };
+    let host_os = match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    };
+    assert!(
+        target.starts_with(host_arch),
+        "target {target} does not start with host arch {host_arch}"
+    );
+    assert!(
+        target.contains(host_os),
+        "target {target} does not contain host OS {host_os}"
+    );
+
+    assert!(
+        stdout.contains("\nbuild\t-features="),
+        "feature list missing: {stdout}"
+    );
+    let modules: usize = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("build\t-modules="))
+        .expect("module count build setting")
+        .parse()
+        .expect("numeric module count");
+
+    // The count must agree with the same registry that `list-modules` walks; a hardcoded or
+    // stale number must fail this assertion.
+    let (list_code, list_stdout, list_stderr) = run(&["list-modules"]);
+    assert_eq!(list_code, 0, "list-modules stderr: {list_stderr}");
+    let listed = list_stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    assert_eq!(
+        modules, listed,
+        "build-info module count must match list-modules"
+    );
+
+    assert!(
+        stdout.contains("\nbuild\t-caddy-baseline=v2.11.9\n"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn environ_prints_caddys_header_and_the_process_environment() {
+    let (code, stdout, stderr) = run(&["environ"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let header = stdout
+        .split("\n\n")
+        .next()
+        .expect("header before blank line");
+    let keys: Vec<&str> = header
+        .lines()
+        .map(|line| line.split('=').next().unwrap_or(line))
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            "caddy.HomeDir",
+            "caddy.AppDataDir",
+            "caddy.AppConfigDir",
+            "caddy.ConfigAutosavePath",
+            "caddy.Version",
+            "runtime.GOOS",
+            "runtime.GOARCH",
+            "runtime.Compiler",
+            "runtime.NumCPU",
+            "runtime.GOMAXPROCS",
+            "runtime.Version",
+            "os.Getwd",
+        ],
+        "{stdout}"
+    );
+    assert!(header.contains("runtime.Compiler=rustc"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("caddy.Version={}", env!("CARGO_PKG_VERSION"))),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("\nPATH="),
+        "environment variables missing: {stdout}"
+    );
+}
+
+#[test]
+fn environ_loads_envfiles_without_overwriting_and_reports_parse_errors() {
+    let directory = tempfile::tempdir().unwrap();
+    let suffix = std::process::id();
+    let key = format!("CADDY_RS_ENVFILE_TEST_{suffix}");
+    let exported = format!("CADDY_RS_ENVFILE_EXPORTED_{suffix}");
+    let keep = format!("CADDY_RS_ENVFILE_KEEP_{suffix}");
+    let duplicate = format!("CADDY_RS_ENVFILE_DUP_{suffix}");
+    let envfile = directory.path().join("caddy.env");
+    std::fs::write(
+        &envfile,
+        format!(
+            "# comment\n\
+             export {exported}=exported\n\
+             {key}=\"line one\nline two\"\n\
+             {keep}=from-file\n\
+             {duplicate}=first\n\
+             {duplicate}=second\n"
+        ),
+    )
+    .unwrap();
+
+    // Seed `keep` in the child's *process* environment. Caddy's loader must not overwrite it.
+    let output = Command::new(binary())
+        .args(["environ", "--envfile", envfile.to_str().unwrap()])
+        .env(&keep, "from-process")
+        .output()
+        .expect("run caddy-rs");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let environment = stdout.split("\n\n").nth(1).unwrap_or_default();
+    let lines: Vec<&str> = environment.lines().collect();
+
+    let key_line = lines
+        .iter()
+        .position(|line| *line == format!("{key}=line one"))
+        .expect("quoted first line in environment output");
+    assert_eq!(lines.get(key_line + 1), Some(&"line two"), "{stdout}");
+    assert!(
+        lines
+            .iter()
+            .any(|line| *line == format!("{exported}=exported")),
+        "{stdout}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| *line == format!("{keep}=from-process")),
+        "existing process variable was overwritten: {stdout}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| *line == format!("{keep}=from-file")),
+        "envfile value replaced the process environment: {stdout}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| *line == format!("{duplicate}=second")),
+        "last duplicate key must win: {stdout}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| *line == format!("{duplicate}=first")),
+        "{stdout}"
+    );
+
+    let malformed = directory.path().join("malformed.env");
+    std::fs::write(&malformed, "not-a-pair\n").unwrap();
+    let (code, _stdout, stderr) = run(&["environ", "--envfile", malformed.to_str().unwrap()]);
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("line 1"), "{stderr}");
+    assert!(stderr.contains("KEY=VALUE"), "{stderr}");
+
+    let missing = directory.path().join("missing.env");
+    let (code, _stdout, stderr) = run(&["environ", "--envfile", missing.to_str().unwrap()]);
+    assert_eq!(code, 1, "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "open {}: no such file or directory",
+            missing.display()
+        )),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("os error"), "{stderr}");
+}
+
+#[test]
+fn completion_scripts_cover_every_subcommand_and_shell() {
+    let (code, stdout, stderr) = run(&["completion", "bash"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(!stdout.trim().is_empty(), "empty bash completion script");
+    for command in [
+        "version",
+        "build-info",
+        "list-modules",
+        "adapt",
+        "validate",
+        "run",
+        "reload",
+        "stop",
+        "environ",
+        "completion",
+        "manpage",
+        "pki",
+        "trust",
+    ] {
+        assert!(
+            stdout.contains(&format!("\"{command}\") opts="))
+                || stdout.contains(&format!(" {command} ")),
+            "bash completion misses {command}: {stdout}"
+        );
+    }
+    assert!(stdout.contains("--envfile"), "{stdout}");
+    assert!(stdout.contains("--directory"), "{stdout}");
+    assert!(
+        stdout.contains("complete -o default -F _caddy_rs caddy-rs"),
+        "{stdout}"
+    );
+
+    for shell in ["zsh", "fish", "powershell"] {
+        let (code, stdout, stderr) = run(&["completion", shell]);
+        assert_eq!(code, 0, "{shell} stderr: {stderr}");
+        assert!(!stdout.trim().is_empty(), "empty {shell} completion script");
+        assert!(stdout.contains("caddy-rs"), "{shell}: {stdout}");
+        assert!(stdout.contains("pki"), "{shell}: {stdout}");
+    }
+
+    let (code, _stdout, stderr) = run(&["completion"]);
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("accepts 1 arg(s), received 0"), "{stderr}");
+
+    let (code, _stdout, stderr) = run(&["completion", "bash", "zsh"]);
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("accepts 1 arg(s), received 2"), "{stderr}");
+
+    let (code, _stdout, stderr) = run(&["completion", "nope"]);
+    assert_eq!(code, 1, "{stderr}");
+    assert!(
+        stderr.contains("invalid argument \"nope\" for \"caddy-rs completion\""),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn manpage_writes_root_and_subcommand_roff_pages() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = directory.path().join("man");
+    let (code, stdout, stderr) = run(&["manpage", "--directory", output.to_str().unwrap()]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+
+    for filename in [
+        "caddy-rs.8",
+        "caddy-rs-adapt.8",
+        "caddy-rs-completion.8",
+        "caddy-rs-environ.8",
+        "caddy-rs-pki.8",
+        "caddy-rs-pki-list.8",
+    ] {
+        assert!(
+            output.join(filename).is_file(),
+            "missing man page {filename}"
+        );
+    }
+
+    let root = std::fs::read_to_string(output.join("caddy-rs.8")).unwrap();
+    assert!(root.starts_with(".TH \"CADDY-RS\" \"8\""), "{root}");
+    assert!(root.contains("\n.SH NAME\n"), "{root}");
+    assert!(root.contains("\n.SH SYNOPSIS\n"), "{root}");
+    assert!(root.contains("\n.SH SUBCOMMANDS\n"), "{root}");
+    for command in ["environ", "completion", "manpage"] {
+        assert!(root.contains(command), "root man page misses {command}");
+    }
+    assert!(root.contains("build\\-info"), "{root}");
+
+    let adapt = std::fs::read_to_string(output.join("caddy-rs-adapt.8")).unwrap();
+    assert!(adapt.starts_with(".TH \"CADDY-RS-ADAPT\" \"8\""), "{adapt}");
+    assert!(adapt.contains("\\-\\-config"), "{adapt}");
+    assert!(adapt.contains("\\-\\-pretty"), "{adapt}");
+    assert!(
+        !adapt.contains("\\-\\-pretty \\fI<"),
+        "boolean flag rendered with a value: {adapt}"
+    );
+}
+
+#[test]
+fn manpage_requires_an_output_directory_with_caddys_exit_code() {
+    let (code, _stdout, stderr) = run(&["manpage"]);
+    assert_eq!(code, 3, "{stderr}");
+    assert!(
+        stderr.contains("designated output directory and specified section are required"),
+        "{stderr}"
+    );
+
+    let (code, _stdout, stderr) = run(&["manpage", "-o", ""]);
+    assert_eq!(
+        code, 3,
+        "empty --directory must be treated as missing: {stderr}"
+    );
+    assert!(
+        stderr.contains("designated output directory and specified section are required"),
+        "{stderr}"
+    );
+}

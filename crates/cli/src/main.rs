@@ -1,11 +1,16 @@
 //! `caddy-rs` command-line interface.
 //!
 //! Command surface follows Caddy's CLI where it is meaningful for this build: `adapt`, `validate`,
-//! `run`, `reload`, `stop`, `list-modules`, `version`. `pki list`/`pki export` and `trust` expose
+//! `run`, `reload`, `stop`, `list-modules`, `version`, `build-info`, `environ`, `completion` and
+//! `manpage`. `pki list`/`pki export` and `trust` expose
 //! the local CA material persisted by automatic HTTPS (`<data-dir>/pki/authorities/<id>/`); see
 //! `docs/compatibility/CADDYFILE.md` for the
 //! supported configuration surface.
 
+mod build_info;
+mod completion;
+mod environ;
+mod manpage;
 mod signals;
 
 use std::path::{Path, PathBuf};
@@ -20,7 +25,7 @@ use http_body_util::{BodyExt, Full};
 use caddy_rs_admin::pki::{resolve_data_dir, PkiError, PkiStore, DEFAULT_CA_ID};
 use caddy_rs_admin::AdminResponse;
 use caddy_rs_config::{AdaptMode, AdaptOptions};
-use caddy_rs_core::{Config, GenerationStore, ModuleRegistry, VERSION};
+use caddy_rs_core::{Config, GenerationStore, VERSION};
 use caddy_rs_server::ServerRuntime;
 
 #[derive(Debug, Parser)]
@@ -42,6 +47,14 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Print information about this build.
+    ///
+    /// The output is the Rust translation of Caddy's `build-info`: tab-separated `rustc`, `path`,
+    /// `mod` and `build` lines. Caddy's Go toolchain line becomes `rustc`, and the Rust-specific
+    /// build settings are named `-profile` (Cargo profile), `-target` (target triple), `-features`
+    /// (enabled Cargo features), `-modules` (number of compiled modules) and `-caddy-baseline`
+    /// (the Caddy version this build targets).
+    BuildInfo,
     /// List modules compiled into this build.
     ListModules {
         /// Machine-readable output.
@@ -115,6 +128,43 @@ enum Command {
         #[arg(long, default_value = "localhost:2019")]
         admin: String,
     },
+    /// Print the environment as seen by this caddy-rs process.
+    ///
+    /// The output mirrors Caddy's `environ` command: the caddy-rs directory and version fields,
+    /// Rust runtime facts, the working directory, a blank line, and then every environment
+    /// variable in `KEY=VALUE` form. Go-named fields carry the Rust equivalent: `runtime.Version`
+    /// is the rustc version and `runtime.Compiler` is `rustc`.
+    ///
+    /// If `--envfile` is specified, an environment file with variables in `KEY=VALUE` format is
+    /// loaded before printing. Existing process variables are never overwritten.
+    Environ {
+        /// Environment file(s) to load (repeatable, or comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        envfile: Vec<PathBuf>,
+    },
+    /// Generate a shell completion script.
+    ///
+    /// The supported shells are `bash`, `zsh`, `fish` and `powershell`, matching Caddy's
+    /// `completion <shell>` argument shape. Scripts are generated from this binary's clap command
+    /// tree, so every compiled subcommand and flag is covered.
+    #[command(override_usage = "caddy-rs completion [bash|zsh|fish|powershell]")]
+    Completion {
+        /// Shell to generate completions for (`bash`, `zsh`, `fish` or `powershell`).
+        #[arg(value_name = "SHELL")]
+        shells: Vec<String>,
+    },
+    /// Generates the manual pages for caddy-rs commands.
+    ///
+    /// Writes one roff manual page per command into the directory given by `--directory`
+    /// (created if it does not exist), in section 8 (System Administration), like Caddy's
+    /// `manpage` command.
+    Manpage {
+        /// The output directory where the manpages are generated.
+        ///
+        /// An empty value is treated as missing, matching Caddy's exit code 3.
+        #[arg(short = 'o', long)]
+        directory: Option<String>,
+    },
     /// Inspect and export the local certificate authority material.
     Pki {
         #[command(subcommand)]
@@ -180,17 +230,41 @@ fn builtin_module_registry() -> caddy_rs_core::ModuleRegistry {
     caddy_rs_core::ModuleRegistry::builtin_for_profile(cfg!(feature = "minimal"))
 }
 
+/// An error that carries Caddy's CLI exit code.
+///
+/// Caddy assigns `ExitCodeFailedQuit` (3) to `manpage` failures and `ExitCodeFailedStartup` (1) to
+/// most other command failures. `anyhow` carries this type through `?`, so only the command that
+/// needs a different code constructs it; [`main`] finds it in the error chain.
+#[derive(Debug)]
+pub(crate) struct CliExit {
+    pub(crate) code: u8,
+    pub(crate) message: String,
+}
+
+impl std::fmt::Display for CliExit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CliExit {}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     match run(cli.command).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
+            let exit_code = error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<CliExit>())
+                .map(|exit| exit.code)
+                .unwrap_or(1);
             match core_error_code(&error) {
                 Some(code) => eprintln!("caddy-rs: error[{code}]: {error:#}"),
                 None => eprintln!("caddy-rs: error: {error:#}"),
             }
-            ExitCode::FAILURE
+            ExitCode::from(exit_code)
         }
     }
 }
@@ -224,6 +298,9 @@ async fn run(command: Command) -> anyhow::Result<()> {
                     caddy_rs_core::CADDY_COMPAT_BASELINE
                 );
             }
+        }
+        Command::BuildInfo => {
+            build_info::print(builtin_module_registry().modules().count());
         }
         Command::ListModules { json } => {
             let registry = builtin_module_registry();
@@ -445,6 +522,16 @@ async fn run(command: Command) -> anyhow::Result<()> {
             let response = admin_request(&admin, "POST", "/stop", Bytes::new()).await?;
             ensure_admin_success(&response)?;
             eprintln!("server stopped");
+        }
+        Command::Environ { envfile } => {
+            environ::run(&envfile)?;
+        }
+        Command::Completion { shells } => match shells.as_slice() {
+            [shell] => print!("{}", completion::generate(shell)?),
+            arguments => bail!("accepts 1 arg(s), received {}", arguments.len()),
+        },
+        Command::Manpage { directory } => {
+            manpage::write(directory.as_deref())?;
         }
         Command::Pki { command } => run_pki(command).await?,
         Command::Trust {
