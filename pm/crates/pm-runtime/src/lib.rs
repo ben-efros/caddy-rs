@@ -81,6 +81,13 @@ use caddy_rs_pm_state::{SnapshotStore, StateError, StateStore};
 use serde_json::Value;
 use thiserror::Error;
 
+mod apply;
+pub use apply::{
+    AdminError, ApplyError, ApplyOutcome, CaddyAdmin, ConfigApplyService, ConfigApplyStatus,
+    ConfigRevision, HttpCaddyAdmin, CONFIG_REVISIONS,
+};
+pub use caddy_rs_config_tx::ApplyFailureKind;
+
 /// Name of the PM-owned directory below the data directory.
 pub const PM_DIRECTORY: &str = "pm";
 
@@ -251,6 +258,7 @@ pub struct PmRuntime {
     config: RuntimeConfig,
     state_path: PathBuf,
     legacy_markers: Vec<String>,
+    store: Arc<dyn StateStore>,
     hosts: HostRepository,
     policies: PolicyRepository,
     certificates: CertificateRepository,
@@ -309,6 +317,7 @@ impl PmRuntime {
             config,
             state_path,
             legacy_markers,
+            store,
             hosts,
             policies,
             certificates,
@@ -326,6 +335,10 @@ impl PmRuntime {
 
     pub fn state_path(&self) -> &Path {
         &self.state_path
+    }
+
+    pub fn state_store(&self) -> Arc<dyn StateStore> {
+        Arc::clone(&self.store)
     }
 
     pub fn hosts(&self) -> &HostRepository {

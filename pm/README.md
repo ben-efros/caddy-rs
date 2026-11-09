@@ -13,9 +13,9 @@ This is the proxy-manager foundation workspace. It is deliberately independent o
 | `caddy-rs-pm-service` | Application service over `pm-hosts`: id-allocating create, CAS update/delete, list, route compilation, and TLS binding validation against auto policies and manual certificate metadata. No REST API, UI or auth. |
 | `caddy-rs-pm-policies` | Durable auto-certificate policy repository over `pm-state`: get/list/create/update/delete with CAS revisions, tombstones, monotonic id reservation and host coverage validation against `pm-core` hosts. |
 | `caddy-rs-pm-import` | Native-first NPM v2.16 host-payload import mapping: proxy/redirect/dead hosts to `pm-core`, explicit certificate origins, located errors for unsupported payload features and warnings for flags without a native implementation. |
-| `caddy-rs-pm-runtime` | PM composition root: data-directory preflight (`0700`, writability probe), `<data_dir>/pm` state layout (including `pm/secrets`), legacy Caddy detection (warning only), and host/policy/certificate/service wiring with compile/assemble entry points. |
+| `caddy-rs-pm-runtime` | PM composition root: data-directory preflight (`0700`, writability probe), `<data_dir>/pm` state layout (including `pm/secrets`), legacy Caddy detection (warning only), host/policy/certificate/service wiring, and the loopback-only config apply pipeline (stage/diff/load/verify/record). |
 | `caddy-rs-pm-certificates` | Manual certificate validation and secret store: strict PEM chain/key parsing, key-match proof, expiry/SAN checks, `0600` key files in a `0700` directory, monotonic ids/tombstones, metadata-only state and no key bytes in responses. |
-| `caddy-rs-pm-api` | Native REST API with axum: `/api/v1` router, host CRUD/enable/disable with strong per-host ETags and `If-Match` CAS, certificate intents with inventory-derived status, manual certificate upload/list/delete, list filters/pagination, health/setup/version/config, typed error envelope, loopback-only mutation guard, request ID and logging middleware. |
+| `caddy-rs-pm-api` | Native REST API with axum: `/api/v1` router, host CRUD/enable/disable with strong per-host ETags and `If-Match` CAS, certificate intents with inventory-derived status, manual certificate upload/list/delete, config apply/revision history, list filters/pagination, health/setup/version/config, typed error envelope, loopback-only mutation guard, request ID and logging middleware. |
 
 ## Why a nested workspace
 
@@ -137,11 +137,44 @@ The original `assemble`/`assemble_from_hosts` output is unchanged: they never em
 `PmRuntime::assemble` uses the certificate-aware path, so stored intent policies and manual
 certificates reach `/api/v1/config`.
 
-This crate does **not** emit logging, access lists or an admin apply step. The optional integration
-test validates manual `load_files`/SNI configs with `caddy-rs validate --adapter json`. The optional integration test validates assembled configs (including
-the TLS automation and skip shapes) with `caddy-rs validate --adapter json` when
-`.scratch/rust-target/debug/caddy-rs` exists (or `CADDY_RS_BIN` names one) and skips with a
-diagnostic otherwise; unit tests never require the binary.
+This crate does **not** emit logging, access lists or perform the admin apply; applying is the
+separate pipeline in `pm-runtime`. The optional integration test validates manual `load_files`/SNI
+configs and assembled configs (including the TLS automation and skip shapes) with
+`caddy-rs validate --adapter json` when `.scratch/rust-target/debug/caddy-rs` exists (or
+`CADDY_RS_BIN` names one) and skips with a diagnostic otherwise; unit tests never require the
+binary.
+
+## Config apply
+
+The ordered pipeline lives in the reusable core crate `caddy-rs-config-tx`
+(`ConfigApplyPipeline` + `ConfigTarget`); `ConfigApplyService` in `pm-runtime` is the PM
+composition of that pipeline and is the only path that changes the live caddy-rs config:
+
+1. assemble the deterministic config from stored hosts, policies and manual certificates;
+2. the core pipeline stages it in `ConfigTx`, which validates Caddy JSON structure and computes
+   the hash, then compares the full config with the active generation;
+3. the core pipeline captures the target's current config, `POST /load`s the staged document to a
+   loopback-only caddy-rs admin listener, and verifies with `GET /config/` (the `admin` app is
+   ignored because the PM does not own it);
+4. on failure the core pipeline reloads the previously active generation, or the captured baseline
+   on a first apply, writes a `Failed` revision to the core audit history, and returns the
+   target/verification/rollback error;
+5. on success the PM records an `applied` row in `config_revisions` in `pm-state` and marks
+   unexpired pending manual certificates `issued`; on failure it records a `failed` row with a
+   bounded error and leaves the previous generation active.
+
+The admin URL must be a literal loopback IP (`http://127.0.0.1:2019` or `http://[::1]:2019`).
+Hostnames are rejected because DNS can move them; HTTPS is not accepted by this client because
+the PM does not own the admin certificate. A non-loopback URL is refused unless the caller
+explicitly opts in. The client disables redirects, bounds the `/config/` response, and never
+stores or returns the admin response body, config bytes, or secrets.
+
+The API route is `POST /api/v1/config/apply` and requires `ApiState::with_applier`; without an
+injected pipeline it is a typed `503`, so starting the API never applies by itself. The pipeline
+holds an in-process lock, so concurrent apply requests serialize rather than race. `GET
+/api/v1/config/revisions` exposes the durable history. Automatic apply after every host or
+certificate mutation, with quarantine of the affected hosts, remains PM-107; this slice is the
+explicit apply primitive it will call.
 
 ## `pm-hosts`
 
@@ -302,13 +335,15 @@ Compile, Config}` and carry the relevant path. No error contains plaintext secre
 | `GET` | `/certificates/custom/{id}` | Unambiguous manual detail (`If-None-Match` supported) |
 | `DELETE` | `/certificates/custom/{id}` | Delete a manual certificate and its secret files; strong `If-Match`; refuses a referencing host |
 | `GET` | `/config` | Assembled Caddy JSON (routes + TLS automation) with a weak `ETag`; honours `If-Match` and `If-None-Match` |
+| `POST` | `/config/apply` | Assemble, load, verify and record the config; loopback-only; `503` without an injected pipeline or when the admin request fails |
+| `GET` | `/config/revisions` | Paginated durable apply history (`applied`/`failed`, hash, timestamp, bounded error) |
 
 ### Shared infrastructure
 
-- **`ApiState`** — wraps a `PmRuntime` (cloned per request via `Arc`) and an optional
-  `Arc<dyn CertificateInventorySource>`; `ApiState::with_inventory` injects the source, and the
-  default is empty.
-- **Typed error envelope** — `{ "error": { "code": "NOT_FOUND|CONFLICT|PRECONDITION_FAILED|PRECONDITION_REQUIRED|FORBIDDEN|UNSUPPORTED_MEDIA_TYPE|VALIDATION|INTERNAL", "message": "...", "location": "field.path" } }` via `ApiError::into_response()`.
+- **`ApiState`** — owns a cloneable `PmRuntime`, an optional `Arc<dyn CertificateInventorySource>`
+  and an optional `Arc<ConfigApplyService>`; `ApiState::with_inventory` and
+  `ApiState::with_applier` inject them, and both default to absent.
+- **Typed error envelope** — `{ "error": { "code": "NOT_FOUND|CONFLICT|PRECONDITION_FAILED|PRECONDITION_REQUIRED|FORBIDDEN|UNSUPPORTED_MEDIA_TYPE|VALIDATION|SERVICE_UNAVAILABLE|INTERNAL", "message": "...", "location": "field.path" } }` via `ApiError::into_response()`.
 - **Pagination** — `limit` (default 50, max 200) and `offset` (default 0) query params; an out-of-range `limit` is clamped and the effective window is echoed in `{ "items": [...], "total": N, "limit": L, "offset": O }` via `PaginatedResponse<T>`.
 - **Preconditions** — `evaluate_get_preconditions` implements RFC 9110 ordering for the config `GET`: a failing `If-Match` is `412 Precondition Failed`, a matching `If-None-Match` is `304 Not Modified`, and `*` matches any representation. Host mutations require a strong `If-Match`: missing is `428 Precondition Required`; stale, weak `W/"..."` or unparseable is `412`; `*` matches any current revision.
 - **ETags** — config uses a weak `W/"<hash>"` content hash. Hosts use a strong `"h<id>-r<revision>"` tag derived from the stored revision, so the tag is both a cache validator and the CAS token. A mutation reads the host, requires `If-Match` to match that revision, and passes the same revision to `pm-service`; a CAS conflict after the read is `412`, never retried. Certificate details use a strong hash over the whole response body (`"c<id>-<hash>"`): the body includes inventory-derived status/expiry/issuer/source/renewal error, so a policy revision alone would produce a false `304` when a certificate is issued or starts failing.
@@ -441,5 +476,6 @@ and the core on-demand manager. The taxonomy and invariants are in
 
 At-rest secrecy is filesystem permissions only; this slice does **not** encrypt the key file. An
 operator who needs encryption at rest must place the data directory on an encrypted volume. The
-status stays `pending` until a real apply path exists; no `issued` state is fabricated. Deletion
-requires a strong `If-Match`, refuses a certificate referenced by a host, and tombstones the id.
+status starts `pending`; only a verified config apply advances it to `issued`, so a stored upload
+never claims to be live before `/load` succeeds. Deletion requires a strong `If-Match`, refuses a
+certificate referenced by a host, and tombstones the id.

@@ -750,9 +750,11 @@ fn manual_summary(stored: &StoredCertificate, now_unix: i64) -> ManualCertificat
     let certificate = &stored.certificate;
     let status = if certificate.expires_at_unix <= now_unix {
         CertificateIntentStatus::Expired
+    } else if certificate.status == caddy_rs_pm_core::CertificateStatus::Issued {
+        // Only a verified config apply advances the stored status; storing bytes alone stays
+        // pending. This keeps the API from claiming a certificate is live before `/load`.
+        CertificateIntentStatus::Issued
     } else {
-        // No apply path exists in this slice. Never report `issued` for a certificate that has
-        // merely been stored: the data plane may not have loaded it yet.
         CertificateIntentStatus::Pending
     };
     let mut name = match certificate.domains.len() {

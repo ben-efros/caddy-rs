@@ -582,6 +582,47 @@ impl CertificateRepository {
             .collect())
     }
 
+    /// Mark every unexpired pending manual certificate as issued after a verified config apply.
+    ///
+    /// The status is local bookkeeping and is only advanced after the caller has loaded and
+    /// verified the configuration in caddy-rs. A concurrent edit wins the CAS and is left
+    /// untouched; it is retried against its new revision.
+    pub fn mark_applied(&self, now_unix: i64) -> Result<Vec<CertificateId>, CertificateError> {
+        let mut applied = Vec::new();
+        for stored in self.list()? {
+            if stored.certificate.status != CertificateStatus::Pending
+                || stored.certificate.expires_at_unix <= now_unix
+            {
+                continue;
+            }
+            let mut updated = stored.certificate.clone();
+            updated.status = CertificateStatus::Issued;
+            let key = updated.id.0.to_string();
+            let mut revision = stored.revision;
+            for attempt in 0..4 {
+                let transaction = Transaction::new()
+                    .check_revision(CERTIFICATES, key.clone(), revision)
+                    .put(CERTIFICATES, key.clone(), serde_json::to_value(&updated)?);
+                match self.store.transact(transaction) {
+                    Ok(commit) => {
+                        let _ = revision_of(&commit, &key)?;
+                        applied.push(updated.id);
+                        break;
+                    }
+                    Err(StateError::Conflict { .. }) if attempt < 3 => {
+                        let Some(current) = self.get(updated.id)? else {
+                            break;
+                        };
+                        revision = current.revision;
+                    }
+                    Err(StateError::Conflict { .. }) => break,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+        Ok(applied)
+    }
+
     /// Store validated material under a fresh monotonic id.
     ///
     /// Secret files are written first with `create_new` (refusing an existing path) and the metadata

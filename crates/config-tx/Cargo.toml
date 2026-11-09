@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 caddy-rs-core = { path = "../core", default-features = false }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -95,13 +95,15 @@ fn validate_http_app(value: &Value, path: &str) -> Result<(), ConfigStructureErr
         message: "http app must be an object".to_string(),
     })?;
 
+    // Mirror the JSON fields of caddyhttp.App in the pinned Caddy oracle. Anything else here is
+    // not accepted by Caddy and must not pass staging either.
     let known_keys = [
         "servers",
-        "handles",
-        "routes",
-        "graceful_shutdown",
+        "grace_period",
+        "http_port",
+        "https_port",
+        "shutdown_delay",
         "metrics",
-        "experimental_http3",
     ];
 
     for key in obj.keys() {
@@ -130,21 +132,34 @@ fn validate_server(value: &Value, path: &str) -> Result<(), ConfigStructureError
         message: "server must be an object".to_string(),
     })?;
 
+    // Mirror caddyhttp.Server in the pinned Caddy oracle. Keep this exact: accepting a key Caddy
+    // rejects would make staging pass and the later `/load` fail.
     let known_keys = [
         "listen",
-        "routes",
-        "protocols",
-        "strict_sni_host",
-        "tls_connection_policies",
-        "connection_policies",
-        "metrics",
-        "errors",
-        "idle_timeout",
-        "read_header_timeout",
+        "listener_wrappers",
+        "packet_conn_wrappers",
         "read_timeout",
+        "read_header_timeout",
+        "read_idle_timeout",
+        "read_min_rate",
         "write_timeout",
-        "max_header_size",
-        "max_request_body_size",
+        "write_idle_timeout",
+        "write_min_rate",
+        "max_write_chunk",
+        "idle_timeout",
+        "keepalive_interval",
+        "keepalive_idle",
+        "keepalive_count",
+        "max_header_bytes",
+        "enable_full_duplex",
+        "expected_underscore_headers",
+        "expected_dot_headers",
+        "routes",
+        "errors",
+        "named_routes",
+        "tls_connection_policies",
+        "automatic_https",
+        "strict_sni_host",
     ];
 
     for key in obj.keys() {
@@ -410,6 +425,40 @@ mod tests {
         let err = validate_config_structure(&config).unwrap_err();
         assert_eq!(err.path, "apps.http.unknown_key");
         assert!(err.message.contains("unknown http app key"));
+    }
+
+    #[test]
+    fn test_http_app_accepts_caddy_port_and_grace_fields() {
+        let config = json!({
+            "apps": {
+                "http": {
+                    "http_port": 8080,
+                    "https_port": 8443,
+                    "grace_period": 5000000000_u64,
+                    "shutdown_delay": 1000000000_u64
+                }
+            }
+        });
+        assert!(validate_config_structure(&config).is_ok());
+    }
+
+    #[test]
+    fn test_server_accepts_caddy_automatic_https_and_timeout_fields() {
+        let config = json!({
+            "apps": {
+                "http": {
+                    "servers": {
+                        "pm": {
+                            "listen": [":443"],
+                            "automatic_https": {"disable": true},
+                            "max_header_bytes": 16384,
+                            "keepalive_interval": 30000000000_u64
+                        }
+                    }
+                }
+            }
+        });
+        assert!(validate_config_structure(&config).is_ok());
     }
 
     #[test]
