@@ -100,10 +100,12 @@ fn check_deprecated_directives(
             .find(|candidate| candidate.alias == directive.name)
         {
             match mode {
-                // Compatible preserves the pre-mode accepted surface exactly: the alias is
-                // accepted and produces the same configuration, with no warning.
-                AdaptMode::Compatible => {}
-                AdaptMode::Warn => warnings.push(deprecated.warning.to_string()),
+                // Compatible matches Caddy's default: the alias is accepted and Caddy's
+                // deprecation warning is emitted. `warn` is a superset that will also report
+                // additional ambiguity constructs as the mode system grows.
+                AdaptMode::Compatible | AdaptMode::Warn => {
+                    warnings.push(deprecated.warning.to_string());
+                }
                 AdaptMode::Strict => {
                     return Err(adapter_error(
                         directive.position.clone(),
@@ -117,17 +119,33 @@ fn check_deprecated_directives(
             }
         }
         // Only blocks that Caddy parses as nested directive lists are scanned. Option blocks
-        // (`map`, `vars`, `tls`, `reverse_proxy`, ...) may legitimately contain a token with an
-        // alias's spelling as a value or option name; treating those as directives would be a
-        // false positive.
-        if matches!(
-            directive.name.as_str(),
-            "route" | "handle" | "handle_path" | "handle_errors"
-        ) {
-            check_deprecated_directives(&directive.block, mode, warnings)?;
+        // (`map`, `vars`, `tls`, ...) may legitimately contain a token with an alias's spelling as
+        // a value or option name; treating those as directives would be a false positive.
+        for block in nested_directive_lists(directive) {
+            check_deprecated_directives(block, mode, warnings)?;
         }
     }
     Ok(())
+}
+
+/// Directive lists nested under `directive`, following Caddy's parser boundaries.
+///
+/// `route`/`handle`/`handle_path`/`handle_errors` bodies are directive lists. A proxy's
+/// `handle_response` body is also parsed as a subroute (`ParseSegmentAsSubroute`), so aliases in it
+/// are real directives there too; the surrounding proxy option block is not a directive list.
+fn nested_directive_lists(directive: &Directive) -> Vec<&[Directive]> {
+    match directive.name.as_str() {
+        "route" | "handle" | "handle_path" | "handle_errors" => {
+            vec![directive.block.as_slice()]
+        }
+        "reverse_proxy" | "forward_auth" | "php_fastcgi" => directive
+            .block
+            .iter()
+            .filter(|item| item.name == "handle_response")
+            .map(|item| item.block.as_slice())
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// The Caddyfile adapter.
@@ -6690,8 +6708,9 @@ fn invoke_handler(args: &[String], position: Position) -> caddy_rs_core::Result<
     }
 }
 
-/// Caddy's `vars` directive: set request variables, with Caddy's scalar conversion of unquoted
-/// values (numbers, booleans, otherwise strings).
+/// Caddy's `vars` directive: set request variables with Caddy's `ScalarVal` typing. Quoted tokens
+/// are strings; unquoted tokens are integers, floats or Go boolean spellings (`TRUE`, `t`, ...),
+/// otherwise strings.
 fn vars_handler(directive: &Directive, args: &[String]) -> caddy_rs_core::Result<Value> {
     let mut object = Map::new();
     object.insert("handler".to_string(), json!("vars"));
@@ -6702,7 +6721,12 @@ fn vars_handler(directive: &Directive, args: &[String]) -> caddy_rs_core::Result
                 "`vars` requires a name and a value",
             ));
         };
-        object.insert(name.clone(), scalar_json(value));
+        // Quoted tokens are string literals in Caddy (`Dispenser.ScalarVal`); the value is the
+        // last argument even after the optional matcher token was consumed.
+        object.insert(
+            name.clone(),
+            scalar_val_json(value, directive.arg_quoted.last().copied().unwrap_or(false)),
+        );
     }
     for item in &directive.block {
         if !item.block.is_empty() || item.args.len() != 1 {
@@ -6711,12 +6735,19 @@ fn vars_handler(directive: &Directive, args: &[String]) -> caddy_rs_core::Result
                 "`vars` block entries require a name and a value",
             ));
         }
-        object.insert(item.name.clone(), scalar_json(&item.args[0]));
+        object.insert(
+            item.name.clone(),
+            scalar_val_json(
+                &item.args[0],
+                item.arg_quoted.first().copied().unwrap_or(false),
+            ),
+        );
     }
     Ok(Value::Object(object))
 }
 
-/// `caddyfile.Dispenser.ScalarVal` for a token whose quotedness is no longer tracked.
+/// Caddy's `ScalarVal` conversion for an **unquoted** token: integers, floats, Go boolean
+/// spellings (`strconv.ParseBool`), otherwise a string.
 fn scalar_json(text: &str) -> Value {
     if let Ok(value) = text.parse::<i64>() {
         return json!(value);
@@ -6724,13 +6755,13 @@ fn scalar_json(text: &str) -> Value {
     if let Ok(value) = text.parse::<f64>() {
         return json!(value);
     }
-    if text == "true" {
-        return json!(true);
+    // Go's `strconv.ParseBool` spellings, in Caddy's `ScalarVal` order (integers and floats are
+    // tried first, so "1"/"0" above are numbers, exactly like Atoi).
+    match text {
+        "t" | "T" | "TRUE" | "true" | "True" => json!(true),
+        "f" | "F" | "FALSE" | "false" | "False" => json!(false),
+        _ => json!(text),
     }
-    if text == "false" {
-        return json!(false);
-    }
-    json!(text)
 }
 
 /// `log_skip` keeps a request out of the access log by setting the `log_skip` request variable.
@@ -6840,9 +6871,8 @@ fn map_handler(directive: &Directive, args: &[String]) -> caddy_rs_core::Result<
     Ok(Value::Object(object))
 }
 
-/// `caddyfile.Dispenser.ScalarVal`: quoted tokens are always strings; unquoted tokens are parsed
-/// as integers, floats, or booleans where possible. `-` is null in Caddy's map outputs (handled by
-/// the caller via [`scalar_json_quoted`] before scalar conversion).
+/// A `map` output scalar: a quoted token is a string, an unquoted `-` is null (Caddy applies that
+/// sentinel only to map outputs), and other unquoted tokens use [`scalar_json`].
 fn scalar_json_quoted(text: &str, quoted: bool) -> Value {
     if text == "-" {
         return Value::Null;
@@ -6851,6 +6881,17 @@ fn scalar_json_quoted(text: &str, quoted: bool) -> Value {
         return json!(text);
     }
     scalar_json(text)
+}
+
+/// Caddy's `caddyfile.Dispenser.ScalarVal`: a quoted token is a string literal; an unquoted token
+/// is converted by [`scalar_json`]. Unlike the `map` outputs, there is no `-`-means-null sentinel
+/// here (`map` applies that separately).
+fn scalar_val_json(text: &str, quoted: bool) -> Value {
+    if quoted {
+        json!(text)
+    } else {
+        scalar_json(text)
+    }
 }
 
 /// Names invoked by a directive list, recursively.

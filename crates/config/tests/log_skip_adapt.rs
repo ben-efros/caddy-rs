@@ -93,9 +93,12 @@ fn log_skip_is_valid_in_every_adapt_mode() {
 }
 
 #[test]
-fn skip_log_is_silent_in_compatible_mode() {
+fn skip_log_warns_in_compatible_mode_like_caddy() {
     let adapted = adapt_in(DEPRECATED, AdaptMode::Compatible);
-    assert!(adapted.warnings.is_empty(), "{:?}", adapted.warnings);
+    assert_eq!(
+        adapted.warnings,
+        vec!["the 'skip_log' directive is deprecated, please use 'log_skip' instead!".to_string()]
+    );
 }
 
 #[test]
@@ -128,11 +131,16 @@ fn skip_log_is_rejected_in_strict_mode_with_a_located_error() {
 fn basicauth_is_the_second_table_entry_and_is_mode_gated() {
     let caddyfile = "example.com {\n\tbasicauth {\n\t\talice $2a$14$01234567890123456789012345678901234567890123456789012\n\t}\n\trespond \"ok\"\n}\n";
 
-    // Compatible: accepted silently (the pre-mode behaviour).
+    // Compatible (Caddy's default): accepted with Caddy's deprecation warning.
     let compatible = adapt_in(caddyfile, AdaptMode::Compatible);
-    assert!(compatible.warnings.is_empty(), "{:?}", compatible.warnings);
+    assert_eq!(
+        compatible.warnings,
+        vec![
+            "the 'basicauth' directive is deprecated, please use 'basic_auth' instead!".to_string()
+        ]
+    );
 
-    // Warn: accepted with Caddy's deprecation warning naming both spellings.
+    // Warn: accepted with the same deprecation warning naming both spellings.
     let warn = adapt_in(caddyfile, AdaptMode::Warn);
     assert_eq!(
         warn.warnings,
@@ -158,12 +166,129 @@ fn deprecated_alias_inside_a_route_block_is_also_mode_gated() {
     // The check walks nested directive blocks, so aliases in `route`/`handle` bodies are covered.
     let caddyfile = "example.com {\n\troute {\n\t\tskip_log\n\t\trespond \"ok\"\n\t}\n}\n";
     let compatible = adapt_in(caddyfile, AdaptMode::Compatible);
-    assert!(compatible.warnings.is_empty(), "{:?}", compatible.warnings);
+    assert_eq!(compatible.warnings.len(), 1, "{:?}", compatible.warnings);
     let warn = adapt_in(caddyfile, AdaptMode::Warn);
     assert_eq!(warn.warnings.len(), 1, "{:?}", warn.warnings);
     let error = adapt_with_options(caddyfile, None, AdaptOptions::new(AdaptMode::Strict))
         .expect_err("strict mode rejects nested aliases");
     assert!(error.to_string().contains("Caddyfile line 3"), "{error}");
+}
+
+/// Extract the first handler of the consolidated `vars` + `respond` route.
+fn first_handler(config: &Value) -> &Value {
+    &config["apps"]["http"]["servers"]["srv0"]["routes"][0]["handle"][0]["routes"][0]["handle"][0]
+}
+
+#[test]
+fn skip_log_inside_handle_response_is_mode_gated() {
+    // `handle_response` bodies are parsed as subroutes, so aliases there are real directives and
+    // Caddy warns for them. They sit under `reverse_proxy`, which the scan must enter.
+    let caddyfile = "example.com {\n\treverse_proxy localhost:9000 {\n\t\thandle_response {\n\t\t\tskip_log\n\t\t}\n\t}\n}\n";
+    let warning =
+        "the 'skip_log' directive is deprecated, please use 'log_skip' instead!".to_string();
+
+    let compatible = adapt_in(caddyfile, AdaptMode::Compatible);
+    assert_eq!(compatible.warnings, vec![warning.clone()]);
+    assert!(
+        compatible.config.to_string().contains("\"log_skip\":true"),
+        "{}",
+        compatible.config
+    );
+
+    let warn = adapt_in(caddyfile, AdaptMode::Warn);
+    assert_eq!(warn.warnings, vec![warning]);
+
+    let error = adapt_with_options(caddyfile, None, AdaptOptions::new(AdaptMode::Strict))
+        .expect_err("strict mode rejects an alias inside handle_response");
+    let message = error.to_string();
+    assert_eq!(error.code(), "config.invalid", "{message}");
+    assert!(
+        message.contains("deprecated alias for `log_skip`"),
+        "{message}"
+    );
+    assert!(message.contains("Caddyfile line 4"), "{message}");
+}
+
+#[test]
+fn skip_log_inside_forward_auth_handle_response_is_mode_gated() {
+    let caddyfile = "example.com {\n\tforward_auth localhost:9000 {\n\t\turi /auth\n\t\thandle_response {\n\t\t\tskip_log\n\t\t}\n\t}\n}\n";
+    let warning =
+        "the 'skip_log' directive is deprecated, please use 'log_skip' instead!".to_string();
+    assert_eq!(
+        adapt_in(caddyfile, AdaptMode::Compatible).warnings,
+        vec![warning.clone()]
+    );
+    assert_eq!(adapt_in(caddyfile, AdaptMode::Warn).warnings, vec![warning]);
+    let error = adapt_with_options(caddyfile, None, AdaptOptions::new(AdaptMode::Strict))
+        .expect_err("strict mode rejects an alias inside forward_auth handle_response");
+    assert!(error.to_string().contains("Caddyfile line 5"), "{error}");
+}
+
+#[test]
+fn basicauth_inside_handle_response_is_mode_gated() {
+    let caddyfile = "example.com {\n\treverse_proxy localhost:9000 {\n\t\thandle_response {\n\t\t\tbasicauth {\n\t\t\t\talice $2a$14$01234567890123456789012345678901234567890123456789012\n\t\t\t}\n\t\t}\n\t}\n}\n";
+    let warning =
+        "the 'basicauth' directive is deprecated, please use 'basic_auth' instead!".to_string();
+    assert_eq!(
+        adapt_in(caddyfile, AdaptMode::Compatible).warnings,
+        vec![warning.clone()]
+    );
+    assert_eq!(adapt_in(caddyfile, AdaptMode::Warn).warnings, vec![warning]);
+    let error = adapt_with_options(caddyfile, None, AdaptOptions::new(AdaptMode::Strict))
+        .expect_err("strict mode rejects basicauth inside handle_response");
+    let message = error.to_string();
+    assert!(
+        message.contains("deprecated alias for `basic_auth`"),
+        "{message}"
+    );
+    assert!(message.contains("Caddyfile line 4"), "{message}");
+}
+
+#[test]
+fn non_alias_handle_response_body_is_untouched() {
+    let caddyfile = "example.com {\n\treverse_proxy localhost:9000 {\n\t\thandle_response {\n\t\t\trespond \"upstream failed\" 502\n\t\t}\n\t}\n}\n";
+    let compatible = adapt_in(caddyfile, AdaptMode::Compatible);
+    assert!(compatible.warnings.is_empty(), "{:?}", compatible.warnings);
+    let warn = adapt_in(caddyfile, AdaptMode::Warn);
+    assert_eq!(warn.config, compatible.config);
+    assert!(warn.warnings.is_empty(), "{:?}", warn.warnings);
+    let strict = adapt_in(caddyfile, AdaptMode::Strict);
+    assert_eq!(strict.config, compatible.config);
+}
+
+#[test]
+fn vars_scalar_values_follow_caddys_scalar_conversion() {
+    // Caddy's `Dispenser.ScalarVal`: quoted tokens stay strings; unquoted tokens use Go's
+    // `strconv.ParseBool` spellings (so `TRUE`/`t` are booleans, `yes` is a string).
+    for (token, expected) in [
+        ("\"true\"", json!("true")),
+        ("\"TRUE\"", json!("TRUE")),
+        ("TRUE", json!(true)),
+        ("t", json!(true)),
+        ("yes", json!("yes")),
+        // `vars` has no `-`-means-null sentinel (that is a `map` output rule).
+        ("-", json!("-")),
+        ("\"-\"", json!("-")),
+    ] {
+        let caddyfile = format!("example.com {{\n\tvars log_skip {token}\n\trespond \"ok\"\n}}\n");
+        let adapted = adapt_in(&caddyfile, AdaptMode::Compatible);
+        assert_eq!(
+            first_handler(&adapted.config),
+            &json!({"handler": "vars", "log_skip": expected}),
+            "token `{token}`"
+        );
+    }
+}
+
+#[test]
+fn vars_block_values_preserve_quoting() {
+    let caddyfile =
+        "example.com {\n\tvars {\n\t\tlog_skip \"true\"\n\t\tflag t\n\t}\n\trespond \"ok\"\n}\n";
+    let adapted = adapt_in(caddyfile, AdaptMode::Compatible);
+    assert_eq!(
+        first_handler(&adapted.config),
+        &json!({"handler": "vars", "log_skip": "true", "flag": true})
+    );
 }
 
 #[test]

@@ -29,9 +29,9 @@ whose name starts with `Caddyfile` is read as a Caddyfile and every other file i
 other adapter name is rejected with an error.
 
 `--adapt-mode` selects how strictly the **Caddyfile** adapter treats deprecated spellings:
-`compatible` (the default) accepts them silently, `warn` accepts them and prints Caddy's deprecation
-warning, and `strict` rejects them with a located error naming both the deprecated and the current
-spelling. The mode is a caddy-rs extension (Caddy has no equivalent flag); it governs
+`compatible` (the default) accepts them and prints Caddy's deprecation warning, `warn` accepts them
+as a superset of `compatible` (adding warnings for future ambiguity gates), and `strict` rejects
+them with a located error naming both the deprecated and the current spelling. The mode is a caddy-rs extension (Caddy has no equivalent flag); it governs
 configuration-acceptance strictness only and never relaxes a security rejection. It is available on
 `adapt`, `validate` and `run`; the JSON adapter ignores it.
 
