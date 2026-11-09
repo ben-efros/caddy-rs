@@ -162,8 +162,11 @@ hosts without approximating unsupported settings:
 - non-empty `advanced_config`, non-empty `locations`, a non-zero `access_list_id` and stream
   payloads (`import_stream`) fail with a located error because the host model has no representation
   for them yet;
-- `caching_enabled`, `block_exploits`, `http2_support` and a set `allow_websocket_upgrade` produce
-  warnings instead of errors, because the native route compiler does not apply them.
+- `caching_enabled`, `block_exploits`, `http2_support`, a set `allow_websocket_upgrade` and
+  `trust_forwarded_proto` produce warnings instead of errors, because the native route compiler does
+  not apply them. In particular, `trust_forwarded_proto` does not apply proxy trust; trusted proxies
+  must be configured explicitly. Redirection hosts warn for `block_exploits`/`http2_support` and
+  dead hosts for `http2_support`.
 
 The importer never invents a certificate origin and never drops an unsupported setting. Full
 `Host::validate` certificate/policy coverage remains a caller responsibility, as with `pm-hosts`.

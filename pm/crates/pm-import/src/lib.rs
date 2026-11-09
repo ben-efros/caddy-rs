@@ -4,8 +4,8 @@
 //! hosts. It intentionally refuses to approximate settings that the native host model cannot
 //! represent: `advanced_config`, `locations`, access lists and stream hosts fail with a located
 //! error instead of being dropped. Features that are only metadata today (caching, exploit
-//! blocking, HTTP/2 support and the WebSocket flag) are reported as warnings so the caller can see
-//! exactly what the native compiler did not apply.
+//! blocking, HTTP/2 support, the WebSocket flag and forwarded-proto trust) are reported as
+//! warnings so the caller can see exactly what the native compiler did not apply.
 //!
 //! The importer never chooses a certificate origin. A non-zero `certificate_id` requires the caller
 //! to supply the origin map, and TLS flags without a certificate are rejected rather than cleared
@@ -104,6 +104,8 @@ pub struct NpmProxyHost {
     pub allow_websocket_upgrade: bool,
     #[serde(deserialize_with = "serde_flag")]
     pub http2_support: bool,
+    #[serde(deserialize_with = "serde_flag")]
+    pub trust_forwarded_proto: bool,
 }
 
 /// NPM v2.16 redirection host payload. Only the fields needed for the native host mapping are
@@ -128,6 +130,10 @@ pub struct NpmRedirectionHost {
     #[serde(deserialize_with = "serde_flag")]
     pub hsts_subdomains: bool,
     pub advanced_config: String,
+    #[serde(deserialize_with = "serde_flag")]
+    pub block_exploits: bool,
+    #[serde(deserialize_with = "serde_flag")]
+    pub http2_support: bool,
 }
 
 /// NPM v2.16 dead host payload. Only the fields needed for the native host mapping are declared;
@@ -147,6 +153,8 @@ pub struct NpmDeadHost {
     #[serde(deserialize_with = "serde_flag")]
     pub hsts_subdomains: bool,
     pub advanced_config: String,
+    #[serde(deserialize_with = "serde_flag")]
+    pub http2_support: bool,
 }
 
 /// Map an NPM proxy host payload to a native proxy host.
@@ -226,7 +234,7 @@ pub fn import_redirection(
             enabled: payload.enabled,
             spec: HostSpec::Redirect(spec),
         },
-        Vec::new(),
+        redirection_warnings(payload),
     )
 }
 
@@ -255,7 +263,7 @@ pub fn import_dead(
             enabled: payload.enabled,
             spec: HostSpec::Dead(DeadSpec),
         },
-        Vec::new(),
+        dead_warnings(payload),
     )
 }
 
@@ -367,32 +375,87 @@ fn redirect_scheme(host_id: u64, scheme: &str) -> Result<RedirectScheme, ImportE
     }
 }
 
+const CACHING_WARNING: &str =
+    "caching_enabled is not implemented by the native compiler; the flag is not applied";
+const BLOCK_EXPLOITS_WARNING: &str =
+    "block_exploits is not implemented by the native compiler; the flag is not applied";
+const HTTP2_SUPPORT_WARNING: &str =
+    "http2_support is a listener-level setting; the host route compiler does not apply it";
+const WEBSOCKET_WARNING: &str =
+    "allow_websocket_upgrade is declared; Caddy proxies WebSocket upgrades natively so route output is unchanged";
+const TRUST_FORWARDED_PROTO_WARNING: &str =
+    "trust_forwarded_proto is set but proxy trust is not applied by the native compiler; trusted proxies must be configured explicitly";
+
+fn host_warning(host_id: u64, message: &str) -> String {
+    format!("host {host_id}: {message}")
+}
+
+fn push_flag_warning(warnings: &mut Vec<String>, host_id: u64, enabled: bool, message: &str) {
+    if enabled {
+        warnings.push(host_warning(host_id, message));
+    }
+}
+
 fn proxy_warnings(payload: &NpmProxyHost) -> Vec<String> {
     let mut warnings = Vec::new();
-    if payload.caching_enabled {
-        warnings.push(format!(
-            "host {}: caching_enabled is not implemented by the native compiler; the flag is not applied",
-            payload.id
-        ));
-    }
-    if payload.block_exploits {
-        warnings.push(format!(
-            "host {}: block_exploits is not implemented by the native compiler; the flag is not applied",
-            payload.id
-        ));
-    }
-    if payload.http2_support {
-        warnings.push(format!(
-            "host {}: http2_support is a listener-level setting; the host route compiler does not apply it",
-            payload.id
-        ));
-    }
-    if payload.allow_websocket_upgrade {
-        warnings.push(format!(
-            "host {}: allow_websocket_upgrade is declared; Caddy proxies WebSocket upgrades natively so route output is unchanged",
-            payload.id
-        ));
-    }
+    push_flag_warning(
+        &mut warnings,
+        payload.id,
+        payload.caching_enabled,
+        CACHING_WARNING,
+    );
+    push_flag_warning(
+        &mut warnings,
+        payload.id,
+        payload.block_exploits,
+        BLOCK_EXPLOITS_WARNING,
+    );
+    push_flag_warning(
+        &mut warnings,
+        payload.id,
+        payload.http2_support,
+        HTTP2_SUPPORT_WARNING,
+    );
+    push_flag_warning(
+        &mut warnings,
+        payload.id,
+        payload.allow_websocket_upgrade,
+        WEBSOCKET_WARNING,
+    );
+    push_flag_warning(
+        &mut warnings,
+        payload.id,
+        payload.trust_forwarded_proto,
+        TRUST_FORWARDED_PROTO_WARNING,
+    );
+    warnings
+}
+
+fn redirection_warnings(payload: &NpmRedirectionHost) -> Vec<String> {
+    let mut warnings = Vec::new();
+    push_flag_warning(
+        &mut warnings,
+        payload.id,
+        payload.block_exploits,
+        BLOCK_EXPLOITS_WARNING,
+    );
+    push_flag_warning(
+        &mut warnings,
+        payload.id,
+        payload.http2_support,
+        HTTP2_SUPPORT_WARNING,
+    );
+    warnings
+}
+
+fn dead_warnings(payload: &NpmDeadHost) -> Vec<String> {
+    let mut warnings = Vec::new();
+    push_flag_warning(
+        &mut warnings,
+        payload.id,
+        payload.http2_support,
+        HTTP2_SUPPORT_WARNING,
+    );
     warnings
 }
 
@@ -639,7 +702,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_advanced_config() {
+    fn rejects_proxy_advanced_config() {
         let payload = proxy(
             r#"{
                 "id": 7,
@@ -651,6 +714,41 @@ mod tests {
         let error = import_proxy(&payload, &BTreeMap::new()).unwrap_err();
 
         assert_eq!(error, ImportError::UnsupportedAdvancedConfig { host_id: 7 });
+        assert!(error.to_string().contains("advanced_config"));
+    }
+
+    #[test]
+    fn rejects_redirection_advanced_config() {
+        let payload = redirection(
+            r#"{
+                "id": 8,
+                "domain_names": ["advanced.example.com"],
+                "forward_scheme": "http",
+                "forward_domain_name": "new.example.com",
+                "forward_http_code": 301,
+                "advanced_config": "{\"headers\": {\"X-Test\": [\"1\"]}}"
+            }"#,
+        );
+
+        let error = import_redirection(&payload, &BTreeMap::new()).unwrap_err();
+
+        assert_eq!(error, ImportError::UnsupportedAdvancedConfig { host_id: 8 });
+        assert!(error.to_string().contains("advanced_config"));
+    }
+
+    #[test]
+    fn rejects_dead_advanced_config() {
+        let payload = dead(
+            r#"{
+                "id": 9,
+                "domain_names": ["advanced.example.com"],
+                "advanced_config": "{\"headers\": {\"X-Test\": [\"1\"]}}"
+            }"#,
+        );
+
+        let error = import_dead(&payload, &BTreeMap::new()).unwrap_err();
+
+        assert_eq!(error, ImportError::UnsupportedAdvancedConfig { host_id: 9 });
         assert!(error.to_string().contains("advanced_config"));
     }
 
@@ -911,7 +1009,8 @@ mod tests {
                 "caching_enabled": 1,
                 "block_exploits": 1,
                 "allow_websocket_upgrade": 1,
-                "http2_support": 1
+                "http2_support": 1,
+                "trust_forwarded_proto": 1
             }"#,
         );
 
@@ -924,6 +1023,7 @@ mod tests {
                 "host 7: block_exploits is not implemented by the native compiler; the flag is not applied".to_string(),
                 "host 7: http2_support is a listener-level setting; the host route compiler does not apply it".to_string(),
                 "host 7: allow_websocket_upgrade is declared; Caddy proxies WebSocket upgrades natively so route output is unchanged".to_string(),
+                "host 7: trust_forwarded_proto is set but proxy trust is not applied by the native compiler; trusted proxies must be configured explicitly".to_string(),
             ]
         );
         assert!(
@@ -933,6 +1033,64 @@ mod tests {
                     websocket: true,
                     preserve_host: true,
                 })
+        );
+    }
+
+    #[test]
+    fn warns_for_redirection_flags_without_native_implementation() {
+        let payload = redirection(
+            r#"{
+                "id": 8,
+                "domain_names": ["flags.example.com"],
+                "enabled": 1,
+                "forward_scheme": "https",
+                "forward_domain_name": "new.example.com",
+                "forward_http_code": 308,
+                "preserve_path": 0,
+                "certificate_id": 0,
+                "ssl_forced": 0,
+                "hsts_enabled": 0,
+                "hsts_subdomains": 0,
+                "advanced_config": "",
+                "block_exploits": 1,
+                "http2_support": 1
+            }"#,
+        );
+
+        let outcome = import_redirection(&payload, &BTreeMap::new()).expect("redirect imports");
+
+        assert_eq!(
+            outcome.warnings,
+            vec![
+                "host 8: block_exploits is not implemented by the native compiler; the flag is not applied".to_string(),
+                "host 8: http2_support is a listener-level setting; the host route compiler does not apply it".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn warns_for_dead_http2_support() {
+        let payload = dead(
+            r#"{
+                "id": 9,
+                "domain_names": ["flags.example.com"],
+                "enabled": 1,
+                "certificate_id": 0,
+                "ssl_forced": 0,
+                "hsts_enabled": 0,
+                "hsts_subdomains": 0,
+                "advanced_config": "",
+                "http2_support": 1
+            }"#,
+        );
+
+        let outcome = import_dead(&payload, &BTreeMap::new()).expect("dead imports");
+
+        assert_eq!(
+            outcome.warnings,
+            vec![
+                "host 9: http2_support is a listener-level setting; the host route compiler does not apply it".to_string(),
+            ]
         );
     }
 
