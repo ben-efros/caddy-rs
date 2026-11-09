@@ -27,20 +27,21 @@ rsa = { version = "0.9.10", default-features = false, features = ["std", "pem", 
 sha2 = { version = "0.10.9", features = ["oid"] }
 rand = "0.8.8"
 
-# ACME order client: production HTTP(S) transport over hyper + rustls (ring provider).
-# All of these are already in the offline registry cache; feature sets deliberately avoid
-# aws-lc-rs, rustls-native-certs and webpki-roots (not cached in this workspace).
+# ACME order client: production HTTP(S) transport over hyper + rustls.
+# The rustls provider is aws-lc-rs (not ring): it implements the ECDSA P-521 signature scheme
+# Caddy accepts for certificates. aws-lc-rs 1.19 / aws-lc-sys 0.47 are in the workspace offline
+# cargo cache, so the locked build stays offline.
 bytes = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 httpdate = "1.0.3"
-rustls = { version = "0.23.45", default-features = false, features = ["std", "ring", "tls12", "logging"] }
-hyper-rustls = { version = "0.27.10", default-features = false, features = ["http1", "http2", "tls12", "logging", "ring"] }
+rustls = { version = "0.23.45", default-features = false, features = ["std", "aws_lc_rs", "tls12", "logging"] }
+hyper-rustls = { version = "0.27.10", default-features = false, features = ["http1", "http2", "tls12", "logging", "aws-lc-rs"] }
 # Proxy support for ACME `network_proxy`: a tower-service connector that upgrades the proxy
 # CONNECT tunnel with rustls before handing it to hyper (T-TLS-070).
 tower-service = "0.3"
-tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["aws_lc_rs", "tls12", "logging"] }
 hmac = "0.12.1"
 hex = "0.4.3"
 percent-encoding = "2.3.2"

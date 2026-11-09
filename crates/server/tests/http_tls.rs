@@ -96,14 +96,73 @@ async fn start(config: Config) -> (ServerRuntime, SocketAddr) {
     (runtime, address)
 }
 
-fn client_config(alpn: Vec<Vec<u8>>) -> Arc<ClientConfig> {
+/// Build a TLS listener serving exactly one `load_pem` certificate/key pair.
+fn config_with_pem_certificate(certificate: &str, key: &str) -> Config {
+    let mut http = serde_json::json!({
+        "servers": {"srv0": {
+            "listen": ["127.0.0.1:0"],
+            "tls_connection_policies": [{}],
+            "routes": [{"handle": [{"handler": "static_response", "body": BODY_PLACEHOLDERS}]}]
+        }}
+    });
+    http["http_port"] = serde_json::json!(free_loopback_port());
+    Config::from_value(serde_json::json!({
+        "admin": {"disabled": true},
+        "apps": {
+            "http": http,
+            "tls": {"certificates": {"load_pem": [
+                {"certificate": certificate, "key": key}
+            ]}}
+        }
+    }))
+    .expect("test config decodes")
+}
+
+/// Build a TLS listener from `load_files` pairs (`(certificate path, key path)`), preserving
+/// configuration order so a failure can name the offending index.
+fn config_with_certificate_files(files: &[(String, String)]) -> Config {
+    let load_files: Vec<serde_json::Value> = files
+        .iter()
+        .map(|(certificate, key)| serde_json::json!({"certificate": certificate, "key": key}))
+        .collect();
+    let mut http = serde_json::json!({
+        "servers": {"srv0": {
+            "listen": ["127.0.0.1:0"],
+            "tls_connection_policies": [{}],
+            "routes": [{"handle": [{"handler": "static_response", "body": BODY_PLACEHOLDERS}]}]
+        }}
+    });
+    http["http_port"] = serde_json::json!(free_loopback_port());
+    Config::from_value(serde_json::json!({
+        "admin": {"disabled": true},
+        "apps": {
+            "http": http,
+            "tls": {"certificates": {"load_files": load_files}}
+        }
+    }))
+    .expect("test config decodes")
+}
+
+/// Apply a configuration that is expected to fail and return the error message.
+async fn apply_error(config: Config) -> String {
+    let store = Arc::new(GenerationStore::with_builtin_registry());
+    store.load(config).expect("test config validates");
+    let mut runtime = ServerRuntime::new(store);
+    runtime
+        .apply()
+        .await
+        .expect_err("runtime apply must fail")
+        .to_string()
+}
+
+fn client_config_with_roots(root_pems: &[&str], alpn: Vec<Vec<u8>>) -> Arc<ClientConfig> {
     let mut roots = RootCertStore::empty();
-    for pem in [EXAMPLE_CERT, OTHER_CERT] {
+    for pem in root_pems {
         for certificate in caddy_rs_tls::certificates_from_pem(pem).expect("fixture PEM parses") {
             roots.add(certificate).expect("fixture is a valid root");
         }
     }
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let mut config = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .expect("safe protocol versions")
@@ -113,12 +172,18 @@ fn client_config(alpn: Vec<Vec<u8>>) -> Arc<ClientConfig> {
     Arc::new(config)
 }
 
-async fn tls_connect(
+fn client_config(alpn: Vec<Vec<u8>>) -> Arc<ClientConfig> {
+    client_config_with_roots(&[EXAMPLE_CERT, OTHER_CERT], alpn)
+}
+
+async fn tls_connect_with_roots(
     address: SocketAddr,
     server_name: &str,
     alpn: &[&str],
+    root_pems: &[&str],
 ) -> TlsStream<TcpStream> {
-    let connector = TlsConnector::from(client_config(
+    let connector = TlsConnector::from(client_config_with_roots(
+        root_pems,
         alpn.iter()
             .map(|protocol| protocol.as_bytes().to_vec())
             .collect(),
@@ -129,6 +194,30 @@ async fn tls_connect(
         .connect(server_name, stream)
         .await
         .expect("TLS handshake")
+}
+
+/// Start a TLS listener with one certificate and complete a real HTTP/1.1 request over TLS.
+async fn assert_certificate_handshake(name: &str, certificate: &str, key: &str) {
+    let (runtime, address) = start(config_with_pem_certificate(certificate, key)).await;
+    let mut stream =
+        tls_connect_with_roots(address, "localhost", &["http/1.1"], &[certificate]).await;
+    assert_eq!(
+        negotiated_alpn(&stream).as_deref(),
+        Some("http/1.1"),
+        "{name}"
+    );
+    let (status, body) = http1_get(&mut stream, "localhost").await;
+    assert_eq!(status, 200, "{name}");
+    assert_eq!(body, "https http/1.1", "{name}");
+    runtime.shutdown().await;
+}
+
+async fn tls_connect(
+    address: SocketAddr,
+    server_name: &str,
+    alpn: &[&str],
+) -> TlsStream<TcpStream> {
+    tls_connect_with_roots(address, server_name, alpn, &[EXAMPLE_CERT, OTHER_CERT]).await
 }
 
 fn negotiated_alpn(stream: &TlsStream<TcpStream>) -> Option<String> {
@@ -422,4 +511,210 @@ async fn proxy_protocol_header_is_consumed_before_the_tls_handshake() {
     );
 
     runtime.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// T-TLS-089: per-algorithm certificate handshakes and key-type diagnostics.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn rsa2048_pkcs1_certificate_completes_tls_handshake() {
+    assert_certificate_handshake(
+        "RSA-2048 PKCS#1",
+        include_str!("../../tls/testdata/key-types/rsa2048-pkcs1.pem"),
+        include_str!("../../tls/testdata/key-types/rsa2048-pkcs1.key"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn rsa2048_pkcs8_certificate_completes_tls_handshake() {
+    assert_certificate_handshake(
+        "RSA-2048 PKCS#8",
+        include_str!("../../tls/testdata/key-types/rsa2048-pkcs8.pem"),
+        include_str!("../../tls/testdata/key-types/rsa2048-pkcs8.key"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn rsa4096_certificate_completes_tls_handshake() {
+    assert_certificate_handshake(
+        "RSA-4096",
+        include_str!("../../tls/testdata/key-types/rsa4096.pem"),
+        include_str!("../../tls/testdata/key-types/rsa4096.key"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ecdsa_p256_sec1_certificate_completes_tls_handshake() {
+    assert_certificate_handshake(
+        "ECDSA P-256 SEC1",
+        include_str!("../../tls/testdata/key-types/p256-sec1.pem"),
+        include_str!("../../tls/testdata/key-types/p256-sec1.key"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ecdsa_p256_pkcs8_certificate_completes_tls_handshake() {
+    assert_certificate_handshake(
+        "ECDSA P-256 PKCS#8",
+        include_str!("../../tls/testdata/key-types/p256-pkcs8.pem"),
+        include_str!("../../tls/testdata/key-types/p256-pkcs8.key"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ecdsa_p384_certificate_completes_tls_handshake() {
+    assert_certificate_handshake(
+        "ECDSA P-384",
+        include_str!("../../tls/testdata/key-types/p384.pem"),
+        include_str!("../../tls/testdata/key-types/p384.key"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ecdsa_p521_sec1_certificate_completes_tls_handshake() {
+    assert_certificate_handshake(
+        "ECDSA P-521 SEC1",
+        include_str!("../../tls/testdata/key-types/p521-sec1.pem"),
+        include_str!("../../tls/testdata/key-types/p521-sec1.key"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ecdsa_p521_pkcs8_certificate_completes_tls_handshake() {
+    assert_certificate_handshake(
+        "ECDSA P-521 PKCS#8",
+        include_str!("../../tls/testdata/key-types/p521-pkcs8.pem"),
+        include_str!("../../tls/testdata/key-types/p521-pkcs8.key"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ed25519_certificate_completes_tls_handshake() {
+    assert_certificate_handshake(
+        "Ed25519",
+        include_str!("../../tls/testdata/key-types/ed25519.pem"),
+        include_str!("../../tls/testdata/key-types/ed25519.key"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn secp256k1_certificate_key_is_rejected_with_located_curve_error() {
+    let message = apply_error(config_with_pem_certificate(
+        include_str!("../../tls/testdata/key-types/secp256k1.pem"),
+        include_str!("../../tls/testdata/key-types/secp256k1.key"),
+    ))
+    .await;
+    assert!(
+        message.contains("TLS configuration at `apps.tls.certificates.load_pem[0]`"),
+        "{message}"
+    );
+    assert!(message.contains("localhost"), "{message}");
+    assert!(message.contains("secp256k1"), "{message}");
+    assert!(
+        message.contains("x509: unsupported elliptic curve"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn ed448_certificate_key_is_rejected_naming_the_algorithm_oid() {
+    let message = apply_error(config_with_pem_certificate(
+        include_str!("../../tls/testdata/key-types/ed448.pem"),
+        include_str!("../../tls/testdata/key-types/ed448.key"),
+    ))
+    .await;
+    assert!(message.contains("TLS configuration at"), "{message}");
+    assert!(message.contains("Ed448"), "{message}");
+    assert!(message.contains("1.3.101.113"), "{message}");
+    assert!(message.contains("localhost"), "{message}");
+}
+
+#[tokio::test]
+async fn dsa_certificate_key_is_rejected_naming_the_algorithm_oid() {
+    let message = apply_error(config_with_pem_certificate(
+        include_str!("../../tls/testdata/key-types/dsa.pem"),
+        include_str!("../../tls/testdata/key-types/dsa.key"),
+    ))
+    .await;
+    assert!(message.contains("TLS configuration at"), "{message}");
+    assert!(message.contains("DSA"), "{message}");
+    assert!(message.contains("1.2.840.10040.4.1"), "{message}");
+    assert!(message.contains("localhost"), "{message}");
+}
+
+#[tokio::test]
+async fn encrypted_private_key_is_rejected_with_caddy_wording() {
+    let message = apply_error(config_with_pem_certificate(
+        include_str!("../../tls/testdata/key-types/encrypted-p256.pem"),
+        include_str!("../../tls/testdata/key-types/encrypted-p256.key"),
+    ))
+    .await;
+    assert!(message.contains("TLS configuration at"), "{message}");
+    assert!(
+        message.contains("encrypted private keys are not supported"),
+        "{message}"
+    );
+    assert!(message.contains("localhost"), "{message}");
+}
+
+#[tokio::test]
+async fn second_load_files_certificate_with_unsupported_key_is_named() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let first_certificate = directory.path().join("first.pem");
+    let first_key = directory.path().join("first.key");
+    let second_certificate = directory.path().join("second.pem");
+    let second_key = directory.path().join("second.key");
+    std::fs::write(
+        &first_certificate,
+        include_str!("../../tls/testdata/key-types/p256-sec1.pem"),
+    )
+    .expect("write first certificate");
+    std::fs::write(
+        &first_key,
+        include_str!("../../tls/testdata/key-types/p256-sec1.key"),
+    )
+    .expect("write first key");
+    std::fs::write(
+        &second_certificate,
+        include_str!("../../tls/testdata/key-types/secp256k1.pem"),
+    )
+    .expect("write second certificate");
+    std::fs::write(
+        &second_key,
+        include_str!("../../tls/testdata/key-types/secp256k1.key"),
+    )
+    .expect("write second key");
+
+    let message = apply_error(config_with_certificate_files(&[
+        (
+            first_certificate.display().to_string(),
+            first_key.display().to_string(),
+        ),
+        (
+            second_certificate.display().to_string(),
+            second_key.display().to_string(),
+        ),
+    ]))
+    .await;
+    assert!(
+        message.contains("apps.tls.certificates.load_files[1]"),
+        "the error must name the second entry: {message}"
+    );
+    assert!(message.contains("second.pem"), "{message}");
+    assert!(message.contains("localhost"), "{message}");
+    assert!(message.contains("secp256k1"), "{message}");
+    assert!(
+        message.contains("x509: unsupported elliptic curve"),
+        "{message}"
+    );
 }

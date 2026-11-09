@@ -17,14 +17,14 @@ http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 rustls = { version = "0.23.45", default-features = false, features = [
-    "std", "ring", "tls12", "logging",
+    "std", "aws_lc_rs", "tls12", "logging",
 ] }
 serde_json = { workspace = true }
 socket2 = { version = "0.6.5", features = ["all"] }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { version = "0.26.6", default-features = false, features = [
-    "ring", "tls12", "logging",
+    "aws_lc_rs", "tls12", "logging",
 ] }
 tower-service = "0.3.3"
 

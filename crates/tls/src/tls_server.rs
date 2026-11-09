@@ -54,6 +54,7 @@ use caddy_rs_core::config::{CertKeyPemPair, Config, TlsApp};
 use caddy_rs_core::listen::{ListenAddr, Network};
 
 use crate::certificate::{Certificate, CertificateCache};
+use crate::key_type::{classify, KeySupport};
 use crate::storage::{CertificateStorage, StoredCertificate};
 use crate::{Error, Result};
 
@@ -140,53 +141,72 @@ impl TlsVersions {
 
 /// TLS key-exchange group / curve selected by `tls_connection_policies[].curves`.
 ///
-/// Caddy/Go names are `x25519`, `secp256r1`, `secp384r1`, `secp521r1` and
-/// `x25519mlkem768`. The rustls *ring* provider supports only X25519, P-256 and P-384; the
-/// unsupported names fail loudly when parsed.
+/// Caddy v2.11.9 accepts `x25519mlkem768`, `x25519`, `secp256r1`, `secp384r1` and `secp521r1`.
+/// rustls' aws-lc-rs provider implements the first four as key-exchange groups; it has no P-521
+/// key-exchange group, so `secp521r1` still fails loudly (P-521 *certificate* keys are separate
+/// and supported).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TlsCurve {
+    /// X25519MLKEM768 hybrid (Go `x25519mlkem768`).
+    X25519MlKem768,
     /// X25519 (Go `x25519`).
     X25519,
     /// NIST P-256 (Go `secp256r1`).
     P256,
     /// NIST P-384 (Go `secp384r1`).
     P384,
+    /// NIST P-521 (Go `secp521r1`), accepted by Caddy but without a rustls key-exchange group.
+    Secp521r1,
 }
+
+/// Caddy v2.11.9's default curves (`external/caddy/modules/caddytls/values.go`):
+/// `X25519MLKEM768, X25519, P-256`.
+const DEFAULT_CURVES: &[TlsCurve] = &[TlsCurve::X25519MlKem768, TlsCurve::X25519, TlsCurve::P256];
 
 impl TlsCurve {
     fn parse(value: &str) -> Result<Self> {
         match value {
+            "x25519mlkem768" => Ok(Self::X25519MlKem768),
             "x25519" => Ok(Self::X25519),
             "secp256r1" => Ok(Self::P256),
             "secp384r1" => Ok(Self::P384),
-            "secp521r1" | "x25519mlkem768" => Err(Error::Unsupported {
-                path: "tls_connection_policies[0].curves".to_string(),
-                feature: format!(
-                    "TLS curve `{value}` (the rustls ring provider supports x25519, secp256r1 and secp384r1)"
-                ),
-                tracking_id: "TLS-POLICY",
-            }),
+            "secp521r1" => Ok(Self::Secp521r1),
             other => Err(Error::TlsConfig {
                 path: "tls_connection_policies[0].curves".to_string(),
                 message: format!(
-                    "unsupported TLS curve `{other}`; expected x25519, secp256r1, secp384r1, secp521r1 or x25519mlkem768"
+                    "unsupported TLS curve `{other}`; expected x25519mlkem768, x25519, secp256r1, secp384r1 or secp521r1"
                 ),
             }),
         }
     }
 
-    fn kx_group(self) -> &'static dyn SupportedKxGroup {
+    /// Go/Caddy name (for located errors and documentation).
+    fn name(self) -> &'static str {
         match self {
-            Self::X25519 => rustls::crypto::ring::kx_group::X25519,
-            Self::P256 => rustls::crypto::ring::kx_group::SECP256R1,
-            Self::P384 => rustls::crypto::ring::kx_group::SECP384R1,
+            Self::X25519MlKem768 => "x25519mlkem768",
+            Self::X25519 => "x25519",
+            Self::P256 => "secp256r1",
+            Self::P384 => "secp384r1",
+            Self::Secp521r1 => "secp521r1",
+        }
+    }
+
+    /// The provider's key-exchange group, when it implements one for this curve.
+    fn kx_group(self) -> Option<&'static dyn SupportedKxGroup> {
+        match self {
+            Self::X25519MlKem768 => Some(rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768),
+            Self::X25519 => Some(rustls::crypto::aws_lc_rs::kx_group::X25519),
+            Self::P256 => Some(rustls::crypto::aws_lc_rs::kx_group::SECP256R1),
+            Self::P384 => Some(rustls::crypto::aws_lc_rs::kx_group::SECP384R1),
+            Self::Secp521r1 => None,
         }
     }
 }
 
 /// TLS 1.2 cipher suite selected by `tls_connection_policies[].cipher_suites`.
 ///
-/// These are the six ECDHE AEAD suites rustls' ring provider implements. TLS 1.3 cipher suites
+/// These are the six ECDHE AEAD suites rustls' aws-lc-rs provider implements. TLS 1.3 cipher
+/// suites
 /// are not configurable in rustls (or Go), so listing them fails loudly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tls12CipherSuite {
@@ -246,17 +266,33 @@ impl Tls12CipherSuite {
     }
 
     fn supported_suite(self) -> SupportedCipherSuite {
-        use rustls::crypto::ring::cipher_suite as suites;
-        match self {
-            Self::EcdheEcdsaAes128GcmSha256 => suites::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-            Self::EcdheEcdsaAes256GcmSha384 => suites::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-            Self::EcdheEcdsaChacha20Poly1305 => {
-                suites::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+        // The aws-lc-rs provider exposes its suites as `DEFAULT_CIPHER_SUITES` rather than the
+        // per-suite `cipher_suite` module the rustls ring provider used. Look each selectable
+        // suite up by its wire identifier so the restricted-policy code stays provider-agnostic.
+        let suite = match self {
+            Self::EcdheEcdsaAes128GcmSha256 => {
+                rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
             }
-            Self::EcdheRsaAes128GcmSha256 => suites::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-            Self::EcdheRsaAes256GcmSha384 => suites::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-            Self::EcdheRsaChacha20Poly1305 => suites::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
-        }
+            Self::EcdheEcdsaAes256GcmSha384 => {
+                rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+            }
+            Self::EcdheEcdsaChacha20Poly1305 => {
+                rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+            }
+            Self::EcdheRsaAes128GcmSha256 => {
+                rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+            }
+            Self::EcdheRsaAes256GcmSha384 => {
+                rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+            }
+            Self::EcdheRsaChacha20Poly1305 => {
+                rustls::CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+            }
+        };
+        *rustls::crypto::aws_lc_rs::DEFAULT_CIPHER_SUITES
+            .iter()
+            .find(|candidate| candidate.suite() == suite)
+            .expect("the aws-lc-rs provider implements every selectable TLS 1.2 cipher suite")
     }
 }
 
@@ -267,8 +303,8 @@ pub struct TlsServerOptions {
     pub alpn: Vec<Vec<u8>>,
     /// Enabled TLS protocol versions.
     pub versions: TlsVersions,
-    /// Key-exchange group preference (`tls_connection_policies[0].curves`); empty means the
-    /// provider defaults (X25519, P-256, P-384).
+    /// Key-exchange group preference (`tls_connection_policies[0].curves`); empty means Caddy's
+    /// defaults (`x25519mlkem768`, `x25519`, `secp256r1`).
     pub curves: Vec<TlsCurve>,
     /// TLS 1.2 cipher-suite preference (`cipher_suites`/`ciphers`); empty means the provider
     /// defaults. TLS 1.3 suites are fixed by rustls and cannot be configured here.
@@ -693,6 +729,9 @@ pub struct TlsCertificate {
     private_key: PrivateKeyDer<'static>,
     /// DER-encoded OCSP response to staple with this certificate (T-TLS-051).
     ocsp_staple: Option<Vec<u8>>,
+    /// Configured source of this certificate, used to locate key errors when several
+    /// certificates are configured (`apps.tls.certificates.load_files[i]`, a storage key, ...).
+    source: Option<String>,
 }
 
 impl Clone for TlsCertificate {
@@ -703,6 +742,7 @@ impl Clone for TlsCertificate {
             chain: self.chain.clone(),
             private_key: self.private_key.clone_key(),
             ocsp_staple: self.ocsp_staple.clone(),
+            source: self.source.clone(),
         }
     }
 }
@@ -713,17 +753,32 @@ impl TlsCertificate {
     /// The certificate names are taken from the leaf's subjectAltName extension (falling back to
     /// the subject commonName). Supported key encodings are PKCS#8 (`PRIVATE KEY`), SEC1
     /// (`EC PRIVATE KEY`) and PKCS#1 (`RSA PRIVATE KEY`); the key type must be supported by
-    /// rustls' `ring` provider.
+    /// rustls' aws-lc-rs provider.
     pub fn from_pem(certificate_pem: &str, private_key_pem: &str) -> Result<Self> {
+        Self::from_pem_with_source(certificate_pem, private_key_pem, None)
+    }
+
+    /// Load a certificate chain and private key, recording the configured source for located
+    /// key errors.
+    ///
+    /// Names are parsed before the private key so a key error can name the certificate that
+    /// failed (DNS names plus source) even when several certificates are configured.
+    pub(crate) fn from_pem_with_source(
+        certificate_pem: &str,
+        private_key_pem: &str,
+        source: Option<String>,
+    ) -> Result<Self> {
         let chain = certificate_chain_from_pem(certificate_pem)?;
-        let private_key = private_key_from_pem(private_key_pem)?;
         let names = certificate_names(chain[0].as_ref())?;
+        let private_key = private_key_from_pem(private_key_pem)
+            .map_err(|error| attach_certificate_identity(error, source.as_deref(), &names))?;
         Ok(Self {
             names,
             tags: Vec::new(),
             chain,
             private_key,
             ocsp_staple: None,
+            source,
         })
     }
 
@@ -751,28 +806,39 @@ impl TlsCertificate {
             chain: chain_der.into_iter().map(CertificateDer::from).collect(),
             private_key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(private_key_der)),
             ocsp_staple: None,
+            source: None,
         })
     }
 
     /// Build from a stored certificate (PEM chain + PEM key, names from metadata).
     pub fn from_stored(stored: &StoredCertificate) -> Result<Self> {
+        Self::from_stored_with_source(stored, None)
+    }
+
+    /// Build from a stored certificate, recording the storage key for located key errors.
+    pub(crate) fn from_stored_with_source(
+        stored: &StoredCertificate,
+        source: Option<String>,
+    ) -> Result<Self> {
         let chain_der: Vec<Vec<u8>> = stored
             .certificate_pem
             .iter()
             .map(|pem| certificate_chain_from_pem(pem).map(|chain| chain[0].as_ref().to_vec()))
             .collect::<Result<Vec<_>>>()?;
-        let private_key = private_key_from_pem(&stored.private_key_pem)?;
         let names = if stored.domains.is_empty() {
             certificate_names(chain_der[0].as_slice())?
         } else {
             stored.domains.clone()
         };
+        let private_key = private_key_from_pem(&stored.private_key_pem)
+            .map_err(|error| attach_certificate_identity(error, source.as_deref(), &names))?;
         Ok(Self {
             names,
             tags: Vec::new(),
             chain: chain_der.into_iter().map(CertificateDer::from).collect(),
             private_key,
             ocsp_staple: None,
+            source,
         })
     }
 
@@ -813,6 +879,13 @@ impl TlsCertificate {
         self
     }
 
+    /// Attach the configured source (a file path, `load_pem` entry or storage key) so a later
+    /// key error names this certificate instead of only `certificates`.
+    pub fn with_source(mut self, source: impl Into<String>) -> Self {
+        self.source = Some(source.into());
+        self
+    }
+
     /// Attach a DER-encoded OCSP response to staple with this certificate (T-TLS-051).
     ///
     /// The server hook obtains the response through the [`crate::ocsp::OcspStapler`] and rebuilds
@@ -837,15 +910,30 @@ impl TlsCertificate {
         &self.private_key
     }
 
-    /// Convert to the rustls signing form, validating the key type against the `ring` provider.
+    /// Convert to the rustls signing form, validating the key type against the aws-lc-rs provider.
+    ///
+    /// A failure names the configured source and the first DNS names of this certificate, so a
+    /// configuration with several certificates identifies the offending entry.
     pub fn certified_key(&self) -> Result<CertifiedKey> {
-        let signing_key = rustls::crypto::ring::sign::any_supported_type(&self.private_key)
-            .map_err(|error| Error::TlsConfig {
-                path: "certificates".to_string(),
-                message: format!(
-                    "private key type is not supported by the rustls ring provider: {error}"
-                ),
-            })?;
+        let signing_key =
+            match rustls::crypto::aws_lc_rs::sign::any_supported_type(&self.private_key) {
+                Ok(key) => key,
+                Err(provider_error) => {
+                    let reason = classify_private_key_der(&self.private_key).unwrap_or_else(|| {
+                        format!(
+                            "private key type is not supported by the rustls aws-lc-rs provider: \
+                         {provider_error}"
+                        )
+                    });
+                    return Err(Error::TlsConfig {
+                        path: "certificates".to_string(),
+                        message: format!(
+                            "{}: {reason}",
+                            certificate_identity(self.source.as_deref(), &self.names)
+                        ),
+                    });
+                }
+            };
         Ok(CertifiedKey {
             cert: self.chain.clone(),
             key: signing_key,
@@ -984,7 +1072,11 @@ impl CertificateResolver {
         let resolver = Self::new();
         for key in storage.list("").await? {
             if let Some(stored) = storage.load(&key).await? {
-                resolver.insert(TlsCertificate::from_stored(&stored)?)?;
+                let certificate = TlsCertificate::from_stored_with_source(
+                    &stored,
+                    Some(format!("storage key {key}")),
+                )?;
+                resolver.insert(certificate)?;
             }
         }
         Ok(resolver)
@@ -1228,20 +1320,47 @@ impl ResolvesServerCert for ConnectionPolicyResolver {
     }
 }
 
+/// Install the aws-lc-rs crypto provider as the process-wide rustls default.
+///
+/// caddy-rs builds every rustls client/server configuration with an explicit provider, so this
+/// is mainly for dependencies that call [`CryptoProvider::get_default`]. Installing is
+/// idempotent: an already-installed provider (another component or a test) is left untouched.
+pub fn install_default_crypto_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
 /// Build the rustls crypto provider for a listener, applying the configured key-exchange
-/// groups and TLS 1.2 cipher suites on top of the ring defaults.
+/// groups and TLS 1.2 cipher suites on top of the aws-lc-rs defaults.
 ///
 /// TLS 1.3 cipher suites are fixed in rustls (and Go's `crypto/tls`), so only TLS 1.2 suites can
 /// be restricted; the provider always retains the fixed TLS 1.3 suites.
 fn crypto_provider(options: &TlsServerOptions) -> Result<Arc<CryptoProvider>> {
-    let mut provider = rustls::crypto::ring::default_provider();
-    if !options.curves.is_empty() {
-        provider.kx_groups = options
-            .curves
-            .iter()
-            .map(|curve| curve.kx_group())
-            .collect();
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    // Caddy defaults to [x25519mlkem768, x25519, secp256r1]; rustls' aws-lc-rs default differs
+    // (no post-quantum preference unless the `prefer-post-quantum` feature is on), so always set
+    // the list explicitly. A configured curve the compiled provider lacks fails closed.
+    let curves: &[TlsCurve] = if options.curves.is_empty() {
+        DEFAULT_CURVES
+    } else {
+        &options.curves
+    };
+    let mut groups: Vec<&'static dyn SupportedKxGroup> = Vec::with_capacity(curves.len());
+    for &curve in curves {
+        let Some(group) = curve.kx_group() else {
+            return Err(Error::Unsupported {
+                path: "tls_connection_policies[0].curves".to_string(),
+                feature: format!(
+                    "TLS curve `{}` accepted by Caddy but not implemented by rustls' aws-lc-rs \
+                     provider (no P-521 key-exchange group; P-521 certificate keys are supported \
+                     separately)",
+                    curve.name()
+                ),
+                tracking_id: "TLS-POLICY",
+            });
+        };
+        groups.push(group);
     }
+    provider.kx_groups = groups;
     if !options.cipher_suites.is_empty() {
         let mut suites: Vec<SupportedCipherSuite> = options
             .cipher_suites
@@ -1434,19 +1553,24 @@ pub fn certificates_from_tls_app(tls: &TlsApp) -> Result<Vec<TlsCertificate>> {
                 path: format!("{path}.key"),
                 message: format!("cannot read `{}`: {error}", pair.key),
             })?;
-        let certificate = TlsCertificate::from_pem(&certificate_pem, &private_key_pem)
-            .map(|certificate| certificate.with_tags(pair.tags.clone()))
-            .map_err(|error| Error::TlsConfig {
-                path: path.clone(),
-                message: error.to_string(),
-            })?;
+        let source = format!(
+            "{path} (certificate file {}, key file {})",
+            pair.certificate, pair.key
+        );
+        let certificate =
+            TlsCertificate::from_pem_with_source(&certificate_pem, &private_key_pem, Some(source))
+                .map(|certificate| certificate.with_tags(pair.tags.clone()))
+                .map_err(|error| Error::TlsConfig {
+                    path: path.clone(),
+                    message: located_message(error),
+                })?;
         certificates.push(certificate);
     }
     Ok(certificates)
 }
 
 fn load_pem_pair(pair: &CertKeyPemPair, path: &str) -> Result<TlsCertificate> {
-    TlsCertificate::from_pem(&pair.certificate, &pair.key)
+    TlsCertificate::from_pem_with_source(&pair.certificate, &pair.key, Some(path.to_string()))
         .map(|certificate| certificate.with_tags(pair.tags.clone()))
         .map_err(|error| match error {
             Error::TlsConfig { message, .. } => Error::TlsConfig {
@@ -1455,6 +1579,15 @@ fn load_pem_pair(pair: &CertKeyPemPair, path: &str) -> Result<TlsCertificate> {
             },
             other => other,
         })
+}
+
+/// Extract the message of a located error, so wrapping at a more precise path does not nest
+/// `TLS configuration at ...` prefixes.
+fn located_message(error: Error) -> String {
+    match error {
+        Error::TlsConfig { message, .. } => message,
+        other => other.to_string(),
+    }
 }
 
 /// Listener policy: whether a configured TCP listener terminates TLS.
@@ -1574,18 +1707,90 @@ fn certificate_chain_from_pem(pem: &str) -> Result<Vec<CertificateDer<'static>>>
 }
 
 fn private_key_from_pem(pem: &str) -> Result<PrivateKeyDer<'static>> {
-    for (label, der) in pem_blocks(pem)? {
-        match label.as_str() {
-            "PRIVATE KEY" => return Ok(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(der))),
-            "EC PRIVATE KEY" => return Ok(PrivateKeyDer::Sec1(PrivateSec1KeyDer::from(der))),
-            "RSA PRIVATE KEY" => return Ok(PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(der))),
-            _ => continue,
-        }
+    let blocks = pem_blocks(pem)?;
+    let key_blocks: Vec<usize> = blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, (label, _))| label.ends_with("PRIVATE KEY"))
+        .map(|(index, _)| index)
+        .collect();
+    let Some(&first) = key_blocks.first() else {
+        return Err(Error::TlsConfig {
+            path: "certificates".to_string(),
+            message: "no private key block found in PEM data".to_string(),
+        });
+    };
+    if key_blocks.len() > 1 {
+        let (first_label, _) = &blocks[first];
+        let (second_label, _) = &blocks[key_blocks[1]];
+        eprintln!(
+            "caddy-rs: warning: private key PEM data contains multiple private key blocks; \
+             using the first (`{first_label}` at block {first}) and ignoring `{second_label}` at \
+             block {}",
+            key_blocks[1]
+        );
     }
-    Err(Error::TlsConfig {
-        path: "certificates".to_string(),
-        message: "no private key block found in PEM data".to_string(),
+    let (label, der) = &blocks[first];
+    if let Some(KeySupport::Unsupported(message)) = classify(label, der) {
+        return Err(Error::TlsConfig {
+            path: "certificates".to_string(),
+            message,
+        });
+    }
+    Ok(match label.as_str() {
+        "PRIVATE KEY" => PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(der.clone())),
+        "EC PRIVATE KEY" => PrivateKeyDer::Sec1(PrivateSec1KeyDer::from(der.clone())),
+        "RSA PRIVATE KEY" => PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(der.clone())),
+        other => unreachable!("unsupported private key label `{other}` was not classified"),
     })
+}
+
+/// Label and DER payload of a parsed private key (the DER borrows from `key`).
+fn private_key_label_and_der<'a>(key: &'a PrivateKeyDer<'_>) -> (&'static str, &'a [u8]) {
+    match key {
+        PrivateKeyDer::Pkcs8(key) => ("PRIVATE KEY", key.secret_pkcs8_der()),
+        PrivateKeyDer::Sec1(key) => ("EC PRIVATE KEY", key.secret_sec1_der()),
+        PrivateKeyDer::Pkcs1(key) => ("RSA PRIVATE KEY", key.secret_pkcs1_der()),
+        // `PrivateKeyDer` is non-exhaustive; an unknown future variant stays unclassified and
+        // falls back to the provider's own error.
+        _ => ("", &[]),
+    }
+}
+
+/// Classify a parsed private key, returning the unsupported-type reason when known.
+fn classify_private_key_der(key: &PrivateKeyDer<'_>) -> Option<String> {
+    let (label, der) = private_key_label_and_der(key);
+    match classify(label, der) {
+        Some(KeySupport::Unsupported(message)) => Some(message),
+        _ => None,
+    }
+}
+
+/// Human-readable certificate identity for located key errors.
+fn certificate_identity(source: Option<&str>, names: &[String]) -> String {
+    let mut identity = String::from("private key for certificate");
+    if let Some(source) = source {
+        identity.push_str(&format!(" `{source}`"));
+    }
+    if !names.is_empty() {
+        let mut shown = names.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+        if names.len() > 3 {
+            shown.push_str(", ...");
+        }
+        identity.push_str(&format!(" (DNS names: {shown})"));
+    }
+    identity
+}
+
+/// Prefix a certificate-loading error with the certificate identity (source + DNS names).
+fn attach_certificate_identity(error: Error, source: Option<&str>, names: &[String]) -> Error {
+    match error {
+        Error::TlsConfig { path, message } => Error::TlsConfig {
+            path,
+            message: format!("{}: {message}", certificate_identity(source, names)),
+        },
+        other => other,
+    }
 }
 
 /// Located path for client-authentication configuration errors.
@@ -2389,6 +2594,138 @@ mod tests {
         certificate.chain()[0].as_ref().to_vec()
     }
 
+    /// Every certificate key algorithm the aws-lc-rs provider accepts must still load and
+    /// produce a rustls signing key. P-521 is the regression this task fixes; the rest guard the
+    /// matrix Caddy accepts.
+    #[test]
+    fn supported_private_key_matrix_builds_signing_keys() {
+        let keys = [
+            (
+                "RSA-2048 PKCS#1",
+                include_str!("../testdata/key-types/rsa2048-pkcs1.key"),
+            ),
+            (
+                "RSA-2048 PKCS#8",
+                include_str!("../testdata/key-types/rsa2048-pkcs8.key"),
+            ),
+            (
+                "RSA-4096",
+                include_str!("../testdata/key-types/rsa4096.key"),
+            ),
+            (
+                "ECDSA P-256 SEC1",
+                include_str!("../testdata/key-types/p256-sec1.key"),
+            ),
+            (
+                "ECDSA P-256 PKCS#8",
+                include_str!("../testdata/key-types/p256-pkcs8.key"),
+            ),
+            (
+                "ECDSA P-384 PKCS#8",
+                include_str!("../testdata/key-types/p384.key"),
+            ),
+            (
+                "ECDSA P-521 SEC1",
+                include_str!("../testdata/key-types/p521-sec1.key"),
+            ),
+            (
+                "ECDSA P-521 PKCS#8",
+                include_str!("../testdata/key-types/p521-pkcs8.key"),
+            ),
+            ("Ed25519", include_str!("../testdata/key-types/ed25519.key")),
+        ];
+        for (name, pem) in keys {
+            let key = private_key_from_pem(pem).unwrap_or_else(|error| panic!("{name}: {error}"));
+            rustls::crypto::aws_lc_rs::sign::any_supported_type(&key)
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+        }
+    }
+
+    /// Unsupported key types stay rejected with a located message that names the detected type
+    /// (and uses Caddy's wording where Caddy rejects the same key).
+    #[test]
+    fn unsupported_private_key_types_are_classified() {
+        let cases = [
+            (
+                "secp256k1",
+                include_str!("../testdata/key-types/secp256k1.key"),
+                ["secp256k1", "x509: unsupported elliptic curve"].as_slice(),
+            ),
+            (
+                "Ed448",
+                include_str!("../testdata/key-types/ed448.key"),
+                ["Ed448", "1.3.101.113"].as_slice(),
+            ),
+            (
+                "DSA",
+                include_str!("../testdata/key-types/dsa.key"),
+                ["DSA", "1.2.840.10040.4.1"].as_slice(),
+            ),
+            (
+                "encrypted",
+                include_str!("../testdata/key-types/encrypted-p256.key"),
+                ["encrypted private keys are not supported"].as_slice(),
+            ),
+        ];
+        for (name, pem, expected) in cases {
+            let error = match private_key_from_pem(pem) {
+                Ok(_) => panic!("{name} must be rejected"),
+                Err(error) => error,
+            };
+            let message = error.to_string();
+            assert!(
+                message.contains("TLS configuration at `certificates`"),
+                "{name}: {message}"
+            );
+            for needle in expected {
+                assert!(message.contains(needle), "{name}: {message}");
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_key_error_names_certificate_source_and_dns_names() {
+        let error = TlsCertificate::from_pem_with_source(
+            include_str!("../testdata/key-types/p256-sec1.pem"),
+            include_str!("../testdata/key-types/secp256k1.key"),
+            Some("apps.tls.certificates.load_pem[1]".to_string()),
+        )
+        .expect_err("secp256k1 must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("apps.tls.certificates.load_pem[1]"),
+            "{message}"
+        );
+        assert!(message.contains("localhost"), "{message}");
+        assert!(message.contains("secp256k1"), "{message}");
+    }
+
+    #[test]
+    fn malformed_private_key_der_names_the_block_label() {
+        // DER prefix `30 82 01 00` claims a 256-byte SEQUENCE with no body: truncated.
+        let pem = "-----BEGIN PRIVATE KEY-----\nMIIBAA==\n-----END PRIVATE KEY-----\n";
+        let error = private_key_from_pem(pem).expect_err("truncated DER must be rejected");
+        let message = error.to_string();
+        assert!(message.contains("`PRIVATE KEY` block"), "{message}");
+        assert!(message.contains("truncated"), "{message}");
+    }
+
+    #[test]
+    fn multiple_private_key_blocks_use_the_first() {
+        let combined = format!(
+            "{}{}",
+            include_str!("../testdata/key-types/p256-sec1.key"),
+            include_str!("../testdata/key-types/p521-sec1.key")
+        );
+        let used = private_key_from_pem(&combined).expect("the first key is used");
+        let first = private_key_from_pem(include_str!("../testdata/key-types/p256-sec1.key"))
+            .expect("first key parses alone");
+        assert_eq!(
+            private_key_label_and_der(&used),
+            private_key_label_and_der(&first)
+        );
+    }
+
     const CLIENT_CA_CERT: &str = include_str!("../testdata/auto-https/ca.pem");
     const CLIENT_CERT: &str = include_str!("../testdata/client-auth/client.pem");
     const CLIENT_KEY: &str = include_str!("../testdata/client-auth/client.key");
@@ -2442,7 +2779,7 @@ mod tests {
                 .map(|_| ())
                 .map_err(|error| format!("server handshake: {error}"))
         });
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let builder = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
             .with_protocol_versions(versions)
             .map_err(|error| error.to_string())?
@@ -3198,11 +3535,19 @@ mod tests {
         );
     }
 
+    /// Look up one of the aws-lc-rs provider's cipher suites by its wire identifier.
+    fn aws_lc_suite(suite: rustls::CipherSuite) -> SupportedCipherSuite {
+        *rustls::crypto::aws_lc_rs::DEFAULT_CIPHER_SUITES
+            .iter()
+            .find(|candidate| candidate.suite() == suite)
+            .expect("aws-lc-rs provides the cipher suite")
+    }
+
     fn provider_with(
         curves: Option<&[&'static dyn SupportedKxGroup]>,
         suites: Option<Vec<SupportedCipherSuite>>,
     ) -> Arc<CryptoProvider> {
-        let mut provider = rustls::crypto::ring::default_provider();
+        let mut provider = rustls::crypto::aws_lc_rs::default_provider();
         if let Some(curves) = curves {
             provider.kx_groups = curves.to_vec();
         }
@@ -3291,7 +3636,7 @@ mod tests {
     #[test]
     fn parses_curve_and_cipher_suite_policy_fields() {
         let options = TlsServerOptions::from_connection_policies(Some(&[serde_json::json!({
-            "curves": ["x25519", "secp384r1", "x25519"],
+            "curves": ["x25519mlkem768", "x25519", "secp384r1", "x25519"],
             "cipher_suites": [
                 "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
                 "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
@@ -3299,7 +3644,10 @@ mod tests {
             ]
         })]))
         .expect("curves and cipher suites parse");
-        assert_eq!(options.curves, vec![TlsCurve::X25519, TlsCurve::P384]);
+        assert_eq!(
+            options.curves,
+            vec![TlsCurve::X25519MlKem768, TlsCurve::X25519, TlsCurve::P384,]
+        );
         assert_eq!(
             options.cipher_suites,
             vec![
@@ -3326,19 +3674,36 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_curve_and_cipher_names_fail_loudly() {
-        for curve in ["secp521r1", "x25519mlkem768"] {
-            let error = TlsServerOptions::from_connection_policies(Some(&[
-                serde_json::json!({"curves": [curve]}),
-            ]))
-            .unwrap_err();
-            assert!(
-                error.to_string().contains("unsupported TLS curve")
-                    || error.to_string().contains("TLS curve"),
-                "{curve}: {error}"
-            );
-        }
+    fn secp521r1_curve_fails_closed_and_unknown_names_fail_loudly() {
+        // Caddy accepts secp521r1 as a curve; rustls' aws-lc-rs provider has no P-521
+        // key-exchange group, so the policy must fail with a located error instead of being
+        // silently dropped. P-521 *certificate* keys are supported (see the key-type tests).
+        let options = TlsServerOptions::from_connection_policies(Some(&[
+            serde_json::json!({"curves": ["secp521r1"]}),
+        ]))
+        .expect("secp521r1 parses like Caddy");
+        assert_eq!(options.curves, vec![TlsCurve::Secp521r1]);
+        let resolver =
+            Arc::new(CertificateResolver::from_certificates([example()]).expect("resolver"));
+        let error = build_server_config(resolver, &options).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("secp521r1"), "{message}");
+        assert!(message.contains("aws-lc-rs"), "{message}");
+        assert!(message.contains("TLS-POLICY"), "{message}");
 
+        // A curve name Caddy does not know still fails at parse time.
+        let error = TlsServerOptions::from_connection_policies(Some(&[
+            serde_json::json!({"curves": ["bogus-curve"]}),
+        ]))
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("unsupported TLS curve"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn unsupported_cipher_names_fail_loudly() {
         let error = TlsServerOptions::from_connection_policies(Some(&[
             serde_json::json!({"cipher_suites": ["TLS_AES_128_GCM_SHA256"]}),
         ]))
@@ -3376,7 +3741,6 @@ mod tests {
 
     #[tokio::test]
     async fn restricted_tls12_cipher_suites_are_negotiated() {
-        use rustls::crypto::ring::cipher_suite;
         let server = policy_server(
             Vec::new(),
             vec![Tls12CipherSuite::EcdheEcdsaAes128GcmSha256],
@@ -3384,7 +3748,9 @@ mod tests {
         );
         let client = provider_with(
             None,
-            Some(vec![cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256]),
+            Some(vec![aws_lc_suite(
+                rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+            )]),
         );
         let (suite, _group, version) = handshake_with_provider(server, client, TLS12_ONLY)
             .await
@@ -3402,7 +3768,9 @@ mod tests {
         );
         let mismatched_client = provider_with(
             None,
-            Some(vec![cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384]),
+            Some(vec![aws_lc_suite(
+                rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+            )]),
         );
         assert!(
             handshake_with_provider(server, mismatched_client, TLS12_ONLY)
@@ -3414,7 +3782,7 @@ mod tests {
 
     #[tokio::test]
     async fn restricted_curves_are_negotiated() {
-        use rustls::crypto::ring::kx_group;
+        use rustls::crypto::aws_lc_rs::kx_group;
         // TLS 1.3 restriction: server offers only P-384, client only supplies P-384.
         let server = policy_server(vec![TlsCurve::P384], Vec::new(), TlsVersions::Default);
         let client = provider_with(Some(&[kx_group::SECP384R1]), None);
@@ -3444,31 +3812,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tls13_cipher_suites_remain_fixed_when_tls12_is_restricted() {
-        use rustls::crypto::ring::cipher_suite;
-        let server = policy_server(
-            Vec::new(),
-            vec![Tls12CipherSuite::EcdheEcdsaAes128GcmSha256],
-            TlsVersions::Tls13Only,
-        );
-        let client = provider_with(
-            None,
-            Some(vec![
-                cipher_suite::TLS13_AES_128_GCM_SHA256,
-                cipher_suite::TLS13_AES_256_GCM_SHA384,
-                cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
-            ]),
-        );
-        let (suite, _group, version) = handshake_with_provider(server, client, TLS13_ONLY)
+    async fn each_supported_curve_negotiates_when_configured_alone() {
+        use rustls::crypto::aws_lc_rs::kx_group;
+        let cases: [(TlsCurve, &'static dyn SupportedKxGroup, rustls::NamedGroup); 4] = [
+            (
+                TlsCurve::X25519MlKem768,
+                kx_group::X25519MLKEM768,
+                rustls::NamedGroup::X25519MLKEM768,
+            ),
+            (
+                TlsCurve::X25519,
+                kx_group::X25519,
+                rustls::NamedGroup::X25519,
+            ),
+            (
+                TlsCurve::P256,
+                kx_group::SECP256R1,
+                rustls::NamedGroup::secp256r1,
+            ),
+            (
+                TlsCurve::P384,
+                kx_group::SECP384R1,
+                rustls::NamedGroup::secp384r1,
+            ),
+        ];
+        for (curve, client_group, expected) in cases {
+            let server = policy_server(vec![curve], Vec::new(), TlsVersions::Tls13Only);
+            let client = provider_with(Some(&[client_group]), None);
+            let (_, group, version) = handshake_with_provider(server, client, TLS13_ONLY)
+                .await
+                .unwrap_or_else(|error| panic!("{}: {error}", curve.name()));
+            assert_eq!(
+                group,
+                expected,
+                "{} negotiated the wrong group",
+                curve.name()
+            );
+            assert_eq!(version, rustls::ProtocolVersion::TLSv1_3);
+        }
+    }
+
+    #[tokio::test]
+    async fn default_curves_prefer_mlkem_and_fall_back_to_x25519() {
+        use rustls::crypto::aws_lc_rs::kx_group;
+
+        // Caddy's default curve list starts with x25519mlkem768. A client that offers a hybrid
+        // key share must negotiate it (rustls' own default client order starts with X25519, so
+        // pin the client order explicitly here).
+        let server = policy_server(Vec::new(), Vec::new(), TlsVersions::Tls13Only);
+        let client = provider_with(Some(&[kx_group::X25519MLKEM768, kx_group::X25519]), None);
+        let (_, group, _) = handshake_with_provider(server, client, TLS13_ONLY)
             .await
-            .expect("TLS 1.3 still negotiates with a TLS 1.2 cipher restriction");
-        assert_eq!(version, rustls::ProtocolVersion::TLSv1_3);
-        assert!(matches!(
-            suite,
-            rustls::CipherSuite::TLS13_AES_128_GCM_SHA256
-                | rustls::CipherSuite::TLS13_AES_256_GCM_SHA384
-                | rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256
-        ));
+            .expect("default policy handshake");
+        assert_eq!(group, rustls::NamedGroup::X25519MLKEM768);
+
+        // A client that offers only X25519 still connects: the server falls back past the
+        // hybrid group instead of requiring it.
+        let server = policy_server(Vec::new(), Vec::new(), TlsVersions::Tls13Only);
+        let client = provider_with(Some(&[kx_group::X25519]), None);
+        let (_, group, _) = handshake_with_provider(server, client, TLS13_ONLY)
+            .await
+            .expect("x25519-only client falls back");
+        assert_eq!(group, rustls::NamedGroup::X25519);
     }
 
     #[tokio::test]
@@ -3481,6 +3886,33 @@ mod tests {
         assert!(matches!(
             version,
             rustls::ProtocolVersion::TLSv1_3 | rustls::ProtocolVersion::TLSv1_2
+        ));
+    }
+
+    #[tokio::test]
+    async fn tls13_cipher_suites_remain_fixed_when_tls12_is_restricted() {
+        let server = policy_server(
+            Vec::new(),
+            vec![Tls12CipherSuite::EcdheEcdsaAes128GcmSha256],
+            TlsVersions::Tls13Only,
+        );
+        let client = provider_with(
+            None,
+            Some(vec![
+                aws_lc_suite(rustls::CipherSuite::TLS13_AES_128_GCM_SHA256),
+                aws_lc_suite(rustls::CipherSuite::TLS13_AES_256_GCM_SHA384),
+                aws_lc_suite(rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256),
+            ]),
+        );
+        let (suite, _group, version) = handshake_with_provider(server, client, TLS13_ONLY)
+            .await
+            .expect("TLS 1.3 still negotiates with a TLS 1.2 cipher restriction");
+        assert_eq!(version, rustls::ProtocolVersion::TLSv1_3);
+        assert!(matches!(
+            suite,
+            rustls::CipherSuite::TLS13_AES_128_GCM_SHA256
+                | rustls::CipherSuite::TLS13_AES_256_GCM_SHA384
+                | rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256
         ));
     }
 
@@ -3534,17 +3966,34 @@ mod tests {
 
     #[test]
     fn resolver_rejects_unsupported_key_types() {
-        // A syntactically valid PEM block whose DER is not a supported key is rejected when the
-        // rustls signing key is built (i.e. when the resolver inserts the certificate).
-        let certificate = TlsCertificate::from_pem(
+        // A syntactically valid PEM block whose DER is not a supported key is rejected while
+        // loading the certificate, with a message naming the block and the certificate.
+        let error = TlsCertificate::from_pem(
             EXAMPLE_CERT,
             "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n",
         )
-        .unwrap();
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("certificates"), "{message}");
+        assert!(message.contains("`PRIVATE KEY` block"), "{message}");
+
+        // A certificate built from DER (the in-memory cache/storage path) bypasses the PEM
+        // classifier; the provider rejection must still name the key type and certificate.
+        let (_, ed448_der) = pem_blocks(include_str!("../testdata/key-types/ed448.key"))
+            .expect("Ed448 fixture PEM parses")
+            .remove(0);
+        let certificate = TlsCertificate::from_der(
+            vec![certificate_der(&example())],
+            ed448_der,
+            vec!["example.com".to_string()],
+        )
+        .expect("DER certificate builds");
         let error = certificate.certified_key().unwrap_err();
-        assert!(error.to_string().contains("certificates"), "{error}");
+        let message = error.to_string();
+        assert!(message.contains("Ed448"), "{message}");
+        assert!(message.contains("DNS names: example.com"), "{message}");
         let error = CertificateResolver::from_certificates([certificate]).unwrap_err();
-        assert!(error.to_string().contains("certificates"), "{error}");
+        assert!(error.to_string().contains("Ed448"), "{error}");
     }
 
     // ---- connection-policy SNI matching and certificate_selection tags -------------------
@@ -3620,7 +4069,7 @@ mod tests {
             let _ = tls.shutdown().await;
         });
 
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let mut client = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
             .with_safe_default_protocol_versions()
             .unwrap()
@@ -3829,7 +4278,7 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             acceptor.accept(stream).await
         });
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let mut client = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
             .with_safe_default_protocol_versions()
             .unwrap()
@@ -3976,7 +4425,7 @@ mod tests {
     }
 
     fn resumption_client(identity: Option<(&str, &str)>) -> Arc<rustls::ClientConfig> {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
             .with_protocol_versions(TLS12_ONLY)
             .expect("TLS 1.2 client config")

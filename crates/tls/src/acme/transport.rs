@@ -5,8 +5,8 @@
 //! [`order`](super::order) tests). This module supplies the production implementation:
 //!
 //! * `http://` and `https://` via hyper 1.x's legacy client and `hyper-rustls`;
-//! * rustls with the `ring` provider only (the workspace's offline registry cache has no
-//!   aws-lc-rs, rustls-native-certs or webpki-roots crates);
+//! * rustls with the aws-lc-rs provider (the same provider as the server terminator), so
+//!   ECDSA P-521 certificates and account keys use one consistent crypto stack;
 //! * trust roots loaded from the platform CA bundle (best effort: the usual Linux locations),
 //!   or supplied explicitly for tests and private ACME CAs.
 //!
@@ -205,7 +205,7 @@ fn client_config(roots: &[CertificateDer<'static>], set_alpn: bool) -> Result<Cl
                 reason: format!("invalid trust root: {error}"),
             })?;
     }
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let mut config = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|error| AcmeError::Transport {
@@ -784,7 +784,7 @@ mod tests {
             "test fixture must hold one certificate"
         );
         let key = pem_block_der(TEST_KEY_PEM, "PRIVATE KEY");
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let config = rustls::ServerConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
             .unwrap()
@@ -1165,7 +1165,7 @@ mod tests {
     ) -> (u16, Vec<CertificateDer<'static>>) {
         let certificates = parse_pem_certificates(TEST_CERT_PEM.as_bytes()).unwrap();
         let key = pem_block_der(TEST_KEY_PEM, "PRIVATE KEY");
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let mut config = rustls::ServerConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
             .unwrap()

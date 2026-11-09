@@ -1305,7 +1305,11 @@ impl AutomaticHttpsProvisioner {
                     managed.push(certificate);
                 }
             }
-            resolver.insert(TlsCertificate::from_stored(&stored)?)?;
+            let certificate = TlsCertificate::from_stored_with_source(
+                &stored,
+                Some(format!("storage key {key}")),
+            )?;
+            resolver.insert(certificate)?;
         }
 
         // Reuse the previous generation's in-memory certificates first. This is what keeps a
@@ -1987,7 +1991,7 @@ mod tests {
                 let _ = stream.shutdown().await;
             }
         });
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let mut roots = rustls::RootCertStore::empty();
         roots
             .add(rustls::pki_types::CertificateDer::from(root_der))
@@ -3525,7 +3529,7 @@ mod tests {
         let listener = TcpListener::from_std(listener).unwrap();
         let certificates = parse_pem_certificates(ACME_TLS_CERT_PEM.as_bytes()).unwrap();
         let key = pem_block_der(ACME_TLS_KEY_PEM, "PRIVATE KEY");
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let config = rustls::ServerConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
             .unwrap()

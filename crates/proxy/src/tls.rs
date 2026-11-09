@@ -26,7 +26,7 @@
 //!   dial host (TCP) or must be configured (Unix sockets have no host).
 //! * `handshake_timeout` bounds the TLS handshake, like Caddy's `TLSHandshakeTimeout`.
 //!
-//! Only the `ring` crypto provider is used because the offline build has no `aws-lc-rs`.
+//! The aws-lc-rs crypto provider is used, matching the server terminator (ECDSA P-521).
 //!
 //! Unsupported Caddy TLS options (`client_certificate_automate`, explicit `curves`, any
 //! `renegotiation` other than "never") fail loudly with tracked errors instead of being ignored.
@@ -146,7 +146,7 @@ impl UpstreamTls {
             .filter(|timeout| *timeout > 0)
             .map(Duration::from_nanos);
 
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let builder = ClientConfig::builder_with_provider(Arc::clone(&provider))
             .with_safe_default_protocol_versions()
             .map_err(|error| {

@@ -200,7 +200,7 @@ fn client_config(force_tls12: bool) -> Arc<ClientConfig> {
     {
         roots.add(certificate).expect("fixture is a valid root");
     }
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let builder = ClientConfig::builder_with_provider(provider);
     let builder = if force_tls12 {
         builder

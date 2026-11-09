@@ -34,13 +34,18 @@ http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 libc = "0.2.189"
-quinn = { version = "0.11", optional = true }
-rustls = { version = "0.23.45", default-features = false, features = ["std", "ring", "tls12", "logging"] }
+# QUIC uses the same rustls provider as TCP TLS: aws-lc-rs (rustls-ring would pull the ring
+# provider back in and rustls rejects a second default provider). `bloom`, `log` and
+# `runtime-tokio` replace quinn's default feature set minus `rustls-ring`.
+quinn = { version = "0.11", optional = true, default-features = false, features = [
+    "bloom", "log", "platform-verifier", "runtime-tokio", "rustls-aws-lc-rs",
+] }
+rustls = { version = "0.23.45", default-features = false, features = ["std", "aws_lc_rs", "tls12", "logging"] }
 serde_json = { workspace = true }
 socket2 = "0.6.5"
 thiserror = { workspace = true }
 tokio = { workspace = true }
-tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["aws_lc_rs", "tls12", "logging"] }
 tracing = { workspace = true }
 
 [dev-dependencies]

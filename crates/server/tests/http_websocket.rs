@@ -313,7 +313,7 @@ async fn websocket_upgrade_passthrough_over_tls() {
     for certificate in caddy_rs_tls::certificates_from_pem(EXAMPLE_CERT).expect("cert PEM parses") {
         roots.add(certificate).expect("valid root");
     }
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let mut tls_config = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .expect("safe protocol versions")
