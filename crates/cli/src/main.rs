@@ -19,6 +19,7 @@ use http_body_util::{BodyExt, Full};
 
 use caddy_rs_admin::pki::{resolve_data_dir, PkiError, PkiStore, DEFAULT_CA_ID};
 use caddy_rs_admin::AdminResponse;
+use caddy_rs_config::{AdaptMode, AdaptOptions};
 use caddy_rs_core::{Config, GenerationStore, ModuleRegistry, VERSION};
 use caddy_rs_server::ServerRuntime;
 
@@ -55,6 +56,9 @@ enum Command {
         /// Adapter name (`caddyfile` or `json`).
         #[arg(long)]
         adapter: Option<String>,
+        /// Configuration-acceptance mode (`compatible`, `warn` or `strict`); default compatible.
+        #[arg(long, default_value = "compatible", value_name = "MODE")]
+        adapt_mode: String,
         /// Indented output.
         #[arg(long)]
         pretty: bool,
@@ -70,6 +74,9 @@ enum Command {
         /// Adapter name (`caddyfile` or `json`).
         #[arg(long)]
         adapter: Option<String>,
+        /// Configuration-acceptance mode (`compatible`, `warn` or `strict`); default compatible.
+        #[arg(long, default_value = "compatible", value_name = "MODE")]
+        adapt_mode: String,
     },
     /// Run the server with a configuration.
     Run {
@@ -79,6 +86,9 @@ enum Command {
         /// Adapter name (`caddyfile` or `json`).
         #[arg(long)]
         adapter: Option<String>,
+        /// Configuration-acceptance mode (`compatible`, `warn` or `strict`); default compatible.
+        #[arg(long, default_value = "compatible", value_name = "MODE")]
+        adapt_mode: String,
         /// Use saved config, if any (and prefer over --config file).
         #[arg(short = 'r', long)]
         resume: bool,
@@ -239,10 +249,12 @@ async fn run(command: Command) -> anyhow::Result<()> {
         Command::Adapt {
             config,
             adapter,
+            adapt_mode,
             pretty,
             output,
         } => {
-            let (json, warnings) = adapt(&config, adapter.as_deref())?;
+            let options = adapt_options(&adapt_mode)?;
+            let (json, warnings) = adapt(&config, adapter.as_deref(), options)?;
             let json = if pretty {
                 let value: serde_json::Value = serde_json::from_slice(&json)
                     .context("cannot parse adapted JSON for pretty printing")?;
@@ -260,8 +272,13 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 None => println!("{}", String::from_utf8_lossy(&json)),
             }
         }
-        Command::Validate { config, adapter } => {
-            let loaded = load_validated(&config, adapter.as_deref())?;
+        Command::Validate {
+            config,
+            adapter,
+            adapt_mode,
+        } => {
+            let options = adapt_options(&adapt_mode)?;
+            let loaded = load_validated(&config, adapter.as_deref(), options)?;
             for warning in &loaded.warnings {
                 eprintln!("warning: {warning}");
             }
@@ -284,9 +301,11 @@ async fn run(command: Command) -> anyhow::Result<()> {
         Command::Run {
             config,
             adapter,
+            adapt_mode,
             resume,
             autosave_path,
         } => {
+            let options = adapt_options(&adapt_mode)?;
             // Caddy's autosave path: the `--autosave-path` flag wins, then the environment-derived
             // default (`$XDG_CONFIG_HOME/caddy-rs/autosave.json`, `$HOME/.config/caddy-rs/...`,
             // `./.caddy-rs/...`); see `caddy_rs_core::autosave`.
@@ -337,7 +356,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
             let loaded = match loaded {
                 Some(loaded) => loaded,
                 None => match config {
-                    Some(path) => load_validated(&path, adapter.as_deref())?,
+                    Some(path) => load_validated(&path, adapter.as_deref(), options)?,
                     None => bail!(
                         "no configuration to load: pass --config <path> or use --resume with an \
                          existing autosave file"
@@ -410,7 +429,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
             adapter,
             admin,
         } => {
-            let loaded = load_validated(&config, adapter.as_deref())?;
+            let loaded = load_validated(&config, adapter.as_deref(), AdaptOptions::default())?;
             for warning in &loaded.warnings {
                 eprintln!("warning: {warning}");
             }
@@ -485,18 +504,31 @@ impl LoadedConfig {
     }
 }
 
+/// Parse the `--adapt-mode` flag into adapter options, rejecting unknown mode names with the
+/// three accepted values.
+fn adapt_options(value: &str) -> anyhow::Result<AdaptOptions> {
+    let mode = value
+        .parse::<AdaptMode>()
+        .map_err(|message| anyhow!("{message}"))?;
+    Ok(AdaptOptions::new(mode))
+}
+
 /// Read `config` and adapt it to Caddy JSON, returning the exact JSON bytes of the loaded/adapted
 /// config plus any adapter warnings. For the JSON adapter the bytes are the file contents verbatim
 /// (Caddy autosaves the exact bytes it loaded); for the Caddyfile adapter they are the adapter's
 /// JSON output.
-fn adapt(config: &Path, adapter: Option<&str>) -> anyhow::Result<(Vec<u8>, Vec<String>)> {
+fn adapt(
+    config: &Path,
+    adapter: Option<&str>,
+    options: AdaptOptions,
+) -> anyhow::Result<(Vec<u8>, Vec<String>)> {
     let input = std::fs::read(config)
         .with_context(|| format!("cannot read config `{}`", config.display()))?;
     match infer_adapter(config, adapter).as_deref() {
         Some("caddyfile") => {
             let text = std::str::from_utf8(&input)
                 .with_context(|| format!("`{}` is not valid UTF-8", config.display()))?;
-            let adapted = caddy_rs_config::adapt_with_source(text, Some(config))
+            let adapted = caddy_rs_config::adapt_with_options(text, Some(config), options)
                 .with_context(|| format!("cannot adapt `{}`", config.display()))?;
             let json = serde_json::to_vec(&adapted.config)
                 .context("cannot serialize adapted configuration")?;
@@ -513,8 +545,12 @@ fn adapt(config: &Path, adapter: Option<&str>) -> anyhow::Result<(Vec<u8>, Vec<S
     }
 }
 
-fn load_validated(config: &Path, adapter: Option<&str>) -> anyhow::Result<LoadedConfig> {
-    let (json, warnings) = adapt(config, adapter)?;
+fn load_validated(
+    config: &Path,
+    adapter: Option<&str>,
+    options: AdaptOptions,
+) -> anyhow::Result<LoadedConfig> {
+    let (json, warnings) = adapt(config, adapter, options)?;
     let model = Config::from_slice(&json).with_context(|| {
         format!(
             "`{}` does not match the configuration model",
@@ -735,7 +771,11 @@ async fn run_trust(
     dry_run: bool,
 ) -> anyhow::Result<()> {
     let loaded = match &config_path {
-        Some(path) => Some(load_validated(path, adapter.as_deref())?),
+        Some(path) => Some(load_validated(
+            path,
+            adapter.as_deref(),
+            AdaptOptions::default(),
+        )?),
         None => None,
     };
     let storage_root = loaded.as_ref().and_then(|loaded| {

@@ -1076,3 +1076,132 @@ fn trust_honours_install_trust_false_from_config_as_a_clear_no_op() {
         "{stderr}"
     );
 }
+
+// ---- --adapt-mode (T-HTTP-050) -----------------------------------------------------------------
+
+fn write_caddyfile(directory: &tempfile::TempDir, body: &str) -> std::path::PathBuf {
+    let config = directory.path().join("Caddyfile");
+    std::fs::write(&config, body).expect("write Caddyfile");
+    config
+}
+
+#[test]
+fn adapt_mode_flag_controls_deprecated_alias_handling() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = write_caddyfile(&directory, ":8080 {\n\tskip_log\n\trespond \"ok\"\n}\n");
+    let path = config.to_str().unwrap();
+
+    // compatible (default): alias accepted, no warning, same JSON as log_skip.
+    let (code, stdout, stderr) = run(&["adapt", "--config", path]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(!stderr.contains("deprecated"), "{stderr}");
+    let compatible: serde_json::Value = serde_json::from_str(&stdout).expect("compatible JSON");
+
+    // warn: alias accepted, Caddy's deprecation warning emitted, JSON unchanged.
+    let (code, stdout, stderr) = run(&["adapt", "--config", path, "--adapt-mode", "warn"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        stderr.contains("the 'skip_log' directive is deprecated, please use 'log_skip' instead!"),
+        "{stderr}"
+    );
+    let warned: serde_json::Value = serde_json::from_str(&stdout).expect("warn JSON");
+    assert_eq!(warned, compatible);
+
+    // strict: rejected with a located error naming both spellings, no warning-then-accept.
+    let (code, _stdout, stderr) = run(&["adapt", "--config", path, "--adapt-mode", "strict"]);
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("`skip_log` is a deprecated alias for `log_skip`"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("Caddyfile line 2"), "{stderr}");
+    assert!(!stderr.contains("warning:"), "{stderr}");
+}
+
+#[test]
+fn adapt_mode_strict_still_accepts_log_skip() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = write_caddyfile(&directory, ":8080 {\n\tlog_skip\n\trespond \"ok\"\n}\n");
+    let (code, stdout, stderr) = run(&[
+        "adapt",
+        "--config",
+        config.to_str().unwrap(),
+        "--adapt-mode",
+        "strict",
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("JSON");
+    assert_eq!(
+        value["apps"]["http"]["servers"]["srv0"]["routes"][0]["handle"][0]["handler"],
+        "vars"
+    );
+}
+
+#[test]
+fn validate_honours_adapt_mode() {
+    let directory = tempfile::tempdir().unwrap();
+    let skip_log = write_caddyfile(&directory, ":8080 {\n\tskip_log\n\trespond \"ok\"\n}\n");
+
+    let (code, stdout, stderr) = run(&["validate", "--config", skip_log.to_str().unwrap()]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("Valid configuration"), "{stdout}");
+
+    let (code, _stdout, stderr) = run(&[
+        "validate",
+        "--config",
+        skip_log.to_str().unwrap(),
+        "--adapt-mode",
+        "strict",
+    ]);
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("deprecated alias for `log_skip`"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("skip_log"), "{stderr}");
+}
+
+#[test]
+fn run_honours_adapt_mode_before_starting_listeners() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = write_caddyfile(&directory, ":8080 {\n\tskip_log\n\trespond \"ok\"\n}\n");
+    let (code, _stdout, stderr) = run(&[
+        "run",
+        "--config",
+        config.to_str().unwrap(),
+        "--adapt-mode",
+        "strict",
+    ]);
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("deprecated alias for `log_skip`"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn unknown_adapt_mode_is_rejected_with_the_three_modes() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = write_caddyfile(&directory, ":8080 {\n\trespond \"ok\"\n}\n");
+    let (code, _stdout, stderr) = run(&[
+        "adapt",
+        "--config",
+        config.to_str().unwrap(),
+        "--adapt-mode",
+        "reckless",
+    ]);
+    assert_ne!(code, 0);
+    assert!(stderr.contains("reckless"), "{stderr}");
+    assert!(stderr.contains("compatible"), "{stderr}");
+    assert!(stderr.contains("warn"), "{stderr}");
+    assert!(stderr.contains("strict"), "{stderr}");
+}
+
+#[test]
+fn adapt_help_documents_adapt_mode() {
+    let (code, stdout, _stderr) = run(&["adapt", "--help"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("--adapt-mode"), "{stdout}");
+    assert!(stdout.contains("compatible"), "{stdout}");
+    assert!(stdout.contains("strict"), "{stdout}");
+}
