@@ -25,13 +25,36 @@
 //! `https://<host>/acme/local/directory` exactly like Caddy.
 //!
 //! `X-Forwarded-Proto` and `X-Forwarded-Host` select the external origin for a TLS-terminating
-//! reverse proxy only when the server's trusted-proxy policy marks the peer trusted
-//! (`trusted_proxy` request variable); the client-facing scheme and host then replace the
-//! listener's connection scheme and request `Host`. Validation applies regardless of that policy:
-//! malformed forwarded values are rejected even from untrusted peers. Valid values from an
-//! untrusted peer are ignored and cannot spoof the origin. The headers affect URL construction
-//! only (the JWS `url` binding uses the same origin); routing, certificate identifiers and the
-//! `http-01` fetch target never read them.
+//! reverse proxy only when the request carries `trusted_proxy=true`; the client-facing scheme and
+//! host then replace the listener's connection scheme and request `Host`. Validation applies
+//! regardless of that policy: malformed forwarded values are rejected even from untrusted peers.
+//! Valid values from an untrusted peer are ignored and cannot spoof the origin. The headers affect
+//! URL construction only (the JWS `url` binding uses the same origin); routing, certificate
+//! identifiers and the `http-01` fetch target never read them.
+//!
+//! The trust gate is **configuration-level, not a proof about the request**. The server normally
+//! derives `trusted_proxy` before routing from the transport peer (or the peer claimed by an
+//! accepted PROXY-protocol header) against `apps.http.servers.<name>.trusted_proxies` /
+//! `trusted_proxies_unix`, but operator `vars`/`map` handlers can also write the variable,
+//! including values expanded from request placeholders such as `{http.request.header.*}`. Such a
+//! configuration is request-influenceable by design; never map untrusted request data into
+//! `trusted_proxy`/`client_ip`. A permissive range (`all`, `0.0.0.0/0`, `::/0`) or an exposed
+//! PROXY-protocol listener makes the gate depend on a network peer's claim; the server emits a
+//! load-time warning for both (T-TLS-087). The resolved decision is observable per request as
+//! `{http.vars.trusted_proxy}` (and `{http.vars.client_ip}`); this handler consumes that variable
+//! as-is and does not re-derive it from the peer address.
+//!
+//! Proxy deployment obligations (security review findings F-4/F-5):
+//!
+//! * the trusted proxy must overwrite or strip client-supplied `X-Forwarded-Proto` and
+//!   `X-Forwarded-Host` instead of reflecting them;
+//! * malformed forwarded values are a `malformed` problem even from an untrusted peer, so an
+//!   intermediary that synthesizes comma-joined or otherwise invalid values breaks every ACME
+//!   request behind it (F-4);
+//! * a TLS-terminating proxy must forward the client-facing scheme faithfully. Forwarding
+//!   `X-Forwarded-Host` without `X-Forwarded-Proto` advertises the backend connection scheme
+//!   (usually `http`), and `X-Forwarded-Proto: http` downgrades the advertised origin, including
+//!   a configured `host` (F-5).
 //!
 //! Direct requests keep the historical `https` scheme, but their authority now goes through the
 //! same strict `host`/`host:port` validation as forwarded headers. An authority outside that
@@ -1572,13 +1595,19 @@ impl AcmeServerHandler {
     /// from it advertised a directory the client could not bind to. This matches Caddy/smallstep's
     /// single-origin behaviour but changes the expected `url` for configurations with `host` set.
     ///
-    /// Forwarded origin *selection* requires the server's trusted-proxy policy to set
-    /// `trusted_proxy=true` for the peer (the same signal `reverse_proxy` and `forward_auth`
-    /// consume). Without that signal, valid forwarded values are ignored so an arbitrary client
-    /// cannot choose the external URL. Validation is not gated: malformed forwarded values are a
-    /// loud `malformed` problem for trusted and untrusted peers alike. Operator `vars`/`map`
-    /// configuration can also set `trusted_proxy` — the same operator-controlled footgun class as
-    /// Caddy — so the gate is not request-influenceable, but it is not immutable configuration.
+    /// Forwarded origin *selection* requires `trusted_proxy=true` for the request (the same
+    /// signal `reverse_proxy` and `forward_auth` consume). The server normally derives that value
+    /// before routing from the transport peer against `trusted_proxies`/`trusted_proxies_unix`,
+    /// but operator `vars`/`map` configuration can also set it, including from request
+    /// placeholders. The gate is therefore configuration-level trust, not a request-integrity
+    /// proof: a configuration that maps untrusted request data into `trusted_proxy` lets a client
+    /// select the advertised origin. Without the variable, valid forwarded values are ignored.
+    ///
+    /// Validation is not gated: malformed forwarded values are a loud `malformed` problem for
+    /// trusted and untrusted peers alike, so an intermediary must not synthesize broken values
+    /// (F-4). A trusted proxy must forward the client-facing scheme faithfully; an `http`
+    /// forwarded scheme downgrades the advertised origin even when a configured `host` supplies
+    /// the authority (F-5).
     ///
     /// Security note: a forwarded origin changes only the strings this handler advertises and
     /// compares in the JWS protected `url` header. It does not affect routing, account or order
@@ -1601,9 +1630,10 @@ impl AcmeServerHandler {
             .map(|host| parse_external_host(host, "X-Forwarded-Host"))
             .transpose()?;
 
-        // Operator `vars`/`map` configuration can set this variable too (the same
-        // operator-controlled footgun as Caddy); it is not settable by request headers, but it is
-        // not an immutable trust anchor either.
+        // The handler consumes the resolved variable as-is. It can come from the server's
+        // peer-address policy or from operator `vars`/`map` configuration (including
+        // request-header placeholders); provenance is not distinguishable here, so the docs treat
+        // this gate as configuration-level trust, not a request-integrity proof.
         let trusted = request
             .vars
             .get(TRUSTED_PROXY_VAR)

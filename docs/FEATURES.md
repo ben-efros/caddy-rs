@@ -34,6 +34,26 @@ Server-level `trusted_proxies`, `trusted_proxies_strict`, `trusted_proxies_unix`
 `client_ip_headers` control how the proxy's forwarding headers are believed. They affect the
 resolved client address used by the `client_ip` matcher, forwarding decisions and access logs.
 
+The derived `trusted_proxy`/`client_ip` variables are also consumed by `reverse_proxy`,
+`forward_auth` and the `acme_server` external-origin selection, and the per-request decision is
+observable as `{http.vars.trusted_proxy}` / `{http.vars.client_ip}`. That trust decision is
+**configuration-level, not a proof about the request**:
+
+- a permissive `trusted_proxies` range (`all`, `0.0.0.0/0`, `::/0`) trusts every peer. The server
+  prints a load-time `caddy-rs: warning: ... (T-TLS-087)` naming the server and range;
+- a `proxy_protocol` listener wrapper on an exposed (non-loopback) address lets an accepted header
+  replace the peer address used by the decision. The server also warns at load time, naming the
+  server and listener;
+- operator `vars`/`map` handlers can write `trusted_proxy`/`client_ip` directly, including values
+  expanded from request placeholders such as `{http.request.header.*}`. Never map untrusted
+  request data into those variables.
+
+A trusted TLS-terminating proxy must overwrite or strip inbound `X-Forwarded-Proto` and
+`X-Forwarded-Host` rather than reflect client values, and must forward the client-facing scheme:
+a forwarded host without a forwarded proto falls back to the backend connection scheme (usually
+`http`), and `X-Forwarded-Proto: http` advertises a cleartext origin. Malformed forwarded values
+are rejected even from untrusted peers, so an intermediary must not synthesize them.
+
 ## Routing
 
 A server owns an ordered list of routes. Each route has a list of matcher sets, a handler chain,
@@ -338,6 +358,25 @@ on the host) with `caddy-rs trust`.
 Issuer settings include `ca` (directory URL, default Let's Encrypt), `email`, `account_key`,
 `external_account`, `trusted_roots_pem_files`, `acme_timeout`, `network_proxy`,
 `renewal_window`, and per-challenge `disabled` switches.
+
+### Internal ACME server
+
+`http.handlers.acme_server` turns a route into an RFC 8555 ACME server backed by the internal CA,
+serving Caddy's URL shape (`<path_prefix><ca>/directory`, nonces, accounts, orders,
+authorizations, challenges, certificates and revocation) with HTTP-01 validation. Accounts,
+orders and revocation state are in memory for one configuration generation; the unimplemented
+surface (dns-01/tls-alpn-01, persistence, CRL) fails loudly and is recorded in the compatibility
+divergences.
+
+When the handler runs behind a TLS-terminating proxy, `X-Forwarded-Proto` and `X-Forwarded-Host`
+select the external origin in the advertised URLs and in the JWS-protected `url` binding only when
+the server marks the peer as a trusted proxy. The forwarded-header security-review obligations
+apply: the proxy must overwrite or strip client-supplied values, must forward both the client-facing
+scheme and host (a host without a proto falls back to the backend connection scheme), and must not
+synthesize malformed values (they are a `malformed` 400 even from untrusted peers). A permissive
+`trusted_proxies` range or an exposed `proxy_protocol` wrapper makes the origin selectable by any
+peer and produces a load-time warning; a `vars`/`map` handler that writes `trusted_proxy` from
+request data makes it request-influenceable by configuration.
 
 ### Certificates and storage
 

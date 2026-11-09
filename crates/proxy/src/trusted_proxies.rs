@@ -93,6 +93,7 @@ impl IpNet {
 #[derive(Debug, Clone, Default)]
 pub struct ServerTrustedProxies {
     ranges: Vec<IpNet>,
+    permissive_ranges: Vec<String>,
     strict: bool,
     unix: bool,
     client_ip_headers: Vec<String>,
@@ -108,8 +109,8 @@ impl ServerTrustedProxies {
         let object = server
             .as_object()
             .ok_or_else(|| invalid(path, "server configuration must be an object"))?;
-        let ranges = match object.get("trusted_proxies") {
-            None | Some(Value::Null) => Vec::new(),
+        let (ranges, permissive_ranges) = match object.get("trusted_proxies") {
+            None | Some(Value::Null) => (Vec::new(), Vec::new()),
             Some(value) => parse_trusted_proxies_value(value, &format!("{path}.trusted_proxies"))?,
         };
         let strict = match object.get("trusted_proxies_strict") {
@@ -155,6 +156,7 @@ impl ServerTrustedProxies {
         };
         Ok(Self {
             ranges,
+            permissive_ranges,
             strict,
             unix,
             client_ip_headers,
@@ -164,6 +166,16 @@ impl ServerTrustedProxies {
     /// The configured ranges (empty when `trusted_proxies` is absent or `none`).
     pub fn ranges(&self) -> &[IpNet] {
         &self.ranges
+    }
+
+    /// Configured range expressions that trust every address (a `/0` range: `all`,
+    /// `0.0.0.0/0`, `::/0`).
+    ///
+    /// The strings are the operator's original entries, so a load-time warning can name the
+    /// configured value. A non-empty list means every peer is a trusted proxy, which is only as
+    /// safe as the network path to this server (the runtime warns at load time, T-TLS-087).
+    pub fn permissive_ranges(&self) -> &[String] {
+        &self.permissive_ranges
     }
 
     /// Whether `trusted_proxies_strict` is enabled.
@@ -225,7 +237,7 @@ impl ServerTrustedProxies {
     }
 }
 
-fn parse_trusted_proxies_value(value: &Value, path: &str) -> HttpResult<Vec<IpNet>> {
+fn parse_trusted_proxies_value(value: &Value, path: &str) -> HttpResult<(Vec<IpNet>, Vec<String>)> {
     // Caddy JSON: {"source": "static", "ranges": [...]}. Bare arrays are accepted too so the
     // helper can be used from tests/adapters that have not materialised the module object.
     let (source, entries) = match value {
@@ -262,6 +274,7 @@ fn parse_trusted_proxies_value(value: &Value, path: &str) -> HttpResult<Vec<IpNe
     };
     let _ = source;
     let mut ranges = Vec::new();
+    let mut permissive_ranges = Vec::new();
     for (index, entry) in entries.iter().enumerate() {
         let text = entry.as_str().ok_or_else(|| {
             invalid(
@@ -272,13 +285,17 @@ fn parse_trusted_proxies_value(value: &Value, path: &str) -> HttpResult<Vec<IpNe
         for range in expand_range(text)
             .map_err(|message| invalid(&format!("{path}.ranges[{index}]"), message))?
         {
-            ranges.push(
-                IpNet::parse(&range)
-                    .map_err(|message| invalid(&format!("{path}.ranges[{index}]"), message))?,
-            );
+            let parsed = IpNet::parse(&range)
+                .map_err(|message| invalid(&format!("{path}.ranges[{index}]"), message))?;
+            // Keep the operator's original spelling (`all`, `0.0.0.0/0`, ...) so a warning can
+            // name exactly what was configured rather than every expanded network.
+            if parsed.prefix == 0 && !permissive_ranges.iter().any(|seen| seen == text.trim()) {
+                permissive_ranges.push(text.trim().to_string());
+            }
+            ranges.push(parsed);
         }
     }
-    Ok(ranges)
+    Ok((ranges, permissive_ranges))
 }
 
 fn expand_range(text: &str) -> Result<Vec<String>, String> {
@@ -414,6 +431,24 @@ mod tests {
             .ranges()
             .iter()
             .any(|range| range.contains("2001:db8::1".parse().unwrap())));
+        assert_eq!(
+            trusted.permissive_ranges(),
+            ["all"],
+            "the warning must name the configured spelling, not the two expanded /0 networks"
+        );
+
+        let server = serde_json::json!({
+            "trusted_proxies": {"source": "static", "ranges": ["none", "0.0.0.0/0", "::/0", "all"]}
+        });
+        let trusted = ServerTrustedProxies::from_server_json(&server, "server").unwrap();
+        assert_eq!(trusted.permissive_ranges(), ["0.0.0.0/0", "::/0", "all"]);
+        assert!(
+            trusted
+                .permissive_ranges()
+                .iter()
+                .all(|range| range != "none"),
+            "`none` must never be reported as permissive"
+        );
 
         let server =
             serde_json::json!({"trusted_proxies": {"source": "static", "ranges": ["none"]}});
