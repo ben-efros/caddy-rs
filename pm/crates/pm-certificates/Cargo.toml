@@ -1,0 +1,20 @@
+[package]
+name = "caddy-rs-pm-certificates"
+description = "Manual certificate validation and secret storage for the caddy-rs proxy manager"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+base64 = { workspace = true }
+caddy-rs-pm-core = { path = "../pm-core" }
+caddy-rs-pm-state = { path = "../pm-state" }
+ring = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

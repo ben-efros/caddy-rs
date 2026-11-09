@@ -548,6 +548,18 @@ pub fn create_router(state: ApiState) -> Router {
         .route("/hosts/{id}/disable", post(hosts::disable_handler))
         .route("/certificates", get(certificates::list_handler))
         .route("/certificates/intent", post(certificates::create_handler))
+        .route(
+            "/certificates/intent/{id}",
+            get(certificates::get_intent_handler),
+        )
+        .route(
+            "/certificates/custom",
+            post(certificates::create_custom_handler),
+        )
+        .route(
+            "/certificates/custom/{id}",
+            get(certificates::get_custom_handler).delete(certificates::delete_custom_handler),
+        )
         .route("/certificates/{id}", get(certificates::get_handler))
         .route("/config", get(config_handler))
         .layer(middleware::from_fn(observe_middleware))
@@ -644,8 +656,9 @@ mod hosts;
 
 pub use certificates::{
     derive_intent_status, CertificateIntentRequest, CertificateIntentStatus,
-    CertificateIntentSummary, CertificateInventorySource, CertificateRecord,
-    EmptyCertificateInventory, InventoryError, SharedCertificateInventory, EXPIRING_SOON_SECONDS,
+    CertificateIntentSummary, CertificateInventorySource, CertificateRecord, CertificateSummary,
+    CustomCertificateRequest, EmptyCertificateInventory, InventoryError, ManualCertificateSummary,
+    SharedCertificateInventory, EXPIRING_SOON_SECONDS,
 };
 
 #[cfg(test)]

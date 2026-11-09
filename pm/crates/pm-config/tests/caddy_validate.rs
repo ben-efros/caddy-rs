@@ -7,10 +7,13 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use caddy_rs_pm_config::{assemble_from_hosts, assemble_with_tls, ConfigSettings};
+use caddy_rs_pm_config::{
+    assemble_from_hosts, assemble_with_tls, assemble_with_tls_and_certificates, CertificateFiles,
+    ConfigSettings,
+};
 use caddy_rs_pm_core::{
-    AcmeChallenge, AutoCertificatePolicy, AutoMode, Host, HostId, HostSpec, HostTls, PolicyId,
-    ProxySpec, Upstream, UpstreamScheme,
+    AcmeChallenge, AutoCertificatePolicy, AutoMode, CertificateId, CertificateOrigin, Host, HostId,
+    HostSpec, HostTls, PolicyId, ProxySpec, Upstream, UpstreamScheme,
 };
 use serde_json::Value;
 
@@ -155,5 +158,34 @@ fn internal_tls_automation_and_disabled_host_skip_are_accepted() {
     )];
     let config =
         assemble_with_tls(&hosts, &policies, &ConfigSettings::default()).expect("assemble");
+    validate_with_caddy(&config);
+}
+
+#[test]
+fn manual_certificate_load_files_are_accepted() {
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+    let hosts = vec![proxy_host(
+        2,
+        "manual.example.com",
+        HostTls::for_explicit(CertificateId(1), CertificateOrigin::Manual),
+    )];
+    let certificates = vec![CertificateFiles {
+        id: 1,
+        domains: vec![
+            "manual.example.com".to_string(),
+            "www.manual.example.com".to_string(),
+        ],
+        certificate: fixtures.join("manual-valid.crt.pem"),
+        key: fixtures.join("manual-valid.key.pem"),
+    }];
+    let config =
+        assemble_with_tls_and_certificates(&hosts, &[], &certificates, &ConfigSettings::default())
+            .expect("assemble manual certificate config");
+    let load = &config["apps"]["tls"]["certificates"]["load_files"][0];
+    assert_eq!(load["tags"], serde_json::json!(["pm-cert-1"]));
+    assert_eq!(
+        config["apps"]["http"]["servers"]["pm_https"]["tls_connection_policies"][0]["match"]["sni"],
+        serde_json::json!(["manual.example.com", "www.manual.example.com"])
+    );
     validate_with_caddy(&config);
 }

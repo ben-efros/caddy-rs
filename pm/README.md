@@ -8,13 +8,14 @@ This is the proxy-manager foundation workspace. It is deliberately independent o
 | `caddy-rs-pm-state` | Backend-agnostic durable document state: snapshots, revisions, CAS transactions, one serialized writer. No SQL, C or network dependency. |
 | `caddy-rs-pm-core` | Certificate and host domain model: certificate origins/policies, host TLS binding, proxy/redirect/dead host validation, domain uniqueness. |
 | `caddy-rs-pm-compiler` | Deterministic Caddy JSON route compiler for proxy/redirect/dead hosts; emits HTTP and HTTPS route lists, HSTS and forced-SSL redirects. No listeners, TLS automation or key material. |
-| `caddy-rs-pm-config` | Deterministic Caddy JSON assembler: route-only `assemble`/`assemble_from_hosts` plus policy-aware `assemble_with_tls` that adds `apps.tls` automation and `automatic_https.skip` for HTTP-only hosts. No TLS connection policies, logging, access lists or admin apply. |
+| `caddy-rs-pm-config` | Deterministic Caddy JSON assembler: route-only `assemble`/`assemble_from_hosts`, policy-aware `assemble_with_tls` with `apps.tls` automation, and `assemble_with_tls_and_certificates` with `load_files` + tagged `tls_connection_policies` for stored manual certificates. No logging, access lists or admin apply. |
 | `caddy-rs-pm-hosts` | Durable host repository over `pm-state`: get/list/create/update/delete with CAS revisions, atomic domain-index uniqueness, next-id reservation, and memory/snapshot backend tests. |
-| `caddy-rs-pm-service` | Application service over `pm-hosts`: id-allocating create, CAS update/delete, list, and route compilation. No REST API, UI, auth or certificate policy loading. |
+| `caddy-rs-pm-service` | Application service over `pm-hosts`: id-allocating create, CAS update/delete, list, route compilation, and TLS binding validation against auto policies and manual certificate metadata. No REST API, UI or auth. |
 | `caddy-rs-pm-policies` | Durable auto-certificate policy repository over `pm-state`: get/list/create/update/delete with CAS revisions, tombstones, monotonic id reservation and host coverage validation against `pm-core` hosts. |
 | `caddy-rs-pm-import` | Native-first NPM v2.16 host-payload import mapping: proxy/redirect/dead hosts to `pm-core`, explicit certificate origins, located errors for unsupported payload features and warnings for flags without a native implementation. |
-| `caddy-rs-pm-runtime` | PM composition root: data-directory preflight (`0700`, writability probe), `<data_dir>/pm` state layout, legacy Caddy detection (warning only), and host/policy/service wiring with compile/assemble entry points. |
-| `caddy-rs-pm-api` | Native REST API with axum: `/api/v1` router, host CRUD/enable/disable with strong per-host ETags and `If-Match` CAS, certificate intents with inventory-derived status, list filters/pagination, health/setup/version/config, typed error envelope, loopback-only mutation guard, request ID and logging middleware. |
+| `caddy-rs-pm-runtime` | PM composition root: data-directory preflight (`0700`, writability probe), `<data_dir>/pm` state layout (including `pm/secrets`), legacy Caddy detection (warning only), and host/policy/certificate/service wiring with compile/assemble entry points. |
+| `caddy-rs-pm-certificates` | Manual certificate validation and secret store: strict PEM chain/key parsing, key-match proof, expiry/SAN checks, `0600` key files in a `0700` directory, monotonic ids/tombstones, metadata-only state and no key bytes in responses. |
+| `caddy-rs-pm-api` | Native REST API with axum: `/api/v1` router, host CRUD/enable/disable with strong per-host ETags and `If-Match` CAS, certificate intents with inventory-derived status, manual certificate upload/list/delete, list filters/pagination, health/setup/version/config, typed error envelope, loopback-only mutation guard, request ID and logging middleware. |
 
 ## Why a nested workspace
 
@@ -122,14 +123,22 @@ point. It compiles the same routes and adds a deterministic `apps.tls`:
   because this slice stores no DNS provider credentials; no half-configured DNS policy is emitted.
 - Domains of hosts whose TLS mode is not `Auto` (Disabled, Manual, ACME-configured or
   Internal-CA) are added to `apps.http.servers.pm_http|pm_https.automatic_https.skip` unless an
-  enabled policy automates them. This slice emits no `load_files`, so skipping prevents Caddy from
-  silently auto-issuing a second certificate for a name an explicit certificate already owns.
+  enabled policy automates them. Skipping prevents Caddy from silently auto-issuing a second
+  certificate for a name an explicit certificate or manual loader already owns.
+
+`assemble_with_tls_and_certificates` additionally emits, when stored manual certificates exist:
+
+- `apps.tls.certificates.load_files[]` with absolute `certificate`/`key` paths and the tag
+  `pm-cert-<id>`;
+- `apps.http.servers.pm_https.tls_connection_policies[]` matching the certificate's DNS names by
+  SNI and selecting `any_tag: ["pm-cert-<id>"]`, followed by an empty default policy.
 
 The original `assemble`/`assemble_from_hosts` output is unchanged: they never emit `apps.tls`.
-`PmRuntime::assemble` uses the policy-aware path, so a stored intent policy reaches `/api/v1/config`.
+`PmRuntime::assemble` uses the certificate-aware path, so stored intent policies and manual
+certificates reach `/api/v1/config`.
 
-This crate does **not** emit `tls_connection_policies`, certificate loaders/storage, logging, access
-lists or an admin apply step. The optional integration test validates assembled configs (including
+This crate does **not** emit logging, access lists or an admin apply step. The optional integration
+test validates manual `load_files`/SNI configs with `caddy-rs validate --adapter json`. The optional integration test validates assembled configs (including
 the TLS automation and skip shapes) with `caddy-rs validate --adapter json` when
 `.scratch/rust-target/debug/caddy-rs` exists (or `CADDY_RS_BIN` names one) and skips with a
 diagnostic otherwise; unit tests never require the binary.
@@ -286,8 +295,12 @@ Compile, Config}` and carry the relevant path. No error contains plaintext secre
 | `POST` | `/hosts/{id}/enable` | Set `enabled=true`; requires `If-Match` |
 | `POST` | `/hosts/{id}/disable` | Set `enabled=false`; requires `If-Match` |
 | `POST` | `/certificates/intent` | Record a certificate intent (`201` + `Location` + strong `ETag`); loopback-only; DNS-01 and NPM fields are typed `400`s |
-| `GET` | `/certificates` | Paginated intent list with inventory-derived `status`; filters `domain`, `status` |
-| `GET` | `/certificates/{id}` | One intent with the same derived status and a strong representation `ETag` |
+| `POST` | `/certificates/custom` | Upload a manual PEM chain + key (`201`, metadata only); loopback-only; mismatched/expired/wrong-SAN input is a located `400` |
+| `GET` | `/certificates` | Paginated mixed intent/manual list with `origin` and inventory-derived `status`; filters `domain`, `status` |
+| `GET` | `/certificates/{id}` | One intent or manual certificate; ambiguous shared ids are `409` |
+| `GET` | `/certificates/intent/{id}` | Unambiguous intent detail |
+| `GET` | `/certificates/custom/{id}` | Unambiguous manual detail (`If-None-Match` supported) |
+| `DELETE` | `/certificates/custom/{id}` | Delete a manual certificate and its secret files; strong `If-Match`; refuses a referencing host |
 | `GET` | `/config` | Assembled Caddy JSON (routes + TLS automation) with a weak `ETag`; honours `If-Match` and `If-None-Match` |
 
 ### Shared infrastructure
@@ -406,3 +419,27 @@ CARGO_HOME=/root/caddy-rs/.scratch/cargo-home \
 The next slices are the PM web UI, the daemon-side inventory source, explicit ACME issuance jobs
 and the core on-demand manager. The taxonomy and invariants are in
 `docs/research/PROXY-MANAGER-CERTIFICATES.md`.
+
+### Manual certificates
+
+`POST /certificates/custom` takes exactly `{ "domains": [...], "certificate": "<PEM chain>",
+"privateKey": "<PEM key>" }`. The service:
+
+- parses only `CERTIFICATE` blocks in the chain and exactly one unencrypted PKCS#8/PKCS#1 key; it
+  rejects encrypted/SEC1 keys, unknown labels, oversize input, malformed base64 and text outside
+  blocks;
+- proves key possession by signing a fixed challenge and verifies the signature against the leaf
+  public key (no key bytes are compared);
+- rejects expired and not-yet-valid leaves and any requested domain not covered by a SAN/CN
+  (wildcards cover exactly one label);
+- stores metadata in `pm-state` and writes the canonical chain/key to
+  `<data_dir>/pm/secrets/manual-<id>.crt.pem` / `.key.pem` with `0600` files in a `0700`
+  directory, using `O_CREAT|O_EXCL` and refusing symlinked paths;
+- returns metadata only (`id`, `origin: "manual"`, `domains`, `status: "pending"`, `revision`,
+  `keyType`, `fingerprintSha256`, validity); the API never returns PEM/key bytes and the state
+  document contains no key material.
+
+At-rest secrecy is filesystem permissions only; this slice does **not** encrypt the key file. An
+operator who needs encryption at rest must place the data directory on an encrypted volume. The
+status stays `pending` until a real apply path exists; no `issued` state is fabricated. Deletion
+requires a strong `If-Match`, refuses a certificate referenced by a host, and tombstones the id.

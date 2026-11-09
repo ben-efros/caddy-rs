@@ -69,8 +69,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use caddy_rs_pm_certificates::{CertificateError, CertificateRepository};
 use caddy_rs_pm_compiler::{compile_routes, CompileError, CompiledRoutes};
-use caddy_rs_pm_config::{assemble_with_tls, ConfigError, ConfigSettings};
+use caddy_rs_pm_config::{
+    assemble_with_tls_and_certificates, CertificateFiles, ConfigError, ConfigSettings,
+};
 use caddy_rs_pm_hosts::HostRepository;
 use caddy_rs_pm_policies::PolicyRepository;
 use caddy_rs_pm_service::{HostService, ServiceError};
@@ -80,6 +83,9 @@ use thiserror::Error;
 
 /// Name of the PM-owned directory below the data directory.
 pub const PM_DIRECTORY: &str = "pm";
+
+/// Directory below `<data_dir>/pm` that holds manual certificate and key files.
+pub const CERTIFICATES_DIRECTORY: &str = "secrets";
 
 /// Name of the PM state file below [`PM_DIRECTORY`].
 pub const STATE_FILE: &str = "state.json";
@@ -139,6 +145,7 @@ pub struct RuntimeStatus {
     pub state_path: PathBuf,
     pub host_count: usize,
     pub policy_count: usize,
+    pub certificate_count: usize,
     pub legacy_caddy_detected: bool,
     /// Operator-facing diagnostics. Warnings never contain secret material.
     pub warnings: Vec<String>,
@@ -208,6 +215,18 @@ pub enum RuntimeError {
         #[source]
         source: ServiceError,
     },
+    /// The manual-certificate repository could not be read.
+    #[error("PM certificate error for {path}: {source}")]
+    Certificate {
+        path: PathBuf,
+        #[source]
+        source: CertificateError,
+    },
+    /// A manual certificate's file is missing or not a regular file.
+    #[error(
+        "manual certificate {certificate_id} secret file {path} is missing or not a regular file"
+    )]
+    MissingCertificateFile { certificate_id: u64, path: PathBuf },
     /// Stored hosts could not be compiled into routes.
     #[error("cannot compile routes for hosts stored in {path}: {source}")]
     Compile {
@@ -234,6 +253,7 @@ pub struct PmRuntime {
     legacy_markers: Vec<String>,
     hosts: HostRepository,
     policies: PolicyRepository,
+    certificates: CertificateRepository,
     service: HostService,
 }
 
@@ -273,7 +293,13 @@ impl PmRuntime {
         )?);
         let hosts = HostRepository::new(Arc::clone(&store));
         let policies = PolicyRepository::new(Arc::clone(&store));
-        let service = HostService::with_policies(Arc::clone(&store), policies.clone());
+        let certificates =
+            CertificateRepository::new(Arc::clone(&store), pm_dir.join(CERTIFICATES_DIRECTORY));
+        let service = HostService::with_policies_and_certificates(
+            Arc::clone(&store),
+            policies.clone(),
+            certificates.clone(),
+        );
 
         // Keep the effective (canonical, when a symlink override was used) data directory so
         // `data_dir()` and `status()` describe where state actually lives.
@@ -285,6 +311,7 @@ impl PmRuntime {
             legacy_markers,
             hosts,
             policies,
+            certificates,
             service,
         })
     }
@@ -309,6 +336,10 @@ impl PmRuntime {
         &self.policies
     }
 
+    pub fn certificates(&self) -> &CertificateRepository {
+        &self.certificates
+    }
+
     pub fn service(&self) -> &HostService {
         &self.service
     }
@@ -330,6 +361,10 @@ impl PmRuntime {
             .policies
             .list()
             .map_err(|source| self.service_error(ServiceError::Policy(source)))?;
+        let certificates = self
+            .certificates
+            .list()
+            .map_err(|source| self.certificate_error(source))?;
         let legacy_caddy_detected = !self.legacy_markers.is_empty();
         let mut warnings = Vec::new();
         if legacy_caddy_detected {
@@ -346,6 +381,7 @@ impl PmRuntime {
             state_path: self.state_path.clone(),
             host_count: hosts.len(),
             policy_count: policies.len(),
+            certificate_count: certificates.len(),
             legacy_caddy_detected,
             warnings,
         })
@@ -379,10 +415,42 @@ impl PmRuntime {
             .policies
             .snapshot_policies()
             .map_err(|source| self.service_error(ServiceError::Policy(source)))?;
-        assemble_with_tls(&hosts, &policies, &settings).map_err(|source| RuntimeError::Config {
+        let certificates = self
+            .certificates
+            .snapshot_certificates()
+            .map_err(|source| self.certificate_error(source))?;
+        let mut files = Vec::with_capacity(certificates.len());
+        for certificate in &certificates {
+            let certificate_path = self.certificates.secret_path(&certificate.certificate_file);
+            let key_path = self.certificates.secret_path(&certificate.key_file);
+            for path in [&certificate_path, &key_path] {
+                if !is_regular_file(path) {
+                    return Err(RuntimeError::MissingCertificateFile {
+                        certificate_id: certificate.id.0,
+                        path: path.to_path_buf(),
+                    });
+                }
+            }
+            files.push(CertificateFiles {
+                id: certificate.id.0,
+                domains: certificate.domains.clone(),
+                certificate: certificate_path,
+                key: key_path,
+            });
+        }
+        assemble_with_tls_and_certificates(&hosts, &policies, &files, &settings).map_err(|source| {
+            RuntimeError::Config {
+                path: self.state_path.clone(),
+                source,
+            }
+        })
+    }
+
+    fn certificate_error(&self, source: CertificateError) -> RuntimeError {
+        RuntimeError::Certificate {
             path: self.state_path.clone(),
             source,
-        })
+        }
     }
 
     fn service_error(&self, source: ServiceError) -> RuntimeError {
@@ -391,6 +459,12 @@ impl PmRuntime {
             source,
         }
     }
+}
+
+fn is_regular_file(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_file())
+        .unwrap_or(false)
 }
 
 fn resolve_or_create_directory(path: &Path, allow_symlinks: bool) -> Result<PathBuf, RuntimeError> {

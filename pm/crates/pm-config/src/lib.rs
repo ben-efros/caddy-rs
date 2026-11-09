@@ -7,23 +7,28 @@
 //!
 //! The assembler is deliberately narrow for this slice. It does not emit:
 //!
-//! * `tls_connection_policies` or any `apps.tls` certificate automation/loader/storage;
-//! * certificate deployment or management endpoints;
+//! * certificate deployment/apply calls (the output is config, not an applied config);
 //! * logging, access lists or request authentication;
 //! * an admin apply step.
 //!
-//! Those are later slices. Keeping the route layer separate means listeners and TLS policy can be
-//! added without changing host compilation semantics.
+//! [`assemble_with_tls_and_certificates`] additionally emits
+//! `apps.tls.certificates.load_files` for stored manual certificates and matching
+//! `apps.http.servers.pm_https.tls_connection_policies` entries. It only writes file paths; the
+//! output never contains private-key bytes. Manual keys stay in the proxy manager's secret store,
+//! and auto/ACME keys never enter it.
 //!
-//! The output contains no private-key material; manual keys stay in the proxy manager's secret
-//! store, and auto/ACME keys never enter it.
+//! The route layer stays separate so listeners and TLS policy can be added without changing host
+//! compilation semantics.
 
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 
 use caddy_rs_pm_compiler::{compile_routes, CompileError, CompiledRoutes};
-use caddy_rs_pm_core::{AcmeChallenge, AutoCertificatePolicy, AutoMode, CoreError, Host, TlsMode};
+use caddy_rs_pm_core::{
+    normalize_pattern, AcmeChallenge, AutoCertificatePolicy, AutoMode, CoreError, Host, TlsMode,
+};
 use serde_json::{json, Map, Value};
 use thiserror::Error;
 
@@ -58,6 +63,21 @@ impl ConfigSettings {
             https_port,
         }
     }
+}
+
+/// Files and names for one stored manual certificate, as seen by the config assembler.
+///
+/// Paths are absolute paths to files in the PM secret store. The type carries no key bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CertificateFiles {
+    /// Numeric manual certificate id; used for the Caddy tag `pm-cert-<id>`.
+    pub id: u64,
+    /// Every DNS name the certificate covers.
+    pub domains: Vec<String>,
+    /// Absolute path to the PEM certificate chain.
+    pub certificate: PathBuf,
+    /// Absolute path to the PEM private key.
+    pub key: PathBuf,
 }
 
 /// A failed configuration assembly.
@@ -103,6 +123,9 @@ pub enum ConfigError {
          not implement; store an eager policy instead"
     )]
     UnsupportedMode { policy_id: u64 },
+    /// A stored manual certificate has an unusable id, domain or file path.
+    #[error("manual certificate {certificate_id} cannot be assembled: {reason}")]
+    InvalidCertificate { certificate_id: u64, reason: String },
 }
 
 /// Assemble compiled routes into a complete Caddy configuration value.
@@ -175,6 +198,29 @@ pub fn assemble_with_tls(
     assemble_routes_with_tls(&compiled, hosts, policies, settings)
 }
 
+/// Compile hosts and assemble routes, certificate automation **and** manual certificate loaders.
+///
+/// This is the full config entry point for the manual-certificate slice. It calls
+/// [`assemble_with_tls`] first, then adds:
+///
+/// * `apps.tls.certificates.load_files`, one `{certificate, key, tags}` object per stored manual
+///   certificate in numeric id order;
+/// * `apps.http.servers.pm_https.tls_connection_policies`, one SNI/tag policy per certificate plus
+///   a final empty default policy.
+///
+/// No Caddy admin API is called. `load_files` references the files written by
+/// [`caddy_rs_pm_certificates::CertificateRepository`]; the config itself is deterministic and
+/// contains no private-key material.
+pub fn assemble_with_tls_and_certificates(
+    hosts: &[Host],
+    policies: &[AutoCertificatePolicy],
+    certificates: &[CertificateFiles],
+    settings: &ConfigSettings,
+) -> Result<Value, ConfigError> {
+    let compiled = compile_routes(hosts)?;
+    assemble_routes_with_tls_and_certificates(&compiled, hosts, policies, certificates, settings)
+}
+
 /// Assemble already-compiled routes plus certificate automation.
 ///
 /// See [`assemble_with_tls`] for the emitted shape. A caller that has compiled routes for a
@@ -216,6 +262,92 @@ pub fn assemble_routes_with_tls(
     Ok(config)
 }
 
+/// Assemble compiled routes, automation and manual certificate loaders.
+///
+/// See [`assemble_with_tls_and_certificates`]. Entries are sorted by certificate id and their SNI
+/// lists are sorted and deduplicated, so equal inputs always produce byte-identical JSON.
+pub fn assemble_routes_with_tls_and_certificates(
+    compiled: &CompiledRoutes,
+    hosts: &[Host],
+    policies: &[AutoCertificatePolicy],
+    certificates: &[CertificateFiles],
+    settings: &ConfigSettings,
+) -> Result<Value, ConfigError> {
+    let mut config = assemble_routes_with_tls(compiled, hosts, policies, settings)?;
+    if certificates.is_empty() {
+        return Ok(config);
+    }
+
+    let mut sorted: Vec<&CertificateFiles> = certificates.iter().collect();
+    sorted.sort_by_key(|certificate| certificate.id);
+
+    let mut load_files = Vec::with_capacity(sorted.len());
+    let mut connection_policies = Vec::with_capacity(sorted.len() + 1);
+    for certificate in sorted {
+        if certificate.id == 0 {
+            return Err(ConfigError::InvalidCertificate {
+                certificate_id: 0,
+                reason: "certificate id must be greater than zero".to_string(),
+            });
+        }
+        let certificate_path =
+            certificate
+                .certificate
+                .to_str()
+                .ok_or_else(|| ConfigError::InvalidCertificate {
+                    certificate_id: certificate.id,
+                    reason: "certificate path is not valid UTF-8".to_string(),
+                })?;
+        let key_path = certificate
+            .key
+            .to_str()
+            .ok_or_else(|| ConfigError::InvalidCertificate {
+                certificate_id: certificate.id,
+                reason: "private-key path is not valid UTF-8".to_string(),
+            })?;
+        let mut domains = BTreeSet::new();
+        for domain in &certificate.domains {
+            let normalized =
+                normalize_pattern(domain).map_err(|error| ConfigError::InvalidCertificate {
+                    certificate_id: certificate.id,
+                    reason: format!("invalid domain `{domain}`: {error}"),
+                })?;
+            domains.insert(normalized);
+        }
+        if domains.is_empty() {
+            return Err(ConfigError::InvalidCertificate {
+                certificate_id: certificate.id,
+                reason: "certificate has no DNS names".to_string(),
+            });
+        }
+        let tag = format!("pm-cert-{}", certificate.id);
+        load_files.push(json!({
+            "certificate": certificate_path,
+            "key": key_path,
+            "tags": [tag]
+        }));
+        connection_policies.push(json!({
+            "match": { "sni": domains.into_iter().collect::<Vec<_>>() },
+            "certificate_selection": { "any_tag": [tag] }
+        }));
+    }
+    // Keep a default policy for SNI that is served by automation rather than a manual cert.
+    connection_policies.push(json!({}));
+
+    let tls = config["apps"]
+        .as_object_mut()
+        .ok_or_else(|| ConfigError::InvalidCertificate {
+            certificate_id: 0,
+            reason: "assembled config has no apps object".to_string(),
+        })?
+        .entry("tls")
+        .or_insert_with(|| json!({}));
+    tls["certificates"]["load_files"] = Value::Array(load_files);
+    config["apps"]["http"]["servers"]["pm_https"]["tls_connection_policies"] =
+        Value::Array(connection_policies);
+    Ok(config)
+}
+
 fn apply_automatic_https_skip(
     config: &mut Value,
     hosts: &[Host],
@@ -223,10 +355,10 @@ fn apply_automatic_https_skip(
 ) {
     let mut skip = BTreeSet::new();
     for host in hosts {
-        // `Disabled` is the documented case; manual/ACME/internal-CA hosts are skipped too
-        // because this assembler emits no `load_files`, so Caddy would otherwise auto-issue a
-        // second certificate for a name that an explicit certificate already owns. `Auto` hosts
-        // are left alone: their policy is the issuance authority.
+        // `Disabled` is the documented case. Explicit modes are skipped unless a policy covers
+        // them: a manual certificate may be loaded, and Caddy must not auto-issue a second
+        // certificate for the same name. `Auto` hosts are left alone: their policy is the
+        // issuance authority.
         if host.tls.mode == TlsMode::Auto {
             continue;
         }

@@ -176,6 +176,14 @@ fn map_service_error(error: ServiceError) -> ApiError {
         ServiceError::Tls { source, .. } => ApiError::validation(source.to_string(), "tls"),
         ServiceError::Compile(error) => ApiError::Internal(error.to_string()),
         ServiceError::Policy(error) => ApiError::Internal(error.to_string()),
+        ServiceError::Certificate(error) => ApiError::Internal(error.to_string()),
+        ServiceError::CertificateNotFound {
+            host_id,
+            certificate_id,
+        } => ApiError::validation(
+            format!("host {host_id} references unknown manual certificate {certificate_id}"),
+            "tls.certificateId",
+        ),
     }
 }
 
