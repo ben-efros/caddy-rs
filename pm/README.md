@@ -13,6 +13,7 @@ This is the proxy-manager foundation workspace. It is deliberately independent o
 | `caddy-rs-pm-service` | Application service over `pm-hosts`: id-allocating create, CAS update/delete, list, and route compilation. No REST API, UI, auth or certificate policy loading. |
 | `caddy-rs-pm-policies` | Durable auto-certificate policy repository over `pm-state`: get/list/create/update/delete with CAS revisions, tombstones, monotonic id reservation and host coverage validation against `pm-core` hosts. |
 | `caddy-rs-pm-import` | Native-first NPM v2.16 host-payload import mapping: proxy/redirect/dead hosts to `pm-core`, explicit certificate origins, located errors for unsupported payload features and warnings for flags without a native implementation. |
+| `caddy-rs-pm-runtime` | PM composition root: data-directory preflight (`0700`, writability probe), `<data_dir>/pm` state layout, legacy Caddy detection (warning only), and host/policy/service wiring with compile/assemble entry points. |
 
 ## Why a nested workspace
 
@@ -185,6 +186,54 @@ store, one `pm.policies` document per policy:
 
 The repository is persistence only and does not depend on `pm-hosts`; coverage reads `pm-core`
 `Host` values directly.
+
+## `pm-runtime`
+
+`PmRuntime::open(RuntimeConfig::new(data_dir))` is the composition root. It owns the one filesystem
+layout below the deployment's data directory:
+
+```text
+<data_dir>/
+  pm/
+    state.json   # PM host/policy documents (SnapshotStore, mode 0600)
+```
+
+PM state is **never** written directly to `<data_dir>` (`<data_dir>/state.json` is not used).
+
+Preflight, in order:
+
+1. reject an empty or non-directory data directory with a path-aware `RuntimeError`;
+2. create a missing data directory with mode `0700` on Unix, then `<data_dir>/pm` (also `0700`);
+   existing directories keep their mode and ownership — the runtime never `chown`s anything;
+3. prove writability by creating a unique `.pm-write-probe-*` file **inside** `<data_dir>/pm`,
+   writing it, `fsync`ing it and removing it. On failure `RuntimeError::DataDirNotWritable` names
+   `<data_dir>/pm` and the I/O error and says to fix ownership/permissions. There is no fallback to
+   the current directory or `/tmp`;
+4. open `<data_dir>/pm/state.json` through `SnapshotStore::open`;
+5. build one `HostRepository`, one `PolicyRepository`, and `HostService::with_policies` over the
+   same store, exposed as `hosts()`, `policies()` and `service()`.
+
+`status()` returns `data_dir`, `state_path`, `host_count`, `policy_count`,
+`legacy_caddy_detected` and operator `warnings`. Both counts are fresh store reads on every call,
+not cached.
+
+Legacy Caddy data is detected at open from direct children of `<data_dir>`:
+
+- directories named `certificates`, `acme` or `pki`;
+- a regular file named `instance.uuid`;
+- regular files named `caddy.db` or beginning with `caddy.db-`/`caddy.db.` (the SQLite database and
+  its lock/journal/backup sidecars).
+
+Detection only reads directory entries and file types (symlinks are not followed). The paths are
+never opened, read, adopted, migrated or modified. A detection adds a warning to `status().warnings`
+and leaves PM state under `<data_dir>/pm`; there is no automatic import from Caddy and no automatic
+migration of the data directory.
+
+`compile()` compiles the stored hosts through `pm-compiler`; `assemble(ConfigSettings)` delegates to
+`pm-config`'s `assemble_from_hosts` and returns the assembled Caddy JSON. Errors are
+`RuntimeError::{InvalidDataDir, NotADirectory, DataDirUnreadable, CreateDirectory,
+DataDirNotWritable, State, Service, Compile, Config}` and carry the relevant path. No error contains
+plaintext secrets.
 
 ## `pm-import`
 

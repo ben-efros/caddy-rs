@@ -9,6 +9,7 @@ members = [
     "crates/pm-service",
     "crates/pm-policies",
     "crates/pm-import",
+    "crates/pm-runtime",
 ]
 
 [workspace.package]

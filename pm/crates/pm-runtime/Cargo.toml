@@ -1,0 +1,22 @@
+[package]
+name = "caddy-rs-pm-runtime"
+description = "PM composition root: data-directory preflight, state layout and service wiring"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+caddy-rs-pm-compiler = { path = "../pm-compiler" }
+caddy-rs-pm-config = { path = "../pm-config" }
+caddy-rs-pm-hosts = { path = "../pm-hosts" }
+caddy-rs-pm-policies = { path = "../pm-policies" }
+caddy-rs-pm-service = { path = "../pm-service" }
+caddy-rs-pm-state = { path = "../pm-state" }
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+caddy-rs-pm-core = { path = "../pm-core" }
+tempfile.workspace = true
