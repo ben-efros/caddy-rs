@@ -274,6 +274,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "caddy-rs-config-tx"
+version = "0.1.0-trial.2"
+dependencies = [
+ "caddy-rs-core",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "uuid",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "caddy-rs-core"
 version = "0.1.0-trial.2"
 dependencies = [
@@ -3379,6 +3394,12 @@ dependencies = [
  "unicode-xid",
  "wasmparser 0.233.0",
 ]
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "550a2b930b62486a393c52d5c3b84bff264b28aa437ed64694d31e93b1757af7"
 
 [[package]]
 name = "zerocopy"

@@ -11,6 +11,7 @@ members = [
     "crates/cli",
     "crates/plug",
     "crates/authn",
+    "crates/config-tx",
 ]
 
 [workspace.package]
@@ -28,6 +29,7 @@ authors = ["caddy-rs contributors"]
 # `default-features = false`).
 caddy-rs-core = { path = "crates/core", default-features = false }
 caddy-rs-config = { path = "crates/config", default-features = false }
+caddy-rs-config-tx = { path = "crates/config-tx", default-features = false }
 caddy-rs-http = { path = "crates/http", default-features = false }
 caddy-rs-proxy = { path = "crates/proxy", default-features = false }
 caddy-rs-tls = { path = "crates/tls", default-features = false }
