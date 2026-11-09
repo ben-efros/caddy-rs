@@ -4,6 +4,9 @@
 //! extractors and serialization the daemon uses. Assertions are on observable HTTP behaviour
 //! (status, headers, body shape), not on private helpers alone.
 
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use super::*;
 use crate::dto::{HostResponse, HostSpecDto, HostTlsDto, HostWriteRequest};
 use axum_test::TestServer;
@@ -741,4 +744,405 @@ async fn update_to_an_owned_domain_is_409_not_412() {
     let body: HostResponse = response.json();
     assert_eq!(body.domains, vec!["first.example.com".to_string()]);
     assert_eq!(body.revision, 1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Certificate intents
+// ---------------------------------------------------------------------------------------------
+
+struct FakeInventory {
+    records: Vec<CertificateRecord>,
+}
+
+impl CertificateInventorySource for FakeInventory {
+    fn list_certificates(&self) -> Result<Vec<CertificateRecord>, InventoryError> {
+        Ok(self.records.clone())
+    }
+}
+
+fn server_with_inventory(records: Vec<CertificateRecord>) -> (TempDir, TestServer, PmRuntime) {
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let config = RuntimeConfig::new(temp_dir.path().join("data"));
+    let runtime = PmRuntime::open(config).expect("open runtime");
+    let state = ApiState::new(runtime.clone()).with_inventory(Arc::new(FakeInventory { records }));
+    let app = create_router(state).into_make_service_with_connect_info::<std::net::SocketAddr>();
+    (temp_dir, TestServer::new(app), runtime)
+}
+
+fn now_unix() -> i64 {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_secs();
+    i64::try_from(seconds).expect("timestamp fits i64")
+}
+
+fn days(seconds: i64) -> i64 {
+    seconds * 24 * 60 * 60
+}
+
+fn intent_body(domains: &[&str], issuer: &str, challenge: &str) -> serde_json::Value {
+    serde_json::json!({
+        "domains": domains,
+        "issuer": issuer,
+        "challenge": challenge
+    })
+}
+
+async fn create_intent(
+    server: &TestServer,
+    domains: &[&str],
+    issuer: &str,
+    challenge: &str,
+) -> CertificateIntentSummary {
+    let response = server
+        .post("/api/v1/certificates/intent")
+        .json(&intent_body(domains, issuer, challenge))
+        .await;
+    assert_eq!(
+        response.status_code(),
+        StatusCode::CREATED,
+        "create intent {domains:?}: {}",
+        response.text()
+    );
+    response.json()
+}
+
+fn record(domains: &[&str], sans: &[&str], expires_at_unix: Option<i64>) -> CertificateRecord {
+    CertificateRecord {
+        domains: domains.iter().map(|value| (*value).to_string()).collect(),
+        sans: sans.iter().map(|value| (*value).to_string()).collect(),
+        issuer: "local".to_string(),
+        expires_at_unix,
+        source: "managed".to_string(),
+        renewal_error: None,
+    }
+}
+
+#[tokio::test]
+async fn create_certificate_intent_returns_201_location_etag_and_persists_a_policy() {
+    let (_dir, server, runtime) = server_with_runtime();
+    let response = server
+        .post("/api/v1/certificates/intent")
+        .json(&intent_body(&["api.example.com"], "letsencrypt", "http01"))
+        .await;
+
+    assert_eq!(response.status_code(), StatusCode::CREATED);
+    assert_eq!(response.header("location"), "/api/v1/certificates/1");
+    assert_eq!(response.header("etag"), "\"c1-r1\"");
+    let body: CertificateIntentSummary = response.json();
+    assert_eq!(body.policy_id, 1);
+    assert_eq!(body.domains, vec!["api.example.com".to_string()]);
+    assert_eq!(body.issuer, "letsencrypt");
+    assert_eq!(body.challenge, caddy_rs_pm_core::AcmeChallenge::Http01);
+    assert_eq!(body.status, CertificateIntentStatus::Pending);
+    assert!(body.enabled);
+    assert_eq!(body.name, "Certificate intent for api.example.com");
+
+    let stored = runtime
+        .policies()
+        .get(caddy_rs_pm_core::PolicyId(1))
+        .expect("read policy")
+        .expect("policy persisted");
+    assert_eq!(stored.policy.mode, caddy_rs_pm_core::AutoMode::Eager);
+    assert_eq!(stored.policy.issuer.as_deref(), Some("letsencrypt"));
+    assert_eq!(
+        stored.policy.challenge,
+        caddy_rs_pm_core::AcmeChallenge::Http01
+    );
+    assert!(stored.policy.key_type.is_none());
+    assert!(stored.policy.enabled);
+}
+
+#[tokio::test]
+async fn create_certificate_intent_rejects_dns01_with_a_located_400() {
+    let (_dir, server, runtime) = server_with_runtime();
+    let response = server
+        .post("/api/v1/certificates/intent")
+        .json(&intent_body(&["example.com"], "letsencrypt", "dns01"))
+        .await;
+
+    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    let body: ApiErrorResponse = response.json();
+    assert_eq!(body.error.code, ErrorCode::Validation);
+    assert_eq!(body.error.location.as_deref(), Some("challenge"));
+    assert!(body.error.message.contains("DNS provider credentials"));
+    assert!(
+        runtime.policies().list().expect("list policies").is_empty(),
+        "rejected DNS-01 must not persist anything"
+    );
+}
+
+#[tokio::test]
+async fn create_certificate_intent_rejects_npm_and_unknown_fields() {
+    let (_dir, server, _runtime) = server_with_runtime();
+    for payload in [
+        serde_json::json!({
+            "domains": ["example.com"],
+            "issuer": "letsencrypt",
+            "challenge": "http01",
+            "provider": "letsencrypt"
+        }),
+        serde_json::json!({
+            "domains": ["example.com"],
+            "issuer": "letsencrypt",
+            "challenge": "http01",
+            "certificate": "PEM"
+        }),
+    ] {
+        let response = server
+            .post("/api/v1/certificates/intent")
+            .json(&payload)
+            .await;
+        assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+        let body: ApiErrorResponse = response.json();
+        assert_eq!(body.error.code, ErrorCode::Validation);
+        assert_eq!(body.error.location.as_deref(), Some("body"));
+    }
+}
+
+#[tokio::test]
+async fn create_certificate_intent_validates_domains() {
+    let (_dir, server, _runtime) = server_with_runtime();
+    let duplicate = server
+        .post("/api/v1/certificates/intent")
+        .json(&intent_body(
+            &["example.com", "EXAMPLE.com"],
+            "letsencrypt",
+            "http01",
+        ))
+        .await;
+    assert_eq!(duplicate.status_code(), StatusCode::BAD_REQUEST);
+    let body: ApiErrorResponse = duplicate.json();
+    assert_eq!(body.error.code, ErrorCode::Validation);
+    assert_eq!(body.error.location.as_deref(), Some("domains"));
+    assert!(body.error.message.contains("duplicate domain"));
+
+    let wildcard = server
+        .post("/api/v1/certificates/intent")
+        .json(&intent_body(&["*.example.com"], "letsencrypt", "http01"))
+        .await;
+    assert_eq!(wildcard.status_code(), StatusCode::BAD_REQUEST);
+    let body: ApiErrorResponse = wildcard.json();
+    assert_eq!(body.error.location.as_deref(), Some("domains"));
+}
+
+#[tokio::test]
+async fn certificate_intent_mutations_require_connect_info() {
+    let (_dir, server) = server();
+    let response = server
+        .post("/api/v1/certificates/intent")
+        .json(&intent_body(&["example.com"], "letsencrypt", "http01"))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::FORBIDDEN);
+    let body: ApiErrorResponse = response.json();
+    assert_eq!(body.error.code, ErrorCode::Forbidden);
+}
+
+#[tokio::test]
+async fn certificate_intent_mutations_reject_a_remote_peer() {
+    use axum::extract::Request;
+    use axum::middleware::Next;
+    use axum::routing::post;
+
+    let (_dir, state) = runtime();
+    let app = Router::new()
+        .route(
+            "/api/v1/certificates/intent",
+            post(crate::certificates::create_handler),
+        )
+        .layer(axum::middleware::from_fn(
+            |mut request: Request, next: Next| async move {
+                request
+                    .extensions_mut()
+                    .insert(PeerAddr(Some(std::net::SocketAddr::from((
+                        [192, 0, 2, 10],
+                        5000,
+                    )))));
+                next.run(request).await
+            },
+        ))
+        .with_state(state);
+    let server = TestServer::new(app);
+
+    let response = server
+        .post("/api/v1/certificates/intent")
+        .json(&intent_body(&["example.com"], "letsencrypt", "http01"))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        response.json::<ApiErrorResponse>().error.code,
+        ErrorCode::Forbidden
+    );
+}
+
+#[tokio::test]
+async fn certificate_list_reports_pending_without_an_inventory_source() {
+    let (_dir, server, _runtime) = server_with_runtime();
+    create_intent(&server, &["pending.example.com"], "internal", "http01").await;
+
+    let response = server.get("/api/v1/certificates").await;
+    assert_eq!(response.status_code(), StatusCode::OK);
+    let body: PaginatedResponse<CertificateIntentSummary> = response.json();
+    assert_eq!(body.total, 1);
+    assert_eq!(body.items[0].status, CertificateIntentStatus::Pending);
+    assert!(body.items[0].expires_at_unix.is_none());
+    assert!(body.items[0].certificate_issuer.is_none());
+}
+
+#[tokio::test]
+async fn certificate_list_derives_issued_expiring_expired_and_renewal_error_statuses() {
+    let now = now_unix();
+    let (_dir, server, _runtime) = server_with_inventory(vec![
+        record(&["issued.example.com"], &[], Some(now + days(90))),
+        record(&["expiring.example.com"], &[], Some(now + days(10))),
+        record(&["expired.example.com"], &[], Some(now - 1)),
+        CertificateRecord {
+            renewal_error: Some("account is rate limited".to_string()),
+            ..record(&["failing.example.com"], &[], Some(now + days(90)))
+        },
+        record(&["noexpiry.example.com"], &[], None),
+    ]);
+
+    for domain in [
+        "issued.example.com",
+        "expiring.example.com",
+        "expired.example.com",
+        "failing.example.com",
+        "noexpiry.example.com",
+    ] {
+        create_intent(&server, &[domain], "letsencrypt", "http01").await;
+    }
+
+    let statuses = |body: &PaginatedResponse<CertificateIntentSummary>, domain: &str| {
+        body.items
+            .iter()
+            .find(|item| item.domains == vec![domain.to_string()])
+            .map(|item| item.status)
+            .expect("intent present")
+    };
+
+    let body: PaginatedResponse<CertificateIntentSummary> =
+        server.get("/api/v1/certificates").await.json();
+    assert_eq!(body.total, 5);
+    assert_eq!(
+        statuses(&body, "issued.example.com"),
+        CertificateIntentStatus::Issued
+    );
+    assert_eq!(
+        statuses(&body, "expiring.example.com"),
+        CertificateIntentStatus::ExpiringSoon
+    );
+    assert_eq!(
+        statuses(&body, "expired.example.com"),
+        CertificateIntentStatus::Expired
+    );
+    assert_eq!(
+        statuses(&body, "failing.example.com"),
+        CertificateIntentStatus::RenewalError
+    );
+    assert_eq!(
+        statuses(&body, "noexpiry.example.com"),
+        CertificateIntentStatus::Issued,
+        "an observation without expiry is issued, never fabricated as expired"
+    );
+
+    let filtered: PaginatedResponse<CertificateIntentSummary> = server
+        .get("/api/v1/certificates?status=expiring_soon")
+        .await
+        .json();
+    assert_eq!(filtered.total, 1);
+    assert_eq!(filtered.items[0].domains, vec!["expiring.example.com"]);
+    assert!(filtered.items[0].expires_at_unix.is_some());
+    assert_eq!(
+        filtered.items[0].certificate_issuer.as_deref(),
+        Some("local")
+    );
+}
+
+#[tokio::test]
+async fn certificate_list_filters_before_paginating() {
+    let now = now_unix();
+    let (_dir, server, _runtime) = server_with_inventory(vec![
+        record(&["one.example.com"], &[], Some(now + days(90))),
+        record(&["two.example.com"], &[], Some(now + days(90))),
+    ]);
+    for domain in ["one.example.com", "two.example.com", "three.other.net"] {
+        create_intent(&server, &[domain], "internal", "http01").await;
+    }
+
+    let page: PaginatedResponse<CertificateIntentSummary> = server
+        .get("/api/v1/certificates?domain=example.com&limit=1&offset=1")
+        .await
+        .json();
+    assert_eq!(
+        page.total, 2,
+        "the domain filter is applied before the window"
+    );
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].domains, vec!["two.example.com"]);
+    assert_eq!(page.limit, 1);
+    assert_eq!(page.offset, 1);
+
+    let page: PaginatedResponse<CertificateIntentSummary> = server
+        .get("/api/v1/certificates?domain=other.net")
+        .await
+        .json();
+    assert_eq!(page.total, 1);
+    assert_eq!(page.items[0].domains, vec!["three.other.net"]);
+}
+
+#[tokio::test]
+async fn certificate_detail_serves_an_etag_and_404_for_unknown_intents() {
+    let (_dir, server, _runtime) = server_with_runtime();
+    create_intent(&server, &["detail.example.com"], "internal", "http01").await;
+
+    let response = server.get("/api/v1/certificates/1").await;
+    assert_eq!(response.status_code(), StatusCode::OK);
+    assert_eq!(response.header("etag"), "\"c1-r1\"");
+    let body: CertificateIntentSummary = response.json();
+    assert_eq!(body.policy_id, 1);
+    assert_eq!(body.status, CertificateIntentStatus::Pending);
+
+    let not_modified = server
+        .get("/api/v1/certificates/1")
+        .add_header("If-None-Match", "\"c1-r1\"")
+        .await;
+    assert_eq!(not_modified.status_code(), StatusCode::NOT_MODIFIED);
+
+    let missing = server.get("/api/v1/certificates/99").await;
+    assert_eq!(missing.status_code(), StatusCode::NOT_FOUND);
+    let body: ApiErrorResponse = missing.json();
+    assert_eq!(body.error.code, ErrorCode::NotFound);
+}
+
+#[tokio::test]
+async fn certificate_list_rejects_an_unknown_status_filter() {
+    let (_dir, server) = server();
+    let response = server.get("/api/v1/certificates?status=renewing").await;
+    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    let body: ApiErrorResponse = response.json();
+    assert_eq!(body.error.code, ErrorCode::Validation);
+    assert_eq!(body.error.location.as_deref(), Some("status"));
+}
+
+#[tokio::test]
+async fn config_after_an_intent_contains_tls_automation_and_disabled_host_skip() {
+    let (_dir, server, _runtime) = server_with_runtime();
+    create_intent(&server, &["app.example.com"], "letsencrypt", "http01").await;
+    let _ = create_dead(&server, "plain.example.com").await;
+
+    let config: serde_json::Value = server.get("/api/v1/config").await.json();
+    assert_eq!(
+        config["apps"]["tls"]["certificates"]["automate"],
+        serde_json::json!(["app.example.com"])
+    );
+    assert_eq!(
+        config["apps"]["tls"]["automation"]["policies"][0]["issuers"][0]["module"],
+        serde_json::json!("acme")
+    );
+    assert_eq!(
+        config["apps"]["http"]["servers"]["pm_https"]["automatic_https"]["skip"],
+        serde_json::json!(["plain.example.com"])
+    );
 }

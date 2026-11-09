@@ -8,13 +8,13 @@ This is the proxy-manager foundation workspace. It is deliberately independent o
 | `caddy-rs-pm-state` | Backend-agnostic durable document state: snapshots, revisions, CAS transactions, one serialized writer. No SQL, C or network dependency. |
 | `caddy-rs-pm-core` | Certificate and host domain model: certificate origins/policies, host TLS binding, proxy/redirect/dead host validation, domain uniqueness. |
 | `caddy-rs-pm-compiler` | Deterministic Caddy JSON route compiler for proxy/redirect/dead hosts; emits HTTP and HTTPS route lists, HSTS and forced-SSL redirects. No listeners, TLS automation or key material. |
-| `caddy-rs-pm-config` | Deterministic Caddy JSON assembler for compiled routes: two servers with configurable HTTP/HTTPS ports. No TLS connection policies, certificate automation, logging, access lists or admin apply. |
+| `caddy-rs-pm-config` | Deterministic Caddy JSON assembler: route-only `assemble`/`assemble_from_hosts` plus policy-aware `assemble_with_tls` that adds `apps.tls` automation and `automatic_https.skip` for HTTP-only hosts. No TLS connection policies, logging, access lists or admin apply. |
 | `caddy-rs-pm-hosts` | Durable host repository over `pm-state`: get/list/create/update/delete with CAS revisions, atomic domain-index uniqueness, next-id reservation, and memory/snapshot backend tests. |
 | `caddy-rs-pm-service` | Application service over `pm-hosts`: id-allocating create, CAS update/delete, list, and route compilation. No REST API, UI, auth or certificate policy loading. |
 | `caddy-rs-pm-policies` | Durable auto-certificate policy repository over `pm-state`: get/list/create/update/delete with CAS revisions, tombstones, monotonic id reservation and host coverage validation against `pm-core` hosts. |
 | `caddy-rs-pm-import` | Native-first NPM v2.16 host-payload import mapping: proxy/redirect/dead hosts to `pm-core`, explicit certificate origins, located errors for unsupported payload features and warnings for flags without a native implementation. |
 | `caddy-rs-pm-runtime` | PM composition root: data-directory preflight (`0700`, writability probe), `<data_dir>/pm` state layout, legacy Caddy detection (warning only), and host/policy/service wiring with compile/assemble entry points. |
-| `caddy-rs-pm-api` | Native REST API with axum: `/api/v1` router, host CRUD/enable/disable with strong per-host ETags and `If-Match` CAS, list filters/pagination, health/setup/version/config, typed error envelope, loopback-only mutation guard, request ID and logging middleware. |
+| `caddy-rs-pm-api` | Native REST API with axum: `/api/v1` router, host CRUD/enable/disable with strong per-host ETags and `If-Match` CAS, certificate intents with inventory-derived status, list filters/pagination, health/setup/version/config, typed error envelope, loopback-only mutation guard, request ID and logging middleware. |
 
 ## Why a nested workspace
 
@@ -55,9 +55,12 @@ The certificate model separates the classes that must never be conflated:
 | `acme_configured` | ACME (configured) | certificate id | never enters the PM |
 | `internal_ca` | Internal CA | certificate id | never enters the PM |
 
-`AutoCertificatePolicy` owns subjects/wildcards, `on_demand` vs `eager` mode, issuer, key type and
-renewal ratio. `HostTls` requires exactly one mode and validates subject coverage before a host is
-saved. An auto-generated certificate cannot be selected by id; a manual/ACME certificate cannot be
+`AutoCertificatePolicy` owns subjects/wildcards, `on_demand` vs `eager` mode, issuer, key type,
+renewal ratio and the ACME challenge (`http01`, `tls-alpn01` or `dns01`, default `http01`). Core
+on-demand TLS is not implemented, so the default policy mode is `eager`. Validation rejects a
+wildcard subject with HTTP-01/TLS-ALPN-01 (public ACME only issues wildcards via DNS-01); an
+`internal` issuer is exempt because it runs no ACME challenge. `HostTls` requires exactly one mode
+and validates subject coverage before a host is saved. An auto-generated certificate cannot be selected by id; a manual/ACME certificate cannot be
 attached to an auto policy.
 
 The certificate types contain **no private-key bytes**. Manual key material belongs in a separate
@@ -105,12 +108,31 @@ changing host semantics.
   material;
 - `assemble_from_hosts` runs `compile_routes` first and reports a `ConfigError` for invalid hosts.
 
-This crate does **not** emit `tls_connection_policies`, certificate automation/loaders/storage,
-logging, access lists or an admin apply step. Those are later slices; the assembler only owns the
-route/listener layer. The optional integration test validates assembled configs with
-`caddy-rs validate --adapter json` when `.scratch/rust-target/debug/caddy-rs` exists (or
-`CADDY_RS_BIN` names one) and skips with a diagnostic otherwise; unit tests never require the
-binary.
+`assemble_with_tls(&[Host], &[AutoCertificatePolicy], &ConfigSettings)` is the policy-aware entry
+point. It compiles the same routes and adds a deterministic `apps.tls`:
+
+- `certificates.automate` is the sorted union of enabled policy subjects;
+- `automation.policies[]` has one entry per enabled policy in id order, with its subjects, optional
+  `key_type`/`renewal_window_ratio`, and one issuer module:
+  - `letsencrypt` -> `acme` with `https://acme-v02.api.letsencrypt.org/directory`;
+  - `zerossl` -> `acme` with `https://acme.zerossl.com/v2/DV90` (no EAB secret is stored in PM);
+  - `internal` -> `{ "module": "internal" }` (no ACME challenge object);
+  - HTTP-01/TLS-ALPN-01 set the corresponding `issuers[i].challenges` flags.
+- A policy with the `dns01` challenge returns a located `ConfigError::UnsupportedDnsChallenge`
+  because this slice stores no DNS provider credentials; no half-configured DNS policy is emitted.
+- Domains of hosts whose TLS mode is not `Auto` (Disabled, Manual, ACME-configured or
+  Internal-CA) are added to `apps.http.servers.pm_http|pm_https.automatic_https.skip` unless an
+  enabled policy automates them. This slice emits no `load_files`, so skipping prevents Caddy from
+  silently auto-issuing a second certificate for a name an explicit certificate already owns.
+
+The original `assemble`/`assemble_from_hosts` output is unchanged: they never emit `apps.tls`.
+`PmRuntime::assemble` uses the policy-aware path, so a stored intent policy reaches `/api/v1/config`.
+
+This crate does **not** emit `tls_connection_policies`, certificate loaders/storage, logging, access
+lists or an admin apply step. The optional integration test validates assembled configs (including
+the TLS automation and skip shapes) with `caddy-rs validate --adapter json` when
+`.scratch/rust-target/debug/caddy-rs` exists (or `CADDY_RS_BIN` names one) and skips with a
+diagnostic otherwise; unit tests never require the binary.
 
 ## `pm-hosts`
 
@@ -263,11 +285,16 @@ Compile, Config}` and carry the relevant path. No error contains plaintext secre
 | `DELETE` | `/hosts/{id}` | Delete and tombstone the id; requires `If-Match` |
 | `POST` | `/hosts/{id}/enable` | Set `enabled=true`; requires `If-Match` |
 | `POST` | `/hosts/{id}/disable` | Set `enabled=false`; requires `If-Match` |
-| `GET` | `/config` | Assembled Caddy JSON with a weak `ETag`; honours `If-Match` and `If-None-Match` |
+| `POST` | `/certificates/intent` | Record a certificate intent (`201` + `Location` + strong `ETag`); loopback-only; DNS-01 and NPM fields are typed `400`s |
+| `GET` | `/certificates` | Paginated intent list with inventory-derived `status`; filters `domain`, `status` |
+| `GET` | `/certificates/{id}` | One intent with the same derived status and a strong `ETag` |
+| `GET` | `/config` | Assembled Caddy JSON (routes + TLS automation) with a weak `ETag`; honours `If-Match` and `If-None-Match` |
 
 ### Shared infrastructure
 
-- **`ApiState`** — wraps a `PmRuntime` (cloned per request via `Arc`).
+- **`ApiState`** — wraps a `PmRuntime` (cloned per request via `Arc`) and an optional
+  `Arc<dyn CertificateInventorySource>`; `ApiState::with_inventory` injects the source, and the
+  default is empty.
 - **Typed error envelope** — `{ "error": { "code": "NOT_FOUND|CONFLICT|PRECONDITION_FAILED|PRECONDITION_REQUIRED|FORBIDDEN|UNSUPPORTED_MEDIA_TYPE|VALIDATION|INTERNAL", "message": "...", "location": "field.path" } }` via `ApiError::into_response()`.
 - **Pagination** — `limit` (default 50, max 200) and `offset` (default 0) query params; an out-of-range `limit` is clamped and the effective window is echoed in `{ "items": [...], "total": N, "limit": L, "offset": O }` via `PaginatedResponse<T>`.
 - **Preconditions** — `evaluate_get_preconditions` implements RFC 9110 ordering for the config `GET`: a failing `If-Match` is `412 Precondition Failed`, a matching `If-None-Match` is `304 Not Modified`, and `*` matches any representation. Host mutations require a strong `If-Match`: missing is `428 Precondition Required`; stale, weak `W/"..."` or unparseable is `412`; `*` matches any current revision.
@@ -275,6 +302,42 @@ Compile, Config}` and carry the relevant path. No error contains plaintext secre
 - **Native schema** — request/response bodies are camelCase (`preserveHost`, `sslForced`, `autoPolicyId`) and reject unknown fields. NPM names such as `forward_host` are a typed `400`, not silently ignored; the `--compat npm` adapter will translate them.
 - **Middleware** — request ID (`x-request-id`), structured logging, and a loopback-only mutation guard. The guard reads the socket peer from `ConnectInfo<SocketAddr>`; a missing peer or a non-loopback peer is `403`, and `X-Forwarded-For` is never trusted. This is a fail-closed boundary until PM auth lands, not authentication: the management port must stay unpublished and `create_router` must be served with `into_make_service_with_connect_info::<SocketAddr>()`.
 - **No authentication yet** — the loopback guard is temporary; PM management auth is CORE-PM-12/PM-115 work.
+
+### Certificate intents and status
+
+`POST /certificates/intent` takes exactly `{ "domains": [...], "issuer": "letsencrypt" |
+"zerossl" | "internal", "challenge": "http01" | "tls-alpn01" | "dns01" }` and records an eager
+`AutoCertificatePolicy` through `PmRuntime::policies()`. It normalizes and validates every domain,
+rejects duplicate domains, unknown/NPM fields and DNS-01 (no provider credentials in this slice),
+and allocates the policy id with the repository's persisted `next_id()`; exhaustion and races are
+typed `409`s. The response is `201` with `policyId`, `domains`, `issuer`, `challenge`, `status:
+"pending"`, `Location: /api/v1/certificates/{id}` and a strong `"c<id>-r<revision>"` ETag. No PEM,
+private key or secret is accepted or returned.
+
+`GET /certificates` and `/certificates/{id}` derive status from an injected
+`CertificateInventorySource` (`CertificateRecord { domains, sans, issuer, expires_at_unix, source,
+renewal_error }`):
+
+| Status | Condition |
+|---|---|
+| `pending` | no record covers at least one subject |
+| `renewal_error` | a covering record reports an error |
+| `expired` | the latest covering record expired |
+| `expiring_soon` | less than 30 days remain |
+| `issued` | covered and not near expiry (also used when the source has no expiry) |
+
+Coverage is per subject: one intent may be covered by several certificates (for example an exact
+SAN plus a wildcard). A record without an expiry is still an issuance observation and is reported
+`issued` with no `expiresAt`; it is never turned into a fabricated epoch date.
+
+**Integration point (deliberately not implemented here).** `pm-api` has no HTTP client. The daemon
+that owns the caddy-rs admin URL implements `CertificateInventorySource` over
+`GET /runtime/inventory` and injects it with `ApiState::with_inventory`. The current caddy-rs
+inventory payload (`crates/admin/src/inventory.rs`) exposes only `subject`, `sans`, `issuer`,
+`source` and optional `not_after`: it has **no issuance-state or renewal-error field**. This slice
+therefore reports `issued`/`expiring_soon`/`expired` from expiry and `pending` when no certificate
+is observed; `renewal_error` is surfaced only when a future source can provide it. It never
+fabricates "issued" from a `201`.
 
 ### Testing
 
@@ -286,6 +349,13 @@ Tests use `axum_test::TestServer` against a real `PmRuntime` backed by a tempora
 - `/config` returns a stable weak ETag; `If-None-Match` yields 304, a stale `If-Match` yields 412 with a typed `PRECONDITION_FAILED` body, and `*`/current tags succeed.
 - `If-Match` is evaluated before `If-None-Match`; malformed tags, including a non-UTF-8 header value, fail closed with 412.
 - Mutation-side `require_if_match` rejects missing and stale revisions and accepts current/`*`.
+- Certificate intents return 201/`Location`/ETag and persist an eager policy; DNS-01, NPM fields,
+  duplicate/invalid domains and unknown issuers are typed 400s with a `location`; missing
+  `ConnectInfo` and non-loopback peers are 403 before the body is parsed.
+- Certificate list/detail derive pending/issued/expiring_soon/expired/renewal_error from a fake
+  inventory (including split-certificate coverage and a record without expiry), filter before
+  pagination, and `/config` after an intent contains `apps.tls` plus `automatic_https.skip` for an
+  HTTP-only host.
 - Error bodies carry `location` only when a field is at fault.
 
 ## `pm-import`
@@ -325,13 +395,14 @@ CARGO_HOME=/root/caddy-rs/.scratch/cargo-home \
 
 ## Not in this slice
 
-- PM REST API/UI and the NPM compatibility adapter;
-- the REST API/UI service;
-- certificate service/ACME jobs;
+- the PM web UI and the NPM compatibility adapter;
+- a real ACME/DNS-01 issuance service or certificate job API: this slice records intent and
+  compiles Caddy automation, it does not request, renew or revoke certificates itself;
+- DNS provider credentials and a DNS-01 policy path;
 - a durable backend with a journal (redb/SQLite/Postgres);
 - core on-demand TLS manager (tracked separately in
   `docs/research/DYNAMIC-CERTIFICATE-DECISIONS.md`).
 
-The next slices are the native REST API/UI, certificate policy persistence, the read-model
-synchronizer, and the core on-demand manager. The taxonomy and invariants are in
+The next slices are the PM web UI, the daemon-side inventory source, explicit ACME issuance jobs
+and the core on-demand manager. The taxonomy and invariants are in
 `docs/research/PROXY-MANAGER-CERTIFICATES.md`.

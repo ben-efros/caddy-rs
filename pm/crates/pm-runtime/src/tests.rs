@@ -60,9 +60,10 @@ fn auto_policy(id: u64, subjects: &[&str]) -> AutoCertificatePolicy {
         name: format!("policy-{id}"),
         subjects: subjects.iter().map(|value| (*value).to_string()).collect(),
         mode: AutoMode::OnDemand,
-        issuer: None,
+        issuer: Some("letsencrypt".to_string()),
         key_type: None,
         renewal_window_ratio: Some(0.3),
+        challenge: caddy_rs_pm_core::AcmeChallenge::Http01,
         enabled: true,
     }
 }
@@ -391,6 +392,18 @@ fn compile_and_assemble_use_the_stored_hosts() {
         .expect("https routes");
     assert_eq!(https_routes.len(), 1);
     assert_eq!(https_routes[0]["match"][0]["host"][0], json!("example.com"));
+    assert_eq!(
+        config["apps"]["tls"]["certificates"]["automate"],
+        json!(["example.com"])
+    );
+    assert_eq!(
+        config["apps"]["tls"]["automation"]["policies"][0]["subjects"],
+        json!(["example.com"])
+    );
+    assert_eq!(
+        config["apps"]["tls"]["automation"]["policies"][0]["issuers"][0]["module"],
+        json!("acme")
+    );
 }
 
 #[cfg(unix)]

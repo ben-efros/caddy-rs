@@ -7,9 +7,10 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use caddy_rs_pm_config::{assemble_from_hosts, ConfigSettings};
+use caddy_rs_pm_config::{assemble_from_hosts, assemble_with_tls, ConfigSettings};
 use caddy_rs_pm_core::{
-    Host, HostId, HostSpec, HostTls, PolicyId, ProxySpec, Upstream, UpstreamScheme,
+    AcmeChallenge, AutoCertificatePolicy, AutoMode, Host, HostId, HostSpec, HostTls, PolicyId,
+    ProxySpec, Upstream, UpstreamScheme,
 };
 use serde_json::Value;
 
@@ -100,5 +101,59 @@ fn custom_ports_and_tls_routes_are_accepted() {
         HostTls::for_auto(PolicyId(4)),
     )];
     let config = assemble_from_hosts(&hosts, &ConfigSettings::new(8080, 8443)).expect("assemble");
+    validate_with_caddy(&config);
+}
+
+fn tls_policy(
+    id: u64,
+    subjects: &[&str],
+    issuer: &str,
+    challenge: AcmeChallenge,
+) -> AutoCertificatePolicy {
+    AutoCertificatePolicy {
+        id: PolicyId(id),
+        name: format!("policy-{id}"),
+        subjects: subjects.iter().map(|value| (*value).to_string()).collect(),
+        mode: AutoMode::Eager,
+        issuer: Some(issuer.to_string()),
+        key_type: None,
+        renewal_window_ratio: Some(0.3),
+        challenge,
+        enabled: true,
+    }
+}
+
+#[test]
+fn letsencrypt_http01_tls_automation_is_accepted() {
+    let hosts = vec![proxy_host(
+        2,
+        "secure.example.com",
+        HostTls::for_auto(PolicyId(4)),
+    )];
+    let policies = vec![tls_policy(
+        4,
+        &["secure.example.com"],
+        "letsencrypt",
+        AcmeChallenge::Http01,
+    )];
+    let config =
+        assemble_with_tls(&hosts, &policies, &ConfigSettings::default()).expect("assemble");
+    validate_with_caddy(&config);
+}
+
+#[test]
+fn internal_tls_automation_and_disabled_host_skip_are_accepted() {
+    let hosts = vec![
+        proxy_host(2, "internal.example.com", HostTls::for_auto(PolicyId(4))),
+        proxy_host(3, "plain.example.com", HostTls::disabled()),
+    ];
+    let policies = vec![tls_policy(
+        4,
+        &["internal.example.com"],
+        "internal",
+        AcmeChallenge::Http01,
+    )];
+    let config =
+        assemble_with_tls(&hosts, &policies, &ConfigSettings::default()).expect("assemble");
     validate_with_caddy(&config);
 }

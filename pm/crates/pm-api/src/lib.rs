@@ -59,9 +59,8 @@
 
 #![forbid(unsafe_code)]
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::{
     extract::{connect_info::ConnectInfo, State},
@@ -86,11 +85,29 @@ pub const MAX_LIMIT: u32 = 200;
 #[derive(Clone)]
 pub struct ApiState {
     pub runtime: PmRuntime,
+    inventory: Option<SharedCertificateInventory>,
 }
 
 impl ApiState {
+    /// State with no certificate inventory. Every intent is reported as `pending` until the
+    /// daemon injects a source with [`ApiState::with_inventory`].
     pub fn new(runtime: PmRuntime) -> Self {
-        Self { runtime }
+        Self {
+            runtime,
+            inventory: None,
+        }
+    }
+
+    /// Inject the certificate inventory the daemon reads from the caddy-rs admin endpoint.
+    #[must_use]
+    pub fn with_inventory(mut self, inventory: SharedCertificateInventory) -> Self {
+        self.inventory = Some(inventory);
+        self
+    }
+
+    /// The injected inventory, if any.
+    pub fn inventory(&self) -> Option<&SharedCertificateInventory> {
+        self.inventory.as_ref()
     }
 }
 
@@ -517,6 +534,9 @@ pub fn create_router(state: ApiState) -> Router {
         )
         .route("/hosts/{id}/enable", post(hosts::enable_handler))
         .route("/hosts/{id}/disable", post(hosts::disable_handler))
+        .route("/certificates", get(certificates::list_handler))
+        .route("/certificates/intent", post(certificates::create_handler))
+        .route("/certificates/{id}", get(certificates::get_handler))
         .route("/config", get(config_handler))
         .layer(middleware::from_fn(observe_middleware))
         .layer(middleware::from_fn(capture_peer_middleware))
@@ -606,8 +626,15 @@ fn hash_bytes(bytes: &[u8]) -> String {
     format!("{hash:016x}")
 }
 
+mod certificates;
 mod dto;
 mod hosts;
+
+pub use certificates::{
+    derive_intent_status, CertificateIntentRequest, CertificateIntentStatus,
+    CertificateIntentSummary, CertificateInventorySource, CertificateRecord,
+    EmptyCertificateInventory, InventoryError, SharedCertificateInventory, EXPIRING_SOON_SECONDS,
+};
 
 #[cfg(test)]
 mod tests;
