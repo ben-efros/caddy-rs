@@ -7,24 +7,14 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[features]
-default = []
-pm-state = ["caddy-rs-pm-state"]
-
 [dependencies]
-# Internal crates
-caddy-rs-core = { path = "../core", default-features = false }
-caddy-rs-pm-state = { path = "../../pm/crates/pm-state", optional = true, default-features = false }
 # External dependencies
 serde = { workspace = true }
-serde_json = { workspace = true }
 thiserror = { workspace = true }
-anyhow = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
-tracing = { workspace = true }
 # Crypto and JWT
-argon2 = { version = "0.5", features = ["std"] }
+argon2 = { version = "0.5", features = ["std", "password-hash"] }
 bcrypt = "0.15"
 jsonwebtoken = "9.3"
 rand = { version = "0.8", features = ["std", "getrandom"] }
@@ -32,9 +22,10 @@ base32 = "0.5"
 totp-lite = "2.0"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.11", features = ["v4", "serde", "fast-rng"] }
-zeroize = "1.8"
-secrecy = "0.10"
 urlencoding = "2.1"
+sha2 = { workspace = true }
+subtle = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+serde_json = { workspace = true }

@@ -1,12 +1,16 @@
 //! Authentication and authorization service for caddy-rs.
 //!
 //! This crate provides a reusable authentication and authorization system with:
-//! - User management with roles, capabilities, and visibility
+//! - User management with roles, capabilities, and row-level visibility
 //! - Password hashing (argon2id preferred, bcrypt fallback) with constant-time verification
-//! - JWT access tokens and opaque refresh tokens with rotation
-//! - TOTP two-factor authentication
+//! - JWT access tokens and rotating opaque refresh tokens
+//! - TOTP two-factor authentication with replay protection
 //! - Permission checking based on roles, capabilities, and visibility
-//! - Multiple storage backends (in-memory and persistent via pm-state adapter)
+//! - An in-memory [`UserStore`] implementation; persistent backends belong outside this crate
+//!
+//! The crate deliberately has no dependency on the process-manager (`pm-*`) crates. A persistent
+//! store can implement [`UserStore`] without pulling process-manager state into the authentication
+//! boundary.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -28,10 +32,18 @@ use jsonwebtoken::{
 };
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::sync::RwLock;
-use totp_lite::{totp, Sha1};
+use totp_lite::{totp_custom, Sha1};
 use uuid::Uuid;
+
+/// Length of a TOTP time step in seconds.
+const TOTP_STEP_SECONDS: u64 = 30;
+
+/// Number of digits in a TOTP code.
+const TOTP_DIGITS: u32 = 6;
 
 /// Unique identifier for a user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -50,17 +62,15 @@ impl Default for UserId {
     }
 }
 
-impl std::fmt::Display for UserId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl std::str::FromStr for UserId {
-    type Err = uuid::Error;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self(Uuid::parse_str(s)?))
-    }
+/// Visibility scope for a role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Visibility {
+    /// Can access all resources in permitted sections.
+    All,
+    /// Can only access resources owned by the user.
+    #[default]
+    Owner,
 }
 
 /// User role with capabilities and visibility.
@@ -70,28 +80,14 @@ pub struct Role {
     pub name: String,
     /// Set of capabilities this role grants.
     pub capabilities: CapabilitySet,
-    /// Visibility scope: All resources or only owner's resources.
+    /// Visibility scope: all resources or only the owner's resources.
     pub visibility: Visibility,
 }
 
-/// Visibility scope for a role.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Visibility {
-    /// Can access all resources in permitted sections.
-    All,
-    /// Can only access resources owned by the user.
-    Owner,
-}
-
-impl Default for Visibility {
-    fn default() -> Self {
-        Self::Owner
-    }
-}
-
-/// Bitflags for capabilities across different sections.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Bitflags for capabilities across the six configuration sections.
+///
+/// Each section owns six action bits: view, create, update, delete, manage and admin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct CapabilitySet(u64);
 
 impl CapabilitySet {
@@ -121,24 +117,24 @@ impl CapabilitySet {
         Self(0)
     }
 
-    /// Create from raw bits.
+    /// Create a capability set from raw bits.
     pub const fn from_bits(bits: u64) -> Self {
         Self(bits)
     }
 
-    /// Get raw bits.
+    /// Get the raw bits of this capability set.
     pub const fn bits(&self) -> u64 {
         self.0
     }
 
-    /// Check if a specific capability is set.
+    /// Check whether a specific capability is set.
     pub fn has(&self, section: Section, action: Action) -> bool {
         let shift = section.shift();
         let bit = action.bit();
         (self.0 >> shift) & bit != 0
     }
 
-    /// Set a specific capability.
+    /// Set or clear a specific capability.
     pub fn set(&mut self, section: Section, action: Action, value: bool) {
         let shift = section.shift();
         let bit = action.bit();
@@ -149,12 +145,12 @@ impl CapabilitySet {
         }
     }
 
-    /// Enable a capability.
+    /// Enable a specific capability.
     pub fn enable(&mut self, section: Section, action: Action) {
         self.set(section, action, true);
     }
 
-    /// Disable a capability.
+    /// Disable a specific capability.
     pub fn disable(&mut self, section: Section, action: Action) {
         self.set(section, action, false);
     }
@@ -170,47 +166,21 @@ impl CapabilitySet {
     }
 }
 
-impl Default for CapabilitySet {
-    fn default() -> Self {
-        Self::NONE
-    }
-}
-
-impl std::ops::BitOr for CapabilitySet {
-    type Output = Self;
-    fn bitor(self, rhs: Self) -> Self::Output {
-        Self(self.0 | rhs.0)
-    }
-}
-
-impl std::ops::BitAnd for CapabilitySet {
-    type Output = Self;
-    fn bitand(self, rhs: Self) -> Self::Output {
-        Self(self.0 & rhs.0)
-    }
-}
-
-impl std::ops::BitOrAssign for CapabilitySet {
-    fn bitor_assign(&mut self, rhs: Self) {
-        self.0 |= rhs.0;
-    }
-}
-
-impl std::ops::BitAndAssign for CapabilitySet {
-    fn bitand_assign(&mut self, rhs: Self) {
-        self.0 &= rhs.0;
-    }
-}
-
 /// Configuration sections for capabilities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Section {
+    /// Host configuration.
     Hosts,
+    /// TLS certificate configuration.
     Certificates,
+    /// Access-list configuration.
     AccessLists,
+    /// User management.
     Users,
+    /// Log access.
     Logs,
+    /// Global settings.
     Settings,
 }
 
@@ -243,11 +213,17 @@ impl Section {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Action {
+    /// Read a resource.
     View,
+    /// Create a resource.
     Create,
+    /// Update a resource.
     Update,
+    /// Delete a resource.
     Delete,
+    /// Manage a resource's lifecycle.
     Manage,
+    /// Administrative operations.
     Admin,
 }
 
@@ -276,21 +252,19 @@ impl Action {
     }
 }
 
-/// Predefined role templates.
 impl Role {
     /// Administrator role with full access to everything.
     pub fn admin() -> Self {
-        let mut caps = CapabilitySet::ALL;
         Self {
             name: "admin".to_string(),
-            capabilities: caps,
+            capabilities: CapabilitySet::ALL,
             visibility: Visibility::All,
         }
     }
 
-    /// Editor role with create/update/delete on most sections, view on settings.
+    /// Editor role with create/update/delete on most sections and view on settings.
     pub fn editor() -> Self {
-        let mut caps = CapabilitySet::new();
+        let mut capabilities = CapabilitySet::new();
         for section in [
             Section::Hosts,
             Section::Certificates,
@@ -304,32 +278,32 @@ impl Role {
                 Action::Delete,
                 Action::Manage,
             ] {
-                caps.enable(section, action);
+                capabilities.enable(section, action);
             }
         }
-        caps.enable(Section::Users, Action::View);
-        caps.enable(Section::Settings, Action::View);
+        capabilities.enable(Section::Users, Action::View);
+        capabilities.enable(Section::Settings, Action::View);
         Self {
             name: "editor".to_string(),
-            capabilities: caps,
+            capabilities,
             visibility: Visibility::All,
         }
     }
 
-    /// Viewer role with read-only access to most sections.
+    /// Viewer role with read-only access to every section and owner-only visibility.
     pub fn viewer() -> Self {
-        let mut caps = CapabilitySet::new();
+        let mut capabilities = CapabilitySet::new();
         for section in Section::all() {
-            caps.enable(section, Action::View);
+            capabilities.enable(section, Action::View);
         }
         Self {
             name: "viewer".to_string(),
-            capabilities: caps,
+            capabilities,
             visibility: Visibility::Owner,
         }
     }
 
-    /// Custom role with specified capabilities and visibility.
+    /// Custom role with the specified capabilities and visibility.
     pub fn custom(
         name: impl Into<String>,
         capabilities: CapabilitySet,
@@ -344,18 +318,25 @@ impl Role {
 }
 
 /// User account.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct User {
     /// Unique user identifier.
     pub id: UserId,
     /// Username (unique).
     pub username: String,
-    /// Argon2id or bcrypt password hash.
+    /// Argon2id or bcrypt password hash. Never a plaintext password.
     pub password_hash: String,
     /// User's role.
     pub role: Role,
     /// TOTP secret (base32 encoded), if 2FA is enabled.
     pub totp_secret: Option<String>,
+    /// Last TOTP time step accepted for this user, used for replay protection.
+    pub totp_last_step: Option<u64>,
+    /// Monotonically increasing authentication epoch.
+    ///
+    /// Access tokens carry the epoch they were issued under. Password changes, role changes and
+    /// explicit revocation increment it, which invalidates every previously issued access token.
+    pub auth_epoch: u64,
     /// Account creation timestamp.
     pub created_at: DateTime<Utc>,
     /// Last update timestamp.
@@ -367,54 +348,130 @@ impl User {
     pub fn has_totp(&self) -> bool {
         self.totp_secret.is_some()
     }
+
+    /// A serializable view with no credential material.
+    ///
+    /// [`User`] deliberately does not implement `Serialize`: it holds the password hash and the
+    /// TOTP seed, and any accidental `serde_json::to_value(user)` in an API response would leak
+    /// both. Use this view for responses. A persistent store must define its own record type rather
+    /// than serializing the domain object.
+    pub fn public(&self) -> PublicUser {
+        PublicUser {
+            id: self.id,
+            username: self.username.clone(),
+            role: self.role.clone(),
+            totp_enabled: self.has_totp(),
+            auth_epoch: self.auth_epoch,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+    }
+}
+
+/// Safe-to-serialize user view without a password hash or TOTP secret.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PublicUser {
+    /// Unique user identifier.
+    pub id: UserId,
+    /// Username (unique).
+    pub username: String,
+    /// User's role and capabilities.
+    pub role: Role,
+    /// Whether TOTP is configured; the secret itself is never serialized.
+    pub totp_enabled: bool,
+    /// Authentication epoch the user is currently on.
+    pub auth_epoch: u64,
+    /// Account creation timestamp.
+    pub created_at: DateTime<Utc>,
+    /// Last update timestamp.
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Increment a user's authentication epoch, failing closed on exhaustion.
+///
+/// Wrapping would make an ancient token valid again after 2^64 changes; that is unreachable in
+/// practice but must not silently become a downgrade.
+fn bump_epoch(user: &mut User) -> AuthResult<()> {
+    user.auth_epoch = user
+        .auth_epoch
+        .checked_add(1)
+        .ok_or_else(|| AuthError::Internal("authentication epoch exhausted".to_string()))?;
+    Ok(())
+}
+
+impl std::fmt::Debug for User {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("User")
+            .field("id", &self.id)
+            .field("username", &self.username)
+            .field("password_hash", &"[redacted]")
+            .field("role", &self.role)
+            .field(
+                "totp_secret",
+                &self.totp_secret.as_ref().map(|_| "[redacted]"),
+            )
+            .field("totp_last_step", &self.totp_last_step)
+            .field("auth_epoch", &self.auth_epoch)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
 }
 
 /// Authentication errors.
 #[derive(Debug, Error)]
 pub enum AuthError {
+    /// The requested user does not exist.
     #[error("user not found")]
     UserNotFound,
+    /// A user with the requested username already exists.
     #[error("username already exists")]
     UsernameExists,
+    /// The supplied credentials are invalid.
     #[error("invalid credentials")]
     InvalidCredentials,
+    /// A token is invalid, malformed, or no longer valid for its user.
     #[error("invalid or expired token")]
     InvalidToken,
+    /// A token has expired.
     #[error("token expired")]
     TokenExpired,
+    /// A token signature did not verify.
     #[error("invalid token signature")]
     InvalidSignature,
+    /// A refresh token has already been revoked.
     #[error("refresh token revoked")]
     RefreshTokenRevoked,
+    /// A refresh token was never issued or has been deleted.
     #[error("refresh token not found")]
     RefreshTokenNotFound,
+    /// The supplied TOTP code is invalid or has already been used.
     #[error("invalid TOTP code")]
     InvalidTotpCode,
+    /// TOTP is not configured for the user.
     #[error("TOTP not configured for user")]
     TotpNotConfigured,
+    /// A password hash is malformed or uses an unsupported format.
     #[error("password hash error: {0}")]
     PasswordHash(String),
+    /// A JWT operation failed.
     #[error("JWT error: {0}")]
     Jwt(#[from] jsonwebtoken::errors::Error),
+    /// An argon2 operation failed.
     #[error("argon2 error: {0}")]
     Argon2(#[from] argon2::password_hash::Error),
+    /// A bcrypt operation failed.
     #[error("bcrypt error: {0}")]
     Bcrypt(#[from] bcrypt::BcryptError),
+    /// A storage backend failed.
     #[error("store error: {0}")]
     Store(String),
-    #[error("configuration error: {0}")]
-    Config(String),
+    /// An internal invariant was violated.
     #[error("internal error: {0}")]
     Internal(String),
 }
 
-impl From<anyhow::Error> for AuthError {
-    fn from(err: anyhow::Error) -> Self {
-        Self::Internal(err.to_string())
-    }
-}
-
-/// Result type for auth operations.
+/// Result type for authentication operations.
 pub type AuthResult<T> = Result<T, AuthError>;
 
 /// JWT claims for access tokens.
@@ -424,46 +481,77 @@ pub struct Claims {
     pub sub: UserId,
     /// Role name.
     pub role: String,
-    /// Capabilities as bitmask.
+    /// Capabilities as a bitmask.
     pub caps: u64,
-    /// Visibility.
+    /// Visibility scope.
     pub vis: Visibility,
+    /// Authentication epoch at issue time.
+    pub epoch: u64,
     /// Issued at (Unix timestamp).
     pub iat: i64,
     /// Expiration (Unix timestamp).
     pub exp: i64,
+    /// Issuer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iss: Option<String>,
+    /// Audience.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aud: Option<String>,
 }
 
 impl Claims {
-    /// Check if token has a specific capability.
+    /// Check if the token has a specific capability.
     pub fn has_capability(&self, section: Section, action: Action) -> bool {
-        let caps = CapabilitySet::from_bits(self.caps);
-        caps.has(section, action)
+        CapabilitySet::from_bits(self.caps).has(section, action)
     }
 }
 
-/// Token pair returned on login/refresh.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Token pair returned on login or refresh.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct TokenPair {
-    /// Short-lived JWT access token (e.g., 15 minutes).
+    /// Short-lived JWT access token.
     pub access_token: String,
-    /// Long-lived opaque refresh token (e.g., 7 days).
+    /// Long-lived opaque refresh token. Only its SHA-256 digest is stored.
     pub refresh_token: String,
 }
 
+impl std::fmt::Debug for TokenPair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenPair")
+            .field("access_token", &"[redacted]")
+            .field("refresh_token", &"[redacted]")
+            .finish()
+    }
+}
+
 /// Refresh token record stored in the database.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct RefreshTokenRecord {
-    /// Hash of the refresh token (argon2id).
+#[derive(Clone, Serialize, Deserialize)]
+pub struct RefreshTokenRecord {
+    /// SHA-256 hex digest of the opaque refresh token. The token itself is never stored.
     token_hash: String,
     /// Associated user ID.
     user_id: UserId,
     /// Issued at timestamp.
     iat: i64,
+    /// Expiration timestamp.
+    expires_at: i64,
     /// Revoked at timestamp (if revoked).
     revoked_at: Option<i64>,
     /// Token ID for revocation tracking.
     token_id: String,
+}
+
+impl std::fmt::Debug for RefreshTokenRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RefreshTokenRecord")
+            .field("token_hash", &"[redacted]")
+            .field("user_id", &self.user_id)
+            .field("iat", &self.iat)
+            .field("expires_at", &self.expires_at)
+            .field("revoked_at", &self.revoked_at)
+            .field("token_id", &self.token_id)
+            .finish()
+    }
 }
 
 /// Argon2 parameters for password hashing.
@@ -479,26 +567,17 @@ pub struct Argon2Config {
 
 impl Default for Argon2Config {
     fn default() -> Self {
-        // OWASP recommended defaults for Argon2id (2024)
+        // OWASP recommended defaults for Argon2id (2024).
         Self {
-            memory_cost: 19456, // 19 MiB
+            memory_cost: 19456,
             time_cost: 2,
             parallelism: 1,
         }
     }
 }
 
-impl Argon2Config {
-    /// Create Argon2 instance from config.
-    fn to_argon2(&self) -> Result<Argon2<'static>, AuthError> {
-        let params = Argon2Params::new(self.memory_cost, self.time_cost, self.parallelism)
-            .map_err(|e| AuthError::PasswordHash(e.to_string()))?;
-        Ok(Argon2::new(Algorithm::Argon2id, Version::V0x13, params))
-    }
-}
-
 /// Authentication service configuration.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AuthnConfig {
     /// JWT signing secret (32 bytes for HS256).
     pub jwt_secret: [u8; 32],
@@ -516,14 +595,13 @@ pub struct AuthnConfig {
 
 impl Default for AuthnConfig {
     fn default() -> Self {
-        // Generate a random secret if not provided (for development only)
         let mut jwt_secret = [0u8; 32];
         OsRng.fill_bytes(&mut jwt_secret);
 
         Self {
             jwt_secret,
-            access_ttl: Duration::from_secs(15 * 60), // 15 minutes
-            refresh_ttl: Duration::from_secs(7 * 24 * 60 * 60), // 7 days
+            access_ttl: Duration::from_secs(15 * 60),
+            refresh_ttl: Duration::from_secs(7 * 24 * 60 * 60),
             argon2_params: Argon2Config::default(),
             issuer: None,
             audience: None,
@@ -531,13 +609,29 @@ impl Default for AuthnConfig {
     }
 }
 
+impl std::fmt::Debug for AuthnConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthnConfig")
+            .field("jwt_secret", &"[redacted]")
+            .field("access_ttl", &self.access_ttl)
+            .field("refresh_ttl", &self.refresh_ttl)
+            .field("argon2_params", &self.argon2_params)
+            .field("issuer", &self.issuer)
+            .field("audience", &self.audience)
+            .finish()
+    }
+}
+
 /// Trait for user storage backends.
+///
+/// Implementations must be safe for concurrent use. Refresh tokens are keyed by their SHA-256
+/// digest; the plaintext token must never be persisted.
 #[async_trait]
 pub trait UserStore: Send + Sync {
-    /// Get user by ID.
+    /// Get a user by ID.
     async fn get_user(&self, user_id: UserId) -> AuthResult<Option<User>>;
 
-    /// Get user by username.
+    /// Get a user by username.
     async fn get_user_by_username(&self, username: &str) -> AuthResult<Option<User>>;
 
     /// Create a new user.
@@ -549,20 +643,35 @@ pub trait UserStore: Send + Sync {
     /// Delete a user.
     async fn delete_user(&self, user_id: UserId) -> AuthResult<()>;
 
-    /// List all users (for admin purposes).
+    /// List all users (for administrative purposes).
     async fn list_users(&self) -> AuthResult<Vec<User>>;
 
-    /// Get refresh token record by token ID.
-    async fn get_refresh_token(&self, token_id: &str) -> AuthResult<Option<RefreshTokenRecord>>;
+    /// Get a refresh token record by the SHA-256 digest of the token.
+    async fn get_refresh_token(&self, token_hash: &str) -> AuthResult<Option<RefreshTokenRecord>>;
 
     /// Store a new refresh token record.
     async fn store_refresh_token(&self, record: RefreshTokenRecord) -> AuthResult<()>;
 
-    /// Update a refresh token record (e.g., mark revoked).
-    async fn update_refresh_token(&self, record: RefreshTokenRecord) -> AuthResult<()>;
+    /// Atomically consume a refresh token, marking it revoked.
+    ///
+    /// Returns [`AuthError::RefreshTokenNotFound`] for an unknown digest,
+    /// [`AuthError::RefreshTokenRevoked`] for a token that was already consumed or revoked, and
+    /// [`AuthError::TokenExpired`] for an expired token.
+    async fn consume_refresh_token(
+        &self,
+        token_hash: &str,
+        now: i64,
+    ) -> AuthResult<RefreshTokenRecord>;
 
-    /// Delete all refresh tokens for a user.
-    async fn delete_refresh_tokens_for_user(&self, user_id: UserId) -> AuthResult<()>;
+    /// Mark every refresh token belonging to a user as revoked.
+    async fn revoke_all_refresh_tokens_for_user(&self, user_id: UserId, now: i64)
+        -> AuthResult<()>;
+
+    /// Atomically accept a TOTP time step for a user.
+    ///
+    /// Returns `false` when the step was already accepted (or is older than the last accepted
+    /// step), which is how replay of a still-valid TOTP code is rejected.
+    async fn accept_totp_step(&self, user_id: UserId, step: u64) -> AuthResult<bool>;
 }
 
 /// In-memory user store implementation.
@@ -583,17 +692,14 @@ impl MemoryUserStore {
 #[async_trait]
 impl UserStore for MemoryUserStore {
     async fn get_user(&self, user_id: UserId) -> AuthResult<Option<User>> {
-        let users = self.users.read().await;
-        Ok(users.get(&user_id).cloned())
+        Ok(self.users.read().await.get(&user_id).cloned())
     }
 
     async fn get_user_by_username(&self, username: &str) -> AuthResult<Option<User>> {
-        let users_by_username = self.users_by_username.read().await;
-        let users = self.users.read().await;
-        if let Some(user_id) = users_by_username.get(username) {
-            Ok(users.get(user_id).cloned())
-        } else {
-            Ok(None)
+        let user_id = self.users_by_username.read().await.get(username).copied();
+        match user_id {
+            Some(user_id) => Ok(self.users.read().await.get(&user_id).cloned()),
+            None => Ok(None),
         }
     }
 
@@ -604,6 +710,9 @@ impl UserStore for MemoryUserStore {
         if users_by_username.contains_key(&user.username) {
             return Err(AuthError::UsernameExists);
         }
+        if users.contains_key(&user.id) {
+            return Err(AuthError::Store("user id already exists".to_string()));
+        }
 
         users_by_username.insert(user.username.clone(), user.id);
         users.insert(user.id, user.clone());
@@ -612,16 +721,19 @@ impl UserStore for MemoryUserStore {
 
     async fn update_user(&self, user: User) -> AuthResult<User> {
         let mut users = self.users.write().await;
-        let users_by_username = self.users_by_username.read().await;
+        let mut users_by_username = self.users_by_username.write().await;
 
-        // Check if username changed and new username is taken
-        if let Some(existing) = users.get(&user.id) {
-            if existing.username != user.username && users_by_username.contains_key(&user.username)
-            {
+        let old_username = match users.get(&user.id) {
+            Some(existing) => existing.username.clone(),
+            None => return Err(AuthError::UserNotFound),
+        };
+
+        if old_username != user.username {
+            if users_by_username.contains_key(&user.username) {
                 return Err(AuthError::UsernameExists);
             }
-        } else {
-            return Err(AuthError::UserNotFound);
+            users_by_username.remove(&old_username);
+            users_by_username.insert(user.username.clone(), user.id);
         }
 
         users.insert(user.id, user.clone());
@@ -632,352 +744,138 @@ impl UserStore for MemoryUserStore {
         let mut users = self.users.write().await;
         let mut users_by_username = self.users_by_username.write().await;
 
-        if let Some(user) = users.remove(&user_id) {
-            users_by_username.remove(&user.username);
-            // Also clean up refresh tokens
-            let mut refresh_tokens = self.refresh_tokens.write().await;
-            refresh_tokens.retain(|_, record| record.user_id != user_id);
-            Ok(())
-        } else {
-            Err(AuthError::UserNotFound)
-        }
-    }
+        let Some(user) = users.remove(&user_id) else {
+            return Err(AuthError::UserNotFound);
+        };
+        users_by_username.remove(&user.username);
 
-    async fn list_users(&self) -> AuthResult<Vec<User>> {
-        let users = self.users.read().await;
-        Ok(users.values().cloned().collect())
-    }
-
-    async fn get_refresh_token(&self, token_id: &str) -> AuthResult<Option<RefreshTokenRecord>> {
-        let refresh_tokens = self.refresh_tokens.read().await;
-        Ok(refresh_tokens.get(token_id).cloned())
-    }
-
-    async fn store_refresh_token(&self, record: RefreshTokenRecord) -> AuthResult<()> {
-        let mut refresh_tokens = self.refresh_tokens.write().await;
-        refresh_tokens.insert(record.token_id.clone(), record);
-        Ok(())
-    }
-
-    async fn update_refresh_token(&self, record: RefreshTokenRecord) -> AuthResult<()> {
-        let mut refresh_tokens = self.refresh_tokens.write().await;
-        if refresh_tokens.contains_key(&record.token_id) {
-            refresh_tokens.insert(record.token_id.clone(), record);
-            Ok(())
-        } else {
-            Err(AuthError::RefreshTokenNotFound)
-        }
-    }
-
-    async fn delete_refresh_tokens_for_user(&self, user_id: UserId) -> AuthResult<()> {
         let mut refresh_tokens = self.refresh_tokens.write().await;
         refresh_tokens.retain(|_, record| record.user_id != user_id);
         Ok(())
     }
-}
 
-/// Adapter for pm-state StateStore to implement UserStore.
-#[cfg(feature = "pm-state")]
-pub mod pm_state_adapter {
-    use super::*;
-    use caddy_rs_pm_state::{Document, Key, StateError, StateStore, Transaction, Value};
-
-    /// Namespace for auth data in pm-state.
-    const NAMESPACE_USERS: &str = "authn_users";
-    const NAMESPACE_REFRESH_TOKENS: &str = "authn_refresh_tokens";
-
-    /// UserStore implementation backed by pm-state StateStore.
-    #[derive(Clone)]
-    pub struct PmStateUserStore {
-        store: Arc<dyn StateStore>,
+    async fn list_users(&self) -> AuthResult<Vec<User>> {
+        Ok(self.users.read().await.values().cloned().collect())
     }
 
-    impl PmStateUserStore {
-        /// Create a new adapter wrapping a StateStore.
-        pub fn new(store: Arc<dyn StateStore>) -> Self {
-            Self { store }
-        }
-
-        fn user_key(username: &str) -> Key {
-            Key::new(NAMESPACE_USERS, username)
-        }
-
-        fn user_id_key(user_id: UserId) -> Key {
-            Key::new(NAMESPACE_USERS, format!("id:{}", user_id.0))
-        }
-
-        fn refresh_token_key(token_id: &str) -> Key {
-            Key::new(NAMESPACE_REFRESH_TOKENS, token_id)
-        }
-
-        fn user_to_value(user: &User) -> Result<Value, AuthError> {
-            serde_json::to_value(user).map_err(|e| AuthError::Store(e.to_string()))
-        }
-
-        fn value_to_user(value: Value) -> Result<User, AuthError> {
-            serde_json::from_value(value).map_err(|e| AuthError::Store(e.to_string()))
-        }
-
-        fn refresh_to_value(record: &RefreshTokenRecord) -> Result<Value, AuthError> {
-            serde_json::to_value(record).map_err(|e| AuthError::Store(e.to_string()))
-        }
-
-        fn value_to_refresh(value: Value) -> Result<RefreshTokenRecord, AuthError> {
-            serde_json::from_value(value).map_err(|e| AuthError::Store(e.to_string()))
-        }
+    async fn get_refresh_token(&self, token_hash: &str) -> AuthResult<Option<RefreshTokenRecord>> {
+        Ok(self.refresh_tokens.read().await.get(token_hash).cloned())
     }
 
-    #[async_trait]
-    impl UserStore for PmStateUserStore {
-        async fn get_user(&self, user_id: UserId) -> AuthResult<Option<User>> {
-            let doc = self
-                .store
-                .get(NAMESPACE_USERS, &format!("id:{}", user_id.0))
-                .map_err(|e| AuthError::Store(e.to_string()))?;
-            Ok(doc.map(|d| Self::value_to_user(d.value)).transpose()?)
+    async fn store_refresh_token(&self, record: RefreshTokenRecord) -> AuthResult<()> {
+        let token_hash = record.token_hash.clone();
+        self.refresh_tokens.write().await.insert(token_hash, record);
+        Ok(())
+    }
+
+    async fn consume_refresh_token(
+        &self,
+        token_hash: &str,
+        now: i64,
+    ) -> AuthResult<RefreshTokenRecord> {
+        let mut refresh_tokens = self.refresh_tokens.write().await;
+        let record = refresh_tokens
+            .get_mut(token_hash)
+            .ok_or(AuthError::RefreshTokenNotFound)?;
+
+        if record.revoked_at.is_some() {
+            return Err(AuthError::RefreshTokenRevoked);
+        }
+        if now >= record.expires_at {
+            return Err(AuthError::TokenExpired);
         }
 
-        async fn get_user_by_username(&self, username: &str) -> AuthResult<Option<User>> {
-            let doc = self
-                .store
-                .get(NAMESPACE_USERS, username)
-                .map_err(|e| AuthError::Store(e.to_string()))?;
-            Ok(doc.map(|d| Self::value_to_user(d.value)).transpose()?)
-        }
+        record.revoked_at = Some(now);
+        Ok(record.clone())
+    }
 
-        async fn create_user(&self, user: User) -> AuthResult<User> {
-            // Check if username exists
-            let existing = self
-                .store
-                .get(NAMESPACE_USERS, &user.username)
-                .map_err(|e| AuthError::Store(e.to_string()))?;
-            if existing.is_some() {
-                return Err(AuthError::UsernameExists);
+    async fn revoke_all_refresh_tokens_for_user(
+        &self,
+        user_id: UserId,
+        now: i64,
+    ) -> AuthResult<()> {
+        let mut refresh_tokens = self.refresh_tokens.write().await;
+        for record in refresh_tokens.values_mut() {
+            if record.user_id == user_id && record.revoked_at.is_none() {
+                record.revoked_at = Some(now);
             }
+        }
+        Ok(())
+    }
 
-            // Check if user ID exists
-            let existing_id = self
-                .store
-                .get(NAMESPACE_USERS, &format!("id:{}", user.id.0))
-                .map_err(|e| AuthError::Store(e.to_string()))?;
-            if existing_id.is_some() {
-                return Err(AuthError::Internal("User ID collision".to_string()));
-            }
+    async fn accept_totp_step(&self, user_id: UserId, step: u64) -> AuthResult<bool> {
+        let mut users = self.users.write().await;
+        let user = users.get_mut(&user_id).ok_or(AuthError::UserNotFound)?;
 
-            let user_value = Self::user_to_value(&user)?;
-            let txn = Transaction::new()
-                .check_missing(NAMESPACE_USERS, &user.username)
-                .check_missing(NAMESPACE_USERS, &format!("id:{}", user.id.0))
-                .put(NAMESPACE_USERS, &user.username, user_value.clone())
-                .put(NAMESPACE_USERS, &format!("id:{}", user.id.0), user_value);
-
-            self.store
-                .transact(txn)
-                .map_err(|e| AuthError::Store(e.to_string()))?;
-            Ok(user)
+        if user.totp_secret.is_none() {
+            return Ok(false);
+        }
+        if user.totp_last_step.is_some_and(|last| step <= last) {
+            return Ok(false);
         }
 
-        async fn update_user(&self, user: User) -> AuthResult<User> {
-            let existing = self
-                .store
-                .get(NAMESPACE_USERS, &format!("id:{}", user.id.0))
-                .map_err(|e| AuthError::Store(e.to_string()))?;
-            let existing_doc = existing.ok_or(AuthError::UserNotFound)?;
-
-            // Check if username changed
-            let existing_user = Self::value_to_user(existing_doc.value)?;
-            if existing_user.username != user.username {
-                let username_exists = self
-                    .store
-                    .get(NAMESPACE_USERS, &user.username)
-                    .map_err(|e| AuthError::Store(e.to_string()))?;
-                if username_exists.is_some() {
-                    return Err(AuthError::UsernameExists);
-                }
-            }
-
-            let user_value = Self::user_to_value(&user)?;
-            let txn = Transaction::new()
-                .check_revision(
-                    NAMESPACE_USERS,
-                    &format!("id:{}", user.id.0),
-                    existing_doc.revision,
-                )
-                .put(
-                    NAMESPACE_USERS,
-                    &format!("id:{}", user.id.0),
-                    user_value.clone(),
-                );
-
-            if existing_user.username != user.username {
-                txn.delete(NAMESPACE_USERS, &existing_user.username).put(
-                    NAMESPACE_USERS,
-                    &user.username,
-                    user_value,
-                );
-            } else {
-                txn.put(NAMESPACE_USERS, &user.username, user_value);
-            }
-
-            self.store
-                .transact(txn)
-                .map_err(|e| AuthError::Store(e.to_string()))?;
-            Ok(user)
-        }
-
-        async fn delete_user(&self, user_id: UserId) -> AuthResult<()> {
-            let existing = self
-                .store
-                .get(NAMESPACE_USERS, &format!("id:{}", user_id.0))
-                .map_err(|e| AuthError::Store(e.to_string()))?;
-            let existing_doc = existing.ok_or(AuthError::UserNotFound)?;
-            let existing_user = Self::value_to_user(existing_doc.value)?;
-
-            let txn = Transaction::new()
-                .check_revision(
-                    NAMESPACE_USERS,
-                    &format!("id:{}", user_id.0),
-                    existing_doc.revision,
-                )
-                .delete(NAMESPACE_USERS, &format!("id:{}", user_id.0))
-                .delete(NAMESPACE_USERS, &existing_user.username);
-
-            self.store
-                .transact(txn)
-                .map_err(|e| AuthError::Store(e.to_string()))?;
-
-            // Delete refresh tokens for user
-            self.delete_refresh_tokens_for_user(user_id).await?;
-            Ok(())
-        }
-
-        async fn list_users(&self) -> AuthResult<Vec<User>> {
-            let docs = self
-                .store
-                .scan(NAMESPACE_USERS, "id:")
-                .map_err(|e| AuthError::Store(e.to_string()))?;
-            let mut users = Vec::new();
-            for doc in docs {
-                users.push(Self::value_to_user(doc.value)?);
-            }
-            Ok(users)
-        }
-
-        async fn get_refresh_token(
-            &self,
-            token_id: &str,
-        ) -> AuthResult<Option<RefreshTokenRecord>> {
-            let doc = self
-                .store
-                .get(NAMESPACE_REFRESH_TOKENS, token_id)
-                .map_err(|e| AuthError::Store(e.to_string()))?;
-            Ok(doc.map(|d| Self::value_to_refresh(d.value)).transpose()?)
-        }
-
-        async fn store_refresh_token(&self, record: RefreshTokenRecord) -> AuthResult<()> {
-            let value = Self::refresh_to_value(&record)?;
-            let txn = Transaction::new()
-                .check_missing(NAMESPACE_REFRESH_TOKENS, &record.token_id)
-                .put(NAMESPACE_REFRESH_TOKENS, &record.token_id, value);
-            self.store
-                .transact(txn)
-                .map_err(|e| AuthError::Store(e.to_string()))?;
-            Ok(())
-        }
-
-        async fn update_refresh_token(&self, record: RefreshTokenRecord) -> AuthResult<()> {
-            let existing = self
-                .store
-                .get(NAMESPACE_REFRESH_TOKENS, &record.token_id)
-                .map_err(|e| AuthError::Store(e.to_string()))?;
-            let existing_doc = existing.ok_or(AuthError::RefreshTokenNotFound)?;
-
-            let value = Self::refresh_to_value(&record)?;
-            let txn = Transaction::new()
-                .check_revision(
-                    NAMESPACE_REFRESH_TOKENS,
-                    &record.token_id,
-                    existing_doc.revision,
-                )
-                .put(NAMESPACE_REFRESH_TOKENS, &record.token_id, value);
-            self.store
-                .transact(txn)
-                .map_err(|e| AuthError::Store(e.to_string()))?;
-            Ok(())
-        }
-
-        async fn delete_refresh_tokens_for_user(&self, user_id: UserId) -> AuthResult<()> {
-            let docs = self
-                .store
-                .scan(NAMESPACE_REFRESH_TOKENS, "")
-                .map_err(|e| AuthError::Store(e.to_string()))?;
-
-            let mut txn = Transaction::new();
-            let mut has_deletes = false;
-            for doc in docs {
-                if let Ok(record) = Self::value_to_refresh(doc.value.clone()) {
-                    if record.user_id == user_id {
-                        txn = txn.delete(NAMESPACE_REFRESH_TOKENS, &doc.key.key);
-                        has_deletes = true;
-                    }
-                }
-            }
-
-            if has_deletes {
-                self.store
-                    .transact(txn)
-                    .map_err(|e| AuthError::Store(e.to_string()))?;
-            }
-            Ok(())
-        }
+        user.totp_last_step = Some(step);
+        user.updated_at = Utc::now();
+        Ok(true)
     }
 }
 
-/// Hash a password using Argon2id (preferred) with bcrypt fallback.
+/// Hash a password using Argon2id, falling back to bcrypt if Argon2 cannot run.
 pub fn hash_password(password: &str, argon2_config: &Argon2Config) -> AuthResult<String> {
-    let argon2 = argon2_config.to_argon2()?;
+    let params = Argon2Params::new(
+        argon2_config.memory_cost,
+        argon2_config.time_cost,
+        argon2_config.parallelism,
+        None,
+    )
+    .map_err(|err| AuthError::PasswordHash(err.to_string()))?;
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let salt = SaltString::generate(&mut OsRng);
 
-    match argon2.hash_password(password.as_bytes(), &salt) {
-        Ok(hash) => Ok(hash.to_string()),
-        Err(_) => {
-            // Fallback to bcrypt
-            let hash = bcrypt_hash(password, DEFAULT_COST)
-                .map_err(|e| AuthError::PasswordHash(e.to_string()))?;
-            Ok(hash)
-        }
+    if let Ok(hash) = argon2.hash_password(password.as_bytes(), &salt) {
+        return Ok(hash.to_string());
     }
+
+    let hash = bcrypt_hash(password, DEFAULT_COST)?;
+    Ok(hash)
 }
 
-/// Verify a password against a hash (constant-time).
-/// Supports both Argon2id and bcrypt hashes.
+/// Verify a password against a stored Argon2id or bcrypt hash.
+///
+/// A wrong password returns `Ok(false)`; only a malformed or unsupported hash is an error.
+/// Argon2's `PasswordVerifier` performs the comparison in constant time.
 pub fn verify_password(password: &str, hash: &str) -> AuthResult<bool> {
-    // Try Argon2id first
-    if let Ok(parsed_hash) = PasswordHash::new(hash) {
-        let argon2 = Argon2::default();
-        if argon2
-            .verify_password(password.as_bytes(), &parsed_hash)
-            .is_ok()
-        {
-            return Ok(true);
+    if hash.starts_with("$argon2") {
+        let parsed = PasswordHash::new(hash)?;
+        if parsed.version.is_none() || parsed.salt.is_none() || parsed.hash.is_none() {
+            return Err(AuthError::PasswordHash(
+                "incomplete argon2 password hash".to_string(),
+            ));
         }
+        return match Argon2::default().verify_password(password.as_bytes(), &parsed) {
+            Ok(()) => Ok(true),
+            Err(argon2::password_hash::Error::Password) => Ok(false),
+            Err(err) => Err(AuthError::Argon2(err)),
+        };
     }
 
-    // Fallback to bcrypt
-    match bcrypt_verify(password, hash) {
-        Ok(valid) => Ok(valid),
-        Err(e) => Err(AuthError::PasswordHash(e.to_string())),
+    if hash.starts_with("$2") {
+        return Ok(bcrypt_verify(password, hash)?);
     }
+
+    Err(AuthError::PasswordHash(
+        "unsupported password hash format".to_string(),
+    ))
 }
 
-/// Generate a random refresh token.
+/// Generate an opaque refresh token.
 fn generate_refresh_token() -> String {
     let mut bytes = [0u8; 32];
     OsRng.fill_bytes(&mut bytes);
     base32::encode(Alphabet::Rfc4648 { padding: false }, &bytes)
 }
 
-/// Generate a random token ID.
+/// Generate a random token ID used for bookkeeping.
 fn generate_token_id() -> String {
     Uuid::new_v4().to_string()
 }
@@ -990,6 +888,70 @@ fn now_ts() -> i64 {
         .as_secs() as i64
 }
 
+/// Current TOTP time step.
+fn now_step() -> u64 {
+    u64::try_from(now_ts()).unwrap_or_default() / TOTP_STEP_SECONDS
+}
+
+/// SHA-256 hex digest of an opaque refresh token.
+fn hash_refresh_token(token: &str) -> String {
+    use std::fmt::Write as _;
+
+    let digest = Sha256::digest(token.as_bytes());
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
+}
+
+/// Generate a TOTP code for a time step.
+fn totp_code(secret: &[u8], step: u64) -> String {
+    totp_custom::<Sha1>(
+        TOTP_STEP_SECONDS,
+        TOTP_DIGITS,
+        secret,
+        step * TOTP_STEP_SECONDS,
+    )
+}
+
+/// Constant-time comparison for fixed-length TOTP codes.
+fn constant_time_eq(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.as_bytes().ct_eq(right.as_bytes()).into()
+}
+
+/// Check whether a claim set may access a row owned by `owner_id`.
+///
+/// `Visibility::All` grants access to every row. `Visibility::Owner` grants access only when the
+/// token subject is the row owner.
+pub fn check_row_access(claims: &Claims, owner_id: UserId) -> bool {
+    match claims.vis {
+        Visibility::All => true,
+        Visibility::Owner => claims.sub == owner_id,
+    }
+}
+
+/// Filter rows to those visible under the claims' visibility scope.
+///
+/// This is the row-level enforcement point: callers must pass every candidate row through this
+/// function (or [`check_row_access`]) rather than trusting the claims alone.
+pub fn filter_visible_rows<T>(
+    claims: &Claims,
+    rows: Vec<T>,
+    owner_id: impl Fn(&T) -> UserId,
+) -> Vec<T> {
+    match claims.vis {
+        Visibility::All => rows,
+        Visibility::Owner => rows
+            .into_iter()
+            .filter(|row| claims.sub == owner_id(row))
+            .collect(),
+    }
+}
+
 /// Main authentication service.
 pub struct AuthnService<S: UserStore> {
     store: S,
@@ -999,7 +961,7 @@ pub struct AuthnService<S: UserStore> {
 }
 
 impl<S: UserStore> AuthnService<S> {
-    /// Create a new AuthnService with the given store and config.
+    /// Create a new service with the given store and configuration.
     pub fn new(store: S, config: AuthnConfig) -> Self {
         let encoding_key = EncodingKey::from_secret(&config.jwt_secret);
         let decoding_key = DecodingKey::from_secret(&config.jwt_secret);
@@ -1011,7 +973,7 @@ impl<S: UserStore> AuthnService<S> {
         }
     }
 
-    /// Get a reference to the config.
+    /// Get a reference to the service configuration.
     pub fn config(&self) -> &AuthnConfig {
         &self.config
     }
@@ -1024,21 +986,20 @@ impl<S: UserStore> AuthnService<S> {
         role: Role,
     ) -> AuthResult<User> {
         let username = username.into();
-
-        // Check if user already exists
         if self.store.get_user_by_username(&username).await?.is_some() {
             return Err(AuthError::UsernameExists);
         }
 
         let password_hash = hash_password(password, &self.config.argon2_params)?;
         let now = Utc::now();
-
         let user = User {
             id: UserId::new(),
             username,
             password_hash,
             role,
             totp_secret: None,
+            totp_last_step: None,
+            auth_epoch: 0,
             created_at: now,
             updated_at: now,
         };
@@ -1046,7 +1007,10 @@ impl<S: UserStore> AuthnService<S> {
         self.store.create_user(user).await
     }
 
-    /// Update a user's password (requires old password for verification).
+    /// Update a user's password after verifying the old password.
+    ///
+    /// The authentication epoch is incremented and every refresh token is revoked, so access and
+    /// refresh tokens issued before the change stop working immediately.
     pub async fn update_password(
         &self,
         user_id: UserId,
@@ -1059,25 +1023,24 @@ impl<S: UserStore> AuthnService<S> {
             .await?
             .ok_or(AuthError::UserNotFound)?;
 
-        // Verify old password
         if !verify_password(old_password, &user.password_hash)? {
             return Err(AuthError::InvalidCredentials);
         }
 
-        // Hash new password
         user.password_hash = hash_password(new_password, &self.config.argon2_params)?;
+        bump_epoch(&mut user)?;
         user.updated_at = Utc::now();
-
-        // Update user
         self.store.update_user(user).await?;
-
-        // Revoke all refresh tokens for this user (password change invalidates sessions)
-        self.store.delete_refresh_tokens_for_user(user_id).await?;
-
+        self.store
+            .revoke_all_refresh_tokens_for_user(user_id, now_ts())
+            .await?;
         Ok(())
     }
 
-    /// Set a user's password (admin operation, no old password required).
+    /// Set a user's password (administrative operation; no old password required).
+    ///
+    /// Like [`AuthnService::update_password`], this increments the authentication epoch and
+    /// revokes every refresh token.
     pub async fn set_password(&self, user_id: UserId, new_password: &str) -> AuthResult<()> {
         let mut user = self
             .store
@@ -1086,17 +1049,19 @@ impl<S: UserStore> AuthnService<S> {
             .ok_or(AuthError::UserNotFound)?;
 
         user.password_hash = hash_password(new_password, &self.config.argon2_params)?;
+        bump_epoch(&mut user)?;
         user.updated_at = Utc::now();
-
         self.store.update_user(user).await?;
-
-        // Revoke all refresh tokens for this user
-        self.store.delete_refresh_tokens_for_user(user_id).await?;
-
+        self.store
+            .revoke_all_refresh_tokens_for_user(user_id, now_ts())
+            .await?;
         Ok(())
     }
 
     /// Update a user's role.
+    ///
+    /// The authentication epoch is incremented so tokens carrying the old role and capabilities
+    /// are rejected.
     pub async fn update_role(&self, user_id: UserId, role: Role) -> AuthResult<User> {
         let mut user = self
             .store
@@ -1105,13 +1070,13 @@ impl<S: UserStore> AuthnService<S> {
             .ok_or(AuthError::UserNotFound)?;
 
         user.role = role;
+        bump_epoch(&mut user)?;
         user.updated_at = Utc::now();
-
         self.store.update_user(user.clone()).await?;
         Ok(user)
     }
 
-    /// Enable TOTP for a user. Returns (secret, otpauth URI).
+    /// Enable TOTP for a user. Returns `(secret, otpauth URI)`.
     pub async fn totp_setup(&self, user_id: UserId) -> AuthResult<(String, String)> {
         let mut user = self
             .store
@@ -1119,43 +1084,61 @@ impl<S: UserStore> AuthnService<S> {
             .await?
             .ok_or(AuthError::UserNotFound)?;
 
-        // Generate a new TOTP secret
         let mut secret_bytes = [0u8; 20];
         OsRng.fill_bytes(&mut secret_bytes);
         let secret = base32::encode(Alphabet::Rfc4648 { padding: false }, &secret_bytes);
 
-        // Build otpauth URI
         let issuer = self.config.issuer.as_deref().unwrap_or("caddy-rs");
         let uri = format!(
-            "otpauth://totp/{}:{}?secret={}&issuer={}&algorithm=SHA1&digits=6&period=30",
+            "otpauth://totp/{}:{}?secret={}&issuer={}&algorithm=SHA1&digits={}&period={}",
             urlencoding::encode(issuer),
             urlencoding::encode(&user.username),
             secret,
-            urlencoding::encode(issuer)
+            urlencoding::encode(issuer),
+            TOTP_DIGITS,
+            TOTP_STEP_SECONDS,
         );
 
         user.totp_secret = Some(secret.clone());
+        user.totp_last_step = None;
         user.updated_at = Utc::now();
-
         self.store.update_user(user).await?;
 
         Ok((secret, uri))
     }
 
     /// Verify a TOTP code for a user.
+    ///
+    /// The current step and one adjacent step in either direction are accepted for clock skew.
+    /// The accepted step is recorded atomically, so the same code cannot be used twice.
     pub async fn totp_verify(&self, user_id: UserId, code: &str) -> AuthResult<bool> {
         let user = self
             .store
             .get_user(user_id)
             .await?
             .ok_or(AuthError::UserNotFound)?;
+        let secret = user
+            .totp_secret
+            .as_deref()
+            .ok_or(AuthError::TotpNotConfigured)?;
+        let secret_bytes = base32::decode(Alphabet::Rfc4648 { padding: false }, secret)
+            .ok_or_else(|| AuthError::Internal("invalid base32 TOTP secret".to_string()))?;
 
-        let secret = user.totp_secret.ok_or(AuthError::TotpNotConfigured)?;
+        let current = now_step();
+        let mut steps = vec![current];
+        if current > 0 {
+            steps.push(current - 1);
+        }
+        steps.push(current + 1);
 
-        let totp = Totp::new(&secret)
-            .map_err(|e| AuthError::Internal(format!("TOTP init failed: {}", e)))?;
+        let matched = steps
+            .into_iter()
+            .find(|&step| constant_time_eq(code, &totp_code(&secret_bytes, step)));
+        let Some(step) = matched else {
+            return Ok(false);
+        };
 
-        Ok(totp.verify_current(code).unwrap_or(false))
+        self.store.accept_totp_step(user_id, step).await
     }
 
     /// Disable TOTP for a user.
@@ -1167,13 +1150,13 @@ impl<S: UserStore> AuthnService<S> {
             .ok_or(AuthError::UserNotFound)?;
 
         user.totp_secret = None;
+        user.totp_last_step = None;
         user.updated_at = Utc::now();
-
         self.store.update_user(user).await?;
         Ok(())
     }
 
-    /// Login with username, password, and optional TOTP code.
+    /// Log in with a username, password and optional TOTP code.
     pub async fn login(
         &self,
         username: &str,
@@ -1186,12 +1169,10 @@ impl<S: UserStore> AuthnService<S> {
             .await?
             .ok_or(AuthError::InvalidCredentials)?;
 
-        // Verify password
         if !verify_password(password, &user.password_hash)? {
             return Err(AuthError::InvalidCredentials);
         }
 
-        // Verify TOTP if configured
         if user.has_totp() {
             let code = totp_code.ok_or(AuthError::InvalidTotpCode)?;
             if !self.totp_verify(user.id, code).await? {
@@ -1202,164 +1183,46 @@ impl<S: UserStore> AuthnService<S> {
         self.issue_token_pair(&user).await
     }
 
-    /// Issue a new access+refresh token pair for a user.
-    async fn issue_token_pair(&self, user: &User) -> AuthResult<TokenPair> {
-        let now = now_ts();
-        let access_exp = now + self.config.access_ttl.as_secs() as i64;
-        let refresh_exp = now + self.config.refresh_ttl.as_secs() as i64;
-
-        // Create access token (JWT)
-        let claims = Claims {
-            sub: user.id,
-            role: user.role.name.clone(),
-            caps: user.role.capabilities.bits(),
-            vis: user.role.visibility,
-            iat: now,
-            exp: access_exp,
-        };
-
-        let mut header = Header::new(JwtAlgorithm::HS256);
-        if let Some(issuer) = &self.config.issuer {
-            header.iss = Some(issuer.clone());
-        }
-        if let Some(audience) = &self.config.audience {
-            header.aud = Some(jsonwebtoken::RegisteredClaim::Single(audience.clone()));
-        }
-
-        let access_token = encode(&header, &claims, &self.encoding_key)?;
-
-        // Create refresh token (opaque)
-        let refresh_token = generate_refresh_token();
-        let token_id = generate_token_id();
-        let refresh_hash = hash_password(&refresh_token, &self.config.argon2_params)?;
-
-        let record = RefreshTokenRecord {
-            token_hash: refresh_hash,
-            user_id: user.id,
-            iat: now,
-            revoked_at: None,
-            token_id: token_id.clone(),
-        };
-
-        self.store.store_refresh_token(record).await?;
-
-        Ok(TokenPair {
-            access_token,
-            refresh_token,
-        })
-    }
-
-    /// Refresh an access token using a refresh token (rotates refresh token).
+    /// Refresh an access token using a refresh token.
+    ///
+    /// The presented refresh token is atomically consumed and a fresh pair is issued. A reused,
+    /// revoked or expired token is rejected.
     pub async fn refresh(&self, refresh_token: &str) -> AuthResult<TokenPair> {
-        // We need to find the refresh token by trying all records (since we only store hash)
-        // For efficiency, we store token_id separately, but here we need to look up by hash.
-        // In practice, we'd include token_id in the refresh token itself.
-        // For now, we'll scan all refresh tokens (acceptable for moderate scale).
-
-        let all_tokens = self.get_all_refresh_tokens().await?;
-        let mut found_record: Option<RefreshTokenRecord> = None;
-
-        for record in all_tokens {
-            if verify_password(refresh_token, &record.token_hash)? {
-                found_record = Some(record);
-                break;
-            }
-        }
-
-        let mut record = found_record.ok_or(AuthError::RefreshTokenNotFound)?;
-
-        // Check if revoked
-        if record.revoked_at.is_some() {
-            return Err(AuthError::RefreshTokenRevoked);
-        }
-
-        // Check expiration
-        let now = now_ts();
-        if now > record.iat + self.config.refresh_ttl.as_secs() as i64 {
-            return Err(AuthError::TokenExpired);
-        }
-
-        // Get user
+        let token_hash = hash_refresh_token(refresh_token);
+        let record = self
+            .store
+            .consume_refresh_token(&token_hash, now_ts())
+            .await?;
         let user = self
             .store
             .get_user(record.user_id)
             .await?
             .ok_or(AuthError::UserNotFound)?;
-
-        // Revoke old refresh token
-        record.revoked_at = Some(now);
-        self.store.update_refresh_token(record).await?;
-
-        // Issue new token pair
         self.issue_token_pair(&user).await
     }
 
-    /// Get all refresh tokens (for lookup by hash).
-    async fn get_all_refresh_tokens(&self) -> AuthResult<Vec<RefreshTokenRecord>> {
-        // This is a helper that would need to be implemented per store
-        // For MemoryUserStore, we can access directly
-        // For other stores, we'd need to add a method to UserStore
-        // For now, we'll use a workaround via the store trait
-        // In a real implementation, we'd add this to the trait
-
-        // We'll implement this via a downcast or by adding to trait
-        // For simplicity, let's add a method to the trait
-        // But since we can't change the trait easily, we'll use a different approach:
-        // Store the token_id in the refresh token itself (prefix)
-        // Actually, let's just add a method to UserStore
-
-        // This is a limitation - we need to scan. Let's add a method.
-        // But we can't modify the trait from here without breaking.
-        // Alternative: encode token_id in the refresh token.
-        // Let's do that: refresh_token = token_id + "." + random_bytes
-
-        // Actually, let's rethink. The refresh token returned to the client should be the full opaque token.
-        // We can encode token_id as a prefix: token_id + "." + random
-        // Then we can look up directly by token_id.
-
-        // Let me change the approach: refresh token = token_id + "." + random_part
-        // Then we can extract token_id and look up directly.
-
-        // But the current implementation already stores the hash of the full token.
-        // We need to change this. Let me update the approach.
-
-        Err(AuthError::Internal(
-            "get_all_refresh_tokens not implemented; use token_id prefix in refresh token"
-                .to_string(),
-        ))
-    }
-
-    /// Revoke a specific refresh token.
-    pub async fn revoke_refresh_token(&self, refresh_token: &str) -> AuthResult<()> {
-        // Extract token_id from refresh token (format: token_id.random)
-        let token_id = refresh_token
-            .split('.')
-            .next()
-            .ok_or(AuthError::InvalidToken)?;
-
-        let mut record = self
-            .store
-            .get_refresh_token(token_id)
-            .await?
-            .ok_or(AuthError::RefreshTokenNotFound)?;
-
-        // Verify the token matches (constant-time)
-        if !verify_password(refresh_token, &record.token_hash)? {
-            return Err(AuthError::InvalidToken);
-        }
-
-        record.revoked_at = Some(now_ts());
-        self.store.update_refresh_token(record).await?;
-        Ok(())
-    }
-
-    /// Revoke all refresh tokens for a user.
+    /// Revoke every refresh token for a user and invalidate existing access tokens.
     pub async fn revoke_all_for_user(&self, user_id: UserId) -> AuthResult<()> {
-        self.store.delete_refresh_tokens_for_user(user_id).await
+        let mut user = self
+            .store
+            .get_user(user_id)
+            .await?
+            .ok_or(AuthError::UserNotFound)?;
+
+        bump_epoch(&mut user)?;
+        user.updated_at = Utc::now();
+        self.store.update_user(user).await?;
+        self.store
+            .revoke_all_refresh_tokens_for_user(user_id, now_ts())
+            .await
     }
 
-    /// Verify an access token and return claims.
-    pub fn verify_access_token(&self, token: &str) -> AuthResult<Claims> {
+    /// Verify an access token and return its claims.
+    ///
+    /// Verification is asynchronous because the token's authentication epoch is compared with the
+    /// current epoch in the store. A token issued before a password change, role change or
+    /// revocation is rejected even if it has not expired.
+    pub async fn verify_access_token(&self, token: &str) -> AuthResult<Claims> {
         let mut validation = Validation::new(JwtAlgorithm::HS256);
         if let Some(issuer) = &self.config.issuer {
             validation.set_issuer(&[issuer]);
@@ -1368,125 +1231,68 @@ impl<S: UserStore> AuthnService<S> {
             validation.set_audience(&[audience]);
         }
         validation.validate_exp = true;
+        // Access tokens are short-lived; do not accept them past their `exp` claim.
+        validation.leeway = 0;
 
-        let token_data = decode::<Claims>(token, &self.decoding_key, &validation).map_err(|e| {
-            match e.kind() {
-                jsonwebtoken::errors::ErrorKind::ExpiredSignature => AuthError::TokenExpired,
-                jsonwebtoken::errors::ErrorKind::InvalidSignature => AuthError::InvalidSignature,
-                _ => AuthError::InvalidToken,
-            }
-        })?;
+        let token_data =
+            decode::<Claims>(token, &self.decoding_key, &validation).map_err(|err| {
+                match err.kind() {
+                    jsonwebtoken::errors::ErrorKind::ExpiredSignature => AuthError::TokenExpired,
+                    jsonwebtoken::errors::ErrorKind::InvalidSignature => {
+                        AuthError::InvalidSignature
+                    }
+                    _ => AuthError::InvalidToken,
+                }
+            })?;
 
-        Ok(token_data.claims)
-    }
-
-    /// Check if claims have permission for a section/action.
-    pub fn check_permission(&self, claims: &Claims, section: Section, action: Action) -> bool {
-        claims.has_capability(section, action)
-    }
-}
-
-/// Extension trait to add refresh token lookup by token_id prefix.
-#[async_trait]
-pub trait UserStoreExt: UserStore {
-    /// Get refresh token by token_id (prefix of the refresh token).
-    async fn get_refresh_token_by_id(
-        &self,
-        token_id: &str,
-    ) -> AuthResult<Option<RefreshTokenRecord>> {
-        self.get_refresh_token(token_id).await
-    }
-}
-
-impl<S: UserStore> UserStoreExt for S {}
-
-// Re-implement AuthnService methods that need the extension
-impl<S: UserStore> AuthnService<S> {
-    /// Refresh an access token using a refresh token (rotates refresh token).
-    /// Refresh token format: token_id.random_part
-    pub async fn refresh(&self, refresh_token: &str) -> AuthResult<TokenPair> {
-        // Extract token_id from refresh token (format: token_id.random_part)
-        let token_id = refresh_token
-            .split('.')
-            .next()
-            .ok_or(AuthError::InvalidToken)?;
-
-        let mut record = self
+        let claims = token_data.claims;
+        let user = self
             .store
-            .get_refresh_token_by_id(token_id)
+            .get_user(claims.sub)
             .await?
-            .ok_or(AuthError::RefreshTokenNotFound)?;
-
-        // Verify the full token matches (constant-time)
-        if !verify_password(refresh_token, &record.token_hash)? {
+            .ok_or(AuthError::InvalidToken)?;
+        if user.auth_epoch != claims.epoch {
             return Err(AuthError::InvalidToken);
         }
 
-        // Check if revoked
-        if record.revoked_at.is_some() {
-            return Err(AuthError::RefreshTokenRevoked);
-        }
-
-        // Check expiration
-        let now = now_ts();
-        if now > record.iat + self.config.refresh_ttl.as_secs() as i64 {
-            return Err(AuthError::TokenExpired);
-        }
-
-        // Get user
-        let user = self
-            .store
-            .get_user(record.user_id)
-            .await?
-            .ok_or(AuthError::UserNotFound)?;
-
-        // Revoke old refresh token
-        record.revoked_at = Some(now);
-        self.store.update_refresh_token(record).await?;
-
-        // Issue new token pair
-        self.issue_token_pair(&user).await
+        Ok(claims)
     }
 
-    /// Internal: issue a new token pair with token_id embedded in refresh token.
+    /// Check whether claims grant permission for a section/action pair.
+    pub fn check_permission(&self, claims: &Claims, section: Section, action: Action) -> bool {
+        claims.has_capability(section, action)
+    }
+
+    /// Issue a new access/refresh token pair for a user.
     async fn issue_token_pair(&self, user: &User) -> AuthResult<TokenPair> {
         let now = now_ts();
-        let access_exp = now + self.config.access_ttl.as_secs() as i64;
-
-        // Create access token (JWT)
         let claims = Claims {
             sub: user.id,
             role: user.role.name.clone(),
             caps: user.role.capabilities.bits(),
             vis: user.role.visibility,
+            epoch: user.auth_epoch,
             iat: now,
-            exp: access_exp,
+            exp: now + self.config.access_ttl.as_secs() as i64,
+            iss: self.config.issuer.clone(),
+            aud: self.config.audience.clone(),
         };
+        let access_token = encode(
+            &Header::new(JwtAlgorithm::HS256),
+            &claims,
+            &self.encoding_key,
+        )?;
 
-        let mut header = Header::new(JwtAlgorithm::HS256);
-        if let Some(issuer) = &self.config.issuer {
-            header.iss = Some(issuer.clone());
-        }
-        if let Some(audience) = &self.config.audience {
-            header.aud = Some(jsonwebtoken::RegisteredClaim::Single(audience.clone()));
-        }
-
-        let access_token = encode(&header, &claims, &self.encoding_key)?;
-
-        // Create refresh token with embedded token_id
-        let token_id = generate_token_id();
-        let random_part = generate_refresh_token();
-        let refresh_token = format!("{}.{}", token_id, random_part);
-        let refresh_hash = hash_password(&refresh_token, &self.config.argon2_params)?;
-
+        let refresh_token = generate_refresh_token();
+        let token_hash = hash_refresh_token(&refresh_token);
         let record = RefreshTokenRecord {
-            token_hash: refresh_hash,
+            token_hash,
             user_id: user.id,
             iat: now,
+            expires_at: now + self.config.refresh_ttl.as_secs() as i64,
             revoked_at: None,
-            token_id: token_id.clone(),
+            token_id: generate_token_id(),
         };
-
         self.store.store_refresh_token(record).await?;
 
         Ok(TokenPair {
@@ -1497,438 +1303,4 @@ impl<S: UserStore> AuthnService<S> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_password_hash_argon2id() {
-        let config = Argon2Config::default();
-        let password = "test_password_123";
-        let hash = hash_password(password, &config).unwrap();
-
-        // Should be Argon2id format
-        assert!(hash.starts_with("$argon2id$"));
-
-        // Verify works
-        assert!(verify_password(password, &hash).unwrap());
-        assert!(!verify_password("wrong_password", &hash).unwrap());
-    }
-
-    #[tokio::test]
-    async fn test_password_hash_bcrypt_fallback() {
-        // Test that bcrypt hashes can still be verified
-        let bcrypt_hash = bcrypt_hash("test_password", DEFAULT_COST).unwrap();
-        assert!(verify_password("test_password", &bcrypt_hash).unwrap());
-        assert!(!verify_password("wrong", &bcrypt_hash).unwrap());
-    }
-
-    #[tokio::test]
-    async fn test_constant_time_verification() {
-        let config = Argon2Config::default();
-        let hash = hash_password("password", &config).unwrap();
-
-        // Multiple verifications should take similar time (we can't easily test timing here,
-        // but we can verify the function doesn't early-return on wrong password)
-        for _ in 0..10 {
-            assert!(!verify_password("wrong", &hash).unwrap());
-        }
-        assert!(verify_password("password", &hash).unwrap());
-    }
-
-    #[tokio::test]
-    async fn test_capability_set() {
-        let mut caps = CapabilitySet::new();
-        assert!(!caps.has(Section::Hosts, Action::View));
-
-        caps.enable(Section::Hosts, Action::View);
-        assert!(caps.has(Section::Hosts, Action::View));
-        assert!(!caps.has(Section::Hosts, Action::Create));
-
-        caps.enable(Section::Hosts, Action::Create);
-        assert!(caps.has(Section::Hosts, Action::Create));
-
-        caps.disable(Section::Hosts, Action::View);
-        assert!(!caps.has(Section::Hosts, Action::View));
-        assert!(caps.has(Section::Hosts, Action::Create));
-    }
-
-    #[tokio::test]
-    async fn test_role_templates() {
-        let admin = Role::admin();
-        assert_eq!(admin.name, "admin");
-        assert_eq!(admin.visibility, Visibility::All);
-        for section in Section::all() {
-            for action in Action::all() {
-                assert!(
-                    admin.capabilities.has(section, action),
-                    "admin missing {section:?}/{action:?}"
-                );
-            }
-        }
-
-        let editor = Role::editor();
-        assert_eq!(editor.name, "editor");
-        assert!(editor.capabilities.has(Section::Hosts, Action::Create));
-        assert!(editor.capabilities.has(Section::Settings, Action::View));
-        assert!(!editor.capabilities.has(Section::Settings, Action::Create));
-
-        let viewer = Role::viewer();
-        assert_eq!(viewer.name, "viewer");
-        assert_eq!(viewer.visibility, Visibility::Owner);
-        for section in Section::all() {
-            assert!(viewer.capabilities.has(section, Action::View));
-            assert!(!viewer.capabilities.has(section, Action::Create));
-        }
-    }
-
-    #[tokio::test]
-    async fn test_memory_store_crud() {
-        let store = MemoryUserStore::new();
-        let user = User {
-            id: UserId::new(),
-            username: "testuser".to_string(),
-            password_hash: "hash".to_string(),
-            role: Role::viewer(),
-            totp_secret: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        };
-
-        // Create
-        let created = store.create_user(user.clone()).await.unwrap();
-        assert_eq!(created.username, "testuser");
-
-        // Get by ID
-        let got = store.get_user(user.id).await.unwrap().unwrap();
-        assert_eq!(got.username, "testuser");
-
-        // Get by username
-        let got = store
-            .get_user_by_username("testuser")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(got.id, user.id);
-
-        // Duplicate username fails
-        let dup = store.create_user(user).await;
-        assert!(matches!(dup, Err(AuthError::UsernameExists)));
-
-        // Update
-        let mut updated = got.clone();
-        updated.username = "updated".to_string();
-        let updated = store.update_user(updated).await.unwrap();
-        assert_eq!(updated.username, "updated");
-
-        // List
-        let users = store.list_users().await.unwrap();
-        assert_eq!(users.len(), 1);
-
-        // Delete
-        store.delete_user(user.id).await.unwrap();
-        let got = store.get_user(user.id).await.unwrap();
-        assert!(got.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_refresh_token_storage() {
-        let store = MemoryUserStore::new();
-        let user_id = UserId::new();
-
-        let record = RefreshTokenRecord {
-            token_hash: "hash".to_string(),
-            user_id,
-            iat: now_ts(),
-            revoked_at: None,
-            token_id: "token123".to_string(),
-        };
-
-        store.store_refresh_token(record.clone()).await.unwrap();
-        let got = store.get_refresh_token("token123").await.unwrap().unwrap();
-        assert_eq!(got.user_id, user_id);
-
-        let mut revoked = record.clone();
-        revoked.revoked_at = Some(now_ts());
-        store.update_refresh_token(revoked).await.unwrap();
-
-        let got = store.get_refresh_token("token123").await.unwrap().unwrap();
-        assert!(got.revoked_at.is_some());
-
-        store.delete_refresh_tokens_for_user(user_id).await.unwrap();
-        let got = store.get_refresh_token("token123").await.unwrap();
-        assert!(got.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_full_login_flow() {
-        let store = MemoryUserStore::new();
-        let config = AuthnConfig::default();
-        let service = AuthnService::new(store, config);
-
-        // Create user
-        let user = service
-            .create_user("alice", "password123", Role::editor())
-            .await
-            .unwrap();
-
-        // Login without TOTP
-        let tokens = service.login("alice", "password123", None).await.unwrap();
-        assert!(!tokens.access_token.is_empty());
-        assert!(!tokens.refresh_token.is_empty());
-        assert!(tokens.refresh_token.contains('.'));
-
-        // Verify access token
-        let claims = service.verify_access_token(&tokens.access_token).unwrap();
-        assert_eq!(claims.sub, user.id);
-        assert_eq!(claims.role, "editor");
-        assert!(claims.has_capability(Section::Hosts, Action::Create));
-
-        // Refresh token
-        let new_tokens = service.refresh(&tokens.refresh_token).await.unwrap();
-        assert_ne!(new_tokens.access_token, tokens.access_token);
-        assert_ne!(new_tokens.refresh_token, tokens.refresh_token);
-
-        // Old refresh token should be revoked
-        let result = service.refresh(&tokens.refresh_token).await;
-        assert!(matches!(result, Err(AuthError::RefreshTokenRevoked)));
-
-        // New refresh token works
-        let tokens2 = service.refresh(&new_tokens.refresh_token).await.unwrap();
-        assert_ne!(tokens2.access_token, new_tokens.access_token);
-    }
-
-    #[tokio::test]
-    async fn test_totp_setup_and_verify() {
-        let store = MemoryUserStore::new();
-        let config = AuthnConfig::default();
-        let service = AuthnService::new(store, config);
-
-        let user = service
-            .create_user("bob", "password123", Role::viewer())
-            .await
-            .unwrap();
-
-        // Setup TOTP
-        let (secret, uri) = service.totp_setup(user.id).await.unwrap();
-        assert!(!secret.is_empty());
-        assert!(uri.starts_with("otpauth://totp/"));
-        assert!(uri.contains(&secret));
-
-        // Verify valid code (we can't easily generate a valid code in test without time sync)
-        // But we can test invalid code fails
-        let result = service.totp_verify(user.id, "000000").await;
-        // This might pass or fail depending on time, but shouldn't error
-        assert!(result.is_ok());
-
-        // Login now requires TOTP
-        let result = service.login("bob", "password123", None).await;
-        assert!(matches!(result, Err(AuthError::InvalidTotpCode)));
-
-        // Disable TOTP
-        service.totp_disable(user.id).await.unwrap();
-
-        // Login works without TOTP again
-        let tokens = service.login("bob", "password123", None).await.unwrap();
-        assert!(!tokens.access_token.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_password_change_revokes_tokens() {
-        let store = MemoryUserStore::new();
-        let config = AuthnConfig::default();
-        let service = AuthnService::new(store, config);
-
-        let user = service
-            .create_user("charlie", "oldpass", Role::editor())
-            .await
-            .unwrap();
-        let tokens = service.login("charlie", "oldpass", None).await.unwrap();
-
-        // Change password
-        service
-            .update_password(user.id, "oldpass", "newpass")
-            .await
-            .unwrap();
-
-        // Old refresh token should be revoked
-        let result = service.refresh(&tokens.refresh_token).await;
-        assert!(matches!(result, Err(AuthError::RefreshTokenRevoked)));
-
-        // Login with new password works
-        let new_tokens = service.login("charlie", "newpass", None).await.unwrap();
-        assert!(!new_tokens.access_token.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_admin_set_password_revokes_tokens() {
-        let store = MemoryUserStore::new();
-        let config = AuthnConfig::default();
-        let service = AuthnService::new(store, config);
-
-        let user = service
-            .create_user("dave", "oldpass", Role::viewer())
-            .await
-            .unwrap();
-        let tokens = service.login("dave", "oldpass", None).await.unwrap();
-
-        // Admin sets password (no old password required)
-        service.set_password(user.id, "adminpass").await.unwrap();
-
-        // Old refresh token should be revoked
-        let result = service.refresh(&tokens.refresh_token).await;
-        assert!(matches!(result, Err(AuthError::RefreshTokenRevoked)));
-
-        // Login with new password works
-        let new_tokens = service.login("dave", "adminpass", None).await.unwrap();
-        assert!(!new_tokens.access_token.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_permission_checks() {
-        let store = MemoryUserStore::new();
-        let config = AuthnConfig::default();
-        let service = AuthnService::new(store, config);
-
-        let user = service
-            .create_user("eve", "password", Role::editor())
-            .await
-            .unwrap();
-        let tokens = service.login("eve", "password", None).await.unwrap();
-        let claims = service.verify_access_token(&tokens.access_token).unwrap();
-
-        // Editor has create/update/delete on hosts
-        assert!(service.check_permission(&claims, Section::Hosts, Action::View));
-        assert!(service.check_permission(&claims, Section::Hosts, Action::Create));
-        assert!(service.check_permission(&claims, Section::Hosts, Action::Update));
-        assert!(service.check_permission(&claims, Section::Hosts, Action::Delete));
-        assert!(service.check_permission(&claims, Section::Hosts, Action::Manage));
-
-        // Editor has view on settings
-        assert!(service.check_permission(&claims, Section::Settings, Action::View));
-        assert!(!service.check_permission(&claims, Section::Settings, Action::Create));
-
-        // Editor has view on users
-        assert!(service.check_permission(&claims, Section::Users, Action::View));
-        assert!(!service.check_permission(&claims, Section::Users, Action::Create));
-    }
-
-    #[tokio::test]
-    async fn test_visibility_owner_vs_all() {
-        let store = MemoryUserStore::new();
-        let config = AuthnConfig::default();
-        let service = AuthnService::new(store, config);
-
-        // Viewer has Owner visibility
-        let viewer_user = service
-            .create_user("viewer1", "password", Role::viewer())
-            .await
-            .unwrap();
-        let viewer_tokens = service.login("viewer1", "password", None).await.unwrap();
-        let viewer_claims = service
-            .verify_access_token(&viewer_tokens.access_token)
-            .unwrap();
-        assert_eq!(viewer_claims.vis, Visibility::Owner);
-
-        // Admin has All visibility
-        let admin_user = service
-            .create_user("admin1", "password", Role::admin())
-            .await
-            .unwrap();
-        let admin_tokens = service.login("admin1", "password", None).await.unwrap();
-        let admin_claims = service
-            .verify_access_token(&admin_tokens.access_token)
-            .unwrap();
-        assert_eq!(admin_claims.vis, Visibility::All);
-    }
-
-    #[tokio::test]
-    async fn test_revoke_all_for_user() {
-        let store = MemoryUserStore::new();
-        let config = AuthnConfig::default();
-        let service = AuthnService::new(store, config);
-
-        let user = service
-            .create_user("frank", "password", Role::editor())
-            .await
-            .unwrap();
-
-        // Create multiple sessions
-        let tokens1 = service.login("frank", "password", None).await.unwrap();
-        let tokens2 = service.login("frank", "password", None).await.unwrap();
-        let tokens3 = service.login("frank", "password", None).await.unwrap();
-
-        // All should work
-        service.verify_access_token(&tokens1.access_token).unwrap();
-        service.verify_access_token(&tokens2.access_token).unwrap();
-        service.verify_access_token(&tokens3.access_token).unwrap();
-
-        // Revoke all
-        service.revoke_all_for_user(user.id).await.unwrap();
-
-        // All refresh tokens should be revoked
-        assert!(matches!(
-            service.refresh(&tokens1.refresh_token).await,
-            Err(AuthError::RefreshTokenRevoked)
-        ));
-        assert!(matches!(
-            service.refresh(&tokens2.refresh_token).await,
-            Err(AuthError::RefreshTokenRevoked)
-        ));
-        assert!(matches!(
-            service.refresh(&tokens3.refresh_token).await,
-            Err(AuthError::RefreshTokenRevoked)
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_token_expiration() {
-        let store = MemoryUserStore::new();
-        let config = AuthnConfig {
-            access_ttl: Duration::from_secs(1), // 1 second
-            refresh_ttl: Duration::from_secs(1),
-            ..AuthnConfig::default()
-        };
-        let service = AuthnService::new(store, config);
-
-        let user = service
-            .create_user("grace", "password", Role::viewer())
-            .await
-            .unwrap();
-        let tokens = service.login("grace", "password", None).await.unwrap();
-
-        // Token should be valid immediately
-        service.verify_access_token(&tokens.access_token).unwrap();
-
-        // Wait for expiration
-        tokio::time::sleep(Duration::from_secs(2)).await;
-
-        // Access token should be expired
-        assert!(matches!(
-            service.verify_access_token(&tokens.access_token),
-            Err(AuthError::TokenExpired)
-        ));
-
-        // Refresh token should also be expired
-        assert!(matches!(
-            service.refresh(&tokens.refresh_token).await,
-            Err(AuthError::TokenExpired)
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_custom_role() {
-        let mut caps = CapabilitySet::new();
-        caps.enable(Section::Hosts, Action::View);
-        caps.enable(Section::Hosts, Action::Create);
-        caps.enable(Section::Certificates, Action::View);
-
-        let role = Role::custom("custom_role", caps, Visibility::Owner);
-        assert_eq!(role.name, "custom_role");
-        assert_eq!(role.visibility, Visibility::Owner);
-        assert!(role.capabilities.has(Section::Hosts, Action::View));
-        assert!(role.capabilities.has(Section::Hosts, Action::Create));
-        assert!(role.capabilities.has(Section::Certificates, Action::View));
-        assert!(!role.capabilities.has(Section::Certificates, Action::Create));
-        assert!(!role.capabilities.has(Section::Users, Action::View));
-    }
-}
+mod tests;
