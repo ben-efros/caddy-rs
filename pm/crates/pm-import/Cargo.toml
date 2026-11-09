@@ -1,0 +1,14 @@
+[package]
+name = "caddy-rs-pm-import"
+description = "Native-first NPM v2.16 host-payload import mapping for the caddy-rs proxy manager"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+caddy-rs-pm-core = { path = "../pm-core" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

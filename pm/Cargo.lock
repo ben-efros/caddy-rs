@@ -49,6 +49,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "caddy-rs-pm-import"
+version = "0.1.0"
+dependencies = [
+ "caddy-rs-pm-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "caddy-rs-pm-policies"
 version = "0.1.0"
 dependencies = [
