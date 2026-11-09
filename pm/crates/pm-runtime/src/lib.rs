@@ -70,7 +70,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use caddy_rs_pm_compiler::{compile_routes, CompileError, CompiledRoutes};
-use caddy_rs_pm_config::{assemble_from_hosts, ConfigError, ConfigSettings};
+use caddy_rs_pm_config::{assemble_with_tls, ConfigError, ConfigSettings};
 use caddy_rs_pm_hosts::HostRepository;
 use caddy_rs_pm_policies::PolicyRepository;
 use caddy_rs_pm_service::{HostService, ServiceError};
@@ -364,12 +364,22 @@ impl PmRuntime {
     }
 
     /// Compile the stored hosts and assemble a complete Caddy configuration.
+    ///
+    /// This is the policy-aware path: enabled auto-certificate policies populate
+    /// `apps.tls.certificates.automate` and `apps.tls.automation.policies`, and HTTPS-disabled
+    /// hosts are added to `automatic_https.skip` unless an enabled policy automates them. Route
+    /// assembly itself is unchanged; callers that only want routes use
+    /// [`caddy_rs_pm_config::assemble`].
     pub fn assemble(&self, settings: ConfigSettings) -> Result<Value, RuntimeError> {
         let hosts = self
             .hosts
             .snapshot_hosts()
             .map_err(|source| self.service_error(ServiceError::Host(source)))?;
-        assemble_from_hosts(&hosts, &settings).map_err(|source| RuntimeError::Config {
+        let policies = self
+            .policies
+            .snapshot_policies()
+            .map_err(|source| self.service_error(ServiceError::Policy(source)))?;
+        assemble_with_tls(&hosts, &policies, &settings).map_err(|source| RuntimeError::Config {
             path: self.state_path.clone(),
             source,
         })

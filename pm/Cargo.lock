@@ -176,6 +176,7 @@ dependencies = [
  "caddy-rs-pm-config",
  "caddy-rs-pm-core",
  "caddy-rs-pm-hosts",
+ "caddy-rs-pm-policies",
  "caddy-rs-pm-runtime",
  "caddy-rs-pm-service",
  "caddy-rs-pm-state",

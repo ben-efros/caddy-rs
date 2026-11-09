@@ -327,6 +327,11 @@ mod tests {
             issuer: None,
             key_type: None,
             renewal_window_ratio: None,
+            challenge: if subjects.iter().any(|subject| subject.starts_with("*.")) {
+                caddy_rs_pm_core::AcmeChallenge::Dns01
+            } else {
+                caddy_rs_pm_core::AcmeChallenge::Http01
+            },
             enabled,
         }
     }

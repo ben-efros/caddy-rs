@@ -306,6 +306,7 @@ mod tests {
             issuer: None,
             key_type: None,
             renewal_window_ratio: Some(0.3),
+            challenge: caddy_rs_pm_core::AcmeChallenge::Http01,
             enabled: true,
         }
     }

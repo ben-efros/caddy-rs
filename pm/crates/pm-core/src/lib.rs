@@ -105,6 +105,49 @@ pub enum AutoMode {
     Eager,
 }
 
+/// ACME challenge type used to prove control of a policy subject.
+///
+/// The wire values are the NPM/ACME spellings (`http01`, `tls-alpn01`, `dns01`). DNS-01 needs a
+/// DNS provider with credentials; this slice stores no credentials, so the API rejects a DNS-01
+/// intent instead of silently falling back to HTTP-01.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum AcmeChallenge {
+    #[default]
+    #[serde(rename = "http01")]
+    Http01,
+    #[serde(rename = "tls-alpn01")]
+    TlsAlpn01,
+    #[serde(rename = "dns01")]
+    Dns01,
+}
+
+impl AcmeChallenge {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Http01 => "http01",
+            Self::TlsAlpn01 => "tls-alpn01",
+            Self::Dns01 => "dns01",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, CoreError> {
+        match value {
+            "http01" => Ok(Self::Http01),
+            "tls-alpn01" => Ok(Self::TlsAlpn01),
+            "dns01" => Ok(Self::Dns01),
+            other => Err(CoreError::Invalid(format!(
+                "unsupported ACME challenge `{other}`; expected http01, tls-alpn01 or dns01"
+            ))),
+        }
+    }
+}
+
+impl fmt::Display for AcmeChallenge {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KeyType {
@@ -153,7 +196,33 @@ pub struct AutoCertificatePolicy {
     pub key_type: Option<KeyType>,
     /// Renew when this fraction of lifetime remains (0.0–1.0).
     pub renewal_window_ratio: Option<f64>,
+    /// ACME challenge type. Defaults to HTTP-01; `#[serde(default)]` keeps policies written by
+    /// earlier slices readable.
+    #[serde(default)]
+    pub challenge: AcmeChallenge,
     pub enabled: bool,
+}
+
+impl Default for AutoCertificatePolicy {
+    /// A syntactically valid default for builders: enabled eager policy with an HTTP-01 challenge
+    /// and no id/name/subjects. [`AutoCertificatePolicy::validate`] still rejects it until a name
+    /// and at least one subject are supplied.
+    ///
+    /// The default mode is [`AutoMode::Eager`]: core on-demand TLS is not implemented yet, so a
+    /// builder default must never compile to an unsupported on-demand policy.
+    fn default() -> Self {
+        Self {
+            id: PolicyId(0),
+            name: String::new(),
+            subjects: Vec::new(),
+            mode: AutoMode::Eager,
+            issuer: None,
+            key_type: None,
+            renewal_window_ratio: None,
+            challenge: AcmeChallenge::Http01,
+            enabled: true,
+        }
+    }
 }
 
 impl AutoCertificatePolicy {
@@ -175,11 +244,31 @@ impl AutoCertificatePolicy {
             ));
         }
         let mut seen = BTreeSet::new();
+        let mut wildcard = None;
         for subject in &self.subjects {
             let normalized = normalize_pattern(subject)?;
+            if normalized.starts_with("*.") {
+                wildcard = Some(normalized.clone());
+            }
             if !seen.insert(normalized.clone()) {
                 return Err(CoreError::Invalid(format!(
                     "duplicate subject `{normalized}`"
+                )));
+            }
+        }
+        // Public ACME only issues wildcards via DNS-01. Reject the impossible combination here
+        // instead of compiling a policy whose issuance can never succeed. The internal issuer
+        // never performs an ACME challenge, so it is not subject to this rule.
+        if let Some(wildcard) = wildcard {
+            let internal_issuer = self
+                .issuer
+                .as_deref()
+                .is_some_and(|issuer| issuer.trim().eq_ignore_ascii_case("internal"));
+            if !internal_issuer && self.challenge != AcmeChallenge::Dns01 {
+                return Err(CoreError::Invalid(format!(
+                    "wildcard subject `{wildcard}` requires the dns01 challenge; {} cannot issue \
+                     a wildcard certificate",
+                    self.challenge.as_str()
                 )));
             }
         }
@@ -1093,7 +1182,11 @@ fn certificate_covers(domains: &[String], host_domain: &str) -> bool {
 
 /// Whether a policy/certificate pattern covers a host pattern. Exact names match only the same
 /// name; `*.example.com` covers `*.example.com` and exactly one label below it.
-fn pattern_covers(covering: &str, target: &str) -> bool {
+///
+/// Invalid patterns never cover anything, so callers can use this on untrusted inventory values
+/// without folding validation into the comparison.
+#[must_use]
+pub fn pattern_covers(covering: &str, target: &str) -> bool {
     let (Ok(covering), Ok(target)) = (normalize_pattern(covering), normalize_pattern(target))
     else {
         return false;
@@ -1129,6 +1222,7 @@ mod tests {
             issuer: Some("acme".to_string()),
             key_type: Some(KeyType::P256),
             renewal_window_ratio: Some(0.33),
+            challenge: AcmeChallenge::Dns01,
             enabled: true,
         }
     }
@@ -1653,5 +1747,69 @@ mod tests {
             host.validate(Some(&certificate), None),
             Err(CoreError::Coverage { .. })
         ));
+    }
+
+    #[test]
+    fn challenge_round_trips_through_json_and_parses_wire_names() {
+        for (challenge, wire) in [
+            (AcmeChallenge::Http01, "http01"),
+            (AcmeChallenge::TlsAlpn01, "tls-alpn01"),
+            (AcmeChallenge::Dns01, "dns01"),
+        ] {
+            assert_eq!(
+                AcmeChallenge::parse(wire).expect("parse challenge"),
+                challenge
+            );
+            assert_eq!(challenge.as_str(), wire);
+            let encoded = serde_json::to_value(challenge).expect("serialize challenge");
+            assert_eq!(encoded, serde_json::json!(wire));
+            let decoded: AcmeChallenge =
+                serde_json::from_value(encoded).expect("deserialize challenge");
+            assert_eq!(decoded, challenge);
+        }
+        assert_eq!(AcmeChallenge::default(), AcmeChallenge::Http01);
+        assert!(AcmeChallenge::parse("http-01").is_err());
+    }
+
+    #[test]
+    fn policy_json_defaults_a_missing_challenge_to_http01() {
+        let mut value = serde_json::to_value(policy()).expect("serialize policy");
+        value.as_object_mut().expect("object").remove("challenge");
+        let decoded: AutoCertificatePolicy =
+            serde_json::from_value(value).expect("policies from earlier slices stay readable");
+        assert_eq!(decoded.challenge, AcmeChallenge::Http01);
+    }
+
+    #[test]
+    fn wildcard_subject_requires_dns01_unless_the_issuer_is_internal() {
+        let mut policy = policy();
+        policy.challenge = AcmeChallenge::Http01;
+        let error = policy
+            .validate()
+            .expect_err("wildcard + http01 is impossible");
+        assert!(error.to_string().contains("dns01"), "{error}");
+
+        policy.challenge = AcmeChallenge::TlsAlpn01;
+        assert!(policy.validate().is_err());
+
+        policy.challenge = AcmeChallenge::Dns01;
+        assert!(policy.validate().is_ok());
+
+        let mut internal = policy;
+        internal.issuer = Some("internal".to_string());
+        internal.challenge = AcmeChallenge::Http01;
+        assert!(internal.validate().is_ok());
+    }
+
+    #[test]
+    fn policy_default_uses_eager_mode_because_on_demand_is_not_implemented() {
+        let policy = AutoCertificatePolicy::default();
+        assert_eq!(policy.mode, AutoMode::Eager);
+        assert_eq!(policy.challenge, AcmeChallenge::Http01);
+        assert!(policy.enabled);
+        assert!(
+            policy.validate().is_err(),
+            "default still needs name and subjects"
+        );
     }
 }
