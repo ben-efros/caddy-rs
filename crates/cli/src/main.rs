@@ -507,9 +507,10 @@ impl LoadedConfig {
 /// Parse the `--adapt-mode` flag into adapter options, rejecting unknown mode names with the
 /// three accepted values.
 fn adapt_options(value: &str) -> anyhow::Result<AdaptOptions> {
-    let mode = value
-        .parse::<AdaptMode>()
-        .map_err(|message| anyhow!("{message}"))?;
+    let mode = value.parse::<AdaptMode>().map_err(|message| {
+        // There is no configuration file to point at, so the flag itself is the location.
+        anyhow::Error::new(caddy_rs_core::Error::invalid("--adapt-mode", message))
+    })?;
     Ok(AdaptOptions::new(mode))
 }
 
