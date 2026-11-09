@@ -61,7 +61,7 @@ use ASCII inputs, where both engines agree, and do not claim compatibility for t
 `docs/compatibility/BEHAVIOR-DIVERGENCES.md`, DIV-0015 (`caddy-rs behaviour`): append this exact
 sentence to the end of the paragraph:
 
-> The admin access-log `regexp` and `multi_regexp` filters use the same shared `caddy-rs-core` regex wrapper and the same Go-compatible `Regexp.ReplaceAllString` replacement expansion (`$N`/`${N}`/`$name`/`${name}`, non-participating or absent groups expanding to nothing, and longest-parse unbraced names); the Unicode `\b`/`\w`/`\d`/`\s` residual above applies to filter patterns too.
+> The admin access-log `regexp` and `multi_regexp` filters use the same shared `caddy-rs-core` regex wrapper, with Go-compatible replacement expansion for **well-formed** references (`$N`/`${N}`/`$name`/`${name}`, non-participating or absent groups expanding to nothing, and longest-parse unbraced names); malformed references diverge from Go's `Regexp.ReplaceAllString` (for pattern `(a)` and input `a`: Go expands `$01`/`${01}`/`$<2-digit-char>` to the empty string and leaves `${}`/`${a b}` literally, where caddy-rs expands `$01`/`${01}` to the first group, drops `${}`/`${a b}`, and leaves `$\u{e9}` literal — registered as a DIV-0015 residual and covered by `regexp_filter_malformed_reference_parsing_diverges_from_go`); the Unicode `\b`/`\w`/`\d`/`\s` residual above applies to filter patterns too.
 
 Recommended companion edits (optional, but they keep the entry auditable):
 
@@ -73,3 +73,19 @@ Recommended companion edits (optional, but they keep the entry auditable):
 
 No `CONFIGURATION.md` or `CADDYFILE.md` row changes are required: access-log field filters are JSON
 configuration and this task changes no accepted configuration or emitted JSON.
+
+### Reference-parsing residuals (verified against Go 1.26.4)
+
+For pattern `(a)` and input `a`, Go's `Regexp.ReplaceAllString` and caddy-rs disagree on
+malformed references:
+
+| template | Go | caddy-rs |
+|---|---|---|
+| `$01` | `` (empty) | `a` |
+| `${01}` | `` (empty) | `a` |
+| `${}` | `${}` | `` (empty) |
+| `${a b}` | `${a b}` | `` (empty) |
+| `$é` | `$é` | `$é` (literal, as Go) |
+
+These are registered as part of the DIV-0015 reference-parsing residual; well-formed `$N`,
+`${N}`, `$name` and `${name}` references match Go (26/27 oracle cases).
