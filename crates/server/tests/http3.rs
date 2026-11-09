@@ -49,8 +49,13 @@ fn free_port() -> u16 {
             .local_addr()
             .expect("local addr")
             .port();
+        // The runtime binds this number for TCP *and* QUIC/UDP, so a port that only looks free on
+        // TCP can still collide with another process's UDP socket (a parallel test binary, or a
+        // QUIC endpoint left by an earlier run). Probe both protocols; the UDP probe is closed
+        // immediately, but it removes the case where a UDP port was never checked at all.
+        let udp_free = std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok();
         let mut guard = issued.lock().expect("port registry");
-        if guard.insert(port) {
+        if udp_free && guard.insert(port) {
             return port;
         }
     }
@@ -138,12 +143,85 @@ fn static_routes() -> serde_json::Value {
     serde_json::json!([{"handle": [{"handler": "static_response", "body": BODY}]}])
 }
 
+/// Pick fresh ports for every `listen` entry in the configuration, keeping the `udp/` prefixes.
+fn reallocate_ports(config: &Config) -> Config {
+    let mut value = serde_json::to_value(config).expect("config to JSON");
+    let mut http = match value.get_mut("apps").and_then(|apps| apps.get_mut("http")) {
+        Some(http) => Some(http),
+        None => value.get_mut("http"),
+    };
+    // `http_port` is a listener too (the derived `:port` on a wildcard address), and `https_port`
+    // is the number the TLS site uses; leaving either at an old value makes a retry unable to
+    // recover, or silently moves the TLS listener off the re-picked TCP port.
+    if let Some(http) = http.as_deref_mut() {
+        if http.get("http_port").is_some() {
+            http["http_port"] = serde_json::json!(free_port());
+        }
+        if http.get("https_port").is_some() {
+            http["https_port"] = serde_json::json!(free_port());
+        }
+    }
+    let servers = http
+        .and_then(|http| http.get_mut("servers"))
+        .and_then(|servers| servers.as_object_mut());
+    if let Some(servers) = servers {
+        for server in servers.values_mut() {
+            if let Some(listen) = server
+                .get_mut("listen")
+                .and_then(|listen| listen.as_array_mut())
+            {
+                for entry in listen {
+                    let Some(address) = entry.as_str() else {
+                        continue;
+                    };
+                    let (prefix, host) = match address.rsplit_once(':') {
+                        Some((head, _port)) => {
+                            (head.to_string(), head.rsplit('/').next().unwrap_or(head))
+                        }
+                        None => continue,
+                    };
+                    let _ = host;
+                    *entry = serde_json::json!(format!("{prefix}:{}", free_port()));
+                }
+            }
+        }
+    }
+    serde_json::from_value(value).expect("config from JSON")
+}
+
+/// `AddrInUse` is the one apply failure the harness retries: the port probes are
+/// time-of-check/time-of-use, so another process can claim a number between the probe and the
+/// bind. Every other failure is a test bug and must surface.
+fn is_addr_in_use(error: &str) -> bool {
+    let lower = error.to_lowercase();
+    lower.contains("address already in use")
+        || lower.contains("addrinuse")
+        || lower.contains("address in use")
+}
+
 async fn start(config: Config) -> (ServerRuntime, caddy_rs_server::RuntimeStatus) {
-    let store = Arc::new(GenerationStore::with_builtin_registry());
-    store.load(config).expect("test config validates");
-    let mut runtime = ServerRuntime::new(Arc::clone(&store));
-    let status = runtime.apply().await.expect("runtime applies");
-    (runtime, status)
+    let mut config = config;
+    let mut last = None;
+    for _ in 0..8 {
+        let store = Arc::new(GenerationStore::with_builtin_registry());
+        store.load(config.clone()).expect("test config validates");
+        let mut runtime = ServerRuntime::new(Arc::clone(&store));
+        match runtime.apply().await {
+            Ok(status) => return (runtime, status),
+            Err(error) => {
+                let text = error.to_string();
+                if !is_addr_in_use(&text) {
+                    panic!("runtime applies: {text}");
+                }
+                last = Some(text);
+                config = reallocate_ports(&config);
+            }
+        }
+    }
+    panic!(
+        "h3 test listeners could not bind after 8 attempts: {}",
+        last.unwrap_or_default()
+    );
 }
 
 fn client_config(alpn: Vec<Vec<u8>>) -> Arc<ClientConfig> {
@@ -343,8 +421,16 @@ async fn h1_request(address: SocketAddr, path: &str) -> (u16, http::HeaderMap, B
 }
 
 fn udp_address(status: &caddy_rs_server::RuntimeStatus, port: u16) -> SocketAddr {
+    // Prefer the configured port; when `start`'s AddrInUse retry re-picked it, fall back to the
+    // first bound QUIC listener.
     status
         .listener_address(&format!("udp/127.0.0.1:{port}"))
+        .or_else(|| {
+            status
+                .listener_addresses()
+                .find(|(configured, _)| configured.starts_with("udp/"))
+                .map(|(_, address)| address)
+        })
         .expect("UDP listener bound")
         .parse()
         .expect("UDP listener address")
@@ -353,6 +439,12 @@ fn udp_address(status: &caddy_rs_server::RuntimeStatus, port: u16) -> SocketAddr
 fn tcp_address(status: &caddy_rs_server::RuntimeStatus, port: u16) -> SocketAddr {
     status
         .listener_address(&format!("127.0.0.1:{port}"))
+        .or_else(|| {
+            status
+                .listener_addresses()
+                .find(|(configured, _)| !configured.starts_with("udp/"))
+                .map(|(_, address)| address)
+        })
         .expect("TCP listener bound")
         .parse()
         .expect("TCP listener address")
@@ -905,6 +997,43 @@ async fn warm_up_for_0rtt(endpoint: &quinn::Endpoint, address: SocketAddr) {
     drop(connection);
     // The NewSessionTicket arrives after the handshake; give the client a moment to store it.
     tokio::time::sleep(Duration::from_millis(500)).await;
+}
+
+#[tokio::test]
+async fn start_retries_when_the_http_port_is_taken() {
+    // `apps.http.http_port` is a listener too (the derived `:port` on a wildcard address), so a
+    // collision there must be recoverable as well - review #2 showed the retry could exhaust its
+    // attempts when only `listen` entries were re-picked.
+    let config = config(0, None, Some(&["h1", "h2"]), static_routes());
+    let http_port = serde_json::to_value(&config).expect("config JSON")["apps"]["http"]["http_port"]
+        .as_u64()
+        .expect("http_port present") as u16;
+    let occupied = std::net::TcpListener::bind(("0.0.0.0", http_port))
+        .or_else(|_| std::net::TcpListener::bind(("127.0.0.1", http_port)))
+        .expect("hold the http_port");
+    let (runtime, status) = start(config).await;
+    let bound = tcp_address(&status, 0);
+    assert_ne!(bound.port(), http_port, "the http_port must be re-picked");
+    runtime.shutdown().await;
+    drop(occupied);
+}
+
+#[tokio::test]
+async fn start_retries_when_a_requested_port_is_taken() {
+    // Hold a TCP port so the first apply fails with AddrInUse, exactly as a parallel test binary
+    // can. `start` must re-pick ports and still return a serving runtime, and the address helpers
+    // must report the port actually bound rather than the one we asked for.
+    let occupied = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("hold a port");
+    let taken = occupied.local_addr().expect("local addr").port();
+    let (runtime, status) = start(config(taken, None, Some(&["h1", "h2"]), static_routes())).await;
+    let address = tcp_address(&status, taken);
+    assert_ne!(
+        address.port(),
+        taken,
+        "start must re-pick a taken port instead of failing"
+    );
+    assert_eq!(address.ip().to_string(), "127.0.0.1");
+    runtime.shutdown().await;
 }
 
 #[tokio::test]
