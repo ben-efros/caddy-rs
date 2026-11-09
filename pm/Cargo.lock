@@ -55,6 +55,7 @@ dependencies = [
  "caddy-rs-pm-compiler",
  "caddy-rs-pm-core",
  "caddy-rs-pm-hosts",
+ "caddy-rs-pm-policies",
  "caddy-rs-pm-state",
  "serde_json",
  "tempfile",
