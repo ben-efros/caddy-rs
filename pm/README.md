@@ -108,22 +108,41 @@ mutation when TLS references are involved.
 
 ## `pm-service`
 
-`HostService` is the command layer a future API/UI calls. It owns no storage and no policy:
+`HostService` is the command layer a future API/UI calls. It owns no storage of its own, but it
+can be wired to the host repository and an optional policy repository:
 
-- `create(HostDraft)` reserves `next_id`, builds `Host::new` and calls the repository. The id is
-  allocated before validation, so a rejected draft or a domain conflict consumes it; id gaps are
-  normal and ids are never reused;
+- `create(HostDraft)` reserves `next_id`, builds `Host::new`, validates the TLS binding, and calls
+  the repository. The id is allocated before validation, so a rejected draft, a failed TLS
+  validation or a domain conflict consumes it; id gaps are normal and ids are never reused;
 - `update(id, expected_revision, draft)` and `delete(id, expected_revision)` pass the caller's
   revision straight through, preserving the repository's compare-and-swap (update does not read the
-  current host first);
+  current host first). Update builds and validates the candidate host before `repository.update`,
+  so a rejected update leaves the stored host and its revision unchanged;
 - `list()` returns `StoredHost` values with revisions; `compile()` reads one snapshot and calls
   `compile_routes`.
 
+`HostService::new(store)` configures no policy repository. It keeps the disabled-TLS path unchanged
+(the repository still validates structure), but any `TlsMode::Auto` draft fails with
+`ServiceError::PolicyValidationUnavailable` instead of silently skipping coverage.
+`HostService::with_policies(store, policy_repository)` must receive a `PolicyRepository` over the
+same underlying store and enables policy-aware validation before every create and update:
+
+- `TlsMode::Disabled` loads nothing and proceeds; the repository still runs
+  `Host::validate_structure`;
+- `TlsMode::Auto` loads `tls.auto_policy_id`. A missing policy is a located
+  `ServiceError::PolicyNotFound`; a disabled policy or a domain-coverage failure is a located
+  `ServiceError::Tls` carrying the `CoreError` from `Host::validate(None, Some(&policy))`, which
+  also re-checks TLS mode/reference consistency and coverage;
+- `TlsMode::Manual`, `AcmeConfigured` and `InternalCa` fail with
+  `ServiceError::UnsupportedExplicitCertificate`. There is no certificate repository yet, so
+  coverage cannot be proven; reporting success would silently skip it.
+
 `HostDraft` carries `domains`, `tls` and `spec`; drafts are always enabled and `update` replaces the
-whole host. Structure validation stays in the repository. This crate does **not** load certificates
-or auto policies and does not expose REST/UI/auth, so a caller using `Manual`, `AcmeConfigured`,
-`InternalCa` or `Auto` TLS must load the referenced object and run `Host::validate` before a
-mutation; the structural check cannot prove existence or domain coverage.
+whole host. The repository still validates structure before writing. Failed policy-aware validation
+persists nothing, but a failed `create` has already consumed its allocated id; a failed `update`
+does not change the stored host or revision. This crate does **not** load certificates and does not
+expose REST/UI/auth.
+
 ## `pm-policies`
 
 `PolicyRepository` persists validated `AutoCertificatePolicy` documents in the same `pm-state`
