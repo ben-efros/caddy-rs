@@ -78,6 +78,9 @@ enum Command {
         /// Write output to a file instead of stdout.
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Environment file(s) in KEY=VALUE form, loaded before adaptation.
+        #[arg(long = "envfile", value_name = "PATH")]
+        envfile: Vec<PathBuf>,
     },
     /// Validate a configuration without running it.
     Validate {
@@ -90,6 +93,9 @@ enum Command {
         /// Configuration-acceptance mode (`compatible`, `warn` or `strict`); default compatible.
         #[arg(long, default_value = "compatible", value_name = "MODE")]
         adapt_mode: String,
+        /// Environment file(s) in KEY=VALUE form, loaded before validation.
+        #[arg(long = "envfile", value_name = "PATH")]
+        envfile: Vec<PathBuf>,
     },
     /// Run the server with a configuration.
     Run {
@@ -105,10 +111,20 @@ enum Command {
         /// Use saved config, if any (and prefer over --config file).
         #[arg(short = 'r', long)]
         resume: bool,
-        /// Autosave file to persist and to load with --resume (default:
-        /// `$XDG_CONFIG_HOME/caddy-rs/autosave.json` or `$HOME/.config/caddy-rs/autosave.json`).
+        /// Autosave file to persist and to load with --resume (default: Caddy's
+        /// `$XDG_CONFIG_HOME/caddy/autosave.json`, with legacy caddy-rs fallback).
         #[arg(long)]
         autosave_path: Option<PathBuf>,
+        /// Data directory override (default: Caddy's XDG data path, with legacy `.caddy-rs`
+        /// fallback).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Print the process environment before starting (same as `environ`).
+        #[arg(long, short = 'e')]
+        environ: bool,
+        /// Environment file(s) in KEY=VALUE form, loaded before config adaptation.
+        #[arg(long = "envfile", value_name = "PATH")]
+        envfile: Vec<PathBuf>,
     },
     /// Load a new configuration into a running server through its admin API.
     Reload {
@@ -118,14 +134,17 @@ enum Command {
         /// Adapter name (`caddyfile` or `json`).
         #[arg(long)]
         adapter: Option<String>,
-        /// Admin API address.
-        #[arg(long, default_value = "localhost:2019")]
+        /// Admin API address (stock Caddy calls this `--address`).
+        #[arg(long = "address", alias = "admin", default_value = "localhost:2019")]
         admin: String,
+        /// Force the reload even when the configuration is byte-identical (stock `--force`).
+        #[arg(long, short = 'f')]
+        force: bool,
     },
     /// Stop a running server through its admin API.
     Stop {
-        /// Admin API address.
-        #[arg(long, default_value = "localhost:2019")]
+        /// Admin API address (stock Caddy calls this `--address`).
+        #[arg(long = "address", alias = "admin", default_value = "localhost:2019")]
         admin: String,
     },
     /// Print the environment as seen by this caddy-rs process.
@@ -329,7 +348,9 @@ async fn run(command: Command) -> anyhow::Result<()> {
             adapt_mode,
             pretty,
             output,
+            envfile,
         } => {
+            load_env_files(&envfile)?;
             let options = adapt_options(&adapt_mode)?;
             let (json, warnings) = adapt(&config, adapter.as_deref(), options)?;
             let json = if pretty {
@@ -353,7 +374,9 @@ async fn run(command: Command) -> anyhow::Result<()> {
             config,
             adapter,
             adapt_mode,
+            envfile,
         } => {
+            load_env_files(&envfile)?;
             let options = adapt_options(&adapt_mode)?;
             let loaded = load_validated(&config, adapter.as_deref(), options)?;
             for warning in &loaded.warnings {
@@ -381,13 +404,37 @@ async fn run(command: Command) -> anyhow::Result<()> {
             adapt_mode,
             resume,
             autosave_path,
+            data_dir,
+            environ,
+            envfile,
         } => {
             let options = adapt_options(&adapt_mode)?;
+            load_env_files(&envfile)?;
+            if environ {
+                crate::environ::run(&[])?;
+            }
+            let mut config = config;
+            if config.is_none() && !resume && Path::new("Caddyfile").is_file() {
+                config = Some(PathBuf::from("Caddyfile"));
+            }
             // Caddy's autosave path: the `--autosave-path` flag wins, then the environment-derived
-            // default (`$XDG_CONFIG_HOME/caddy-rs/autosave.json`, `$HOME/.config/caddy-rs/...`,
-            // `./.caddy-rs/...`); see `caddy_rs_core::autosave`.
-            let autosave_path =
-                autosave_path.unwrap_or_else(caddy_rs_core::autosave::default_autosave_path);
+            // default (Caddy's `caddy/autosave.json`, with a legacy caddy-rs fallback).
+            let autosave_path = match autosave_path {
+                Some(path) => path,
+                None => {
+                    let resolved = caddy_rs_core::autosave::resolve_autosave_path();
+                    if resolved.legacy {
+                        eprintln!(
+                            "caddy-rs: warning: using legacy autosave `{}`; the Caddy-compatible path is `{}`",
+                            resolved.path.display(),
+                            caddy_rs_core::autosave::config_dir()
+                                .join(caddy_rs_core::autosave::AUTOSAVE_FILE_NAME)
+                                .display()
+                        );
+                    }
+                    resolved.path
+                }
+            };
             // Publish the path to the admin API this process starts, so admin-driven config
             // changes (`POST /load`, `/config/...`) autosave to the very same file, like Caddy.
             std::env::set_var(caddy_rs_admin::AUTOSAVE_PATH_ENV, &autosave_path);
@@ -456,9 +503,19 @@ async fn run(command: Command) -> anyhow::Result<()> {
             for warning in warnings {
                 eprintln!("warning: {warning}");
             }
+            let storage_root = model
+                .storage()
+                .and_then(|storage| storage.root())
+                .map(PathBuf::from);
+            let resolved_data_dir =
+                caddy_rs_core::data_dir::resolve_server_data_dir(data_dir, storage_root);
+            for warning in &resolved_data_dir.warnings {
+                eprintln!("caddy-rs: warning: {warning}");
+            }
             let store = Arc::new(GenerationStore::new(Arc::new(builtin_module_registry())));
             let activated = store.load(model).context("cannot activate configuration")?;
-            let mut runtime = ServerRuntime::new(Arc::clone(&store));
+            let mut runtime =
+                ServerRuntime::new(Arc::clone(&store)).with_data_root(resolved_data_dir.path);
             let status = runtime.apply().await.context("cannot start listeners")?;
             if persist_config {
                 // Caddy autosaves the exact bytes of the successfully loaded config after the
@@ -505,6 +562,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
             config,
             adapter,
             admin,
+            force,
         } => {
             let loaded = load_validated(&config, adapter.as_deref(), AdaptOptions::default())?;
             for warning in &loaded.warnings {
@@ -514,7 +572,8 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 .model
                 .to_vec()
                 .context("cannot encode configuration")?;
-            let response = admin_request(&admin, "POST", "/load", Bytes::from(body)).await?;
+            let response =
+                admin_request_with(&admin, "POST", "/load", Bytes::from(body), force).await?;
             ensure_admin_success(&response)?;
             eprintln!("configuration reloaded");
         }
@@ -541,6 +600,53 @@ async fn run(command: Command) -> anyhow::Result<()> {
             adapter,
             dry_run,
         } => run_trust(data_dir, &ca, config, adapter, dry_run).await?,
+    }
+    Ok(())
+}
+
+fn load_env_files(paths: &[PathBuf]) -> anyhow::Result<()> {
+    const MAX_ENV_FILE_BYTES: u64 = 1024 * 1024;
+    for path in paths {
+        let metadata = std::fs::metadata(path)
+            .with_context(|| format!("cannot read environment file `{}`", path.display()))?;
+        if metadata.len() > MAX_ENV_FILE_BYTES {
+            bail!(
+                "environment file `{}` is larger than {} bytes",
+                path.display(),
+                MAX_ENV_FILE_BYTES
+            );
+        }
+        let contents = std::fs::read_to_string(path)
+            .with_context(|| format!("cannot read environment file `{}`", path.display()))?;
+        for (line_number, line) in contents.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let line = line.strip_prefix("export ").unwrap_or(line).trim();
+            let Some((key, value)) = line.split_once('=') else {
+                bail!(
+                    "invalid environment line {} in `{}`: expected KEY=VALUE",
+                    line_number + 1,
+                    path.display()
+                );
+            };
+            let key = key.trim();
+            if key.is_empty()
+                || !key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                || key.as_bytes()[0].is_ascii_digit()
+            {
+                bail!(
+                    "invalid environment variable name `{key}` at `{}:{}`",
+                    path.display(),
+                    line_number + 1
+                );
+            }
+            let value = value.trim().trim_matches('"').trim_matches('\'');
+            std::env::set_var(key, value);
+        }
     }
     Ok(())
 }
@@ -661,6 +767,16 @@ async fn admin_request(
     path: &str,
     body: Bytes,
 ) -> anyhow::Result<AdminResponse> {
+    admin_request_with(admin, method, path, body, false).await
+}
+
+async fn admin_request_with(
+    admin: &str,
+    method: &str,
+    path: &str,
+    body: Bytes,
+    force_reload: bool,
+) -> anyhow::Result<AdminResponse> {
     let admin = admin
         .strip_prefix("http://")
         .or_else(|| admin.strip_prefix("https://"))
@@ -668,10 +784,14 @@ async fn admin_request(
     let client: hyper_util::client::legacy::Client<_, Full<Bytes>> =
         hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
             .build_http();
-    let request = hyper::Request::builder()
+    let mut builder = hyper::Request::builder()
         .method(method)
         .uri(format!("http://{admin}{path}"))
-        .header(http::header::CONTENT_TYPE, "application/json")
+        .header(http::header::CONTENT_TYPE, "application/json");
+    if force_reload {
+        builder = builder.header(http::header::CACHE_CONTROL, "must-revalidate");
+    }
+    let request = builder
         .body(Full::new(body))
         .context("cannot build admin request")?;
     let response = client

@@ -20,12 +20,14 @@
 pub mod adapter;
 pub mod autosave;
 pub mod config;
+pub mod data_dir;
 pub mod duration;
 pub mod error;
 pub mod generation;
 pub mod lifecycle;
 pub mod listen;
 pub mod module;
+pub mod notify;
 pub mod regex;
 pub mod validate;
 

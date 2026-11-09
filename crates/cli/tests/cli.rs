@@ -600,6 +600,176 @@ fn run_honours_admin_config_persist_false_and_does_not_autosave() {
     );
 }
 
+#[test]
+fn environ_prints_the_process_environment() {
+    let (code, stdout, stderr) = run(&["environ"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        stdout.lines().any(|line| line.starts_with("PATH=")),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn adapt_loads_an_envfile_before_adaptation() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let config = directory.path().join("Caddyfile");
+    std::fs::write(
+        &config,
+        ":8080 {\n\trespond \"{$CADDY_TEST_GREETING}\"\n}\n",
+    )
+    .expect("write Caddyfile");
+    let envfile = directory.path().join("test.env");
+    std::fs::write(&envfile, "CADDY_TEST_GREETING=hellofromenv\n").expect("write envfile");
+    let (code, stdout, stderr) = run(&[
+        "adapt",
+        "--config",
+        config.to_str().expect("utf-8 config"),
+        "--envfile",
+        envfile.to_str().expect("utf-8 envfile"),
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("adapted JSON");
+    assert_eq!(
+        value["apps"]["http"]["servers"]["srv0"]["routes"][0]["handle"][0]["body"],
+        "hellofromenv"
+    );
+}
+
+#[test]
+fn run_discovers_caddyfile_in_the_working_directory() {
+    let _guard = SERVER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let directory = tempfile::tempdir().expect("tempdir");
+    let site_port = free_port();
+    let admin_port = free_port();
+    std::fs::write(
+        directory.path().join("Caddyfile"),
+        format!(
+            "{{\n\tauto_https off\n\tadmin 127.0.0.1:{admin_port}\n}}\n:{site_port} {{\n\trespond \"discovered\"\n}}\n"
+        ),
+    )
+    .expect("write Caddyfile");
+    let log = directory.path().join("discovery.stderr");
+    let file = std::fs::File::create(&log).expect("create child log");
+    let mut child = Command::new(binary())
+        .arg("run")
+        .arg("--autosave-path")
+        .arg(directory.path().join("autosave.json"))
+        .env("XDG_CONFIG_HOME", directory.path().join("config"))
+        .env("XDG_DATA_HOME", directory.path().join("data"))
+        .current_dir(directory.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(file))
+        .spawn()
+        .expect("spawn caddy-rs run");
+    let served = wait_until(Duration::from_secs(15), || {
+        http_request(SocketAddr::from(([127, 0, 0, 1], site_port)), "GET", "/")
+            .is_some_and(|(status, body)| status == 200 && body == "discovered")
+    });
+    if !served {
+        child_failure(
+            &mut child,
+            &log,
+            "Caddyfile was not discovered in the working directory",
+        );
+    }
+    assert_eq!(admin_post_stop(admin_port), 200);
+    let Some(status) = wait_for_child_exit(&mut child, Duration::from_secs(10)) else {
+        child_failure(&mut child, &log, "run did not exit after /stop");
+    };
+    assert!(status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn run_sends_systemd_notifications() {
+    let _guard = SERVER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    use std::os::unix::net::UnixDatagram;
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let site_port = free_port();
+    let admin_port = free_port();
+    let notify_path = directory.path().join("notify.sock");
+    let receiver = UnixDatagram::bind(&notify_path).expect("bind notify socket");
+    receiver
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .expect("read timeout");
+
+    let config = directory.path().join("config.json");
+    std::fs::write(
+        &config,
+        serde_json::to_string(&serde_json::json!({
+            "admin": {"listen": format!("127.0.0.1:{admin_port}")},
+            "apps": {"http": {"servers": {"srv0": {
+                "listen": [format!("127.0.0.1:{site_port}")],
+                "routes": [{"handle": [{"handler": "static_response", "body": "notify"}]}]
+            }}}}
+        }))
+        .expect("serialize config"),
+    )
+    .expect("write config");
+    let log = directory.path().join("notify.stderr");
+    let file = std::fs::File::create(&log).expect("create child log");
+    let mut child = Command::new(binary())
+        .args([
+            "run",
+            "--config",
+            config.to_str().expect("utf-8 config"),
+            "--adapter",
+            "json",
+            "--data-dir",
+            directory
+                .path()
+                .join("data")
+                .to_str()
+                .expect("utf-8 data dir"),
+            "--autosave-path",
+            directory
+                .path()
+                .join("autosave.json")
+                .to_str()
+                .expect("utf-8 autosave"),
+        ])
+        .env("NOTIFY_SOCKET", &notify_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(file))
+        .spawn()
+        .expect("spawn caddy-rs run");
+
+    let mut messages = Vec::new();
+    let mut buffer = [0_u8; 256];
+    let mut saw_ready = false;
+    while !saw_ready {
+        let size = receiver.recv(&mut buffer).expect("receive notify message");
+        let message = String::from_utf8_lossy(&buffer[..size]).to_string();
+        saw_ready = message == "READY=1";
+        messages.push(message);
+    }
+    assert!(
+        messages.iter().any(|message| message == "RELOADING=1"),
+        "expected RELOADING before READY, got {messages:?}"
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(10), || connect_admin(admin_port)
+            .is_some()),
+        "admin API did not become reachable"
+    );
+    assert_eq!(admin_post_stop(admin_port), 200);
+    let mut saw_stopping = false;
+    while !saw_stopping {
+        let size = receiver
+            .recv(&mut buffer)
+            .expect("receive stopping message");
+        let message = String::from_utf8_lossy(&buffer[..size]).to_string();
+        saw_stopping = message == "STOPPING=1";
+    }
+    let Some(status) = wait_for_child_exit(&mut child, Duration::from_secs(10)) else {
+        child_failure(&mut child, &log, "run did not exit after /stop");
+    };
+    assert!(status.success());
+}
+
 // ---- PKI / trust commands (read-only local CA material) --------------------------------------
 //
 // The fixtures live in the admin crate (`crates/admin/tests/fixtures/pki/authorities/...`); they

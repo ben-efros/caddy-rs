@@ -138,13 +138,15 @@ caddy-rs: error[config.invalid]: cannot adapt `./Caddyfile`: invalid configurati
 
 | State | Default | Override |
 |---|---|---|
-| Data directory | `.caddy-rs` in the working directory | `storage.root` in a JSON configuration; `--data-dir` or `CADDY_RS_DATA_DIR` on `pki` and `trust` |
-| Autosave file | `$XDG_CONFIG_HOME/caddy-rs/autosave.json`, else `$HOME/.config/caddy-rs/autosave.json`, else `./.caddy-rs/autosave.json` | `run --autosave-path` |
+| Data directory | Caddy's `$XDG_DATA_HOME/caddy` or `$HOME/.local/share/caddy`; legacy `.caddy-rs` in the working directory when it already exists | `run --data-dir`; `storage.root` in a JSON configuration; `CADDY_RS_DATA_DIR` |
+| Autosave file | `$XDG_CONFIG_HOME/caddy/autosave.json`, else `$HOME/.config/caddy/autosave.json`, else `./caddy/autosave.json`; a legacy `caddy-rs` autosave is used only when the Caddy path is absent | `run --autosave-path` |
 | Admin API | `localhost:2019` | `admin <address>` in the Caddyfile or `admin.listen` in JSON; `admin off` disables it |
 
 The data directory holds `pki/authorities/<ca-id>/` (the local certificate authority) and
-`certificates/`. After a configuration loads successfully, `run` writes the exact JSON to the
-autosave file and prints the path. `run --resume` loads that file instead of `--config`.
+`certificates/`. Caddy's XDG path is the default so an existing Caddy data directory can be reused
+in place; an existing `.caddy-rs` directory is still used for continuity. After a configuration
+loads successfully, `run` writes the exact JSON to the autosave file and prints the path.
+`run --resume` loads that file instead of `--config`.
 
 ## Running as a service
 

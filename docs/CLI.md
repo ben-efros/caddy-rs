@@ -144,16 +144,19 @@ Synopsis: `caddy-rs run [OPTIONS]`
 | `--adapter <ADAPTER>` | `caddyfile` or `json`; inferred from the file name when omitted. | inferred |
 | `--adapt-mode <MODE>` | Caddyfile acceptance mode: `compatible`, `warn` or `strict`. | `compatible` |
 | `-r, --resume` | Load the last autosave file, preferring it over `--config`. | off |
-| `--autosave-path <PATH>` | Autosave file to write, and to load with `--resume`. | `$XDG_CONFIG_HOME/caddy-rs/autosave.json`, else `$HOME/.config/caddy-rs/autosave.json`, else `./.caddy-rs/autosave.json` |
+| `--autosave-path <PATH>` | Autosave file to write, and to load with `--resume`. | `$XDG_CONFIG_HOME/caddy/autosave.json`, else `$HOME/.config/caddy/autosave.json`, else `./caddy/autosave.json`; a legacy caddy-rs autosave is used only when the Caddy path is absent |
+| `--data-dir <PATH>` | Certificate/account/pki data directory. | Caddy's `$XDG_DATA_HOME/caddy`/`$HOME/.local/share/caddy`, with legacy `.caddy-rs` fallback |
+| `--envfile <PATH>` | Load `KEY=VALUE` environment file(s) before adaptation. | none |
+| `-e, --environ` | Print the environment before starting. | off |
 
 ```sh
 caddy-rs run --config ./Caddyfile --adapter caddyfile
 ```
 
-Pass `--config`, or `--resume` when an autosave file exists. With neither, the command exits 1 with
-`no configuration to load`. `--resume` loads the autosave file when one exists and warns that it is
-ignoring `--config` if you passed both. A missing autosave file is not an error; `run` falls back to
-`--config`.
+With no `--config`, `run` loads `./Caddyfile` when it exists, matching stock Caddy. Pass
+`--config`, or `--resume` when an autosave file exists. `--resume` loads the autosave file when one
+exists and warns that it is ignoring `--config` if you passed both. A missing autosave file is not
+an error; `run` falls back to `--config`.
 
 After a configuration loads, `run` writes the exact JSON it loaded to the autosave file and prints
 that path. It also prints the active generation, every listening address and the admin API address
@@ -347,7 +350,8 @@ Warnings go to standard error and do not change the exit status.
 
 | Variable | Read by | Effect |
 |---|---|---|
-| `CADDY_RS_DATA_DIR` | `pki`, `trust` | Data directory when `--data-dir` is absent. |
+| `CADDY_RS_DATA_DIR` | `run`, `pki`, `trust` | Data directory when `--data-dir` is absent. |
+| `XDG_DATA_HOME` | `run` | Base for Caddy's default data directory. |
 | `XDG_CONFIG_HOME` | `run` | Base for the default autosave path. |
 | `HOME` | `run`, `trust` | Fallback base for the autosave path; home directory for NSS/Firefox discovery in `trust`. |
 | `CADDY_RS_TRUST_PREFIX` | `trust` | Prefix for platform trust-store paths, default `/`. Intended for tests and containers. |

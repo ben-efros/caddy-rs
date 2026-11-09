@@ -1579,6 +1579,9 @@ impl AdminApi {
         }
         self.notify_reload();
         if self.exit_process_on_stop {
+            // Tell a systemd `Type=notify` unit before the delayed process exit; best-effort,
+            // because a missing/broken NOTIFY_SOCKET must not change /stop semantics.
+            let _ = caddy_rs_core::notify::stopping();
             // Use an OS thread, not a tokio task: the runtime may already be shutting down (that is
             // precisely the stuck state this exits from), and a spawned task could be dropped
             // before its timer fires.
