@@ -60,6 +60,15 @@ impl RuntimeStatus {
     pub fn listener_address(&self, configured: &str) -> Option<&str> {
         self.listeners.get(configured).map(String::as_str)
     }
+
+    /// Every bound listener, keyed by its configured address (`127.0.0.1:8080`,
+    /// `udp/127.0.0.1:8443`, ...). A test that re-picks ports after an `AddrInUse` retry reads the
+    /// addresses actually bound instead of the ones it asked for.
+    pub fn listener_addresses(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.listeners
+            .iter()
+            .map(|(configured, bound)| (configured.as_str(), bound.as_str()))
+    }
 }
 
 /// Caddy's shutdown timing configuration (`apps.http.grace_period` / `shutdown_delay`).
