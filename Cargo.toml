@@ -10,6 +10,7 @@ members = [
     "crates/server",
     "crates/cli",
     "crates/plug",
+    "crates/authn",
 ]
 
 [workspace.package]
@@ -33,6 +34,7 @@ caddy-rs-tls = { path = "crates/tls", default-features = false }
 caddy-rs-admin = { path = "crates/admin", default-features = false }
 caddy-rs-server = { path = "crates/server", default-features = false }
 caddy-rs-plug = { path = "crates/plug", default-features = false }
+caddy-rs-authn = { path = "crates/authn", default-features = false }
 anyhow = "1.0.104"
 async-trait = "0.1.92"
 bytes = "1.12.1"
@@ -53,6 +55,18 @@ tokio = { version = "1.53.1", features = [
     "rt-multi-thread", "macros", "net", "time", "sync", "io-util", "fs",
 ] }
 tracing = "0.1.44"
+# Crypto and JWT (for authn crate)
+argon2 = { version = "0.5", features = ["std"] }
+bcrypt = "0.15"
+jsonwebtoken = "9.3"
+rand = { version = "0.8", features = ["std", "getrandom"] }
+base32 = "0.5"
+totp-lite = "2.0"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.11", features = ["v4", "serde", "fast-rng"] }
+zeroize = "1.8"
+secrecy = "0.10"
+urlencoding = "2.1"
 
 [patch.crates-io]
 # The sandbox that authored this repository has a read-only crates.io cache and cannot download
