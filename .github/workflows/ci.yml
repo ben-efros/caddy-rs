@@ -9,7 +9,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Rust version comes from rust-toolchain.toml, not from the action tag: pinning the
       # tag made Dependabot propose nonexistent toolchains (1.120.0) and broke CI.
       # Version and components come from rust-toolchain.toml.

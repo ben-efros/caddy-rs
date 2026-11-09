@@ -19,7 +19,7 @@ jobs:
     name: audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # A prebuilt binary keeps the job short; the gate itself is `cargo audit`'s exit status.
       # The version is pinned: the action resolves its own default otherwise, so the gate could
       # start failing (or silently stop failing) on a tool upgrade nobody reviewed. 0.22.2 is the
