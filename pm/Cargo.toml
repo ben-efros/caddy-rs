@@ -4,6 +4,7 @@ members = [
     "crates/pm-state",
     "crates/pm-core",
     "crates/pm-compiler",
+    "crates/pm-config",
     "crates/pm-hosts",
     "crates/pm-service",
     "crates/pm-policies",
