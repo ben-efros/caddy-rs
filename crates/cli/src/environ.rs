@@ -129,7 +129,7 @@ fn home_dir() -> PathBuf {
     PathBuf::from(".")
 }
 
-/// The negative of Caddy's `runtime.NumCPU()` / default `runtime.GOMAXPROCS(0)`.
+/// The Rust analogue of Caddy's `runtime.NumCPU()` / default `runtime.GOMAXPROCS(0)`.
 fn parallelism() -> usize {
     std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)

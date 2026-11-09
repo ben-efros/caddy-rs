@@ -47,6 +47,12 @@ enum Command {
         json: bool,
     },
     /// Print information about this build.
+    ///
+    /// The output is the Rust translation of Caddy's `build-info`: tab-separated `rustc`, `path`,
+    /// `mod` and `build` lines. Caddy's Go toolchain line becomes `rustc`, and the Rust-specific
+    /// build settings are named `-profile` (Cargo profile), `-target` (target triple), `-features`
+    /// (enabled Cargo features), `-modules` (number of compiled modules) and `-caddy-baseline`
+    /// (the Caddy version this build targets).
     BuildInfo,
     /// List modules compiled into this build.
     ListModules {
