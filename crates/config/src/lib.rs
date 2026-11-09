@@ -10,7 +10,9 @@ pub mod adapter;
 pub mod lexer;
 pub mod parser;
 
-pub use adapter::{adapt, adapt_with_source, CaddyfileAdapter};
+pub use adapter::{
+    adapt, adapt_with_options, adapt_with_source, AdaptMode, AdaptOptions, CaddyfileAdapter,
+};
 pub use parser::{
     expand_env_vars, expand_env_vars_with, parse, parse_with_source, Caddyfile, Directive,
     EnvExpansion, GlobalOptions, NamedRoute, PkiCertificateAuthority, PkiKeyPairConfig, PkiOptions,

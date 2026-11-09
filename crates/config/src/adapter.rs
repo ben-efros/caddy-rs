@@ -23,6 +23,10 @@ const DIRECTIVE_ORDER: &[&str] = &[
     "map",
     "vars",
     "root",
+    // Caddy's default order places the access-log control directives immediately after `root`:
+    // `skip_log` (deprecated) before `log_skip`.
+    "skip_log",
+    "log_skip",
     "header",
     "copy_response_headers",
     "request_body",
@@ -48,6 +52,83 @@ const DIRECTIVE_ORDER: &[&str] = &[
     "file_server",
     "acme_server",
 ];
+
+/// A Caddyfile spelling Caddy still accepts but documents as deprecated.
+///
+/// The table is the single place that knows about backward-compatibility aliases: `compatible`
+/// accepts an alias silently, `warn` accepts it and emits Caddy's deprecation warning, and
+/// `strict` rejects it with a located error naming the replacement.
+struct DeprecatedDirective {
+    /// Deprecated spelling.
+    alias: &'static str,
+    /// Current spelling that produces the same configuration.
+    replacement: &'static str,
+    /// Caddy v2.11.9's warning text, emitted in `warn` mode.
+    warning: &'static str,
+}
+
+/// Deprecated Caddyfile spellings accepted by this adapter.
+///
+/// Keep this in sync with Caddy: only add an alias here when the adapter already implements the
+/// replacement (`skip_log` and `basicauth` are the two Caddy v2.11.9 aliases this build supports).
+const DEPRECATED_DIRECTIVES: &[DeprecatedDirective] = &[
+    DeprecatedDirective {
+        alias: "skip_log",
+        replacement: "log_skip",
+        warning: "the 'skip_log' directive is deprecated, please use 'log_skip' instead!",
+    },
+    DeprecatedDirective {
+        alias: "basicauth",
+        replacement: "basic_auth",
+        warning: "the 'basicauth' directive is deprecated, please use 'basic_auth' instead!",
+    },
+];
+
+/// Handle deprecated directive spellings anywhere in a block, according to the adapt mode.
+///
+/// This runs on the parsed Caddyfile before route building so an alias is handled identically in
+/// every position Caddy accepts it (`route`, `handle`, named routes, `handle_response`, ...) and
+/// each occurrence produces exactly one warning or error.
+fn check_deprecated_directives(
+    directives: &[Directive],
+    mode: AdaptMode,
+    warnings: &mut Vec<String>,
+) -> caddy_rs_core::Result<()> {
+    for directive in directives {
+        if let Some(deprecated) = DEPRECATED_DIRECTIVES
+            .iter()
+            .find(|candidate| candidate.alias == directive.name)
+        {
+            match mode {
+                // Compatible preserves the pre-mode accepted surface exactly: the alias is
+                // accepted and produces the same configuration, with no warning.
+                AdaptMode::Compatible => {}
+                AdaptMode::Warn => warnings.push(deprecated.warning.to_string()),
+                AdaptMode::Strict => {
+                    return Err(adapter_error(
+                        directive.position.clone(),
+                        format!(
+                            "directive `{}` is a deprecated alias for `{}`; remove it (strict \
+                             mode rejects backward-compatibility aliases)",
+                            deprecated.alias, deprecated.replacement
+                        ),
+                    ));
+                }
+            }
+        }
+        // Only blocks that Caddy parses as nested directive lists are scanned. Option blocks
+        // (`map`, `vars`, `tls`, `reverse_proxy`, ...) may legitimately contain a token with an
+        // alias's spelling as a value or option name; treating those as directives would be a
+        // false positive.
+        if matches!(
+            directive.name.as_str(),
+            "route" | "handle" | "handle_path" | "handle_errors"
+        ) {
+            check_deprecated_directives(&directive.block, mode, warnings)?;
+        }
+    }
+    Ok(())
+}
 
 /// The Caddyfile adapter.
 #[derive(Debug, Clone, Copy, Default)]
@@ -863,15 +944,96 @@ fn apply_global_server_options(
     }
 }
 
+/// Configuration-acceptance mode for the Caddyfile adapter.
+///
+/// This is a caddy-rs extension: Caddy v2.11.9 has no equivalent flag and always accepts the
+/// spellings it historically accepted. `Compatible` preserves the pre-mode behaviour (and Caddy's
+/// accepted surface); `Warn` additionally reports accepted deprecated spellings; `Strict` rejects
+/// them. Modes never relax a security rejection: every located error that is not a documented
+/// deprecated alias stays an error in all three modes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AdaptMode {
+    /// Accept deprecated spellings silently (today's behaviour; the default).
+    #[default]
+    Compatible,
+    /// Accept deprecated spellings and emit a non-fatal warning.
+    Warn,
+    /// Reject deprecated spellings with a located error.
+    Strict,
+}
+
+impl AdaptMode {
+    /// The three mode names, in CLI order, for diagnostics and `--help` text.
+    pub const NAMES: [&'static str; 3] = ["compatible", "warn", "strict"];
+
+    /// Parse a mode name (`compatible`, `warn`, `strict`).
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "compatible" => Ok(Self::Compatible),
+            "warn" => Ok(Self::Warn),
+            "strict" => Ok(Self::Strict),
+            other => Err(format!(
+                "invalid adapt mode `{other}`: expected one of {}",
+                Self::NAMES.join(", ")
+            )),
+        }
+    }
+}
+
+impl std::str::FromStr for AdaptMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+impl std::fmt::Display for AdaptMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Compatible => "compatible",
+            Self::Warn => "warn",
+            Self::Strict => "strict",
+        })
+    }
+}
+
+/// Caddyfile adapter options.
+///
+/// The default (`AdaptMode::Compatible`) accepts exactly what Caddy v2.11.9 accepts. The options
+/// are a caddy-rs extension, so a configuration that adapts identically to Caddy may be rejected in
+/// `strict` mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AdaptOptions {
+    /// Acceptance mode for deprecated spellings and future ambiguity gates.
+    pub mode: AdaptMode,
+}
+
+impl AdaptOptions {
+    /// Options for one mode.
+    pub fn new(mode: AdaptMode) -> Self {
+        Self { mode }
+    }
+}
+
 /// Adapt a Caddyfile string to Caddy JSON.
 pub fn adapt(input: &str) -> caddy_rs_core::Result<AdaptedConfig> {
-    adapt_with_source(input, None)
+    adapt_with_options(input, None, AdaptOptions::default())
 }
 
 /// Adapt a Caddyfile string to Caddy JSON, resolving file/glob imports relative to `source`.
 pub fn adapt_with_source(
     input: &str,
     source: Option<&std::path::Path>,
+) -> caddy_rs_core::Result<AdaptedConfig> {
+    adapt_with_options(input, source, AdaptOptions::default())
+}
+
+/// Adapt a Caddyfile string to Caddy JSON with explicit [`AdaptOptions`].
+pub fn adapt_with_options(
+    input: &str,
+    source: Option<&std::path::Path>,
+    adapt_options: AdaptOptions,
 ) -> caddy_rs_core::Result<AdaptedConfig> {
     if input.trim().is_empty() {
         return Err(adapter_error(
@@ -885,6 +1047,15 @@ pub fn adapt_with_source(
     let http_port = options.http_port.unwrap_or(80);
     let https_port = options.https_port.unwrap_or(443);
     let mut warnings = options.warnings.clone();
+
+    // Deprecated spellings anywhere in the file (sites and named routes) are accepted, warned
+    // about or rejected according to the adapt mode, before any route is built.
+    for site in &file.sites {
+        check_deprecated_directives(&site.directives, adapt_options.mode, &mut warnings)?;
+    }
+    for named in &file.named_routes {
+        check_deprecated_directives(&named.directives, adapt_options.mode, &mut warnings)?;
+    }
 
     // Parse each block's `tls` directive once; the adapter builds routes and the TLS app from it.
     let site_tls: Vec<Option<SiteTls>> = file
@@ -6019,6 +6190,8 @@ fn build_handlers(
         "forward_auth" => vec![forward_auth_handler(directive, args)?],
         "invoke" => vec![invoke_handler(args, directive.position.clone())?],
         "vars" => vec![vars_handler(directive, args)?],
+        // `skip_log` is the deprecated spelling of `log_skip`; both emit the same `vars` handler.
+        "log_skip" | "skip_log" => vec![log_skip_handler(directive, args)?],
         "map" => vec![map_handler(directive, args)?],
         "error" => vec![error_handler(directive, args)?],
         "copy_response" => vec![copy_response_handler(directive, args)?],
@@ -6558,6 +6731,34 @@ fn scalar_json(text: &str) -> Value {
         return json!(false);
     }
     json!(text)
+}
+
+/// `log_skip` keeps a request out of the access log by setting the `log_skip` request variable.
+///
+/// Caddy v2.11.9's `parseLogSkip` accepts only an optional matcher and no block; there is no
+/// `http.handlers.log_skip` module, so the emitted handler is the generic `vars` handler
+/// (`{"handler":"vars","log_skip":true}`). The runtime checks that variable when it renders the
+/// access entry, after the whole handler chain has run.
+fn log_skip_handler(directive: &Directive, args: &[String]) -> caddy_rs_core::Result<Value> {
+    if let Some(extra) = args.first() {
+        return Err(adapter_error(
+            directive.position.clone(),
+            format!(
+                "directive `{}` takes no arguments (unexpected `{extra}`); only an optional \
+                 matcher is accepted",
+                directive.name
+            ),
+        ));
+    }
+    if let Some(first) = directive.block.first() {
+        // Caddy's `h.NextBlock` advances into the block before reporting the error, so the
+        // location is the first block token rather than the directive line.
+        return Err(adapter_error(
+            first.position.clone(),
+            "log_skip directive does not accept blocks",
+        ));
+    }
+    Ok(json!({"handler": "vars", "log_skip": true}))
 }
 
 /// Caddy's `http.handlers.map` handler: map the placeholder in `source` through the block's
