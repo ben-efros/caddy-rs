@@ -49,8 +49,13 @@ fn free_port() -> u16 {
             .local_addr()
             .expect("local addr")
             .port();
+        // The runtime binds this number for TCP *and* QUIC/UDP, so a port that only looks free on
+        // TCP can still collide with another process's UDP socket (a parallel test binary, or a
+        // QUIC endpoint left by an earlier run). Probe both protocols; the UDP probe is closed
+        // immediately, but it removes the case where a UDP port was never checked at all.
+        let udp_free = std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok();
         let mut guard = issued.lock().expect("port registry");
-        if guard.insert(port) {
+        if udp_free && guard.insert(port) {
             return port;
         }
     }
