@@ -70,6 +70,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "caddy-rs-pm-runtime"
+version = "0.1.0"
+dependencies = [
+ "caddy-rs-pm-compiler",
+ "caddy-rs-pm-config",
+ "caddy-rs-pm-core",
+ "caddy-rs-pm-hosts",
+ "caddy-rs-pm-policies",
+ "caddy-rs-pm-service",
+ "caddy-rs-pm-state",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "caddy-rs-pm-service"
 version = "0.1.0"
 dependencies = [
