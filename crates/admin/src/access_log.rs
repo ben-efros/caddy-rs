@@ -3308,6 +3308,28 @@ mod tests {
     // ---- T-ADMIN-049: named captures, word boundaries and mixed expansion ----------------------
 
     #[test]
+    fn regexp_filter_malformed_reference_parsing() {
+        // Divergences from Go's `Regexp.ReplaceAllString` for malformed references, with pattern
+        // `(a)` and input `a`. Go gives "", "", "${}", "${a b}" and "" respectively (U+00E9 counts
+        // as a Unicode reference name for Go); caddy-rs expands the numeric forms to group 1,
+        // drops the empty/space-containing braces, and leaves `$<letter>` literal. Registered as
+        // the DIV-0015 reference-parsing residual, so this asserts our side rather than Go's.
+        for (template, ours) in [
+            ("$01", "a"),
+            ("${01}", "a"),
+            ("${}", ""),
+            ("${a b}", ""),
+            ("$\u{e9}", "$\u{e9}"),
+        ] {
+            assert_eq!(
+                regexp_replace_all("(a)", template, "a"),
+                ours,
+                "caddy-rs expansion of `{template}` changed; see the DIV-0015 residual table"
+            );
+        }
+    }
+
+    #[test]
     fn regexp_filter_named_captures_match_go() {
         // Caddy's `regexp` filter calls Go's `Regexp.ReplaceAllString`, so the replacement
         // expansion below is the reference behaviour. Every expected value was computed with the

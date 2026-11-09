@@ -4,7 +4,7 @@ The normative divergence register lives in the program repository
 (`docs/compatibility/BEHAVIOR-DIVERGENCES.md`), which is read-only for implementation tasks. DIV-0015
 currently describes only the routing `path_regexp` matcher/rewrite. This note extends the entry's
 scope to the admin access-log `regexp`/`multi_regexp` filters, which delegate to the same shared
-`caddy-rs-core` regex wrapper and therefore share its Go-compatible replacement expansion. The exact
+`caddy-rs-core` regex wrapper and therefore share its replacement expansion (Go-compatible for well-formed ASCII references). The exact
 sentence for the Lead to merge is at the bottom.
 
 ## Oracle verification (Go 1.26.4)
@@ -77,7 +77,8 @@ configuration and this task changes no accepted configuration or emitted JSON.
 ### Reference-parsing residuals (verified against Go 1.26.4)
 
 For pattern `(a)` and input `a`, Go's `Regexp.ReplaceAllString` and caddy-rs disagree on
-malformed references:
+malformed references. "Well-formed" means ASCII `$N`/`${N}`/`$name`/`${name}` references; Go
+also accepts Unicode letters in a reference name, which is one of the divergences below.
 
 | template | Go | caddy-rs |
 |---|---|---|
@@ -85,7 +86,7 @@ malformed references:
 | `${01}` | `` (empty) | `a` |
 | `${}` | `${}` | `` (empty) |
 | `${a b}` | `${a b}` | `` (empty) |
-| `$é` | `$é` | `$é` (literal, as Go) |
+| `$é` | `` (empty) | `$é` |
 
-These are registered as part of the DIV-0015 reference-parsing residual; well-formed `$N`,
-`${N}`, `$name` and `${name}` references match Go (26/27 oracle cases).
+These are registered as part of the DIV-0015 reference-parsing residual and asserted by
+`regexp_filter_malformed_reference_parsing` (caddy-rs side).
