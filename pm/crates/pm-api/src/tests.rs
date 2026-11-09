@@ -1579,6 +1579,25 @@ async fn failed_apply_returns_503_and_records_a_failed_revision() {
 }
 
 #[tokio::test]
+async fn failed_apply_leaves_the_uploaded_certificate_pending() {
+    let (_dir, server, admin) = server_with_apply();
+    let upload = server
+        .post("/api/v1/certificates/custom")
+        .json(&manual_body(&["manual.example.com"]))
+        .await;
+    assert_eq!(upload.status_code(), StatusCode::CREATED);
+    admin.fail(true);
+
+    let response = server.post("/api/v1/config/apply").await;
+    assert_eq!(response.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let detail = server.get("/api/v1/certificates/custom/1").await;
+    assert_eq!(detail.status_code(), StatusCode::OK);
+    let body: serde_json::Value = detail.json();
+    assert_eq!(body["status"], "pending");
+}
+
+#[tokio::test]
 async fn successful_apply_marks_the_uploaded_certificate_issued() {
     let (_dir, server, admin) = server_with_apply();
     let upload = server

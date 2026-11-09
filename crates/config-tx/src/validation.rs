@@ -125,6 +125,44 @@ fn validate_http_app(value: &Value, path: &str) -> Result<(), ConfigStructureErr
     Ok(())
 }
 
+/// JSON fields of caddyhttp.Server in the pinned Caddy v2.11.9 oracle.
+const SERVER_KEYS: &[&str] = &[
+    "allow_0rtt",
+    "automatic_https",
+    "client_ip_headers",
+    "enable_full_duplex",
+    "errors",
+    "expected_dot_headers",
+    "expected_underscore_headers",
+    "idle_timeout",
+    "keepalive_count",
+    "keepalive_idle",
+    "keepalive_interval",
+    "listen",
+    "listen_protocols",
+    "listener_wrappers",
+    "logs",
+    "max_header_bytes",
+    "max_write_chunk",
+    "metrics",
+    "named_routes",
+    "packet_conn_wrappers",
+    "protocols",
+    "read_header_timeout",
+    "read_idle_timeout",
+    "read_min_rate",
+    "read_timeout",
+    "routes",
+    "strict_sni_host",
+    "tls_connection_policies",
+    "trusted_proxies",
+    "trusted_proxies_strict",
+    "trusted_proxies_unix",
+    "write_idle_timeout",
+    "write_min_rate",
+    "write_timeout",
+];
+
 /// Validate a server configuration.
 fn validate_server(value: &Value, path: &str) -> Result<(), ConfigStructureError> {
     let obj = value.as_object().ok_or_else(|| ConfigStructureError {
@@ -133,37 +171,10 @@ fn validate_server(value: &Value, path: &str) -> Result<(), ConfigStructureError
     })?;
 
     // Mirror caddyhttp.Server in the pinned Caddy oracle. Keep this exact: accepting a key Caddy
-    // rejects would make staging pass and the later `/load` fail.
-    let known_keys = [
-        "listen",
-        "listener_wrappers",
-        "packet_conn_wrappers",
-        "read_timeout",
-        "read_header_timeout",
-        "read_idle_timeout",
-        "read_min_rate",
-        "write_timeout",
-        "write_idle_timeout",
-        "write_min_rate",
-        "max_write_chunk",
-        "idle_timeout",
-        "keepalive_interval",
-        "keepalive_idle",
-        "keepalive_count",
-        "max_header_bytes",
-        "enable_full_duplex",
-        "expected_underscore_headers",
-        "expected_dot_headers",
-        "routes",
-        "errors",
-        "named_routes",
-        "tls_connection_policies",
-        "automatic_https",
-        "strict_sni_host",
-    ];
-
+    // rejects would make staging pass and the later `/load` fail; omitting a real field would
+    // reject a document Caddy accepts.
     for key in obj.keys() {
-        if !known_keys.contains(&key.as_str()) {
+        if !SERVER_KEYS.contains(&key.as_str()) {
             return Err(ConfigStructureError {
                 path: format!("{}.{}", path, key),
                 message: format!("unknown server key: {}", key),
@@ -440,6 +451,25 @@ mod tests {
             }
         });
         assert!(validate_config_structure(&config).is_ok());
+    }
+
+    #[test]
+    fn test_server_accepts_every_pinned_caddy_server_field() {
+        for field in SERVER_KEYS {
+            let mut server = serde_json::Map::new();
+            server.insert((*field).to_string(), json!({}));
+            let config = json!({
+                "apps": {
+                    "http": {
+                        "servers": {
+                            "pm": serde_json::Value::Object(server)
+                        }
+                    }
+                }
+            });
+            validate_config_structure(&config)
+                .unwrap_or_else(|error| panic!("field {field} rejected: {error:?}"));
+        }
     }
 
     #[test]

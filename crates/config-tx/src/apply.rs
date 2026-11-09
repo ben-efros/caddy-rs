@@ -101,9 +101,11 @@ impl<S: RevisionStore + RevisionStoreExt> ConfigApplyPipeline<S> {
             });
         }
         let previous = self.tx.active_generation();
+        let diff = self.tx.diff();
         let changed = previous
             .as_ref()
-            .is_none_or(|active| active.config != config);
+            .is_none_or(|active| active.config != config)
+            || diff.as_ref().is_some_and(|diff| !diff.is_empty());
         let baseline = match target.current().await {
             Ok(baseline) => baseline,
             Err(error) => {
@@ -324,7 +326,7 @@ mod tests {
         let target = FakeTarget::new(serde_json::json!({}));
         let pipeline = ConfigApplyPipeline::new(InMemoryRevisionStore::new());
         let first = serde_json::json!({"apps": {"http": {"servers": {"one": {}}}}});
-        pipeline.apply(first, &target).await.expect("first");
+        pipeline.apply(first.clone(), &target).await.expect("first");
         target.set_fail(true);
         let second = serde_json::json!({"apps": {"http": {"servers": {"two": {}}}}});
         let failure = pipeline
@@ -339,6 +341,7 @@ mod tests {
             pipeline.tx().active_generation().expect("active").revision,
             1
         );
+        assert_eq!(*target.current.lock().unwrap(), first);
         assert!(failure.changed);
     }
 
@@ -352,5 +355,6 @@ mod tests {
             .expect_err("invalid app");
         assert!(matches!(failure.kind, ApplyFailureKind::Transaction(_)));
         assert_eq!(target.loads(), 0);
+        assert_eq!(pipeline.tx().history(10, 0).len(), 1);
     }
 }

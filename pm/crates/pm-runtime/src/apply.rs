@@ -458,6 +458,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn durable_revisions_survive_a_runtime_reopen() {
+        let (dir, service, admin) = service();
+        service.apply().await.expect("apply");
+        drop(service);
+
+        let runtime =
+            PmRuntime::open(crate::RuntimeConfig::new(dir.path().join("data"))).expect("reopen");
+        let reopened = ConfigApplyService::new(runtime, Arc::new(admin), ConfigSettings::default());
+        let revisions = reopened.revisions().expect("revisions");
+        assert_eq!(revisions.len(), 1);
+        assert_eq!(revisions[0].status, ConfigApplyStatus::Applied);
+    }
+
+    #[tokio::test]
     async fn failed_load_keeps_the_previous_generation_and_records_failure() {
         let (_dir, service, admin) = service();
         service.apply().await.expect("initial apply");
@@ -495,6 +509,10 @@ mod tests {
         assert!(HttpCaddyAdmin::new("http://user:pass@127.0.0.1:2019", false).is_err());
         assert!(HttpCaddyAdmin::new("https://127.0.0.1:2019", false).is_err());
         assert!(HttpCaddyAdmin::new("http://127.0.0.1:2019/admin", false).is_err());
+        assert!(
+            HttpCaddyAdmin::new("http://127.0.0.1:2019?x=y", false).is_err(),
+            "query strings must not be accepted"
+        );
         assert!(HttpCaddyAdmin::new("http://10.0.0.5:2019", true).is_ok());
     }
 }
@@ -510,6 +528,7 @@ mod http_tests {
     };
     use serde_json::json;
     use std::sync::Mutex as StdMutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     type Sink = Arc<StdMutex<Value>>;
@@ -548,6 +567,74 @@ mod http_tests {
         admin.load(&expected).await.expect("load");
         assert_eq!(*sink.lock().unwrap(), expected);
         assert_eq!(admin.current().await.expect("current"), expected);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn http_admin_does_not_follow_admin_redirects() {
+        async fn redirect_current() -> axum::response::Redirect {
+            axum::response::Redirect::temporary("/followed")
+        }
+        async fn followed(AxumState(sink): AxumState<Sink>) -> AxumJson<Value> {
+            *sink.lock().unwrap() = json!({"followed": true});
+            AxumJson(json!({}))
+        }
+
+        let sink: Sink = Arc::new(StdMutex::new(json!({})));
+        let app = Router::new()
+            .route("/config/", axum_get(redirect_current))
+            .route("/followed", axum_get(followed))
+            .with_state(Arc::clone(&sink));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let admin = HttpCaddyAdmin::new(&format!("http://{address}"), false).expect("client");
+        assert!(matches!(admin.current().await, Err(AdminError::Http(307))));
+        assert_eq!(
+            *sink.lock().unwrap(),
+            json!({}),
+            "redirect was not followed"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn http_admin_rejects_an_oversized_chunked_config_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n",
+                )
+                .await
+                .expect("headers");
+            let chunk = vec![b'x'; 8192];
+            let prefix = format!("{:x}\r\n", chunk.len());
+            let mut sent = 0;
+            while sent <= MAX_ADMIN_RESPONSE_BYTES {
+                if socket.write_all(prefix.as_bytes()).await.is_err()
+                    || socket.write_all(&chunk).await.is_err()
+                    || socket.write_all(b"\r\n").await.is_err()
+                {
+                    return;
+                }
+                sent += chunk.len();
+            }
+            let _ = socket.write_all(b"0\r\n\r\n").await;
+        });
+
+        let admin = HttpCaddyAdmin::new(&format!("http://{address}"), false).expect("client");
+        assert!(matches!(
+            admin.current().await,
+            Err(AdminError::ResponseTooLarge)
+        ));
         server.abort();
     }
 
