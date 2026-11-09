@@ -2,6 +2,14 @@
 #
 # Every ignore below is an explicit, reviewable decision with a reason and a tracking task; the
 # default posture is to upgrade rather than ignore. Run `cargo audit` after changing this file.
+#
+# The workflow runs cargo-audit 0.22.2 with `--deny warnings`, so informational advisories
+# (unmaintained, unsound, yanked) gate exactly like vulnerabilities. That is deliberate: without
+# `--deny warnings` cargo-audit exits 0 on warnings, so a dependency that becomes unmaintained is
+# only printed to the log and can never block a merge. Gating turns every new warning into a
+# decision -- upgrade, or accept it here with a reason. Advisory-database churn is not a reason to
+# leave warnings advisory: if the database adds a warning, the job fails and the decision is made
+# in review rather than silently inherited.
 
 [advisories]
 ignore = [
@@ -16,6 +24,11 @@ ignore = [
   # Upgrading to the fixed releases (>=48) is a major API change tracked by T-PLUG-030; until
   # then enabling the feature is documented as experimental and not for untrusted plugins.
   "RUSTSEC-2025-0118",
+  # --- fxhash 0.2.1 (RUSTSEC-2025-0057, unmaintained): transitive through
+  # fxprof-processed-profile via Wasmtime 34, so it is unreachable exactly like the advisories
+  # above (the `wasm-runtime` feature is off by default). The crate has no maintained or patched
+  # release; it disappears with the Wasmtime upgrade tracked by T-PLUG-030.
+  "RUSTSEC-2025-0057",
   "RUSTSEC-2026-0006",
   "RUSTSEC-2026-0020",
   "RUSTSEC-2026-0021",

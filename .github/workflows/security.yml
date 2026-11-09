@@ -21,13 +21,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # A prebuilt binary keeps the job short; the gate itself is `cargo audit`'s exit status.
+      # The version is pinned: the action resolves its own default otherwise, so the gate could
+      # start failing (or silently stop failing) on a tool upgrade nobody reviewed. 0.22.2 is the
+      # version this policy was verified against; bump it together with `.cargo/audit.toml` when
+      # adopting a new cargo-audit.
       - name: Install cargo-audit
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-audit
+          tool: cargo-audit@0.22.2
       # The policy (accepted advisories with reasons) lives in .cargo/audit.toml, so the exit code
-      # is the whole decision. This replaced rustsec/audit-check, which failed with
+      # is the whole decision. `--deny warnings` makes informational advisories (unmaintained,
+      # unsound, yanked) gate too, so accepting one is a reviewed policy entry rather than log
+      # noise. This replaced rustsec/audit-check, which failed with
       # "Not Found ... checks/runs#update-a-check-run" after a clean audit because it tries to update
       # a check run it did not create in this run.
       - name: RustSec advisory check
-        run: cargo audit --file Cargo.lock
+        run: cargo audit --file Cargo.lock --deny warnings
