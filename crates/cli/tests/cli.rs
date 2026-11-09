@@ -572,10 +572,18 @@ fn run_honours_admin_config_persist_false_and_does_not_autosave() {
         !autosave.exists(),
         "admin.config.persist=false must suppress autosave"
     );
-    let stderr = std::fs::read_to_string(&log).unwrap_or_default();
+    // The message is written by the run loop after the admin listener is up, so asserting on a
+    // single read races it (CI failed here while the same test passed locally). Wait for it, then
+    // report the whole log on timeout.
+    let announced = wait_until(Duration::from_secs(5), || {
+        std::fs::read_to_string(&log)
+            .map(|stderr| stderr.contains("config persistence disabled"))
+            .unwrap_or(false)
+    });
     assert!(
-        stderr.contains("config persistence disabled"),
-        "stderr must announce the persistence opt-out:\n{stderr}"
+        announced,
+        "stderr must announce the persistence opt-out:\n{}",
+        std::fs::read_to_string(&log).unwrap_or_default()
     );
 
     assert_eq!(admin_post_stop(admin_port), 200, "POST /stop returns 200");
