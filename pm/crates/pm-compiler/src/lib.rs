@@ -146,10 +146,17 @@ fn host_handle(host: &Host, on_https: bool) -> Result<Vec<Value>, CompileError> 
                     }
                 }));
             }
-            handle.push(json!({
+            let mut proxy = json!({
                 "handler": "reverse_proxy",
                 "upstreams": [{ "dial": spec.upstream.dial() }]
-            }));
+            });
+            if spec.upstream.scheme == caddy_rs_pm_core::UpstreamScheme::Https {
+                proxy["transport"] = json!({
+                    "protocol": "http",
+                    "tls": {}
+                });
+            }
+            handle.push(proxy);
         }
         HostSpec::Redirect(spec) => {
             let scheme = spec.scheme.as_caddy_placeholder();
@@ -250,7 +257,7 @@ mod tests {
                 "match": [{ "host": ["example.com"] }],
                 "handle": [{
                     "handler": "reverse_proxy",
-                    "upstreams": [{ "dial": "http://10.0.0.5:8080" }]
+                    "upstreams": [{ "dial": "10.0.0.5:8080" }]
                 }]
             })
         );
@@ -269,7 +276,7 @@ mod tests {
         );
         assert_eq!(
             compiled.https[0]["handle"][0]["upstreams"][0]["dial"],
-            "http://10.0.0.5:8080"
+            "10.0.0.5:8080"
         );
     }
 

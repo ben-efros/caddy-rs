@@ -725,14 +725,15 @@ impl Upstream {
         Ok(())
     }
 
-    /// The Caddy `dial` form: `scheme://host:port`, with IPv6 literals bracketed.
+    /// The Caddy `dial` form: `host:port` with IPv6 literals bracketed. The scheme is not part of
+    /// `dial` in Caddy JSON; HTTPS upstreams select TLS through `reverse_proxy.transport`.
     pub fn dial(&self) -> String {
         let host = if self.host.contains(':') && !self.host.starts_with('[') {
             format!("[{}]", self.host)
         } else {
             self.host.clone()
         };
-        format!("{}://{}:{}", self.scheme.as_str(), host, self.port)
+        format!("{}:{}", host, self.port)
     }
 }
 
@@ -1535,11 +1536,11 @@ mod tests {
     fn ipv6_upstream_is_bracketed_in_dial_and_validated() {
         let upstream = Upstream::new(UpstreamScheme::Https, "2001:db8::5", 8443);
         upstream.validate().expect("valid IPv6");
-        assert_eq!(upstream.dial(), "https://[2001:db8::5]:8443");
+        assert_eq!(upstream.dial(), "[2001:db8::5]:8443");
 
         let upstream = Upstream::new(UpstreamScheme::Https, "[2001:db8::5]", 8443);
         upstream.validate().expect("bracketed IPv6");
-        assert_eq!(upstream.dial(), "https://[2001:db8::5]:8443");
+        assert_eq!(upstream.dial(), "[2001:db8::5]:8443");
 
         let upstream = Upstream::new(UpstreamScheme::Http, "not:ipv6", 8080);
         assert!(upstream.validate().is_err());
