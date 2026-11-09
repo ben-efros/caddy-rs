@@ -20,7 +20,8 @@ mod validation;
 
 pub use diff::{Diff, DiffKind};
 pub use revision_store::{
-    InMemoryRevisionStore, PersistentRevisionStore, RevisionRecord, RevisionStore, RevisionStoreExt,
+    InMemoryRevisionStore, PersistentRevisionStore, RevisionRecord, RevisionStore,
+    RevisionStoreError, RevisionStoreExt,
 };
 pub use validation::{validate_config_structure, ConfigStructureError};
 
@@ -244,14 +245,17 @@ impl<S: RevisionStore + RevisionStoreExt> ConfigTx<S> {
         // Re-check structure on apply: stage is the normal validation point, but `StagedConfig` is
         // public and a caller can construct one directly.
         if let Err(error) = validate_config_structure(&staged.config) {
-            let active = self.active_generation.read().unwrap();
+            // Hold the write lock through recording: revision allocation and the audit write must
+            // be one critical section, otherwise two failed attempts can pick the same number and
+            // the BTreeMap record store silently overwrites one.
+            let active = self.active_generation.write().unwrap();
             let revision = self.next_revision(active.as_ref());
-            drop(active);
             self.record_failure(
                 revision,
                 &staged,
                 format!("Validation: {} at {}", error.message, error.path),
             )?;
+            drop(active);
             return Err(TxError::validation(error.path, error.message));
         }
 
@@ -270,7 +274,8 @@ impl<S: RevisionStore + RevisionStoreExt> ConfigTx<S> {
             };
             if active.etag() != expected {
                 let actual = active.etag();
-                drop(active_guard);
+                // Keep `active_guard` held until the failed record is durable: releasing it here
+                // lets a concurrent apply allocate the same revision and overwrite this record.
                 self.record_failure(
                     revision,
                     &staged,
@@ -852,5 +857,49 @@ mod tests {
         tx2.stage(valid_config()).unwrap();
         let next = tx2.apply(None).unwrap();
         assert_eq!(next.revision, 2);
+    }
+
+    #[test]
+    fn concurrent_failed_applies_hold_unique_revisions() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let tx = Arc::new(ConfigTx::new(InMemoryRevisionStore::new()));
+        tx.stage(valid_config()).unwrap();
+        tx.apply(None).unwrap();
+        // A successful apply consumes the staged document; stage again for the failing attempts.
+        tx.stage(valid_config()).unwrap();
+
+        let barrier = Arc::new(Barrier::new(8));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let tx = Arc::clone(&tx);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..25 {
+                    let error = tx
+                        .apply(Some("W/\"999\"".to_string()))
+                        .expect_err("stale precondition");
+                    assert!(matches!(error, TxError::PreconditionFailed { .. }));
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("worker");
+        }
+
+        let history = tx.history(1000, 0);
+        assert_eq!(history.len(), 201, "one applied + 200 failed records");
+        let mut revisions: Vec<u64> = history.iter().map(|record| record.revision).collect();
+        revisions.sort_unstable();
+        assert_eq!(revisions, (1..=201).collect::<Vec<_>>());
+        assert_eq!(
+            history
+                .iter()
+                .filter(|record| record.status == RevisionStatus::Failed)
+                .count(),
+            200
+        );
     }
 }

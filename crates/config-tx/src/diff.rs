@@ -89,7 +89,108 @@ pub fn compute_diff(old: &Value, new: &Value) -> Diff {
     // Also diff top-level structure for non-route changes
     diff_values(&mut changes, "", old, new);
 
+    // Routes without an @id are not covered by the keyed pass. Emit them explicitly so an unkeyed
+    // route edit cannot silently produce an empty diff.
+    diff_unkeyed_routes(&mut changes, old, new);
+
     Diff { changes }
+}
+
+fn route_id(route: &Value) -> Option<&str> {
+    route.get("@id").and_then(Value::as_str)
+}
+
+fn server_routes(config: &Value) -> HashMap<&str, &Vec<Value>> {
+    let mut routes = HashMap::new();
+    if let Some(servers) = config
+        .get("apps")
+        .and_then(|apps| apps.get("http"))
+        .and_then(|http| http.get("servers"))
+        .and_then(Value::as_object)
+    {
+        for (name, server) in servers {
+            if let Some(array) = server.get("routes").and_then(Value::as_array) {
+                routes.insert(name.as_str(), array);
+            }
+        }
+    }
+    routes
+}
+
+fn diff_unkeyed_routes(changes: &mut Vec<DiffChange>, old: &Value, new: &Value) {
+    let old_servers = server_routes(old);
+    let new_servers = server_routes(new);
+    let mut names: Vec<&str> = old_servers
+        .keys()
+        .chain(new_servers.keys())
+        .copied()
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+
+    for name in names {
+        let old_routes = old_servers.get(name).copied();
+        let new_routes = new_servers.get(name).copied();
+        let length = old_routes
+            .map_or(0, Vec::len)
+            .max(new_routes.map_or(0, Vec::len));
+        for index in 0..length {
+            let old_route = old_routes.and_then(|routes| routes.get(index));
+            let new_route = new_routes.and_then(|routes| routes.get(index));
+            let path = format!("apps.http.servers.{name}.routes[{index}]");
+
+            match (old_route, new_route) {
+                (Some(old_route), Some(new_route)) => {
+                    match (route_id(old_route), route_id(new_route)) {
+                        // Both keyed: the keyed pass owns this change.
+                        (Some(_), Some(_)) => {}
+                        (None, None) if old_route == new_route => {}
+                        (None, None) => changes.push(DiffChange {
+                            kind: DiffKind::Modified,
+                            route_id: None,
+                            path,
+                            old_value: Some(old_route.clone()),
+                            new_value: Some(new_route.clone()),
+                        }),
+                        // One side is keyed and therefore already reported as added/removed.
+                        (None, Some(_)) => changes.push(DiffChange {
+                            kind: DiffKind::Removed,
+                            route_id: None,
+                            path,
+                            old_value: Some(old_route.clone()),
+                            new_value: None,
+                        }),
+                        (Some(_), None) => changes.push(DiffChange {
+                            kind: DiffKind::Added,
+                            route_id: None,
+                            path,
+                            old_value: None,
+                            new_value: Some(new_route.clone()),
+                        }),
+                    }
+                }
+                (Some(old_route), None) if route_id(old_route).is_none() => {
+                    changes.push(DiffChange {
+                        kind: DiffKind::Removed,
+                        route_id: None,
+                        path,
+                        old_value: Some(old_route.clone()),
+                        new_value: None,
+                    });
+                }
+                (None, Some(new_route)) if route_id(new_route).is_none() => {
+                    changes.push(DiffChange {
+                        kind: DiffKind::Added,
+                        route_id: None,
+                        path,
+                        old_value: None,
+                        new_value: Some(new_route.clone()),
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 /// Extract routes from a config, keyed by @id.
@@ -285,6 +386,43 @@ mod tests {
             .collect();
         assert_eq!(removed.len(), 1);
         assert_eq!(removed[0].route_id, Some("host2".to_string()));
+    }
+
+    #[test]
+    fn test_compute_diff_modified_route_without_id() {
+        let old = json!({
+            "apps": {
+                "http": {
+                    "servers": {
+                        "srv0": {
+                            "routes": [
+                                {"handle": [{"handler": "static_response", "body": "Hello"}]}
+                            ]
+                        }
+                    }
+                }
+            }
+        });
+        let new = json!({
+            "apps": {
+                "http": {
+                    "servers": {
+                        "srv0": {
+                            "routes": [
+                                {"handle": [{"handler": "static_response", "body": "World"}]}
+                            ]
+                        }
+                    }
+                }
+            }
+        });
+
+        let diff = compute_diff(&old, &new);
+        assert_eq!(diff.changes.len(), 1, "unkeyed edit must produce one entry");
+        let change = &diff.changes[0];
+        assert_eq!(change.kind, DiffKind::Modified);
+        assert_eq!(change.route_id, None);
+        assert_eq!(change.path, "apps.http.servers.srv0.routes[0]");
     }
 
     #[test]
