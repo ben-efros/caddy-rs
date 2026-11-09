@@ -53,6 +53,43 @@ pub(crate) fn generate(shell: &str) -> Result<String> {
     Ok(script)
 }
 
+/// Dispatch the `completion` argument vector.
+///
+/// The command deliberately keeps a single positional vector instead of clap subcommands: Caddy
+/// accepts `completion <shell>` positionally, and the existing "invalid argument ... for
+/// \"caddy-rs completion\"" message for an unknown shell must survive. `install`, `uninstall` and
+/// `status` are reserved action words in the same position.
+pub(crate) fn dispatch(arguments: &[String], shells: &[String], dry_run: bool) -> Result<()> {
+    match arguments {
+        [action] if action == "install" => crate::completion_install::install(shells, dry_run),
+        [action] if action == "uninstall" => crate::completion_install::uninstall(shells, dry_run),
+        [action] if action == "status" => {
+            if !shells.is_empty() {
+                bail!("`completion status` does not accept --shell; it reports every shell");
+            }
+            if dry_run {
+                bail!("`completion status` does not accept --dry-run; it never writes");
+            }
+            crate::completion_install::status()
+        }
+        [shell] => {
+            if !shells.is_empty() {
+                bail!(
+                    "`--shell` is only valid with `completion install` or `completion uninstall`"
+                );
+            }
+            if dry_run {
+                bail!(
+                    "`--dry-run` is only valid with `completion install` or `completion uninstall`"
+                );
+            }
+            print!("{}", generate(shell)?);
+            Ok(())
+        }
+        arguments => bail!("accepts 1 arg(s), received {}", arguments.len()),
+    }
+}
+
 fn collect(command: &clap::Command, path: Vec<String>) -> CommandSpec {
     let mut options = Vec::new();
     let mut positionals = Vec::new();
@@ -103,7 +140,11 @@ fn collect(command: &clap::Command, path: Vec<String>) -> CommandSpec {
     if path == ["completion"] {
         if let Some(positional) = positionals.first_mut() {
             if positional.values.is_empty() {
-                positional.values = SHELLS.iter().map(ToString::to_string).collect();
+                positional.values = SHELLS
+                    .iter()
+                    .map(ToString::to_string)
+                    .chain(["install", "uninstall", "status"].map(String::from))
+                    .collect();
             }
         }
     }
