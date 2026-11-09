@@ -61,7 +61,10 @@
 //!   never dropped.
 //! * [`AccessLogContext`] is the shared per-request carrier for the values only the server and
 //!   handlers can observe (byte counters, user id, upstream attempt, write error, extras), so the
-//!   entry can be rendered after the response body has been streamed.
+//!   entry can be rendered after the response body has been streamed. It also carries Caddy's
+//!   post-routing `log_skip`/`log_name`/`log_level` request variables
+//!   ([`AccessLogContext::set_log_skip`], [`AccessLogContext::set_logger_names`],
+//!   [`AccessLogContext::set_log_level`]) from the `vars` handler to the emission point.
 //!
 //! ## Request correlation and tracing (T-ADMIN-022)
 //!
@@ -564,7 +567,13 @@ impl<'de> Deserialize<'de> for ExtraLogFields {
 /// A server creates one context per request when access logging is enabled, stores it on the
 /// request (or a transport-owned per-request state), lets handlers contribute
 /// (`set_user_id`, `set_upstream`, `add_extra_field`, `set_write_error`) and calls [`apply_to`]
-/// when the response is complete (after [`AccessLogContext::finish`]). All clones share one state.
+/// when the response is complete (after [`AccessLogContext::finish`]). The context also carries
+/// the post-routing access-log decision Caddy reads from the request context: [`set_log_skip`],
+/// [`set_logger_names`] (`log_name`) and [`set_log_level`]. All clones share one state.
+///
+/// [`set_log_skip`]: AccessLogContext::set_log_skip
+/// [`set_logger_names`]: AccessLogContext::set_logger_names
+/// [`set_log_level`]: AccessLogContext::set_log_level
 ///
 /// [`apply_to`]: AccessLogContext::apply_to
 #[derive(Clone, Debug, Default)]
@@ -582,6 +591,13 @@ struct AccessLogContextState {
     write_error: Option<String>,
     /// Caddy's `log_skip` request variable: when true, only the access entry is suppressed.
     log_skip: bool,
+    /// Caddy's `access_logger_names` request variable (`log_name`): the explicit logger names for
+    /// this request. `None` means the variable is unset (or was assigned a non-array value), so
+    /// the server's per-host mapping decides; `Some([])` selects no logger at all.
+    logger_names: Option<Vec<String>>,
+    /// Caddy's `log_level` request variable: the raw value the last assignment stored. Parsed
+    /// leniently at emission time (`DEBUG`..=`ERROR`); `None` keeps the status-derived level.
+    log_level: Option<String>,
     extra_fields: ExtraLogFields,
 }
 
@@ -681,6 +697,36 @@ impl AccessLogContext {
     /// Whether the request is excluded from the access log.
     pub fn log_skip(&self) -> bool {
         self.state().log_skip
+    }
+
+    /// Record Caddy's `access_logger_names` request variable (the `log_name` directive).
+    ///
+    /// Caddy's `ServerLogConfig.wrapLogger` checks this variable after the handler chain and, when
+    /// it holds a JSON array, uses those names for the request instead of the per-host mapping
+    /// (`modules/caddyhttp/logging.go:98-112`). `None` clears a previous assignment: Caddy's type
+    /// assertion only accepts an array, so any other value leaves the per-host mapping in charge.
+    /// An empty list selects no logger, which suppresses the entry exactly like Caddy.
+    pub fn set_logger_names(&self, names: Option<Vec<String>>) {
+        self.state().logger_names = names;
+    }
+
+    /// The explicit per-request logger names, when a valid `access_logger_names` array was set.
+    pub fn logger_names(&self) -> Option<Vec<String>> {
+        self.state().logger_names.clone()
+    }
+
+    /// Record Caddy's `log_level` request variable.
+    ///
+    /// Caddy stores the assignment verbatim and only uses it when the value is a string that
+    /// parses to `DEBUG`..=`ERROR` (`modules/caddyhttp/server.go:1271-1282`). `None` clears a
+    /// previous assignment, which is what a non-string value does at request time.
+    pub fn set_log_level(&self, level: Option<String>) {
+        self.state().log_level = level;
+    }
+
+    /// The raw `log_level` request variable value, when a string assignment was stored.
+    pub fn log_level(&self) -> Option<String> {
+        self.state().log_level.clone()
     }
 
     /// Add an extra top-level field (Caddy's `ExtraLogFields`).
@@ -3786,6 +3832,40 @@ mod tests {
         assert_eq!(value["proxy_attempt"], 2);
         // Headers were not touched by the context.
         assert_eq!(value["resp_headers"]["Content-Type"], json!(["text/plain"]));
+    }
+
+    #[test]
+    fn access_log_context_carries_request_scoped_log_controls() {
+        let context = AccessLogContext::new();
+        assert!(!context.log_skip());
+        assert_eq!(context.logger_names(), None);
+        assert_eq!(context.log_level(), None);
+
+        context.set_log_skip(true);
+        context.set_logger_names(Some(vec!["access".to_string(), "admin".to_string()]));
+        context.set_log_level(Some("WARN".to_string()));
+        assert!(context.log_skip());
+        assert_eq!(
+            context.logger_names(),
+            Some(vec!["access".to_string(), "admin".to_string()])
+        );
+        assert_eq!(context.log_level().as_deref(), Some("WARN"));
+
+        // An explicit empty list is distinct from "unset": it selects no logger at all, while
+        // `None` restores the per-host mapping (Caddy's `GetVar` returns nil only when unset).
+        context.set_logger_names(Some(Vec::new()));
+        assert_eq!(context.logger_names(), Some(Vec::new()));
+        context.set_logger_names(None);
+        assert_eq!(context.logger_names(), None);
+
+        // A non-string assignment clears a previous string value; the raw accepted spelling is
+        // preserved so the emission-time parser (case-insensitive, `DEBUG`..=`ERROR`) decides.
+        context.set_log_level(Some("warn".to_string()));
+        assert_eq!(context.log_level().as_deref(), Some("warn"));
+        context.set_log_level(None);
+        assert_eq!(context.log_level(), None);
+        context.set_log_skip(false);
+        assert!(!context.log_skip());
     }
 
     #[test]

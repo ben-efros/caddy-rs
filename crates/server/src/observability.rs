@@ -24,6 +24,21 @@
 //! sink from the implicit Caddy default would otherwise write every request to stderr even though
 //! the operator never configured access logging.
 //!
+//! ## Request-scoped logging decisions (T-ADMIN-047)
+//!
+//! Caddy reads `log_skip`, `access_logger_names` (`log_name`) and `log_level` from the request
+//! context *after* the handler chain (`modules/caddyhttp/server.go:1246-1282`,
+//! `modules/caddyhttp/logging.go:98-112`). The access-log context attached to the request carries
+//! those decisions (`AccessLogContext::log_skip`/`logger_names`/`log_level`) from the `vars`
+//! handler to [`PendingObservation::finish`], which applies them in Caddy's order:
+//!
+//! * `log_skip == true` returns before any entry is rendered (metrics are already recorded),
+//! * the per-server host policy is evaluated first; a skipped host never logs, exactly because
+//!   Caddy's `shouldLogRequest` gates logging before the handler chain runs,
+//! * otherwise an explicit `access_logger_names` array replaces the host logger mapping,
+//! * a valid `log_level` replaces the status-derived entry level, and every sink's
+//!   `include`/`exclude` rules are applied to the entry's logger name before writing.
+//!
 //! ## Access-log field population (T-ADMIN-045)
 //!
 //! The server creates one `caddy_rs_admin::access_log::AccessLogContext` per request when logging
@@ -114,11 +129,16 @@ impl AccessLogRuntime {
         self.sinks.len()
     }
 
-    /// Emit one access entry to every sink.
+    /// Emit one access entry to every sink whose `include`/`exclude` rules accept its logger.
     ///
+    /// Caddy routes a record by its logger name, so a request-scoped `log_name` selects the
+    /// matching logs (and only those) rather than being broadcast to every configured sink.
     /// Encoding/write failures are logged and counted by the sink; they must never fail a request.
     pub(crate) fn emit(&self, entry: &AccessLogEntry) {
         for built in &self.sinks {
+            if !built.accepts_logger(&entry.logger) {
+                continue;
+            }
             if let Err(error) = built.sink.emit(entry) {
                 eprintln!(
                     "caddy-rs: access log `{}` could not write an entry: {error}",
@@ -668,9 +688,22 @@ impl PendingObservation {
             context.response_bytes().set(response_size);
             context.finish();
         }
-        let AccessLogRoute::Loggers(loggers) = self.policy.route(&snapshot.host) else {
+        // Caddy's `shouldLogRequest` gates logging before the handler chain by host, so a
+        // request-scoped `log_name` cannot rescue a skipped host. When the host is logged, the
+        // explicit `access_logger_names` variable replaces the per-host logger mapping
+        // (`modules/caddyhttp/logging.go:98-112`).
+        let AccessLogRoute::Loggers(host_loggers) = self.policy.route(&snapshot.host) else {
             return;
         };
+        let loggers = self
+            .context
+            .as_ref()
+            .and_then(|context| context.logger_names())
+            .unwrap_or(host_loggers);
+        let log_level = self
+            .context
+            .as_ref()
+            .and_then(|context| context.log_level());
         for component in loggers {
             let mut entry =
                 snapshot.access_entry(self.status, duration, response_size, &self.response_headers);
@@ -683,6 +716,10 @@ impl PendingObservation {
                 entry.write_error = Some(error.to_string());
             }
             entry.logger = logger_name(&component);
+            // Caddy's status-derived level is replaced by a valid `log_level` request variable
+            // (invalid values keep the default), and the sink's configured threshold filters on
+            // the resulting level (`modules/caddyhttp/server.go:1271-1282`).
+            caddy_rs_admin::apply_access_log_level(&mut entry, log_level.as_deref());
             self.access_log.emit(&entry);
         }
     }

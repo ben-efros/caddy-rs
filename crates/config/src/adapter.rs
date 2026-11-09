@@ -27,6 +27,8 @@ const DIRECTIVE_ORDER: &[&str] = &[
     // `skip_log` (deprecated) before `log_skip`.
     "skip_log",
     "log_skip",
+    "log_name",
+    "log_level",
     "header",
     "copy_response_headers",
     "request_body",
@@ -6309,6 +6311,8 @@ fn build_handlers(
         "vars" => vec![vars_handler(directive, args)?],
         // `skip_log` is the deprecated spelling of `log_skip`; both emit the same `vars` handler.
         "log_skip" | "skip_log" => vec![log_skip_handler(directive, args)?],
+        "log_name" => vec![log_name_handler(args)],
+        "log_level" => vec![log_level_handler(directive, args)?],
         "map" => vec![map_handler(directive, args)?],
         "error" => vec![error_handler(directive, args)?],
         "copy_response" => vec![copy_response_handler(directive, args)?],
@@ -6889,6 +6893,73 @@ fn log_skip_handler(directive: &Directive, args: &[String]) -> caddy_rs_core::Re
         ));
     }
     Ok(json!({"handler": "vars", "log_skip": true}))
+}
+
+/// `log_name` overrides the logger(s) the access entry is written to for matching requests.
+///
+/// Caddy's `parseLogName` stores `h.RemainingArgs()` in the `access_logger_names` request
+/// variable (`caddyconfig/httpcaddyfile/builtins.go:1248-1256`), so the emitted config is the
+/// generic `vars` handler carrying a JSON array. With no names `RemainingArgs` returns a nil Go
+/// slice, which serialises as `null`; Caddy's JSON loader stores nil and `wrapLogger` falls back
+/// to the per-host mapping, so the runtime treats it the same way. Caddy never calls `NextBlock`
+/// here, so a block is silently ignored (and is not emitted as configuration).
+fn log_name_handler(args: &[String]) -> Value {
+    let names = if args.is_empty() {
+        Value::Null
+    } else {
+        json!(args)
+    };
+    json!({"handler": "vars", "access_logger_names": names})
+}
+
+/// `log_level [<matcher>] <level>` overrides the access-entry level for matching requests.
+///
+/// Caddy's `parseLogLevel` requires exactly one argument (the matcher token is consumed before
+/// the handler is built), rejects blocks, validates the name with `zapcore.ParseLevel` restricted
+/// to `DEBUG`..=`ERROR`, and stores the canonical lower-case spelling in the `log_level` request
+/// variable (`caddyconfig/httpcaddyfile/builtins.go:1258-1286`).
+fn log_level_handler(directive: &Directive, args: &[String]) -> caddy_rs_core::Result<Value> {
+    let [level] = args else {
+        // Caddy's `h.ArgErr()` names the last token it consumed: the directive itself with no
+        // arguments, otherwise the trailing argument.
+        let last = args
+            .last()
+            .cloned()
+            .unwrap_or_else(|| directive.name.clone());
+        return Err(adapter_error(
+            directive.position.clone(),
+            format!("wrong argument count or unexpected line ending after '{last}'"),
+        ));
+    };
+    if let Some(first) = directive.block.first() {
+        // Caddy calls `NextBlock` after validating the argument count, so the location is the
+        // first block token.
+        return Err(adapter_error(
+            first.position.clone(),
+            "log_level directive does not accept blocks",
+        ));
+    }
+    let Some(level) = log_level_value(level) else {
+        return Err(adapter_error(
+            directive.position.clone(),
+            format!("invalid log level \"{level}\": expected DEBUG, INFO, WARN, or ERROR"),
+        ));
+    };
+    Ok(json!({"handler": "vars", "log_level": level}))
+}
+
+/// The canonical lower-case request-variable value for an accepted `log_level` argument.
+///
+/// `zapcore.ParseLevel` lower-cases the text; Caddy then restricts the result to
+/// `DEBUG`..=`ERROR`, so `DPANIC`/`PANIC`/`FATAL` are rejected even though zap parses them.
+fn log_level_value(name: &str) -> Option<&'static str> {
+    Some(match name.to_ascii_lowercase().as_str() {
+        "debug" => "debug",
+        "info" => "info",
+        "warn" => "warn",
+        "error" => "error",
+        _ => return None,
+    })
 }
 
 /// Caddy's `http.handlers.map` handler: map the placeholder in `source` through the block's

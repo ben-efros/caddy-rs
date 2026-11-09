@@ -4146,5 +4146,6 @@ mod tests {
 }
 
 pub use logging_config::{
-    access_log_level, apply_access_log_level, LogLevelOverride, LOG_LEVEL_NAMES, LOG_LEVEL_VAR,
+    access_log_level, apply_access_log_level, LogLevelOverride, ACCESS_LOGGER_NAMES_VAR,
+    LOG_LEVEL_NAMES, LOG_LEVEL_VAR,
 };

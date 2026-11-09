@@ -72,19 +72,29 @@
 //!   (`0`/absent -> 100), `thereafter` (`0`/absent -> 100), matching Caddy's provisioning
 //!   defaults. Negative values and non-integer intervals are rejected.
 //! * `include`/`exclude`: logger-name prefix filters, applied with Caddy's
-//!   `loggerAllowed` semantics to decide whether the log receives `http.log.access`. Caddy's
-//!   provisioning rules for contradictory include/exclude lists are enforced.
+//!   `loggerAllowed` semantics. Caddy's provisioning rules for contradictory include/exclude
+//!   lists are enforced. A log dedicated to a named access logger (`include:
+//!   ["http.log.access.admin"]`) is provisioned even though the base `http.log.access` does not
+//!   match it; [`BuiltAccessLogSink::accepts_logger`] then applies the same rules to each entry's
+//!   logger name, so a request-scoped `log_name` reaches exactly the logs that accept it.
 //!
-//! ## Per-request level override
+//! ## Per-request logging variables
 //!
-//! Caddy's `log_level` Caddyfile directive is not part of the `logging` JSON: it compiles to a
-//! `vars` handler that sets the `log_level` request variable, and the server applies it while
-//! building each access entry. The status default (`INFO`, or `ERROR` for `status >= 500`) is
-//! *replaced* by a valid `DEBUG`/`INFO`/`WARN`/`ERROR` value, which both raises and lowers
-//! verbosity; an absent or invalid variable keeps the default. This module models that override
-//! ([`LOG_LEVEL_VAR`], [`LOG_LEVEL_NAMES`], [`LogLevelOverride`], [`access_log_level`],
-//! [`apply_access_log_level`]) for the server and the Caddyfile adapter; the runtime hook that
-//! captures the request variable lives in the HTTP/server crates.
+//! Caddy's `log_skip`, `log_name` and `log_level` Caddyfile directives are not part of the
+//! `logging` JSON: each compiles to a `vars` handler that stores a request variable, and the
+//! server reads the variables *after* the handler chain while building each access entry.
+//!
+//! * `log_skip`: only the boolean `true` suppresses the entry (metrics and the response are
+//!   unaffected).
+//! * [`ACCESS_LOGGER_NAMES_VAR`] / `log_name`: a JSON array of logger names replaces the server's
+//!   per-host `logger_names` mapping for this request; `""` selects the base logger and an empty
+//!   list selects none. Any other value type leaves the per-host mapping in charge.
+//! * [`LOG_LEVEL_VAR`] / `log_level`: the status default (`INFO`, or `ERROR` for `status >= 500`)
+//!   is *replaced* by a valid `DEBUG`/`INFO`/`WARN`/`ERROR` value, which both raises and lowers
+//!   verbosity; an absent or invalid variable keeps the default. This module models the level
+//!   override ([`LOG_LEVEL_NAMES`], [`LogLevelOverride`], [`access_log_level`],
+//!   [`apply_access_log_level`]); the request-scoped carrier and emission hook live in the
+//!   HTTP/server crates.
 //!
 //! ## Defaults
 //!
@@ -192,6 +202,10 @@ impl std::error::Error for LoggingConfigError {}
 pub struct AccessLogTarget {
     name: String,
     config: AccessLogSinkConfig,
+    /// Caddy's `include` logger-name prefixes: only a logger under one of these is routed here.
+    include: Vec<String>,
+    /// Caddy's `exclude` logger-name prefixes.
+    exclude: Vec<String>,
 }
 
 impl AccessLogTarget {
@@ -203,6 +217,16 @@ impl AccessLogTarget {
     /// The sink configuration derived from the log definition.
     pub fn sink_config(&self) -> &AccessLogSinkConfig {
         &self.config
+    }
+
+    /// Caddy's `include` logger-name prefixes (empty means every logger).
+    pub fn include(&self) -> &[String] {
+        &self.include
+    }
+
+    /// Caddy's `exclude` logger-name prefixes.
+    pub fn exclude(&self) -> &[String] {
+        &self.exclude
     }
 
     /// Build a working sink for this target.
@@ -227,6 +251,22 @@ pub struct BuiltAccessLogSink {
     pub name: String,
     /// Constructed, ready-to-emit sink.
     pub sink: AccessLogSink,
+    /// Caddy's `include` logger-name prefixes (`logging.logs.<name>.include`).
+    pub include: Vec<String>,
+    /// Caddy's `exclude` logger-name prefixes (`logging.logs.<name>.exclude`).
+    pub exclude: Vec<String>,
+}
+
+impl BuiltAccessLogSink {
+    /// Whether this log receives an entry emitted under `logger`.
+    ///
+    /// Caddy evaluates `include`/`exclude` against the *logger name* of every record, so a
+    /// request whose `log_name` selects `http.log.access.admin` is routed to exactly the logs
+    /// that accept that name. caddy-rs has one sink per `logging.logs[]` entry, so the same test
+    /// runs at emission time (`logger_allowed`).
+    pub fn accepts_logger(&self, logger: &str) -> bool {
+        logger_allowed(logger, &self.include, &self.exclude)
+    }
 }
 
 /// Validated access-log targets derived from Caddy's `logging` configuration.
@@ -248,19 +288,22 @@ impl LoggingConfig {
         validate_logging(logging)?;
 
         // Caddy always has a `default` log; custom logs are added on top. Access entries are tee'd
-        // to every log whose include/exclude rules accept the access logger.
+        // to every log whose include/exclude rules accept the logger name: the base access logger
+        // or, for a request-scoped `log_name`, one of its named children.
         let mut effective: BTreeMap<String, CustomLog> = logging.logs.clone();
         effective.entry("default".to_string()).or_default();
 
         let mut targets = Vec::new();
         for (name, log) in &effective {
             validate_custom_log(name, log)?;
-            if !logger_allowed(ACCESS_LOG_LOGGER, &log.include, &log.exclude) {
+            if !access_logger_target_allowed(&log.include, &log.exclude) {
                 continue;
             }
             targets.push(AccessLogTarget {
                 name: name.clone(),
                 config: convert_log(name, log)?,
+                include: log.include.clone(),
+                exclude: log.exclude.clone(),
             });
         }
         // Caddy sets up the default log first, then custom logs in map iteration order; sort the
@@ -324,6 +367,8 @@ impl LoggingConfig {
             built.push(BuiltAccessLogSink {
                 name: target.name.clone(),
                 sink: target.build_sink()?,
+                include: target.include.clone(),
+                exclude: target.exclude.clone(),
             });
         }
         Ok(built)
@@ -442,6 +487,24 @@ fn validate_logger_filters(
         }
     }
     Ok(())
+}
+
+/// Whether a log definition can receive any access-log record.
+///
+/// The base logger test covers the un-named case and every `include` prefix that also covers
+/// `http.log.access`. A `log_name` request emits under `http.log.access.<name>`, so an `include`
+/// that names a descendant namespace (Caddy's own way to dedicate a log to one named access
+/// logger) also keeps the target alive; `logger_allowed` is applied per entry at emission time.
+fn access_logger_target_allowed(include: &[String], exclude: &[String]) -> bool {
+    if logger_allowed(ACCESS_LOG_LOGGER, include, exclude) {
+        return true;
+    }
+    include.iter().any(|namespace| {
+        namespace
+            .strip_prefix(ACCESS_LOG_LOGGER)
+            .is_some_and(|rest| rest.starts_with('.'))
+            && logger_allowed(namespace, include, exclude)
+    })
 }
 
 /// Port of Caddy's `CustomLog.loggerAllowed` for a concrete logger name (`is_module = false`).
@@ -1511,6 +1574,15 @@ fn parse_level(path: &str, level: Option<&str>) -> Result<Option<LogLevel>, Logg
 /// and `INFO` on a `500` logs at INFO.
 pub const LOG_LEVEL_VAR: &str = "log_level";
 
+/// Caddy's request variable for explicit access-logger names (the `log_name` directive).
+///
+/// `caddyhttp.AccessLoggerNameVarKey` is `access_logger_names`
+/// (`modules/caddyhttp/logging.go:311-313`); the `log_name` directive compiles to a `vars`
+/// handler carrying a JSON array of names (`caddyconfig/httpcaddyfile/builtins.go:1248-1256`).
+/// `ServerLogConfig.wrapLogger` uses the array verbatim, with `""` selecting the default logger,
+/// instead of the server's per-host `logger_names` mapping.
+pub const ACCESS_LOGGER_NAMES_VAR: &str = "access_logger_names";
+
 /// The level names Caddy accepts for a `log_level` override, in severity order.
 ///
 /// `zapcore.ParseLevel` also accepts `DPANIC`, `PANIC` and `FATAL`, but both the Caddyfile parser
@@ -1820,6 +1892,53 @@ mod tests {
         let targets = targets_from(&logging);
         let names: Vec<&str> = targets.iter().map(AccessLogTarget::name).collect();
         assert_eq!(names, vec!["default", "access"]);
+    }
+
+    #[test]
+    fn named_access_logger_targets_are_kept_and_route_by_logger_name() {
+        let logging = json!({
+            "logs": {
+                "default": {
+                    "writer": {"output": "discard"},
+                    "exclude": ["http.log.access.admin"]
+                },
+                "admin": {
+                    "writer": {"output": "discard"},
+                    "include": ["http.log.access.admin"]
+                },
+                "admin-api": {
+                    "writer": {"output": "discard"},
+                    "include": ["admin.api"]
+                }
+            }
+        });
+        let config = LoggingConfig::from_json(&logging).expect("map");
+        let names: Vec<&str> = config.targets().iter().map(AccessLogTarget::name).collect();
+        // A log dedicated to a named access logger must stay provisioned; a log for a different
+        // module namespace can never receive access records and is still skipped.
+        assert_eq!(names, vec!["default", "admin"]);
+
+        let sinks = config.build_sinks().expect("build sinks");
+        let default = sinks
+            .iter()
+            .find(|sink| sink.name == "default")
+            .expect("default sink");
+        let admin = sinks
+            .iter()
+            .find(|sink| sink.name == "admin")
+            .expect("admin sink");
+        assert!(default.accepts_logger("http.log.access"));
+        assert!(!default.accepts_logger("http.log.access.admin"));
+        assert!(admin.accepts_logger("http.log.access.admin"));
+        assert!(!admin.accepts_logger("http.log.access"));
+        assert!(!admin.accepts_logger("http.log.access.other"));
+    }
+
+    #[test]
+    fn access_log_control_variable_names_match_caddy() {
+        // `modules/caddyhttp/logging.go:311-313`.
+        assert_eq!(ACCESS_LOGGER_NAMES_VAR, "access_logger_names");
+        assert_eq!(LOG_LEVEL_VAR, "log_level");
     }
 
     #[test]
