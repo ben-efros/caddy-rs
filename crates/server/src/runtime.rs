@@ -475,6 +475,37 @@ impl ServerRuntime {
             generation.config(),
             self.validation_data_root().as_deref(),
         );
+        // Caddy resolves `acme_server.ca` through the PKI app: `local` is provisioned on demand,
+        // every other id has to be declared in `apps.pki.certificate_authorities`. The ACME
+        // server's provision rules also need each authority's intermediate lifetime and whether
+        // the operator supplied that intermediate.
+        let acme_server_authorities: std::collections::BTreeMap<
+            String,
+            caddy_rs_http::router::AcmeServerAuthority,
+        > = generation
+            .config()
+            .pki()
+            .and_then(|pki| pki.certificate_authorities.as_ref())
+            .map(|authorities| {
+                authorities
+                    .iter()
+                    .map(|(id, ca)| {
+                        let intermediate_lifetime = ca
+                            .intermediate_lifetime
+                            .and_then(|nanos| u64::try_from(nanos).ok())
+                            .map(std::time::Duration::from_nanos)
+                            .unwrap_or(caddy_rs_tls::DEFAULT_INTERMEDIATE_LIFETIME);
+                        (
+                            id.clone(),
+                            caddy_rs_http::router::AcmeServerAuthority {
+                                intermediate_lifetime,
+                                operator_intermediate: ca.intermediate.is_some(),
+                            },
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         for (server_name, server) in &http.servers {
             let _limits = ServerLimits::from_http_server(server_name, server)?;
             let _trusted_proxies = parse_server_trusted_proxies(server, server_name)?;
@@ -495,6 +526,7 @@ impl ServerRuntime {
                 server,
                 &status_sink,
                 acme_server_data_root.as_deref(),
+                &acme_server_authorities,
             )?;
             for listen in &server.listen {
                 let parsed = match caddy_rs_core::ListenAddr::parse(listen) {
@@ -1591,6 +1623,10 @@ impl ServerRuntime {
         server: &caddy_rs_core::HttpServer,
         status_sink: &Arc<UpstreamStatusSink>,
         acme_server_data_root: Option<&std::path::Path>,
+        acme_server_authorities: &std::collections::BTreeMap<
+            String,
+            caddy_rs_http::router::AcmeServerAuthority,
+        >,
     ) -> Result<Arc<caddy_rs_http::Router>> {
         let routes_value = serde_json::to_value(&server.routes).map_err(|error| {
             Error::Config(caddy_rs_core::Error::invalid(
@@ -1616,7 +1652,8 @@ impl ServerRuntime {
             .with_custom_handler(handler_factory_with_status_sink(Arc::clone(status_sink)))
             .with_optional_acme_server_data_root(
                 acme_server_data_root.map(std::path::Path::to_path_buf),
-            );
+            )
+            .with_acme_server_authorities(acme_server_authorities.clone());
         let router_builder = router_builder
             .with_error_routes(
                 errors_value.as_ref(),
@@ -1666,6 +1703,37 @@ impl ServerRuntime {
         };
         let http_port = http.http_port.unwrap_or(caddy_rs_tls::DEFAULT_HTTP_PORT);
         let acme_server_data_root = self.acme_server_data_root(generation.config())?;
+        // Caddy resolves `acme_server.ca` through the PKI app: `local` is provisioned on demand,
+        // every other id has to be declared in `apps.pki.certificate_authorities`. The ACME
+        // server's provision rules also need each authority's intermediate lifetime and whether
+        // the operator supplied that intermediate.
+        let acme_server_authorities: std::collections::BTreeMap<
+            String,
+            caddy_rs_http::router::AcmeServerAuthority,
+        > = generation
+            .config()
+            .pki()
+            .and_then(|pki| pki.certificate_authorities.as_ref())
+            .map(|authorities| {
+                authorities
+                    .iter()
+                    .map(|(id, ca)| {
+                        let intermediate_lifetime = ca
+                            .intermediate_lifetime
+                            .and_then(|nanos| u64::try_from(nanos).ok())
+                            .map(std::time::Duration::from_nanos)
+                            .unwrap_or(caddy_rs_tls::DEFAULT_INTERMEDIATE_LIFETIME);
+                        (
+                            id.clone(),
+                            caddy_rs_http::router::AcmeServerAuthority {
+                                intermediate_lifetime,
+                                operator_intermediate: ca.intermediate.is_some(),
+                            },
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         for (server_name, server) in &http.servers {
             let limits = Arc::new(ServerLimits::from_http_server(server_name, server)?);
             let trusted_proxies = parse_server_trusted_proxies(server, server_name)?;
@@ -1687,6 +1755,7 @@ impl ServerRuntime {
                 server,
                 status_sink,
                 acme_server_data_root.as_deref(),
+                &acme_server_authorities,
             )?;
             // HTTP/3 Alt-Svc advertisement (h1/h2 responses only), when this server offers h3 on a
             // concrete UDP port. During the automatic-HTTPS bootstrap phase there is no final

@@ -16,6 +16,7 @@ pub mod cloudflare;
 pub mod digitalocean;
 pub mod dns;
 pub mod dns_providers;
+pub mod go_duration;
 pub mod internal_ca;
 pub mod issuer;
 pub mod ocsp;
@@ -59,6 +60,7 @@ pub use dns::{
 pub use dns_providers::{
     build_dns01_solver, build_dns_provider, DNS_PROVIDER_TRACKING_ID, SUPPORTED_DNS_PROVIDERS,
 };
+pub use go_duration::format_go_duration;
 pub use internal_ca::{
     ca_storage_keys, CaCertificates, CaLifetimes, CaStorage, CaStorageKeys, LocalCa,
     SignedExternalCertificate, DEFAULT_BACKDATE, DEFAULT_CA_DISPLAY_NAME, DEFAULT_CA_ID,
