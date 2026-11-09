@@ -119,6 +119,11 @@ fn extract_routes(config: &Value) -> HashMap<String, Value> {
 
 /// Recursively diff two JSON values.
 fn diff_values(changes: &mut Vec<DiffChange>, path: &str, old: &Value, new: &Value) {
+    // Skip route-level changes as they're handled separately by extract_routes
+    if is_route_path(path) {
+        return;
+    }
+
     match (old, new) {
         (Value::Object(old_map), Value::Object(new_map)) => {
             let all_keys: std::collections::HashSet<_> =
@@ -136,10 +141,7 @@ fn diff_values(changes: &mut Vec<DiffChange>, path: &str, old: &Value, new: &Val
                         diff_values(changes, &new_path, old_val, new_val);
                     }
                     (None, Some(new_val)) => {
-                        // Skip route-level changes as they're handled separately
-                        if !new_path.starts_with("apps.http.servers")
-                            || !new_path.contains(".routes")
-                        {
+                        if !is_route_path(&new_path) {
                             changes.push(DiffChange {
                                 kind: DiffKind::Added,
                                 route_id: None,
@@ -150,7 +152,7 @@ fn diff_values(changes: &mut Vec<DiffChange>, path: &str, old: &Value, new: &Val
                         }
                     }
                     (Some(old_val), None) => {
-                        if !path.starts_with("apps.http.servers") || !path.contains(".routes") {
+                        if !is_route_path(&new_path) {
                             changes.push(DiffChange {
                                 kind: DiffKind::Removed,
                                 route_id: None,
@@ -166,7 +168,8 @@ fn diff_values(changes: &mut Vec<DiffChange>, path: &str, old: &Value, new: &Val
         }
         (Value::Array(old_arr), Value::Array(new_arr)) => {
             // For arrays, do a simple comparison - if different, mark as modified
-            if old_arr != new_arr {
+            // Only if not a routes array
+            if old_arr != new_arr && !is_route_path(path) {
                 changes.push(DiffChange {
                     kind: DiffKind::Modified,
                     route_id: None,
@@ -176,7 +179,7 @@ fn diff_values(changes: &mut Vec<DiffChange>, path: &str, old: &Value, new: &Val
                 });
             }
         }
-        (old_val, new_val) if old_val != new_val => {
+        (old_val, new_val) if old_val != new_val && !is_route_path(path) => {
             changes.push(DiffChange {
                 kind: DiffKind::Modified,
                 route_id: None,
@@ -187,6 +190,14 @@ fn diff_values(changes: &mut Vec<DiffChange>, path: &str, old: &Value, new: &Val
         }
         _ => {}
     }
+}
+
+/// Check if a JSON path is within a routes array (to avoid double-counting route changes).
+fn is_route_path(path: &str) -> bool {
+    // Match the routes array itself ("apps.http.servers.srv0.routes") and anything inside it
+    // ("...routes[0].handle"). Route changes are emitted once, by route @id, above; recursing into
+    // the array would add a second, array-level Modified entry for the same change.
+    path.ends_with(".routes") || path.contains(".routes[")
 }
 
 #[cfg(test)]

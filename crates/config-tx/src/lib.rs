@@ -179,9 +179,14 @@ pub struct ConfigTx<S: RevisionStore> {
 
 impl<S: RevisionStore + RevisionStoreExt> ConfigTx<S> {
     /// Create a new ConfigTx with the given revision store.
+    ///
+    /// The active generation is restored from the store's newest applied or rolled-back
+    /// generation. A restart therefore continues from the durable revision instead of starting at
+    /// `None` and reusing revision 1.
     pub fn new(revisions: S) -> Self {
+        let active = revisions.latest_generation();
         Self {
-            active_generation: Arc::new(RwLock::new(None)),
+            active_generation: Arc::new(RwLock::new(active)),
             staged: Mutex::new(None),
             revisions,
         }
@@ -199,12 +204,13 @@ impl<S: RevisionStore + RevisionStoreExt> ConfigTx<S> {
 
     /// Stage a new configuration.
     ///
-    /// Validates that the JSON is a valid Caddy config structure (apps.http, apps.tls, etc.),
-    /// computes the xxHash64 hash, and returns the staged configuration.
+    /// Validates the Caddy JSON structure and computes the xxHash64 hash. Structural validation is
+    /// deliberately done here so an invalid document never becomes the active configuration and a
+    /// caller gets the error at the point of the mistake. Semantic validation (routes, upstreams,
+    /// TLS coverage) belongs to the compiler and is re-checked on apply.
     pub fn stage(&self, config: Value) -> Result<StagedConfig, TxError> {
-        // Validate config structure
-        validate_config_structure(&config).map_err(|e| TxError::validation(e.path, e.message))?;
-
+        validate_config_structure(&config)
+            .map_err(|error| TxError::validation(error.path, error.message))?;
         let staged = StagedConfig::new(config);
         *self.staged.lock().unwrap() = Some(staged.clone());
         Ok(staged)
@@ -222,58 +228,105 @@ impl<S: RevisionStore + RevisionStoreExt> ConfigTx<S> {
 
     /// Apply the staged configuration atomically.
     ///
-    /// If `if_match` is provided, it must match the active generation's ETag (`W/"<revision>"`).
-    /// Atomically swaps active = staged, increments revision, records revision in store,
-    /// clears staged, and returns the new generation.
-    /// On failure (precondition mismatch, validation error), active is unchanged.
+    /// If `if_match` is provided, it must match the active generation's ETag
+    /// (`W/"<revision>"`). The active generation is swapped only after validation, the
+    /// precondition and the revision record have all succeeded. A failed attempt leaves the active
+    /// generation and the staged configuration untouched, and records a `Failed` revision so the
+    /// audit trail shows the attempt.
     pub fn apply(&self, if_match: Option<String>) -> Result<Generation, TxError> {
-        // Take the staged config
         let staged = self
             .staged
             .lock()
             .unwrap()
-            .take()
+            .clone()
             .ok_or_else(|| TxError::precondition_failed("no staged configuration"))?;
 
-        // Validate the staged config again before applying
-        validate_config_structure(&staged.config)
-            .map_err(|e| TxError::validation(e.path, e.message))?;
+        // Re-check structure on apply: stage is the normal validation point, but `StagedConfig` is
+        // public and a caller can construct one directly.
+        if let Err(error) = validate_config_structure(&staged.config) {
+            let active = self.active_generation.read().unwrap();
+            let revision = self.next_revision(active.as_ref());
+            drop(active);
+            self.record_failure(
+                revision,
+                &staged,
+                format!("Validation: {} at {}", error.message, error.path),
+            )?;
+            return Err(TxError::validation(error.path, error.message));
+        }
 
-        // Check precondition
+        // One write lock makes "check If-Match then swap" atomic against other applies.
         let mut active_guard = self.active_generation.write().unwrap();
-        if let Some(if_match) = if_match {
-            let active = active_guard.as_ref().ok_or_else(|| {
-                TxError::precondition_failed("precondition failed: no active generation")
-            })?;
-            if active.etag() != if_match {
+        let revision = self.next_revision(active_guard.as_ref());
+
+        if let Some(expected) = if_match {
+            let active = match active_guard.as_ref() {
+                Some(active) => active,
+                None => {
+                    return Err(TxError::precondition_failed(
+                        "precondition failed: no active generation",
+                    ))
+                }
+            };
+            if active.etag() != expected {
+                let actual = active.etag();
+                drop(active_guard);
+                self.record_failure(
+                    revision,
+                    &staged,
+                    format!(
+                        "PreconditionFailed: ETag mismatch (expected {actual}, got {expected})"
+                    ),
+                )?;
                 return Err(TxError::precondition_failed(format!(
-                    "ETag mismatch: expected {}, got {}",
-                    active.etag(),
-                    if_match
+                    "ETag mismatch: expected {actual}, got {expected}"
                 )));
             }
         }
 
-        // Create new generation with incremented revision
-        let new_revision = active_guard.as_ref().map(|g| g.revision).unwrap_or(0) + 1;
-        let new_generation = Generation::new(staged.config, new_revision);
-
-        // Record in revision store
+        let generation = Generation::new(staged.config, revision);
         let record = RevisionRecord {
-            revision: new_generation.revision,
-            hash: new_generation.hash.clone(),
-            timestamp: new_generation.timestamp,
+            revision: generation.revision,
+            hash: generation.hash.clone(),
+            timestamp: generation.timestamp,
             status: RevisionStatus::Applied,
             error: None,
         };
         self.revisions
-            .record_generation(record, new_generation.clone())
-            .map_err(|e| TxError::internal(format!("failed to record revision: {}", e)))?;
+            .record_generation(record, generation.clone())
+            .map_err(|error| TxError::internal(format!("failed to record revision: {error}")))?;
 
-        // Atomically swap
-        *active_guard = Some(new_generation.clone());
+        *active_guard = Some(generation.clone());
+        drop(active_guard);
+        *self.staged.lock().unwrap() = None;
+        Ok(generation)
+    }
 
-        Ok(new_generation)
+    /// Next revision number, accounting for failed attempts and a restored store.
+    fn next_revision(&self, active: Option<&Generation>) -> u64 {
+        let active = active.map_or(0, |generation| generation.revision);
+        let recorded = self.revisions.latest_revision().unwrap_or(0);
+        active.max(recorded) + 1
+    }
+
+    /// Record a failed attempt without changing the active generation or the staged configuration.
+    fn record_failure(
+        &self,
+        revision: u64,
+        staged: &StagedConfig,
+        error: String,
+    ) -> Result<(), TxError> {
+        let generation = Generation::new(staged.config.clone(), revision);
+        let record = RevisionRecord {
+            revision,
+            hash: generation.hash.clone(),
+            timestamp: generation.timestamp,
+            status: RevisionStatus::Failed,
+            error: Some(error),
+        };
+        self.revisions
+            .record_generation(record, generation)
+            .map_err(|error| TxError::internal(format!("failed to record revision: {error}")))
     }
 
     /// Quarantine specific host routes in the staged configuration.
@@ -326,15 +379,20 @@ impl<S: RevisionStore + RevisionStoreExt> ConfigTx<S> {
     ///
     /// Restores a previous generation as the active configuration.
     pub fn rollback(&self, revision: u64) -> Result<Generation, TxError> {
-        // Retrieve the revision from the store
         let record = self
             .revisions
             .get(revision)
             .ok_or_else(|| TxError::not_found(format!("revision {}", revision)))?;
-
-        // Get the config for this revision (we need to store full config in revision store)
-        // For now, we'll need the revision store to also store the config
-        // This is a limitation - we'll handle it by having the revision store return the generation
+        // A failed attempt is audit evidence, not a restorable configuration. Rolling back to it
+        // would publish the exact document that was rejected.
+        if !matches!(
+            record.status,
+            RevisionStatus::Applied | RevisionStatus::RolledBack
+        ) {
+            return Err(TxError::not_found(format!(
+                "revision {revision} is not a successful generation"
+            )));
+        }
         let generation = self
             .revisions
             .get_generation(revision)
@@ -346,7 +404,7 @@ impl<S: RevisionStore + RevisionStoreExt> ConfigTx<S> {
 
         // Atomically swap
         let mut active_guard = self.active_generation.write().unwrap();
-        let new_revision = active_guard.as_ref().map(|g| g.revision).unwrap_or(0) + 1;
+        let new_revision = self.next_revision(active_guard.as_ref());
         let mut new_generation = generation.clone();
         new_generation.revision = new_revision;
         new_generation.timestamp = Utc::now();
@@ -365,6 +423,8 @@ impl<S: RevisionStore + RevisionStoreExt> ConfigTx<S> {
             .map_err(|e| TxError::internal(format!("failed to record rollback: {}", e)))?;
 
         *active_guard = Some(new_generation.clone());
+        drop(active_guard);
+        *self.staged.lock().unwrap() = None;
 
         Ok(new_generation)
     }
@@ -532,25 +592,14 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_invalid_config_fails() {
+    fn test_apply_without_a_staged_config_fails() {
         let store = InMemoryRevisionStore::new();
         let tx = ConfigTx::new(store);
-        let config = valid_config();
 
-        tx.stage(config).unwrap();
-        tx.apply(None).unwrap();
-
-        // Stage invalid config
-        let invalid = invalid_config();
-        tx.stage(invalid).unwrap();
-
-        // Apply should fail with validation error
         let result = tx.apply(None);
-        assert!(matches!(result, Err(TxError::Validation { .. })));
-
-        // Active generation should be unchanged (still revision 1)
-        let active = tx.active_generation().unwrap();
-        assert_eq!(active.revision, 1);
+        assert!(matches!(result, Err(TxError::PreconditionFailed { .. })));
+        assert!(tx.active_generation().is_none());
+        assert!(tx.history(10, 0).is_empty());
     }
 
     #[test]
@@ -657,6 +706,28 @@ mod tests {
     }
 
     #[test]
+    fn rollback_refuses_a_failed_attempt() {
+        let store = InMemoryRevisionStore::new();
+        let tx = ConfigTx::new(store);
+        tx.stage(valid_config()).unwrap();
+        let first = tx.apply(None).unwrap();
+
+        let mut second = valid_config();
+        second["apps"]["http"]["servers"]["srv0"]["listen"] = serde_json::json!([":8080"]);
+        tx.stage(second).unwrap();
+        let error = tx
+            .apply(Some("W/\"999\"".to_string()))
+            .expect_err("stale precondition");
+        assert!(matches!(error, TxError::PreconditionFailed { .. }));
+
+        let error = tx
+            .rollback(2)
+            .expect_err("failed revision is not restorable");
+        assert!(matches!(error, TxError::NotFound { .. }));
+        assert_eq!(tx.active_generation().unwrap().revision, first.revision);
+    }
+
+    #[test]
     fn test_history() {
         let store = InMemoryRevisionStore::new();
         let tx = ConfigTx::new(store);
@@ -686,55 +757,72 @@ mod tests {
         tx.stage(config2).unwrap();
         tx.apply(None).unwrap();
 
+        // Newest first.
         let history = tx.history(10, 0);
         assert_eq!(history.len(), 2);
+        assert_eq!(history[0].revision, 2);
         assert_eq!(history[0].status, RevisionStatus::Applied);
+        assert_eq!(history[1].revision, 1);
         assert_eq!(history[1].status, RevisionStatus::Applied);
-        assert_eq!(history[0].revision, 1);
-        assert_eq!(history[1].revision, 2);
     }
 
     #[test]
-    fn test_full_workflow_valid_then_invalid() {
-        // This is the non-PM test harness test:
-        // stages a valid config, applies, verifies active,
-        // then stages invalid config, apply fails, active unchanged,
-        // history shows both attempts
+    fn test_full_workflow_valid_then_stale_precondition() {
+        // Non-PM harness: stage+apply a valid config, then stage another valid config and fail the
+        // apply on a stale precondition. The active generation must not move, the staged config
+        // must survive for a corrected retry, and both attempts must be in history.
         let store = InMemoryRevisionStore::new();
         let tx = ConfigTx::new(store);
 
-        // Stage and apply valid config
         let config = valid_config();
         tx.stage(config.clone()).unwrap();
         let gen1 = tx.apply(None).unwrap();
         assert_eq!(gen1.revision, 1);
+        assert_eq!(tx.active_generation().unwrap().config, config);
 
-        // Verify active
+        let config2 = serde_json::json!({
+            "apps": {
+                "http": {
+                    "servers": {
+                        "srv0": {
+                            "listen": [":8080"],
+                            "routes": [
+                                {
+                                    "@id": "host2",
+                                    "match": [{"host": ["example.org"]}],
+                                    "handle": [{"handler": "static_response", "body": "World"}]
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        });
+        tx.stage(config2).unwrap();
+
+        let result = tx.apply(Some("W/\"999\"".to_string()));
+        assert!(matches!(result, Err(TxError::PreconditionFailed { .. })));
+
+        // Active is unchanged and the staged document is still available.
         let active = tx.active_generation().unwrap();
         assert_eq!(active.revision, 1);
         assert_eq!(active.config, config);
+        assert!(tx.staged_config().is_some());
 
-        // Stage invalid config
-        let invalid = invalid_config();
-        tx.stage(invalid).unwrap();
-
-        // Apply should fail with Validation error
-        let result = tx.apply(None);
-        assert!(matches!(result, Err(TxError::Validation { .. })));
-
-        // Active should be unchanged
-        let active = tx.active_generation().unwrap();
-        assert_eq!(active.revision, 1);
-        assert_eq!(active.config, config);
-
-        // History should show both attempts
+        // History: failed attempt 2, applied attempt 1 (newest first).
         let history = tx.history(10, 0);
         assert_eq!(history.len(), 2);
-        assert_eq!(history[0].status, RevisionStatus::Applied);
-        assert_eq!(history[0].revision, 1);
-        assert_eq!(history[1].status, RevisionStatus::Failed);
-        assert_eq!(history[1].revision, 2); // Revision still increments on failed attempt
-        assert!(history[1].error.is_some());
+        assert_eq!(history[0].revision, 2);
+        assert_eq!(history[0].status, RevisionStatus::Failed);
+        assert!(history[0].error.is_some());
+        assert_eq!(history[1].revision, 1);
+        assert_eq!(history[1].status, RevisionStatus::Applied);
+
+        // A corrected retry succeeds at the next revision and consumes the staged config.
+        let gen3 = tx.apply(Some(gen1.etag())).unwrap();
+        assert_eq!(gen3.revision, 3);
+        assert!(tx.staged_config().is_none());
+        assert_eq!(tx.history(10, 0)[0].status, RevisionStatus::Applied);
     }
 
     #[test]
@@ -750,14 +838,19 @@ mod tests {
         let gen = tx.apply(None).unwrap();
         assert_eq!(gen.revision, 1);
 
-        // Create new ConfigTx with same store
+        // Reopen: the applied generation is restored as active and the next apply continues the
+        // durable revision instead of reusing revision 1.
         let store2 = PersistentRevisionStore::new(temp_dir.path().join("revisions.json")).unwrap();
         let tx2 = ConfigTx::new(store2);
 
-        // History should persist
         let history = tx2.history(10, 0);
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].revision, 1);
         assert_eq!(history[0].status, RevisionStatus::Applied);
+        assert_eq!(tx2.active_generation().unwrap().revision, 1);
+
+        tx2.stage(valid_config()).unwrap();
+        let next = tx2.apply(None).unwrap();
+        assert_eq!(next.revision, 2);
     }
 }
