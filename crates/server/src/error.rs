@@ -65,6 +65,10 @@ pub enum Error {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// The certificate/account data directory could not be prepared.
+    #[error("data directory: {0}")]
+    DataDir(#[from] caddy_rs_core::data_dir::DataDirError),
+
     /// Observability (access-log / metrics) configuration is invalid.
     ///
     /// The message carries the located JSON path from [`caddy_rs_admin::LoggingConfigError`] and,

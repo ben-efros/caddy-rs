@@ -388,8 +388,9 @@ Storage is selected by the top-level `storage` object. The `file_system` backend
 on-disk layout:
 `<root>/certificates/<issuer-key>/<name>/<name>.crt`, `.key` and `.json`, with CertMagic metadata
 preserved across rewrites. Wildcard names are stored with `*` replaced by `wildcard_`. The data
-directory defaults to `.caddy-rs`, and can be overridden with `storage.root` or the
-`CADDY_RS_DATA_DIR` environment variable.
+directory defaults to Caddy's `$XDG_DATA_HOME/caddy` (or `$HOME/.local/share/caddy`), with a legacy
+`.caddy-rs` fallback, and can be overridden with `run --data-dir`, `storage.root` or
+`CADDY_RS_DATA_DIR`.
 
 ### Connection policies
 

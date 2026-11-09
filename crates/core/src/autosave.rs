@@ -6,11 +6,11 @@
 //! `unsyncedDecodeAndRun`). The `--resume` startup flag then loads that file in preference to
 //! `--config` (`cmd/commandfuncs.go`, run command).
 //!
-//! The autosave path is configurable, matching Caddy's `AppConfigDir()` resolution
-//! (`storage.go`): a per-call override (the CLI's `--autosave-path` flag) wins, then
-//! `$XDG_CONFIG_HOME/caddy-rs/autosave.json`, then `$HOME/.config/caddy-rs/autosave.json`, then
-//! `./.caddy-rs/autosave.json` (the same `.caddy-rs` default name the data directory uses) when
-//! neither environment variable is set.
+//! The autosave path follows Caddy's `AppConfigDir()` resolution: a per-call override (the CLI's
+//! `--autosave-path` flag) wins, then `$XDG_CONFIG_HOME/caddy/autosave.json`, then
+//! `$HOME/.config/caddy/autosave.json`, then `./caddy/autosave.json` when neither environment
+//! variable is set. A legacy caddy-rs autosave under `caddy-rs` or `.caddy-rs` is used only when
+//! the Caddy path does not exist, so an upgrade does not silently lose `--resume` state.
 //!
 //! Unlike Caddy (which writes the file in place with `os.WriteFile`), the write here is atomic:
 //! the JSON is written to a uniquely-named temporary file in the same directory, `fsync`ed, and
@@ -45,9 +45,12 @@ const OPEN_NOFOLLOW_CLOEXEC: i32 = 0;
 /// The autosave file name, matching Caddy's `autosave.json` under the config directory.
 pub const AUTOSAVE_FILE_NAME: &str = "autosave.json";
 
-/// The subdirectory appended to the XDG/HOME config base, mirroring Caddy's `caddy` subdir but
-/// using this project's name (`caddy-rs`), consistent with the `.caddy-rs` data-directory default.
-pub const CONFIG_DIR_SUBDIR: &str = "caddy-rs";
+/// The subdirectory appended to the XDG/HOME config base: Caddy's `caddy`, for drop-in
+/// compatibility.
+pub const CONFIG_DIR_SUBDIR: &str = "caddy";
+
+/// Legacy caddy-rs config subdirectory, consulted only when the Caddy path is absent.
+pub const LEGACY_CONFIG_DIR_SUBDIR: &str = "caddy-rs";
 
 /// Environment variable consulted first for the config base directory (Unix convention).
 pub const XDG_CONFIG_HOME_ENV: &str = "XDG_CONFIG_HOME";
@@ -55,13 +58,16 @@ pub const XDG_CONFIG_HOME_ENV: &str = "XDG_CONFIG_HOME";
 /// Environment variable consulted when `XDG_CONFIG_HOME` is unset.
 pub const HOME_ENV: &str = "HOME";
 
-/// Fallback config base when neither `XDG_CONFIG_HOME` nor `HOME` is set; the `.caddy-rs` file
-/// appears in the working directory, like Caddy's `./caddy` fallback (`AppConfigDir`).
-pub const FALLBACK_CONFIG_DIR: &str = ".caddy-rs";
+/// Fallback config base when neither `XDG_CONFIG_HOME` nor `HOME` is set; Caddy's `./caddy`
+/// fallback (`AppConfigDir`).
+pub const FALLBACK_CONFIG_DIR: &str = "caddy";
 
-/// The application config directory: `$XDG_CONFIG_HOME/caddy-rs` when `XDG_CONFIG_HOME` is set,
-/// `$HOME/.config/caddy-rs` otherwise, and `./.caddy-rs` when `HOME` is also unavailable. This is
-/// the caddy-rs analogue of Caddy's `AppConfigDir()`.
+/// Legacy fallback config base used by older caddy-rs versions.
+pub const LEGACY_FALLBACK_CONFIG_DIR: &str = ".caddy-rs";
+
+/// The application config directory: `$XDG_CONFIG_HOME/caddy` when `XDG_CONFIG_HOME` is set,
+/// `$HOME/.config/caddy` otherwise, and `./caddy` when `HOME` is also unavailable. This is Caddy's
+/// `AppConfigDir()` layout.
 pub fn config_dir() -> PathBuf {
     config_dir_with(
         std::env::var_os(XDG_CONFIG_HOME_ENV),
@@ -85,9 +91,77 @@ pub fn config_dir_with(
     }
 }
 
-/// The default autosave path: [`AUTOSAVE_FILE_NAME`] under [`config_dir`].
+/// Result of resolving the autosave path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutosavePath {
+    /// Path to use.
+    pub path: PathBuf,
+    /// Whether a legacy caddy-rs autosave was selected.
+    pub legacy: bool,
+}
+
+/// The default autosave path: the Caddy config directory when it exists, otherwise a legacy
+/// caddy-rs autosave when that exists, otherwise the Caddy path for a new installation.
 pub fn default_autosave_path() -> PathBuf {
-    config_dir().join(AUTOSAVE_FILE_NAME)
+    resolve_autosave_path().path
+}
+
+/// Resolve the default autosave path and report whether a legacy path was used.
+pub fn resolve_autosave_path() -> AutosavePath {
+    resolve_autosave_path_with(
+        std::env::var_os(XDG_CONFIG_HOME_ENV),
+        std::env::var_os(HOME_ENV),
+    )
+}
+
+/// Testable form of [`resolve_autosave_path`].
+pub fn resolve_autosave_path_with(
+    xdg_config_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> AutosavePath {
+    let caddy = config_dir_with(xdg_config_home.clone(), home.clone()).join(AUTOSAVE_FILE_NAME);
+    if caddy.exists() {
+        return AutosavePath {
+            path: caddy,
+            legacy: false,
+        };
+    }
+    let legacy = legacy_config_dir_with(xdg_config_home, home).join(AUTOSAVE_FILE_NAME);
+    if legacy.exists() {
+        AutosavePath {
+            path: legacy,
+            legacy: true,
+        }
+    } else {
+        AutosavePath {
+            path: caddy,
+            legacy: false,
+        }
+    }
+}
+
+/// Legacy caddy-rs config directory (`caddy-rs` under the XDG/HOME base, or `.caddy-rs`).
+pub fn legacy_config_dir() -> PathBuf {
+    legacy_config_dir_with(
+        std::env::var_os(XDG_CONFIG_HOME_ENV),
+        std::env::var_os(HOME_ENV),
+    )
+}
+
+/// Testable form of [`legacy_config_dir`].
+pub fn legacy_config_dir_with(
+    xdg_config_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> PathBuf {
+    if let Some(base) = xdg_config_home.filter(|value| !value.is_empty()) {
+        PathBuf::from(base).join(LEGACY_CONFIG_DIR_SUBDIR)
+    } else if let Some(home) = home.filter(|value| !value.is_empty()) {
+        PathBuf::from(home)
+            .join(".config")
+            .join(LEGACY_CONFIG_DIR_SUBDIR)
+    } else {
+        PathBuf::from(LEGACY_FALLBACK_CONFIG_DIR)
+    }
 }
 
 /// Atomically persist `config_json` to `path`.
@@ -378,17 +452,17 @@ mod tests {
     fn config_dir_follows_xdg_then_home_then_fallback() {
         assert_eq!(
             config_dir_with(Some("/xdg".into()), Some("/home/user".into())),
-            PathBuf::from("/xdg/caddy-rs")
+            PathBuf::from("/xdg/caddy")
         );
         assert_eq!(
             config_dir_with(None, Some("/home/user".into())),
-            PathBuf::from("/home/user/.config/caddy-rs")
+            PathBuf::from("/home/user/.config/caddy")
         );
-        assert_eq!(config_dir_with(None, None), PathBuf::from(".caddy-rs"));
+        assert_eq!(config_dir_with(None, None), PathBuf::from("caddy"));
         // An empty XDG_CONFIG_HOME means "unset", matching Caddy's `!= ""` check.
         assert_eq!(
             config_dir_with(Some("".into()), Some("/home/user".into())),
-            PathBuf::from("/home/user/.config/caddy-rs")
+            PathBuf::from("/home/user/.config/caddy")
         );
     }
 
@@ -396,12 +470,33 @@ mod tests {
     fn default_autosave_path_is_autosave_json_under_the_config_dir() {
         assert_eq!(
             config_dir_with(Some("/xdg".into()), None).join(AUTOSAVE_FILE_NAME),
-            PathBuf::from("/xdg/caddy-rs/autosave.json")
+            PathBuf::from("/xdg/caddy/autosave.json")
         );
-        assert_eq!(
-            default_autosave_path(),
-            config_dir().join(AUTOSAVE_FILE_NAME)
-        );
+        let resolved = resolve_autosave_path_with(Some("/xdg".into()), None);
+        assert_eq!(resolved.path, PathBuf::from("/xdg/caddy/autosave.json"));
+        assert!(!resolved.legacy);
+    }
+
+    #[test]
+    fn legacy_autosave_is_used_only_when_the_caddy_path_is_absent() {
+        let base = TestDir::new("autosave-legacy");
+        let legacy_dir = base.path().join("caddy-rs");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        let legacy = legacy_dir.join(AUTOSAVE_FILE_NAME);
+        std::fs::write(&legacy, b"{}").unwrap();
+        let resolved =
+            resolve_autosave_path_with(Some(base.path().as_os_str().to_os_string()), None);
+        assert_eq!(resolved.path, legacy);
+        assert!(resolved.legacy);
+
+        let caddy_dir = base.path().join("caddy");
+        std::fs::create_dir_all(&caddy_dir).unwrap();
+        let caddy = caddy_dir.join(AUTOSAVE_FILE_NAME);
+        std::fs::write(&caddy, b"{}").unwrap();
+        let resolved =
+            resolve_autosave_path_with(Some(base.path().as_os_str().to_os_string()), None);
+        assert_eq!(resolved.path, caddy);
+        assert!(!resolved.legacy);
     }
 
     #[cfg(unix)]

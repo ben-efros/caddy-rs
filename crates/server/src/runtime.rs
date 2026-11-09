@@ -569,6 +569,21 @@ impl ServerRuntime {
     /// A failure after step 2 restores the previous generation's states and stops newly bound
     /// listeners, so a failed issuance keeps the old generation serving.
     pub async fn apply(&mut self) -> Result<RuntimeStatus> {
+        // Stock Caddy notifies the service manager around every Load (initial start and reload).
+        // Notifications are best-effort; a missing/broken NOTIFY_SOCKET must never fail the apply.
+        notify_warn(caddy_rs_core::notify::reloading(), "reloading");
+        let result = self.apply_inner().await;
+        match &result {
+            Ok(_) => notify_warn(caddy_rs_core::notify::ready(), "ready"),
+            Err(_) => notify_warn(
+                caddy_rs_core::notify::status("configuration apply failed"),
+                "apply-failed",
+            ),
+        }
+        result
+    }
+
+    async fn apply_inner(&mut self) -> Result<RuntimeStatus> {
         let Some(generation) = self.store.current() else {
             self.stop_all().await;
             self.status = RuntimeStatus::default();
@@ -1122,6 +1137,7 @@ impl ServerRuntime {
                 .map(|d| d.as_millis() as u64),
             "initiating shutdown"
         );
+        notify_warn(caddy_rs_core::notify::stopping(), "stopping");
         self.graceful_stop(force).await;
         Ok(())
     }
@@ -1377,6 +1393,9 @@ impl ServerRuntime {
         let Some(plan) = plan_automatic_https(config)? else {
             return Ok(None);
         };
+        // The CLI resolves Caddy's drop-in data path (with legacy detection) and passes it through
+        // `with_data_root`. Library embedders and tests that do not set one keep the historical
+        // `.caddy-rs` working-directory default.
         let default_root = self
             .data_root
             .clone()
@@ -1392,6 +1411,18 @@ impl ServerRuntime {
         // provisioner persists certificates, ACME accounts and internal-CA leaves through it.
         let selected_storage =
             caddy_rs_tls::SelectedStorage::from_config(config, Some(&default_root))?;
+        // Check/create the filesystem root before any listener or ACME order. A non-filesystem
+        // storage module has no root to probe.
+        if let Some(storage_root) = selected_storage.root() {
+            let report = caddy_rs_core::data_dir::preflight(storage_root)?;
+            for warning in &report.warnings {
+                tracing::warn!("{warning}");
+                eprintln!("caddy-rs: warning: {warning}");
+            }
+            if report.created {
+                tracing::info!(root = %report.root.display(), "created data directory");
+            }
+        }
         let root = selected_storage
             .root()
             .map(std::path::Path::to_path_buf)
@@ -2323,6 +2354,13 @@ fn spawn_ocsp_refresh(
         }
     });
     OcspRefresh { handle }
+}
+
+fn notify_warn(result: std::io::Result<()>, event: &str) {
+    if let Err(error) = result {
+        tracing::warn!(event, %error, "sd_notify failed");
+        eprintln!("caddy-rs: warning: sd_notify {event} failed: {error}");
+    }
 }
 
 #[cfg(test)]
