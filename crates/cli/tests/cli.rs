@@ -1286,3 +1286,80 @@ fn build_info_reports_the_rust_toolchain_and_build_settings() {
         "{stdout}"
     );
 }
+
+#[test]
+fn environ_prints_caddys_header_and_the_process_environment() {
+    let (code, stdout, stderr) = run(&["environ"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let header = stdout
+        .split("\n\n")
+        .next()
+        .expect("header before blank line");
+    let keys: Vec<&str> = header
+        .lines()
+        .map(|line| line.split('=').next().unwrap_or(line))
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            "caddy.HomeDir",
+            "caddy.AppDataDir",
+            "caddy.AppConfigDir",
+            "caddy.ConfigAutosavePath",
+            "caddy.Version",
+            "runtime.GOOS",
+            "runtime.GOARCH",
+            "runtime.Compiler",
+            "runtime.NumCPU",
+            "runtime.GOMAXPROCS",
+            "runtime.Version",
+            "os.Getwd",
+        ],
+        "{stdout}"
+    );
+    assert!(header.contains("runtime.Compiler=rustc"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("caddy.Version={}", env!("CARGO_PKG_VERSION"))),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("\nPATH="),
+        "environment variables missing: {stdout}"
+    );
+}
+
+#[test]
+fn environ_loads_envfiles_without_overwriting_and_reports_parse_errors() {
+    let directory = tempfile::tempdir().unwrap();
+    let suffix = std::process::id();
+    let key = format!("CADDY_RS_ENVFILE_TEST_{suffix}");
+    let exported = format!("CADDY_RS_ENVFILE_EXPORTED_{suffix}");
+    let envfile = directory.path().join("caddy.env");
+    std::fs::write(
+        &envfile,
+        format!("# comment\nexport {exported}=exported\n{key}=\"line one\nline two\"\n"),
+    )
+    .unwrap();
+    let (code, stdout, stderr) = run(&["environ", "--envfile", envfile.to_str().unwrap()]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let environment = stdout.split("\n\n").nth(1).unwrap_or_default();
+    let lines: Vec<&str> = environment.lines().collect();
+    let key_line = lines
+        .iter()
+        .position(|line| *line == format!("{key}=line one"))
+        .expect("quoted first line in environment output");
+    assert_eq!(lines.get(key_line + 1), Some(&"line two"), "{stdout}");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line == format!("{exported}=exported")),
+        "{stdout}"
+    );
+
+    let malformed = directory.path().join("malformed.env");
+    std::fs::write(&malformed, "not-a-pair\n").unwrap();
+    let (code, _stdout, stderr) = run(&["environ", "--envfile", malformed.to_str().unwrap()]);
+    assert_ne!(code, 0);
+    assert!(stderr.contains("line 1"), "{stderr}");
+    assert!(stderr.contains("KEY=VALUE"), "{stderr}");
+}

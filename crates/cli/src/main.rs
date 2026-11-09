@@ -7,6 +7,7 @@
 //! supported configuration surface.
 
 mod build_info;
+mod environ;
 mod signals;
 
 use std::path::{Path, PathBuf};
@@ -117,6 +118,20 @@ enum Command {
         /// Admin API address.
         #[arg(long, default_value = "localhost:2019")]
         admin: String,
+    },
+    /// Print the environment as seen by this caddy-rs process.
+    ///
+    /// The output mirrors Caddy's `environ` command: the caddy-rs directory and version fields,
+    /// Rust runtime facts, the working directory, a blank line, and then every environment
+    /// variable in `KEY=VALUE` form. Go-named fields carry the Rust equivalent: `runtime.Version`
+    /// is the rustc version and `runtime.Compiler` is `rustc`.
+    ///
+    /// If `--envfile` is specified, an environment file with variables in `KEY=VALUE` format is
+    /// loaded before printing. Existing process variables are never overwritten.
+    Environ {
+        /// Environment file(s) to load (repeatable, or comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        envfile: Vec<PathBuf>,
     },
     /// Inspect and export the local certificate authority material.
     Pki {
@@ -451,6 +466,9 @@ async fn run(command: Command) -> anyhow::Result<()> {
             let response = admin_request(&admin, "POST", "/stop", Bytes::new()).await?;
             ensure_admin_success(&response)?;
             eprintln!("server stopped");
+        }
+        Command::Environ { envfile } => {
+            environ::run(&envfile)?;
         }
         Command::Pki { command } => run_pki(command).await?,
         Command::Trust {
