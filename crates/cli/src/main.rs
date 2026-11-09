@@ -1,7 +1,8 @@
 //! `caddy-rs` command-line interface.
 //!
 //! Command surface follows Caddy's CLI where it is meaningful for this build: `adapt`, `validate`,
-//! `run`, `reload`, `stop`, `list-modules`, `version`. `pki list`/`pki export` and `trust` expose
+//! `run`, `reload`, `stop`, `list-modules`, `version`, `build-info`, `environ`, `completion` and
+//! `manpage`. `pki list`/`pki export` and `trust` expose
 //! the local CA material persisted by automatic HTTPS (`<data-dir>/pki/authorities/<id>/`); see
 //! `docs/compatibility/CADDYFILE.md` for the
 //! supported configuration surface.
