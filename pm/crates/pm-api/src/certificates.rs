@@ -272,7 +272,13 @@ fn summary_for(
         expires_at_unix: record.and_then(|record| record.expires_at_unix),
         certificate_issuer: record.map(|record| record.issuer.clone()),
         certificate_source: record.map(|record| record.source.clone()),
-        renewal_error: record.and_then(|record| record.renewal_error.clone()),
+        // The status is `renewal_error` when *any* covering certificate reports one. Surface that
+        // reason even when the latest-expiring observation is a different, healthy certificate.
+        renewal_error: covering_records(subjects, records).and_then(|covering| {
+            covering
+                .iter()
+                .find_map(|record| record.renewal_error.clone())
+        }),
     }
 }
 
@@ -383,8 +389,17 @@ fn set_intent_headers(response: &mut Response, etag: &str) {
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
 }
 
-fn intent_etag(id: u64, revision: u64) -> String {
-    format!("\"c{id}-r{revision}\"")
+/// A strong validator over the *whole* representation, including inventory-derived status,
+/// expiry, certificate issuer/source and renewal error. A policy revision alone is insufficient:
+/// inventory can change the body without touching the stored policy.
+fn summary_etag(summary: &CertificateIntentSummary) -> Result<String, ApiError> {
+    let bytes = serde_json::to_vec(summary)
+        .map_err(|error| ApiError::Internal(format!("serialize certificate intent: {error}")))?;
+    Ok(format!(
+        "\"c{}-{}\"",
+        summary.policy_id,
+        crate::hash_bytes(&bytes)
+    ))
 }
 
 fn records_for(state: &ApiState) -> Result<Vec<CertificateRecord>, ApiError> {
@@ -446,7 +461,7 @@ pub async fn create_handler(
     let summary = summary_for(&stored, &[], now_unix());
     debug_assert_eq!(summary.status, CertificateIntentStatus::Pending);
 
-    let etag = intent_etag(stored.policy.id.0, stored.revision);
+    let etag = summary_etag(&summary)?;
     let location = format!("/api/v1/certificates/{}", stored.policy.id.0);
     let mut response = (StatusCode::CREATED, Json(summary)).into_response();
     set_intent_headers(&mut response, &etag);
@@ -554,7 +569,7 @@ pub async fn get_handler(
         .ok_or_else(|| ApiError::NotFound(format!("certificate intent {id}")))?;
     let records = records_for(&state)?;
     let summary = summary_for(&stored, &records, now_unix());
-    let etag = intent_etag(id, stored.revision);
+    let etag = summary_etag(&summary)?;
     if let Some(response) = evaluate_get_preconditions(&headers, &etag)? {
         return Ok(response);
     }

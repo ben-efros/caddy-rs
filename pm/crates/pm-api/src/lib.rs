@@ -286,7 +286,19 @@ impl IntoResponse for ApiError {
 
 impl From<caddy_rs_pm_runtime::RuntimeError> for ApiError {
     fn from(source: caddy_rs_pm_runtime::RuntimeError) -> Self {
-        Self::Internal(source.to_string())
+        use caddy_rs_pm_runtime::RuntimeError;
+        match source {
+            // A stored policy or host that no longer compiles is a state conflict, not a server
+            // failure. The message names the offending policy/host; `GET /config` therefore
+            // returns a typed 409 instead of an opaque 500.
+            RuntimeError::Config { source, .. } => Self::Conflict(format!(
+                "stored certificate policy cannot be assembled: {source}"
+            )),
+            RuntimeError::Compile { source, .. } => {
+                Self::Conflict(format!("stored hosts cannot be compiled: {source}"))
+            }
+            other => Self::Internal(other.to_string()),
+        }
     }
 }
 

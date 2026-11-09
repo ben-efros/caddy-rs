@@ -287,7 +287,7 @@ Compile, Config}` and carry the relevant path. No error contains plaintext secre
 | `POST` | `/hosts/{id}/disable` | Set `enabled=false`; requires `If-Match` |
 | `POST` | `/certificates/intent` | Record a certificate intent (`201` + `Location` + strong `ETag`); loopback-only; DNS-01 and NPM fields are typed `400`s |
 | `GET` | `/certificates` | Paginated intent list with inventory-derived `status`; filters `domain`, `status` |
-| `GET` | `/certificates/{id}` | One intent with the same derived status and a strong `ETag` |
+| `GET` | `/certificates/{id}` | One intent with the same derived status and a strong representation `ETag` |
 | `GET` | `/config` | Assembled Caddy JSON (routes + TLS automation) with a weak `ETag`; honours `If-Match` and `If-None-Match` |
 
 ### Shared infrastructure
@@ -298,7 +298,7 @@ Compile, Config}` and carry the relevant path. No error contains plaintext secre
 - **Typed error envelope** — `{ "error": { "code": "NOT_FOUND|CONFLICT|PRECONDITION_FAILED|PRECONDITION_REQUIRED|FORBIDDEN|UNSUPPORTED_MEDIA_TYPE|VALIDATION|INTERNAL", "message": "...", "location": "field.path" } }` via `ApiError::into_response()`.
 - **Pagination** — `limit` (default 50, max 200) and `offset` (default 0) query params; an out-of-range `limit` is clamped and the effective window is echoed in `{ "items": [...], "total": N, "limit": L, "offset": O }` via `PaginatedResponse<T>`.
 - **Preconditions** — `evaluate_get_preconditions` implements RFC 9110 ordering for the config `GET`: a failing `If-Match` is `412 Precondition Failed`, a matching `If-None-Match` is `304 Not Modified`, and `*` matches any representation. Host mutations require a strong `If-Match`: missing is `428 Precondition Required`; stale, weak `W/"..."` or unparseable is `412`; `*` matches any current revision.
-- **ETags** — config uses a weak `W/"<hash>"` content hash. Hosts use a strong `"h<id>-r<revision>"` tag derived from the stored revision, so the tag is both a cache validator and the CAS token. A mutation reads the host, requires `If-Match` to match that revision, and passes the same revision to `pm-service`; a CAS conflict after the read is `412`, never retried.
+- **ETags** — config uses a weak `W/"<hash>"` content hash. Hosts use a strong `"h<id>-r<revision>"` tag derived from the stored revision, so the tag is both a cache validator and the CAS token. A mutation reads the host, requires `If-Match` to match that revision, and passes the same revision to `pm-service`; a CAS conflict after the read is `412`, never retried. Certificate details use a strong hash over the whole response body (`"c<id>-<hash>"`): the body includes inventory-derived status/expiry/issuer/source/renewal error, so a policy revision alone would produce a false `304` when a certificate is issued or starts failing.
 - **Native schema** — request/response bodies are camelCase (`preserveHost`, `sslForced`, `autoPolicyId`) and reject unknown fields. NPM names such as `forward_host` are a typed `400`, not silently ignored; the `--compat npm` adapter will translate them.
 - **Middleware** — request ID (`x-request-id`), structured logging, and a loopback-only mutation guard. The guard reads the socket peer from `ConnectInfo<SocketAddr>`; a missing peer or a non-loopback peer is `403`, and `X-Forwarded-For` is never trusted. This is a fail-closed boundary until PM auth lands, not authentication: the management port must stay unpublished and `create_router` must be served with `into_make_service_with_connect_info::<SocketAddr>()`.
 - **No authentication yet** — the loopback guard is temporary; PM management auth is CORE-PM-12/PM-115 work.
@@ -311,7 +311,7 @@ Compile, Config}` and carry the relevant path. No error contains plaintext secre
 rejects duplicate domains, unknown/NPM fields and DNS-01 (no provider credentials in this slice),
 and allocates the policy id with the repository's persisted `next_id()`; exhaustion and races are
 typed `409`s. The response is `201` with `policyId`, `domains`, `issuer`, `challenge`, `status:
-"pending"`, `Location: /api/v1/certificates/{id}` and a strong `"c<id>-r<revision>"` ETag. No PEM,
+"pending"`, `Location: /api/v1/certificates/{id}` and a strong `"c<id>-<hash>"` ETag over that pending representation. No PEM,
 private key or secret is accepted or returned.
 
 `GET /certificates` and `/certificates/{id}` derive status from an injected
@@ -346,7 +346,7 @@ Tests use `axum_test::TestServer` against a real `PmRuntime` backed by a tempora
 - `/hosts` paginates, clamps an oversized `limit`, and returns typed 400 errors for non-numeric or negative ones; filters apply before pagination.
 - Host CRUD returns 201/`Location`/ETag, rejects duplicate domains with 409, rejects NPM field names with 400, and requires strong `If-Match` (428 missing, 412 stale/weak).
 - `PATCH` preserves unnamed fields; enable/disable are set operations; delete tombstones the id; revisions are monotonic; a stale read cannot overwrite a newer write.
-- `/config` returns a stable weak ETag; `If-None-Match` yields 304, a stale `If-Match` yields 412 with a typed `PRECONDITION_FAILED` body, and `*`/current tags succeed.
+- `/config` returns a stable weak ETag; `If-None-Match` yields 304, a stale `If-Match` yields 412 with a typed `PRECONDITION_FAILED` body, and `*`/current tags succeed. If a stored policy/host cannot be assembled, the response is a typed `409 CONFLICT` naming the offending policy or host, not an opaque `500`.
 - `If-Match` is evaluated before `If-None-Match`; malformed tags, including a non-UTF-8 header value, fail closed with 412.
 - Mutation-side `require_if_match` rejects missing and stale revisions and accepts current/`*`.
 - Certificate intents return 201/`Location`/ETag and persist an eager policy; DNS-01, NPM fields,

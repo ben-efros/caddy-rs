@@ -59,7 +59,8 @@ fn auto_policy(id: u64, subjects: &[&str]) -> AutoCertificatePolicy {
         id: PolicyId(id),
         name: format!("policy-{id}"),
         subjects: subjects.iter().map(|value| (*value).to_string()).collect(),
-        mode: AutoMode::OnDemand,
+        // Core on-demand issuance is not implemented; the assembler rejects it.
+        mode: AutoMode::Eager,
         issuer: Some("letsencrypt".to_string()),
         key_type: None,
         renewal_window_ratio: Some(0.3),

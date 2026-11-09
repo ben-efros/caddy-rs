@@ -23,7 +23,7 @@
 use std::collections::BTreeSet;
 
 use caddy_rs_pm_compiler::{compile_routes, CompileError, CompiledRoutes};
-use caddy_rs_pm_core::{AcmeChallenge, AutoCertificatePolicy, Host, TlsMode};
+use caddy_rs_pm_core::{AcmeChallenge, AutoCertificatePolicy, AutoMode, CoreError, Host, TlsMode};
 use serde_json::{json, Map, Value};
 use thiserror::Error;
 
@@ -89,6 +89,20 @@ pub enum ConfigError {
         subject: String,
         reason: String,
     },
+    /// A stored policy is structurally invalid (for example a wildcard subject with HTTP-01).
+    #[error("auto-certificate policy {policy_id} is invalid: {source}")]
+    InvalidPolicy {
+        policy_id: u64,
+        #[source]
+        source: CoreError,
+    },
+    /// Core on-demand issuance is not implemented; silently emitting an eager policy would change
+    /// the stored intent, so only `Eager` is accepted.
+    #[error(
+        "auto-certificate policy {policy_id} uses the on-demand mode, which this assembler does \
+         not implement; store an eager policy instead"
+    )]
+    UnsupportedMode { policy_id: u64 },
 }
 
 /// Assemble compiled routes into a complete Caddy configuration value.
@@ -240,6 +254,20 @@ fn apply_automatic_https_skip(
 }
 
 fn automation_policy(policy: &AutoCertificatePolicy) -> Result<Value, ConfigError> {
+    // The assembler is public and can be called with policies that were never stored through
+    // `PolicyRepository`, so it must enforce the same structural rules as the repository rather
+    // than emitting an invalid wildcard/HTTP-01 combination.
+    policy
+        .validate()
+        .map_err(|source| ConfigError::InvalidPolicy {
+            policy_id: policy.id.0,
+            source,
+        })?;
+    if policy.mode != AutoMode::Eager {
+        return Err(ConfigError::UnsupportedMode {
+            policy_id: policy.id.0,
+        });
+    }
     let subjects: Vec<String> = policy
         .subjects
         .iter()
@@ -795,6 +823,41 @@ mod tests {
         let entry = &config["apps"]["tls"]["automation"]["policies"][0];
         assert_eq!(entry["key_type"], "p384");
         assert_eq!(entry["renewal_window_ratio"], 0.25);
+    }
+
+    #[test]
+    fn direct_assembly_rejects_a_wildcard_with_http01() {
+        // The repository rejects this combination, but the public assembler must not rely on
+        // callers having validated first.
+        let policy = tls_policy(
+            7,
+            &["*.wild.example.com"],
+            "letsencrypt",
+            AcmeChallenge::Http01,
+        );
+        let error = assemble_with_tls(&[], &[policy], &ConfigSettings::default())
+            .expect_err("wildcard http01 must be rejected");
+        assert!(matches!(
+            error,
+            ConfigError::InvalidPolicy { policy_id: 7, .. }
+        ));
+    }
+
+    #[test]
+    fn direct_assembly_rejects_on_demand_mode_instead_of_emitting_eager() {
+        let mut policy = tls_policy(
+            8,
+            &["ondemand.example.com"],
+            "letsencrypt",
+            AcmeChallenge::Http01,
+        );
+        policy.mode = AutoMode::OnDemand;
+        let error = assemble_with_tls(&[], &[policy], &ConfigSettings::default())
+            .expect_err("on-demand is not implemented");
+        assert!(matches!(
+            error,
+            ConfigError::UnsupportedMode { policy_id: 8 }
+        ));
     }
 
     #[test]

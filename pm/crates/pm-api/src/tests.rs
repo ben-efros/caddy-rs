@@ -754,6 +754,21 @@ struct FakeInventory {
     records: Vec<CertificateRecord>,
 }
 
+/// Inventory that the test can change between requests, to prove validators track the body.
+struct MutableInventory(std::sync::Mutex<Vec<CertificateRecord>>);
+
+impl MutableInventory {
+    fn set(&self, records: Vec<CertificateRecord>) {
+        *self.0.lock().expect("lock inventory") = records;
+    }
+}
+
+impl CertificateInventorySource for MutableInventory {
+    fn list_certificates(&self) -> Result<Vec<CertificateRecord>, InventoryError> {
+        Ok(self.0.lock().expect("lock inventory").clone())
+    }
+}
+
 impl CertificateInventorySource for FakeInventory {
     fn list_certificates(&self) -> Result<Vec<CertificateRecord>, InventoryError> {
         Ok(self.records.clone())
@@ -829,7 +844,8 @@ async fn create_certificate_intent_returns_201_location_etag_and_persists_a_poli
 
     assert_eq!(response.status_code(), StatusCode::CREATED);
     assert_eq!(response.header("location"), "/api/v1/certificates/1");
-    assert_eq!(response.header("etag"), "\"c1-r1\"");
+    let etag = response.header("etag").to_str().expect("ascii").to_owned();
+    assert!(etag.starts_with("\"c1-"), "unexpected etag {etag}");
     let body: CertificateIntentSummary = response.json();
     assert_eq!(body.policy_id, 1);
     assert_eq!(body.domains, vec!["api.example.com".to_string()]);
@@ -1099,14 +1115,15 @@ async fn certificate_detail_serves_an_etag_and_404_for_unknown_intents() {
 
     let response = server.get("/api/v1/certificates/1").await;
     assert_eq!(response.status_code(), StatusCode::OK);
-    assert_eq!(response.header("etag"), "\"c1-r1\"");
+    let etag = response.header("etag").to_str().expect("ascii").to_owned();
+    assert!(etag.starts_with("\"c1-"), "unexpected etag {etag}");
     let body: CertificateIntentSummary = response.json();
     assert_eq!(body.policy_id, 1);
     assert_eq!(body.status, CertificateIntentStatus::Pending);
 
     let not_modified = server
         .get("/api/v1/certificates/1")
-        .add_header("If-None-Match", "\"c1-r1\"")
+        .add_header("If-None-Match", etag.as_str())
         .await;
     assert_eq!(not_modified.status_code(), StatusCode::NOT_MODIFIED);
 
@@ -1144,5 +1161,74 @@ async fn config_after_an_intent_contains_tls_automation_and_disabled_host_skip()
     assert_eq!(
         config["apps"]["http"]["servers"]["pm_https"]["automatic_https"]["skip"],
         serde_json::json!(["plain.example.com"])
+    );
+}
+
+#[tokio::test]
+async fn certificate_detail_etag_tracks_inventory_changes_not_just_policy_revision() {
+    let inventory = Arc::new(MutableInventory(std::sync::Mutex::new(Vec::new())));
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let runtime = PmRuntime::open(RuntimeConfig::new(temp_dir.path().join("data"))).expect("open");
+    let state = ApiState::new(runtime).with_inventory(inventory.clone());
+    let server = TestServer::new(
+        create_router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    );
+
+    create_intent(&server, &["etag.example.com"], "letsencrypt", "http01").await;
+    let first = server.get("/api/v1/certificates/1").await;
+    let first_etag = first.header("etag").to_str().expect("ascii").to_owned();
+    let first_body: CertificateIntentSummary = first.json();
+    assert_eq!(first_body.status, CertificateIntentStatus::Pending);
+
+    inventory.set(vec![record(
+        &["etag.example.com"],
+        &[],
+        Some(now_unix() + 90 * 24 * 60 * 60),
+    )]);
+
+    let refreshed = server.get("/api/v1/certificates/1").await;
+    let refreshed_etag = refreshed.header("etag").to_str().expect("ascii").to_owned();
+    let refreshed_body: CertificateIntentSummary = refreshed.json();
+    assert_eq!(refreshed_body.status, CertificateIntentStatus::Issued);
+    assert_ne!(
+        refreshed_etag, first_etag,
+        "inventory changed the representation"
+    );
+
+    let conditional = server
+        .get("/api/v1/certificates/1")
+        .add_header("If-None-Match", first_etag.as_str())
+        .await;
+    assert_eq!(conditional.status_code(), StatusCode::OK);
+    let conditional_body: CertificateIntentSummary = conditional.json();
+    assert_eq!(conditional_body.status, CertificateIntentStatus::Issued);
+}
+
+#[tokio::test]
+async fn config_maps_a_stored_policy_assembly_error_to_typed_409() {
+    let (_dir, server, runtime) = server_with_runtime();
+    runtime
+        .policies()
+        .create(caddy_rs_pm_core::AutoCertificatePolicy {
+            id: caddy_rs_pm_core::PolicyId(1),
+            name: "broken".to_string(),
+            subjects: vec!["broken.example.com".to_string()],
+            mode: caddy_rs_pm_core::AutoMode::Eager,
+            issuer: Some("corporate-acme".to_string()),
+            key_type: None,
+            renewal_window_ratio: None,
+            challenge: caddy_rs_pm_core::AcmeChallenge::Http01,
+            enabled: true,
+        })
+        .expect("store policy accepted by the repository");
+
+    let response = server.get("/api/v1/config").await;
+    assert_eq!(response.status_code(), StatusCode::CONFLICT);
+    let body: ApiErrorResponse = response.json();
+    assert_eq!(body.error.code, ErrorCode::Conflict);
+    assert!(
+        body.error.message.contains("corporate-acme"),
+        "{}",
+        body.error.message
     );
 }
