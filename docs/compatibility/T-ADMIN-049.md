@@ -55,19 +55,21 @@ use ASCII inputs, where both engines agree, and do not claim compatibility for t
   `${name}` addressing the same and different groups in one template.
 - `regexp_and_multi_regexp_filters_apply_named_captures_and_word_boundaries` — the end-to-end
   `AccessLogEntry::render` path through both `regexp` and `multi_regexp` filters.
+- `regexp_filter_malformed_reference_parsing` — the registered DIV-0015 residual: caddy-rs's
+  expansion for `$01`, `${01}`, `${}`, `${a b}` and `$é`, with Go's values recorded in the note.
 
 ## Exact program-repository text to merge
 
 `docs/compatibility/BEHAVIOR-DIVERGENCES.md`, DIV-0015 (`caddy-rs behaviour`): append this exact
 sentence to the end of the paragraph:
 
-> The admin access-log `regexp` and `multi_regexp` filters use the same shared `caddy-rs-core` regex wrapper, with Go-compatible replacement expansion for **well-formed** references (`$N`/`${N}`/`$name`/`${name}`, non-participating or absent groups expanding to nothing, and longest-parse unbraced names); malformed references diverge from Go's `Regexp.ReplaceAllString` (for pattern `(a)` and input `a`: Go expands `$01`/`${01}`/`$<2-digit-char>` to the empty string and leaves `${}`/`${a b}` literally, where caddy-rs expands `$01`/`${01}` to the first group, drops `${}`/`${a b}`, and leaves `$\u{e9}` literal — registered as a DIV-0015 residual and covered by `regexp_filter_malformed_reference_parsing_diverges_from_go`); the Unicode `\b`/`\w`/`\d`/`\s` residual above applies to filter patterns too.
+> The admin access-log `regexp` and `multi_regexp` filters use the same shared `caddy-rs-core` regex wrapper, with Go-compatible replacement expansion for **well-formed ASCII references** (`$N`/`${N}`/`$name`/`${name}`, non-participating or absent groups expanding to nothing, and longest-parse unbraced names). Malformed references diverge from Go's `Regexp.ReplaceAllString`: for pattern `(a)` and input `a`, Go expands `$01` and `${01}` to the empty string and keeps `${}` and `${a b}` literal, while caddy-rs expands `$01`/`${01}` to the first group and drops `${}`/`${a b}`; Go also treats `$é` as a reference to an absent (Unicode-named) group and expands it to the empty string where caddy-rs leaves it literal. This is registered as the DIV-0015 reference-parsing residual and asserted on the caddy-rs side by `regexp_filter_malformed_reference_parsing`; the Unicode `\b`/`\w`/`\d`/`\s` residual above applies to filter patterns too.
 
 Recommended companion edits (optional, but they keep the entry auditable):
 
 - `Tracking:` append ` T-ADMIN-049`.
 - `Test:` append
-  `` `crates/admin/src/access_log.rs` (`regexp_filter_named_captures_match_go`, `regexp_filter_word_boundaries_match_go`, `regexp_filter_mixed_numeric_and_named_expansion_matches_go`, `regexp_and_multi_regexp_filters_apply_named_captures_and_word_boundaries`) ``.
+  `` `crates/admin/src/access_log.rs` (`regexp_filter_named_captures_match_go`, `regexp_filter_word_boundaries_match_go`, `regexp_filter_mixed_numeric_and_named_expansion_matches_go`, `regexp_and_multi_regexp_filters_apply_named_captures_and_word_boundaries`, `regexp_filter_malformed_reference_parsing`) ``.
 - `Area:` may become `Routing / Logging` if the Lead wants the expanded scope visible in the index;
   no other DIV-0015 field changes (status stays `fixed`).
 
