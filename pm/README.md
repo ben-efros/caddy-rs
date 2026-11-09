@@ -14,6 +14,7 @@ This is the proxy-manager foundation workspace. It is deliberately independent o
 | `caddy-rs-pm-policies` | Durable auto-certificate policy repository over `pm-state`: get/list/create/update/delete with CAS revisions, tombstones, monotonic id reservation and host coverage validation against `pm-core` hosts. |
 | `caddy-rs-pm-import` | Native-first NPM v2.16 host-payload import mapping: proxy/redirect/dead hosts to `pm-core`, explicit certificate origins, located errors for unsupported payload features and warnings for flags without a native implementation. |
 | `caddy-rs-pm-runtime` | PM composition root: data-directory preflight (`0700`, writability probe), `<data_dir>/pm` state layout, legacy Caddy detection (warning only), and host/policy/service wiring with compile/assemble entry points. |
+| `caddy-rs-pm-api` | Native REST API skeleton with axum: `/api/v1` router, health/setup/version endpoints, typed error envelope, pagination params, revision preconditions via `If-Match`/`If-None-Match` with weak ETags, request ID and logging middleware. |
 
 ## Why a nested workspace
 
@@ -244,6 +245,33 @@ migration of the data directory.
 `RuntimeError::{InvalidDataDir, NotADirectory, SymlinkNotAllowed, SymlinkUnresolvable,
 SymlinkTargetNotDirectory, DataDirUnreadable, CreateDirectory, DataDirNotWritable, State, Service,
 Compile, Config}` and carry the relevant path. No error contains plaintext secrets.
+
+## `caddy-rs-pm-api`
+
+`create_router(ApiState)` builds the `/api/v1` router with the following endpoints:
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/health` | Returns `{ "status": "ok", "setup": true }` |
+| `GET` | `/setup` | Returns `{ "configured": false }` (admin user check deferred to PM-109/CORE-PM-12) |
+| `GET` | `/version` | Returns `{ "version": "<crate version>", "caddy_rs": "<caddy-rs-core VERSION>" }` |
+
+### Shared infrastructure
+
+- **`ApiState`** — wraps a `PmRuntime` (cloned per request via `Arc`).
+- **Typed error envelope** — `{ "error": { "code": "NOT_FOUND|CONFLICT|PRECONDITION_FAILED|VALIDATION|INTERNAL", "message": "...", "location": "field.path" } }` via `ApiError::into_response()`.
+- **Pagination** — `limit` (default 50, max 200) and `offset` (default 0) query params; response envelope `{ "items": [...], "total": N, "limit": L, "offset": O }` via `PaginatedResponse<T>`.
+- **Revision preconditions** — `If-Match: <etag>` and `If-None-Match: <etag>` parsed; ETags are weak tags `W/"<revision>"`; mismatch returns `412 Precondition Failed`.
+- **Middleware** — request ID (`x-request-id` header) and structured logging.
+- **No authentication** — deferred to PM-109/CORE-PM-12.
+
+### Testing
+
+Tests use `axum_test::TestServer` against a real `PmRuntime` backed by `MemoryStore`:
+- Health/setup/version return 200 with correct shapes.
+- Pagination params validated and clamped.
+- `If-Match` on non-existent resource returns 412 (when wired to resources).
+- Error response shape matches spec.
 
 ## `pm-import`
 
