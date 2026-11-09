@@ -300,6 +300,7 @@ dependencies = [
 name = "caddy-rs-config-tx"
 version = "0.1.0-trial.2"
 dependencies = [
+ "async-trait",
  "caddy-rs-core",
  "chrono",
  "serde",

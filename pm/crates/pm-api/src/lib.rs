@@ -21,6 +21,8 @@
 //! | `POST` | `/api/v1/hosts/{id}/enable` | Set enabled under a strong `If-Match` |
 //! | `POST` | `/api/v1/hosts/{id}/disable` | Set disabled under a strong `If-Match` |
 //! | `GET` | `/api/v1/config` | Assembled Caddy JSON with a weak `ETag`; supports conditional requests |
+//! | `POST` | `/api/v1/config/apply` | Apply the assembled config to the loopback caddy-rs admin API |
+//! | `GET` | `/api/v1/config/revisions` | Durable apply history |
 //!
 //! # Preconditions
 //!
@@ -61,6 +63,7 @@
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use axum::{
     extract::{connect_info::ConnectInfo, State},
@@ -71,7 +74,7 @@ use axum::{
     Router,
 };
 use caddy_rs_pm_config::ConfigSettings;
-use caddy_rs_pm_runtime::PmRuntime;
+use caddy_rs_pm_runtime::{ConfigApplyService, PmRuntime};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::info;
@@ -86,6 +89,7 @@ pub const MAX_LIMIT: u32 = 200;
 pub struct ApiState {
     pub runtime: PmRuntime,
     inventory: Option<SharedCertificateInventory>,
+    applier: Option<Arc<ConfigApplyService>>,
 }
 
 impl ApiState {
@@ -95,6 +99,7 @@ impl ApiState {
         Self {
             runtime,
             inventory: None,
+            applier: None,
         }
     }
 
@@ -108,6 +113,19 @@ impl ApiState {
     /// The injected inventory, if any.
     pub fn inventory(&self) -> Option<&SharedCertificateInventory> {
         self.inventory.as_ref()
+    }
+
+    /// Inject the config apply pipeline. Without one, `/config/apply` is a typed `503`; merely
+    /// running the API never changes the live caddy-rs config.
+    #[must_use]
+    pub fn with_applier(mut self, applier: ConfigApplyService) -> Self {
+        self.applier = Some(Arc::new(applier));
+        self
+    }
+
+    /// The injected apply pipeline, if any.
+    pub fn applier(&self) -> Option<&Arc<ConfigApplyService>> {
+        self.applier.as_ref()
     }
 }
 
@@ -183,6 +201,7 @@ pub enum ErrorCode {
     Forbidden,
     UnsupportedMediaType,
     Validation,
+    ServiceUnavailable,
     Internal,
 }
 
@@ -206,6 +225,8 @@ pub enum ApiError {
         message: String,
         location: Option<String>,
     },
+    #[error("service unavailable: {0}")]
+    ServiceUnavailable(String),
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -228,6 +249,7 @@ impl ApiError {
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::UnsupportedMediaType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Self::Validation { .. } => StatusCode::BAD_REQUEST,
+            Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -242,6 +264,7 @@ impl ApiError {
             Self::Forbidden(_) => ErrorCode::Forbidden,
             Self::UnsupportedMediaType(_) => ErrorCode::UnsupportedMediaType,
             Self::Validation { .. } => ErrorCode::Validation,
+            Self::ServiceUnavailable(_) => ErrorCode::ServiceUnavailable,
             Self::Internal(_) => ErrorCode::Internal,
         }
     }
@@ -562,6 +585,8 @@ pub fn create_router(state: ApiState) -> Router {
         )
         .route("/certificates/{id}", get(certificates::get_handler))
         .route("/config", get(config_handler))
+        .route("/config/apply", post(apply::apply_handler))
+        .route("/config/revisions", get(apply::revisions_handler))
         .layer(middleware::from_fn(observe_middleware))
         .layer(middleware::from_fn(capture_peer_middleware))
         .with_state(state);
@@ -650,10 +675,12 @@ fn hash_bytes(bytes: &[u8]) -> String {
     format!("{hash:016x}")
 }
 
+mod apply;
 mod certificates;
 mod dto;
 mod hosts;
 
+pub use apply::ApplyResponse;
 pub use certificates::{
     derive_intent_status, CertificateIntentRequest, CertificateIntentStatus,
     CertificateIntentSummary, CertificateInventorySource, CertificateRecord, CertificateSummary,

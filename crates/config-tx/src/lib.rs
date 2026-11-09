@@ -14,10 +14,15 @@ use serde_json::Value;
 use thiserror::Error;
 use xxhash_rust::xxh3::xxh3_64;
 
+mod apply;
 mod diff;
 mod revision_store;
 mod validation;
 
+pub use apply::{
+    configs_match_ignoring_admin, ApplyFailure, ApplyFailureKind, ApplyOutcome,
+    ConfigApplyPipeline, ConfigTarget,
+};
 pub use diff::{Diff, DiffKind};
 pub use revision_store::{
     InMemoryRevisionStore, PersistentRevisionStore, RevisionRecord, RevisionStore,
@@ -305,6 +310,22 @@ impl<S: RevisionStore + RevisionStoreExt> ConfigTx<S> {
         drop(active_guard);
         *self.staged.lock().unwrap() = None;
         Ok(generation)
+    }
+
+    /// Record a failed apply attempt in the revision store without changing the active or staged
+    /// configuration. Used by [`crate::ConfigApplyPipeline`] for target and verification failures
+    /// that occur after the structural stage succeeded.
+    pub fn record_failed_attempt(
+        &self,
+        config: Value,
+        error: impl Into<String>,
+    ) -> Result<u64, TxError> {
+        // Serialize revision allocation and the durable audit write against concurrent applies.
+        let active = self.active_generation.write().unwrap();
+        let revision = self.next_revision(active.as_ref());
+        let staged = StagedConfig::new(config);
+        self.record_failure(revision, &staged, error.into())?;
+        Ok(revision)
     }
 
     /// Next revision number, accounting for failed attempts and a restored store.

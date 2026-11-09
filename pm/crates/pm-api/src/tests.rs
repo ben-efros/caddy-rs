@@ -10,7 +10,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::*;
 use crate::dto::{HostResponse, HostSpecDto, HostTlsDto, HostWriteRequest};
 use axum_test::TestServer;
-use caddy_rs_pm_runtime::{PmRuntime, RuntimeConfig};
+use caddy_rs_pm_runtime::{
+    ConfigApplyService, ConfigApplyStatus, ConfigRevision, PmRuntime, RuntimeConfig,
+};
 use tempfile::TempDir;
 
 fn runtime() -> (TempDir, ApiState) {
@@ -1463,4 +1465,166 @@ async fn manual_certificate_delete_requires_if_match_and_refuses_a_referencing_h
         server.get("/api/v1/certificates/1").await.status_code(),
         StatusCode::NOT_FOUND
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Config apply
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Clone, Default)]
+struct FakeAdmin {
+    current: Arc<std::sync::Mutex<serde_json::Value>>,
+    fail: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl FakeAdmin {
+    fn fail(&self, fail: bool) {
+        self.fail.store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn current(&self) -> serde_json::Value {
+        self.current.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl caddy_rs_pm_runtime::CaddyAdmin for FakeAdmin {
+    type Error = caddy_rs_pm_runtime::AdminError;
+
+    async fn load(
+        &self,
+        config: &serde_json::Value,
+    ) -> Result<(), caddy_rs_pm_runtime::AdminError> {
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(caddy_rs_pm_runtime::AdminError::Http(500));
+        }
+        *self.current.lock().unwrap() = config.clone();
+        Ok(())
+    }
+
+    async fn current(&self) -> Result<serde_json::Value, caddy_rs_pm_runtime::AdminError> {
+        Ok(self.current())
+    }
+}
+
+fn server_with_apply() -> (TempDir, TestServer, FakeAdmin) {
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let config = RuntimeConfig::new(temp_dir.path().join("data"));
+    let runtime = PmRuntime::open(config).expect("open runtime");
+    let admin = FakeAdmin::default();
+    let applier = ConfigApplyService::new(
+        runtime.clone(),
+        Arc::new(admin.clone()),
+        ConfigSettings::default(),
+    );
+    let app = create_router(ApiState::new(runtime).with_applier(applier))
+        .into_make_service_with_connect_info::<std::net::SocketAddr>();
+    (temp_dir, TestServer::new(app), admin)
+}
+
+#[tokio::test]
+async fn apply_is_unavailable_without_a_pipeline() {
+    let (_dir, state) = runtime();
+    let app = create_router(state).into_make_service_with_connect_info::<std::net::SocketAddr>();
+    let server = TestServer::new(app);
+    let response = server.post("/api/v1/config/apply").await;
+    assert_eq!(response.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: ApiErrorResponse = response.json();
+    assert_eq!(body.error.code, ErrorCode::ServiceUnavailable);
+}
+
+#[tokio::test]
+async fn apply_loads_verifies_and_exposes_the_durable_revision() {
+    let (_dir, server, admin) = server_with_apply();
+    let expected = server
+        .get("/api/v1/config")
+        .await
+        .json::<serde_json::Value>();
+
+    let response = server.post("/api/v1/config/apply").await;
+    assert_eq!(response.status_code(), StatusCode::OK);
+    let body: ApplyResponse = response.json();
+    assert_eq!(body.revision, 1);
+    assert!(body.changed);
+    assert_eq!(admin.current(), expected);
+
+    let history = server.get("/api/v1/config/revisions").await;
+    assert_eq!(history.status_code(), StatusCode::OK);
+    let history: PaginatedResponse<ConfigRevision> = history.json();
+    assert_eq!(history.total, 1);
+    assert_eq!(history.items[0].status, ConfigApplyStatus::Applied);
+    assert_eq!(history.items[0].hash, body.hash);
+}
+
+#[tokio::test]
+async fn failed_apply_returns_503_and_records_a_failed_revision() {
+    let (_dir, server, admin) = server_with_apply();
+    server.post("/api/v1/config/apply").await.assert_status_ok();
+    let before = admin.current();
+    admin.fail(true);
+
+    let response = server.post("/api/v1/config/apply").await;
+    assert_eq!(response.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: ApiErrorResponse = response.json();
+    assert_eq!(body.error.code, ErrorCode::ServiceUnavailable);
+    assert_eq!(admin.current(), before, "previous config stays active");
+
+    let history: PaginatedResponse<ConfigRevision> =
+        server.get("/api/v1/config/revisions").await.json();
+    assert_eq!(history.total, 2);
+    assert_eq!(
+        history.items.last().unwrap().status,
+        ConfigApplyStatus::Failed
+    );
+}
+
+#[tokio::test]
+async fn failed_apply_leaves_the_uploaded_certificate_pending() {
+    let (_dir, server, admin) = server_with_apply();
+    let upload = server
+        .post("/api/v1/certificates/custom")
+        .json(&manual_body(&["manual.example.com"]))
+        .await;
+    assert_eq!(upload.status_code(), StatusCode::CREATED);
+    admin.fail(true);
+
+    let response = server.post("/api/v1/config/apply").await;
+    assert_eq!(response.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let detail = server.get("/api/v1/certificates/custom/1").await;
+    assert_eq!(detail.status_code(), StatusCode::OK);
+    let body: serde_json::Value = detail.json();
+    assert_eq!(body["status"], "pending");
+}
+
+#[tokio::test]
+async fn successful_apply_marks_the_uploaded_certificate_issued() {
+    let (_dir, server, admin) = server_with_apply();
+    let upload = server
+        .post("/api/v1/certificates/custom")
+        .json(&manual_body(&["manual.example.com"]))
+        .await;
+    assert_eq!(upload.status_code(), StatusCode::CREATED);
+
+    let response = server.post("/api/v1/config/apply").await;
+    assert_eq!(
+        response.status_code(),
+        StatusCode::OK,
+        "{}",
+        response.text()
+    );
+    let config = admin.current();
+    assert_eq!(
+        config["apps"]["tls"]["certificates"]["load_files"][0]["certificate"],
+        serde_json::json!(_dir
+            .path()
+            .join("data/pm/secrets/manual-1.crt.pem")
+            .display()
+            .to_string())
+    );
+
+    let detail = server.get("/api/v1/certificates/custom/1").await;
+    assert_eq!(detail.status_code(), StatusCode::OK);
+    let body: serde_json::Value = detail.json();
+    assert_eq!(body["status"], "issued");
 }
