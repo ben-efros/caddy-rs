@@ -1,0 +1,17 @@
+[package]
+name = "caddy-rs-pm-policies"
+description = "Durable auto-certificate policy repository for the caddy-rs proxy manager"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+caddy-rs-pm-core = { path = "../pm-core" }
+caddy-rs-pm-state = { path = "../pm-state" }
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

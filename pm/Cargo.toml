@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/pm-state", "crates/pm-core", "crates/pm-compiler", "crates/pm-hosts"]
+members = [
+    "crates/pm-state",
+    "crates/pm-core",
+    "crates/pm-compiler",
+    "crates/pm-hosts",
+    "crates/pm-policies",
+]
 
 [workspace.package]
 version = "0.1.0"

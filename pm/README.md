@@ -9,6 +9,7 @@ This is the proxy-manager foundation workspace. It is deliberately independent o
 | `caddy-rs-pm-core` | Certificate and host domain model: certificate origins/policies, host TLS binding, proxy/redirect/dead host validation, domain uniqueness. |
 | `caddy-rs-pm-compiler` | Deterministic Caddy JSON route compiler for proxy/redirect/dead hosts; emits HTTP and HTTPS route lists, HSTS and forced-SSL redirects. No listeners, TLS automation or key material. |
 | `caddy-rs-pm-hosts` | Durable host repository over `pm-state`: get/list/create/update/delete with CAS revisions, atomic domain-index uniqueness, next-id reservation, and memory/snapshot backend tests. |
+| `caddy-rs-pm-policies` | Durable auto-certificate policy repository over `pm-state`: get/list/create/update/delete with CAS revisions, tombstones, monotonic id reservation and host coverage validation against `pm-core` hosts. |
 
 ## Why a nested workspace
 
@@ -103,6 +104,27 @@ changing host semantics.
 The repository validates `Host::validate_structure` before writing. It does **not** load certificate
 or policy objects; the API/service layer performs the full `Host::validate` coverage check before a
 mutation when TLS references are involved.
+
+## `pm-policies`
+
+`PolicyRepository` persists validated `AutoCertificatePolicy` documents in the same `pm-state`
+store, one `pm.policies` document per policy:
+
+- `create` validates the policy, rejects a duplicate or retired id, and writes the document in one
+  transaction;
+- `update` requires the caller's revision and commits under a compare-and-swap;
+- `delete` requires the revision and writes a `pm.policy-tombstones` marker, so a policy id is never
+  reused;
+- `next_id` reserves a monotonic id from a counter persisted in `pm.meta`, skipping existing and
+  retired ids. Arithmetic is checked, so a counter at `u64::MAX` fails with `IdExhausted` instead of
+  overflowing;
+- `get`, `list`, `snapshot_policies`;
+- `validate_policy_coverage(policy, &[Host])` checks only hosts bound with `TlsMode::Auto` to that
+  policy and reports the uncovered domains together with the affected host ids; manual/ACME/CA and
+  disabled hosts are ignored.
+
+The repository is persistence only and does not depend on `pm-hosts`; coverage reads `pm-core`
+`Host` values directly.
 
 ## Commands
 
