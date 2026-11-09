@@ -8,6 +8,7 @@ This is the proxy-manager foundation workspace. It is deliberately independent o
 | `caddy-rs-pm-state` | Backend-agnostic durable document state: snapshots, revisions, CAS transactions, one serialized writer. No SQL, C or network dependency. |
 | `caddy-rs-pm-core` | Certificate and host domain model: certificate origins/policies, host TLS binding, proxy/redirect/dead host validation, domain uniqueness. |
 | `caddy-rs-pm-compiler` | Deterministic Caddy JSON route compiler for proxy/redirect/dead hosts; emits HTTP and HTTPS route lists, HSTS and forced-SSL redirects. No listeners, TLS automation or key material. |
+| `caddy-rs-pm-hosts` | Durable host repository over `pm-state`: get/list/create/update/delete with CAS revisions, atomic domain-index uniqueness, next-id reservation, and memory/snapshot backend tests. |
 
 ## Why a nested workspace
 
@@ -65,22 +66,42 @@ without loading every certificate:
 - `validate_structure` — ids, domains, TLS mode/reference consistency, HSTS/forced-SSL invariants and
   kind-specific fields (upstream scheme/host/port, redirect status/target, dead host);
 - `validate` — additionally checks the referenced certificate/policy and domain coverage;
-- `validate_host_domain_uniqueness` — rejects a domain claimed by two hosts.
+- `validate_host_domain_uniqueness` and `validate_host_id_uniqueness` — reject a domain or id claimed
+  by two hosts.
 
 ## `pm-compiler`
 
 `compile_routes(&[Host])` returns ordered `http` and `https` route lists:
 
-- proxy → `reverse_proxy` with a `dial` URI; `preserve_host=false` rewrites upstream `Host`;
+- proxy → `reverse_proxy` with a `dial` address (`host:port`, IPv6 bracketed); HTTPS upstreams get a
+  TLS `transport`; `preserve_host=false` rewrites upstream `Host`;
 - redirect → `static_response` with a `Location` placeholder, `Auto` scheme, optional path preserve;
 - dead → 404;
 - TLS-enabled hosts get an HTTPS route; `ssl_forced` adds a 301 HTTP route; HSTS is added only to the
   HTTPS route;
-- disabled hosts are omitted; duplicate domains are rejected; output order is deterministic.
+- disabled hosts are omitted; duplicate ids/domains are rejected; redirect targets are normalized;
+  output order is deterministic.
 
 The compiler does not yet emit listeners, `tls_connection_policies`, access lists or advanced
 handlers. Those are later slices; the route layer stays independent so those can be added without
 changing host semantics.
+
+## `pm-hosts`
+
+`HostRepository` persists validated `Host` documents and a normalized-domain index in one
+`pm-state` store:
+
+- `create` checks the host id and every domain index are absent, then writes the host and indexes in
+  one transaction;
+- `update` requires the caller's revision, checks added domains, releases removed domains and
+  commits atomically;
+- `delete` requires the revision and refuses an index owned by another host;
+- `next_id` reserves a monotonic id in the same store;
+- `get`, `list`, `snapshot_hosts`, `domain_owner`.
+
+The repository validates `Host::validate_structure` before writing. It does **not** load certificate
+or policy objects; the API/service layer performs the full `Host::validate` coverage check before a
+mutation when TLS references are involved.
 
 ## Commands
 
@@ -95,12 +116,12 @@ CARGO_HOME=/root/caddy-rs/.scratch/cargo-home \
 ## Not in this slice
 
 - PM REST API/UI and the NPM compatibility adapter;
-- host persistence and the API service (this slice is model + compiler only);
+- the REST API/UI service;
 - certificate service/ACME jobs;
 - a durable backend with a journal (redb/SQLite/Postgres);
 - core on-demand TLS manager (tracked separately in
   `docs/research/DYNAMIC-CERTIFICATE-DECISIONS.md`).
 
-The next slices are host/policy persistence services, the certificate policy API, the read-model
+The next slices are the native REST API/UI, certificate policy persistence, the read-model
 synchronizer, and the core on-demand manager. The taxonomy and invariants are in
 `docs/research/PROXY-MANAGER-CERTIFICATES.md`.
