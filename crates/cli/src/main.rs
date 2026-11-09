@@ -2,7 +2,7 @@
 //!
 //! Command surface follows Caddy's CLI where it is meaningful for this build: `adapt`, `validate`,
 //! `run`, `reload`, `stop`, `list-modules`, `version`, `build-info`, `environ`, `completion` and
-//! `manpage`. `pki list`/`pki export` and `trust` expose
+//! `manpage`. `pki list`/`pki show`/`pki export` and `trust` expose
 //! the local CA material persisted by automatic HTTPS (`<data-dir>/pki/authorities/<id>/`); see
 //! `docs/compatibility/CADDYFILE.md` for the
 //! supported configuration surface.
@@ -13,16 +13,18 @@ mod environ;
 mod manpage;
 mod signals;
 
+use std::io;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{ExitCode, Stdio};
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context};
 use bytes::Bytes;
-use clap::{Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use http_body_util::{BodyExt, Full};
 
-use caddy_rs_admin::pki::{resolve_data_dir, PkiError, PkiStore, DEFAULT_CA_ID};
+use caddy_rs_admin::pki::{CertificateInfo, PkiError, PkiStore, DEFAULT_CA_ID, DEFAULT_CA_NAME};
+use caddy_rs_admin::trust::{TrustEnvironment, TrustPlan, TrustStatus, TrustStep};
 use caddy_rs_admin::AdminResponse;
 use caddy_rs_config::{AdaptMode, AdaptOptions};
 use caddy_rs_core::{Config, GenerationStore, VERSION};
@@ -184,7 +186,7 @@ enum Command {
         #[arg(short = 'o', long)]
         directory: Option<String>,
     },
-    /// Inspect and export the local certificate authority material.
+    /// Inspect, show and export the local certificate authority material.
     Pki {
         #[command(subcommand)]
         command: PkiCommand,
@@ -209,32 +211,88 @@ enum Command {
     },
 }
 
+/// Which certificate(s) `pki export` writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum PkiExportType {
+    /// The root certificate (the certificate `trust` installs).
+    Root,
+    /// The intermediate certificate chain only.
+    Intermediate,
+    /// The full chain, intermediates first and root last (Caddy's `/pki/ca/<id>/certificates` order).
+    Chain,
+}
+
 /// `pki` subcommands.
 #[derive(Debug, Subcommand)]
 enum PkiCommand {
     /// List the local certificate authorities provisioned in the data directory.
     List {
-        /// Data directory containing `pki/authorities` (default: `$CADDY_RS_DATA_DIR` or `.caddy-rs`).
+        /// Data directory containing `pki/authorities` (default: the server's resolved data root).
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        /// Configuration whose `storage.root` and `apps.pki` `install_trust` settings apply.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Config adapter for `--config` (for example `caddyfile`).
+        #[arg(long)]
+        adapter: Option<String>,
         /// Machine-readable JSON output.
         #[arg(long)]
         json: bool,
     },
-    /// Export one CA certificate (root by default) as PEM to stdout.
-    Export {
+    /// Show one certificate authority: subjects, validity, key files and trust state.
+    Show {
         /// CA identifier (for example `local`).
         id: String,
-        /// Data directory containing `pki/authorities` (default: `$CADDY_RS_DATA_DIR` or `.caddy-rs`).
+        /// Data directory containing `pki/authorities` (default: the server's resolved data root).
         #[arg(long)]
         data_dir: Option<PathBuf>,
-        /// Export the root certificate (default).
+        /// Configuration whose `storage.root`, CA name and `install_trust` settings apply.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Config adapter for `--config` (for example `caddyfile`).
+        #[arg(long)]
+        adapter: Option<String>,
+        /// Machine-readable JSON output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Export one CA certificate as PEM to stdout (or to `--out`).
+    #[command(group(
+        ArgGroup::new("ca_selector")
+            .args(["id", "ca"])
+            .required(true)
+            .multiple(false)
+    ))]
+    Export {
+        /// CA identifier (for example `local`); alternative to `--ca`.
+        id: Option<String>,
+        /// CA identifier (for example `local`); same as the positional `<ID>`.
+        #[arg(long, value_name = "ID")]
+        ca: Option<String>,
+        /// Data directory containing `pki/authorities` (default: the server's resolved data root).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Configuration whose `storage.root` settings apply.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Config adapter for `--config` (for example `caddyfile`).
+        #[arg(long)]
+        adapter: Option<String>,
+        /// Certificate to export: `root` (default), `intermediate` or `chain`.
+        #[arg(long = "type", value_enum, value_name = "TYPE",
+              conflicts_with_all = ["root", "intermediate", "chain"])]
+        export_type: Option<PkiExportType>,
+        /// Write the PEM to this file instead of standard output.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+        /// Export the root certificate (default; kept as an alias for `--type root`).
         #[arg(long, conflicts_with_all = ["intermediate", "chain"])]
         root: bool,
-        /// Export the intermediate certificate chain only.
+        /// Export the intermediate certificate chain only (alias for `--type intermediate`).
         #[arg(long, conflicts_with = "chain")]
         intermediate: bool,
-        /// Export the full chain: intermediate(s) first, root last (Caddy's `/certificates` order).
+        /// Export the full chain, intermediates first and root last (alias for `--type chain`).
         #[arg(long)]
         chain: bool,
     },
@@ -832,11 +890,335 @@ fn ensure_admin_success(response: &AdminResponse) -> anyhow::Result<()> {
 // PKI and trust commands
 // -------------------------------------------------------------------------------------------------
 
-/// Resolve the data directory for CLI commands: `--data-dir`, then `$CADDY_RS_DATA_DIR`, then the
-/// server runtime's default (`.caddy-rs`). The CLI has no configuration file in this path, so the
-/// config `storage.root` fallback cannot apply; document `--data-dir` for non-default deployments.
-fn cli_data_dir(explicit: Option<PathBuf>) -> PathBuf {
-    resolve_data_dir(explicit, None)
+/// How a CA's `apps.pki.certificate_authorities.<id>.install_trust` setting is configured.
+///
+/// Caddy installs the root certificate when the field is absent, so `Default` means "install" and is
+/// distinct from an explicit `true` only for reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallTrust {
+    /// Explicitly `true`.
+    Enabled,
+    /// Explicitly `false`; Caddy logs and skips `installRoot`.
+    Disabled,
+    /// Absent; Caddy's default is to install the root.
+    Default,
+}
+
+impl InstallTrust {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+            Self::Default => "default",
+        }
+    }
+}
+
+/// Read-only state of the platform trust store for one CA root.
+///
+/// Caddy has no read-only trust query (the admin API exposes certificates, not store state), so this
+/// is a caddy-rs extension. It is honest: `Unknown` is reported when the platform store cannot be
+/// inspected without changing it (the macOS keychain and the Windows store are only reachable through
+/// install commands).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrustState {
+    /// The platform install target contains this root certificate (and the Linux CA bundle does
+    /// not contradict it).
+    Installed,
+    /// The platform target does not contain this root certificate, or its Linux CA bundle is stale.
+    Missing,
+    /// `install_trust: false` in the supplied configuration.
+    Disabled,
+    /// The platform store cannot be inspected in a read-only way, or no platform target exists.
+    Unknown,
+}
+
+impl TrustState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Installed => "installed",
+            Self::Missing => "missing",
+            Self::Disabled => "disabled",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl PkiExportType {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Root => "root certificate",
+            Self::Intermediate => "intermediate certificate chain",
+            Self::Chain => "certificate chain",
+        }
+    }
+}
+
+/// Load `--config` for a pki command, reporting adapter/validation warnings like `run` does.
+fn load_pki_config(
+    config: Option<PathBuf>,
+    adapter: Option<String>,
+) -> anyhow::Result<Option<LoadedConfig>> {
+    let Some(path) = config else {
+        return Ok(None);
+    };
+    let loaded = load_validated(&path, adapter.as_deref(), AdaptOptions::default())?;
+    for warning in &loaded.warnings {
+        eprintln!("warning: {warning}");
+    }
+    Ok(Some(loaded))
+}
+
+fn pki_storage_root(loaded: Option<&LoadedConfig>) -> Option<PathBuf> {
+    loaded
+        .and_then(|loaded| loaded.model.storage())
+        .and_then(|storage| storage.root())
+        .map(PathBuf::from)
+}
+
+/// Resolve the data directory exactly as the server does.
+///
+/// This is `caddy_rs_core::data_dir::resolve_server_data_dir`: a configured `storage.root` wins (it is
+/// the storage the server actually writes), then `--data-dir`, then `$CADDY_RS_DATA_DIR`, then Caddy's
+/// `AppDataDir()` (XDG/HOME) with the legacy `.caddy-rs` fallback. The admin API's
+/// `caddy_rs_admin::pki::resolve_data_dir` is *not* used here: it predates the server's Caddy-path
+/// default and would keep looking in a relative `.caddy-rs`.
+fn resolve_pki_data_dir(
+    explicit: Option<PathBuf>,
+    loaded: Option<&LoadedConfig>,
+) -> caddy_rs_core::data_dir::ResolvedDataDir {
+    let resolved =
+        caddy_rs_core::data_dir::resolve_server_data_dir(explicit, pki_storage_root(loaded));
+    for warning in &resolved.warnings {
+        eprintln!("caddy-rs: warning: {warning}");
+    }
+    resolved
+}
+
+/// Refuse a data directory that cannot be inspected instead of silently listing nothing.
+///
+/// An existing but empty data directory is a valid "no CA provisioned yet" state; a missing or
+/// unreadable one means the operator pointed the command at the wrong place, so it fails loudly and
+/// names the path and how it was chosen.
+fn require_data_dir(resolved: &caddy_rs_core::data_dir::ResolvedDataDir) -> anyhow::Result<()> {
+    let path = &resolved.path;
+    let source = resolved.source.label();
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => bail!(
+            "pki: data directory `{}` (from {source}) is not a directory",
+            path.display()
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => bail!(
+            "pki: data directory `{}` (from {source}) does not exist; the server creates it when it \
+             provisions the internal CA (pass --data-dir or set CADDY_RS_DATA_DIR)",
+            path.display()
+        ),
+        Err(error) => bail!(
+            "pki: cannot read data directory `{}` (from {source}): {error}",
+            path.display()
+        ),
+    }
+    std::fs::read_dir(path).map_err(|error| {
+        anyhow!(
+            "pki: cannot read data directory `{}` (from {source}): {error}",
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn install_trust_setting(loaded: Option<&LoadedConfig>, id: &str) -> InstallTrust {
+    let setting = loaded
+        .and_then(|loaded| loaded.model.pki())
+        .and_then(|pki| pki.certificate_authorities.as_ref())
+        .and_then(|authorities| authorities.get(id))
+        .and_then(|authority| authority.install_trust);
+    match setting {
+        Some(false) => InstallTrust::Disabled,
+        Some(true) => InstallTrust::Enabled,
+        None => InstallTrust::Default,
+    }
+}
+
+/// Caddy's `caInfo.name` for a configured CA: the configured name, else `Caddy Local Authority`
+/// (`caddypki` `defaultCAName`). `None` means no configuration was supplied, so the caller falls
+/// back to the CA id (the data directory alone does not persist the name).
+fn configured_ca_name(loaded: Option<&LoadedConfig>, id: &str) -> Option<String> {
+    loaded.map(|loaded| {
+        loaded
+            .model
+            .pki()
+            .and_then(|pki| pki.certificate_authorities.as_ref())
+            .and_then(|authorities| authorities.get(id))
+            .and_then(|authority| authority.name.clone())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| DEFAULT_CA_NAME.to_string())
+    })
+}
+
+/// Inspect the platform trust store for one root certificate without modifying anything.
+fn trust_state(ca_id: &str, root_path: &Path, setting: InstallTrust) -> TrustState {
+    if setting == InstallTrust::Disabled {
+        return TrustState::Disabled;
+    }
+    let environment = TrustEnvironment::detect();
+    let plan = TrustPlan::detect(ca_id, root_path, &environment);
+    let Some(platform) = plan.targets.first() else {
+        return TrustState::Unknown;
+    };
+    if !matches!(platform.status, TrustStatus::Ready) {
+        // A missing tool/store means this build cannot prove the certificate is trusted; report
+        // `unknown` rather than claiming it is absent (an operator may have installed it manually).
+        return TrustState::Unknown;
+    }
+    if let Some(probe) = &platform.probe {
+        return if trust_probe_succeeds(probe) {
+            TrustState::Installed
+        } else {
+            TrustState::Missing
+        };
+    }
+    let mut copy_target = false;
+    for step in &platform.steps {
+        if let TrustStep::Copy { from, to } = step {
+            copy_target = true;
+            if files_match(from, to) {
+                // On Linux a matching staged copy is not enough if the generated CA bundle is
+                // present and does not contain it (the operator still has to run
+                // `update-ca-certificates`); report that honestly as missing.
+                return if bundle_lacks_root(from, &environment.platform_prefix) {
+                    TrustState::Missing
+                } else {
+                    TrustState::Installed
+                };
+            }
+        }
+    }
+    if copy_target {
+        TrustState::Missing
+    } else {
+        // The macOS keychain/Windows store are only reachable through install commands.
+        TrustState::Unknown
+    }
+}
+
+fn trust_probe_succeeds(step: &TrustStep) -> bool {
+    let TrustStep::Run { program, args } = step else {
+        return false;
+    };
+    std::process::Command::new(program)
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn files_match(from: &Path, to: &Path) -> bool {
+    match (std::fs::read(from), std::fs::read(to)) {
+        (Ok(from), Ok(to)) => from == to,
+        _ => false,
+    }
+}
+
+/// Whether a present Linux CA bundle demonstrably lacks this root certificate.
+///
+/// Debian-family hosts rebuild `/etc/ssl/certs/ca-certificates.crt` from
+/// `/usr/local/share/ca-certificates`; a matching staged copy with a stale bundle is not trusted yet.
+/// Other layouts/platforms (no bundle at this path) report `false`, so the staged-copy check stands.
+fn bundle_lacks_root(root_path: &Path, platform_prefix: &Path) -> bool {
+    if !cfg!(target_os = "linux") {
+        return false;
+    }
+    let bundle = platform_prefix.join("etc/ssl/certs/ca-certificates.crt");
+    let Ok(bundle) = std::fs::read(&bundle) else {
+        return false;
+    };
+    let Ok(root) = std::fs::read(root_path) else {
+        return false;
+    };
+    !bundle.windows(root.len()).any(|window| window == root)
+}
+
+fn certificate_subject(certificate: &CertificateInfo) -> String {
+    certificate
+        .common_name
+        .as_deref()
+        .map(|common_name| format!("CN={common_name}"))
+        .unwrap_or_else(|| "(no common name)".to_string())
+}
+
+fn certificate_issuer(certificate: &CertificateInfo) -> String {
+    certificate
+        .issuer_common_name
+        .as_deref()
+        .map(|common_name| format!("CN={common_name}"))
+        .unwrap_or_else(|| "(unknown issuer)".to_string())
+}
+
+fn certificate_dns_names(certificate: &CertificateInfo) -> String {
+    if certificate.dns_names.is_empty() {
+        "-".to_string()
+    } else {
+        certificate.dns_names.join(", ")
+    }
+}
+
+fn key_file_line(directory: &Path, file: &str) -> String {
+    let path = directory.join(file);
+    format!(
+        "{} ({})",
+        path.display(),
+        if path.is_file() { "present" } else { "missing" }
+    )
+}
+
+fn certificate_json(
+    certificate: &CertificateInfo,
+    directory: &Path,
+    key_file: &str,
+) -> serde_json::Value {
+    let key_path = directory.join(key_file);
+    serde_json::json!({
+        "subject": certificate_subject(certificate),
+        "issuer": certificate_issuer(certificate),
+        "serial": certificate.serial_hex,
+        "not_before": certificate.not_before,
+        "not_after": certificate.not_after,
+        "dns_names": certificate.dns_names,
+        "key_path": key_path.to_string_lossy(),
+        "key_present": key_path.is_file(),
+    })
+}
+
+fn print_certificate(
+    certificate: &CertificateInfo,
+    directory: &Path,
+    key_file: &str,
+    first_prefix: &str,
+    continuation: &str,
+) {
+    println!(
+        "{first_prefix}subject: {}",
+        certificate_subject(certificate)
+    );
+    println!("{continuation}issuer: {}", certificate_issuer(certificate));
+    println!("{continuation}serial: {}", certificate.serial_hex);
+    println!(
+        "{continuation}not before: {}",
+        certificate.not_before.as_deref().unwrap_or("-")
+    );
+    println!(
+        "{continuation}not after: {}",
+        certificate.not_after.as_deref().unwrap_or("-")
+    );
+    println!(
+        "{continuation}dns names: {}",
+        certificate_dns_names(certificate)
+    );
+    println!("{continuation}key: {}", key_file_line(directory, key_file));
 }
 
 fn pki_error(error: PkiError) -> anyhow::Error {
@@ -848,16 +1230,25 @@ fn pki_error(error: PkiError) -> anyhow::Error {
 
 async fn run_pki(command: PkiCommand) -> anyhow::Result<()> {
     match command {
-        PkiCommand::List { data_dir, json } => {
-            let store = PkiStore::new(cli_data_dir(data_dir));
+        PkiCommand::List {
+            data_dir,
+            config,
+            adapter,
+            json,
+        } => {
+            let loaded = load_pki_config(config, adapter)?;
+            let resolved = resolve_pki_data_dir(data_dir, loaded.as_ref());
+            require_data_dir(&resolved)?;
+            let store = PkiStore::new(resolved.path);
             let authorities = store.list().await.map_err(pki_error)?;
             if json {
-                let value = serde_json::json!({
-                    "data_dir": store.data_dir().to_string_lossy(),
-                    "authorities_dir": store.authorities_dir().to_string_lossy(),
-                    "authorities": authorities
-                        .iter()
-                        .map(|summary| serde_json::json!({
+                let authorities = authorities
+                    .iter()
+                    .map(|summary| {
+                        let setting = install_trust_setting(loaded.as_ref(), &summary.id);
+                        let trust =
+                            trust_state(&summary.id, &summary.directory.join("root.crt"), setting);
+                        serde_json::json!({
                             "id": summary.id,
                             "directory": summary.directory.to_string_lossy(),
                             "root_common_name": summary.root_common_name,
@@ -865,27 +1256,40 @@ async fn run_pki(command: PkiCommand) -> anyhow::Result<()> {
                             "root_not_after": summary.root_not_after,
                             "intermediate_not_after": summary.intermediate_not_after,
                             "has_intermediate": summary.has_intermediate,
-                        }))
-                        .collect::<Vec<_>>(),
+                            "trust": {
+                                "state": trust.label(),
+                                "install_trust": setting.label(),
+                            },
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let value = serde_json::json!({
+                    "data_dir": store.data_dir().to_string_lossy(),
+                    "authorities_dir": store.authorities_dir().to_string_lossy(),
+                    "authorities": authorities,
                 });
                 println!("{}", serde_json::to_string_pretty(&value)?);
                 return Ok(());
             }
             if authorities.is_empty() {
                 println!(
-                    "no local certificate authorities under `{}`",
-                    store.authorities_dir().display()
+                    "no local certificate authorities under `{}` (data directory `{}`)",
+                    store.authorities_dir().display(),
+                    store.data_dir().display()
                 );
                 return Ok(());
             }
-            let mut rows: Vec<[String; 5]> = vec![[
+            let mut rows: Vec<[String; 6]> = vec![[
                 "ID".to_string(),
                 "ROOT_CN".to_string(),
                 "INTERMEDIATE_CN".to_string(),
                 "ROOT_EXPIRES".to_string(),
                 "INTERMEDIATE_EXPIRES".to_string(),
+                "TRUST".to_string(),
             ]];
             for summary in &authorities {
+                let setting = install_trust_setting(loaded.as_ref(), &summary.id);
+                let trust = trust_state(&summary.id, &summary.directory.join("root.crt"), setting);
                 rows.push([
                     summary.id.clone(),
                     summary
@@ -904,10 +1308,11 @@ async fn run_pki(command: PkiCommand) -> anyhow::Result<()> {
                         .intermediate_not_after
                         .clone()
                         .unwrap_or_else(|| "-".to_string()),
+                    trust.label().to_string(),
                 ]);
             }
             // Column widths follow the data (real Caddy CNs are much longer than the headers).
-            let mut widths = [0usize; 5];
+            let mut widths = [0usize; 6];
             for row in &rows {
                 for (index, cell) in row.iter().enumerate() {
                     widths[index] = widths[index].max(cell.chars().count());
@@ -915,43 +1320,169 @@ async fn run_pki(command: PkiCommand) -> anyhow::Result<()> {
             }
             for row in &rows {
                 println!(
-                    "{:<id_width$} {:<root_width$} {:<intermediate_width$} {:<root_expires_width$} {:<intermediate_expires_width$}",
+                    "{:<id_width$} {:<root_width$} {:<intermediate_width$} {:<root_expires_width$} {:<intermediate_expires_width$} {:<trust_width$}",
                     row[0],
                     row[1],
                     row[2],
                     row[3],
                     row[4],
+                    row[5],
                     id_width = widths[0],
                     root_width = widths[1],
                     intermediate_width = widths[2],
                     root_expires_width = widths[3],
                     intermediate_expires_width = widths[4],
+                    trust_width = widths[5],
+                );
+            }
+        }
+        PkiCommand::Show {
+            id,
+            data_dir,
+            config,
+            adapter,
+            json,
+        } => {
+            let loaded = load_pki_config(config, adapter)?;
+            let resolved = resolve_pki_data_dir(data_dir, loaded.as_ref());
+            require_data_dir(&resolved)?;
+            let store = PkiStore::new(resolved.path);
+            let mut ca = store.load(&id).await.map_err(pki_error)?;
+            if let Some(name) = configured_ca_name(loaded.as_ref(), ca.id()) {
+                ca = ca.with_name(name);
+            }
+            let setting = install_trust_setting(loaded.as_ref(), ca.id());
+            let trust = trust_state(ca.id(), &ca.directory().join("root.crt"), setting);
+            if json {
+                let mut value = ca.info_json();
+                let object = value.as_object_mut().expect("caInfo is a JSON object");
+                object.insert(
+                    "directory".to_string(),
+                    serde_json::json!(ca.directory().to_string_lossy()),
+                );
+                object.insert(
+                    "root".to_string(),
+                    certificate_json(ca.root(), ca.directory(), "root.key"),
+                );
+                object.insert(
+                    "intermediates".to_string(),
+                    serde_json::Value::Array(
+                        ca.intermediates()
+                            .iter()
+                            .enumerate()
+                            .map(|(index, certificate)| {
+                                let mut value = certificate_json(
+                                    certificate,
+                                    ca.directory(),
+                                    "intermediate.key",
+                                );
+                                let object =
+                                    value.as_object_mut().expect("certificate JSON object");
+                                object.insert("index".to_string(), serde_json::json!(index + 1));
+                                value
+                            })
+                            .collect(),
+                    ),
+                );
+                object.insert(
+                    "trust".to_string(),
+                    serde_json::json!({
+                        "state": trust.label(),
+                        "install_trust": setting.label(),
+                    }),
+                );
+                println!("{}", serde_json::to_string_pretty(&value)?);
+                return Ok(());
+            }
+            println!("CA: {}", ca.id());
+            println!("name: {}", ca.name());
+            println!("directory: {}", ca.directory().display());
+            println!(
+                "trust: {} (install_trust: {})",
+                trust.label(),
+                setting.label()
+            );
+            println!("root certificate:");
+            print_certificate(ca.root(), ca.directory(), "root.key", "  ", "  ");
+            println!("intermediates: {}", ca.intermediates().len());
+            for (index, certificate) in ca.intermediates().iter().enumerate() {
+                print_certificate(
+                    certificate,
+                    ca.directory(),
+                    "intermediate.key",
+                    &format!("  [{}] ", index + 1),
+                    "      ",
                 );
             }
         }
         PkiCommand::Export {
             id,
+            ca,
             data_dir,
+            config,
+            adapter,
+            export_type,
+            out,
             root: _,
             intermediate,
             chain,
         } => {
-            let store = PkiStore::new(cli_data_dir(data_dir));
-            let ca = store.load(&id).await.map_err(pki_error)?;
-            let pem = if chain {
-                ca.chain_pem()
-            } else if intermediate {
-                let pem = ca.intermediate_pem();
-                if pem.is_empty() {
-                    bail!("CA `{id}` has no intermediate certificate");
-                }
-                pem
-            } else {
-                // Root is the default export (it is the certificate `trust` installs).
-                ca.root_pem().to_string()
+            let Some(id) = id.or(ca) else {
+                // The clap `ca_selector` group already enforces this; keep a located error in case
+                // the command is constructed programmatically.
+                bail!("pki export: specify the CA as the positional <ID> or with --ca <ID>");
             };
-            // PEM is written verbatim to stdout so it can be piped into other tools.
-            print!("{pem}");
+            let loaded = load_pki_config(config, adapter)?;
+            let resolved = resolve_pki_data_dir(data_dir, loaded.as_ref());
+            require_data_dir(&resolved)?;
+            let store = PkiStore::new(resolved.path);
+            let ca = store.load(&id).await.map_err(pki_error)?;
+            let export_type = export_type.unwrap_or_else(|| {
+                if chain {
+                    PkiExportType::Chain
+                } else if intermediate {
+                    PkiExportType::Intermediate
+                } else {
+                    // Root is the default export (it is the certificate `trust` installs).
+                    PkiExportType::Root
+                }
+            });
+            let pem = match export_type {
+                PkiExportType::Root => ca.root_pem().to_string(),
+                PkiExportType::Intermediate => {
+                    let pem = ca.intermediate_pem();
+                    if pem.is_empty() {
+                        bail!("pki: CA `{id}` has no intermediate certificate");
+                    }
+                    pem
+                }
+                PkiExportType::Chain => ca.chain_pem(),
+            };
+            match out {
+                Some(path) => {
+                    if let Some(parent) = path.parent() {
+                        if !parent.as_os_str().is_empty() && !parent.is_dir() {
+                            bail!(
+                                "pki export: output directory `{}` does not exist",
+                                parent.display()
+                            );
+                        }
+                    }
+                    std::fs::write(&path, pem.as_bytes()).with_context(|| {
+                        format!("pki export: cannot write `{}`", path.display())
+                    })?;
+                    eprintln!(
+                        "caddy-rs: exported {} for CA `{}` to `{}`",
+                        export_type.label(),
+                        ca.id(),
+                        path.display()
+                    );
+                }
+                None => {
+                    // PEM is written verbatim to stdout so it can be piped into other tools.
+                    print!("{pem}");
+                }
+            }
         }
     }
     Ok(())
@@ -978,21 +1509,7 @@ async fn run_trust(
     adapter: Option<String>,
     dry_run: bool,
 ) -> anyhow::Result<()> {
-    let loaded = match &config_path {
-        Some(path) => Some(load_validated(
-            path,
-            adapter.as_deref(),
-            AdaptOptions::default(),
-        )?),
-        None => None,
-    };
-    let storage_root = loaded.as_ref().and_then(|loaded| {
-        loaded
-            .model
-            .storage()
-            .and_then(|storage| storage.root())
-            .map(PathBuf::from)
-    });
+    let loaded = load_pki_config(config_path, adapter)?;
     if let Some(loaded) = &loaded {
         if let Some(message) = trust_installation_disabled(&loaded.model, ca_id) {
             eprintln!("caddy-rs: {message}");
@@ -1000,14 +1517,12 @@ async fn run_trust(
         }
     }
 
-    let store = PkiStore::new(resolve_data_dir(data_dir, storage_root));
+    let resolved = resolve_pki_data_dir(data_dir, loaded.as_ref());
+    require_data_dir(&resolved)?;
+    let store = PkiStore::new(resolved.path);
     let ca = store.load(ca_id).await.map_err(pki_error)?;
-    let environment = caddy_rs_admin::trust::TrustEnvironment::detect();
-    let plan = caddy_rs_admin::trust::TrustPlan::detect(
-        ca.id(),
-        ca.directory().join("root.crt"),
-        &environment,
-    );
+    let environment = TrustEnvironment::detect();
+    let plan = TrustPlan::detect(ca.id(), ca.directory().join("root.crt"), &environment);
 
     if dry_run {
         println!("CA id: {}", ca.id());

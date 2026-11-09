@@ -14,7 +14,7 @@ Commands:
   run           Run the server with a configuration
   reload        Load a new configuration into a running server through its admin API
   stop          Stop a running server through its admin API
-  pki           Inspect and export the local certificate authority material
+  pki           Inspect, show and export the local certificate authority material
   trust         Install the local CA root certificate into the host trust stores
   help          Print this message or the help of the given subcommand(s)
 ```
@@ -225,61 +225,133 @@ Inspects and exports the local certificate authority material stored in the data
 commands only read the data directory; the CA is created by the server when it issues a certificate
 with the internal issuer.
 
+`caddy-rs pki` is a caddy-rs extension. Stock Caddy v2.11.9 has no `pki` CLI (`cmd/pki*.go` does not
+exist); Caddy's CA surface is the admin API `GET /pki/ca/<id>` and `GET /pki/ca/<id>/certificates`
+(`modules/caddypki/adminapi.go`). The storage layout is Caddy's `caddypki` layout
+(`<data-dir>/pki/authorities/<id>/{root,intermediate}.{crt,key}`), the `--json` CA fields use
+Caddy's `caInfo` names, and chains are ordered intermediates first, root last, exactly like
+`/pki/ca/<id>/certificates`.
+
+The data directory is resolved exactly as the server resolves it: a configured `storage.root` from
+`--config` (the storage the server writes), then `--data-dir`, then `$CADDY_RS_DATA_DIR`, then
+Caddy's `AppDataDir()` (`$XDG_DATA_HOME/caddy`, `$HOME/.local/share/caddy`, platform variants), with
+the legacy `.caddy-rs` working-directory directory when it already exists. A missing or unreadable
+data directory is an error that names the path and how it was chosen; an existing but empty one is
+the normal "no CA provisioned yet" state.
+
 Synopsis: `caddy-rs pki <COMMAND>`
 
 | Command | Purpose |
 |---|---|
 | `list` | List the local certificate authorities. |
-| `export <ID>` | Export one CA certificate as PEM. |
+| `show <ID>` | Show one CA: subjects, validity, key files and trust state. |
+| `export <ID>` | Export one CA certificate or chain as PEM. |
 
 ### pki list
 
 Prints one row per certificate authority, with the columns `ID`, `ROOT_CN`, `INTERMEDIATE_CN`,
-`ROOT_EXPIRES` and `INTERMEDIATE_EXPIRES`. An empty data directory prints
-`no local certificate authorities under ...` and still exits 0.
+`ROOT_EXPIRES`, `INTERMEDIATE_EXPIRES` and `TRUST`.
+
+`TRUST` is the read-only state of the platform trust store for the CA root: `installed` (the
+platform install target contains this exact root certificate and, on Linux, the generated
+`/etc/ssl/certs/ca-certificates.crt` bundle does not contradict it), `missing` (the target does not
+contain it, or the bundle is stale), `disabled` (the supplied configuration has
+`apps.pki.certificate_authorities.<id>.install_trust: false`) or `unknown` (the platform store
+cannot be inspected without installing, as on macOS and Windows, or the platform tool is
+unavailable). On Linux the checked install target is
+`/usr/local/share/ca-certificates/caddy-rs-<id>.crt`. NSS/Firefox and Java stores are not queried by
+`list`; use `caddy-rs trust --dry-run` to see every target.
 
 Synopsis: `caddy-rs pki list [OPTIONS]`
 
 | Option | Description | Default |
 |---|---|---|
-| `--data-dir <DATA_DIR>` | Data directory containing `pki/authorities`. | `$CADDY_RS_DATA_DIR` or `.caddy-rs` |
+| `--data-dir <DATA_DIR>` | Data directory containing `pki/authorities`. | server resolution (see above) |
+| `--config <CONFIG>` | Configuration whose `storage.root` and `apps.pki` `install_trust` settings apply. | none |
+| `--adapter <ADAPTER>` | Adapter for `--config`. | inferred |
 | `--json` | Machine-readable JSON output. | off |
 
 ```sh
 caddy-rs pki list
 caddy-rs pki list --json
+caddy-rs pki list --config /etc/caddy/Caddyfile
 ```
+
+An empty authorities directory prints
+`no local certificate authorities under <authorities-dir> (data directory <data-dir>)` and exits 0.
 
 The JSON form includes `data_dir`, `authorities_dir` and an `authorities` array. Each entry has
 `id`, `directory`, `root_common_name`, `intermediate_common_name`, `root_not_after`,
-`intermediate_not_after` and `has_intermediate`.
+`intermediate_not_after`, `has_intermediate` and `trust` (`state` and `install_trust`).
 
-Exit status is 0 on success and 1 when the data directory cannot be read.
+Exit status is 0 on success, 1 when the data directory is missing/unreadable or cannot be listed,
+and 2 for usage errors.
 
-### pki export
+### pki show
 
-Exports one certificate or certificate chain as PEM to standard output.
+Shows one CA in detail: the CA id, name (Caddy's configured `apps.pki...name` when `--config` is
+supplied, otherwise the id), directory, platform trust state, the root certificate's subject,
+issuer, serial, validity and key file, and each intermediate certificate with the same fields.
+`key` reports whether `<ca>/root.key` / `<ca>/intermediate.key` exists; the key material itself is
+never read or printed.
 
-Synopsis: `caddy-rs pki export [OPTIONS] <ID>`
+Synopsis: `caddy-rs pki show [OPTIONS] <ID>`
 
 | Option | Description | Default |
 |---|---|---|
 | `<ID>` | CA identifier, for example `local`. | required |
-| `--data-dir <DATA_DIR>` | Data directory containing `pki/authorities`. | `$CADDY_RS_DATA_DIR` or `.caddy-rs` |
-| `--root` | Export the root certificate; this is the default export. | — |
-| `--intermediate` | Export the intermediate certificate chain only. | off |
-| `--chain` | Export the full chain, intermediates first and root last. | off |
+| `--data-dir <DATA_DIR>` | Data directory containing `pki/authorities`. | server resolution (see above) |
+| `--config <CONFIG>` | Configuration whose `storage.root`, CA name and `install_trust` settings apply. | none |
+| `--adapter <ADAPTER>` | Adapter for `--config`. | inferred |
+| `--json` | Machine-readable JSON output. | off |
 
-`--root`, `--intermediate` and `--chain` are mutually exclusive.
+```sh
+caddy-rs pki show local
+caddy-rs pki show local --json
+```
+
+`--json` prints Caddy's `caInfo` fields (`id`, `name`, `root_common_name`,
+`intermediate_common_name`, `root_certificate`, `intermediate_certificate`) plus `directory`,
+`root`, `intermediates` (1-based `index`, subject, issuer, serial, validity, DNS names, key path)
+and `trust`. A missing CA or an unknown id is an error that reports the directory it looked in.
+
+### pki export
+
+Exports one certificate or certificate chain as PEM. The default is the root certificate. PEM is
+written byte-for-byte, so `--out` produces the same bytes as Caddy's `root.crt`/`intermediate.crt`
+(and stdout can be piped directly).
+
+Synopsis: `caddy-rs pki export [OPTIONS] <ID>` or `caddy-rs pki export --ca <ID> ...`
+
+| Option | Description | Default |
+|---|---|---|
+| `<ID>` | CA identifier, for example `local`; alternative to `--ca`. | required (one of them) |
+| `--ca <ID>` | CA identifier; same as the positional `<ID>`. | required (one of them) |
+| `--data-dir <DATA_DIR>` | Data directory containing `pki/authorities`. | server resolution (see above) |
+| `--config <CONFIG>` | Configuration whose `storage.root` applies. | none |
+| `--adapter <ADAPTER>` | Adapter for `--config`. | inferred |
+| `--type <TYPE>` | `root`, `intermediate` or `chain`. | `root` |
+| `--out <PATH>` | Write the PEM to a file instead of standard output. | stdout |
+| `--root` | Alias for `--type root` (kept for compatibility). | — |
+| `--intermediate` | Alias for `--type intermediate`. | off |
+| `--chain` | Alias for `--type chain`, intermediates first and root last. | off |
+
+`--type` cannot be combined with the alias flags, and the positional `<ID>` cannot be combined with
+`--ca`. `--out` does not create missing parent directories; a missing directory is a located error
+and no file is written.
 
 ```sh
 caddy-rs pki export local > local-root.crt
+caddy-rs pki export --ca local --type intermediate --out local-intermediate.crt
+caddy-rs pki export --ca local --type chain --out local-chain.crt
 ```
 
 The CA must already exist in the data directory. A missing CA is an error that reports the path it
-looked in.
+looked in; exporting the intermediate of a root-only CA is also an error rather than an empty file.
 
-Exit status is 0 on success and 1 when the data directory cannot be read or the CA does not exist.
+Exit status is 0 on success, 1 when the data directory/CA is missing or the output cannot be
+written, and 2 for usage errors (missing/ambiguous CA selector, unknown `--type`, conflicting
+flags).
 
 ## trust
 
@@ -292,7 +364,7 @@ Synopsis: `caddy-rs trust [OPTIONS]`
 
 | Option | Description | Default |
 |---|---|---|
-| `--data-dir <DATA_DIR>` | Data directory containing `pki/authorities`. | `$CADDY_RS_DATA_DIR` or `.caddy-rs` |
+| `--data-dir <DATA_DIR>` | Data directory containing `pki/authorities`. | server resolution (same as `pki`) |
 | `--ca <CA>` | CA identifier. | `local` |
 | `--config <CONFIG>` | Configuration whose `apps.pki` `install_trust` and `storage.root` settings apply. | none |
 | `--adapter <ADAPTER>` | Adapter for `--config`. | inferred |
