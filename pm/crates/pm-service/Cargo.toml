@@ -1,0 +1,19 @@
+[package]
+name = "caddy-rs-pm-service"
+description = "Application service for proxy-manager host commands and route compilation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+caddy-rs-pm-compiler = { path = "../pm-compiler" }
+caddy-rs-pm-core = { path = "../pm-core" }
+caddy-rs-pm-hosts = { path = "../pm-hosts" }
+caddy-rs-pm-state = { path = "../pm-state" }
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true

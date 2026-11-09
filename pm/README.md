@@ -9,6 +9,7 @@ This is the proxy-manager foundation workspace. It is deliberately independent o
 | `caddy-rs-pm-core` | Certificate and host domain model: certificate origins/policies, host TLS binding, proxy/redirect/dead host validation, domain uniqueness. |
 | `caddy-rs-pm-compiler` | Deterministic Caddy JSON route compiler for proxy/redirect/dead hosts; emits HTTP and HTTPS route lists, HSTS and forced-SSL redirects. No listeners, TLS automation or key material. |
 | `caddy-rs-pm-hosts` | Durable host repository over `pm-state`: get/list/create/update/delete with CAS revisions, atomic domain-index uniqueness, next-id reservation, and memory/snapshot backend tests. |
+| `caddy-rs-pm-service` | Application service over `pm-hosts`: id-allocating create, CAS update/delete, list, and route compilation. No REST API, UI, auth or certificate policy loading. |
 
 ## Why a nested workspace
 
@@ -103,6 +104,25 @@ changing host semantics.
 The repository validates `Host::validate_structure` before writing. It does **not** load certificate
 or policy objects; the API/service layer performs the full `Host::validate` coverage check before a
 mutation when TLS references are involved.
+
+## `pm-service`
+
+`HostService` is the command layer a future API/UI calls. It owns no storage and no policy:
+
+- `create(HostDraft)` reserves `next_id`, builds `Host::new` and calls the repository. The id is
+  allocated before validation, so a rejected draft or a domain conflict consumes it; id gaps are
+  normal and ids are never reused;
+- `update(id, expected_revision, draft)` and `delete(id, expected_revision)` pass the caller's
+  revision straight through, preserving the repository's compare-and-swap (update does not read the
+  current host first);
+- `list()` returns `StoredHost` values with revisions; `compile()` reads one snapshot and calls
+  `compile_routes`.
+
+`HostDraft` carries `domains`, `tls` and `spec`; drafts are always enabled and `update` replaces the
+whole host. Structure validation stays in the repository. This crate does **not** load certificates
+or auto policies and does not expose REST/UI/auth, so a caller using `Manual`, `AcmeConfigured`,
+`InternalCa` or `Auto` TLS must load the referenced object and run `Host::validate` before a
+mutation; the structural check cannot prove existence or domain coverage.
 
 ## Commands
 
