@@ -2336,29 +2336,42 @@ pub(crate) fn parse_go_duration_ns(value: &str) -> Result<i64, String> {
     if value.len() > 1024 {
         return Err("parsing duration: input string too long".to_string());
     }
-    // `caddy.ParseDuration`'s day rewrite (caddy.go): every 'd' is replaced by the preceding
-    // number times 24 and an 'h'. The loop's index handling is part of the behaviour, because it
-    // determines the rewritten string that Go's parser (and its error text) sees.
-    let mut text = value.to_string();
+    // `caddy.ParseDuration`'s day rewrite (caddy.go) walks *bytes*: `s[i] == 'd'`, then
+    // `strconv.ParseFloat(s[start:i])` on the preceding run. Working on bytes matters: a multi-byte
+    // rune such as `µ` can start a run, and Go hands the raw bytes to ParseFloat, which reports them
+    // as `\xb5`. Slicing the Rust `str` at those indices panicked (`not a char boundary`) for input
+    // like `µd`.
+    let mut bytes: Vec<u8> = value.as_bytes().to_vec();
     let mut in_number = false;
     let mut number_start = 0_usize;
     let mut index = 0_usize;
-    while index < text.len() {
-        let byte = text.as_bytes()[index];
+    while index < bytes.len() {
+        let byte = bytes[index];
         if byte == b'd' {
-            let days_text = &text[number_start..index];
-            let days: f64 = days_text.parse().map_err(|_| {
-                format!("strconv.ParseFloat: parsing \"{days_text}\": invalid syntax")
-            })?;
+            let days_bytes = &bytes[number_start..index];
+            let days: f64 = match std::str::from_utf8(days_bytes) {
+                Ok(days_text) => days_text.parse().map_err(|_| {
+                    format!(
+                        "strconv.ParseFloat: parsing \"{}\": invalid syntax",
+                        go_quote_bytes(days_bytes)
+                    )
+                })?,
+                Err(_) => {
+                    return Err(format!(
+                        "strconv.ParseFloat: parsing \"{}\": invalid syntax",
+                        go_quote_bytes(days_bytes)
+                    ))
+                }
+            };
             let hours = days * 24.0;
             // Go's `strconv.FormatFloat(hours, 'f', -1, 64)`: shortest decimal representation.
             let hours_text = format!("{hours}");
-            text = format!(
-                "{}{}h{}",
-                &text[..number_start],
-                hours_text,
-                &text[index + 1..]
-            );
+            let mut rebuilt = Vec::with_capacity(bytes.len() + hours_text.len() + 1);
+            rebuilt.extend_from_slice(&bytes[..number_start]);
+            rebuilt.extend_from_slice(hours_text.as_bytes());
+            rebuilt.push(b'h');
+            rebuilt.extend_from_slice(&bytes[index + 1..]);
+            bytes = rebuilt;
             // Go does `i--; continue`, then the loop's `i++`: the same byte is processed again.
             continue;
         }
@@ -2368,7 +2381,22 @@ pub(crate) fn parse_go_duration_ns(value: &str) -> Result<i64, String> {
         in_number = byte.is_ascii_digit() || matches!(byte, b'.' | b'-' | b'+');
         index += 1;
     }
+    let text = String::from_utf8(bytes).map_err(|_| "duration is not valid UTF-8".to_string())?;
     parse_go_duration(&text)
+}
+
+/// Go's `strconv.Quote` byte escaping for error text: printable ASCII as-is, everything else `\xNN`.
+fn go_quote_bytes(bytes: &[u8]) -> String {
+    let mut quoted = String::new();
+    for byte in bytes {
+        match byte {
+            b'\\' => quoted.push_str("\\\\"),
+            b'"' => quoted.push_str("\\\""),
+            0x20..=0x7e => quoted.push(*byte as char),
+            other => quoted.push_str(&format!("\\x{other:02x}")),
+        }
+    }
+    quoted
 }
 
 /// Go's `time.ParseDuration` for the string Caddy's day rewrite produced.
@@ -2738,6 +2766,26 @@ mod tests {
     }
 
     #[test]
+    fn day_rewrite_is_byte_safe_for_multibyte_prefixes() {
+        // Caddy's day rewrite walks bytes and hands the preceding run to strconv.ParseFloat; a
+        // multi-byte rune before `d` used to slice the Rust `str` at a non-char boundary and panic.
+        // Go reports the raw byte as `\xb5`; verify the message and, above all, that nothing panics.
+        for value in ["\u{b5}d", "1\u{b5}d", "\u{1f600}d"] {
+            let error = parse_go_duration_ns(value).expect_err("a rune is not a number");
+            assert!(
+                error.contains("strconv.ParseFloat: parsing"),
+                "unexpected error for {value:?}: {error}"
+            );
+        }
+        assert_eq!(
+            parse_go_duration_ns("\u{b5}d").unwrap_err(),
+            "strconv.ParseFloat: parsing \"\\xb5\": invalid syntax"
+        );
+        // Valid day forms still rewrite correctly.
+        assert_eq!(parse_go_duration_ns("1d").unwrap(), 86_400_000_000_000);
+        assert_eq!(parse_go_duration_ns("1.5d").unwrap(), 129_600_000_000_000);
+    }
+
     fn go_duration_parser_error_text_matches_go_and_caddy() {
         // Exact messages from Go's `time.ParseDuration` (after Caddy's day rewrite), verified
         // against the v2.11.9 oracle; the adapter adds Caddy's directive prefix on top.
