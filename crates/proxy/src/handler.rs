@@ -27,8 +27,12 @@
 //! configured upstream target; no separate `Host` field is forwarded on h2.
 
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -137,6 +141,87 @@ impl ProxyError {
     /// Whether this is the "upgrade needs the streaming path" error.
     fn is_upgrade_not_supported(&self) -> bool {
         matches!(self, ProxyError::UpgradeNotSupported)
+    }
+}
+
+/// How often the header deadline re-checks whether the connector is still dialing.
+const HEADER_DEADLINE_RECHECK: Duration = Duration::from_millis(5);
+
+/// Wait for an upstream response head, charging only time the request is *not* in the connector.
+///
+/// Caddy's `transport.response_header_timeout` is Go's `http.Transport.ResponseHeaderTimeout`,
+/// which starts after the request has been written and therefore excludes dialing, waiting for a
+/// connection slot and TLS negotiation. hyper-util's client future covers all of those phases, so
+/// this wrapper pauses the budget whenever the connector reports an in-flight connection attempt
+/// (`connectors_in_flight`); the budget resumes once hyper owns the connection.
+///
+/// Approximation: the budget also covers writing the request, because hyper does not expose the
+/// "request fully written" boundary; Go starts it after the write completes.
+struct ResponseHeaderWait<F> {
+    inner: Pin<Box<F>>,
+    limit: Duration,
+    connectors_in_flight: Arc<AtomicUsize>,
+    /// Time spent inside the header budget (excluding paused connector stretches).
+    elapsed: Duration,
+    /// When the current unpaused stretch started; `None` means the budget is paused.
+    active_since: Option<tokio::time::Instant>,
+    /// Either the remaining-duration sleep (unpaused) or the short recheck sleep (paused).
+    timer: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<F> ResponseHeaderWait<F> {
+    fn new(inner: F, limit: Duration, connectors_in_flight: Arc<AtomicUsize>) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            limit,
+            connectors_in_flight,
+            elapsed: Duration::ZERO,
+            active_since: None,
+            timer: None,
+        }
+    }
+}
+
+impl<F: Future> Future for ResponseHeaderWait<F> {
+    type Output = Result<F::Output, Duration>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        loop {
+            if let Poll::Ready(output) = this.inner.as_mut().poll(cx) {
+                return Poll::Ready(Ok(output));
+            }
+            let now = tokio::time::Instant::now();
+            if this.connectors_in_flight.load(Ordering::SeqCst) > 0 {
+                if let Some(since) = this.active_since.take() {
+                    this.elapsed += now.saturating_duration_since(since);
+                    this.timer = None;
+                }
+                if this.timer.is_none() {
+                    this.timer = Some(Box::pin(tokio::time::sleep(HEADER_DEADLINE_RECHECK)));
+                }
+                let Some(timer) = this.timer.as_mut() else {
+                    return Poll::Pending;
+                };
+                if timer.as_mut().poll(cx).is_ready() {
+                    this.timer = None;
+                    continue;
+                }
+                return Poll::Pending;
+            }
+            if this.active_since.is_none() {
+                this.active_since = Some(now);
+                let remaining = this.limit.saturating_sub(this.elapsed);
+                this.timer = Some(Box::pin(tokio::time::sleep(remaining)));
+            }
+            let Some(timer) = this.timer.as_mut() else {
+                return Poll::Pending;
+            };
+            if timer.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(Err(this.limit));
+            }
+            return Poll::Pending;
+        }
     }
 }
 
@@ -757,11 +842,19 @@ impl ReverseProxyHandler {
         *outbound.headers_mut() = headers;
 
         let started = std::time::Instant::now();
+        // `transport.response_header_timeout` pauses while the connector is dialing or waiting
+        // for a `max_conns_per_host` slot, so only the wait for the response head is bounded.
         let request_future = client.request(outbound);
-        let mut response = match self.transport.response_header_timeout {
-            Some(limit) => match tokio::time::timeout(limit, request_future).await {
+        let mut response = match self.transport.tuning.response_header_timeout {
+            Some(limit) => match ResponseHeaderWait::new(
+                request_future,
+                limit,
+                Arc::clone(&self.transport.tuning.connectors_in_flight),
+            )
+            .await
+            {
                 Ok(result) => result?,
-                Err(_) => {
+                Err(limit) => {
                     return Err(ProxyError::ResponseTimeout(format!(
                         "upstream `{}` did not send response headers within {limit:?}",
                         upstream.dial
@@ -2207,11 +2300,9 @@ struct TransportConfig {
     proxy_protocol: Option<ProxyProtocolVersion>,
     /// `transport.dial_timeout`: cap on establishing the upstream connection.
     dial_timeout: Option<Duration>,
-    /// Connection tuning knobs (keep-alive, connection limits, dial fallback, local bind,
-    /// resolver, read buffer).
+    /// Connection tuning knobs (keep-alive, connection limits, dial fallback, response-header
+    /// timeout, local bind, resolver).
     tuning: TransportTuning,
-    /// `transport.response_header_timeout`: bound on waiting for response headers.
-    response_header_timeout: Option<Duration>,
 }
 
 /// Publish one upstream attempt into the request's access-log context (caddy-rs `upstream`).
@@ -2477,16 +2568,6 @@ fn parse_transport(value: Option<&Value>, path: &str) -> HttpResult<TransportCon
     .filter(|count| *count > 0)
     .map(|count| count as usize);
 
-    // Go's `ReadBufferSize` clamps values below 4 KiB up to 4 KiB; 0 keeps hyper's adaptive
-    // buffer (Caddy's default).
-    let read_buffer_size = parse_integer(
-        object.get("read_buffer_size"),
-        &format!("{transport_path}.read_buffer_size"),
-        "read_buffer_size",
-    )?
-    .filter(|size| *size > 0)
-    .map(|size| (size as usize).max(4096));
-
     let local_address = match object.get("local_address") {
         None | Some(Value::Null) => None,
         Some(value) => Some(parse_local_address(
@@ -2507,15 +2588,19 @@ fn parse_transport(value: Option<&Value>, path: &str) -> HttpResult<TransportCon
     };
 
     // Caddy's `compression` controls the transport's *transparent* gzip. caddy-rs never adds
-    // `Accept-Encoding` or decompresses, which is exactly `compression: false`; the default
-    // (`true`) is therefore not faithful and explicit `true` is rejected.
+    // `Accept-Encoding` or decompresses, which is exactly `compression: false`, so an explicit
+    // `false` is faithful and an explicit `true` is rejected. An absent field is Caddy's default
+    // `true`, which caddy-rs silently behaves as `false` for: that is the documented compression
+    // divergence proposed to the Lead (caddy-rs never compresses), not an implementation of the
+    // knob.
     match object.get("compression") {
         None | Some(Value::Null) => {}
         Some(Value::Bool(false)) => {}
         Some(Value::Bool(true)) => {
             return Err(invalid(
                 &format!("{transport_path}.compression"),
-                "HTTP transport transparent compression (`compression: true`) is not implemented                  by this build (PROXY-TRANSPORT-COMPRESSION); set `compression: false` or remove                  the field",
+                "HTTP transport transparent compression (`compression: true`) is not implemented by this \
+                 build (PROXY-TRANSPORT-COMPRESSION); set `compression: false` or remove the field",
             ))
         }
         Some(_) => {
@@ -2528,7 +2613,18 @@ fn parse_transport(value: Option<&Value>, path: &str) -> HttpResult<TransportCon
 
     // Real Caddy transport knobs that this build cannot honour faithfully: reject rather than
     // silently ignore them.
+    //
+    // `read_buffer_size` is here because hyper's `http1_read_buf_exact_size` caps the
+    // response-header buffer instead of providing Caddy/Go's growable initial read buffer: an
+    // 8 KiB upstream header with `read_buffer 4KiB` would become a 502, so the knob is refused.
+    // `expect_continue_timeout` is here because hyper's `Expect: 100-continue` handling exposes no
+    // equivalent timer; it is deliberately not approximated.
     const UNSUPPORTED_TRANSPORT_OPTIONS: &[(&str, &str, &str)] = &[
+        (
+            "read_buffer_size",
+            "PROXY-TRANSPORT-READ-BUFFER",
+            "HTTP transport read buffer sizing",
+        ),
         (
             "write_buffer_size",
             "PROXY-TRANSPORT-WRITE-BUFFER",
@@ -2570,7 +2666,8 @@ fn parse_transport(value: Option<&Value>, path: &str) -> HttpResult<TransportCon
             return Err(invalid(
                 &format!("{transport_path}.{field}"),
                 format!(
-                    "{feature} is not implemented by this build ({tracking_id}); remove                      `{field}` or use a build that supports it"
+                    "{feature} is not implemented by this build ({tracking_id}); remove `{field}` or use a \
+                     build that supports it"
                 ),
             ));
         }
@@ -2631,11 +2728,11 @@ fn parse_transport(value: Option<&Value>, path: &str) -> HttpResult<TransportCon
             keep_alive,
             max_conns_per_host,
             fallback_delay,
+            response_header_timeout,
             local_address,
             resolver,
-            read_buffer_size,
+            ..TransportTuning::default()
         },
-        response_header_timeout,
     })
 }
 
@@ -4439,6 +4536,11 @@ mod tests {
         // Knobs this build cannot honour faithfully stay loud, named errors with a tracking id.
         for (field, value, tracking_id) in [
             (
+                "read_buffer_size",
+                serde_json::json!(4096),
+                "PROXY-TRANSPORT-READ-BUFFER",
+            ),
+            (
                 "write_buffer_size",
                 serde_json::json!(16384),
                 "PROXY-TRANSPORT-WRITE-BUFFER",
@@ -5846,6 +5948,485 @@ mod tests {
         }));
         assert_eq!(handler.upstreams()[0].max_requests(), Some(7));
         assert!(!handler.upstreams()[0].is_full());
+    }
+    // ---- T-PROXY-054: transport connection-tuning knobs --------------------------------------
+
+    /// Cleartext HTTP/1.1 upstream that records connections, peak concurrency and peer addresses.
+    #[derive(Clone)]
+    struct CountedUpstream {
+        dial: String,
+        connections: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        max_active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        peers: std::sync::Arc<Mutex<Vec<SocketAddr>>>,
+    }
+
+    async fn spawn_counted_upstream(delay: Duration) -> CountedUpstream {
+        spawn_counted_upstream_on("127.0.0.1:0", delay).await
+    }
+
+    async fn spawn_counted_upstream_on(bind: &str, delay: Duration) -> CountedUpstream {
+        use std::sync::atomic::Ordering;
+
+        let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
+        let dial = listener.local_addr().unwrap().to_string();
+        let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peers = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let seen_connections = std::sync::Arc::clone(&connections);
+        let seen_max = std::sync::Arc::clone(&max_active);
+        let seen_peers = std::sync::Arc::clone(&peers);
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, peer)) = listener.accept().await else {
+                    break;
+                };
+                seen_connections.fetch_add(1, Ordering::SeqCst);
+                seen_peers.lock().unwrap().push(peer);
+                let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let max_active = std::sync::Arc::clone(&seen_max);
+                let service_active = std::sync::Arc::clone(&active);
+                let service = service_fn(move |_request: hyper::Request<hyper::body::Incoming>| {
+                    let active = std::sync::Arc::clone(&service_active);
+                    let max_active = std::sync::Arc::clone(&max_active);
+                    async move {
+                        let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        let _ = max_active.fetch_max(now, Ordering::SeqCst);
+                        if !delay.is_zero() {
+                            tokio::time::sleep(delay).await;
+                        }
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        Ok::<_, Infallible>(
+                            hyper::Response::builder()
+                                .status(200)
+                                .body(Full::new(Bytes::from_static(b"ok")))
+                                .unwrap(),
+                        )
+                    }
+                });
+                tokio::spawn(async move {
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        CountedUpstream {
+            dial,
+            connections,
+            max_active,
+            peers,
+        }
+    }
+
+    /// Raw HTTP/1.1 upstream that sends response headers immediately but delays the two-byte
+    /// body, so a streaming response keeps its connection (and `max_conns_per_host` permit) busy.
+    async fn spawn_slow_body_upstream() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dial = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buffer = Vec::new();
+                    loop {
+                        let mut chunk = [0_u8; 1024];
+                        let read = match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(read) => read,
+                        };
+                        buffer.extend_from_slice(&chunk[..read]);
+                        if !buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                            continue;
+                        }
+                        buffer.clear();
+                        if stream
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\n",
+                            )
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        if stream.flush().await.is_err() {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        if stream.write_all(b"ok").await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        dial
+    }
+
+    /// Handler with `transport` enabled; `tuning` must include `"protocol": "http"`.
+    fn tuned_handler(dial: &str, tuning: serde_json::Value) -> ReverseProxyHandler {
+        build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": dial}],
+            "transport": tuning,
+        }))
+    }
+
+    async fn respond_status(handler: &ReverseProxyHandler, path: &str) -> StatusCode {
+        match handler.handle(get_request(path, None)).await.unwrap() {
+            Outcome::Respond(response) => response.status,
+            Outcome::Continue(_) => panic!("reverse_proxy must respond"),
+        }
+    }
+
+    #[test]
+    fn transport_tuning_defaults_match_caddy() {
+        let handler = tuned_handler("127.0.0.1:9", serde_json::json!({"protocol": "http"}));
+        let tuning = &handler.transport.tuning;
+        assert!(tuning.keep_alive.enabled);
+        assert_eq!(
+            tuning.keep_alive.probe_interval,
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(tuning.keep_alive.max_idle_conns, None);
+        assert_eq!(tuning.keep_alive.max_idle_conns_per_host, 32);
+        assert_eq!(
+            tuning.keep_alive.idle_timeout,
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(tuning.max_conns_per_host, None);
+        assert_eq!(tuning.fallback_delay, Some(Duration::from_millis(300)));
+        assert_eq!(tuning.response_header_timeout, None);
+        assert_eq!(tuning.local_address, None);
+        assert!(tuning.resolver.is_none());
+    }
+
+    #[test]
+    fn keep_alive_zero_values_are_caddys_defaults_and_negative_disables() {
+        let handler = tuned_handler(
+            "127.0.0.1:9",
+            serde_json::json!({
+                "protocol": "http",
+                "keep_alive": {
+                    "probe_interval": 0,
+                    "idle_timeout": 0,
+                    "max_idle_conns_per_host": 0,
+                    "max_idle_conns": 5
+                }
+            }),
+        );
+        let keep_alive = &handler.transport.tuning.keep_alive;
+        assert_eq!(keep_alive.probe_interval, Some(Duration::from_secs(30)));
+        assert_eq!(keep_alive.idle_timeout, Some(Duration::from_secs(120)));
+        assert_eq!(keep_alive.max_idle_conns_per_host, 32);
+        assert_eq!(keep_alive.max_idle_conns, Some(5));
+
+        let handler = tuned_handler(
+            "127.0.0.1:9",
+            serde_json::json!({
+                "protocol": "http",
+                "keep_alive": {"probe_interval": -1, "idle_timeout": -1}
+            }),
+        );
+        let keep_alive = &handler.transport.tuning.keep_alive;
+        assert_eq!(
+            keep_alive.probe_interval, None,
+            "negative disables TCP probes"
+        );
+        assert_eq!(
+            keep_alive.idle_timeout, None,
+            "negative disables the idle timeout"
+        );
+    }
+
+    #[test]
+    fn dial_fallback_delay_defaults_to_300ms_and_negative_disables() {
+        let default = tuned_handler("127.0.0.1:9", serde_json::json!({"protocol": "http"}));
+        assert_eq!(
+            default.transport.tuning.fallback_delay,
+            Some(Duration::from_millis(300))
+        );
+
+        let zero = tuned_handler(
+            "127.0.0.1:9",
+            serde_json::json!({"protocol": "http", "dial_fallback_delay": 0}),
+        );
+        assert_eq!(
+            zero.transport.tuning.fallback_delay,
+            Some(Duration::from_millis(300)),
+            "zero means Go's default 300 ms"
+        );
+
+        let disabled = tuned_handler(
+            "127.0.0.1:9",
+            serde_json::json!({"protocol": "http", "dial_fallback_delay": -1}),
+        );
+        assert_eq!(
+            disabled.transport.tuning.fallback_delay, None,
+            "a negative delay disables Fast Fallback"
+        );
+
+        let custom = tuned_handler(
+            "127.0.0.1:9",
+            serde_json::json!({"protocol": "http", "dial_fallback_delay": 25_000_000}),
+        );
+        assert_eq!(
+            custom.transport.tuning.fallback_delay,
+            Some(Duration::from_millis(25))
+        );
+    }
+
+    #[tokio::test]
+    async fn keep_alive_off_does_not_reuse_connections() {
+        use std::sync::atomic::Ordering;
+
+        let upstream = spawn_counted_upstream(Duration::ZERO).await;
+        let handler = tuned_handler(&upstream.dial, serde_json::json!({"protocol": "http"}));
+        assert_eq!(respond_status(&handler, "/one").await, StatusCode::OK);
+        assert_eq!(respond_status(&handler, "/two").await, StatusCode::OK);
+        assert_eq!(
+            upstream.connections.load(Ordering::SeqCst),
+            1,
+            "keep-alive on must reuse the pooled connection"
+        );
+
+        let upstream = spawn_counted_upstream(Duration::ZERO).await;
+        let handler = tuned_handler(
+            &upstream.dial,
+            serde_json::json!({"protocol": "http", "keep_alive": {"enabled": false}}),
+        );
+        assert_eq!(respond_status(&handler, "/one").await, StatusCode::OK);
+        assert_eq!(respond_status(&handler, "/two").await, StatusCode::OK);
+        assert_eq!(
+            upstream.connections.load(Ordering::SeqCst),
+            2,
+            "keep_alive off must open a fresh connection per request"
+        );
+    }
+
+    #[tokio::test]
+    async fn max_conns_per_host_limits_concurrent_upstream_connections() {
+        use std::sync::atomic::Ordering;
+
+        let upstream = spawn_counted_upstream(Duration::from_millis(200)).await;
+        let handler = std::sync::Arc::new(tuned_handler(
+            &upstream.dial,
+            serde_json::json!({"protocol": "http", "max_conns_per_host": 1}),
+        ));
+        let first = {
+            let handler = std::sync::Arc::clone(&handler);
+            tokio::spawn(async move { respond_status(&handler, "/first").await })
+        };
+        let second = {
+            let handler = std::sync::Arc::clone(&handler);
+            tokio::spawn(async move { respond_status(&handler, "/second").await })
+        };
+        let (first, second) = tokio::join!(first, second);
+        assert_eq!(first.unwrap(), StatusCode::OK);
+        assert_eq!(second.unwrap(), StatusCode::OK);
+        assert_eq!(
+            upstream.max_active.load(Ordering::SeqCst),
+            1,
+            "max_conns_per_host must serialise upstream connections"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_header_timeout_fires_on_slow_headers_but_not_without_it() {
+        let upstream = spawn_counted_upstream(Duration::from_millis(1_500)).await;
+        let timed = tuned_handler(
+            &upstream.dial,
+            serde_json::json!({"protocol": "http", "response_header_timeout": 100_000_000}),
+        );
+        let started = std::time::Instant::now();
+        assert_eq!(
+            respond_status(&timed, "/slow").await,
+            StatusCode::BAD_GATEWAY
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(90) && elapsed < Duration::from_millis(1_500),
+            "response_header_timeout must fire before the upstream answers: {elapsed:?}"
+        );
+
+        let untimed = tuned_handler(&upstream.dial, serde_json::json!({"protocol": "http"}));
+        assert_eq!(respond_status(&untimed, "/slow").await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn response_header_timeout_does_not_bound_the_connection_queue() {
+        let dial = spawn_slow_body_upstream().await;
+        let handler = std::sync::Arc::new(tuned_handler(
+            &dial,
+            serde_json::json!({
+                "protocol": "http",
+                "max_conns_per_host": 1,
+                "response_header_timeout": 100_000_000
+            }),
+        ));
+
+        // The streaming response holds the only allowed connection (and its permit) until its
+        // body is dropped. The second request therefore waits for the connection far longer than
+        // response_header_timeout, but its headers arrive immediately once it is granted.
+        let first = handler
+            .handle_streaming(get_request("/held", None))
+            .await
+            .unwrap();
+        let StreamingOutcome::Respond(first) = first else {
+            panic!("expected a normal streaming response");
+        };
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            drop(first);
+        });
+
+        let started = std::time::Instant::now();
+        assert_eq!(
+            respond_status(&handler, "/queued").await,
+            StatusCode::OK,
+            "the queue wait must not be charged to response_header_timeout"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(200),
+            "the request must actually have queued behind the held connection: {elapsed:?}"
+        );
+        release.await.unwrap();
+    }
+
+    #[test]
+    fn local_address_accepts_tcp_variants_and_rejects_other_networks() {
+        assert!(parse_local_socket_addr("127.0.0.1").is_ok());
+        assert!(parse_local_socket_addr("127.0.0.1:8080").is_ok());
+        assert!(parse_local_socket_addr("tcp/127.0.0.1").is_ok());
+        assert!(parse_local_socket_addr("tcp4/127.0.0.1").is_ok());
+        assert!(parse_local_socket_addr("tcp6/[::1]:0").is_ok());
+
+        let tcp4 = parse_local_socket_addr("tcp4/127.0.0.2").unwrap();
+        assert_eq!(tcp4.ip(), "127.0.0.2".parse::<IpAddr>().unwrap());
+        assert!(parse_local_socket_addr("tcp4/[::1]").is_err());
+        assert!(parse_local_socket_addr("tcp6/127.0.0.1").is_err());
+
+        let udp = parse_local_socket_addr("udp/127.0.0.1").unwrap_err();
+        assert!(udp.contains("must be a TCP address"), "{udp}");
+        let unix = parse_local_socket_addr("unix//run/upstream.sock").unwrap_err();
+        assert!(unix.contains("not supported"), "{unix}");
+        let hostname = parse_local_socket_addr("localhost:0").unwrap_err();
+        assert!(hostname.contains("must be an IP address"), "{hostname}");
+    }
+
+    #[tokio::test]
+    async fn local_address_reaches_the_upstream_as_the_peer_address() {
+        use std::sync::atomic::Ordering;
+
+        // The default `tcp` network and the explicit `tcp4` form both bind IPv4 source addresses.
+        for local_address in ["127.0.0.2", "tcp4/127.0.0.2"] {
+            let upstream = spawn_counted_upstream(Duration::ZERO).await;
+            let handler = tuned_handler(
+                &upstream.dial,
+                serde_json::json!({"protocol": "http", "local_address": local_address}),
+            );
+            assert_eq!(respond_status(&handler, "/bound").await, StatusCode::OK);
+            let peers = upstream.peers.lock().unwrap();
+            assert_eq!(
+                peers.last().map(|peer| peer.ip()),
+                Some("127.0.0.2".parse::<IpAddr>().unwrap()),
+                "`local_address {local_address}` must be the upstream's peer address"
+            );
+            assert_eq!(upstream.connections.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn local_address_tcp6_binds_an_ipv6_source_address() {
+        use std::sync::atomic::Ordering;
+
+        // IPv6 loopback may be disabled on some hosts; probe before building the IPv6 upstream.
+        if std::net::TcpListener::bind("[::1]:0").is_err() {
+            eprintln!("skipping tcp6 local_address test: IPv6 loopback is unavailable");
+            return;
+        }
+        let upstream = spawn_counted_upstream_on("[::1]:0", Duration::ZERO).await;
+        let handler = tuned_handler(
+            &upstream.dial,
+            serde_json::json!({"protocol": "http", "local_address": "tcp6/::1"}),
+        );
+        assert_eq!(respond_status(&handler, "/bound").await, StatusCode::OK);
+        let peers = upstream.peers.lock().unwrap();
+        assert_eq!(
+            peers.last().map(|peer| peer.ip()),
+            Some("::1".parse::<IpAddr>().unwrap()),
+            "tcp6/::1 must be the upstream's peer address"
+        );
+        assert_eq!(upstream.connections.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn local_address_and_resolver_unsupported_forms_fail_loudly() {
+        for (field, value, expected) in [
+            (
+                "local_address",
+                serde_json::json!("localhost:0"),
+                "must be an IP address",
+            ),
+            (
+                "local_address",
+                serde_json::json!("udp/127.0.0.1"),
+                "must be a TCP address",
+            ),
+            (
+                "local_address",
+                serde_json::json!("unix//run/local.sock"),
+                "not supported",
+            ),
+        ] {
+            let error = ReverseProxyHandler::from_json(
+                &serde_json::json!({
+                    "handler": "reverse_proxy",
+                    "upstreams": [{"dial": "127.0.0.1:9"}],
+                    "transport": {"protocol": "http", field: value}
+                }),
+                "handler",
+            )
+            .err()
+            .unwrap_or_else(|| panic!("`{field}` must fail loudly"));
+            let message = error.to_string();
+            assert!(
+                message.contains(expected) && message.contains("handler.transport.local_address"),
+                "`{field}` error must be located and specific: {message}"
+            );
+        }
+
+        // Resolver addresses accept IP literals (udp/tcp); a host name cannot be resolved without
+        // itself needing a resolver, so it stays a located error.
+        for address in ["udp/8.8.8.8", "tcp/8.8.8.8", "8.8.4.4:53"] {
+            tuned_handler(
+                "127.0.0.1:9",
+                serde_json::json!({
+                    "protocol": "http",
+                    "resolver": {"addresses": [address]}
+                }),
+            );
+        }
+        let error = ReverseProxyHandler::from_json(
+            &serde_json::json!({
+                "handler": "reverse_proxy",
+                "upstreams": [{"dial": "127.0.0.1:9"}],
+                "transport": {"protocol": "http", "resolver": {"addresses": ["dns.example"]}}
+            }),
+            "handler",
+        )
+        .err()
+        .expect("a host-name resolver address must fail loudly");
+        let message = error.to_string();
+        assert!(
+            message.contains("handler.transport.resolver.addresses")
+                && message.contains("IP address"),
+            "resolver error must be located and specific: {message}"
+        );
     }
 }
 

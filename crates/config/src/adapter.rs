@@ -5279,7 +5279,13 @@ fn insert_nonzero(object: &mut Map<String, Value>, key: &str, value: i64) {
     }
 }
 
-/// The first argument of a `transport http` subdirective, rejecting blocks and missing values.
+/// The single argument of a `transport http` subdirective, rejecting blocks, missing values and
+/// extra arguments.
+///
+/// Caddy's Caddyfile loop consumes exactly one argument per subdirective; a second token on the
+/// same line becomes the next subdirective and fails with `unrecognized subdirective <token>`.
+/// Matching that here rejects `read_buffer 8KiB 9KiB`, `local_address A B`, `keepalive 30s 60s`
+/// and `max_conns_per_host 4 5` instead of silently dropping the extra argument.
 fn transport_option_value<'a>(option: &'a Directive) -> Result<&'a str, CoreError> {
     if !option.block.is_empty() {
         return Err(adapter_error(
@@ -5287,24 +5293,47 @@ fn transport_option_value<'a>(option: &'a Directive) -> Result<&'a str, CoreErro
             format!("`{}` does not take a block", option.name),
         ));
     }
-    option.args.first().map(String::as_str).ok_or_else(|| {
-        adapter_error(
+    let Some(value) = option.args.first() else {
+        return Err(adapter_error(
             option.position.clone(),
             format!("`{}` requires a value", option.name),
-        )
-    })
+        ));
+    };
+    if let Some(extra) = option.args.get(1) {
+        return Err(adapter_error(
+            option.position.clone(),
+            format!("unrecognized subdirective {extra}"),
+        ));
+    }
+    Ok(value)
 }
 
-/// Parse a `transport http` duration: Caddy's `caddy.Duration` (integer ns or Go duration) as an
-/// integer nanosecond count.
+/// Parse a `transport http` duration with Go's `time.ParseDuration` grammar as an integer
+/// nanosecond count.
+///
+/// Caddyfile durations require a unit (the bare string `0` is Go's one exception); a bare integer
+/// such as `dial_fallback_delay 500000000` is rejected with Go's "missing unit in duration"
+/// message. A leading `-` is preserved because Caddy uses negative durations to disable TCP
+/// keep-alive probes and the Fast Fallback delay.
 fn parse_transport_duration(option: &Directive) -> Result<i64, CoreError> {
     let value = transport_option_value(option)?;
-    match value.parse::<i64>() {
-        Ok(raw) => Ok(raw),
-        Err(_) => parse_duration(value)
-            .map(|nanos| nanos as i64)
-            .map_err(|message| adapter_error(option.position.clone(), message)),
+    parse_go_duration_text(value).map_err(|message| adapter_error(option.position.clone(), message))
+}
+
+fn parse_go_duration_text(value: &str) -> Result<i64, String> {
+    if value == "0" {
+        return Ok(0);
     }
+    let (negative, magnitude) = match value.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, value.strip_prefix('+').unwrap_or(value)),
+    };
+    if magnitude.is_empty() || magnitude.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("time: missing unit in duration \"{value}\""));
+    }
+    let nanos = parse_duration(magnitude)?;
+    let nanos = i64::try_from(nanos).map_err(|_| format!("duration `{value}` overflows"))?;
+    Ok(if negative { -nanos } else { nanos })
 }
 
 /// Parse a `transport http` size (humanize byte units) as an integer byte count.
@@ -7659,18 +7688,10 @@ fn dynamic_duration_option(item: &Directive, option: &str) -> caddy_rs_core::Res
     parse_dynamic_duration(value).map_err(|reason| adapter_error(item.position.clone(), reason))
 }
 
-/// Caddy durations allow a leading `-` (notably for `dial_fallback_delay`); the shared
-/// unsigned parser is used for the magnitude so the accepted grammar stays identical.
+/// Dynamic-upstream durations use the same Go `time.ParseDuration` grammar as `transport http`
+/// (a unit is required, `0` is the one exception, a leading `-` is preserved).
 fn parse_dynamic_duration(value: &str) -> Result<i64, String> {
-    if let Some(rest) = value.strip_prefix('-') {
-        let magnitude = parse_duration(rest)?;
-        let magnitude =
-            i64::try_from(magnitude).map_err(|_| format!("duration `{value}` overflows"))?;
-        Ok(-magnitude)
-    } else {
-        let magnitude = parse_duration(value)?;
-        i64::try_from(magnitude).map_err(|_| format!("duration `{value}` overflows"))
-    }
+    parse_go_duration_text(value)
 }
 
 fn parse_srv_source(
@@ -8457,26 +8478,15 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
                                     );
                                 }
                                 "keepalive" => {
-                                    if !option.block.is_empty() {
-                                        return Err(adapter_error(
-                                            option.position.clone(),
-                                            "`keepalive` does not take a block",
-                                        ));
-                                    }
-                                    let Some(value) = option.args.first() else {
-                                        return Err(adapter_error(
-                                            option.position.clone(),
-                                            "`keepalive` requires `off` or a duration",
-                                        ));
-                                    };
+                                    let value = transport_option_value(option)?;
                                     let keep_alive = keep_alive_object(&mut extra_transport);
                                     if value == "off" {
                                         keep_alive.insert("enabled".to_string(), json!(false));
                                     } else {
-                                        let nanos = parse_duration(value).map_err(|message| {
-                                            adapter_error(option.position.clone(), message)
-                                        })?
-                                            as i64;
+                                        let nanos =
+                                            parse_go_duration_text(value).map_err(|message| {
+                                                adapter_error(option.position.clone(), message)
+                                            })?;
                                         insert_nonzero(keep_alive, "idle_timeout", nanos);
                                     }
                                 }
@@ -8512,6 +8522,14 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
                                         .insert("versions".to_string(), json!(option.args));
                                 }
                                 "compression" => {
+                                    // Caddy consumes exactly one argument; a second one is parsed
+                                    // as the next subdirective and is an error.
+                                    if let Some(extra) = option.args.get(1) {
+                                        return Err(adapter_error(
+                                            option.position.clone(),
+                                            format!("unrecognized subdirective {extra}"),
+                                        ));
+                                    }
                                     // Caddy only honours `compression off`; any other argument
                                     // leaves the default (`true`) unset in the JSON.
                                     if option.args.first().map(String::as_str) == Some("off") {
@@ -8528,18 +8546,7 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
                                     );
                                 }
                                 "local_address" => {
-                                    if !option.block.is_empty() {
-                                        return Err(adapter_error(
-                                            option.position.clone(),
-                                            "`local_address` does not take a block",
-                                        ));
-                                    }
-                                    let Some(value) = option.args.first() else {
-                                        return Err(adapter_error(
-                                            option.position.clone(),
-                                            "`local_address` requires a value",
-                                        ));
-                                    };
+                                    let value = transport_option_value(option)?;
                                     extra_transport
                                         .insert("local_address".to_string(), json!(value));
                                 }

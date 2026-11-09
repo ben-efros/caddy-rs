@@ -1628,3 +1628,132 @@ fn servers_0rtt_off_matches_real_caddy_v2_11_9() {
         );
     }
 }
+
+fn adapt_transport_subdirectives(subdirectives: &str) -> Value {
+    let adapted = adapt(&format!(
+        ":8080 {{\n\treverse_proxy 127.0.0.1:9000 {{\n\t\ttransport http {{\n{subdirectives}\n\t\t}}\n\t}}\n}}\n"
+    ))
+    .unwrap_or_else(|error| panic!("adapt transport block:\n{subdirectives}\n{error}"));
+    adapted.config["apps"]["http"]["servers"]["srv0"]["routes"][0]["handle"][0]["transport"].clone()
+}
+
+fn transport_subdirective_error(subdirectives: &str) -> caddy_rs_core::Error {
+    adapt(&format!(
+        ":8080 {{\n\treverse_proxy 127.0.0.1:9000 {{\n\t\ttransport http {{\n{subdirectives}\n\t\t}}\n\t}}\n}}\n"
+    ))
+    .expect_err("expected the adapter to reject this transport block")
+}
+
+#[test]
+fn transport_forms_match_caddy_v2_11_9() {
+    // Golden from `/root/caddy-rs/.scratch/oracle-eval-2.11.9/caddy adapt`.
+    let transport = adapt_transport_subdirectives(
+        "\t\t\tread_buffer 4KiB\n\
+         \t\t\twrite_buffer 8KiB\n\
+         \t\t\tmax_response_header 1MiB\n\
+         \t\t\tdial_timeout 5s\n\
+         \t\t\tdial_fallback_delay -300ms\n\
+         \t\t\tresponse_header_timeout 2s\n\
+         \t\t\texpect_continue_timeout 1s\n\
+         \t\t\tresolvers 8.8.8.8 8.8.4.4\n\
+         \t\t\tkeepalive 30s\n\
+         \t\t\tkeepalive_interval -1s\n\
+         \t\t\tkeepalive_idle_conns 5\n\
+         \t\t\tkeepalive_idle_conns_per_host 2\n\
+         \t\t\tversions 1.1 2\n\
+         \t\t\tcompression off\n\
+         \t\t\tmax_conns_per_host 4\n\
+         \t\t\tlocal_address 192.168.0.1",
+    );
+    assert_eq!(
+        transport,
+        json!({
+            "protocol": "http",
+            "read_buffer_size": 4096,
+            "write_buffer_size": 8192,
+            "max_response_header_size": 1_048_576,
+            "dial_timeout": 5_000_000_000_i64,
+            "dial_fallback_delay": -300_000_000_i64,
+            "response_header_timeout": 2_000_000_000_i64,
+            "expect_continue_timeout": 1_000_000_000_i64,
+            "resolver": {"addresses": ["8.8.8.8", "8.8.4.4"]},
+            "keep_alive": {
+                "idle_timeout": 30_000_000_000_i64,
+                "probe_interval": -1_000_000_000_i64,
+                "max_idle_conns": 5,
+                "max_idle_conns_per_host": 2,
+            },
+            "versions": ["1.1", "2"],
+            "compression": false,
+            "max_conns_per_host": 4,
+            "local_address": "192.168.0.1",
+        })
+    );
+}
+
+#[test]
+fn transport_zero_durations_are_omitted_like_caddy() {
+    // `dial_timeout 0` is Caddy's `omitempty`; `keepalive 0` still emits an empty object because
+    // the Caddyfile parser allocated it.
+    assert_eq!(
+        adapt_transport_subdirectives("\t\t\tdial_timeout 0\n\t\t\tkeepalive 0"),
+        json!({"protocol": "http", "keep_alive": {}})
+    );
+    assert_eq!(
+        adapt_transport_subdirectives("\t\t\tkeepalive off"),
+        json!({"protocol": "http", "keep_alive": {"enabled": false}})
+    );
+}
+
+#[test]
+fn transport_extra_arguments_are_rejected_like_caddy() {
+    // Caddy's loop consumes one argument per subdirective; the second token is the next
+    // subdirective and errors. Reproduced with the v2.11.9 oracle.
+    for (subdirectives, extra) in [
+        ("read_buffer 8KiB 9KiB", "9KiB"),
+        ("write_buffer 8KiB 9KiB", "9KiB"),
+        ("max_response_header 1MiB 2MiB", "2MiB"),
+        ("dial_timeout 5s 6s", "6s"),
+        ("dial_fallback_delay 300ms 400ms", "400ms"),
+        ("response_header_timeout 1s 2s", "2s"),
+        ("expect_continue_timeout 1s 2s", "2s"),
+        ("read_timeout 1s 2s", "2s"),
+        ("write_timeout 1s 2s", "2s"),
+        ("keepalive 30s 60s", "60s"),
+        ("keepalive_interval 30s 60s", "60s"),
+        ("keepalive_idle_conns 5 6", "6"),
+        ("keepalive_idle_conns_per_host 5 6", "6"),
+        ("max_conns_per_host 4 5", "5"),
+        ("local_address 192.168.0.1 192.168.0.2", "192.168.0.2"),
+        ("compression off on", "on"),
+    ] {
+        let error = transport_subdirective_error(subdirectives);
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("unrecognized subdirective {extra}")),
+            "`{subdirectives}` must reject the extra token like Caddy: {message}"
+        );
+    }
+}
+
+#[test]
+fn transport_durations_require_a_unit_like_caddy() {
+    // Go's `time.ParseDuration` rejects a bare integer; Caddy reports the Go message.
+    for subdirective in [
+        "dial_timeout",
+        "dial_fallback_delay",
+        "response_header_timeout",
+        "expect_continue_timeout",
+        "read_timeout",
+        "write_timeout",
+        "keepalive_interval",
+        "keepalive",
+    ] {
+        let error = transport_subdirective_error(&format!("{subdirective} 500000000"));
+        let message = error.to_string();
+        assert!(
+            message.contains("missing unit in duration \"500000000\""),
+            "`{subdirective} 500000000` must be rejected with Go's message: {message}"
+        );
+    }
+}

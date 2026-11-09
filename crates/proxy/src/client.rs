@@ -15,11 +15,13 @@
 //!   stateless and `Clone`.
 //! * `unixs://<hex-encoded-socket-path>/...` is the same socket wrapped in TLS.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -188,9 +190,11 @@ impl Default for KeepAliveConfig {
 impl KeepAliveConfig {
     /// The idle-connection cap hyper's pool should enforce for one upstream client.
     ///
-    /// caddy-rs builds one client per upstream (see [`FixedUpstreamConnector`]), so Caddy's
-    /// *global* `max_idle_conns` and its per-host cap both constrain the same pool: the tighter
-    /// of the two applies (DIV-0112 documents this).
+    /// Approximation: Caddy's `keep_alive.max_idle_conns` is a cap across *all* hosts of one
+    /// transport, but caddy-rs builds one client (one pool) per upstream, so a global cap cannot
+    /// be applied globally. The tighter of the global cap and the per-host cap is enforced in
+    /// each upstream's pool instead; with several upstreams the effective aggregate can exceed
+    /// Caddy's `max_idle_conns`.
     pub fn pool_max_idle_per_host(&self) -> usize {
         if !self.enabled {
             return 0;
@@ -207,6 +211,10 @@ impl KeepAliveConfig {
 /// Caddy's transport uses the configured resolvers only for hostnames; an IP-literal upstream
 /// dial is never resolved. Queries reuse the transport's `dial_timeout` as their bound, like
 /// Caddy's resolver dialer.
+///
+/// Subset: caddy-rs accepts only `udp/` and `tcp/` resolver addresses whose host is an IP
+/// literal (Caddy additionally resolves host names and accepts other network names). A hostname
+/// resolver address is rejected at config load rather than silently ignored.
 #[derive(Debug, Clone)]
 pub struct TransportResolver {
     addresses: Vec<ResolverAddress>,
@@ -233,25 +241,49 @@ impl TransportResolver {
 }
 
 /// Connection-tuning subset of Caddy's HTTP transport (`keep_alive`, `max_conns_per_host`,
-/// `dial_fallback_delay`, `local_address`, `resolver`, `read_buffer_size`).
+/// `dial_fallback_delay`, `response_header_timeout`, `local_address`, `resolver`).
 ///
 /// `Default` is Caddy's default transport. The handler parses the JSON form into this type and
 /// hands it to the per-upstream client builders.
+///
+/// `read_buffer_size`, `write_buffer_size` and `max_response_header_size` are *not* part of this
+/// type: hyper cannot express Caddy's "growable initial read buffer" semantics (hyper's
+/// `http1_read_buf_exact_size` caps the response-header buffer instead), so those knobs stay loud
+/// located errors rather than being approximated.
 #[derive(Debug, Clone)]
 pub struct TransportTuning {
     /// Caddy `keep_alive`.
     pub keep_alive: KeepAliveConfig,
     /// Caddy `max_conns_per_host`; `None` means no limit.
     pub max_conns_per_host: Option<usize>,
-    /// Caddy `dial_fallback_delay`: `Some(delay)` races resolved addresses, `None` (a negative
-    /// value in Caddy) dials them serially. Caddy's default is 300 ms.
+    /// Caddy `dial_fallback_delay`: `Some(delay)` starts the next resolved address after `delay`,
+    /// `None` (a negative value in Caddy) dials them serially. Caddy's default is 300 ms.
     pub fallback_delay: Option<Duration>,
+    /// Caddy `response_header_timeout`: bound on waiting for an HTTP/1 response head.
+    ///
+    /// Like Go's `http.Transport.ResponseHeaderTimeout`, the budget excludes dialing, TLS
+    /// negotiation and waiting for a pooled/limited connection. Approximation: it also covers
+    /// writing the request (hyper exposes no "request fully written" boundary), and it is applied
+    /// even to h2 upstreams, whose Go transport ignores this setting.
+    pub response_header_timeout: Option<Duration>,
     /// Caddy `local_address`, resolved to a socket address at config load.
+    ///
+    /// Only `tcp`/`tcp4`/`tcp6` addresses whose host is an IP literal are accepted; Caddy also
+    /// resolves a host name here and supports Unix socket local addresses.
     pub local_address: Option<SocketAddr>,
     /// Caddy `resolver`.
     pub resolver: Option<Arc<TransportResolver>>,
-    /// Caddy `read_buffer_size` (HTTP/1 read buffer; Caddy's minimum is 4 KiB).
-    pub read_buffer_size: Option<usize>,
+    /// Per-host connection limiters shared by every client this tuning builds.
+    ///
+    /// The key is the upstream dial (`host:port`), matching Go's per-`host:port`
+    /// `MaxConnsPerHost` bucket. Sharing the map is what keeps the normal client and the
+    /// HTTP/1.1-only upgrade client for one upstream under a single limit.
+    pub(crate) conn_limiters: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
+    /// Number of connector futures currently dialing or waiting for a connection limit slot.
+    ///
+    /// The handler's `response_header_timeout` pauses while this is non-zero so that dialing and
+    /// pool/limit waits are not charged against the time-to-headers budget.
+    pub(crate) connectors_in_flight: Arc<AtomicUsize>,
 }
 
 impl Default for TransportTuning {
@@ -260,10 +292,29 @@ impl Default for TransportTuning {
             keep_alive: KeepAliveConfig::default(),
             max_conns_per_host: None,
             fallback_delay: Some(Duration::from_millis(300)),
+            response_header_timeout: None,
             local_address: None,
             resolver: None,
-            read_buffer_size: None,
+            conn_limiters: Arc::new(Mutex::new(HashMap::new())),
+            connectors_in_flight: Arc::new(AtomicUsize::new(0)),
         }
+    }
+}
+
+impl TransportTuning {
+    /// The `max_conns_per_host` limiter for `dial`, created once per dial and shared by every
+    /// client built from this tuning (normal and upgrade companions, fixed and dynamic).
+    fn connection_limiter(&self, dial: &str) -> Option<Arc<Semaphore>> {
+        let limit = self.max_conns_per_host?;
+        let mut limiters = self
+            .conn_limiters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Some(Arc::clone(
+            limiters
+                .entry(dial.to_string())
+                .or_insert_with(|| Arc::new(Semaphore::new(limit))),
+        ))
     }
 }
 
@@ -656,6 +707,22 @@ enum DialTarget {
     Unix(std::path::PathBuf),
 }
 
+/// Counts one connector `call()` while it dials (or waits for a `max_conns_per_host` slot).
+struct ConnectorGuard(Arc<AtomicUsize>);
+
+impl ConnectorGuard {
+    fn new(activity: Arc<AtomicUsize>) -> Self {
+        activity.fetch_add(1, Ordering::SeqCst);
+        Self(activity)
+    }
+}
+
+impl Drop for ConnectorGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Connector bound to one upstream target.
 ///
 /// hyper's client derives the HTTP/2 `:authority` pseudo-header (and HTTP/1.1 `Host`, when the
@@ -676,8 +743,6 @@ pub struct FixedUpstreamConnector {
     dial_timeout: Option<Duration>,
     /// Connection tuning parsed from `transport` (T-PROXY-054).
     tuning: Arc<TransportTuning>,
-    /// `transport.max_conns_per_host` slots; held by live connections.
-    max_conns: Option<Arc<Semaphore>>,
 }
 
 impl Service<Uri> for FixedUpstreamConnector {
@@ -697,8 +762,10 @@ impl Service<Uri> for FixedUpstreamConnector {
         let proxy_protocol = self.proxy_protocol;
         let dial_timeout = self.dial_timeout;
         let tuning = Arc::clone(&self.tuning);
-        let max_conns = self.max_conns.clone();
         Box::pin(async move {
+            // Any error path drops the guard too, so the handler's header timer resumes after a
+            // failed dial just as it does after a successful one.
+            let _connector_guard = ConnectorGuard::new(Arc::clone(&tuning.connectors_in_flight));
             // The authority marker carries the PROXY-protocol source address. Health checks build
             // plain upstream URLs (no marker) and therefore send no header, matching Caddy's
             // active checker, which uses the default HTTP client instead of the configured
@@ -709,16 +776,16 @@ impl Service<Uri> for FixedUpstreamConnector {
             match target {
                 DialTarget::Tcp(address) => {
                     // One semaphore permit is held by each live connection (idle or in use), which
-                    // is Go's `MaxConnsPerHost` accounting.
-                    let permit = match &max_conns {
-                        Some(semaphore) => {
-                            Some(semaphore.clone().acquire_owned().await.map_err(|_| {
-                                io::Error::new(
-                                    io::ErrorKind::BrokenPipe,
-                                    "upstream connection limiter closed",
-                                )
-                            })?)
-                        }
+                    // is Go's `MaxConnsPerHost` accounting. The limiter is looked up by dial
+                    // address, so the normal and upgrade clients for one upstream (and clients
+                    // rebuilt for a dynamic placeholder) share a single limit.
+                    let permit = match tuning.connection_limiter(&address) {
+                        Some(semaphore) => Some(semaphore.acquire_owned().await.map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::BrokenPipe,
+                                "upstream connection limiter closed",
+                            )
+                        })?),
                         None => None,
                     };
                     let dial = dial_tcp(&address, &tuning);
@@ -793,7 +860,8 @@ impl Service<Uri> for FixedUpstreamConnector {
 /// `local_address` and `resolver`.
 ///
 /// Name resolution happens here (rather than in hyper-util's `HttpConnector`) so the transport's
-/// resolver, local bind address and RFC 6555 Fast Fallback apply to the actual dial.
+/// resolver and local bind address apply to the actual dial. Caddy resolves a `local_address`
+/// host name at config load; caddy-rs accepts an IP literal there and rejects a host name loudly.
 async fn dial_tcp(address: &str, tuning: &TransportTuning) -> io::Result<TcpStream> {
     let (host, port) = split_host_port(address)?;
     let mut addresses = resolve_upstream(host, port, tuning).await?;
@@ -910,8 +978,11 @@ async fn connect_address(address: SocketAddr, local: Option<SocketAddr>) -> io::
 /// Race resolved addresses: start the next attempt after `delay` (or immediately after a
 /// failure), and keep the first connection that succeeds.
 ///
-/// This is the RFC 6555 Fast Fallback behaviour of Go's `net.Dialer.FallbackDelay`, which Caddy
-/// exposes as `transport.dial_fallback_delay`.
+/// This approximates the RFC 6555 Fast Fallback behaviour of Go's `net.Dialer.FallbackDelay`
+/// (Caddy's `transport.dial_fallback_delay`): every resolved address is tried in order, with the
+/// next attempt launched `delay` after the previous one started. Go additionally partitions
+/// dual-stack addresses into primary/fallback families before racing; caddy-rs races the
+/// resolved list in order.
 async fn race_connect<T, F, Fut>(
     addresses: Vec<SocketAddr>,
     delay: Duration,
@@ -1136,16 +1207,13 @@ pub fn build_upstream_client_for_tuned(
         Transport::Unix { path } => DialTarget::Unix(path.clone()),
     };
     let mut builder = Client::builder(TokioExecutor::new());
-    // Caddy's pool: `keep_alive.idle_timeout` and the effective idle cap (per-host, since each
-    // client serves exactly one upstream target).
+    // Caddy's pool: `keep_alive.idle_timeout` and the effective idle cap. Each client serves one
+    // upstream target, so the global `max_idle_conns` is approximated per client (see
+    // [`KeepAliveConfig::pool_max_idle_per_host`]). `enabled: false` also clears the pool for
+    // HTTP/2 clients; Go's `DisableKeepAlives` is an HTTP/1 transport setting, so this is
+    // stricter than Caddy for h2 upstreams.
     builder.pool_max_idle_per_host(tuning.keep_alive.pool_max_idle_per_host());
     builder.pool_idle_timeout(tuning.keep_alive.idle_timeout);
-    if let Some(size) = tuning.read_buffer_size {
-        builder.http1_read_buf_exact_size(size);
-    }
-    let max_conns = tuning
-        .max_conns_per_host
-        .map(|limit| Arc::new(Semaphore::new(limit)));
     Ok(builder.build(FixedUpstreamConnector {
         target,
         tls,
@@ -1153,8 +1221,9 @@ pub fn build_upstream_client_for_tuned(
         h2c,
         proxy_protocol,
         dial_timeout,
+        // The clone shares `conn_limiters`, so the main and upgrade clients built from this
+        // tuning enforce one `max_conns_per_host` limit per dial.
         tuning: Arc::new(tuning.clone()),
-        max_conns,
     }))
 }
 
@@ -1345,6 +1414,327 @@ mod tests {
                 .parse::<std::net::Ipv6Addr>()
                 .unwrap()
                 .octets()
+        );
+    }
+    // ---- T-PROXY-054: connection-tuning behaviour -------------------------------------------
+
+    /// Cleartext upstream that records how many TCP connections it accepted, the peak number of
+    /// concurrently served requests and the peer address of every connection.
+    #[derive(Clone)]
+    struct CountedUpstream {
+        dial: String,
+        max_active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        peers: std::sync::Arc<Mutex<Vec<SocketAddr>>>,
+    }
+
+    async fn spawn_counted_upstream(delay: Duration) -> CountedUpstream {
+        use std::sync::atomic::Ordering;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dial = listener.local_addr().unwrap().to_string();
+        let max_active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peers = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let seen_max = std::sync::Arc::clone(&max_active);
+        let seen_peers = std::sync::Arc::clone(&peers);
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, peer)) = listener.accept().await else {
+                    break;
+                };
+                seen_peers.lock().unwrap().push(peer);
+                let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let max_active = std::sync::Arc::clone(&seen_max);
+                let service_active = std::sync::Arc::clone(&active);
+                let service = service_fn(move |_request: hyper::Request<hyper::body::Incoming>| {
+                    let active = std::sync::Arc::clone(&service_active);
+                    let max_active = std::sync::Arc::clone(&max_active);
+                    async move {
+                        let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        let _ = max_active.fetch_max(now, Ordering::SeqCst);
+                        if !delay.is_zero() {
+                            tokio::time::sleep(delay).await;
+                        }
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        Ok::<_, Infallible>(
+                            hyper::Response::builder()
+                                .status(200)
+                                .body(Full::new(Bytes::from_static(b"ok")))
+                                .unwrap(),
+                        )
+                    }
+                });
+                tokio::spawn(async move {
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        CountedUpstream {
+            dial,
+            max_active,
+            peers,
+        }
+    }
+
+    fn client_request(upstream: &Upstream, path: &str) -> hyper::Request<RequestBody> {
+        hyper::Request::builder()
+            .uri(upstream.url(path))
+            .body(RequestBody::empty())
+            .unwrap()
+    }
+
+    #[test]
+    fn keep_alive_idle_caps_follow_caddys_rules() {
+        let default = KeepAliveConfig::default();
+        assert_eq!(default.pool_max_idle_per_host(), 32);
+
+        let mut config = KeepAliveConfig::default();
+        config.max_idle_conns = Some(4);
+        assert_eq!(config.pool_max_idle_per_host(), 4);
+        config.max_idle_conns = Some(64);
+        assert_eq!(config.pool_max_idle_per_host(), 32);
+        config.enabled = false;
+        assert_eq!(config.pool_max_idle_per_host(), 0);
+    }
+
+    #[tokio::test]
+    async fn tcp_keepalive_is_enabled_with_the_probe_interval_and_disabled_by_negative() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let stream = TcpStream::connect(address).await.unwrap();
+        let _ = accept.await.unwrap();
+
+        apply_tcp_keepalive(&stream, Some(Duration::from_secs(45))).unwrap();
+        let socket = socket2::SockRef::from(&stream);
+        assert!(socket.keepalive().unwrap(), "keep-alive probe must be on");
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(
+                socket.tcp_keepalive_time().unwrap(),
+                Duration::from_secs(45)
+            );
+            assert_eq!(
+                socket.tcp_keepalive_interval().unwrap(),
+                Duration::from_secs(45)
+            );
+        }
+
+        // A negative `keep_alive.probe_interval` maps to `None` and turns SO_KEEPALIVE off.
+        apply_tcp_keepalive(&stream, None).unwrap();
+        assert!(!socket.keepalive().unwrap(), "keep-alive probe must be off");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fallback_delay_starts_the_next_address_after_the_delay() {
+        use std::net::Ipv4Addr;
+
+        let first = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 1), 80));
+        let second = SocketAddr::from((Ipv4Addr::new(127, 0, 0, 1), 80));
+        let started = tokio::time::Instant::now();
+        let selected = race_connect(
+            vec![first, second],
+            Duration::from_millis(300),
+            move |address| async move {
+                if address == second {
+                    Ok(address)
+                } else {
+                    // The first attempt never completes: only the fallback delay can produce `second`.
+                    std::future::pending::<io::Result<SocketAddr>>().await
+                }
+            },
+        )
+        .await
+        .expect("the raced second address succeeds");
+        assert_eq!(selected, second);
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_millis(300),
+            "the fallback attempt must start after dial_fallback_delay"
+        );
+    }
+
+    #[tokio::test]
+    async fn max_conns_per_host_is_shared_by_main_and_upgrade_clients() {
+        let upstream = spawn_counted_upstream(Duration::from_millis(200)).await;
+        let target = Upstream::parse_dial(&upstream.dial, false).unwrap();
+        let mut tuning = TransportTuning::default();
+        tuning.max_conns_per_host = Some(1);
+        tuning.keep_alive.enabled = false;
+        let main = build_upstream_client_for_tuned(
+            target.transport().unwrap(),
+            None,
+            false,
+            false,
+            None,
+            None,
+            &tuning,
+        )
+        .expect("main client");
+        // The HTTP/1.1-only companion is built from the same tuning, like the upgrade client.
+        let upgrade = build_upstream_client_for_tuned(
+            target.transport().unwrap(),
+            None,
+            false,
+            true,
+            None,
+            None,
+            &tuning,
+        )
+        .expect("upgrade client");
+
+        let first = main.request(client_request(&target, "/main"));
+        let second = upgrade.request(client_request(&target, "/upgrade"));
+        let (first, second) = tokio::join!(first, second);
+        assert_eq!(first.expect("main request").status(), 200);
+        assert_eq!(second.expect("upgrade request").status(), 200);
+        assert_eq!(
+            upstream
+                .max_active
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "both clients must share one max_conns_per_host limiter"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_address_binds_the_configured_source_address() {
+        use std::net::Ipv4Addr;
+
+        let upstream = spawn_counted_upstream(Duration::ZERO).await;
+        let target = Upstream::parse_dial(&upstream.dial, false).unwrap();
+        let mut tuning = TransportTuning::default();
+        // 127.0.0.0/8 is loopback on Linux, so a non-default source address is observable.
+        tuning.local_address = Some(SocketAddr::from((Ipv4Addr::new(127, 0, 0, 2), 0)));
+        let client = build_upstream_client_for_tuned(
+            target.transport().unwrap(),
+            None,
+            false,
+            false,
+            None,
+            None,
+            &tuning,
+        )
+        .expect("client");
+
+        let response = client
+            .request(client_request(&target, "/bound"))
+            .await
+            .expect("request through the bound source address");
+        assert_eq!(response.status(), 200);
+        let peers = upstream.peers.lock().unwrap();
+        assert_eq!(
+            peers.last().map(|peer| peer.ip()),
+            Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))),
+            "the upstream must see the configured local_address as its peer"
+        );
+    }
+
+    /// Minimal DNS response: echoes the question and answers A queries with `address`; AAAA gets
+    /// NOERROR with no answers, which is all `lookup_ip` needs.
+    fn dns_reply(query: &[u8], address: std::net::Ipv4Addr) -> Vec<u8> {
+        let qtype = u16::from_be_bytes([query[query.len() - 4], query[query.len() - 3]]);
+        let mut reply = Vec::new();
+        reply.extend_from_slice(&query[..2]);
+        reply.extend_from_slice(&[0x81, 0x80]);
+        reply.extend_from_slice(&1_u16.to_be_bytes());
+        reply.extend_from_slice(&u16::from(qtype == 1).to_be_bytes());
+        reply.extend_from_slice(&[0, 0, 0, 0]);
+        reply.extend_from_slice(&query[12..]);
+        if qtype == 1 {
+            reply.extend_from_slice(&[0xc0, 12]);
+            reply.extend_from_slice(&1_u16.to_be_bytes());
+            reply.extend_from_slice(&1_u16.to_be_bytes());
+            reply.extend_from_slice(&300_u32.to_be_bytes());
+            reply.extend_from_slice(&4_u16.to_be_bytes());
+            reply.extend_from_slice(&address.octets());
+        }
+        reply
+    }
+
+    async fn resolve_and_request_with(
+        resolver: ResolverAddress,
+        timeout: Duration,
+    ) -> http::StatusCode {
+        let upstream = spawn_counted_upstream(Duration::ZERO).await;
+        let port: u16 = upstream.dial.rsplit_once(':').unwrap().1.parse().unwrap();
+        let target = Upstream::parse_dial(&format!("tuned-upstream.test:{port}"), false).unwrap();
+        let mut tuning = TransportTuning::default();
+        tuning.resolver = Some(std::sync::Arc::new(TransportResolver::new(
+            vec![resolver],
+            timeout,
+        )));
+        let client = build_upstream_client_for_tuned(
+            target.transport().unwrap(),
+            None,
+            false,
+            false,
+            None,
+            None,
+            &tuning,
+        )
+        .expect("client with resolver");
+        let response = client
+            .request(client_request(&target, "/resolved"))
+            .await
+            .expect("resolver-backed request");
+        response.status()
+    }
+
+    #[tokio::test]
+    async fn resolver_uses_a_udp_ip_literal_resolver() {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let mut buffer = [0_u8; 512];
+                let Ok((len, peer)) = socket.recv_from(&mut buffer).await else {
+                    return;
+                };
+                let reply = dns_reply(&buffer[..len], std::net::Ipv4Addr::new(127, 0, 0, 1));
+                let _ = socket.send_to(&reply, peer).await;
+            }
+        });
+        let resolver = ResolverAddress::parse(&format!("udp/{address}")).unwrap();
+        assert_eq!(
+            resolve_and_request_with(resolver, Duration::from_secs(5)).await,
+            http::StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn resolver_uses_a_tcp_ip_literal_resolver() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            for _ in 0..2 {
+                let mut length = [0_u8; 2];
+                if tokio::io::AsyncReadExt::read_exact(&mut stream, &mut length)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                let mut query = vec![0_u8; usize::from(u16::from_be_bytes(length))];
+                if tokio::io::AsyncReadExt::read_exact(&mut stream, &mut query)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                let reply = dns_reply(&query, std::net::Ipv4Addr::new(127, 0, 0, 1));
+                let _ = stream.write_all(&(reply.len() as u16).to_be_bytes()).await;
+                let _ = stream.write_all(&reply).await;
+            }
+        });
+        let resolver = ResolverAddress::parse(&format!("tcp/{address}")).unwrap();
+        assert_eq!(
+            resolve_and_request_with(resolver, Duration::from_secs(5)).await,
+            http::StatusCode::OK
         );
     }
 }
