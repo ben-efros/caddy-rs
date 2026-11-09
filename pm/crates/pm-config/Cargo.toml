@@ -1,0 +1,17 @@
+[package]
+name = "caddy-rs-pm-config"
+description = "Deterministic Caddy JSON assembler for compiled proxy-manager routes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+caddy-rs-pm-compiler = { path = "../pm-compiler" }
+caddy-rs-pm-core = { path = "../pm-core" }
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

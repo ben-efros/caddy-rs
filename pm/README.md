@@ -8,6 +8,7 @@ This is the proxy-manager foundation workspace. It is deliberately independent o
 | `caddy-rs-pm-state` | Backend-agnostic durable document state: snapshots, revisions, CAS transactions, one serialized writer. No SQL, C or network dependency. |
 | `caddy-rs-pm-core` | Certificate and host domain model: certificate origins/policies, host TLS binding, proxy/redirect/dead host validation, domain uniqueness. |
 | `caddy-rs-pm-compiler` | Deterministic Caddy JSON route compiler for proxy/redirect/dead hosts; emits HTTP and HTTPS route lists, HSTS and forced-SSL redirects. No listeners, TLS automation or key material. |
+| `caddy-rs-pm-config` | Deterministic Caddy JSON assembler for compiled routes: two servers with configurable HTTP/HTTPS ports. No TLS connection policies, certificate automation, logging, access lists or admin apply. |
 | `caddy-rs-pm-hosts` | Durable host repository over `pm-state`: get/list/create/update/delete with CAS revisions, atomic domain-index uniqueness, next-id reservation, and memory/snapshot backend tests. |
 | `caddy-rs-pm-service` | Application service over `pm-hosts`: id-allocating create, CAS update/delete, list, and route compilation. No REST API, UI, auth or certificate policy loading. |
 | `caddy-rs-pm-policies` | Durable auto-certificate policy repository over `pm-state`: get/list/create/update/delete with CAS revisions, tombstones, monotonic id reservation and host coverage validation against `pm-core` hosts. |
@@ -87,6 +88,26 @@ without loading every certificate:
 The compiler does not yet emit listeners, `tls_connection_policies`, access lists or advanced
 handlers. Those are later slices; the route layer stays independent so those can be added without
 changing host semantics.
+
+## `pm-config`
+
+`assemble(&CompiledRoutes, &ConfigSettings)` wraps compiled routes in a complete Caddy
+`apps.http` configuration:
+
+- `ConfigSettings` defaults to 80/443; the ports are written to both `http_port`/`https_port` and
+  the `pm_http`/`pm_https` `listen` addresses;
+- HTTP routes stay on `pm_http` with `automatic_https.disable_redirects` set, so host-level
+  redirects remain authoritative; HTTPS routes stay on `pm_https`;
+- route order is the compiler order; the JSON is deterministic and contains no private-key
+  material;
+- `assemble_from_hosts` runs `compile_routes` first and reports a `ConfigError` for invalid hosts.
+
+This crate does **not** emit `tls_connection_policies`, certificate automation/loaders/storage,
+logging, access lists or an admin apply step. Those are later slices; the assembler only owns the
+route/listener layer. The optional integration test validates assembled configs with
+`caddy-rs validate --adapter json` when `.scratch/rust-target/debug/caddy-rs` exists (or
+`CADDY_RS_BIN` names one) and skips with a diagnostic otherwise; unit tests never require the
+binary.
 
 ## `pm-hosts`
 

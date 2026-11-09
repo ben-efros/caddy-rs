@@ -18,6 +18,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "caddy-rs-pm-config"
+version = "0.1.0"
+dependencies = [
+ "caddy-rs-pm-compiler",
+ "caddy-rs-pm-core",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "caddy-rs-pm-core"
 version = "0.1.0"
 dependencies = [
