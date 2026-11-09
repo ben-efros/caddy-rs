@@ -29,14 +29,6 @@ const FCGI_PARAMS: u8 = 4;
 const FCGI_STDOUT: u8 = 6;
 const FCGI_VERSION_1: u8 = 1;
 
-fn free_loopback_port() -> u16 {
-    std::net::TcpListener::bind(("127.0.0.1", 0))
-        .expect("bind an ephemeral port")
-        .local_addr()
-        .expect("local address")
-        .port()
-}
-
 /// Minimal FastCGI responder: captures the CGI parameters of the first request and answers with
 /// a CGI head + body.
 fn spawn_fastcgi_upstream() -> (String, Arc<Mutex<Option<BTreeMap<String, String>>>>) {
@@ -166,7 +158,9 @@ fn config(fastcgi: &str, tls: bool) -> Config {
         server["tls_connection_policies"] = serde_json::json!([{}]);
     }
     let mut http = serde_json::json!({"servers": {"srv0": server}});
-    http["http_port"] = serde_json::json!(free_loopback_port());
+    // Never bind the default port 80; `http_port: 0` lets the kernel assign the derived
+    // redirect/challenge listener's port exactly once.
+    http["http_port"] = serde_json::json!(0);
     let mut apps = serde_json::json!({"http": http});
     if tls {
         apps["tls"] = serde_json::json!({

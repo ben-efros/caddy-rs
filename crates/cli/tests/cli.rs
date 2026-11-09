@@ -443,16 +443,13 @@ use std::process::{Child, ExitStatus, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use caddy_rs_test_support::{free_port, is_address_in_use};
+
 /// Serialises tests that touch the default admin port (2019).
 static SERVER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("reserve port")
-        .local_addr()
-        .expect("local addr")
-        .port()
-}
+/// Attempts for a server start whose configured port was taken before the child could bind it.
+const START_ATTEMPTS: usize = 8;
 
 fn ipv6_loopback_available() -> bool {
     TcpListener::bind("[::1]:0").is_ok()
@@ -510,6 +507,60 @@ fn wait_until(timeout: Duration, mut ready: impl FnMut() -> bool) -> bool {
         std::thread::sleep(Duration::from_millis(10));
     }
     false
+}
+
+/// Whether the child stopped because a configured port was claimed before it could bind.
+///
+/// `free_port` keeps every issued number out of this process's own allocations, but the kernel can
+/// still hand a just-released number to another process before `caddy-rs run` binds it. The child
+/// reports that as `Address already in use`; the caller retries with a fresh port.
+fn child_lost_port_race(log: &Path) -> bool {
+    std::fs::read_to_string(log)
+        .map(|stderr| is_address_in_use(&stderr))
+        .unwrap_or(false)
+}
+
+/// Poll `ready` until it is true, the child exits, or `timeout` expires.
+fn wait_until_serving(
+    child: &mut Child,
+    timeout: Duration,
+    mut ready: impl FnMut() -> bool,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if ready() {
+            return true;
+        }
+        if child.try_wait().expect("poll caddy-rs").is_some() {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    false
+}
+
+/// Start the CLI, retrying with the ports `start` allocates if the child lost the bind race.
+///
+/// `start` writes the configuration for the ports it just allocated and spawns the child; `ready`
+/// polls the freshly started process and receives whatever state the caller needs afterwards.
+fn spawn_until_ready<S>(
+    mut start: impl FnMut() -> (Child, std::path::PathBuf, S),
+    mut ready: impl FnMut(&mut Child, &mut S) -> bool,
+    detail: &str,
+) -> (Child, std::path::PathBuf, S) {
+    for attempt in 0..START_ATTEMPTS {
+        let (mut child, log, mut state) = start();
+        if ready(&mut child, &mut state) {
+            return (child, log, state);
+        }
+        if attempt + 1 < START_ATTEMPTS && child_lost_port_race(&log) {
+            let _ = child.kill();
+            let _ = child.wait();
+            continue;
+        }
+        child_failure(&mut child, &log, detail);
+    }
+    unreachable!("child_failure diverges")
 }
 
 fn connect_admin(port: u16) -> Option<TcpStream> {
@@ -576,27 +627,27 @@ fn admin_post_stop(port: u16) -> u16 {
 fn run_serves_hostless_caddyfile_site_and_admin_stop_exits() {
     let _guard = SERVER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let directory = tempfile::tempdir().expect("tempdir");
-    let port = free_port();
     let config = directory.path().join("Caddyfile");
-    std::fs::write(
-        &config,
-        format!("{{\n\tauto_https off\n}}\n:{port} {{\n\trespond \"cli-wildcard\"\n}}\n"),
-    )
-    .expect("write Caddyfile");
-
-    let (mut child, log) = spawn_run(&config, "caddyfile", directory.path(), "caddyfile");
-    // A Caddyfile-derived `:PORT` must bind the wildcard and serve IPv4 immediately...
-    let served = wait_until(Duration::from_secs(15), || {
-        http_request(SocketAddr::from(([127, 0, 0, 1], port)), "GET", "/")
-            .is_some_and(|(status, body)| status == 200 && body == "cli-wildcard")
-    });
-    if !served {
-        child_failure(
-            &mut child,
-            &log,
-            "hostless Caddyfile site did not serve IPv4",
-        );
-    }
+    let (mut child, log, port) = spawn_until_ready(
+        || {
+            let port = free_port();
+            std::fs::write(
+                &config,
+                format!("{{\n\tauto_https off\n}}\n:{port} {{\n\trespond \"cli-wildcard\"\n}}\n"),
+            )
+            .expect("write Caddyfile");
+            let (child, log) = spawn_run(&config, "caddyfile", directory.path(), "caddyfile");
+            (child, log, port)
+        },
+        |child, port| {
+            // A Caddyfile-derived `:PORT` must bind the wildcard and serve IPv4 immediately...
+            wait_until_serving(child, Duration::from_secs(15), || {
+                http_request(SocketAddr::from(([127, 0, 0, 1], *port)), "GET", "/")
+                    .is_some_and(|(status, body)| status == 200 && body == "cli-wildcard")
+            })
+        },
+        "hostless Caddyfile site did not serve IPv4",
+    );
     // ...and IPv6 too, matching Caddy's dual-stack `:port` semantics (when the host has IPv6).
     if ipv6_loopback_available() {
         let served_v6 = wait_until(Duration::from_secs(5), || {
@@ -640,27 +691,32 @@ fn run_serves_hostless_caddyfile_site_and_admin_stop_exits() {
 fn run_json_adapter_admin_stop_exits_process() {
     let _guard = SERVER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let directory = tempfile::tempdir().expect("tempdir");
-    let admin_port = free_port();
     let config = directory.path().join("config.json");
-    std::fs::write(
-        &config,
-        serde_json::to_string(&serde_json::json!({
-            "admin": {"listen": format!("127.0.0.1:{admin_port}")},
-            "apps": {"http": {"servers": {"srv0": {
-                "listen": ["127.0.0.1:0"],
-                "routes": [{"handle": [{"handler": "static_response", "body": "json-ok"}]}]
-            }}}}
-        }))
-        .expect("serialize config"),
-    )
-    .expect("write config");
-
-    let (mut child, log) = spawn_run(&config, "json", directory.path(), "json");
-    if !wait_until(Duration::from_secs(15), || {
-        connect_admin(admin_port).is_some()
-    }) {
-        child_failure(&mut child, &log, "JSON-adapter admin API did not start");
-    }
+    let (mut child, log, admin_port) = spawn_until_ready(
+        || {
+            let admin_port = free_port();
+            std::fs::write(
+                &config,
+                serde_json::to_string(&serde_json::json!({
+                    "admin": {"listen": format!("127.0.0.1:{admin_port}")},
+                    "apps": {"http": {"servers": {"srv0": {
+                        "listen": ["127.0.0.1:0"],
+                        "routes": [{"handle": [{"handler": "static_response", "body": "json-ok"}]}]
+                    }}}}
+                }))
+                .expect("serialize config"),
+            )
+            .expect("write config");
+            let (child, log) = spawn_run(&config, "json", directory.path(), "json");
+            (child, log, admin_port)
+        },
+        |child, admin_port| {
+            wait_until_serving(child, Duration::from_secs(15), || {
+                connect_admin(*admin_port).is_some()
+            })
+        },
+        "JSON-adapter admin API did not start",
+    );
     assert_eq!(admin_post_stop(admin_port), 200, "POST /stop returns 200");
 
     let Some(status) = wait_for_child_exit(&mut child, Duration::from_secs(10)) else {
@@ -680,60 +736,64 @@ fn run_json_adapter_admin_stop_exits_process() {
 fn run_resume_loads_the_last_autosave_and_prefers_it_over_config() {
     let _guard = SERVER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let directory = tempfile::tempdir().expect("tempdir");
-    let site_port = free_port();
-    let admin_port = free_port();
-    let other_port = free_port();
     let autosave = directory.path().join("custom-autosave.json");
-    std::fs::write(
-        &autosave,
-        serde_json::to_string(&serde_json::json!({
-            "admin": {"listen": format!("127.0.0.1:{admin_port}")},
-            "apps": {"http": {"servers": {"srv0": {
-                "listen": [format!("127.0.0.1:{site_port}")],
-                "routes": [{"handle": [{"handler": "static_response", "body": "resumed"}]}]
-            }}}}
-        }))
-        .expect("serialize autosave"),
-    )
-    .expect("write autosave");
     // A --config passed alongside --resume must be ignored (Caddy's precedence) and warned about.
     let ignored_config = directory.path().join("ignored.json");
-    std::fs::write(
-        &ignored_config,
-        serde_json::to_string(&serde_json::json!({
-            "admin": {"disabled": true},
-            "apps": {"http": {"servers": {"srv0": {
-                "listen": [format!("127.0.0.1:{other_port}")],
-                "routes": [{"handle": [{"handler": "static_response", "body": "config-file"}]}]
-            }}}}
-        }))
-        .expect("serialize ignored config"),
-    )
-    .expect("write ignored config");
-
     let log = directory.path().join("resume.stderr");
-    let file = std::fs::File::create(&log).expect("create child log");
-    let mut child = Command::new(binary())
-        .args([
-            "run",
-            "--resume",
-            "--autosave-path",
-            autosave.to_str().expect("utf-8 autosave path"),
-            "--config",
-            ignored_config.to_str().expect("utf-8 config path"),
-            "--adapter",
-            "json",
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(file))
-        .spawn()
-        .expect("spawn caddy-rs run --resume");
-
-    if !wait_until(Duration::from_secs(15), || {
-        connect_admin(admin_port).is_some()
-    }) {
-        child_failure(&mut child, &log, "resumed admin API did not start");
-    }
+    let (mut child, log, (site_port, admin_port, other_port)) = spawn_until_ready(
+        || {
+            let site_port = free_port();
+            let admin_port = free_port();
+            let other_port = free_port();
+            std::fs::write(
+                &autosave,
+                serde_json::to_string(&serde_json::json!({
+                    "admin": {"listen": format!("127.0.0.1:{admin_port}")},
+                    "apps": {"http": {"servers": {"srv0": {
+                        "listen": [format!("127.0.0.1:{site_port}")],
+                        "routes": [{"handle": [{"handler": "static_response", "body": "resumed"}]}]
+                    }}}}
+                }))
+                .expect("serialize autosave"),
+            )
+            .expect("write autosave");
+            std::fs::write(
+                &ignored_config,
+                serde_json::to_string(&serde_json::json!({
+                    "admin": {"disabled": true},
+                    "apps": {"http": {"servers": {"srv0": {
+                        "listen": [format!("127.0.0.1:{other_port}")],
+                        "routes": [{"handle": [{"handler": "static_response", "body": "config-file"}]}]
+                    }}}}
+                }))
+                .expect("serialize ignored config"),
+            )
+            .expect("write ignored config");
+            let file = std::fs::File::create(&log).expect("create child log");
+            let child = Command::new(binary())
+                .args([
+                    "run",
+                    "--resume",
+                    "--autosave-path",
+                    autosave.to_str().expect("utf-8 autosave path"),
+                    "--config",
+                    ignored_config.to_str().expect("utf-8 config path"),
+                    "--adapter",
+                    "json",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::from(file))
+                .spawn()
+                .expect("spawn caddy-rs run --resume");
+            (child, log.clone(), (site_port, admin_port, other_port))
+        },
+        |child, (_, admin_port, _)| {
+            wait_until_serving(child, Duration::from_secs(15), || {
+                connect_admin(*admin_port).is_some()
+            })
+        },
+        "resumed admin API did not start",
+    );
 
     // The autosave configuration is served ...
     let served = wait_until(Duration::from_secs(10), || {
@@ -777,48 +837,52 @@ fn run_resume_loads_the_last_autosave_and_prefers_it_over_config() {
 fn run_honours_admin_config_persist_false_and_does_not_autosave() {
     let _guard = SERVER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let directory = tempfile::tempdir().expect("tempdir");
-    let site_port = free_port();
-    let admin_port = free_port();
     let autosave = directory.path().join("autosave.json");
     let config = directory.path().join("config.json");
-    std::fs::write(
-        &config,
-        serde_json::to_string(&serde_json::json!({
-            "admin": {
-                "listen": format!("127.0.0.1:{admin_port}"),
-                "config": {"persist": false}
-            },
-            "apps": {"http": {"servers": {"srv0": {
-                "listen": [format!("127.0.0.1:{site_port}")],
-                "routes": [{"handle": [{"handler": "static_response", "body": "ok"}]}]
-            }}}}
-        }))
-        .expect("serialize config"),
-    )
-    .expect("write config");
-
     let log = directory.path().join("persist.stderr");
-    let file = std::fs::File::create(&log).expect("create child log");
-    let mut child = Command::new(binary())
-        .args([
-            "run",
-            "--config",
-            config.to_str().expect("utf-8 config path"),
-            "--adapter",
-            "json",
-            "--autosave-path",
-            autosave.to_str().expect("utf-8 autosave path"),
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(file))
-        .spawn()
-        .expect("spawn caddy-rs run");
-
-    if !wait_until(Duration::from_secs(15), || {
-        connect_admin(admin_port).is_some()
-    }) {
-        child_failure(&mut child, &log, "admin API did not start");
-    }
+    let (mut child, log, (_site_port, admin_port)) = spawn_until_ready(
+        || {
+            let site_port = free_port();
+            let admin_port = free_port();
+            std::fs::write(
+                &config,
+                serde_json::to_string(&serde_json::json!({
+                    "admin": {
+                        "listen": format!("127.0.0.1:{admin_port}"),
+                        "config": {"persist": false}
+                    },
+                    "apps": {"http": {"servers": {"srv0": {
+                        "listen": [format!("127.0.0.1:{site_port}")],
+                        "routes": [{"handle": [{"handler": "static_response", "body": "ok"}]}]
+                    }}}}
+                }))
+                .expect("serialize config"),
+            )
+            .expect("write config");
+            let file = std::fs::File::create(&log).expect("create child log");
+            let child = Command::new(binary())
+                .args([
+                    "run",
+                    "--config",
+                    config.to_str().expect("utf-8 config path"),
+                    "--adapter",
+                    "json",
+                    "--autosave-path",
+                    autosave.to_str().expect("utf-8 autosave path"),
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::from(file))
+                .spawn()
+                .expect("spawn caddy-rs run");
+            (child, log.clone(), (site_port, admin_port))
+        },
+        |child, (_, admin_port)| {
+            wait_until_serving(child, Duration::from_secs(15), || {
+                connect_admin(*admin_port).is_some()
+            })
+        },
+        "admin API did not start",
+    );
 
     assert!(
         !autosave.exists(),
@@ -892,39 +956,40 @@ fn adapt_loads_an_envfile_before_adaptation() {
 fn run_discovers_caddyfile_in_the_working_directory() {
     let _guard = SERVER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let directory = tempfile::tempdir().expect("tempdir");
-    let site_port = free_port();
-    let admin_port = free_port();
-    std::fs::write(
-        directory.path().join("Caddyfile"),
-        format!(
-            "{{\n\tauto_https off\n\tadmin 127.0.0.1:{admin_port}\n}}\n:{site_port} {{\n\trespond \"discovered\"\n}}\n"
-        ),
-    )
-    .expect("write Caddyfile");
     let log = directory.path().join("discovery.stderr");
-    let file = std::fs::File::create(&log).expect("create child log");
-    let mut child = Command::new(binary())
-        .arg("run")
-        .arg("--autosave-path")
-        .arg(directory.path().join("autosave.json"))
-        .env("XDG_CONFIG_HOME", directory.path().join("config"))
-        .env("XDG_DATA_HOME", directory.path().join("data"))
-        .current_dir(directory.path())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(file))
-        .spawn()
-        .expect("spawn caddy-rs run");
-    let served = wait_until(Duration::from_secs(15), || {
-        http_request(SocketAddr::from(([127, 0, 0, 1], site_port)), "GET", "/")
-            .is_some_and(|(status, body)| status == 200 && body == "discovered")
-    });
-    if !served {
-        child_failure(
-            &mut child,
-            &log,
-            "Caddyfile was not discovered in the working directory",
-        );
-    }
+    let (mut child, log, (_site_port, admin_port)) = spawn_until_ready(
+        || {
+            let site_port = free_port();
+            let admin_port = free_port();
+            std::fs::write(
+                directory.path().join("Caddyfile"),
+                format!(
+                    "{{\n\tauto_https off\n\tadmin 127.0.0.1:{admin_port}\n}}\n:{site_port} {{\n\trespond \"discovered\"\n}}\n"
+                ),
+            )
+            .expect("write Caddyfile");
+            let file = std::fs::File::create(&log).expect("create child log");
+            let child = Command::new(binary())
+                .arg("run")
+                .arg("--autosave-path")
+                .arg(directory.path().join("autosave.json"))
+                .env("XDG_CONFIG_HOME", directory.path().join("config"))
+                .env("XDG_DATA_HOME", directory.path().join("data"))
+                .current_dir(directory.path())
+                .stdout(Stdio::null())
+                .stderr(Stdio::from(file))
+                .spawn()
+                .expect("spawn caddy-rs run");
+            (child, log.clone(), (site_port, admin_port))
+        },
+        |child, (site_port, _)| {
+            wait_until_serving(child, Duration::from_secs(15), || {
+                http_request(SocketAddr::from(([127, 0, 0, 1], *site_port)), "GET", "/")
+                    .is_some_and(|(status, body)| status == 200 && body == "discovered")
+            })
+        },
+        "Caddyfile was not discovered in the working directory",
+    );
     assert_eq!(admin_post_stop(admin_port), 200);
     let Some(status) = wait_for_child_exit(&mut child, Duration::from_secs(10)) else {
         child_failure(&mut child, &log, "run did not exit after /stop");
@@ -939,64 +1004,89 @@ fn run_sends_systemd_notifications() {
     use std::os::unix::net::UnixDatagram;
 
     let directory = tempfile::tempdir().expect("tempdir");
-    let site_port = free_port();
-    let admin_port = free_port();
     let notify_path = directory.path().join("notify.sock");
-    let receiver = UnixDatagram::bind(&notify_path).expect("bind notify socket");
-    receiver
-        .set_read_timeout(Some(Duration::from_secs(15)))
-        .expect("read timeout");
-
     let config = directory.path().join("config.json");
-    std::fs::write(
-        &config,
-        serde_json::to_string(&serde_json::json!({
-            "admin": {"listen": format!("127.0.0.1:{admin_port}")},
-            "apps": {"http": {"servers": {"srv0": {
-                "listen": [format!("127.0.0.1:{site_port}")],
-                "routes": [{"handle": [{"handler": "static_response", "body": "notify"}]}]
-            }}}}
-        }))
-        .expect("serialize config"),
-    )
-    .expect("write config");
     let log = directory.path().join("notify.stderr");
-    let file = std::fs::File::create(&log).expect("create child log");
-    let mut child = Command::new(binary())
-        .args([
-            "run",
-            "--config",
-            config.to_str().expect("utf-8 config"),
-            "--adapter",
-            "json",
-            "--data-dir",
-            directory
-                .path()
-                .join("data")
-                .to_str()
-                .expect("utf-8 data dir"),
-            "--autosave-path",
-            directory
-                .path()
-                .join("autosave.json")
-                .to_str()
-                .expect("utf-8 autosave"),
-        ])
-        .env("NOTIFY_SOCKET", &notify_path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(file))
-        .spawn()
-        .expect("spawn caddy-rs run");
-
-    let mut messages = Vec::new();
-    let mut buffer = [0_u8; 256];
-    let mut saw_ready = false;
-    while !saw_ready {
-        let size = receiver.recv(&mut buffer).expect("receive notify message");
-        let message = String::from_utf8_lossy(&buffer[..size]).to_string();
-        saw_ready = message == "READY=1";
-        messages.push(message);
-    }
+    let (mut child, log, (_site_port, admin_port, receiver, messages)) = spawn_until_ready(
+        || {
+            let site_port = free_port();
+            let admin_port = free_port();
+            std::fs::write(
+                &config,
+                serde_json::to_string(&serde_json::json!({
+                    "admin": {"listen": format!("127.0.0.1:{admin_port}")},
+                    "apps": {"http": {"servers": {"srv0": {
+                        "listen": [format!("127.0.0.1:{site_port}")],
+                        "routes": [{"handle": [{"handler": "static_response", "body": "notify"}]}]
+                    }}}}
+                }))
+                .expect("serialize config"),
+            )
+            .expect("write config");
+            // A retry re-binds the notify socket, so drop the previous attempt's path first.
+            let _ = std::fs::remove_file(&notify_path);
+            let receiver = UnixDatagram::bind(&notify_path).expect("bind notify socket");
+            receiver
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .expect("read timeout");
+            let file = std::fs::File::create(&log).expect("create child log");
+            let child = Command::new(binary())
+                .args([
+                    "run",
+                    "--config",
+                    config.to_str().expect("utf-8 config"),
+                    "--adapter",
+                    "json",
+                    "--data-dir",
+                    directory
+                        .path()
+                        .join("data")
+                        .to_str()
+                        .expect("utf-8 data dir"),
+                    "--autosave-path",
+                    directory
+                        .path()
+                        .join("autosave.json")
+                        .to_str()
+                        .expect("utf-8 autosave"),
+                ])
+                .env("NOTIFY_SOCKET", &notify_path)
+                .stdout(Stdio::null())
+                .stderr(Stdio::from(file))
+                .spawn()
+                .expect("spawn caddy-rs run");
+            (
+                child,
+                log.clone(),
+                (site_port, admin_port, receiver, Vec::new()),
+            )
+        },
+        |child, (_, _, receiver, messages)| {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut buffer = [0_u8; 256];
+            while Instant::now() < deadline {
+                match receiver.recv(&mut buffer) {
+                    Ok(size) => {
+                        let message = String::from_utf8_lossy(&buffer[..size]).to_string();
+                        let ready = message == "READY=1";
+                        messages.push(message);
+                        if ready {
+                            return true;
+                        }
+                    }
+                    Err(_) => {
+                        // A notification read timeout is expected before READY; stop early if
+                        // the child already exited because its port was taken.
+                        if child.try_wait().expect("poll caddy-rs").is_some() {
+                            return false;
+                        }
+                    }
+                }
+            }
+            false
+        },
+        "systemd notification run did not become ready",
+    );
     assert!(
         messages.iter().any(|message| message == "RELOADING=1"),
         "expected RELOADING before READY, got {messages:?}"
@@ -1008,14 +1098,15 @@ fn run_sends_systemd_notifications() {
         "admin API did not become reachable"
     );
     assert_eq!(admin_post_stop(admin_port), 200);
+    let deadline = Instant::now() + Duration::from_secs(10);
     let mut saw_stopping = false;
-    while !saw_stopping {
-        let size = receiver
-            .recv(&mut buffer)
-            .expect("receive stopping message");
-        let message = String::from_utf8_lossy(&buffer[..size]).to_string();
-        saw_stopping = message == "STOPPING=1";
+    let mut buffer = [0_u8; 256];
+    while !saw_stopping && Instant::now() < deadline {
+        if let Ok(size) = receiver.recv(&mut buffer) {
+            saw_stopping = String::from_utf8_lossy(&buffer[..size]) == "STOPPING=1";
+        }
     }
+    assert!(saw_stopping, "expected STOPPING=1 notification");
     let Some(status) = wait_for_child_exit(&mut child, Duration::from_secs(10)) else {
         child_failure(&mut child, &log, "run did not exit after /stop");
     };

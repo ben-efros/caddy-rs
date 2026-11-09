@@ -5,6 +5,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use caddy_rs_test_support::{free_port, retry_addr_in_use};
+
 use caddy_rs_core::{Config, GenerationStore};
 use caddy_rs_server::ServerRuntime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -176,14 +178,6 @@ async fn read_exact(stream: &mut TcpStream, length: usize, timeout: Duration) ->
     let mut buffer = vec![0u8; length];
     let _ = tokio::time::timeout(timeout, stream.read_exact(&mut buffer)).await;
     buffer
-}
-
-fn free_loopback_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("reserve a port")
-        .local_addr()
-        .expect("local addr")
-        .port()
 }
 
 fn body_contains(response: &[u8], needle: &[u8]) -> bool {
@@ -381,9 +375,25 @@ async fn second_signal_forces_immediate_shutdown() {
 
 #[tokio::test]
 async fn admin_stop_drains_within_grace_period() {
-    let admin_port = free_loopback_port();
     let upstream = spawn_slow_upstream(Duration::from_millis(300));
-    let (runtime, address) = start(config_with_admin(&upstream, "1s", admin_port)).await;
+    // The admin listener needs a stable fixed port for the `run` loop; retry the initial bind on
+    // AddrInUse with a freshly allocated one.
+    let (runtime, address, admin_port) = retry_addr_in_use(|| {
+        let admin_port = free_port();
+        let config = config_with_admin(&upstream, "1s", admin_port);
+        let store = Arc::new(GenerationStore::with_builtin_registry());
+        store.load(config).expect("config loads");
+        let mut runtime = ServerRuntime::new(store);
+        async move {
+            runtime.apply().await?;
+            let address = runtime
+                .listener_address("127.0.0.1:0")
+                .expect("listener bound");
+            Ok::<_, caddy_rs_server::Error>((runtime, address, admin_port))
+        }
+    })
+    .await
+    .expect("runtime applies");
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
     let running = tokio::spawn(async move { runtime.run(shutdown_rx).await });
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -529,8 +539,8 @@ async fn reload_honors_shutdown_delay_and_grace_for_closing_listeners() {
     // grace-period context (`modules/caddyhttp/app.go`). A reload itself does not wait for the
     // grace period, but the closing listener's over-grace request is force-closed.
     let upstream = spawn_slow_upstream(Duration::from_secs(2));
-    let old_port = free_loopback_port();
-    let new_port = free_loopback_port();
+    let old_port = free_port();
+    let new_port = free_port();
     let old_config = config_with_listen(
         &upstream,
         &format!("127.0.0.1:{old_port}"),

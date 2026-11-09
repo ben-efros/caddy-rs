@@ -229,6 +229,7 @@ dependencies = [
  "caddy-rs-config",
  "caddy-rs-core",
  "caddy-rs-server",
+ "caddy-rs-test-support",
  "clap",
  "http",
  "http-body-util",
@@ -389,6 +390,7 @@ dependencies = [
  "caddy-rs-core",
  "caddy-rs-http",
  "caddy-rs-proxy",
+ "caddy-rs-test-support",
  "caddy-rs-tls",
  "h2",
  "h3",
@@ -409,6 +411,10 @@ dependencies = [
  "tokio-rustls",
  "tracing",
 ]
+
+[[package]]
+name = "caddy-rs-test-support"
+version = "0.1.0-trial.5"
 
 [[package]]
 name = "caddy-rs-tls"

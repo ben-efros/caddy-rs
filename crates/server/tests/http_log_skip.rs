@@ -4,7 +4,7 @@
 //! only the access-log entry (`modules/caddyhttp/server.go:1246-1253`). These tests drive real
 //! listeners and assert on the sink output and the metrics endpoint, never on an internal helper.
 
-use std::net::{SocketAddr, TcpListener};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -15,14 +15,6 @@ use http_body_util::{BodyExt, Full};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use serde_json::{json, Value};
-
-fn free_loopback_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral port")
-        .local_addr()
-        .expect("local addr")
-        .port()
-}
 
 async fn request(address: SocketAddr, method: &str, path: &str) -> (StatusCode, HeaderMap, Bytes) {
     request_with_host(address, method, path, "example.com").await
@@ -111,20 +103,18 @@ async fn caddyfile_log_skip_suppresses_the_matching_entry_but_keeps_metrics() {
     // runtime must honour it. The unmatched request in the same server must still be logged.
     let directory = tempfile::tempdir().expect("tempdir");
     let log_path = directory.path().join("access.log");
-    let port = free_loopback_port();
-    let caddyfile = format!(
-        r#"{{
+    // Port 0 makes the adapter emit a wildcard ephemeral listener; the runtime reports the port.
+    let caddyfile = r#"{
 	admin 127.0.0.1:0
 	auto_https off
-}}
+}
 
-http://127.0.0.1:{port} {{
+http://127.0.0.1:0 {
 	@skip path /skip
 	log_skip @skip
 	respond "ok"
-}}
-"#
-    );
+}
+"#;
     let adapted = caddy_rs_config::adapt_with_source(&caddyfile, None)
         .expect("Caddyfile with log_skip adapts");
     // The handler must be the generic vars handler, not a `log_skip` module.
@@ -147,11 +137,10 @@ http://127.0.0.1:{port} {{
     store.load(config).expect("adapted config validates");
     let mut runtime = ServerRuntime::new(Arc::clone(&store));
     runtime.apply().await.expect("runtime applies");
-    let listen = format!(":{port}");
-    runtime
-        .listener_address(&listen)
+    let bound = runtime
+        .listener_address(":0")
         .expect("Caddyfile listener bound");
-    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    let address = SocketAddr::from(([127, 0, 0, 1], bound.port()));
     let admin = runtime.admin_address().expect("admin bound");
 
     let (status, _headers, body) = request_with_host(address, "GET", "/skip", "127.0.0.1").await;
@@ -307,22 +296,20 @@ async fn caddyfile_vars_boolean_spellings_match_the_runtime() {
     // string (log). This is the adapter+runtime agreement for the `vars` forms.
     let directory = tempfile::tempdir().expect("tempdir");
     let log_path = directory.path().join("access.log");
-    let port = free_loopback_port();
-    let caddyfile = format!(
-        r#"{{
+    // Port 0 makes the adapter emit a wildcard ephemeral listener; the runtime reports the port.
+    let caddyfile = r#"{
 	admin 127.0.0.1:0
 	auto_https off
-}}
+}
 
-http://127.0.0.1:{port} {{
+http://127.0.0.1:0 {
 	@truthy path /truthy
 	vars @truthy log_skip TRUE
 	@quoted path /quoted
 	vars @quoted log_skip "true"
 	respond "ok"
-}}
-"#
-    );
+}
+"#;
     let adapted = caddy_rs_config::adapt_with_source(&caddyfile, None).expect("Caddyfile adapts");
     let mut config_value = adapted.config;
     config_value["logging"] = json!({"logs": {"default": {
@@ -335,10 +322,10 @@ http://127.0.0.1:{port} {{
     store.load(config).expect("adapted config validates");
     let mut runtime = ServerRuntime::new(Arc::clone(&store));
     runtime.apply().await.expect("runtime applies");
-    runtime
-        .listener_address(&format!(":{port}"))
-        .expect("listener bound");
-    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    let bound = runtime
+        .listener_address(":0")
+        .expect("Caddyfile listener bound");
+    let address = SocketAddr::from(([127, 0, 0, 1], bound.port()));
 
     for path in ["/truthy", "/quoted", "/plain"] {
         let (status, _headers, body) = request_with_host(address, "GET", path, "127.0.0.1").await;

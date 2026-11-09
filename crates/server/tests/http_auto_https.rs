@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use caddy_rs_test_support::{free_port, retry_addr_in_use};
+
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use ring::rand::SystemRandom;
@@ -1029,15 +1031,6 @@ async fn apply(
     (runtime, https, http, directory)
 }
 
-/// A fixed loopback port that is currently free (released immediately before use).
-fn free_loopback_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("reserve a port")
-        .local_addr()
-        .expect("local addr")
-        .port()
-}
-
 /// Send `POST <path>` over a fresh connection and return the status code.
 async fn post_plain(address: SocketAddr, path: &str) -> u16 {
     let mut stream = TcpStream::connect(address).await.expect("connect for POST");
@@ -1595,7 +1588,7 @@ async fn tls_alpn_probe_failure_keeps_previous_generation() {
 async fn admin_stop_ends_runtime_loop_with_automatic_https() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().to_string_lossy().to_string();
-    let admin_port = free_loopback_port();
+    let admin_port = free_port();
     let store = Arc::new(GenerationStore::with_builtin_registry());
     store
         .load(config_with_admin(
@@ -1868,7 +1861,8 @@ async fn default_on_issues_certificate_for_implicit_https_site() {
     let (https_address, activation) = prebound_listener();
     let listen = https_address.to_string();
     let https_port = https_address.port();
-    let http_port = free_loopback_port();
+    // Port 0 keeps the derived HTTP redirect listener ephemeral; the runtime reports its port.
+    let http_port = 0;
     let store = Arc::new(GenerationStore::with_builtin_registry());
     store
         .load(implicit_https_config(
@@ -1918,7 +1912,7 @@ async fn default_on_disable_does_not_issue_and_fails_loudly_without_certificates
     store
         .load(implicit_https_config(
             &listen,
-            free_loopback_port(),
+            0,
             https_address.port(),
             &root,
             Some(serde_json::json!({"disable": true})),
@@ -1948,33 +1942,41 @@ async fn default_on_disable_does_not_issue_and_fails_loudly_without_certificates
 #[tokio::test]
 async fn default_on_caddyfile_end_to_end() {
     let directory = tempfile::tempdir().unwrap();
-    let http_port = free_loopback_port();
-    let https_port = free_loopback_port();
-    let caddyfile = format!(
-        "{{\n\thttp_port {http_port}\n\thttps_port {https_port}\n}}\n\nexample.com {{\n\trespond \"hello caddyfile\"\n}}\n"
-    );
-    let adapted = caddy_rs_config::adapt_with_source(&caddyfile, None)
-        .expect("simple public-host Caddyfile adapts");
-    let config = Config::from_value(adapted.config).expect("adapted JSON decodes");
-    // The adapter relies on Caddy's default-on automatic HTTPS: no apps.tls automation, no
-    // explicit tls_connection_policies are required.
-    assert!(
-        config
-            .tls()
-            .map(|tls| tls.automation_policies().is_empty())
-            .unwrap_or(true),
-        "test must not rely on explicit automation policies"
-    );
-    let store = Arc::new(GenerationStore::with_builtin_registry());
-    store.load(config).expect("adapted Caddyfile validates");
     let fake = Arc::new(FakeCa::new(false));
-    let mut runtime = ServerRuntime::new(Arc::clone(&store))
-        .with_acme_transport(fake.clone())
-        .with_data_root(directory.path());
-    runtime
-        .apply()
-        .await
-        .expect("adapted Caddyfile gets automatic HTTPS by default");
+    // Both listeners bind fixed ports, so a parallel test can still claim one between allocation
+    // and bind; re-adapt with fresh ports and retry the runtime start on AddrInUse.
+    let (runtime, https_port, http_port) = retry_addr_in_use(|| {
+        let directory = directory.path().to_path_buf();
+        let fake = Arc::clone(&fake);
+        async move {
+            let http_port = free_port();
+            let https_port = free_port();
+            let caddyfile = format!(
+                "{{\n\thttp_port {http_port}\n\thttps_port {https_port}\n}}\n\nexample.com {{\n\trespond \"hello caddyfile\"\n}}\n"
+            );
+            let adapted = caddy_rs_config::adapt_with_source(&caddyfile, None)
+                .expect("simple public-host Caddyfile adapts");
+            let config = Config::from_value(adapted.config).expect("adapted JSON decodes");
+            // The adapter relies on Caddy's default-on automatic HTTPS: no apps.tls automation,
+            // no explicit tls_connection_policies are required.
+            assert!(
+                config
+                    .tls()
+                    .map(|tls| tls.automation_policies().is_empty())
+                    .unwrap_or(true),
+                "test must not rely on explicit automation policies"
+            );
+            let store = Arc::new(GenerationStore::with_builtin_registry());
+            store.load(config).expect("adapted Caddyfile validates");
+            let mut runtime = ServerRuntime::new(Arc::clone(&store))
+                .with_acme_transport(fake)
+                .with_data_root(&directory);
+            runtime.apply().await?;
+            Ok::<_, caddy_rs_server::Error>((runtime, https_port, http_port))
+        }
+    })
+    .await
+    .expect("adapted Caddyfile gets automatic HTTPS by default");
     assert_eq!(fake.domains(), vec!["example.com".to_string()]);
 
     let https = SocketAddr::from(([127, 0, 0, 1], https_port));
@@ -2019,8 +2021,8 @@ async fn adapted_plain_http_site_serves_cleartext() {
     // port plus server-level `automatic_https.skip`; it must stay plaintext instead of failing
     // with "host matchers require TLS".
     let _directory = tempfile::tempdir().unwrap();
-    let port = free_loopback_port();
-    let caddyfile = format!("http://127.0.0.1:{port} {{\n\trespond \"plain ok\"\n}}\n");
+    // Port 0 makes the adapter emit a wildcard ephemeral listener; the runtime reports the port.
+    let caddyfile = "http://127.0.0.1:0 {\n\trespond \"plain ok\"\n}\n";
     let adapted =
         caddy_rs_config::adapt_with_source(&caddyfile, None).expect("plain HTTP Caddyfile adapts");
     let config = Config::from_value(adapted.config).expect("adapted JSON decodes");
@@ -2033,10 +2035,10 @@ async fn adapted_plain_http_site_serves_cleartext() {
         .apply()
         .await
         .expect("skipped host must not demand automatic HTTPS");
-    runtime
-        .listener_address(&format!(":{port}"))
+    let bound = runtime
+        .listener_address(":0")
         .expect("plain HTTP listener bound");
-    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    let address = SocketAddr::from(([127, 0, 0, 1], bound.port()));
     let (status, _, body) = plain_get(address, "127.0.0.1", "/").await;
     assert_eq!(status, 200);
     assert_eq!(body, "plain ok");
@@ -2050,7 +2052,8 @@ async fn implicit_https_on_non_standard_port_terminates_tls_and_redirects_to_it(
     let (https_address, activation) = prebound_listener();
     let https_port = https_address.port();
     let listen = https_address.to_string();
-    let http_port = free_loopback_port();
+    // Port 0 keeps the derived HTTP redirect listener ephemeral; the runtime reports its port.
+    let http_port = 0;
     assert_ne!(https_port, 443, "pre-bound test port is non-standard");
     let store = Arc::new(GenerationStore::with_builtin_registry());
     store
@@ -2154,7 +2157,8 @@ async fn configured_storage_root_wins_over_the_data_directory() {
     let (https_address, activation) = prebound_listener();
     let listen = https_address.to_string();
     let https_port = https_address.port();
-    let http_port = free_loopback_port();
+    // Port 0 keeps the derived HTTP redirect listener ephemeral; the runtime reports its port.
+    let http_port = 0;
     let store = Arc::new(GenerationStore::with_builtin_registry());
     store
         .load(implicit_https_config(

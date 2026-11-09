@@ -49,6 +49,7 @@ tokio-rustls = { version = "0.26.6", default-features = false, features = ["aws_
 tracing = { workspace = true }
 
 [dev-dependencies]
+caddy-rs-test-support = { path = "../test-support" }
 async-trait = { workspace = true }
 h2 = "0.4.19"
 caddy-rs-config = { workspace = true }

@@ -10,6 +10,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use caddy_rs_test_support::free_port;
+
 use caddy_rs_core::{Config, GenerationStore};
 use caddy_rs_server::ServerRuntime;
 use serde_json::Value;
@@ -18,14 +20,6 @@ use tokio::net::TcpStream;
 
 const LOADED_CERT: &str = include_str!("../../tls/testdata/acme/localhost-cert.pem");
 const LOADED_KEY: &str = include_str!("../../tls/testdata/acme/localhost-key.pem");
-
-fn free_loopback_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("reserve a port")
-        .local_addr()
-        .expect("local addr")
-        .port()
-}
 
 fn inventory_config(admin_port: u16, listen: &str) -> Config {
     Config::from_value(serde_json::json!({
@@ -88,16 +82,14 @@ async fn admin_request(address: SocketAddr, method: &str, path: &str) -> (u16, V
 
 #[tokio::test]
 async fn runtime_inventory_lists_generation_listeners_and_loaded_certificates() {
-    let admin_port = free_loopback_port();
     let store = Arc::new(GenerationStore::with_builtin_registry());
+    // An ephemeral admin listener avoids a fixed-port race for this single-apply test.
     store
-        .load(inventory_config(admin_port, "127.0.0.1:0"))
+        .load(inventory_config(0, "127.0.0.1:0"))
         .expect("config validates");
     let mut runtime = ServerRuntime::new(Arc::clone(&store));
     runtime.apply().await.expect("runtime applies");
-    let admin: SocketAddr = format!("127.0.0.1:{admin_port}")
-        .parse()
-        .expect("admin address");
+    let admin = runtime.admin_address().expect("admin listener bound");
 
     let (status, value) = admin_request(admin, "GET", "/runtime/inventory").await;
     assert_eq!(status, 200, "{value}");
@@ -158,7 +150,7 @@ async fn runtime_inventory_lists_generation_listeners_and_loaded_certificates() 
 
 #[tokio::test]
 async fn runtime_inventory_tracks_reload_and_health_check_schedulers() {
-    let admin_port = free_loopback_port();
+    let admin_port = free_port();
     let store = Arc::new(GenerationStore::with_builtin_registry());
     store
         .load(proxy_health_config(admin_port, "127.0.0.1:0"))
@@ -181,7 +173,7 @@ async fn runtime_inventory_tracks_reload_and_health_check_schedulers() {
 
     // Reload with a different concrete listener port: generation/config hash/listener inventory
     // must all move together in the installed snapshot.
-    let new_port = free_loopback_port();
+    let new_port = free_port();
     store
         .load(proxy_health_config(
             admin_port,

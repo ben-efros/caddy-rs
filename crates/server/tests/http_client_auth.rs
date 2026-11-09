@@ -31,14 +31,6 @@ serial=[{http.request.tls.client.serial}] fingerprint=[{http.request.tls.client.
 san0=[{http.request.tls.client.san.dns_names.0}] san=[{http.request.tls.client.san.dns_names}] \
 pem=[{http.request.tls.client.certificate_pem}]";
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind(("127.0.0.1", 0))
-        .expect("bind ephemeral port")
-        .local_addr()
-        .expect("local addr")
-        .port()
-}
-
 fn client_ca_base64() -> String {
     use base64::engine::general_purpose::STANDARD;
     let der = caddy_rs_tls::certificates_from_pem(CLIENT_CA)
@@ -56,7 +48,8 @@ fn config(mode: &str, with_ca: bool) -> Config {
         });
     }
     let http = serde_json::json!({
-        "http_port": free_port(),
+        // Never bind the default port 80; port 0 makes the derived HTTP listener ephemeral.
+        "http_port": 0,
         "servers": {"srv0": {
             "listen": ["127.0.0.1:0"],
             "tls_connection_policies": [{"client_authentication": client_authentication}],

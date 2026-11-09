@@ -6,7 +6,7 @@
 //! `modules/caddyhttp/reverseproxy/reverseproxy.go` (`handle_response` + copy handlers).
 
 use std::convert::Infallible;
-use std::net::{SocketAddr, TcpListener};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -16,14 +16,6 @@ use http_body_util::{BodyExt, Full};
 use hyper::service::service_fn;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
-
-fn free_loopback_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("reserve a port")
-        .local_addr()
-        .expect("local addr")
-        .port()
-}
 
 async fn request(address: SocketAddr, path: &str) -> (u16, Bytes) {
     let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
@@ -95,28 +87,30 @@ async fn handle_errors_runs_for_error_handlers_over_a_real_listener() {
 
 #[tokio::test]
 async fn adapted_handle_errors_caddyfile_serves_end_to_end() {
-    let port = free_loopback_port();
-    let caddyfile = format!(
-        r#"{{
+    // Port 0 lets the adapter emit a wildcard ephemeral listener (`:0`); the runtime reports the
+    // port the kernel assigned, so there is no fixed-port race.
+    let caddyfile = r#"{
 	auto_https off
-}}
+}
 
-http://127.0.0.1:{port} {{
+http://127.0.0.1:0 {
 	error /private* "Unauthorized" 403
-	handle_errors 4xx {{
-		respond "custom error {{http.error.status_code}}" 403
-	}}
+	handle_errors 4xx {
+		respond "custom error {http.error.status_code}" 403
+	}
 	respond "ok"
-}}
-"#
-    );
+}
+"#;
     let adapted = caddy_rs_config::adapt(&caddyfile).expect("Caddyfile adapts");
     let config = Config::from_value(adapted.config).expect("adapted config decodes");
     let store = Arc::new(GenerationStore::with_builtin_registry());
     store.load(config).expect("adapted config validates");
     let mut runtime = ServerRuntime::new(Arc::clone(&store));
     runtime.apply().await.expect("runtime applies");
-    let address = format!("127.0.0.1:{port}").parse().unwrap();
+    let bound = runtime
+        .listener_address(":0")
+        .expect("Caddyfile listener bound");
+    let address = SocketAddr::from(([127, 0, 0, 1], bound.port()));
     let (status, body) = request(address, "/private/x").await;
     assert_eq!(status, 403);
     assert_eq!(body, Bytes::from_static(b"custom error 403"));

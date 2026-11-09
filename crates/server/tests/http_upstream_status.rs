@@ -5,6 +5,8 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use caddy_rs_test_support::free_port;
+
 use bytes::Bytes;
 use caddy_rs_core::{Config, GenerationStore};
 use caddy_rs_server::ServerRuntime;
@@ -12,15 +14,6 @@ use http_body_util::{BodyExt, Full};
 use hyper::service::service_fn;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
-
-/// A fixed loopback port that is currently free (released immediately before use).
-fn free_loopback_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("reserve a port")
-        .local_addr()
-        .expect("local addr")
-        .port()
-}
 
 /// Wait until nothing listens on `address` (after aborting the upstream task).
 async fn wait_until_unreachable(address: &str) {
@@ -194,7 +187,7 @@ async fn admin_reports_failed_upstream_attempts() {
 async fn reload_swaps_the_admin_upstream_source() {
     let (first_dial, _first_shutdown) = spawn_upstream_bound("first-upstream");
     let (second_dial, _second_shutdown) = spawn_upstream_bound("second-upstream");
-    let admin_port = free_loopback_port();
+    let admin_port = free_port();
     let admin_listen = format!("127.0.0.1:{admin_port}");
     let store = Arc::new(GenerationStore::with_builtin_registry());
     store

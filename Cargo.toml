@@ -12,6 +12,7 @@ members = [
     "crates/plug",
     "crates/authn",
     "crates/config-tx",
+    "crates/test-support",
 ]
 
 [workspace.package]

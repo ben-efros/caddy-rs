@@ -4,6 +4,8 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use caddy_rs_test_support::{free_port, retry_addr_in_use};
+
 use bytes::Bytes;
 use caddy_rs_core::{Config, GenerationStore};
 use caddy_rs_server::ServerRuntime;
@@ -29,15 +31,6 @@ fn config_with_admin(listen: &str, body: &str, admin: serde_json::Value) -> Conf
         }}}}
     }))
     .expect("test config decodes")
-}
-
-/// A fixed loopback port that is currently free (released immediately before use).
-fn free_loopback_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("reserve a port")
-        .local_addr()
-        .expect("local addr")
-        .port()
 }
 
 async fn request(
@@ -245,23 +238,31 @@ fn ipv6_loopback_available() -> bool {
 /// accident of external signals).
 #[tokio::test]
 async fn admin_stop_ends_the_runtime_loop() {
-    let store = Arc::new(GenerationStore::with_builtin_registry());
     // Use a fixed admin port: the supervisor re-applies once on entry, and an ephemeral admin
-    // `:0` would be rebound to a new port on every apply (the test needs a stable address).
-    let admin_port = free_loopback_port();
-    store
-        .load(config_with_admin(
-            "127.0.0.1:0",
-            "hello",
-            serde_json::json!({"listen": format!("127.0.0.1:{admin_port}")}),
-        ))
-        .unwrap();
-    let mut runtime = ServerRuntime::new(Arc::clone(&store));
-    runtime.apply().await.expect("apply");
-    let admin = runtime.admin_address().expect("admin listener bound");
-    let web = runtime
-        .listener_address("127.0.0.1:0")
-        .expect("web listener bound");
+    // `:0` would be rebound to a new port on every apply (the test needs a stable address). The
+    // fixed port can lose the allocation race, so retry the initial bind with a fresh one.
+    let (runtime, admin, web) = retry_addr_in_use(|| {
+        let admin_port = free_port();
+        let store = Arc::new(GenerationStore::with_builtin_registry());
+        store
+            .load(config_with_admin(
+                "127.0.0.1:0",
+                "hello",
+                serde_json::json!({"listen": format!("127.0.0.1:{admin_port}")}),
+            ))
+            .unwrap();
+        let mut runtime = ServerRuntime::new(store);
+        async move {
+            runtime.apply().await?;
+            let admin = runtime.admin_address().expect("admin listener bound");
+            let web = runtime
+                .listener_address("127.0.0.1:0")
+                .expect("web listener bound");
+            Ok::<_, caddy_rs_server::Error>((runtime, admin, web))
+        }
+    })
+    .await
+    .expect("apply");
 
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let running = tokio::spawn(async move { runtime.run(shutdown_rx).await });

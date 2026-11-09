@@ -10,6 +10,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use caddy_rs_test_support::free_port;
+
 use bytes::{Buf, Bytes, BytesMut};
 use caddy_rs_core::{Config, GenerationStore};
 use caddy_rs_server::ServerRuntime;
@@ -30,36 +32,6 @@ const CLIENT_CERT_BODY: &str =
     "subject=[{http.request.tls.client.subject}] issuer=[{http.request.tls.client.issuer}] \
      serial=[{http.request.tls.client.serial}] fingerprint=[{http.request.tls.client.fingerprint}] \
      san=[{http.request.tls.client.san.dns_names}] pem=[{http.request.tls.client.certificate_pem}]";
-
-/// Hand out an ephemeral port that no other test in this process has taken.
-///
-/// Binding `:0` and dropping the socket is a time-of-check/time-of-use race: a parallel test can
-/// claim the same number between the probe and the runtime's real bind (this showed up as a
-/// sporadic `AddrInUse`). Recording every handed-out port makes intra-process reuse impossible;
-/// the underlying TCP+UDP listeners then bind the same number in the two protocol spaces.
-fn free_port() -> u16 {
-    use std::collections::HashSet;
-    use std::sync::{Mutex, OnceLock};
-
-    static ISSUED: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
-    let issued = ISSUED.get_or_init(|| Mutex::new(HashSet::new()));
-    loop {
-        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
-            .expect("bind ephemeral port")
-            .local_addr()
-            .expect("local addr")
-            .port();
-        // The runtime binds this number for TCP *and* QUIC/UDP, so a port that only looks free on
-        // TCP can still collide with another process's UDP socket (a parallel test binary, or a
-        // QUIC endpoint left by an earlier run). Probe both protocols; the UDP probe is closed
-        // immediately, but it removes the case where a UDP port was never checked at all.
-        let udp_free = std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok();
-        let mut guard = issued.lock().expect("port registry");
-        if udp_free && guard.insert(port) {
-            return port;
-        }
-    }
-}
 
 /// Configuration with TLS material and optional UDP (HTTP/3) listener.
 fn config(

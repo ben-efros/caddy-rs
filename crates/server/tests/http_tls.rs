@@ -35,15 +35,6 @@ const OTHER_KEY: &str = include_str!("../../tls/testdata/https/other.example.key
 /// The body template used by test routes: connection scheme plus negotiated ALPN.
 const BODY_PLACEHOLDERS: &str = "{http.request.scheme} {http.vars.tls.alpn}";
 
-/// An ephemeral loopback port for derived listeners (released before the runtime binds it).
-fn free_loopback_port() -> u16 {
-    std::net::TcpListener::bind(("127.0.0.1", 0))
-        .expect("bind an ephemeral port")
-        .local_addr()
-        .expect("local address")
-        .port()
-}
-
 /// Build a configuration with one HTTP server and optional TLS material/policies.
 fn config(
     listen: &str,
@@ -60,10 +51,9 @@ fn config(
     }
     let mut http = serde_json::json!({"servers": {"srv0": server}});
     // Automatic HTTPS derives a cleartext redirect/challenge listener for hostless TLS servers
-    // (Caddy's catch-all redirects). Tests must not bind the default port 80: an ephemeral
-    // http_port keeps every test (and parallel test) on its own socket, exactly like the other
-    // auto-HTTPS suites.
-    http["http_port"] = serde_json::json!(free_loopback_port());
+    // (Caddy's catch-all redirects). Tests must not bind the default port 80: `http_port: 0` makes
+    // the derived listener ephemeral too (`:0`), so the kernel assigns its port exactly once.
+    http["http_port"] = serde_json::json!(0);
     if let Some(https_port) = https_port {
         http["https_port"] = serde_json::json!(https_port);
     }
@@ -112,7 +102,7 @@ fn config_with_pem_certificate(certificate: &str, key: &str) -> Config {
             "routes": [{"handle": [{"handler": "static_response", "body": BODY_PLACEHOLDERS}]}]
         }}
     });
-    http["http_port"] = serde_json::json!(free_loopback_port());
+    http["http_port"] = serde_json::json!(0);
     Config::from_value(serde_json::json!({
         "admin": {"disabled": true},
         "apps": {
@@ -139,7 +129,7 @@ fn config_with_certificate_files(files: &[(String, String)]) -> Config {
             "routes": [{"handle": [{"handler": "static_response", "body": BODY_PLACEHOLDERS}]}]
         }}
     });
-    http["http_port"] = serde_json::json!(free_loopback_port());
+    http["http_port"] = serde_json::json!(0);
     Config::from_value(serde_json::json!({
         "admin": {"disabled": true},
         "apps": {
