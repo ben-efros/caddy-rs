@@ -1,0 +1,83 @@
+:9080 {
+	forward_auth auth:9091 {
+		uri /auth
+		handle_response {
+			respond "denied" 401
+		}
+	}
+}
+----------
+{
+	"apps": {
+		"http": {
+			"servers": {
+				"srv0": {
+					"listen": [
+						":9080"
+					],
+					"routes": [
+						{
+							"handle": [
+								{
+									"handle_response": [
+										{
+											"match": {
+												"status_code": [
+													2
+												]
+											},
+											"routes": [
+												{
+													"handle": [
+														{
+															"handler": "vars"
+														}
+													]
+												}
+											]
+										},
+										{
+											"routes": [
+												{
+													"handle": [
+														{
+															"body": "denied",
+															"handler": "static_response",
+															"status_code": 401
+														}
+													]
+												}
+											]
+										}
+									],
+									"handler": "reverse_proxy",
+									"headers": {
+										"request": {
+											"set": {
+												"X-Forwarded-Method": [
+													"{http.request.method}"
+												],
+												"X-Forwarded-Uri": [
+													"{http.request.uri}"
+												]
+											}
+										}
+									},
+									"rewrite": {
+										"method": "GET",
+										"uri": "/auth"
+									},
+									"upstreams": [
+										{
+											"dial": "auth:9091"
+										}
+									]
+								}
+							]
+						}
+					]
+				}
+			}
+		}
+	}
+}
