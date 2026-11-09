@@ -8,7 +8,7 @@ that names it and the line it appears on — it is never silently ignored:
 
 ```
 caddy-rs: error[config.invalid]: cannot adapt `/etc/caddy/Caddyfile`: invalid configuration at
-`Caddyfile line 25`: directive `log_skip` is not supported by this build
+`Caddyfile line 25`: directive `push` is not supported by this build
 ```
 
 Check a configuration before running it:
@@ -54,6 +54,8 @@ caddy-rs validate --config ./Caddyfile --adapter caddyfile
 | `tls` | **adapted + runtime** | `tls internal` (local CA), `tls <email>`, `tls <cert> <key>`, block options `ca`, `dns <provider>`, `on_demand` (rejected loudly at runtime), `key_type`, and `issuer internal { ca <id>; lifetime <dur>; sign_with_root }` emit Caddy-compatible `apps.tls` JSON (the internal CA ID must exist in `apps.pki`,). Explicit automation now terminates TLS, obtains certificates (ACME HTTP-01/DNS-01/TLS-ALPN-01 or internal CA), redirects HTTP→HTTPS, and renews with hot-swap; default-on auto-HTTPS is not enabled . Evidence: `tls_automation_policies_*`, `tls_conn_policy_consolidate`, `enable_tls_for_catch_all_site`, `acme_dns_configured`. Explicit `issuer acme [<ca>] { ... }` adapts `timeout` to `acme_timeout`, positional CA/`dir`, `email`, `disable_http_challenge`, `disable_tlsalpn_challenge`, `trusted_roots` and `eab` to Caddy's exact JSON; other ACME options stay located errors and `network_proxy` is JSON-only . |
 | `log` | **adapted (runtime-backed subset,)** | Site form `log [<name>] { hostnames <hosts...>; no_hostname; output stdout\ |
 | `log_level` | **unsupported (runtime gap)** | Located error: the runtime access log does not honor Caddy's per-request `log_level` variable override, so the adapter rejects the directive instead of emitting a config whose behaviour would differ. |
+| `log_skip` | `log_skip [<matcher>]` (no arguments, no block) | `{"handler":"vars","log_skip":true}` exactly like Caddy v2.11.9 (there is no `http.handlers.log_skip` module). The runtime suppresses the access-log entry when the final `log_skip` request variable is the boolean `true`; metrics, status and response are unchanged. Evidence: `crates/config/tests/log_skip_adapt.rs`, `crates/server/tests/http_log_skip.rs`. |
+| `skip_log` | **deprecated alias** for `log_skip` (same syntax) | Accepts and emits identical JSON in `compatible` mode (the default) and `warn` mode, emitting Caddy's deprecation warning in both; rejected with a located error naming `log_skip` in `strict` mode. Evidence: `crates/config/tests/log_skip_adapt.rs`, `crates/cli/tests/cli.rs`. |
 | `map` | **adapted (runtime-backed)** | `map <source> <destinations...> { <input> <outputs...>; default <outputs...> }` emits Caddy's exact `map` handler: literal and `~` regular-expression sources with `${N}` capture outputs, multiple destinations/defaults, and Caddy scalar coercion (quoted stays string, unquoted `-` is null). Sources/destinations may use any placeholder; Caddyfile shorthands are expanded before parsing. |
 | `request_body` | `request_body [<matcher>] { max_size <size>; set <body> }` | `request_body` handler with `max_size` (decimal Caddy size units) and experimental `set` body replacement; runtime enforces the limit lazily (413) |
 | `try_files` | `try_files [<matcher>] <files...> [<fallback>]` | `rewrite` route with a `file` matcher (`try_files`/`try_policy`/`split_path`); query-carrying file arguments become grouped routes with Caddy's first-match semantics |
@@ -100,6 +102,14 @@ caddy-rs validate --config ./Caddyfile --adapter caddyfile
 - Heredocs (`<<EOF`) and line continuations are supported.
 - A directive may be supported with a narrower syntax than Caddy accepts. Using the unsupported part
   fails adaptation and names the construct rather than dropping it.
+- `--adapt-mode compatible|warn|strict` (caddy-rs extension; default `compatible`) selects the
+  configuration-acceptance strictness on `adapt`, `validate` and `run`. It currently gates the
+  deprecated-alias table only: `skip_log` → `log_skip` and `basicauth` → `basic_auth` are accepted
+  with Caddy's deprecation warning in `compatible` (the default) and `warn`, and rejected with a
+  located error naming both spellings in `strict` (where `warn` becomes a superset once more
+  ambiguity constructs are gated). `log_skip` itself and every non-alias construct
+  are accepted in all modes. The flag never relaxes a security rejection: every other located error
+  (unknown module/directive, TLS/auth/trust validation, nesting depth, ...) is unchanged.
 
 ## Reference deployment examples
 

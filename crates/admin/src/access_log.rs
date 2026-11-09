@@ -580,6 +580,8 @@ struct AccessLogContextState {
     user_id: Option<String>,
     upstream: Option<AccessLogUpstream>,
     write_error: Option<String>,
+    /// Caddy's `log_skip` request variable: when true, only the access entry is suppressed.
+    log_skip: bool,
     extra_fields: ExtraLogFields,
 }
 
@@ -665,6 +667,20 @@ impl AccessLogContext {
     /// The recorded write error.
     pub fn write_error(&self) -> Option<String> {
         self.state().write_error.clone()
+    }
+
+    /// Record Caddy's `log_skip` request variable for the access logger.
+    ///
+    /// Caddy sets this variable through the generic `vars` handler and reads it after the handler
+    /// chain (`modules/caddyhttp/server.go:1246-1253`); only the access-log entry is skipped, while
+    /// metrics, the status code and the response are unaffected.
+    pub fn set_log_skip(&self, skip: bool) {
+        self.state().log_skip = skip;
+    }
+
+    /// Whether the request is excluded from the access log.
+    pub fn log_skip(&self) -> bool {
+        self.state().log_skip
     }
 
     /// Add an extra top-level field (Caddy's `ExtraLogFields`).

@@ -645,6 +645,17 @@ impl PendingObservation {
             eprintln!("caddy-rs: cannot record request metrics: {error}");
         }
 
+        // Caddy checks the request variable after the handler chain
+        // (`modules/caddyhttp/server.go:1246-1253`): only the access entry is suppressed. Metrics
+        // were recorded above and the response has already been served unchanged.
+        if self
+            .context
+            .as_ref()
+            .is_some_and(|context| context.log_skip())
+        {
+            return;
+        }
+
         if !self.access_log.is_enabled() {
             return;
         }

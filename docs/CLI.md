@@ -28,6 +28,13 @@ The examples assume `caddy-rs` is on your `PATH`. When running from a build dire
 whose name starts with `Caddyfile` is read as a Caddyfile and every other file is read as JSON. Any
 other adapter name is rejected with an error.
 
+`--adapt-mode` selects how strictly the **Caddyfile** adapter treats deprecated spellings:
+`compatible` (the default) accepts them and prints Caddy's deprecation warning, `warn` accepts them
+as a superset of `compatible` (adding warnings for future ambiguity gates), and `strict` rejects
+them with a located error naming both the deprecated and the current spelling. The mode is a caddy-rs extension (Caddy has no equivalent flag); it governs
+configuration-acceptance strictness only and never relaxes a security rejection. It is available on
+`adapt`, `validate` and `run`; the JSON adapter ignores it.
+
 ## version
 
 Prints the build version and the Caddy configuration baseline it targets.
@@ -91,6 +98,7 @@ Synopsis: `caddy-rs adapt [OPTIONS] --config <CONFIG>`
 |---|---|---|
 | `-c, --config <CONFIG>` | Configuration file to read. | required |
 | `--adapter <ADAPTER>` | `caddyfile` or `json`; inferred from the file name when omitted. | inferred |
+| `--adapt-mode <MODE>` | Caddyfile acceptance mode: `compatible`, `warn` or `strict`. | `compatible` |
 | `--pretty` | Indent the JSON output. | off |
 | `-o, --output <OUTPUT>` | Write the JSON to a file instead of standard output. | standard output |
 
@@ -115,6 +123,7 @@ Synopsis: `caddy-rs validate [OPTIONS] --config <CONFIG>`
 |---|---|---|
 | `-c, --config <CONFIG>` | Configuration file to read. | required |
 | `--adapter <ADAPTER>` | `caddyfile` or `json`; inferred from the file name when omitted. | inferred |
+| `--adapt-mode <MODE>` | Caddyfile acceptance mode: `compatible`, `warn` or `strict`. | `compatible` |
 
 ```sh
 caddy-rs validate --config ./caddy.json --adapter json
@@ -133,6 +142,7 @@ Synopsis: `caddy-rs run [OPTIONS]`
 |---|---|---|
 | `-c, --config <CONFIG>` | Configuration file to read. | none |
 | `--adapter <ADAPTER>` | `caddyfile` or `json`; inferred from the file name when omitted. | inferred |
+| `--adapt-mode <MODE>` | Caddyfile acceptance mode: `compatible`, `warn` or `strict`. | `compatible` |
 | `-r, --resume` | Load the last autosave file, preferring it over `--config`. | off |
 | `--autosave-path <PATH>` | Autosave file to write, and to load with `--resume`. | `$XDG_CONFIG_HOME/caddy-rs/autosave.json`, else `$HOME/.config/caddy-rs/autosave.json`, else `./.caddy-rs/autosave.json` |
 
