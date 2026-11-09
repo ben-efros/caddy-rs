@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+caddy-rs-pm-certificates = { path = "../pm-certificates" }
 caddy-rs-pm-compiler = { path = "../pm-compiler" }
 caddy-rs-pm-config = { path = "../pm-config" }
 caddy-rs-pm-hosts = { path = "../pm-hosts" }

@@ -27,9 +27,12 @@
 //!   [`ServiceError::PolicyNotFound`]; a disabled policy or a domain-coverage failure is a located
 //!   [`ServiceError::Tls`] carrying the [`CoreError`] from
 //!   [`Host::validate`], which also re-checks mode/reference consistency;
-//! * `Manual`, `AcmeConfigured` and `InternalCa` fail with
-//!   [`ServiceError::UnsupportedExplicitCertificate`]. This crate has no certificate repository,
-//!   so coverage cannot be checked; returning success would silently skip it.
+//! * `Manual`, `AcmeConfigured` and `InternalCa` require a certificate repository. Without one,
+//!   they fail with [`ServiceError::UnsupportedExplicitCertificate`] rather than silently skipping
+//!   coverage. With one, the referenced certificate is loaded, an unknown id is
+//!   [`ServiceError::CertificateNotFound`], and [`Host::validate`] re-checks origin, coverage,
+//!   status and reference consistency. Cross-origin references (for example an
+//!   `InternalCa` host pointing at a `Manual` certificate) are located validation errors.
 //!
 //! Failed validation persists nothing. [`HostService::create`] still reserves the id first, so a
 //! rejected create consumes that id and leaves the store otherwise unchanged.
@@ -39,9 +42,9 @@
 //!
 //! # Scope
 //!
-//! This crate has no REST API, UI, authentication or authorization. It does not load
-//! certificates: explicit-certificate TLS modes are rejected as unsupported until a certificate
-//! repository exists. Auto policies are loaded only when a policy repository is configured.
+//! This crate has no REST API, UI, authentication or authorization. It validates certificate
+//! *metadata* through [`CertificateRepository`]; it never reads key material. Auto policies and
+//! manual certificates are loaded only when their repositories are configured.
 //!
 //! # Id allocation
 //!
@@ -54,6 +57,7 @@
 
 use std::sync::Arc;
 
+use caddy_rs_pm_certificates::{CertificateError, CertificateRepository};
 use caddy_rs_pm_compiler::{compile_routes, CompileError, CompiledRoutes};
 use caddy_rs_pm_core::{CoreError, Host, HostId, HostSpec, HostTls, TlsMode};
 use caddy_rs_pm_hosts::{HostError, HostRepository, StoredHost};
@@ -104,6 +108,9 @@ pub enum ServiceError {
     /// The auto-certificate policy repository could not be read.
     #[error(transparent)]
     Policy(#[from] PolicyError),
+    /// The certificate repository could not be read.
+    #[error(transparent)]
+    Certificate(#[from] CertificateError),
     /// Auto TLS was requested but the service has no policy repository to validate against.
     #[error(
         "auto TLS validation is unavailable: HostService was constructed without a policy \
@@ -113,6 +120,9 @@ pub enum ServiceError {
     /// An auto TLS host references a policy that is not stored.
     #[error("host {host_id} references auto-certificate policy {policy_id}, which was not found")]
     PolicyNotFound { host_id: u64, policy_id: u64 },
+    /// An explicit TLS host references a manual certificate that is not stored.
+    #[error("host {host_id} references manual certificate {certificate_id}, which was not found")]
+    CertificateNotFound { host_id: u64, certificate_id: u64 },
     /// Explicit-certificate TLS cannot be validated without a certificate repository.
     #[error(
         "host {host_id} uses TLS mode {mode:?}, which requires a certificate repository that \
@@ -136,6 +146,7 @@ pub enum ServiceError {
 pub struct HostService {
     repository: HostRepository,
     policies: Option<PolicyRepository>,
+    certificates: Option<CertificateRepository>,
 }
 
 impl HostService {
@@ -148,6 +159,7 @@ impl HostService {
         Self {
             repository: HostRepository::new(store),
             policies: None,
+            certificates: None,
         }
     }
 
@@ -159,6 +171,23 @@ impl HostService {
         Self {
             repository: HostRepository::new(store),
             policies: Some(policies),
+            certificates: None,
+        }
+    }
+
+    /// Build a service that validates both auto policies and explicit manual certificates.
+    ///
+    /// `store`, `policies` and `certificates` must share the same underlying store; the service
+    /// cannot check this, so the caller wires all three from one [`StateStore`].
+    pub fn with_policies_and_certificates(
+        store: Arc<dyn StateStore>,
+        policies: PolicyRepository,
+        certificates: CertificateRepository,
+    ) -> Self {
+        Self {
+            repository: HostRepository::new(store),
+            policies: Some(policies),
+            certificates: Some(certificates),
         }
     }
 
@@ -196,8 +225,9 @@ impl HostService {
     ///
     /// `Disabled` needs no lookup. `Auto` requires a configured policy repository, loads the
     /// referenced policy and delegates the enabled-state, reference-consistency and coverage
-    /// checks to [`Host::validate`]. Explicit-certificate modes are rejected until this crate has
-    /// a certificate repository.
+    /// checks to [`Host::validate`]. Explicit-certificate modes load the referenced manual
+    /// certificate and delegate origin, coverage, status and reference checks to
+    /// [`Host::validate`].
     fn validate_tls(&self, host: &Host) -> Result<(), ServiceError> {
         match host.tls.mode {
             TlsMode::Disabled => Ok(()),
@@ -218,10 +248,23 @@ impl HostService {
                     .map_err(|source| tls_error(host, source))
             }
             TlsMode::Manual | TlsMode::AcmeConfigured | TlsMode::InternalCa => {
-                Err(ServiceError::UnsupportedExplicitCertificate {
-                    host_id: host.id.0,
-                    mode: host.tls.mode,
-                })
+                let Some(certificates) = &self.certificates else {
+                    return Err(ServiceError::UnsupportedExplicitCertificate {
+                        host_id: host.id.0,
+                        mode: host.tls.mode,
+                    });
+                };
+                let Some(certificate_id) = host.tls.certificate_id else {
+                    return Err(tls_error(host, CoreError::Missing("certificate_id")));
+                };
+                let Some(stored) = certificates.get(certificate_id)? else {
+                    return Err(ServiceError::CertificateNotFound {
+                        host_id: host.id.0,
+                        certificate_id: certificate_id.0,
+                    });
+                };
+                host.validate(Some(&stored.certificate.as_explicit()), None)
+                    .map_err(|source| tls_error(host, source))
             }
         }
     }
@@ -661,5 +704,87 @@ mod tests {
             })
         ));
         assert_eq!(service.list().expect("list"), vec![created]);
+    }
+}
+
+#[cfg(test)]
+mod manual_certificate_tests {
+    use super::*;
+    use caddy_rs_pm_certificates::{validate_manual_certificate, CertificateRepository};
+    use caddy_rs_pm_core::{
+        CertificateId, CertificateOrigin, HostSpec, HostTls, ProxySpec, TlsMode, Upstream,
+        UpstreamScheme,
+    };
+    use caddy_rs_pm_state::MemoryStore;
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    fn fixture(name: &str) -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures")
+            .join(name);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+    }
+
+    fn service() -> (TempDir, HostService, CertificateRepository) {
+        let dir = TempDir::new().expect("temp dir");
+        let store: Arc<dyn StateStore> = Arc::new(MemoryStore::default());
+        let certificates =
+            CertificateRepository::new(Arc::clone(&store), dir.path().join("secrets"));
+        let material = validate_manual_certificate(
+            &fixture("manual-valid.crt.pem"),
+            &fixture("manual-valid.key.pem"),
+            &["manual.example.com".to_string()],
+            1_750_000_000,
+        )
+        .expect("valid fixture");
+        certificates
+            .create(material, 1_750_000_000)
+            .expect("store certificate");
+        let service = HostService::with_policies_and_certificates(
+            store,
+            PolicyRepository::new(Arc::new(MemoryStore::default())),
+            certificates.clone(),
+        );
+        (dir, service, certificates)
+    }
+
+    fn draft(certificate_id: u64, origin: CertificateOrigin) -> HostDraft {
+        HostDraft {
+            domains: vec!["manual.example.com".to_string()],
+            tls: HostTls::for_explicit(CertificateId(certificate_id), origin),
+            spec: HostSpec::Proxy(ProxySpec::new(Upstream::new(
+                UpstreamScheme::Http,
+                "10.0.0.5",
+                8080,
+            ))),
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn manual_host_requires_an_existing_matching_certificate() {
+        let (_dir, service, _certificates) = service();
+        let host = service
+            .create(draft(1, CertificateOrigin::Manual))
+            .expect("covered manual certificate");
+        assert_eq!(host.host.tls.mode, TlsMode::Manual);
+
+        let error = service
+            .create(draft(9, CertificateOrigin::Manual))
+            .expect_err("unknown certificate");
+        assert!(matches!(
+            error,
+            ServiceError::CertificateNotFound {
+                certificate_id: 9,
+                ..
+            }
+        ));
+
+        let error = service
+            .create(draft(1, CertificateOrigin::InternalCa))
+            .expect_err("origin mismatch");
+        assert!(matches!(error, ServiceError::Tls { .. }), "{error}");
     }
 }

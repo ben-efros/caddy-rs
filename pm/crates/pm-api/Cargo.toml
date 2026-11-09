@@ -11,6 +11,7 @@ repository.workspace = true
 axum = { version = "0.8", features = ["json"] }
 caddy-rs-pm-config = { path = "../pm-config" }
 caddy-rs-pm-core = { path = "../pm-core" }
+caddy-rs-pm-certificates = { path = "../pm-certificates" }
 caddy-rs-pm-hosts = { path = "../pm-hosts" }
 caddy-rs-pm-policies = { path = "../pm-policies" }
 caddy-rs-pm-runtime = { path = "../pm-runtime" }

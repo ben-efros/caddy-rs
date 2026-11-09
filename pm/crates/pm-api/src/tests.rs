@@ -1232,3 +1232,235 @@ async fn config_maps_a_stored_policy_assembly_error_to_typed_409() {
         body.error.message
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Manual certificates
+// ---------------------------------------------------------------------------------------------
+
+fn manual_fixture(name: &str) -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures")
+        .join(name);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read fixture {}: {error}", path.display()))
+}
+
+fn manual_body(domains: &[&str]) -> serde_json::Value {
+    serde_json::json!({
+        "domains": domains,
+        "certificate": manual_fixture("manual-valid.crt.pem"),
+        "privateKey": manual_fixture("manual-valid.key.pem"),
+    })
+}
+
+#[tokio::test]
+async fn create_manual_certificate_returns_metadata_without_key_material() {
+    let (dir, server, _runtime) = server_with_runtime();
+    let response = server
+        .post("/api/v1/certificates/custom")
+        .json(&manual_body(&[
+            "manual.example.com",
+            "www.manual.example.com",
+        ]))
+        .await;
+    assert_eq!(
+        response.status_code(),
+        StatusCode::CREATED,
+        "{}",
+        response.text()
+    );
+    assert_eq!(response.header("location"), "/api/v1/certificates/custom/1");
+    let text = response.text();
+    assert!(
+        !text.contains("PRIVATE KEY"),
+        "response leaked a private key"
+    );
+    assert!(
+        !text.contains("BEGIN CERTIFICATE"),
+        "response leaked PEM material"
+    );
+    let body: serde_json::Value = serde_json::from_str(&text).expect("json");
+    assert_eq!(body["id"], 1);
+    assert_eq!(body["origin"], "manual");
+    assert_eq!(body["status"], "pending");
+    assert_eq!(
+        body["domains"],
+        serde_json::json!(["manual.example.com", "www.manual.example.com"])
+    );
+
+    let state = std::fs::read_to_string(dir.path().join("data/pm/state.json")).expect("state");
+    assert!(!state.contains("PRIVATE KEY"), "state leaked a private key");
+    assert!(
+        !state.contains("BEGIN CERTIFICATE"),
+        "state leaked certificate bytes"
+    );
+    let secrets = dir.path().join("data/pm/secrets");
+    let dir_meta = std::fs::metadata(&secrets).expect("secrets dir");
+    let key_path = secrets.join("manual-1.key.pem");
+    let key_meta = std::fs::metadata(&key_path).expect("key file");
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(dir_meta.permissions().mode() & 0o777, 0o700);
+    assert_eq!(key_meta.permissions().mode() & 0o777, 0o600);
+}
+
+#[tokio::test]
+async fn manual_certificate_rejects_a_mismatched_key_with_a_located_400() {
+    let (_dir, server, _runtime) = server_with_runtime();
+    let response = server
+        .post("/api/v1/certificates/custom")
+        .json(&serde_json::json!({
+            "domains": ["manual.example.com"],
+            "certificate": manual_fixture("manual-valid.crt.pem"),
+            "privateKey": manual_fixture("manual-other.key.pem"),
+        }))
+        .await;
+    assert_eq!(
+        response.status_code(),
+        StatusCode::BAD_REQUEST,
+        "{}",
+        response.text()
+    );
+    let body: ApiErrorResponse = response.json();
+    assert_eq!(body.error.code, ErrorCode::Validation);
+    assert!(!body.error.message.contains("PRIVATE KEY"));
+    let list: serde_json::Value = server.get("/api/v1/certificates").await.json();
+    assert_eq!(list["total"], 0, "rejected material must not be persisted");
+}
+
+#[tokio::test]
+async fn manual_certificate_lists_and_is_loaded_by_config() {
+    let (_dir, server, runtime) = server_with_runtime();
+    let response = server
+        .post("/api/v1/certificates/custom")
+        .json(&manual_body(&[
+            "manual.example.com",
+            "www.manual.example.com",
+        ]))
+        .await;
+    assert_eq!(
+        response.status_code(),
+        StatusCode::CREATED,
+        "{}",
+        response.text()
+    );
+    let etag = response.header("etag").to_str().expect("ascii").to_owned();
+
+    let list: serde_json::Value = server.get("/api/v1/certificates").await.json();
+    assert_eq!(list["total"], 1);
+    assert_eq!(list["items"][0]["origin"], "manual");
+    assert_eq!(list["items"][0]["status"], "pending");
+
+    let detail = server.get("/api/v1/certificates/1").await;
+    assert_eq!(detail.status_code(), StatusCode::OK);
+    let detail_body: serde_json::Value = detail.json();
+    assert_eq!(detail_body["origin"], "manual");
+    let not_modified = server
+        .get("/api/v1/certificates/custom/1")
+        .add_header("If-None-Match", etag.as_str())
+        .await;
+    assert_eq!(not_modified.status_code(), StatusCode::NOT_MODIFIED);
+
+    let host = server
+        .post("/api/v1/hosts")
+        .json(&serde_json::json!({
+            "domains": ["manual.example.com"],
+            "tls": {"mode": "manual", "certificateId": 1},
+            "spec": {"kind": "dead"}
+        }))
+        .await;
+    assert_eq!(host.status_code(), StatusCode::CREATED, "{}", host.text());
+
+    let config: serde_json::Value = server.get("/api/v1/config").await.json();
+    let load = &config["apps"]["tls"]["certificates"]["load_files"][0];
+    assert_eq!(load["tags"], serde_json::json!(["pm-cert-1"]));
+    assert!(load["certificate"]
+        .as_str()
+        .expect("cert path")
+        .ends_with("manual-1.crt.pem"));
+    assert!(load["key"]
+        .as_str()
+        .expect("key path")
+        .ends_with("manual-1.key.pem"));
+    let policies = config["apps"]["http"]["servers"]["pm_https"]["tls_connection_policies"]
+        .as_array()
+        .expect("policies");
+    assert_eq!(
+        policies[0]["certificate_selection"]["any_tag"],
+        serde_json::json!(["pm-cert-1"])
+    );
+    assert_eq!(
+        policies[0]["match"]["sni"],
+        serde_json::json!(["manual.example.com", "www.manual.example.com"])
+    );
+    assert_eq!(policies.last(), Some(&serde_json::json!({})));
+
+    let _ = runtime;
+}
+
+#[tokio::test]
+async fn manual_certificate_delete_requires_if_match_and_refuses_a_referencing_host() {
+    let (dir, server, _runtime) = server_with_runtime();
+    let response = server
+        .post("/api/v1/certificates/custom")
+        .json(&manual_body(&["manual.example.com"]))
+        .await;
+    assert_eq!(
+        response.status_code(),
+        StatusCode::CREATED,
+        "{}",
+        response.text()
+    );
+    let etag = response.header("etag").to_str().expect("ascii").to_owned();
+
+    let host = server
+        .post("/api/v1/hosts")
+        .json(&serde_json::json!({
+            "domains": ["manual.example.com"],
+            "tls": {"mode": "manual", "certificateId": 1},
+            "spec": {"kind": "dead"}
+        }))
+        .await;
+    assert_eq!(host.status_code(), StatusCode::CREATED, "{}", host.text());
+
+    let missing = server.delete("/api/v1/certificates/custom/1").await;
+    assert_eq!(missing.status_code(), StatusCode::PRECONDITION_FAILED);
+    let referenced = server
+        .delete("/api/v1/certificates/custom/1")
+        .add_header("If-Match", etag.as_str())
+        .await;
+    assert_eq!(
+        referenced.status_code(),
+        StatusCode::CONFLICT,
+        "{}",
+        referenced.text()
+    );
+
+    // Remove the host, then delete for real.
+    let host_etag = server
+        .get("/api/v1/hosts/1")
+        .await
+        .header("etag")
+        .to_str()
+        .expect("host etag")
+        .to_owned();
+    let deleted_host = server
+        .delete("/api/v1/hosts/1")
+        .add_header("If-Match", host_etag.as_str())
+        .await;
+    assert_eq!(deleted_host.status_code(), StatusCode::NO_CONTENT);
+    let deleted = server
+        .delete("/api/v1/certificates/custom/1")
+        .add_header("If-Match", etag.as_str())
+        .await;
+    assert_eq!(
+        deleted.status_code(),
+        StatusCode::NO_CONTENT,
+        "{}",
+        deleted.text()
+    );
+    assert!(!dir.path().join("data/pm/secrets/manual-1.key.pem").exists());
+    assert_eq!(
+        server.get("/api/v1/certificates/1").await.status_code(),
+        StatusCode::NOT_FOUND
+    );
+}
