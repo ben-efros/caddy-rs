@@ -190,6 +190,12 @@ pub(crate) fn parse_certificate(der: &[u8]) -> Result<ParsedCertificate, X509Err
 fn parse_time(tlv: &Tlv<'_>) -> Result<i64, X509Error> {
     let text =
         std::str::from_utf8(tlv.content).map_err(|_| error("certificate time is not ASCII"))?;
+    // The length checks below count bytes, but slicing is only safe at a UTF-8 character
+    // boundary. Certificate times are ASCII by definition; reject any multi-byte input before
+    // indexing so a crafted certificate cannot panic the parser.
+    if !text.is_ascii() {
+        return Err(error("certificate time is not ASCII"));
+    }
     let (year, rest) = match tlv.tag {
         0x17 => {
             if text.len() != 13 || !text.ends_with('Z') {
@@ -446,5 +452,26 @@ mod tests {
         let mut der = pem_der(VALID);
         der.push(0);
         assert!(parse_certificate(&der).is_err());
+    }
+}
+
+#[cfg(test)]
+mod time_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_non_ascii_time_without_panicking() {
+        // 13 bytes: a 3-byte U+20AC followed by 9 ASCII bytes and `Z`. The byte length passes the
+        // UTCTime check, but index 2 is not a char boundary.
+        let utc = Tlv {
+            tag: 0x17,
+            content: "€abcdefghiZ".as_bytes(),
+        };
+        assert!(parse_time(&utc).is_err());
+        let generalized = Tlv {
+            tag: 0x18,
+            content: "€abcdefghijZ".as_bytes(),
+        };
+        assert!(parse_time(&generalized).is_err());
     }
 }

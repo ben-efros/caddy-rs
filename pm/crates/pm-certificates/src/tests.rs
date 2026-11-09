@@ -366,3 +366,31 @@ fn explicit_host_modes_only_bind_their_own_origin() {
         CertificateOrigin::Manual
     ));
 }
+
+#[test]
+fn arbitrary_der_bytes_never_panic_the_certificate_parser() {
+    // Deterministic pseudo-random inputs exercise every length/tag branch; the parser must always
+    // return an error rather than panic. This complements the targeted non-ASCII UTCTime test.
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    for case in 0..2_000_u32 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let len = (state as usize % 512).min(511);
+        let bytes: Vec<u8> = (0..len)
+            .map(|index| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (state >> (index % 8 * 8)) as u8
+            })
+            .collect();
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parse_certificate(&bytes)));
+        assert!(
+            result.is_ok(),
+            "parser panicked on case {case} with {} bytes",
+            bytes.len()
+        );
+    }
+}
