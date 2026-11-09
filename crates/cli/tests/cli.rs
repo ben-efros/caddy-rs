@@ -1380,6 +1380,7 @@ fn completion_scripts_cover_every_subcommand_and_shell() {
         "stop",
         "environ",
         "completion",
+        "manpage",
         "pki",
         "trust",
     ] {
@@ -1390,6 +1391,7 @@ fn completion_scripts_cover_every_subcommand_and_shell() {
         );
     }
     assert!(stdout.contains("--envfile"), "{stdout}");
+    assert!(stdout.contains("--directory"), "{stdout}");
     assert!(
         stdout.contains("complete -o default -F _caddy_rs caddy-rs"),
         "{stdout}"
@@ -1406,4 +1408,56 @@ fn completion_scripts_cover_every_subcommand_and_shell() {
     let (code, _stdout, stderr) = run(&["completion", "nope"]);
     assert_eq!(code, 1, "{stderr}");
     assert!(stderr.contains("unrecognized shell: nope"), "{stderr}");
+}
+
+#[test]
+fn manpage_writes_root_and_subcommand_roff_pages() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = directory.path().join("man");
+    let (code, stdout, stderr) = run(&["manpage", "--directory", output.to_str().unwrap()]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+
+    for filename in [
+        "caddy-rs.8",
+        "caddy-rs-adapt.8",
+        "caddy-rs-completion.8",
+        "caddy-rs-environ.8",
+        "caddy-rs-pki.8",
+        "caddy-rs-pki-list.8",
+    ] {
+        assert!(
+            output.join(filename).is_file(),
+            "missing man page {filename}"
+        );
+    }
+
+    let root = std::fs::read_to_string(output.join("caddy-rs.8")).unwrap();
+    assert!(root.starts_with(".TH \"CADDY-RS\" \"8\""), "{root}");
+    assert!(root.contains("\n.SH NAME\n"), "{root}");
+    assert!(root.contains("\n.SH SYNOPSIS\n"), "{root}");
+    assert!(root.contains("\n.SH SUBCOMMANDS\n"), "{root}");
+    for command in ["environ", "completion", "manpage"] {
+        assert!(root.contains(command), "root man page misses {command}");
+    }
+    assert!(root.contains("build\\-info"), "{root}");
+
+    let adapt = std::fs::read_to_string(output.join("caddy-rs-adapt.8")).unwrap();
+    assert!(adapt.starts_with(".TH \"CADDY-RS-ADAPT\" \"8\""), "{adapt}");
+    assert!(adapt.contains("\\-\\-config"), "{adapt}");
+    assert!(adapt.contains("\\-\\-pretty"), "{adapt}");
+    assert!(
+        !adapt.contains("\\-\\-pretty \\fI<"),
+        "boolean flag rendered with a value: {adapt}"
+    );
+}
+
+#[test]
+fn manpage_requires_an_output_directory_with_caddys_exit_code() {
+    let (code, _stdout, stderr) = run(&["manpage"]);
+    assert_eq!(code, 3, "{stderr}");
+    assert!(
+        stderr.contains("designated output directory and specified section are required"),
+        "{stderr}"
+    );
 }

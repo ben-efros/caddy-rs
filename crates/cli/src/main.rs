@@ -9,6 +9,7 @@
 mod build_info;
 mod completion;
 mod environ;
+mod manpage;
 mod signals;
 
 use std::path::{Path, PathBuf};
@@ -144,6 +145,16 @@ enum Command {
         #[arg(value_name = "SHELL")]
         shell: String,
     },
+    /// Generate manual pages for caddy-rs commands.
+    ///
+    /// Writes one roff manual page per command into the directory given by `--directory`
+    /// (created if it does not exist), in section 8 (System Administration), like Caddy's
+    /// `manpage` command.
+    Manpage {
+        /// Output directory for the generated manual pages.
+        #[arg(short = 'o', long)]
+        directory: Option<PathBuf>,
+    },
     /// Inspect and export the local certificate authority material.
     Pki {
         #[command(subcommand)]
@@ -209,17 +220,41 @@ fn builtin_module_registry() -> caddy_rs_core::ModuleRegistry {
     caddy_rs_core::ModuleRegistry::builtin_for_profile(cfg!(feature = "minimal"))
 }
 
+/// An error that carries Caddy's CLI exit code.
+///
+/// Caddy assigns `ExitCodeFailedQuit` (3) to `manpage` failures and `ExitCodeFailedStartup` (1) to
+/// most other command failures. `anyhow` carries this type through `?`, so only the command that
+/// needs a different code constructs it; [`main`] finds it in the error chain.
+#[derive(Debug)]
+pub(crate) struct CliExit {
+    pub(crate) code: u8,
+    pub(crate) message: String,
+}
+
+impl std::fmt::Display for CliExit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CliExit {}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     match run(cli.command).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
+            let exit_code = error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<CliExit>())
+                .map(|exit| exit.code)
+                .unwrap_or(1);
             match core_error_code(&error) {
                 Some(code) => eprintln!("caddy-rs: error[{code}]: {error:#}"),
                 None => eprintln!("caddy-rs: error: {error:#}"),
             }
-            ExitCode::FAILURE
+            ExitCode::from(exit_code)
         }
     }
 }
@@ -483,6 +518,9 @@ async fn run(command: Command) -> anyhow::Result<()> {
         }
         Command::Completion { shell } => {
             print!("{}", completion::generate(&shell)?);
+        }
+        Command::Manpage { directory } => {
+            manpage::write(directory.as_deref())?;
         }
         Command::Pki { command } => run_pki(command).await?,
         Command::Trust {
