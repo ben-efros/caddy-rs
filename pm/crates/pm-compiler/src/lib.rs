@@ -329,6 +329,23 @@ mod tests {
     }
 
     #[test]
+    fn https_upstream_gets_tls_transport_without_a_scheme_in_dial() {
+        let mut host = proxy_host(17, &["example.com"], HostTls::disabled());
+        if let HostSpec::Proxy(spec) = &mut host.spec {
+            spec.upstream = caddy_rs_pm_core::Upstream::new(
+                caddy_rs_pm_core::UpstreamScheme::Https,
+                "backend.internal",
+                8443,
+            );
+        }
+        let compiled = compile_routes(&[host]).expect("compile");
+        let proxy = &compiled.http[0]["handle"][0];
+        assert_eq!(proxy["upstreams"][0]["dial"], "backend.internal:8443");
+        assert_eq!(proxy["transport"]["protocol"], "http");
+        assert_eq!(proxy["transport"]["tls"], json!({}));
+    }
+
+    #[test]
     fn preserve_host_false_rewrites_the_upstream_host_header() {
         let mut host = proxy_host(16, &["example.com"], HostTls::disabled());
         if let HostSpec::Proxy(spec) = &mut host.spec {
