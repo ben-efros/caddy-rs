@@ -18,6 +18,40 @@ fn run(args: &[&str]) -> (i32, String, String) {
     )
 }
 
+/// Run the binary with a bounded wait.
+///
+/// A regression that makes the server start (for example the `--adapt-mode` flag being ignored)
+/// must fail this test instead of hanging the whole suite on a foreground `run` process.
+fn run_within(args: &[&str], timeout: Duration) -> (i32, String, String) {
+    let mut child = Command::new(binary())
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn caddy-rs");
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait().expect("poll caddy-rs").is_some() {
+            let mut stdout = String::new();
+            let mut stderr = String::new();
+            if let Some(mut pipe) = child.stdout.take() {
+                let _ = pipe.read_to_string(&mut stdout);
+            }
+            if let Some(mut pipe) = child.stderr.take() {
+                let _ = pipe.read_to_string(&mut stderr);
+            }
+            let status = child.wait().expect("reap caddy-rs");
+            return (status.code().unwrap_or(-1), stdout, stderr);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("caddy-rs did not exit within {timeout:?}: {args:?}");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 #[test]
 fn version_reports_implementation_and_caddy_baseline() {
     let (code, stdout, _stderr) = run(&["version"]);
@@ -1091,10 +1125,13 @@ fn adapt_mode_flag_controls_deprecated_alias_handling() {
     let config = write_caddyfile(&directory, ":8080 {\n\tskip_log\n\trespond \"ok\"\n}\n");
     let path = config.to_str().unwrap();
 
-    // compatible (default): alias accepted, no warning, same JSON as log_skip.
+    // compatible (default): alias accepted with Caddy's deprecation warning, same JSON.
     let (code, stdout, stderr) = run(&["adapt", "--config", path]);
     assert_eq!(code, 0, "stderr: {stderr}");
-    assert!(!stderr.contains("deprecated"), "{stderr}");
+    assert!(
+        stderr.contains("the 'skip_log' directive is deprecated, please use 'log_skip' instead!"),
+        "{stderr}"
+    );
     let compatible: serde_json::Value = serde_json::from_str(&stdout).expect("compatible JSON");
 
     // warn: alias accepted, Caddy's deprecation warning emitted, JSON unchanged.
@@ -1145,6 +1182,10 @@ fn validate_honours_adapt_mode() {
     let (code, stdout, stderr) = run(&["validate", "--config", skip_log.to_str().unwrap()]);
     assert_eq!(code, 0, "stderr: {stderr}");
     assert!(stdout.contains("Valid configuration"), "{stdout}");
+    assert!(
+        stderr.contains("the 'skip_log' directive is deprecated, please use 'log_skip' instead!"),
+        "{stderr}"
+    );
 
     let (code, _stdout, stderr) = run(&[
         "validate",
@@ -1165,13 +1206,16 @@ fn validate_honours_adapt_mode() {
 fn run_honours_adapt_mode_before_starting_listeners() {
     let directory = tempfile::tempdir().unwrap();
     let config = write_caddyfile(&directory, ":8080 {\n\tskip_log\n\trespond \"ok\"\n}\n");
-    let (code, _stdout, stderr) = run(&[
-        "run",
-        "--config",
-        config.to_str().unwrap(),
-        "--adapt-mode",
-        "strict",
-    ]);
+    let (code, _stdout, stderr) = run_within(
+        &[
+            "run",
+            "--config",
+            config.to_str().unwrap(),
+            "--adapt-mode",
+            "strict",
+        ],
+        Duration::from_secs(30),
+    );
     assert_ne!(code, 0);
     assert!(
         stderr.contains("deprecated alias for `log_skip`"),

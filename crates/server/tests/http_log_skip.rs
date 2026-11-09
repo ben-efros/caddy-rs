@@ -300,3 +300,55 @@ async fn log_skip_also_suppresses_error_status_entries() {
     let entries = read_log_lines(&log_path);
     assert!(entries.is_empty(), "{entries:?}");
 }
+
+#[tokio::test]
+async fn caddyfile_vars_boolean_spellings_match_the_runtime() {
+    // Caddy's `ScalarVal` makes unquoted `TRUE` a boolean (skip) while a quoted "true" stays a
+    // string (log). This is the adapter+runtime agreement for the `vars` forms.
+    let directory = tempfile::tempdir().expect("tempdir");
+    let log_path = directory.path().join("access.log");
+    let port = free_loopback_port();
+    let caddyfile = format!(
+        r#"{{
+	admin 127.0.0.1:0
+	auto_https off
+}}
+
+http://127.0.0.1:{port} {{
+	@truthy path /truthy
+	vars @truthy log_skip TRUE
+	@quoted path /quoted
+	vars @quoted log_skip "true"
+	respond "ok"
+}}
+"#
+    );
+    let adapted = caddy_rs_config::adapt_with_source(&caddyfile, None).expect("Caddyfile adapts");
+    let mut config_value = adapted.config;
+    config_value["logging"] = json!({"logs": {"default": {
+        "writer": {"output": "file", "filename": log_path.to_string_lossy()},
+        "encoder": {"format": "json"},
+        "level": "INFO"
+    }}});
+    let config = Config::from_value(config_value).expect("adapted JSON decodes");
+    let store = Arc::new(GenerationStore::with_builtin_registry());
+    store.load(config).expect("adapted config validates");
+    let mut runtime = ServerRuntime::new(Arc::clone(&store));
+    runtime.apply().await.expect("runtime applies");
+    runtime
+        .listener_address(&format!(":{port}"))
+        .expect("listener bound");
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
+
+    for path in ["/truthy", "/quoted", "/plain"] {
+        let (status, _headers, body) = request_with_host(address, "GET", path, "127.0.0.1").await;
+        assert_eq!(status, 200, "{path}");
+        assert_eq!(body, Bytes::from_static(b"ok"), "{path}");
+    }
+
+    runtime.shutdown().await;
+    let entries = read_log_lines(&log_path);
+    let mut uris = logged_uris(&entries);
+    uris.sort_unstable();
+    assert_eq!(uris, vec!["/plain", "/quoted"], "{entries:?}");
+}
