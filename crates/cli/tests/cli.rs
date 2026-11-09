@@ -1257,3 +1257,32 @@ fn adapt_help_documents_adapt_mode() {
     assert!(stdout.contains("compatible"), "{stdout}");
     assert!(stdout.contains("strict"), "{stdout}");
 }
+
+#[test]
+fn build_info_reports_the_rust_toolchain_and_build_settings() {
+    let (code, stdout, stderr) = run(&["build-info"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.starts_with("rustc\t"), "{stdout}");
+    assert!(stdout.contains("\npath\tcaddy-rs\n"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("\nmod\tcaddy-rs\t{}\t", env!("CARGO_PKG_VERSION"))),
+        "{stdout}"
+    );
+    assert!(stdout.contains("\nbuild\t-profile="), "{stdout}");
+    assert!(
+        stdout.contains("\nbuild\t-target="),
+        "target triple missing: {stdout}"
+    );
+    assert!(
+        stdout.contains("\nbuild\t-features="),
+        "feature list missing: {stdout}"
+    );
+    assert!(
+        stdout.contains("\nbuild\t-modules="),
+        "module count missing: {stdout}"
+    );
+    assert!(
+        stdout.contains("\nbuild\t-caddy-baseline=v2.11.9\n"),
+        "{stdout}"
+    );
+}

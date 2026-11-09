@@ -6,6 +6,7 @@
 //! `docs/compatibility/CADDYFILE.md` for the
 //! supported configuration surface.
 
+mod build_info;
 mod signals;
 
 use std::path::{Path, PathBuf};
@@ -20,7 +21,7 @@ use http_body_util::{BodyExt, Full};
 use caddy_rs_admin::pki::{resolve_data_dir, PkiError, PkiStore, DEFAULT_CA_ID};
 use caddy_rs_admin::AdminResponse;
 use caddy_rs_config::{AdaptMode, AdaptOptions};
-use caddy_rs_core::{Config, GenerationStore, ModuleRegistry, VERSION};
+use caddy_rs_core::{Config, GenerationStore, VERSION};
 use caddy_rs_server::ServerRuntime;
 
 #[derive(Debug, Parser)]
@@ -42,6 +43,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Print information about this build.
+    BuildInfo,
     /// List modules compiled into this build.
     ListModules {
         /// Machine-readable output.
@@ -224,6 +227,9 @@ async fn run(command: Command) -> anyhow::Result<()> {
                     caddy_rs_core::CADDY_COMPAT_BASELINE
                 );
             }
+        }
+        Command::BuildInfo => {
+            build_info::print(builtin_module_registry().modules().count());
         }
         Command::ListModules { json } => {
             let registry = builtin_module_registry();
