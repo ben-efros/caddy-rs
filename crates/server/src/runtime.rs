@@ -436,6 +436,10 @@ impl ServerRuntime {
         let Some(http) = generation.config().http() else {
             return Ok(());
         };
+        // Mirror `apply`'s load-time trust-anchor warnings so `caddy validate` reports them too.
+        for warning in forwarded_trust_warnings(generation.config())? {
+            eprintln!("{warning}");
+        }
         let https_port = http.https_port.unwrap_or(DEFAULT_HTTPS_PORT);
         let status_sink = UpstreamStatusSink::new();
         let acme_server_data_root = self.acme_server_data_root(generation.config())?;
@@ -570,6 +574,11 @@ impl ServerRuntime {
             self.status = RuntimeStatus::default();
             return Ok(self.status.clone());
         };
+        // Load-time diagnostics for the forwarded-header trust anchor (T-TLS-087). Emit before
+        // anything fallible so a permissive range/wrapper is reported even if this apply fails.
+        for warning in forwarded_trust_warnings(generation.config())? {
+            eprintln!("{warning}");
+        }
         // Access-log sinks belong to the active generation: build them before touching listeners
         // so an invalid logging configuration fails the apply loudly and leaves the previous
         // generation serving.
@@ -1850,6 +1859,88 @@ fn parse_server_trusted_proxies(
     .map_err(Error::Http)
 }
 
+/// Load-time security warnings for the forwarded-header trust anchor (T-TLS-087).
+///
+/// Caddy accepts these configurations silently; caddy-rs warns because both make the
+/// `trusted_proxy` request variable depend on a network peer's claim rather than on a real
+/// forwarding proxy:
+///
+/// * a `trusted_proxies` range that trusts every address (`all`, `0.0.0.0/0`, `::/0`). Any peer
+///   is then a trusted proxy, so valid forwarded headers (including the `acme_server` external
+///   origin) are honoured from any client.
+/// * a `proxy_protocol` listener wrapper on an exposed (non-loopback) address. An accepted
+///   PROXY-protocol header replaces the transport peer used by the trusted-proxy decision, so a
+///   network peer can claim a source address that the configured ranges trust.
+///
+/// These are warnings rather than located errors: the configuration explicitly names the trust,
+/// Caddy accepts it, and there is no unsafe-by-default case (with no `trusted_proxies` and no
+/// wrapper the variable is `false`, so forwarded headers are ignored). The messages name the
+/// server, the configured range or listen address, and the tracking id.
+fn forwarded_trust_warnings(config: &caddy_rs_core::Config) -> Result<Vec<String>> {
+    let Some(http) = config.http() else {
+        return Ok(Vec::new());
+    };
+    let mut warnings = Vec::new();
+    for (server_name, server) in &http.servers {
+        let trusted_proxies = parse_server_trusted_proxies(server, server_name)?;
+        for range in trusted_proxies.permissive_ranges() {
+            warnings.push(format!(
+                "caddy-rs: warning: server `{server_name}`: `trusted_proxies` range `{range}` \
+                 trusts every peer; valid forwarded headers (including the acme_server external \
+                 origin) are honoured from any client. Restrict the range to the real proxies \
+                 (T-TLS-087)"
+            ));
+        }
+        let proxy_protocol = server
+            .listener_wrappers
+            .iter()
+            .any(|wrapper| wrapper.wrapper.as_deref() == Some("proxy_protocol"));
+        if !proxy_protocol {
+            continue;
+        }
+        for listen in &server.listen {
+            if listen_address_is_exposed(listen) {
+                warnings.push(format!(
+                    "caddy-rs: warning: server `{server_name}`: listener `{listen}` uses the \
+                     `proxy_protocol` listener wrapper on an exposed address; an accepted header \
+                     can replace the peer address used by the trusted-proxy decision. Restrict \
+                     `allow`/`fallback_policy` or run the wrapper on a private listener \
+                     (T-TLS-087)"
+                ));
+            }
+        }
+    }
+    Ok(warnings)
+}
+
+/// Whether a listen address can receive connections from outside the local host.
+///
+/// Wildcard binds and non-loopback addresses are exposed; loopback literals, `localhost` and
+/// Unix sockets are not. A hostname other than `localhost` is treated as exposed because its
+/// resolved address is not known here (Caddy binds what the OS resolves).
+fn listen_address_is_exposed(listen: &str) -> bool {
+    let Ok(address) = ListenAddr::parse(listen) else {
+        // A malformed listen address is a located error later; it cannot be known to be safe, so
+        // do not claim it is exposed or private here.
+        return false;
+    };
+    if address.network == Network::Unix {
+        return false;
+    }
+    let host = address.host();
+    if host.is_empty() {
+        return true;
+    }
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.eq_ignore_ascii_case("localhost") {
+        return false;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => !ip.is_loopback(),
+        Err(_) => true,
+    }
+}
+
 /// Whether a server explicitly offers cleartext h2c Upgrade (Caddy `protocols` includes `h2c`).
 ///
 /// Caddy's defaults are HTTP/1.1 plus HTTP/2 over TLS and do **not** include h2c, so an
@@ -2267,6 +2358,132 @@ mod shutdown_timing_tests {
         assert_eq!(
             timing.shutdown_delay,
             Some(std::time::Duration::from_secs(2))
+        );
+    }
+}
+
+#[cfg(test)]
+mod forwarded_trust_warning_tests {
+    use super::{forwarded_trust_warnings, listen_address_is_exposed};
+    use caddy_rs_core::Config;
+
+    fn test_config(server: serde_json::Value) -> Config {
+        Config::from_value(serde_json::json!({
+            "admin": {"disabled": true},
+            "apps": {"http": {"servers": {"srv0": server}}}
+        }))
+        .expect("test config decodes")
+    }
+
+    fn warning_messages(config: &Config) -> Vec<String> {
+        forwarded_trust_warnings(config).expect("trusted proxies parse")
+    }
+
+    #[test]
+    fn permissive_range_warns_with_server_and_configured_spelling() {
+        let config = test_config(serde_json::json!({
+            "listen": ["127.0.0.1:0"],
+            "trusted_proxies": {"source": "static", "ranges": ["10.0.0.0/8", "all"]}
+        }));
+        let warnings = warning_messages(&config);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("server `srv0`"),
+            "warning must name the server: {}",
+            warnings[0]
+        );
+        assert!(
+            warnings[0].contains("range `all`"),
+            "warning must name the configured range: {}",
+            warnings[0]
+        );
+        assert!(
+            warnings[0].contains("T-TLS-087"),
+            "warning must carry the tracking id: {}",
+            warnings[0]
+        );
+        assert!(
+            warnings[0].contains("acme_server"),
+            "warning must say what the trust affects: {}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn every_permissive_spelling_warns_and_specific_ranges_do_not() {
+        let config = test_config(serde_json::json!({
+            "listen": ["127.0.0.1:0"],
+            "trusted_proxies": {
+                "source": "static",
+                "ranges": ["203.0.113.0/24", "0.0.0.0/0", "::/0"]
+            }
+        }));
+        let warnings = warning_messages(&config);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("`0.0.0.0/0`"), "{}", warnings[0]);
+        assert!(warnings[1].contains("`::/0`"), "{}", warnings[1]);
+
+        let specific = test_config(serde_json::json!({
+            "listen": ["127.0.0.1:0"],
+            "trusted_proxies": {"source": "static", "ranges": ["10.0.0.0/8", "private_ranges"]}
+        }));
+        assert_eq!(
+            warning_messages(&specific),
+            Vec::<String>::new(),
+            "specific and private ranges must not warn"
+        );
+    }
+
+    #[test]
+    fn proxy_protocol_warns_only_on_exposed_listeners() {
+        let config = test_config(serde_json::json!({
+            "listen": [":443", "127.0.0.1:8443", "localhost:8444", "unix//run/caddy.sock"],
+            "listener_wrappers": [{"wrapper": "proxy_protocol"}]
+        }));
+        let warnings = warning_messages(&config);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("server `srv0`") && warnings[0].contains("`:443`"),
+            "warning must name the server and the exposed listener: {}",
+            warnings[0]
+        );
+        assert!(
+            warnings[0].contains("proxy_protocol") && warnings[0].contains("T-TLS-087"),
+            "warning must name the wrapper and the tracking id: {}",
+            warnings[0]
+        );
+
+        // A hostname that is not `localhost` may resolve to a public address and is exposed.
+        let named = test_config(serde_json::json!({
+            "listen": ["acme.example:443"],
+            "listener_wrappers": [{"wrapper": "proxy_protocol"}]
+        }));
+        assert_eq!(
+            warning_messages(&named).len(),
+            1,
+            "{:?}",
+            warning_messages(&named)
+        );
+
+        // Without the wrapper there is nothing to warn about, even on an exposed listener.
+        let no_wrapper = test_config(serde_json::json!({"listen": [":443"]}));
+        assert!(warning_messages(&no_wrapper).is_empty());
+    }
+
+    #[test]
+    fn exposed_listener_classification_is_conservative() {
+        assert!(listen_address_is_exposed(":443"));
+        assert!(listen_address_is_exposed("0.0.0.0:443"));
+        assert!(listen_address_is_exposed("[::]:443"));
+        assert!(listen_address_is_exposed("203.0.113.7:443"));
+        assert!(listen_address_is_exposed("acme.example:443"));
+        assert!(!listen_address_is_exposed("127.0.0.1:443"));
+        assert!(!listen_address_is_exposed("[::1]:443"));
+        assert!(!listen_address_is_exposed("localhost:443"));
+        assert!(!listen_address_is_exposed("unix//run/caddy.sock"));
+        assert!(
+            !listen_address_is_exposed("not-a-listen-address"),
+            "a malformed address must not produce a bogus warning"
         );
     }
 }

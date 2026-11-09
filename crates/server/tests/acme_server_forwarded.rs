@@ -31,6 +31,23 @@ fn config(server_fields: Value) -> Config {
     .expect("test config decodes")
 }
 
+/// A route that writes the reserved `trusted_proxy` variable from a client header before the ACME
+/// handler. This is the operator-configuration footgun T-TLS-087 documents: the trust gate is
+/// configuration-level, so a header-derived `vars` value makes it request-influenceable.
+fn config_with_header_driven_trust() -> Config {
+    Config::from_value(json!({
+        "admin": {"disabled": true},
+        "apps": {"http": {"servers": {"srv0": {
+            "listen": ["127.0.0.1:0"],
+            "routes": [{"handle": [
+                {"handler": "vars", "trusted_proxy": "{http.request.header.X-Trusted}"},
+                {"handler": "acme_server"}
+            ]}]
+        }}}}
+    }))
+    .expect("test config decodes")
+}
+
 async fn start(config: Config, data_root: &std::path::Path) -> (ServerRuntime, SocketAddr) {
     let store = Arc::new(GenerationStore::with_builtin_registry());
     store.load(config).expect("test config validates");
@@ -124,6 +141,50 @@ async fn server_trusted_proxies_gate_the_acme_forwarded_origin() {
     assert_eq!(
         body["type"], "urn:ietf:params:acme:error:malformed",
         "{body}"
+    );
+    runtime.shutdown().await;
+}
+
+/// The trust gate is the `trusted_proxy` variable, not a proof about the request: an operator
+/// `vars` handler that expands a client header into that variable makes forwarded-origin
+/// selection request-influenceable. The module docs and `docs/FEATURES.md` state this explicitly
+/// (T-TLS-087); this test pins the behaviour so the documentation cannot silently become false.
+#[tokio::test]
+async fn operator_header_driven_vars_makes_the_trust_gate_request_influenceable() {
+    let directory_root = tempfile::tempdir().expect("data directory");
+    let (runtime, address) = start(config_with_header_driven_trust(), directory_root.path()).await;
+
+    // Without the header, `trusted_proxy` expands to an empty value (not "true"): forwarded
+    // headers are ignored exactly as for any untrusted request.
+    let (status, body) = directory(
+        address,
+        &[
+            ("X-Forwarded-Proto", "https"),
+            ("X-Forwarded-Host", "public.example"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["newNonce"], "https://acme.test/acme/local/new-nonce",
+        "an empty vars value must not enable the forwarded origin"
+    );
+
+    // The client-supplied header now selects the external origin. This is deliberate Caddy/vars
+    // parity, not a bug; the operator must not map untrusted request data into `trusted_proxy`.
+    let (status, body) = directory(
+        address,
+        &[
+            ("X-Trusted", "true"),
+            ("X-Forwarded-Proto", "https"),
+            ("X-Forwarded-Host", "public.example"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["newNonce"], "https://public.example/acme/local/new-nonce",
+        "a header-driven `trusted_proxy` var must be visible to the handler (configuration-level trust)"
     );
     runtime.shutdown().await;
 }
