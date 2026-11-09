@@ -43,10 +43,19 @@ async fn undeclared_authority_ids_are_rejected_like_caddy() {
     let directory = tempfile::tempdir().expect("data directory");
     let declared = |ids: &[&str]| {
         ids.iter()
-            .map(|id| (*id).to_string())
-            .collect::<std::collections::BTreeSet<_>>()
+            .map(|id| {
+                (
+                    (*id).to_string(),
+                    caddy_rs_http::router::AcmeServerAuthority::default(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
     };
-    let build_with = |ca: &str, authorities: std::collections::BTreeSet<String>| {
+    let build_with = |ca: &str,
+                      authorities: std::collections::BTreeMap<
+        String,
+        caddy_rs_http::router::AcmeServerAuthority,
+    >| {
         RouterBuilder::new()
             .with_acme_server_data_root(directory.path())
             .with_acme_server_authorities(authorities)
@@ -70,6 +79,9 @@ async fn undeclared_authority_ids_are_rejected_like_caddy() {
 
     build_with("nested-ca", declared(&["nested-ca"])).expect("a declared authority is accepted");
     build_with("local", declared(&[])).expect("`local` is always provisioned on demand");
+    // An empty `ca` means the default `local` authority in Caddy, so it must not be treated as an
+    // undeclared id.
+    build_with("", declared(&[])).expect("an empty `ca` is the default local authority");
 }
 
 async fn body_text(response: &Response) -> String {

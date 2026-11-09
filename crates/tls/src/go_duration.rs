@@ -18,15 +18,31 @@ pub fn format_go_duration(duration: Duration) -> String {
         return "0s".to_string();
     }
 
+    // Sub-second: Go prints the largest unit with a fractional remainder (`1.5ms`, `1.5µs`), not a
+    // whole number of smaller units.
     if nanos < 1_000_000_000 {
-        // Sub-second: pick the largest unit that divides the value exactly.
-        if nanos % 1_000_000 == 0 {
-            return format!("{}ms", nanos / 1_000_000);
+        let (unit_nanos, suffix) = if nanos < 1_000 {
+            (1_u128, "ns")
+        } else if nanos < 1_000_000 {
+            (1_000_u128, "µs")
+        } else {
+            (1_000_000_u128, "ms")
+        };
+        let whole = nanos / unit_nanos;
+        let remainder = nanos % unit_nanos;
+        if remainder == 0 {
+            return format!("{whole}{suffix}");
         }
-        if nanos % 1_000 == 0 {
-            return format!("{}µs", nanos / 1_000);
+        let width = match unit_nanos {
+            1_000_000 => 6,
+            1_000 => 3,
+            _ => 0,
+        };
+        let mut fraction = format!("{remainder:0width$}");
+        while fraction.ends_with('0') {
+            fraction.pop();
         }
-        return format!("{nanos}ns");
+        return format!("{whole}.{fraction}{suffix}");
     }
 
     let total_seconds = nanos / 1_000_000_000;
@@ -47,7 +63,6 @@ pub fn format_go_duration(duration: Duration) -> String {
         text.push_str(&format!("{seconds}"));
     }
     if fraction_nanos != 0 {
-        // Go prints the fractional second with trailing zeros trimmed (up to nanosecond precision).
         let mut fraction = format!("{fraction_nanos:09}");
         while fraction.ends_with('0') {
             fraction.pop();
@@ -75,6 +90,8 @@ mod tests {
             (Duration::from_secs(3600 + 30 * 60), "1h30m0s"),
             (Duration::from_secs(1) + Duration::from_millis(500), "1.5s"),
             (Duration::from_millis(500), "500ms"),
+            (Duration::from_micros(1500), "1.5ms"),
+            (Duration::from_nanos(1500), "1.5µs"),
             (Duration::from_micros(250), "250µs"),
             (Duration::from_nanos(7), "7ns"),
         ] {

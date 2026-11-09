@@ -444,12 +444,35 @@ impl ServerRuntime {
         let status_sink = UpstreamStatusSink::new();
         let acme_server_data_root = self.acme_server_data_root(generation.config())?;
         // Caddy resolves `acme_server.ca` through the PKI app: `local` is provisioned on demand,
-        // every other id has to be declared in `apps.pki.certificate_authorities`.
-        let acme_server_authorities: std::collections::BTreeSet<String> = generation
+        // every other id has to be declared in `apps.pki.certificate_authorities`. The ACME
+        // server's provision rules also need each authority's intermediate lifetime and whether
+        // the operator supplied that intermediate.
+        let acme_server_authorities: std::collections::BTreeMap<
+            String,
+            caddy_rs_http::router::AcmeServerAuthority,
+        > = generation
             .config()
             .pki()
             .and_then(|pki| pki.certificate_authorities.as_ref())
-            .map(|authorities| authorities.keys().cloned().collect())
+            .map(|authorities| {
+                authorities
+                    .iter()
+                    .map(|(id, ca)| {
+                        let intermediate_lifetime = ca
+                            .intermediate_lifetime
+                            .and_then(|nanos| u64::try_from(nanos).ok())
+                            .map(std::time::Duration::from_nanos)
+                            .unwrap_or(caddy_rs_tls::DEFAULT_INTERMEDIATE_LIFETIME);
+                        (
+                            id.clone(),
+                            caddy_rs_http::router::AcmeServerAuthority {
+                                intermediate_lifetime,
+                                operator_intermediate: ca.intermediate.is_some(),
+                            },
+                        )
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
         for (server_name, server) in &http.servers {
             let _limits = ServerLimits::from_http_server(server_name, server)?;
@@ -1568,7 +1591,10 @@ impl ServerRuntime {
         server: &caddy_rs_core::HttpServer,
         status_sink: &Arc<UpstreamStatusSink>,
         acme_server_data_root: Option<&std::path::Path>,
-        acme_server_authorities: &std::collections::BTreeSet<String>,
+        acme_server_authorities: &std::collections::BTreeMap<
+            String,
+            caddy_rs_http::router::AcmeServerAuthority,
+        >,
     ) -> Result<Arc<caddy_rs_http::Router>> {
         let routes_value = serde_json::to_value(&server.routes).map_err(|error| {
             Error::Config(caddy_rs_core::Error::invalid(
@@ -1646,12 +1672,35 @@ impl ServerRuntime {
         let http_port = http.http_port.unwrap_or(caddy_rs_tls::DEFAULT_HTTP_PORT);
         let acme_server_data_root = self.acme_server_data_root(generation.config())?;
         // Caddy resolves `acme_server.ca` through the PKI app: `local` is provisioned on demand,
-        // every other id has to be declared in `apps.pki.certificate_authorities`.
-        let acme_server_authorities: std::collections::BTreeSet<String> = generation
+        // every other id has to be declared in `apps.pki.certificate_authorities`. The ACME
+        // server's provision rules also need each authority's intermediate lifetime and whether
+        // the operator supplied that intermediate.
+        let acme_server_authorities: std::collections::BTreeMap<
+            String,
+            caddy_rs_http::router::AcmeServerAuthority,
+        > = generation
             .config()
             .pki()
             .and_then(|pki| pki.certificate_authorities.as_ref())
-            .map(|authorities| authorities.keys().cloned().collect())
+            .map(|authorities| {
+                authorities
+                    .iter()
+                    .map(|(id, ca)| {
+                        let intermediate_lifetime = ca
+                            .intermediate_lifetime
+                            .and_then(|nanos| u64::try_from(nanos).ok())
+                            .map(std::time::Duration::from_nanos)
+                            .unwrap_or(caddy_rs_tls::DEFAULT_INTERMEDIATE_LIFETIME);
+                        (
+                            id.clone(),
+                            caddy_rs_http::router::AcmeServerAuthority {
+                                intermediate_lifetime,
+                                operator_intermediate: ca.intermediate.is_some(),
+                            },
+                        )
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
         for (server_name, server) in &http.servers {
             let limits = Arc::new(ServerLimits::from_http_server(server_name, server)?);

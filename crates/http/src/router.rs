@@ -487,6 +487,29 @@ fn apply_pending_headers(headers: &mut http::HeaderMap, request: &Request) {
 }
 
 /// Builds routers from Caddy JSON route arrays.
+/// What the PKI app says about one certificate authority, for `acme_server`'s provision rules.
+///
+/// Caddy's ACME server refuses a leaf lifetime that is not strictly shorter than the managed
+/// intermediate's lifetime, and skips that rule when the operator supplied the intermediate
+/// (`modules/caddypki/acmeserver/acmeserver.go`: `ca.Intermediate == nil`). Both facts come from
+/// `apps.pki.certificate_authorities.<id>`, so the server passes them down.
+#[derive(Debug, Clone, Copy)]
+pub struct AcmeServerAuthority {
+    /// `intermediate_lifetime`, or Caddy's 7-day default when the field is absent.
+    pub intermediate_lifetime: std::time::Duration,
+    /// Whether the operator supplied the intermediate certificate (`intermediate` present).
+    pub operator_intermediate: bool,
+}
+
+impl Default for AcmeServerAuthority {
+    fn default() -> Self {
+        Self {
+            intermediate_lifetime: caddy_rs_tls::DEFAULT_INTERMEDIATE_LIFETIME,
+            operator_intermediate: false,
+        }
+    }
+}
+
 pub struct RouterBuilder {
     custom: Option<CustomHandlerFactory>,
     error_routes: Option<Vec<Value>>,
@@ -501,7 +524,7 @@ pub struct RouterBuilder {
     /// authority configured with id" when the id is neither declared nor the implicitly
     /// provisioned `local` authority. `None` means the caller did not supply the PKI app, so
     /// the lookup is not enforced (unit tests and embedders); the server always supplies it.
-    acme_server_authorities: Option<std::collections::BTreeSet<String>>,
+    acme_server_authorities: Option<std::collections::BTreeMap<String, AcmeServerAuthority>>,
 }
 
 impl Default for RouterBuilder {
@@ -580,7 +603,7 @@ impl RouterBuilder {
     /// reproduces that rule; without them the lookup is not enforced.
     pub fn with_acme_server_authorities(
         mut self,
-        authorities: std::collections::BTreeSet<String>,
+        authorities: std::collections::BTreeMap<String, AcmeServerAuthority>,
     ) -> Self {
         self.acme_server_authorities = Some(authorities);
         self
@@ -719,19 +742,36 @@ impl RouterBuilder {
                                   router was built without one)"
                                     .to_string(),
                         })?;
-                if let Some(authorities) = &self.acme_server_authorities {
-                    let ca = value
-                        .get("ca")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("local");
-                    if ca != "local" && !authorities.contains(ca) {
-                        return Err(Error::InvalidConfig {
-                            path: format!("{path}.ca"),
-                            message: format!("no certificate authority configured with id: {ca}"),
-                        });
+                let authority = match &self.acme_server_authorities {
+                    Some(authorities) => {
+                        // Caddy treats an empty `ca` as the default `local` authority, which the
+                        // PKI app provisions on demand rather than requiring in `apps.pki`.
+                        let ca = value
+                            .get("ca")
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|ca| !ca.is_empty())
+                            .unwrap_or("local");
+                        match authorities.get(ca).copied() {
+                            Some(authority) => Some(authority),
+                            None if ca == "local" => Some(AcmeServerAuthority::default()),
+                            None => {
+                                return Err(Error::InvalidConfig {
+                                    path: format!("{path}.ca"),
+                                    message: format!(
+                                        "no certificate authority configured with id: {ca}"
+                                    ),
+                                })
+                            }
+                        }
                     }
-                }
-                Arc::new(AcmeServerHandler::from_json(value, path, root)?)
+                    None => None,
+                };
+                Arc::new(match authority {
+                    Some(authority) => {
+                        AcmeServerHandler::from_json_with_authority(value, path, root, authority)?
+                    }
+                    None => AcmeServerHandler::from_json(value, path, root)?,
+                })
             }
             #[cfg(feature = "templates")]
             "templates" => Arc::new(TemplatesHandler::from_json(value, path)?),

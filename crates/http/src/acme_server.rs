@@ -1545,10 +1545,23 @@ fn request_authority(request: &Request) -> std::result::Result<String, Problem> 
 fn check_leaf_lifetime(
     config: &AcmeServerConfig,
     issuer: &InternalIssuer,
+    authority: Option<crate::router::AcmeServerAuthority>,
     path: &str,
 ) -> Result<()> {
-    let lifetime = config.effective_lifetime();
-    let intermediate = issuer.intermediate_lifetime();
+    // Caddy skips the rule when the operator supplied the intermediate (`ca.Intermediate == nil`).
+    let (intermediate, operator_intermediate) = match authority {
+        Some(authority) => (
+            authority.intermediate_lifetime,
+            authority.operator_intermediate,
+        ),
+        None => (issuer.intermediate_lifetime(), false),
+    };
+    if operator_intermediate {
+        return Ok(());
+    }
+    // Caddy compares the configured lifetime itself (`ash.Lifetime`), not the value clamped for
+    // issuance, so this uses the raw field: a 400d lifetime must report 9600h0m0s, not 8760h0m0s.
+    let lifetime = config.lifetime;
     if lifetime >= intermediate {
         return Err(invalid(
             &format!("{path}.lifetime"),
@@ -1569,7 +1582,28 @@ impl AcmeServerHandler {
     pub fn from_json(value: &Value, path: &str, data_root: &Path) -> Result<Self> {
         let config = AcmeServerConfig::from_json(value, path)?;
         let issuer = InternalIssuer::from_data_directory(data_root).with_name(config.ca.clone());
-        check_leaf_lifetime(&config, &issuer, path)?;
+        check_leaf_lifetime(&config, &issuer, None, path)?;
+        Ok(Self::new(
+            Arc::new(config),
+            Arc::new(issuer),
+            Arc::new(HyperHttp01Transport::new()),
+        ))
+    }
+
+    /// Build the handler with the PKI app's facts about its authority.
+    ///
+    /// [`Self::from_json`] keeps the historical behaviour for embedders and unit tests that have no
+    /// `apps.pki` at hand: the issuer's own intermediate lifetime is used and the authority is
+    /// treated as managed. The router always calls this constructor with the real facts.
+    pub fn from_json_with_authority(
+        value: &Value,
+        path: &str,
+        data_root: &Path,
+        authority: crate::router::AcmeServerAuthority,
+    ) -> Result<Self> {
+        let config = AcmeServerConfig::from_json(value, path)?;
+        let issuer = InternalIssuer::from_data_directory(data_root).with_name(config.ca.clone());
+        check_leaf_lifetime(&config, &issuer, Some(authority), path)?;
         Ok(Self::new(
             Arc::new(config),
             Arc::new(issuer),
@@ -1588,7 +1622,7 @@ impl AcmeServerHandler {
         transport: Arc<dyn Http01Transport>,
     ) -> Result<Self> {
         let config = AcmeServerConfig::from_json(value, path)?;
-        check_leaf_lifetime(&config, &issuer, path)?;
+        check_leaf_lifetime(&config, &issuer, None, path)?;
         Ok(Self::new(Arc::new(config), issuer, transport))
     }
 
@@ -3647,6 +3681,62 @@ mod tests {
             Arc::new(MemoryAcmeStorage::new()),
             Box::new(MemoryStorage::new()),
         ))
+    }
+
+    #[test]
+    fn lifetime_rule_uses_the_pki_facts() {
+        // Caddy compares the configured lifetime with the *configured* intermediate lifetime of the
+        // authority, skips the rule for an operator-supplied intermediate, and prints the raw
+        // lifetime in the message (not the value clamped for issuance).
+        let directory = tempfile::tempdir().expect("data directory");
+        let facts = |intermediate_seconds: u64, operator_intermediate: bool| {
+            crate::router::AcmeServerAuthority {
+                intermediate_lifetime: Duration::from_secs(intermediate_seconds),
+                operator_intermediate,
+            }
+        };
+        let config = |seconds: u64| {
+            serde_json::json!({
+                "handler": "acme_server",
+                "lifetime": seconds * 1_000_000_000_u64,
+            })
+        };
+        let build = |seconds: u64, authority: crate::router::AcmeServerAuthority| {
+            AcmeServerHandler::from_json_with_authority(
+                &config(seconds),
+                "test",
+                directory.path(),
+                authority,
+            )
+        };
+
+        // 30d intermediate, 14d leaf: accepted (the default 7d would have rejected it).
+        build(14 * 24 * 60 * 60, facts(30 * 24 * 60 * 60, false))
+            .expect("a 14d leaf under a 30d intermediate is valid");
+        // 1d intermediate, 3d leaf: rejected in Caddy's words, with both raw durations.
+        let error = match build(3 * 24 * 60 * 60, facts(24 * 60 * 60, false)) {
+            Ok(_) => panic!("3d leaf under a 1d intermediate must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains(
+                "certificate lifetime (72h0m0s) should be less than intermediate certificate \
+                 lifetime (24h0m0s)"
+            ),
+            "{error}"
+        );
+        // Operator-supplied intermediate: exempt even though 14d exceeds the 7d default.
+        build(14 * 24 * 60 * 60, facts(7 * 24 * 60 * 60, true))
+            .expect("an operator-supplied intermediate is exempt");
+        // Raw lifetime in the message: 400d prints 9600h0m0s, not the 365d clamp.
+        let error = match build(400 * 24 * 60 * 60, facts(7 * 24 * 60 * 60, false)) {
+            Ok(_) => panic!("400d leaf must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("(9600h0m0s)"),
+            "raw lifetime must be printed: {error}"
+        );
     }
 
     #[test]
