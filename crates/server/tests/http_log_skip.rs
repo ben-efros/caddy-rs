@@ -233,8 +233,8 @@ async fn log_skip_inside_an_unmatched_matcher_still_logs() {
 #[tokio::test]
 async fn the_final_log_skip_value_decides_at_emit_time() {
     // Caddy reads the variable after the whole handler chain. A later vars handler must be able to
-    // clear an earlier `true` (logged) or set a later `true` (skipped); a string "true" is not a
-    // boolean and must not skip.
+    // clear an earlier `true` (logged) or set a later `true` (skipped); a string "true" and a
+    // non-scalar value are not the boolean `true` and must not skip.
     let directory = tempfile::tempdir().expect("tempdir");
     let log_path = directory.path().join("access.log");
     let config = runtime_config(
@@ -244,13 +244,20 @@ async fn the_final_log_skip_value_decides_at_emit_time() {
             {"match": [{"path": ["/false-then-true"]}], "handle": [{"handler": "vars", "log_skip": false}]},
             {"match": [{"path": ["/false-then-true"]}], "handle": [{"handler": "vars", "log_skip": true}]},
             {"match": [{"path": ["/string-true"]}], "handle": [{"handler": "vars", "log_skip": "true"}]},
+            {"match": [{"path": ["/true-then-array"]}], "handle": [{"handler": "vars", "log_skip": true}]},
+            {"match": [{"path": ["/true-then-array"]}], "handle": [{"handler": "vars", "log_skip": ["x"]}]},
             {"handle": [{"handler": "static_response", "body": "ok"}]}
         ]),
         &log_path,
     );
     let (_store, runtime, address) = start(config).await;
 
-    for path in ["/true-then-false", "/false-then-true", "/string-true"] {
+    for path in [
+        "/true-then-false",
+        "/false-then-true",
+        "/string-true",
+        "/true-then-array",
+    ] {
         let (status, _headers, _body) = request(address, "GET", path).await;
         assert_eq!(status, 200, "{path}");
     }
@@ -261,8 +268,9 @@ async fn the_final_log_skip_value_decides_at_emit_time() {
     uris.sort_unstable();
     assert_eq!(
         uris,
-        vec!["/string-true", "/true-then-false"],
-        "the final boolean value decides; a string \"true\" does not skip: {entries:?}"
+        vec!["/string-true", "/true-then-array", "/true-then-false"],
+        "the final boolean value decides; a string \"true\" or non-scalar value does not skip: \
+         {entries:?}"
     );
 }
 

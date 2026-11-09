@@ -442,6 +442,11 @@ enum VarValue {
     String(String),
     Number(String),
     Bool(bool),
+    /// A JSON value caddy-rs does not materialise as a request variable (array, object, null).
+    ///
+    /// Caddy still stores it, so a later non-boolean `log_skip` overwrites an earlier boolean and
+    /// the request is logged. Remembering the assignment restores that overwrite semantics.
+    Unsupported,
 }
 
 impl VarsHandler {
@@ -459,7 +464,12 @@ impl VarsHandler {
                 serde_json::Value::String(value) => VarValue::String(value.clone()),
                 serde_json::Value::Number(number) => VarValue::Number(number.to_string()),
                 serde_json::Value::Bool(flag) => VarValue::Bool(*flag),
-                _ => continue,
+                _ => {
+                    if key == "log_skip" {
+                        vars.push((key.clone(), VarValue::Unsupported));
+                    }
+                    continue;
+                }
             };
             vars.push((key.clone(), value));
         }
@@ -483,21 +493,26 @@ impl Handler for VarsHandler {
                     VarValue::String(value) => VarValue::String(request.replace_all(value)),
                     VarValue::Number(value) => VarValue::Number(request.replace_all(value)),
                     VarValue::Bool(flag) => VarValue::Bool(*flag),
+                    VarValue::Unsupported => VarValue::Unsupported,
                 };
                 (key, value)
             })
             .collect();
         for (key, value) in vars {
-            let storable = match &value {
-                VarValue::String(value) | VarValue::Number(value) => value.clone(),
-                VarValue::Bool(flag) => flag.to_string(),
-            };
             // Caddy's access logger reads `log_skip` as a bool after the handler chain; assigning
             // any non-boolean value (or `false`) means the request is logged normally.
             if key == "log_skip" {
                 request.set_log_skip(matches!(value, VarValue::Bool(true)));
             }
-            request.vars.insert(key, storable);
+            match value {
+                VarValue::String(value) | VarValue::Number(value) => {
+                    request.vars.insert(key, value);
+                }
+                VarValue::Bool(flag) => {
+                    request.vars.insert(key, flag.to_string());
+                }
+                VarValue::Unsupported => {}
+            }
         }
         Ok(Outcome::Continue(request))
     }
