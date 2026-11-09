@@ -5272,6 +5272,80 @@ fn request_body_handler(directive: &Directive) -> caddy_rs_core::Result<Value> {
     Ok(Value::Object(object))
 }
 
+/// Insert a numeric JSON field only when it is non-zero (Caddy's `omitempty`).
+fn insert_nonzero(object: &mut Map<String, Value>, key: &str, value: i64) {
+    if value != 0 {
+        object.insert(key.to_string(), json!(value));
+    }
+}
+
+/// The first argument of a `transport http` subdirective, rejecting blocks and missing values.
+fn transport_option_value<'a>(option: &'a Directive) -> Result<&'a str, CoreError> {
+    if !option.block.is_empty() {
+        return Err(adapter_error(
+            option.position.clone(),
+            format!("`{}` does not take a block", option.name),
+        ));
+    }
+    option.args.first().map(String::as_str).ok_or_else(|| {
+        adapter_error(
+            option.position.clone(),
+            format!("`{}` requires a value", option.name),
+        )
+    })
+}
+
+/// Parse a `transport http` duration: Caddy's `caddy.Duration` (integer ns or Go duration) as an
+/// integer nanosecond count.
+fn parse_transport_duration(option: &Directive) -> Result<i64, CoreError> {
+    let value = transport_option_value(option)?;
+    match value.parse::<i64>() {
+        Ok(raw) => Ok(raw),
+        Err(_) => parse_duration(value)
+            .map(|nanos| nanos as i64)
+            .map_err(|message| adapter_error(option.position.clone(), message)),
+    }
+}
+
+/// Parse a `transport http` size (humanize byte units) as an integer byte count.
+fn parse_transport_size(option: &Directive) -> Result<i64, CoreError> {
+    let value = transport_option_value(option)?;
+    let size = parse_caddy_size(value).map_err(|message| {
+        adapter_error(
+            option.position.clone(),
+            format!("invalid size `{value}`: {message}"),
+        )
+    })?;
+    i64::try_from(size).map_err(|_| {
+        adapter_error(
+            option.position.clone(),
+            format!("size `{value}` is too large"),
+        )
+    })
+}
+
+/// Parse a `transport http` integer (`strconv.Atoi` in Caddy).
+fn parse_transport_integer(option: &Directive) -> Result<i64, CoreError> {
+    let value = transport_option_value(option)?;
+    value.parse::<i64>().map_err(|_| {
+        adapter_error(
+            option.position.clone(),
+            format!("`{}` requires an integer, got `{value}`", option.name),
+        )
+    })
+}
+
+/// Get or create the emitted `keep_alive` transport object.
+fn keep_alive_object(extra_transport: &mut Map<String, Value>) -> &mut Map<String, Value> {
+    extra_transport
+        .entry("keep_alive".to_string())
+        .or_insert_with(|| json!({}));
+    extra_transport
+        .get_mut("keep_alive")
+        .and_then(Value::as_object_mut)
+        .expect("keep_alive is an object")
+}
+
 /// Parse a size the way Caddy does (`go-humanize.ParseBytes`): an optional fractional number
 /// (commas allowed as thousand separators) followed by an optional size suffix. Decimal suffixes
 /// (`kb`, `mb`, …) use powers of 1000; `kib`/`mib`/… use powers of 1024; the bare `k`/`m`/`g`/…
@@ -8309,29 +8383,165 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
                                     }
                                 }
                                 "dial_timeout" => {
-                                    // `transport http { dial_timeout 5s }` — Caddy stores a
-                                    // `caddy.Duration`; the connector applies it to the dial.
+                                    // Caddy stores `caddy.Duration` nanoseconds; zero values are
+                                    // omitted by `omitempty`.
+                                    let nanos = parse_transport_duration(option)?;
+                                    insert_nonzero(&mut extra_transport, "dial_timeout", nanos);
+                                }
+                                "dial_fallback_delay" => {
+                                    let nanos = parse_transport_duration(option)?;
+                                    insert_nonzero(
+                                        &mut extra_transport,
+                                        "dial_fallback_delay",
+                                        nanos,
+                                    );
+                                }
+                                "response_header_timeout" => {
+                                    let nanos = parse_transport_duration(option)?;
+                                    insert_nonzero(
+                                        &mut extra_transport,
+                                        "response_header_timeout",
+                                        nanos,
+                                    );
+                                }
+                                "expect_continue_timeout" => {
+                                    let nanos = parse_transport_duration(option)?;
+                                    insert_nonzero(
+                                        &mut extra_transport,
+                                        "expect_continue_timeout",
+                                        nanos,
+                                    );
+                                }
+                                "read_timeout" => {
+                                    let nanos = parse_transport_duration(option)?;
+                                    insert_nonzero(&mut extra_transport, "read_timeout", nanos);
+                                }
+                                "write_timeout" => {
+                                    let nanos = parse_transport_duration(option)?;
+                                    insert_nonzero(&mut extra_transport, "write_timeout", nanos);
+                                }
+                                "read_buffer" => {
+                                    let size = parse_transport_size(option)?;
+                                    insert_nonzero(&mut extra_transport, "read_buffer_size", size);
+                                }
+                                "write_buffer" => {
+                                    let size = parse_transport_size(option)?;
+                                    insert_nonzero(&mut extra_transport, "write_buffer_size", size);
+                                }
+                                "max_response_header" => {
+                                    let size = parse_transport_size(option)?;
+                                    insert_nonzero(
+                                        &mut extra_transport,
+                                        "max_response_header_size",
+                                        size,
+                                    );
+                                }
+                                "resolvers" => {
+                                    // `resolvers <addr...>` emits `resolver.addresses`; Caddy
+                                    // requires at least one address.
                                     if !option.block.is_empty() {
                                         return Err(adapter_error(
                                             option.position.clone(),
-                                            "`dial_timeout` does not take a block",
+                                            "`resolvers` does not take a block",
+                                        ));
+                                    }
+                                    if option.args.is_empty() {
+                                        return Err(adapter_error(
+                                            option.position.clone(),
+                                            "must specify at least one resolver address",
+                                        ));
+                                    }
+                                    extra_transport.insert(
+                                        "resolver".to_string(),
+                                        json!({"addresses": option.args}),
+                                    );
+                                }
+                                "keepalive" => {
+                                    if !option.block.is_empty() {
+                                        return Err(adapter_error(
+                                            option.position.clone(),
+                                            "`keepalive` does not take a block",
                                         ));
                                     }
                                     let Some(value) = option.args.first() else {
                                         return Err(adapter_error(
                                             option.position.clone(),
-                                            "`dial_timeout` requires a value",
+                                            "`keepalive` requires `off` or a duration",
                                         ));
                                     };
-                                    let nanos: i64 = match value.parse::<i64>() {
-                                        Ok(raw) => raw,
-                                        Err(_) => parse_duration(value).map_err(|message| {
+                                    let keep_alive = keep_alive_object(&mut extra_transport);
+                                    if value == "off" {
+                                        keep_alive.insert("enabled".to_string(), json!(false));
+                                    } else {
+                                        let nanos = parse_duration(value).map_err(|message| {
                                             adapter_error(option.position.clone(), message)
                                         })?
-                                            as i64,
+                                            as i64;
+                                        insert_nonzero(keep_alive, "idle_timeout", nanos);
+                                    }
+                                }
+                                "keepalive_interval" => {
+                                    let nanos = parse_transport_duration(option)?;
+                                    let keep_alive = keep_alive_object(&mut extra_transport);
+                                    insert_nonzero(keep_alive, "probe_interval", nanos);
+                                }
+                                "keepalive_idle_conns" => {
+                                    let count = parse_transport_integer(option)?;
+                                    let keep_alive = keep_alive_object(&mut extra_transport);
+                                    insert_nonzero(keep_alive, "max_idle_conns", count);
+                                }
+                                "keepalive_idle_conns_per_host" => {
+                                    let count = parse_transport_integer(option)?;
+                                    let keep_alive = keep_alive_object(&mut extra_transport);
+                                    insert_nonzero(keep_alive, "max_idle_conns_per_host", count);
+                                }
+                                "versions" => {
+                                    if !option.block.is_empty() {
+                                        return Err(adapter_error(
+                                            option.position.clone(),
+                                            "`versions` does not take a block",
+                                        ));
+                                    }
+                                    if option.args.is_empty() {
+                                        return Err(adapter_error(
+                                            option.position.clone(),
+                                            "`versions` requires at least one version",
+                                        ));
+                                    }
+                                    extra_transport
+                                        .insert("versions".to_string(), json!(option.args));
+                                }
+                                "compression" => {
+                                    // Caddy only honours `compression off`; any other argument
+                                    // leaves the default (`true`) unset in the JSON.
+                                    if option.args.first().map(String::as_str) == Some("off") {
+                                        extra_transport
+                                            .insert("compression".to_string(), json!(false));
+                                    }
+                                }
+                                "max_conns_per_host" => {
+                                    let count = parse_transport_integer(option)?;
+                                    insert_nonzero(
+                                        &mut extra_transport,
+                                        "max_conns_per_host",
+                                        count,
+                                    );
+                                }
+                                "local_address" => {
+                                    if !option.block.is_empty() {
+                                        return Err(adapter_error(
+                                            option.position.clone(),
+                                            "`local_address` does not take a block",
+                                        ));
+                                    }
+                                    let Some(value) = option.args.first() else {
+                                        return Err(adapter_error(
+                                            option.position.clone(),
+                                            "`local_address` requires a value",
+                                        ));
                                     };
                                     extra_transport
-                                        .insert("dial_timeout".to_string(), json!(nanos));
+                                        .insert("local_address".to_string(), json!(value));
                                 }
                                 other => {
                                     return Err(adapter_error(

@@ -27,7 +27,7 @@
 //! configured upstream target; no separate `Host` field is forwarded on h2.
 
 use std::collections::{BTreeMap, HashMap};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -49,10 +49,11 @@ use caddy_rs_http::{
 
 use crate::balancer::{self, Balancer};
 use crate::client::{
-    build_upstream_client_for, build_upstream_client_with_proxy_protocol, proxy_protocol_authority,
-    ProxyProtocolVersion, UpstreamClient,
+    build_upstream_client_for_tuned, build_upstream_client_with_proxy_protocol_tuned,
+    proxy_protocol_authority, KeepAliveConfig, ProxyProtocolVersion, TransportResolver,
+    TransportTuning, UpstreamClient,
 };
-use crate::dns::{DnsResolver, SystemDnsResolver};
+use crate::dns::{DnsResolver, ResolverAddress, SystemDnsResolver};
 use crate::dynamic_upstreams::{DynamicUpstreamSource, DynamicUpstreams};
 use crate::fastcgi::{FastCgiError, FastCgiTransport};
 use crate::forward_auth::{HandleResponse, HandleResponseResult, RequestRewrite};
@@ -106,6 +107,9 @@ enum ProxyError {
     /// FastCGI transport failure (dial, protocol, timeout or body error).
     #[error("fastcgi transport error: {0}")]
     FastCgi(#[from] FastCgiError),
+    /// `transport.response_header_timeout` elapsed before the upstream sent a response head.
+    #[error("upstream response header timeout: {0}")]
+    ResponseTimeout(String),
 }
 
 impl ProxyError {
@@ -734,6 +738,17 @@ impl ReverseProxyHandler {
             }
         };
 
+        // `keep_alive.enabled: false` means the connection carries one HTTP/1.1 request (Go's
+        // `DisableKeepAlives` also sends `Connection: close`). HTTP/2 has no such header; the
+        // pool is already configured to retain no idle connection.
+        if !self.transport.tuning.keep_alive.enabled
+            && !self.upstream_h2_capable(upstream)
+            && headers.get(http::header::CONNECTION).is_none()
+            && headers.get(http::header::UPGRADE).is_none()
+        {
+            headers.insert(http::header::CONNECTION, HeaderValue::from_static("close"));
+        }
+
         let mut outbound = hyper::Request::builder()
             .method(method)
             .uri(url)
@@ -742,7 +757,19 @@ impl ReverseProxyHandler {
         *outbound.headers_mut() = headers;
 
         let started = std::time::Instant::now();
-        let mut response = client.request(outbound).await?;
+        let request_future = client.request(outbound);
+        let mut response = match self.transport.response_header_timeout {
+            Some(limit) => match tokio::time::timeout(limit, request_future).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    return Err(ProxyError::ResponseTimeout(format!(
+                        "upstream `{}` did not send response headers within {limit:?}",
+                        upstream.dial
+                    )))
+                }
+            },
+            None => request_future.await?,
+        };
         let latency = started.elapsed();
         let status = response.status();
         let version = response.version();
@@ -1019,13 +1046,14 @@ impl ReverseProxyHandler {
             None
         };
         let build = |http1_only: bool| {
-            build_upstream_client_for(
+            build_upstream_client_for_tuned(
                 transport,
                 tls.clone(),
                 self.transport.h2c,
                 http1_only,
                 self.transport.proxy_protocol,
                 self.transport.dial_timeout,
+                &self.transport.tuning,
             )
             .map_err(|message| {
                 ProxyError::Request(format!(
@@ -2179,6 +2207,11 @@ struct TransportConfig {
     proxy_protocol: Option<ProxyProtocolVersion>,
     /// `transport.dial_timeout`: cap on establishing the upstream connection.
     dial_timeout: Option<Duration>,
+    /// Connection tuning knobs (keep-alive, connection limits, dial fallback, local bind,
+    /// resolver, read buffer).
+    tuning: TransportTuning,
+    /// `transport.response_header_timeout`: bound on waiting for response headers.
+    response_header_timeout: Option<Duration>,
 }
 
 /// Publish one upstream attempt into the request's access-log context (caddy-rs `upstream`).
@@ -2252,13 +2285,14 @@ fn build_upstream_clients(
             if upstream.is_dynamic() {
                 return Ok(None);
             }
-            build_upstream_client_with_proxy_protocol(
+            build_upstream_client_with_proxy_protocol_tuned(
                 upstream,
                 upstream_tls(upstream, transport),
                 transport.h2c,
                 false,
                 transport.proxy_protocol,
                 transport.dial_timeout,
+                &transport.tuning,
             )
             .map(Some)
             .map_err(|message| invalid(&format!("{path}.transport"), message))
@@ -2288,13 +2322,14 @@ fn build_upgrade_clients(
             if upstream.is_dynamic() {
                 return Ok(None);
             }
-            build_upstream_client_with_proxy_protocol(
+            build_upstream_client_with_proxy_protocol_tuned(
                 upstream,
                 upstream_tls(upstream, transport),
                 transport.h2c,
                 true,
                 transport.proxy_protocol,
                 transport.dial_timeout,
+                &transport.tuning,
             )
             .map(Some)
             .map_err(|message| invalid(&format!("{path}.transport"), message))
@@ -2407,65 +2442,137 @@ fn parse_transport(value: Option<&Value>, path: &str) -> HttpResult<TransportCon
         }
     };
 
-    // Real Caddy transport knobs that this build does not implement: reject rather than ignore.
+    // `transport.keep_alive`: Caddy's defaults are applied for absent fields and for zero
+    // duration/count values (see `NewTransport`).
+    let keep_alive = match object.get("keep_alive") {
+        None | Some(Value::Null) => KeepAliveConfig::default(),
+        Some(value) => parse_keep_alive(value, &format!("{transport_path}.keep_alive"))?,
+    };
+
+    // `dial_fallback_delay`: Go's Fast Fallback races resolved addresses. Zero means Go's
+    // 300 ms default; a negative value disables the race (serial dialing).
+    let fallback_delay = match parse_duration_nanos(
+        object.get("dial_fallback_delay"),
+        &format!("{transport_path}.dial_fallback_delay"),
+        "dial_fallback_delay",
+    )? {
+        None | Some(0) => Some(Duration::from_millis(300)),
+        Some(nanos) if nanos < 0 => None,
+        Some(nanos) => Some(Duration::from_nanos(nanos as u64)),
+    };
+
+    let response_header_timeout = parse_duration_nanos(
+        object.get("response_header_timeout"),
+        &format!("{transport_path}.response_header_timeout"),
+        "response_header_timeout",
+    )?
+    .filter(|nanos| *nanos > 0)
+    .map(|nanos| Duration::from_nanos(nanos as u64));
+
+    let max_conns_per_host = parse_integer(
+        object.get("max_conns_per_host"),
+        &format!("{transport_path}.max_conns_per_host"),
+        "max_conns_per_host",
+    )?
+    .filter(|count| *count > 0)
+    .map(|count| count as usize);
+
+    // Go's `ReadBufferSize` clamps values below 4 KiB up to 4 KiB; 0 keeps hyper's adaptive
+    // buffer (Caddy's default).
+    let read_buffer_size = parse_integer(
+        object.get("read_buffer_size"),
+        &format!("{transport_path}.read_buffer_size"),
+        "read_buffer_size",
+    )?
+    .filter(|size| *size > 0)
+    .map(|size| (size as usize).max(4096));
+
+    let local_address = match object.get("local_address") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(parse_local_address(
+            value,
+            &format!("{transport_path}.local_address"),
+        )?),
+    };
+
+    // The resolver's own dials use the transport's dial timeout, like Caddy's resolver dialer
+    // (`net.Dialer{Timeout: h.DialTimeout}`), whose default is 3 s.
+    let resolver = match object.get("resolver") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(Arc::new(parse_transport_resolver(
+            value,
+            &format!("{transport_path}.resolver"),
+            dial_timeout.unwrap_or(Duration::from_secs(3)),
+        )?)),
+    };
+
+    // Caddy's `compression` controls the transport's *transparent* gzip. caddy-rs never adds
+    // `Accept-Encoding` or decompresses, which is exactly `compression: false`; the default
+    // (`true`) is therefore not faithful and explicit `true` is rejected.
+    match object.get("compression") {
+        None | Some(Value::Null) => {}
+        Some(Value::Bool(false)) => {}
+        Some(Value::Bool(true)) => {
+            return Err(invalid(
+                &format!("{transport_path}.compression"),
+                "HTTP transport transparent compression (`compression: true`) is not implemented                  by this build (PROXY-TRANSPORT-COMPRESSION); set `compression: false` or remove                  the field",
+            ))
+        }
+        Some(_) => {
+            return Err(invalid(
+                &format!("{transport_path}.compression"),
+                "`compression` must be a boolean",
+            ))
+        }
+    }
+
+    // Real Caddy transport knobs that this build cannot honour faithfully: reject rather than
+    // silently ignore them.
     const UNSUPPORTED_TRANSPORT_OPTIONS: &[(&str, &str, &str)] = &[
         (
-            "keep_alive",
-            "PROXY-TRANSPORT-KEEPALIVE",
-            "HTTP transport keep-alive tuning",
-        ),
-        (
-            "dial_fallback_delay",
-            "PROXY-TRANSPORT-FALLBACK-DELAY",
-            "HTTP transport dial fallback delay",
-        ),
-        (
-            "response_header_timeout",
-            "PROXY-TRANSPORT-RESPONSE-TIMEOUT",
-            "HTTP transport response header timeout",
-        ),
-        (
-            "read_buffer_size",
-            "PROXY-TRANSPORT-BUFFERS",
-            "HTTP transport read buffer sizing",
-        ),
-        (
             "write_buffer_size",
-            "PROXY-TRANSPORT-BUFFERS",
+            "PROXY-TRANSPORT-WRITE-BUFFER",
             "HTTP transport write buffer sizing",
         ),
         (
             "max_response_header_size",
-            "PROXY-TRANSPORT-BUFFERS",
+            "PROXY-TRANSPORT-MAX-RESPONSE-HEADER",
             "HTTP transport response header size limits",
         ),
         (
-            "local_address",
-            "PROXY-TRANSPORT-LOCAL-ADDRESS",
-            "HTTP transport local address binding",
+            "expect_continue_timeout",
+            "PROXY-TRANSPORT-EXPECT-CONTINUE",
+            "HTTP transport `Expect: 100-continue` timeouts",
         ),
         (
-            "resolver",
-            "PROXY-TRANSPORT-RESOLVER",
-            "HTTP transport custom DNS resolvers",
+            "read_timeout",
+            "PROXY-TRANSPORT-RW-TIMEOUT",
+            "HTTP transport per-read timeouts",
         ),
         (
-            "compression",
-            "PROXY-TRANSPORT-COMPRESSION",
-            "HTTP transport compression",
+            "write_timeout",
+            "PROXY-TRANSPORT-RW-TIMEOUT",
+            "HTTP transport per-write timeouts",
         ),
         (
-            "max_conns_per_host",
-            "PROXY-TRANSPORT-MAX-CONNS",
-            "HTTP transport connection limits",
+            "network_proxy",
+            "PROXY-TRANSPORT-NETWORK-PROXY",
+            "HTTP transport upstream network proxies",
+        ),
+        (
+            "forward_proxy_url",
+            "PROXY-TRANSPORT-NETWORK-PROXY",
+            "HTTP transport upstream network proxies",
         ),
     ];
     for (field, tracking_id, feature) in UNSUPPORTED_TRANSPORT_OPTIONS {
         if object.get(*field).is_some() {
-            return Err(HttpError::NotImplemented {
-                feature,
-                tracking_id,
-            });
+            return Err(invalid(
+                &format!("{transport_path}.{field}"),
+                format!(
+                    "{feature} is not implemented by this build ({tracking_id}); remove                      `{field}` or use a build that supports it"
+                ),
+            ));
         }
     }
 
@@ -2520,7 +2627,231 @@ fn parse_transport(value: Option<&Value>, path: &str) -> HttpResult<TransportCon
         fastcgi: None,
         proxy_protocol,
         dial_timeout,
+        tuning: TransportTuning {
+            keep_alive,
+            max_conns_per_host,
+            fallback_delay,
+            local_address,
+            resolver,
+            read_buffer_size,
+        },
+        response_header_timeout,
     })
+}
+
+/// Read one optional Caddy JSON duration (an integer nanosecond count).
+fn parse_duration_nanos(value: Option<&Value>, path: &str, field: &str) -> HttpResult<Option<i64>> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value.as_i64().map(Some).ok_or_else(|| {
+            invalid(
+                path,
+                format!("`{field}` must be an integer number of nanoseconds (Caddy JSON duration)"),
+            )
+        }),
+    }
+}
+
+/// Read one optional Caddy JSON integer.
+fn parse_integer(value: Option<&Value>, path: &str, field: &str) -> HttpResult<Option<i64>> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| invalid(path, format!("`{field}` must be an integer"))),
+    }
+}
+
+/// Parse Caddy's `keep_alive` object into effective settings (Caddy defaulting rules applied).
+fn parse_keep_alive(value: &Value, path: &str) -> HttpResult<KeepAliveConfig> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| invalid(path, "`keep_alive` must be an object"))?;
+    let mut config = KeepAliveConfig::default();
+    if let Some(enabled) = object.get("enabled").filter(|value| !value.is_null()) {
+        config.enabled = enabled.as_bool().ok_or_else(|| {
+            invalid(
+                &format!("{path}.enabled"),
+                "`keep_alive.enabled` must be a boolean",
+            )
+        })?;
+    }
+    if let Some(nanos) = parse_duration_nanos(
+        object.get("probe_interval"),
+        &format!("{path}.probe_interval"),
+        "keep_alive.probe_interval",
+    )? {
+        // Caddy: 0 -> 30 s, negative -> disable TCP keep-alive.
+        config.probe_interval = match nanos {
+            0 => Some(Duration::from_secs(30)),
+            nanos if nanos < 0 => None,
+            nanos => Some(Duration::from_nanos(nanos as u64)),
+        };
+    }
+    if let Some(nanos) = parse_duration_nanos(
+        object.get("idle_timeout"),
+        &format!("{path}.idle_timeout"),
+        "keep_alive.idle_timeout",
+    )? {
+        // Caddy: 0 -> 2 min; a negative value disables the idle timeout entirely.
+        config.idle_timeout = match nanos {
+            0 => Some(Duration::from_secs(120)),
+            nanos if nanos < 0 => None,
+            nanos => Some(Duration::from_nanos(nanos as u64)),
+        };
+    }
+    if let Some(count) = parse_integer(
+        object.get("max_idle_conns"),
+        &format!("{path}.max_idle_conns"),
+        "keep_alive.max_idle_conns",
+    )? {
+        // Go: 0 means "no limit"; negative values also behave as no limit.
+        config.max_idle_conns = (count > 0).then_some(count as usize);
+    }
+    if let Some(count) = parse_integer(
+        object.get("max_idle_conns_per_host"),
+        &format!("{path}.max_idle_conns_per_host"),
+        "keep_alive.max_idle_conns_per_host",
+    )? {
+        // Caddy: 0 -> 32; a negative value means "keep no idle connections".
+        config.max_idle_conns_per_host = match count {
+            0 => 32,
+            count if count < 0 => 0,
+            count => count as usize,
+        };
+    }
+    Ok(config)
+}
+
+/// Parse Caddy's `local_address` (network address syntax, default network `tcp`, port `0`).
+fn parse_local_address(value: &Value, path: &str) -> HttpResult<SocketAddr> {
+    let text = value
+        .as_str()
+        .ok_or_else(|| invalid(path, "`local_address` must be a string"))?;
+    parse_local_socket_addr(text).map_err(|message| invalid(path, message))
+}
+
+fn parse_local_socket_addr(text: &str) -> Result<SocketAddr, String> {
+    let (network, address) = match text.split_once('/') {
+        Some((network, rest)) if is_network_name(network) => (network, rest),
+        _ => ("tcp", text),
+    };
+    match network {
+        "tcp" | "tcp4" | "tcp6" => {}
+        "udp" | "udp4" | "udp6" => {
+            return Err("`local_address` must be a TCP address, not a UDP address".to_string())
+        }
+        other => {
+            return Err(format!(
+                "`local_address` network `{other}` is not supported by this build (supported: tcp, tcp4, tcp6)"
+            ))
+        }
+    }
+    let (host, port) = split_local_host_port(address)?;
+    if let Some(port) = &port {
+        if port.contains('-') {
+            return Err("`local_address` must be a single address, not a port range".to_string());
+        }
+    }
+    let port: u16 = match port {
+        None => 0,
+        Some(port) => port
+            .parse()
+            .map_err(|_| format!("`local_address` has an invalid port `{port}`"))?,
+    };
+    let ip: IpAddr = host.parse().map_err(|_| {
+        format!(
+            "`local_address` host `{host}` must be an IP address (host names are not supported by this build)"
+        )
+    })?;
+    match network {
+        "tcp4" if !ip.is_ipv4() => {
+            return Err(format!(
+                "`local_address` network `tcp4` requires an IPv4 address, got {ip}"
+            ))
+        }
+        "tcp6" if !ip.is_ipv6() => {
+            return Err(format!(
+                "`local_address` network `tcp6` requires an IPv6 address, got {ip}"
+            ))
+        }
+        _ => {}
+    }
+    Ok(SocketAddr::new(ip, port))
+}
+
+fn is_network_name(value: &str) -> bool {
+    matches!(
+        value,
+        "tcp" | "tcp4" | "tcp6" | "udp" | "udp4" | "udp6" | "unix" | "unixgram" | "unixpacket"
+    )
+}
+
+/// Split `host[:port]` or `[v6][:port]`, leaving the port as text so ranges can be rejected.
+fn split_local_host_port(value: &str) -> Result<(String, Option<String>), String> {
+    if let Some(rest) = value.strip_prefix('[') {
+        let (host, after) = rest
+            .split_once(']')
+            .ok_or_else(|| format!("invalid `local_address` `{value}`"))?;
+        let port = if after.is_empty() {
+            None
+        } else {
+            Some(
+                after
+                    .strip_prefix(':')
+                    .ok_or_else(|| format!("invalid `local_address` `{value}`"))?
+                    .to_string(),
+            )
+        };
+        return Ok((host.to_string(), port));
+    }
+    if let Ok(address) = value.parse::<SocketAddr>() {
+        return Ok((address.ip().to_string(), Some(address.port().to_string())));
+    }
+    if value.parse::<IpAddr>().is_ok() {
+        return Ok((value.to_string(), None));
+    }
+    match value.rsplit_once(':') {
+        Some((host, port)) => Ok((host.to_string(), Some(port.to_string()))),
+        None => Ok((value.to_string(), None)),
+    }
+}
+
+/// Parse Caddy's `resolver` object (`{"addresses": [...]}`) into a transport resolver.
+fn parse_transport_resolver(
+    value: &Value,
+    path: &str,
+    timeout: Duration,
+) -> HttpResult<TransportResolver> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| invalid(path, "`resolver` must be an object"))?;
+    let addresses_path = format!("{path}.addresses");
+    let addresses = object
+        .get("addresses")
+        .ok_or_else(|| invalid(&addresses_path, "`resolver.addresses` is required"))?
+        .as_array()
+        .ok_or_else(|| invalid(&addresses_path, "`resolver.addresses` must be an array"))?;
+    if addresses.is_empty() {
+        return Err(invalid(
+            &addresses_path,
+            "`resolver.addresses` must contain at least one resolver address",
+        ));
+    }
+    let mut parsed = Vec::with_capacity(addresses.len());
+    for address in addresses {
+        let address = address.as_str().ok_or_else(|| {
+            invalid(
+                &addresses_path,
+                "`resolver.addresses` entries must be strings",
+            )
+        })?;
+        parsed.push(
+            ResolverAddress::parse(address).map_err(|message| invalid(&addresses_path, message))?,
+        );
+    }
+    Ok(TransportResolver::new(parsed, timeout))
 }
 
 /// A Unix-socket upstream with TLS has no dial host for SNI/verification, so it must configure
@@ -4105,20 +4436,89 @@ mod tests {
 
     #[test]
     fn unsupported_transport_options_fail_loudly() {
+        // Knobs this build cannot honour faithfully stay loud, named errors with a tracking id.
+        for (field, value, tracking_id) in [
+            (
+                "write_buffer_size",
+                serde_json::json!(16384),
+                "PROXY-TRANSPORT-WRITE-BUFFER",
+            ),
+            (
+                "max_response_header_size",
+                serde_json::json!(1_048_576),
+                "PROXY-TRANSPORT-MAX-RESPONSE-HEADER",
+            ),
+            (
+                "expect_continue_timeout",
+                serde_json::json!(1_000_000_000),
+                "PROXY-TRANSPORT-EXPECT-CONTINUE",
+            ),
+            (
+                "read_timeout",
+                serde_json::json!(1_000_000_000),
+                "PROXY-TRANSPORT-RW-TIMEOUT",
+            ),
+            (
+                "write_timeout",
+                serde_json::json!(1_000_000_000),
+                "PROXY-TRANSPORT-RW-TIMEOUT",
+            ),
+            (
+                "network_proxy",
+                serde_json::json!({"from": "url", "url": "http://127.0.0.1:3128"}),
+                "PROXY-TRANSPORT-NETWORK-PROXY",
+            ),
+            (
+                "forward_proxy_url",
+                serde_json::json!("http://127.0.0.1:3128"),
+                "PROXY-TRANSPORT-NETWORK-PROXY",
+            ),
+        ] {
+            let error = ReverseProxyHandler::from_json(
+                &serde_json::json!({
+                    "handler": "reverse_proxy",
+                    "upstreams": [{"dial": "localhost:8080"}],
+                    "transport": {"protocol": "http", field: value}
+                }),
+                "handler",
+            )
+            .err()
+            .unwrap_or_else(|| panic!("`{field}` must fail loudly"));
+            assert!(
+                error.to_string().contains(tracking_id),
+                "`{field}`: {error}"
+            );
+            assert!(
+                error.to_string().contains(field),
+                "`{field}` error must name the option: {error}"
+            );
+        }
+
+        // Transparent compression (`compression: true`) is not implemented; `false` is exact
+        // because caddy-rs never adds `Accept-Encoding` or decompresses.
         let error = ReverseProxyHandler::from_json(
             &serde_json::json!({
                 "handler": "reverse_proxy",
-                "upstreams": [{"dial": "localhost:8443"}],
-                "transport": {"protocol": "http", "keep_alive": {"enabled": false}}
+                "upstreams": [{"dial": "localhost:8080"}],
+                "transport": {"protocol": "http", "compression": true}
             }),
             "handler",
         )
         .err()
-        .expect("unsupported transport option must fail");
+        .expect("compression: true must fail loudly");
         assert!(
-            error.to_string().contains("PROXY-TRANSPORT-KEEPALIVE"),
+            error.to_string().contains("PROXY-TRANSPORT-COMPRESSION"),
             "{error}"
         );
+        ReverseProxyHandler::from_json(
+            &serde_json::json!({
+                "handler": "reverse_proxy",
+                "upstreams": [{"dial": "localhost:8080"}],
+                "transport": {"protocol": "http", "compression": false}
+            }),
+            "handler",
+        )
+        .expect("compression: false matches the implemented behaviour");
     }
 
     #[test]
