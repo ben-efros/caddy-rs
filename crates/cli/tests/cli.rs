@@ -931,8 +931,11 @@ fn pki_list_names_the_directory_checked_when_empty() {
         stdout.contains(&empty.path().join("pki/authorities").display().to_string()),
         "empty listing must name the authorities directory checked:\n{stdout}"
     );
+    // The data directory is a prefix of the authorities path, so a contains() on the bare path
+    // would pass even if the "(data directory ...)" clause were missing. Assert the clause itself.
+    let expected_clause = format!("data directory `{}`", empty.path().display());
     assert!(
-        stdout.contains(&empty.path().display().to_string()),
+        stdout.contains(&expected_clause),
         "empty listing must name the data directory checked:\n{stdout}"
     );
 }
@@ -1661,6 +1664,42 @@ fn run_trust_with_fixture(
         String::from_utf8_lossy(&output.stdout).to_string(),
         String::from_utf8_lossy(&output.stderr).to_string(),
     )
+}
+
+#[cfg(unix)]
+#[test]
+fn trust_uses_the_shared_data_directory_resolution() {
+    // `trust` must resolve the data directory exactly like `run`/`pki`: with no `--data-dir`,
+    // Caddy's `AppDataDir()` ($XDG_DATA_HOME/caddy) is used, and a legacy `.caddy-rs` directory is
+    // only a fallback. Before T-CLI-011 trust kept the legacy resolver, so this test fails if the
+    // shared resolver is dropped.
+    let base = tempfile::tempdir().unwrap();
+    let xdg = base.path().join("xdg");
+    let data = xdg.join("caddy");
+    std::fs::create_dir_all(data.join("pki/authorities")).unwrap();
+    copy_fixture_cas(&data);
+    let fixture = trust_fixture(true);
+    let mut command = Command::new(binary());
+    command
+        .args(["trust", "--dry-run"])
+        .env("XDG_DATA_HOME", &xdg)
+        .env("HOME", &fixture.home)
+        .env("JAVA_HOME", &fixture.java_home)
+        .env("CADDY_RS_TRUST_PREFIX", &fixture.platform_prefix)
+        .env("PATH", fixture.bin.display().to_string());
+    let output = command.output().expect("run caddy-rs trust");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("root certificate:"),
+        "trust did not find the CA under $XDG_DATA_HOME/caddy:\n{stdout}\n{stderr}"
+    );
+    assert!(stdout.contains("no changes made (--dry-run)"), "{stdout}");
 }
 
 #[cfg(unix)]
