@@ -3305,6 +3305,205 @@ mod tests {
         assert_eq!(rendered["request"]["host"], ".a.b.");
     }
 
+    // ---- T-ADMIN-049: named captures, word boundaries and mixed expansion ----------------------
+
+    #[test]
+    fn regexp_filter_malformed_reference_parsing() {
+        // Divergences from Go's `Regexp.ReplaceAllString` for malformed references, with pattern
+        // `(a)` and input `a`. Go gives "", "", "${}", "${a b}" and "" respectively (U+00E9 counts
+        // as a Unicode reference name for Go); caddy-rs expands the numeric forms to group 1,
+        // drops the empty/space-containing braces, and leaves `$<letter>` literal. Registered as
+        // the DIV-0015 reference-parsing residual, so this asserts our side rather than Go's.
+        for (template, ours) in [
+            ("$01", "a"),
+            ("${01}", "a"),
+            ("${}", ""),
+            ("${a b}", ""),
+            ("$\u{e9}", "$\u{e9}"),
+        ] {
+            assert_eq!(
+                regexp_replace_all("(a)", template, "a"),
+                ours,
+                "caddy-rs expansion of `{template}` changed; see the DIV-0015 residual table"
+            );
+        }
+    }
+
+    #[test]
+    fn regexp_filter_named_captures_match_go() {
+        // Caddy's `regexp` filter calls Go's `Regexp.ReplaceAllString`, so the replacement
+        // expansion below is the reference behaviour. Every expected value was computed with the
+        // Go 1.26.4 oracle (`regexp.MustCompile(pattern).ReplaceAllString(input, replacement)`),
+        // not from the Rust engine.
+        assert_eq!(
+            regexp_replace_all("(?P<user>[a-z]+)", "$user", "alice"),
+            "alice"
+        );
+        assert_eq!(
+            regexp_replace_all("(?P<user>[a-z]+)", "${user}", "alice"),
+            "alice"
+        );
+        assert_eq!(
+            regexp_replace_all("(?P<user>[a-z]+)", "<${user}>", "alice bob"),
+            "<alice> <bob>"
+        );
+        assert_eq!(
+            regexp_replace_all(
+                "(?P<user>[a-z]+)@(?P<host>[a-z.]+)",
+                "$host/$user",
+                "alice@example.com bob@test.io"
+            ),
+            "example.com/alice test.io/bob"
+        );
+        assert_eq!(
+            regexp_replace_all(
+                "^(?P<method>[A-Z]+) (?P<path>\\S+)$",
+                "${method} ${path}",
+                "GET /x"
+            ),
+            "GET /x"
+        );
+        assert_eq!(
+            regexp_replace_all("(?P<word>[a-z]+)", "$word$word", "ab"),
+            "abab"
+        );
+        // A group that did not participate in the match expands to the empty string.
+        assert_eq!(
+            regexp_replace_all("(?P<a>foo)|(?P<b>bar)", "[$a|$b]", "foo bar"),
+            "[foo|] [|bar]"
+        );
+        // An unbraced `$name` consumes the longest run of word characters: `$userX` names the
+        // absent group `userX`, not `$user` followed by "X". Braces disambiguate the two, exactly
+        // like Go's `extract`.
+        assert_eq!(
+            regexp_replace_all("(?P<user>[a-z]+)", "$userX", "alice"),
+            ""
+        );
+        assert_eq!(
+            regexp_replace_all("(?P<user>[a-z]+)", "${user}X", "alice"),
+            "aliceX"
+        );
+        // `$$` is a literal `$`; the following `$x` is the named capture.
+        assert_eq!(regexp_replace_all("(?P<x>a)", "$$$x", "a"), "$a");
+        // An unknown group name expands to nothing but keeps the surrounding template text.
+        assert_eq!(
+            regexp_replace_all("(?P<user>[a-z]+)", "<${nope}>", "alice"),
+            "<>"
+        );
+    }
+
+    #[test]
+    fn regexp_filter_word_boundaries_match_go() {
+        // Go's `\b`/`\B` are ASCII word boundaries (word characters are `[0-9A-Za-z_]`). These
+        // ASCII inputs therefore exercise the same boundaries in the shared wrapper; the
+        // Unicode-aware class residual for non-ASCII input is the pre-existing DIV-0015 one.
+        assert_eq!(
+            regexp_replace_all("\\bfoo\\b", "X", "foo foe foo_bar barfoo foo"),
+            "X foe foo_bar barfoo X"
+        );
+        assert_eq!(
+            regexp_replace_all("\\bcat\\b", "CAT", "cat concatenate cat."),
+            "CAT concatenate CAT."
+        );
+        assert_eq!(
+            regexp_replace_all("\\b(?P<num>\\d+)\\b", "[${num}]", "a 12 b 345"),
+            "a [12] b [345]"
+        );
+        // Underscore is a word character, so `_word` and `word_` keep their underscores; only the
+        // bare token has a boundary on both sides.
+        assert_eq!(
+            regexp_replace_all("\\bword\\b", "WORD", "_word word word_"),
+            "_word WORD word_"
+        );
+        // A bare boundary is a zero-length match at every boundary position.
+        assert_eq!(regexp_replace_all("\\b", "|", "ab cd"), "|ab| |cd|");
+        assert_eq!(regexp_replace_all("\\B", "|", "ab cd"), "a|b c|d");
+    }
+
+    #[test]
+    fn regexp_filter_mixed_numeric_and_named_expansion_matches_go() {
+        // Numeric and named references address the same groups (group 1 is `user`), and a
+        // replacement may freely mix `$N`, `${N}`, `$name` and `${name}`.
+        assert_eq!(
+            regexp_replace_all(
+                "^(?P<user>[a-z]+)/(\\d+)/(?P<rest>.*)$",
+                "${2}-$user-${rest}-$1",
+                "alice/42/x/y"
+            ),
+            "42-alice-x/y-alice"
+        );
+        assert_eq!(
+            regexp_replace_all(
+                "(?P<first>\\w+)\\s+(?P<last>\\w+)",
+                "$2, $1",
+                "Ada Lovelace"
+            ),
+            "Lovelace, Ada"
+        );
+        assert_eq!(
+            regexp_replace_all("(?P<a>a)(b)(?P<c>c)", "<${a}-$2-${c}>", "abcz"),
+            "<a-b-c>z"
+        );
+        assert_eq!(
+            regexp_replace_all("(?P<id>\\d+)-(\\d+)", "$id/$2", "12-34"),
+            "12/34"
+        );
+        assert_eq!(
+            regexp_replace_all("(?P<a>a)(b)(c)", "$1${2}$3", "abc"),
+            "abc"
+        );
+    }
+
+    #[test]
+    fn regexp_and_multi_regexp_filters_apply_named_captures_and_word_boundaries() {
+        // The end-to-end filter path: `regexp` rewrites the URI with named captures,
+        // `multi_regexp` applies a named-capture rewrite followed by a `\b`-anchored one, and a
+        // second `regexp` mixes numeric and named references. Expected values are Go 1.26.4
+        // `ReplaceAllString` outputs.
+        let config = AccessLogConfig {
+            filters: vec![
+                FieldFilter {
+                    path: vec!["request".to_string(), "uri".to_string()],
+                    operation: FieldFilterOperation::Regexp {
+                        pattern: "^/api/v(?P<version>\\d+)/users/(?P<id>\\d+)$".to_string(),
+                        replacement: "/v${version}/u/${id}".to_string(),
+                    },
+                },
+                FieldFilter {
+                    path: vec!["request".to_string(), "host".to_string()],
+                    operation: FieldFilterOperation::MultiRegexp {
+                        operations: vec![
+                            RegexpOperation {
+                                pattern: "^(?P<sub>[a-z0-9-]+)\\.example\\.com$".to_string(),
+                                replacement: "$sub.internal".to_string(),
+                            },
+                            RegexpOperation {
+                                pattern: "\\b(?P<env>internal)\\b".to_string(),
+                                replacement: "${env}.test".to_string(),
+                            },
+                        ],
+                    },
+                },
+                FieldFilter {
+                    path: vec!["user_id".to_string()],
+                    operation: FieldFilterOperation::Regexp {
+                        pattern: "^(?P<role>admin)_(\\w+)$".to_string(),
+                        replacement: "${2}:$role".to_string(),
+                    },
+                },
+            ],
+            ..AccessLogConfig::default()
+        };
+        let mut entry = AccessLogEntry::new(AccessLogRequest::default());
+        entry.request.uri = "/api/v2/users/42".to_string();
+        entry.request.host = "api.example.com".to_string();
+        entry.user_id = "admin_read".to_string();
+        let rendered = entry.render(&config).expect("render");
+        assert_eq!(rendered["request"]["uri"], "/v2/u/42");
+        assert_eq!(rendered["request"]["host"], "api.internal.test");
+        assert_eq!(rendered["user_id"], "read:admin");
+    }
+
     #[test]
     fn encoder_format_options_apply_to_json_rendering() {
         let config = AccessLogConfig {
