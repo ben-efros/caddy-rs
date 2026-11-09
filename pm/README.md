@@ -10,6 +10,7 @@ This is the proxy-manager foundation workspace. It is deliberately independent o
 | `caddy-rs-pm-compiler` | Deterministic Caddy JSON route compiler for proxy/redirect/dead hosts; emits HTTP and HTTPS route lists, HSTS and forced-SSL redirects. No listeners, TLS automation or key material. |
 | `caddy-rs-pm-hosts` | Durable host repository over `pm-state`: get/list/create/update/delete with CAS revisions, atomic domain-index uniqueness, next-id reservation, and memory/snapshot backend tests. |
 | `caddy-rs-pm-service` | Application service over `pm-hosts`: id-allocating create, CAS update/delete, list, and route compilation. No REST API, UI, auth or certificate policy loading. |
+| `caddy-rs-pm-policies` | Durable auto-certificate policy repository over `pm-state`: get/list/create/update/delete with CAS revisions, tombstones, monotonic id reservation and host coverage validation against `pm-core` hosts. |
 
 ## Why a nested workspace
 
@@ -123,6 +124,26 @@ whole host. Structure validation stays in the repository. This crate does **not*
 or auto policies and does not expose REST/UI/auth, so a caller using `Manual`, `AcmeConfigured`,
 `InternalCa` or `Auto` TLS must load the referenced object and run `Host::validate` before a
 mutation; the structural check cannot prove existence or domain coverage.
+## `pm-policies`
+
+`PolicyRepository` persists validated `AutoCertificatePolicy` documents in the same `pm-state`
+store, one `pm.policies` document per policy:
+
+- `create` validates the policy, rejects a duplicate or retired id, and writes the document in one
+  transaction;
+- `update` requires the caller's revision and commits under a compare-and-swap;
+- `delete` requires the revision and writes a `pm.policy-tombstones` marker, so a policy id is never
+  reused;
+- `next_id` reserves a monotonic id from a counter persisted in `pm.meta`, skipping existing and
+  retired ids. Arithmetic is checked, so a counter at `u64::MAX` fails with `IdExhausted` instead of
+  overflowing;
+- `get`, `list`, `snapshot_policies`;
+- `validate_policy_coverage(policy, &[Host])` checks only hosts bound with `TlsMode::Auto` to that
+  policy and reports the uncovered domains together with the affected host ids; manual/ACME/CA and
+  disabled hosts are ignored.
+
+The repository is persistence only and does not depend on `pm-hosts`; coverage reads `pm-core`
+`Host` values directly.
 
 ## Commands
 

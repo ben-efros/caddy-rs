@@ -6,6 +6,7 @@ members = [
     "crates/pm-compiler",
     "crates/pm-hosts",
     "crates/pm-service",
+    "crates/pm-policies",
 ]
 
 [workspace.package]
