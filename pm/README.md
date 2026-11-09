@@ -95,8 +95,9 @@ changing host semantics.
   one transaction;
 - `update` requires the caller's revision, checks added domains, releases removed domains and
   commits atomically;
-- `delete` requires the revision and refuses an index owned by another host;
-- `next_id` reserves a monotonic id in the same store;
+- `delete` requires the revision, refuses an index owned by another host, and leaves a tombstone so
+  the id is never reused;
+- `next_id` reserves a monotonic id in the same store, skipping existing and retired ids;
 - `get`, `list`, `snapshot_hosts`, `domain_owner`.
 
 The repository validates `Host::validate_structure` before writing. It does **not** load certificate

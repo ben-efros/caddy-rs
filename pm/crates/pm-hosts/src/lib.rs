@@ -20,6 +20,7 @@ use thiserror::Error;
 
 const HOSTS: &str = "pm.hosts";
 const DOMAINS: &str = "pm.host-domains";
+const TOMBSTONES: &str = "pm.host-tombstones";
 const META: &str = "pm.meta";
 const NEXT_ID: &str = "next-host-id";
 
@@ -50,6 +51,8 @@ pub enum HostError {
     DomainInUse(String),
     #[error("host {0} already exists")]
     AlreadyExists(u64),
+    #[error("host id {0} was retired and cannot be reused")]
+    IdRetired(u64),
     #[error("invalid stored host document: {0}")]
     InvalidDocument(String),
 }
@@ -113,9 +116,18 @@ impl HostRepository {
     /// id and every domain index are written in one transaction.
     pub fn create(&self, host: Host) -> Result<StoredHost, HostError> {
         host.validate_structure()?;
+        if self
+            .store
+            .get(TOMBSTONES, &host.id.0.to_string())?
+            .is_some()
+        {
+            return Err(HostError::IdRetired(host.id.0));
+        }
         let domains = host.normalized_domains()?;
         let value = serde_json::to_value(&host)?;
-        let mut transaction = Transaction::new().check_missing(HOSTS, host.id.0.to_string());
+        let mut transaction = Transaction::new()
+            .check_missing(HOSTS, host.id.0.to_string())
+            .check_missing(TOMBSTONES, host.id.0.to_string());
         for domain in &domains {
             transaction = transaction.check_missing(DOMAINS, domain.clone());
         }
@@ -196,7 +208,9 @@ impl HostRepository {
             transaction = transaction.check_revision(DOMAINS, domain.clone(), document.revision);
             transaction = transaction.delete(DOMAINS, domain);
         }
-        transaction = transaction.delete(HOSTS, id.0.to_string());
+        transaction = transaction
+            .put(TOMBSTONES, id.0.to_string(), json!({ "host_id": id.0 }))
+            .delete(HOSTS, id.0.to_string());
         self.store.transact(transaction)?;
         Ok(())
     }
@@ -208,15 +222,22 @@ impl HostRepository {
         for _ in 0..8 {
             let snapshot = self.store.snapshot()?;
             let document = snapshot.get(META, NEXT_ID);
-            let next = document
+            let counter = document
                 .and_then(|document| document.value.as_u64())
                 .unwrap_or(1);
+            let highest = max_numeric_key(&snapshot, HOSTS)
+                .max(max_numeric_key(&snapshot, TOMBSTONES))
+                .unwrap_or(0);
+            let next = counter.max(highest.saturating_add(1)).max(1);
             let mut transaction = Transaction::new();
             transaction = match document {
                 Some(document) => transaction.check_revision(META, NEXT_ID, document.revision),
                 None => transaction.check_missing(META, NEXT_ID),
             };
-            transaction = transaction.put(META, NEXT_ID, json!(next + 1));
+            transaction = transaction
+                .check_missing(HOSTS, next.to_string())
+                .check_missing(TOMBSTONES, next.to_string())
+                .put(META, NEXT_ID, json!(next + 1));
             match self.store.transact(transaction) {
                 Ok(_) => return Ok(next),
                 Err(StateError::Conflict { .. }) => continue,
@@ -227,6 +248,14 @@ impl HostRepository {
             "host id counter is contended".to_string(),
         )))
     }
+}
+
+fn max_numeric_key(snapshot: &caddy_rs_pm_state::Snapshot, namespace: &str) -> Option<u64> {
+    snapshot
+        .scan(namespace, "")
+        .iter()
+        .filter_map(|document| document.key.parse::<u64>().ok())
+        .max()
 }
 
 fn decode_host(document: Document) -> Result<StoredHost, HostError> {
@@ -392,6 +421,93 @@ mod tests {
         assert_eq!(repo.next_id().expect("first"), 1);
         assert_eq!(repo.next_id().expect("second"), 2);
         assert_eq!(repo.next_id().expect("third"), 3);
+    }
+
+    #[test]
+    fn next_id_skips_existing_and_retired_ids() {
+        let repo = repo();
+        repo.create(proxy(1, &["one.example.com"])).expect("create");
+        assert_eq!(repo.next_id().expect("next"), 2);
+        repo.create(proxy(2, &["two.example.com"])).expect("create");
+        assert_eq!(repo.next_id().expect("next"), 3);
+        repo.delete(HostId(2), 1).expect("delete");
+        assert_eq!(repo.next_id().expect("after delete"), 4);
+    }
+
+    #[test]
+    fn next_id_survives_a_snapshot_reopen() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("pm-state.json");
+        {
+            let repo = HostRepository::new(Arc::new(
+                caddy_rs_pm_state::SnapshotStore::open(&path).expect("open"),
+            ));
+            assert_eq!(repo.next_id().expect("first"), 1);
+            assert_eq!(repo.next_id().expect("second"), 2);
+        }
+        let repo = HostRepository::new(Arc::new(
+            caddy_rs_pm_state::SnapshotStore::open(&path).expect("reopen"),
+        ));
+        assert_eq!(repo.next_id().expect("after reopen"), 3);
+    }
+
+    #[test]
+    fn retired_host_id_cannot_be_reused() {
+        let repo = repo();
+        let created = repo.create(proxy(1, &["one.example.com"])).expect("create");
+        repo.delete(HostId(1), created.revision).expect("delete");
+        assert!(matches!(
+            repo.create(proxy(1, &["one.example.com"])),
+            Err(HostError::IdRetired(1))
+        ));
+    }
+
+    #[test]
+    fn update_rejects_a_domain_owned_by_another_host_without_mutating() {
+        let repo = repo();
+        let first = repo.create(proxy(1, &["one.example.com"])).expect("create");
+        let second = repo.create(proxy(2, &["two.example.com"])).expect("create");
+        let mut candidate = second.host.clone();
+        candidate.domains.push("one.example.com".to_string());
+        assert!(matches!(
+            repo.update(candidate, second.revision),
+            Err(HostError::State(StateError::Conflict { .. }))
+        ));
+        assert_eq!(
+            repo.get(HostId(1)).expect("get").expect("present").revision,
+            first.revision
+        );
+        assert_eq!(
+            repo.get(HostId(2))
+                .expect("get")
+                .expect("present")
+                .host
+                .domains,
+            vec!["two.example.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn delete_refuses_a_domain_index_owned_by_another_host() {
+        let store = Arc::new(MemoryStore::default());
+        let repo = HostRepository::new(Arc::clone(&store) as Arc<dyn StateStore>);
+        repo.create(proxy(1, &["one.example.com"])).expect("create");
+        let second = repo.create(proxy(2, &["two.example.com"])).expect("create");
+        let owner = store
+            .get(DOMAINS, "two.example.com")
+            .expect("get")
+            .expect("present");
+        store
+            .transact(
+                Transaction::new()
+                    .check_revision(DOMAINS, "two.example.com", owner.revision)
+                    .put(DOMAINS, "two.example.com", json!({ "host_id": 1 })),
+            )
+            .expect("rewrite index");
+        assert!(matches!(
+            repo.delete(HostId(2), second.revision),
+            Err(HostError::DomainInUse(domain)) if domain == "two.example.com"
+        ));
     }
 
     #[test]
