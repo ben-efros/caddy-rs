@@ -1,0 +1,19 @@
+{
+	"sans": [
+		"acme-metadata.pebble.test"
+	],
+	"issuer_data": {
+		"url": "https://127.0.0.1:14000/certZ/6ff5c62f807e373d",
+		"ca": "https://127.0.0.1:14000/dir",
+		"account": "https://127.0.0.1:14000/my-account/6a6c7b104c35bf51",
+		"renewal_info": {
+			"suggestedWindow": {
+				"start": "2027-01-07T22:24:33Z",
+				"end": "2027-01-09T22:24:33Z"
+			},
+			"_uniqueIdentifier": "HUs42kCEEnTySLdsFZee9Zyc73E.b_XGL4B-Nz0",
+			"_retryAfter": "2026-11-09T20:24:34.533380417-08:00",
+			"_selectedTime": "2027-01-09T04:31:31Z"
+		}
+	}
+}

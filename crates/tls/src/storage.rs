@@ -13,8 +13,8 @@
 //! ```text
 //! <root>/certificates/<issuer-key>/<name>/<name>.crt   full PEM chain, leaf first
 //! <root>/certificates/<issuer-key>/<name>/<name>.key   PEM private key
-//! <root>/certificates/<issuer-key>/<name>/<name>.json  CertMagic metadata
-//!                                                  (`{"sans": [...], "issuer_data": {...}}`)
+//! <root>/certificates/<issuer-key>/<name>/<name>.json  CertMagic `CertificateResource`
+//!                                                  metadata (see below)
 //! ```
 //!
 //! `<issuer-key>` identifies the issuing CA rather than the issuer module name (Caddy's
@@ -32,10 +32,53 @@
 //! On load, the domains come from the CertMagic `.json` metadata when present (falling back to the
 //! directory name) and `not_after_unix` is recovered from the leaf certificate's validity period.
 //! PEM strings returned by [`FileStorage`] are normalised: one block per entry, no trailing
-//! newline. CertMagic's opaque `issuer_data` (ACME certificate URL/CA/account and ARI info) and
-//! any unknown metadata fields are preserved when a certificate is rewritten, and the metadata is
-//! serialised in CertMagic's tab-indented `sans`-then-`issuer_data` shape without a trailing
 //! newline.
+//!
+//! # CertMagic metadata document (`CertificateResource`)
+//!
+//! CertMagic serialises `CertificateResource` with `json.MarshalIndent(cert, "", "\t")`
+//! (`certmagic/crypto.go:147-149`). The Go struct (`certmagic/certmagic.go:401-419`) has exactly
+//! two JSON fields, in this order:
+//!
+//! ```json
+//! {
+//!     "sans": ["example.com"],
+//!     "issuer_data": {
+//!         "url": "https://acme.test/certificate/1",
+//!         "ca": "https://acme.test/directory",
+//!         "account": "https://acme.test/account/1",
+//!         "renewal_info": {
+//!             "suggestedWindow": {
+//!                 "start": "2027-01-07T22:19:39Z",
+//!                 "end": "2027-01-09T22:19:39Z"
+//!             },
+//!             "explanationURL": "https://example.test/why",
+//!             "_uniqueIdentifier": "JBtT3CKXUylISOQIUeqByyeDUEg.CNEAsJavqfI",
+//!             "_retryAfter": "2026-11-09T20:19:40.546459079-08:00",
+//!             "_selectedTime": "2027-01-08T21:30:28Z"
+//!         }
+//!     }
+//! }
+//! ```
+//!
+//! * `sans` is a Go `[]string` with `omitempty`, so an empty name set omits the key.
+//! * `issuer_data` is a Go `json.RawMessage` with `omitempty`. CertMagic fills it with
+//!   `json.Marshal(issuedCert.Metadata)` (`certmagic/config.go:784-791`); a nil metadata value
+//!   marshals to the four bytes `null`, so the key is present (with value `null`) even for issuers
+//!   that supply no metadata (for example the internal CA). An ACME certificate's `issuer_data` is
+//!   acmez's `acme.Certificate` (`mholt/acmez/v3/acme/certificate.go:34-64`): `url` (always
+//!   written), `ca`, `account` and `renewal_info`.
+//! * `renewal_info` is acmez's `acme.RenewalInfo` (`mholt/acmez/v3/acme/ari.go:40-89`):
+//!   `suggestedWindow` (always written) with `start`/`end` RFC 3339 timestamps, `explanationURL`,
+//!   `_uniqueIdentifier` (the ARI certificate identifier), `_retryAfter` and `_selectedTime` (the
+//!   selected renewal time, always written by Go's marshaller).
+//!
+//! [`FileStorage`] reproduces that document exactly: Go field order at every level, tab
+//! indentation, no trailing newline, `null` for absent `issuer_data`, and unknown fields preserved
+//! at the top level and inside `issuer_data`, `renewal_info` and `suggestedWindow`. A `.json`
+//! written by a real Caddy data directory therefore round-trips byte-for-byte through a caddy-rs
+//! rewrite. caddy-rs does not synthesise ARI: `renewal_info` is persisted when the issuer supplies
+//! it, and the ACME issuer currently supplies `url`/`ca`/`account`.
 //!
 //! # Divergences from CertMagic (T-TLS-068)
 //!
@@ -48,10 +91,9 @@
 //! * **Account JSON:** accounts live at CertMagic's `acme/<ca-dir>/users/<user>/account.{key,json}`
 //!   paths, but the JSON body is caddy-rs's own `StoredAccount` serialisation (it is not
 //!   byte-compatible with certmagic's Go `Account` JSON); the account key is PKCS#8 PEM.
-//! * **Certificate metadata:** the `.json` shape matches CertMagic's `CertificateResource` field
-//!   names (`sans`, `issuer_data`) and tab indentation, but caddy-rs does not synthesise the ARI
-//!   `renewal_info`/`unique_id` fields itself; opaque `issuer_data` provided by the issuer is
-//!   preserved verbatim and unknown metadata fields survive rewrites.
+//! * **Certificate metadata:** the `.json` document is byte-compatible with CertMagic's
+//!   `CertificateResource` as described above (T-TLS-084, closes the DIV-0051 storage-format gap);
+//!   ARI generation at issuance remains a residual, not a serialisation difference.
 //! * **`apps.tls.storage`:** upstream Caddy v2.11.7 has no such field; storage is selected by the
 //!   top-level `storage` module and per-automation-policy `apps.tls.automation.policies[].storage`.
 //!   This build wires the top-level module; per-policy storage is a located unsupported error
@@ -66,6 +108,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use base64::Engine as _;
+use serde::ser::SerializeMap as _;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 
@@ -303,8 +346,9 @@ impl CertificateStorage for FileStorage {
         restrict_private_key_permissions(&paths.private_key).await;
 
         // CertMagic serialises `CertificateResource` with `json.MarshalIndent(cert, "", "\t")`:
-        // tab indentation, struct field order (`sans`, then `issuer_data`), no trailing newline.
-        // Preserve any unknown metadata fields after those.
+        // tab indentation, Go struct field order (`sans`, then `issuer_data`), no trailing
+        // newline. `issuer_data` is always present (`null` when the issuer supplied no metadata)
+        // and unknown fields at every level are preserved after the known ones.
         let data = serialize_certificate_metadata(
             &certificate.domains,
             certificate.issuer_data.as_ref(),
@@ -401,9 +445,12 @@ impl<T: CertificateStorage + ?Sized> CertificateStorage for Arc<T> {
 
 /// Metadata file written by CertMagic alongside `<name>.crt` / `<name>.key`.
 ///
-/// CertMagic's JSON has `sans` and an opaque `issuer_data` object (for ACME: certificate URL,
-/// CA directory and account URL, optionally ARI renewal info). Unknown fields are preserved on
-/// rewrite so a newer Caddy metadata key survives a caddy-rs renewal.
+/// This is CertMagic's `CertificateResource` (`certmagic/certmagic.go:401-419`): `sans`, then
+/// `issuer_data` (for ACME the `acme.Certificate` document including optional ARI
+/// `renewal_info`). A JSON `null` `issuer_data` — what CertMagic writes for an issuer that
+/// supplies no metadata, such as the internal CA — decodes to `None`. Unknown fields are
+/// preserved at every level so a metadata document written by a newer Caddy survives a caddy-rs
+/// rewrite.
 #[derive(Debug, Deserialize)]
 pub(crate) struct CaddyCertificateMetadata {
     #[serde(default)]
@@ -416,8 +463,119 @@ pub(crate) struct CaddyCertificateMetadata {
     pub(crate) extra: BTreeMap<String, serde_json::Value>,
 }
 
-/// Serialize CertMagic's `CertificateResource` metadata exactly as the file-system backend does:
-/// tab-indented `sans` then opaque `issuer_data` (and preserved unknown fields), no trailing
+/// Go struct field order of acmez's `acme.Certificate`
+/// (`mholt/acmez/v3@v3.1.7/acme/certificate.go:34-64`).
+const ACME_CERTIFICATE_FIELDS: &[&str] = &["url", "ca", "account", "renewal_info"];
+
+/// Go struct field order of acmez's `acme.RenewalInfo`
+/// (`mholt/acmez/v3@v3.1.7/acme/ari.go:40-89`).
+const RENEWAL_INFO_FIELDS: &[&str] = &[
+    "suggestedWindow",
+    "explanationURL",
+    "_uniqueIdentifier",
+    "_retryAfter",
+    "_selectedTime",
+];
+
+/// Go struct field order of the `suggestedWindow` object (`ari.go:45-50`).
+const SUGGESTED_WINDOW_FIELDS: &[&str] = &["start", "end"];
+
+/// One of the Go structs nested inside a `CertificateResource` metadata document.
+#[derive(Clone, Copy)]
+enum CertMagicObject {
+    AcmeCertificate,
+    RenewalInfo,
+    SuggestedWindow,
+}
+
+impl CertMagicObject {
+    /// Go struct field order for this object.
+    fn fields(self) -> &'static [&'static str] {
+        match self {
+            Self::AcmeCertificate => ACME_CERTIFICATE_FIELDS,
+            Self::RenewalInfo => RENEWAL_INFO_FIELDS,
+            Self::SuggestedWindow => SUGGESTED_WINDOW_FIELDS,
+        }
+    }
+
+    /// The object's field for `key`, when that field is itself an ordered Go struct.
+    fn child(self, key: &str) -> Option<Self> {
+        match (self, key) {
+            (Self::AcmeCertificate, "renewal_info") => Some(Self::RenewalInfo),
+            (Self::RenewalInfo, "suggestedWindow") => Some(Self::SuggestedWindow),
+            _ => None,
+        }
+    }
+}
+
+/// Serialise a metadata value in Go struct order, keeping unknown keys after the known ones.
+struct CertMagicValue<'a> {
+    value: &'a serde_json::Value,
+    object: CertMagicObject,
+}
+
+impl Serialize for CertMagicValue<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let serde_json::Value::Object(map) = self.value else {
+            // A non-object value (for example `null`) is preserved verbatim.
+            return self.value.serialize(serializer);
+        };
+        let fields = self.object.fields();
+        let mut object = serializer.serialize_map(Some(map.len()))?;
+        for field in fields {
+            if let Some(value) = map.get(*field) {
+                match self.object.child(field) {
+                    Some(child) => object.serialize_entry(
+                        field,
+                        &CertMagicValue {
+                            value,
+                            object: child,
+                        },
+                    )?,
+                    None => object.serialize_entry(field, value)?,
+                }
+            }
+        }
+        for (key, value) in map {
+            if !fields.contains(&key.as_str()) {
+                object.serialize_entry(key, value)?;
+            }
+        }
+        object.end()
+    }
+}
+
+/// Serialise `issuer_data` the way Go marshals a `json.RawMessage`: a missing/nil value becomes
+/// `null` (CertMagic marshals a nil `IssuedCertificate.Metadata` to `null` before storing it), and
+/// object keys follow acmez's Go struct order with unknown keys preserved.
+fn serialize_issuer_data<S>(
+    issuer_data: &Option<&serde_json::Value>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match issuer_data {
+        Some(value) => CertMagicValue {
+            value,
+            object: CertMagicObject::AcmeCertificate,
+        }
+        .serialize(serializer),
+        None => serializer.serialize_none(),
+    }
+}
+
+/// Go `omitempty` for a `[]string` field: an empty SAN list omits `sans`.
+fn sans_is_empty(sans: &&[String]) -> bool {
+    sans.is_empty()
+}
+
+/// Serialize CertMagic's `CertificateResource` metadata exactly as CertMagic's file-system
+/// backend does: tab-indented Go field order (`sans` then `issuer_data`), `issuer_data` always
+/// present (`null` when there is none), unknown fields preserved at every level, no trailing
 /// newline. Shared with the S3-compatible backend (T-TLS-022).
 pub(crate) fn serialize_certificate_metadata(
     domains: &[String],
@@ -426,8 +584,9 @@ pub(crate) fn serialize_certificate_metadata(
 ) -> Result<Vec<u8>> {
     #[derive(Serialize)]
     struct CertMagicMetadata<'a> {
+        #[serde(skip_serializing_if = "sans_is_empty")]
         sans: &'a [String],
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(serialize_with = "serialize_issuer_data")]
         issuer_data: Option<&'a serde_json::Value>,
         #[serde(flatten)]
         extra: &'a BTreeMap<String, serde_json::Value>,
@@ -1388,7 +1547,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writes_certmagic_metadata_with_issuer_data_and_preserves_unknown_fields() {
+    async fn writes_full_certmagic_certificate_resource_and_preserves_unknown_fields() {
         let temporary = tempfile::tempdir().unwrap();
         let storage = FileStorage::new(temporary.path());
         let stored = StoredCertificate {
@@ -1399,7 +1558,20 @@ mod tests {
             issuer_data: Some(serde_json::json!({
                 "url": "https://acme.test/certificate/1",
                 "ca": "https://acme.test/directory",
-                "account": "https://acme.test/account/1"
+                "account": "https://acme.test/account/1",
+                "renewal_info": {
+                    "suggestedWindow": {
+                        "start": "2027-01-07T22:19:39Z",
+                        "end": "2027-01-09T22:19:39Z",
+                        "future_window": 7
+                    },
+                    "explanationURL": "https://acme.test/why",
+                    "_uniqueIdentifier": "JBtT3CKXUylISOQIUeqByyeDUEg.CNEAsJavqfI",
+                    "_retryAfter": "2026-11-09T20:19:40.546459079-08:00",
+                    "_selectedTime": "2027-01-08T21:30:28Z",
+                    "future_ari": "kept"
+                },
+                "future_issuer": "kept"
             })),
             metadata_extra: BTreeMap::from([(
                 "future_field".to_string(),
@@ -1415,11 +1587,41 @@ mod tests {
             .join(caddy_certificate_storage_name("example.com"))
             .join("example.com.json");
         let metadata = std::fs::read_to_string(&metadata_path).unwrap();
-        // CertMagic uses `json.MarshalIndent(cert, "", "\t")`: tab indentation, `sans` first,
-        // then `issuer_data`, no trailing newline. The opaque issuer_data object's keys are sorted
-        // by serde_json's map, which is semantically identical JSON.
-        let expected = "{\n\t\"sans\": [\n\t\t\"example.com\",\n\t\t\"www.example.com\"\n\t],\n\t\"issuer_data\": {\n\t\t\"account\": \"https://acme.test/account/1\",\n\t\t\"ca\": \"https://acme.test/directory\",\n\t\t\"url\": \"https://acme.test/certificate/1\"\n\t},\n\t\"future_field\": \"kept\"\n}";
+        // CertMagic uses `json.MarshalIndent(cert, "", "\t")`: tab indentation, Go struct field
+        // order, no trailing newline. The ACME `issuer_data` object follows acmez's
+        // `acme.Certificate` order (`url`, `ca`, `account`, `renewal_info`) and `renewal_info`
+        // follows `acme.RenewalInfo` order (`suggestedWindow`, `explanationURL`,
+        // `_uniqueIdentifier`, `_retryAfter`, `_selectedTime`); unknown fields stay after the
+        // known fields at every level.
+        let expected = concat!(
+            "{\n",
+            "\t\"sans\": [\n\t\t\"example.com\",\n\t\t\"www.example.com\"\n\t],\n",
+            "\t\"issuer_data\": {\n",
+            "\t\t\"url\": \"https://acme.test/certificate/1\",\n",
+            "\t\t\"ca\": \"https://acme.test/directory\",\n",
+            "\t\t\"account\": \"https://acme.test/account/1\",\n",
+            "\t\t\"renewal_info\": {\n",
+            "\t\t\t\"suggestedWindow\": {\n",
+            "\t\t\t\t\"start\": \"2027-01-07T22:19:39Z\",\n",
+            "\t\t\t\t\"end\": \"2027-01-09T22:19:39Z\",\n",
+            "\t\t\t\t\"future_window\": 7\n",
+            "\t\t\t},\n",
+            "\t\t\t\"explanationURL\": \"https://acme.test/why\",\n",
+            "\t\t\t\"_uniqueIdentifier\": \"JBtT3CKXUylISOQIUeqByyeDUEg.CNEAsJavqfI\",\n",
+            "\t\t\t\"_retryAfter\": \"2026-11-09T20:19:40.546459079-08:00\",\n",
+            "\t\t\t\"_selectedTime\": \"2027-01-08T21:30:28Z\",\n",
+            "\t\t\t\"future_ari\": \"kept\"\n",
+            "\t\t},\n",
+            "\t\t\"future_issuer\": \"kept\"\n",
+            "\t},\n",
+            "\t\"future_field\": \"kept\"\n",
+            "}"
+        );
         assert_eq!(metadata, expected);
+        assert!(
+            !metadata.ends_with('\n'),
+            "CertMagic metadata has no trailing newline"
+        );
 
         let loaded = storage
             .load(key)
@@ -1434,6 +1636,117 @@ mod tests {
         // Rewriting the loaded record keeps the CertMagic metadata byte-for-byte.
         storage.store(key, &loaded).await.unwrap();
         assert_eq!(std::fs::read_to_string(&metadata_path).unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn writes_null_issuer_data_for_issuers_without_metadata_like_caddy() {
+        let temporary = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(temporary.path());
+        // The internal issuer supplies no `IssuedCertificate.Metadata`, which CertMagic marshals
+        // as `null`; the pinned Caddy v2.11.9 oracle writes exactly this document for an internal
+        // certificate.
+        let certificate = fixture_certificate();
+        storage
+            .store("local/example.com", &certificate)
+            .await
+            .unwrap();
+        let metadata_path = temporary
+            .path()
+            .join("certificates")
+            .join("local")
+            .join("example.com")
+            .join("example.com.json");
+        let metadata = std::fs::read_to_string(&metadata_path).unwrap();
+        let expected = concat!(
+            "{\n",
+            "\t\"sans\": [\n\t\t\"example.com\",\n\t\t\"www.example.com\"\n\t],\n",
+            "\t\"issuer_data\": null\n",
+            "}"
+        );
+        assert_eq!(metadata, expected);
+        let loaded = storage
+            .load("local/example.com")
+            .await
+            .unwrap()
+            .expect("stored certificate");
+        assert_eq!(loaded.issuer_data, None);
+        assert!(loaded.metadata_extra.is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_certificate_metadata_loads_documented_defaults() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary
+            .path()
+            .join(CERTIFICATES_DIRECTORY)
+            .join("local")
+            .join("example.com");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("example.com.crt"),
+            fixture_chain().join("\n"),
+        )
+        .unwrap();
+        std::fs::write(directory.join("example.com.key"), fixture_key()).unwrap();
+
+        let storage = FileStorage::new(temporary.path());
+        let loaded = storage
+            .load("local/example.com")
+            .await
+            .unwrap()
+            .expect("certificate without metadata loads");
+        // Documented defaults: the directory name is the SAN set, there is no issuer metadata and
+        // no unknown fields, and the metadata is re-created in Caddy's shape on rewrite.
+        assert_eq!(loaded.domains, vec!["example.com".to_string()]);
+        assert_eq!(loaded.issuer_data, None);
+        assert!(loaded.metadata_extra.is_empty());
+        storage.store("local/example.com", &loaded).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(directory.join("example.com.json")).unwrap(),
+            "{\n\t\"sans\": [\n\t\t\"example.com\"\n\t],\n\t\"issuer_data\": null\n}"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_certificate_metadata_loads_documented_defaults() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary
+            .path()
+            .join(CERTIFICATES_DIRECTORY)
+            .join("local")
+            .join("example.com");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("example.com.crt"),
+            fixture_chain().join("\n"),
+        )
+        .unwrap();
+        std::fs::write(directory.join("example.com.key"), fixture_key()).unwrap();
+
+        let storage = FileStorage::new(temporary.path());
+        // Sans-only (the pre-T-TLS-084 caddy-rs shape): no issuer_data key.
+        std::fs::write(
+            directory.join("example.com.json"),
+            "{\"sans\":[\"example.com\",\"www.example.com\"]}",
+        )
+        .unwrap();
+        let loaded = storage.load("local/example.com").await.unwrap().unwrap();
+        assert_eq!(loaded.domains, vec!["example.com", "www.example.com"]);
+        assert_eq!(loaded.issuer_data, None);
+        assert!(loaded.metadata_extra.is_empty());
+
+        // Issuer-data-only: the SAN set falls back to the directory name.
+        std::fs::write(
+            directory.join("example.com.json"),
+            r#"{"issuer_data":{"url":"https://acme.test/cert/1"}}"#,
+        )
+        .unwrap();
+        let loaded = storage.load("local/example.com").await.unwrap().unwrap();
+        assert_eq!(loaded.domains, vec!["example.com".to_string()]);
+        assert_eq!(
+            loaded.issuer_data,
+            Some(serde_json::json!({"url": "https://acme.test/cert/1"}))
+        );
     }
 
     #[test]
@@ -1524,7 +1837,7 @@ mod tests {
     }
 
     #[test]
-    fn certmagic_certificate_metadata_fixture_round_trips() {
+    fn certmagic_certificate_metadata_fixture_round_trips_unchanged() {
         let directory = tempfile::tempdir().unwrap();
         let issuer_dir = directory
             .path()
@@ -1542,9 +1855,31 @@ mod tests {
             include_str!("../testdata/https/example.com.key"),
         )
         .unwrap();
-        // Hand-written CertMagic `CertificateResource` fixture (certmagic v0.25 JSON tags:
-        // `sans`, `issuer_data` with ACME `url`/`ca`/`account` and ARI `renewal_info`).
-        let fixture = "{\n\t\"sans\": [\n\t\t\"example.com\"\n\t],\n\t\"issuer_data\": {\n\t\t\"url\": \"https://acme.test/cert/1\",\n\t\t\"ca\": \"https://acme.test/directory\",\n\t\t\"account\": \"https://acme.test/account/1\",\n\t\t\"renewal_info\": {\"suggestedWindow\": {}},\n\t\t\"unique_id\": \"fixture-id\"\n\t}\n}";
+        // A `CertificateResource` document in exactly the shape Caddy v2.11.9/certmagic v0.25.6
+        // writes (Go struct order, tab indentation, no trailing newline), plus unknown fields at
+        // the top level and inside `issuer_data`/`renewal_info` to prove forward compatibility.
+        let fixture = concat!(
+            "{\n",
+            "\t\"sans\": [\n\t\t\"example.com\"\n\t],\n",
+            "\t\"issuer_data\": {\n",
+            "\t\t\"url\": \"https://acme.test/cert/1\",\n",
+            "\t\t\"ca\": \"https://acme.test/directory\",\n",
+            "\t\t\"account\": \"https://acme.test/account/1\",\n",
+            "\t\t\"renewal_info\": {\n",
+            "\t\t\t\"suggestedWindow\": {\n",
+            "\t\t\t\t\"start\": \"2027-01-07T22:19:39Z\",\n",
+            "\t\t\t\t\"end\": \"2027-01-09T22:19:39Z\"\n",
+            "\t\t\t},\n",
+            "\t\t\t\"_uniqueIdentifier\": \"JBtT3CKXUylISOQIUeqByyeDUEg.CNEAsJavqfI\",\n",
+            "\t\t\t\"_retryAfter\": \"2026-11-09T20:19:40.546459079-08:00\",\n",
+            "\t\t\t\"_selectedTime\": \"2027-01-08T21:30:28Z\",\n",
+            "\t\t\t\"future_ari\": \"kept\"\n",
+            "\t\t},\n",
+            "\t\t\"future_issuer\": \"kept\"\n",
+            "\t},\n",
+            "\t\"future_field\": \"kept\"\n",
+            "}"
+        );
         std::fs::write(issuer_dir.join("example.com.json"), fixture).unwrap();
 
         let storage = FileStorage::new(directory.path());
@@ -1554,35 +1889,36 @@ mod tests {
         assert_eq!(stored.domains, vec!["example.com".to_string()]);
         let issuer_data = stored.issuer_data.as_ref().expect("issuer_data preserved");
         assert_eq!(issuer_data["url"], "https://acme.test/cert/1");
+        assert_eq!(issuer_data["ca"], "https://acme.test/directory");
+        assert_eq!(issuer_data["account"], "https://acme.test/account/1");
         assert_eq!(
             issuer_data["renewal_info"]["suggestedWindow"],
-            serde_json::json!({})
+            serde_json::json!({
+                "start": "2027-01-07T22:19:39Z",
+                "end": "2027-01-09T22:19:39Z"
+            })
         );
-        assert_eq!(issuer_data["unique_id"], "fixture-id");
+        assert_eq!(
+            issuer_data["renewal_info"]["_uniqueIdentifier"],
+            "JBtT3CKXUylISOQIUeqByyeDUEg.CNEAsJavqfI"
+        );
+        assert_eq!(
+            issuer_data["renewal_info"]["_retryAfter"],
+            "2026-11-09T20:19:40.546459079-08:00"
+        );
+        assert_eq!(
+            issuer_data["renewal_info"]["_selectedTime"],
+            "2027-01-08T21:30:28Z"
+        );
+        assert_eq!(issuer_data["renewal_info"]["future_ari"], "kept");
+        assert_eq!(issuer_data["future_issuer"], "kept");
+        assert_eq!(stored.metadata_extra["future_field"], "kept");
 
-        // Rewriting preserves issuer_data and any unknown top-level metadata fields; the JSON
-        // shape stays CertMagic's tab-indented `sans`-then-`issuer_data` document without a
-        // trailing newline.
-        let rewritten = StoredCertificate {
-            metadata_extra: BTreeMap::from([(
-                "future_field".to_string(),
-                serde_json::json!("kept"),
-            )]),
-            ..stored
-        };
-        tokio_test_block_on(CertificateStorage::store(&storage, key, &rewritten)).unwrap();
-        let raw = std::fs::read_to_string(issuer_dir.join("example.com.json")).unwrap();
-        assert!(raw.starts_with("{\n\t\"sans\": ["), "{raw}");
-        assert!(raw.contains("\"future_field\": \"kept\""), "{raw}");
-        assert!(
-            !raw.ends_with('\n'),
-            "CertMagic metadata has no trailing newline: {raw:?}"
-        );
-        let reloaded = tokio_test_block_on(CertificateStorage::load(&storage, key))
-            .unwrap()
-            .unwrap();
-        assert_eq!(reloaded.issuer_data, rewritten.issuer_data);
-        assert_eq!(reloaded.metadata_extra, rewritten.metadata_extra);
+        // Rewriting the untouched record reproduces Caddy's document byte-for-byte: no known or
+        // unknown field is lost or reordered, and there is no trailing newline.
+        tokio_test_block_on(CertificateStorage::store(&storage, key, &stored)).unwrap();
+        let rewritten = std::fs::read_to_string(issuer_dir.join("example.com.json")).unwrap();
+        assert_eq!(rewritten, fixture);
     }
 
     /// Tiny blocking executor for the storage tests (the rest of this module is async-tested).
