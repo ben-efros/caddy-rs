@@ -63,19 +63,32 @@ use thiserror::Error;
 
 /// The caller-supplied fields of a host, without a stable id.
 ///
-/// The service assigns the id in [`HostService::create`]. Drafts always produce enabled hosts;
-/// enabling or disabling an existing host is not part of this slice, and [`HostService::update`]
-/// replaces the whole host with the draft.
+/// The service assigns the id in [`HostService::create`]. A draft defaults to enabled; use
+/// [`HostDraft::with_enabled`] to create a disabled host, and [`HostService::update`] replaces the
+/// whole host (including its enabled flag) with the draft.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostDraft {
     pub domains: Vec<String>,
     pub tls: HostTls,
     pub spec: HostSpec,
+    pub enabled: bool,
 }
 
 impl HostDraft {
     pub fn new(domains: Vec<String>, tls: HostTls, spec: HostSpec) -> Self {
-        Self { domains, tls, spec }
+        Self {
+            domains,
+            tls,
+            spec,
+            enabled: true,
+        }
+    }
+
+    /// Set the host's enabled flag. Disabled hosts are stored and compiled as non-serving.
+    #[must_use]
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
     }
 }
 
@@ -156,7 +169,8 @@ impl HostService {
     /// unchanged. See the crate-level documentation on id allocation.
     pub fn create(&self, draft: HostDraft) -> Result<StoredHost, ServiceError> {
         let id = self.repository.next_id()?;
-        let host = Host::new(HostId(id), draft.domains, draft.tls, draft.spec);
+        let mut host = Host::new(HostId(id), draft.domains, draft.tls, draft.spec);
+        host.enabled = draft.enabled;
         self.validate_tls(&host)?;
         Ok(self.repository.create(host)?)
     }
@@ -172,7 +186,8 @@ impl HostService {
         expected_revision: Revision,
         draft: HostDraft,
     ) -> Result<StoredHost, ServiceError> {
-        let host = Host::new(id, draft.domains, draft.tls, draft.spec);
+        let mut host = Host::new(id, draft.domains, draft.tls, draft.spec);
+        host.enabled = draft.enabled;
         self.validate_tls(&host)?;
         Ok(self.repository.update(host, expected_revision)?)
     }
@@ -281,6 +296,7 @@ mod tests {
             domains: names(domains),
             tls: HostTls::disabled(),
             spec: proxy_spec(),
+            enabled: true,
         }
     }
 
@@ -289,6 +305,7 @@ mod tests {
             domains: names(domains),
             tls: HostTls::for_auto(PolicyId(policy_id)),
             spec: proxy_spec(),
+            enabled: true,
         }
     }
 
@@ -297,6 +314,7 @@ mod tests {
             domains: names(domains),
             tls: HostTls::for_explicit(CertificateId(1), CertificateOrigin::Manual),
             spec: proxy_spec(),
+            enabled: true,
         }
     }
 

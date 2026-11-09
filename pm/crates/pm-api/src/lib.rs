@@ -12,7 +12,14 @@
 //! | `GET` | `/api/v1/health` | Liveness probe; always `200` while the process serves requests |
 //! | `GET` | `/api/v1/setup` | Whether first-run setup has completed (no user store yet, so `false`) |
 //! | `GET` | `/api/v1/version` | API version and the embedded caddy-rs version |
-//! | `GET` | `/api/v1/hosts` | Read-only host summaries, paginated |
+//! | `GET` | `/api/v1/hosts` | Host summaries, paginated and filterable |
+//! | `POST` | `/api/v1/hosts` | Create a host; `201` plus `Location` and a strong `ETag` |
+//! | `GET` | `/api/v1/hosts/{id}` | Full host document; supports `If-None-Match` |
+//! | `PUT` | `/api/v1/hosts/{id}` | Replace a host under a strong `If-Match` |
+//! | `PATCH` | `/api/v1/hosts/{id}` | Partial update under a strong `If-Match` |
+//! | `DELETE` | `/api/v1/hosts/{id}` | Delete under a strong `If-Match` |
+//! | `POST` | `/api/v1/hosts/{id}/enable` | Set enabled under a strong `If-Match` |
+//! | `POST` | `/api/v1/hosts/{id}/disable` | Set disabled under a strong `If-Match` |
 //! | `GET` | `/api/v1/config` | Assembled Caddy JSON with a weak `ETag`; supports conditional requests |
 //!
 //! # Preconditions
@@ -35,22 +42,33 @@
 //! clamped into `1..=MAX_LIMIT` and the effective window is echoed in the envelope, so a client
 //! never has to guess what it actually received.
 //!
-//! # Scope
+//! # Host revision preconditions
 //!
-//! No authentication or authorization: that belongs to `caddy-rs-authn` and is wired in a later
-//! slice. No mutation routes yet (host CRUD is the next slice). Errors are typed and carry a
+//! Hosts use a strong `"h<id>-r<revision>"` ETag. Every mutation reads the host, requires a strong
+//! `If-Match` matching that revision, then passes the same revision to the service as its CAS
+//! expectation. Missing is `428`, stale/weak/unparseable is `412`, and a CAS conflict after the
+//! read is `412`. There is no automatic retry.
+//!
+//! # Scope and exposure
+//!
+//! Mutations are loopback-only until management auth lands: [`create_router`] must be served with
+//! `into_make_service_with_connect_info::<SocketAddr>()`, and a missing or non-loopback socket peer
+//! is `403`. Forwarding headers are never trusted. This is a fail-closed boundary, not
+//! authentication, so the management port must not be published. Errors are typed and carry a
 //! `location` when a field is at fault; no response body contains secret material.
 
 #![forbid(unsafe_code)]
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use std::net::SocketAddr;
+
 use axum::{
-    extract::{rejection::QueryRejection, Query, State},
+    extract::{connect_info::ConnectInfo, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Json, Response},
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use caddy_rs_pm_config::ConfigSettings;
@@ -144,6 +162,9 @@ pub enum ErrorCode {
     NotFound,
     Conflict,
     PreconditionFailed,
+    PreconditionRequired,
+    Forbidden,
+    UnsupportedMediaType,
     Validation,
     Internal,
 }
@@ -157,6 +178,12 @@ pub enum ApiError {
     Conflict(String),
     #[error("precondition failed: {0}")]
     PreconditionFailed(String),
+    #[error("precondition required: {0}")]
+    PreconditionRequired(String),
+    #[error("forbidden: {0}")]
+    Forbidden(String),
+    #[error("unsupported media type: {0}")]
+    UnsupportedMediaType(String),
     #[error("validation error: {message}")]
     Validation {
         message: String,
@@ -180,6 +207,9 @@ impl ApiError {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::PreconditionFailed(_) => StatusCode::PRECONDITION_FAILED,
+            Self::PreconditionRequired(_) => StatusCode::PRECONDITION_REQUIRED,
+            Self::Forbidden(_) => StatusCode::FORBIDDEN,
+            Self::UnsupportedMediaType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Self::Validation { .. } => StatusCode::BAD_REQUEST,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -191,6 +221,9 @@ impl ApiError {
             Self::NotFound(_) => ErrorCode::NotFound,
             Self::Conflict(_) => ErrorCode::Conflict,
             Self::PreconditionFailed(_) => ErrorCode::PreconditionFailed,
+            Self::PreconditionRequired(_) => ErrorCode::PreconditionRequired,
+            Self::Forbidden(_) => ErrorCode::Forbidden,
+            Self::UnsupportedMediaType(_) => ErrorCode::UnsupportedMediaType,
             Self::Validation { .. } => ErrorCode::Validation,
             Self::Internal(_) => ErrorCode::Internal,
         }
@@ -289,7 +322,7 @@ pub fn format_weak_etag(hash: &str) -> String {
 ///
 /// Accepts `W/"x"`, `"x"`, `x`, and `*`. A malformed member is kept verbatim so it simply fails to
 /// match instead of being silently dropped.
-fn normalize_etag_member(member: &str) -> &str {
+pub(crate) fn normalize_etag_member(member: &str) -> &str {
     let member = member.trim();
     let member = member.strip_prefix("W/").unwrap_or(member);
     member.trim_matches('"')
@@ -300,7 +333,7 @@ fn normalize_etag_member(member: &str) -> &str {
 /// A header that is present but not valid UTF-8 is an error, not an absent header. Treating it as
 /// absent would make an unparseable `If-Match` succeed, which is the fail-open case a precondition
 /// must never have.
-fn etag_members(
+pub(crate) fn etag_members(
     headers: &HeaderMap,
     name: header::HeaderName,
 ) -> Result<Option<Vec<String>>, ApiError> {
@@ -317,7 +350,7 @@ fn etag_members(
     ))
 }
 
-fn matches_any(members: &[String], current: &str) -> bool {
+pub(crate) fn matches_any(members: &[String], current: &str) -> bool {
     members
         .iter()
         .any(|member| member == "*" || member == current)
@@ -428,6 +461,39 @@ async fn observe_middleware(mut request: axum::extract::Request, next: Next) -> 
 #[derive(Debug, Clone)]
 pub struct RequestId(pub String);
 
+/// Peer address captured before routing.
+///
+/// The API does not trust forwarding headers: only the socket peer counts. `None` means the server
+/// was mounted without `into_make_service_with_connect_info`, which is treated as remote.
+#[derive(Debug, Clone, Copy)]
+pub struct PeerAddr(pub Option<SocketAddr>);
+
+async fn capture_peer_middleware(mut request: axum::extract::Request, next: Next) -> Response {
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|connect| connect.0);
+    request.extensions_mut().insert(PeerAddr(peer));
+    next.run(request).await
+}
+
+/// Mutations are local-only until the management authentication slice is wired.
+///
+/// A loopback socket is not authentication, but it is a fail-closed boundary: the management port
+/// must not be published, and a future auth layer replaces this guard rather than relaxing it.
+pub(crate) fn require_local_peer(peer: PeerAddr) -> Result<(), ApiError> {
+    match peer.0 {
+        Some(address) if address.ip().is_loopback() => Ok(()),
+        Some(address) => Err(ApiError::Forbidden(format!(
+            "management mutations are local-only; peer {address} is not loopback"
+        ))),
+        None => Err(ApiError::Forbidden(
+            "management mutations require a known socket peer; serve the router with connect info"
+                .to_owned(),
+        )),
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Router and handlers
 // ---------------------------------------------------------------------------------------------
@@ -438,9 +504,22 @@ pub fn create_router(state: ApiState) -> Router {
         .route("/health", get(health_handler))
         .route("/setup", get(setup_handler))
         .route("/version", get(version_handler))
-        .route("/hosts", get(hosts_handler))
+        .route(
+            "/hosts",
+            get(hosts::list_handler).post(hosts::create_handler),
+        )
+        .route(
+            "/hosts/{id}",
+            get(hosts::get_handler)
+                .put(hosts::replace_handler)
+                .patch(hosts::patch_handler)
+                .delete(hosts::delete_handler),
+        )
+        .route("/hosts/{id}/enable", post(hosts::enable_handler))
+        .route("/hosts/{id}/disable", post(hosts::disable_handler))
         .route("/config", get(config_handler))
         .layer(middleware::from_fn(observe_middleware))
+        .layer(middleware::from_fn(capture_peer_middleware))
         .with_state(state);
 
     Router::new().nest("/api/v1", api)
@@ -469,33 +548,7 @@ async fn version_handler(State(_state): State<ApiState>) -> Json<VersionResponse
     })
 }
 
-/// `GET /api/v1/hosts` — read-only host summaries.
-async fn hosts_handler(
-    State(state): State<ApiState>,
-    query: Result<Query<PaginationParams>, QueryRejection>,
-) -> Result<Json<PaginatedResponse<HostSummary>>, ApiError> {
-    let Query(params) =
-        query.map_err(|rejection| ApiError::validation(rejection.body_text(), "limit"))?;
-    let stored = state
-        .runtime
-        .hosts()
-        .list()
-        .map_err(|error| ApiError::Internal(error.to_string()))?;
-    let summaries: Vec<HostSummary> = stored
-        .iter()
-        .map(|stored| HostSummary {
-            id: stored.host.id.0,
-            domains: stored.host.domains.clone(),
-            kind: host_kind(&stored.host.spec).to_owned(),
-            enabled: stored.host.enabled,
-            revision: stored.revision,
-            tls_mode: tls_mode(&stored.host.tls),
-        })
-        .collect();
-    Ok(Json(params.paginate(&summaries)))
-}
-
-fn host_kind(spec: &caddy_rs_pm_core::HostSpec) -> &'static str {
+pub(crate) fn host_kind(spec: &caddy_rs_pm_core::HostSpec) -> &'static str {
     match spec {
         caddy_rs_pm_core::HostSpec::Proxy(_) => "proxy",
         caddy_rs_pm_core::HostSpec::Redirect(_) => "redirect",
@@ -503,7 +556,7 @@ fn host_kind(spec: &caddy_rs_pm_core::HostSpec) -> &'static str {
     }
 }
 
-fn tls_mode(tls: &caddy_rs_pm_core::HostTls) -> String {
+pub(crate) fn tls_mode(tls: &caddy_rs_pm_core::HostTls) -> String {
     use caddy_rs_pm_core::TlsMode;
     match tls.mode {
         TlsMode::Disabled => "disabled",
@@ -552,6 +605,9 @@ fn hash_bytes(bytes: &[u8]) -> String {
     }
     format!("{hash:016x}")
 }
+
+mod dto;
+mod hosts;
 
 #[cfg(test)]
 mod tests;
