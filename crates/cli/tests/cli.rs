@@ -1407,7 +1407,10 @@ fn completion_scripts_cover_every_subcommand_and_shell() {
 
     let (code, _stdout, stderr) = run(&["completion", "nope"]);
     assert_eq!(code, 1, "{stderr}");
-    assert!(stderr.contains("unrecognized shell: nope"), "{stderr}");
+    assert!(
+        stderr.contains("invalid argument \"nope\" for \"caddy-rs completion\""),
+        "{stderr}"
+    );
 }
 
 #[test]

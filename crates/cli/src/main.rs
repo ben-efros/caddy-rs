@@ -151,13 +151,13 @@ enum Command {
         #[arg(value_name = "SHELL")]
         shell: String,
     },
-    /// Generate manual pages for caddy-rs commands.
+    /// Generates the manual pages for caddy-rs commands.
     ///
     /// Writes one roff manual page per command into the directory given by `--directory`
     /// (created if it does not exist), in section 8 (System Administration), like Caddy's
     /// `manpage` command.
     Manpage {
-        /// Output directory for the generated manual pages.
+        /// The output directory where the manpages are generated.
         #[arg(short = 'o', long)]
         directory: Option<PathBuf>,
     },

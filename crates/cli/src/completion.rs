@@ -46,7 +46,9 @@ pub(crate) fn generate(shell: &str) -> Result<String> {
         "zsh" => zsh(&spec),
         "fish" => fish(&spec),
         "powershell" => powershell(&spec),
-        other => bail!("unrecognized shell: {other}"),
+        // Caddy validates the shell with cobra.OnlyValidArgs before RunE, so this is the
+        // message a user actually sees (the switch default below it is unreachable).
+        other => bail!("invalid argument \"{other}\" for \"caddy-rs completion\""),
     };
     Ok(script)
 }
