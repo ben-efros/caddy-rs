@@ -14,7 +14,7 @@ This is the proxy-manager foundation workspace. It is deliberately independent o
 | `caddy-rs-pm-policies` | Durable auto-certificate policy repository over `pm-state`: get/list/create/update/delete with CAS revisions, tombstones, monotonic id reservation and host coverage validation against `pm-core` hosts. |
 | `caddy-rs-pm-import` | Native-first NPM v2.16 host-payload import mapping: proxy/redirect/dead hosts to `pm-core`, explicit certificate origins, located errors for unsupported payload features and warnings for flags without a native implementation. |
 | `caddy-rs-pm-runtime` | PM composition root: data-directory preflight (`0700`, writability probe), `<data_dir>/pm` state layout, legacy Caddy detection (warning only), and host/policy/service wiring with compile/assemble entry points. |
-| `caddy-rs-pm-api` | Native REST API skeleton with axum: `/api/v1` router, health/setup/version endpoints, typed error envelope, pagination params, revision preconditions via `If-Match`/`If-None-Match` with weak ETags, request ID and logging middleware. |
+| `caddy-rs-pm-api` | Native REST API skeleton with axum: `/api/v1` router, health/setup/version/hosts/config endpoints, typed error envelope, pagination params, revision preconditions via `If-Match`/`If-None-Match` with weak ETags, request ID and logging middleware. |
 
 ## Why a nested workspace
 
@@ -255,23 +255,28 @@ Compile, Config}` and carry the relevant path. No error contains plaintext secre
 | `GET` | `/health` | Returns `{ "status": "ok", "setup": true }` |
 | `GET` | `/setup` | Returns `{ "configured": false }` (admin user check deferred to PM-109/CORE-PM-12) |
 | `GET` | `/version` | Returns `{ "version": "<crate version>", "caddy_rs": "<caddy-rs-core VERSION>" }` |
+| `GET` | `/hosts` | Paginated read-only host summaries (`id`, `domains`, `kind`, `enabled`, `revision`, `tlsMode`) |
+| `GET` | `/config` | Assembled Caddy JSON with a weak `ETag`; honours `If-Match` and `If-None-Match` |
 
 ### Shared infrastructure
 
 - **`ApiState`** — wraps a `PmRuntime` (cloned per request via `Arc`).
 - **Typed error envelope** — `{ "error": { "code": "NOT_FOUND|CONFLICT|PRECONDITION_FAILED|VALIDATION|INTERNAL", "message": "...", "location": "field.path" } }` via `ApiError::into_response()`.
-- **Pagination** — `limit` (default 50, max 200) and `offset` (default 0) query params; response envelope `{ "items": [...], "total": N, "limit": L, "offset": O }` via `PaginatedResponse<T>`.
-- **Revision preconditions** — `If-Match: <etag>` and `If-None-Match: <etag>` parsed; ETags are weak tags `W/"<revision>"`; mismatch returns `412 Precondition Failed`.
-- **Middleware** — request ID (`x-request-id` header) and structured logging.
+- **Pagination** — `limit` (default 50, max 200) and `offset` (default 0) query params; an out-of-range `limit` is clamped and the effective window is echoed in `{ "items": [...], "total": N, "limit": L, "offset": O }` via `PaginatedResponse<T>`.
+- **Preconditions** — `evaluate_get_preconditions` implements RFC 9110 ordering for `GET`: a failing `If-Match` is `412 Precondition Failed`, a matching `If-None-Match` is `304 Not Modified`, and `*` matches any representation. `require_if_match` is the mutation-side guard: a missing or stale `If-Match` is a `412` rather than a silent last-writer-wins update.
+- **ETags** — weak tags `W/"<hash>"` derived from the response bytes (FNV-1a), so they change exactly when the representation changes. The hash is a change detector, not a security primitive.
+- **Middleware** — request ID (`x-request-id`) and structured logging.
 - **No authentication** — deferred to PM-109/CORE-PM-12.
 
 ### Testing
 
-Tests use `axum_test::TestServer` against a real `PmRuntime` backed by `MemoryStore`:
-- Health/setup/version return 200 with correct shapes.
-- Pagination params validated and clamped.
-- `If-Match` on non-existent resource returns 412 (when wired to resources).
-- Error response shape matches spec.
+Tests use `axum_test::TestServer` against a real `PmRuntime` backed by a temporary data directory:
+- Health/setup/version return 200 with the documented shapes.
+- `/hosts` paginates, clamps an oversized `limit`, and rejects a non-numeric one with 400.
+- `/config` returns a stable weak ETag; `If-None-Match` yields 304, a stale `If-Match` yields 412 with a typed `PRECONDITION_FAILED` body, and `*`/current tags succeed.
+- `If-Match` is evaluated before `If-None-Match`, and a malformed tag fails closed.
+- Mutation-side `require_if_match` rejects missing and stale revisions and accepts current/`*`.
+- Error bodies carry `location` only when a field is at fault.
 
 ## `pm-import`
 

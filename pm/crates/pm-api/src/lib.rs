@@ -1,68 +1,134 @@
-//! PM native REST API skeleton with axum.
+//! Native REST API skeleton for the caddy-rs proxy manager.
 //!
-//! This crate provides the HTTP API layer for the proxy manager, exposing
-//! runtime functionality through a versioned REST interface.
+//! This crate is the HTTP presentation layer only. It owns no state, no validation and no
+//! persistence: every read goes through [`PmRuntime`], which composes the repositories and the
+//! route compiler. Keeping the mapping in one thin module is what lets the native API and a later
+//! `--compat npm` adapter share the same service layer instead of duplicating it.
+//!
+//! # Endpoints
+//!
+//! | Method | Path | Behaviour |
+//! |---|---|---|
+//! | `GET` | `/api/v1/health` | Liveness probe; always `200` while the process serves requests |
+//! | `GET` | `/api/v1/setup` | Whether first-run setup has completed (no user store yet, so `false`) |
+//! | `GET` | `/api/v1/version` | API version and the embedded caddy-rs version |
+//! | `GET` | `/api/v1/hosts` | Read-only host summaries, paginated |
+//! | `GET` | `/api/v1/config` | Assembled Caddy JSON with a weak `ETag`; supports conditional requests |
+//!
+//! # Preconditions
+//!
+//! The skeleton implements the precondition primitives that mutation routes (host create/update,
+//! certificate intent) reuse, and exercises them on the two document endpoints:
+//!
+//! * `If-None-Match` matching the current `ETag` returns `304 Not Modified`;
+//! * `If-Match` that does not match the current `ETag` returns `412 Precondition Failed`;
+//! * `If-Match` matching returns the representation;
+//! * `*` matches any current representation, and an absent header never fails.
+//!
+//! ETags are weak (`W/"<hash>"`) and derived from the response bytes, so they change exactly when
+//! the representation changes. [`evaluate_get_preconditions`] is the single place that implements
+//! the rules, so mutation routes cannot grow a second, subtly different copy.
+//!
+//! # Pagination
+//!
+//! List responses use [`PaginatedResponse`] and [`PaginationParams`]. An out-of-range `limit` is
+//! clamped into `1..=MAX_LIMIT` and the effective window is echoed in the envelope, so a client
+//! never has to guess what it actually received.
+//!
+//! # Scope
+//!
+//! No authentication or authorization: that belongs to `caddy-rs-authn` and is wired in a later
+//! slice. No mutation routes yet (host CRUD is the next slice). Errors are typed and carry a
+//! `location` when a field is at fault; no response body contains secret material.
 
 #![forbid(unsafe_code)]
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::{
-    body::Body,
-    extract::{Query, Request, State},
-    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
+    extract::{Query, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Json, Response},
-    routing::{get, post},
+    routing::get,
     Router,
 };
-use axum_extra::headers::{HeaderMapExt, IfMatch, IfNoneMatch};
+use caddy_rs_pm_config::ConfigSettings;
 use caddy_rs_pm_runtime::PmRuntime;
-use caddy_rs_pm_state::{Revision, StateStore};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::{debug, info, warn};
-use uuid::Uuid;
+use tracing::info;
 
-/// Application state shared across all handlers.
+/// Default page size when the caller does not ask for one.
+pub const DEFAULT_LIMIT: u32 = 50;
+/// Upper bound on a page size; larger requests are clamped, never rejected.
+pub const MAX_LIMIT: u32 = 200;
+
+/// Shared state for every handler. Cloning is cheap: the runtime shares one store.
 #[derive(Clone)]
 pub struct ApiState {
     pub runtime: PmRuntime,
 }
 
 impl ApiState {
-    /// Create a new API state with the given runtime.
     pub fn new(runtime: PmRuntime) -> Self {
         Self { runtime }
     }
 }
 
-/// Pagination query parameters.
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+/// `?limit=&offset=` for list endpoints.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 pub struct PaginationParams {
-    /// Maximum number of items to return (default: 50, max: 200).
     #[serde(default = "default_limit")]
     pub limit: u32,
-    /// Number of items to skip (default: 0).
     #[serde(default)]
     pub offset: u32,
 }
 
-fn default_limit() -> u32 {
-    50
-}
-
-impl PaginationParams {
-    /// Validate and clamp pagination parameters.
-    pub fn validate(self) -> Result<Self, ApiError> {
-        let limit = self.limit.clamp(1, 200);
-        let offset = self.offset;
-        Ok(Self { limit, offset })
+impl Default for PaginationParams {
+    fn default() -> Self {
+        Self {
+            limit: DEFAULT_LIMIT,
+            offset: 0,
+        }
     }
 }
 
-/// Paginated response envelope.
-#[derive(Debug, Clone, Serialize)]
+fn default_limit() -> u32 {
+    DEFAULT_LIMIT
+}
+
+impl PaginationParams {
+    /// Clamp the page size into `1..=MAX_LIMIT`.
+    ///
+    /// Clamping rather than rejecting keeps a list endpoint from failing because a client asked for
+    /// more than the server will serve; the effective values are echoed in the envelope.
+    #[must_use]
+    pub fn clamped(self) -> Self {
+        Self {
+            limit: self.limit.clamp(1, MAX_LIMIT),
+            offset: self.offset,
+        }
+    }
+
+    /// Apply the window to a full collection, returning the envelope.
+    #[must_use]
+    pub fn paginate<T: Clone>(self, all: &[T]) -> PaginatedResponse<T> {
+        let params = self.clamped();
+        let total = all.len() as u64;
+        let start = (params.offset as usize).min(all.len());
+        let end = start.saturating_add(params.limit as usize).min(all.len());
+        PaginatedResponse {
+            items: all[start..end].to_vec(),
+            total,
+            limit: params.limit,
+            offset: params.offset,
+        }
+    }
+}
+
+/// List envelope: the page, the total before pagination, and the effective window.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PaginatedResponse<T> {
     pub items: Vec<T>,
@@ -71,9 +137,76 @@ pub struct PaginatedResponse<T> {
     pub offset: u32,
 }
 
-/// Typed API error response.
+/// Stable machine-readable error codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ErrorCode {
+    NotFound,
+    Conflict,
+    PreconditionFailed,
+    Validation,
+    Internal,
+}
+
+/// A failed request. `location` names the offending field when there is one.
+#[derive(Debug, Error)]
+pub enum ApiError {
+    #[error("not found: {0}")]
+    NotFound(String),
+    #[error("conflict: {0}")]
+    Conflict(String),
+    #[error("precondition failed: {0}")]
+    PreconditionFailed(String),
+    #[error("validation error: {message}")]
+    Validation {
+        message: String,
+        location: Option<String>,
+    },
+    #[error("internal error: {0}")]
+    Internal(String),
+}
+
+impl ApiError {
+    pub fn validation(message: impl Into<String>, location: impl Into<String>) -> Self {
+        Self::Validation {
+            message: message.into(),
+            location: Some(location.into()),
+        }
+    }
+
+    #[must_use]
+    pub fn status_code(&self) -> StatusCode {
+        match self {
+            Self::NotFound(_) => StatusCode::NOT_FOUND,
+            Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::PreconditionFailed(_) => StatusCode::PRECONDITION_FAILED,
+            Self::Validation { .. } => StatusCode::BAD_REQUEST,
+            Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    #[must_use]
+    pub fn error_code(&self) -> ErrorCode {
+        match self {
+            Self::NotFound(_) => ErrorCode::NotFound,
+            Self::Conflict(_) => ErrorCode::Conflict,
+            Self::PreconditionFailed(_) => ErrorCode::PreconditionFailed,
+            Self::Validation { .. } => ErrorCode::Validation,
+            Self::Internal(_) => ErrorCode::Internal,
+        }
+    }
+
+    #[must_use]
+    pub fn location(&self) -> Option<&str> {
+        match self {
+            Self::Validation { location, .. } => location.as_deref(),
+            _ => None,
+        }
+    }
+}
+
+/// Wire shape of an error: `{"error":{"code":..,"message":..,"location":..}}`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ApiErrorResponse {
     pub error: ApiErrorDetail,
 }
@@ -87,384 +220,319 @@ pub struct ApiErrorDetail {
     pub location: Option<String>,
 }
 
-/// Error codes for API responses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum ErrorCode {
-    NotFound,
-    Conflict,
-    PreconditionFailed,
-    Validation,
-    Internal,
-}
-
-/// API error with HTTP status code mapping.
-#[derive(Debug, Error)]
-pub enum ApiError {
-    #[error("not found: {0}")]
-    NotFound(String),
-    #[error("conflict: {0}")]
-    Conflict(String),
-    #[error("precondition failed: {0}")]
-    PreconditionFailed(String),
-    #[error("validation error: {0}")]
-    Validation(String),
-    #[error("internal error: {0}")]
-    Internal(String),
-    #[error("invalid pagination: {0}")]
-    InvalidPagination(String),
-    #[error("missing required header: {0}")]
-    MissingHeader(String),
-    #[error("invalid header value: {0}")]
-    InvalidHeader(String),
-}
-
-impl ApiError {
-    /// Get the HTTP status code for this error.
-    pub fn status_code(&self) -> StatusCode {
-        match self {
-            ApiError::NotFound(_) => StatusCode::NOT_FOUND,
-            ApiError::Conflict(_) => StatusCode::CONFLICT,
-            ApiError::PreconditionFailed(_) => StatusCode::PRECONDITION_FAILED,
-            ApiError::Validation(_) => StatusCode::BAD_REQUEST,
-            ApiError::InvalidPagination(_) => StatusCode::BAD_REQUEST,
-            ApiError::MissingHeader(_) => StatusCode::BAD_REQUEST,
-            ApiError::InvalidHeader(_) => StatusCode::BAD_REQUEST,
-            ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        }
-    }
-
-    /// Get the error code for the response body.
-    pub fn error_code(&self) -> ErrorCode {
-        match self {
-            ApiError::NotFound(_) => ErrorCode::NotFound,
-            ApiError::Conflict(_) => ErrorCode::Conflict,
-            ApiError::PreconditionFailed(_) => ErrorCode::PreconditionFailed,
-            ApiError::Validation(_) | ApiError::InvalidPagination(_) => ErrorCode::Validation,
-            ApiError::MissingHeader(_) | ApiError::InvalidHeader(_) => ErrorCode::Validation,
-            ApiError::Internal(_) => ErrorCode::Internal,
-        }
-    }
-
-    /// Get the location field for the response body.
-    pub fn location(&self) -> Option<String> {
-        match self {
-            ApiError::Validation(msg) | ApiError::InvalidPagination(msg) => Some(msg.clone()),
-            _ => None,
-        }
-    }
-}
-
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.status_code();
-        let error_response = ApiErrorResponse {
+        let body = ApiErrorResponse {
             error: ApiErrorDetail {
                 code: self.error_code(),
                 message: self.to_string(),
-                location: self.location(),
+                location: self.location().map(ToOwned::to_owned),
             },
         };
-        (status, Json(error_response)).into_response()
+        (status, Json(body)).into_response()
     }
 }
 
-/// Health check response.
-#[derive(Debug, Clone, Serialize)]
+impl From<caddy_rs_pm_runtime::RuntimeError> for ApiError {
+    fn from(source: caddy_rs_pm_runtime::RuntimeError) -> Self {
+        Self::Internal(source.to_string())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HealthResponse {
     pub status: String,
     pub setup: bool,
 }
 
-/// Setup status response.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetupResponse {
     pub configured: bool,
 }
 
-/// Version response.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VersionResponse {
     pub version: String,
     pub caddy_rs: String,
 }
 
-/// Extract ETag from If-Match header.
-fn extract_if_match(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
-    if let Some(if_match) = headers.typed_get::<IfMatch>() {
-        let etag = if_match.to_string();
-        // Remove the W/ prefix if present and quotes
-        let etag = etag
-            .trim_start_matches('W')
-            .trim_matches('/')
-            .trim_matches('"');
-        Ok(Some(etag.to_string()))
+/// One host as listed by `GET /api/v1/hosts`.
+///
+/// Deliberately a summary: the full host document with TLS references is served by the detail route
+/// in the CRUD slice, so a list response never grows with every host's TLS configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostSummary {
+    pub id: u64,
+    pub domains: Vec<String>,
+    pub kind: String,
+    pub enabled: bool,
+    pub revision: u64,
+    pub tls_mode: String,
+}
+
+// ---------------------------------------------------------------------------------------------
+// Preconditions
+// ---------------------------------------------------------------------------------------------
+
+/// Format a representation hash as a weak ETag, the shape caddy-rs core uses for config.
+#[must_use]
+pub fn format_weak_etag(hash: &str) -> String {
+    format!("W/\"{hash}\"")
+}
+
+/// Normalize one `If-Match`/`If-None-Match` member to its opaque value.
+///
+/// Accepts `W/"x"`, `"x"`, `x`, and `*`. A malformed member is kept verbatim so it simply fails to
+/// match instead of being silently dropped.
+fn normalize_etag_member(member: &str) -> &str {
+    let member = member.trim();
+    let member = member.strip_prefix("W/").unwrap_or(member);
+    member.trim_matches('"')
+}
+
+/// Split a comma-separated ETag header into its members.
+fn etag_members(headers: &HeaderMap, name: header::HeaderName) -> Option<Vec<String>> {
+    let raw = headers.get(name)?.to_str().ok()?;
+    Some(
+        raw.split(',')
+            .map(|member| normalize_etag_member(member).to_owned())
+            .collect(),
+    )
+}
+
+fn matches_any(members: &[String], current: &str) -> bool {
+    members
+        .iter()
+        .any(|member| member == "*" || member == current)
+}
+
+/// Evaluate `If-Match`/`If-None-Match` for a `GET`.
+///
+/// Returns `Some(response)` when the request must be short-circuited (`304` or `412`), and `None`
+/// when the representation should be served. `If-Match` is evaluated before `If-None-Match`, the
+/// order RFC 9110 requires.
+#[must_use]
+pub fn evaluate_get_preconditions(headers: &HeaderMap, current_etag: &str) -> Option<Response> {
+    let current = normalize_etag_member(current_etag).to_owned();
+
+    if let Some(members) = etag_members(headers, header::IF_MATCH) {
+        if !matches_any(&members, &current) {
+            return Some(
+                ApiError::PreconditionFailed(format!(
+                    "If-Match does not match the current representation ({current_etag})"
+                ))
+                .into_response(),
+            );
+        }
+    }
+
+    if let Some(members) = etag_members(headers, header::IF_NONE_MATCH) {
+        if matches_any(&members, &current) {
+            return Some(not_modified(current_etag));
+        }
+    }
+
+    None
+}
+
+/// Evaluate `If-Match` for an unsafe method that requires one.
+///
+/// A missing header is an error here, unlike on `GET`: mutating without an expected revision is
+/// exactly the lost-update race the precondition exists to prevent.
+pub fn require_if_match(headers: &HeaderMap, current_etag: &str) -> Result<(), ApiError> {
+    let members = etag_members(headers, header::IF_MATCH).ok_or_else(|| {
+        ApiError::PreconditionFailed(
+            "If-Match is required for this request; fetch the resource and send its ETag"
+                .to_owned(),
+        )
+    })?;
+    let current = normalize_etag_member(current_etag).to_owned();
+    if matches_any(&members, &current) {
+        Ok(())
     } else {
-        Ok(None)
+        Err(ApiError::PreconditionFailed(format!(
+            "If-Match does not match the current revision ({current_etag})"
+        )))
     }
 }
 
-/// Extract ETag from If-None-Match header.
-fn extract_if_none_match(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
-    if let Some(if_none_match) = headers.typed_get::<IfNoneMatch>() {
-        let etag = if_none_match.to_string();
-        let etag = etag
-            .trim_start_matches('W')
-            .trim_matches('/')
-            .trim_matches('"');
-        Ok(Some(etag.to_string()))
-    } else {
-        Ok(None)
+fn not_modified(current_etag: &str) -> Response {
+    let mut response = StatusCode::NOT_MODIFIED.into_response();
+    if let Ok(value) = HeaderValue::from_str(current_etag) {
+        response.headers_mut().insert(header::ETAG, value);
     }
-}
-
-/// Format revision as weak ETag.
-fn format_etag(revision: Revision) -> String {
-    format!(r#"W/"{revision}""#)
-}
-
-/// Middleware to add request ID for tracing.
-async fn request_id_middleware(mut request: Request, next: Next) -> Response {
-    let request_id = Uuid::new_v4().to_string();
-    request.extensions_mut().insert(request_id.clone());
-    let mut response = next.run(request).await;
-    response.headers_mut().insert(
-        "x-request-id",
-        HeaderValue::from_str(&request_id).unwrap_or_default(),
-    );
     response
 }
 
-/// Middleware for logging requests.
-async fn logging_middleware(request: Request, next: Next) -> Response {
+// ---------------------------------------------------------------------------------------------
+// Middleware
+// ---------------------------------------------------------------------------------------------
+
+static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Attach a process-local request id and log one completion line.
+///
+/// The id is a counter, not a UUID: it is diagnostic only, contains no client input, and cannot
+/// fail to convert to a header value.
+async fn observe_middleware(mut request: axum::extract::Request, next: Next) -> Response {
+    let request_id = format!("req-{}", REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed));
+    if let Ok(value) = HeaderValue::from_str(&request_id) {
+        request
+            .extensions_mut()
+            .insert(RequestId(request_id.clone()));
+        request.headers_mut().insert("x-request-id", value);
+    }
+
     let method = request.method().clone();
-    let uri = request.uri().clone();
-    let start = std::time::Instant::now();
-    let response = next.run(request).await;
-    let duration = start.elapsed();
+    let path = request.uri().path().to_owned();
+    let started = std::time::Instant::now();
+    let mut response = next.run(request).await;
+    let elapsed = started.elapsed();
+
     info!(
-        method = %method,
-        uri = %uri,
-        status = %response.status(),
-        duration_ms = %duration.as_millis(),
-        "request completed"
+        %method,
+        %path,
+        status = response.status().as_u16(),
+        elapsed_ms = elapsed.as_millis() as u64,
+        request_id = %request_id,
+        "pm api request"
     );
+
+    if let Ok(value) = HeaderValue::from_str(&request_id) {
+        response.headers_mut().insert("x-request-id", value);
+    }
     response
 }
 
-/// Create the API router at `/api/v1`.
+/// Request id carried in request extensions.
+#[derive(Debug, Clone)]
+pub struct RequestId(pub String);
+
+// ---------------------------------------------------------------------------------------------
+// Router and handlers
+// ---------------------------------------------------------------------------------------------
+
+/// Build the `/api/v1` router.
 pub fn create_router(state: ApiState) -> Router {
-    let api_routes = Router::new()
+    let api = Router::new()
         .route("/health", get(health_handler))
         .route("/setup", get(setup_handler))
         .route("/version", get(version_handler))
-        .layer(middleware::from_fn(logging_middleware))
-        .layer(middleware::from_fn(request_id_middleware))
+        .route("/hosts", get(hosts_handler))
+        .route("/config", get(config_handler))
+        .layer(middleware::from_fn(observe_middleware))
         .with_state(state);
 
-    Router::new().nest("/api/v1", api_routes)
+    Router::new().nest("/api/v1", api)
 }
 
-/// GET /api/v1/health
 async fn health_handler(State(_state): State<ApiState>) -> Json<HealthResponse> {
     Json(HealthResponse {
-        status: "ok".to_string(),
+        status: "ok".to_owned(),
         setup: true,
     })
 }
 
-/// GET /api/v1/setup
 async fn setup_handler(State(_state): State<ApiState>) -> Json<SetupResponse> {
-    // TODO: Check if any admin user exists (PM-109/CORE-PM-12)
+    // No user store is wired yet (caddy-rs-authn lands in a later slice), so setup is never
+    // complete. Reporting `true` here would let a client skip the setup wizard against a server
+    // that has no administrator.
     Json(SetupResponse { configured: false })
 }
 
-/// GET /api/v1/version
 async fn version_handler(State(_state): State<ApiState>) -> Json<VersionResponse> {
     Json(VersionResponse {
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        caddy_rs: caddy_rs_core::VERSION.to_string(),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        caddy_rs: caddy_rs_core::VERSION.to_owned(),
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use axum_test::TestServer;
-    use caddy_rs_pm_runtime::{PmRuntime, RuntimeConfig};
-    use caddy_rs_pm_state::MemoryStore;
-    use std::sync::Arc;
-    use tempfile::TempDir;
+/// `GET /api/v1/hosts` — read-only host summaries.
+async fn hosts_handler(
+    State(state): State<ApiState>,
+    Query(params): Query<PaginationParams>,
+) -> Result<Json<PaginatedResponse<HostSummary>>, ApiError> {
+    let stored = state
+        .runtime
+        .hosts()
+        .list()
+        .map_err(|error| ApiError::Internal(error.to_string()))?;
+    let summaries: Vec<HostSummary> = stored
+        .iter()
+        .map(|stored| HostSummary {
+            id: stored.host.id.0,
+            domains: stored.host.domains.clone(),
+            kind: host_kind(&stored.host.spec).to_owned(),
+            enabled: stored.host.enabled,
+            revision: stored.revision,
+            tls_mode: tls_mode(&stored.host.tls),
+        })
+        .collect();
+    Ok(Json(params.paginate(&summaries)))
+}
 
-    fn create_test_runtime() -> PmRuntime {
-        let temp_dir = TempDir::new().expect("create temp dir");
-        let config = RuntimeConfig::new(temp_dir.path().join("data"));
-        PmRuntime::open(config).expect("open runtime")
-    }
-
-    fn create_test_state() -> ApiState {
-        ApiState::new(create_test_runtime())
-    }
-
-    #[tokio::test]
-    async fn test_health_endpoint() {
-        let state = create_test_state();
-        let server = TestServer::new(create_router(state)).expect("create test server");
-
-        let response = server.get("/api/v1/health").await;
-        assert_eq!(response.status_code(), 200);
-
-        let body: HealthResponse = response.json();
-        assert_eq!(body.status, "ok");
-        assert!(body.setup);
-    }
-
-    #[tokio::test]
-    async fn test_setup_endpoint() {
-        let state = create_test_state();
-        let server = TestServer::new(create_router(state)).expect("create test server");
-
-        let response = server.get("/api/v1/setup").await;
-        assert_eq!(response.status_code(), 200);
-
-        let body: SetupResponse = response.json();
-        assert!(!body.configured);
-    }
-
-    #[tokio::test]
-    async fn test_version_endpoint() {
-        let state = create_test_state();
-        let server = TestServer::new(create_router(state)).expect("create test server");
-
-        let response = server.get("/api/v1/version").await;
-        assert_eq!(response.status_code(), 200);
-
-        let body: VersionResponse = response.json();
-        assert!(!body.version.is_empty());
-        assert!(!body.caddy_rs.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_pagination_params_default() {
-        let params = PaginationParams::default()
-            .validate()
-            .expect("valid default");
-        assert_eq!(params.limit, 50);
-        assert_eq!(params.offset, 0);
-    }
-
-    #[tokio::test]
-    async fn test_pagination_params_clamped() {
-        let params = PaginationParams {
-            limit: 300,
-            offset: 10,
-        }
-        .validate()
-        .expect("valid clamped");
-        assert_eq!(params.limit, 200);
-        assert_eq!(params.offset, 10);
-    }
-
-    #[tokio::test]
-    async fn test_pagination_params_min_limit() {
-        let params = PaginationParams {
-            limit: 0,
-            offset: 0,
-        }
-        .validate()
-        .expect("valid min");
-        assert_eq!(params.limit, 1);
-    }
-
-    #[tokio::test]
-    async fn test_if_match_on_nonexistent_returns_412() {
-        let state = create_test_state();
-        let server = TestServer::new(create_router(state)).expect("create test server");
-
-        // If-Match on a non-existent resource should return 412
-        let response = server
-            .get("/api/v1/health")
-            .add_header("If-Match", r#"W/"999""#)
-            .await;
-        // Health endpoint doesn't check preconditions yet, so this should be 200
-        // But we test the middleware parsing works
-        assert_eq!(response.status_code(), 200);
-    }
-
-    #[tokio::test]
-    async fn test_error_response_shape() {
-        let error = ApiError::NotFound("resource not found".to_string());
-        let response = error.into_response();
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-
-        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("read body");
-        let body: ApiErrorResponse = serde_json::from_slice(&body_bytes).expect("parse json");
-
-        assert_eq!(body.error.code, ErrorCode::NotFound);
-        assert_eq!(body.error.message, "not found: resource not found");
-        assert!(body.error.location.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_error_response_with_location() {
-        let error = ApiError::Validation("field.name".to_string());
-        let response = error.into_response();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-
-        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("read body");
-        let body: ApiErrorResponse = serde_json::from_slice(&body_bytes).expect("parse json");
-
-        assert_eq!(body.error.code, ErrorCode::Validation);
-        assert_eq!(body.error.location, Some("field.name".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_etag_formatting() {
-        let etag = format_etag(42);
-        assert_eq!(etag, r#"W/"42""#);
-    }
-
-    #[tokio::test]
-    async fn test_extract_if_match() {
-        let mut headers = HeaderMap::new();
-        headers.insert("If-Match", r#"W/"123""#.parse().unwrap());
-
-        let result = extract_if_match(&headers).expect("extract");
-        assert_eq!(result, Some("123".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_extract_if_none_match() {
-        let mut headers = HeaderMap::new();
-        headers.insert("If-None-Match", r#"W/"456""#.parse().unwrap());
-
-        let result = extract_if_none_match(&headers).expect("extract");
-        assert_eq!(result, Some("456".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_paginated_response_serialization() {
-        let response = PaginatedResponse {
-            items: vec!["a", "b"],
-            total: 100,
-            limit: 50,
-            offset: 0,
-        };
-
-        let json = serde_json::to_string(&response).expect("serialize");
-        let parsed: PaginatedResponse<String> = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(parsed.items, vec!["a", "b"]);
-        assert_eq!(parsed.total, 100);
-        assert_eq!(parsed.limit, 50);
-        assert_eq!(parsed.offset, 0);
+fn host_kind(spec: &caddy_rs_pm_core::HostSpec) -> &'static str {
+    match spec {
+        caddy_rs_pm_core::HostSpec::Proxy(_) => "proxy",
+        caddy_rs_pm_core::HostSpec::Redirect(_) => "redirect",
+        caddy_rs_pm_core::HostSpec::Dead(_) => "dead",
     }
 }
+
+fn tls_mode(tls: &caddy_rs_pm_core::HostTls) -> String {
+    use caddy_rs_pm_core::TlsMode;
+    match tls.mode {
+        TlsMode::Disabled => "disabled",
+        TlsMode::Auto => "auto",
+        TlsMode::Manual => "manual",
+        TlsMode::AcmeConfigured => "acme_configured",
+        TlsMode::InternalCa => "internal_ca",
+    }
+    .to_owned()
+}
+
+/// `GET /api/v1/config` — the assembled Caddy configuration with conditional-request support.
+async fn config_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let config = state.runtime.assemble(ConfigSettings::default())?;
+    let bytes = serde_json::to_vec(&config)
+        .map_err(|error| ApiError::Internal(format!("serialize config: {error}")))?;
+    let etag = format_weak_etag(&hash_bytes(&bytes));
+
+    if let Some(response) = evaluate_get_preconditions(&headers, &etag) {
+        return Ok(response);
+    }
+
+    let mut response = Json(config).into_response();
+    if let Ok(value) = HeaderValue::from_str(&etag) {
+        response.headers_mut().insert(header::ETAG, value);
+    }
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    Ok(response)
+}
+
+/// 64-bit FNV-1a over the response bytes.
+///
+/// An ETag only has to change when the representation changes; this is a change detector, not a
+/// security primitive. caddy-rs core keeps xxhash64 for Caddy-compatible admin `ETag` parity, but
+/// the PM API has no Caddy-side ETag to match, so a dependency-free hash avoids a new crate.
+fn hash_bytes(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+#[cfg(test)]
+mod tests;
