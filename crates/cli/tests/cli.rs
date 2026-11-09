@@ -1363,3 +1363,47 @@ fn environ_loads_envfiles_without_overwriting_and_reports_parse_errors() {
     assert!(stderr.contains("line 1"), "{stderr}");
     assert!(stderr.contains("KEY=VALUE"), "{stderr}");
 }
+
+#[test]
+fn completion_scripts_cover_every_subcommand_and_shell() {
+    let (code, stdout, stderr) = run(&["completion", "bash"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(!stdout.trim().is_empty(), "empty bash completion script");
+    for command in [
+        "version",
+        "build-info",
+        "list-modules",
+        "adapt",
+        "validate",
+        "run",
+        "reload",
+        "stop",
+        "environ",
+        "completion",
+        "pki",
+        "trust",
+    ] {
+        assert!(
+            stdout.contains(&format!("\"{command}\") opts="))
+                || stdout.contains(&format!(" {command} ")),
+            "bash completion misses {command}: {stdout}"
+        );
+    }
+    assert!(stdout.contains("--envfile"), "{stdout}");
+    assert!(
+        stdout.contains("complete -o default -F _caddy_rs caddy-rs"),
+        "{stdout}"
+    );
+
+    for shell in ["zsh", "fish", "powershell"] {
+        let (code, stdout, stderr) = run(&["completion", shell]);
+        assert_eq!(code, 0, "{shell} stderr: {stderr}");
+        assert!(!stdout.trim().is_empty(), "empty {shell} completion script");
+        assert!(stdout.contains("caddy-rs"), "{shell}: {stdout}");
+        assert!(stdout.contains("pki"), "{shell}: {stdout}");
+    }
+
+    let (code, _stdout, stderr) = run(&["completion", "nope"]);
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("unrecognized shell: nope"), "{stderr}");
+}

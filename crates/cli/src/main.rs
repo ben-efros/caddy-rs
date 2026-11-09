@@ -7,6 +7,7 @@
 //! supported configuration surface.
 
 mod build_info;
+mod completion;
 mod environ;
 mod signals;
 
@@ -132,6 +133,16 @@ enum Command {
         /// Environment file(s) to load (repeatable, or comma-separated).
         #[arg(long, value_delimiter = ',')]
         envfile: Vec<PathBuf>,
+    },
+    /// Generate a shell completion script.
+    ///
+    /// The supported shells are `bash`, `zsh`, `fish` and `powershell`, matching Caddy's
+    /// `completion <shell>` argument shape. Scripts are generated from this binary's clap command
+    /// tree, so every compiled subcommand and flag is covered.
+    Completion {
+        /// Shell to generate completions for (`bash`, `zsh`, `fish` or `powershell`).
+        #[arg(value_name = "SHELL")]
+        shell: String,
     },
     /// Inspect and export the local certificate authority material.
     Pki {
@@ -469,6 +480,9 @@ async fn run(command: Command) -> anyhow::Result<()> {
         }
         Command::Environ { envfile } => {
             environ::run(&envfile)?;
+        }
+        Command::Completion { shell } => {
+            print!("{}", completion::generate(&shell)?);
         }
         Command::Pki { command } => run_pki(command).await?,
         Command::Trust {
