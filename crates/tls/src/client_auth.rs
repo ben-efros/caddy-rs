@@ -519,6 +519,9 @@ use crate::Error;
 ///
 /// * `pki_authorities`: configured `apps.pki` CA id → authority directory (the directory holding
 ///   `root.crt`/`intermediate.crt`, caddy-rs's data-directory layout).
+/// * `implicit_authority_root`: data-directory root for Caddy's implicit default `local` CA; when
+///   set, `pki_root`/`pki_intermediate` sources naming `local` provision it on first use instead
+///   of reporting it as unconfigured.
 /// * `storage_root`: root of the configured `file_system` storage (Caddy's default storage), used
 ///   to resolve `storage.pem_keys`.
 /// * `system_roots`: platform roots override for tests/embedders; `None` loads the real platform
@@ -528,6 +531,15 @@ use crate::Error;
 pub struct CaPoolContext {
     /// Configured `apps.pki` CA id → authority directory (`pki/authorities/<id>`).
     pub pki_authorities: BTreeMap<String, PathBuf>,
+    /// Data-directory root used to provision Caddy's implicit default `local` PKI authority.
+    ///
+    /// Caddy's PKI app provisions `local` on demand (`ProvisionDefaultCA`/`GetCA`) under
+    /// `<data-dir>/pki/authorities/local`, including during `caddy validate`. The runtime sets
+    /// this when the configuration does not explicitly declare a `local` authority, so a
+    /// `pki_root`/`pki_intermediate` source naming `local` loads (and, on first use, generates)
+    /// the material at the same location. `None` keeps the strict "not configured in apps.pki"
+    /// error.
+    pub implicit_authority_root: Option<PathBuf>,
     /// Root directory of the `file_system` storage backend used for `storage` pool sources.
     pub storage_root: Option<PathBuf>,
     /// Platform roots override; `None` loads the host CA bundle.
@@ -544,6 +556,65 @@ impl CaPoolContext {
             ..Self::default()
         }
     }
+}
+
+/// `<data-dir>/pki/authorities/local`, the directory Caddy's PKI app uses for the implicit
+/// default `local` authority.
+fn default_local_authority_directory(root: &std::path::Path) -> PathBuf {
+    root.join("pki")
+        .join("authorities")
+        .join(crate::internal_ca::DEFAULT_CA_ID)
+}
+
+/// Provision — generate on first use, otherwise reuse — Caddy's implicit default `local` CA.
+///
+/// Caddy's PKI app does this lazily in `ProvisionDefaultCA`/`GetCA`, including during
+/// `caddy validate`. The loader here is synchronous, so the async issuer runs on a dedicated
+/// current-thread runtime; that also works when the caller is already inside a Tokio runtime.
+/// [`InternalIssuer::load_ca`](crate::internal_ca::InternalIssuer::load_ca) loads existing
+/// `root.crt`/`intermediate.crt` material instead of replacing it.
+fn provision_default_local_authority(root: &std::path::Path, path: &str) -> Result<(), Error> {
+    let directory = default_local_authority_directory(root);
+    let data_directory = root.to_path_buf();
+    let joined = std::thread::Builder::new()
+        .name("caddy-rs-default-ca".to_string())
+        .spawn(move || -> Result<(), String> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())?;
+            runtime
+                .block_on(
+                    crate::internal_ca::InternalIssuer::from_data_directory(data_directory)
+                        .with_name(crate::internal_ca::DEFAULT_CA_ID)
+                        .load_ca(),
+                )
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        })
+        .map_err(|error| Error::TlsConfig {
+            path: path.to_string(),
+            message: format!(
+                "provisioning the implicit default PKI authority `local` under `{}`: {error}",
+                directory.display()
+            ),
+        })?;
+    joined
+        .join()
+        .map_err(|_| Error::TlsConfig {
+            path: path.to_string(),
+            message: format!(
+                "provisioning the implicit default PKI authority `local` under `{}` failed",
+                directory.display()
+            ),
+        })?
+        .map_err(|error| Error::TlsConfig {
+            path: path.to_string(),
+            message: format!(
+                "provisioning the implicit default PKI authority `local` under `{}`: {error}",
+                directory.display()
+            ),
+        })
 }
 
 /// Load one `tls.ca_pool.source.*` provider value (Caddy `modules/caddytls/capools.go`).
@@ -666,22 +737,45 @@ pub fn load_ca_pool_source(
                     message: format!("{provider} CA pool source requires `authority`"),
                 });
             }
+            let file = if provider == "pki_root" {
+                "root.crt"
+            } else {
+                "intermediate.crt"
+            };
             let mut certificates = Vec::new();
             for authority in authorities {
-                let directory =
-                    context
-                        .pki_authorities
-                        .get(&authority)
-                        .ok_or_else(|| Error::TlsConfig {
+                let directory = match context.pki_authorities.get(&authority) {
+                    Some(directory) => directory.clone(),
+                    // Caddy's `GetCA` provisions the default `local` authority on demand when the
+                    // configuration did not declare it. Generate/persist it under the data
+                    // directory before reading, so a first `validate` succeeds exactly like
+                    // Caddy and later calls reuse the same material.
+                    None if authority == crate::internal_ca::DEFAULT_CA_ID => {
+                        let root = context.implicit_authority_root.as_ref().ok_or_else(|| {
+                            Error::TlsConfig {
+                                path: field_path("authority"),
+                                message: format!(
+                                    "PKI authority `{authority}` is not configured in apps.pki"
+                                ),
+                            }
+                        })?;
+                        let directory = default_local_authority_directory(root);
+                        // Reuse existing certificates as-is: a trust-anchor loader does not need
+                        // the CA signing keys, and a data directory provisioned by real Caddy
+                        // stores them in a PEM encoding this crate does not parse for a pool.
+                        if !directory.join(file).is_file() {
+                            provision_default_local_authority(root, path)?;
+                        }
+                        directory
+                    }
+                    None => {
+                        return Err(Error::TlsConfig {
                             path: field_path("authority"),
                             message: format!(
                                 "PKI authority `{authority}` is not configured in apps.pki"
                             ),
-                        })?;
-                let file = if provider == "pki_root" {
-                    "root.crt"
-                } else {
-                    "intermediate.crt"
+                        })
+                    }
                 };
                 let pem_path = directory.join(file);
                 let pem = std::fs::read_to_string(&pem_path).map_err(|error| {
@@ -1002,6 +1096,126 @@ mod ca_pool_tests {
         assert!(
             missing.to_string().contains("not configured in apps.pki"),
             "{missing}"
+        );
+    }
+
+    #[test]
+    fn provisions_the_implicit_local_authority_once_and_reuses_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = default_context();
+        context.implicit_authority_root = Some(dir.path().to_path_buf());
+        let root_source = json!({"provider": "pki_root", "authority": ["local"]});
+        let intermediate_source = json!({"provider": "pki_intermediate", "authority": ["local"]});
+
+        let root = load_ca_pool_source(&root_source, "ca", &context).unwrap();
+        assert_eq!(root.len(), 1, "the generated root loads as a trust anchor");
+        let intermediate = load_ca_pool_source(&intermediate_source, "ca", &context).unwrap();
+        assert_eq!(intermediate.len(), 1);
+
+        let authority = dir.path().join("pki").join("authorities").join("local");
+        for file in [
+            "root.crt",
+            "root.key",
+            "intermediate.crt",
+            "intermediate.key",
+        ] {
+            assert!(
+                authority.join(file).is_file(),
+                "expected Caddy's `{}` layout at `{}`",
+                file,
+                authority.display()
+            );
+        }
+        let root_pem = std::fs::read_to_string(authority.join("root.crt")).unwrap();
+        let intermediate_pem = std::fs::read_to_string(authority.join("intermediate.crt")).unwrap();
+
+        // A second load must reuse the persisted material, not regenerate it.
+        assert_eq!(
+            load_ca_pool_source(&root_source, "ca", &context).unwrap(),
+            root
+        );
+        assert_eq!(
+            std::fs::read_to_string(authority.join("root.crt")).unwrap(),
+            root_pem
+        );
+        assert_eq!(
+            std::fs::read_to_string(authority.join("intermediate.crt")).unwrap(),
+            intermediate_pem
+        );
+    }
+
+    #[test]
+    fn implicit_local_without_a_data_root_stays_a_located_error() {
+        let error = load_ca_pool_source(
+            &json!({"provider": "pki_root", "authority": ["local"]}),
+            "ca",
+            &default_context(),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("not configured in apps.pki"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn explicitly_configured_local_authority_is_never_generated() {
+        // An `apps.pki.certificate_authorities.local` entry is resolved from its configured
+        // location; only the implicit default is provisioned on demand.
+        let explicit = tempfile::tempdir().unwrap();
+        let implicit = tempfile::tempdir().unwrap();
+        let mut context = default_context();
+        context
+            .pki_authorities
+            .insert("local".to_string(), explicit.path().to_path_buf());
+        context.implicit_authority_root = Some(implicit.path().to_path_buf());
+
+        let error = load_ca_pool_source(
+            &json!({"provider": "pki_root", "authority": ["local"]}),
+            "ca",
+            &context,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("root.crt"),
+            "explicit authorities keep the loud missing-material error: {error}"
+        );
+        assert!(
+            !implicit.path().join("pki").exists(),
+            "the implicit root must not be touched for an explicitly configured authority"
+        );
+    }
+
+    #[test]
+    fn reuses_certificates_from_a_real_caddy_data_directory_without_its_keys() {
+        // The oracle runs real Caddy first against the same data directory. Caddy writes its CA
+        // keys as `EC PRIVATE KEY` (SEC1); a trust-anchor pool only needs the certificates, so
+        // pre-existing `root.crt`/`intermediate.crt` must be reused without touching the keys.
+        let dir = tempfile::tempdir().unwrap();
+        let authority = dir.path().join("pki").join("authorities").join("local");
+        std::fs::create_dir_all(&authority).unwrap();
+        std::fs::write(authority.join("root.crt"), CERT).unwrap();
+        std::fs::write(authority.join("intermediate.crt"), OTHER).unwrap();
+        let mut context = default_context();
+        context.implicit_authority_root = Some(dir.path().to_path_buf());
+
+        let root = load_ca_pool_source(
+            &json!({"provider": "pki_root", "authority": ["local"]}),
+            "ca",
+            &context,
+        )
+        .unwrap();
+        assert_eq!(root, certs(CERT));
+        let intermediate = load_ca_pool_source(
+            &json!({"provider": "pki_intermediate", "authority": ["local"]}),
+            "ca",
+            &context,
+        )
+        .unwrap();
+        assert_eq!(intermediate, certs(OTHER));
+        assert!(
+            !authority.join("root.key").exists() && !authority.join("intermediate.key").exists(),
+            "pre-existing certificates must not trigger key loading or generation"
         );
     }
 

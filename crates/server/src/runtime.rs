@@ -275,6 +275,11 @@ enum ActivationState {
 ///
 /// `apps.pki.certificate_authorities` ids map to `<data-dir>/pki/authorities/<id>` (the layout the
 /// runtime provisions), and `storage` pool sources read from the configured file-system root.
+///
+/// Caddy's PKI app always provides the default `local` authority: `Provision` creates it when no
+/// CA is configured and `GetCA` provisions it on demand otherwise. When the configuration does not
+/// declare a `local` authority, the context's `implicit_authority_root` carries the data root so
+/// the loader can provision and reuse `<root>/pki/authorities/local` exactly like Caddy.
 fn client_auth_ca_pool_context(
     config: &caddy_rs_core::Config,
     data_root: Option<&std::path::Path>,
@@ -288,10 +293,10 @@ fn client_auth_ca_pool_context(
         .or_else(|| default_root.clone())
     {
         context.storage_root = Some(root.clone());
-        let mut declares_authorities = false;
+        let mut declares_local = false;
         if let Some(pki) = config.apps.as_ref().and_then(|apps| apps.pki.as_ref()) {
             if let Some(authorities) = pki.certificate_authorities.as_ref() {
-                declares_authorities = !authorities.is_empty();
+                declares_local = authorities.contains_key(caddy_rs_tls::internal_ca::DEFAULT_CA_ID);
                 for id in authorities.keys() {
                     context
                         .pki_authorities
@@ -299,15 +304,13 @@ fn client_auth_ca_pool_context(
                 }
             }
         }
-        // Caddy provisions a default `local` authority whenever `certificate_authorities` is empty
-        // (`modules/caddypki/pki.go`: `ProvisionDefaultCA` runs only when no CA is configured), so a
-        // client-auth pool may reference `local` without declaring `apps.pki` at all. Resolve the
-        // same on-disk location here; the loader still fails loudly when the material is absent.
-        if !declares_authorities {
-            context
-                .pki_authorities
-                .entry("local".to_string())
-                .or_insert_with(|| root.join("pki").join("authorities").join("local"));
+        // Caddy provisions the default `local` authority on demand (`GetCA`) whenever the
+        // configuration does not declare it, so a client-auth pool may reference `local` without
+        // declaring `apps.pki` at all. The loader provisions the material at this root on first
+        // use and reuses it afterwards; an explicitly declared `local` keeps its configured
+        // location and is never regenerated here.
+        if !declares_local {
+            context.implicit_authority_root = Some(root);
         }
     }
     context
@@ -383,6 +386,31 @@ impl ServerRuntime {
         self
     }
 
+    /// Data-directory root used while validating the active generation.
+    ///
+    /// Caddy's `validate` provisions the apps, so the PKI app creates the implicit `local` CA in
+    /// the default storage root even when the configuration declares no CA. `caddy-rs validate`
+    /// does not pass `--data-dir`, so when neither [`Self::with_data_root`] nor the configuration's
+    /// `storage.root` supplies a root, resolve the same drop-in Caddy data path `run` would use
+    /// (`CADDY_RS_DATA_DIR`, XDG/HOME, legacy detection). The CA-pool context still gives
+    /// `storage.root` precedence, so this fallback is only consulted for the implicit authority.
+    fn validation_data_root(&self) -> Option<std::path::PathBuf> {
+        if self.data_root.is_some() {
+            return self.data_root.clone();
+        }
+        let storage_root = self.store.current().and_then(|generation| {
+            generation
+                .config()
+                .storage()
+                .and_then(|storage| storage.root())
+                .map(std::path::PathBuf::from)
+        });
+        if storage_root.is_some() {
+            return None;
+        }
+        Some(caddy_rs_core::data_dir::resolve_server_data_dir(None, None).path)
+    }
+
     /// The HTTP-01 token store shared with the ACME issuer (tests seed tokens directly).
     pub fn challenge_tokens(&self) -> Arc<caddy_rs_tls::Http01TokenStore> {
         Arc::clone(&self.challenge_tokens)
@@ -443,6 +471,10 @@ impl ServerRuntime {
         let https_port = http.https_port.unwrap_or(DEFAULT_HTTPS_PORT);
         let status_sink = UpstreamStatusSink::new();
         let acme_server_data_root = self.acme_server_data_root(generation.config())?;
+        let ca_pool_context = client_auth_ca_pool_context(
+            generation.config(),
+            self.validation_data_root().as_deref(),
+        );
         for (server_name, server) in &http.servers {
             let _limits = ServerLimits::from_http_server(server_name, server)?;
             let _trusted_proxies = parse_server_trusted_proxies(server, server_name)?;
@@ -456,7 +488,7 @@ impl ServerRuntime {
             }
             let _tls_options = TlsServerOptions::from_connection_policies_with_ca_pool(
                 policies,
-                &client_auth_ca_pool_context(generation.config(), self.data_root.as_deref()),
+                &ca_pool_context,
             )?;
             let _router = Self::build_router(
                 server_name,
