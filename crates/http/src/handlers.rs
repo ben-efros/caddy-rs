@@ -428,11 +428,24 @@ impl Handler for HeadersHandler {
 
 /// `vars`: set request variables, expanding placeholders in names and values.
 pub struct VarsHandler {
-    vars: Vec<(String, String)>,
+    vars: Vec<(String, VarValue)>,
+}
+
+/// One configured `vars` value, keeping its JSON type.
+///
+/// Caddy stores the decoded value in the request context and `log_skip` only takes effect when it
+/// is the boolean `true` (`GetVar(ctx, "log_skip").(bool)`); a string `"true"` must not skip. The
+/// rest of the runtime exposes variables as strings, so the string form is still what
+/// [`Request::vars`] holds — but the original type is preserved here for the access-log check.
+#[derive(Debug, Clone)]
+enum VarValue {
+    String(String),
+    Number(String),
+    Bool(bool),
 }
 
 impl VarsHandler {
-    /// Build from Caddy JSON; every string field except `handler` is a variable.
+    /// Build from Caddy JSON; every field except `handler` is a variable.
     pub fn from_json(value: &serde_json::Value, path: &str) -> Result<Self> {
         let object = value
             .as_object()
@@ -443,9 +456,9 @@ impl VarsHandler {
                 continue;
             }
             let value = match value {
-                serde_json::Value::String(value) => value.clone(),
-                serde_json::Value::Number(number) => number.to_string(),
-                serde_json::Value::Bool(flag) => flag.to_string(),
+                serde_json::Value::String(value) => VarValue::String(value.clone()),
+                serde_json::Value::Number(number) => VarValue::Number(number.to_string()),
+                serde_json::Value::Bool(flag) => VarValue::Bool(*flag),
                 _ => continue,
             };
             vars.push((key.clone(), value));
@@ -461,13 +474,30 @@ impl Handler for VarsHandler {
     }
 
     async fn handle(&self, mut request: Request) -> Result<Outcome> {
-        let vars: Vec<(String, String)> = self
+        let vars: Vec<(String, VarValue)> = self
             .vars
             .iter()
-            .map(|(key, value)| (request.replace_all(key), request.replace_all(value)))
+            .map(|(key, value)| {
+                let key = request.replace_all(key);
+                let value = match value {
+                    VarValue::String(value) => VarValue::String(request.replace_all(value)),
+                    VarValue::Number(value) => VarValue::Number(request.replace_all(value)),
+                    VarValue::Bool(flag) => VarValue::Bool(*flag),
+                };
+                (key, value)
+            })
             .collect();
         for (key, value) in vars {
-            request.vars.insert(key, value);
+            let storable = match &value {
+                VarValue::String(value) | VarValue::Number(value) => value.clone(),
+                VarValue::Bool(flag) => flag.to_string(),
+            };
+            // Caddy's access logger reads `log_skip` as a bool after the handler chain; assigning
+            // any non-boolean value (or `false`) means the request is logged normally.
+            if key == "log_skip" {
+                request.set_log_skip(matches!(value, VarValue::Bool(true)));
+            }
+            request.vars.insert(key, storable);
         }
         Ok(Outcome::Continue(request))
     }

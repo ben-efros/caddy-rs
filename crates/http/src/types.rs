@@ -376,6 +376,17 @@ impl Request {
         self.access_log.as_ref()
     }
 
+    /// Record Caddy's `log_skip` request variable for the access logger.
+    ///
+    /// The generic `vars` handler calls this when it assigns `log_skip`; Caddy stores the value on
+    /// the request context and the server reads it after the handler chain when it renders the
+    /// access entry. It is a no-op when access logging is disabled.
+    pub fn set_log_skip(&self, skip: bool) {
+        if let Some(context) = &self.access_log {
+            context.set_log_skip(skip);
+        }
+    }
+
     /// Publish the authenticated user id into the access-log context (Caddy's `user_id`).
     ///
     /// Authentication handlers call this after a successful credential check; it is a no-op when
