@@ -112,8 +112,10 @@ impl HostRepository {
 
     /// Insert a host with a caller-assigned id.
     ///
-    /// Fails if the id exists or any normalized domain is already owned by another host. The host
-    /// id and every domain index are written in one transaction.
+    /// Fails if the id exists or any normalized domain is already owned by another host. A retired
+    /// id (one returned by a previous [`delete`](Self::delete)) fails with
+    /// [`HostError::IdRetired`] and is never reused. The host id and every domain index are written
+    /// in one transaction.
     pub fn create(&self, host: Host) -> Result<StoredHost, HostError> {
         host.validate_structure()?;
         if self
@@ -193,6 +195,10 @@ impl HostRepository {
     }
 
     /// Delete a host and every domain index owned by it.
+    ///
+    /// The id is retired by writing a tombstone in the same transaction, so it can never be reused:
+    /// [`create`](Self::create) rejects it with [`HostError::IdRetired`] and
+    /// [`next_id`](Self::next_id) skips it, including after the store is reopened.
     pub fn delete(&self, id: HostId, expected_revision: Revision) -> Result<(), HostError> {
         let current = self.get(id)?.ok_or(HostError::NotFound(id.0))?;
         let snapshot = self.store.snapshot()?;
@@ -217,7 +223,15 @@ impl HostRepository {
 
     /// Reserve the next numeric host id.
     ///
-    /// The counter is persisted in the same store; concurrent callers race on a CAS and retry.
+    /// Reservation is monotonic: the returned id is the maximum of the persisted counter, one past
+    /// the highest existing host, and one past the highest retired id. Existing and retired ids are
+    /// skipped, so a deleted host id is never handed out again. The counter write and the
+    /// `check_missing` guards for the candidate are one compare-and-swap transaction; concurrent
+    /// callers race on that CAS and retry.
+    ///
+    /// If the next candidate cannot be advanced past [`u64::MAX`] the id space is exhausted and the
+    /// call fails closed with [`HostError::State`] wrapping [`StateError::Unavailable`] instead of
+    /// panicking or returning an id it could not reserve.
     pub fn next_id(&self) -> Result<u64, HostError> {
         for _ in 0..8 {
             let snapshot = self.store.snapshot()?;
@@ -229,6 +243,11 @@ impl HostRepository {
                 .max(max_numeric_key(&snapshot, TOMBSTONES))
                 .unwrap_or(0);
             let next = counter.max(highest.saturating_add(1)).max(1);
+            let Some(reserved) = next.checked_add(1) else {
+                return Err(HostError::State(StateError::Unavailable(
+                    "host id space exhausted".to_string(),
+                )));
+            };
             let mut transaction = Transaction::new();
             transaction = match document {
                 Some(document) => transaction.check_revision(META, NEXT_ID, document.revision),
@@ -237,7 +256,7 @@ impl HostRepository {
             transaction = transaction
                 .check_missing(HOSTS, next.to_string())
                 .check_missing(TOMBSTONES, next.to_string())
-                .put(META, NEXT_ID, json!(next + 1));
+                .put(META, NEXT_ID, json!(reserved));
             match self.store.transact(transaction) {
                 Ok(_) => return Ok(next),
                 Err(StateError::Conflict { .. }) => continue,
@@ -449,6 +468,124 @@ mod tests {
             caddy_rs_pm_state::SnapshotStore::open(&path).expect("reopen"),
         ));
         assert_eq!(repo.next_id().expect("after reopen"), 3);
+    }
+
+    #[test]
+    fn tombstone_survives_a_snapshot_reopen() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("pm-state.json");
+        {
+            let repo = HostRepository::new(Arc::new(
+                caddy_rs_pm_state::SnapshotStore::open(&path).expect("open"),
+            ));
+            let created = repo
+                .create(proxy(1, &["retired.example.com"]))
+                .expect("create");
+            repo.delete(HostId(1), created.revision).expect("delete");
+        }
+        let repo = HostRepository::new(Arc::new(
+            caddy_rs_pm_state::SnapshotStore::open(&path).expect("reopen"),
+        ));
+        assert!(matches!(
+            repo.create(proxy(1, &["reused.example.com"])),
+            Err(HostError::IdRetired(1))
+        ));
+        assert_eq!(repo.next_id().expect("next after reopen"), 2);
+    }
+
+    #[test]
+    fn next_id_fails_closed_when_the_id_space_is_exhausted() {
+        let repo = repo();
+        repo.create(proxy(u64::MAX, &["max.example.com"]))
+            .expect("create max id");
+        assert!(matches!(
+            repo.next_id(),
+            Err(HostError::State(StateError::Unavailable(message)))
+                if message == "host id space exhausted"
+        ));
+    }
+
+    #[test]
+    fn next_id_guard_retries_when_a_tombstone_appears_after_the_snapshot() {
+        let store = Arc::new(RaceStore::new(
+            Transaction::new().check_missing(TOMBSTONES, "1").put(
+                TOMBSTONES,
+                "1",
+                json!({ "host_id": 1 }),
+            ),
+        ));
+        let repo = HostRepository::new(Arc::clone(&store) as Arc<dyn StateStore>);
+        assert_eq!(repo.next_id().expect("next"), 2);
+        assert!(repo.get(HostId(1)).expect("get").is_none());
+        assert_eq!(store.snapshot_count(), 2);
+    }
+
+    #[test]
+    fn next_id_guard_retries_when_a_host_appears_after_the_snapshot() {
+        let store = Arc::new(RaceStore::new(
+            Transaction::new().check_missing(HOSTS, "1").put(
+                HOSTS,
+                "1",
+                serde_json::to_value(proxy(1, &["raced.example.com"])).expect("host json"),
+            ),
+        ));
+        let repo = HostRepository::new(Arc::clone(&store) as Arc<dyn StateStore>);
+        assert_eq!(repo.next_id().expect("next"), 2);
+        assert_eq!(store.snapshot_count(), 2);
+    }
+
+    /// Injects a conflicting write after returning a snapshot, simulating another writer that
+    /// commits between `next_id`'s snapshot read and its transaction.
+    struct RaceStore {
+        inner: MemoryStore,
+        pending: std::sync::Mutex<Option<Transaction>>,
+        snapshots: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RaceStore {
+        fn new(pending: Transaction) -> Self {
+            Self {
+                inner: MemoryStore::default(),
+                pending: std::sync::Mutex::new(Some(pending)),
+                snapshots: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn snapshot_count(&self) -> usize {
+            self.snapshots.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl StateStore for RaceStore {
+        fn get(&self, namespace: &str, key: &str) -> Result<Option<Document>, StateError> {
+            self.inner.get(namespace, key)
+        }
+
+        fn scan(&self, namespace: &str, prefix: &str) -> Result<Vec<Document>, StateError> {
+            self.inner.scan(namespace, prefix)
+        }
+
+        fn snapshot(&self) -> Result<caddy_rs_pm_state::Snapshot, StateError> {
+            let snapshot = self.inner.snapshot()?;
+            self.snapshots
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let pending = self.pending.lock().expect("race store lock").take();
+            if let Some(transaction) = pending {
+                self.inner.transact(transaction)?;
+            }
+            Ok(snapshot)
+        }
+
+        fn transact(
+            &self,
+            transaction: Transaction,
+        ) -> Result<caddy_rs_pm_state::Commit, StateError> {
+            self.inner.transact(transaction)
+        }
+
+        fn backup(&self, path: &std::path::Path) -> Result<(), StateError> {
+            self.inner.backup(path)
+        }
     }
 
     #[test]
