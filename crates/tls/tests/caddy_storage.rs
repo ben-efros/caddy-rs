@@ -43,6 +43,7 @@ async fn loads_caddy_layout_fixture_tree_from_temp_dir() {
     assert_eq!(
         keys,
         vec![
+            "127.0.0.1-14000-dir/acme-metadata.pebble.test".to_string(),
             "acme-v02.api.letsencrypt.org-directory/example.com".to_string(),
             "local/*.example.net".to_string(),
         ]
@@ -132,4 +133,69 @@ async fn a_realistic_caddy_data_directory_is_reused_without_conversion() {
     );
     let local = storage.list("local/").await.unwrap();
     assert_eq!(local, vec!["local/*.example.net".to_string()]);
+}
+
+/// The `127.0.0.1-14000-dir/acme-metadata.pebble.test` fixture was written by the pinned Caddy
+/// v2.11.9 oracle (`external/caddy`, certmagic v0.25.6) after an ACME issuance against a local
+/// Pebble CA that advertises ARI. Its `.json` is therefore a genuine `CertificateResource`
+/// document, including `issuer_data.renewal_info` with `suggestedWindow`, `_uniqueIdentifier`,
+/// `_retryAfter` and `_selectedTime`. Loading it and storing it back through caddy-rs storage must
+/// reproduce the exact bytes Caddy wrote, so a real Caddy data directory round-trips without loss.
+#[tokio::test]
+async fn real_caddy_acme_metadata_round_trips_byte_for_byte() {
+    const ISSUER: &str = "127.0.0.1-14000-dir";
+    const NAME: &str = "acme-metadata.pebble.test";
+    const KEY: &str = "127.0.0.1-14000-dir/acme-metadata.pebble.test";
+
+    let temporary = tempfile::tempdir().unwrap();
+    copy_tree(&fixture_directory(), temporary.path());
+    let storage = FileStorage::new(temporary.path());
+    let metadata_path = temporary
+        .path()
+        .join("certificates")
+        .join(ISSUER)
+        .join(NAME)
+        .join(format!("{NAME}.json"));
+    let caddy_document = std::fs::read_to_string(&metadata_path).unwrap();
+
+    let stored = storage.load(KEY).await.unwrap().expect("fixture loads");
+    assert_eq!(stored.domains, vec![NAME.to_string()]);
+    let issuer_data = stored.issuer_data.as_ref().expect("issuer_data preserved");
+    // acmez `acme.Certificate` (`mholt/acmez/v3/acme/certificate.go:34-64`).
+    assert_eq!(
+        issuer_data["url"],
+        "https://127.0.0.1:14000/certZ/6ff5c62f807e373d"
+    );
+    assert_eq!(issuer_data["ca"], "https://127.0.0.1:14000/dir");
+    assert_eq!(
+        issuer_data["account"],
+        "https://127.0.0.1:14000/my-account/6a6c7b104c35bf51"
+    );
+    // acmez `acme.RenewalInfo` (`mholt/acmez/v3/acme/ari.go:40-89`).
+    assert_eq!(
+        issuer_data["renewal_info"]["suggestedWindow"],
+        serde_json::json!({
+            "start": "2027-01-07T22:24:33Z",
+            "end": "2027-01-09T22:24:33Z"
+        })
+    );
+    assert_eq!(
+        issuer_data["renewal_info"]["_uniqueIdentifier"],
+        "HUs42kCEEnTySLdsFZee9Zyc73E.b_XGL4B-Nz0"
+    );
+    assert_eq!(
+        issuer_data["renewal_info"]["_retryAfter"],
+        "2026-11-09T20:24:34.533380417-08:00"
+    );
+    assert_eq!(
+        issuer_data["renewal_info"]["_selectedTime"],
+        "2027-01-09T04:31:31Z"
+    );
+
+    // Round-trip untouched; the document must be byte-identical to what Caddy wrote.
+    storage.store(KEY, &stored).await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&metadata_path).unwrap(),
+        caddy_document
+    );
 }
