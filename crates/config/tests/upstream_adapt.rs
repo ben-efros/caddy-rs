@@ -348,6 +348,23 @@ fn forward_auth_copy_headers_matches_caddy() {
 }
 
 #[test]
+fn forward_auth_canonical_only_matches_caddy() {
+    // Baseline: with no user `handle_response`, the canonical 2xx handler is the only entry.
+    assert_adapts_like_caddy("forward_auth_canonical_only.caddyfiletest");
+}
+
+#[test]
+fn forward_auth_preserves_the_user_handle_response_block() {
+    // T-CONF-057: Caddy appends its canonical 2xx response handler *before* the user's own
+    // `handle_response` entries (`forwardauth.parseCaddyfile` seeds `HandleResponse`, then
+    // `FinalizeUnmarshalCaddyfile` appends and moves matcher-less entries to the end). The
+    // adapter must merge instead of overwrite, so a user `respond`/`log_skip` handler reaches
+    // the adapted JSON.
+    assert_adapts_like_caddy("forward_auth_user_handle_response.caddyfiletest");
+    assert_adapts_like_caddy("forward_auth_user_handle_response_merged.caddyfiletest");
+}
+
+#[test]
 fn forward_auth_duplicate_uri_is_rejected_like_caddy() {
     let error = adapt(
         "localhost:9080 {\n\tforward_auth :9091 {\n\t\turi /first\n\t\turi /second\n\t\tcopy_headers Remote-User\n\t}\n\n\trespond \"ok\" 200\n}\n",

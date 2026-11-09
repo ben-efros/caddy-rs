@@ -1,0 +1,107 @@
+:9080 {
+	forward_auth auth:9091 {
+		uri /auth
+		copy_headers Remote-User
+	}
+}
+----------
+{
+	"apps": {
+		"http": {
+			"servers": {
+				"srv0": {
+					"listen": [
+						":9080"
+					],
+					"routes": [
+						{
+							"handle": [
+								{
+									"handle_response": [
+										{
+											"match": {
+												"status_code": [
+													2
+												]
+											},
+											"routes": [
+												{
+													"handle": [
+														{
+															"handler": "vars"
+														}
+													]
+												},
+												{
+													"handle": [
+														{
+															"handler": "headers",
+															"request": {
+																"delete": [
+																	"Remote-User"
+																]
+															}
+														}
+													]
+												},
+												{
+													"handle": [
+														{
+															"handler": "headers",
+															"request": {
+																"set": {
+																	"Remote-User": [
+																		"{http.reverse_proxy.header.Remote-User}"
+																	]
+																}
+															}
+														}
+													],
+													"match": [
+														{
+															"not": [
+																{
+																	"vars": {
+																		"{http.reverse_proxy.header.Remote-User}": [
+																			""
+																		]
+																	}
+																}
+															]
+														}
+													]
+												}
+											]
+										}
+									],
+									"handler": "reverse_proxy",
+									"headers": {
+										"request": {
+											"set": {
+												"X-Forwarded-Method": [
+													"{http.request.method}"
+												],
+												"X-Forwarded-Uri": [
+													"{http.request.uri}"
+												]
+											}
+										}
+									},
+									"rewrite": {
+										"method": "GET",
+										"uri": "/auth"
+									},
+									"upstreams": [
+										{
+											"dial": "auth:9091"
+										}
+									]
+								}
+							]
+						}
+					]
+				}
+			}
+		}
+	}
+}

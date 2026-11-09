@@ -71,7 +71,7 @@ caddy-rs validate --config ./Caddyfile --adapter caddyfile
 | `error` | **exact** (subset) | `error [<matcher>] <message> [<status>]` → `error` handler; status may be an integer or a status placeholder, message is a placeholder-expanded string. |
 | `handle_errors` | **adapted** | `handle_errors [<codes>] {...}` → server `errors.routes` with status-code filters (integers, classes like `4xx`, ranges) emitted as the canonical `expression` status subset; host wrapping and route ordering follow Caddy (issue #5124). Site-block only; nested use is a located error. |
 | `reverse_proxy` `handle_response` forms | **adapted** | `@name status |
-| `forward_auth` | **adapted + runtime** | Adapts to Caddy's canonical expansion (`reverse_proxy` + `rewrite` + request header set + `handle_response` header copy) and executes end to end; verified by the local acceptance scenario `forward_auth_authelia` (AS-05). Live Authelia deployment remains external . |
+| `forward_auth` | **adapted + runtime** | Adapts to Caddy's canonical expansion (`reverse_proxy` + `rewrite` + request header set + `handle_response` header copy) and executes end to end; the user's own `handle_response`/`replace_status` entries are preserved *after* the canonical 2xx entry instead of being overwritten (Caddy's `forwardauth.parseCaddyfile` seeds `HandleResponse` with the 2xx copy handler, then `FinalizeUnmarshalCaddyfile` appends the user's entries and moves matcher-less ones last), so a non-2xx auth response reaches the user's handler; verified by the local acceptance scenario `forward_auth_authelia` (AS-05) and the differential fixtures `forward_auth_canonical_only`, `forward_auth_user_handle_response` and `forward_auth_user_handle_response_merged`. Live Authelia deployment remains external . |
 | `basic_auth` | **adapted + runtime** | `basic_auth`/`basicauth` adapt to the `authentication` handler (`bcrypt` hashes, optional realm) and execute; Caddy's broader provider/hash forms are rejected loudly . |
 
 ## Matchers supported
@@ -160,6 +160,43 @@ Supported: adapts to the canonical `reverse_proxy` + `rewrite` + `handle_respons
 executes end to end (401/403 pass-through, identity header copy on 2xx); local acceptance evidence is
 AS-05 (`forward_auth_authelia`). A live Authelia deployment remains externally blocked
 .
+
+A user `handle_response` block inside `forward_auth` is preserved after the canonical 2xx entry, not
+overwritten. Caddy's `parseCaddyfile` seeds `rpHandler.HandleResponse` with the 2xx copy handler and
+only then calls `UnmarshalCaddyfile`; `FinalizeUnmarshalCaddyfile` appends the user's entries and
+moves entries without a response matcher to the end
+(`modules/caddyhttp/reverseproxy/forwardauth/caddyfile.go`). Because the canonical 2xx entry stays
+first, a 2xx auth response copies the identity headers and continues down the chain, while a non-2xx
+response reaches the user's handler:
+
+```caddyfile
+app.example.com {
+	forward_auth authelia:9091 {
+		uri /api/verify
+		copy_headers Remote-User
+		handle_response {
+			log_skip
+			respond "denied" 401
+		}
+	}
+	reverse_proxy app:8080
+}
+```
+
+Adaptation emits Caddy v2.11.9's exact JSON for `respond`, `log_skip`, `vars`, `headers`,
+`copy_response` and `copy_response_headers` inside that block.
+
+**Runtime limitation (already registered in DIV-0099).** A `forward_auth` user `handle_response`
+containing `log_skip` (or any `vars` handler with a non-string value) adapts to Caddy's exact JSON,
+but this build's runtime refuses the configuration when the handler is built:
+
+```
+not implemented: `vars` handler values other than strings inside `handle_response` (T-PROXY-037)
+```
+
+Caddy accepts and executes it. DIV-0099 item (4) already registers non-string `vars` values inside
+`handle_response` as located errors, so no new divergence entry is required; the adapter no longer
+drops the block, so the limitation fails loudly instead of silently discarding the handler.
 
 ### Cloudflare DNS-01
 

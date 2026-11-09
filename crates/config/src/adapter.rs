@@ -6767,9 +6767,20 @@ fn forward_auth_handler(directive: &Directive, args: &[String]) -> caddy_rs_core
             "match": [{"not": [{"vars": Value::Object(vars)}]}],
         }));
     }
+    // Caddy appends the canonical 2xx response handler *before* the user's own
+    // `handle_response` entries, it never replaces them: `forwardauth.parseCaddyfile` seeds
+    // `rpHandler.HandleResponse` with this 2xx handler and only then calls
+    // `rpHandler.UnmarshalCaddyfile`, and `FinalizeUnmarshalCaddyfile` appends the user's entries
+    // (moving entries without a response matcher to the end). The canonical entry always has a
+    // matcher, so it remains first; the user's entries follow in declaration order, with the
+    // already-applied with-matcher/without-matcher ordering preserved.
+    let mut response_handlers = vec![json!({"match": {"status_code": [2]}, "routes": copy_routes})];
+    if let Some(Value::Array(user_handlers)) = object.remove("handle_response") {
+        response_handlers.extend(user_handlers);
+    }
     object.insert(
         "handle_response".to_string(),
-        json!([{"match": {"status_code": [2]}, "routes": copy_routes}]),
+        Value::Array(response_handlers),
     );
     Ok(Value::Object(object))
 }
