@@ -4,9 +4,9 @@
 //! configuration logic free of listener I/O so it can be unit-tested:
 //!
 //! * [`TlsCertificate`] loads a PEM/DER certificate chain + private key and extracts the names
-//!   the certificate covers (subjectAltName `dNSName` entries, falling back to subject
-//!   `commonName`) with a small DER walker — no X.509 parsing crate is available in the offline
-//!   registry cache;
+//!   the certificate covers (subjectAltName `dNSName` entries plus the subject `commonName`, like
+//!   Caddy's certmagic) with a small DER walker — no X.509 parsing crate is available in the
+//!   offline registry cache;
 //! * [`CertificateResolver`] implements rustls' [`ResolvesServerCert`] with exact-name then
 //!   one-label-wildcard matching, a default certificate for empty/unknown SNI, and constructors
 //!   from the existing [`CertificateCache`], from [`CertificateStorage`], and from typed
@@ -750,8 +750,11 @@ impl Clone for TlsCertificate {
 impl TlsCertificate {
     /// Load a certificate chain and private key from PEM text.
     ///
-    /// The certificate names are taken from the leaf's subjectAltName extension (falling back to
-    /// the subject commonName). Supported key encodings are PKCS#8 (`PRIVATE KEY`), SEC1
+    /// The certificate names are taken from the leaf's subjectAltName extension plus the subject
+    /// commonName. Caddy's certmagic (`fillCertFromLeaf`) keeps both: a certificate whose only
+    /// identity is the deprecated commonName still loads, and when SANs exist the commonName is
+    /// retained as an additional name (SAN entries are listed first here).
+    /// Supported key encodings are PKCS#8 (`PRIVATE KEY`), SEC1
     /// (`EC PRIVATE KEY`) and PKCS#1 (`RSA PRIVATE KEY`); the key type must be supported by
     /// rustls' aws-lc-rs provider.
     pub fn from_pem(certificate_pem: &str, private_key_pem: &str) -> Result<Self> {
@@ -2453,8 +2456,12 @@ fn x509_error(message: impl Into<String>) -> Error {
     }
 }
 
-/// Extract the names a certificate covers: subjectAltName `dNSName` entries, or the subject
-/// commonName when no SAN DNS names are present.
+/// Extract the names a certificate covers: subjectAltName `dNSName` entries plus the subject
+/// commonName (SAN entries first; a commonName already covered by a SAN is not duplicated).
+///
+/// Caddy's certmagic `fillCertFromLeaf` keeps the commonName even when SANs are present, and a
+/// certificate whose only identity is the deprecated commonName still loads (Go's `crypto/x509`
+/// parses it). A certificate with neither SAN DNS names nor a commonName remains a located error.
 fn certificate_names(der: &[u8]) -> Result<Vec<String>> {
     let outer = read_tlv(der)?;
     if outer.tag != 0x30 {
@@ -2481,8 +2488,11 @@ fn certificate_names(der: &[u8]) -> Result<Vec<String>> {
     if let Some(extensions) = children.iter().find(|child| child.tag == 0xA3) {
         names = subject_alt_names(extensions.content)?;
     }
-    if names.is_empty() {
-        if let Some(common_name) = common_name(subject.content)? {
+    if let Some(common_name) = common_name(subject)? {
+        if !names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(&common_name))
+        {
             names.push(common_name);
         }
     }
@@ -2538,38 +2548,84 @@ fn subject_alt_names(extensions_der: &[u8]) -> Result<Vec<String>> {
     Ok(names)
 }
 
-fn common_name(subject_der: &[u8]) -> Result<Option<String>> {
-    // Name ::= SEQUENCE OF RelativeDistinguishedName; RDN ::= SET OF AttributeTypeAndValue.
-    let name = read_tlv(subject_der)?;
-    if name.tag != 0x30 {
-        return Ok(None);
+/// Extract the subject commonName (OID 2.5.4.3) from the DER `Name` SEQUENCE.
+///
+/// The walk is `Name ::= SEQUENCE OF RDN` -> `RDN ::= SET OF AttributeTypeAndValue` ->
+/// `AttributeTypeAndValue ::= SEQUENCE { type OBJECT IDENTIFIER, value ANY }`, so a CN in any RDN
+/// (including a later one) is found. Structural violations and a CN value that is not one of Go's
+/// ASN.1 string types are located errors: silently skipping them would turn a malformed
+/// certificate into a confusing "no names" rejection. Go's `pkix.Name.FillFromRDNSequence` keeps
+/// the last commonName, so a subject with several CN attributes resolves the same way here.
+fn common_name(subject: &Tlv<'_>) -> Result<Option<String>> {
+    if subject.tag != 0x30 {
+        return Err(x509_error("subject is not a SEQUENCE"));
     }
-    for rdn in read_children(name.content)? {
+    let mut common_name = None;
+    for rdn in read_children(subject.content)? {
         if rdn.tag != 0x31 {
-            continue;
+            return Err(x509_error(
+                "subject relative distinguished name is not a SET",
+            ));
         }
         for attribute in read_children(rdn.content)? {
             if attribute.tag != 0x30 {
-                continue;
+                return Err(x509_error("subject attribute is not a SEQUENCE"));
             }
             let parts = read_children(attribute.content)?;
-            let Some(oid) = parts.first() else { continue };
-            if oid.tag != 0x06 || oid.content != [0x55, 0x04, 0x03] {
+            let Some(oid) = parts.first() else {
+                return Err(x509_error("subject attribute has no type"));
+            };
+            if oid.tag != 0x06 {
+                return Err(x509_error(
+                    "subject attribute type is not an OBJECT IDENTIFIER",
+                ));
+            }
+            if oid.content != [0x55, 0x04, 0x03] {
                 continue;
             }
-            let Some(value) = parts.get(1) else { continue };
-            // UTF8String (0x0C), PrintableString (0x13) or IA5String (0x16).
-            let text = match value.tag {
-                0x0C => std::str::from_utf8(value.content).ok().map(str::to_string),
-                0x13 | 0x16 => std::str::from_utf8(value.content).ok().map(str::to_string),
-                _ => None,
-            };
-            if text.is_some() {
-                return Ok(text);
-            }
+            let value = parts
+                .get(1)
+                .ok_or_else(|| x509_error("subject commonName has no value"))?;
+            common_name = Some(common_name_string(value)?);
         }
     }
-    Ok(None)
+    // Caddy/Go ignores an empty commonName; an earlier non-empty CN does not survive a later
+    // empty one because `FillFromRDNSequence` keeps the last attribute.
+    Ok(common_name.filter(|name| !name.is_empty()))
+}
+
+/// Decode an ASN.1 string value the way Go's `crypto/x509` does for `Name` attributes.
+///
+/// Go accepts PrintableString (0x13), UTF8String (0x0C), IA5String (0x16), T61String (0x14,
+/// treated as Latin-1), BMPString (0x1E, UCS-2/UTF-16BE) and NumericString (0x12); any other tag
+/// is an unsupported string type and fails the certificate parse. Matching that set keeps a
+/// commonName's encoding from changing whether a certificate loads.
+fn common_name_string(value: &Tlv<'_>) -> Result<String> {
+    match value.tag {
+        0x0C => std::str::from_utf8(value.content)
+            .map(str::to_string)
+            .map_err(|_| x509_error("subject commonName is not valid UTF-8")),
+        0x12 | 0x13 | 0x16 => std::str::from_utf8(value.content)
+            .map(str::to_string)
+            .map_err(|_| x509_error("subject commonName is not valid ASCII")),
+        // T.61 is defunct; Go (like BoringSSL) treats it as ISO-8859-1.
+        0x14 => Ok(value.content.iter().map(|byte| char::from(*byte)).collect()),
+        0x1E => {
+            if value.content.len() % 2 != 0 {
+                return Err(x509_error("subject commonName BMPString has an odd length"));
+            }
+            let units: Vec<u16> = value
+                .content
+                .chunks_exact(2)
+                .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+                .collect();
+            String::from_utf16(&units)
+                .map_err(|_| x509_error("subject commonName BMPString is not valid UTF-16"))
+        }
+        tag => Err(x509_error(format!(
+            "subject commonName has unsupported value tag 0x{tag:02X}"
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -2581,6 +2637,12 @@ mod tests {
     const EXAMPLE_KEY: &str = include_str!("../testdata/https/example.com.key");
     const OTHER_CERT: &str = include_str!("../testdata/https/other.example.pem");
     const OTHER_KEY: &str = include_str!("../testdata/https/other.example.key");
+    /// Subject CN only, no subjectAltName extension (the deprecated form Caddy still accepts).
+    const CN_ONLY_CERT: &str = include_str!("../testdata/https/cn-only.pem");
+    const CN_ONLY_KEY: &str = include_str!("../testdata/https/cn-only.key");
+    /// Subject CN and a different subjectAltName dNSName.
+    const CN_AND_SAN_CERT: &str = include_str!("../testdata/https/cn-and-san.pem");
+    const CN_AND_SAN_KEY: &str = include_str!("../testdata/https/cn-and-san.key");
 
     fn example() -> TlsCertificate {
         TlsCertificate::from_pem(EXAMPLE_CERT, EXAMPLE_KEY).expect("example fixture loads")
@@ -2848,6 +2910,222 @@ mod tests {
             error.to_string().contains("cannot read certificate names"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn cn_only_certificate_loads_and_matches_its_name() {
+        // Regression for T-TLS-091: common_name() used to receive the Subject SEQUENCE content
+        // and then look for a SEQUENCE inside it, so the first RDN SET made it return None and
+        // every CN-only certificate failed with "no subjectAltName ... and no subject commonName".
+        let certificate =
+            TlsCertificate::from_pem(CN_ONLY_CERT, CN_ONLY_KEY).expect("CN-only certificate loads");
+        assert_eq!(certificate.names(), &["cn-only.example".to_string()]);
+        let resolver = CertificateResolver::from_certificates([certificate]).expect("resolver");
+        assert!(resolver.covers("cn-only.example"));
+        assert!(resolver.covers("CN-ONLY.EXAMPLE."));
+        assert!(!resolver.covers("other.example"));
+        assert!(resolver.select(Some("cn-only.example")).is_some());
+    }
+
+    #[test]
+    fn cn_and_san_certificate_prefers_san_and_keeps_cn_like_caddy() {
+        // The pinned Caddy v2.11.9 oracle serves this certificate for both SNI values: certmagic's
+        // fillCertFromLeaf keeps leaf.Subject.CommonName and appends the SANs. SAN entries are
+        // listed first here so the SAN stays the preferred identity.
+        let certificate = TlsCertificate::from_pem(CN_AND_SAN_CERT, CN_AND_SAN_KEY)
+            .expect("CN+SAN certificate loads");
+        assert_eq!(
+            certificate.names(),
+            &[
+                "san-name.example".to_string(),
+                "cn-name.example".to_string()
+            ]
+        );
+        let resolver = CertificateResolver::from_certificates([certificate]).expect("resolver");
+        assert!(resolver.covers("san-name.example"));
+        assert!(resolver.covers("cn-name.example"));
+    }
+
+    // ---- subject commonName DER walk ------------------------------------------------------
+
+    fn der_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+        assert!(content.len() < 0x80, "test DER uses short-form lengths");
+        let mut out = Vec::with_capacity(content.len() + 2);
+        out.push(tag);
+        out.push(content.len() as u8);
+        out.extend_from_slice(content);
+        out
+    }
+
+    fn der_sequence(parts: &[Vec<u8>]) -> Vec<u8> {
+        let content: Vec<u8> = parts.iter().flatten().copied().collect();
+        der_tlv(0x30, &content)
+    }
+
+    fn der_set(parts: &[Vec<u8>]) -> Vec<u8> {
+        let content: Vec<u8> = parts.iter().flatten().copied().collect();
+        der_tlv(0x31, &content)
+    }
+
+    fn common_name_attribute(value: &[u8]) -> Vec<u8> {
+        der_sequence(&[der_tlv(0x06, &[0x55, 0x04, 0x03]), value.to_vec()])
+    }
+
+    /// `Certificate ::= SEQUENCE { tbsCertificate }` with exactly the fixed tbs fields
+    /// `certificate_names` indexes (version omitted): serial, signature, issuer, validity,
+    /// subject, subjectPublicKeyInfo. No signature is needed; this tests name extraction only.
+    fn certificate_with_subject(subject: &[u8]) -> Vec<u8> {
+        der_sequence(&[der_sequence(&[
+            der_tlv(0x02, &[0x01]),
+            der_sequence(&[]),
+            der_sequence(&[]),
+            der_sequence(&[]),
+            subject.to_vec(),
+            der_sequence(&[]),
+        ])])
+    }
+
+    #[test]
+    fn common_name_is_read_from_the_attribute_value_tlv() {
+        let subject = der_sequence(&[der_set(&[common_name_attribute(&der_tlv(
+            0x0C,
+            b"walked.example",
+        ))])]);
+        let subject = read_tlv(&subject).expect("subject parses");
+        assert_eq!(
+            common_name(&subject).expect("CN walks"),
+            Some("walked.example".to_string())
+        );
+    }
+
+    #[test]
+    fn common_name_is_found_in_a_later_multi_rdn_subject() {
+        let organization =
+            der_sequence(&[der_tlv(0x06, &[0x55, 0x04, 0x0A]), der_tlv(0x0C, b"Org")]);
+        let subject = der_sequence(&[
+            der_set(&[organization]),
+            der_set(&[common_name_attribute(&der_tlv(0x13, b"later.example"))]),
+        ]);
+        let subject = read_tlv(&subject).expect("subject parses");
+        assert_eq!(
+            common_name(&subject).expect("CN walks"),
+            Some("later.example".to_string())
+        );
+    }
+
+    #[test]
+    fn common_name_supports_go_string_encodings() {
+        let bmp: Vec<u8> = "bmp.example"
+            .encode_utf16()
+            .flat_map(u16::to_be_bytes)
+            .collect();
+        let subject = der_sequence(&[der_set(&[common_name_attribute(&der_tlv(0x1E, &bmp))])]);
+        let subject = read_tlv(&subject).expect("subject parses");
+        assert_eq!(
+            common_name(&subject).expect("BMPString CN walks"),
+            Some("bmp.example".to_string())
+        );
+        let t61 = der_sequence(&[der_set(&[common_name_attribute(&der_tlv(
+            0x14,
+            b"t61.example",
+        ))])]);
+        let t61 = read_tlv(&t61).expect("subject parses");
+        assert_eq!(
+            common_name(&t61).expect("T61String CN walks"),
+            Some("t61.example".to_string())
+        );
+    }
+
+    #[test]
+    fn non_string_common_name_value_fails_loudly() {
+        let subject = der_sequence(&[der_set(&[common_name_attribute(&der_tlv(
+            0x04,
+            b"not a string",
+        ))])]);
+        let subject = read_tlv(&subject).expect("subject parses");
+        let error = common_name(&subject).expect_err("OCTET STRING CN is rejected");
+        assert!(
+            error.to_string().contains("unsupported value tag 0x04"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn empty_subject_is_a_located_error_not_a_panic() {
+        let error =
+            certificate_names(&certificate_with_subject(&der_sequence(&[]))).expect_err("no names");
+        assert!(
+            error
+                .to_string()
+                .contains("no subjectAltName dNSName entries and no subject commonName"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn malformed_subject_is_a_located_error_not_a_panic() {
+        // RDN SET claims two content bytes but only one follows inside a well-formed outer TLV.
+        let malformed = der_tlv(0x30, &[0x31, 0x02, 0x30]);
+        let error =
+            certificate_names(&certificate_with_subject(&malformed)).expect_err("truncated RDN");
+        assert!(
+            error.to_string().contains("cannot read certificate names"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cn_only_certificate_is_selected_over_tls() {
+        let cn_only =
+            TlsCertificate::from_pem(CN_ONLY_CERT, CN_ONLY_KEY).expect("CN-only certificate loads");
+        let expected_leaf = cn_only.chain()[0].as_ref().to_vec();
+        let resolver = Arc::new(
+            CertificateResolver::from_certificates([example(), cn_only]).expect("resolver builds"),
+        );
+        let server_config = build_server_config(resolver, &TlsServerOptions::default())
+            .expect("server config builds");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("local address");
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            acceptor.accept(stream).await.map(|_| ())
+        });
+
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let client = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+            .with_safe_default_protocol_versions()
+            .expect("safe protocol versions")
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyCertificate(provider)))
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
+        let stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("TCP connect");
+        let server_name = rustls::pki_types::ServerName::try_from("cn-only.example".to_string())
+            .expect("valid server name");
+        let stream = connector
+            .connect(server_name, stream)
+            .await
+            .expect("handshake");
+        assert_eq!(
+            stream
+                .get_ref()
+                .1
+                .peer_certificates()
+                .expect("peer certificate")[0]
+                .as_ref(),
+            expected_leaf.as_slice(),
+            "SNI cn-only.example must select the CN-only certificate"
+        );
+        server
+            .await
+            .expect("server task")
+            .expect("server handshake");
     }
 
     #[test]
