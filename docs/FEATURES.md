@@ -529,5 +529,5 @@ environment values and non-listening descriptors also fail loudly.
 | `caddy-rs stop` | Stop the server through the admin API. |
 | `caddy-rs list-modules [--json]` | List the modules compiled into this build. |
 | `caddy-rs version [--json]` | Print the version and configuration baseline. |
-| `caddy-rs pki list` / `pki export <id>` | Inspect and export local CA material. |
+| `caddy-rs pki list` / `pki show <id>` / `pki export <id>` | Inspect local CA material (`list` includes platform trust state) and export byte-identical root/intermediate/chain PEM (`--type`, `--out`). |
 | `caddy-rs trust` | Install the local CA root into host trust stores; `--dry-run` prints the commands. |

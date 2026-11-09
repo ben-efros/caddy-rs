@@ -772,9 +772,9 @@ fn run_sends_systemd_notifications() {
 
 // ---- PKI / trust commands (read-only local CA material) --------------------------------------
 //
-// The fixtures live in the admin crate (`crates/admin/tests/fixtures/pki/authorities/...`); they
-// are read-only test data generated for this task (root + intermediate certificates for `local`
-// and `staging` CAs in Caddy's data-directory layout).
+// The certificate fixtures live in the admin crate (`crates/admin/tests/fixtures/pki/...`) in
+// Caddy's data-directory layout. The key file is borrowed from the TLS test corpus: `pki show` only
+// reports whether `<ca>/root.key` and `<ca>/intermediate.key` exist (it never parses keys).
 
 use std::path::PathBuf;
 
@@ -782,11 +782,49 @@ fn pki_fixture_data_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../admin/tests/fixtures")
 }
 
+fn pki_key_fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tls/testdata/https/example.com.key")
+}
+
+/// Copy the fixture CAs (certificates only) into a fresh Caddy-style data directory.
+fn copy_fixture_cas(data_dir: &Path) {
+    let source = pki_fixture_data_dir();
+    for id in ["local", "staging"] {
+        let target = data_dir.join("pki/authorities").join(id);
+        std::fs::create_dir_all(&target).expect("create CA fixture directory");
+        for file in ["root.crt", "intermediate.crt"] {
+            std::fs::copy(
+                source.join("pki/authorities").join(id).join(file),
+                target.join(file),
+            )
+            .expect("copy certificate fixture");
+        }
+    }
+}
+
+/// A temporary data directory with root/intermediate certificates and key files for `local` and
+/// `staging`, matching the layout Caddy's `caddypki` writes.
+fn pki_data_dir_with_keys() -> tempfile::TempDir {
+    let directory = tempfile::tempdir().expect("temp data dir");
+    copy_fixture_cas(directory.path());
+    for id in ["local", "staging"] {
+        let ca = directory.path().join("pki/authorities").join(id);
+        for file in ["root.key", "intermediate.key"] {
+            std::fs::copy(pki_key_fixture(), ca.join(file)).expect("copy key fixture");
+        }
+    }
+    directory
+}
+
 fn run_pki(args: &[&str]) -> (i32, String, String) {
-    let output = Command::new(binary())
-        .args(args)
-        .output()
-        .expect("run caddy-rs pki");
+    run_pki_with(args, |_command| {})
+}
+
+fn run_pki_with(args: &[&str], configure: impl FnOnce(&mut Command)) -> (i32, String, String) {
+    let mut command = Command::new(binary());
+    command.args(args);
+    configure(&mut command);
+    let output = command.output().expect("run caddy-rs pki");
     (
         output.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&output.stdout).to_string(),
@@ -807,27 +845,46 @@ fn assert_pem_count(pem: &str, count: usize) {
     );
 }
 
+fn row_for<'a>(stdout: &'a str, id: &str) -> &'a str {
+    stdout
+        .lines()
+        .find(|line| line.starts_with(&format!("{id} ")))
+        .unwrap_or_else(|| panic!("no `{id}` row in:\n{stdout}"))
+}
+
 #[test]
 fn pki_list_reports_provisioned_cas_and_json_shape() {
-    let data_dir = pki_fixture_data_dir();
+    let data = pki_data_dir_with_keys();
+    let data_dir = data.path().to_str().unwrap();
+    let trust_prefix = tempfile::tempdir().unwrap();
     let (code, stdout, stderr) =
-        run_pki(&["pki", "list", "--data-dir", data_dir.to_str().unwrap()]);
+        run_pki_with(&["pki", "list", "--data-dir", data_dir], |command| {
+            command.env("CADDY_RS_TRUST_PREFIX", trust_prefix.path());
+        });
     assert_eq!(code, 0, "stderr: {stderr}");
     assert!(stdout.contains("ID"), "{stdout}");
+    assert!(stdout.contains("ROOT_CN"), "{stdout}");
+    assert!(stdout.contains("ROOT_EXPIRES"), "{stdout}");
+    assert!(stdout.contains("INTERMEDIATE_EXPIRES"), "{stdout}");
+    assert!(stdout.contains("TRUST"), "{stdout}");
     assert!(stdout.contains("local"), "{stdout}");
     assert!(stdout.contains("staging"), "{stdout}");
     assert!(stdout.contains("caddy-rs test root"), "{stdout}");
     assert!(stdout.contains("caddy-rs test intermediate"), "{stdout}");
 
-    let (code, stdout, stderr) = run_pki(&[
-        "pki",
-        "list",
-        "--json",
-        "--data-dir",
-        data_dir.to_str().unwrap(),
-    ]);
+    let (code, stdout, stderr) = run_pki_with(
+        &["pki", "list", "--json", "--data-dir", data_dir],
+        |command| {
+            command.env("CADDY_RS_TRUST_PREFIX", trust_prefix.path());
+        },
+    );
     assert_eq!(code, 0, "stderr: {stderr}");
     let value: serde_json::Value = serde_json::from_str(&stdout).expect("list JSON");
+    assert_eq!(value["data_dir"], data_dir);
+    assert!(value["authorities_dir"]
+        .as_str()
+        .unwrap()
+        .ends_with("authorities"));
     let authorities = value["authorities"].as_array().expect("authorities array");
     assert_eq!(authorities.len(), 2);
     assert_eq!(authorities[0]["id"], "local");
@@ -842,19 +899,26 @@ fn pki_list_reports_provisioned_cas_and_json_shape() {
         .ends_with("authorities/local"));
     assert!(authorities[0]["root_not_after"].is_string());
     assert!(authorities[0]["has_intermediate"].as_bool().unwrap());
+    assert_eq!(authorities[0]["trust"]["install_trust"], "default");
+    assert!(
+        ["installed", "missing", "unknown"]
+            .contains(&authorities[0]["trust"]["state"].as_str().unwrap()),
+        "{stdout}"
+    );
 
     // `$CADDY_RS_DATA_DIR` is respected when --data-dir is absent.
-    let output = Command::new(binary())
-        .args(["pki", "list"])
-        .env("CADDY_RS_DATA_DIR", &data_dir)
-        .output()
-        .expect("run with env data dir");
-    assert_eq!(output.status.code(), Some(0));
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let (code, stdout, stderr) = run_pki_with(&["pki", "list"], |command| {
+        command
+            .env("CADDY_RS_DATA_DIR", data_dir)
+            .env("CADDY_RS_TRUST_PREFIX", trust_prefix.path());
+    });
+    assert_eq!(code, 0, "stderr: {stderr}");
     assert!(stdout.contains("local"), "{stdout}");
     assert!(stdout.contains("staging"), "{stdout}");
+}
 
-    // An empty/missing data dir lists nothing but is not an error.
+#[test]
+fn pki_list_names_the_directory_checked_when_empty() {
     let empty = tempfile::tempdir().unwrap();
     let (code, stdout, stderr) =
         run_pki(&["pki", "list", "--data-dir", empty.path().to_str().unwrap()]);
@@ -863,33 +927,400 @@ fn pki_list_reports_provisioned_cas_and_json_shape() {
         stdout.contains("no local certificate authorities"),
         "{stdout}"
     );
+    assert!(
+        stdout.contains(&empty.path().join("pki/authorities").display().to_string()),
+        "empty listing must name the authorities directory checked:\n{stdout}"
+    );
+    // The data directory is a prefix of the authorities path, so a contains() on the bare path
+    // would pass even if the "(data directory ...)" clause were missing. Assert the clause itself.
+    let expected_clause = format!("data directory `{}`", empty.path().display());
+    assert!(
+        stdout.contains(&expected_clause),
+        "empty listing must name the data directory checked:\n{stdout}"
+    );
 }
 
 #[test]
-fn pki_export_writes_root_intermediate_and_chain_pem() {
-    let data_dir = pki_fixture_data_dir();
-    let data_dir = data_dir.to_str().unwrap();
-    let root_expected =
-        std::fs::read_to_string(pki_fixture_data_dir().join("pki/authorities/local/root.crt"))
-            .expect("root fixture");
-    let intermediate_expected = std::fs::read_to_string(
-        pki_fixture_data_dir().join("pki/authorities/local/intermediate.crt"),
-    )
-    .expect("intermediate fixture");
+fn pki_list_fails_loudly_for_a_missing_data_directory() {
+    let base = tempfile::tempdir().unwrap();
+    let missing = base.path().join("does/not/exist");
+    let (code, stdout, stderr) = run_pki(&["pki", "list", "--data-dir", missing.to_str().unwrap()]);
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("does not exist"), "{stderr}");
+    assert!(stderr.contains(&missing.display().to_string()), "{stderr}");
+    assert!(stderr.contains("from --data-dir"), "{stderr}");
+    assert!(stderr.contains("CADDY_RS_DATA_DIR"), "{stderr}");
 
-    let (code, stdout, stderr) = run_pki(&["pki", "export", "local", "--data-dir", data_dir]);
+    // The same preflight protects `show` and `export`.
+    for subcommand in ["show local", "export local"] {
+        let mut args = vec!["pki"];
+        args.extend(subcommand.split(' '));
+        args.extend(["--data-dir", missing.to_str().unwrap()]);
+        let (code, stdout, stderr) = run_pki(&args);
+        assert_eq!(code, 1, "pki {subcommand}: {stderr}");
+        assert!(stdout.is_empty(), "{stdout}");
+        assert!(stderr.contains("does not exist"), "{stderr}");
+        assert!(stderr.contains(&missing.display().to_string()), "{stderr}");
+    }
+}
+
+#[test]
+fn pki_list_fails_loudly_when_the_data_directory_is_a_file() {
+    let base = tempfile::tempdir().unwrap();
+    let file = base.path().join("data-dir-is-a-file");
+    std::fs::write(&file, b"not a directory").unwrap();
+    let (code, stdout, stderr) = run_pki(&["pki", "list", "--data-dir", file.to_str().unwrap()]);
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("is not a directory"), "{stderr}");
+    assert!(stderr.contains(&file.display().to_string()), "{stderr}");
+}
+
+#[test]
+fn pki_list_uses_the_same_data_directory_resolution_as_run() {
+    // A configured `storage.root` is the storage the server writes, so it wins over `--data-dir`
+    // (the server's precedence in `caddy_rs_core::data_dir::resolve_server_data_dir`).
+    let data = pki_data_dir_with_keys();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let config = elsewhere.path().join("caddy.json");
+    let config_value = serde_json::json!({
+        "storage": {"module": "file_system", "root": data.path().to_string_lossy()},
+    });
+    std::fs::write(&config, serde_json::to_vec(&config_value).unwrap()).unwrap();
+    let (code, stdout, stderr) = run_pki(&[
+        "pki",
+        "list",
+        "--json",
+        "--config",
+        config.to_str().unwrap(),
+        "--data-dir",
+        elsewhere.path().to_str().unwrap(),
+    ]);
     assert_eq!(code, 0, "stderr: {stderr}");
-    assert_pem_count(&stdout, 1);
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("list JSON");
     assert_eq!(
-        stdout.trim(),
-        root_expected.trim(),
-        "default export is the root"
+        value["data_dir"].as_str().unwrap(),
+        data.path().to_str().unwrap()
+    );
+    assert_eq!(value["authorities"].as_array().unwrap().len(), 2);
+
+    // Caddy's `AppDataDir()`: `$XDG_DATA_HOME/caddy` is the default when no override is supplied.
+    let base = tempfile::tempdir().unwrap();
+    let xdg = base.path().join("xdg");
+    let work = base.path().join("work");
+    let home = base.path().join("home");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    copy_fixture_cas(&xdg.join("caddy"));
+    let trust_prefix = base.path().join("prefix");
+    let (code, stdout, stderr) = run_pki_with(&["pki", "list", "--json"], |command| {
+        command
+            .current_dir(&work)
+            .env_remove("CADDY_RS_DATA_DIR")
+            .env("XDG_DATA_HOME", &xdg)
+            .env("HOME", &home)
+            .env("CADDY_RS_TRUST_PREFIX", &trust_prefix);
+    });
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("list JSON");
+    assert_eq!(
+        value["data_dir"].as_str().unwrap(),
+        xdg.join("caddy").to_str().unwrap()
+    );
+    assert_eq!(value["authorities"].as_array().unwrap().len(), 2);
+
+    // The legacy `.caddy-rs` working-directory directory is still found, like the server's fallback.
+    let legacy_base = tempfile::tempdir().unwrap();
+    let legacy_cwd = legacy_base.path().join("work");
+    let legacy_home = legacy_base.path().join("home");
+    let empty_xdg = legacy_base.path().join("xdg");
+    std::fs::create_dir_all(&legacy_cwd).unwrap();
+    std::fs::create_dir_all(&legacy_home).unwrap();
+    copy_fixture_cas(&legacy_cwd.join(".caddy-rs"));
+    let (code, stdout, stderr) = run_pki_with(&["pki", "list", "--json"], |command| {
+        command
+            .current_dir(&legacy_cwd)
+            .env_remove("CADDY_RS_DATA_DIR")
+            .env("XDG_DATA_HOME", &empty_xdg)
+            .env("HOME", &legacy_home)
+            .env("CADDY_RS_TRUST_PREFIX", legacy_base.path().join("prefix"));
+    });
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("list JSON");
+    assert!(
+        value["data_dir"].as_str().unwrap().ends_with(".caddy-rs"),
+        "{stdout}"
+    );
+    assert_eq!(value["authorities"].as_array().unwrap().len(), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn pki_list_reports_platform_trust_store_state() {
+    let data = pki_data_dir_with_keys();
+    let fixture = trust_fixture(true);
+    let data_dir = data.path().to_str().unwrap();
+    let run = |extra: &[&str]| {
+        let mut args = vec!["pki", "list", "--data-dir", data_dir];
+        args.extend_from_slice(extra);
+        run_pki_with(&args, |command| {
+            command
+                .env("HOME", &fixture.home)
+                .env("JAVA_HOME", &fixture.java_home)
+                .env("PATH", &fixture.bin)
+                .env("CADDY_RS_TRUST_PREFIX", &fixture.platform_prefix);
+        })
+    };
+
+    let (code, stdout, stderr) = run(&[]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(row_for(&stdout, "local").contains("missing"), "{stdout}");
+    assert!(row_for(&stdout, "staging").contains("missing"), "{stdout}");
+
+    // Plant the exact root PEM where the Linux platform plan installs it.
+    let installed = fixture
+        .platform_prefix
+        .join("usr/local/share/ca-certificates/caddy-rs-local.crt");
+    std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+    std::fs::copy(
+        data.path().join("pki/authorities/local/root.crt"),
+        &installed,
+    )
+    .unwrap();
+    if cfg!(target_os = "linux") {
+        // A matching staged copy plus a stale generated CA bundle is not trusted yet.
+        let bundle = fixture
+            .platform_prefix
+            .join("etc/ssl/certs/ca-certificates.crt");
+        std::fs::create_dir_all(bundle.parent().unwrap()).unwrap();
+        std::fs::write(&bundle, b"-----BEGIN CERTIFICATE-----\nstale bundle\n").unwrap();
+        let (code, stdout, stderr) = run(&[]);
+        assert_eq!(code, 0, "stderr: {stderr}");
+        assert!(
+            row_for(&stdout, "local").contains("missing"),
+            "stale CA bundle must be reported as missing:\n{stdout}"
+        );
+        std::fs::copy(data.path().join("pki/authorities/local/root.crt"), &bundle).unwrap();
+    }
+    let (code, stdout, stderr) = run(&[]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(row_for(&stdout, "local").contains("installed"), "{stdout}");
+    assert!(row_for(&stdout, "staging").contains("missing"), "{stdout}");
+
+    // `install_trust: false` is reported as disabled, matching Caddy skipping `installRoot`.
+    let config = data.path().join("caddy.json");
+    std::fs::write(
+        &config,
+        serde_json::to_vec(&serde_json::json!({
+            "apps": {"pki": {"certificate_authorities": {
+                "local": {"install_trust": false}
+            }}},
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let (code, stdout, stderr) = run(&["--config", config.to_str().unwrap()]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(row_for(&stdout, "local").contains("disabled"), "{stdout}");
+}
+
+#[test]
+fn pki_show_prints_subject_expiry_keys_and_ca_info() {
+    let data = pki_data_dir_with_keys();
+    let data_dir = data.path().to_str().unwrap();
+    let trust_prefix = tempfile::tempdir().unwrap();
+    let (code, stdout, stderr) = run_pki_with(
+        &["pki", "show", "local", "--data-dir", data_dir],
+        |command| {
+            command.env("CADDY_RS_TRUST_PREFIX", trust_prefix.path());
+        },
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    for expected in [
+        "CA: local",
+        "name: local",
+        "root certificate:",
+        "subject: CN=caddy-rs test root",
+        "issuer: CN=caddy-rs test root",
+        "not before:",
+        "not after:",
+        "intermediates: 1",
+        "subject: CN=caddy-rs test intermediate",
+        "root.key (present)",
+        "intermediate.key (present)",
+        "trust:",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "show output misses `{expected}`:\n{stdout}"
+        );
+    }
+
+    let (code, stdout, stderr) = run_pki_with(
+        &["pki", "show", "--json", "local", "--data-dir", data_dir],
+        |command| {
+            command.env("CADDY_RS_TRUST_PREFIX", trust_prefix.path());
+        },
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("show JSON");
+    assert_eq!(value["id"], "local");
+    assert_eq!(value["name"], "local");
+    assert_eq!(value["root_common_name"], "caddy-rs test root");
+    assert_eq!(
+        value["intermediate_common_name"],
+        "caddy-rs test intermediate"
+    );
+    assert!(value["root_certificate"]
+        .as_str()
+        .unwrap()
+        .starts_with("-----BEGIN CERTIFICATE-----"));
+    assert_pem_count(value["intermediate_certificate"].as_str().unwrap(), 1);
+    assert_eq!(value["root"]["subject"], "CN=caddy-rs test root");
+    assert!(value["root"]["not_after"].is_string());
+    assert_eq!(value["root"]["key_present"], true);
+    let intermediates = value["intermediates"].as_array().unwrap();
+    assert_eq!(intermediates.len(), 1);
+    assert_eq!(intermediates[0]["index"], 1);
+    assert_eq!(intermediates[0]["key_present"], true);
+    assert!(value["trust"]["state"].is_string());
+
+    // An unknown CA is a loud, located error, not an empty report.
+    let (code, stdout, stderr) =
+        run_pki(&["pki", "show", "does-not-exist", "--data-dir", data_dir]);
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(
+        stderr.contains("no certificate authority configured with id `does-not-exist`"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("must be provisioned"), "{stderr}");
+}
+
+#[test]
+fn pki_show_uses_configured_name_and_install_trust() {
+    let data = pki_data_dir_with_keys();
+    let config = data.path().join("caddy.json");
+    std::fs::write(
+        &config,
+        serde_json::to_vec(&serde_json::json!({
+            "apps": {"pki": {"certificate_authorities": {
+                "local": {"name": "Test Local CA", "install_trust": false}
+            }}},
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let (code, stdout, stderr) = run_pki(&[
+        "pki",
+        "show",
+        "local",
+        "--config",
+        config.to_str().unwrap(),
+        "--data-dir",
+        data.path().to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("name: Test Local CA"), "{stdout}");
+    assert!(
+        stdout.contains("trust: disabled (install_trust: disabled)"),
+        "{stdout}"
     );
 
+    let (code, stdout, stderr) = run_pki(&[
+        "pki",
+        "show",
+        "--json",
+        "local",
+        "--config",
+        config.to_str().unwrap(),
+        "--data-dir",
+        data.path().to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("show JSON");
+    assert_eq!(value["name"], "Test Local CA");
+    assert_eq!(value["trust"]["state"], "disabled");
+    assert_eq!(value["trust"]["install_trust"], "disabled");
+}
+
+#[test]
+fn pki_export_round_trips_root_and_intermediate_byte_identically() {
+    let data = pki_data_dir_with_keys();
+    let data_dir = data.path().to_str().unwrap();
+    let root_expected =
+        std::fs::read(pki_fixture_data_dir().join("pki/authorities/local/root.crt"))
+            .expect("root fixture");
+    let intermediate_expected =
+        std::fs::read(pki_fixture_data_dir().join("pki/authorities/local/intermediate.crt"))
+            .expect("intermediate fixture");
+    let mut chain_expected = intermediate_expected.clone();
+    chain_expected.extend_from_slice(&root_expected);
+
+    // Default export is the root certificate, byte-for-byte.
+    let (code, stdout, stderr) = run_pki(&["pki", "export", "local", "--data-dir", data_dir]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout.as_bytes(), root_expected.as_slice());
+    assert_pem_count(&stdout, 1);
+
+    // The documented task form: `export --ca <id> --type root|intermediate --out <path>`.
+    let out = data.path().join("exported-root.crt");
+    let (code, stdout, stderr) = run_pki(&[
+        "pki",
+        "export",
+        "--ca",
+        "local",
+        "--type",
+        "root",
+        "--out",
+        out.to_str().unwrap(),
+        "--data-dir",
+        data_dir,
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert_eq!(std::fs::read(&out).unwrap(), root_expected);
+    assert!(stderr.contains("exported root certificate"), "{stderr}");
+
+    let out = data.path().join("exported-intermediate.crt");
+    let (code, stdout, stderr) = run_pki(&[
+        "pki",
+        "export",
+        "--ca",
+        "local",
+        "--type",
+        "intermediate",
+        "--out",
+        out.to_str().unwrap(),
+        "--data-dir",
+        data_dir,
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert_eq!(std::fs::read(&out).unwrap(), intermediate_expected);
+    assert_pem_count(&std::fs::read_to_string(&out).unwrap(), 1);
+
+    let out = data.path().join("exported-chain.crt");
+    let (code, stdout, stderr) = run_pki(&[
+        "pki",
+        "export",
+        "local",
+        "--type",
+        "chain",
+        "--out",
+        out.to_str().unwrap(),
+        "--data-dir",
+        data_dir,
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert_eq!(std::fs::read(&out).unwrap(), chain_expected);
+
+    // The pre-existing flag aliases keep working.
     let (code, stdout, _) = run_pki(&["pki", "export", "local", "--root", "--data-dir", data_dir]);
     assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), root_expected.trim());
-
+    assert_eq!(stdout.as_bytes(), root_expected.as_slice());
     let (code, stdout, _) = run_pki(&[
         "pki",
         "export",
@@ -899,23 +1330,69 @@ fn pki_export_writes_root_intermediate_and_chain_pem() {
         data_dir,
     ]);
     assert_eq!(code, 0);
-    assert_pem_count(&stdout, 1);
-    assert_eq!(stdout.trim(), intermediate_expected.trim());
-
-    // Caddy chain order: intermediate(s) first, root last.
+    assert_eq!(stdout.as_bytes(), intermediate_expected.as_slice());
     let (code, stdout, _) = run_pki(&["pki", "export", "local", "--chain", "--data-dir", data_dir]);
     assert_eq!(code, 0);
-    assert_pem_count(&stdout, 2);
-    assert!(
-        stdout.trim().starts_with(intermediate_expected.trim()),
-        "{stdout}"
-    );
-    assert!(stdout.trim().ends_with(root_expected.trim()), "{stdout}");
+    assert_eq!(stdout.as_bytes(), chain_expected.as_slice());
+}
 
-    // Unknown CA is a loud, located error with nothing on stdout.
+#[test]
+fn pki_export_rejects_ambiguous_selectors_and_bad_output_paths() {
+    let data = pki_data_dir_with_keys();
+    let data_dir = data.path().to_str().unwrap();
+
+    // No CA selector at all.
+    let (code, stdout, stderr) = run_pki(&["pki", "export", "--data-dir", data_dir]);
+    assert_eq!(code, 2, "stderr: {stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("required arguments"), "{stderr}");
+
+    // Positional ID and --ca together.
+    let (code, _stdout, stderr) = run_pki(&[
+        "pki",
+        "export",
+        "local",
+        "--ca",
+        "local",
+        "--data-dir",
+        data_dir,
+    ]);
+    assert_eq!(code, 2, "stderr: {stderr}");
+    assert!(stderr.contains("cannot be used with"), "{stderr}");
+
+    // --type and a legacy type flag together.
+    let (code, _stdout, stderr) = run_pki(&[
+        "pki",
+        "export",
+        "local",
+        "--type",
+        "root",
+        "--root",
+        "--data-dir",
+        data_dir,
+    ]);
+    assert_eq!(code, 2, "stderr: {stderr}");
+    assert!(stderr.contains("cannot be used with"), "{stderr}");
+
+    let (code, _stdout, stderr) = run_pki(&[
+        "pki",
+        "export",
+        "local",
+        "--type",
+        "leaf",
+        "--data-dir",
+        data_dir,
+    ]);
+    assert_eq!(code, 2, "stderr: {stderr}");
+    assert!(
+        stderr.contains("possible values: root, intermediate, chain"),
+        "{stderr}"
+    );
+
+    // An unknown CA is a loud, located error with nothing on stdout.
     let (code, stdout, stderr) =
         run_pki(&["pki", "export", "does-not-exist", "--data-dir", data_dir]);
-    assert_ne!(code, 0);
+    assert_eq!(code, 1, "stderr: {stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(
         stderr.contains("no certificate authority configured with id `does-not-exist`"),
@@ -923,18 +1400,55 @@ fn pki_export_writes_root_intermediate_and_chain_pem() {
     );
     assert!(stderr.contains("must be provisioned"), "{stderr}");
 
-    // `--root` and `--chain` conflict at the argument-parsing level.
-    let (code, _stdout, stderr) = run_pki(&[
+    // A missing output directory fails before writing anything and names the path.
+    let out = data.path().join("missing-dir/root.crt");
+    let (code, stdout, stderr) = run_pki(&[
         "pki",
         "export",
+        "--ca",
         "local",
-        "--root",
-        "--chain",
+        "--type",
+        "root",
+        "--out",
+        out.to_str().unwrap(),
         "--data-dir",
         data_dir,
     ]);
-    assert_ne!(code, 0);
-    assert!(stderr.contains("cannot be used with"), "{stderr}");
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("output directory"), "{stderr}");
+    assert!(stderr.contains("missing-dir"), "{stderr}");
+    assert!(!out.exists());
+
+    // A CA with no intermediate reports that plainly instead of writing an empty file.
+    let root_only = tempfile::tempdir().unwrap();
+    let ca = root_only.path().join("pki/authorities/root-only");
+    std::fs::create_dir_all(&ca).unwrap();
+    std::fs::copy(
+        pki_fixture_data_dir().join("pki/authorities/local/root.crt"),
+        ca.join("root.crt"),
+    )
+    .unwrap();
+    let out = root_only.path().join("intermediate.crt");
+    let (code, stdout, stderr) = run_pki(&[
+        "pki",
+        "export",
+        "--ca",
+        "root-only",
+        "--type",
+        "intermediate",
+        "--out",
+        out.to_str().unwrap(),
+        "--data-dir",
+        root_only.path().to_str().unwrap(),
+    ]);
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(
+        stderr.contains("has no intermediate certificate"),
+        "{stderr}"
+    );
+    assert!(!out.exists());
 }
 
 #[test]
@@ -1150,6 +1664,42 @@ fn run_trust_with_fixture(
         String::from_utf8_lossy(&output.stdout).to_string(),
         String::from_utf8_lossy(&output.stderr).to_string(),
     )
+}
+
+#[cfg(unix)]
+#[test]
+fn trust_uses_the_shared_data_directory_resolution() {
+    // `trust` must resolve the data directory exactly like `run`/`pki`: with no `--data-dir`,
+    // Caddy's `AppDataDir()` ($XDG_DATA_HOME/caddy) is used, and a legacy `.caddy-rs` directory is
+    // only a fallback. Before T-CLI-011 trust kept the legacy resolver, so this test fails if the
+    // shared resolver is dropped.
+    let base = tempfile::tempdir().unwrap();
+    let xdg = base.path().join("xdg");
+    let data = xdg.join("caddy");
+    std::fs::create_dir_all(data.join("pki/authorities")).unwrap();
+    copy_fixture_cas(&data);
+    let fixture = trust_fixture(true);
+    let mut command = Command::new(binary());
+    command
+        .args(["trust", "--dry-run"])
+        .env("XDG_DATA_HOME", &xdg)
+        .env("HOME", &fixture.home)
+        .env("JAVA_HOME", &fixture.java_home)
+        .env("CADDY_RS_TRUST_PREFIX", &fixture.platform_prefix)
+        .env("PATH", fixture.bin.display().to_string());
+    let output = command.output().expect("run caddy-rs trust");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("root certificate:"),
+        "trust did not find the CA under $XDG_DATA_HOME/caddy:\n{stdout}\n{stderr}"
+    );
+    assert!(stdout.contains("no changes made (--dry-run)"), "{stdout}");
 }
 
 #[cfg(unix)]
