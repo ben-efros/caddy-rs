@@ -1,0 +1,12 @@
+[package]
+name = "caddy-rs-pm-compiler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+caddy-rs-pm-core = { path = "../pm-core" }
+serde_json.workspace = true
+thiserror.workspace = true
