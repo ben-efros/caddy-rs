@@ -146,10 +146,21 @@ fn static_routes() -> serde_json::Value {
 /// Pick fresh ports for every `listen` entry in the configuration, keeping the `udp/` prefixes.
 fn reallocate_ports(config: &Config) -> Config {
     let mut value = serde_json::to_value(config).expect("config to JSON");
-    let http = match value.get_mut("apps").and_then(|apps| apps.get_mut("http")) {
+    let mut http = match value.get_mut("apps").and_then(|apps| apps.get_mut("http")) {
         Some(http) => Some(http),
         None => value.get_mut("http"),
     };
+    // `http_port` is a listener too (the derived `:port` on a wildcard address), and `https_port`
+    // is the number the TLS site uses; leaving either at an old value makes a retry unable to
+    // recover, or silently moves the TLS listener off the re-picked TCP port.
+    if let Some(http) = http.as_deref_mut() {
+        if http.get("http_port").is_some() {
+            http["http_port"] = serde_json::json!(free_port());
+        }
+        if http.get("https_port").is_some() {
+            http["https_port"] = serde_json::json!(free_port());
+        }
+    }
     let servers = http
         .and_then(|http| http.get_mut("servers"))
         .and_then(|servers| servers.as_object_mut());
@@ -986,6 +997,25 @@ async fn warm_up_for_0rtt(endpoint: &quinn::Endpoint, address: SocketAddr) {
     drop(connection);
     // The NewSessionTicket arrives after the handshake; give the client a moment to store it.
     tokio::time::sleep(Duration::from_millis(500)).await;
+}
+
+#[tokio::test]
+async fn start_retries_when_the_http_port_is_taken() {
+    // `apps.http.http_port` is a listener too (the derived `:port` on a wildcard address), so a
+    // collision there must be recoverable as well - review #2 showed the retry could exhaust its
+    // attempts when only `listen` entries were re-picked.
+    let config = config(0, None, Some(&["h1", "h2"]), static_routes());
+    let http_port = serde_json::to_value(&config).expect("config JSON")["apps"]["http"]["http_port"]
+        .as_u64()
+        .expect("http_port present") as u16;
+    let occupied = std::net::TcpListener::bind(("0.0.0.0", http_port))
+        .or_else(|_| std::net::TcpListener::bind(("127.0.0.1", http_port)))
+        .expect("hold the http_port");
+    let (runtime, status) = start(config).await;
+    let bound = tcp_address(&status, 0);
+    assert_ne!(bound.port(), http_port, "the http_port must be re-picked");
+    runtime.shutdown().await;
+    drop(occupied);
 }
 
 #[tokio::test]
