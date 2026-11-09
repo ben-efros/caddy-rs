@@ -11,6 +11,7 @@ This is the proxy-manager foundation workspace. It is deliberately independent o
 | `caddy-rs-pm-hosts` | Durable host repository over `pm-state`: get/list/create/update/delete with CAS revisions, atomic domain-index uniqueness, next-id reservation, and memory/snapshot backend tests. |
 | `caddy-rs-pm-service` | Application service over `pm-hosts`: id-allocating create, CAS update/delete, list, and route compilation. No REST API, UI, auth or certificate policy loading. |
 | `caddy-rs-pm-policies` | Durable auto-certificate policy repository over `pm-state`: get/list/create/update/delete with CAS revisions, tombstones, monotonic id reservation and host coverage validation against `pm-core` hosts. |
+| `caddy-rs-pm-import` | Native-first NPM v2.16 host-payload import mapping: proxy/redirect/dead hosts to `pm-core`, explicit certificate origins, located errors for unsupported payload features and warnings for flags without a native implementation. |
 
 ## Why a nested workspace
 
@@ -144,6 +145,28 @@ store, one `pm.policies` document per policy:
 
 The repository is persistence only and does not depend on `pm-hosts`; coverage reads `pm-core`
 `Host` values directly.
+
+## `pm-import`
+
+`import_proxy`, `import_redirection` and `import_dead` map NPM v2.16 host API payloads to `pm-core`
+hosts without approximating unsupported settings:
+
+- ids are checked (0 is rejected) and `domain_names` are normalized into host patterns;
+- `certificate_id = 0` maps to disabled TLS; a non-zero id needs a caller-supplied
+  `certificate_origins` map, builds `HostTls::for_explicit` and preserves the payload's
+  `ssl_forced`/HSTS flags. TLS flags without a certificate are rejected rather than silently
+  cleared the way NPM does, and an auto-generated origin cannot be selected by id;
+- proxy upstreams map scheme/host/port with `preserve_host = true`; redirects map
+  `forward_scheme` (`auto`/`http`/`https`), target and status through the core validator; dead hosts
+  map to `DeadSpec`;
+- non-empty `advanced_config`, non-empty `locations`, a non-zero `access_list_id` and stream
+  payloads (`import_stream`) fail with a located error because the host model has no representation
+  for them yet;
+- `caching_enabled`, `block_exploits`, `http2_support` and a set `allow_websocket_upgrade` produce
+  warnings instead of errors, because the native route compiler does not apply them.
+
+The importer never invents a certificate origin and never drops an unsupported setting. Full
+`Host::validate` certificate/policy coverage remains a caller responsibility, as with `pm-hosts`.
 
 ## Commands
 
