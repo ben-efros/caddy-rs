@@ -27,9 +27,11 @@ introduces it ships with its compatibility rationale. Move it into the register 
      `TLS-POLICY` error. rustls' aws-lc-rs provider has no P-521 key-exchange group
      (`ALL_KX_GROUPS` contains X25519MLKEM768, SECP256R1MLKEM768, X25519, SECP256R1, SECP384R1,
      MLKEM768 and MLKEM1024 only). P-521 *certificate* keys are supported via signature schemes.
-  2. RSA certificate keys smaller than 2048 bits are accepted by Caddy but rejected by aws-lc-rs
-     (`failed to parse private key as RSA, ECDSA, or EdDSA`). The located error names the source
-     entry and DNS names; it is not silently upgraded or ignored.
+  2. RSA certificate keys smaller than 2048 bits are accepted by Caddy but rejected by aws-lc-rs.
+     Exact current error (RSA-1024 fixture, `load_files[0]`):
+     `TLS configuration at `certificates`: private key for certificate `apps.tls.certificates.load_files[0] (certificate file <path>, key file <path>)` (DNS names: localhost): private key type is not supported by the rustls aws-lc-rs provider: unexpected error: failed to parse private key as RSA, ECDSA, or EdDSA`.
+     The located error names the source entry and DNS names; the key is not silently upgraded or
+     ignored.
 - Rationale: aws-lc-rs is the only rustls provider that implements
   `SignatureScheme::ECDSA_NISTP521_SHA512`, which is required to serve the P-521 certificates
   Caddy accepts. Rejecting the two remaining unsupported cases loudly (with a located error)
@@ -45,11 +47,26 @@ introduces it ships with its compatibility rationale. Move it into the register 
   `crates/config/tests/tls_ciphers.rs` (`mlkem_curve_lands_in_the_connection_policy`,
   `caddy_accepted_but_runtime_unsupported_curves_fail_loudly`).
 
-## TLS configuration row
+## Exact program-repository text to merge
 
-`docs/compatibility/CONFIGURATION.md`'s `apps.tls` row describes certificate loading and SNI
-resolution without enumerating key types; `apps.tls.automation.policies[].key_type` (the
-issuance key type) still lists p256/p384/rsa2048/rsa4096 as before. No row text needed changing
-for this task beyond the register entry above; if the register or configuration matrix grows a
-manual-certificate key-type column, it should say: RSA-2048/3072/4096, ECDSA P-256/P-384/P-521
-(SEC1 and PKCS#8) and Ed25519 accepted; Ed448/DSA/secp256k1/brainpool/encrypted rejected loudly.
+`docs/compatibility/BEHAVIOR-DIVERGENCES.md`: insert the `## DIV-0114` section above (next free
+number after DIV-0113), keeping every field line.
+
+`docs/compatibility/CONFIGURATION.md`, row
+`servers.<name>.tls_connection_policies`: append this sentence to the existing row:
+
+> `curves` accepts Caddy's names `x25519mlkem768`, `x25519`, `secp256r1` and `secp384r1` and
+> emits them verbatim; `secp521r1` is a located `TLS-POLICY` error because rustls' aws-lc-rs
+> provider has no P-521 key-exchange group (P-521 certificate keys are supported). `cipher_suites`
+> accepts the six TLS 1.2 ECDHE AEAD suites; TLS 1.3/CBC names are located errors.
+
+`docs/compatibility/CADDYFILE.md`, `tls` row: append this sentence:
+
+> `tls { ciphers <name...>; curves <name...> }` emits `cipher_suites`/`curves`;
+> `curves x25519mlkem768` is accepted (aws-lc-rs) while `curves secp521r1` is a located
+> `TLS-POLICY` error.
+
+Manual-certificate key-type summary for any future matrix column: RSA-2048/3072/4096, ECDSA
+P-256/P-384/P-521 (SEC1 and PKCS#8) and Ed25519 accepted; RSA-1024, Ed448, DSA, secp256k1,
+brainpool curves and encrypted PEM rejected loudly with a located error naming the configured
+entry, its DNS names and the detected type.
