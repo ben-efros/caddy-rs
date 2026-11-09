@@ -498,7 +498,7 @@ configuration would produce a file the shell never loads.
 | bash | basename of `$SHELL` is `bash`; `~/.bashrc` exists; `~/.bash_completion` exists |
 | zsh | basename of `$SHELL` is `zsh`; `~/.oh-my-zsh` exists; `~/.zshrc` exists |
 | fish | basename of `$SHELL` is `fish`; the fish config directory exists (`$XDG_CONFIG_HOME/fish`, else `~/.config/fish`) |
-| powershell | basename of `$SHELL` is `pwsh` or `powershell`; an executable `pwsh` is on `PATH`; `~/.config/powershell` exists |
+| powershell | basename of `$SHELL` is `pwsh` or `powershell`; an executable `pwsh` is on `PATH`; the PowerShell config directory exists (`$XDG_CONFIG_HOME/powershell`, else `~/.config/powershell`) |
 
 The `pwsh`-on-`PATH` rule is the one deliberate binary exception: `pwsh` only appears after an
 explicit PowerShell installation.

@@ -49,7 +49,8 @@
 //! * bash: `~/.bashrc` or `~/.bash_completion` exists;
 //! * zsh: `~/.oh-my-zsh` or `~/.zshrc` exists;
 //! * fish: the fish config directory exists (`$XDG_CONFIG_HOME/fish`, else `~/.config/fish`);
-//! * powershell: an executable `pwsh` is on `PATH`, or `~/.config/powershell` exists.
+//! * powershell: an executable `pwsh` is on `PATH`, or `~/.config/powershell` exists (the
+//!   PowerShell config directory is also checked under `XDG_CONFIG_HOME` when that is set).
 //!
 //! Merely having a shell binary on `PATH` does not count for bash, zsh or fish: a binary without a
 //! configuration would make `install` write a file that shell never reads. `status` names the rule
