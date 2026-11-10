@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use argon2::{
-    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    password_hash::{phc::PasswordHash, PasswordHasher, PasswordVerifier},
     Algorithm, Argon2, Params as Argon2Params, Version,
 };
 use async_trait::async_trait;
@@ -830,9 +830,12 @@ pub fn hash_password(password: &str, argon2_config: &Argon2Config) -> AuthResult
     )
     .map_err(|err| AuthError::PasswordHash(err.to_string()))?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    let salt = SaltString::generate(&mut OsRng);
+    // password-hash 0.6 dropped `SaltString`; the salt is plain bytes and the PHC encoder
+    // base64s them exactly as before, so stored hashes keep the same shape.
+    let mut salt = [0u8; 16];
+    OsRng.fill_bytes(&mut salt);
 
-    if let Ok(hash) = argon2.hash_password(password.as_bytes(), &salt) {
+    if let Ok(hash) = argon2.hash_password_with_salt(password.as_bytes(), &salt) {
         return Ok(hash.to_string());
     }
 
@@ -846,7 +849,8 @@ pub fn hash_password(password: &str, argon2_config: &Argon2Config) -> AuthResult
 /// Argon2's `PasswordVerifier` performs the comparison in constant time.
 pub fn verify_password(password: &str, hash: &str) -> AuthResult<bool> {
     if hash.starts_with("$argon2") {
-        let parsed = PasswordHash::new(hash)?;
+        let parsed =
+            PasswordHash::new(hash).map_err(|err| AuthError::PasswordHash(err.to_string()))?;
         if parsed.version.is_none() || parsed.salt.is_none() || parsed.hash.is_none() {
             return Err(AuthError::PasswordHash(
                 "incomplete argon2 password hash".to_string(),
@@ -854,7 +858,7 @@ pub fn verify_password(password: &str, hash: &str) -> AuthResult<bool> {
         }
         return match Argon2::default().verify_password(password.as_bytes(), &parsed) {
             Ok(()) => Ok(true),
-            Err(argon2::password_hash::Error::Password) => Ok(false),
+            Err(argon2::password_hash::Error::PasswordInvalid) => Ok(false),
             Err(err) => Err(AuthError::Argon2(err)),
         };
     }
