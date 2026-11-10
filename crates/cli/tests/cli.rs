@@ -18,6 +18,46 @@ fn run(args: &[&str]) -> (i32, String, String) {
     )
 }
 
+/// Run the binary in `directory` with the given arguments.
+fn run_in(directory: &std::path::Path, args: &[&str]) -> (i32, String, String) {
+    let output = Command::new(binary())
+        .current_dir(directory)
+        .args(args)
+        .output()
+        .expect("run caddy-rs");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
+/// Run the binary with `stdin` supplied on its standard input.
+fn run_with_stdin(args: &[&str], stdin: &str) -> (i32, String, String) {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = Command::new(binary())
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn caddy-rs");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin pipe")
+        .write_all(stdin.as_bytes())
+        .expect("write stdin");
+    let output = child.wait_with_output().expect("wait for caddy-rs");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
 /// Run the binary with a bounded wait.
 ///
 /// A regression that makes the server start (for example the `--adapt-mode` flag being ignored)
@@ -78,6 +118,191 @@ fn list_modules_includes_implemented_handlers() {
     assert!(ids.contains(&"http.handlers.reverse_proxy"), "{ids:?}");
     assert!(ids.contains(&"http.handlers.file_server"), "{ids:?}");
     assert!(ids.contains(&"http.matchers.host"), "{ids:?}");
+}
+
+const FMT_LINT: &str = "Caddyfile input is not formatted; Tip: use '--overwrite' to update your Caddyfile in-place instead of previewing it. Consult '--help' for more options";
+
+#[test]
+fn fmt_formats_and_locates_unformatted_input() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("Caddyfile");
+
+    // Caddy prints the formatted result and then fails with a located message.
+    std::fs::write(&config, "  a   b\nc {\nd\ne\n}\n").unwrap();
+    let (code, stdout, stderr) = run(&["fmt", config.to_str().unwrap()]);
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert_eq!(stdout, "a b\nc {\n\td\n\te\n}\n");
+    assert!(
+        stderr.contains(&format!("{}:1: {FMT_LINT}", config.display())),
+        "stderr: {stderr}"
+    );
+
+    // An already-formatted file prints the same bytes and exits 0.
+    let formatted = "a b\nc {\n\td\n\te\n}\n";
+    std::fs::write(&config, formatted).unwrap();
+    let (code, stdout, stderr) = run(&["fmt", config.to_str().unwrap()]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, formatted);
+    assert!(stderr.is_empty(), "stderr: {stderr}");
+}
+
+#[test]
+fn fmt_preserves_heredocs_and_quoted_literals() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("Caddyfile");
+    let input =
+        "block {\n\theredoc <<EOF\n\tkeep   these    spaces\n\tEOF\n\trespond \"a  b\"\n}\n";
+    std::fs::write(&config, input).unwrap();
+
+    let (code, stdout, stderr) = run(&["fmt", config.to_str().unwrap()]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, input);
+    assert!(stderr.is_empty(), "stderr: {stderr}");
+}
+
+#[test]
+fn fmt_overwrite_rewrites_in_place_and_skips_the_lint() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("Caddyfile");
+    let formatted = "a b\nc {\n\td\n\te\n}\n";
+
+    std::fs::write(&config, "  a   b\nc {\nd\ne\n}\n").unwrap();
+    let (code, stdout, stderr) = run(&["fmt", "--overwrite", config.to_str().unwrap()]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.is_empty(), "stdout: {stdout}");
+    assert!(stderr.is_empty(), "stderr: {stderr}");
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), formatted);
+
+    // `--overwrite` wins over `--diff`, exactly like Caddy.
+    std::fs::write(&config, "  a   b\n").unwrap();
+    let (code, stdout, _stderr) = run(&["fmt", "-w", "-d", config.to_str().unwrap()]);
+    assert_eq!(code, 0);
+    assert!(stdout.is_empty(), "stdout: {stdout}");
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), "a b\n");
+}
+
+#[test]
+fn fmt_diff_prints_aligned_changes_and_still_fails() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("Caddyfile");
+    std::fs::write(&config, "a b\nc {\nd\ne\n}\n").unwrap();
+
+    let (code, stdout, stderr) = run(&["fmt", "--diff", config.to_str().unwrap()]);
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert_eq!(stdout, "  a b\n  c {\n- d\n- e\n+ \td\n+ \te\n  }\n  \n");
+    assert!(
+        stderr.contains(&format!("{}:3: {FMT_LINT}", config.display())),
+        "stderr: {stderr}"
+    );
+
+    // A formatted file diffs as all-common and exits 0.
+    std::fs::write(&config, "a b\nc {\n\td\n\te\n}\n").unwrap();
+    let (code, stdout, _stderr) = run(&["fmt", "-d", config.to_str().unwrap()]);
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "  a b\n  c {\n  \td\n  \te\n  }\n  \n");
+}
+
+#[test]
+fn fmt_reads_stdin_for_dash_and_ignores_overwrite_and_diff() {
+    for args in [
+        &["fmt", "-"][..],
+        &["fmt", "--overwrite", "-"][..],
+        &["fmt", "--diff", "-"][..],
+    ] {
+        let (code, stdout, stderr) = run_with_stdin(args, "  a   b\n");
+        assert_eq!(code, 0, "args {args:?}, stderr: {stderr}");
+        assert_eq!(stdout, "a b\n", "args {args:?}");
+        assert!(stderr.is_empty(), "args {args:?}, stderr: {stderr}");
+    }
+}
+
+#[test]
+fn fmt_reads_the_config_flag_as_the_path() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("site.caddy");
+    std::fs::write(&config, "a b\n").unwrap();
+
+    let (code, stdout, stderr) = run(&["fmt", "--config", config.to_str().unwrap()]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "a b\n");
+}
+
+#[test]
+fn fmt_defaults_to_the_caddyfile_in_the_working_directory() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("Caddyfile"), "  a   b\n").unwrap();
+
+    let (code, stdout, stderr) = run_in(directory.path(), &["fmt"]);
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert_eq!(stdout, "a b\n");
+    assert!(
+        stderr.contains(&format!("Caddyfile:1: {FMT_LINT}")),
+        "{stderr}"
+    );
+
+    std::fs::write(directory.path().join("Caddyfile"), "a b\n").unwrap();
+    let (code, _stdout, stderr) = run_in(directory.path(), &["fmt"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+}
+
+#[test]
+fn fmt_rejects_multiple_inputs_like_caddy() {
+    let directory = tempfile::tempdir().unwrap();
+    let first = directory.path().join("a.caddy");
+    let second = directory.path().join("b.caddy");
+    std::fs::write(&first, "a\n").unwrap();
+    std::fs::write(&second, "b\n").unwrap();
+    let (first, second) = (first.to_str().unwrap(), second.to_str().unwrap());
+
+    let (code, stdout, stderr) = run(&["fmt", first, second]);
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(stdout.is_empty(), "stdout: {stdout}");
+    assert!(
+        stderr.contains(&format!(
+            "fmt does not support multiple files  {first} {second}"
+        )),
+        "stderr: {stderr}"
+    );
+
+    let (code, _stdout, stderr) = run(&["fmt", "--config", first, second]);
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains(&format!(
+            "fmt does not support multiple files {first} {second}"
+        )),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn fmt_reports_an_unreadable_file_with_its_path() {
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("missing.caddy");
+
+    let (code, stdout, stderr) = run(&["fmt", missing.to_str().unwrap()]);
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(stdout.is_empty(), "stdout: {stdout}");
+    assert!(stderr.contains("reading input file"), "stderr: {stderr}");
+    assert!(stderr.contains("missing.caddy"), "stderr: {stderr}");
+}
+
+#[test]
+fn fmt_help_matches_caddys_usage_and_flags() {
+    let (code, stdout, stderr) = run(&["fmt", "--help"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        stdout.contains("Usage: caddy-rs fmt [--overwrite] [--diff] [<path>]"),
+        "{stdout}"
+    );
+    for flag in [
+        "-c, --config <CONFIG>",
+        "-w, --overwrite",
+        "-d, --diff",
+        "If --diff is specified, the output will be compared against the input",
+        "use - as the path",
+    ] {
+        assert!(stdout.contains(flag), "missing {flag:?} in:\n{stdout}");
+    }
 }
 
 #[test]
