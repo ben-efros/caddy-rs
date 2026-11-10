@@ -55,6 +55,26 @@ const DIRECTIVE_ORDER: &[&str] = &[
     "acme_server",
 ];
 
+/// Directives this build recognises as valid Caddyfile constructs but does not implement.
+///
+/// The list is Caddy v2.11.9's registered directives that [`DIRECTIVE_ORDER`] does not cover,
+/// plus the documented caddy-rs extension `rate_limit` (no Caddyfile adapter yet, T-CONF-013).
+/// A name in this list is a real construct with a known shape, so rejecting it stays
+/// `config.unsupported`. A name in neither list is unknown to Caddy too, so it must be
+/// `config.invalid` with Caddy's `unrecognized directive: <name>` wording.
+const RECOGNISED_UNIMPLEMENTED_DIRECTIVES: &[&str] = &[
+    "abort",
+    "fs",
+    "intercept",
+    "log_append",
+    "metrics",
+    "push",
+    "rate_limit",
+    "request_header",
+    "timeouts",
+    "tracing",
+];
+
 /// A Caddyfile spelling Caddy still accepts but documents as deprecated.
 ///
 /// The table is the single place that knows about backward-compatibility aliases: `compatible`
@@ -5133,6 +5153,21 @@ fn build_routes(
             ));
         }
         if !DIRECTIVE_ORDER.contains(&directive.name.as_str()) {
+            // The `unsupported` class is reserved for recognised constructs (Caddy's registered
+            // directives and the documented extension gaps above). A name that is not recognised
+            // at all (for example `handle_response` directly under `route`) is a malformed
+            // Caddyfile: Caddy reports `unrecognized directive: <name>`, so this is
+            // `config.invalid`. Keep the located line and the directive name.
+            if !RECOGNISED_UNIMPLEMENTED_DIRECTIVES.contains(&directive.name.as_str()) {
+                return Err(CoreError::invalid(
+                    directive.position.label(),
+                    format!(
+                        "unrecognized directive: {} - are you sure your Caddyfile structure \
+                         (nesting and braces) is correct?",
+                        directive.name
+                    ),
+                ));
+            }
             return Err(adapter_error(
                 directive.position.clone(),
                 format!(

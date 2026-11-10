@@ -1,0 +1,9 @@
+example.com {
+	handle_path /api/* {
+		reverse_proxy localhost:9000 {
+			handle_response {
+				skip_log
+			}
+		}
+	}
+}
