@@ -15,7 +15,7 @@ async-trait = { workspace = true }
 tokio = { workspace = true }
 # Crypto and JWT
 argon2 = { version = "0.5", features = ["std", "password-hash"] }
-bcrypt = "0.15"
+bcrypt = "0.16"
 jsonwebtoken = "9.3"
 rand = { version = "0.8", features = ["std", "getrandom"] }
 base32 = "0.5"
