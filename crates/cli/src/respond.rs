@@ -162,14 +162,42 @@ pub(crate) async fn run(args: Args) -> Result<()> {
 
 /// Apply Caddy's status/body selection rules to the flags and the unnamed argument.
 ///
-/// Mirrors `cmdRespond` line for line, including the `strconv.Atoi` branch: a numeric argument
-/// that is not a 3-digit code is *ignored* (it is not used as a body), and an argument that is
-/// numeric while `--status` was specified becomes the body.
+/// This is the production entry point: it supplies the process-wide stdin policy and reader. The
+/// logic itself lives in [`select_response_with_stdin`] so unit tests can inject both instead of
+/// depending on how the test process happens to be wired (CI runs steps with stdin as a pipe, a
+/// local TTY or `/dev/null` does not).
 fn select_response(
     status_flag: i64,
     body_flag: &str,
     argument: &str,
     status_flag_specified: bool,
+) -> Result<(i64, String, Option<BodyOrigin>)> {
+    select_response_with_stdin(
+        status_flag,
+        body_flag,
+        argument,
+        status_flag_specified,
+        stdin_is_pipe(),
+        &mut std::io::stdin(),
+    )
+}
+
+/// Apply Caddy's status/body selection rules with the stdin policy and reader injected.
+///
+/// Mirrors `cmdRespond` line for line, including the `strconv.Atoi` branch: a numeric argument
+/// that is not a 3-digit code is *ignored* (it is not used as a body), and an argument that is
+/// numeric while `--status` was specified becomes the body.
+///
+/// `stdin_is_pipe` is Caddy's `os.ModeNamedPipe` test and `stdin` is only read when it is true and
+/// no body has been selected yet; the production wrapper passes [`stdin_is_pipe`] and
+/// [`std::io::stdin`], so this seam cannot change the CLI's behaviour.
+fn select_response_with_stdin(
+    status_flag: i64,
+    body_flag: &str,
+    argument: &str,
+    status_flag_specified: bool,
+    stdin_is_pipe: bool,
+    stdin: &mut impl Read,
 ) -> Result<(i64, String, Option<BodyOrigin>)> {
     let mut status = status_flag;
     let mut body = body_flag.to_string();
@@ -205,9 +233,9 @@ fn select_response(
 
     // If we still need a body, read it from stdin when it is a pipe (Caddy's ModeNamedPipe test;
     // a regular-file redirect is deliberately not read, matching Caddy).
-    if body.is_empty() && stdin_is_pipe() {
+    if body.is_empty() && stdin_is_pipe {
         let mut bytes = Vec::new();
-        std::io::stdin()
+        stdin
             .read_to_end(&mut bytes)
             .context("cannot read the response body from stdin")?;
         body = String::from_utf8(bytes).map_err(|_| CliExit {
@@ -737,44 +765,98 @@ mod tests {
         }
     }
 
+    /// Call the selection logic with stdin deliberately *not* a pipe, so the assertion cannot
+    /// depend on how the test process's fd 0 happens to be wired (a TTY locally, a pipe in CI).
+    fn select_no_stdin(
+        status_flag: i64,
+        body_flag: &str,
+        argument: &str,
+        status_flag_specified: bool,
+    ) -> Result<(i64, String, Option<BodyOrigin>)> {
+        select_response_with_stdin(
+            status_flag,
+            body_flag,
+            argument,
+            status_flag_specified,
+            false,
+            &mut std::io::empty(),
+        )
+    }
+
     #[test]
     fn response_selection_matches_caddy() {
         // No argument: the flag values win.
         assert_eq!(
-            select_response(201, "hi", "", false).unwrap(),
+            select_no_stdin(201, "hi", "", false).unwrap(),
             (201, "hi".to_string(), Some(BodyOrigin::Flag))
         );
         // A 3-digit numeric argument is the status when --status is absent.
         assert_eq!(
-            select_response(200, "", "404", false).unwrap(),
+            select_no_stdin(200, "", "404", false).unwrap(),
             (404, String::new(), None)
         );
         // A non-numeric argument is the body.
         assert_eq!(
-            select_response(200, "", "hello", false).unwrap(),
+            select_no_stdin(200, "", "hello", false).unwrap(),
             (200, "hello".to_string(), Some(BodyOrigin::Argument))
         );
         // A numeric non-3-digit argument is ignored, exactly like Caddy's Atoi branch.
         assert_eq!(
-            select_response(200, "", "99", false).unwrap(),
+            select_no_stdin(200, "", "99", false).unwrap(),
             (200, String::new(), None)
         );
         // --status plus a numeric argument: the argument becomes the body.
         assert_eq!(
-            select_response(201, "", "404", true).unwrap(),
+            select_no_stdin(201, "", "404", true).unwrap(),
             (201, "404".to_string(), Some(BodyOrigin::Argument))
         );
         // --status=404 is not the literal `--status`, so Caddy treats the argument as the status.
         assert_eq!(
-            select_response(404, "", "200", false).unwrap(),
+            select_no_stdin(404, "", "200", false).unwrap(),
             (200, String::new(), None)
         );
         // Body and status flags together make the argument redundant.
-        let error = select_response(201, "x", "y", true).expect_err("override must fail");
+        let error = select_no_stdin(201, "x", "y", true).expect_err("override must fail");
         assert!(
             format!("{error:#}").contains("unflagged argument \"y\" is overridden by flags"),
             "{error:#}"
         );
+    }
+
+    #[test]
+    fn response_selection_reads_a_piped_stdin_body() {
+        // Non-empty UTF-8 on a pipe: the bytes become the body and the origin is Stdin.
+        let mut stdin = &b"from stdin"[..];
+        assert_eq!(
+            select_response_with_stdin(200, "", "", false, true, &mut stdin).unwrap(),
+            (200, "from stdin".to_string(), Some(BodyOrigin::Stdin))
+        );
+
+        // An empty pipe still selects the stdin origin: Caddy reads whatever the pipe holds, so
+        // `(404, "", Some(Stdin))` is correct for a 3-digit argument with nothing piped. This is
+        // exactly what CI's piped stdin produced while the old test assumed `None`.
+        let mut stdin = &b""[..];
+        assert_eq!(
+            select_response_with_stdin(404, "", "404", false, true, &mut stdin).unwrap(),
+            (404, String::new(), Some(BodyOrigin::Stdin))
+        );
+
+        // A body selected from the flags or the argument wins: the pipe is not read at all.
+        let mut stdin = &b"ignored"[..];
+        assert_eq!(
+            select_response_with_stdin(200, "", "hello", false, true, &mut stdin).unwrap(),
+            (200, "hello".to_string(), Some(BodyOrigin::Argument))
+        );
+
+        // Invalid UTF-8 is a located error, not a lossy body.
+        let mut stdin = &[0xff, 0xfe][..];
+        let error = select_response_with_stdin(200, "", "", false, true, &mut stdin)
+            .expect_err("invalid UTF-8 must fail");
+        let exit = error
+            .downcast_ref::<CliExit>()
+            .expect("a located CLI error");
+        assert_eq!(exit.code, 1);
+        assert!(exit.message.contains("not valid UTF-8"), "{exit}");
     }
 
     #[test]
