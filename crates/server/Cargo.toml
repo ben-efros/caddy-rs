@@ -20,7 +20,7 @@ compression = ["caddy-rs-http/compression"]
 templates = ["caddy-rs-http/templates"]
 
 [dependencies]
-base64 = "0.22.1"
+base64 = "0.23.1"
 bytes = { workspace = true }
 caddy-rs-admin = { workspace = true, default-features = false }
 caddy-rs-core = { workspace = true, default-features = false }
@@ -52,6 +52,6 @@ tracing = { workspace = true }
 async-trait = { workspace = true }
 h2 = "0.4.19"
 caddy-rs-config = { workspace = true }
-base64 = "0.22.1"
+base64 = "0.23.1"
 ring = "0.17.14"
 tempfile = "3.27.0"

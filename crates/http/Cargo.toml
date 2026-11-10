@@ -20,7 +20,7 @@ templates = ["caddy-rs-core/templates"]
 [dependencies]
 argon2 = "0.5"
 async-trait = { workspace = true }
-base64 = "0.22.1"
+base64 = "0.23.1"
 bcrypt = "0.16"
 bytes = { workspace = true }
 # The request-scoped access-log carrier (`AccessLogContext`) is owned by the admin crate, which the
