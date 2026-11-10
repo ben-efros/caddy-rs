@@ -41,6 +41,68 @@ const OID_SECP384R1: &str = "1.3.132.0.34";
 const OID_SECP521R1: &str = "1.3.132.0.35";
 const OID_SECP256K1: &str = "1.3.132.0.10";
 
+/// The DER structure of a private key, independent of the PEM label it arrived under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DerForm {
+    /// PKCS#8 `PrivateKeyInfo` (or `OneAsymmetricKey`, version 0 or 1).
+    Pkcs8,
+    /// SEC1 / RFC 5915 `ECPrivateKey`.
+    Sec1,
+    /// PKCS#1 / RFC 8017 `RSAPrivateKey`.
+    Pkcs1,
+    /// Not a recognised private-key structure.
+    Unknown,
+}
+
+/// Identify the DER structure of a private key from its outer ASN.1 only.
+///
+/// The PEM label is only a hint: a block can be labelled `PRIVATE KEY` while its body is SEC1 or
+/// PKCS#1 (some exporters do this), and label-less paths such as the certificate cache carry DER
+/// with no label at all. The structure decides which [`rustls::pki_types::PrivateKeyDer`] variant
+/// to build; only the outer tags are inspected here, never the secret scalar or exponent.
+pub(crate) fn sniff_der_form(der: &[u8]) -> DerForm {
+    let Some((tag, body, total)) = read_tlv(der) else {
+        return DerForm::Unknown;
+    };
+    if tag != 0x30 || total != der.len() {
+        return DerForm::Unknown;
+    }
+    let Some((version_tag, _, version_len)) = read_tlv(body) else {
+        return DerForm::Unknown;
+    };
+    if version_tag != 0x02 {
+        return DerForm::Unknown;
+    }
+    let Some((second_tag, _, _)) = read_tlv(&body[version_len..]) else {
+        return DerForm::Unknown;
+    };
+    match second_tag {
+        // PKCS#8: version INTEGER then AlgorithmIdentifier SEQUENCE then the key OCTET STRING.
+        0x30 => {
+            if pkcs8_algorithm_identifier(der).is_some() {
+                DerForm::Pkcs8
+            } else {
+                DerForm::Unknown
+            }
+        }
+        // SEC1: version INTEGER(1) then the private key OCTET STRING.
+        0x04 => DerForm::Sec1,
+        // PKCS#1 RSA: version INTEGER(0) then the modulus INTEGER.
+        0x02 => DerForm::Pkcs1,
+        _ => DerForm::Unknown,
+    }
+}
+
+/// Human name for a detected DER form, used in diagnostics.
+pub(crate) fn der_form_label(form: DerForm) -> &'static str {
+    match form {
+        DerForm::Pkcs8 => "PKCS#8 (`BEGIN PRIVATE KEY`)",
+        DerForm::Sec1 => "SEC1 (`BEGIN EC PRIVATE KEY`)",
+        DerForm::Pkcs1 => "PKCS#1 (`BEGIN RSA PRIVATE KEY`)",
+        DerForm::Unknown => "an unrecognised private-key structure",
+    }
+}
+
 /// Classify one PEM block by its label and DER payload.
 ///
 /// Returns `None` only when the block is an inspectable private key encoding whose type cannot be

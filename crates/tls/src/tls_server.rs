@@ -56,7 +56,7 @@ use caddy_rs_core::config::{CertKeyPemPair, Config, TlsApp};
 use caddy_rs_core::listen::{ListenAddr, Network};
 
 use crate::certificate::{Certificate, CertificateCache};
-use crate::key_type::{classify, KeySupport};
+use crate::key_type::{self, classify, KeySupport};
 use crate::storage::{CertificateStorage, StoredCertificate};
 use crate::{Error, Result};
 
@@ -805,11 +805,33 @@ impl TlsCertificate {
                 message: "certificate must cover at least one name".to_string(),
             });
         }
+        // Label-less DER (the certificate cache, renewal and `from_cache_certificate`) can be any
+        // of the three encodings; the structure decides the rustls variant, not an assumption.
+        let private_key = match key_type::sniff_der_form(&private_key_der) {
+            key_type::DerForm::Pkcs8 => {
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(private_key_der))
+            }
+            key_type::DerForm::Sec1 => PrivateKeyDer::Sec1(PrivateSec1KeyDer::from(private_key_der)),
+            key_type::DerForm::Pkcs1 => {
+                PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(private_key_der))
+            }
+            key_type::DerForm::Unknown => {
+                return Err(Error::TlsConfig {
+                    path: "certificates".to_string(),
+                    message: format!(
+                        "private key is {}; expected PKCS#8, SEC1 or PKCS#1. Encrypted keys must be \
+                         decrypted (`openssl pkey -in <key> -out <key.plain>`), otherwise re-export \
+                         as PKCS#8 (`openssl pkcs8 -topk8 -nocrypt -in <key> -out <key.pk8>`)",
+                        key_type::der_form_label(key_type::DerForm::Unknown)
+                    ),
+                })
+            }
+        };
         Ok(Self {
             names,
             tags: Vec::new(),
             chain: chain_der.into_iter().map(CertificateDer::from).collect(),
-            private_key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(private_key_der)),
+            private_key,
             ocsp_staple: None,
             source: None,
         })
@@ -1711,6 +1733,14 @@ fn certificate_chain_from_pem(pem: &str) -> Result<Vec<CertificateDer<'static>>>
     Ok(chain)
 }
 
+/// Labels whose rejection reason is the label itself, not the DER structure.
+fn form_is_label_specific(label: &str) -> bool {
+    matches!(
+        label,
+        "ENCRYPTED PRIVATE KEY" | "DSA PRIVATE KEY" | "OPENSSH PRIVATE KEY"
+    )
+}
+
 fn private_key_from_pem(pem: &str) -> Result<PrivateKeyDer<'static>> {
     let blocks = pem_blocks(pem)?;
     let key_blocks: Vec<usize> = blocks
@@ -1736,17 +1766,56 @@ fn private_key_from_pem(pem: &str) -> Result<PrivateKeyDer<'static>> {
         );
     }
     let (label, der) = &blocks[first];
+    // The DER structure decides the variant. The label is only a hint: some exporters write a
+    // `PRIVATE KEY` label over a SEC1 or PKCS#1 body, and rejecting those would be a parsing gap,
+    // not a security property.
+    // Labels that are unsupported for reasons of their own keep their specific message
+    // (encrypted PEM, DSA, OpenSSH); the structure sniff only decides between the three formats
+    // rustls can read.
     if let Some(KeySupport::Unsupported(message)) = classify(label, der) {
+        if form_is_label_specific(label) {
+            return Err(Error::TlsConfig {
+                path: "certificates".to_string(),
+                message,
+            });
+        }
+    }
+    let form = key_type::sniff_der_form(der);
+    if form == key_type::DerForm::Unknown {
+        return Err(Error::TlsConfig {
+            path: "certificates".to_string(),
+            message: format!(
+                "`{label}` block is not a recognised PKCS#8, SEC1 or PKCS#1 private key (the \
+                 ASN.1 is truncated, has trailing data, or is not a private key). If the key is \
+                 encrypted, decrypt it (`openssl pkey -in <key> -out <key.plain>`); otherwise \
+                 re-export it as PKCS#8 (`openssl pkcs8 -topk8 -nocrypt -in <key> -out <key.pk8>`)"
+            ),
+        });
+    }
+    let canonical = match form {
+        key_type::DerForm::Pkcs8 => "PRIVATE KEY",
+        key_type::DerForm::Sec1 => "EC PRIVATE KEY",
+        key_type::DerForm::Pkcs1 => "RSA PRIVATE KEY",
+        key_type::DerForm::Unknown => unreachable!(),
+    };
+    if canonical != label {
+        eprintln!(
+            "caddy-rs: warning: private key block labelled `{label}` is {}; using its structure. \
+             Re-export it as PKCS#8 to silence this",
+            key_type::der_form_label(form)
+        );
+    }
+    if let Some(KeySupport::Unsupported(message)) = classify(canonical, der) {
         return Err(Error::TlsConfig {
             path: "certificates".to_string(),
             message,
         });
     }
-    Ok(match label.as_str() {
-        "PRIVATE KEY" => PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(der.clone())),
-        "EC PRIVATE KEY" => PrivateKeyDer::Sec1(PrivateSec1KeyDer::from(der.clone())),
-        "RSA PRIVATE KEY" => PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(der.clone())),
-        other => unreachable!("unsupported private key label `{other}` was not classified"),
+    Ok(match form {
+        key_type::DerForm::Pkcs8 => PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(der.clone())),
+        key_type::DerForm::Sec1 => PrivateKeyDer::Sec1(PrivateSec1KeyDer::from(der.clone())),
+        key_type::DerForm::Pkcs1 => PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(der.clone())),
+        key_type::DerForm::Unknown => unreachable!(),
     })
 }
 
@@ -2703,6 +2772,75 @@ mod tests {
             rustls::crypto::aws_lc_rs::sign::any_supported_type(&key)
                 .unwrap_or_else(|error| panic!("{name}: {error}"));
         }
+    }
+
+    /// Label-less DER (the certificate cache path) must dispatch on structure: a SEC1 body is
+    /// not PKCS#8 and wrapping it as such is the reported startup failure.
+    #[test]
+    fn from_der_dispatches_on_the_der_structure_not_pkcs8() {
+        let certificate = example();
+        let chain: Vec<Vec<u8>> = certificate.chain().iter().map(|der| der.to_vec()).collect();
+        let names = vec!["example.com".to_string()];
+
+        for (name, pem_file) in [
+            ("SEC1 P-256", "p256-sec1"),
+            ("PKCS#1 RSA-2048", "rsa2048-pkcs1"),
+            ("PKCS#8 P-256", "p256-pkcs8"),
+        ] {
+            let pem = std::fs::read_to_string(format!(
+                "{}/testdata/key-types/{pem_file}.key",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let der = crate::storage::private_key_der(&pem)
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let uto = TlsCertificate::from_der(chain.clone(), der, names.clone())
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            uto.certified_key()
+                .unwrap_or_else(|error| panic!("{name} must produce a signing key: {error}"));
+        }
+    }
+
+    /// A block labelled `PRIVATE KEY` whose body is SEC1 or PKCS#1 is accepted by structure, with
+    /// a warning; the label is a hint, not a gate.
+    #[test]
+    fn private_key_from_pem_accepts_a_mislabelled_structure() {
+        let sec1 = include_str!("../testdata/key-types/p256-sec1.key");
+        let relabelled = sec1
+            .replace("BEGIN EC PRIVATE KEY", "BEGIN PRIVATE KEY")
+            .replace("END EC PRIVATE KEY", "END PRIVATE KEY");
+        let key = private_key_from_pem(&relabelled).expect("structure wins over the label");
+        assert!(
+            matches!(key, PrivateKeyDer::Sec1(_)),
+            "a SEC1 body under a PKCS#8 label must build the SEC1 variant"
+        );
+
+        let pkcs1 = include_str!("../testdata/key-types/rsa2048-pkcs1.key");
+        let relabelled = pkcs1
+            .replace("BEGIN RSA PRIVATE KEY", "BEGIN PRIVATE KEY")
+            .replace("END RSA PRIVATE KEY", "END PRIVATE KEY");
+        let key = private_key_from_pem(&relabelled).expect("structure wins over the label");
+        assert!(
+            matches!(key, PrivateKeyDer::Pkcs1(_)),
+            "a PKCS#1 body under a PKCS#8 label must build the PKCS#1 variant"
+        );
+    }
+
+    /// A block that is none of the three structures stays loud, and the message tells the operator
+    /// what to do instead of blaming the ASN.1.
+    #[test]
+    fn unknown_private_key_structure_reports_the_conversion_command() {
+        let not_a_key = "-----BEGIN PRIVATE KEY-----\nZGVhZGJlZWY=\n-----END PRIVATE KEY-----\n";
+        let error = private_key_from_pem(not_a_key).expect_err("garbage must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("not a recognised PKCS#8, SEC1 or PKCS#1"),
+            "{message}"
+        );
+        assert!(
+            message.contains("openssl pkcs8 -topk8 -nocrypt"),
+            "the error must carry the conversion command: {message}"
+        );
     }
 
     /// Unsupported key types stay rejected with a located message that names the detected type
