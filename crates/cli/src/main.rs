@@ -10,6 +10,7 @@
 mod build_info;
 mod completion;
 mod environ;
+mod fmt;
 mod manpage;
 mod signals;
 
@@ -162,6 +163,41 @@ enum Command {
         /// Environment file(s) to load (repeatable, or comma-separated).
         #[arg(long, value_delimiter = ',')]
         envfile: Vec<PathBuf>,
+    },
+    /// Formats a Caddyfile.
+    ///
+    /// Formats the Caddyfile by adding proper indentation and spaces to improve
+    /// human readability. It prints the result to stdout.
+    ///
+    /// If --overwrite is specified, the output will be written to the config file
+    /// directly instead of printing it.
+    ///
+    /// If --diff is specified, the output will be compared against the input, and
+    /// lines will be prefixed with '-' and '+' where they differ. Note that
+    /// unchanged lines are prefixed with two spaces for alignment, and that this
+    /// is not a valid patch format.
+    ///
+    /// If you wish to use stdin instead of a regular file, use - as the path.
+    /// When reading from stdin, the --overwrite flag has no effect: the result
+    /// is always printed to stdout.
+    #[command(
+        about = "Formats a Caddyfile",
+        long_about = "Formats the Caddyfile by adding proper indentation and spaces to improve\nhuman readability. It prints the result to stdout.\n\nIf --overwrite is specified, the output will be written to the config file\ndirectly instead of printing it.\n\nIf --diff is specified, the output will be compared against the input, and\nlines will be prefixed with '-' and '+' where they differ. Note that\nunchanged lines are prefixed with two spaces for alignment, and that this\nis not a valid patch format.\n\nIf you wish to use stdin instead of a regular file, use - as the path.\nWhen reading from stdin, the --overwrite flag has no effect: the result\nis always printed to stdout.",
+        override_usage = "caddy-rs fmt [--overwrite] [--diff] [<path>]"
+    )]
+    Fmt {
+        /// Configuration file.
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+        /// Overwrite the input file with the results.
+        #[arg(short = 'w', long)]
+        overwrite: bool,
+        /// Print the differences between the input file and the formatted output.
+        #[arg(short, long)]
+        diff: bool,
+        /// Caddyfile to format; `-` reads standard input.
+        #[arg(value_name = "PATH")]
+        paths: Vec<PathBuf>,
     },
     /// Generate a shell completion script.
     ///
@@ -642,6 +678,14 @@ async fn run(command: Command) -> anyhow::Result<()> {
         }
         Command::Environ { envfile } => {
             environ::run(&envfile)?;
+        }
+        Command::Fmt {
+            config,
+            overwrite,
+            diff,
+            paths,
+        } => {
+            fmt::run(config, overwrite, diff, paths)?;
         }
         Command::Completion { shells } => match shells.as_slice() {
             [shell] => print!("{}", completion::generate(shell)?),

@@ -8,12 +8,17 @@ Usage: caddy-rs <COMMAND>
 
 Commands:
   version       Print the version
+  build-info    Print information about this build
   list-modules  List modules compiled into this build
   adapt         Adapt a user-facing config to Caddy JSON
   validate      Validate a configuration without running it
   run           Run the server with a configuration
   reload        Load a new configuration into a running server through its admin API
   stop          Stop a running server through its admin API
+  environ       Print the environment as seen by this caddy-rs process
+  fmt           Formats a Caddyfile
+  completion    Generate a shell completion script
+  manpage       Generates the manual pages for caddy-rs commands
   pki           Inspect, show and export the local certificate authority material
   trust         Install the local CA root certificate into the host trust stores
   help          Print this message or the help of the given subcommand(s)
@@ -110,6 +115,53 @@ The command converts the input; it does not check that the result can run. Use `
 adapted file for that.
 
 Exit status is 0 on success, 1 when the file cannot be read or adapted, and 2 for a usage error.
+
+## fmt
+
+Formats a Caddyfile the way `caddy fmt` does: it rewrites bracing, indentation and inter-token
+spacing, while leaving words, comments, quoted and backticked strings, escaped characters and
+heredocs untouched. The formatter is a port of the pinned Caddy v2.11.9 implementation, and its
+output is byte-identical to the oracle for the upstream formatter test corpus and the differential
+probe in `.scratch/logs/t-cli-005-oracle/`.
+
+Synopsis: `caddy-rs fmt [--overwrite] [--diff] [<path>]`
+
+| Option | Description | Default |
+|---|---|---|
+| `-c, --config <CONFIG>` | Configuration file to format. | `Caddyfile` |
+| `-w, --overwrite` | Write the formatted result back to the file instead of printing it. | off |
+| `-d, --diff` | Print a line diff instead of the formatted file. | off |
+| `<path>` | Caddyfile path; `-` reads standard input. | `./Caddyfile` |
+
+```sh
+caddy-rs fmt ./Caddyfile                 # preview; fails if the file was not formatted
+caddy-rs fmt --overwrite ./Caddyfile     # rewrite in place, exit 0
+caddy-rs fmt --diff ./Caddyfile          # show the changes, fail if any
+curl -s https://example.com/Caddyfile | caddy-rs fmt -   # stdin -> stdout
+```
+
+Behaviour matches Caddy's `cmdFmt`:
+
+- With `--overwrite`, the file is rewritten (mode unchanged) and the command exits 0 without the
+  "not formatted" check. `--overwrite` wins over `--diff`.
+- With `--diff`, every line is printed with a two-space prefix when unchanged, `- ` when only in
+  the input and `+ ` when only in the output. This is not a valid patch format, matching Caddy.
+- A path of `-` reads stdin, prints to stdout, and ignores `--overwrite`/`--diff`; the
+  "not formatted" check is skipped and the exit status is 0.
+- Otherwise the formatted result is printed first. If the input was not already formatted, the
+  command then fails with exit 1 and a located message:
+
+  ```text
+  caddy-rs: error: ./Caddyfile:3: Caddyfile input is not formatted; Tip: use '--overwrite' to update your Caddyfile in-place instead of previewing it. Consult '--help' for more options
+  ```
+
+  The line number is the first byte at which the normalized input (CRLF is compared as LF) differs
+  from its formatted form.
+- A missing/unreadable file fails with `reading input file: ...`; more than one input (positional
+  or `--config` plus a positional) fails with Caddy's `fmt does not support multiple files ...`.
+
+Exit status is 0 on success (including `--overwrite`), 1 when the file cannot be read, when the
+input is not formatted, or when multiple inputs are given, and 2 for a clap usage error.
 
 ## validate
 
