@@ -227,7 +227,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "caddy-rs"
-version = "0.1.0-trial.2"
+version = "0.1.0-trial.5"
 dependencies = [
  "anyhow",
  "bytes",
@@ -248,7 +248,7 @@ dependencies = [
 
 [[package]]
 name = "caddy-rs-admin"
-version = "0.1.0-trial.2"
+version = "0.1.0-trial.5"
 dependencies = [
  "base64",
  "bytes",
@@ -266,7 +266,7 @@ dependencies = [
 
 [[package]]
 name = "caddy-rs-authn"
-version = "0.1.0-trial.2"
+version = "0.1.0-trial.5"
 dependencies = [
  "argon2",
  "async-trait",
@@ -289,7 +289,7 @@ dependencies = [
 
 [[package]]
 name = "caddy-rs-config"
-version = "0.1.0-trial.2"
+version = "0.1.0-trial.5"
 dependencies = [
  "caddy-rs-core",
  "serde_json",
@@ -298,7 +298,7 @@ dependencies = [
 
 [[package]]
 name = "caddy-rs-config-tx"
-version = "0.1.0-trial.2"
+version = "0.1.0-trial.5"
 dependencies = [
  "async-trait",
  "caddy-rs-core",
@@ -314,7 +314,7 @@ dependencies = [
 
 [[package]]
 name = "caddy-rs-core"
-version = "0.1.0-trial.2"
+version = "0.1.0-trial.5"
 dependencies = [
  "async-trait",
  "regex",
@@ -326,7 +326,7 @@ dependencies = [
 
 [[package]]
 name = "caddy-rs-http"
-version = "0.1.0-trial.2"
+version = "0.1.0-trial.5"
 dependencies = [
  "argon2",
  "async-trait",
@@ -353,7 +353,7 @@ dependencies = [
 
 [[package]]
 name = "caddy-rs-plug"
-version = "0.1.0-trial.2"
+version = "0.1.0-trial.5"
 dependencies = [
  "async-trait",
  "caddy-rs-core",
@@ -363,7 +363,7 @@ dependencies = [
 
 [[package]]
 name = "caddy-rs-proxy"
-version = "0.1.0-trial.2"
+version = "0.1.0-trial.5"
 dependencies = [
  "async-trait",
  "base64",
@@ -385,7 +385,7 @@ dependencies = [
 
 [[package]]
 name = "caddy-rs-server"
-version = "0.1.0-trial.2"
+version = "0.1.0-trial.5"
 dependencies = [
  "async-trait",
  "base64",
@@ -418,7 +418,7 @@ dependencies = [
 
 [[package]]
 name = "caddy-rs-tls"
-version = "0.1.0-trial.2"
+version = "0.1.0-trial.5"
 dependencies = [
  "async-trait",
  "base64",
