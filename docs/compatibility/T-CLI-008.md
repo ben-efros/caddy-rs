@@ -124,7 +124,7 @@ parsing, argument precedence, header semantics, status validation and template e
 ## Proposed register entry (program repository)
 
 ```text
-## DIV-0117 — `respond` rejects `--debug` and other capabilities this build lacks
+## DIV-0118 — `respond` rejects `--debug` and other capabilities this build lacks
 
 - Area: CLI
 - Caddy behaviour: `caddy respond` accepts `--debug` (debug-level internal logging), any integer
