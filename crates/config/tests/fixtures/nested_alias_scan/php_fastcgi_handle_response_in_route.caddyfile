@@ -1,0 +1,9 @@
+example.com {
+	route {
+		php_fastcgi localhost:9000 {
+			handle_response {
+				skip_log
+			}
+		}
+	}
+}

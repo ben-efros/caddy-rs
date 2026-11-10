@@ -1,0 +1,11 @@
+example.com {
+	route {
+		reverse_proxy localhost:9000 {
+			@alias status 500
+			replace_status @alias 400
+			handle_response {
+				skip_log
+			}
+		}
+	}
+}

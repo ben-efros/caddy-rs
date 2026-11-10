@@ -1,0 +1,132 @@
+{
+  "apps": {
+    "http": {
+      "servers": {
+        "srv0": {
+          "listen": [
+            ":443"
+          ],
+          "routes": [
+            {
+              "handle": [
+                {
+                  "handler": "subroute",
+                  "routes": [
+                    {
+                      "handle": [
+                        {
+                          "handler": "subroute",
+                          "routes": [
+                            {
+                              "handle": [
+                                {
+                                  "handler": "static_response",
+                                  "headers": {
+                                    "Location": [
+                                      "./{http.request.orig_uri.path.file_escaped}/{http.request.orig_uri.prefixed_query}"
+                                    ]
+                                  },
+                                  "status_code": 308
+                                }
+                              ],
+                              "match": [
+                                {
+                                  "file": {
+                                    "try_files": [
+                                      "{http.request.uri.path}/index.php"
+                                    ]
+                                  },
+                                  "not": [
+                                    {
+                                      "path": [
+                                        "*/"
+                                      ]
+                                    }
+                                  ]
+                                }
+                              ]
+                            },
+                            {
+                              "handle": [
+                                {
+                                  "handler": "rewrite",
+                                  "uri": "{http.matchers.file.relative}"
+                                }
+                              ],
+                              "match": [
+                                {
+                                  "file": {
+                                    "split_path": [
+                                      ".php"
+                                    ],
+                                    "try_files": [
+                                      "{http.request.uri.path}",
+                                      "{http.request.uri.path}/index.php",
+                                      "index.php"
+                                    ],
+                                    "try_policy": "first_exist_fallback"
+                                  }
+                                }
+                              ]
+                            },
+                            {
+                              "handle": [
+                                {
+                                  "handle_response": [
+                                    {
+                                      "routes": [
+                                        {
+                                          "handle": [
+                                            {
+                                              "handler": "vars",
+                                              "log_skip": true
+                                            }
+                                          ]
+                                        }
+                                      ]
+                                    }
+                                  ],
+                                  "handler": "reverse_proxy",
+                                  "transport": {
+                                    "protocol": "fastcgi",
+                                    "split_path": [
+                                      ".php"
+                                    ]
+                                  },
+                                  "upstreams": [
+                                    {
+                                      "dial": "localhost:9000"
+                                    }
+                                  ]
+                                }
+                              ],
+                              "match": [
+                                {
+                                  "path": [
+                                    "*.php"
+                                  ]
+                                }
+                              ]
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ],
+              "match": [
+                {
+                  "host": [
+                    "example.com"
+                  ]
+                }
+              ],
+              "terminal": true
+            }
+          ]
+        }
+      }
+    }
+  }
+}
