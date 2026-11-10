@@ -2966,3 +2966,601 @@ fn manpage_requires_an_output_directory_with_caddys_exit_code() {
         "{stderr}"
     );
 }
+
+// ---- `caddy-rs respond` (real spawned process, real HTTP responses) --------------------------
+//
+// Each test starts the compiled binary, reads the `Server address:` line Caddy documents, issues
+// a real HTTP/1.1 request, and asserts the status line, the headers Caddy's `static_response`
+// handler sets, and the body. The helpers kill the child on drop, so a failing assertion cannot
+// leave a listener behind.
+
+use std::io::{BufRead, BufReader};
+use std::sync::mpsc;
+
+/// A spawned `caddy-rs respond` process plus a line reader for its stdout.
+struct RespondProcess {
+    child: Child,
+    lines: mpsc::Receiver<String>,
+    log: std::path::PathBuf,
+}
+
+impl RespondProcess {
+    fn stop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
+    /// Send SIGTERM and wait for a graceful exit, returning the captured stderr.
+    fn terminate(&mut self) -> String {
+        // SAFETY: `child.id()` is this live child's pid; SIGTERM is a valid signal.
+        unsafe { libc::kill(self.child.id() as libc::c_int, libc::SIGTERM) };
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if self.child.try_wait().expect("poll respond child").is_some() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                self.stop();
+                panic!(
+                    "respond did not exit after SIGTERM\nstderr:\n{}",
+                    std::fs::read_to_string(&self.log).unwrap_or_default()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    /// The next stdout line, or a panic naming the child's stderr.
+    fn next_line(&mut self) -> String {
+        match self.lines.recv_timeout(Duration::from_secs(15)) {
+            Ok(line) => line,
+            Err(error) => {
+                self.stop();
+                panic!(
+                    "respond printed no `Server address:` line ({error})\nstderr:\n{}",
+                    std::fs::read_to_string(&self.log).unwrap_or_default()
+                );
+            }
+        }
+    }
+
+    /// The next `Server address:` line's address.
+    fn next_address(&mut self) -> SocketAddr {
+        let line = self.next_line();
+        let address = line
+            .strip_prefix("Server address: ")
+            .unwrap_or_else(|| panic!("unexpected respond stdout line: {line:?}"));
+        address
+            .parse()
+            .unwrap_or_else(|error| panic!("unparsable address {address:?}: {error}"))
+    }
+}
+
+impl Drop for RespondProcess {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Spawn `caddy-rs respond` with `args`, optionally feeding `stdin`.
+fn spawn_respond(directory: &Path, args: &[&str], stdin: Option<&str>) -> RespondProcess {
+    let mut command = Command::new(binary());
+    command.arg("respond").args(args);
+    spawn_respond_command(command, directory, stdin)
+}
+
+/// Spawn an already-built `respond` command (used to inject process environment and descriptors).
+fn spawn_respond_command(
+    mut command: Command,
+    directory: &Path,
+    stdin: Option<&str>,
+) -> RespondProcess {
+    let log = directory.join("respond.stderr");
+    let file = std::fs::File::create(&log).expect("create respond stderr log");
+    command.stdout(Stdio::piped()).stderr(Stdio::from(file));
+    if stdin.is_some() {
+        command.stdin(Stdio::piped());
+    } else {
+        command.stdin(Stdio::null());
+    }
+    let mut child = command.spawn().expect("spawn caddy-rs respond");
+    if let Some(data) = stdin {
+        let mut pipe = child.stdin.take().expect("respond stdin pipe");
+        pipe.write_all(data.as_bytes())
+            .expect("write respond stdin");
+        drop(pipe);
+    }
+    let stdout = child.stdout.take().expect("respond stdout pipe");
+    let (sender, lines) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    RespondProcess { child, lines, log }
+}
+
+/// An HTTP/1.1 response with headers preserved (lower-cased names) and the raw body.
+struct HttpResponse {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: String,
+}
+
+impl HttpResponse {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(field, _)| field.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// Send one HTTP/1.1 request to `address` (an unspecified bind is reached over IPv4 loopback).
+fn http_exchange(address: SocketAddr, method: &str) -> HttpResponse {
+    let target = if address.ip().is_unspecified() {
+        SocketAddr::from(([127, 0, 0, 1], address.port()))
+    } else {
+        address
+    };
+    let mut stream =
+        TcpStream::connect_timeout(&target, Duration::from_secs(5)).expect("connect respond");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
+    write!(
+        stream,
+        "{method} / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )
+    .expect("write request");
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).expect("read response");
+    let split = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("response header terminator")
+        + 4;
+    let head = String::from_utf8_lossy(&response[..split]);
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .expect("status code");
+    let headers = head
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            Some((name.trim().to_ascii_lowercase(), value.trim().to_string()))
+        })
+        .collect();
+    HttpResponse {
+        status,
+        headers,
+        body: String::from_utf8_lossy(&response[split..]).into_owned(),
+    }
+}
+
+/// A contiguous pair of free loopback ports (a `respond --listen` port range).
+fn free_port_pair() -> u16 {
+    for base in 20000..60000 {
+        let first = TcpListener::bind(("127.0.0.1", base));
+        let second = TcpListener::bind(("127.0.0.1", base + 1));
+        if first.is_ok() && second.is_ok() {
+            return base;
+        }
+    }
+    panic!("no contiguous free port pair");
+}
+
+#[test]
+fn respond_serves_the_documented_default_and_prints_the_listen_address() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let port = free_port();
+    let listen = format!("127.0.0.1:{port}");
+    let mut server = spawn_respond(directory.path(), &["--listen", &listen], None);
+
+    let line = server.next_line();
+    assert_eq!(line, format!("Server address: {listen}"));
+    let address = server.next_address_after(&line);
+    let response = http_exchange(address, "GET");
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, "");
+    // Caddy writes no Content-Type for an empty body (`static_response` only infers one from a
+    // non-empty body).
+    assert_eq!(response.header("content-type"), None);
+    assert_eq!(response.header("content-length"), Some("0"));
+
+    // A random-port listener (`:0`, the default) prints the actual bound address.
+    let mut random = spawn_respond(directory.path(), &["--listen", ":0"], None);
+    let line = random.next_line();
+    assert!(line.starts_with("Server address: "), "{line}");
+    let address = random.next_address_after(&line);
+    assert_ne!(address.port(), 0);
+    assert_eq!(http_exchange(address, "GET").status, 200);
+}
+
+/// Parse the address out of an already-consumed `Server address:` line.
+impl RespondProcess {
+    fn next_address_after(&self, line: &str) -> SocketAddr {
+        line.strip_prefix("Server address: ")
+            .unwrap_or_else(|| panic!("unexpected respond stdout line: {line:?}"))
+            .parse()
+            .unwrap_or_else(|error| panic!("unparsable address in {line:?}: {error}"))
+    }
+}
+
+#[test]
+fn respond_serves_custom_status_body_and_headers() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let mut server = spawn_respond(
+        directory.path(),
+        &[
+            "--listen",
+            "127.0.0.1:0",
+            "--status",
+            "418",
+            "--body",
+            "teapot",
+            "--header",
+            "X-Test: yes",
+            "--header",
+            "Content-Language: en",
+        ],
+        None,
+    );
+    let address = server.next_address();
+    let response = http_exchange(address, "GET");
+    assert_eq!(response.status, 418);
+    assert_eq!(response.body, "teapot");
+    assert_eq!(response.header("x-test"), Some("yes"));
+    assert_eq!(response.header("content-language"), Some("en"));
+    assert_eq!(
+        response.header("content-type"),
+        Some("text/plain; charset=utf-8")
+    );
+    assert_eq!(response.header("content-length"), Some("6"));
+
+    // JSON bodies get Caddy's implicit application/json type; an explicit header still wins.
+    let mut json = spawn_respond(
+        directory.path(),
+        &["--listen", "127.0.0.1:0", "--body", "{\"a\":1}"],
+        None,
+    );
+    let response = http_exchange(json.next_address(), "GET");
+    assert_eq!(response.header("content-type"), Some("application/json"));
+    assert_eq!(response.body, "{\"a\":1}");
+
+    let mut explicit = spawn_respond(
+        directory.path(),
+        &[
+            "--listen",
+            "127.0.0.1:0",
+            "--body",
+            "hello",
+            "--header",
+            "Content-Type: application/xml",
+        ],
+        None,
+    );
+    let response = http_exchange(explicit.next_address(), "GET");
+    assert_eq!(response.header("content-type"), Some("application/xml"));
+}
+
+#[test]
+fn respond_honours_head_semantics_and_caddy_positional_arguments() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let mut server = spawn_respond(
+        directory.path(),
+        &["--listen", "127.0.0.1:0", "--body", "hello"],
+        None,
+    );
+    let response = http_exchange(server.next_address(), "HEAD");
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, "");
+    assert_eq!(
+        response.header("content-type"),
+        Some("text/plain; charset=utf-8")
+    );
+    assert_eq!(response.header("content-length"), Some("5"));
+
+    // A 3-digit unnamed argument is the status code.
+    let mut status = spawn_respond(directory.path(), &["--listen", "127.0.0.1:0", "404"], None);
+    let response = http_exchange(status.next_address(), "GET");
+    assert_eq!(response.status, 404);
+    assert_eq!(response.body, "");
+
+    // Any other unnamed argument is the body.
+    let mut body = spawn_respond(
+        directory.path(),
+        &["--listen", "127.0.0.1:0", "hello"],
+        None,
+    );
+    let response = http_exchange(body.next_address(), "GET");
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, "hello");
+
+    // `--status`/`--body` override the argument; a literal "404" body with a 200 status works.
+    let mut overridden = spawn_respond(
+        directory.path(),
+        &["--listen", "127.0.0.1:0", "--status", "201", "404"],
+        None,
+    );
+    let response = http_exchange(overridden.next_address(), "GET");
+    assert_eq!(response.status, 201);
+    assert_eq!(response.body, "404");
+}
+
+#[test]
+fn respond_reads_a_piped_stdin_body() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let mut server = spawn_respond(
+        directory.path(),
+        &["--listen", "127.0.0.1:0"],
+        Some("from-stdin"),
+    );
+    let response = http_exchange(server.next_address(), "GET");
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, "from-stdin");
+    assert_eq!(
+        response.header("content-type"),
+        Some("text/plain; charset=utf-8")
+    );
+}
+
+#[test]
+fn respond_expands_a_port_range_with_template_variables() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let base = free_port_pair();
+    let listen = format!("127.0.0.1:{base}-{}", base + 1);
+    let mut server = spawn_respond(
+        directory.path(),
+        &[
+            "--listen",
+            &listen,
+            "--body",
+            "n={{.N}} port={{.Port}} addr={{.Address}}",
+        ],
+        None,
+    );
+    let first = server.next_address();
+    let second = server.next_address();
+    assert_eq!(first.to_string(), format!("127.0.0.1:{base}"));
+    assert_eq!(second.to_string(), format!("127.0.0.1:{}", base + 1));
+
+    let response = http_exchange(first, "GET");
+    assert_eq!(
+        response.body,
+        format!("n=0 port={base} addr=127.0.0.1:{base}")
+    );
+    let response = http_exchange(second, "GET");
+    assert_eq!(
+        response.body,
+        format!("n=1 port={} addr=127.0.0.1:{}", base + 1, base + 1)
+    );
+}
+
+#[test]
+fn respond_writes_the_access_log_when_requested() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let mut server = spawn_respond(
+        directory.path(),
+        &[
+            "--listen",
+            "127.0.0.1:0",
+            "--access-log",
+            "--body",
+            "logged",
+        ],
+        None,
+    );
+    let response = http_exchange(server.next_address(), "GET");
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, "logged");
+    // A graceful shutdown flushes the buffered access-log sink; SIGKILL would not.
+    let stderr = server.terminate();
+    assert!(
+        stderr.contains("http.log.access") && stderr.contains("\"status\":200"),
+        "access log not written:\n{stderr}"
+    );
+}
+
+#[test]
+fn respond_rejects_debug_with_a_located_error() {
+    // `--debug` maps to Caddy's debug-level internal logging, which this build does not have; it
+    // must fail loudly instead of being silently ignored.
+    let (code, stdout, stderr) = run_within(
+        &["respond", "--debug", "--listen", "127.0.0.1:0"],
+        Duration::from_secs(10),
+    );
+    assert_eq!(code, 1, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("--debug"), "{stderr}");
+    assert!(stderr.contains("not supported"), "{stderr}");
+}
+
+#[test]
+fn respond_rejects_interim_1xx_statuses_with_a_located_error() {
+    // Caddy sends a 1xx as an interim response and then keeps handling (200 with the body); this
+    // build has no interim-response plumbing, so it must reject 1xx at startup rather than answer
+    // every request with a 500.
+    for status in ["100", "102", "103", "199"] {
+        let (code, stdout, stderr) = run_within(
+            &["respond", "--status", status, "--listen", "127.0.0.1:0"],
+            Duration::from_secs(10),
+        );
+        assert_eq!(code, 1, "status {status}: stdout {stdout}\nstderr {stderr}");
+        assert!(stdout.is_empty(), "status {status}: {stdout}");
+        assert!(stderr.contains("--status"), "status {status}: {stderr}");
+        assert!(stderr.contains("interim"), "status {status}: {stderr}");
+        assert!(stderr.contains("200-999"), "status {status}: {stderr}");
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn respond_ignores_systemd_socket_activation() {
+    use std::os::unix::io::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
+    // Caddy's `respond` does not consult LISTEN_FDS; an inherited descriptor must not make the
+    // command fail. The shell sets LISTEN_PID to the pid the final process keeps across exec.
+    let directory = tempfile::tempdir().expect("tempdir");
+    let inherited = TcpListener::bind("127.0.0.1:0").expect("inherited listener");
+    let fd = inherited.as_raw_fd();
+    let mut command = Command::new("sh");
+    command
+        .arg("-c")
+        .arg("export LISTEN_PID=$$; exec \"$0\" respond --listen 127.0.0.1:0")
+        .arg(binary())
+        .env("LISTEN_FDS", "1")
+        .env("LISTEN_FDNAMES", "unrelated");
+    // SAFETY: the closure only duplicates a descriptor this test owns; `dup2`/`fcntl` are
+    // async-signal-safe.
+    unsafe {
+        command.pre_exec(move || {
+            if fd != 3 {
+                if libc::dup2(fd, 3) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            } else if libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut server = spawn_respond_command(command, directory.path(), None);
+    let response = http_exchange(server.next_address(), "GET");
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, "");
+}
+
+#[test]
+fn respond_accepts_the_network_prefixes_caddy_drops() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    // Caddy's `buildHTTPServer` rebuilds the address with `JoinHostPort`, dropping the network
+    // prefix; all of these end up as plain TCP listeners.
+    let mut listens = vec!["tcp4/127.0.0.1:0", "udp/127.0.0.1:0", "udp4/127.0.0.1:0"];
+    if ipv6_loopback_available() {
+        listens.push("tcp6/[::1]:0");
+    }
+    for listen in listens {
+        let mut server = spawn_respond(
+            directory.path(),
+            &["--listen", listen, "--body", "prefixed"],
+            None,
+        );
+        let response = http_exchange(server.next_address(), "GET");
+        assert_eq!(response.status, 200, "{listen}");
+        assert_eq!(response.body, "prefixed", "{listen}");
+    }
+}
+
+#[test]
+fn respond_sanitizes_header_values_and_drops_bad_names_like_caddy() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let mut server = spawn_respond(
+        directory.path(),
+        &[
+            "--listen",
+            "127.0.0.1:0",
+            "--body",
+            "hi",
+            "--header",
+            "X-Lf: a\nb",
+            "--header",
+            "X-Cr: a\rb",
+            "--header",
+            "X-Ctl: a\u{1}b",
+            "--header",
+            "Bad Header: x",
+            "--header",
+            "X-Kept: yes",
+        ],
+        None,
+    );
+    let response = http_exchange(server.next_address(), "GET");
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, "hi");
+    assert_eq!(response.header("x-lf"), Some("a b"));
+    assert_eq!(response.header("x-cr"), Some("a b"));
+    assert_eq!(response.header("x-ctl"), Some("a b"));
+    assert_eq!(response.header("x-kept"), Some("yes"));
+    assert_eq!(response.header("bad header"), None);
+}
+
+#[test]
+fn respond_applies_caddys_read_header_timeout() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let mut server = spawn_respond(directory.path(), &["--listen", "127.0.0.1:0"], None);
+    let address = server.next_address();
+    let mut stream =
+        TcpStream::connect_timeout(&address, Duration::from_secs(5)).expect("connect respond");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .expect("read timeout");
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n")
+        .expect("write request line");
+    // Caddy's `buildHTTPServer` uses a 10 s read-header timeout; a header sent after it must not
+    // be answered.
+    std::thread::sleep(Duration::from_secs(11));
+    let _ = stream.write_all(b"X-Late: yes\r\nConnection: close\r\n\r\n");
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    assert!(
+        response.is_empty(),
+        "server answered after its 10s header timeout: {:?}",
+        String::from_utf8_lossy(&response)
+    );
+}
+
+#[test]
+fn respond_rejects_invalid_headers_arguments_and_templates() {
+    for (args, needle) in [
+        (
+            vec!["respond", "--header", "X-Bad", "--listen", "127.0.0.1:0"],
+            "header 0: invalid format \"X-Bad\"",
+        ),
+        (vec!["respond", "a", "b"], "too many unflagged arguments"),
+        (
+            vec![
+                "respond",
+                "--status",
+                "201",
+                "--body",
+                "x",
+                "y",
+                "--listen",
+                "127.0.0.1:0",
+            ],
+            "unflagged argument \"y\" is overridden by flags",
+        ),
+        (
+            vec!["respond", "--body", "{{.Foo}}", "--listen", "127.0.0.1:0"],
+            "unsupported template expression",
+        ),
+        (
+            vec!["respond", "--listen", "unixpacket//tmp/x.sock"],
+            "SOCK_SEQPACKET",
+        ),
+        (
+            vec!["respond", "--listen", "unix/relative.sock"],
+            "unix socket path must be absolute",
+        ),
+        (
+            vec!["respond", "--status", "99", "--listen", "127.0.0.1:0"],
+            "--status: 99",
+        ),
+    ] {
+        let (code, stdout, stderr) = run_within(&args, Duration::from_secs(10));
+        assert_eq!(code, 1, "args {args:?}: stdout {stdout}\nstderr {stderr}");
+        assert!(stdout.is_empty(), "args {args:?}: {stdout}");
+        assert!(stderr.contains(needle), "args {args:?}: {stderr}");
+    }
+}
