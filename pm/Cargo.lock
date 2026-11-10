@@ -168,7 +168,7 @@ checksum = "7354288c522e7e980fafd2075d63d1285794c3a6a16cdd492f189ea406e5f18b"
 
 [[package]]
 name = "caddy-rs-config-tx"
-version = "0.1.0-trial.2"
+version = "0.1.0-trial.5"
 dependencies = [
  "async-trait",
  "caddy-rs-core",
@@ -183,7 +183,7 @@ dependencies = [
 
 [[package]]
 name = "caddy-rs-core"
-version = "0.1.0-trial.2"
+version = "0.1.0-trial.5"
 dependencies = [
  "async-trait",
  "regex",
