@@ -14,7 +14,7 @@ thiserror = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 # Crypto and JWT
-argon2 = { version = "0.5", features = ["std", "password-hash"] }
+argon2 = { version = "0.6", features = ["password-hash"] }
 bcrypt = "0.16"
 jsonwebtoken = "9.3"
 rand = { version = "0.8", features = ["std", "getrandom"] }
