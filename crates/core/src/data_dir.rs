@@ -13,6 +13,8 @@ use std::ffi::OsString;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Environment override for the data directory (caddy-rs-specific).
 pub const DATA_DIR_ENV: &str = "CADDY_RS_DATA_DIR";
@@ -269,6 +271,10 @@ pub struct DataDirReport {
     pub warnings: Vec<String>,
 }
 
+/// Number of times a preflight is retried when the data directory itself is created or removed by
+/// another thread/process while it is being checked.
+const CONCURRENT_RETRIES: usize = 3;
+
 /// Create/check the data directory before any certificate work.
 ///
 /// This is intentionally conservative:
@@ -277,7 +283,38 @@ pub struct DataDirReport {
 /// * a root owned by another uid is refused unless this process is root;
 /// * a random `0600` probe file is created and removed with `create_new` (no symlink following);
 /// * failures carry the path, operation, parent mode/owner and a fix hint.
+///
+/// A data directory can legitimately be created or removed concurrently: two runtimes (or two
+/// parallel tests) may resolve the same path, and one may clean it up while the other checks it.
+/// That is not a permission failure, so [`preflight_once`] is retried a bounded number of times
+/// before the losing side of the race is reported.
 pub fn preflight(root: &Path) -> Result<DataDirReport, DataDirError> {
+    let mut attempt = 0;
+    loop {
+        match preflight_once(root) {
+            Err(error) if attempt < CONCURRENT_RETRIES && is_concurrent_race(&error) => {
+                attempt += 1;
+                std::thread::yield_now();
+            }
+            result => return result,
+        }
+    }
+}
+
+/// Whether `error` looks like the data directory changed under us rather than a permission problem.
+///
+/// `NotFound` covers a directory (or probe file) removed by another actor between our stat and our
+/// use; `AlreadyExists` covers a directory created by another actor after we saw it missing. Both
+/// are retried, and a real permission failure still surfaces with its original location.
+fn is_concurrent_race(error: &DataDirError) -> bool {
+    error.kind == DataDirErrorKind::Io
+        && matches!(
+            error.source.as_ref().map(io::Error::kind),
+            Some(io::ErrorKind::NotFound | io::ErrorKind::AlreadyExists)
+        )
+}
+
+fn preflight_once(root: &Path) -> Result<DataDirReport, DataDirError> {
     let root = absolute_path(root)?;
     let mut warnings = Vec::new();
 
@@ -334,22 +371,29 @@ pub fn preflight(root: &Path) -> Result<DataDirReport, DataDirError> {
         if let Some(ancestor) = &nearest {
             check_ancestor(ancestor, &root)?;
         }
-        create_root(&root).map_err(|error| DataDirError {
-            path: root.clone(),
-            operation: "create data directory",
-            source: Some(error),
-            kind: DataDirErrorKind::Io,
-            parent,
-            parent_mode: nearest.as_deref().and_then(mode_of),
-            process_uid: process_uid(),
-            hint: Some(format!(
-                "create it as the service user: install -d -o {} -g {} -m 0750 {}",
-                user_name(),
-                group_name(),
-                root.display()
-            )),
-        })?;
-        created = true;
+        created = match create_root(&root) {
+            Ok(()) => true,
+            // Another thread/process created the directory between our stat and our create. That
+            // is success: the directory exists, and the mode/owner/write checks below still run.
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
+            Err(error) => {
+                return Err(DataDirError {
+                    path: root.clone(),
+                    operation: "create data directory",
+                    source: Some(error),
+                    kind: DataDirErrorKind::Io,
+                    parent,
+                    parent_mode: nearest.as_deref().and_then(mode_of),
+                    process_uid: process_uid(),
+                    hint: Some(format!(
+                        "create it as the service user: install -d -o {} -g {} -m 0750 {}",
+                        user_name(),
+                        group_name(),
+                        root.display()
+                    )),
+                })
+            }
+        };
     }
 
     let metadata = std::fs::metadata(&root).map_err(|error| DataDirError {
@@ -436,48 +480,94 @@ fn create_root(root: &Path) -> io::Result<()> {
     }
 }
 
+/// Distinguishes probes created in the same clock tick by different threads of this process.
+///
+/// `SystemTime` has nanosecond *resolution*, not nanosecond *granularity*: two threads (or two
+/// virtualized hosts) can read the same tick, and before this counter existed both computed the
+/// same probe filename. The first `create_new` then won and the second failed with `AlreadyExists`,
+/// while the winner's `remove_file` failed with `NotFound` after the loser cleaned up — a flaky
+/// "data directory is not writable" panic from a directory that was perfectly writable.
+static PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// How many probe names to try before accepting a persistent collision as proof of writability.
+const PROBE_ATTEMPTS: usize = 3;
+
+fn probe_name(nonce: u128) -> String {
+    let sequence = PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!(
+        ".caddy-rs-write-test.{}.{nonce}.{sequence}",
+        std::process::id()
+    )
+}
+
 fn probe_write(root: &Path) -> Result<(), DataDirError> {
-    use std::io::Write;
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let probe = root.join(format!(
-        ".caddy-rs-write-test.{}.{nonce}",
-        std::process::id()
-    ));
-    let result = (|| -> io::Result<()> {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+    probe_write_with_nonce(root, nonce)
+}
+
+/// Write and remove one `0600` probe file. `nonce` is a parameter so tests can force two probes
+/// into the same clock tick and prove that they still do not collide.
+fn probe_write_with_nonce(root: &Path, nonce: u128) -> Result<(), DataDirError> {
+    probe_write_with_names(root, || probe_name(nonce))
+}
+
+/// The retry loop, with the probe filename supplied by `next_name` so tests can force an
+/// `AlreadyExists` collision deterministically instead of relying on a timing race.
+fn probe_write_with_names(
+    root: &Path,
+    mut next_name: impl FnMut() -> String,
+) -> Result<(), DataDirError> {
+    for _ in 0..PROBE_ATTEMPTS {
+        let probe = root.join(next_name());
+        match try_probe(&probe) {
+            Ok(()) => return Ok(()),
+            // The name exists already. Another actor is demonstrably able to create files here,
+            // which is what the probe checks, so retry with a fresh name and then accept success.
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                let _ = std::fs::remove_file(&probe);
+                return Err(DataDirError {
+                    path: root.to_path_buf(),
+                    operation: "write-probe data directory",
+                    source: Some(error),
+                    kind: DataDirErrorKind::Io,
+                    parent: root.parent().map(Path::to_path_buf),
+                    parent_mode: root.parent().and_then(mode_of),
+                    process_uid: process_uid(),
+                    hint: Some(format!(
+                        "ensure the service user can create files in `{}`",
+                        root.display()
+                    )),
+                });
+            }
         }
-        let mut file = options.open(&probe)?;
-        file.write_all(b"caddy-rs data-directory preflight\n")?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::remove_file(&probe)?;
-        Ok(())
-    })();
-    if let Err(error) = result {
-        let _ = std::fs::remove_file(&probe);
-        return Err(DataDirError {
-            path: root.to_path_buf(),
-            operation: "write-probe data directory",
-            source: Some(error),
-            kind: DataDirErrorKind::Io,
-            parent: root.parent().map(Path::to_path_buf),
-            parent_mode: root.parent().and_then(mode_of),
-            process_uid: process_uid(),
-            hint: Some(format!(
-                "ensure the service user can create files in `{}`",
-                root.display()
-            )),
-        });
     }
     Ok(())
+}
+
+fn try_probe(probe: &Path) -> io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(probe)?;
+    file.write_all(b"caddy-rs data-directory preflight\n")?;
+    file.sync_all()?;
+    drop(file);
+    match std::fs::remove_file(probe) {
+        Ok(()) => Ok(()),
+        // Another actor removed our probe first (a colliding probe name, or a cleanup). The write
+        // itself succeeded, so this is not a data-directory failure.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn check_ancestor(ancestor: &Path, root: &Path) -> Result<(), DataDirError> {
@@ -640,7 +730,8 @@ fn group_name() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::collections::HashSet;
+    use std::sync::{Arc, Barrier};
 
     fn temp_dir(label: &str) -> PathBuf {
         let nonce = SystemTime::now()
@@ -764,6 +855,131 @@ mod tests {
             "probe must be removed"
         );
         let _ = std::fs::remove_dir_all(parent);
+    }
+
+    /// The probe filename must stay unique even when parallel threads read the same clock tick:
+    /// before the atomic sequence existed, both threads used `pid.nonce` and one lost with
+    /// `AlreadyExists` (the other's `remove_file` then failed with `NotFound`).
+    #[test]
+    fn probe_names_are_unique_within_one_clock_tick() {
+        const THREADS: usize = 64;
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let mut handles = Vec::new();
+        for _ in 0..THREADS {
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                probe_name(7)
+            }));
+        }
+        let names: HashSet<String> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(names.len(), THREADS, "probe names must not collide");
+    }
+
+    /// Two probes that were handed the *same* nonce (the exact race) must both succeed, leave no
+    /// file behind, and must not report the other's file as a data-directory failure.
+    #[test]
+    fn concurrent_probes_in_the_same_clock_tick_succeed() {
+        const THREADS: usize = 16;
+        let parent = temp_dir("probe-concurrent");
+        let root = parent.join("data");
+        std::fs::create_dir_all(&root).unwrap();
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let mut handles = Vec::new();
+        for _ in 0..THREADS {
+            let root = root.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                probe_write_with_nonce(&root, 42)
+            }));
+        }
+        for handle in handles {
+            handle
+                .join()
+                .unwrap()
+                .expect("concurrent probe must succeed");
+        }
+        assert_eq!(
+            std::fs::read_dir(&root).unwrap().count(),
+            0,
+            "probes must remove their own files"
+        );
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    /// The `AlreadyExists` retry branch, forced deterministically instead of by a timing race: the
+    /// first two generated names are a pre-existing file, so `create_new` must fail with
+    /// `AlreadyExists`, the loop must retry with the next name, and the third name must succeed.
+    #[test]
+    fn probe_retries_a_name_that_already_exists() {
+        let parent = temp_dir("probe-retry");
+        let root = parent.join("data");
+        std::fs::create_dir_all(&root).unwrap();
+        let occupied = ".caddy-rs-write-test.occupied";
+        std::fs::write(root.join(occupied), b"pre-existing").unwrap();
+
+        let mut generated = 0usize;
+        let result = probe_write_with_names(&root, || {
+            generated += 1;
+            if generated < PROBE_ATTEMPTS {
+                occupied.to_string()
+            } else {
+                format!(".caddy-rs-write-test.retry-{generated}")
+            }
+        });
+
+        result.expect("a colliding probe name must be retried, not reported as a write failure");
+        assert_eq!(
+            generated, PROBE_ATTEMPTS,
+            "every collision must consume one bounded attempt"
+        );
+        let entries: Vec<OsString> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![OsString::from(occupied)],
+            "the pre-existing file must be left alone and the probe removed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(occupied)).unwrap(),
+            "pre-existing"
+        );
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    /// A shared data directory is not an error when several threads preflight it at once: the
+    /// directory appears and the probe files come and go concurrently.
+    #[test]
+    fn concurrent_preflight_of_one_fresh_root_succeeds() {
+        const THREADS: usize = 32;
+        const ROUNDS: usize = 25;
+        for round in 0..ROUNDS {
+            let parent = temp_dir(&format!("preflight-concurrent-{round}"));
+            let root = parent.join("data");
+            let barrier = Arc::new(Barrier::new(THREADS));
+            let mut handles = Vec::new();
+            for _ in 0..THREADS {
+                let root = root.clone();
+                let barrier = Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    preflight(&root)
+                }));
+            }
+            for handle in handles {
+                handle
+                    .join()
+                    .unwrap()
+                    .expect("concurrent preflight must succeed");
+            }
+            let _ = std::fs::remove_dir_all(parent);
+        }
     }
 
     #[test]

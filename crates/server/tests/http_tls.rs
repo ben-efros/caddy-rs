@@ -85,15 +85,22 @@ fn config(
     .expect("test config decodes")
 }
 
-async fn start(config: Config) -> (ServerRuntime, SocketAddr) {
+/// Start a runtime with a data directory private to this test.
+///
+/// Every test used to preflight the process-wide `.caddy-rs` under `crates/server`; parallel tests
+/// then raced to create the directory and their probe files. The returned `TempDir` keeps the
+/// per-test root alive for as long as the runtime and removes it on drop, so a test never observes
+/// (or leaves behind) another test's data directory.
+async fn start(config: Config) -> (ServerRuntime, SocketAddr, tempfile::TempDir) {
+    let data_dir = tempfile::tempdir().expect("per-test data directory");
     let store = Arc::new(GenerationStore::with_builtin_registry());
     store.load(config).expect("test config validates");
-    let mut runtime = ServerRuntime::new(Arc::clone(&store));
+    let mut runtime = ServerRuntime::new(Arc::clone(&store)).with_data_root(data_dir.path());
     runtime.apply().await.expect("runtime applies");
     let address = runtime
         .listener_address("127.0.0.1:0")
         .expect("listener is bound");
-    (runtime, address)
+    (runtime, address, data_dir)
 }
 
 /// Build a TLS listener serving exactly one `load_pem` certificate/key pair.
@@ -144,10 +151,14 @@ fn config_with_certificate_files(files: &[(String, String)]) -> Config {
 }
 
 /// Apply a configuration that is expected to fail and return the error message.
+///
+/// The data directory is per call for the same reason as [`start`]: a failing apply still runs the
+/// preflight, and the test must not race another test's directory.
 async fn apply_error(config: Config) -> String {
+    let data_dir = tempfile::tempdir().expect("per-test data directory");
     let store = Arc::new(GenerationStore::with_builtin_registry());
     store.load(config).expect("test config validates");
-    let mut runtime = ServerRuntime::new(store);
+    let mut runtime = ServerRuntime::new(store).with_data_root(data_dir.path());
     runtime
         .apply()
         .await
@@ -198,7 +209,7 @@ async fn tls_connect_with_roots(
 
 /// Start a TLS listener with one certificate and complete a real HTTP/1.1 request over TLS.
 async fn assert_certificate_handshake(name: &str, certificate: &str, key: &str) {
-    let (runtime, address) = start(config_with_pem_certificate(certificate, key)).await;
+    let (runtime, address, _data_dir) = start(config_with_pem_certificate(certificate, key)).await;
     let mut stream =
         tls_connect_with_roots(address, "localhost", &["http/1.1"], &[certificate]).await;
     assert_eq!(
@@ -322,7 +333,7 @@ async fn cleartext_get(address: SocketAddr) -> (u16, Bytes) {
 
 #[tokio::test]
 async fn https_http1_request_reports_tls_and_alpn() {
-    let (runtime, address) = start(config("127.0.0.1:0", true, None, true)).await;
+    let (runtime, address, _data_dir) = start(config("127.0.0.1:0", true, None, true)).await;
     let mut stream = tls_connect(address, "example.com", &["http/1.1"]).await;
     assert_eq!(negotiated_alpn(&stream).as_deref(), Some("http/1.1"));
 
@@ -334,7 +345,7 @@ async fn https_http1_request_reports_tls_and_alpn() {
 
 #[tokio::test]
 async fn https_h2_request_end_to_end() {
-    let (runtime, address) = start(config("127.0.0.1:0", true, None, true)).await;
+    let (runtime, address, _data_dir) = start(config("127.0.0.1:0", true, None, true)).await;
     let stream = tls_connect(address, "example.com", &["h2"]).await;
     assert_eq!(negotiated_alpn(&stream).as_deref(), Some("h2"));
     let (status, body) = h2_get(stream).await;
@@ -345,7 +356,7 @@ async fn https_h2_request_end_to_end() {
 
 #[tokio::test]
 async fn sni_selects_the_configured_certificate_for_two_names() {
-    let (runtime, address) = start(config("127.0.0.1:0", true, None, true)).await;
+    let (runtime, address, _data_dir) = start(config("127.0.0.1:0", true, None, true)).await;
 
     let mut example = tls_connect(address, "example.com", &["http/1.1"]).await;
     assert_eq!(peer_leaf_der(&example), fixture_leaf_der(EXAMPLE_CERT));
@@ -365,7 +376,7 @@ async fn sni_selects_the_configured_certificate_for_two_names() {
 async fn unsupported_alpn_falls_back_to_configured_protocol() {
     // The server offers h2 and http/1.1; a client offering only http/1.1 must negotiate it even
     // though h2 is preferred by default.
-    let (runtime, address) = start(config("127.0.0.1:0", true, None, true)).await;
+    let (runtime, address, _data_dir) = start(config("127.0.0.1:0", true, None, true)).await;
     let stream = tls_connect(address, "example.com", &["http/1.1"]).await;
     assert_eq!(negotiated_alpn(&stream).as_deref(), Some("http/1.1"));
     runtime.shutdown().await;
@@ -373,7 +384,7 @@ async fn unsupported_alpn_falls_back_to_configured_protocol() {
 
 #[tokio::test]
 async fn cleartext_listener_still_serves_http1() {
-    let (runtime, address) = start(config("127.0.0.1:0", false, None, false)).await;
+    let (runtime, address, _data_dir) = start(config("127.0.0.1:0", false, None, false)).await;
     let (status, body) = cleartext_get(address).await;
     assert_eq!(status, 200);
     // No TLS: `{http.request.scheme}` is `http` and the ALPN variable is empty.
@@ -385,7 +396,7 @@ async fn cleartext_listener_still_serves_http1() {
 async fn certificates_alone_do_not_force_tls_on_an_http_listener() {
     // Certificates are configured, but the listener is neither the HTTPS port nor covered by a
     // connection policy: it must stay cleartext (TLS is opt-in per listener policy).
-    let (runtime, address) = start(config("127.0.0.1:0", false, None, true)).await;
+    let (runtime, address, _data_dir) = start(config("127.0.0.1:0", false, None, true)).await;
     let (status, body) = cleartext_get(address).await;
     assert_eq!(status, 200);
     assert_eq!(body, Bytes::from_static(b"http "));
@@ -396,7 +407,7 @@ async fn certificates_alone_do_not_force_tls_on_an_http_listener() {
 async fn https_port_forces_tls_without_connection_policies() {
     // `https_port: 0` makes the ephemeral test listener the effective HTTPS port, exercising the
     // port-based half of the listener policy without binding a fixed privileged port.
-    let (runtime, address) = start(config("127.0.0.1:0", false, Some(0), true)).await;
+    let (runtime, address, _data_dir) = start(config("127.0.0.1:0", false, Some(0), true)).await;
     let mut stream = tls_connect(address, "example.com", &["http/1.1"]).await;
     assert_eq!(negotiated_alpn(&stream).as_deref(), Some("http/1.1"));
     let (status, body) = http1_get(&mut stream, "example.com").await;
@@ -407,11 +418,12 @@ async fn https_port_forces_tls_without_connection_policies() {
 
 #[tokio::test]
 async fn tls_listener_without_certificates_fails_loudly() {
+    let data_dir = tempfile::tempdir().expect("per-test data directory");
     let store = Arc::new(GenerationStore::with_builtin_registry());
     store
         .load(config("127.0.0.1:0", true, None, false))
         .expect("config validates even without certificates");
-    let mut runtime = ServerRuntime::new(store);
+    let mut runtime = ServerRuntime::new(store).with_data_root(data_dir.path());
     let error = runtime
         .apply()
         .await
@@ -433,9 +445,10 @@ async fn strict_sni_host_is_rejected_loudly() {
         .expect("config serializes");
     value["apps"]["http"]["servers"]["srv0"]["strict_sni_host"] = serde_json::json!(true);
     let config = Config::from_value(value).expect("config decodes");
+    let data_dir = tempfile::tempdir().expect("per-test data directory");
     let store = Arc::new(GenerationStore::with_builtin_registry());
     store.load(config).expect("config validates");
-    let mut runtime = ServerRuntime::new(store);
+    let mut runtime = ServerRuntime::new(store).with_data_root(data_dir.path());
     let error = runtime
         .apply()
         .await
@@ -452,9 +465,10 @@ async fn unimplemented_connection_policy_field_fails_loudly() {
     value["apps"]["http"]["servers"]["srv0"]["tls_connection_policies"] =
         serde_json::json!([{"default_sni": "example.com"}]);
     let config = Config::from_value(value).expect("config decodes");
+    let data_dir = tempfile::tempdir().expect("per-test data directory");
     let store = Arc::new(GenerationStore::with_builtin_registry());
     store.load(config).expect("config validates");
-    let mut runtime = ServerRuntime::new(store);
+    let mut runtime = ServerRuntime::new(store).with_data_root(data_dir.path());
     let error = runtime
         .apply()
         .await
@@ -481,7 +495,7 @@ async fn proxy_protocol_header_is_consumed_before_the_tls_handshake() {
                     "body": "{http.request.remote.host}:{http.request.remote.port}"}]
     }]);
     let config = Config::from_value(value).expect("proxy protocol TLS config decodes");
-    let (runtime, address) = start(config).await;
+    let (runtime, address, _data_dir) = start(config).await;
 
     // With a header the TLS handshake succeeds and the handler sees the header addresses.
     let stream = TcpStream::connect(address).await.expect("TCP connect");
