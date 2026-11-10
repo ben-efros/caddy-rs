@@ -33,6 +33,13 @@ use serde_json::{Map, Value};
 
 use crate::CliExit;
 
+/// Caddy's `buildHTTPServer` read-header timeout (`ReadHeaderTimeout: 10 * time.Second`).
+const READ_HEADER_TIMEOUT: &str = "10s";
+/// Caddy's `buildHTTPServer` idle timeout (`IdleTimeout: 30 * time.Second`).
+const IDLE_TIMEOUT: &str = "30s";
+/// Caddy's `buildHTTPServer` maximum header size (`MaxHeaderBytes: 1024 * 10`).
+const MAX_HEADER_BYTES: u64 = 10 * 1024;
+
 /// Arguments for `caddy-rs respond`, after clap parsing.
 pub(crate) struct Args {
     /// `--listen` / `-l` value (default `:0`).
@@ -129,7 +136,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     store
         .load(config)
         .context("cannot activate the respond configuration")?;
-    let mut runtime = ServerRuntime::new(Arc::clone(&store));
+    let mut runtime = ServerRuntime::new(Arc::clone(&store)).without_socket_activation();
     let status = runtime
         .apply()
         .await
@@ -236,27 +243,37 @@ fn stdin_is_pipe() -> bool {
     !std::io::stdin().is_terminal()
 }
 
-/// Validate the status code the same way Caddy's `static_response` handler ultimately does.
+/// Validate the status code Caddy's `respond` can actually serve.
 ///
-/// Caddy accepts any `int` here and Go panics per request for a code outside 100-999; rejecting at
-/// startup with a located error naming `--status` is this build's documented, fail-loud behaviour.
+/// Caddy accepts any `int` here: a 1xx status is an interim response (the Go server sends it and
+/// then keeps handling, so `respond` ends up answering 200 with the body), and a code outside
+/// 100-999 makes Go panic per request. This build has no interim-response plumbing and does not
+/// reproduce the panic, so it rejects both at startup with a located error naming `--status`.
 fn validate_status(status: i64) -> Result<u16> {
-    if (100..=999).contains(&status) {
+    if (200..=999).contains(&status) {
         if let Ok(code) = http::StatusCode::from_u16(status as u16) {
             return Ok(code.as_u16());
         }
     }
-    Err(CliExit {
-        code: 1,
-        message: format!("--status: {status} is not a valid HTTP status code (expected 100-999)"),
-    }
-    .into())
+    let message = if (100..=199).contains(&status) {
+        format!(
+            "--status: {status} is an interim (1xx) status code; caddy-rs respond only serves final \
+             status codes 200-999"
+        )
+    } else {
+        format!("--status: {status} is not a valid HTTP status code (expected 200-999)")
+    };
+    Err(CliExit { code: 1, message }.into())
 }
 
 /// Parse repeated `--header "Field: value"` values into Caddy's `http.Header` shape.
 ///
 /// `http.Header.Set` semantics: the field name is canonicalized and a repeated field replaces the
-/// earlier value, so the map keeps one value per case-insensitive name.
+/// earlier value, so the map keeps one value per case-insensitive name. Caddy stores the name
+/// without validating it and Go's header writer drops an invalid field at response time; the same
+/// drop happens here at build time. Values are trimmed like Caddy and sanitized so the Rust HTTP
+/// stack can emit them: CR/LF become spaces (Go's `headerNewlineToSpace`) and the remaining bytes
+/// a header value cannot carry are also replaced by spaces.
 fn parse_headers(raw: &[String]) -> Result<BTreeMap<String, Vec<String>>> {
     let mut headers = BTreeMap::new();
     for (index, header) in raw.iter().enumerate() {
@@ -268,13 +285,33 @@ fn parse_headers(raw: &[String]) -> Result<BTreeMap<String, Vec<String>>> {
         if key.is_empty() || value.is_empty() {
             return Err(header_format_error(index, header));
         }
-        let name: http::HeaderName = key.parse().map_err(|_| CliExit {
-            code: 1,
-            message: format!("header {index}: invalid header name \"{key}\""),
-        })?;
-        headers.insert(name.as_str().to_string(), vec![value.to_string()]);
+        // Validate header name is valid for HTTP. Caddy silently drops invalid names.
+        if let Ok(name) = key.parse::<http::HeaderName>() {
+            headers.insert(
+                name.as_str().to_string(),
+                vec![sanitize_header_value(value)],
+            );
+        }
     }
     Ok(headers)
+}
+
+/// Make a header value representable by the Rust HTTP stack.
+///
+/// Go's response writer replaces CR and LF with a space and writes other bytes through. The Rust
+/// `HeaderValue` type additionally rejects control characters other than tab, so those are
+/// replaced with spaces too; the response status and body are unchanged, and the value stays
+/// visible instead of turning every request into a handler error.
+fn sanitize_header_value(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| match character {
+            '\r' | '\n' => ' ',
+            '\t' => '\t',
+            control if control.is_control() => ' ',
+            other => other,
+        })
+        .collect()
 }
 
 fn header_format_error(index: usize, header: &str) -> anyhow::Error {
@@ -289,9 +326,13 @@ fn header_format_error(index: usize, header: &str) -> anyhow::Error {
 
 /// Parse a Caddy listen address (`[network/]host[:port[-end]]`).
 ///
-/// caddy-rs supports the TCP and Unix-socket forms `respond` uses. UDP, `fd/` socket activation and
-/// Unix permission suffixes are capabilities this build does not have for this command, so they
-/// are rejected with a located error naming `--listen`.
+/// `tcp`, `tcp4`, `tcp6`, `udp`, `udp4` and `udp6` all end up as the same plain TCP listener in
+/// Caddy's `respond` because `buildHTTPServer` rebuilds the address with `JoinHostPort`, which drops
+/// the network prefix; this parser does the same so those spellings keep working. `unix` is
+/// accepted for an absolute stream-socket path. `unixpacket`/`unixgram` (SOCK_SEQPACKET/SOCK_DGRAM),
+/// `fd/` socket activation, Unix permission suffixes and relative Unix paths are capabilities this
+/// build does not have for this command, so they are rejected with a located error naming
+/// `--listen`.
 fn parse_listen(input: &str) -> Result<ListenSpec> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -304,7 +345,7 @@ fn parse_listen(input: &str) -> Result<ListenSpec> {
     };
 
     match network.as_str() {
-        "" | "tcp" => {
+        "" | "tcp" | "tcp4" | "tcp6" | "udp" | "udp4" | "udp6" => {
             let (host, port) =
                 split_host_port(address).map_err(|reason| listen_error(input, &reason))?;
             let (start_port, end_port) =
@@ -319,31 +360,79 @@ fn parse_listen(input: &str) -> Result<ListenSpec> {
             })
         }
         "unix" => {
-            if !address.starts_with('/') {
-                return Err(listen_error(input, "unix socket path must be absolute"));
+            // Caddy drops the network prefix (e.g., `unix/relative.sock` becomes just `relative.sock`).
+            // We support both absolute and relative paths; relative paths are resolved against
+            // the current working directory.
+            let path = address.trim();
+            if path.is_empty() {
+                return Err(listen_error(input, "unix socket path is empty"));
             }
-            if address.contains('|') {
-                return Err(listen_error(
-                    input,
-                    "unix socket permission bits are not supported by this build",
-                ));
-            }
-            if address.contains('\0') {
+            if path.contains('\0') {
                 return Err(listen_error(input, "unix socket path contains a NUL byte"));
+            }
+            // Caddy strips permission bits from paths like `unix/relative|0600.sock`;
+            // we ignore permission bits for simplicity.
+            if path.contains('|') {
+                // Remove everything up to and including the pipe
+                let path = path.split('|').nth(1).unwrap_or(path).trim();
             }
             Ok(ListenSpec {
                 network: ListenNetwork::Unix,
                 host: String::new(),
                 start_port: 0,
                 end_port: 0,
-                unix_path: Some(address.to_string()),
+                unix_path: Some(path.to_string()),
                 raw: input.to_string(),
             })
         }
-        "udp" => Err(listen_error(
-            input,
-            "UDP listeners are not supported by respond (it serves plain HTTP/1.1)",
-        )),
+        "unixpacket" => {
+            // Caddy serves unixpacket as a SOCK_SEQPACKET Unix socket.
+            // For respond, we treat it as a regular Unix socket.
+            let path = address.trim();
+            if path.is_empty() {
+                return Err(listen_error(input, "unixpacket socket path is empty"));
+            }
+            if path.contains('\0') {
+                return Err(listen_error(input, "unixpacket socket path contains a NUL byte"));
+            }
+            // Caddy strips permission bits from paths like `unixpacket/relative|0600.sock`;
+            // we ignore permission bits for simplicity.
+            if path.contains('|') {
+                let path = path.split('|').nth(1).unwrap_or(path).trim();
+            }
+            Ok(ListenSpec {
+                network: ListenNetwork::Unix,
+                host: String::new(),
+                start_port: 0,
+                end_port: 0,
+                unix_path: Some(path.to_string()),
+                raw: input.to_string(),
+            })
+        }
+        "unixgram" => {
+            // Caddy serves unixgram as a SOCK_DGRAM Unix socket.
+            // For respond, we treat it as a regular Unix socket.
+            let path = address.trim();
+            if path.is_empty() {
+                return Err(listen_error(input, "unixgram socket path is empty"));
+            }
+            if path.contains('\0') {
+                return Err(listen_error(input, "unixgram socket path contains a NUL byte"));
+            }
+            // Caddy strips permission bits from paths like `unixgram/relative|0600.sock`;
+            // we ignore permission bits for simplicity.
+            if path.contains('|') {
+                let path = path.split('|').nth(1).unwrap_or(path).trim();
+            }
+            Ok(ListenSpec {
+                network: ListenNetwork::Unix,
+                host: String::new(),
+                start_port: 0,
+                end_port: 0,
+                unix_path: Some(path.to_string()),
+                raw: input.to_string(),
+            })
+        }
         "fd" => Err(listen_error(
             input,
             "fd/socket-activation listeners are not supported by this build",
@@ -491,8 +580,20 @@ fn build_config(
                 disable_redirects: true,
                 ..Default::default()
             }),
+            // Caddy's `buildHTTPServer` limits: 10 s read-header timeout, 30 s idle timeout and
+            // 10 KiB maximum header bytes. `read_header_timeout`/`max_header_bytes` are read from
+            // the preserved unknown-field map by the server limits parser.
+            idle_timeout: Some(Value::String(IDLE_TIMEOUT.to_string())),
             ..Default::default()
         };
+        http_server.extra.insert(
+            "read_header_timeout".to_string(),
+            Value::String(READ_HEADER_TIMEOUT.to_string()),
+        );
+        http_server.extra.insert(
+            "max_header_bytes".to_string(),
+            Value::from(MAX_HEADER_BYTES),
+        );
         if access_log {
             http_server.logs = Some(ServerLogConfig::default());
         }
@@ -627,9 +728,28 @@ mod tests {
     }
 
     #[test]
+    fn listen_accepts_the_network_prefixes_caddy_drops() {
+        // Caddy's `buildHTTPServer` rebuilds the address with `JoinHostPort`, which drops the
+        // network prefix, so all of these end up as the same plain TCP listener.
+        for (input, expected) in [
+            ("tcp/127.0.0.1:8080", "127.0.0.1:8080"),
+            ("tcp4/127.0.0.1:8080", "127.0.0.1:8080"),
+            ("tcp6/[::1]:8080", "[::1]:8080"),
+            ("udp/127.0.0.1:8080", "127.0.0.1:8080"),
+            ("udp4/127.0.0.1:8080", "127.0.0.1:8080"),
+            ("udp6/[::1]:8080", "[::1]:8080"),
+        ] {
+            let spec = tcp_spec(input);
+            assert_eq!(spec.network, ListenNetwork::Tcp, "{input}");
+            assert_eq!(spec.servers()[0].configured, expected, "{input}");
+        }
+    }
+
+    #[test]
     fn listen_rejects_unsupported_and_malformed_forms() {
         for (input, needle) in [
-            ("udp/:0", "UDP listeners"),
+            ("unixpacket//tmp/x.sock", "SOCK_SEQPACKET"),
+            ("unixgram//tmp/x.sock", "SOCK_DGRAM"),
             ("fd/3", "socket-activation"),
             ("unix/relative.sock", "absolute"),
             ("unix//tmp/x.sock|0666", "permission bits"),
@@ -688,7 +808,7 @@ mod tests {
     }
 
     #[test]
-    fn headers_follow_set_semantics_and_report_bad_input() {
+    fn headers_follow_set_semantics_drop_bad_names_and_sanitize_values() {
         let headers = parse_headers(&[
             "X-Test: yes".into(),
             "x-test: replaced".into(),
@@ -701,11 +821,36 @@ mod tests {
             vec!["application/json".to_string()]
         );
 
+        // Go's header writer drops a field whose name is invalid; Caddy starts and serves the
+        // response without it, so the command must not fail.
+        let headers = parse_headers(&[
+            "Bad Header: x".into(),
+            "X Test: x".into(),
+            "X-Kept: yes".into(),
+        ])
+        .unwrap();
+        assert_eq!(headers.len(), 1, "{headers:?}");
+        assert_eq!(headers["x-kept"], vec!["yes".to_string()]);
+
+        // CR/LF are Go's `headerNewlineToSpace`; other control bytes cannot be represented by the
+        // Rust header type and become spaces too, instead of turning every request into a 500.
+        let headers = parse_headers(&[
+            "X-Lf: a\nb".into(),
+            "X-Cr: a\rb".into(),
+            "X-Ctl: a\u{1}b".into(),
+            "X-Tab: a\tb".into(),
+        ])
+        .unwrap();
+        assert_eq!(headers["x-lf"], vec!["a b".to_string()]);
+        assert_eq!(headers["x-cr"], vec!["a b".to_string()]);
+        assert_eq!(headers["x-ctl"], vec!["a b".to_string()]);
+        assert_eq!(headers["x-tab"], vec!["a\tb".to_string()]);
+
+        // Caddy's argument-shape errors still fail loudly.
         for (raw, needle) in [
             ("X-Bad", "header 0: invalid format \"X-Bad\""),
             ("X-Empty: ", "invalid format"),
             ("   : value", "invalid format"),
-            ("bad header: value", "invalid header name"),
         ] {
             let error = parse_headers(&[raw.to_string()]).expect_err(raw);
             assert!(format!("{error:#}").contains(needle), "{raw:?}: {error:#}");
@@ -713,14 +858,28 @@ mod tests {
     }
 
     #[test]
-    fn status_codes_outside_go_http_range_are_rejected_by_name() {
+    fn status_codes_outside_the_final_range_are_rejected_by_name() {
         assert_eq!(validate_status(200).unwrap(), 200);
+        assert_eq!(validate_status(418).unwrap(), 418);
         assert_eq!(validate_status(600).unwrap(), 600);
         for status in [0, 99, 1000, -1] {
             let error = validate_status(status).expect_err("invalid status");
+            let message = format!("{error:#}");
             assert!(
-                format!("{error:#}").contains("--status"),
-                "{status}: {error:#}"
+                message.contains("--status") && message.contains("200-999"),
+                "{status}: {message}"
+            );
+        }
+        // Caddy sends a 1xx as an interim response and then a 200 with the body; this build has no
+        // interim-response plumbing, so it rejects 1xx at startup instead of returning a 500.
+        for status in [100, 101, 102, 103, 199] {
+            let error = validate_status(status).expect_err("interim status");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("--status")
+                    && message.contains("interim")
+                    && message.contains("200-999"),
+                "{status}: {message}"
             );
         }
     }
@@ -772,6 +931,12 @@ mod tests {
         let server = &value["apps"]["http"]["servers"]["static0"];
         assert_eq!(server["listen"][0], "127.0.0.1:0");
         assert_eq!(server["logs"], serde_json::json!({}));
+        // Caddy's `buildHTTPServer` limits must be part of the in-memory configuration; the
+        // server limits parser reads `read_header_timeout`/`max_header_bytes` from the preserved
+        // unknown-field map.
+        assert_eq!(server["idle_timeout"], "30s");
+        assert_eq!(server["read_header_timeout"], "10s");
+        assert_eq!(server["max_header_bytes"], 10240);
         assert_eq!(
             server["routes"][0]["handle"][0],
             serde_json::json!({

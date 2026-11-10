@@ -284,7 +284,7 @@ Synopsis: `caddy-rs respond [--status <code>] [--body <content>] [--listen <addr
 | Option | Description | Default |
 |---|---|---|
 | `-l, --listen <ADDR>` | Address to bind (`[network/]host[:port[-end]]`). | `:0` |
-| `-s, --status <CODE>` | Response status code (100-999). | `200` |
+| `-s, --status <CODE>` | Response status code (200-999; 1xx interim statuses are rejected). | `200` |
 | `-b, --body <CONTENT>` | Response body. | empty |
 | `-H, --header <FIELD: VALUE>` | Add a response header; repeat for several headers. | none |
 | `--access-log` | Enable the access log (written to standard error). | off |
@@ -303,7 +303,11 @@ echo 'from stdin' | caddy-rs respond
 
 The listen address is always printed to standard output as `Server address: <addr>` (the bound
 address, so `:0` and omitted ports report the actual port). A port range starts one server per port,
-matching Caddy.
+matching Caddy. The `tcp4/`, `tcp6/`, `udp/`, `udp4/` and `udp6/` prefixes are accepted and map to
+the same plain TCP listener Caddy ends up with (Caddy's `JoinHostPort` drops the prefix). `unix/`
+takes an absolute stream-socket path; relative paths, `unixpacket/`, `unixgram/`, `fd/` and Unix
+permission suffixes are rejected naming `--listen`. `respond` ignores `LISTEN_FDS`/`LISTEN_PID`:
+it builds its own listeners, so an inherited systemd socket never affects it.
 
 The body supports Caddy's three documented template variables — `{{.N}}` (server number),
 `{{.Port}}` (configured port) and `{{.Address}}` (configured address). Caddy evaluates the body
@@ -313,20 +317,33 @@ other template construct with an error naming where the body came from. A body m
 matching Caddy).
 
 `--header` uses Caddy's `Field: value` syntax; an empty field or value is an error and a repeated
-field name replaces the earlier value.
+field name replaces the earlier value. A field name Go's writer rejects (`Bad Header`) is dropped
+and the server starts, matching Caddy. CR/LF in a value become spaces (Go's writer behaviour); the
+other control bytes the Rust HTTP stack cannot carry also become spaces instead of turning every
+request into a 500.
+
+The server applies Caddy's `buildHTTPServer` read-header timeout (10 s) and idle timeout (30 s).
+`max_header_bytes` is set to Caddy's 10 KiB, but this build uses it as the HTTP/1 read-buffer cap,
+not Go's post-parse header-size limit: a 16,000-byte request head gets 200 where Caddy returns 431
+(12,000 and 20,000 bytes match). That residual is recorded in
+[`compatibility/T-CLI-008.md`](compatibility/T-CLI-008.md).
 
 Differences from Caddy v2.11.9 are recorded in
 [`compatibility/T-CLI-008.md`](compatibility/T-CLI-008.md):
 
 - `--debug` is rejected with a located error naming the flag. This build has no debug-level
   internal logging, so accepting the flag would silently do nothing.
-- A status outside 100-999 (`--status 99`, `--status 1000`) is rejected at startup naming
-  `--status`; Caddy starts and then panics per request.
-- The `udp/` and `fd/` network prefixes and Unix socket permission suffixes are rejected naming
-  `--listen`; this build serves plain HTTP/1.1 over TCP or a Unix socket.
+- 1xx statuses (`--status 100`, `102`, `103`, `199`) are rejected at startup naming `--status`;
+  Caddy sends an interim response and then a final 200. A status outside 100-999 (`--status 99`,
+  `--status 1000`) is also rejected naming `--status`; Caddy starts and then panics per request.
+- Relative Unix socket paths, `unixpacket/`, `unixgram/`, `fd/` and Unix permission suffixes are
+  rejected naming `--listen`; this build serves plain HTTP/1.1 over TCP or an absolute Unix stream
+  socket.
+- The maximum-header-size field is not equivalent to Go's `MaxHeaderBytes` (measurements above).
 - Header names are emitted lower-case (the Rust HTTP stack) and the `Server: Caddy` header is not
   set; both are HTTP/1.1 case-insensitive or already registered CLI/server divergences. The
-  access-log line format is this build's documented access-log format.
+  access-log line format is this build's documented access-log format. Help text follows the CLI's
+  clap layout (`-h` is short help, no `[flags]` suffix), tracked under DIV-0023.
 
 Exit status is 0 while the server runs and exits cleanly on `SIGINT`/`SIGTERM`. Invalid flags,
 unsupported capabilities and bind failures exit 1 with a message; clap usage errors exit 2.
@@ -647,7 +664,7 @@ Warnings go to standard error and do not change the exit status.
 | `CADDY_RS_TRUST_PREFIX` | `trust` | Prefix for platform trust-store paths, default `/`. Intended for tests and containers. |
 | `JAVA_HOME` | `trust` | Java installation whose keystore is discovered. |
 | `PATH` | `trust`, `completion` | Locates the tools used to update trust stores; finds an executable `pwsh` for PowerShell detection. |
-| `LISTEN_PID`, `LISTEN_FDS`, `LISTEN_FDNAMES` | `run` | systemd socket activation. |
+| `LISTEN_PID`, `LISTEN_FDS`, `LISTEN_FDNAMES` | `run` | systemd socket activation; `respond` deliberately ignores them. |
 
 The configuration's `storage.root` also sets the data directory for `run`, and for `trust` when
 `--config` is given.

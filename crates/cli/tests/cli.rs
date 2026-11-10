@@ -3045,14 +3045,20 @@ impl Drop for RespondProcess {
 
 /// Spawn `caddy-rs respond` with `args`, optionally feeding `stdin`.
 fn spawn_respond(directory: &Path, args: &[&str], stdin: Option<&str>) -> RespondProcess {
+    let mut command = Command::new(binary());
+    command.arg("respond").args(args);
+    spawn_respond_command(command, directory, stdin)
+}
+
+/// Spawn an already-built `respond` command (used to inject process environment and descriptors).
+fn spawn_respond_command(
+    mut command: Command,
+    directory: &Path,
+    stdin: Option<&str>,
+) -> RespondProcess {
     let log = directory.join("respond.stderr");
     let file = std::fs::File::create(&log).expect("create respond stderr log");
-    let mut command = Command::new(binary());
-    command
-        .arg("respond")
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::from(file));
+    command.stdout(Stdio::piped()).stderr(Stdio::from(file));
     if stdin.is_some() {
         command.stdin(Stdio::piped());
     } else {
@@ -3379,6 +3385,142 @@ fn respond_rejects_debug_with_a_located_error() {
 }
 
 #[test]
+fn respond_rejects_interim_1xx_statuses_with_a_located_error() {
+    // Caddy sends a 1xx as an interim response and then keeps handling (200 with the body); this
+    // build has no interim-response plumbing, so it must reject 1xx at startup rather than answer
+    // every request with a 500.
+    for status in ["100", "102", "103", "199"] {
+        let (code, stdout, stderr) = run_within(
+            &["respond", "--status", status, "--listen", "127.0.0.1:0"],
+            Duration::from_secs(10),
+        );
+        assert_eq!(code, 1, "status {status}: stdout {stdout}\nstderr {stderr}");
+        assert!(stdout.is_empty(), "status {status}: {stdout}");
+        assert!(stderr.contains("--status"), "status {status}: {stderr}");
+        assert!(stderr.contains("interim"), "status {status}: {stderr}");
+        assert!(stderr.contains("200-999"), "status {status}: {stderr}");
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn respond_ignores_systemd_socket_activation() {
+    use std::os::unix::io::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
+    // Caddy's `respond` does not consult LISTEN_FDS; an inherited descriptor must not make the
+    // command fail. The shell sets LISTEN_PID to the pid the final process keeps across exec.
+    let directory = tempfile::tempdir().expect("tempdir");
+    let inherited = TcpListener::bind("127.0.0.1:0").expect("inherited listener");
+    let fd = inherited.as_raw_fd();
+    let mut command = Command::new("sh");
+    command
+        .arg("-c")
+        .arg("export LISTEN_PID=$$; exec \"$0\" respond --listen 127.0.0.1:0")
+        .arg(binary())
+        .env("LISTEN_FDS", "1")
+        .env("LISTEN_FDNAMES", "unrelated");
+    // SAFETY: the closure only duplicates a descriptor this test owns; `dup2`/`fcntl` are
+    // async-signal-safe.
+    unsafe {
+        command.pre_exec(move || {
+            if fd != 3 {
+                if libc::dup2(fd, 3) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            } else if libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut server = spawn_respond_command(command, directory.path(), None);
+    let response = http_exchange(server.next_address(), "GET");
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, "");
+}
+
+#[test]
+fn respond_accepts_the_network_prefixes_caddy_drops() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    // Caddy's `buildHTTPServer` rebuilds the address with `JoinHostPort`, dropping the network
+    // prefix; all of these end up as plain TCP listeners.
+    let mut listens = vec!["tcp4/127.0.0.1:0", "udp/127.0.0.1:0", "udp4/127.0.0.1:0"];
+    if ipv6_loopback_available() {
+        listens.push("tcp6/[::1]:0");
+    }
+    for listen in listens {
+        let mut server = spawn_respond(
+            directory.path(),
+            &["--listen", listen, "--body", "prefixed"],
+            None,
+        );
+        let response = http_exchange(server.next_address(), "GET");
+        assert_eq!(response.status, 200, "{listen}");
+        assert_eq!(response.body, "prefixed", "{listen}");
+    }
+}
+
+#[test]
+fn respond_sanitizes_header_values_and_drops_bad_names_like_caddy() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let mut server = spawn_respond(
+        directory.path(),
+        &[
+            "--listen",
+            "127.0.0.1:0",
+            "--body",
+            "hi",
+            "--header",
+            "X-Lf: a\nb",
+            "--header",
+            "X-Cr: a\rb",
+            "--header",
+            "X-Ctl: a\u{1}b",
+            "--header",
+            "Bad Header: x",
+            "--header",
+            "X-Kept: yes",
+        ],
+        None,
+    );
+    let response = http_exchange(server.next_address(), "GET");
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, "hi");
+    assert_eq!(response.header("x-lf"), Some("a b"));
+    assert_eq!(response.header("x-cr"), Some("a b"));
+    assert_eq!(response.header("x-ctl"), Some("a b"));
+    assert_eq!(response.header("x-kept"), Some("yes"));
+    assert_eq!(response.header("bad header"), None);
+}
+
+#[test]
+fn respond_applies_caddys_read_header_timeout() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let mut server = spawn_respond(directory.path(), &["--listen", "127.0.0.1:0"], None);
+    let address = server.next_address();
+    let mut stream =
+        TcpStream::connect_timeout(&address, Duration::from_secs(5)).expect("connect respond");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .expect("read timeout");
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n")
+        .expect("write request line");
+    // Caddy's `buildHTTPServer` uses a 10 s read-header timeout; a header sent after it must not
+    // be answered.
+    std::thread::sleep(Duration::from_secs(11));
+    let _ = stream.write_all(b"X-Late: yes\r\nConnection: close\r\n\r\n");
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    assert!(
+        response.is_empty(),
+        "server answered after its 10s header timeout: {:?}",
+        String::from_utf8_lossy(&response)
+    );
+}
+
+#[test]
 fn respond_rejects_invalid_headers_arguments_and_templates() {
     for (args, needle) in [
         (
@@ -3403,7 +3545,14 @@ fn respond_rejects_invalid_headers_arguments_and_templates() {
             vec!["respond", "--body", "{{.Foo}}", "--listen", "127.0.0.1:0"],
             "unsupported template expression",
         ),
-        (vec!["respond", "--listen", "udp/:0"], "--listen \"udp/:0\""),
+        (
+            vec!["respond", "--listen", "unixpacket//tmp/x.sock"],
+            "SOCK_SEQPACKET",
+        ),
+        (
+            vec!["respond", "--listen", "unix/relative.sock"],
+            "unix socket path must be absolute",
+        ),
         (
             vec!["respond", "--status", "99", "--listen", "127.0.0.1:0"],
             "--status: 99",

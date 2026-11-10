@@ -380,6 +380,17 @@ impl ServerRuntime {
         self
     }
 
+    /// Ignore `LISTEN_PID`/`LISTEN_FDS`/`LISTEN_FDNAMES` for this runtime.
+    ///
+    /// Commands that build their own listeners (for example `caddy-rs respond`) must not adopt
+    /// inherited systemd sockets: the environment belongs to the process, not to the command, and
+    /// an unrelated inherited descriptor would otherwise fail the apply. `caddy-rs run` keeps the
+    /// default [`ActivationState::Environment`] behaviour.
+    pub fn without_socket_activation(mut self) -> Self {
+        self.activation = ActivationState::Injected(None);
+        self
+    }
+
     /// Inject the ACME HTTP transport used for automatic-HTTPS certificate acquisition.
     ///
     /// Tests inject a fake local CA; production leaves this unset so a [`HyperTransport`] (platform
