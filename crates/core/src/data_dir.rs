@@ -511,8 +511,17 @@ fn probe_write(root: &Path) -> Result<(), DataDirError> {
 /// Write and remove one `0600` probe file. `nonce` is a parameter so tests can force two probes
 /// into the same clock tick and prove that they still do not collide.
 fn probe_write_with_nonce(root: &Path, nonce: u128) -> Result<(), DataDirError> {
+    probe_write_with_names(root, || probe_name(nonce))
+}
+
+/// The retry loop, with the probe filename supplied by `next_name` so tests can force an
+/// `AlreadyExists` collision deterministically instead of relying on a timing race.
+fn probe_write_with_names(
+    root: &Path,
+    mut next_name: impl FnMut() -> String,
+) -> Result<(), DataDirError> {
     for _ in 0..PROBE_ATTEMPTS {
-        let probe = root.join(probe_name(nonce));
+        let probe = root.join(next_name());
         match try_probe(&probe) {
             Ok(()) => return Ok(()),
             // The name exists already. Another actor is demonstrably able to create files here,
@@ -898,6 +907,48 @@ mod tests {
             std::fs::read_dir(&root).unwrap().count(),
             0,
             "probes must remove their own files"
+        );
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    /// The `AlreadyExists` retry branch, forced deterministically instead of by a timing race: the
+    /// first two generated names are a pre-existing file, so `create_new` must fail with
+    /// `AlreadyExists`, the loop must retry with the next name, and the third name must succeed.
+    #[test]
+    fn probe_retries_a_name_that_already_exists() {
+        let parent = temp_dir("probe-retry");
+        let root = parent.join("data");
+        std::fs::create_dir_all(&root).unwrap();
+        let occupied = ".caddy-rs-write-test.occupied";
+        std::fs::write(root.join(occupied), b"pre-existing").unwrap();
+
+        let mut generated = 0usize;
+        let result = probe_write_with_names(&root, || {
+            generated += 1;
+            if generated < PROBE_ATTEMPTS {
+                occupied.to_string()
+            } else {
+                format!(".caddy-rs-write-test.retry-{generated}")
+            }
+        });
+
+        result.expect("a colliding probe name must be retried, not reported as a write failure");
+        assert_eq!(
+            generated, PROBE_ATTEMPTS,
+            "every collision must consume one bounded attempt"
+        );
+        let entries: Vec<OsString> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![OsString::from(occupied)],
+            "the pre-existing file must be left alone and the probe removed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(occupied)).unwrap(),
+            "pre-existing"
         );
         let _ = std::fs::remove_dir_all(parent);
     }
