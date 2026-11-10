@@ -81,6 +81,10 @@ pub(crate) struct ListenerState {
     pub(crate) client_auth_verified: bool,
     /// Whether the QUIC listener accepts 0-RTT early data (Caddy `allow_0rtt`). Caddy's default
     /// when the field is absent is "allowed"; only an explicit `false` disables it.
+    ///
+    /// Only the QUIC listener reads this, and that code is behind the `http3` feature; in a
+    /// TCP-only build the field is carried but inert, so it must not be reported as dead.
+    #[cfg_attr(not(feature = "http3"), allow(dead_code))]
     pub(crate) allow_0rtt: bool,
     /// Automatic-HTTPS pre-routing (challenge responses, HTTP→HTTPS redirects) for cleartext
     /// listeners; `None` when automatic HTTPS is not active for this generation.
