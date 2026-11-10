@@ -16,7 +16,7 @@ tokio = { workspace = true }
 # Crypto and JWT
 argon2 = { version = "0.6", features = ["password-hash"] }
 bcrypt = "0.16"
-jsonwebtoken = "9.3"
+jsonwebtoken = { version = "10.3", features = ["aws_lc_rs"] }
 rand = { version = "0.8", features = ["std", "getrandom"] }
 base32 = "0.5"
 totp-lite = "2.0"
