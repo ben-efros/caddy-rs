@@ -59,7 +59,7 @@ pub enum Error {
 
     /// Server-side TLS configuration errors.
     #[error("TLS error: {0}")]
-    Tls(#[from] caddy_rs_tls::Error),
+    Tls(caddy_rs_tls::Error),
 
     /// I/O errors.
     #[error("I/O error: {0}")]
@@ -97,3 +97,9 @@ pub type BoundAddress = SocketAddr;
 
 /// Result alias for the server crate.
 pub type Result<T> = std::result::Result<T, Error>;
+
+impl From<caddy_rs_tls::Error> for Error {
+    fn from(error: caddy_rs_tls::Error) -> Self {
+        Self::Tls(error)
+    }
+}

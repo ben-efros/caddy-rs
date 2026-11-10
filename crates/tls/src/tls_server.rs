@@ -853,7 +853,7 @@ impl TlsCertificate {
             chain: chain_der.into_iter().map(CertificateDer::from).collect(),
             private_key,
             ocsp_staple: None,
-            source: None,
+            source,
         })
     }
 
@@ -2819,6 +2819,35 @@ mod tests {
     /// not PKCS#8 and wrapping it as such is the reported startup failure.
     /// The cache path now classifies the key and names where it came from, and the located prefix
     /// and identity each appear once (the operator saw both doubled in one message).
+    /// Pin the idempotence of `attach_certificate_identity`: a caller that already produced a
+    /// located, identity-carrying message must not get a second prefix or identity.
+    #[test]
+    fn attach_certificate_identity_is_idempotent() {
+        let inner = "TLS configuration at `certificates`: private key for certificate `src`: boom";
+        let error = attach_certificate_identity(
+            Error::TlsConfig {
+                path: "certificates".to_string(),
+                message: inner.to_string(),
+            },
+            Some("src"),
+            &["example.com".to_string()],
+        );
+        let message = error.to_string();
+        assert_eq!(
+            message
+                .matches("TLS configuration at `certificates`")
+                .count(),
+            1,
+            "{message}"
+        );
+        assert_eq!(
+            message.matches("private key for certificate").count(),
+            1,
+            "{message}"
+        );
+        assert!(message.ends_with("boom"), "{message}");
+    }
+
     #[test]
     fn cache_path_errors_name_the_source_once() {
         let certificate = example();
