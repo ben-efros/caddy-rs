@@ -1,0 +1,75 @@
+{
+  "apps": {
+    "http": {
+      "servers": {
+        "srv0": {
+          "listen": [
+            ":443"
+          ],
+          "routes": [
+            {
+              "handle": [
+                {
+                  "handler": "subroute",
+                  "routes": [
+                    {
+                      "handle": [
+                        {
+                          "handler": "subroute",
+                          "routes": [
+                            {
+                              "handle": [
+                                {
+                                  "handle_response": [
+                                    {
+                                      "match": {
+                                        "status_code": [
+                                          500
+                                        ]
+                                      },
+                                      "status_code": 400
+                                    },
+                                    {
+                                      "routes": [
+                                        {
+                                          "handle": [
+                                            {
+                                              "handler": "vars",
+                                              "log_skip": true
+                                            }
+                                          ]
+                                        }
+                                      ]
+                                    }
+                                  ],
+                                  "handler": "reverse_proxy",
+                                  "upstreams": [
+                                    {
+                                      "dial": "localhost:9000"
+                                    }
+                                  ]
+                                }
+                              ]
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ],
+              "match": [
+                {
+                  "host": [
+                    "example.com"
+                  ]
+                }
+              ],
+              "terminal": true
+            }
+          ]
+        }
+      }
+    }
+  }
+}
