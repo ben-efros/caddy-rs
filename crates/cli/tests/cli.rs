@@ -136,7 +136,10 @@ fn validate_accepts_and_rejects() {
 }
 
 #[test]
-fn adapt_surfaces_unsupported_directive_as_error() {
+fn adapt_surfaces_an_unknown_directive_as_an_invalid_configuration() {
+    // T-HTTP-052 split the classes: a directive Caddy does not register at all is `config.invalid`
+    // with Caddy's own "unrecognized directive" wording, not the "not supported by this build"
+    // message (which is reserved for directives Caddy accepts).
     let directory = tempfile::tempdir().unwrap();
     let config = directory.path().join("Caddyfile");
     std::fs::write(&config, ":80 {\n\tsome_unknown_directive foo\n}\n").unwrap();
@@ -148,7 +151,31 @@ fn adapt_surfaces_unsupported_directive_as_error() {
         "caddyfile",
     ]);
     assert_ne!(code, 0);
+    assert!(stderr.contains("config.invalid"), "{stderr}");
     assert!(stderr.contains("some_unknown_directive"), "{stderr}");
+    assert!(
+        stderr.contains("unrecognized directive"),
+        "Caddy's wording, not the unsupported message: {stderr}"
+    );
+}
+
+#[test]
+fn adapt_surfaces_a_registered_but_unimplemented_directive_as_unsupported() {
+    // The other half of the split: Caddy adapts `abort`, so refusing it is a documented gap and
+    // must keep the "not supported by this build" class and the pointer to the compatibility doc.
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("Caddyfile");
+    std::fs::write(&config, ":80 {\n\tabort\n}\n").unwrap();
+    let (code, _stdout, stderr) = run(&[
+        "adapt",
+        "--config",
+        config.to_str().unwrap(),
+        "--adapter",
+        "caddyfile",
+    ]);
+    assert_ne!(code, 0);
+    assert!(stderr.contains("config.unsupported"), "{stderr}");
+    assert!(stderr.contains("abort"), "{stderr}");
     assert!(stderr.contains("docs/compatibility"), "{stderr}");
 }
 
