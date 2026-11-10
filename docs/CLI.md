@@ -15,6 +15,7 @@ Commands:
   run           Run the server with a configuration
   reload        Load a new configuration into a running server through its admin API
   stop          Stop a running server through its admin API
+  respond       Simple, hard-coded HTTP responses for development and testing
   environ       Print the environment as seen by this caddy-rs process
   fmt           Formats a Caddyfile
   completion    Generate a shell completion script
@@ -270,6 +271,65 @@ The command posts to `/stop` and prints `server stopped` to standard error.
 
 Exit status is 0 when the server accepts the request and 1 when the admin API cannot be reached or
 rejects it.
+
+## respond
+
+Starts a fixed-response HTTP server for development and testing, like Caddy's `caddy respond`. The
+command builds a one-route `static_response` configuration in memory, serves it with the same
+runtime as `caddy-rs run` (the admin endpoint is disabled), prints the actual listener address, and
+blocks until interrupted.
+
+Synopsis: `caddy-rs respond [--status <code>] [--body <content>] [--listen <addr>] [--access-log] [--header "Field: value"] <body|status>`
+
+| Option | Description | Default |
+|---|---|---|
+| `-l, --listen <ADDR>` | Address to bind (`[network/]host[:port[-end]]`). | `:0` |
+| `-s, --status <CODE>` | Response status code (100-999). | `200` |
+| `-b, --body <CONTENT>` | Response body. | empty |
+| `-H, --header <FIELD: VALUE>` | Add a response header; repeat for several headers. | none |
+| `--access-log` | Enable the access log (written to standard error). | off |
+| `--debug` | Rejected by this build; see below. | off |
+| `<body\|status>` | A 3-digit number is the status, anything else is the body. | none |
+
+```sh
+caddy-rs respond                       # random port, empty 200
+caddy-rs respond 404                   # status 404
+caddy-rs respond --body "hello"        # 200 text/plain
+caddy-rs respond --status 200 404      # body literally "404", status 200
+caddy-rs respond -l 127.0.0.1:8080 -H "X-Env: dev" --body '{"ok":true}'
+caddy-rs respond -l 127.0.0.1:8000-8001 --body 'server {{.N}} on {{.Port}}'
+echo 'from stdin' | caddy-rs respond
+```
+
+The listen address is always printed to standard output as `Server address: <addr>` (the bound
+address, so `:0` and omitted ports report the actual port). A port range starts one server per port,
+matching Caddy.
+
+The body supports Caddy's three documented template variables — `{{.N}}` (server number),
+`{{.Port}}` (configured port) and `{{.Address}}` (configured address). Caddy evaluates the body
+with Go's full `text/template`; this build supports only those three variables and rejects any
+other template construct with an error naming where the body came from. A body may come from
+`--body`, the unnamed argument, or a pipe on standard input (a regular-file redirect is not read,
+matching Caddy).
+
+`--header` uses Caddy's `Field: value` syntax; an empty field or value is an error and a repeated
+field name replaces the earlier value.
+
+Differences from Caddy v2.11.9 are recorded in
+[`compatibility/T-CLI-008.md`](compatibility/T-CLI-008.md):
+
+- `--debug` is rejected with a located error naming the flag. This build has no debug-level
+  internal logging, so accepting the flag would silently do nothing.
+- A status outside 100-999 (`--status 99`, `--status 1000`) is rejected at startup naming
+  `--status`; Caddy starts and then panics per request.
+- The `udp/` and `fd/` network prefixes and Unix socket permission suffixes are rejected naming
+  `--listen`; this build serves plain HTTP/1.1 over TCP or a Unix socket.
+- Header names are emitted lower-case (the Rust HTTP stack) and the `Server: Caddy` header is not
+  set; both are HTTP/1.1 case-insensitive or already registered CLI/server divergences. The
+  access-log line format is this build's documented access-log format.
+
+Exit status is 0 while the server runs and exits cleanly on `SIGINT`/`SIGTERM`. Invalid flags,
+unsupported capabilities and bind failures exit 1 with a message; clap usage errors exit 2.
 
 ## pki
 

@@ -82,6 +82,7 @@ mod completion_install;
 mod environ;
 mod fmt;
 mod manpage;
+mod respond;
 mod signals;
 
 use std::io;
@@ -219,6 +220,35 @@ enum Command {
         /// Admin API address (stock Caddy calls this `--address`).
         #[arg(long = "address", alias = "admin", default_value = "localhost:2019")]
         admin: String,
+    },
+    /// Simple, hard-coded HTTP responses for development and testing
+    #[command(
+        about = "Simple, hard-coded HTTP responses for development and testing",
+        long_about = "Spins up a quick-and-clean HTTP server for development and testing purposes.\n\nWith no options specified, this command listens on a random available port\nand answers HTTP requests with an empty 200 response. The listen address can\nbe customized with the --listen flag and will always be printed to stdout.\nIf the listen address includes a port range, multiple servers will be started.\n\nIf a final, unnamed argument is given, it will be treated as a status code\n(same as the --status flag) if it is a 3-digit number. Otherwise, it is used\nas the response body (same as the --body flag). The --status and --body flags\nwill always override this argument (for example, to write a body that\nliterally says \"404\" but with a status code of 200, do '--status 200 404').\n\nA body may be given in 3 ways: a flag, a final (and unnamed) argument to\nthe command, or piped to stdin (if flag and argument are unset). Limited\ntemplate evaluation is supported on the body, with the following variables:\n\n\t{{.N}}        The server number (useful if using a port range)\n\t{{.Port}}     The listener port\n\t{{.Address}}  The listener address\n\nAccess/request logging and more verbose debug logging can also be enabled.\n\nResponse headers may be added using the --header flag for each header field.",
+        override_usage = "caddy-rs respond [--status <code>] [--body <content>] [--listen <addr>] [--access-log] [--debug] [--header \"Field: value\"] <body|status>"
+    )]
+    Respond {
+        /// The address to which to bind the listener
+        #[arg(short = 'l', long, default_value = ":0", value_name = "ADDR")]
+        listen: String,
+        /// The response status code
+        #[arg(short = 's', long, default_value_t = 200, value_name = "CODE")]
+        status: i64,
+        /// The body of the HTTP response
+        #[arg(short = 'b', long, default_value = "", value_name = "CONTENT")]
+        body: String,
+        /// Enable the access log
+        #[arg(long)]
+        access_log: bool,
+        /// Enable more verbose debug-level logging
+        #[arg(short = 'v', long)]
+        debug: bool,
+        /// Set a header on the response (format: "Field: value")
+        #[arg(short = 'H', long = "header", value_name = "FIELD: VALUE")]
+        header: Vec<String>,
+        /// A status code (a 3-digit number) or the response body
+        #[arg(value_name = "BODY|STATUS")]
+        argument: Vec<String>,
     },
     /// Print the environment as seen by this caddy-rs process.
     ///
@@ -759,6 +789,26 @@ async fn run(command: Command) -> anyhow::Result<()> {
             let response = admin_request(&admin, "POST", "/stop", Bytes::new()).await?;
             ensure_admin_success(&response)?;
             eprintln!("server stopped");
+        }
+        Command::Respond {
+            listen,
+            status,
+            body,
+            access_log,
+            debug,
+            header,
+            argument,
+        } => {
+            respond::run(respond::Args {
+                listen,
+                status,
+                body,
+                access_log,
+                debug,
+                headers: header,
+                arguments: argument,
+            })
+            .await?;
         }
         Command::Environ { envfile } => {
             environ::run(&envfile)?;
