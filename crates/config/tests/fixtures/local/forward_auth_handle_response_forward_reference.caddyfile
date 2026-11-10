@@ -1,0 +1,9 @@
+:8080 {
+	forward_auth 127.0.0.1:9000 {
+		uri /auth
+		handle_response @late {
+			respond "late"
+		}
+		@late status 500
+	}
+}

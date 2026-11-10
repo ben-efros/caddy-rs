@@ -1,0 +1,8 @@
+:8080 {
+	php_fastcgi 127.0.0.1:9000 {
+		handle_response @late {
+			respond "late"
+		}
+		@late status 500
+	}
+}
