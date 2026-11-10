@@ -1317,7 +1317,10 @@ impl AutomaticHttpsProvisioner {
         // unavailable; storage is still consulted below for certificates absent from the cache.
         if let Some(shared_store) = &self.shared_certificate_store {
             for certificate in shared_store.certificates() {
-                resolver.insert(TlsCertificate::from_cache_certificate(&certificate)?)?;
+                resolver.insert(TlsCertificate::from_cache_certificate_with_source(
+                    &certificate,
+                    Some(format!("certificate cache ({})", certificate.issuer)),
+                )?)?;
                 if plan.subjects.iter().any(|subject| {
                     certificate
                         .domains
@@ -1363,7 +1366,10 @@ impl AutomaticHttpsProvisioner {
                 )));
             }
             let certificate = self.obtain_subject(plan, subject).await?;
-            resolver.insert(TlsCertificate::from_cache_certificate(&certificate)?)?;
+            resolver.insert(TlsCertificate::from_cache_certificate_with_source(
+                &certificate,
+                Some(format!("issued for {subject}")),
+            )?)?;
             managed.push(certificate.clone());
             issued.push(certificate);
         }

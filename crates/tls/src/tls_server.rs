@@ -793,6 +793,16 @@ impl TlsCertificate {
         private_key_der: Vec<u8>,
         names: Vec<String>,
     ) -> Result<Self> {
+        Self::from_der_with_source(chain_der, private_key_der, names, None)
+    }
+
+    /// Build from DER components, naming the origin and classifying the key.
+    pub fn from_der_with_source(
+        chain_der: Vec<Vec<u8>>,
+        private_key_der: Vec<u8>,
+        names: Vec<String>,
+        source: Option<String>,
+    ) -> Result<Self> {
         if chain_der.is_empty() {
             return Err(Error::TlsConfig {
                 path: "certificates".to_string(),
@@ -827,6 +837,16 @@ impl TlsCertificate {
                 })
             }
         };
+        if let Some(message) = classify_private_key_der(&private_key) {
+            return Err(attach_certificate_identity(
+                Error::TlsConfig {
+                    path: "certificates".to_string(),
+                    message,
+                },
+                source.as_deref(),
+                &names,
+            ));
+        }
         Ok(Self {
             names,
             tags: Vec::new(),
@@ -871,6 +891,14 @@ impl TlsCertificate {
 
     /// Build from a [`Certificate`] in the in-memory cache.
     pub fn from_cache_certificate(certificate: &Certificate) -> Result<Self> {
+        Self::from_cache_certificate_with_source(certificate, None)
+    }
+
+    /// Build from a cached certificate, naming where the loader got it from.
+    pub fn from_cache_certificate_with_source(
+        certificate: &Certificate,
+        source: Option<String>,
+    ) -> Result<Self> {
         let names = if certificate.domains.is_empty() {
             let leaf = certificate
                 .cert_chain_der
@@ -883,10 +911,11 @@ impl TlsCertificate {
         } else {
             certificate.domains.clone()
         };
-        Self::from_der(
+        Self::from_der_with_source(
             certificate.cert_chain_der.clone(),
             certificate.private_key_der.clone(),
             names,
+            source,
         )
     }
 
@@ -1859,12 +1888,24 @@ fn certificate_identity(source: Option<&str>, names: &[String]) -> String {
 /// Prefix a certificate-loading error with the certificate identity (source + DNS names).
 fn attach_certificate_identity(error: Error, source: Option<&str>, names: &[String]) -> Error {
     match error {
-        Error::TlsConfig { path, message } => Error::TlsConfig {
-            path,
-            message: format!("{}: {message}", certificate_identity(source, names)),
-        },
+        Error::TlsConfig { path, message } => {
+            let message = strip_located_prefix(&message, &path);
+            if message.starts_with("private key for certificate") {
+                return Error::TlsConfig { path, message };
+            }
+            Error::TlsConfig {
+                path,
+                message: format!("{}: {message}", certificate_identity(source, names)),
+            }
+        }
         other => other,
     }
+}
+
+/// Remove a leading located prefix before the error is wrapped in that same prefix again.
+fn strip_located_prefix(message: &str, path: &str) -> String {
+    let prefix = format!("TLS configuration at `{path}`: ");
+    message.strip_prefix(&prefix).unwrap_or(message).to_string()
 }
 
 /// Located path for client-authentication configuration errors.
@@ -2776,6 +2817,46 @@ mod tests {
 
     /// Label-less DER (the certificate cache path) must dispatch on structure: a SEC1 body is
     /// not PKCS#8 and wrapping it as such is the reported startup failure.
+    /// The cache path now classifies the key and names where it came from, and the located prefix
+    /// and identity each appear once (the operator saw both doubled in one message).
+    #[test]
+    fn cache_path_errors_name_the_source_once() {
+        let certificate = example();
+        let chain: Vec<Vec<u8>> = certificate.chain().iter().map(|der| der.to_vec()).collect();
+        let names = vec!["example.com".to_string()];
+        let secp256k1 =
+            crate::storage::private_key_der(include_str!("../testdata/key-types/secp256k1.key"))
+                .expect("fixture DER");
+        let error = TlsCertificate::from_der_with_source(
+            chain,
+            secp256k1,
+            names,
+            Some("storage key certificates/local/example.com".to_string()),
+        )
+        .expect_err("secp256k1 must be rejected on the cache path");
+        let message = error.to_string();
+        assert!(
+            message.contains("storage key certificates/local/example.com"),
+            "{message}"
+        );
+        assert!(
+            message.contains("x509: unsupported elliptic curve"),
+            "{message}"
+        );
+        assert_eq!(
+            message
+                .matches("TLS configuration at `certificates`")
+                .count(),
+            1,
+            "{message}"
+        );
+        assert_eq!(
+            message.matches("private key for certificate").count(),
+            1,
+            "{message}"
+        );
+    }
+
     #[test]
     fn from_der_dispatches_on_the_der_structure_not_pkcs8() {
         let certificate = example();
@@ -4549,23 +4630,26 @@ mod tests {
         assert!(message.contains("certificates"), "{message}");
         assert!(message.contains("`PRIVATE KEY` block"), "{message}");
 
-        // A certificate built from DER (the in-memory cache/storage path) bypasses the PEM
-        // classifier; the provider rejection must still name the key type and certificate.
+        // A certificate built from DER (the in-memory cache/storage path) is classified too, so the
+        // rejection now happens when the certificate is built and still names the key type and
+        // certificate rather than surfacing the provider's raw error later.
         let (_, ed448_der) = pem_blocks(include_str!("../testdata/key-types/ed448.key"))
             .expect("Ed448 fixture PEM parses")
             .remove(0);
-        let certificate = TlsCertificate::from_der(
+        let error = TlsCertificate::from_der_with_source(
             vec![certificate_der(&example())],
             ed448_der,
             vec!["example.com".to_string()],
+            Some("storage key certificates/local/example.com".to_string()),
         )
-        .expect("DER certificate builds");
-        let error = certificate.certified_key().unwrap_err();
+        .expect_err("the DER path must reject Ed448");
         let message = error.to_string();
         assert!(message.contains("Ed448"), "{message}");
         assert!(message.contains("DNS names: example.com"), "{message}");
-        let error = CertificateResolver::from_certificates([certificate]).unwrap_err();
-        assert!(error.to_string().contains("Ed448"), "{error}");
+        assert!(
+            message.contains("storage key certificates/local/example.com"),
+            "{message}"
+        );
     }
 
     // ---- connection-policy SNI matching and certificate_selection tags -------------------
