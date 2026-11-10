@@ -1,0 +1,13 @@
+:8080 {
+	reverse_proxy localhost:9000 {
+		@s status 500
+		handle_response @s {
+			respond "matched"
+		}
+		replace_status 502
+		handle_response {
+			respond "plain"
+		}
+		replace_status @s 503
+	}
+}

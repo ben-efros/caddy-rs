@@ -1,0 +1,12 @@
+:8080 {
+	reverse_proxy localhost:9000 {
+		handle_response {
+			respond "first"
+		}
+		replace_status 404
+		handle_response {
+			respond "second"
+		}
+		replace_status 500
+	}
+}
