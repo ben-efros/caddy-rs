@@ -1,19 +1,21 @@
-//! Nested traversal of the deprecated-alias scan (T-HTTP-051).
+//! Nested traversal of the deprecated-alias scan (T-HTTP-051, extended by T-HTTP-052).
 //!
 //! `check_deprecated_directives` only enters blocks that Caddy itself parses as directive lists:
 //! the bodies of `route`/`handle`/`handle_path`/`handle_errors`, and the `handle_response` bodies
 //! under `reverse_proxy`/`forward_auth`/`php_fastcgi` (`nested_directive_lists` in `adapter.rs`).
 //!
 //! The reviewer mutation that drops `php_fastcgi` from that table leaves the rest of the adapter
-//! suite green, so these tests pin the two paths that mutation would silently break: a deprecated
-//! alias inside `php_fastcgi`'s `handle_response`, and one inside a `reverse_proxy` nested under
-//! `route`. They also pin the unsupported placement (`handle_response` directly under `route`),
-//! which must fail loudly rather than being skipped.
+//! suite green, so these tests pin the paths that mutation would silently break: a deprecated
+//! alias inside `php_fastcgi`'s `handle_response`, one inside a `reverse_proxy` nested under
+//! `route`, and one inside a `reverse_proxy` nested under each of `handle`, `handle_path` and
+//! `handle_errors`. They also pin the invalid placement (`handle_response` directly under
+//! `route`), which must fail loudly rather than being skipped.
 //!
 //! Each accepted fixture is the exact `caddy adapt` output of the pinned Caddy v2.11.9 oracle
 //! (`.scratch/oracle-eval-2.11.9/caddy`); both binaries were run over the same Caddyfile and their
 //! parsed JSON diffed before the fixture was committed. The rejection case was run through the
-//! oracle too: it exits 1 with `unrecognized directive: handle_response`.
+//! oracle too: it exits 1 with `unrecognized directive: handle_response`, which is Caddy's
+//! `config.invalid` class, not an unsupported-but-valid construct.
 
 use caddy_rs_config::{adapt, adapt_with_options, AdaptMode, AdaptOptions};
 use serde_json::{json, Value};
@@ -162,9 +164,81 @@ fn reverse_proxy_handle_response_inside_route_is_scanned_with_replace_status_ali
     assert!(message.contains("Caddyfile line 7"), "{message}");
 }
 
+/// A `reverse_proxy` nested under a directive-list container keeps the deprecated alias in its
+/// `handle_response` reachable by the scan, and the emitted JSON must equal Caddy's.
+///
+/// Mutation: dropping the container from `nested_directive_lists` in `adapter.rs` means the scan
+/// never enters its body, so `warnings` is empty and strict mode succeeds; every assertion below
+/// fails. Each container has its own test so a single missing entry is pinpointed by name.
+fn assert_nested_proxy_alias_is_scanned(fixture_name: &str, container: &str) {
+    let (caddyfile, expected) = fixture(fixture_name);
+
+    let compatible = adapt_in(&caddyfile, AdaptMode::Compatible);
+    assert_eq!(
+        compatible.config, expected,
+        "{container} JSON differs from the v2.11.9 oracle"
+    );
+    assert_eq!(
+        compatible.warnings,
+        vec![SKIP_LOG_WARNING.to_string()],
+        "the alias inside {container} > reverse_proxy > handle_response must be scanned"
+    );
+    assert_eq!(
+        adapt_in(&caddyfile, AdaptMode::Warn).warnings,
+        vec![SKIP_LOG_WARNING.to_string()],
+        "warn mode reports the nested alias exactly once"
+    );
+
+    let error = adapt_with_options(&caddyfile, None, AdaptOptions::new(AdaptMode::Strict))
+        .expect_err("strict mode rejects the alias inside the nested proxy's handle_response");
+    let message = error.to_string();
+    assert_eq!(error.code(), "config.invalid", "{message}");
+    assert!(
+        message.contains("deprecated alias for `log_skip`"),
+        "{message}"
+    );
+    assert!(message.contains("Caddyfile line 5"), "{message}");
+}
+
+/// `handle` bodies are directive lists in Caddy, so the alias scan must enter them.
+///
+/// Mutation: removing `handle` from `nested_directive_lists` leaves the rest of the adapter suite
+/// green but makes this test fail (no warning, strict mode succeeds).
+#[test]
+fn handle_body_is_scanned_for_nested_proxy_aliases() {
+    assert_nested_proxy_alias_is_scanned("reverse_proxy_handle_response_in_handle", "handle");
+}
+
+/// `handle_path` bodies are directive lists in Caddy, so the alias scan must enter them.
+///
+/// Mutation: removing `handle_path` from `nested_directive_lists` leaves the rest of the adapter
+/// suite green but makes this test fail (no warning, strict mode succeeds).
+#[test]
+fn handle_path_body_is_scanned_for_nested_proxy_aliases() {
+    assert_nested_proxy_alias_is_scanned(
+        "reverse_proxy_handle_response_in_handle_path",
+        "handle_path",
+    );
+}
+
+/// `handle_errors` bodies are directive lists in Caddy, so the alias scan must enter them.
+///
+/// Mutation: removing `handle_errors` from `nested_directive_lists` leaves the rest of the adapter
+/// suite green but makes this test fail (no warning, strict mode succeeds).
+#[test]
+fn handle_errors_body_is_scanned_for_nested_proxy_aliases() {
+    assert_nested_proxy_alias_is_scanned(
+        "reverse_proxy_handle_response_in_handle_errors",
+        "handle_errors",
+    );
+}
+
 /// `handle_response` is a `reverse_proxy` subdirective, not a directive of its own, so placing it
-/// directly in a `route` body is unsupported. The adapter must fail loudly with a located error
-/// instead of treating the body as a directive list (which would also silence aliases inside it).
+/// directly in a `route` body is invalid: Caddy does not register it as a directive at all. The
+/// adapter must report Caddy's `unrecognized directive` wording as `config.invalid` (not
+/// `config.unsupported`, which is reserved for valid Caddy constructs this build lacks) with a
+/// located error, instead of treating the body as a directive list (which would also silence
+/// aliases inside it).
 ///
 /// Oracle v2.11.9 rejects the same Caddyfile with exit 1 and
 /// `unrecognized directive: handle_response`; caddy-rs names the more precise line 3.
@@ -174,7 +248,24 @@ fn handle_response_directly_under_route_is_rejected_with_a_located_error() {
         "example.com {\n\troute {\n\t\thandle_response {\n\t\t\trespond \"x\"\n\t\t}\n\t}\n}\n";
     let error = adapt(caddyfile).expect_err("handle_response is not a route directive");
     let message = error.to_string();
-    assert_eq!(error.code(), "config.unsupported", "{message}");
-    assert!(message.contains("directive `handle_response`"), "{message}");
+    assert_eq!(error.code(), "config.invalid", "{message}");
+    assert!(
+        message.contains("unrecognized directive: handle_response"),
+        "{message}"
+    );
     assert!(message.contains("Caddyfile line 3"), "{message}");
+}
+
+/// A directive Caddy registers but this build does not implement (`abort`) is a valid Caddy
+/// construct, so rejecting it stays `config.unsupported`. This guards the split introduced for
+/// the `unrecognized directive` class above: only names Caddy itself does not know are invalid.
+///
+/// Oracle v2.11.9 adapts `example.com { abort }` successfully (exit 0).
+#[test]
+fn unimplemented_caddy_directive_stays_unsupported() {
+    let error = adapt("example.com {\n\tabort\n}\n").expect_err("abort is not implemented");
+    let message = error.to_string();
+    assert_eq!(error.code(), "config.unsupported", "{message}");
+    assert!(message.contains("directive `abort`"), "{message}");
+    assert!(message.contains("Caddyfile line 2"), "{message}");
 }
