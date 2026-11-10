@@ -1886,26 +1886,17 @@ fn certificate_identity(source: Option<&str>, names: &[String]) -> String {
 }
 
 /// Prefix a certificate-loading error with the certificate identity (source + DNS names).
+///
+/// Every caller hands in a bare diagnosis (the key classifier's or the PEM parser's), never a
+/// message that already carries the `TLS configuration at ...` prefix, so this wraps exactly once.
 fn attach_certificate_identity(error: Error, source: Option<&str>, names: &[String]) -> Error {
     match error {
-        Error::TlsConfig { path, message } => {
-            let message = strip_located_prefix(&message, &path);
-            if message.starts_with("private key for certificate") {
-                return Error::TlsConfig { path, message };
-            }
-            Error::TlsConfig {
-                path,
-                message: format!("{}: {message}", certificate_identity(source, names)),
-            }
-        }
+        Error::TlsConfig { path, message } => Error::TlsConfig {
+            path,
+            message: format!("{}: {message}", certificate_identity(source, names)),
+        },
         other => other,
     }
-}
-
-/// Remove a leading located prefix before the error is wrapped in that same prefix again.
-fn strip_located_prefix(message: &str, path: &str) -> String {
-    let prefix = format!("TLS configuration at `{path}`: ");
-    message.strip_prefix(&prefix).unwrap_or(message).to_string()
 }
 
 /// Located path for client-authentication configuration errors.
@@ -2815,39 +2806,8 @@ mod tests {
         }
     }
 
-    /// Label-less DER (the certificate cache path) must dispatch on structure: a SEC1 body is
-    /// not PKCS#8 and wrapping it as such is the reported startup failure.
-    /// The cache path now classifies the key and names where it came from, and the located prefix
-    /// and identity each appear once (the operator saw both doubled in one message).
-    /// Pin the idempotence of `attach_certificate_identity`: a caller that already produced a
-    /// located, identity-carrying message must not get a second prefix or identity.
-    #[test]
-    fn attach_certificate_identity_is_idempotent() {
-        let inner = "TLS configuration at `certificates`: private key for certificate `src`: boom";
-        let error = attach_certificate_identity(
-            Error::TlsConfig {
-                path: "certificates".to_string(),
-                message: inner.to_string(),
-            },
-            Some("src"),
-            &["example.com".to_string()],
-        );
-        let message = error.to_string();
-        assert_eq!(
-            message
-                .matches("TLS configuration at `certificates`")
-                .count(),
-            1,
-            "{message}"
-        );
-        assert_eq!(
-            message.matches("private key for certificate").count(),
-            1,
-            "{message}"
-        );
-        assert!(message.ends_with("boom"), "{message}");
-    }
-
+    /// A key rejected on the certificate-cache path names where it came from, and the located
+    /// prefix and the certificate identity each appear once (an operator saw both doubled).
     #[test]
     fn cache_path_errors_name_the_source_once() {
         let certificate = example();
@@ -2886,6 +2846,57 @@ mod tests {
         );
     }
 
+    /// A key the classifier accepts can still be refused by the provider: aws-lc-rs rejects an
+    /// RSA key whose public exponent is even. That fallback has to keep the located path, the
+    /// source and the DNS names rather than surfacing the provider's bare message, and the
+    /// resolver has to reject the certificate too (T-TLS-095).
+    #[test]
+    fn provider_refusal_keeps_the_certificate_identity() {
+        let certificate = example();
+        let chain: Vec<Vec<u8>> = certificate.chain().iter().map(|der| der.to_vec()).collect();
+        let source = "storage key certificates/local/example.com";
+        let (_, bad_rsa) = pem_blocks(include_str!(
+            "../testdata/key-types/rsa2048-bad-exponent.key"
+        ))
+        .expect("bad-exponent fixture PEM parses")
+        .remove(0);
+        let certificate = TlsCertificate::from_der_with_source(
+            chain,
+            bad_rsa,
+            vec!["example.com".to_string()],
+            Some(source.to_string()),
+        )
+        .expect("the classifier accepts RSA-2048; the provider refuses the exponent later");
+
+        let error = certificate
+            .certified_key()
+            .expect_err("the provider must refuse an even public exponent");
+        let message = error.to_string();
+        assert!(message.contains(source), "{message}");
+        assert!(message.contains("DNS names: example.com"), "{message}");
+        assert!(
+            message.contains("not supported by the rustls aws-lc-rs provider"),
+            "{message}"
+        );
+        assert_eq!(
+            message.matches("private key for certificate").count(),
+            1,
+            "{message}"
+        );
+
+        let error = CertificateResolver::from_certificates([certificate])
+            .expect_err("the resolver must refuse a certificate the provider cannot sign with");
+        let message = error.to_string();
+        assert!(message.contains(source), "{message}");
+        assert_eq!(
+            message.matches("private key for certificate").count(),
+            1,
+            "{message}"
+        );
+    }
+
+    /// Label-less DER (the certificate cache path) must dispatch on structure: a SEC1 body is
+    /// not PKCS#8 and wrapping it as such is the reported startup failure.
     #[test]
     fn from_der_dispatches_on_the_der_structure_not_pkcs8() {
         let certificate = example();

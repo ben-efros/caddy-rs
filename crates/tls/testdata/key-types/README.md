@@ -26,6 +26,7 @@ openssl req -new -x509 -key <key> -out <cert> -days 3650 \
 | `brainpool-p384-pkcs8` | PKCS#8 `PRIVATE KEY`, brainpoolP384r1 | rejected: `x509: unsupported elliptic curve` |
 | `ed448` | PKCS#8 `PRIVATE KEY`, Ed448 | rejected: Ed448 not implemented |
 | `dsa` | PKCS#8 `PRIVATE KEY`, DSA | rejected: DSA not implemented |
+| `rsa2048-bad-exponent` | PKCS#1 `RSA PRIVATE KEY`, RSA-2048 with an even public exponent | classifier accepts (RSA-2048), provider refuses at signing: exercises the classifier-to-provider fallback (`T-TLS-095`) |
 | `encrypted-p256` | `ENCRYPTED PRIVATE KEY` (AES-256-CBC, P-256) | rejected: encrypted keys unsupported |
 
 `encrypted-p256.key` is the encrypted form of `p256-sec1.key`; its certificate is the same

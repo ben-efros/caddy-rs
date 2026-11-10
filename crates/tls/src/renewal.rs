@@ -289,8 +289,15 @@ pub trait CertificatePublisher: Send + Sync {
 /// `Arc` and new handshakes use the new certificate.
 impl CertificatePublisher for crate::tls_server::CertificateResolver {
     fn publish(&self, certificate: &Certificate) -> Result<()> {
+        // The store does not know whether this certificate was just issued or reloaded from disk,
+        // so it names itself and the issuer rather than inventing "issued for" or a storage key.
+        // Without a source the error would name only the DNS names (T-TLS-095).
+        let source = format!("stored certificate (issuer {})", certificate.issuer);
         let tls_certificate =
-            crate::tls_server::TlsCertificate::from_cache_certificate(certificate)?;
+            crate::tls_server::TlsCertificate::from_cache_certificate_with_source(
+                certificate,
+                Some(source),
+            )?;
         self.insert(tls_certificate)
     }
 }
@@ -1290,6 +1297,26 @@ mod tests {
 
     fn at(seconds: u64) -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(seconds)
+    }
+
+    /// A certificate the live resolver refuses names where it came from, not only its DNS names:
+    /// the store labels it with the issuer that produced it (T-TLS-095).
+    #[test]
+    fn publishing_a_refused_certificate_names_the_store_source() {
+        let resolver = crate::tls_server::CertificateResolver::new();
+        let mut certificate = ninety_day_certificate(&["example.com"], at(1_000));
+        certificate.private_key_der =
+            crate::storage::private_key_der(include_str!("../testdata/key-types/secp256k1.key"))
+                .expect("fixture DER");
+        let error = resolver
+            .publish(&certificate)
+            .expect_err("an unsupported key must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("stored certificate (issuer fake-ca)"),
+            "{message}"
+        );
+        assert!(message.contains("DNS names: example.com"), "{message}");
     }
 
     // ---- policy --------------------------------------------------------------------------

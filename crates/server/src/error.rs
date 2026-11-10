@@ -103,3 +103,20 @@ impl From<caddy_rs_tls::Error> for Error {
         Self::Tls(error)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+
+    /// The CLI renders `{error:#}`, which walks the source chain. While `Tls` was a `#[from]`
+    /// variant thiserror also exposed the embedded TLS error as the variant's source, so the CLI
+    /// printed the same TLS message twice: once from the variant's `Display` and once from its
+    /// source. `Tls` must stay a plain field, converted through the manual `From` below
+    /// (T-TLS-095).
+    #[test]
+    fn a_tls_error_is_not_printed_twice_through_its_own_source() {
+        let error = Error::Tls(caddy_rs_tls::Error::Certificate("boom".to_string()));
+        assert!(std::error::Error::source(&error).is_none());
+        assert_eq!(format!("{error:#}"), "TLS error: certificate error: boom");
+    }
+}
