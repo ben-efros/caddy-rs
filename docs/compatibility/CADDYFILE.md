@@ -70,7 +70,7 @@ caddy-rs validate --config ./Caddyfile --adapter caddyfile
 | `rate_limit` | **runtime JSON extension only** | No Caddyfile adapter yet; use the caddy-rs `rate_limit` handler in JSON . |
 | `error` | **exact** (subset) | `error [<matcher>] <message> [<status>]` → `error` handler; status may be an integer or a status placeholder, message is a placeholder-expanded string. |
 | `handle_errors` | **adapted** | `handle_errors [<codes>] {...}` → server `errors.routes` with status-code filters (integers, classes like `4xx`, ranges) emitted as the canonical `expression` status subset; host wrapping and route ordering follow Caddy (issue #5124). Site-block only; nested use is a located error. |
-| `reverse_proxy` `handle_response` forms | **adapted** | `@name status |
+| `reverse_proxy` `handle_response` forms | **adapted** | `@name status\|header ...`, `handle_response [@name] {...}`, `replace_status [@name] <status>`, `copy_response [<status>]`, `copy_response_headers {include\|exclude ...}` adapt to Caddy's `handle_response[]` JSON and run end to end (status/header matching, pass-through, `replace_status`, synthetic responses, copy body/headers; body buffered on copy, `DIV-0099`). Ordering matches Caddy's two-phase collection: every `replace_status` (in declaration order) precedes every `handle_response` (in declaration order), then entries without a response matcher move last, stably (T-CONF-058). |
 | `forward_auth` | **adapted + runtime** | Adapts to Caddy's canonical expansion (`reverse_proxy` + `rewrite` + request header set + `handle_response` header copy) and executes end to end; the user's own `handle_response`/`replace_status` entries are preserved *after* the canonical 2xx entry instead of being overwritten (Caddy's `forwardauth.parseCaddyfile` seeds `HandleResponse` with the 2xx copy handler, then `FinalizeUnmarshalCaddyfile` appends the user's entries and moves matcher-less ones last), so a non-2xx auth response reaches the user's handler; verified by the local acceptance scenario `forward_auth_authelia` (AS-05) and the differential fixtures `forward_auth_canonical_only`, `forward_auth_user_handle_response` and `forward_auth_user_handle_response_merged`. Live Authelia deployment remains external . |
 | `basic_auth` | **adapted + runtime** | `basic_auth`/`basicauth` adapt to the `authentication` handler (`bcrypt` hashes, optional realm) and execute; Caddy's broader provider/hash forms are rejected loudly . |
 
@@ -167,7 +167,9 @@ only then calls `UnmarshalCaddyfile`; `FinalizeUnmarshalCaddyfile` appends the u
 moves entries without a response matcher to the end
 (`modules/caddyhttp/reverseproxy/forwardauth/caddyfile.go`). Because the canonical 2xx entry stays
 first, a 2xx auth response copies the identity headers and continues down the chain, while a non-2xx
-response reaches the user's handler:
+response reaches the user's handler. Interleaved `replace_status`/`handle_response` declarations keep
+Caddy's two-phase order: every `replace_status` entry first (in declaration order), then the deferred
+`handle_response` blocks (in declaration order), then matcher-less entries last, stably (T-CONF-058).
 
 ```caddyfile
 app.example.com {

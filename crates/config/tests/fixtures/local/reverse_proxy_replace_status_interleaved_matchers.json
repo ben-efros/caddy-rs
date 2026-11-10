@@ -1,0 +1,79 @@
+{
+  "apps": {
+    "http": {
+      "servers": {
+        "srv0": {
+          "listen": [
+            ":8080"
+          ],
+          "routes": [
+            {
+              "handle": [
+                {
+                  "handle_response": [
+                    {
+                      "match": {
+                        "status_code": [
+                          500
+                        ]
+                      },
+                      "status_code": 400
+                    },
+                    {
+                      "match": {
+                        "status_code": [
+                          500
+                        ]
+                      },
+                      "status_code": 401
+                    },
+                    {
+                      "match": {
+                        "status_code": [
+                          500
+                        ]
+                      },
+                      "routes": [
+                        {
+                          "handle": [
+                            {
+                              "body": "with matcher",
+                              "handler": "static_response"
+                            }
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "match": {
+                        "status_code": [
+                          500
+                        ]
+                      },
+                      "routes": [
+                        {
+                          "handle": [
+                            {
+                              "body": "with matcher 2",
+                              "handler": "static_response"
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ],
+                  "handler": "reverse_proxy",
+                  "upstreams": [
+                    {
+                      "dial": "localhost:9000"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

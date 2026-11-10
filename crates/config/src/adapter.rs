@@ -8343,6 +8343,11 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
         }
     }
     let mut handle_response: Vec<Value> = Vec::new();
+    // Caddy appends `replace_status` handlers to `Handler.HandleResponse` immediately during
+    // `UnmarshalCaddyfile`, but defers `handle_response` segments to
+    // `FinalizeUnmarshalCaddyfile`; the deferred entries therefore follow every `replace_status`
+    // in the block regardless of declaration order. Keep the two groups separate until finalize.
+    let mut replace_status: Vec<Value> = Vec::new();
 
     for item in &directive.block {
         if item.name.starts_with('@') {
@@ -8421,7 +8426,7 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
                     entry.insert("match".to_string(), matcher.clone());
                 }
                 entry.insert("status_code".to_string(), weak_status_json(status));
-                handle_response.push(Value::Object(entry));
+                replace_status.push(Value::Object(entry));
             }
             "lb_policy" => {
                 let Some(policy) = item.args.first() else {
@@ -8982,12 +8987,13 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
         }
     }
 
-    // Caddy moves `handle_response` entries without a matcher to the end (stable order within
-    // each group): `httptype`/`FinalizeUnmarshalCaddyfile`.
-    if !handle_response.is_empty() {
+    // Finalize in Caddy's order: every `replace_status` first (in declaration order), then the
+    // deferred `handle_response` segments (in declaration order), then move entries without a
+    // matcher to the end, stably within each group: `FinalizeUnmarshalCaddyfile`.
+    if !replace_status.is_empty() || !handle_response.is_empty() {
         let mut with_matchers = Vec::new();
         let mut without_matchers = Vec::new();
-        for entry in handle_response {
+        for entry in replace_status.into_iter().chain(handle_response) {
             if entry.get("match").is_some() {
                 with_matchers.push(entry);
             } else {
