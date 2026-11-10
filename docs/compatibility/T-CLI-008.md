@@ -55,7 +55,7 @@ prints the actual bound address(es) as `Server address: <addr>` and blocks until
 | `respond --debug` | exit 1, located error naming `--debug` |
 | `--status 99` / `--status 1000` | exit 1, located error naming `--status` and `200-999` |
 | `--status 100/102/103/199` | exit 1, located error naming `--status` and the interim 1xx status |
-| `--listen udp/:0` / `fd/3` / `unixpacket//tmp/x.sock` | exit 1, located error naming `--listen` |
+| `--listen fd/3` / `unixpacket//tmp/x.sock` / `unixgram//tmp/x.sock` / `unix/relative.sock` / `unix//tmp/x.sock\|0666` | exit 1, located error naming `--listen` and the construct |
 | two unnamed arguments | exit 1, `too many unflagged arguments` |
 | `--status`+`--body`+unnamed argument | exit 1, `unflagged argument "<arg>" is overridden by flags` |
 | `--header` without `Field: value` | exit 1, Caddy's `header <i>: invalid format ...` |
@@ -158,6 +158,15 @@ Additional probes for the rejection fixes (`/root/caddy-rs/.scratch/logs/t-cli-0
   measurements above.
 - `LISTEN_FDS`: an inherited fd 3 with `LISTEN_FDS=1`/`LISTEN_PID=$$` bound to another port makes
   caddy-rs start and serve 200 after `ServerRuntime::without_socket_activation`.
+
+Re-verified after the review rejection with `.scratch/logs/t-cli-008-fix2/probe.py`
+(`probe.json`), each binary on its own free port, oracle `v2.11.9`: `--status 100/102/103/199`
+(caddy-rs exits 1 naming `--status` and `interim`; Caddy sends the interim response then a final
+200), `LISTEN_FDS` (both start and serve 200), `--header $'X-Lf: a\nb'` + `Bad Header: x` (both
+200, `x-lf: a b`, bad name dropped, `x-kept: yes`), `tcp4/`/`udp4/` (both 200), `unix/relative.sock`
+and `unixpacket/` (Caddy starts; caddy-rs exits 1 naming `--listen`), `unixgram/` and `fd/3` (both
+exit 1), a 16,000-byte `X-Pad` request head (Caddy 431, caddy-rs 200 — the registered residual), and
+a header sent 12 s after the request line (both close without answering).
 
 Integration tests: `crates/cli/tests/cli.rs` (`respond_*`) spawn the real binary and assert the
 `Server address:` line, status, headers, body, HEAD semantics, stdin, port-range templates, the

@@ -329,10 +329,10 @@ fn header_format_error(index: usize, header: &str) -> anyhow::Error {
 /// `tcp`, `tcp4`, `tcp6`, `udp`, `udp4` and `udp6` all end up as the same plain TCP listener in
 /// Caddy's `respond` because `buildHTTPServer` rebuilds the address with `JoinHostPort`, which drops
 /// the network prefix; this parser does the same so those spellings keep working. `unix` is
-/// accepted for an absolute stream-socket path. `unixpacket`/`unixgram` (SOCK_SEQPACKET/SOCK_DGRAM),
-/// `fd/` socket activation, Unix permission suffixes and relative Unix paths are capabilities this
-/// build does not have for this command, so they are rejected with a located error naming
-/// `--listen`.
+/// accepted for an absolute stream-socket path. Relative Unix paths, Unix permission suffixes,
+/// `unixpacket`/`unixgram` (SOCK_SEQPACKET/SOCK_DGRAM) and `fd/` socket activation are capabilities
+/// this build does not have for this command, so they are rejected up front with a located error
+/// naming `--listen` and the construct.
 fn parse_listen(input: &str) -> Result<ListenSpec> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -360,9 +360,10 @@ fn parse_listen(input: &str) -> Result<ListenSpec> {
             })
         }
         "unix" => {
-            // Caddy drops the network prefix (e.g., `unix/relative.sock` becomes just `relative.sock`).
-            // We support both absolute and relative paths; relative paths are resolved against
-            // the current working directory.
+            // Caddy drops the network prefix and binds the path as given; a relative path is
+            // resolved against the process working directory. This build's listener only binds
+            // absolute paths, and a socket whose location depends on the caller's cwd is easy to
+            // get wrong, so both relative paths and permission suffixes are rejected up front.
             let path = address.trim();
             if path.is_empty() {
                 return Err(listen_error(input, "unix socket path is empty"));
@@ -370,11 +371,18 @@ fn parse_listen(input: &str) -> Result<ListenSpec> {
             if path.contains('\0') {
                 return Err(listen_error(input, "unix socket path contains a NUL byte"));
             }
-            // Caddy strips permission bits from paths like `unix/relative|0600.sock`;
-            // we ignore permission bits for simplicity.
             if path.contains('|') {
-                // Remove everything up to and including the pipe
-                let path = path.split('|').nth(1).unwrap_or(path).trim();
+                return Err(listen_error(
+                    input,
+                    "Unix socket permission bits (`|mode` suffixes) are not supported by this build",
+                ));
+            }
+            if !path.starts_with('/') {
+                return Err(listen_error(
+                    input,
+                    "unix socket path must be absolute (Caddy also accepts relative paths; this \
+                     build rejects them)",
+                ));
             }
             Ok(ListenSpec {
                 network: ListenNetwork::Unix,
@@ -385,54 +393,16 @@ fn parse_listen(input: &str) -> Result<ListenSpec> {
                 raw: input.to_string(),
             })
         }
-        "unixpacket" => {
-            // Caddy serves unixpacket as a SOCK_SEQPACKET Unix socket.
-            // For respond, we treat it as a regular Unix socket.
-            let path = address.trim();
-            if path.is_empty() {
-                return Err(listen_error(input, "unixpacket socket path is empty"));
-            }
-            if path.contains('\0') {
-                return Err(listen_error(input, "unixpacket socket path contains a NUL byte"));
-            }
-            // Caddy strips permission bits from paths like `unixpacket/relative|0600.sock`;
-            // we ignore permission bits for simplicity.
-            if path.contains('|') {
-                let path = path.split('|').nth(1).unwrap_or(path).trim();
-            }
-            Ok(ListenSpec {
-                network: ListenNetwork::Unix,
-                host: String::new(),
-                start_port: 0,
-                end_port: 0,
-                unix_path: Some(path.to_string()),
-                raw: input.to_string(),
-            })
-        }
-        "unixgram" => {
-            // Caddy serves unixgram as a SOCK_DGRAM Unix socket.
-            // For respond, we treat it as a regular Unix socket.
-            let path = address.trim();
-            if path.is_empty() {
-                return Err(listen_error(input, "unixgram socket path is empty"));
-            }
-            if path.contains('\0') {
-                return Err(listen_error(input, "unixgram socket path contains a NUL byte"));
-            }
-            // Caddy strips permission bits from paths like `unixgram/relative|0600.sock`;
-            // we ignore permission bits for simplicity.
-            if path.contains('|') {
-                let path = path.split('|').nth(1).unwrap_or(path).trim();
-            }
-            Ok(ListenSpec {
-                network: ListenNetwork::Unix,
-                host: String::new(),
-                start_port: 0,
-                end_port: 0,
-                unix_path: Some(path.to_string()),
-                raw: input.to_string(),
-            })
-        }
+        "unixpacket" => Err(listen_error(
+            input,
+            "unixpacket (SOCK_SEQPACKET) listeners are not supported by this build; Caddy serves \
+             them as a SOCK_SEQPACKET Unix socket",
+        )),
+        "unixgram" => Err(listen_error(
+            input,
+            "unixgram (SOCK_DGRAM) listeners are not supported by this build; Caddy refuses \
+             unixgram for HTTP connections",
+        )),
         "fd" => Err(listen_error(
             input,
             "fd/socket-activation listeners are not supported by this build",
