@@ -17,7 +17,7 @@ tokio = { workspace = true }
 
 # ACME (RFC 8555) account/JWS foundation: ES256 signing, SHA-256, HMAC and base64url.
 # Both crates are present in the offline registry cache used by this workspace.
-base64 = "0.22.1"
+base64 = "0.23.1"
 ring = "0.17.14"
 
 # RSA account keys and certificate keys (certmagic supports rsa2048/rsa4096). All transitive
