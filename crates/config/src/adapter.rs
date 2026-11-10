@@ -8342,6 +8342,14 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
             parse_response_matcher(item, &mut response_matchers)?;
         }
     }
+    // Caddy resolves the two reference kinds at different phases. `replace_status` is appended to
+    // `Handler.HandleResponse` while `UnmarshalCaddyfile` walks the block, so it can only see
+    // matchers declared *before* it and a forward reference fails with "no named response matcher
+    // defined with name '...'" (reverseproxy/caddyfile.go). `handle_response` is deferred to
+    // `FinalizeUnmarshalCaddyfile`, which runs after the whole block is parsed and therefore sees
+    // every matcher in the block. `declared_response_matchers` is the declaration-order prefix
+    // used by `replace_status`; the pre-pass map above stays the complete set used at finalize.
+    let mut declared_response_matchers: BTreeMap<String, Value> = BTreeMap::new();
     let mut handle_response: Vec<Value> = Vec::new();
     // Caddy appends `replace_status` handlers to `Handler.HandleResponse` immediately during
     // `UnmarshalCaddyfile`, but defers `handle_response` segments to
@@ -8350,7 +8358,13 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
     let mut replace_status: Vec<Value> = Vec::new();
 
     for item in &directive.block {
-        if item.name.starts_with('@') {
+        if let Some(name) = item.name.strip_prefix('@') {
+            // The pre-pass already validated and parsed this matcher; mirror it into the
+            // declaration-order prefix so a later `replace_status` can see it, but an earlier one
+            // cannot.
+            if let Some(matcher) = response_matchers.get(name) {
+                declared_response_matchers.insert(name.to_string(), matcher.clone());
+            }
             continue;
         }
         match item.name.as_str() {
@@ -8417,7 +8431,9 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
                             "must use a named response matcher, starting with '@'",
                         ));
                     };
-                    let Some(matcher) = response_matchers.get(name) else {
+                    // Caddy resolves this immediately while walking the block, so only matchers
+                    // declared earlier are visible; a forward reference is an error.
+                    let Some(matcher) = declared_response_matchers.get(name) else {
                         return Err(adapter_error(
                             item.position.clone(),
                             format!("no named response matcher defined with name '{name}'"),

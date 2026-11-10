@@ -1,0 +1,10 @@
+:8080 {
+	reverse_proxy 127.0.0.1:9000 {
+		@late status 404
+		replace_status @late 418
+		@ok status 2xx
+		handle_response @ok {
+			respond "ok"
+		}
+	}
+}

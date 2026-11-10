@@ -1,0 +1,78 @@
+{
+	"apps": {
+		"http": {
+			"servers": {
+				"srv0": {
+					"listen": [
+						":8080"
+					],
+					"routes": [
+						{
+							"handle": [
+								{
+									"handle_response": [
+										{
+											"match": {
+												"status_code": [
+													2
+												]
+											},
+											"routes": [
+												{
+													"handle": [
+														{
+															"handler": "vars"
+														}
+													]
+												}
+											]
+										},
+										{
+											"match": {
+												"status_code": [
+													500
+												]
+											},
+											"routes": [
+												{
+													"handle": [
+														{
+															"body": "late",
+															"handler": "static_response"
+														}
+													]
+												}
+											]
+										}
+									],
+									"handler": "reverse_proxy",
+									"headers": {
+										"request": {
+											"set": {
+												"X-Forwarded-Method": [
+													"{http.request.method}"
+												],
+												"X-Forwarded-Uri": [
+													"{http.request.uri}"
+												]
+											}
+										}
+									},
+									"rewrite": {
+										"method": "GET",
+										"uri": "/auth"
+									},
+									"upstreams": [
+										{
+											"dial": "127.0.0.1:9000"
+										}
+									]
+								}
+							]
+						}
+					]
+				}
+			}
+		}
+	}
+}

@@ -1,0 +1,7 @@
+:8080 {
+	forward_auth 127.0.0.1:9000 {
+		uri /auth
+		@late status 401
+		replace_status @late 418
+	}
+}

@@ -1,0 +1,111 @@
+{
+	"apps": {
+		"http": {
+			"servers": {
+				"srv0": {
+					"listen": [
+						":8080"
+					],
+					"routes": [
+						{
+							"match": [
+								{
+									"file": {
+										"try_files": [
+											"{http.request.uri.path}/index.php"
+										]
+									},
+									"not": [
+										{
+											"path": [
+												"*/"
+											]
+										}
+									]
+								}
+							],
+							"handle": [
+								{
+									"handler": "static_response",
+									"headers": {
+										"Location": [
+											"./{http.request.orig_uri.path.file_escaped}/{http.request.orig_uri.prefixed_query}"
+										]
+									},
+									"status_code": 308
+								}
+							]
+						},
+						{
+							"match": [
+								{
+									"file": {
+										"try_files": [
+											"{http.request.uri.path}",
+											"{http.request.uri.path}/index.php",
+											"index.php"
+										],
+										"try_policy": "first_exist_fallback",
+										"split_path": [
+											".php"
+										]
+									}
+								}
+							],
+							"handle": [
+								{
+									"handler": "rewrite",
+									"uri": "{http.matchers.file.relative}"
+								}
+							]
+						},
+						{
+							"match": [
+								{
+									"path": [
+										"*.php"
+									]
+								}
+							],
+							"handle": [
+								{
+									"handle_response": [
+										{
+											"match": {
+												"status_code": [
+													500
+												]
+											},
+											"routes": [
+												{
+													"handle": [
+														{
+															"body": "late",
+															"handler": "static_response"
+														}
+													]
+												}
+											]
+										}
+									],
+									"handler": "reverse_proxy",
+									"transport": {
+										"protocol": "fastcgi",
+										"split_path": [
+											".php"
+										]
+									},
+									"upstreams": [
+										{
+											"dial": "127.0.0.1:9000"
+										}
+									]
+								}
+							]
+						}
+					]
+				}
+			}
+		}
+	}
+}

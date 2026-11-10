@@ -1,0 +1,46 @@
+{
+	"apps": {
+		"http": {
+			"servers": {
+				"srv0": {
+					"listen": [
+						":8080"
+					],
+					"routes": [
+						{
+							"handle": [
+								{
+									"handle_response": [
+										{
+											"match": {
+												"status_code": [
+													500
+												]
+											},
+											"routes": [
+												{
+													"handle": [
+														{
+															"body": "late",
+															"handler": "static_response"
+														}
+													]
+												}
+											]
+										}
+									],
+									"handler": "reverse_proxy",
+									"upstreams": [
+										{
+											"dial": "127.0.0.1:9000"
+										}
+									]
+								}
+							]
+						}
+					]
+				}
+			}
+		}
+	}
+}
