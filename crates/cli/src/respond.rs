@@ -249,23 +249,6 @@ fn select_response_with_stdin(
 }
 
 /// Whether stdin is a pipe (Caddy reads a body only from `os.ModeNamedPipe`).
-#[cfg(unix)]
-fn stdin_is_pipe() -> bool {
-    use std::os::unix::io::AsRawFd;
-
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: `fstat` initializes the buffer it is given on success; the fd is stdin, which is
-    // valid for the lifetime of the call.
-    let result = unsafe { libc::fstat(std::io::stdin().as_raw_fd(), stat.as_mut_ptr()) };
-    if result != 0 {
-        return false;
-    }
-    // SAFETY: `result == 0` means `fstat` filled the buffer.
-    let stat = unsafe { stat.assume_init() };
-    (stat.st_mode & libc::S_IFMT) == libc::S_IFIFO
-}
-
-#[cfg(not(unix))]
 fn stdin_is_pipe() -> bool {
     use std::io::IsTerminal;
     !std::io::stdin().is_terminal()
