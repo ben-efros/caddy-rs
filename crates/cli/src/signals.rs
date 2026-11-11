@@ -34,14 +34,16 @@ pub fn shutdown_channels() -> anyhow::Result<SignalChannels> {
     // signal numbers and `sighandler_t` ABI are the standard Linux/POSIX ones provided by
     // `libc`.
     unsafe {
-        libc::signal(
-            libc::SIGINT,
-            handle_signal as *const () as libc::sighandler_t,
-        );
-        libc::signal(
-            libc::SIGTERM,
-            handle_signal as *const () as libc::sighandler_t,
-        );
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = handle_signal as usize;
+        libc::sigemptyset(&mut sa.sa_mask);
+        sa.sa_flags = libc::SA_RESTART;
+        if libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut()) == -1 {
+            return Err(anyhow::anyhow!("failed to install SIGINT handler"));
+        }
+        if libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut()) == -1 {
+            return Err(anyhow::anyhow!("failed to install SIGTERM handler"));
+        }
     }
 
     let (shutdown_sender, shutdown) = watch::channel(false);
