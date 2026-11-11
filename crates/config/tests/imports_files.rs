@@ -322,3 +322,25 @@ fn import_error_does_not_leak_absolute_path() {
     let root_str = tree.root.to_str().expect("valid utf-8 root");
     assert!(!message.contains(root_str), "{message}");
 }
+
+#[test]
+fn glob_pattern_error_does_not_leak_absolute_path() {
+    let tree = TempTree::new("sanitize-glob");
+    let root_str = tree.root.to_str().expect("valid utf-8 root").to_string();
+    for pattern in ["sub/*/*.caddyfile", "sub/[ab].caddyfile"] {
+        tree.write(
+            "Caddyfile",
+            &format!("example.com {{\n\timport {pattern}\n}}\n"),
+        );
+        let caddyfile = std::fs::read_to_string(tree.caddyfile()).expect("read root");
+        let error = tree
+            .adapt(&caddyfile)
+            .expect_err("multi-wildcard glob should be rejected");
+        let message = error.to_string();
+        assert!(message.contains("Glob pattern"), "{message}");
+        // The pattern as written by the user must still be reported.
+        assert!(message.contains(pattern), "{message}");
+        // The absolute temp directory must not leak into the diagnostic.
+        assert!(!message.contains(&root_str), "{message}");
+    }
+}
