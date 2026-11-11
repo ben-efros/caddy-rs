@@ -16,7 +16,7 @@
 //!   "rate": "10r/s",
 //!   "burst": 20,
 //!   "key": "{http.request.remote.host}",
-//!   "max_keys": 100000,
+//!   "max_keys": 10000,
 //!   "status_code": 429,
 //!   "headers": {"X-RateLimit-Realm": ["default"]},
 //!   "body": "rate limit exceeded"
@@ -31,7 +31,7 @@
 //! * `key` (optional): placeholder expression used to select a bucket, expanded with `ReplaceAll`
 //!   semantics at request time; defaults to `{http.request.remote.host}`. An empty expansion is
 //!   keyed as `"<unknown>"` so requests without a peer address share one bucket.
-//! * `max_keys` (optional): bound on the number of live buckets (default 100000). At the bound,
+//! * `max_keys` (optional): bound on the number of live buckets (default 10000). At the bound,
 //!   fully refilled (idle) buckets are evicted oldest-first; if every bucket is still consuming
 //!   tokens, new keys are rate limited rather than growing the map without bound.
 //! * `status_code` (optional): response status for limited requests (default `429`).
@@ -52,6 +52,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
+use sha2::{Digest, Sha256};
 
 use crate::types::{Error, Handler, Outcome, Request, Response, Result};
 
@@ -360,7 +361,7 @@ impl RateLimitHandler {
         };
 
         let max_keys = match object.get("max_keys") {
-            None | Some(serde_json::Value::Null) => 100_000usize,
+            None | Some(serde_json::Value::Null) => 10_000usize,
             Some(value) => {
                 let configured = value.as_u64().ok_or_else(|| {
                     invalid(
@@ -477,6 +478,13 @@ impl RateLimitHandler {
         let expanded = request.replace_all(&self.config.key);
         if expanded.is_empty() {
             "<unknown>".to_string()
+        } else if expanded.len() > 256 {
+            let hash = Sha256::digest(expanded.as_bytes());
+            let mut hex = String::with_capacity(64);
+            for byte in hash {
+                hex.push_str(&format!("{:02x}", byte));
+            }
+            format!("sha256:{}", hex)
         } else {
             expanded
         }
@@ -877,5 +885,32 @@ mod tests {
         assert!(parse_rate("xr/s").is_err());
         assert_eq!(default_burst(10.0), 10);
         assert_eq!(default_burst(0.1), 1);
+    }
+
+    #[test]
+    fn default_max_keys_is_ten_thousand() {
+        let clock: Arc<dyn RateLimitClock> = Arc::new(ManualClock::new());
+        let value = serde_json::json!({"handler": "rate_limit", "rate": "10r/s"});
+        let handler =
+            RateLimitHandler::from_json_with_clock(&value, "handler", Arc::clone(&clock))
+                .expect("valid config");
+        assert_eq!(handler.config.max_keys, 10_000);
+    }
+
+    #[test]
+    fn very_long_key_is_hashed() {
+        let clock = Arc::new(ManualClock::new());
+        let long_key = "a".repeat(500);
+        let handler = config(
+            Arc::clone(&clock),
+            serde_json::json!({"rate": "1r/s", "burst": 1, "key": "{http.request.header.X-Key}"}),
+        );
+        let admission1 = handler.limiter.check(&long_key);
+        assert!(admission1.allowed);
+        let admission2 = handler.limiter.check(&long_key);
+        assert!(!admission2.allowed);
+        // Only one bucket created despite the long key.
+        let state = handler.limiter.state.lock().unwrap();
+        assert_eq!(state.buckets.len(), 1);
     }
 }
