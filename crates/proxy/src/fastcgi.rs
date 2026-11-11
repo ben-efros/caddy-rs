@@ -68,8 +68,6 @@ const MAX_WRITE: usize = 65500;
 const REQUEST_ID: u16 = 1;
 /// Caddy's default dial timeout for FastCGI.
 const DEFAULT_DIAL_TIMEOUT: Duration = Duration::from_secs(3);
-/// Caddy compatibility baseline reported in `SERVER_SOFTWARE` (see `CADDY_COMPAT_BASELINE`).
-const CADDY_COMPAT_VERSION: &str = "2.11.9";
 
 /// FastCGI transport errors.
 #[derive(Debug, thiserror::Error)]
@@ -130,6 +128,8 @@ pub struct FastCgiTransport {
     write_timeout: Duration,
     /// Capture and log FastCGI STDERR output.
     capture_stderr: bool,
+    /// `SERVER_SOFTWARE` value for the configured server identity; `None` omits it (T-CONF-060).
+    server_software: Option<String>,
 }
 
 /// A FastCGI response head plus a streaming body.
@@ -149,6 +149,22 @@ impl FastCgiTransport {
     /// Caddy's FastCGI transport has no HTTP version/TLS options; any other field (including
     /// `tls`/`versions`, which would silently do nothing) fails loudly rather than being ignored.
     pub fn from_json(value: &Value, path: &str) -> HttpResult<Self> {
+        Self::from_json_with_server_software(
+            value,
+            path,
+            Some(format!("caddy-rs/{}", env!("CARGO_PKG_VERSION"))),
+        )
+    }
+
+    /// Parse a FastCGI transport and use `server_software` for the `SERVER_SOFTWARE` parameter.
+    ///
+    /// The HTTP server's identity mode is resolved by the server runtime and passed in; `None`
+    /// omits the parameter (identity mode `none`, caddy-rs extension T-CONF-060).
+    pub fn from_json_with_server_software(
+        value: &Value,
+        path: &str,
+        server_software: Option<String>,
+    ) -> HttpResult<Self> {
         let object = value
             .as_object()
             .ok_or_else(|| invalid(path, "`transport` for fastcgi must be an object"))?;
@@ -268,6 +284,7 @@ impl FastCgiTransport {
             read_timeout,
             write_timeout,
             capture_stderr,
+            server_software,
         })
     }
 
@@ -510,10 +527,9 @@ impl FastCgiTransport {
             }
             .to_string(),
         );
-        env.insert(
-            "SERVER_SOFTWARE".to_string(),
-            format!("Caddy/{CADDY_COMPAT_VERSION}"),
-        );
+        if let Some(software) = &self.server_software {
+            env.insert("SERVER_SOFTWARE".to_string(), software.clone());
+        }
         env.insert("DOCUMENT_ROOT".to_string(), root.clone());
         env.insert("DOCUMENT_URI".to_string(), document_uri);
         env.insert(
@@ -1725,6 +1741,60 @@ mod tests {
         .expect("fastcgi handler builds")
     }
 
+    fn build_handler_with_server_software(
+        dial: &str,
+        transport: Value,
+        server_software: Option<String>,
+    ) -> super::super::handler::ReverseProxyHandler {
+        super::super::handler::ReverseProxyHandler::from_json_with_server_software(
+            &serde_json::json!({
+                "handler": "reverse_proxy",
+                "upstreams": [{"dial": dial}],
+                "transport": transport
+            }),
+            "handler",
+            server_software,
+        )
+        .expect("fastcgi handler builds")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn server_software_follows_the_configured_identity_mode() {
+        let default_identity = format!("caddy-rs/{}", env!("CARGO_PKG_VERSION"));
+        let modes: [(Option<String>, Option<String>); 5] = [
+            (
+                Some(default_identity),
+                Some(format!("caddy-rs/{}", env!("CARGO_PKG_VERSION"))),
+            ),
+            (Some("Caddy".to_string()), Some("Caddy".to_string())),
+            (
+                Some("Caddy/2.11.9".to_string()),
+                Some("Caddy/2.11.9".to_string()),
+            ),
+            (
+                Some("Acme Server/2".to_string()),
+                Some("Acme Server/2".to_string()),
+            ),
+            (None, None),
+        ];
+        for (configured, expected) in modes {
+            let (dial, captured) = spawn_tcp_mock(Behavior::responds(0)).await;
+            let handler = build_handler_with_server_software(
+                &dial,
+                transport_json(serde_json::json!({})),
+                configured,
+            );
+            let response = respond(&handler, request(Method::GET, "/index.php"));
+            assert_eq!(response.status, StatusCode::OK);
+            let captured = captured.lock().unwrap().clone().expect("captured request");
+            assert_eq!(
+                captured.params.get("SERVER_SOFTWARE"),
+                expected.as_ref(),
+                "SERVER_SOFTWARE must follow the configured identity mode"
+            );
+        }
+    }
+
     fn request(method: Method, uri: &str) -> Request {
         let mut request = Request::new(method, uri.parse().unwrap());
         request.remote_addr = Some("203.0.113.7:5555".parse().unwrap());
@@ -1785,7 +1855,10 @@ mod tests {
         assert_eq!(params["REQUEST_METHOD"], "POST");
         assert_eq!(params["REQUEST_SCHEME"], "http");
         assert_eq!(params["SERVER_PROTOCOL"], "HTTP/1.1");
-        assert_eq!(params["SERVER_SOFTWARE"], "Caddy/2.11.9");
+        assert_eq!(
+            params["SERVER_SOFTWARE"],
+            format!("caddy-rs/{}", env!("CARGO_PKG_VERSION"))
+        );
         assert_eq!(params["SERVER_NAME"], "app.example.com");
         assert_eq!(params["SERVER_PORT"], "80");
         assert_eq!(params["DOCUMENT_ROOT"], "/srv/www");

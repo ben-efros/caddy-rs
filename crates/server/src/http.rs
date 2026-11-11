@@ -250,9 +250,9 @@ pub(crate) async fn serve_internal_buffered(
     }
     trusted_proxies.apply(&mut internal);
     match router.handle_upgradable(internal).await {
-        Ok(ResponseOutcome::Response(response)) => {
-            ServedResponse::Response(to_hyper_streaming(response))
-        }
+        Ok(ResponseOutcome::Response(response)) => ServedResponse::Response(
+            to_hyper_streaming_with_identity(response, &limits.server_identity),
+        ),
         Ok(ResponseOutcome::Upgrade(_)) => ServedResponse::Response(status_response(
             StatusCode::NOT_IMPLEMENTED,
             crate::listeners::H3_UPGRADE_UNSUPPORTED_BODY,
@@ -501,9 +501,9 @@ pub(crate) async fn serve_request_with_automatic_upgradable(
     trusted_proxies.apply(&mut internal);
 
     match router.handle_upgradable(internal).await {
-        Ok(ResponseOutcome::Response(response)) => {
-            ServedResponse::Response(to_hyper_streaming(response))
-        }
+        Ok(ResponseOutcome::Response(response)) => ServedResponse::Response(
+            to_hyper_streaming_with_identity(response, &limits.server_identity),
+        ),
         Ok(ResponseOutcome::Upgrade(upgraded)) => {
             let Some(on_upgrade) = on_upgrade else {
                 eprintln!(
@@ -628,6 +628,34 @@ async fn read_body(body: Incoming, limit: Option<u64>) -> Result<Bytes, BodyRead
 /// Convert a fully buffered internal response to a hyper response.
 pub fn to_hyper(response: Response) -> hyper::Response<Body> {
     to_hyper_streaming(StreamingResponse::from_buffered(response))
+}
+
+/// Apply the configured server identity to a response's HTTP `Server` header
+/// (caddy-rs extension, T-CONF-060).
+///
+/// Caddy sets the header before routing, so a handler may override it: an explicit `Server`
+/// header is preserved here. `none` mode adds nothing.
+pub(crate) fn apply_server_identity(
+    response: &mut hyper::Response<Body>,
+    identity: &caddy_rs_core::ServerIdentity,
+) {
+    if let Some(value) = identity.http_header_value() {
+        if !response.headers().contains_key(http::header::SERVER) {
+            if let Ok(value) = http::HeaderValue::from_str(&value) {
+                response.headers_mut().insert(http::header::SERVER, value);
+            }
+        }
+    }
+}
+
+/// Convert an internal response and stamp the server identity onto it.
+fn to_hyper_streaming_with_identity(
+    response: StreamingResponse,
+    identity: &caddy_rs_core::ServerIdentity,
+) -> hyper::Response<Body> {
+    let mut response = to_hyper_streaming(response);
+    apply_server_identity(&mut response, identity);
+    response
 }
 
 /// Convert an internal (possibly streaming) response to a hyper response, applying the framing

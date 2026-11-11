@@ -286,6 +286,14 @@ fn validate_server_limits(server: &HttpServer, path: &str) -> Result<()> {
             ));
         }
     }
+    // caddy-rs extension: server identity (T-CONF-060). A non-string or empty value is a located
+    // error, matching the server parser so `validate`/`load` fail instead of only apply.
+    if let Some(value) = server.extra.get("server_identity") {
+        crate::identity::ServerIdentity::from_config_value(
+            value,
+            &format!("{path}.server_identity"),
+        )?;
+    }
     Ok(())
 }
 

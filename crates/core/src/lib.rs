@@ -24,6 +24,7 @@ pub mod data_dir;
 pub mod duration;
 pub mod error;
 pub mod generation;
+pub mod identity;
 pub mod lifecycle;
 pub mod listen;
 pub mod module;
@@ -47,6 +48,7 @@ pub use error::{Error, Result};
 pub use generation::{
     drain, DrainOutcome, Generation, GenerationStore, LifecycleState, LoadResult, StopResult,
 };
+pub use identity::ServerIdentity;
 pub use lifecycle::{
     CancellationToken, GenerationHooks, GenerationResource, GenerationResources, ResourceLifecycle,
 };
