@@ -633,12 +633,31 @@ async fn refresh_token_is_stored_hashed() {
 #[test]
 fn debug_redacts_secrets() {
     let config = AuthnConfig {
-        jwt_secret_source: JwtSecretSource::Master("other-secret".to_string()),
+        jwt_secret_source: JwtSecretSource::Master("super-secret-value".to_string()),
         ..test_config()
     };
     let config_debug = format!("{config:?}");
     assert!(config_debug.contains("[redacted]"));
-    assert!(!config_debug.contains("171"));
+    assert!(
+        !config_debug.contains("super-secret-value"),
+        "config Debug must not leak the master secret: {config_debug}"
+    );
+
+    // The source's own Debug impl must redact too, not just the config wrapper.
+    let source = JwtSecretSource::Master("super-secret-value".to_string());
+    let source_debug = format!("{source:?}");
+    assert!(source_debug.contains("[redacted]"), "{source_debug}");
+    assert!(
+        !source_debug.contains("super-secret-value"),
+        "JwtSecretSource Debug must not leak the master secret: {source_debug}"
+    );
+    assert_eq!(
+        format!("{:?}", JwtSecretSource::Ephemeral),
+        "Ephemeral",
+        "ephemeral sources carry no secret and print plainly"
+    );
+    let file_debug = format!("{:?}", JwtSecretSource::File(PathBuf::from("/tmp/jwt.key")));
+    assert!(file_debug.contains("/tmp/jwt.key"), "{file_debug}");
 
     let user = User {
         password_hash: "PASSWORD_HASH_SECRET".to_string(),
@@ -898,10 +917,191 @@ async fn sessions_survive_a_restart_with_a_persistent_secret() {
         claims.sub, user.id,
         "the token still belongs to the same user"
     );
+    // NOTE: the `UserStore` is shared with the first service on purpose. That only makes the
+    // restart partial: it proves the signing key was persisted, not that refresh-token or user
+    // state would survive a real process restart (a persistent store is a separate concern).
+    // So the refresh below only proves this store still holds the token, nothing more.
     after
         .refresh(&tokens.refresh_token)
         .await
-        .expect("refresh token must still work after a restart");
+        .expect("refresh token is still present in this store (not a restart guarantee)");
+
+    // What actually has to hold across a restart: the same on-disk secret resolves to the same
+    // key no matter how many service instances are built from it.
+    let first_key = JwtSecretSource::File(path.clone())
+        .resolve()
+        .expect("resolve first");
+    let second_key = JwtSecretSource::File(path.clone())
+        .resolve()
+        .expect("resolve second");
+    assert_eq!(
+        first_key, second_key,
+        "two services built from the same File source must sign with the same key"
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("read secret file"),
+        first_key,
+        "the persisted file is what both instances resolved"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn empty_secret_file_is_repaired_instead_of_failing_forever() {
+    let dir = std::env::temp_dir().join(format!("caddy-rs-jwt-empty-{:?}", UserId::new()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("jwt.key");
+    std::fs::write(&path, b"").expect("write empty secret file");
+
+    let key = JwtSecretSource::File(path.clone())
+        .resolve()
+        .expect("an empty leftover must be repaired, not hard-fail every start");
+    assert_eq!(
+        std::fs::read(&path).expect("read secret file"),
+        key,
+        "the repaired file holds the key that was returned"
+    );
+    assert_eq!(
+        JwtSecretSource::File(path.clone()).resolve().expect("read"),
+        key,
+        "the repaired secret is stable across later starts"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn concurrent_creation_does_not_diverge() {
+    // Two cold starts that both see a missing file must agree on one key, and the file must end
+    // up holding exactly the key both returned. Repeated because the interleaving of the two
+    // racers is not fully under the test's control.
+    for round in 0..10 {
+        let dir = std::env::temp_dir().join(format!(
+            "caddy-rs-jwt-race-{}-{round}-{:?}",
+            std::process::id(),
+            UserId::new()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("jwt.key");
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    JwtSecretSource::File(path).resolve()
+                })
+            })
+            .collect();
+        let keys: Vec<[u8; 32]> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("resolve thread").expect("resolve"))
+            .collect();
+
+        assert_eq!(
+            keys[0], keys[1],
+            "concurrent cold starts must not diverge on the signing key (round {round})"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read secret file"),
+            keys[0],
+            "the installed file must hold the key both processes returned (round {round})"
+        );
+        let mut leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read temp dir")
+            .map(|entry| entry.expect("dir entry").file_name())
+            .filter(|name| name.to_string_lossy().ends_with(".tmp"))
+            .collect();
+        leftovers.sort();
+        assert_eq!(leftovers.len(), 0, "no temp files may be left behind");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[test]
+fn existing_world_readable_secret_file_is_read_without_rewriting_it() {
+    let dir = std::env::temp_dir().join(format!("caddy-rs-jwt-mode-{:?}", UserId::new()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("jwt.key");
+    let existing = [0x5Au8; 32];
+    std::fs::write(&path, existing).expect("write pre-existing secret");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("make secret world-readable");
+    }
+
+    let key = JwtSecretSource::File(path.clone())
+        .resolve()
+        .expect("an existing 32-byte secret is still usable");
+    assert_eq!(
+        key, existing,
+        "the existing secret is honoured, not replaced"
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("read secret file"),
+        existing,
+        "a populated secret file is never rewritten"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn planted_symlink_at_temp_path_is_not_followed() {
+    let dir = std::env::temp_dir().join(format!("caddy-rs-jwt-link-{:?}", UserId::new()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("jwt.key");
+    let victim = dir.join("victim.txt");
+    let victim_contents = b"victim contents that must never be truncated";
+    std::fs::write(&victim, victim_contents).expect("write victim file");
+
+    // Attack 1: plant a symlink at the historical deterministic temp path.
+    let legacy_temp = path.with_extension("tmp");
+    std::os::unix::fs::symlink(&victim, &legacy_temp).expect("plant symlink");
+    let key = JwtSecretSource::File(path.clone())
+        .resolve()
+        .expect("resolve must succeed despite the planted symlink");
+    assert_eq!(
+        std::fs::read(&victim).expect("read victim"),
+        victim_contents,
+        "the symlink target must not be truncated or replaced"
+    );
+    assert!(
+        std::fs::symlink_metadata(&legacy_temp)
+            .expect("legacy temp lstat")
+            .file_type()
+            .is_symlink(),
+        "the planted symlink is left untouched"
+    );
+    assert!(
+        std::fs::symlink_metadata(&path)
+            .expect("secret lstat")
+            .file_type()
+            .is_file(),
+        "the real secret is a regular file, not a symlink"
+    );
+    assert_eq!(std::fs::read(&path).expect("read secret"), key);
+
+    // Attack 2: the exclusive temp creation itself refuses a planted symlink.
+    let temp = dir.join(".planted.tmp");
+    std::os::unix::fs::symlink(&victim, &temp).expect("plant second symlink");
+    let result = write_secret_temp(&temp, &[0x11u8; 32]);
+    assert!(
+        matches!(result, Err(AuthError::Internal(_))),
+        "temp creation must refuse to follow a planted symlink"
+    );
+    assert_eq!(
+        std::fs::read(&victim).expect("read victim"),
+        victim_contents,
+        "refusing the symlink must not touch its target"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }

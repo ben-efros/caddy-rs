@@ -654,7 +654,7 @@ impl Default for Argon2Config {
 /// [`JwtSecretSource::File`] so that existing sessions remain valid across config
 /// reloads and process restarts. [`JwtSecretSource::Ephemeral`] is provided only
 /// for backwards compatibility and local development.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum JwtSecretSource {
     /// Derive from a user-provided master secret string.
     ///
@@ -677,6 +677,17 @@ impl Default for JwtSecretSource {
     }
 }
 
+// Hand-written so that `Master(String)` plaintext can never reach a log line through `{:?}`.
+impl std::fmt::Debug for JwtSecretSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JwtSecretSource::Master(_) => f.write_str("Master(\"[redacted]\")"),
+            JwtSecretSource::File(path) => f.debug_tuple("File").field(path).finish(),
+            JwtSecretSource::Ephemeral => f.write_str("Ephemeral"),
+        }
+    }
+}
+
 impl JwtSecretSource {
     /// Resolve this source to a 32-byte signing key.
     ///
@@ -694,62 +705,21 @@ impl JwtSecretSource {
                 Ok(Sha256::digest(secret.as_bytes()).into())
             }
             JwtSecretSource::File(path) => {
-                match std::fs::read(path) {
-                    Ok(bytes) if bytes.len() == 32 => {
-                        let mut key = [0u8; 32];
-                        key.copy_from_slice(&bytes);
-                        return Ok(key);
-                    }
-                    Ok(bytes) => {
-                        return Err(AuthError::Internal(format!(
-                            "JWT secret file {} must contain exactly 32 bytes, found {}",
-                            path.display(),
-                            bytes.len()
-                        )));
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => {
-                        return Err(AuthError::Internal(format!(
-                            "could not read JWT secret file {}: {error}",
-                            path.display()
-                        )));
-                    }
+                if let Some(key) = read_secret_file(path)? {
+                    return Ok(key);
                 }
 
                 let mut key = [0u8; 32];
                 OsRng.fill_bytes(&mut key);
-                // Write to a sibling temp file that is created owner-only, then rename it into
-                // place. `rename` is atomic on the same filesystem, so a concurrent start never
-                // observes a partially written secret.
-                let temp = path.with_extension("tmp");
-                let mut options = std::fs::OpenOptions::new();
-                options.write(true).create(true).truncate(true);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    options.mode(0o600);
-                }
-                let mut file = options.open(&temp).map_err(|error| {
-                    AuthError::Internal(format!(
-                        "could not create JWT secret file {}: {error}",
-                        temp.display()
-                    ))
-                })?;
-                use std::io::Write;
-                file.write_all(&key).map_err(|error| {
-                    AuthError::Internal(format!(
-                        "could not write JWT secret file {}: {error}",
-                        temp.display()
-                    ))
-                })?;
-                file.sync_all().ok();
-                std::fs::rename(&temp, path).map_err(|error| {
-                    AuthError::Internal(format!(
-                        "could not install JWT secret file {}: {error}",
-                        path.display()
-                    ))
-                })?;
-                Ok(key)
+
+                // Write to a freshly created, owner-only sibling temp file and install it. The
+                // install never clobbers a secret another process created first: in that case this
+                // process keeps the winner's on-disk key instead of its own.
+                install_secret(path, &key)?;
+
+                // Only ever return a key observed on disk: this both proves the write landed and
+                // makes a concurrent first start converge on whichever key won the install race.
+                read_secret_file_with_retries(path)
             }
             JwtSecretSource::Ephemeral => {
                 let mut key = [0u8; 32];
@@ -758,6 +728,187 @@ impl JwtSecretSource {
             }
         }
     }
+}
+
+/// How often a freshly installed secret file is re-read before giving up.
+const SECRET_READ_ATTEMPTS: usize = 3;
+
+/// Read a `[u8; 32]` secret file, returning `Ok(None)` when it does not exist yet.
+fn read_secret_file(path: &std::path::Path) -> AuthResult<Option<[u8; 32]>> {
+    match std::fs::read(path) {
+        Ok(bytes) if bytes.len() == 32 => {
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&bytes);
+            Ok(Some(key))
+        }
+        // An empty file is an unusable leftover (e.g. a crash between create and write), never a
+        // valid secret: treat it as absent so the next start repairs it instead of hard-failing.
+        Ok(bytes) if bytes.is_empty() => Ok(None),
+        Ok(bytes) => Err(AuthError::Internal(format!(
+            "JWT secret file {} must contain exactly 32 bytes, found {}",
+            path.display(),
+            bytes.len()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(AuthError::Internal(format!(
+            "could not read JWT secret file {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+/// Re-read the installed secret, retrying briefly so a short or partially written file observed
+/// during a concurrent start is not mistaken for a permanently broken configuration.
+fn read_secret_file_with_retries(path: &std::path::Path) -> AuthResult<[u8; 32]> {
+    let mut last_error = None;
+    for attempt in 0..SECRET_READ_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        match read_secret_file(path) {
+            Ok(Some(key)) => return Ok(key),
+            Ok(None) => {
+                last_error = Some(AuthError::Internal(format!(
+                    "JWT secret file {} disappeared before it could be verified",
+                    path.display()
+                )))
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        AuthError::Internal(format!(
+            "could not verify JWT secret file {}",
+            path.display()
+        ))
+    }))
+}
+
+/// A unique, unpredictable temp path next to `path` (same directory, so install stays atomic).
+fn unique_secret_temp_path(path: &std::path::Path) -> PathBuf {
+    let mut suffix = [0u8; 8];
+    OsRng.fill_bytes(&mut suffix);
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "jwt-secret".to_string());
+    path.with_file_name(format!(
+        ".{name}.{}.{:016x}.tmp",
+        std::process::id(),
+        u64::from_le_bytes(suffix)
+    ))
+}
+
+/// Create `temp` exclusively (never following a planted symlink or hardlink) with owner-only
+/// permissions, write the key, and flush it to disk.
+fn write_secret_temp(temp: &std::path::Path, key: &[u8; 32]) -> AuthResult<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(temp).map_err(|error| {
+        AuthError::Internal(format!(
+            "could not create temporary JWT secret file {}: {error}",
+            temp.display()
+        ))
+    })?;
+    // `create_new` already refuses to follow a symlink; verify anyway so the guarantee is local.
+    let metadata = std::fs::symlink_metadata(temp).map_err(|error| {
+        AuthError::Internal(format!(
+            "could not inspect temporary JWT secret file {}: {error}",
+            temp.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(AuthError::Internal(format!(
+            "refusing to follow symlink at {}",
+            temp.display()
+        )));
+    }
+    use std::io::Write;
+    file.write_all(key).map_err(|error| {
+        AuthError::Internal(format!(
+            "could not write JWT secret file {}: {error}",
+            temp.display()
+        ))
+    })?;
+    // A swallowed fsync could leave an empty or partial secret after a crash.
+    file.sync_all().map_err(|error| {
+        AuthError::Internal(format!(
+            "could not flush JWT secret file {}: {error}",
+            temp.display()
+        ))
+    })?;
+    Ok(())
+}
+
+/// Best-effort parent directory fsync so the rename/link itself is durable.
+fn sync_parent_directory(path: &std::path::Path) {
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => std::path::Path::new("."),
+    };
+    // Directory fsync is unsupported on some platforms/filesystems (ENOTSUP, EINVAL on Windows);
+    // the file contents were already flushed above, so a failure here is not fatal.
+    if let Ok(dir) = std::fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
+}
+
+/// Install `key` at `path` without overwriting a secret another process already installed.
+fn install_secret(path: &std::path::Path, key: &[u8; 32]) -> AuthResult<()> {
+    let temp = unique_secret_temp_path(path);
+    let result = install_secret_inner(&temp, path, key);
+    if result.is_err() {
+        // Never leave a stray temp file (it holds secret material) behind on failure.
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+fn install_secret_inner(
+    temp: &std::path::Path,
+    path: &std::path::Path,
+    key: &[u8; 32],
+) -> AuthResult<()> {
+    write_secret_temp(temp, key)?;
+
+    // `hard_link` fails with `AlreadyExists` instead of replacing the destination, so exactly one
+    // racing process wins the install; the losers then adopt the winner's key on the re-read.
+    match std::fs::hard_link(temp, path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Another process won the race, unless what sits there is an empty leftover: that is
+            // not a usable secret, so replace it atomically instead of adopting it.
+            if matches!(std::fs::metadata(path).map(|meta| meta.len()), Ok(0)) {
+                std::fs::rename(temp, path).map_err(|error| {
+                    AuthError::Internal(format!(
+                        "could not repair JWT secret file {}: {error}",
+                        path.display()
+                    ))
+                })?;
+            }
+        }
+        Err(_) => {
+            // Filesystems without hard links: fall back to rename, which is atomic but may
+            // replace a concurrently installed secret. The verified re-read in `resolve` still
+            // guarantees this process returns a key that is actually on disk.
+            std::fs::rename(temp, path).map_err(|error| {
+                AuthError::Internal(format!(
+                    "could not install JWT secret file {}: {error}",
+                    path.display()
+                ))
+            })?;
+        }
+    }
+
+    // The installed file is the temp inode; drop the temp name (no-op error if rename moved it).
+    let _ = std::fs::remove_file(temp);
+    sync_parent_directory(path);
+    Ok(())
 }
 
 /// Authentication service configuration.
