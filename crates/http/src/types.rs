@@ -376,6 +376,34 @@ impl Request {
         self.access_log.as_ref()
     }
 
+    /// Publish the matched route's first handler module for Caddy's metrics `handler` label.
+    ///
+    /// Caddy wraps each compiled route with `metricsInstrumentedRoute` and labels the
+    /// `caddy_http_*` series with `caddy.GetModuleName(route.Handlers[0])`
+    /// (`modules/caddyhttp/routes.go:174,320-323`). caddy-rs records the observation at the
+    /// connection boundary after the router has consumed the request, so the router records the
+    /// first matched route's handler on the shared context and the server reads it when the
+    /// response completes. The first (outermost) match wins, mirroring the frame Caddy would
+    /// instrument at the top of the route tree; a no-op when no observation context is attached.
+    pub fn set_route_handler(&mut self, handler: &'static str) {
+        if let Some(context) = &self.access_log {
+            if context.route_handler().is_none() {
+                context.set_route_handler(handler);
+            }
+        }
+    }
+
+    /// Mark that a handler (or a matcher) returned an error for this request.
+    ///
+    /// Caddy increments `caddy_http_request_errors_total` when the handler chain returns an error
+    /// (`modules/caddyhttp/metrics.go:371-378`), regardless of the status code the error routes
+    /// later choose. The flag is a metrics input on the shared observation context.
+    pub fn mark_middleware_error(&self) {
+        if let Some(context) = &self.access_log {
+            context.mark_middleware_error();
+        }
+    }
+
     /// Record Caddy's `log_skip` request variable for the access logger.
     ///
     /// The generic `vars` handler calls this when it assigns `log_skip`; Caddy stores the value on

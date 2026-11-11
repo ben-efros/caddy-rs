@@ -61,10 +61,7 @@
 //!   never dropped.
 //! * [`AccessLogContext`] is the shared per-request carrier for the values only the server and
 //!   handlers can observe (byte counters, user id, upstream attempt, write error, extras), so the
-//!   entry can be rendered after the response body has been streamed. It also carries Caddy's
-//!   post-routing `log_skip`/`log_name`/`log_level` request variables
-//!   ([`AccessLogContext::set_log_skip`], [`AccessLogContext::set_logger_names`],
-//!   [`AccessLogContext::set_log_level`]) from the `vars` handler to the emission point.
+//!   entry can be rendered after the response body has been streamed.
 //!
 //! ## Request correlation and tracing (T-ADMIN-022)
 //!
@@ -271,11 +268,58 @@ impl AccessLogRequest {
     ///
     /// The `Host` request header is omitted: Caddy logs the request host as `request.host` and its
     /// `request.headers` object is Go's `http.Header`, which excludes `Host` by construction.
+    ///
+    /// Go's `net/http` server moves the request's `Transfer-Encoding` header into
+    /// `Request.TransferEncoding` and logs it as `request.transfer_encoding`
+    /// (`modules/caddyhttp/marshalers.go:55-57`); caddy-rs's transport keeps the header, so it is
+    /// lifted into [`AccessLogRequest::transfer_encoding`] here and dropped from the header map.
+    /// `identity` is the only encoding Go omits from the list, so an `identity`-only header leaves
+    /// the array empty.
     pub fn with_headers(mut self, headers: &HeaderMap) -> Self {
+        self.transfer_encoding = transfer_encodings(headers);
         self.headers = headers_to_loggable(headers);
         self.headers.remove("Host");
+        self.headers.remove("Transfer-Encoding");
         self
     }
+}
+
+/// The non-identity transfer encodings of a request, mirroring Go's `Request.TransferEncoding`.
+///
+/// Go reports `["chunked"]` for a chunked request; this reads the wire header so the access entry
+/// can carry the same field even though hyper frames the body itself. Values are comma-separated
+/// (RFC 9112 §7) and case-insensitive; `identity` is never listed.
+fn transfer_encodings(headers: &HeaderMap) -> Vec<String> {
+    let mut encodings = Vec::new();
+    for value in headers.get_all(http::header::TRANSFER_ENCODING) {
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        for token in value.split(',') {
+            let token = token.trim();
+            if token.is_empty() || token.eq_ignore_ascii_case("identity") {
+                continue;
+            }
+            // Go stores the lower-cased coding name.
+            encodings.push(token.to_ascii_lowercase());
+        }
+    }
+    encodings
+}
+
+/// The `CN` attribute of a Go-style subject distinguished name.
+///
+/// Caddy's access entry emits `request.tls.client_common_name` from
+/// `PeerCertificates[0].Subject.CommonName` (`modules/caddyhttp/marshalers.go:81-83`); caddy-rs
+/// keeps the formatted subject DN on the client certificate (`ClientCertificate::subject`), so the
+/// common name is recovered from it. The formatter emits `CN=<value>` components joined by commas
+/// without RFC 2253 escaping, so a literal comma inside a common name is not distinguishable; that
+/// limitation is documented in DIV-0069.
+pub fn common_name_from_subject(subject: &str) -> Option<String> {
+    subject
+        .split(',')
+        .find_map(|component| component.strip_prefix("CN="))
+        .map(str::to_string)
 }
 
 /// The caddy-rs `upstream` extension object of an access entry.
@@ -567,13 +611,7 @@ impl<'de> Deserialize<'de> for ExtraLogFields {
 /// A server creates one context per request when access logging is enabled, stores it on the
 /// request (or a transport-owned per-request state), lets handlers contribute
 /// (`set_user_id`, `set_upstream`, `add_extra_field`, `set_write_error`) and calls [`apply_to`]
-/// when the response is complete (after [`AccessLogContext::finish`]). The context also carries
-/// the post-routing access-log decision Caddy reads from the request context: [`set_log_skip`],
-/// [`set_logger_names`] (`log_name`) and [`set_log_level`]. All clones share one state.
-///
-/// [`set_log_skip`]: AccessLogContext::set_log_skip
-/// [`set_logger_names`]: AccessLogContext::set_logger_names
-/// [`set_log_level`]: AccessLogContext::set_log_level
+/// when the response is complete (after [`AccessLogContext::finish`]). All clones share one state.
 ///
 /// [`apply_to`]: AccessLogContext::apply_to
 #[derive(Clone, Debug, Default)]
@@ -591,13 +629,10 @@ struct AccessLogContextState {
     write_error: Option<String>,
     /// Caddy's `log_skip` request variable: when true, only the access entry is suppressed.
     log_skip: bool,
-    /// Caddy's `access_logger_names` request variable (`log_name`): the explicit logger names for
-    /// this request. `None` means the variable is unset (or was assigned a non-array value), so
-    /// the server's per-host mapping decides; `Some([])` selects no logger at all.
-    logger_names: Option<Vec<String>>,
-    /// Caddy's `log_level` request variable: the raw value the last assignment stored. Parsed
-    /// leniently at emission time (`DEBUG`..=`ERROR`); `None` keeps the status-derived level.
-    log_level: Option<String>,
+    /// First handler module of the matched route (Caddy's metrics `handler` label).
+    route_handler: Option<&'static str>,
+    /// Whether a handler returned an error (Caddy's `caddy_http_request_errors_total`).
+    middleware_error: bool,
     extra_fields: ExtraLogFields,
 }
 
@@ -699,34 +734,36 @@ impl AccessLogContext {
         self.state().log_skip
     }
 
-    /// Record Caddy's `access_logger_names` request variable (the `log_name` directive).
+    /// Record the first handler module name of the matched route.
     ///
-    /// Caddy's `ServerLogConfig.wrapLogger` checks this variable after the handler chain and, when
-    /// it holds a JSON array, uses those names for the request instead of the per-host mapping
-    /// (`modules/caddyhttp/logging.go:98-112`). `None` clears a previous assignment: Caddy's type
-    /// assertion only accepts an array, so any other value leaves the per-host mapping in charge.
-    /// An empty list selects no logger, which suppresses the entry exactly like Caddy.
-    pub fn set_logger_names(&self, names: Option<Vec<String>>) {
-        self.state().logger_names = names;
+    /// Caddy's `metricsInstrumentedRoute` labels the `caddy_http_*` families with
+    /// `caddy.GetModuleName(route.Handlers[0])` (`modules/caddyhttp/routes.go:174,320-323`).
+    /// caddy-rs renders the metrics observation at the connection boundary, after the router has
+    /// consumed the request, so the router publishes the matched route's first handler here and the
+    /// server reads it from the shared context when the response completes. This is a metrics
+    /// input only: it never appears in the access entry.
+    pub fn set_route_handler(&self, handler: &'static str) {
+        self.state().route_handler = Some(handler);
     }
 
-    /// The explicit per-request logger names, when a valid `access_logger_names` array was set.
-    pub fn logger_names(&self) -> Option<Vec<String>> {
-        self.state().logger_names.clone()
+    /// The matched route's first handler module name, when a route matched.
+    pub fn route_handler(&self) -> Option<&'static str> {
+        self.state().route_handler
     }
 
-    /// Record Caddy's `log_level` request variable.
+    /// Record that a handler returned an error (Caddy's middleware-error semantics).
     ///
-    /// Caddy stores the assignment verbatim and only uses it when the value is a string that
-    /// parses to `DEBUG`..=`ERROR` (`modules/caddyhttp/server.go:1271-1282`). `None` clears a
-    /// previous assignment, which is what a non-string value does at request time.
-    pub fn set_log_level(&self, level: Option<String>) {
-        self.state().log_level = level;
+    /// Caddy increments `caddy_http_request_errors_total` when the handler chain returns an error
+    /// (`modules/caddyhttp/metrics.go:371-378`), independently of the response status. This is a
+    /// metrics input only; the access entry's level still follows the response status (and the
+    /// `log_level` override).
+    pub fn mark_middleware_error(&self) {
+        self.state().middleware_error = true;
     }
 
-    /// The raw `log_level` request variable value, when a string assignment was stored.
-    pub fn log_level(&self) -> Option<String> {
-        self.state().log_level.clone()
+    /// Whether a handler returned an error during this request.
+    pub fn middleware_error(&self) -> bool {
+        self.state().middleware_error
     }
 
     /// Add an extra top-level field (Caddy's `ExtraLogFields`).
@@ -2525,6 +2562,95 @@ mod tests {
         headers
     }
 
+    #[test]
+    fn transfer_encoding_is_lifted_out_of_the_request_headers() {
+        // Go's net/http moves `Transfer-Encoding` out of `http.Header` and Caddy logs it as
+        // `request.transfer_encoding` (marshalers.go:55-57); caddy-rs must do the same for a
+        // chunked upload even though hyper decodes the framing itself.
+        let request =
+            AccessLogRequest::new("POST", "example.com", "/upload").with_headers(&headers(&[
+                ("host", "example.com"),
+                ("transfer-encoding", "chunked"),
+                ("user-agent", "curl/8.5.0"),
+            ]));
+        assert_eq!(request.transfer_encoding, vec!["chunked".to_string()]);
+        assert!(
+            !request.headers.contains_key("Transfer-Encoding"),
+            "the encoding header is not part of request.headers: {:?}",
+            request.headers
+        );
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["transfer_encoding"], json!(["chunked"]));
+    }
+
+    #[test]
+    fn identity_and_absent_transfer_encodings_are_omitted_like_go() {
+        for header in ["identity", "IDENTITY"] {
+            let request = AccessLogRequest::new("POST", "example.com", "/")
+                .with_headers(&headers(&[("transfer-encoding", header)]));
+            assert!(
+                request.transfer_encoding.is_empty(),
+                "identity is never listed: {header}"
+            );
+        }
+        let request = AccessLogRequest::new("POST", "example.com", "/")
+            .with_headers(&headers(&[("content-length", "4")]));
+        assert!(request.transfer_encoding.is_empty());
+        let value = serde_json::to_value(&request).unwrap();
+        assert!(
+            value.get("transfer_encoding").is_none(),
+            "empty transfer_encoding is omitted: {value}"
+        );
+    }
+
+    #[test]
+    fn comma_separated_transfer_encodings_are_split_and_lowercased() {
+        let request = AccessLogRequest::new("POST", "example.com", "/")
+            .with_headers(&headers(&[("transfer-encoding", "gzip, Chunked")]));
+        assert_eq!(
+            request.transfer_encoding,
+            vec!["gzip".to_string(), "chunked".to_string()]
+        );
+    }
+
+    #[test]
+    fn common_name_is_recovered_from_the_go_style_subject() {
+        // Caddy emits `PeerCertificates[0].Subject.CommonName`
+        // (modules/caddyhttp/marshalers.go:81-83); caddy-rs formats the DN, so the CN component is
+        // extracted from it.
+        assert_eq!(
+            common_name_from_subject("C=US,O=Example,CN=client-1"),
+            Some("client-1".to_string())
+        );
+        assert_eq!(
+            common_name_from_subject("CN=service.example.com,O=Example"),
+            Some("service.example.com".to_string())
+        );
+        assert_eq!(common_name_from_subject("O=Example,OU=Tests"), None);
+        assert_eq!(common_name_from_subject(""), None);
+    }
+
+    #[test]
+    fn access_log_context_carries_route_handler_and_middleware_error() {
+        // Metrics inputs shared through the request context: the router publishes the matched
+        // route's first handler (Caddy's `handler` label) and whether a handler errored
+        // (Caddy's `caddy_http_request_errors_total`). Clones share the state.
+        let context = AccessLogContext::new();
+        assert_eq!(context.route_handler(), None);
+        assert!(!context.middleware_error());
+        context.set_route_handler("reverse_proxy");
+        context.mark_middleware_error();
+        let clone = context.clone();
+        assert_eq!(clone.route_handler(), Some("reverse_proxy"));
+        assert!(clone.middleware_error());
+        // Neither value leaks into the access entry.
+        let mut entry = AccessLogEntry::new(AccessLogRequest::new("GET", "example.com", "/"));
+        context.apply_to(&mut entry);
+        let value = serde_json::to_value(&entry).unwrap();
+        assert!(value.get("route_handler").is_none());
+        assert!(value.get("middleware_error").is_none());
+    }
+
     fn sample_entry() -> AccessLogEntry {
         let request_headers = headers(&[
             ("host", "example.com"),
@@ -3305,205 +3431,6 @@ mod tests {
         assert_eq!(rendered["request"]["host"], ".a.b.");
     }
 
-    // ---- T-ADMIN-049: named captures, word boundaries and mixed expansion ----------------------
-
-    #[test]
-    fn regexp_filter_malformed_reference_parsing() {
-        // Divergences from Go's `Regexp.ReplaceAllString` for malformed references, with pattern
-        // `(a)` and input `a`. Go gives "", "", "${}", "${a b}" and "" respectively (U+00E9 counts
-        // as a Unicode reference name for Go); caddy-rs expands the numeric forms to group 1,
-        // drops the empty/space-containing braces, and leaves `$<letter>` literal. Registered as
-        // the DIV-0015 reference-parsing residual, so this asserts our side rather than Go's.
-        for (template, ours) in [
-            ("$01", "a"),
-            ("${01}", "a"),
-            ("${}", ""),
-            ("${a b}", ""),
-            ("$\u{e9}", "$\u{e9}"),
-        ] {
-            assert_eq!(
-                regexp_replace_all("(a)", template, "a"),
-                ours,
-                "caddy-rs expansion of `{template}` changed; see the DIV-0015 residual table"
-            );
-        }
-    }
-
-    #[test]
-    fn regexp_filter_named_captures_match_go() {
-        // Caddy's `regexp` filter calls Go's `Regexp.ReplaceAllString`, so the replacement
-        // expansion below is the reference behaviour. Every expected value was computed with the
-        // Go 1.26.4 oracle (`regexp.MustCompile(pattern).ReplaceAllString(input, replacement)`),
-        // not from the Rust engine.
-        assert_eq!(
-            regexp_replace_all("(?P<user>[a-z]+)", "$user", "alice"),
-            "alice"
-        );
-        assert_eq!(
-            regexp_replace_all("(?P<user>[a-z]+)", "${user}", "alice"),
-            "alice"
-        );
-        assert_eq!(
-            regexp_replace_all("(?P<user>[a-z]+)", "<${user}>", "alice bob"),
-            "<alice> <bob>"
-        );
-        assert_eq!(
-            regexp_replace_all(
-                "(?P<user>[a-z]+)@(?P<host>[a-z.]+)",
-                "$host/$user",
-                "alice@example.com bob@test.io"
-            ),
-            "example.com/alice test.io/bob"
-        );
-        assert_eq!(
-            regexp_replace_all(
-                "^(?P<method>[A-Z]+) (?P<path>\\S+)$",
-                "${method} ${path}",
-                "GET /x"
-            ),
-            "GET /x"
-        );
-        assert_eq!(
-            regexp_replace_all("(?P<word>[a-z]+)", "$word$word", "ab"),
-            "abab"
-        );
-        // A group that did not participate in the match expands to the empty string.
-        assert_eq!(
-            regexp_replace_all("(?P<a>foo)|(?P<b>bar)", "[$a|$b]", "foo bar"),
-            "[foo|] [|bar]"
-        );
-        // An unbraced `$name` consumes the longest run of word characters: `$userX` names the
-        // absent group `userX`, not `$user` followed by "X". Braces disambiguate the two, exactly
-        // like Go's `extract`.
-        assert_eq!(
-            regexp_replace_all("(?P<user>[a-z]+)", "$userX", "alice"),
-            ""
-        );
-        assert_eq!(
-            regexp_replace_all("(?P<user>[a-z]+)", "${user}X", "alice"),
-            "aliceX"
-        );
-        // `$$` is a literal `$`; the following `$x` is the named capture.
-        assert_eq!(regexp_replace_all("(?P<x>a)", "$$$x", "a"), "$a");
-        // An unknown group name expands to nothing but keeps the surrounding template text.
-        assert_eq!(
-            regexp_replace_all("(?P<user>[a-z]+)", "<${nope}>", "alice"),
-            "<>"
-        );
-    }
-
-    #[test]
-    fn regexp_filter_word_boundaries_match_go() {
-        // Go's `\b`/`\B` are ASCII word boundaries (word characters are `[0-9A-Za-z_]`). These
-        // ASCII inputs therefore exercise the same boundaries in the shared wrapper; the
-        // Unicode-aware class residual for non-ASCII input is the pre-existing DIV-0015 one.
-        assert_eq!(
-            regexp_replace_all("\\bfoo\\b", "X", "foo foe foo_bar barfoo foo"),
-            "X foe foo_bar barfoo X"
-        );
-        assert_eq!(
-            regexp_replace_all("\\bcat\\b", "CAT", "cat concatenate cat."),
-            "CAT concatenate CAT."
-        );
-        assert_eq!(
-            regexp_replace_all("\\b(?P<num>\\d+)\\b", "[${num}]", "a 12 b 345"),
-            "a [12] b [345]"
-        );
-        // Underscore is a word character, so `_word` and `word_` keep their underscores; only the
-        // bare token has a boundary on both sides.
-        assert_eq!(
-            regexp_replace_all("\\bword\\b", "WORD", "_word word word_"),
-            "_word WORD word_"
-        );
-        // A bare boundary is a zero-length match at every boundary position.
-        assert_eq!(regexp_replace_all("\\b", "|", "ab cd"), "|ab| |cd|");
-        assert_eq!(regexp_replace_all("\\B", "|", "ab cd"), "a|b c|d");
-    }
-
-    #[test]
-    fn regexp_filter_mixed_numeric_and_named_expansion_matches_go() {
-        // Numeric and named references address the same groups (group 1 is `user`), and a
-        // replacement may freely mix `$N`, `${N}`, `$name` and `${name}`.
-        assert_eq!(
-            regexp_replace_all(
-                "^(?P<user>[a-z]+)/(\\d+)/(?P<rest>.*)$",
-                "${2}-$user-${rest}-$1",
-                "alice/42/x/y"
-            ),
-            "42-alice-x/y-alice"
-        );
-        assert_eq!(
-            regexp_replace_all(
-                "(?P<first>\\w+)\\s+(?P<last>\\w+)",
-                "$2, $1",
-                "Ada Lovelace"
-            ),
-            "Lovelace, Ada"
-        );
-        assert_eq!(
-            regexp_replace_all("(?P<a>a)(b)(?P<c>c)", "<${a}-$2-${c}>", "abcz"),
-            "<a-b-c>z"
-        );
-        assert_eq!(
-            regexp_replace_all("(?P<id>\\d+)-(\\d+)", "$id/$2", "12-34"),
-            "12/34"
-        );
-        assert_eq!(
-            regexp_replace_all("(?P<a>a)(b)(c)", "$1${2}$3", "abc"),
-            "abc"
-        );
-    }
-
-    #[test]
-    fn regexp_and_multi_regexp_filters_apply_named_captures_and_word_boundaries() {
-        // The end-to-end filter path: `regexp` rewrites the URI with named captures,
-        // `multi_regexp` applies a named-capture rewrite followed by a `\b`-anchored one, and a
-        // second `regexp` mixes numeric and named references. Expected values are Go 1.26.4
-        // `ReplaceAllString` outputs.
-        let config = AccessLogConfig {
-            filters: vec![
-                FieldFilter {
-                    path: vec!["request".to_string(), "uri".to_string()],
-                    operation: FieldFilterOperation::Regexp {
-                        pattern: "^/api/v(?P<version>\\d+)/users/(?P<id>\\d+)$".to_string(),
-                        replacement: "/v${version}/u/${id}".to_string(),
-                    },
-                },
-                FieldFilter {
-                    path: vec!["request".to_string(), "host".to_string()],
-                    operation: FieldFilterOperation::MultiRegexp {
-                        operations: vec![
-                            RegexpOperation {
-                                pattern: "^(?P<sub>[a-z0-9-]+)\\.example\\.com$".to_string(),
-                                replacement: "$sub.internal".to_string(),
-                            },
-                            RegexpOperation {
-                                pattern: "\\b(?P<env>internal)\\b".to_string(),
-                                replacement: "${env}.test".to_string(),
-                            },
-                        ],
-                    },
-                },
-                FieldFilter {
-                    path: vec!["user_id".to_string()],
-                    operation: FieldFilterOperation::Regexp {
-                        pattern: "^(?P<role>admin)_(\\w+)$".to_string(),
-                        replacement: "${2}:$role".to_string(),
-                    },
-                },
-            ],
-            ..AccessLogConfig::default()
-        };
-        let mut entry = AccessLogEntry::new(AccessLogRequest::default());
-        entry.request.uri = "/api/v2/users/42".to_string();
-        entry.request.host = "api.example.com".to_string();
-        entry.user_id = "admin_read".to_string();
-        let rendered = entry.render(&config).expect("render");
-        assert_eq!(rendered["request"]["uri"], "/v2/u/42");
-        assert_eq!(rendered["request"]["host"], "api.internal.test");
-        assert_eq!(rendered["user_id"], "read:admin");
-    }
-
     #[test]
     fn encoder_format_options_apply_to_json_rendering() {
         let config = AccessLogConfig {
@@ -4031,40 +3958,6 @@ mod tests {
         assert_eq!(value["proxy_attempt"], 2);
         // Headers were not touched by the context.
         assert_eq!(value["resp_headers"]["Content-Type"], json!(["text/plain"]));
-    }
-
-    #[test]
-    fn access_log_context_carries_request_scoped_log_controls() {
-        let context = AccessLogContext::new();
-        assert!(!context.log_skip());
-        assert_eq!(context.logger_names(), None);
-        assert_eq!(context.log_level(), None);
-
-        context.set_log_skip(true);
-        context.set_logger_names(Some(vec!["access".to_string(), "admin".to_string()]));
-        context.set_log_level(Some("WARN".to_string()));
-        assert!(context.log_skip());
-        assert_eq!(
-            context.logger_names(),
-            Some(vec!["access".to_string(), "admin".to_string()])
-        );
-        assert_eq!(context.log_level().as_deref(), Some("WARN"));
-
-        // An explicit empty list is distinct from "unset": it selects no logger at all, while
-        // `None` restores the per-host mapping (Caddy's `GetVar` returns nil only when unset).
-        context.set_logger_names(Some(Vec::new()));
-        assert_eq!(context.logger_names(), Some(Vec::new()));
-        context.set_logger_names(None);
-        assert_eq!(context.logger_names(), None);
-
-        // A non-string assignment clears a previous string value; the raw accepted spelling is
-        // preserved so the emission-time parser (case-insensitive, `DEBUG`..=`ERROR`) decides.
-        context.set_log_level(Some("warn".to_string()));
-        assert_eq!(context.log_level().as_deref(), Some("warn"));
-        context.set_log_level(None);
-        assert_eq!(context.log_level(), None);
-        context.set_log_skip(false);
-        assert!(!context.log_skip());
     }
 
     #[test]

@@ -419,6 +419,34 @@ impl UpstreamStatusSink {
         merged.into_values().collect()
     }
 
+    /// Live health of every configured upstream across this generation's proxy handlers.
+    ///
+    /// Mirrors Caddy's `metricsUpstreamsHealthyUpdater`: it iterates each handler's configured
+    /// `Upstreams` (dynamic discovery hosts are excluded) and reports one boolean per dial
+    /// address. Duplicate dials across handlers are merged with AND so the gauge is deterministic;
+    /// a generation with no handlers yields an empty list (the family is absent).
+    pub fn upstream_health(&self) -> Vec<(String, bool)> {
+        let mut handlers = self
+            .handlers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        handlers.retain(|handler| handler.strong_count() > 0);
+        let mut merged: std::collections::BTreeMap<String, bool> =
+            std::collections::BTreeMap::new();
+        for handler in handlers.iter() {
+            let Some(handler) = handler.upgrade() else {
+                continue;
+            };
+            for (dial, healthy) in handler.static_upstream_health() {
+                merged
+                    .entry(dial)
+                    .and_modify(|current| *current &= healthy)
+                    .or_insert(healthy);
+            }
+        }
+        merged.into_iter().collect()
+    }
+
     /// Spawn the active-health-check schedulers for every live handler built for this generation.
     ///
     /// The server runtime owns the returned schedulers and shuts them down when the generation is
@@ -1011,6 +1039,19 @@ impl ReverseProxyHandler {
             }
         }
         statuses
+    }
+
+    /// Live health of the *configured* upstreams, as `(dial address, healthy)`.
+    ///
+    /// Feeds `caddy_reverse_proxy_upstreams_healthy` (`modules/caddyhttp/reverseproxy/metrics.go`):
+    /// Caddy's updater iterates `handler.Upstreams`, so dynamic discovery hosts are not included.
+    /// Health is whatever the active/passive health machinery currently reports; a fresh upstream
+    /// starts healthy.
+    pub fn static_upstream_health(&self) -> Vec<(String, bool)> {
+        self.upstreams
+            .iter()
+            .map(|upstream| (upstream.dial.clone(), upstream.is_healthy()))
+            .collect()
     }
 
     /// Replace the configured dynamic upstream source (embedders/tests; Caddy's

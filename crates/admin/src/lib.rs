@@ -188,9 +188,9 @@ use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use serde_json::{json, Value};
 
 pub use access_log::{
-    AccessLogConfig, AccessLogEntry, AccessLogError, AccessLogField, AccessLogRequest,
-    AccessLogSampler, AccessLogTls, AccessLogUpstream, HeaderRedaction, HeaderTarget, LogLevel,
-    RedactionPolicy, SamplingConfig, ACCESS_LOG_LOGGER,
+    common_name_from_subject, AccessLogConfig, AccessLogEntry, AccessLogError, AccessLogField,
+    AccessLogRequest, AccessLogSampler, AccessLogTls, AccessLogUpstream, HeaderRedaction,
+    HeaderTarget, LogLevel, RedactionPolicy, SamplingConfig, ACCESS_LOG_LOGGER,
 };
 pub use inventory::{
     InventoryAdminListener, InventoryCertificate, InventoryHealthChecks, InventoryListener,
@@ -200,8 +200,8 @@ pub use logging_config::{
     AccessLogTarget, BuiltAccessLogSink, LoggingConfig, LoggingConfigError, LOGGING_TRACKING_ID,
 };
 pub use metrics::{
-    HttpMetrics, MetricsError, MetricsRegistry, ProxyObservation, RequestObservation,
-    METRICS_CONTENT_TYPE,
+    approximate_request_size, sanitize_method, sanitize_status_code, HttpMetrics, MetricsError,
+    MetricsRegistry, ProxyObservation, RequestObservation, METRICS_CONTENT_TYPE,
 };
 pub use metrics_config::{
     HttpMetricsConfig, MetricsConfigError, MetricsHandlerConfig, HTTP_METRICS_CONFIG_PATH,
@@ -423,6 +423,17 @@ pub struct UpstreamStatus {
 pub trait UpstreamStatusSource: Send + Sync + std::fmt::Debug {
     /// Current per-address counters (configured addresses should be included even at zero).
     fn upstream_status(&self) -> Vec<UpstreamStatus>;
+
+    /// Current health of each configured upstream, as `(dial address, healthy)`.
+    ///
+    /// Feeds Caddy's `caddy_reverse_proxy_upstreams_healthy` gauge
+    /// (`modules/caddyhttp/reverseproxy/metrics.go:88-98`). Only *configured* upstreams are
+    /// reported: Caddy iterates `handler.Upstreams` for this metric, while the admin status
+    /// endpoint additionally reports dynamic hosts. Sources without health information return the
+    /// default empty list, so the family is not registered.
+    fn upstream_health(&self) -> Vec<(String, bool)> {
+        Vec::new()
+    }
 }
 
 /// 64-bit xxHash (seed 0), the algorithm Caddy uses for config ETags (`admin.go: etagHasher`).
@@ -950,6 +961,10 @@ impl AdminApi {
                 if method != "GET" && method != "OPTIONS" {
                     return AdminResponse::empty(StatusCode::METHOD_NOT_ALLOWED);
                 }
+                // Caddy's reverse-proxy health updater refreshes the gauge every 10 seconds; the
+                // scrape-time refresh observes the same live values (and picks up a generation
+                // swap immediately) without a background task.
+                self.refresh_reverse_proxy_health_metrics();
                 let mut response = AdminResponse::text(StatusCode::OK, self.metrics.render());
                 response.headers.insert(
                     http::header::CONTENT_TYPE,
@@ -1275,6 +1290,28 @@ impl AdminApi {
     fn generation_config_hash(&self, generation: &Generation) -> Option<String> {
         let bytes = generation.config().to_vec().ok()?;
         Some(format!("{:016x}", xxh64(&bytes)))
+    }
+
+    /// Refresh `caddy_reverse_proxy_upstreams_healthy` from the registered upstream source.
+    ///
+    /// Caddy registers one `caddy_reverse_proxy_upstreams_healthy{upstream="<dial>"}` gauge per
+    /// configured reverse-proxy upstream when the handler is provisioned and resets/sets it every
+    /// 10 seconds (`modules/caddyhttp/reverseproxy/metrics.go`). caddy-rs refreshes it when
+    /// `/metrics` is scraped, which exposes the same current values and drops the series of a
+    /// retired generation; a source that reports no health data leaves the family absent.
+    fn refresh_reverse_proxy_health_metrics(&self) {
+        let Some(source) = &self.upstream_status_source else {
+            return;
+        };
+        let health = source.upstream_health();
+        let metrics = HttpMetrics::new(self.metrics.clone());
+        if let Err(error) = metrics.reverse_proxy_upstreams_healthy(
+            health
+                .iter()
+                .map(|(address, healthy)| (address.as_str(), *healthy)),
+        ) {
+            eprintln!("caddy-rs: cannot record reverse-proxy upstream health: {error}");
+        }
     }
 
     /// `GET /reverse_proxy/upstreams`: Caddy's upstream-status shape for the proxy pools.
