@@ -1121,12 +1121,44 @@ fn malformed_secret_file_is_rejected() {
     let dir = std::env::temp_dir().join(format!("caddy-rs-jwt-bad-{:?}", UserId::new()));
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let path = dir.join("jwt.key");
-    std::fs::write(&path, b"too short").expect("write malformed secret");
 
-    assert!(matches!(
-        JwtSecretSource::File(path.clone()).resolve(),
-        Err(AuthError::Internal(_))
-    ));
+    // Policy: a non-empty file of any other length fails closed permanently; it is never repaired
+    // or truncated (only a zero-byte file is). The error must name the path, the observed length,
+    // and the operator's two options.
+    for found in [1usize, 7, 31, 33, 64] {
+        std::fs::write(&path, vec![0xABu8; found]).expect("write malformed secret");
+
+        for attempt in 0..2 {
+            let err = JwtSecretSource::File(path.clone())
+                .resolve()
+                .expect_err("a malformed secret file must fail closed");
+            match err {
+                AuthError::Internal(message) => {
+                    assert!(
+                        message.contains(&path.display().to_string()),
+                        "the error must name the path (attempt {attempt}): {message}"
+                    );
+                    assert!(
+                        message.contains(&format!("found {found}")),
+                        "the error must report the observed length (attempt {attempt}): {message}"
+                    );
+                    assert!(
+                        message.contains("delete the file") && message.contains("master secret"),
+                        "the error must state the remediation (attempt {attempt}): {message}"
+                    );
+                }
+                other => panic!("expected AuthError::Internal, got {other:?}"),
+            }
+        }
+
+        // Fail closed means the operator's file is left exactly as it was, not truncated or
+        // replaced by a generated secret.
+        assert_eq!(
+            std::fs::read(&path).expect("secret file still present"),
+            vec![0xABu8; found],
+            "a malformed secret file must not be repaired"
+        );
+    }
 
     std::fs::remove_dir_all(&dir).ok();
 }

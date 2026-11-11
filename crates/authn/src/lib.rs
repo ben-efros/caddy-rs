@@ -12,6 +12,19 @@
 //! The crate deliberately has no dependency on the process-manager (`pm-*`) crates. A persistent
 //! store can implement [`UserStore`] without pulling process-manager state into the authentication
 //! boundary.
+//!
+//! # JWT signing secret file
+//!
+//! [`JwtSecretSource::File`] keeps the signing key in a file so existing sessions survive a
+//! restart. The file is created owner-only (`0600`) on first start, must be a regular file (a
+//! symlink at the final path is refused), and must contain exactly 32 bytes.
+//!
+//! Only a **zero-byte** file is repaired: it is an unusable leftover from a crash between create
+//! and write, so it is replaced by a fresh random secret. A non-empty file of any other length is
+//! never repaired, truncated or overwritten — the service fails closed with an error that names
+//! the path and the observed length. The operator must then either delete the file (a new secret
+//! is generated on the next start, which invalidates existing sessions) or configure a master
+//! secret.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -713,6 +726,11 @@ pub enum JwtSecretSource {
     ///
     /// The final path component must be a regular file: a symlink there is refused, so the signing
     /// key cannot be redirected to a file an attacker controls.
+    ///
+    /// An existing file must contain exactly 32 bytes. Only a zero-byte file is repaired (it is a
+    /// crash leftover, replaced by a fresh secret); any other non-empty length fails closed with an
+    /// error naming the path and the observed length, and the operator must delete the file or
+    /// configure a master secret.
     File(PathBuf),
     /// Generate fresh on each start (legacy behavior, **NOT recommended**).
     Ephemeral,
@@ -804,7 +822,8 @@ fn read_secret_file(path: &std::path::Path) -> AuthResult<Option<[u8; 32]>> {
         // valid secret: treat it as absent so the next start repairs it instead of hard-failing.
         0 => Ok(None),
         found => Err(AuthError::Internal(format!(
-            "JWT secret file {} must contain exactly 32 bytes, found {found}",
+            "JWT secret file {} must contain exactly 32 bytes, found {found}; delete the file to \
+             have a new secret generated, or configure a master secret",
             path.display()
         ))),
     }
