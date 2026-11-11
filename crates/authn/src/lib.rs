@@ -1297,6 +1297,22 @@ fn system_time_to_ts(t: SystemTime) -> AuthResult<i64> {
         .map_err(|_| AuthError::Internal("system clock is out of range".to_string()))
 }
 
+/// Compute an expiry timestamp from an issue time and a configured token TTL.
+///
+/// The TTL is configuration input, so a value that does not fit in an `i64` second count, or that
+/// pushes the expiry past the representable range, must fail closed with an actionable error
+/// instead of panicking in a debug build or silently wrapping into the past in a release build.
+fn expiry_after(now: i64, ttl: Duration) -> AuthResult<i64> {
+    let ttl_seconds = i64::try_from(ttl.as_secs()).map_err(|_| {
+        AuthError::Internal(format!(
+            "token TTL of {} seconds is too large",
+            ttl.as_secs()
+        ))
+    })?;
+    now.checked_add(ttl_seconds)
+        .ok_or_else(|| AuthError::Internal("token TTL overflows the expiry timestamp".to_string()))
+}
+
 /// Current TOTP time step.
 fn now_step() -> AuthResult<u64> {
     let now = u64::try_from(now_ts()?)
@@ -1318,6 +1334,8 @@ fn hash_refresh_token(token: &str) -> String {
 
 /// Generate a TOTP code for a time step.
 fn totp_code(secret: &[u8], step: u64) -> String {
+    // INFEASIBLE: every caller derives `step` from `now_step()`, which is at most
+    // `i64::MAX / TOTP_STEP_SECONDS`, so `step * TOTP_STEP_SECONDS` cannot overflow.
     totp_custom::<Sha1>(
         TOTP_STEP_SECONDS,
         TOTP_DIGITS,
@@ -1576,6 +1594,9 @@ impl<S: UserStore> AuthnService<S> {
             .ok_or_else(|| AuthError::Internal("invalid base32 TOTP secret".to_string()))?;
 
         let current = self.current_step()?;
+        // INFEASIBLE: `current` comes from `now_step()`, which is at most
+        // `i64::MAX / TOTP_STEP_SECONDS`, so the `current + 1` steps below cannot overflow, and
+        // `current - 1` is guarded by `current > 0`.
         let mut steps = vec![current];
         match self.config.totp_window {
             TotpWindow::Current => {}
@@ -1744,6 +1765,10 @@ impl<S: UserStore> AuthnService<S> {
     /// Issue a new access/refresh token pair for a user.
     async fn issue_token_pair(&self, user: &User) -> AuthResult<TokenPair> {
         let now = now_ts()?;
+        // Configured TTLs are external input: compute both expiries before issuing anything so a
+        // nonsensical TTL fails closed instead of panicking or wrapping.
+        let access_exp = expiry_after(now, self.config.access_ttl)?;
+        let refresh_expires_at = expiry_after(now, self.config.refresh_ttl)?;
         let claims = Claims {
             sub: user.id,
             role: user.role.name.clone(),
@@ -1751,7 +1776,7 @@ impl<S: UserStore> AuthnService<S> {
             vis: user.role.visibility,
             epoch: user.auth_epoch,
             iat: now,
-            exp: now + self.config.access_ttl.as_secs() as i64,
+            exp: access_exp,
             iss: self.config.issuer.clone(),
             aud: self.config.audience.clone(),
         };
@@ -1767,7 +1792,7 @@ impl<S: UserStore> AuthnService<S> {
             token_hash,
             user_id: user.id,
             iat: now,
-            expires_at: now + self.config.refresh_ttl.as_secs() as i64,
+            expires_at: refresh_expires_at,
             revoked_at: None,
             token_id: generate_token_id(),
         };

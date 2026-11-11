@@ -889,6 +889,39 @@ fn each_auth_entry_point_propagates_clock_error() {
 }
 
 #[tokio::test]
+async fn oversized_token_ttls_fail_closed_instead_of_overflowing() {
+    // A TTL that does not fit in an `i64` second count used to be truncated by `as i64` (a silent
+    // wrap into the past) and a TTL that overflows the expiry addition panicked in debug builds.
+    // Both must be reported as errors and must not issue a token pair.
+    for (access_ttl, refresh_ttl) in [
+        (Duration::from_secs(u64::MAX), Duration::from_secs(60)),
+        (Duration::from_secs(60), Duration::from_secs(u64::MAX)),
+        (
+            Duration::from_secs(i64::MAX as u64),
+            Duration::from_secs(60),
+        ),
+    ] {
+        let mut config = test_config();
+        config.access_ttl = access_ttl;
+        config.refresh_ttl = refresh_ttl;
+        let service = AuthnService::new(MemoryUserStore::new(), config).expect("build service");
+        service
+            .create_user("alice", "password", Role::viewer())
+            .await
+            .unwrap();
+
+        let err = service
+            .login("alice", "password", None)
+            .await
+            .expect_err("an oversized TTL must not issue tokens");
+        assert!(
+            matches!(&err, AuthError::Internal(message) if message.contains("TTL")),
+            "unexpected error: {err:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn current_window_rejects_previous_step() {
     let service = AuthnService::new(MemoryUserStore::new(), test_config())
         .expect("build service")
