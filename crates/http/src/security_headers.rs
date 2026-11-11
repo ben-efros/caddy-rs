@@ -25,6 +25,21 @@
 //! * `Permissions-Policy` — [`SecurityHeadersConfig::permissions_policy`]. Feature policy is
 //!   site-specific, so it is only emitted when configured.
 //!
+//! # HSTS preload requirements
+//!
+//! The `preload` directive is a commitment that is hard to undo, and the HSTS preload list only
+//! accepts a site that sends all of the following (see <https://hstspreload.org>):
+//!
+//! * a `max-age` of at least one year — [`HSTS_PRELOAD_MIN_MAX_AGE`] seconds (`31536000`);
+//! * the `includeSubDomains` directive;
+//! * a domain that has been submitted to and accepted by the preload list.
+//!
+//! [`SecurityHeadersConfig::validate`] rejects the structurally invalid combinations (a too-small
+//! `max-age`, or `preload` without `includeSubDomains`). The remaining admission requirements are
+//! reported by [`SecurityHeadersConfig::warnings`] instead of failing configuration: a `max-age`
+//! below one year is a warning, and membership in the preload list cannot be verified or looked up
+//! at config time, so that is always warned about when `preload` is enabled.
+//!
 //! # Staging and precedence
 //!
 //! [`SecurityHeaders`] is a [`Handler`] that stages its headers into
@@ -48,6 +63,12 @@ pub const DEFAULT_X_CONTENT_TYPE_OPTIONS: &str = "nosniff";
 pub const DEFAULT_REFERRER_POLICY: &str = "strict-origin-when-cross-origin";
 /// Minimum `Strict-Transport-Security` `max-age` accepted by browsers (180 days, in seconds).
 pub const HSTS_MIN_MAX_AGE: u64 = 15_552_000;
+/// Minimum `max-age` required by the HSTS preload list (1 year, in seconds).
+///
+/// The preload list also requires `includeSubDomains` and a submitted domain; see the module docs
+/// for the full set of admission requirements and how [`SecurityHeadersConfig::warnings`] reports
+/// the ones that cannot be enforced at config time.
+pub const HSTS_PRELOAD_MIN_MAX_AGE: u64 = 31_536_000;
 
 fn invalid(path: &str, message: impl Into<String>) -> Error {
     Error::InvalidConfig {
@@ -134,8 +155,9 @@ impl SecurityHeadersConfig {
     ///
     /// This is deliberately minimal: it rejects an HSTS configuration browsers would ignore
     /// (`max-age=0`, `max-age` below [`HSTS_MIN_MAX_AGE`], or `preload` without
-    /// `includeSubDomains`) and values that cannot be represented as an HTTP header value. The
-    /// warning-versus-strict policy for valid-but-unusual configurations belongs to T-HTTP-153.
+    /// `includeSubDomains`) and values that cannot be represented as an HTTP header value.
+    /// Valid configurations that cannot be fully checked here (the HSTS preload-list admission
+    /// requirements) are reported by [`SecurityHeadersConfig::warnings`] instead of being rejected.
     pub fn validate(&self) -> Result<()> {
         if let Some(hsts) = &self.strict_transport_security {
             if hsts.max_age == 0 {
@@ -175,6 +197,42 @@ impl SecurityHeadersConfig {
         }
         Ok(())
     }
+
+    /// Warnings for HSTS preload requirements this configuration cannot verify at config time.
+    ///
+    /// Unlike [`Self::validate`], this never fails: it reports HSTS preload-list admission
+    /// requirements that are valid configuration but unmet or unverifiable here.
+    ///
+    /// * `preload` enabled with a `max-age` below [`HSTS_PRELOAD_MIN_MAX_AGE`]: the warning names
+    ///   the required one-year (`31536000`) minimum and the configured value.
+    /// * `preload` enabled: membership in the HSTS preload list cannot be verified or looked up at
+    ///   config time, so the operator is always reminded to confirm the domain at
+    ///   <https://hstspreload.org>.
+    ///
+    /// An empty vector means the configuration is valid and raises no preload warnings.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        let Some(hsts) = &self.strict_transport_security else {
+            return warnings;
+        };
+        if !hsts.preload {
+            return warnings;
+        }
+        if hsts.max_age < HSTS_PRELOAD_MIN_MAX_AGE {
+            warnings.push(format!(
+                "strict_transport_security.preload: preload requires max_age of at least \
+                 {HSTS_PRELOAD_MIN_MAX_AGE} seconds (1 year); configured max_age is {}",
+                hsts.max_age
+            ));
+        }
+        warnings.push(
+            "strict_transport_security.preload: membership in the HSTS preload list cannot be \
+             verified or looked up at config time; confirm the domain is admitted at \
+             https://hstspreload.org"
+                .to_string(),
+        );
+        warnings
+    }
 }
 
 /// `security_headers`: stage security response headers with secure defaults.
@@ -201,9 +259,20 @@ impl SecurityHeaders {
 
     /// Stage the configured security headers on `headers`.
     ///
+    /// This is the **unconditional form**: it never inspects a request and stages
+    /// `Strict-Transport-Security` whenever HSTS is configured. It is for callers that already
+    /// decided the response is HTTPS (the route engine in T-HTTP-152 calls it from its own staging
+    /// path). The [`Handler`] implementation is the HTTPS gate: it only stages HSTS when
+    /// [`Request::tls`] is true.
+    ///
     /// A header is only inserted when `headers` does not already contain it, so an explicit
     /// response header set earlier in the chain is never clobbered.
     pub fn apply(&self, headers: &mut HeaderMap) {
+        self.stage(headers, true);
+    }
+
+    /// Shared staging implementation; `include_hsts` gates the `Strict-Transport-Security` header.
+    fn stage(&self, headers: &mut HeaderMap, include_hsts: bool) {
         let config = &self.config;
         if let Some(value) = &config.x_frame_options {
             set_if_absent(headers, "x-frame-options", value);
@@ -217,8 +286,10 @@ impl SecurityHeaders {
         if let Some(value) = &config.content_security_policy {
             set_if_absent(headers, "content-security-policy", value);
         }
-        if let Some(hsts) = &config.strict_transport_security {
-            set_if_absent(headers, "strict-transport-security", &hsts.header_value());
+        if include_hsts {
+            if let Some(hsts) = &config.strict_transport_security {
+                set_if_absent(headers, "strict-transport-security", &hsts.header_value());
+            }
         }
         if let Some(value) = &config.permissions_policy {
             set_if_absent(headers, "permissions-policy", value);
@@ -239,6 +310,10 @@ fn set_if_absent(headers: &mut HeaderMap, name: &'static str, value: &str) {
     headers.insert(name, value);
 }
 
+/// The [`Handler`] implementation is the HTTPS gate: `Strict-Transport-Security` is staged only
+/// when [`Request::tls`] is true, so a plain-HTTP response never carries HSTS even when the
+/// configuration enables it. [`SecurityHeaders::apply`] remains the unconditional form (see its
+/// documentation).
 #[async_trait]
 impl Handler for SecurityHeaders {
     fn name(&self) -> &'static str {
@@ -246,7 +321,8 @@ impl Handler for SecurityHeaders {
     }
 
     async fn handle(&self, mut request: Request) -> Result<Outcome> {
-        self.apply(&mut request.pending_response_headers);
+        let include_hsts = request.tls;
+        self.stage(&mut request.pending_response_headers, include_hsts);
         Ok(Outcome::Continue(request))
     }
 }
@@ -270,6 +346,17 @@ mod tests {
     fn config_with_csp(policy: &str) -> SecurityHeadersConfig {
         SecurityHeadersConfig {
             content_security_policy: Some(policy.to_string()),
+            ..SecurityHeadersConfig::default()
+        }
+    }
+
+    fn hsts_config(max_age: u64, include_subdomains: bool, preload: bool) -> SecurityHeadersConfig {
+        SecurityHeadersConfig {
+            strict_transport_security: Some(HstsConfig {
+                max_age,
+                include_subdomains,
+                preload,
+            }),
             ..SecurityHeadersConfig::default()
         }
     }
@@ -463,6 +550,154 @@ mod tests {
         assert_eq!(
             header_value(&headers, "x-content-type-options").as_deref(),
             Some("nosniff")
+        );
+    }
+
+    #[tokio::test]
+    async fn hsts_is_staged_on_https_responses_only() {
+        let middleware = SecurityHeaders::new(hsts_config(31_536_000, true, true)).unwrap();
+
+        // TLS request: the HSTS header is staged with the configured value.
+        let mut https_request = request();
+        https_request.tls = true;
+        let outcome = middleware.handle(https_request).await.unwrap();
+        let Outcome::Continue(https_request) = outcome else {
+            panic!("security_headers must continue the chain");
+        };
+        assert_eq!(
+            header_value(
+                &https_request.pending_response_headers,
+                "strict-transport-security"
+            )
+            .as_deref(),
+            Some("max-age=31536000; includeSubDomains; preload")
+        );
+
+        // Plain-HTTP request: HSTS is not staged even though it is configured, while the
+        // non-HSTS defaults are still staged.
+        let mut http_request = request();
+        assert!(!http_request.tls);
+        let outcome = middleware.handle(http_request).await.unwrap();
+        let Outcome::Continue(http_request) = outcome else {
+            panic!("security_headers must continue the chain");
+        };
+        assert_eq!(
+            header_value(
+                &http_request.pending_response_headers,
+                "strict-transport-security"
+            ),
+            None
+        );
+        assert_eq!(
+            header_value(&http_request.pending_response_headers, "x-frame-options").as_deref(),
+            Some("DENY")
+        );
+    }
+
+    #[tokio::test]
+    async fn hsts_directives_are_configurable() {
+        // Bare max-age: neither includeSubDomains nor preload.
+        let bare = SecurityHeaders::new(hsts_config(15_552_000, false, false)).unwrap();
+        let mut headers = HeaderMap::new();
+        bare.apply(&mut headers);
+        assert_eq!(
+            header_value(&headers, "strict-transport-security").as_deref(),
+            Some("max-age=15552000")
+        );
+
+        // includeSubDomains without preload.
+        let subdomains = SecurityHeaders::new(hsts_config(31_536_000, true, false)).unwrap();
+        let mut headers = HeaderMap::new();
+        subdomains.apply(&mut headers);
+        assert_eq!(
+            header_value(&headers, "strict-transport-security").as_deref(),
+            Some("max-age=31536000; includeSubDomains")
+        );
+
+        // Both directives: preload is emitted last.
+        let full = SecurityHeaders::new(hsts_config(63_072_000, true, true)).unwrap();
+        let mut headers = HeaderMap::new();
+        full.apply(&mut headers);
+        assert_eq!(
+            header_value(&headers, "strict-transport-security").as_deref(),
+            Some("max-age=63072000; includeSubDomains; preload")
+        );
+    }
+
+    #[tokio::test]
+    async fn hsts_header_value_matches_rfc_6797() {
+        // RFC 6797 §6.1: `max-age=<seconds>[; includeSubDomains][; preload]`, lowercase directive
+        // name, semicolon+space separators, camel-case includeSubDomains, preload last.
+        let config = hsts_config(31_536_000, true, true);
+        assert_eq!(
+            config
+                .strict_transport_security
+                .as_ref()
+                .unwrap()
+                .header_value(),
+            "max-age=31536000; includeSubDomains; preload"
+        );
+
+        let middleware = SecurityHeaders::new(config).unwrap();
+        let mut headers = HeaderMap::new();
+        middleware.apply(&mut headers);
+        assert_eq!(
+            header_value(&headers, "strict-transport-security").as_deref(),
+            Some("max-age=31536000; includeSubDomains; preload")
+        );
+    }
+
+    #[test]
+    fn preload_below_one_year_warns_with_required_and_configured_max_age() {
+        // 180 days is structurally valid (validate passes) but not preload-eligible.
+        let config = hsts_config(15_552_000, true, true);
+        config.validate().unwrap();
+
+        let warnings = config.warnings();
+        let short_max_age = warnings
+            .iter()
+            .find(|warning| warning.contains("max_age"))
+            .expect("preload below one year must warn about max_age");
+        assert!(
+            short_max_age.contains("31536000"),
+            "warning must name the required 31536000 minimum: {short_max_age}"
+        );
+        assert!(
+            short_max_age.contains("15552000"),
+            "warning must name the configured value: {short_max_age}"
+        );
+    }
+
+    #[test]
+    fn preload_membership_cannot_be_verified_at_config_time() {
+        // A one-year max-age satisfies the measurable requirement, but list membership still
+        // cannot be checked at config time.
+        let warnings = hsts_config(31_536_000, true, true).warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("cannot be verified or looked up at config time"),
+            "warning must name the unverifiable membership: {}",
+            warnings[0]
+        );
+        assert!(warnings[0].contains("preload list"));
+    }
+
+    #[test]
+    fn no_preload_warnings_when_preload_is_disabled() {
+        assert!(SecurityHeadersConfig::default().warnings().is_empty());
+        assert!(hsts_config(31_536_000, true, false).warnings().is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_stages_hsts_unconditionally_for_route_engines() {
+        // `apply` is the unconditional form used by the route engine (T-HTTP-152); it has no
+        // request, so it stages HSTS regardless of transport. The Handler above is the HTTPS gate.
+        let middleware = SecurityHeaders::new(hsts_config(31_536_000, true, true)).unwrap();
+        let mut headers = HeaderMap::new();
+        middleware.apply(&mut headers);
+        assert_eq!(
+            header_value(&headers, "strict-transport-security").as_deref(),
+            Some("max-age=31536000; includeSubDomains; preload")
         );
     }
 }
