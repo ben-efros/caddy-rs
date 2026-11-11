@@ -299,3 +299,26 @@ fn dot_dot_within_tree_still_works() {
         ])
     );
 }
+
+#[test]
+fn import_error_does_not_leak_absolute_path() {
+    let tree = TempTree::new("sanitize-path");
+    tree.write(
+        "Caddyfile",
+        "example.com {\n\timport sub/bad.caddyfile\n}\n",
+    );
+    // Write invalid UTF-8 bytes so parsing fails inside the file import path.
+    let bad_path = tree.root.join("sub/bad.caddyfile");
+    std::fs::create_dir_all(bad_path.parent().unwrap()).expect("create sub dir");
+    std::fs::write(&bad_path, &[0x80, 0x81, 0x82]).expect("write bad bytes");
+    let caddyfile = std::fs::read_to_string(tree.caddyfile()).expect("read root");
+    let error = tree
+        .adapt(&caddyfile)
+        .expect_err("invalid utf-8 import should fail");
+    let message = error.to_string();
+    // Must still mention the relative path so the user knows which file failed.
+    assert!(message.contains("sub/bad.caddyfile"), "{message}");
+    // Must NOT contain the absolute temp directory path.
+    let root_str = tree.root.to_str().expect("valid utf-8 root");
+    assert!(!message.contains(root_str), "{message}");
+}
