@@ -396,8 +396,8 @@ pub struct UserRecord {
 impl User {
     /// Convert this user to a serializable record suitable for storage.
     ///
-    /// The password hash and TOTP secret are excluded; use `UserRecord::from_user` in a store
-    /// implementation to create the record from a loaded `User`.
+    /// The password hash and TOTP secret are excluded; use this method in a store implementation
+    /// to create the record from a loaded `User`.
     pub fn to_record(&self) -> UserRecord {
         UserRecord {
             id: self.id,
@@ -414,7 +414,11 @@ impl User {
 
 impl UserRecord {
     /// Create a `User` from a record, populating the password hash and TOTP secret.
-    pub fn from_user(record: UserRecord, password_hash: String, totp_secret: Option<String>) -> User {
+    pub fn from_user(
+        record: UserRecord,
+        password_hash: String,
+        totp_secret: Option<String>,
+    ) -> User {
         User {
             id: record.id,
             username: record.username,
