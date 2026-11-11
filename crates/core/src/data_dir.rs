@@ -988,7 +988,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o702)).unwrap();
         }
         let error = preflight(&root).expect_err("world-writable must fail");
         assert_eq!(error.kind, DataDirErrorKind::WorldWritable);
