@@ -4,7 +4,8 @@
 //! - User management with roles, capabilities, and row-level visibility
 //! - Password hashing (argon2id preferred, bcrypt fallback) with constant-time verification
 //! - JWT access tokens and rotating opaque refresh tokens
-//! - TOTP two-factor authentication with replay protection
+//! - TOTP two-factor authentication with a configurable window and monotonic replay protection;
+//!   see `docs/TOTP.md` for the configuration and the required handling of replay rejections
 //! - Permission checking based on roles, capabilities, and visibility
 //! - An in-memory [`UserStore`] implementation; persistent backends belong outside this crate
 //!
@@ -331,7 +332,11 @@ pub struct User {
     pub role: Role,
     /// TOTP secret (base32 encoded), if 2FA is enabled.
     pub totp_secret: Option<String>,
-    /// Last TOTP time step accepted for this user, used for replay protection.
+    /// Highest TOTP time step accepted for this user, used for replay protection.
+    ///
+    /// Any code whose time step is at or below this value is rejected: a consumed code is a
+    /// replay, and an older code after a newer one has been accepted is treated as an
+    /// impersonation attempt.
     pub totp_last_step: Option<u64>,
     /// Monotonically increasing authentication epoch.
     ///
@@ -384,7 +389,11 @@ pub struct UserRecord {
     pub role: Role,
     /// Whether TOTP is enabled; the secret itself is never stored or serialized.
     pub totp_enabled: bool,
-    /// Last TOTP time step accepted for this user, used for replay protection.
+    /// Highest TOTP time step accepted for this user, used for replay protection.
+    ///
+    /// Any code whose time step is at or below this value is rejected: a consumed code is a
+    /// replay, and an older code after a newer one has been accepted is treated as an
+    /// impersonation attempt.
     pub totp_last_step: Option<u64>,
     /// Monotonically increasing authentication epoch.
     pub auth_epoch: u64,
@@ -516,9 +525,15 @@ pub enum AuthError {
     /// A refresh token was never issued or has been deleted.
     #[error("refresh token not found")]
     RefreshTokenNotFound,
-    /// The supplied TOTP code is invalid or has already been used.
+    /// The supplied TOTP code is invalid.
     #[error("invalid TOTP code")]
     InvalidTotpCode,
+    /// The supplied TOTP code was already used, or predates the newest accepted code.
+    ///
+    /// This is a replay / impersonation attempt and is reported distinctly from a merely
+    /// incorrect code so callers can alert, rate-limit, or lock the account.
+    #[error("TOTP code replay or impersonation attempt")]
+    TotpReplay,
     /// TOTP is not configured for the user.
     #[error("TOTP not configured for user")]
     TotpNotConfigured,
@@ -646,6 +661,35 @@ impl Default for Argon2Config {
         }
     }
 }
+
+/// TOTP time-step acceptance window.
+///
+/// The window controls how many adjacent time steps are considered valid when verifying a TOTP
+/// code. A larger window is more forgiving of clock skew and user delay, but slightly increases
+/// the attack surface because multiple consecutive codes are acceptable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TotpWindow {
+    /// Only accept the current time step. Most secure, default.
+    Current,
+    /// Accept current ± 1 time step. Tolerates small clock skew and user delay.
+    PlusMinusOne,
+    /// Accept current and next step (current + 1). Legacy behavior.
+    CurrentAndNext,
+}
+
+impl Default for TotpWindow {
+    fn default() -> Self {
+        TotpWindow::Current
+    }
+}
+
+/// How many steps behind the accepted window are still inspected to classify an older code as a
+/// replay rather than a plain mismatch.
+///
+/// A code older than this horizon is indistinguishable from a wrong guess, so it is reported as
+/// `Ok(false)`. Ten steps is five minutes, which comfortably covers a captured code being replayed
+/// shortly after it was observed, without letting a caller force an unbounded number of HMACs.
+pub const TOTP_REPLAY_LOOKBACK_STEPS: u64 = 10;
 
 /// Source for the JWT signing secret.
 ///
@@ -926,6 +970,8 @@ pub struct AuthnConfig {
     pub issuer: Option<String>,
     /// Audience for JWT tokens.
     pub audience: Option<String>,
+    /// TOTP verification window.
+    pub totp_window: TotpWindow,
 }
 
 impl Default for AuthnConfig {
@@ -937,6 +983,7 @@ impl Default for AuthnConfig {
             argon2_params: Argon2Config::default(),
             issuer: None,
             audience: None,
+            totp_window: TotpWindow::Current,
         }
     }
 }
@@ -950,6 +997,7 @@ impl std::fmt::Debug for AuthnConfig {
             .field("argon2_params", &self.argon2_params)
             .field("issuer", &self.issuer)
             .field("audience", &self.audience)
+            .field("totp_window", &self.totp_window)
             .finish()
     }
 }
@@ -1142,6 +1190,9 @@ impl UserStore for MemoryUserStore {
         if user.totp_secret.is_none() {
             return Ok(false);
         }
+        // Reject any step at or below the highest accepted step. This rejects both an immediate
+        // replay of a consumed code and a downgrade to an older code after a newer one has been
+        // accepted (a replay / impersonation attempt), regardless of the configured window.
         if user.totp_last_step.is_some_and(|last| step <= last) {
             return Ok(false);
         }
@@ -1180,7 +1231,17 @@ pub fn hash_password(password: &str, argon2_config: &Argon2Config) -> AuthResult
 /// A wrong password returns `Ok(false)`; only a malformed or unsupported hash is an error.
 /// Argon2's `PasswordVerifier` performs the comparison in constant time.
 pub fn verify_password(password: &str, hash: &str) -> AuthResult<bool> {
-    if hash.starts_with("$argon2") {
+    let hash_bytes = hash.as_bytes();
+    let is_argon2 = hash_bytes
+        .get(..7)
+        .map(|prefix| prefix.ct_eq(b"$argon2").into())
+        .unwrap_or(false);
+    let is_bcrypt = hash_bytes
+        .get(..2)
+        .map(|prefix| prefix.ct_eq(b"$2").into())
+        .unwrap_or(false);
+
+    if is_argon2 {
         let parsed =
             PasswordHash::new(hash).map_err(|err| AuthError::PasswordHash(err.to_string()))?;
         if parsed.version.is_none() || parsed.salt.is_none() || parsed.hash.is_none() {
@@ -1195,7 +1256,7 @@ pub fn verify_password(password: &str, hash: &str) -> AuthResult<bool> {
         };
     }
 
-    if hash.starts_with("$2") {
+    if is_bcrypt {
         return Ok(bcrypt_verify(password, hash)?);
     }
 
@@ -1217,16 +1278,46 @@ fn generate_token_id() -> String {
 }
 
 /// Current timestamp as Unix seconds.
-fn now_ts() -> i64 {
-    SystemTime::now()
+///
+/// A clock before the Unix epoch is a hard error rather than a silent `0`: treating it as epoch
+/// would make every issued token look epoch-issued, which grants permanent validity.
+fn now_ts() -> AuthResult<i64> {
+    system_time_to_ts(SystemTime::now())
+}
+
+/// Convert a [`SystemTime`] to Unix seconds.
+///
+/// Returns [`AuthError::Internal`] when the clock is before the Unix epoch. Never falls back to a
+/// default value: a wrapped timestamp of `0` would silently defeat expiry checks.
+fn system_time_to_ts(t: SystemTime) -> AuthResult<i64> {
+    let elapsed = t
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
+        .map_err(|_| AuthError::Internal("system clock is before the Unix epoch".to_string()))?;
+    i64::try_from(elapsed.as_secs())
+        .map_err(|_| AuthError::Internal("system clock is out of range".to_string()))
+}
+
+/// Compute an expiry timestamp from an issue time and a configured token TTL.
+///
+/// The TTL is configuration input, so a value that does not fit in an `i64` second count, or that
+/// pushes the expiry past the representable range, must fail closed with an actionable error
+/// instead of panicking in a debug build or silently wrapping into the past in a release build.
+fn expiry_after(now: i64, ttl: Duration) -> AuthResult<i64> {
+    let ttl_seconds = i64::try_from(ttl.as_secs()).map_err(|_| {
+        AuthError::Internal(format!(
+            "token TTL of {} seconds is too large",
+            ttl.as_secs()
+        ))
+    })?;
+    now.checked_add(ttl_seconds)
+        .ok_or_else(|| AuthError::Internal("token TTL overflows the expiry timestamp".to_string()))
 }
 
 /// Current TOTP time step.
-fn now_step() -> u64 {
-    u64::try_from(now_ts()).unwrap_or_default() / TOTP_STEP_SECONDS
+fn now_step() -> AuthResult<u64> {
+    let now = u64::try_from(now_ts()?)
+        .map_err(|_| AuthError::Internal("system clock is before the Unix epoch".to_string()))?;
+    Ok(now / TOTP_STEP_SECONDS)
 }
 
 /// SHA-256 hex digest of an opaque refresh token.
@@ -1236,13 +1327,15 @@ fn hash_refresh_token(token: &str) -> String {
     let digest = Sha256::digest(token.as_bytes());
     let mut encoded = String::with_capacity(digest.len() * 2);
     for byte in digest {
-        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+        write!(&mut encoded, "{byte:02x}").unwrap_or_default();
     }
     encoded
 }
 
 /// Generate a TOTP code for a time step.
 fn totp_code(secret: &[u8], step: u64) -> String {
+    // INFEASIBLE: every caller derives `step` from `now_step()`, which is at most
+    // `i64::MAX / TOTP_STEP_SECONDS`, so `step * TOTP_STEP_SECONDS` cannot overflow.
     totp_custom::<Sha1>(
         TOTP_STEP_SECONDS,
         TOTP_DIGITS,
@@ -1294,6 +1387,10 @@ pub struct AuthnService<S: UserStore> {
     config: AuthnConfig,
     encoding_key: EncodingKey,
     decoding_key: DecodingKey,
+    /// Fixed TOTP time step for tests, so window and replay assertions cannot flake across a
+    /// 30-second boundary.
+    #[cfg(test)]
+    test_step: Option<u64>,
 }
 
 impl<S: UserStore> AuthnService<S> {
@@ -1310,7 +1407,25 @@ impl<S: UserStore> AuthnService<S> {
             config,
             encoding_key,
             decoding_key,
+            #[cfg(test)]
+            test_step: None,
         })
+    }
+
+    /// Pin the TOTP time step. Test-only: production always uses the system clock.
+    #[cfg(test)]
+    pub(crate) fn with_test_step(mut self, step: u64) -> Self {
+        self.test_step = Some(step);
+        self
+    }
+
+    /// The TOTP time step to verify against.
+    fn current_step(&self) -> AuthResult<u64> {
+        #[cfg(test)]
+        if let Some(step) = self.test_step {
+            return Ok(step);
+        }
+        now_step()
     }
 
     /// Get a reference to the service configuration.
@@ -1372,7 +1487,7 @@ impl<S: UserStore> AuthnService<S> {
         user.updated_at = Utc::now();
         self.store.update_user(user).await?;
         self.store
-            .revoke_all_refresh_tokens_for_user(user_id, now_ts())
+            .revoke_all_refresh_tokens_for_user(user_id, now_ts()?)
             .await?;
         Ok(())
     }
@@ -1393,7 +1508,7 @@ impl<S: UserStore> AuthnService<S> {
         user.updated_at = Utc::now();
         self.store.update_user(user).await?;
         self.store
-            .revoke_all_refresh_tokens_for_user(user_id, now_ts())
+            .revoke_all_refresh_tokens_for_user(user_id, now_ts()?)
             .await?;
         Ok(())
     }
@@ -1449,8 +1564,22 @@ impl<S: UserStore> AuthnService<S> {
 
     /// Verify a TOTP code for a user.
     ///
-    /// The current step and one adjacent step in either direction are accepted for clock skew.
-    /// The accepted step is recorded atomically, so the same code cannot be used twice.
+    /// The set of *accepted* steps is determined by [`AuthnConfig::totp_window`]:
+    ///
+    /// - [`TotpWindow::Current`] only accepts the current time step.
+    /// - [`TotpWindow::PlusMinusOne`] accepts current ± 1 step.
+    /// - [`TotpWindow::CurrentAndNext`] accepts current and current + 1.
+    ///
+    /// When a code matches an accepted step, the step is atomically recorded in
+    /// [`User::totp_last_step`]. The record is monotonic: every code for a step at or below it is
+    /// rejected from then on, which prevents both an immediate replay and a downgrade to an older
+    /// code after a newer one was used.
+    ///
+    /// A cryptographically correct code that is *not* accepted is reported as
+    /// [`AuthError::TotpReplay`] rather than `Ok(false)`, so callers can treat it as an
+    /// impersonation attempt. Detection of older codes is bounded by
+    /// [`TOTP_REPLAY_LOOKBACK_STEPS`]: a code older than that is indistinguishable from a wrong
+    /// guess and is reported as `Ok(false)`.
     pub async fn totp_verify(&self, user_id: UserId, code: &str) -> AuthResult<bool> {
         let user = self
             .store
@@ -1464,21 +1593,51 @@ impl<S: UserStore> AuthnService<S> {
         let secret_bytes = base32::decode(Alphabet::Rfc4648 { padding: false }, secret)
             .ok_or_else(|| AuthError::Internal("invalid base32 TOTP secret".to_string()))?;
 
-        let current = now_step();
+        let current = self.current_step()?;
+        // INFEASIBLE: `current` comes from `now_step()`, which is at most
+        // `i64::MAX / TOTP_STEP_SECONDS`, so the `current + 1` steps below cannot overflow, and
+        // `current - 1` is guarded by `current > 0`.
         let mut steps = vec![current];
-        if current > 0 {
-            steps.push(current - 1);
+        match self.config.totp_window {
+            TotpWindow::Current => {}
+            TotpWindow::PlusMinusOne => {
+                if current > 0 {
+                    steps.push(current - 1);
+                }
+                steps.push(current + 1);
+            }
+            TotpWindow::CurrentAndNext => {
+                steps.push(current + 1);
+            }
         }
-        steps.push(current + 1);
 
+        let window_low = *steps.iter().min().unwrap_or(&current);
         let matched = steps
             .into_iter()
             .find(|&step| constant_time_eq(code, &totp_code(&secret_bytes, step)));
-        let Some(step) = matched else {
-            return Ok(false);
-        };
 
-        self.store.accept_totp_step(user_id, step).await
+        if let Some(step) = matched {
+            return if self.store.accept_totp_step(user_id, step).await? {
+                Ok(true)
+            } else {
+                // Correct for the step, but that step was already consumed or a newer one was.
+                Err(AuthError::TotpReplay)
+            };
+        }
+
+        // No code matched the accepted window. A code that is correct for a *stale* step is not a
+        // typo: it is a captured code being replayed, or an attempt to downgrade to an older code.
+        // Report it as an impersonation attempt instead of a plain mismatch. The search is bounded
+        // so an attacker cannot make verification arbitrarily expensive.
+        let lookback_low = window_low.saturating_sub(TOTP_REPLAY_LOOKBACK_STEPS);
+        let stale = (lookback_low..window_low)
+            .rev()
+            .find(|&step| constant_time_eq(code, &totp_code(&secret_bytes, step)));
+        if stale.is_some() {
+            return Err(AuthError::TotpReplay);
+        }
+
+        Ok(false)
     }
 
     /// Disable TOTP for a user.
@@ -1531,7 +1690,7 @@ impl<S: UserStore> AuthnService<S> {
         let token_hash = hash_refresh_token(refresh_token);
         let record = self
             .store
-            .consume_refresh_token(&token_hash, now_ts())
+            .consume_refresh_token(&token_hash, now_ts()?)
             .await?;
         let user = self
             .store
@@ -1553,7 +1712,7 @@ impl<S: UserStore> AuthnService<S> {
         user.updated_at = Utc::now();
         self.store.update_user(user).await?;
         self.store
-            .revoke_all_refresh_tokens_for_user(user_id, now_ts())
+            .revoke_all_refresh_tokens_for_user(user_id, now_ts()?)
             .await
     }
 
@@ -1605,7 +1764,11 @@ impl<S: UserStore> AuthnService<S> {
 
     /// Issue a new access/refresh token pair for a user.
     async fn issue_token_pair(&self, user: &User) -> AuthResult<TokenPair> {
-        let now = now_ts();
+        let now = now_ts()?;
+        // Configured TTLs are external input: compute both expiries before issuing anything so a
+        // nonsensical TTL fails closed instead of panicking or wrapping.
+        let access_exp = expiry_after(now, self.config.access_ttl)?;
+        let refresh_expires_at = expiry_after(now, self.config.refresh_ttl)?;
         let claims = Claims {
             sub: user.id,
             role: user.role.name.clone(),
@@ -1613,7 +1776,7 @@ impl<S: UserStore> AuthnService<S> {
             vis: user.role.visibility,
             epoch: user.auth_epoch,
             iat: now,
-            exp: now + self.config.access_ttl.as_secs() as i64,
+            exp: access_exp,
             iss: self.config.issuer.clone(),
             aud: self.config.audience.clone(),
         };
@@ -1629,7 +1792,7 @@ impl<S: UserStore> AuthnService<S> {
             token_hash,
             user_id: user.id,
             iat: now,
-            expires_at: now + self.config.refresh_ttl.as_secs() as i64,
+            expires_at: refresh_expires_at,
             revoked_at: None,
             token_id: generate_token_id(),
         };

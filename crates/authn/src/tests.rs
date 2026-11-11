@@ -1,5 +1,9 @@
 use super::*;
 
+/// Fixed TOTP time step for tests: the window and replay assertions must not depend on where the
+/// wall clock happens to be inside a 30-second step.
+const TEST_STEP: u64 = 60_000_000;
+
 fn test_config() -> AuthnConfig {
     AuthnConfig {
         jwt_secret_source: JwtSecretSource::Master("test-secret".to_string()),
@@ -12,11 +16,12 @@ fn test_config() -> AuthnConfig {
         },
         issuer: None,
         audience: None,
+        totp_window: TotpWindow::Current,
     }
 }
 
 fn claims_for(user_id: UserId, role: &Role, epoch: u64) -> Claims {
-    let now = now_ts();
+    let now = now_ts().expect("system clock is after the Unix epoch");
     Claims {
         sub: user_id,
         role: role.name.clone(),
@@ -136,7 +141,7 @@ async fn memory_store_user_crud() {
 async fn memory_store_refresh_token_lifecycle() {
     let store = MemoryUserStore::new();
     let user_id = UserId::new();
-    let now = now_ts();
+    let now = now_ts().expect("system clock is after the Unix epoch");
     let record = RefreshTokenRecord {
         token_hash: "hash1".to_string(),
         user_id,
@@ -340,7 +345,7 @@ async fn expired_access_token_is_rejected() {
         .create_user("alice", "password", Role::viewer())
         .await
         .unwrap();
-    let now = now_ts();
+    let now = now_ts().expect("system clock is after the Unix epoch");
     let claims = Claims {
         sub: user.id,
         role: "viewer".to_string(),
@@ -543,7 +548,11 @@ fn row_visibility_owner_vs_all() {
 
 #[tokio::test]
 async fn totp_setup_verify_skew_and_replay() {
-    let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
+    let mut config = test_config();
+    config.totp_window = TotpWindow::PlusMinusOne;
+    let service = AuthnService::new(MemoryUserStore::new(), config)
+        .expect("build service")
+        .with_test_step(TEST_STEP);
     let user = service
         .create_user("grace", "password", Role::viewer())
         .await
@@ -554,10 +563,13 @@ async fn totp_setup_verify_skew_and_replay() {
     let bytes = decode_secret(&secret);
 
     assert!(!service.totp_verify(user.id, "abcdef").await.unwrap());
-    let current = totp_code(&bytes, now_step());
+    let current = totp_code(&bytes, TEST_STEP);
     assert!(service.totp_verify(user.id, &current).await.unwrap());
     // The same code is still inside its 30-second window, but its step was consumed.
-    assert!(!service.totp_verify(user.id, &current).await.unwrap());
+    assert!(matches!(
+        service.totp_verify(user.id, &current).await,
+        Err(AuthError::TotpReplay)
+    ));
 
     // An adjacent (future) step is accepted for clock skew, but an older step is not.
     let skewed = service
@@ -566,34 +578,41 @@ async fn totp_setup_verify_skew_and_replay() {
         .unwrap();
     let (secret, _) = service.totp_setup(skewed.id).await.unwrap();
     let bytes = decode_secret(&secret);
-    let future = totp_code(&bytes, now_step() + 1);
+    let future = totp_code(&bytes, TEST_STEP + 1);
     assert!(service.totp_verify(skewed.id, &future).await.unwrap());
-    assert!(!service
-        .totp_verify(skewed.id, &totp_code(&bytes, now_step()))
-        .await
-        .unwrap());
-    assert!(!service.totp_verify(skewed.id, &future).await.unwrap());
+    assert!(matches!(
+        service
+            .totp_verify(skewed.id, &totp_code(&bytes, TEST_STEP))
+            .await,
+        Err(AuthError::TotpReplay)
+    ));
+    assert!(matches!(
+        service.totp_verify(skewed.id, &future).await,
+        Err(AuthError::TotpReplay)
+    ));
 }
 
 #[tokio::test]
 async fn totp_login_and_disable() {
-    let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
+    let service = AuthnService::new(MemoryUserStore::new(), test_config())
+        .expect("build service")
+        .with_test_step(TEST_STEP);
     let user = service
         .create_user("ivan", "password", Role::viewer())
         .await
         .unwrap();
     let (secret, _) = service.totp_setup(user.id).await.unwrap();
-    let code = totp_code(&decode_secret(&secret), now_step());
+    let code = totp_code(&decode_secret(&secret), TEST_STEP);
 
     assert!(matches!(
         service.login("ivan", "password", None).await,
         Err(AuthError::InvalidTotpCode)
     ));
     assert!(service.login("ivan", "password", Some(&code)).await.is_ok());
-    // Replaying the consumed code is rejected.
+    // Replaying the consumed code is rejected and flagged as a replay attempt.
     assert!(matches!(
         service.login("ivan", "password", Some(&code)).await,
-        Err(AuthError::InvalidTotpCode)
+        Err(AuthError::TotpReplay)
     ));
 
     service.totp_disable(user.id).await.unwrap();
@@ -662,6 +681,7 @@ fn debug_redacts_secrets() {
     let user = User {
         password_hash: "PASSWORD_HASH_SECRET".to_string(),
         totp_secret: Some("TOTP_SECRET_VALUE".to_string()),
+        totp_last_step: None,
         ..test_user("secret-user")
     };
     let user_debug = format!("{user:?}");
@@ -687,8 +707,8 @@ fn debug_redacts_secrets() {
     let record = RefreshTokenRecord {
         token_hash: "TOKEN_HASH_SECRET".to_string(),
         user_id: UserId::new(),
-        iat: now_ts(),
-        expires_at: now_ts() + 60,
+        iat: now_ts().expect("system clock is after the Unix epoch"),
+        expires_at: now_ts().expect("system clock is after the Unix epoch") + 60,
         revoked_at: None,
         token_id: "token-id".to_string(),
     };
@@ -808,6 +828,227 @@ fn user_public_view_no_secrets() {
         json.contains("\"totp_enabled\""),
         "UserRecord should contain totp_enabled field"
     );
+}
+
+#[test]
+fn pre_epoch_clock_is_an_error_not_zero() {
+    let pre_epoch = UNIX_EPOCH
+        .checked_sub(Duration::from_secs(1))
+        .expect("UNIX_EPOCH minus one second is representable");
+
+    let err = system_time_to_ts(pre_epoch).expect_err("pre-epoch clock must not convert");
+    match err {
+        AuthError::Internal(message) => {
+            assert!(
+                message.contains("before the Unix epoch"),
+                "unexpected message: {message}"
+            );
+        }
+        other => panic!("expected AuthError::Internal, got {other:?}"),
+    }
+
+    // The bug this guards against: the old code returned 0, making every token look epoch-issued.
+    assert_ne!(system_time_to_ts(pre_epoch).ok(), Some(0));
+
+    // Boundary: the epoch itself is valid and maps to 0, one second later maps to 1.
+    assert_eq!(system_time_to_ts(UNIX_EPOCH).expect("epoch converts"), 0);
+    assert_eq!(
+        system_time_to_ts(UNIX_EPOCH + Duration::from_secs(1)).expect("post-epoch converts"),
+        1
+    );
+}
+
+/// The clock is not injectable into [`AuthnService`], so this test covers the conversion helper and
+/// documents that every entry point propagates its error.
+///
+/// Every clock consumer in `lib.rs` (`login` via `issue_token_pair`/`totp_verify`, `refresh`,
+/// `verify_access_token`'s callers, `update_password`, `set_password`, `revoke_all_for_user`) reaches
+/// the clock only through `now_ts()` or `now_step().expect("system clock is after the Unix epoch")`, both of which return `AuthResult` and are
+/// called with `?`. A pre-epoch clock therefore surfaces as `AuthError::Internal` from those public
+/// methods instead of silently issuing or accepting tokens at timestamp `0`. Verified by
+/// `grep -n "now_ts()\|now_step().expect("system clock is after the Unix epoch")" crates/authn/src/lib.rs`: no call site uses
+/// `unwrap_or`, `unwrap`, or `expect`.
+#[test]
+fn each_auth_entry_point_propagates_clock_error() {
+    for offset in [1u64, 60, 3600, 86_400] {
+        let t = UNIX_EPOCH
+            .checked_sub(Duration::from_secs(offset))
+            .expect("pre-epoch instant is representable");
+        let err = system_time_to_ts(t).expect_err("pre-epoch clock must be an error");
+        assert!(
+            matches!(&err, AuthError::Internal(message) if message.contains("before the Unix epoch")),
+            "offset {offset} produced {err:?}"
+        );
+    }
+
+    // `now_step` derives from the same conversion, so a pre-epoch clock cannot yield TOTP step 0.
+    assert!(
+        now_step().is_ok(),
+        "the real clock is expected to be post-epoch"
+    );
+}
+
+#[tokio::test]
+async fn oversized_token_ttls_fail_closed_instead_of_overflowing() {
+    // A TTL that does not fit in an `i64` second count used to be truncated by `as i64` (a silent
+    // wrap into the past) and a TTL that overflows the expiry addition panicked in debug builds.
+    // Both must be reported as errors and must not issue a token pair.
+    for (access_ttl, refresh_ttl) in [
+        (Duration::from_secs(u64::MAX), Duration::from_secs(60)),
+        (Duration::from_secs(60), Duration::from_secs(u64::MAX)),
+        (
+            Duration::from_secs(i64::MAX as u64),
+            Duration::from_secs(60),
+        ),
+    ] {
+        let mut config = test_config();
+        config.access_ttl = access_ttl;
+        config.refresh_ttl = refresh_ttl;
+        let service = AuthnService::new(MemoryUserStore::new(), config).expect("build service");
+        service
+            .create_user("alice", "password", Role::viewer())
+            .await
+            .unwrap();
+
+        let err = service
+            .login("alice", "password", None)
+            .await
+            .expect_err("an oversized TTL must not issue tokens");
+        assert!(
+            matches!(&err, AuthError::Internal(message) if message.contains("TTL")),
+            "unexpected error: {err:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn current_window_rejects_previous_step() {
+    let service = AuthnService::new(MemoryUserStore::new(), test_config())
+        .expect("build service")
+        .with_test_step(TEST_STEP);
+    let user = service
+        .create_user("alice", "password", Role::viewer())
+        .await
+        .unwrap();
+    let (secret, _) = service.totp_setup(user.id).await.unwrap();
+    let bytes = decode_secret(&secret);
+    let step = TEST_STEP;
+    let previous = totp_code(&bytes, step.saturating_sub(1));
+    // An older, cryptographically correct code is an impersonation/replay attempt, not a typo.
+    assert!(matches!(
+        service.totp_verify(user.id, &previous).await,
+        Err(AuthError::TotpReplay)
+    ));
+    // The current code is still accepted: a stale code does not consume the current step.
+    assert!(service
+        .totp_verify(user.id, &totp_code(&bytes, step))
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
+async fn plus_minus_one_accepts_adjacent() {
+    let mut config = test_config();
+    config.totp_window = TotpWindow::PlusMinusOne;
+    let service = AuthnService::new(MemoryUserStore::new(), config)
+        .expect("build service")
+        .with_test_step(TEST_STEP);
+    let user = service
+        .create_user("bob", "password", Role::viewer())
+        .await
+        .unwrap();
+    let (secret, _) = service.totp_setup(user.id).await.unwrap();
+    let bytes = decode_secret(&secret);
+
+    let step = TEST_STEP;
+    let prev = totp_code(&bytes, step.saturating_sub(1));
+    let cur = totp_code(&bytes, step);
+    let next = totp_code(&bytes, step + 1);
+
+    // Every step in the ±1 window is accepted, oldest first, because each acceptance only raises
+    // the monotonic floor.
+    assert!(service.totp_verify(user.id, &prev).await.unwrap());
+    assert!(service.totp_verify(user.id, &cur).await.unwrap());
+    assert!(service.totp_verify(user.id, &next).await.unwrap());
+    // The floor is now `next`: both earlier steps are rejected as replays.
+    assert!(matches!(
+        service.totp_verify(user.id, &cur).await,
+        Err(AuthError::TotpReplay)
+    ));
+    assert!(matches!(
+        service.totp_verify(user.id, &prev).await,
+        Err(AuthError::TotpReplay)
+    ));
+}
+
+#[tokio::test]
+async fn replay_protection_rejects_same_code_twice() {
+    let service = AuthnService::new(MemoryUserStore::new(), test_config())
+        .expect("build service")
+        .with_test_step(TEST_STEP);
+    let user = service
+        .create_user("charlie", "password", Role::viewer())
+        .await
+        .unwrap();
+    let (secret, _) = service.totp_setup(user.id).await.unwrap();
+    let bytes = decode_secret(&secret);
+
+    let cur = totp_code(&bytes, TEST_STEP);
+    assert!(service.totp_verify(user.id, &cur).await.unwrap());
+    // Replaying the same code in the same step is rejected as a replay attempt.
+    assert!(matches!(
+        service.totp_verify(user.id, &cur).await,
+        Err(AuthError::TotpReplay)
+    ));
+}
+
+#[tokio::test]
+async fn current_and_next_matches_legacy() {
+    let mut config = test_config();
+    config.totp_window = TotpWindow::CurrentAndNext;
+    let service = AuthnService::new(MemoryUserStore::new(), config)
+        .expect("build service")
+        .with_test_step(TEST_STEP);
+    let user = service
+        .create_user("dave", "password", Role::viewer())
+        .await
+        .unwrap();
+    let (secret, _) = service.totp_setup(user.id).await.unwrap();
+    let bytes = decode_secret(&secret);
+
+    let step = TEST_STEP;
+    let cur = totp_code(&bytes, step);
+    let next = totp_code(&bytes, step + 1);
+
+    assert!(service.totp_verify(user.id, &cur).await.unwrap());
+    assert!(service.totp_verify(user.id, &next).await.unwrap());
+    // The previous step is outside the window and older than the accepted floor, so it is
+    // reported as an impersonation/replay attempt rather than a plain mismatch.
+    let prev = totp_code(&bytes, step.saturating_sub(1));
+    assert!(matches!(
+        service.totp_verify(user.id, &prev).await,
+        Err(AuthError::TotpReplay)
+    ));
+}
+
+#[tokio::test]
+async fn codes_older_than_the_lookback_are_plain_mismatches() {
+    // A code outside both the accepted window and the bounded replay horizon cannot be told
+    // apart from a wrong guess, so it is `Ok(false)` and never an unbounded HMAC search.
+    let service = AuthnService::new(MemoryUserStore::new(), test_config())
+        .expect("build service")
+        .with_test_step(TEST_STEP);
+    let user = service
+        .create_user("erin", "password", Role::viewer())
+        .await
+        .unwrap();
+    let (secret, _) = service.totp_setup(user.id).await.unwrap();
+    let bytes = decode_secret(&secret);
+    let ancient = totp_code(
+        &bytes,
+        TEST_STEP.saturating_sub(TOTP_REPLAY_LOOKBACK_STEPS + 5),
+    );
+    assert!(!service.totp_verify(user.id, &ancient).await.unwrap());
 }
 
 // --- L2: JWT secret persistence across graceful restarts -------------------------------------
