@@ -252,14 +252,21 @@ fn select_response_with_stdin(
 ///
 /// Only a FIFO counts: a regular-file redirect, `/dev/null`, a socket, a terminal and a closed
 /// descriptor all report `false`, so `caddy-rs respond --status 200 < page.html` serves an empty
-/// body exactly like Caddy.
+/// body exactly like Caddy. `/dev/stdin` refers to the same open file description as fd 0, so
+/// `std::fs::metadata` reports the real file type without an `unsafe` `fstat` call.
 #[cfg(unix)]
 fn stdin_is_pipe() -> bool {
-    use rustix::fs::{fstat, FileType};
+    use std::io::IsTerminal;
+    use std::os::unix::fs::FileTypeExt;
 
-    fstat(std::io::stdin())
-        .map(|stat| FileType::from_raw_mode(stat.st_mode) == FileType::Fifo)
-        .unwrap_or(false)
+    match std::fs::metadata("/dev/stdin") {
+        Ok(metadata) => metadata.file_type().is_fifo(),
+        // `/dev/stdin` exists but does not resolve: fd 0 is closed, which is not a pipe.
+        Err(_) if std::fs::symlink_metadata("/dev/stdin").is_ok() => false,
+        // `/dev/stdin` is unavailable on some minimal systems; fall back to the terminal check,
+        // which only over-approximates the pipe case.
+        Err(_) => !std::io::stdin().is_terminal(),
+    }
 }
 
 /// Whether stdin is a pipe, as closely as this platform can tell.

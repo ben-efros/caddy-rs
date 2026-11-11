@@ -236,7 +236,6 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
- "rustix",
  "serde_json",
  "tar",
  "tempfile",
