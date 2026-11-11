@@ -965,16 +965,30 @@ fn generate_token_id() -> String {
 }
 
 /// Current timestamp as Unix seconds.
-fn now_ts() -> i64 {
-    SystemTime::now()
+///
+/// A clock before the Unix epoch is a hard error rather than a silent `0`: treating it as epoch
+/// would make every issued token look epoch-issued, which grants permanent validity.
+fn now_ts() -> AuthResult<i64> {
+    system_time_to_ts(SystemTime::now())
+}
+
+/// Convert a [`SystemTime`] to Unix seconds.
+///
+/// Returns [`AuthError::Internal`] when the clock is before the Unix epoch. Never falls back to a
+/// default value: a wrapped timestamp of `0` would silently defeat expiry checks.
+fn system_time_to_ts(t: SystemTime) -> AuthResult<i64> {
+    let elapsed = t
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
+        .map_err(|_| AuthError::Internal("system clock is before the Unix epoch".to_string()))?;
+    i64::try_from(elapsed.as_secs())
+        .map_err(|_| AuthError::Internal("system clock is out of range".to_string()))
 }
 
 /// Current TOTP time step.
-fn now_step() -> u64 {
-    u64::try_from(now_ts()).unwrap_or_default() / TOTP_STEP_SECONDS
+fn now_step() -> AuthResult<u64> {
+    let now = u64::try_from(now_ts()?)
+        .map_err(|_| AuthError::Internal("system clock is before the Unix epoch".to_string()))?;
+    Ok(now / TOTP_STEP_SECONDS)
 }
 
 /// SHA-256 hex digest of an opaque refresh token.
@@ -1116,7 +1130,7 @@ impl<S: UserStore> AuthnService<S> {
         user.updated_at = Utc::now();
         self.store.update_user(user).await?;
         self.store
-            .revoke_all_refresh_tokens_for_user(user_id, now_ts())
+            .revoke_all_refresh_tokens_for_user(user_id, now_ts()?)
             .await?;
         Ok(())
     }
@@ -1137,7 +1151,7 @@ impl<S: UserStore> AuthnService<S> {
         user.updated_at = Utc::now();
         self.store.update_user(user).await?;
         self.store
-            .revoke_all_refresh_tokens_for_user(user_id, now_ts())
+            .revoke_all_refresh_tokens_for_user(user_id, now_ts()?)
             .await?;
         Ok(())
     }
@@ -1208,7 +1222,7 @@ impl<S: UserStore> AuthnService<S> {
         let secret_bytes = base32::decode(Alphabet::Rfc4648 { padding: false }, secret)
             .ok_or_else(|| AuthError::Internal("invalid base32 TOTP secret".to_string()))?;
 
-        let current = now_step();
+        let current = now_step()?;
         let mut steps = vec![current];
         if current > 0 {
             steps.push(current - 1);
@@ -1275,7 +1289,7 @@ impl<S: UserStore> AuthnService<S> {
         let token_hash = hash_refresh_token(refresh_token);
         let record = self
             .store
-            .consume_refresh_token(&token_hash, now_ts())
+            .consume_refresh_token(&token_hash, now_ts()?)
             .await?;
         let user = self
             .store
@@ -1297,7 +1311,7 @@ impl<S: UserStore> AuthnService<S> {
         user.updated_at = Utc::now();
         self.store.update_user(user).await?;
         self.store
-            .revoke_all_refresh_tokens_for_user(user_id, now_ts())
+            .revoke_all_refresh_tokens_for_user(user_id, now_ts()?)
             .await
     }
 
@@ -1349,7 +1363,7 @@ impl<S: UserStore> AuthnService<S> {
 
     /// Issue a new access/refresh token pair for a user.
     async fn issue_token_pair(&self, user: &User) -> AuthResult<TokenPair> {
-        let now = now_ts();
+        let now = now_ts()?;
         let claims = Claims {
             sub: user.id,
             role: user.role.name.clone(),

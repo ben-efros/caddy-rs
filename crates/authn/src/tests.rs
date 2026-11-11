@@ -16,7 +16,7 @@ fn test_config() -> AuthnConfig {
 }
 
 fn claims_for(user_id: UserId, role: &Role, epoch: u64) -> Claims {
-    let now = now_ts();
+    let now = now_ts().expect("system clock is after the Unix epoch");
     Claims {
         sub: user_id,
         role: role.name.clone(),
@@ -136,7 +136,7 @@ async fn memory_store_user_crud() {
 async fn memory_store_refresh_token_lifecycle() {
     let store = MemoryUserStore::new();
     let user_id = UserId::new();
-    let now = now_ts();
+    let now = now_ts().expect("system clock is after the Unix epoch");
     let record = RefreshTokenRecord {
         token_hash: "hash1".to_string(),
         user_id,
@@ -340,7 +340,7 @@ async fn expired_access_token_is_rejected() {
         .create_user("alice", "password", Role::viewer())
         .await
         .unwrap();
-    let now = now_ts();
+    let now = now_ts().expect("system clock is after the Unix epoch");
     let claims = Claims {
         sub: user.id,
         role: "viewer".to_string(),
@@ -554,7 +554,10 @@ async fn totp_setup_verify_skew_and_replay() {
     let bytes = decode_secret(&secret);
 
     assert!(!service.totp_verify(user.id, "abcdef").await.unwrap());
-    let current = totp_code(&bytes, now_step());
+    let current = totp_code(
+        &bytes,
+        now_step().expect("system clock is after the Unix epoch"),
+    );
     assert!(service.totp_verify(user.id, &current).await.unwrap());
     // The same code is still inside its 30-second window, but its step was consumed.
     assert!(!service.totp_verify(user.id, &current).await.unwrap());
@@ -566,10 +569,19 @@ async fn totp_setup_verify_skew_and_replay() {
         .unwrap();
     let (secret, _) = service.totp_setup(skewed.id).await.unwrap();
     let bytes = decode_secret(&secret);
-    let future = totp_code(&bytes, now_step() + 1);
+    let future = totp_code(
+        &bytes,
+        now_step().expect("system clock is after the Unix epoch") + 1,
+    );
     assert!(service.totp_verify(skewed.id, &future).await.unwrap());
     assert!(!service
-        .totp_verify(skewed.id, &totp_code(&bytes, now_step()))
+        .totp_verify(
+            skewed.id,
+            &totp_code(
+                &bytes,
+                now_step().expect("system clock is after the Unix epoch")
+            )
+        )
         .await
         .unwrap());
     assert!(!service.totp_verify(skewed.id, &future).await.unwrap());
@@ -583,7 +595,10 @@ async fn totp_login_and_disable() {
         .await
         .unwrap();
     let (secret, _) = service.totp_setup(user.id).await.unwrap();
-    let code = totp_code(&decode_secret(&secret), now_step());
+    let code = totp_code(
+        &decode_secret(&secret),
+        now_step().expect("system clock is after the Unix epoch"),
+    );
 
     assert!(matches!(
         service.login("ivan", "password", None).await,
@@ -668,8 +683,8 @@ fn debug_redacts_secrets() {
     let record = RefreshTokenRecord {
         token_hash: "TOKEN_HASH_SECRET".to_string(),
         user_id: UserId::new(),
-        iat: now_ts(),
-        expires_at: now_ts() + 60,
+        iat: now_ts().expect("system clock is after the Unix epoch"),
+        expires_at: now_ts().expect("system clock is after the Unix epoch") + 60,
         revoked_at: None,
         token_id: "token-id".to_string(),
     };
@@ -788,5 +803,63 @@ fn user_public_view_no_secrets() {
     assert!(
         json.contains("\"totp_enabled\""),
         "UserRecord should contain totp_enabled field"
+    );
+}
+
+#[test]
+fn pre_epoch_clock_is_an_error_not_zero() {
+    let pre_epoch = UNIX_EPOCH
+        .checked_sub(Duration::from_secs(1))
+        .expect("UNIX_EPOCH minus one second is representable");
+
+    let err = system_time_to_ts(pre_epoch).expect_err("pre-epoch clock must not convert");
+    match err {
+        AuthError::Internal(message) => {
+            assert!(
+                message.contains("before the Unix epoch"),
+                "unexpected message: {message}"
+            );
+        }
+        other => panic!("expected AuthError::Internal, got {other:?}"),
+    }
+
+    // The bug this guards against: the old code returned 0, making every token look epoch-issued.
+    assert_ne!(system_time_to_ts(pre_epoch).ok(), Some(0));
+
+    // Boundary: the epoch itself is valid and maps to 0, one second later maps to 1.
+    assert_eq!(system_time_to_ts(UNIX_EPOCH).expect("epoch converts"), 0);
+    assert_eq!(
+        system_time_to_ts(UNIX_EPOCH + Duration::from_secs(1)).expect("post-epoch converts"),
+        1
+    );
+}
+
+/// The clock is not injectable into [`AuthnService`], so this test covers the conversion helper and
+/// documents that every entry point propagates its error.
+///
+/// Every clock consumer in `lib.rs` (`login` via `issue_token_pair`/`totp_verify`, `refresh`,
+/// `verify_access_token`'s callers, `update_password`, `set_password`, `revoke_all_for_user`) reaches
+/// the clock only through `now_ts()` or `now_step().expect("system clock is after the Unix epoch")`, both of which return `AuthResult` and are
+/// called with `?`. A pre-epoch clock therefore surfaces as `AuthError::Internal` from those public
+/// methods instead of silently issuing or accepting tokens at timestamp `0`. Verified by
+/// `grep -n "now_ts()\|now_step().expect("system clock is after the Unix epoch")" crates/authn/src/lib.rs`: no call site uses
+/// `unwrap_or`, `unwrap`, or `expect`.
+#[test]
+fn each_auth_entry_point_propagates_clock_error() {
+    for offset in [1u64, 60, 3600, 86_400] {
+        let t = UNIX_EPOCH
+            .checked_sub(Duration::from_secs(offset))
+            .expect("pre-epoch instant is representable");
+        let err = system_time_to_ts(t).expect_err("pre-epoch clock must be an error");
+        assert!(
+            matches!(&err, AuthError::Internal(message) if message.contains("before the Unix epoch")),
+            "offset {offset} produced {err:?}"
+        );
+    }
+
+    // `now_step` derives from the same conversion, so a pre-epoch clock cannot yield TOTP step 0.
+    assert!(
+        now_step().is_ok(),
+        "the real clock is expected to be post-epoch"
     );
 }
