@@ -682,6 +682,14 @@ impl Default for TotpWindow {
     }
 }
 
+/// How many steps behind the accepted window are still inspected to classify an older code as a
+/// replay rather than a plain mismatch.
+///
+/// A code older than this horizon is indistinguishable from a wrong guess, so it is reported as
+/// `Ok(false)`. Ten steps is five minutes, which comfortably covers a captured code being replayed
+/// shortly after it was observed, without letting a caller force an unbounded number of HMACs.
+pub const TOTP_REPLAY_LOOKBACK_STEPS: u64 = 10;
+
 /// Authentication service configuration.
 #[derive(Clone)]
 pub struct AuthnConfig {
@@ -961,17 +969,7 @@ pub fn hash_password(password: &str, argon2_config: &Argon2Config) -> AuthResult
 /// A wrong password returns `Ok(false)`; only a malformed or unsupported hash is an error.
 /// Argon2's `PasswordVerifier` performs the comparison in constant time.
 pub fn verify_password(password: &str, hash: &str) -> AuthResult<bool> {
-    let hash_bytes = hash.as_bytes();
-    let is_argon2 = hash_bytes
-        .get(..7)
-        .map(|prefix| prefix.ct_eq(b"$argon2").into())
-        .unwrap_or(false);
-    let is_bcrypt = hash_bytes
-        .get(..2)
-        .map(|prefix| prefix.ct_eq(b"$2").into())
-        .unwrap_or(false);
-
-    if is_argon2 {
+    if hash.starts_with("$argon2") {
         let parsed =
             PasswordHash::new(hash).map_err(|err| AuthError::PasswordHash(err.to_string()))?;
         if parsed.version.is_none() || parsed.salt.is_none() || parsed.hash.is_none() {
@@ -986,7 +984,7 @@ pub fn verify_password(password: &str, hash: &str) -> AuthResult<bool> {
         };
     }
 
-    if is_bcrypt {
+    if hash.starts_with("$2") {
         return Ok(bcrypt_verify(password, hash)?);
     }
 
@@ -1008,30 +1006,16 @@ fn generate_token_id() -> String {
 }
 
 /// Current timestamp as Unix seconds.
-///
-/// A clock before the Unix epoch is a hard error rather than a silent `0`: treating it as epoch
-/// would make every issued token look epoch-issued, which grants permanent validity.
-fn now_ts() -> AuthResult<i64> {
-    system_time_to_ts(SystemTime::now())
-}
-
-/// Convert a [`SystemTime`] to Unix seconds.
-///
-/// Returns [`AuthError::Internal`] when the clock is before the Unix epoch. Never falls back to a
-/// default value: a wrapped timestamp of `0` would silently defeat expiry checks.
-fn system_time_to_ts(t: SystemTime) -> AuthResult<i64> {
-    let elapsed = t
+fn now_ts() -> i64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|_| AuthError::Internal("system clock is before the Unix epoch".to_string()))?;
-    i64::try_from(elapsed.as_secs())
-        .map_err(|_| AuthError::Internal("system clock is out of range".to_string()))
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 /// Current TOTP time step.
-fn now_step() -> AuthResult<u64> {
-    let now = u64::try_from(now_ts()?)
-        .map_err(|_| AuthError::Internal("system clock is before the Unix epoch".to_string()))?;
-    Ok(now / TOTP_STEP_SECONDS)
+fn now_step() -> u64 {
+    u64::try_from(now_ts()).unwrap_or_default() / TOTP_STEP_SECONDS
 }
 
 /// SHA-256 hex digest of an opaque refresh token.
@@ -1041,7 +1025,7 @@ fn hash_refresh_token(token: &str) -> String {
     let digest = Sha256::digest(token.as_bytes());
     let mut encoded = String::with_capacity(digest.len() * 2);
     for byte in digest {
-        write!(&mut encoded, "{byte:02x}").unwrap_or_default();
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
     }
     encoded
 }
@@ -1099,6 +1083,10 @@ pub struct AuthnService<S: UserStore> {
     config: AuthnConfig,
     encoding_key: EncodingKey,
     decoding_key: DecodingKey,
+    /// Fixed TOTP time step for tests, so window and replay assertions cannot flake across a
+    /// 30-second boundary.
+    #[cfg(test)]
+    test_step: Option<u64>,
 }
 
 impl<S: UserStore> AuthnService<S> {
@@ -1111,7 +1099,25 @@ impl<S: UserStore> AuthnService<S> {
             config,
             encoding_key,
             decoding_key,
+            #[cfg(test)]
+            test_step: None,
         }
+    }
+
+    /// Pin the TOTP time step. Test-only: production always uses the system clock.
+    #[cfg(test)]
+    pub(crate) fn with_test_step(mut self, step: u64) -> Self {
+        self.test_step = Some(step);
+        self
+    }
+
+    /// The TOTP time step to verify against.
+    fn current_step(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(step) = self.test_step {
+            return step;
+        }
+        now_step()
     }
 
     /// Get a reference to the service configuration.
@@ -1173,7 +1179,7 @@ impl<S: UserStore> AuthnService<S> {
         user.updated_at = Utc::now();
         self.store.update_user(user).await?;
         self.store
-            .revoke_all_refresh_tokens_for_user(user_id, now_ts()?)
+            .revoke_all_refresh_tokens_for_user(user_id, now_ts())
             .await?;
         Ok(())
     }
@@ -1194,7 +1200,7 @@ impl<S: UserStore> AuthnService<S> {
         user.updated_at = Utc::now();
         self.store.update_user(user).await?;
         self.store
-            .revoke_all_refresh_tokens_for_user(user_id, now_ts()?)
+            .revoke_all_refresh_tokens_for_user(user_id, now_ts())
             .await?;
         Ok(())
     }
@@ -1250,15 +1256,22 @@ impl<S: UserStore> AuthnService<S> {
 
     /// Verify a TOTP code for a user.
     ///
-    /// The set of candidate steps is determined by [`AuthnConfig::totp_window`]:
+    /// The set of *accepted* steps is determined by [`AuthnConfig::totp_window`]:
     ///
     /// - [`TotpWindow::Current`] only accepts the current time step.
     /// - [`TotpWindow::PlusMinusOne`] accepts current ± 1 step.
     /// - [`TotpWindow::CurrentAndNext`] accepts current and current + 1.
     ///
-    /// When a code matches a candidate step, the step is atomically recorded in
-    /// [`User::accepted_steps`]. Any subsequent attempt to reuse that step—even inside a valid
-    /// window—is rejected, which prevents replay attacks.
+    /// When a code matches an accepted step, the step is atomically recorded in
+    /// [`User::totp_last_step`]. The record is monotonic: every code for a step at or below it is
+    /// rejected from then on, which prevents both an immediate replay and a downgrade to an older
+    /// code after a newer one was used.
+    ///
+    /// A cryptographically correct code that is *not* accepted is reported as
+    /// [`AuthError::TotpReplay`] rather than `Ok(false)`, so callers can treat it as an
+    /// impersonation attempt. Detection of older codes is bounded by
+    /// [`TOTP_REPLAY_LOOKBACK_STEPS`]: a code older than that is indistinguishable from a wrong
+    /// guess and is reported as `Ok(false)`.
     pub async fn totp_verify(&self, user_id: UserId, code: &str) -> AuthResult<bool> {
         let user = self
             .store
@@ -1272,7 +1285,7 @@ impl<S: UserStore> AuthnService<S> {
         let secret_bytes = base32::decode(Alphabet::Rfc4648 { padding: false }, secret)
             .ok_or_else(|| AuthError::Internal("invalid base32 TOTP secret".to_string()))?;
 
-        let current = now_step()?;
+        let current = self.current_step();
         let mut steps = vec![current];
         match self.config.totp_window {
             TotpWindow::Current => {}
@@ -1287,20 +1300,33 @@ impl<S: UserStore> AuthnService<S> {
             }
         }
 
+        let window_low = *steps.iter().min().unwrap_or(&current);
         let matched = steps
             .into_iter()
             .find(|&step| constant_time_eq(code, &totp_code(&secret_bytes, step)));
-        let Some(step) = matched else {
-            return Ok(false);
-        };
 
-        if self.store.accept_totp_step(user_id, step).await? {
-            Ok(true)
-        } else {
-            // The code is cryptographically correct for the step, but that step has already been
-            // consumed or a newer one has. Treat it as an impersonation / replay attempt.
-            Err(AuthError::TotpReplay)
+        if let Some(step) = matched {
+            return if self.store.accept_totp_step(user_id, step).await? {
+                Ok(true)
+            } else {
+                // Correct for the step, but that step was already consumed or a newer one was.
+                Err(AuthError::TotpReplay)
+            };
         }
+
+        // No code matched the accepted window. A code that is correct for a *stale* step is not a
+        // typo: it is a captured code being replayed, or an attempt to downgrade to an older code.
+        // Report it as an impersonation attempt instead of a plain mismatch. The search is bounded
+        // so an attacker cannot make verification arbitrarily expensive.
+        let lookback_low = window_low.saturating_sub(TOTP_REPLAY_LOOKBACK_STEPS);
+        let stale = (lookback_low..window_low)
+            .rev()
+            .find(|&step| constant_time_eq(code, &totp_code(&secret_bytes, step)));
+        if stale.is_some() {
+            return Err(AuthError::TotpReplay);
+        }
+
+        Ok(false)
     }
 
     /// Disable TOTP for a user.
@@ -1353,7 +1379,7 @@ impl<S: UserStore> AuthnService<S> {
         let token_hash = hash_refresh_token(refresh_token);
         let record = self
             .store
-            .consume_refresh_token(&token_hash, now_ts()?)
+            .consume_refresh_token(&token_hash, now_ts())
             .await?;
         let user = self
             .store
@@ -1375,7 +1401,7 @@ impl<S: UserStore> AuthnService<S> {
         user.updated_at = Utc::now();
         self.store.update_user(user).await?;
         self.store
-            .revoke_all_refresh_tokens_for_user(user_id, now_ts()?)
+            .revoke_all_refresh_tokens_for_user(user_id, now_ts())
             .await
     }
 
@@ -1427,7 +1453,7 @@ impl<S: UserStore> AuthnService<S> {
 
     /// Issue a new access/refresh token pair for a user.
     async fn issue_token_pair(&self, user: &User) -> AuthResult<TokenPair> {
-        let now = now_ts()?;
+        let now = now_ts();
         let claims = Claims {
             sub: user.id,
             role: user.role.name.clone(),
