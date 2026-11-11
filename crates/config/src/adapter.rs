@@ -3781,19 +3781,7 @@ fn wildcard_matches(name: &str, pattern: &str) -> bool {
     if pattern == "*" {
         return true;
     }
-    fn matches(name: &[u8], pattern: &[u8]) -> bool {
-        match pattern.first() {
-            None => name.is_empty(),
-            Some(b'*') => {
-                if matches(name, &pattern[1..]) {
-                    return true;
-                }
-                !name.is_empty() && matches(&name[1..], pattern)
-            }
-            Some(expected) => name.first() == Some(expected) && matches(&name[1..], &pattern[1..]),
-        }
-    }
-    matches(name.as_bytes(), pattern.as_bytes())
+    crate::glob::match_subject_wildcard(name, pattern)
 }
 
 /// `automationPolicyIsSubset`: every subject of `policy` is covered by `other`.
