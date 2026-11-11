@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod adapter;
+mod glob;
 pub mod lexer;
 pub mod parser;
 

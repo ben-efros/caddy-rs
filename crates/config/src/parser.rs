@@ -1533,17 +1533,7 @@ impl Parser {
 /// Simple single-wildcard glob matching used for file imports (`*` matches any run, `?` one
 /// character).
 fn glob_match(name: &str, pattern: &str) -> bool {
-    fn matches(name: &[u8], pattern: &[u8]) -> bool {
-        match pattern.first() {
-            None => name.is_empty(),
-            Some(b'*') => {
-                matches(name, &pattern[1..]) || (!name.is_empty() && matches(&name[1..], pattern))
-            }
-            Some(b'?') => !name.is_empty() && matches(&name[1..], &pattern[1..]),
-            Some(expected) => name.first() == Some(expected) && matches(&name[1..], &pattern[1..]),
-        }
-    }
-    matches(name.as_bytes(), pattern.as_bytes())
+    crate::glob::match_import_glob(name, pattern)
 }
 
 fn at_line_start(tokens: &[Token]) -> bool {
