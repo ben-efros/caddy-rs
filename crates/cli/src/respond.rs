@@ -248,23 +248,31 @@ fn select_response_with_stdin(
     Ok((status, body, origin))
 }
 
-/// Whether stdin is a pipe (Caddy reads a body only from `os.ModeNamedPipe`).
+/// Whether stdin is a named pipe (`S_IFIFO`), matching Caddy's `os.ModeNamedPipe` test.
+///
+/// Only a FIFO counts: a regular-file redirect, `/dev/null`, a socket, a terminal and a closed
+/// descriptor all report `false`, so `caddy-rs respond --status 200 < page.html` serves an empty
+/// body exactly like Caddy. `/dev/stdin` refers to the same open file description as fd 0, so
+/// `std::fs::metadata` reports the real file type without an `unsafe` `fstat` call.
 #[cfg(unix)]
 fn stdin_is_pipe() -> bool {
-    use std::os::unix::io::AsRawFd;
+    use std::io::IsTerminal;
+    use std::os::unix::fs::FileTypeExt;
 
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: `fstat` initializes the buffer it is given on success; the fd is stdin, which is
-    // valid for the lifetime of the call.
-    let result = unsafe { libc::fstat(std::io::stdin().as_raw_fd(), stat.as_mut_ptr()) };
-    if result != 0 {
-        return false;
+    match std::fs::metadata("/dev/stdin") {
+        Ok(metadata) => metadata.file_type().is_fifo(),
+        // `/dev/stdin` exists but does not resolve: fd 0 is closed, which is not a pipe.
+        Err(_) if std::fs::symlink_metadata("/dev/stdin").is_ok() => false,
+        // `/dev/stdin` is unavailable on some minimal systems; fall back to the terminal check,
+        // which only over-approximates the pipe case.
+        Err(_) => !std::io::stdin().is_terminal(),
     }
-    // SAFETY: `result == 0` means `fstat` filled the buffer.
-    let stat = unsafe { stat.assume_init() };
-    (stat.st_mode & libc::S_IFMT) == libc::S_IFIFO
 }
 
+/// Whether stdin is a pipe, as closely as this platform can tell.
+///
+/// Non-unix targets expose no `fstat`/`S_IFIFO` equivalent, so `!is_terminal()` is the closest
+/// available approximation (unlike unix, it also accepts a regular-file redirect).
 #[cfg(not(unix))]
 fn stdin_is_pipe() -> bool {
     use std::io::IsTerminal;

@@ -3143,25 +3143,35 @@ fn spawn_respond(directory: &Path, args: &[&str], stdin: Option<&str>) -> Respon
 
 /// Spawn an already-built `respond` command (used to inject process environment and descriptors).
 fn spawn_respond_command(
-    mut command: Command,
+    command: Command,
     directory: &Path,
     stdin: Option<&str>,
 ) -> RespondProcess {
+    let Some(data) = stdin else {
+        return spawn_respond_with_stdin(command, directory, Stdio::null());
+    };
+    let mut process = spawn_respond_with_stdin(command, directory, Stdio::piped());
+    let mut pipe = process.child.stdin.take().expect("respond stdin pipe");
+    pipe.write_all(data.as_bytes())
+        .expect("write respond stdin");
+    drop(pipe);
+    process
+}
+
+/// Spawn an already-built `respond` command with an explicit stdin descriptor, so tests can also
+/// redirect stdin from a regular file (a FIFO is covered by `Stdio::piped`).
+fn spawn_respond_with_stdin(
+    mut command: Command,
+    directory: &Path,
+    stdin: Stdio,
+) -> RespondProcess {
     let log = directory.join("respond.stderr");
     let file = std::fs::File::create(&log).expect("create respond stderr log");
-    command.stdout(Stdio::piped()).stderr(Stdio::from(file));
-    if stdin.is_some() {
-        command.stdin(Stdio::piped());
-    } else {
-        command.stdin(Stdio::null());
-    }
+    command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(file))
+        .stdin(stdin);
     let mut child = command.spawn().expect("spawn caddy-rs respond");
-    if let Some(data) = stdin {
-        let mut pipe = child.stdin.take().expect("respond stdin pipe");
-        pipe.write_all(data.as_bytes())
-            .expect("write respond stdin");
-        drop(pipe);
-    }
     let stdout = child.stdout.take().expect("respond stdout pipe");
     let (sender, lines) = mpsc::channel();
     std::thread::spawn(move || {
@@ -3402,6 +3412,23 @@ fn respond_reads_a_piped_stdin_body() {
         response.header("content-type"),
         Some("text/plain; charset=utf-8")
     );
+}
+
+#[test]
+fn respond_ignores_a_regular_file_stdin_redirect() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let page = directory.path().join("page.html");
+    std::fs::write(&page, "file-body").expect("write stdin file");
+    let stdin = std::fs::File::open(&page).expect("open stdin file");
+    let mut command = Command::new(binary());
+    command.arg("respond").args(["--listen", "127.0.0.1:0"]);
+    // Caddy reads a body only from a named pipe (`os.ModeNamedPipe`); a regular-file redirect
+    // leaves the body empty, unlike `!stdin.is_terminal()`. A real FIFO is covered above by
+    // `respond_reads_a_piped_stdin_body` (`Stdio::piped`).
+    let mut server = spawn_respond_with_stdin(command, directory.path(), Stdio::from(stdin));
+    let response = http_exchange(server.next_address(), "GET");
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, "");
 }
 
 #[test]
