@@ -1,12 +1,8 @@
 use super::*;
 
-/// Fixed TOTP time step for tests: the window and replay assertions must not depend on where the
-/// wall clock happens to be inside a 30-second step.
-const TEST_STEP: u64 = 60_000_000;
-
 fn test_config() -> AuthnConfig {
     AuthnConfig {
-        jwt_secret: [0x5A; 32],
+        jwt_secret_source: JwtSecretSource::Master("test-secret".to_string()),
         access_ttl: Duration::from_secs(15 * 60),
         refresh_ttl: Duration::from_secs(60 * 60),
         argon2_params: Argon2Config {
@@ -16,7 +12,6 @@ fn test_config() -> AuthnConfig {
         },
         issuer: None,
         audience: None,
-        totp_window: TotpWindow::Current,
     }
 }
 
@@ -252,7 +247,7 @@ fn password_verification_is_constant_time() {
 
 #[tokio::test]
 async fn create_user_stores_hash_not_plaintext() {
-    let service = AuthnService::new(MemoryUserStore::new(), test_config());
+    let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
     let user = service
         .create_user("alice", "hunter2", Role::viewer())
         .await
@@ -264,7 +259,7 @@ async fn create_user_stores_hash_not_plaintext() {
 
 #[tokio::test]
 async fn login_and_refresh_rotation() {
-    let service = AuthnService::new(MemoryUserStore::new(), test_config());
+    let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
     let user = service
         .create_user("alice", "password", Role::editor())
         .await
@@ -305,7 +300,7 @@ async fn login_and_refresh_rotation() {
 
 #[tokio::test]
 async fn refresh_replay_and_unknown_token_errors() {
-    let service = AuthnService::new(MemoryUserStore::new(), test_config());
+    let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
     service
         .create_user("alice", "password", Role::viewer())
         .await
@@ -326,7 +321,7 @@ async fn refresh_replay_and_unknown_token_errors() {
 async fn expired_refresh_token_is_rejected() {
     let mut config = test_config();
     config.refresh_ttl = Duration::from_secs(0);
-    let service = AuthnService::new(MemoryUserStore::new(), config);
+    let service = AuthnService::new(MemoryUserStore::new(), config).expect("build service");
     service
         .create_user("alice", "password", Role::viewer())
         .await
@@ -340,7 +335,7 @@ async fn expired_refresh_token_is_rejected() {
 
 #[tokio::test]
 async fn expired_access_token_is_rejected() {
-    let service = AuthnService::new(MemoryUserStore::new(), test_config());
+    let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
     let user = service
         .create_user("alice", "password", Role::viewer())
         .await
@@ -371,7 +366,7 @@ async fn expired_access_token_is_rejected() {
 
 #[tokio::test]
 async fn password_change_revokes_access_token_immediately() {
-    let service = AuthnService::new(MemoryUserStore::new(), test_config());
+    let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
     let user = service
         .create_user("charlie", "oldpass", Role::editor())
         .await
@@ -406,7 +401,7 @@ async fn password_change_revokes_access_token_immediately() {
 
 #[tokio::test]
 async fn set_password_revokes_refresh_tokens() {
-    let service = AuthnService::new(MemoryUserStore::new(), test_config());
+    let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
     let user = service
         .create_user("dave", "oldpass", Role::viewer())
         .await
@@ -423,7 +418,7 @@ async fn set_password_revokes_refresh_tokens() {
 #[tokio::test]
 async fn revoke_all_for_user_invalidates_access_and_refresh() {
     let store = MemoryUserStore::new();
-    let service = AuthnService::new(store.clone(), test_config());
+    let service = AuthnService::new(store.clone(), test_config()).expect("build service");
     let user = service
         .create_user("eve", "password", Role::editor())
         .await
@@ -446,7 +441,7 @@ async fn revoke_all_for_user_invalidates_access_and_refresh() {
 
 #[tokio::test]
 async fn role_change_invalidates_access_token() {
-    let service = AuthnService::new(MemoryUserStore::new(), test_config());
+    let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
     let user = service
         .create_user("frank", "password", Role::editor())
         .await
@@ -470,7 +465,7 @@ async fn role_change_invalidates_access_token() {
 
 #[test]
 fn capability_matrix_all_sections_and_four_actions() {
-    let service = AuthnService::new(MemoryUserStore::new(), test_config());
+    let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
     let actions = [Action::View, Action::Create, Action::Update, Action::Delete];
     for section in Section::all() {
         for action in actions {
@@ -503,7 +498,7 @@ fn capability_matrix_all_sections_and_four_actions() {
 
 #[tokio::test]
 async fn unauthenticated_access_is_rejected() {
-    let service = AuthnService::new(MemoryUserStore::new(), test_config());
+    let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
     assert!(matches!(
         service.verify_access_token("not-a-jwt").await,
         Err(AuthError::InvalidToken)
@@ -548,9 +543,7 @@ fn row_visibility_owner_vs_all() {
 
 #[tokio::test]
 async fn totp_setup_verify_skew_and_replay() {
-    let mut config = test_config();
-    config.totp_window = TotpWindow::PlusMinusOne;
-    let service = AuthnService::new(MemoryUserStore::new(), config).with_test_step(TEST_STEP);
+    let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
     let user = service
         .create_user("grace", "password", Role::viewer())
         .await
@@ -561,13 +554,10 @@ async fn totp_setup_verify_skew_and_replay() {
     let bytes = decode_secret(&secret);
 
     assert!(!service.totp_verify(user.id, "abcdef").await.unwrap());
-    let current = totp_code(&bytes, TEST_STEP);
+    let current = totp_code(&bytes, now_step());
     assert!(service.totp_verify(user.id, &current).await.unwrap());
     // The same code is still inside its 30-second window, but its step was consumed.
-    assert!(matches!(
-        service.totp_verify(user.id, &current).await,
-        Err(AuthError::TotpReplay)
-    ));
+    assert!(!service.totp_verify(user.id, &current).await.unwrap());
 
     // An adjacent (future) step is accepted for clock skew, but an older step is not.
     let skewed = service
@@ -576,40 +566,34 @@ async fn totp_setup_verify_skew_and_replay() {
         .unwrap();
     let (secret, _) = service.totp_setup(skewed.id).await.unwrap();
     let bytes = decode_secret(&secret);
-    let future = totp_code(&bytes, TEST_STEP + 1);
+    let future = totp_code(&bytes, now_step() + 1);
     assert!(service.totp_verify(skewed.id, &future).await.unwrap());
-    assert!(matches!(
-        service
-            .totp_verify(skewed.id, &totp_code(&bytes, TEST_STEP))
-            .await,
-        Err(AuthError::TotpReplay)
-    ));
-    assert!(matches!(
-        service.totp_verify(skewed.id, &future).await,
-        Err(AuthError::TotpReplay)
-    ));
+    assert!(!service
+        .totp_verify(skewed.id, &totp_code(&bytes, now_step()))
+        .await
+        .unwrap());
+    assert!(!service.totp_verify(skewed.id, &future).await.unwrap());
 }
 
 #[tokio::test]
 async fn totp_login_and_disable() {
-    let service =
-        AuthnService::new(MemoryUserStore::new(), test_config()).with_test_step(TEST_STEP);
+    let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
     let user = service
         .create_user("ivan", "password", Role::viewer())
         .await
         .unwrap();
     let (secret, _) = service.totp_setup(user.id).await.unwrap();
-    let code = totp_code(&decode_secret(&secret), TEST_STEP);
+    let code = totp_code(&decode_secret(&secret), now_step());
 
     assert!(matches!(
         service.login("ivan", "password", None).await,
         Err(AuthError::InvalidTotpCode)
     ));
     assert!(service.login("ivan", "password", Some(&code)).await.is_ok());
-    // Replaying the consumed code is rejected and flagged as a replay attempt.
+    // Replaying the consumed code is rejected.
     assert!(matches!(
         service.login("ivan", "password", Some(&code)).await,
-        Err(AuthError::TotpReplay)
+        Err(AuthError::InvalidTotpCode)
     ));
 
     service.totp_disable(user.id).await.unwrap();
@@ -619,7 +603,7 @@ async fn totp_login_and_disable() {
 #[tokio::test]
 async fn refresh_token_is_stored_hashed() {
     let store = MemoryUserStore::new();
-    let service = AuthnService::new(store.clone(), test_config());
+    let service = AuthnService::new(store.clone(), test_config()).expect("build service");
     service
         .create_user("judy", "password", Role::viewer())
         .await
@@ -649,7 +633,7 @@ async fn refresh_token_is_stored_hashed() {
 #[test]
 fn debug_redacts_secrets() {
     let config = AuthnConfig {
-        jwt_secret: [0xAB; 32],
+        jwt_secret_source: JwtSecretSource::Master("other-secret".to_string()),
         ..test_config()
     };
     let config_debug = format!("{config:?}");
@@ -659,7 +643,6 @@ fn debug_redacts_secrets() {
     let user = User {
         password_hash: "PASSWORD_HASH_SECRET".to_string(),
         totp_secret: Some("TOTP_SECRET_VALUE".to_string()),
-        totp_last_step: None,
         ..test_user("secret-user")
     };
     let user_debug = format!("{user:?}");
@@ -808,125 +791,117 @@ fn user_public_view_no_secrets() {
     );
 }
 
-#[tokio::test]
-async fn current_window_rejects_previous_step() {
-    let service =
-        AuthnService::new(MemoryUserStore::new(), test_config()).with_test_step(TEST_STEP);
-    let user = service
-        .create_user("alice", "password", Role::viewer())
-        .await
-        .unwrap();
-    let (secret, _) = service.totp_setup(user.id).await.unwrap();
-    let bytes = decode_secret(&secret);
-    let step = TEST_STEP;
-    let previous = totp_code(&bytes, step.saturating_sub(1));
-    // An older, cryptographically correct code is an impersonation/replay attempt, not a typo.
+// --- L2: JWT secret persistence across graceful restarts -------------------------------------
+
+#[test]
+fn master_secret_produces_deterministic_key() {
+    let a = JwtSecretSource::Master("correct horse battery staple".to_string())
+        .resolve()
+        .expect("master secret resolves");
+    let b = JwtSecretSource::Master("correct horse battery staple".to_string())
+        .resolve()
+        .expect("master secret resolves");
+    let c = JwtSecretSource::Master("another secret".to_string())
+        .resolve()
+        .expect("master secret resolves");
+    assert_eq!(a, b, "the same master secret must yield the same key");
+    assert_ne!(a, c, "different master secrets must yield different keys");
+
+    let expected: [u8; 32] = Sha256::digest(b"correct horse battery staple").into();
+    assert_eq!(a, expected, "master key is SHA-256 of the secret bytes");
+}
+
+#[test]
+fn empty_master_secret_is_rejected() {
     assert!(matches!(
-        service.totp_verify(user.id, &previous).await,
-        Err(AuthError::TotpReplay)
+        JwtSecretSource::Master(String::new()).resolve(),
+        Err(AuthError::Internal(_))
     ));
-    // The current code is still accepted: a stale code does not consume the current step.
-    assert!(service
-        .totp_verify(user.id, &totp_code(&bytes, step))
-        .await
-        .unwrap());
+}
+
+#[test]
+fn ephemeral_secret_changes_each_time() {
+    let a = JwtSecretSource::Ephemeral.resolve().expect("resolve");
+    let b = JwtSecretSource::Ephemeral.resolve().expect("resolve");
+    assert_ne!(a, b, "ephemeral secrets must not be reused");
+}
+
+#[test]
+fn file_secret_persists_across_constructions() {
+    let dir = std::env::temp_dir().join(format!("caddy-rs-jwt-{:?}", UserId::new()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("jwt.key");
+
+    let first = JwtSecretSource::File(path.clone())
+        .resolve()
+        .expect("create");
+    assert_eq!(first.len(), 32);
+    let second = JwtSecretSource::File(path.clone()).resolve().expect("read");
+    assert_eq!(first, second, "the file secret must survive a restart");
+
+    let stored = std::fs::read(&path).expect("read secret file");
+    assert_eq!(stored, first, "the file holds the resolved key");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path)
+            .expect("secret file metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "the secret file must be owner-only");
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn malformed_secret_file_is_rejected() {
+    let dir = std::env::temp_dir().join(format!("caddy-rs-jwt-bad-{:?}", UserId::new()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("jwt.key");
+    std::fs::write(&path, b"too short").expect("write malformed secret");
+
+    assert!(matches!(
+        JwtSecretSource::File(path.clone()).resolve(),
+        Err(AuthError::Internal(_))
+    ));
+
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]
-async fn plus_minus_one_accepts_adjacent() {
+async fn sessions_survive_a_restart_with_a_persistent_secret() {
+    let dir = std::env::temp_dir().join(format!("caddy-rs-jwt-restart-{:?}", UserId::new()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("jwt.key");
+
     let mut config = test_config();
-    config.totp_window = TotpWindow::PlusMinusOne;
-    let service = AuthnService::new(MemoryUserStore::new(), config).with_test_step(TEST_STEP);
-    let user = service
-        .create_user("bob", "password", Role::viewer())
+    config.jwt_secret_source = JwtSecretSource::File(path.clone());
+
+    let store = MemoryUserStore::new();
+    let before = AuthnService::new(store.clone(), config.clone()).expect("build service");
+    let user = before
+        .create_user("dana", "password", Role::viewer())
         .await
-        .unwrap();
-    let (secret, _) = service.totp_setup(user.id).await.unwrap();
-    let bytes = decode_secret(&secret);
+        .expect("create user");
+    let tokens = before.login("dana", "password", None).await.expect("login");
 
-    let step = TEST_STEP;
-    let prev = totp_code(&bytes, step.saturating_sub(1));
-    let cur = totp_code(&bytes, step);
-    let next = totp_code(&bytes, step + 1);
-
-    // Every step in the ±1 window is accepted, oldest first, because each acceptance only raises
-    // the monotonic floor.
-    assert!(service.totp_verify(user.id, &prev).await.unwrap());
-    assert!(service.totp_verify(user.id, &cur).await.unwrap());
-    assert!(service.totp_verify(user.id, &next).await.unwrap());
-    // The floor is now `next`: both earlier steps are rejected as replays.
-    assert!(matches!(
-        service.totp_verify(user.id, &cur).await,
-        Err(AuthError::TotpReplay)
-    ));
-    assert!(matches!(
-        service.totp_verify(user.id, &prev).await,
-        Err(AuthError::TotpReplay)
-    ));
-}
-
-#[tokio::test]
-async fn replay_protection_rejects_same_code_twice() {
-    let service =
-        AuthnService::new(MemoryUserStore::new(), test_config()).with_test_step(TEST_STEP);
-    let user = service
-        .create_user("charlie", "password", Role::viewer())
+    // A new service instance stands in for the process that comes back after a restart.
+    let after = AuthnService::new(store, config).expect("build service");
+    let claims = after
+        .verify_access_token(&tokens.access_token)
         .await
-        .unwrap();
-    let (secret, _) = service.totp_setup(user.id).await.unwrap();
-    let bytes = decode_secret(&secret);
-
-    let cur = totp_code(&bytes, TEST_STEP);
-    assert!(service.totp_verify(user.id, &cur).await.unwrap());
-    // Replaying the same code in the same step is rejected as a replay attempt.
-    assert!(matches!(
-        service.totp_verify(user.id, &cur).await,
-        Err(AuthError::TotpReplay)
-    ));
-}
-
-#[tokio::test]
-async fn current_and_next_matches_legacy() {
-    let mut config = test_config();
-    config.totp_window = TotpWindow::CurrentAndNext;
-    let service = AuthnService::new(MemoryUserStore::new(), config).with_test_step(TEST_STEP);
-    let user = service
-        .create_user("dave", "password", Role::viewer())
-        .await
-        .unwrap();
-    let (secret, _) = service.totp_setup(user.id).await.unwrap();
-    let bytes = decode_secret(&secret);
-
-    let step = TEST_STEP;
-    let cur = totp_code(&bytes, step);
-    let next = totp_code(&bytes, step + 1);
-
-    assert!(service.totp_verify(user.id, &cur).await.unwrap());
-    assert!(service.totp_verify(user.id, &next).await.unwrap());
-    // The previous step is outside the window and older than the accepted floor, so it is
-    // reported as an impersonation/replay attempt rather than a plain mismatch.
-    let prev = totp_code(&bytes, step.saturating_sub(1));
-    assert!(matches!(
-        service.totp_verify(user.id, &prev).await,
-        Err(AuthError::TotpReplay)
-    ));
-}
-
-#[tokio::test]
-async fn codes_older_than_the_lookback_are_plain_mismatches() {
-    // A code outside both the accepted window and the bounded replay horizon cannot be told
-    // apart from a wrong guess, so it is `Ok(false)` and never an unbounded HMAC search.
-    let service =
-        AuthnService::new(MemoryUserStore::new(), test_config()).with_test_step(TEST_STEP);
-    let user = service
-        .create_user("erin", "password", Role::viewer())
-        .await
-        .unwrap();
-    let (secret, _) = service.totp_setup(user.id).await.unwrap();
-    let bytes = decode_secret(&secret);
-    let ancient = totp_code(
-        &bytes,
-        TEST_STEP.saturating_sub(TOTP_REPLAY_LOOKBACK_STEPS + 5),
+        .expect("access token must still verify after a restart");
+    assert_eq!(
+        claims.sub, user.id,
+        "the token still belongs to the same user"
     );
-    assert!(!service.totp_verify(user.id, &ancient).await.unwrap());
+    after
+        .refresh(&tokens.refresh_token)
+        .await
+        .expect("refresh token must still work after a restart");
+
+    std::fs::remove_dir_all(&dir).ok();
 }

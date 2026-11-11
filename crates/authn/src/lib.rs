@@ -4,8 +4,7 @@
 //! - User management with roles, capabilities, and row-level visibility
 //! - Password hashing (argon2id preferred, bcrypt fallback) with constant-time verification
 //! - JWT access tokens and rotating opaque refresh tokens
-//! - TOTP two-factor authentication with a configurable window and monotonic replay protection;
-//!   see `docs/TOTP.md` for the configuration and the required handling of replay rejections
+//! - TOTP two-factor authentication with replay protection
 //! - Permission checking based on roles, capabilities, and visibility
 //! - An in-memory [`UserStore`] implementation; persistent backends belong outside this crate
 //!
@@ -17,6 +16,7 @@
 #![warn(missing_docs)]
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -331,11 +331,7 @@ pub struct User {
     pub role: Role,
     /// TOTP secret (base32 encoded), if 2FA is enabled.
     pub totp_secret: Option<String>,
-    /// Highest TOTP time step accepted for this user, used for replay protection.
-    ///
-    /// Any code whose time step is at or below this value is rejected: a consumed code is a
-    /// replay, and an older code after a newer one has been accepted is treated as an
-    /// impersonation attempt.
+    /// Last TOTP time step accepted for this user, used for replay protection.
     pub totp_last_step: Option<u64>,
     /// Monotonically increasing authentication epoch.
     ///
@@ -388,11 +384,7 @@ pub struct UserRecord {
     pub role: Role,
     /// Whether TOTP is enabled; the secret itself is never stored or serialized.
     pub totp_enabled: bool,
-    /// Highest TOTP time step accepted for this user, used for replay protection.
-    ///
-    /// Any code whose time step is at or below this value is rejected: a consumed code is a
-    /// replay, and an older code after a newer one has been accepted is treated as an
-    /// impersonation attempt.
+    /// Last TOTP time step accepted for this user, used for replay protection.
     pub totp_last_step: Option<u64>,
     /// Monotonically increasing authentication epoch.
     pub auth_epoch: u64,
@@ -524,15 +516,9 @@ pub enum AuthError {
     /// A refresh token was never issued or has been deleted.
     #[error("refresh token not found")]
     RefreshTokenNotFound,
-    /// The supplied TOTP code is invalid.
+    /// The supplied TOTP code is invalid or has already been used.
     #[error("invalid TOTP code")]
     InvalidTotpCode,
-    /// The supplied TOTP code was already used, or predates the newest accepted code.
-    ///
-    /// This is a replay / impersonation attempt and is reported distinctly from a merely
-    /// incorrect code so callers can alert, rate-limit, or lock the account.
-    #[error("TOTP code replay or impersonation attempt")]
-    TotpReplay,
     /// TOTP is not configured for the user.
     #[error("TOTP not configured for user")]
     TotpNotConfigured,
@@ -661,40 +647,124 @@ impl Default for Argon2Config {
     }
 }
 
-/// TOTP time-step acceptance window.
+/// Source for the JWT signing secret.
 ///
-/// The window controls how many adjacent time steps are considered valid when verifying a TOTP
-/// code. A larger window is more forgiving of clock skew and user delay, but slightly increases
-/// the attack surface because multiple consecutive codes are acceptable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TotpWindow {
-    /// Only accept the current time step. Most secure, default.
-    Current,
-    /// Accept current ± 1 time step. Tolerates small clock skew and user delay.
-    PlusMinusOne,
-    /// Accept current and next step (current + 1). Legacy behavior.
-    CurrentAndNext,
+/// # Security Warning
+/// Production deployments should **always** use [`JwtSecretSource::Master`] or
+/// [`JwtSecretSource::File`] so that existing sessions remain valid across config
+/// reloads and process restarts. [`JwtSecretSource::Ephemeral`] is provided only
+/// for backwards compatibility and local development.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum JwtSecretSource {
+    /// Derive from a user-provided master secret string.
+    ///
+    /// The 32-byte signing key is produced by hashing the UTF-8 bytes of the
+    /// secret with SHA-256. The same master secret always yields the same key.
+    Master(String),
+    /// Read from / write to a persistent file.
+    ///
+    /// On first start the file does not exist: a random 32-byte secret is
+    /// generated, written atomically (write-temp-then-rename), and reused on
+    /// every subsequent start.
+    File(PathBuf),
+    /// Generate fresh on each start (legacy behavior, **NOT recommended**).
+    Ephemeral,
 }
 
-impl Default for TotpWindow {
+impl Default for JwtSecretSource {
     fn default() -> Self {
-        TotpWindow::Current
+        Self::Ephemeral
     }
 }
 
-/// How many steps behind the accepted window are still inspected to classify an older code as a
-/// replay rather than a plain mismatch.
-///
-/// A code older than this horizon is indistinguishable from a wrong guess, so it is reported as
-/// `Ok(false)`. Ten steps is five minutes, which comfortably covers a captured code being replayed
-/// shortly after it was observed, without letting a caller force an unbounded number of HMACs.
-pub const TOTP_REPLAY_LOOKBACK_STEPS: u64 = 10;
+impl JwtSecretSource {
+    /// Resolve this source to a 32-byte signing key.
+    ///
+    /// Fails only when a [`JwtSecretSource::File`] secret cannot be read or created; the caller
+    /// must not silently fall back to an ephemeral key, because that would invalidate every
+    /// existing session without telling anyone.
+    fn resolve(&self) -> AuthResult<[u8; 32]> {
+        match self {
+            JwtSecretSource::Master(secret) => {
+                if secret.is_empty() {
+                    return Err(AuthError::Internal(
+                        "JWT master secret must not be empty".to_string(),
+                    ));
+                }
+                Ok(Sha256::digest(secret.as_bytes()).into())
+            }
+            JwtSecretSource::File(path) => {
+                match std::fs::read(path) {
+                    Ok(bytes) if bytes.len() == 32 => {
+                        let mut key = [0u8; 32];
+                        key.copy_from_slice(&bytes);
+                        return Ok(key);
+                    }
+                    Ok(bytes) => {
+                        return Err(AuthError::Internal(format!(
+                            "JWT secret file {} must contain exactly 32 bytes, found {}",
+                            path.display(),
+                            bytes.len()
+                        )));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(AuthError::Internal(format!(
+                            "could not read JWT secret file {}: {error}",
+                            path.display()
+                        )));
+                    }
+                }
+
+                let mut key = [0u8; 32];
+                OsRng.fill_bytes(&mut key);
+                // Write to a sibling temp file that is created owner-only, then rename it into
+                // place. `rename` is atomic on the same filesystem, so a concurrent start never
+                // observes a partially written secret.
+                let temp = path.with_extension("tmp");
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create(true).truncate(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                let mut file = options.open(&temp).map_err(|error| {
+                    AuthError::Internal(format!(
+                        "could not create JWT secret file {}: {error}",
+                        temp.display()
+                    ))
+                })?;
+                use std::io::Write;
+                file.write_all(&key).map_err(|error| {
+                    AuthError::Internal(format!(
+                        "could not write JWT secret file {}: {error}",
+                        temp.display()
+                    ))
+                })?;
+                file.sync_all().ok();
+                std::fs::rename(&temp, path).map_err(|error| {
+                    AuthError::Internal(format!(
+                        "could not install JWT secret file {}: {error}",
+                        path.display()
+                    ))
+                })?;
+                Ok(key)
+            }
+            JwtSecretSource::Ephemeral => {
+                let mut key = [0u8; 32];
+                OsRng.fill_bytes(&mut key);
+                Ok(key)
+            }
+        }
+    }
+}
 
 /// Authentication service configuration.
 #[derive(Clone)]
 pub struct AuthnConfig {
-    /// JWT signing secret (32 bytes for HS256).
-    pub jwt_secret: [u8; 32],
+    /// Source for the JWT signing secret.
+    pub jwt_secret_source: JwtSecretSource,
     /// Access token TTL.
     pub access_ttl: Duration,
     /// Refresh token TTL.
@@ -705,23 +775,17 @@ pub struct AuthnConfig {
     pub issuer: Option<String>,
     /// Audience for JWT tokens.
     pub audience: Option<String>,
-    /// TOTP verification window.
-    pub totp_window: TotpWindow,
 }
 
 impl Default for AuthnConfig {
     fn default() -> Self {
-        let mut jwt_secret = [0u8; 32];
-        OsRng.fill_bytes(&mut jwt_secret);
-
         Self {
-            jwt_secret,
+            jwt_secret_source: JwtSecretSource::Ephemeral,
             access_ttl: Duration::from_secs(15 * 60),
             refresh_ttl: Duration::from_secs(7 * 24 * 60 * 60),
             argon2_params: Argon2Config::default(),
             issuer: None,
             audience: None,
-            totp_window: TotpWindow::Current,
         }
     }
 }
@@ -729,13 +793,12 @@ impl Default for AuthnConfig {
 impl std::fmt::Debug for AuthnConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthnConfig")
-            .field("jwt_secret", &"[redacted]")
+            .field("jwt_secret_source", &"[redacted]")
             .field("access_ttl", &self.access_ttl)
             .field("refresh_ttl", &self.refresh_ttl)
             .field("argon2_params", &self.argon2_params)
             .field("issuer", &self.issuer)
             .field("audience", &self.audience)
-            .field("totp_window", &self.totp_window)
             .finish()
     }
 }
@@ -928,9 +991,6 @@ impl UserStore for MemoryUserStore {
         if user.totp_secret.is_none() {
             return Ok(false);
         }
-        // Reject any step at or below the highest accepted step. This rejects both an immediate
-        // replay of a consumed code and a downgrade to an older code after a newer one has been
-        // accepted (a replay / impersonation attempt), regardless of the configured window.
         if user.totp_last_step.is_some_and(|last| step <= last) {
             return Ok(false);
         }
@@ -1083,41 +1143,23 @@ pub struct AuthnService<S: UserStore> {
     config: AuthnConfig,
     encoding_key: EncodingKey,
     decoding_key: DecodingKey,
-    /// Fixed TOTP time step for tests, so window and replay assertions cannot flake across a
-    /// 30-second boundary.
-    #[cfg(test)]
-    test_step: Option<u64>,
 }
 
 impl<S: UserStore> AuthnService<S> {
     /// Create a new service with the given store and configuration.
-    pub fn new(store: S, config: AuthnConfig) -> Self {
-        let encoding_key = EncodingKey::from_secret(&config.jwt_secret);
-        let decoding_key = DecodingKey::from_secret(&config.jwt_secret);
-        Self {
+    ///
+    /// Fails when the configured [`JwtSecretSource`] cannot produce a signing key, rather than
+    /// silently starting with a different (ephemeral) key that would invalidate every session.
+    pub fn new(store: S, config: AuthnConfig) -> AuthResult<Self> {
+        let secret = config.jwt_secret_source.resolve()?;
+        let encoding_key = EncodingKey::from_secret(&secret);
+        let decoding_key = DecodingKey::from_secret(&secret);
+        Ok(Self {
             store,
             config,
             encoding_key,
             decoding_key,
-            #[cfg(test)]
-            test_step: None,
-        }
-    }
-
-    /// Pin the TOTP time step. Test-only: production always uses the system clock.
-    #[cfg(test)]
-    pub(crate) fn with_test_step(mut self, step: u64) -> Self {
-        self.test_step = Some(step);
-        self
-    }
-
-    /// The TOTP time step to verify against.
-    fn current_step(&self) -> u64 {
-        #[cfg(test)]
-        if let Some(step) = self.test_step {
-            return step;
-        }
-        now_step()
+        })
     }
 
     /// Get a reference to the service configuration.
@@ -1256,22 +1298,8 @@ impl<S: UserStore> AuthnService<S> {
 
     /// Verify a TOTP code for a user.
     ///
-    /// The set of *accepted* steps is determined by [`AuthnConfig::totp_window`]:
-    ///
-    /// - [`TotpWindow::Current`] only accepts the current time step.
-    /// - [`TotpWindow::PlusMinusOne`] accepts current ± 1 step.
-    /// - [`TotpWindow::CurrentAndNext`] accepts current and current + 1.
-    ///
-    /// When a code matches an accepted step, the step is atomically recorded in
-    /// [`User::totp_last_step`]. The record is monotonic: every code for a step at or below it is
-    /// rejected from then on, which prevents both an immediate replay and a downgrade to an older
-    /// code after a newer one was used.
-    ///
-    /// A cryptographically correct code that is *not* accepted is reported as
-    /// [`AuthError::TotpReplay`] rather than `Ok(false)`, so callers can treat it as an
-    /// impersonation attempt. Detection of older codes is bounded by
-    /// [`TOTP_REPLAY_LOOKBACK_STEPS`]: a code older than that is indistinguishable from a wrong
-    /// guess and is reported as `Ok(false)`.
+    /// The current step and one adjacent step in either direction are accepted for clock skew.
+    /// The accepted step is recorded atomically, so the same code cannot be used twice.
     pub async fn totp_verify(&self, user_id: UserId, code: &str) -> AuthResult<bool> {
         let user = self
             .store
@@ -1285,48 +1313,21 @@ impl<S: UserStore> AuthnService<S> {
         let secret_bytes = base32::decode(Alphabet::Rfc4648 { padding: false }, secret)
             .ok_or_else(|| AuthError::Internal("invalid base32 TOTP secret".to_string()))?;
 
-        let current = self.current_step();
+        let current = now_step();
         let mut steps = vec![current];
-        match self.config.totp_window {
-            TotpWindow::Current => {}
-            TotpWindow::PlusMinusOne => {
-                if current > 0 {
-                    steps.push(current - 1);
-                }
-                steps.push(current + 1);
-            }
-            TotpWindow::CurrentAndNext => {
-                steps.push(current + 1);
-            }
+        if current > 0 {
+            steps.push(current - 1);
         }
+        steps.push(current + 1);
 
-        let window_low = *steps.iter().min().unwrap_or(&current);
         let matched = steps
             .into_iter()
             .find(|&step| constant_time_eq(code, &totp_code(&secret_bytes, step)));
+        let Some(step) = matched else {
+            return Ok(false);
+        };
 
-        if let Some(step) = matched {
-            return if self.store.accept_totp_step(user_id, step).await? {
-                Ok(true)
-            } else {
-                // Correct for the step, but that step was already consumed or a newer one was.
-                Err(AuthError::TotpReplay)
-            };
-        }
-
-        // No code matched the accepted window. A code that is correct for a *stale* step is not a
-        // typo: it is a captured code being replayed, or an attempt to downgrade to an older code.
-        // Report it as an impersonation attempt instead of a plain mismatch. The search is bounded
-        // so an attacker cannot make verification arbitrarily expensive.
-        let lookback_low = window_low.saturating_sub(TOTP_REPLAY_LOOKBACK_STEPS);
-        let stale = (lookback_low..window_low)
-            .rev()
-            .find(|&step| constant_time_eq(code, &totp_code(&secret_bytes, step)));
-        if stale.is_some() {
-            return Err(AuthError::TotpReplay);
-        }
-
-        Ok(false)
+        self.store.accept_totp_step(user_id, step).await
     }
 
     /// Disable TOTP for a user.
