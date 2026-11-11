@@ -52,6 +52,9 @@ const DEFAULT_MIME_TYPES: &[&str] = &["text/html", "text/plain", "text/markdown"
 #[derive(Debug)]
 struct TemplatesConfig {
     file_root: String,
+    /// Canonicalized `file_root` for literal paths (no placeholders). Used to enforce the
+    /// security boundary in `resolve_file_path`.
+    canonical_root: Option<PathBuf>,
     mime_types: Vec<String>,
     delimiters: (String, String),
 }
@@ -105,6 +108,23 @@ impl TemplatesHandler {
                     format!("{path}.file_root"),
                     "`file_root` must be a string",
                 ))
+            }
+        };
+        let canonical_root = if file_root.contains('{') || file_root.contains('}') {
+            // Placeholder paths are expanded per-request; canonicalisation is deferred.
+            None
+        } else {
+            match std::fs::canonicalize(&file_root) {
+                Ok(path) => Some(path),
+                Err(error) => {
+                    return Err(invalid(
+                        format!("{path}.file_root"),
+                        format!(
+                            "`file_root` path `{}` does not exist or cannot be resolved: {error}",
+                            file_root
+                        ),
+                    ));
+                }
             }
         };
         let mime_types = match object.get("mime_types") {
@@ -174,6 +194,7 @@ impl TemplatesHandler {
         Ok(Self {
             config: std::sync::Arc::new(TemplatesConfig {
                 file_root,
+                canonical_root,
                 mime_types,
                 delimiters,
             }),
@@ -287,6 +308,9 @@ fn status_allows_body(status: StatusCode) -> bool {
 
 impl TemplatesTransform {
     fn resolve_root(&self) -> Option<PathBuf> {
+        if let Some(ref canonical) = self.config.canonical_root {
+            return Some(canonical.clone());
+        }
         let expanded = self.request.replace_all(&self.config.file_root);
         let expanded = if expanded.is_empty() { "." } else { &expanded };
         Some(PathBuf::from(expanded))
@@ -1788,11 +1812,45 @@ impl<'a> Renderer<'a> {
                 Component::RootDir | Component::Prefix(_) => {}
             }
         }
-        Some(
-            parts
-                .iter()
-                .fold(root.clone(), |path, part| path.join(part)),
-        )
+        let joined = parts
+            .iter()
+            .fold(root.clone(), |path, part| path.join(part));
+
+        // Security: canonicalise both root and joined path and verify the result stays within
+        // the root boundary. This blocks symlink escapes and ensures relative roots with `..`
+        // cannot be exploited.
+        let canonical_root = std::fs::canonicalize(root).ok()?;
+
+        match std::fs::canonicalize(&joined) {
+            Ok(canonical_joined) => {
+                if canonical_joined.starts_with(&canonical_root) {
+                    Some(canonical_joined)
+                } else {
+                    None
+                }
+            }
+            Err(_) => {
+                // The target file does not exist. Walk up the path and verify that the deepest
+                // existing prefix is still inside the canonical root. This preserves meaningful
+                // "file not found" errors while still blocking symlink escapes.
+                let mut current = joined.as_path();
+                while let Some(parent) = current.parent() {
+                    if parent == root.as_path() {
+                        return Some(joined);
+                    }
+                    if let Ok(canonical_parent) = std::fs::canonicalize(parent) {
+                        if canonical_parent.starts_with(&canonical_root) {
+                            return Some(joined);
+                        } else {
+                            return None;
+                        }
+                    }
+                    current = parent;
+                }
+                // Single-component path inside root.
+                Some(joined)
+            }
+        }
     }
 
     fn read_file(&self, name: &str) -> std::result::Result<String, TemplateError> {
@@ -2262,5 +2320,119 @@ mod tests {
         )
         .expect_err("bad delimiters");
         assert!(error.to_string().contains("delimiters"), "{error}");
+    }
+
+    #[test]
+    fn templates_rejects_nonexistent_literal_file_root() {
+        let result = TemplatesHandler::from_json(
+            &serde_json::json!({
+                "handler": "templates",
+                "file_root": "/nonexistent/path/for/templates"
+            }),
+            "handler",
+        );
+        assert!(
+            result.is_err(),
+            "non-existent literal file_root should be rejected"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("file_root") && err.contains("does not exist"),
+            "error should mention file_root path issue: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn templates_canonical_root_blocks_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+
+        // Symlink inside root pointing to the parent directory.
+        let escape = root.join("escape");
+        symlink(temp.path(), &escape).unwrap();
+
+        let handler = TemplatesHandler::from_json(
+            &serde_json::json!({
+                "handler": "templates",
+                "file_root": root.display().to_string()
+            }),
+            "handler",
+        )
+        .expect("valid config");
+
+        // Verify canonical_root was set and differs from the symlink path.
+        let canonical = handler.config.canonical_root.clone().unwrap();
+        assert!(
+            !canonical.as_os_str().to_string_lossy().ends_with("escape"),
+            "canonical_root should resolve symlink: {canonical:?}"
+        );
+
+        // Render a template that tries to escape through the symlink.
+        let req = request("/");
+        let mut renderer = Renderer::new(&req, handler.config.canonical_root.clone());
+        let result = renderer.render_source(
+            "{{readFile \"escape/secret.txt\"}}",
+            &("{{".to_string(), "}}".to_string()),
+        );
+        assert!(
+            result.is_err(),
+            "symlink escape should be blocked: {result:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn templates_canonical_root_restricts_file_root_with_parent_components() {
+        let temp = tempfile::tempdir().unwrap();
+        let templates = temp.path().join("templates");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&templates).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(templates.join("ok.txt"), "ok").unwrap();
+        std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+
+        // Build a relative path like "../../templates" from a nested sub-directory.
+        let nest = temp.path().join("a").join("b");
+        std::fs::create_dir_all(&nest).unwrap();
+        let relative_root = format!("{}/../../templates", nest.display());
+
+        // This relative root should canonicalise to the absolute templates path.
+        let handler = TemplatesHandler::from_json(
+            &serde_json::json!({
+                "handler": "templates",
+                "file_root": relative_root
+            }),
+            "handler",
+        )
+        .expect("valid config");
+
+        let canonical = handler.config.canonical_root.clone().unwrap();
+        assert_eq!(canonical, std::fs::canonicalize(&templates).unwrap());
+
+        // Template requesting a file outside the canonical root should be blocked.
+        let req = request("/");
+        let mut renderer = Renderer::new(&req, handler.config.canonical_root.clone());
+        let result = renderer.render_source(
+            "{{readFile \"../secret.txt\"}}",
+            &("{{".to_string(), "}}".to_string()),
+        );
+        assert!(
+            result.is_err(),
+            "path outside canonical root should be blocked: {result:?}"
+        );
+
+        // A file inside the root should still be readable.
+        let result = renderer.render_source(
+            "{{readFile \"ok.txt\"}}",
+            &("{{".to_string(), "}}".to_string()),
+        );
+        assert_eq!(result.unwrap().trim(), "ok");
     }
 }
