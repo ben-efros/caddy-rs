@@ -442,10 +442,7 @@ impl FastCgiTransport {
             }
         }
         let script_filename = sanitized_path_join(&root, &script_name).ok_or_else(|| {
-            FastCgiError::Request(format!(
-                "SCRIPT_FILENAME escapes root `{}`",
-                root
-            ))
+            FastCgiError::Request(format!("SCRIPT_FILENAME escapes root `{}`", root))
         })?;
         let root_path = Path::new(&root);
         let script_path = Path::new(&script_filename);
@@ -2089,10 +2086,7 @@ mod tests {
             sanitized_path_join("/srv/www", "/"),
             Some("/srv/www".to_string())
         );
-        assert_eq!(
-            sanitized_path_join("/srv/www", "/../etc/passwd"),
-            None
-        );
+        assert_eq!(sanitized_path_join("/srv/www", "/../etc/passwd"), None);
         assert_eq!(
             sanitized_path_join("/srv/www", "/a/../b"),
             Some("/srv/www/b".to_string())
