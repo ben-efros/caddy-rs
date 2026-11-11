@@ -487,7 +487,12 @@ pub struct ReverseProxyHandler {
 impl ReverseProxyHandler {
     /// Build from Caddy JSON using the system DNS resolver for dynamic upstreams.
     pub fn from_json(value: &Value, path: &str) -> HttpResult<Self> {
-        Self::from_json_with_resolver(value, path, Arc::new(SystemDnsResolver))
+        Self::from_json_full(
+            value,
+            path,
+            Arc::new(SystemDnsResolver),
+            Some(format!("caddy-rs/{}", env!("CARGO_PKG_VERSION"))),
+        )
     }
 
     /// Build from Caddy JSON with an injected DNS resolver for `dynamic_upstreams` (tests and
@@ -496,6 +501,30 @@ impl ReverseProxyHandler {
         value: &Value,
         path: &str,
         resolver: Arc<dyn DnsResolver>,
+    ) -> HttpResult<Self> {
+        Self::from_json_full(
+            value,
+            path,
+            resolver,
+            Some(format!("caddy-rs/{}", env!("CARGO_PKG_VERSION"))),
+        )
+    }
+
+    /// Build from Caddy JSON and use `server_software` for a FastCGI transport's
+    /// `SERVER_SOFTWARE` parameter (caddy-rs extension, T-CONF-060).
+    pub fn from_json_with_server_software(
+        value: &Value,
+        path: &str,
+        server_software: Option<String>,
+    ) -> HttpResult<Self> {
+        Self::from_json_full(value, path, Arc::new(SystemDnsResolver), server_software)
+    }
+
+    fn from_json_full(
+        value: &Value,
+        path: &str,
+        resolver: Arc<dyn DnsResolver>,
+        server_software: Option<String>,
     ) -> HttpResult<Self> {
         let object = value
             .as_object()
@@ -508,7 +537,7 @@ impl ReverseProxyHandler {
         // `transport` applies to every upstream of the handler (Caddy's transport is per-handler,
         // not per-upstream). TLS trust and HTTP version configuration are built here so invalid
         // configuration surfaces as located errors instead of per-request transport failures.
-        let transport = parse_transport(object.get("transport"), path)?;
+        let transport = parse_transport(object.get("transport"), path, server_software)?;
         let tls = transport.tls.clone();
 
         // Caddy's `dynamic_upstreams`: a `http.reverse_proxy.upstreams.*` source consulted inside
@@ -2446,7 +2475,11 @@ fn build_upgrade_clients(
 ///   `http/1.1` is offered.
 /// * Cleartext upstreams: `2` alone does not enable HTTP/2 (Go's plaintext transport stays
 ///   HTTP/1.1); `h2c` opts into HTTP/2 prior knowledge.
-fn parse_transport(value: Option<&Value>, path: &str) -> HttpResult<TransportConfig> {
+fn parse_transport(
+    value: Option<&Value>,
+    path: &str,
+    server_software: Option<String>,
+) -> HttpResult<TransportConfig> {
     let Some(value) = value else {
         return Ok(TransportConfig::default());
     };
@@ -2468,7 +2501,11 @@ fn parse_transport(value: Option<&Value>, path: &str) -> HttpResult<TransportCon
         }
         // Caddy's FastCGI transport has its own module shape; `from_json` rejects any HTTP
         // transport field (`tls`, `versions`, ...) instead of silently ignoring it.
-        let fastcgi = FastCgiTransport::from_json(value, &transport_path)?;
+        let fastcgi = FastCgiTransport::from_json_with_server_software(
+            value,
+            &transport_path,
+            server_software,
+        )?;
         return Ok(TransportConfig {
             fastcgi: Some(Arc::new(fastcgi)),
             ..TransportConfig::default()
@@ -3061,10 +3098,26 @@ pub fn handler_factory() -> CustomHandlerFactory {
 /// configuration generation: each apply builds a fresh sink, and the sink only becomes the admin
 /// source once that generation is serving.
 pub fn handler_factory_with_status_sink(sink: Arc<UpstreamStatusSink>) -> CustomHandlerFactory {
+    handler_factory_with_status_sink_and_server_software(
+        sink,
+        Some(format!("caddy-rs/{}", env!("CARGO_PKG_VERSION"))),
+    )
+}
+
+/// Build the reverse_proxy handler factory for one HTTP server, applying the server's resolved
+/// FastCGI `SERVER_SOFTWARE` value (caddy-rs extension, T-CONF-060).
+pub fn handler_factory_with_status_sink_and_server_software(
+    sink: Arc<UpstreamStatusSink>,
+    server_software: Option<String>,
+) -> CustomHandlerFactory {
     Arc::new(move |value: &Value, path: &str| {
         let name = value.get("handler").and_then(Value::as_str);
         if name == Some("reverse_proxy") {
-            let handler = Arc::new(ReverseProxyHandler::from_json(value, path)?);
+            let handler = Arc::new(ReverseProxyHandler::from_json_with_server_software(
+                value,
+                path,
+                server_software.clone(),
+            )?);
             sink.register(&handler);
             let shared: SharedHandler = handler;
             Ok(Some(shared))

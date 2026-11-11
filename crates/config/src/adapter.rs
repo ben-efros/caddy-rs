@@ -600,6 +600,16 @@ fn parse_servers_block(
                         }
                         settings.insert("client_ip_headers".to_string(), Value::Array(headers));
                     }
+                    "server_identity" => {
+                        if has_block {
+                            return Err(adapter_error(
+                                position,
+                                "`server_identity` does not take a block",
+                            ));
+                        }
+                        let identity = parse_server_identity(&arguments, position)?;
+                        settings.insert("server_identity".to_string(), Value::String(identity));
+                    }
                     "0rtt" => {
                         if has_block {
                             return Err(adapter_error(position, "`0rtt` does not take a block"));
@@ -631,7 +641,7 @@ fn parse_servers_block(
                                 "`servers` option `{other}` is not supported by this build \
                                  (tracked as T-CONF-036); supported: listener_wrappers, \
                                  trusted_proxies, trusted_proxies_strict, trusted_proxies_unix, \
-                                 client_ip_headers, 0rtt"
+                                 client_ip_headers, 0rtt, server_identity"
                             ),
                         ))
                     }
@@ -640,6 +650,47 @@ fn parse_servers_block(
         }
     }
     Ok((wrappers, settings))
+}
+
+/// Parse the `server_identity` directive (caddy-rs extension, T-CONF-060).
+///
+/// Accepted forms are `server_identity` (the default `caddy-rs/<build version>` mode),
+/// `server_identity default|name-only|compatible|none`, and
+/// `server_identity custom <string>`. Any other spelling is a located error, so a misspelled mode
+/// is never silently treated as a custom identity.
+fn parse_server_identity(
+    arguments: &[String],
+    position: Position,
+) -> caddy_rs_core::Result<String> {
+    let mode = arguments.first().map(String::as_str);
+    match (mode, arguments.len()) {
+        (None, _) => Ok("default".to_string()),
+        (Some("default"), 1) => Ok("default".to_string()),
+        (Some("name-only"), 1) => Ok("name-only".to_string()),
+        (Some("compatible"), 1) => Ok("compatible".to_string()),
+        (Some("none"), 1) => Ok("none".to_string()),
+        (Some("custom"), 2) => {
+            let value = &arguments[1];
+            if value.trim().is_empty() {
+                return Err(adapter_error(
+                    position,
+                    "`server_identity custom` requires a non-empty identity string",
+                ));
+            }
+            Ok(value.clone())
+        }
+        (Some("custom"), _) => Err(adapter_error(
+            position,
+            "`server_identity custom` requires exactly one identity string",
+        )),
+        (Some(other), _) => Err(adapter_error(
+            position,
+            format!(
+                "unknown `server_identity` mode `{other}`; supported: default, name-only, \
+                 compatible, custom <string>, none"
+            ),
+        )),
+    }
 }
 
 /// Parse the body of a `listener_wrappers { ... }` block (the opening `{` is already consumed).
