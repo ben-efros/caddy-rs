@@ -252,21 +252,41 @@ fn select_response_with_stdin(
 ///
 /// Only a FIFO counts: a regular-file redirect, `/dev/null`, a socket, a terminal and a closed
 /// descriptor all report `false`, so `caddy-rs respond --status 200 < page.html` serves an empty
-/// body exactly like Caddy. `/dev/stdin` refers to the same open file description as fd 0, so
-/// `std::fs::metadata` reports the real file type without an `unsafe` `fstat` call.
+/// body exactly like Caddy, as does `0<&-`.
+///
+/// Caddy asks the kernel about *file descriptor 0* (`fi, err := os.Stdin.Stat()` then
+/// `fi.Mode()&os.ModeNamedPipe != 0`). The Rust standard library exposes no file-type query for a
+/// borrowed descriptor: `std::io::IsTerminal` only distinguishes a terminal, so it would treat a
+/// regular-file redirect, a socket and `/dev/null` as pipe-like and serve their contents as the
+/// response body. Paths are no substitute either: `/dev/stdin` is absent or dangling on some
+/// systems (minimal containers, chroots without `/proc`), where a path-based check errors out.
+/// `fstat(2)` on fd 0 is therefore the only faithful equivalent, and `libc` is already a
+/// dependency of this crate.
 #[cfg(unix)]
 fn stdin_is_pipe() -> bool {
-    use std::io::IsTerminal;
-    use std::os::unix::fs::FileTypeExt;
+    fd_is_fifo(libc::STDIN_FILENO)
+}
 
-    match std::fs::metadata("/dev/stdin") {
-        Ok(metadata) => metadata.file_type().is_fifo(),
-        // `/dev/stdin` exists but does not resolve: fd 0 is closed, which is not a pipe.
-        Err(_) if std::fs::symlink_metadata("/dev/stdin").is_ok() => false,
-        // `/dev/stdin` is unavailable on some minimal systems; fall back to the terminal check,
-        // which only over-approximates the pipe case.
-        Err(_) => !std::io::stdin().is_terminal(),
+/// Whether `fd` refers to a named pipe (`S_IFIFO`) — the test [`stdin_is_pipe`] applies to file
+/// descriptor 0.
+///
+/// Split out so tests can classify descriptors they own (a real pipe, a regular file, `/dev/null`, a
+/// socket, a closed descriptor) without disturbing the process's stdin. Any `fstat` failure, such as
+/// a closed or invalid descriptor, is reported as "not a pipe" rather than panicking.
+#[cfg(unix)]
+fn fd_is_fifo(fd: libc::c_int) -> bool {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `fstat` writes through the pointer to a caller-provided `libc::stat` and retains no
+    // reference to it. The pointer is valid for writes, properly aligned (a `libc::stat` local) and
+    // only read after a zero return, which guarantees the kernel initialised the whole struct.
+    let ok = unsafe { libc::fstat(fd, stat.as_mut_ptr()) } == 0;
+    if !ok {
+        // A closed or otherwise invalid fd cannot be a pipe, so no body is read.
+        return false;
     }
+    // SAFETY: as above, `ok` means `fstat` succeeded and fully initialised `stat`.
+    let stat = unsafe { stat.assume_init() };
+    stat.st_mode & libc::S_IFMT == libc::S_IFIFO
 }
 
 /// Whether stdin is a pipe, as closely as this platform can tell.
@@ -1006,5 +1026,57 @@ mod tests {
                 "headers": {"x-test": ["yes"]},
             })
         );
+    }
+
+    /// The L4 regression: the body policy must be decided by the *type of file descriptor 0*, not
+    /// by a `/dev/stdin` path, so a regular-file redirect is never served as a body even on systems
+    /// where `/dev/stdin` is absent (minimal containers, chroots without `/dev` or `/proc`).
+    #[cfg(unix)]
+    #[test]
+    fn fd_is_fifo_classifies_descriptors_by_type_without_paths() {
+        use std::os::fd::AsRawFd;
+
+        // A real pipe is the one case Caddy reads a body from (`os.ModeNamedPipe`).
+        let mut pipe_fds = [0 as libc::c_int; 2];
+        // SAFETY: `pipe` writes exactly two descriptors into the array it is given.
+        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+        assert!(fd_is_fifo(pipe_fds[0]));
+        // SAFETY: both descriptors were just created by `pipe` and are not used again.
+        unsafe {
+            libc::close(pipe_fds[0]);
+            libc::close(pipe_fds[1]);
+        }
+
+        // A regular-file redirect: not a pipe, so `respond < page.html` serves an empty body.
+        let file = tempfile::tempfile().expect("temporary file");
+        assert!(!fd_is_fifo(file.as_raw_fd()));
+
+        // `/dev/null` is a character device, not a pipe.
+        let null = std::fs::File::open("/dev/null").expect("open /dev/null");
+        assert!(!fd_is_fifo(null.as_raw_fd()));
+
+        // A socket is not a pipe either.
+        let mut socket_pair = [0 as libc::c_int; 2];
+        // SAFETY: `socketpair` writes exactly two descriptors into the array it is given.
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_STREAM,
+                    0,
+                    socket_pair.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        assert!(!fd_is_fifo(socket_pair[0]));
+        // SAFETY: both descriptors were just created by `socketpair` and are not used again.
+        unsafe {
+            libc::close(socket_pair[0]);
+            libc::close(socket_pair[1]);
+        }
+
+        // A closed descriptor (`0<&-`) makes `fstat` fail: no panic, and no body is read.
+        assert!(!fd_is_fifo(-1));
     }
 }
