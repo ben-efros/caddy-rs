@@ -114,9 +114,10 @@ pub struct AdminConfig {
     #[serde(default, skip_serializing_if = "is_false")]
     pub enforce_origin: bool,
 
-    /// Allowed admin API origins.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub origins: Vec<String>,
+    /// Allowed admin API origins.  `None` means "not configured" (derive defaults).
+    /// `Some([])` means explicitly empty (block all origins).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origins: Option<Vec<String>>,
 
     /// Unknown admin fields, preserved.
     #[serde(flatten)]
@@ -129,7 +130,7 @@ impl Default for AdminConfig {
             disabled: false,
             listen: None,
             enforce_origin: false,
-            origins: Vec::new(),
+            origins: None,
             extra: BTreeMap::new(),
         }
     }

@@ -100,8 +100,9 @@ pub struct AdminOptions {
     pub listen: Option<String>,
     /// Require the `Origin` header to appear in `origins`.
     pub enforce_origin: bool,
-    /// Allowed admin API origins (`origins <hosts...>`).
-    pub origins: Vec<String>,
+    /// Allowed admin API origins (`origins <hosts...>`).  
+    /// `None` means not configured; `Some([])` means explicitly empty.
+    pub origins: Option<Vec<String>>,
 }
 
 /// A DNS-challenge provider referenced by `acme_dns` or `tls { dns ... }`:
@@ -1949,13 +1950,13 @@ fn read_global_options(directives: Vec<Directive>) -> Result<GlobalOptions, Pars
                             admin.enforce_origin = true;
                         }
                         "origins" => {
-                            if item.args.is_empty() || !item.block.is_empty() {
+                            if !item.block.is_empty() {
                                 return Err(ParseError::syntax(
                                     item.position.clone(),
-                                    "`origins` requires at least one origin",
+                                    "`origins` does not take a block",
                                 ));
                             }
-                            admin.origins = item.args.clone();
+                            admin.origins = Some(item.args.clone());
                         }
                         other => {
                             return Err(ParseError::syntax(

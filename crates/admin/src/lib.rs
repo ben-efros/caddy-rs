@@ -128,9 +128,8 @@
 //!   sub-handlers) and `/debug/vars`; caddy-rs has no Go runtime to introspect, so they answer with
 //!   a located, documented `501 Not Implemented` (T-ADMIN-022, DIV-0006) instead of fabricating
 //!   pprof/expvar data. The bare `/debug/pprof` path 307-redirects like Caddy's ServeMux.
-//! - Origin policy derives implicit origins from a non-empty `admin.origins`; the shared core
-//!   model cannot distinguish `origins: null` (derive) from `origins: []` (allow none), so an
-//!   explicit empty list derives the defaults instead of blocking the endpoint.
+//! - Origin policy derives implicit origins when `admin.origins` is absent (`None`). An explicit
+//!   empty list (`Some([])`) blocks all origins, matching upstream Caddy's behavior.
 //! - `/pki` is read-only: it serves the local CA material persisted under
 //!   `<data-dir>/pki/authorities/<id>/` but never provisions, repairs or trusts anything. Caddy
 //!   lazily provisions the default `local` CA on a `/pki` read; this build returns `404` instead
@@ -3201,7 +3200,7 @@ mod tests {
     async fn explicit_startup_policy_overrides_the_active_config() {
         let policy = OriginPolicy::from_admin(Some(&caddy_rs_core::AdminConfig {
             enforce_origin: true,
-            origins: vec!["https://startup.example".to_string()],
+            origins: Some(vec!["https://startup.example".to_string()]),
             ..Default::default()
         }));
         let admin = AdminApi::new(Arc::new(GenerationStore::with_builtin_registry()))
@@ -3530,7 +3529,7 @@ mod tests {
         // Origin enforcement is the shared admin policy, like every other endpoint.
         let policy = OriginPolicy::from_admin(Some(&caddy_rs_core::AdminConfig {
             enforce_origin: true,
-            origins: vec!["https://allowed.example".to_string()],
+            origins: Some(vec!["https://allowed.example".to_string()]),
             ..Default::default()
         }));
         let origin_admin = AdminApi::new(Arc::new(GenerationStore::with_builtin_registry()))
