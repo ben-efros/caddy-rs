@@ -1,11 +1,12 @@
 // Headless smoke test for the proxy-manager UI.
 //
 // The Rust side proves the HTTP seam (shell at `/`, assets, SPA fallback, JSON-only `/api/v1`).
-// This test proves the other half: that the bundle actually renders, talks to the documented API
-// shapes, and survives a full sign-in → host list → host creation round trip.
+// This test proves the other half: that the React bundle actually renders, talks to the documented
+// API shapes, and survives a full sign-in → token refresh → host list → host creation round trip.
 //
-// It runs the *source* modules through esbuild (with CSS stripped) inside jsdom, so a broken
-// template, a missing element id, or a wrong JSON field name fails here instead of in a browser.
+// It bundles the *source* entry (with CSS stripped) through esbuild and runs it inside jsdom, so a
+// broken component, a missing element id, a wrong JSON field name or a broken refresh path fails
+// here instead of in a browser.
 //
 // Usage: node test/smoke.mjs   (after `npm install`)
 
@@ -21,11 +22,14 @@ const root = path.resolve(here, '..');
 // --- bundle the source without CSS ---------------------------------------------------------
 
 const bundled = await build({
-  entryPoints: [path.join(root, 'src/main.js')],
+  entryPoints: [path.join(root, 'src/main.tsx')],
   bundle: true,
   format: 'esm',
   write: false,
   loader: { '.css': 'empty' },
+  jsx: 'automatic',
+  jsxImportSource: 'react',
+  define: { 'process.env.NODE_ENV': '"development"' },
   logLevel: 'silent',
 });
 const code = bundled.outputFiles[0].text;
@@ -34,6 +38,9 @@ const code = bundled.outputFiles[0].text;
 
 const calls = [];
 let session = null;
+// When set, the next `/hosts` GET with the old access token is rejected the way the real API
+// rejects an expired JWT: 403 plus `WWW-Authenticate: Bearer error="invalid_token"`.
+let expireAccessOnce = false;
 
 function json(status, body, headers = {}) {
   return new Response(body === null ? null : JSON.stringify(body), {
@@ -63,6 +70,11 @@ async function fakeFetch(input, init = {}) {
     session = { access_token: 'access-1', refresh_token: 'refresh-1' };
     return json(200, session);
   }
+  if (url.pathname === '/api/v1/auth/refresh') {
+    assert.equal(body.refresh_token, session.refresh_token, 'refresh sends the current refresh token');
+    session = { access_token: 'access-2', refresh_token: 'refresh-2' };
+    return json(200, session);
+  }
   if (url.pathname === '/api/v1/auth/me') {
     return json(200, {
       id: 1,
@@ -75,6 +87,14 @@ async function fakeFetch(input, init = {}) {
   if (url.pathname === '/api/v1/auth/logout') return json(204, null);
 
   if (url.pathname === '/api/v1/hosts' && method === 'GET') {
+    if (expireAccessOnce && init.headers?.authorization === 'Bearer access-1') {
+      expireAccessOnce = false;
+      return json(
+        403,
+        { error: { code: 'INVALID_TOKEN', message: 'access token expired' } },
+        { 'www-authenticate': 'Bearer error="invalid_token"' },
+      );
+    }
     return json(200, { items: hosts, total: hosts.length, limit: 50, offset: 0 });
   }
   if (url.pathname === '/api/v1/hosts' && method === 'POST') {
@@ -151,50 +171,90 @@ const dom = new JSDOM('<!DOCTYPE html><html><body><div id="app"></div></body></h
   pretendToBeVisual: true,
 });
 
-globalThis.window = dom.window;
-globalThis.document = dom.window.document;
-globalThis.localStorage = dom.window.localStorage;
-globalThis.history = dom.window.history;
-globalThis.location = dom.window.location;
-globalThis.HTMLElement = dom.window.HTMLElement;
-globalThis.FormData = dom.window.FormData;
-globalThis.URLSearchParams = dom.window.URLSearchParams;
-globalThis.fetch = fakeFetch;
+// Node 26 exposes some of these as getter-only globals, so define rather than assign.
+const globals = {
+  window: dom.window,
+  document: dom.window.document,
+  navigator: dom.window.navigator,
+  localStorage: dom.window.localStorage,
+  history: dom.window.history,
+  location: dom.window.location,
+  HTMLElement: dom.window.HTMLElement,
+  HTMLInputElement: dom.window.HTMLInputElement,
+  HTMLSelectElement: dom.window.HTMLSelectElement,
+  HTMLTextAreaElement: dom.window.HTMLTextAreaElement,
+  HTMLButtonElement: dom.window.HTMLButtonElement,
+  Element: dom.window.Element,
+  Node: dom.window.Node,
+  Event: dom.window.Event,
+  MouseEvent: dom.window.MouseEvent,
+  KeyboardEvent: dom.window.KeyboardEvent,
+  FormData: dom.window.FormData,
+  URLSearchParams: dom.window.URLSearchParams,
+  getComputedStyle: dom.window.getComputedStyle,
+  requestAnimationFrame: dom.window.requestAnimationFrame.bind(dom.window),
+  cancelAnimationFrame: dom.window.cancelAnimationFrame.bind(dom.window),
+  fetch: fakeFetch,
+};
+for (const [key, value] of Object.entries(globals)) {
+  Object.defineProperty(globalThis, key, { value, configurable: true, writable: true });
+}
 
-const tick = () => new Promise((resolve) => setTimeout(resolve, 20));
+const tick = () => new Promise((resolve) => setTimeout(resolve, 25));
+const settle = async () => {
+  for (let i = 0; i < 3; i += 1) await tick();
+};
+const click = (selector) => {
+  const element = document.querySelector(selector);
+  assert.ok(element, `element ${selector} exists`);
+  element.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true, cancelable: true, button: 0 }));
+};
 
 // --- run -----------------------------------------------------------------------------------
 
 await import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`);
-await tick();
+await settle();
 
-const app = document.getElementById('app');
-assert.match(app.textContent, /Sign in to manage hosts/, 'login page renders');
+assert.match(document.body.textContent, /Sign in to manage hosts/, 'login page renders');
+assert.ok(document.querySelector('#auth-form'), 'login form renders');
 
 // Sign in.
 const form = document.querySelector('#auth-form');
 form.querySelector('#username').value = 'admin';
 form.querySelector('#password').value = 'secret';
 form.dispatchEvent(new dom.window.Event('submit', { bubbles: true, cancelable: true }));
-await tick();
-await tick();
+await settle();
+await settle();
 
 assert.equal(dom.window.location.pathname, '/', 'redirected to the dashboard after login');
 assert.equal(localStorage.getItem('pm.access_token'), 'access-1', 'access token stored');
 assert.match(document.body.textContent, /Dashboard/, 'dashboard renders');
 assert.match(document.body.textContent, /app\.example\.com/, 'dashboard lists hosts');
 
-// Hosts page.
-document.querySelector('[data-nav="/hosts"]').dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }));
-await tick();
-await tick();
-assert.equal(dom.window.location.pathname, '/hosts');
-assert.match(document.body.textContent, /old\.example\.com/, 'hosts table renders rows');
+// Token refresh: the first authenticated request on the Hosts page is rejected with the API's
+// 403 + WWW-Authenticate marker, so the client must refresh, rotate tokens and retry once.
+expireAccessOnce = true;
+click('[data-nav="/hosts"]');
+await settle();
+await settle();
+
+assert.equal(dom.window.location.pathname, '/hosts', 'navigated to the hosts page');
+const refresh = calls.find((call) => call.path === '/api/v1/auth/refresh');
+assert.ok(refresh, 'expired access token triggers POST /auth/refresh');
+assert.equal(refresh.method, 'POST');
+assert.deepEqual(refresh.body, { refresh_token: 'refresh-1' }, 'refresh uses the stored refresh token');
+assert.equal(localStorage.getItem('pm.access_token'), 'access-2', 'rotated access token stored');
+assert.equal(localStorage.getItem('pm.refresh_token'), 'refresh-2', 'rotated refresh token stored');
+const retried = calls
+  .filter((call) => call.method === 'GET' && call.path.split('?')[0] === '/api/v1/hosts')
+  .at(-1);
+assert.ok(retried, 'hosts request was retried after the refresh');
+assert.equal(retried.headers.authorization, 'Bearer access-2', 'request retried with the new access token');
+assert.match(document.body.textContent, /old\.example\.com/, 'hosts table renders rows after the refresh');
 
 // Open the create form and submit it.
-document.querySelector('#create-host').dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }));
-await tick();
-await tick();
+click('#create-host');
+await settle();
 
 const hostForm = document.querySelector('#host-form');
 assert.ok(hostForm, 'host form opens');
@@ -202,38 +262,37 @@ hostForm.querySelector('#domains').value = 'new.example.com';
 hostForm.querySelector('#upstream-host').value = '10.0.0.9';
 hostForm.querySelector('#upstream-port').value = '8080';
 hostForm.dispatchEvent(new dom.window.Event('submit', { bubbles: true, cancelable: true }));
-await tick();
-await tick();
+await settle();
 
 const created = calls.find((call) => call.method === 'POST' && call.path === '/api/v1/hosts');
 assert.ok(created, 'host creation was sent');
-assert.equal(created.headers.authorization, 'Bearer access-1', 'bearer token attached');
+assert.equal(created.headers.authorization, 'Bearer access-2', 'bearer token attached');
 
-// The remaining pages must render against the same fake API: a template that dereferences a
+// The remaining pages must render against the same fake API: a component that dereferences a
 // missing field throws here instead of in the browser.
 for (const [path, needle] of [
   ['/certificates', 'secure.example.com'],
   ['/config', 'Assembled Caddy JSON'],
   ['/settings', 'Session and server facts'],
 ]) {
-  document.querySelector(`[data-nav="${path}"]`).dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }));
-  await tick();
-  await tick();
+  click(`[data-nav="${path}"]`);
+  await settle();
+  await settle();
   assert.equal(dom.window.location.pathname, path, `navigated to ${path}`);
   assert.match(document.body.textContent, new RegExp(needle), `${path} renders`);
 }
 
 // Back to the dashboard for the sign-out button, which lives in the shared header.
-document.querySelector('[data-nav="/"]').dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }));
-await tick();
+click('[data-nav="/"]');
+await settle();
 
 // Sign out.
-document.querySelector('#logout-btn').dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }));
-await tick();
-await tick();
+click('#logout-btn');
+await settle();
+await settle();
 assert.equal(dom.window.location.pathname, '/login', 'signed out to the login page');
 assert.equal(localStorage.getItem('pm.access_token'), null, 'access token cleared');
 const logout = calls.find((call) => call.path === '/api/v1/auth/logout');
-assert.deepEqual(logout.body, { refreshToken: 'refresh-1' }, 'logout revokes the refresh token by body');
+assert.deepEqual(logout.body, { refreshToken: 'refresh-2' }, 'logout revokes the refresh token by body');
 
 console.log('ui smoke test passed:', calls.length, 'API calls');
