@@ -30,7 +30,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use crate::lexer::{lex, LexError, Position, Token, TokenKind};
@@ -238,6 +238,26 @@ fn absolute_path(path: &Path) -> PathBuf {
     std::env::current_dir()
         .map(|cwd| cwd.join(path))
         .unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Normalize a path by resolving `.` and `..` components without requiring the path to exist.
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut result = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => {
+                result.push(component);
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                result.pop();
+            }
+            Component::Normal(name) => {
+                result.push(name);
+            }
+        }
+    }
+    result
 }
 
 /// One directive (or matcher definition, `@name`).
@@ -1286,22 +1306,58 @@ impl Parser {
         position: Position,
     ) -> Result<Vec<PathBuf>, ParseError> {
         let raw = Path::new(pattern);
-        let resolved = if raw.is_absolute() {
-            raw.to_path_buf()
-        } else {
-            match self.importing_directory(&position) {
-                Some(directory) => directory.join(raw),
-                None => raw.to_path_buf(),
+        if raw.is_absolute() {
+            return Err(ParseError::syntax(
+                position,
+                format!("Import path must be relative, but got absolute path: {pattern}"),
+            ));
+        }
+        let directory = match self.importing_directory(&position) {
+            Some(directory) => directory,
+            None => {
+                // Without a source path there is no directory to anchor relative imports;
+                // fall back to the raw path so the existing "not found" error is emitted.
+                let resolved = raw.to_path_buf();
+                let has_glob = pattern.contains('*')
+                    || pattern.contains('?')
+                    || (pattern.contains('[') && pattern.contains(']'));
+                if !has_glob {
+                    if resolved.is_file() {
+                        return Ok(vec![resolved]);
+                    }
+                    if resolved.is_dir() {
+                        return Err(ParseError::syntax(
+                            position,
+                            format!("Could not import {pattern}: is a directory"),
+                        ));
+                    }
+                }
+                return Err(ParseError::syntax(
+                    position,
+                    format!(
+                        "File to import not found: {pattern} (this requires the Caddyfile's source \
+                         directory for file/glob imports; adapting stdin has no source path)"
+                    ),
+                ));
             }
         };
+        let resolved = directory.join(raw);
+        let base = normalize_path(&directory);
+        let normalized = normalize_path(&resolved);
+        if !normalized.starts_with(&base) {
+            return Err(ParseError::syntax(
+                position,
+                format!("Import path escapes the Caddyfile directory: {pattern}"),
+            ));
+        }
         let has_glob = pattern.contains('*')
             || pattern.contains('?')
             || (pattern.contains('[') && pattern.contains(']'));
         if !has_glob {
-            if resolved.is_file() {
-                return Ok(vec![resolved]);
+            if normalized.is_file() {
+                return Ok(vec![normalized]);
             }
-            if resolved.is_dir() {
+            if normalized.is_dir() {
                 return Err(ParseError::syntax(
                     position,
                     format!("Could not import {pattern}: is a directory"),
@@ -1309,14 +1365,11 @@ impl Parser {
             }
             return Err(ParseError::syntax(
                 position,
-                format!(
-                    "File to import not found: {pattern} (this requires the Caddyfile's source \
-                     directory for file/glob imports; adapting stdin has no source path)"
-                ),
+                format!("File to import not found: {pattern}"),
             ));
         }
 
-        let resolved_text = resolved.display().to_string();
+        let resolved_text = normalized.display().to_string();
         if resolved_text.matches('*').count() > 1
             || resolved_text.matches('?').count() > 1
             || (resolved_text.contains('[') && resolved_text.contains(']'))
@@ -1328,8 +1381,8 @@ impl Parser {
                 ),
             ));
         }
-        let parent = resolved.parent().unwrap_or_else(|| Path::new("."));
-        let file_pattern = resolved
+        let parent = normalized.parent().unwrap_or_else(|| Path::new("."));
+        let file_pattern = normalized
             .file_name()
             .map(|name| name.to_string_lossy().to_string())
             .unwrap_or_default();
