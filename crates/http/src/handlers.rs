@@ -1120,9 +1120,13 @@ fn build_query_string(input: &str, request: &Request) -> String {
         let next_eq = remaining.find('=');
         let next_amp = remaining.find('&');
         let next_eq = if !wrote_value { next_eq } else { None };
-        let amp_is_next = next_amp.is_some() && (next_eq.is_none_or(|eq| next_amp.unwrap() < eq));
+        let amp_is_next = match (next_amp, next_eq) {
+            (Some(amp), Some(eq)) => amp < eq,
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
         let end = if amp_is_next {
-            next_amp.unwrap()
+            next_amp.unwrap_or(remaining.len())
         } else if let Some(eq) = next_eq {
             eq
         } else {
@@ -1353,12 +1357,20 @@ fn trim_path_prefix_escaped(escaped_path: &str, prefix: &str) -> String {
     let mut prefix_index = 0usize;
     while path_index < path.len() && prefix_index < pattern.len() {
         let mut step = 1usize;
-        let mut character = String::from_utf8_lossy(&path[path_index..path_index + 1]).into_owned();
+        // A byte offset inside a multi-byte character must not panic: such a path can never match
+        // the ASCII prefix, so it is returned unchanged (Caddy compares bytes here as well).
+        let Some(byte) = escaped_path.get(path_index..path_index + 1) else {
+            return escaped_path.to_string();
+        };
+        let mut character = String::from_utf8_lossy(byte.as_bytes()).into_owned();
         if path[path_index] == b'%'
             && !has_valid_percent_encoding(prefix, prefix_index)
             && path.len() >= path_index + 3
         {
-            match path_unescape_triplet(&escaped_path[path_index..path_index + 3]) {
+            let Some(triplet) = escaped_path.get(path_index..path_index + 3) else {
+                return escaped_path.to_string();
+            };
+            match path_unescape_triplet(triplet) {
                 Some(decoded) => {
                     character = decoded;
                     step = 3;
@@ -1387,12 +1399,20 @@ fn trim_path_suffix_escaped(escaped_path: &str, suffix: &str) -> String {
     let mut suffix_index = pattern.len();
     while path_index > 0 && suffix_index > 0 {
         let mut step = 1usize;
-        let mut character = String::from_utf8_lossy(&path[path_index - 1..path_index]).into_owned();
+        // A byte offset inside a multi-byte character must not panic: such a path can never match
+        // the ASCII suffix, so it is returned unchanged (Caddy compares bytes here as well).
+        let Some(byte) = escaped_path.get(path_index - 1..path_index) else {
+            return escaped_path.to_string();
+        };
+        let mut character = String::from_utf8_lossy(byte.as_bytes()).into_owned();
         let path_has_escape = path_index >= 3 && path[path_index - 3] == b'%';
         let suffix_has_escape = has_valid_percent_encoding(suffix, suffix_index.saturating_sub(3))
             || has_valid_percent_encoding(suffix, suffix_index.saturating_sub(1));
         if path_has_escape && !suffix_has_escape {
-            match path_unescape_triplet(&escaped_path[path_index - 3..path_index]) {
+            let Some(triplet) = escaped_path.get(path_index - 3..path_index) else {
+                return escaped_path.to_string();
+            };
+            match path_unescape_triplet(triplet) {
                 Some(decoded) => {
                     character = decoded;
                     step = 3;
@@ -3435,5 +3455,17 @@ mod tests {
         let response = router.handle(request).await.expect("handled");
         assert_eq!(response.status, StatusCode::OK);
         assert_eq!(response.body, Bytes::from_static(b"q=test"));
+    }
+
+    #[test]
+    fn path_stripping_handles_multi_byte_characters_without_panicking() {
+        // Each of these used to slice a `&str` at a byte offset inside a multi-byte character.
+        assert_eq!(trim_path_prefix_escaped("/é/x", "/caf"), "/é/x");
+        assert_eq!(trim_path_suffix_escaped("/brew/é", "/caf"), "/brew/é");
+        assert_eq!(trim_path_prefix_escaped("/%aé/x", "/caf"), "/%aé/x");
+        assert_eq!(trim_path_suffix_escaped("/brew/%aé", "/caf"), "/brew/%aé");
+        // ASCII matching is unchanged.
+        assert_eq!(trim_path_prefix_escaped("/caf/brew", "/caf"), "/brew");
+        assert_eq!(trim_path_suffix_escaped("/brew/caf", "/caf"), "/brew");
     }
 }
