@@ -1,0 +1,37 @@
+[package]
+name = "caddy-rs-pm-cli"
+description = "PM daemon binary: serve, setup and management commands"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "caddy-rs-pm"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait.workspace = true
+base64 = "0.22"
+caddy-rs-authn = { path = "../../../crates/authn" }
+caddy-rs-pm-api = { path = "../pm-api" }
+caddy-rs-pm-runtime = { path = "../pm-runtime" }
+caddy-rs-core = { path = "../../../crates/core" }
+axum = { version = "0.8", features = ["json"] }
+chrono = { version = "0.4", features = ["serde"] }
+clap.workspace = true
+reqwest.workspace = true
+rpassword = "7.0"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "fs", "signal"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+sd-notify.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

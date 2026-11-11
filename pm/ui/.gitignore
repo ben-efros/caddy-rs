@@ -1,0 +1,6 @@
+# Installed dependencies are reproduced by `npm ci` from package-lock.json; committing them would
+# add tens of megabytes and a second, unverified copy of every package.
+node_modules
+
+# `dist/` is deliberately NOT ignored: `pm/crates/pm-api/build.rs` embeds it into the binary, so a
+# build from a clean checkout has to find it in the repository.
