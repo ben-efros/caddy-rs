@@ -185,6 +185,7 @@ impl AdaptiveChallengeSelector {
         let mut state = self
             .state
             .lock()
+            // INFEASIBLE: the guarded selector state never panics, so the mutex cannot be poisoned.
             .expect("adaptive challenge selector mutex poisoned");
         let was_empty = state.preferred.is_empty();
         for challenge_type in offered {
@@ -202,6 +203,7 @@ impl AdaptiveChallengeSelector {
         let mut state = self
             .state
             .lock()
+            // INFEASIBLE: the guarded selector state never panics, so the mutex cannot be poisoned.
             .expect("adaptive challenge selector mutex poisoned");
         if let Some(history) = state
             .preferred
@@ -221,6 +223,7 @@ impl AdaptiveChallengeSelector {
     pub fn ordered(&self) -> Vec<ChallengeType> {
         self.state
             .lock()
+            // INFEASIBLE: the guarded selector state never panics, so the mutex cannot be poisoned.
             .expect("adaptive challenge selector mutex poisoned")
             .preferred
             .iter()
@@ -235,6 +238,7 @@ impl AdaptiveChallengeSelector {
         let mut state = self
             .state
             .lock()
+            // INFEASIBLE: the guarded selector state never panics, so the mutex cannot be poisoned.
             .expect("adaptive challenge selector mutex poisoned");
         if state.preferred.is_empty() {
             for challenge_type in DEFAULT_UNIVERSE {

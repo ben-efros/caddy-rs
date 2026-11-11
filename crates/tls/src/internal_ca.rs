@@ -1020,6 +1020,7 @@ fn generate_leaf_key(key_type: crate::acme::csr::CertificateKeyType) -> Result<G
             let (algorithm, curve_oid) = match key_type {
                 CertificateKeyType::P256 => (&ECDSA_P256_SHA256_ASN1_SIGNING, OID_PRIME256V1),
                 CertificateKeyType::P384 => (&ECDSA_P384_SHA384_ASN1_SIGNING, OID_SECP384R1),
+                // INFEASIBLE: the outer match restricts this arm to P256 and P384.
                 _ => unreachable!("EC branch only"),
             };
             let rng = SystemRandom::new();

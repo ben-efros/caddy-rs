@@ -532,6 +532,8 @@ impl Default for InMemoryDnsProvider {
     }
 }
 
+// INFEASIBLE: every lock unwrap in this impl guards plain Vec/Option state whose critical
+// sections cannot panic, so poisoning is impossible.
 impl InMemoryDnsProvider {
     /// An empty provider named `in_memory`.
     pub fn new() -> Self {
@@ -595,6 +597,7 @@ impl InMemoryDnsProvider {
 }
 
 #[async_trait]
+// INFEASIBLE: same lock invariant as above; these are test-support providers.
 impl DnsProvider for InMemoryDnsProvider {
     fn name(&self) -> &str {
         &self.name

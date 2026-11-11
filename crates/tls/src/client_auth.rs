@@ -68,6 +68,7 @@ impl ClientCertificateInfo {
         let encoded = base64::engine::general_purpose::STANDARD.encode(&self.der);
         let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");
         for chunk in encoded.as_bytes().chunks(64) {
+            // INFEASIBLE: base64 output is ASCII.
             pem.push_str(std::str::from_utf8(chunk).expect("base64 is ASCII"));
             pem.push('\n');
         }

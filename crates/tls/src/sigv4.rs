@@ -92,6 +92,7 @@ pub(crate) fn canonical_query(query: &[(String, String)]) -> String {
 }
 
 fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
+    // INFEASIBLE: HMAC accepts keys of any length.
     let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
