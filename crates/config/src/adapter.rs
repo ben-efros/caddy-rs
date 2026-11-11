@@ -1502,8 +1502,8 @@ pub fn adapt_with_options(
         if admin.enforce_origin {
             admin_object.insert("enforce_origin".to_string(), json!(true));
         }
-        if !admin.origins.is_empty() {
-            admin_object.insert("origins".to_string(), json!(admin.origins));
+        if let Some(origins) = &admin.origins {
+            admin_object.insert("origins".to_string(), json!(origins));
         }
         if options.persist_config_off {
             // Caddy's `persist_config off` is `admin.config.persist = false`, merged into any

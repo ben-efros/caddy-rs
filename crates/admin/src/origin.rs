@@ -28,9 +28,8 @@
 //!   (`listen ...:0`) admin listeners whose bound port is unknown to the configuration; Caddy
 //!   compares host:port exactly against its statically configured listener.
 //! - Caddy distinguishes `origins: null` (derive from the listen address) from `origins: []`
-//!   (allow none). The shared `AdminConfig` models both as an empty `Vec`; this implementation
-//!   treats empty as "not configured", so an explicit empty list derives the defaults instead of
-//!   bricking the endpoint.
+//!   (allow none). The shared `AdminConfig` uses `Option<Vec<String>>` so `Some([])` (explicitly
+//!   empty) blocks all origins while `None` (absent) derives the defaults from the listen address.
 //! - The DNS-rebinding `Host` check runs only when the cross-site mitigation is active
 //!   (`enforce_origin` on, or an `Origin`/`Sec-Fetch-Mode` header present). Caddy applies it to
 //!   every request on non-wildcard local listeners; caddy-rs keeps direct non-browser clients
@@ -79,18 +78,17 @@ impl OriginPolicy {
     /// and no enforced origin).
     pub fn from_admin(admin: Option<&AdminConfig>) -> Self {
         let enforce_origin = admin.is_some_and(|admin| admin.enforce_origin);
-        let configured = admin.map(|admin| admin.origins.clone()).unwrap_or_default();
         let listen = admin
             .map(AdminConfig::listen_addr)
             .unwrap_or("localhost:2019");
 
-        let allowed = if !configured.is_empty() {
-            configured
+        let allowed = match admin.and_then(|a| a.origins.as_ref()) {
+            Some(origins) if !origins.is_empty() => origins
                 .iter()
                 .filter_map(|origin| parse_allowed_origin(origin))
-                .collect()
-        } else {
-            default_origins(listen)
+                .collect(),
+            Some(_) => Vec::new(), // explicitly empty → block all origins
+            None => default_origins(listen), // absent → derive defaults
         };
 
         // Caddy's `enforceHost` is on for every local (non-remote) admin listener that is not a
@@ -443,7 +441,11 @@ mod tests {
     fn admin(enforce: bool, origins: &[&str]) -> AdminConfig {
         AdminConfig {
             enforce_origin: enforce,
-            origins: origins.iter().map(|origin| origin.to_string()).collect(),
+            origins: if origins.is_empty() {
+                None
+            } else {
+                Some(origins.iter().map(|origin| origin.to_string()).collect())
+            },
             ..AdminConfig::default()
         }
     }
@@ -451,6 +453,34 @@ mod tests {
     #[test]
     fn default_loopback_origins() {
         let policy = OriginPolicy::from_admin(Some(&admin(false, &[])));
+        let mut origins = policy.allowed_origins();
+        origins.sort();
+        assert_eq!(
+            origins,
+            vec!["127.0.0.1:2019", "[::1]:2019", "localhost:2019"]
+        );
+    }
+
+    #[test]
+    fn explicit_empty_origins_blocks_all() {
+        let admin = AdminConfig {
+            enforce_origin: false,
+            origins: Some(vec![]),
+            ..AdminConfig::default()
+        };
+        let policy = OriginPolicy::from_admin(Some(&admin));
+        assert!(policy.is_empty());
+        assert_eq!(policy.allowed_origins(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn absent_origins_derives_defaults() {
+        let admin = AdminConfig {
+            enforce_origin: false,
+            origins: None,
+            ..AdminConfig::default()
+        };
+        let policy = OriginPolicy::from_admin(Some(&admin));
         let mut origins = policy.allowed_origins();
         origins.sort();
         assert_eq!(
