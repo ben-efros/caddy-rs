@@ -6,7 +6,7 @@ const TEST_STEP: u64 = 60_000_000;
 
 fn test_config() -> AuthnConfig {
     AuthnConfig {
-        jwt_secret: [0x5A; 32],
+        jwt_secret_source: JwtSecretSource::Master("test-secret".to_string()),
         access_ttl: Duration::from_secs(15 * 60),
         refresh_ttl: Duration::from_secs(60 * 60),
         argon2_params: Argon2Config {
@@ -252,7 +252,7 @@ fn password_verification_is_constant_time() {
 
 #[tokio::test]
 async fn create_user_stores_hash_not_plaintext() {
-    let service = AuthnService::new(MemoryUserStore::new(), test_config());
+    let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
     let user = service
         .create_user("alice", "hunter2", Role::viewer())
         .await
@@ -264,7 +264,7 @@ async fn create_user_stores_hash_not_plaintext() {
 
 #[tokio::test]
 async fn login_and_refresh_rotation() {
-    let service = AuthnService::new(MemoryUserStore::new(), test_config());
+    let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
     let user = service
         .create_user("alice", "password", Role::editor())
         .await
@@ -305,7 +305,7 @@ async fn login_and_refresh_rotation() {
 
 #[tokio::test]
 async fn refresh_replay_and_unknown_token_errors() {
-    let service = AuthnService::new(MemoryUserStore::new(), test_config());
+    let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
     service
         .create_user("alice", "password", Role::viewer())
         .await
@@ -326,7 +326,7 @@ async fn refresh_replay_and_unknown_token_errors() {
 async fn expired_refresh_token_is_rejected() {
     let mut config = test_config();
     config.refresh_ttl = Duration::from_secs(0);
-    let service = AuthnService::new(MemoryUserStore::new(), config);
+    let service = AuthnService::new(MemoryUserStore::new(), config).expect("build service");
     service
         .create_user("alice", "password", Role::viewer())
         .await
@@ -340,7 +340,7 @@ async fn expired_refresh_token_is_rejected() {
 
 #[tokio::test]
 async fn expired_access_token_is_rejected() {
-    let service = AuthnService::new(MemoryUserStore::new(), test_config());
+    let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
     let user = service
         .create_user("alice", "password", Role::viewer())
         .await
@@ -371,7 +371,7 @@ async fn expired_access_token_is_rejected() {
 
 #[tokio::test]
 async fn password_change_revokes_access_token_immediately() {
-    let service = AuthnService::new(MemoryUserStore::new(), test_config());
+    let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
     let user = service
         .create_user("charlie", "oldpass", Role::editor())
         .await
@@ -406,7 +406,7 @@ async fn password_change_revokes_access_token_immediately() {
 
 #[tokio::test]
 async fn set_password_revokes_refresh_tokens() {
-    let service = AuthnService::new(MemoryUserStore::new(), test_config());
+    let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
     let user = service
         .create_user("dave", "oldpass", Role::viewer())
         .await
@@ -423,7 +423,7 @@ async fn set_password_revokes_refresh_tokens() {
 #[tokio::test]
 async fn revoke_all_for_user_invalidates_access_and_refresh() {
     let store = MemoryUserStore::new();
-    let service = AuthnService::new(store.clone(), test_config());
+    let service = AuthnService::new(store.clone(), test_config()).expect("build service");
     let user = service
         .create_user("eve", "password", Role::editor())
         .await
@@ -446,7 +446,7 @@ async fn revoke_all_for_user_invalidates_access_and_refresh() {
 
 #[tokio::test]
 async fn role_change_invalidates_access_token() {
-    let service = AuthnService::new(MemoryUserStore::new(), test_config());
+    let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
     let user = service
         .create_user("frank", "password", Role::editor())
         .await
@@ -470,7 +470,7 @@ async fn role_change_invalidates_access_token() {
 
 #[test]
 fn capability_matrix_all_sections_and_four_actions() {
-    let service = AuthnService::new(MemoryUserStore::new(), test_config());
+    let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
     let actions = [Action::View, Action::Create, Action::Update, Action::Delete];
     for section in Section::all() {
         for action in actions {
@@ -503,7 +503,7 @@ fn capability_matrix_all_sections_and_four_actions() {
 
 #[tokio::test]
 async fn unauthenticated_access_is_rejected() {
-    let service = AuthnService::new(MemoryUserStore::new(), test_config());
+    let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
     assert!(matches!(
         service.verify_access_token("not-a-jwt").await,
         Err(AuthError::InvalidToken)
@@ -550,7 +550,9 @@ fn row_visibility_owner_vs_all() {
 async fn totp_setup_verify_skew_and_replay() {
     let mut config = test_config();
     config.totp_window = TotpWindow::PlusMinusOne;
-    let service = AuthnService::new(MemoryUserStore::new(), config).with_test_step(TEST_STEP);
+    let service = AuthnService::new(MemoryUserStore::new(), config)
+        .expect("build service")
+        .with_test_step(TEST_STEP);
     let user = service
         .create_user("grace", "password", Role::viewer())
         .await
@@ -592,8 +594,9 @@ async fn totp_setup_verify_skew_and_replay() {
 
 #[tokio::test]
 async fn totp_login_and_disable() {
-    let service =
-        AuthnService::new(MemoryUserStore::new(), test_config()).with_test_step(TEST_STEP);
+    let service = AuthnService::new(MemoryUserStore::new(), test_config())
+        .expect("build service")
+        .with_test_step(TEST_STEP);
     let user = service
         .create_user("ivan", "password", Role::viewer())
         .await
@@ -619,7 +622,7 @@ async fn totp_login_and_disable() {
 #[tokio::test]
 async fn refresh_token_is_stored_hashed() {
     let store = MemoryUserStore::new();
-    let service = AuthnService::new(store.clone(), test_config());
+    let service = AuthnService::new(store.clone(), test_config()).expect("build service");
     service
         .create_user("judy", "password", Role::viewer())
         .await
@@ -649,12 +652,31 @@ async fn refresh_token_is_stored_hashed() {
 #[test]
 fn debug_redacts_secrets() {
     let config = AuthnConfig {
-        jwt_secret: [0xAB; 32],
+        jwt_secret_source: JwtSecretSource::Master("super-secret-value".to_string()),
         ..test_config()
     };
     let config_debug = format!("{config:?}");
     assert!(config_debug.contains("[redacted]"));
-    assert!(!config_debug.contains("171"));
+    assert!(
+        !config_debug.contains("super-secret-value"),
+        "config Debug must not leak the master secret: {config_debug}"
+    );
+
+    // The source's own Debug impl must redact too, not just the config wrapper.
+    let source = JwtSecretSource::Master("super-secret-value".to_string());
+    let source_debug = format!("{source:?}");
+    assert!(source_debug.contains("[redacted]"), "{source_debug}");
+    assert!(
+        !source_debug.contains("super-secret-value"),
+        "JwtSecretSource Debug must not leak the master secret: {source_debug}"
+    );
+    assert_eq!(
+        format!("{:?}", JwtSecretSource::Ephemeral),
+        "Ephemeral",
+        "ephemeral sources carry no secret and print plainly"
+    );
+    let file_debug = format!("{:?}", JwtSecretSource::File(PathBuf::from("/tmp/jwt.key")));
+    assert!(file_debug.contains("/tmp/jwt.key"), "{file_debug}");
 
     let user = User {
         password_hash: "PASSWORD_HASH_SECRET".to_string(),
@@ -868,8 +890,9 @@ fn each_auth_entry_point_propagates_clock_error() {
 
 #[tokio::test]
 async fn current_window_rejects_previous_step() {
-    let service =
-        AuthnService::new(MemoryUserStore::new(), test_config()).with_test_step(TEST_STEP);
+    let service = AuthnService::new(MemoryUserStore::new(), test_config())
+        .expect("build service")
+        .with_test_step(TEST_STEP);
     let user = service
         .create_user("alice", "password", Role::viewer())
         .await
@@ -894,7 +917,9 @@ async fn current_window_rejects_previous_step() {
 async fn plus_minus_one_accepts_adjacent() {
     let mut config = test_config();
     config.totp_window = TotpWindow::PlusMinusOne;
-    let service = AuthnService::new(MemoryUserStore::new(), config).with_test_step(TEST_STEP);
+    let service = AuthnService::new(MemoryUserStore::new(), config)
+        .expect("build service")
+        .with_test_step(TEST_STEP);
     let user = service
         .create_user("bob", "password", Role::viewer())
         .await
@@ -925,8 +950,9 @@ async fn plus_minus_one_accepts_adjacent() {
 
 #[tokio::test]
 async fn replay_protection_rejects_same_code_twice() {
-    let service =
-        AuthnService::new(MemoryUserStore::new(), test_config()).with_test_step(TEST_STEP);
+    let service = AuthnService::new(MemoryUserStore::new(), test_config())
+        .expect("build service")
+        .with_test_step(TEST_STEP);
     let user = service
         .create_user("charlie", "password", Role::viewer())
         .await
@@ -947,7 +973,9 @@ async fn replay_protection_rejects_same_code_twice() {
 async fn current_and_next_matches_legacy() {
     let mut config = test_config();
     config.totp_window = TotpWindow::CurrentAndNext;
-    let service = AuthnService::new(MemoryUserStore::new(), config).with_test_step(TEST_STEP);
+    let service = AuthnService::new(MemoryUserStore::new(), config)
+        .expect("build service")
+        .with_test_step(TEST_STEP);
     let user = service
         .create_user("dave", "password", Role::viewer())
         .await
@@ -974,8 +1002,9 @@ async fn current_and_next_matches_legacy() {
 async fn codes_older_than_the_lookback_are_plain_mismatches() {
     // A code outside both the accepted window and the bounded replay horizon cannot be told
     // apart from a wrong guess, so it is `Ok(false)` and never an unbounded HMAC search.
-    let service =
-        AuthnService::new(MemoryUserStore::new(), test_config()).with_test_step(TEST_STEP);
+    let service = AuthnService::new(MemoryUserStore::new(), test_config())
+        .expect("build service")
+        .with_test_step(TEST_STEP);
     let user = service
         .create_user("erin", "password", Role::viewer())
         .await
@@ -987,4 +1016,300 @@ async fn codes_older_than_the_lookback_are_plain_mismatches() {
         TEST_STEP.saturating_sub(TOTP_REPLAY_LOOKBACK_STEPS + 5),
     );
     assert!(!service.totp_verify(user.id, &ancient).await.unwrap());
+}
+
+// --- L2: JWT secret persistence across graceful restarts -------------------------------------
+
+#[test]
+fn master_secret_produces_deterministic_key() {
+    let a = JwtSecretSource::Master("correct horse battery staple".to_string())
+        .resolve()
+        .expect("master secret resolves");
+    let b = JwtSecretSource::Master("correct horse battery staple".to_string())
+        .resolve()
+        .expect("master secret resolves");
+    let c = JwtSecretSource::Master("another secret".to_string())
+        .resolve()
+        .expect("master secret resolves");
+    assert_eq!(a, b, "the same master secret must yield the same key");
+    assert_ne!(a, c, "different master secrets must yield different keys");
+
+    let expected: [u8; 32] = Sha256::digest(b"correct horse battery staple").into();
+    assert_eq!(a, expected, "master key is SHA-256 of the secret bytes");
+}
+
+#[test]
+fn empty_master_secret_is_rejected() {
+    assert!(matches!(
+        JwtSecretSource::Master(String::new()).resolve(),
+        Err(AuthError::Internal(_))
+    ));
+}
+
+#[test]
+fn ephemeral_secret_changes_each_time() {
+    let a = JwtSecretSource::Ephemeral.resolve().expect("resolve");
+    let b = JwtSecretSource::Ephemeral.resolve().expect("resolve");
+    assert_ne!(a, b, "ephemeral secrets must not be reused");
+}
+
+#[test]
+fn file_secret_persists_across_constructions() {
+    let dir = std::env::temp_dir().join(format!("caddy-rs-jwt-{:?}", UserId::new()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("jwt.key");
+
+    let first = JwtSecretSource::File(path.clone())
+        .resolve()
+        .expect("create");
+    assert_eq!(first.len(), 32);
+    let second = JwtSecretSource::File(path.clone()).resolve().expect("read");
+    assert_eq!(first, second, "the file secret must survive a restart");
+
+    let stored = std::fs::read(&path).expect("read secret file");
+    assert_eq!(stored, first, "the file holds the resolved key");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path)
+            .expect("secret file metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "the secret file must be owner-only");
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn malformed_secret_file_is_rejected() {
+    let dir = std::env::temp_dir().join(format!("caddy-rs-jwt-bad-{:?}", UserId::new()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("jwt.key");
+    std::fs::write(&path, b"too short").expect("write malformed secret");
+
+    assert!(matches!(
+        JwtSecretSource::File(path.clone()).resolve(),
+        Err(AuthError::Internal(_))
+    ));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn sessions_survive_a_restart_with_a_persistent_secret() {
+    let dir = std::env::temp_dir().join(format!("caddy-rs-jwt-restart-{:?}", UserId::new()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("jwt.key");
+
+    let mut config = test_config();
+    config.jwt_secret_source = JwtSecretSource::File(path.clone());
+
+    let store = MemoryUserStore::new();
+    let before = AuthnService::new(store.clone(), config.clone()).expect("build service");
+    let user = before
+        .create_user("dana", "password", Role::viewer())
+        .await
+        .expect("create user");
+    let tokens = before.login("dana", "password", None).await.expect("login");
+
+    // A new service instance stands in for the process that comes back after a restart.
+    let after = AuthnService::new(store, config).expect("build service");
+    let claims = after
+        .verify_access_token(&tokens.access_token)
+        .await
+        .expect("access token must still verify after a restart");
+    assert_eq!(
+        claims.sub, user.id,
+        "the token still belongs to the same user"
+    );
+    // NOTE: the `UserStore` is shared with the first service on purpose. That only makes the
+    // restart partial: it proves the signing key was persisted, not that refresh-token or user
+    // state would survive a real process restart (a persistent store is a separate concern).
+    // So the refresh below only proves this store still holds the token, nothing more.
+    after
+        .refresh(&tokens.refresh_token)
+        .await
+        .expect("refresh token is still present in this store (not a restart guarantee)");
+
+    // What actually has to hold across a restart: the same on-disk secret resolves to the same
+    // key no matter how many service instances are built from it.
+    let first_key = JwtSecretSource::File(path.clone())
+        .resolve()
+        .expect("resolve first");
+    let second_key = JwtSecretSource::File(path.clone())
+        .resolve()
+        .expect("resolve second");
+    assert_eq!(
+        first_key, second_key,
+        "two services built from the same File source must sign with the same key"
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("read secret file"),
+        first_key,
+        "the persisted file is what both instances resolved"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn empty_secret_file_is_repaired_instead_of_failing_forever() {
+    let dir = std::env::temp_dir().join(format!("caddy-rs-jwt-empty-{:?}", UserId::new()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("jwt.key");
+    std::fs::write(&path, b"").expect("write empty secret file");
+
+    let key = JwtSecretSource::File(path.clone())
+        .resolve()
+        .expect("an empty leftover must be repaired, not hard-fail every start");
+    assert_eq!(
+        std::fs::read(&path).expect("read secret file"),
+        key,
+        "the repaired file holds the key that was returned"
+    );
+    assert_eq!(
+        JwtSecretSource::File(path.clone()).resolve().expect("read"),
+        key,
+        "the repaired secret is stable across later starts"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn concurrent_creation_does_not_diverge() {
+    // Two cold starts that both see a missing file must agree on one key, and the file must end
+    // up holding exactly the key both returned. Repeated because the interleaving of the two
+    // racers is not fully under the test's control.
+    for round in 0..10 {
+        let dir = std::env::temp_dir().join(format!(
+            "caddy-rs-jwt-race-{}-{round}-{:?}",
+            std::process::id(),
+            UserId::new()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("jwt.key");
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    JwtSecretSource::File(path).resolve()
+                })
+            })
+            .collect();
+        let keys: Vec<[u8; 32]> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("resolve thread").expect("resolve"))
+            .collect();
+
+        assert_eq!(
+            keys[0], keys[1],
+            "concurrent cold starts must not diverge on the signing key (round {round})"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read secret file"),
+            keys[0],
+            "the installed file must hold the key both processes returned (round {round})"
+        );
+        let mut leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read temp dir")
+            .map(|entry| entry.expect("dir entry").file_name())
+            .filter(|name| name.to_string_lossy().ends_with(".tmp"))
+            .collect();
+        leftovers.sort();
+        assert_eq!(leftovers.len(), 0, "no temp files may be left behind");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[test]
+fn existing_world_readable_secret_file_is_read_without_rewriting_it() {
+    let dir = std::env::temp_dir().join(format!("caddy-rs-jwt-mode-{:?}", UserId::new()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("jwt.key");
+    let existing = [0x5Au8; 32];
+    std::fs::write(&path, existing).expect("write pre-existing secret");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("make secret world-readable");
+    }
+
+    let key = JwtSecretSource::File(path.clone())
+        .resolve()
+        .expect("an existing 32-byte secret is still usable");
+    assert_eq!(
+        key, existing,
+        "the existing secret is honoured, not replaced"
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("read secret file"),
+        existing,
+        "a populated secret file is never rewritten"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn planted_symlink_at_temp_path_is_not_followed() {
+    let dir = std::env::temp_dir().join(format!("caddy-rs-jwt-link-{:?}", UserId::new()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("jwt.key");
+    let victim = dir.join("victim.txt");
+    let victim_contents = b"victim contents that must never be truncated";
+    std::fs::write(&victim, victim_contents).expect("write victim file");
+
+    // Attack 1: plant a symlink at the historical deterministic temp path.
+    let legacy_temp = path.with_extension("tmp");
+    std::os::unix::fs::symlink(&victim, &legacy_temp).expect("plant symlink");
+    let key = JwtSecretSource::File(path.clone())
+        .resolve()
+        .expect("resolve must succeed despite the planted symlink");
+    assert_eq!(
+        std::fs::read(&victim).expect("read victim"),
+        victim_contents,
+        "the symlink target must not be truncated or replaced"
+    );
+    assert!(
+        std::fs::symlink_metadata(&legacy_temp)
+            .expect("legacy temp lstat")
+            .file_type()
+            .is_symlink(),
+        "the planted symlink is left untouched"
+    );
+    assert!(
+        std::fs::symlink_metadata(&path)
+            .expect("secret lstat")
+            .file_type()
+            .is_file(),
+        "the real secret is a regular file, not a symlink"
+    );
+    assert_eq!(std::fs::read(&path).expect("read secret"), key);
+
+    // Attack 2: the exclusive temp creation itself refuses a planted symlink.
+    let temp = dir.join(".planted.tmp");
+    std::os::unix::fs::symlink(&victim, &temp).expect("plant second symlink");
+    let result = write_secret_temp(&temp, &[0x11u8; 32]);
+    assert!(
+        matches!(result, Err(AuthError::Internal(_))),
+        "temp creation must refuse to follow a planted symlink"
+    );
+    assert_eq!(
+        std::fs::read(&victim).expect("read victim"),
+        victim_contents,
+        "refusing the symlink must not touch its target"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
 }
