@@ -24,7 +24,9 @@ use caddy_rs_admin::{
 };
 use caddy_rs_core::{Generation, GenerationStore, HttpServer, ListenAddr, Network};
 use caddy_rs_http::RouterBuilder;
-use caddy_rs_proxy::{handler_factory_with_status_sink, HealthCheckScheduler, UpstreamStatusSink};
+use caddy_rs_proxy::{
+    handler_factory_with_status_sink_and_server_software, HealthCheckScheduler, UpstreamStatusSink,
+};
 use caddy_rs_tls::{
     build_server_config, build_server_config_with_cert_resolver, listener_uses_tls,
     plan_automatic_https, resolver_from_config, staple_for_certificate, AcmeTlsAlpnResolver,
@@ -1652,6 +1654,12 @@ impl ServerRuntime {
             caddy_rs_http::router::AcmeServerAuthority,
         >,
     ) -> Result<Arc<caddy_rs_http::Router>> {
+        // Server identity (caddy-rs extension, T-CONF-060): malformed values are located errors,
+        // and the FastCGI `SERVER_SOFTWARE` parameter follows the configured mode.
+        let server_software =
+            caddy_rs_core::ServerIdentity::from_server_extra(server_name, &server.extra)
+                .map_err(Error::Config)?
+                .fastcgi_server_software();
         let routes_value = serde_json::to_value(&server.routes).map_err(|error| {
             Error::Config(caddy_rs_core::Error::invalid(
                 format!("apps.http.servers.{server_name}.routes"),
@@ -1673,7 +1681,10 @@ impl ServerRuntime {
                 ))
             })?;
         let router_builder = RouterBuilder::new()
-            .with_custom_handler(handler_factory_with_status_sink(Arc::clone(status_sink)))
+            .with_custom_handler(handler_factory_with_status_sink_and_server_software(
+                Arc::clone(status_sink),
+                server_software,
+            ))
             .with_optional_acme_server_data_root(
                 acme_server_data_root.map(std::path::Path::to_path_buf),
             )

@@ -193,22 +193,6 @@ impl ConfigAdapter for CaddyfileAdapter {
 /// so the adapter extracts the block from the raw input first (masking it out with spaces to keep
 /// line numbers stable), then applies the parsed options to the generated servers. The
 /// `listener_wrappers`, trusted-proxy and `0rtt` subsets are implemented; every other `servers`
-/// A server identity: how it identifies itself in HTTP responses and FastCGI headers.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-enum ServerIdentity {
-    #[default]
-    /// The default identity: `caddy-rs/<build version>`.
-    Default,
-    /// Use the `Caddy` header only (no version).
-    NameOnly,
-    /// Use `Caddy/2.11.9` as in the "compatible mode".
-    Compatible,
-    /// A custom identity string provided by the operator.
-    Custom(String),
-    /// No identification emitted at all.
-    None,
-}
-
 /// sub-option is a located error.
 #[derive(Debug, Clone, Default)]
 struct GlobalServerOptions {
@@ -220,8 +204,6 @@ struct GlobalServerOptions {
     /// (`trusted_proxies`, `trusted_proxies_strict`, `trusted_proxies_unix`,
     /// `client_ip_headers`).
     settings: Map<String, Value>,
-    /// How the server identifies itself in HTTP responses and FastCGI headers.
-    server_identity: ServerIdentity,
 }
 
 /// Mask one byte span with spaces (keeping newlines) so parser diagnostics keep their line/column.
@@ -620,15 +602,12 @@ fn parse_servers_block(
                     }
                     "server_identity" => {
                         if has_block {
-                            return Err(adapter_error(position, "`server_identity` does not take a block"));
-                        }
-                        if !arguments.is_empty() {
                             return Err(adapter_error(
                                 position,
-                                "`server_identity` does not take arguments",
+                                "`server_identity` does not take a block",
                             ));
                         }
-                        let identity = parse_server_identity(input, &arguments)?;
+                        let identity = parse_server_identity(&arguments, position)?;
                         settings.insert("server_identity".to_string(), Value::String(identity));
                     }
                     "0rtt" => {
@@ -662,7 +641,7 @@ fn parse_servers_block(
                                 "`servers` option `{other}` is not supported by this build \
                                  (tracked as T-CONF-036); supported: listener_wrappers, \
                                  trusted_proxies, trusted_proxies_strict, trusted_proxies_unix, \
-                                 client_ip_headers, 0rtt"
+                                 client_ip_headers, 0rtt, server_identity"
                             ),
                         ))
                     }
@@ -673,53 +652,42 @@ fn parse_servers_block(
     Ok((wrappers, settings))
 }
 
-/// Parse the `server_identity` directive which accepts five modes:
-/// - Default: `caddy-rs/<build version>`
-/// - NameOnly: `Caddy` (no version)
-/// - Compatible: `Caddy/2.11.9`
-/// - Custom: custom string
-/// - None: no identification
+/// Parse the `server_identity` directive (caddy-rs extension, T-CONF-060).
+///
+/// Accepted forms are `server_identity` (the default `caddy-rs/<build version>` mode),
+/// `server_identity default|name-only|compatible|none`, and
+/// `server_identity custom <string>`. Any other spelling is a located error, so a misspelled mode
+/// is never silently treated as a custom identity.
 fn parse_server_identity(
-    input: &str,
-    arguments: &[Value],
+    arguments: &[String],
+    position: Position,
 ) -> caddy_rs_core::Result<String> {
-    if arguments.is_empty() {
-        return Ok("caddy-rs".to_string());
-    }
-    let arg = arguments.get(0).ok_or_else(|| adapter_error(
-        position_at(input, 0),
-        "server_identity must have exactly one argument",
-    ))?;
-
-    match arg {
-        Value::String(s) => {
-            let trimmed = s.trim();
-            if trimmed.is_empty() {
+    let mode = arguments.first().map(String::as_str);
+    match (mode, arguments.len()) {
+        (None, _) => Ok("default".to_string()),
+        (Some("default"), 1) => Ok("default".to_string()),
+        (Some("name-only"), 1) => Ok("name-only".to_string()),
+        (Some("compatible"), 1) => Ok("compatible".to_string()),
+        (Some("none"), 1) => Ok("none".to_string()),
+        (Some("custom"), 2) => {
+            let value = &arguments[1];
+            if value.trim().is_empty() {
                 return Err(adapter_error(
-                    position_at(input, 0),
-                    "server_identity cannot be empty",
+                    position,
+                    "`server_identity custom` requires a non-empty identity string",
                 ));
             }
-            if trimmed == "default" {
-                return Ok("caddy-rs".to_string());
-            }
-            if trimmed == "name-only" {
-                return Ok("Caddy".to_string());
-            }
-            if trimmed == "compatible" {
-                return Ok("Caddy/2.11.9".to_string());
-            }
-            if trimmed == "none" {
-                return Ok("".to_string());
-            }
-            // Custom string
-            Ok(s.clone())
+            Ok(value.clone())
         }
-        other => Err(adapter_error(
-            position_at(input, 0),
+        (Some("custom"), _) => Err(adapter_error(
+            position,
+            "`server_identity custom` requires exactly one identity string",
+        )),
+        (Some(other), _) => Err(adapter_error(
+            position,
             format!(
-                "server_identity argument must be a string, got {}",
-                other
+                "unknown `server_identity` mode `{other}`; supported: default, name-only, \
+                 compatible, custom <string>, none"
             ),
         )),
     }
@@ -1065,15 +1033,6 @@ fn apply_global_server_options(
     for (key, value) in &matching.settings {
         object.insert(key.clone(), value.clone());
     }
-    // Apply server identity to the extra field of the server object
-    let identity_str = match &matching.server_identity {
-        ServerIdentity::Default => "caddy-rs",
-        ServerIdentity::NameOnly => "Caddy",
-        ServerIdentity::Compatible => "Caddy/2.11.9",
-        ServerIdentity::Custom(s) => s.as_str(),
-        ServerIdentity::None => return,
-    };
-    object.insert("extra".to_string(), Value::String(identity_str.to_string()));
 }
 
 /// Configuration-acceptance mode for the Caddyfile adapter.

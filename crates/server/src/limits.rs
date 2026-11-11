@@ -101,6 +101,9 @@ pub struct ServerLimits {
 
     /// caddy-rs extension: maximum concurrent connections. `None` means unlimited.
     pub max_connections: Option<usize>,
+
+    /// Server identity for the HTTP `Server` header (caddy-rs extension, T-CONF-060).
+    pub server_identity: caddy_rs_core::ServerIdentity,
 }
 
 impl Default for ServerLimits {
@@ -113,6 +116,7 @@ impl Default for ServerLimits {
             max_header_bytes: None,
             max_request_body_size: None,
             max_connections: None,
+            server_identity: caddy_rs_core::ServerIdentity::Default,
         }
     }
 }
@@ -174,6 +178,9 @@ impl ServerLimits {
         )?
         .map(|count| usize::try_from(count).unwrap_or(usize::MAX));
 
+        let server_identity =
+            caddy_rs_core::ServerIdentity::from_server_extra(server_name, &server.extra)?;
+
         Ok(Self {
             read_timeout,
             write_timeout,
@@ -182,6 +189,7 @@ impl ServerLimits {
             max_header_bytes,
             max_request_body_size,
             max_connections,
+            server_identity,
         })
     }
 }

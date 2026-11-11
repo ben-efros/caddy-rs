@@ -28,7 +28,7 @@ pub use dns::{DnsResolver, IpVersion, ResolverAddress, ResolverNetwork, SrvRecor
 pub use dynamic_upstreams::{DynamicUpstreamSource, DynamicUpstreams};
 pub use fastcgi::{FastCgiError, FastCgiTransport};
 pub use handler::{
-    handler_factory, handler_factory_with_status_sink, FlushInterval, ReverseProxyHandler,
+    handler_factory, handler_factory_with_status_sink, handler_factory_with_status_sink_and_server_software, FlushInterval, ReverseProxyHandler,
     UpstreamStatus, UpstreamStatusSink,
 };
 pub use health::{status_matches, HealthCheck, HealthCheckScheduler};
