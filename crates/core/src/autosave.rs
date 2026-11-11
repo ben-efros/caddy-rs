@@ -714,7 +714,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = TestDir::new("insecure-dir");
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777))
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o702))
             .expect("chmod");
 
         let error = autosave(b"{}", &dir.path().join("autosave.json"))
