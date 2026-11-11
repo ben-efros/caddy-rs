@@ -786,11 +786,15 @@ async fn serve(global: GlobalArgs, args: ServeArgs) -> Result<(), CliError> {
 
     // Create authentication service.
     //
-    // The JWT signing secret is persisted under the data directory so that tokens issued before a
-    // graceful restart are still accepted afterwards; otherwise every reload would log every user
-    // out. The file is created owner-only on first start.
+    // The JWT signing secret is persisted under the data directory (or supplied by the deployment
+    // through `PM_JWT_SECRET`) so that tokens issued before a restart are still accepted
+    // afterwards; a per-process random key would log every user out on every restart.
+    let env_secret = jwt_secret_from_env()?;
+    let jwt_secret_source =
+        resolve_jwt_secret_source(&runtime.config().data_dir, env_secret.as_deref())?;
+    let env_override = env_secret.is_some();
     let authn_config = AuthnConfig {
-        jwt_secret_source: JwtSecretSource::File(runtime.config().data_dir.join("jwt-secret.key")),
+        jwt_secret_source,
         ..AuthnConfig::default()
     };
     let authn_store = MemoryUserStore::new();
@@ -833,7 +837,10 @@ async fn serve(global: GlobalArgs, args: ServeArgs) -> Result<(), CliError> {
         }
     }
 
-    info!("authentication service created");
+    info!(
+        env_override,
+        "authentication service created with a persisted JWT signing key"
+    );
 
     // Build API state.
     //
@@ -886,6 +893,118 @@ async fn serve(global: GlobalArgs, args: ServeArgs) -> Result<(), CliError> {
         .await?;
 
     info!("management API shut down gracefully");
+    Ok(())
+}
+
+/// Environment variable that supplies the JWT signing key instead of the key file.
+///
+/// Deliberately not a clap argument: an option would also be accepted on the command line, where
+/// the secret is world-readable in the process table (`ps`, `/proc/<pid>/cmdline`). The daemon only
+/// ever reads it from the environment, which the deployment controls (e.g. a 0600 systemd
+/// `EnvironmentFile`).
+const PM_JWT_SECRET_ENV: &str = "PM_JWT_SECRET";
+
+/// Where the JWT signing key lives, relative to the data directory.
+const JWT_SIGNING_KEY_PATH: &str = "auth/signing.key";
+
+/// Read the `PM_JWT_SECRET` override, if any, without exposing its value.
+fn jwt_secret_from_env() -> Result<Option<String>, CliError> {
+    match std::env::var(PM_JWT_SECRET_ENV) {
+        Ok(secret) => Ok(Some(secret)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        // Never echo the value: it is not valid UTF-8 and would end up mangled in a log line.
+        Err(std::env::VarError::NotUnicode(_)) => Err(CliError::InvalidArg(format!(
+            "{PM_JWT_SECRET_ENV} must be valid UTF-8"
+        ))),
+    }
+}
+
+/// Resolve the JWT signing-key source for this boot.
+///
+/// Precedence: an explicit `PM_JWT_SECRET` wins over the key file, so a deployment can rotate the
+/// secret without touching the data directory. Otherwise the key is read from
+/// `<data_dir>/auth/signing.key`; the authn crate creates it with mode 0600 on first boot and
+/// re-reads the same key on every later boot, which is what keeps existing tokens valid.
+///
+/// `env_secret` is a parameter rather than a direct `std::env` read so the precedence can be tested
+/// without mutating process-global state.
+fn resolve_jwt_secret_source(
+    data_dir: &Path,
+    env_secret: Option<&str>,
+) -> Result<JwtSecretSource, CliError> {
+    if let Some(secret) = env_secret {
+        if secret.is_empty() {
+            return Err(CliError::InvalidArg(format!(
+                "{PM_JWT_SECRET_ENV} is set but empty; set a non-empty secret or unset it"
+            )));
+        }
+        return Ok(JwtSecretSource::Master(secret.to_string()));
+    }
+
+    let path = data_dir.join(JWT_SIGNING_KEY_PATH);
+    // `parent()` is always `Some` for a two-component relative path, but fall back rather than
+    // unwrap so a future change to the constant cannot panic the daemon at startup.
+    create_owner_only_dir(path.parent().unwrap_or(data_dir))?;
+    refuse_group_or_world_readable(&path)?;
+    Ok(JwtSecretSource::File(path))
+}
+
+/// Create `dir` and its parents, owner-only (0700) on Unix.
+///
+/// The key file itself is 0600, but the directory that holds it must not be traversable either:
+/// otherwise a local user can enumerate the data directory.
+fn create_owner_only_dir(dir: &Path) -> Result<(), CliError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)?;
+    }
+    Ok(())
+}
+
+/// Refuse a signing-key file that group or other can read.
+///
+/// A JWT signing key readable by any local user lets that user mint tokens for any account, so the
+/// daemon refuses to start with a located error naming the path and the observed mode instead of
+/// silently trusting a misconfigured file (a key restored from a backup, a bad `chmod`). This is a
+/// configuration guard, not a defence against an attacker who can already change the file's mode.
+#[cfg(unix)]
+fn refuse_group_or_world_readable(path: &Path) -> Result<(), CliError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        // Missing is the normal first-boot case: authn creates the file owner-only.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(CliError::InvalidArg(format!(
+                "could not inspect JWT signing key {}: {error}",
+                path.display()
+            )))
+        }
+    };
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(CliError::InvalidArg(format!(
+            "JWT signing key {} has mode 0o{mode:03o}, which is readable by group or other; \
+             restrict it to 0600 with `chmod 600 {}` or supply the key via {PM_JWT_SECRET_ENV}",
+            path.display(),
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn refuse_group_or_world_readable(_path: &Path) -> Result<(), CliError> {
+    // Non-Unix platforms have no POSIX mode bits to check; ACLs are the platform's own concern.
     Ok(())
 }
 
@@ -1430,5 +1549,189 @@ mod tests {
         assert!(!path.exists(), "a stale credentials file must be removed");
 
         std::fs::remove_dir_all(&dir).expect("remove the test directory");
+    }
+
+    /// Boot the authentication service the way `serve` does, against `data_dir`.
+    async fn boot_authn(data_dir: &Path, store: MemoryUserStore) -> AuthnService<MemoryUserStore> {
+        let source = resolve_jwt_secret_source(data_dir, None).expect("resolve the signing key");
+        AuthnService::new(
+            store,
+            AuthnConfig {
+                jwt_secret_source: source,
+                ..AuthnConfig::default()
+            },
+        )
+        .expect("build the authentication service")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_signing_key_is_created_owner_only_on_first_boot() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("create the test directory");
+        let key_path = dir.path().join("auth").join("signing.key");
+        assert!(!key_path.exists(), "no key exists before the first boot");
+
+        let _authn = boot_authn(dir.path(), MemoryUserStore::new()).await;
+
+        let metadata =
+            std::fs::metadata(&key_path).expect("the first boot creates the signing key");
+        assert_eq!(metadata.len(), 32, "the key is 32 bytes of OS randomness");
+        assert_eq!(
+            metadata.permissions().mode() & 0o777,
+            0o600,
+            "a signing key must never be readable by group or other"
+        );
+        let dir_mode = std::fs::metadata(dir.path().join("auth"))
+            .expect("the auth directory exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            dir_mode, 0o700,
+            "the directory holding the key is owner-only as well"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_minted_before_a_restart_is_accepted_after_it() {
+        // The user store is in-memory until T-PM-125, so both "processes" share it: what a restart
+        // must preserve for an existing token to keep verifying is the signing key on disk.
+        let dir = tempfile::tempdir().expect("create the test directory");
+        let key_path = dir.path().join("auth").join("signing.key");
+        let store = MemoryUserStore::new();
+
+        let before_restart = boot_authn(dir.path(), store.clone()).await;
+        before_restart
+            .create_user(
+                "admin@example.com".to_string(),
+                "correct horse battery staple",
+                caddy_rs_authn::Role::admin(),
+            )
+            .await
+            .expect("create the user");
+        let tokens = before_restart
+            .login("admin@example.com", "correct horse battery staple", None)
+            .await
+            .expect("mint an access token");
+        let persisted_key = std::fs::read(&key_path).expect("read the signing key");
+        drop(before_restart);
+
+        // A second daemon instance: new AuthnService, same data directory.
+        let after_restart = boot_authn(dir.path(), store).await;
+        assert_eq!(
+            std::fs::read(&key_path).expect("read the signing key"),
+            persisted_key,
+            "a restart must reuse the persisted key instead of generating a new one"
+        );
+        let claims = after_restart
+            .verify_access_token(&tokens.access_token)
+            .await
+            .expect("a token minted before the restart must still be accepted");
+        assert_eq!(claims.role, "admin");
+    }
+
+    #[tokio::test]
+    async fn the_environment_secret_overrides_the_persisted_key() {
+        let dir = tempfile::tempdir().expect("create the test directory");
+        let key_path = dir.path().join("auth").join("signing.key");
+
+        // A normal first boot persists a key file.
+        let _authn = boot_authn(dir.path(), MemoryUserStore::new()).await;
+        let on_disk = std::fs::read(&key_path).expect("read the signing key");
+
+        let source = resolve_jwt_secret_source(dir.path(), Some("rotated-by-the-deployment"))
+            .expect("resolve the overridden source");
+        match &source {
+            JwtSecretSource::Master(secret) => assert_eq!(secret, "rotated-by-the-deployment"),
+            other => panic!("PM_JWT_SECRET must win over the key file, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(&key_path).expect("read the signing key"),
+            on_disk,
+            "an environment override must not rewrite the persisted key"
+        );
+    }
+
+    #[test]
+    fn an_empty_environment_secret_is_refused_instead_of_falling_back() {
+        let dir = tempfile::tempdir().expect("create the test directory");
+        let error = resolve_jwt_secret_source(dir.path(), Some(""))
+            .expect_err("an empty PM_JWT_SECRET must be refused");
+        assert!(
+            error.to_string().contains(PM_JWT_SECRET_ENV),
+            "the error names the variable: {error}"
+        );
+        assert!(
+            !dir.path().join("auth").exists(),
+            "an invalid override must not create a key file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_group_or_world_readable_signing_key_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("create the test directory");
+        let auth_dir = dir.path().join("auth");
+        std::fs::create_dir_all(&auth_dir).expect("create the auth directory");
+        let key_path = auth_dir.join("signing.key");
+        std::fs::write(&key_path, [7u8; 32]).expect("write a key file");
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o640))
+            .expect("make the key group-readable");
+
+        let error = resolve_jwt_secret_source(dir.path(), None)
+            .expect_err("a key readable by group must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains(&key_path.display().to_string()),
+            "the error names the offending path: {message}"
+        );
+        assert!(
+            message.contains("0o640"),
+            "the error names the observed mode: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_signing_key_never_reaches_the_config_endpoint() {
+        let dir = tempfile::tempdir().expect("create the test directory");
+        let data_dir = dir.path().join("data");
+        let _authn = boot_authn(&data_dir, MemoryUserStore::new()).await;
+        let secret =
+            std::fs::read(data_dir.join("auth").join("signing.key")).expect("read the signing key");
+
+        let runtime = PmRuntime::open(RuntimeConfig::new(data_dir)).expect("open the runtime");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback listener");
+        let addr = listener.local_addr().expect("read the bound address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, create_router(ApiState::new(runtime))).await
+        });
+
+        let body = Client::new()
+            .get(format!("http://{addr}/api/v1/config"))
+            .send()
+            .await
+            .expect("GET /api/v1/config")
+            .text()
+            .await
+            .expect("read the config payload");
+        server.abort();
+
+        assert!(body.contains("\"apps\""), "a config payload: {body}");
+        let hex: String = secret.iter().map(|byte| format!("{byte:02x}")).collect();
+        let base64 = base64::engine::general_purpose::STANDARD.encode(secret);
+        assert!(
+            !body.contains(&hex),
+            "the signing key must not appear in /api/v1/config"
+        );
+        assert!(
+            !body.contains(&base64),
+            "the base64 form of the signing key must not appear in /api/v1/config"
+        );
     }
 }
