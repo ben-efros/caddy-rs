@@ -248,7 +248,25 @@ fn select_response_with_stdin(
     Ok((status, body, origin))
 }
 
-/// Whether stdin is a pipe (Caddy reads a body only from `os.ModeNamedPipe`).
+/// Whether stdin is a named pipe (`S_IFIFO`), matching Caddy's `os.ModeNamedPipe` test.
+///
+/// Only a FIFO counts: a regular-file redirect, `/dev/null`, a socket, a terminal and a closed
+/// descriptor all report `false`, so `caddy-rs respond --status 200 < page.html` serves an empty
+/// body exactly like Caddy.
+#[cfg(unix)]
+fn stdin_is_pipe() -> bool {
+    use rustix::fs::{fstat, FileType};
+
+    fstat(std::io::stdin())
+        .map(|stat| FileType::from_raw_mode(stat.st_mode) == FileType::Fifo)
+        .unwrap_or(false)
+}
+
+/// Whether stdin is a pipe, as closely as this platform can tell.
+///
+/// Non-unix targets expose no `fstat`/`S_IFIFO` equivalent, so `!is_terminal()` is the closest
+/// available approximation (unlike unix, it also accepts a regular-file redirect).
+#[cfg(not(unix))]
 fn stdin_is_pipe() -> bool {
     use std::io::IsTerminal;
     !std::io::stdin().is_terminal()
