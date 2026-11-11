@@ -30,7 +30,9 @@
 //!   least 1.
 //! * `key` (optional): placeholder expression used to select a bucket, expanded with `ReplaceAll`
 //!   semantics at request time; defaults to `{http.request.remote.host}`. An empty expansion is
-//!   keyed as `"<unknown>"` so requests without a peer address share one bucket.
+//!   keyed as `"<unknown>"` so requests without a peer address share one bucket. Expansions longer
+//!   than 256 bytes are hashed to `sha256:<64 lowercase hex chars>` before use as the bucket key,
+//!   so attacker-controlled placeholders cannot inflate per-bucket memory.
 //! * `max_keys` (optional): bound on the number of live buckets (default 10000). At the bound,
 //!   fully refilled (idle) buckets are evicted oldest-first; if every bucket is still consuming
 //!   tokens, new keys are rate limited rather than growing the map without bound.
@@ -891,26 +893,50 @@ mod tests {
     fn default_max_keys_is_ten_thousand() {
         let clock: Arc<dyn RateLimitClock> = Arc::new(ManualClock::new());
         let value = serde_json::json!({"handler": "rate_limit", "rate": "10r/s"});
-        let handler =
-            RateLimitHandler::from_json_with_clock(&value, "handler", Arc::clone(&clock))
-                .expect("valid config");
+        let handler = RateLimitHandler::from_json_with_clock(&value, "handler", Arc::clone(&clock))
+            .expect("valid config");
         assert_eq!(handler.config.max_keys, 10_000);
     }
 
-    #[test]
-    fn very_long_key_is_hashed() {
+    #[tokio::test]
+    async fn very_long_keys_are_hashed_before_bucketing() {
         let clock = Arc::new(ManualClock::new());
-        let long_key = "a".repeat(500);
         let handler = config(
             Arc::clone(&clock),
-            serde_json::json!({"rate": "1r/s", "burst": 1, "key": "{http.request.header.X-Key}"}),
+            serde_json::json!({"rate": "1r/s", "burst": 1}),
         );
-        let admission1 = handler.limiter.check(&long_key);
-        assert!(admission1.allowed);
-        let admission2 = handler.limiter.check(&long_key);
-        assert!(!admission2.allowed);
-        // Only one bucket created despite the long key.
+        let long_key = "a".repeat(500);
+        // Two distinct request objects carrying the same 500-byte header must share one hashed
+        // bucket, and the second must be limited: `handle` runs `bucket_key`, so this exercises
+        // the production hashing path instead of calling the limiter with a precomputed key.
+        assert!(matches!(
+            outcome(&handler, &long_key).await,
+            Outcome::Continue(_)
+        ));
+        assert!(matches!(
+            outcome(&handler, &long_key).await,
+            Outcome::Respond(_)
+        ));
         let state = handler.limiter.state.lock().unwrap();
         assert_eq!(state.buckets.len(), 1);
+        let stored = state.buckets.keys().next().expect("one bucket");
+        assert_eq!(
+            stored,
+            "sha256:69206a472a1f384259f2c387211f123d3cb308ec3c29c9892333814c3ebeba22"
+        );
+        assert_eq!(stored.len(), 71, "sha256: + 64 lowercase hex chars");
+        assert!(!state.buckets.contains_key(&long_key));
+    }
+
+    #[tokio::test]
+    async fn short_keys_are_not_hashed() {
+        let clock = Arc::new(ManualClock::new());
+        let handler = config(Arc::clone(&clock), serde_json::json!({}));
+        assert!(matches!(
+            outcome(&handler, "user-1").await,
+            Outcome::Continue(_)
+        ));
+        let state = handler.limiter.state.lock().unwrap();
+        assert!(state.buckets.contains_key("user-1"));
     }
 }
