@@ -234,6 +234,8 @@ impl ModuleRegistry {
         for module in BUILTIN_MODULES {
             registry
                 .register(module.clone())
+                // INFEASIBLE: `BUILTIN_MODULES` is a compile-time table; duplicate ids would be an
+                // authoring error caught by `cargo test`, never by a configuration file or env var.
                 .expect("built-in module table has no duplicate ids");
         }
         registry

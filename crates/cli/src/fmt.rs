@@ -671,12 +671,15 @@ fn decode_rune(bytes: &[u8]) -> (char, usize) {
     let end = bytes.len().min(4);
     match std::str::from_utf8(&bytes[..end]) {
         Ok(valid) => {
+            // INFEASIBLE: `format`/`trim_space` only call this with a non-empty slice, so a
+            // successful decode always yields at least one char.
             let ch = valid.chars().next().expect("non-empty slice");
             (ch, ch.len_utf8())
         }
         Err(error) if error.valid_up_to() > 0 => {
             let valid =
                 std::str::from_utf8(&bytes[..error.valid_up_to()]).expect("valid_up_to prefix");
+            // INFEASIBLE: the prefix is valid UTF-8 and `valid_up_to() > 0`, so it is non-empty.
             let ch = valid.chars().next().expect("non-empty prefix");
             (ch, ch.len_utf8())
         }
