@@ -66,7 +66,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use axum::{
-    extract::{connect_info::ConnectInfo, State},
+    extract::{connect_info::ConnectInfo, OriginalUri, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Json, Response},
@@ -587,11 +587,29 @@ pub fn create_router(state: ApiState) -> Router {
         .route("/config", get(config_handler))
         .route("/config/apply", post(apply::apply_handler))
         .route("/config/revisions", get(apply::revisions_handler))
+        // The router fallback is the UI (`ui::serve_ui`), which answers unknown paths with the
+        // single-page shell. An API client must never receive HTML, so the nested API router claims
+        // its own fallback and keeps the typed JSON error contract for a mistyped route.
+        .fallback(api_not_found)
         .layer(middleware::from_fn(observe_middleware))
         .layer(middleware::from_fn(capture_peer_middleware))
         .with_state(state);
 
-    Router::new().nest("/api/v1", api)
+    Router::new()
+        .nest("/api/v1", api)
+        // The web UI is served from the same origin as the API so the browser never needs CORS or
+        // a second port. It is embedded at build time (see `build.rs`); without a built bundle the
+        // fallback answers with an explanatory page instead of a 404.
+        .fallback(ui::serve_ui)
+}
+
+/// Unknown `/api/v1` route: a located JSON `404`, never the UI shell.
+///
+/// `OriginalUri` is the path the client asked for: inside a nested router the request URI has the
+/// `/api/v1` prefix stripped, and an error that named the stripped path would send a client looking
+/// for a route it never requested.
+async fn api_not_found(OriginalUri(uri): OriginalUri) -> ApiError {
+    ApiError::NotFound(format!("no route matches {}", uri.path()))
 }
 
 async fn health_handler(State(_state): State<ApiState>) -> Json<HealthResponse> {
@@ -679,6 +697,7 @@ mod apply;
 mod certificates;
 mod dto;
 mod hosts;
+mod ui;
 
 pub use apply::ApplyResponse;
 pub use certificates::{

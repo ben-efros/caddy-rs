@@ -1628,3 +1628,126 @@ async fn successful_apply_marks_the_uploaded_certificate_issued() {
     let body: serde_json::Value = detail.json();
     assert_eq!(body["status"], "issued");
 }
+
+// ---------------------------------------------------------------------------------------------
+// UI serving
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn unknown_api_route_is_a_json_404_and_never_the_ui() {
+    let (_dir, server) = server();
+    let response = server.get("/api/v1/definitely-not-a-route").await;
+    assert_eq!(response.status_code(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        response.header(header::CONTENT_TYPE),
+        "application/json",
+        "an API client that mistypes a route must not receive HTML"
+    );
+    let body: serde_json::Value = response.json();
+    assert_eq!(body["error"]["code"], "NOT_FOUND");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("/api/v1/definitely-not-a-route")),
+        "the error names the path that did not match"
+    );
+}
+
+#[tokio::test]
+async fn api_root_is_a_json_404_for_the_same_reason() {
+    let (_dir, server) = server();
+    let response = server.get("/api/v1").await;
+    assert_eq!(response.status_code(), StatusCode::NOT_FOUND);
+    assert_eq!(response.header(header::CONTENT_TYPE), "application/json");
+}
+
+#[tokio::test]
+async fn the_shell_is_served_at_root_with_the_security_headers() {
+    if !crate::ui::EMBEDDED {
+        // No bundle was built for this target: `not_built` answers instead and is covered by the
+        // unit tests in `ui`. Nothing to assert about embedded assets here.
+        return;
+    }
+    let (_dir, server) = server();
+    let response = server.get("/").await;
+    assert_eq!(response.status_code(), StatusCode::OK);
+    assert_eq!(
+        response.header(header::CONTENT_TYPE),
+        "text/html; charset=utf-8"
+    );
+    assert_eq!(response.header(header::CACHE_CONTROL), "no-cache");
+    assert_eq!(response.header(header::X_CONTENT_TYPE_OPTIONS), "nosniff");
+    assert_eq!(response.header(header::REFERRER_POLICY), "no-referrer");
+    assert!(
+        response
+            .header(header::CONTENT_SECURITY_POLICY)
+            .to_str()
+            .is_ok_and(|value| value.contains("default-src 'self'")),
+        "the shell must carry the CSP"
+    );
+    assert!(
+        response.text().contains("/assets/"),
+        "the shell is the bundle's index.html"
+    );
+}
+
+#[tokio::test]
+async fn a_client_side_page_route_falls_back_to_the_shell() {
+    if !crate::ui::EMBEDDED {
+        return;
+    }
+    let (_dir, server) = server();
+    let response = server.get("/hosts/7").await;
+    assert_eq!(
+        response.status_code(),
+        StatusCode::OK,
+        "a reload on a client-side route must not 404"
+    );
+    assert_eq!(
+        response.header(header::CONTENT_TYPE),
+        "text/html; charset=utf-8"
+    );
+}
+
+#[tokio::test]
+async fn a_missing_asset_is_a_real_404() {
+    let (_dir, server) = server();
+    let response = server.get("/assets/missing-BdEf0123.js").await;
+    assert_eq!(
+        response.status_code(),
+        StatusCode::NOT_FOUND,
+        "serving the shell for a missing .js file turns a broken deploy into a syntax error"
+    );
+}
+
+#[tokio::test]
+async fn an_embedded_asset_is_served_immutable() {
+    if !crate::ui::EMBEDDED {
+        return;
+    }
+    let Some((route, bytes, _)) = crate::ui::ASSETS
+        .iter()
+        .find(|(route, _, _)| route.starts_with("/assets/"))
+    else {
+        return;
+    };
+    let (_dir, server) = server();
+    let response = server.get(route).await;
+    assert_eq!(response.status_code(), StatusCode::OK);
+    assert_eq!(
+        response.header(header::CACHE_CONTROL),
+        "public, max-age=31536000, immutable"
+    );
+    assert_eq!(response.as_bytes().len(), bytes.len());
+}
+
+#[tokio::test]
+async fn the_ui_answers_a_non_read_method_with_405() {
+    if !crate::ui::EMBEDDED {
+        return;
+    }
+    let (_dir, server) = server();
+    let response = server.post("/").await;
+    assert_eq!(response.status_code(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(response.header(header::ALLOW), "GET, HEAD");
+}

@@ -71,9 +71,7 @@ use std::sync::Arc;
 
 use caddy_rs_pm_certificates::{CertificateError, CertificateRepository};
 use caddy_rs_pm_compiler::{compile_routes, CompileError, CompiledRoutes};
-use caddy_rs_pm_config::{
-    assemble_with_tls_and_certificates, CertificateFiles, ConfigError, ConfigSettings,
-};
+use caddy_rs_pm_config::{assemble_with_tls_and_certificates, CertificateFiles, ConfigError};
 use caddy_rs_pm_hosts::HostRepository;
 use caddy_rs_pm_policies::PolicyRepository;
 use caddy_rs_pm_service::{HostService, ServiceError};
@@ -87,6 +85,10 @@ pub use apply::{
     ConfigRevision, HttpCaddyAdmin, CONFIG_REVISIONS,
 };
 pub use caddy_rs_config_tx::ApplyFailureKind;
+// `PmRuntime::assemble` and `ConfigApplyService::new` take this type in their public signatures, so
+// a caller outside the PM crates (the daemon) has to be able to name it without depending on
+// `pm-config` directly.
+pub use caddy_rs_pm_config::ConfigSettings;
 
 /// Name of the PM-owned directory below the data directory.
 pub const PM_DIRECTORY: &str = "pm";
