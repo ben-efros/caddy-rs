@@ -527,6 +527,8 @@ impl Failures {
 
     fn into_error(self, generation: u64, phase: &'static str) -> Error {
         match self.into_result(generation, phase) {
+            // INFEASIBLE: every caller records at least one failure (`add`) before asking for the
+            // error, so `into_result` always has a failure to convert.
             Ok(()) => unreachable!("into_error called with no failures"),
             Err(error) => error,
         }

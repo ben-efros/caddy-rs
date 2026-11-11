@@ -139,6 +139,8 @@ fn parse_host_port(address: &str) -> std::result::Result<(), String> {
 
 fn split_host_port(address: &str) -> Option<(&str, &str)> {
     if let Some(rest) = address.strip_prefix('[') {
+        // INFEASIBLE: `end` is the byte offset of `]` inside `rest`, which is `address` minus the
+        // stripped `[`, so `end + 2 <= address.len()` and both slices below stay in bounds.
         let end = rest.find(']')?;
         let host = &address[..end + 2];
         let port = address[end + 2..].strip_prefix(':')?;
