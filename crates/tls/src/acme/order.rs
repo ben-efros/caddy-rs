@@ -943,6 +943,7 @@ impl<T: AcmeTransport> AcmeAccountClient<T> {
                     }
                     .into())
                 }
+                // INFEASIBLE: the outer match handles every ACME order status.
                 _ => unreachable!("all order statuses are handled above"),
             }
         }

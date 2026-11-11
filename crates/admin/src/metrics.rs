@@ -294,6 +294,7 @@ impl MetricsRegistry {
             let family = state
                 .families
                 .get_mut(name)
+                // INFEASIBLE: `ensure_family` just inserted this family.
                 .expect("family was just registered");
             match family.series.entry(labels.clone()) {
                 std::collections::btree_map::Entry::Occupied(entry) => match entry.get() {
@@ -611,6 +612,7 @@ fn validate_metric_name(name: &str) -> Result<(), MetricsError> {
         return Err(MetricsError::new("(empty)", "metric name is empty"));
     }
     let mut characters = name.chars();
+    // INFEASIBLE: emptiness was rejected just above.
     let first = characters.next().expect("name is not empty");
     if !(first.is_ascii_alphabetic() || first == '_' || first == ':') {
         return Err(MetricsError::new(
@@ -642,6 +644,7 @@ fn validate_labels(name: &str, labels: &[(&str, &str)]) -> Result<Labels, Metric
             ));
         }
         let mut characters = label.chars();
+        // INFEASIBLE: emptiness was rejected just above.
         let first = characters.next().expect("label is not empty");
         if !(first.is_ascii_alphabetic() || first == '_') {
             return Err(MetricsError::new(
@@ -777,7 +780,9 @@ pub fn format_float(value: f64) -> String {
     let scientific = format!("{magnitude:e}");
     let (mantissa, exponent) = scientific
         .split_once('e')
+        // INFEASIBLE: Rust's `LowerExp` always emits `e<exponent>`.
         .expect("LowerExp always contains an exponent");
+    // INFEASIBLE: `LowerExp` exponents are decimal integers.
     let exponent: i32 = exponent.parse().expect("LowerExp exponent is an integer");
     let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
     let digits_len = digits.len() as i32;

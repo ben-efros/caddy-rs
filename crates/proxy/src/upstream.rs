@@ -167,6 +167,8 @@ impl Upstream {
     /// The socket path is hex-encoded because a URI authority cannot contain `/`;
     /// [`crate::client::UpstreamConnector`] decodes it again before dialing.
     pub fn url(&self, path_and_query: &str) -> String {
+        // INFEASIBLE: resolve_target fills `transport` for a dynamic upstream before url() runs, and
+        // active health checks only run against fixed upstreams (they have a prebuilt client).
         let transport = self
             .transport
             .as_ref()
@@ -188,6 +190,7 @@ impl Upstream {
     /// Host header used when a request does not carry one (health checks use `localhost` for Unix
     /// sockets, matching Caddy).
     pub fn fallback_host(&self) -> &str {
+        // INFEASIBLE: same invariant as `url`: fallback_host is only reached after expansion.
         let transport = self
             .transport
             .as_ref()

@@ -1275,6 +1275,7 @@ impl AccountKey {
         let curve_oid = match key_type {
             AccountKeyType::P256 => OID_PRIME256V1,
             AccountKeyType::P384 => OID_SECP384R1,
+            // INFEASIBLE: the caller only reaches this EC path for P256/P384.
             _ => unreachable!(),
         };
         let sec1 = ec_pkcs8_to_sec1(der, curve_oid, &public_key)?;
@@ -1286,6 +1287,7 @@ impl AccountKey {
             material: match key_type {
                 AccountKeyType::P256 => AccountKeyMaterial::EcdsaP256(key_pair),
                 AccountKeyType::P384 => AccountKeyMaterial::EcdsaP384(key_pair),
+                // INFEASIBLE: the caller only reaches this EC path for P256/P384.
                 _ => unreachable!(),
             },
         })

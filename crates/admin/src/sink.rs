@@ -932,6 +932,7 @@ impl NetSink {
             Some(NetConnection::Unix(stream)) => stream.write_all(bytes),
             #[cfg(unix)]
             Some(NetConnection::Unixgram(socket)) => socket.send(bytes).map(|_| ()),
+            // INFEASIBLE: the connection was assigned just above.
             None => unreachable!("connection established above"),
         };
         if result.is_err() {
@@ -945,6 +946,7 @@ impl NetSink {
                 Some(NetConnection::Unix(stream)) => stream.write_all(bytes),
                 #[cfg(unix)]
                 Some(NetConnection::Unixgram(socket)) => socket.send(bytes).map(|_| ()),
+                // INFEASIBLE: the connection was reassigned just above.
                 None => unreachable!(),
             }?;
         }
@@ -1127,6 +1129,7 @@ impl AccessLogSink {
                 let path = config
                     .filename
                     .clone()
+                    // INFEASIBLE: `AccessLogSinkConfig::validate` rejects file outputs without a filename.
                     .expect("validated file output has a filename");
                 let file = FileSink::open(path.clone(), config.file.clone(), capacity).map_err(
                     |error| {
@@ -1142,6 +1145,7 @@ impl AccessLogSink {
                 let net = config
                     .net
                     .clone()
+                    // INFEASIBLE: `AccessLogSinkConfig::validate` rejects net outputs without a configuration.
                     .expect("validated net output has a configuration");
                 let net = NetSink::new(net).map_err(|error| {
                     AccessLogError::new(

@@ -221,6 +221,7 @@ impl CertificateRequest {
                     der_sequence(&[der_oid(OID_ECDSA_WITH_SHA384)]),
                 )
             }
+            // INFEASIBLE: generate_ec is only called for the P256/P384 key types.
             _ => unreachable!(),
         };
         let certification_request_info = certification_request_info(&domains, spki)?;
@@ -258,6 +259,7 @@ impl CertificateRequest {
         let bits = match key_type {
             CertificateKeyType::Rsa2048 => 2048,
             CertificateKeyType::Rsa4096 => 4096,
+            // INFEASIBLE: generate_rsa is only called for the RSA key types.
             _ => unreachable!(),
         };
         let private_key = rsa::RsaPrivateKey::new(&mut OsRng, bits).map_err(|error| {

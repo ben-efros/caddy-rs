@@ -290,6 +290,7 @@ fn encode_query(id: u16, name: &str, qtype: u16) -> Result<Vec<u8>, String> {
         if label.is_empty() || label.len() > 63 {
             return Err(format!("invalid DNS label in `{name}`"));
         }
+        // INFEASIBLE: the label length was checked to be at most 63 just above.
         query.push(u8::try_from(label.len()).expect("label length checked"));
         query.extend_from_slice(label.as_bytes());
     }
