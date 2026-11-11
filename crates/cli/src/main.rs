@@ -1,11 +1,11 @@
 //! `caddy-rs` command-line interface.
 //!
 //! Command surface follows Caddy's CLI where it is meaningful for this build: `adapt`, `validate`,
-//! `run`, `reload`, `stop`, `list-modules`, `version`, `build-info`, `environ`, `completion` and
-//! `manpage`. `pki list`/`pki show`/`pki export` and `trust` expose
-//! the local CA material persisted by automatic HTTPS (`<data-dir>/pki/authorities/<id>/`); see
-//! `docs/compatibility/CADDYFILE.md` for the
-//! supported configuration surface.
+//! `run`, `reload`, `stop`, `list-modules`, `version`, `build-info`, `environ`, `completion`,
+//! `manpage` and `storage export`/`storage import`. `pki list`/`pki show`/`pki export` and `trust`
+//! expose the local CA material persisted by automatic HTTPS
+//! (`<data-dir>/pki/authorities/<id>/`); see `docs/compatibility/CADDYFILE.md` for the supported
+//! configuration surface.
 //!
 //! # Shell completion installation
 //!
@@ -84,6 +84,7 @@ mod fmt;
 mod manpage;
 mod respond;
 mod signals;
+mod storage;
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -92,7 +93,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context};
 use bytes::Bytes;
-use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, CommandFactory, Parser, Subcommand, ValueEnum};
 use http_body_util::{BodyExt, Full};
 
 use caddy_rs_admin::pki::{CertificateInfo, PkiError, PkiStore, DEFAULT_CA_ID, DEFAULT_CA_NAME};
@@ -358,6 +359,69 @@ enum Command {
         /// Print the exact commands and paths without modifying any trust store.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Commands for working with Caddy's storage (EXPERIMENTAL).
+    #[command(
+        override_usage = "caddy-rs storage [COMMAND]",
+        about = "Commands for working with Caddy's storage (EXPERIMENTAL)",
+        long_about = "\
+Allows exporting and importing Caddy's storage contents. The two commands can be
+combined in a pipeline to transfer directly from one storage to another:
+
+$ caddy-rs storage export --config Caddyfile.old --output - |
+> caddy-rs storage import --config Caddyfile.new --input -
+
+The - argument refers to stdout and stdin, respectively.
+
+NOTE: When importing to or exporting from file_system storage (the default), the command
+should be run as the user that owns the associated root path.
+
+EXPERIMENTAL: May be changed or removed."
+    )]
+    Storage {
+        #[command(subcommand)]
+        command: Option<StorageCommand>,
+    },
+}
+
+/// `storage` subcommands.
+#[derive(Debug, Subcommand)]
+enum StorageCommand {
+    /// Exports storage assets as a tarball.
+    #[command(
+        override_usage = "caddy-rs storage export --config <path> --output <path>",
+        about = "Exports storage assets as a tarball",
+        long_about = "\
+The contents of the configured storage module (TLS certificates, etc)
+are exported via a tarball.
+
+--output is required, - can be given for stdout."
+    )]
+    Export {
+        /// Input configuration file (required).
+        #[arg(short, long, value_name = "CONFIG")]
+        config: Option<PathBuf>,
+        /// Output path.
+        #[arg(short, long, value_name = "OUTPUT")]
+        output: Option<PathBuf>,
+    },
+    /// Imports storage assets from a tarball.
+    #[command(
+        override_usage = "caddy-rs storage import --config <path> --input <path>",
+        about = "Imports storage assets from a tarball.",
+        long_about = "\
+Imports storage assets to the configured storage module. The import file must be
+a tar archive.
+
+--input is required, - can be given for stdin."
+    )]
+    Import {
+        /// Configuration file to load (required).
+        #[arg(short, long, value_name = "CONFIG")]
+        config: Option<PathBuf>,
+        /// Tar of assets to load (required).
+        #[arg(short, long, value_name = "INPUT")]
+        input: Option<PathBuf>,
     },
 }
 
@@ -831,6 +895,12 @@ async fn run(command: Command) -> anyhow::Result<()> {
         Command::Manpage { directory } => {
             manpage::write(directory.as_deref())?;
         }
+        Command::Storage { command } => match command {
+            Some(command) => run_storage(command)?,
+            // Caddy's parent `storage` command has no handler, so cobra prints its help and ends
+            // with a successful exit; do the same instead of a clap "missing subcommand" error.
+            None => print_storage_help()?,
+        },
         Command::Pki { command } => run_pki(command).await?,
         Command::Trust {
             data_dir,
@@ -1406,6 +1476,28 @@ fn pki_error(error: PkiError) -> anyhow::Error {
     match error.provisioning_hint() {
         Some(hint) => anyhow!("{error}; {hint}"),
         None => anyhow!("{error}"),
+    }
+}
+
+/// Print `storage --help` like Caddy does for the bare parent command.
+fn print_storage_help() -> anyhow::Result<()> {
+    let mut cli = Cli::command();
+    let storage = cli
+        .find_subcommand_mut("storage")
+        .ok_or_else(|| anyhow!("the `storage` subcommand is missing from the command tree"))?;
+    storage.print_long_help()?;
+    Ok(())
+}
+
+/// Run a `storage` subcommand.
+fn run_storage(command: StorageCommand) -> anyhow::Result<()> {
+    match command {
+        StorageCommand::Export { config, output } => {
+            storage::export(config.as_deref(), output.as_deref())
+        }
+        StorageCommand::Import { config, input } => {
+            storage::import(config.as_deref(), input.as_deref())
+        }
     }
 }
 

@@ -38,6 +38,7 @@ hyper = { workspace = true }
 hyper-util = { workspace = true }
 libc = "0.2.189"
 serde_json = { workspace = true }
+tar = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]

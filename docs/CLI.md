@@ -22,6 +22,7 @@ Commands:
   manpage       Generates the manual pages for caddy-rs commands
   pki           Inspect, show and export the local certificate authority material
   trust         Install the local CA root certificate into the host trust stores
+  storage       Commands for working with Caddy's storage (EXPERIMENTAL)
   help          Print this message or the help of the given subcommand(s)
 ```
 
@@ -482,6 +483,101 @@ Exit status is 0 on success, 1 when the data directory/CA is missing or the outp
 written, and 2 for usage errors (missing/ambiguous CA selector, unknown `--type`, conflicting
 flags).
 
+## storage
+
+Exports and imports Caddy's storage contents as a tar archive. The two commands can be combined in
+a pipeline to transfer storage directly between installations:
+
+```sh
+caddy-rs storage export --config Caddyfile.old --output - |
+caddy-rs storage import --config Caddyfile.new --input -
+```
+
+The `-` argument refers to stdout and stdin, respectively.
+
+NOTE: When importing to or exporting from file_system storage (the default), the command should be
+run as the user that owns the associated root path.
+
+EXPERIMENTAL: May be changed or removed.
+
+This build implements the `file_system` storage module (Caddy's default), also accepted as
+`caddy.storage.file_system`. There a storage key is the slash-separated path of a file below the
+storage root, so the archive is the set of regular files under the root and an import recreates
+them below the root. Any other configured storage module is a located error, not a silent fallback.
+
+Neither command accepts `--adapter`: like `caddy storage`, the format of `--config` is inferred from
+its name (`*.json` is JSON; a base name starting with `caddyfile`, case-insensitively, or ending in
+`.caddyfile` is a Caddyfile; anything else is JSON). The configuration is adapted and decoded but
+not provisioned or validated, so it only has to carry the `storage` object.
+
+The storage root is `storage.root` from the configuration when set; otherwise it is Caddy's data
+directory, resolved exactly as the server resolves it (`$CADDY_RS_DATA_DIR`, then Caddy's
+`AppDataDir()` — `$XDG_DATA_HOME/caddy`, `$HOME/.local/share/caddy`, platform variants — with the
+legacy `.caddy-rs` working-directory directory when it already exists). There is no `--data-dir`
+flag, matching Caddy.
+
+Synopsis: `caddy-rs storage <COMMAND>`
+
+| Command | Purpose |
+|---|---|
+| `export --config <PATH> --output <PATH>` | Export the storage contents as a tarball. |
+| `import --config <PATH> --input <PATH>` | Import storage contents from a tarball. |
+
+### storage export
+
+Writes every terminal key of the storage module to a tar archive. `file_system` storage has no
+directory keys, so the archive holds every regular file below the storage root, in lexical key
+order. Each entry is named after the key (slash separators), carries mode `0600` (whatever the
+file's own mode is), the file's modification time in whole seconds, and the file's exact contents.
+
+Synopsis: `caddy-rs storage export --config <PATH> --output <PATH>`
+
+| Option | Description | Default |
+|---|---|---|
+| `-c, --config <CONFIG>` | Input configuration file (required). | none |
+| `-o, --output <OUTPUT>` | Output path; `-` writes the archive to stdout (required). | none |
+
+```sh
+caddy-rs storage export --config /etc/caddy/Caddyfile --output storage.tar
+caddy-rs storage export --config /etc/caddy/Caddyfile --output - > storage.tar
+```
+
+The keys are listed before the output file is created or truncated, so a listing failure writes
+nothing and does not destroy an existing archive. A key removed after listing is reported as
+`warning: key: <key> removed while export is in-progress` and skipped. An empty storage root
+produces a valid empty tar archive.
+
+Exit status is 0 on success; 1 when a required flag is missing, `--config` cannot be read, adapted
+or decoded, the storage module is unsupported, the storage root cannot be listed, or the output
+cannot be opened; 3 when reading a key or writing the archive fails. Usage errors exit 2.
+
+### storage import
+
+Stores every entry of a tar archive in the storage module. The entry name is the key; its contents
+are written below the storage root with missing parent directories created and mode `0600`, so a
+re-import also resets an existing key's mode. An empty archive is a successful no-op. Entry names
+that are empty, absolute, or contain `..` components are refused with exit 3 before anything is
+written, so an archive cannot escape the storage root by name; a `./` prefix is cleaned away as
+Go's `filepath.Join` would.
+
+Synopsis: `caddy-rs storage import --config <PATH> --input <PATH>`
+
+| Option | Description | Default |
+|---|---|---|
+| `-c, --config <CONFIG>` | Configuration file to load (required). | none |
+| `-i, --input <INPUT>` | Tar of assets to load; `-` reads stdin (required). | none |
+
+```sh
+caddy-rs storage import --config /etc/caddy/Caddyfile --input storage.tar
+caddy-rs storage import --config /etc/caddy/Caddyfile --input - < storage.tar
+```
+
+On success the command prints `Successfully imported storage`.
+
+Exit status is 0 on success; 1 when a required flag is missing, `--config` cannot be read, adapted
+or decoded, the storage module is unsupported, or the input cannot be opened; 3 when reading the
+archive or storing a key fails. Usage errors exit 2.
+
 ## trust
 
 Installs the local CA root certificate into host trust stores. The command works directly from the
@@ -625,6 +721,7 @@ error.
 | 0 | The command succeeded. |
 | 1 | The command failed: invalid configuration, unreachable admin API, missing CA, failed trust-store update, and similar. |
 | 2 | Command-line usage error: missing required argument, unknown option, or conflicting options. |
+| 3 | The command started but processing failed: `storage export` could not write the archive, or `storage import` could not read it or store a key. |
 
 Errors from the configuration model are printed as:
 
@@ -656,15 +753,15 @@ Warnings go to standard error and do not change the exit status.
 
 | Variable | Read by | Effect |
 |---|---|---|
-| `CADDY_RS_DATA_DIR` | `run`, `pki`, `trust` | Data directory when `--data-dir` is absent. |
-| `XDG_DATA_HOME` | `run`, `completion` | Base for Caddy's default data directory; bash/zsh completion install location. |
+| `CADDY_RS_DATA_DIR` | `run`, `pki`, `trust`, `storage` | Data directory when `--data-dir` is absent; `storage` uses it when the config sets no `storage.root`. |
+| `XDG_DATA_HOME` | `run`, `completion`, `storage` | Base for Caddy's default data directory; bash/zsh completion install location. |
 | `XDG_CONFIG_HOME` | `run`, `completion` | Base for the default autosave path; fish/PowerShell completion install location. |
-| `HOME` | `run`, `trust`, `completion` | Fallback base for the autosave path; home directory for NSS/Firefox discovery in `trust`; base for completion paths and detection dot-directories. |
+| `HOME` | `run`, `trust`, `completion`, `storage` | Fallback base for the autosave path; home directory for NSS/Firefox discovery in `trust`; base for completion paths and detection dot-directories. |
 | `SHELL` | `completion` | Detection rule: its basename names the shell in use. |
 | `CADDY_RS_TRUST_PREFIX` | `trust` | Prefix for platform trust-store paths, default `/`. Intended for tests and containers. |
 | `JAVA_HOME` | `trust` | Java installation whose keystore is discovered. |
 | `PATH` | `trust`, `completion` | Locates the tools used to update trust stores; finds an executable `pwsh` for PowerShell detection. |
 | `LISTEN_PID`, `LISTEN_FDS`, `LISTEN_FDNAMES` | `run` | systemd socket activation; `respond` deliberately ignores them. |
 
-The configuration's `storage.root` also sets the data directory for `run`, and for `trust` when
-`--config` is given.
+The configuration's `storage.root` also sets the data directory for `run`, and for `trust` and
+`storage export`/`storage import` when `--config` is given.
