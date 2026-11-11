@@ -710,6 +710,9 @@ pub enum JwtSecretSource {
     /// On first start the file does not exist: a random 32-byte secret is
     /// generated, written atomically (write-temp-then-rename), and reused on
     /// every subsequent start.
+    ///
+    /// The final path component must be a regular file: a symlink there is refused, so the signing
+    /// key cannot be redirected to a file an attacker controls.
     File(PathBuf),
     /// Generate fresh on each start (legacy behavior, **NOT recommended**).
     Ephemeral,
@@ -779,26 +782,101 @@ const SECRET_READ_ATTEMPTS: usize = 3;
 
 /// Read a `[u8; 32]` secret file, returning `Ok(None)` when it does not exist yet.
 fn read_secret_file(path: &std::path::Path) -> AuthResult<Option<[u8; 32]>> {
-    match std::fs::read(path) {
-        Ok(bytes) if bytes.len() == 32 => {
+    use std::io::Read as _;
+
+    let Some(mut file) = open_secret_file(path)? else {
+        return Ok(None);
+    };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|error| {
+        AuthError::Internal(format!(
+            "could not read JWT secret file {}: {error}",
+            path.display()
+        ))
+    })?;
+    match bytes.len() {
+        32 => {
             let mut key = [0u8; 32];
             key.copy_from_slice(&bytes);
             Ok(Some(key))
         }
         // An empty file is an unusable leftover (e.g. a crash between create and write), never a
         // valid secret: treat it as absent so the next start repairs it instead of hard-failing.
-        Ok(bytes) if bytes.is_empty() => Ok(None),
-        Ok(bytes) => Err(AuthError::Internal(format!(
-            "JWT secret file {} must contain exactly 32 bytes, found {}",
-            path.display(),
-            bytes.len()
+        0 => Ok(None),
+        found => Err(AuthError::Internal(format!(
+            "JWT secret file {} must contain exactly 32 bytes, found {found}",
+            path.display()
         ))),
+    }
+}
+
+/// Open the secret file, refusing to follow a symlink at the final path component.
+///
+/// A symlink planted at the configured secret path would redirect the signing key to a file an
+/// attacker controls (or let the process read a file it should not), so the final component must
+/// be a regular file. The check cannot be a bare `symlink_metadata` before `File::open`: the path
+/// could be swapped for a symlink in between. The descriptor's own metadata is therefore compared
+/// with the path metadata *after* the open, and any disagreement means the path changed while it
+/// was being opened, so the read is refused rather than trusted.
+#[cfg(unix)]
+fn open_secret_file(path: &std::path::Path) -> AuthResult<Option<std::fs::File>> {
+    let link_metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(AuthError::Internal(format!(
+                "could not inspect JWT secret file {}: {error}",
+                path.display()
+            )))
+        }
+    };
+    if link_metadata.file_type().is_symlink() {
+        return Err(AuthError::Internal(format!(
+            "refusing to read JWT secret file {}: the final path component is a symlink; replace \
+             it with a regular file or configure a master secret",
+            path.display()
+        )));
+    }
+
+    let file = std::fs::File::open(path).map_err(|error| {
+        AuthError::Internal(format!(
+            "could not read JWT secret file {}: {error}",
+            path.display()
+        ))
+    })?;
+    let opened_metadata = file.metadata().map_err(|error| {
+        AuthError::Internal(format!(
+            "could not inspect opened JWT secret file {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !same_file(&opened_metadata, &link_metadata) {
+        return Err(AuthError::Internal(format!(
+            "refusing to read JWT secret file {}: it was replaced while being opened",
+            path.display()
+        )));
+    }
+    Ok(Some(file))
+}
+
+/// Non-Unix fallback: no `dev`/`ino` to compare, so only the pre-open symlink check is available.
+#[cfg(not(unix))]
+fn open_secret_file(path: &std::path::Path) -> AuthResult<Option<std::fs::File>> {
+    match std::fs::File::open(path) {
+        Ok(file) => Ok(Some(file)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(AuthError::Internal(format!(
             "could not read JWT secret file {}: {error}",
             path.display()
         ))),
     }
+}
+
+/// Whether two metadata snapshots describe the same file (same device and inode).
+#[cfg(unix)]
+fn same_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
 }
 
 /// Re-read the installed secret, retrying briefly so a short or partially written file observed
