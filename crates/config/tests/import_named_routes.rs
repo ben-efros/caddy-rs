@@ -180,10 +180,13 @@ fn import_cycle_error_through_adapt() {
 }
 
 #[test]
-fn file_imports_without_a_source_path_fail_loudly() {
+fn absolute_file_imports_fail_loudly_with_a_located_error() {
     let error = adapt_error(":80 {\n import /etc/caddy/snippets.caddy\n}\n");
     assert!(
-        error.contains("File to import not found: /etc/caddy/snippets.caddy"),
+        error.contains(
+            "invalid configuration at `Caddyfile line 2`: Import path must be relative, but got \
+             absolute path: /etc/caddy/snippets.caddy"
+        ),
         "{error}"
     );
 }
