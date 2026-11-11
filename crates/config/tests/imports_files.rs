@@ -210,3 +210,92 @@ fn file_import_without_a_source_path_fails_loudly() {
     assert!(message.contains("File to import not found"), "{message}");
     assert!(message.contains("source"), "{message}");
 }
+
+#[test]
+fn absolute_import_path_is_rejected() {
+    let tree = TempTree::new("absolute-import");
+    tree.write("Caddyfile", "example.com {\n\timport /etc/passwd\n}\n");
+    let caddyfile = std::fs::read_to_string(tree.caddyfile()).expect("read root");
+    let error = tree
+        .adapt(&caddyfile)
+        .expect_err("absolute import should be rejected");
+    let message = error.to_string();
+    assert!(
+        message.contains("absolute") || message.contains("outside"),
+        "expected absolute-path rejection, got: {message}"
+    );
+}
+
+#[test]
+fn parent_traversal_import_is_rejected() {
+    let tree = TempTree::new("traversal-import");
+    tree.write(
+        "Caddyfile",
+        "example.com {\n\timport ../../../etc/passwd\n}\n",
+    );
+    let caddyfile = std::fs::read_to_string(tree.caddyfile()).expect("read root");
+    let error = tree
+        .adapt(&caddyfile)
+        .expect_err("traversal import should be rejected");
+    let message = error.to_string();
+    assert!(
+        message.contains("outside") || message.contains("traversal") || message.contains(".."),
+        "expected traversal rejection, got: {message}"
+    );
+}
+
+#[test]
+fn traversal_through_child_directory_is_rejected() {
+    let tree = TempTree::new("traversal-child-import");
+    tree.write(
+        "Caddyfile",
+        "example.com {\n\timport sub/../../etc/passwd\n}\n",
+    );
+    tree.write("sub/dummy.conf", "# dummy\n");
+    let caddyfile = std::fs::read_to_string(tree.caddyfile()).expect("read root");
+    let error = tree
+        .adapt(&caddyfile)
+        .expect_err("traversal import through child dir should be rejected");
+    let message = error.to_string();
+    assert!(
+        message.contains("outside") || message.contains("traversal") || message.contains(".."),
+        "expected traversal rejection, got: {message}"
+    );
+}
+
+#[test]
+fn legitimate_relative_import_still_works() {
+    let tree = TempTree::new("legitimate-import");
+    tree.write("Caddyfile", "example.com {\n\timport extra.conf\n}\n");
+    tree.write("extra.conf", "header X-Extra yes\n");
+    let caddyfile = std::fs::read_to_string(tree.caddyfile()).expect("read root");
+    let adapted = tree
+        .adapt(&caddyfile)
+        .expect("legitimate import should work");
+    assert_eq!(
+        route_handlers(&adapted),
+        &serde_json::json!([
+            {"handler": "headers", "response": {"set": {"X-Extra": ["yes"]}}},
+        ])
+    );
+}
+
+#[test]
+fn dot_dot_within_tree_still_works() {
+    let tree = TempTree::new("ddot-within-tree");
+    tree.write(
+        "Caddyfile",
+        "example.com {\n\timport sub/../extra.conf\n}\n",
+    );
+    tree.write("extra.conf", "header X-Extra yes\n");
+    let caddyfile = std::fs::read_to_string(tree.caddyfile()).expect("read root");
+    let adapted = tree
+        .adapt(&caddyfile)
+        .expect("self-referential .. should work");
+    assert_eq!(
+        route_handlers(&adapted),
+        &serde_json::json!([
+            {"handler": "headers", "response": {"set": {"X-Extra": ["yes"]}}},
+        ])
+    );
+}
