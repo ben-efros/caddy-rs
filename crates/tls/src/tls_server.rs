@@ -294,6 +294,7 @@ impl Tls12CipherSuite {
         *rustls::crypto::aws_lc_rs::DEFAULT_CIPHER_SUITES
             .iter()
             .find(|candidate| candidate.suite() == suite)
+            // INFEASIBLE: the aws-lc-rs provider ships every suite in our selectable list.
             .expect("the aws-lc-rs provider implements every selectable TLS 1.2 cipher suite")
     }
 }
@@ -1825,6 +1826,7 @@ fn private_key_from_pem(pem: &str) -> Result<PrivateKeyDer<'static>> {
         key_type::DerForm::Pkcs8 => "PRIVATE KEY",
         key_type::DerForm::Sec1 => "EC PRIVATE KEY",
         key_type::DerForm::Pkcs1 => "RSA PRIVATE KEY",
+        // INFEASIBLE: `form` was narrowed to a known private-key structure above.
         key_type::DerForm::Unknown => unreachable!(),
     };
     if canonical != label {
@@ -1844,6 +1846,7 @@ fn private_key_from_pem(pem: &str) -> Result<PrivateKeyDer<'static>> {
         key_type::DerForm::Pkcs8 => PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(der.clone())),
         key_type::DerForm::Sec1 => PrivateKeyDer::Sec1(PrivateSec1KeyDer::from(der.clone())),
         key_type::DerForm::Pkcs1 => PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(der.clone())),
+        // INFEASIBLE: `form` was narrowed to a known private-key structure above.
         key_type::DerForm::Unknown => unreachable!(),
     })
 }

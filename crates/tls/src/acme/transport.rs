@@ -97,6 +97,7 @@ impl Clone for HyperTransport {
             self.proxy.clone(),
             self.user_agent.clone(),
         )
+        // INFEASIBLE: cloning the configured transport is a plain field copy.
         .expect("cloning a configured HyperTransport cannot fail")
     }
 }
