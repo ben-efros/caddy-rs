@@ -202,6 +202,8 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
                     }
                     _ => match scan_word(&mut chars, position, &mut column) {
                         Some(token) => tokens.push(token),
+                        // INFEASIBLE: `scan_word` only returns `None` without consuming input,
+                        // and a leading `\\` is always consumed by its escape arm.
                         None => unreachable!("a word starting with `\\` must consume input"),
                     },
                 }
@@ -215,6 +217,8 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
                     }
                     None => match scan_word(&mut chars, position, &mut column) {
                         Some(token) => tokens.push(token),
+                        // INFEASIBLE: `lex_heredoc` probes a clone, so the cursor still holds
+                        // the `<` and `scan_word` consumes it.
                         None => unreachable!("a word starting with `<` must consume input"),
                     },
                 }
