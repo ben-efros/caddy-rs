@@ -404,25 +404,10 @@ impl FastCgiTransport {
         let fpath = normalized_script_path(path)?;
 
         // Caddy's `splitPos`: an empty split-path list yields index 0 (whole path is PATH_INFO).
-        let split_pos: Option<usize> = if self.split_path.is_empty() {
-            Some(0)
-        } else {
-            self.split_path
-                .iter()
-                .filter(|split| !split.is_empty() && split.len() <= fpath.len())
-                .find_map(|split| {
-                    // INFEASIBLE: the filter above keeps only splits no longer than fpath.
-                    (0..=fpath.len() - split.len())
-                        .find(|start| {
-                            fpath[*start..*start + split.len()].eq_ignore_ascii_case(split)
-                        })
-                        .map(|start| start + split.len())
-                })
-        };
+        let split_pos: Option<usize> = cgi_split_pos(&self.split_path, &fpath);
         let (document_uri, mut path_info, mut script_name) = match split_pos {
             Some(pos) => {
-                let document_uri = &fpath[..pos];
-                let path_info = &fpath[pos..];
+                let (document_uri, path_info) = fpath.split_at(pos);
                 let script_name = fpath.strip_suffix(path_info).unwrap_or(fpath.as_str());
                 (
                     document_uri.to_string(),
@@ -909,6 +894,37 @@ fn find_cgi_header_end(buffer: &[u8]) -> Option<(usize, usize)> {
         }
     }
     None
+}
+
+/// Caddy's `splitPos`: index just past the first case-insensitive `split_path` match in `fpath`
+/// (0 when the split list is empty), or `None` when nothing matches.
+///
+/// `fpath` is the percent-decoded request path and may contain multibyte UTF-8, so the scan
+/// compares `as_bytes()` (like Go's byte-oriented `strings.Index`) instead of slicing `&str` at
+/// raw byte offsets. The returned offset is always a char boundary: `split_path` entries are
+/// validated ASCII, so a byte match cannot begin inside a multibyte character, and the boundary
+/// checks keep the result total (and `fpath.split_at` panic-free) for any input.
+fn cgi_split_pos(split_path: &[String], fpath: &str) -> Option<usize> {
+    if split_path.is_empty() {
+        return Some(0);
+    }
+    split_path
+        .iter()
+        .filter(|split| !split.is_empty() && split.len() <= fpath.len())
+        .find_map(|split| {
+            let needle = split.as_bytes();
+            (0..=fpath.len() - split.len())
+                .find(|start| {
+                    let end = start + split.len();
+                    fpath
+                        .as_bytes()
+                        .get(*start..end)
+                        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(needle))
+                        && fpath.is_char_boundary(*start)
+                        && fpath.is_char_boundary(end)
+                })
+                .map(|start| start + split.len())
+        })
 }
 
 /// Caddy's `caddyhttp.NormalizedPath` for CGI path derivation: decode the URI path, reject NUL
@@ -2098,27 +2114,58 @@ mod tests {
     fn split_pos_matches_caddy_semantics() {
         // Non-empty split matches case-insensitively and ends the script name.
         assert_eq!(
-            split_pos(&[".php".to_string()], "/dir/index.PHP/extra"),
+            cgi_split_pos(&[".php".to_string()], "/dir/index.PHP/extra"),
             Some(14)
         );
         // No match -> None (Caddy -1).
-        assert_eq!(split_pos(&[".php".to_string()], "/plain/path"), None);
+        assert_eq!(cgi_split_pos(&[".php".to_string()], "/plain/path"), None);
         // Empty split list -> Some(0) (Caddy returns 0, whole path is PATH_INFO).
-        assert_eq!(split_pos(&[], "/anything"), Some(0));
+        assert_eq!(cgi_split_pos(&[], "/anything"), Some(0));
     }
 
-    fn split_pos(split_path: &[String], path: &str) -> Option<usize> {
-        if split_path.is_empty() {
-            return Some(0);
-        }
-        split_path
-            .iter()
-            .filter(|split| !split.is_empty() && split.len() <= path.len())
-            .find_map(|split| {
-                (0..=path.len() - split.len())
-                    .find(|start| path[*start..*start + split.len()].eq_ignore_ascii_case(split))
-                    .map(|start| start + split.len())
-            })
+    #[test]
+    fn cgi_split_pos_ascii_paths_keep_existing_behaviour() {
+        // SEC-L9-PROXY regression guard: plain ASCII keeps the exact offsets the existing
+        // integration tests assert (`/index.php/extra` -> DOCUMENT_URI `/index.php`,
+        // PATH_INFO `/extra`).
+        let split_path = [".php".to_string()];
+        assert_eq!(cgi_split_pos(&split_path, "/index.php/extra"), Some(10));
+        assert_eq!(
+            "/index.php/extra".split_at(10),
+            ("/index.php", "/extra"),
+            "ASCII split yields the same DOCUMENT_URI/PATH_INFO pair as before"
+        );
+        assert_eq!(
+            cgi_split_pos(&split_path, "/dir name/script.php"),
+            Some(20),
+            "a space in the path is still matched normally"
+        );
+    }
+
+    #[test]
+    fn cgi_split_pos_multibyte_paths_do_not_panic_on_non_boundaries() {
+        // SEC-L9-PROXY: the scan probes offsets inside multibyte characters (`/caf\u{e9}` puts
+        // byte 5 inside `\u{e9}`); slicing `&str` there panicked with "byte index 5 is not a char
+        // boundary". Byte comparison must instead find the real match at the end of the path.
+        let split_path = [".php".to_string()];
+        assert_eq!(cgi_split_pos(&split_path, "/caf\u{e9}/x.php"), Some(12));
+        assert_eq!(
+            cgi_split_pos(&split_path, "/caf\u{e9}/x.php/more"),
+            Some(12)
+        );
+        assert_eq!(
+            cgi_split_pos(&split_path, "/\u{4f60}\u{597d}.php"),
+            Some(11)
+        );
+        // A suffix that starts inside a multibyte character is not a match, and not a panic.
+        assert_eq!(cgi_split_pos(&split_path, "/caf\u{e9}/x"), None);
+        // Defensive: `split_path` entries are ASCII-validated at config load, but a match that
+        // would end inside a character is skipped rather than sliced (the offset must stay a
+        // char boundary for `fpath.split_at`).
+        assert_eq!(
+            cgi_split_pos(&["\u{a9}\u{c3}".to_string()], "\u{e9}\u{e9}"),
+            None
+        );
     }
 
     #[test]
@@ -2379,6 +2426,65 @@ mod tests {
                 "{key}: {captured:?}"
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fastcgi_multibyte_path_splits_like_the_ascii_equivalent() {
+        // SEC-L9-PROXY: `GET /caf%C3%A9/x.php` panicked ("byte index 5 is not a char boundary")
+        // because the split scan sliced the decoded multibyte `fpath` at byte offsets. The split
+        // must be byte-oriented and identical to the ASCII-equivalent path.
+        async fn capture(uri: &str) -> BTreeMap<String, String> {
+            let (dial, captured) = spawn_tcp_mock(Behavior::responds(0)).await;
+            let handler = build_handler(
+                &dial,
+                transport_json(serde_json::json!({
+                    "root": "/srv/www",
+                    "split_path": [".php"]
+                })),
+            );
+            assert_eq!(
+                respond(&handler, request(Method::GET, uri)).status,
+                StatusCode::OK
+            );
+            let captured = captured.lock().unwrap();
+            captured
+                .as_ref()
+                .expect("mock captured the request")
+                .params
+                .clone()
+        }
+
+        // Exact reviewer reproduction: no panic, whole decoded path is the script.
+        let exact = capture("/caf%C3%A9/x.php").await;
+        assert_eq!(exact["SCRIPT_NAME"], "/caf\u{e9}/x.php");
+        assert_eq!(exact["DOCUMENT_URI"], "/caf\u{e9}/x.php");
+        assert_eq!(exact["SCRIPT_FILENAME"], "/srv/www/caf\u{e9}/x.php");
+        assert_eq!(exact["PATH_INFO"], "");
+
+        let multibyte = capture("/caf%C3%A9/x.php/more").await;
+        assert_eq!(multibyte["SCRIPT_NAME"], "/caf\u{e9}/x.php");
+        assert_eq!(multibyte["DOCUMENT_URI"], "/caf\u{e9}/x.php");
+        assert_eq!(multibyte["SCRIPT_FILENAME"], "/srv/www/caf\u{e9}/x.php");
+        assert_eq!(multibyte["PATH_INFO"], "/more");
+        assert_eq!(multibyte["PATH_TRANSLATED"], "/srv/www/more");
+
+        // Same split offsets as the ASCII path: DOCUMENT_URI + PATH_INFO == decoded path.
+        let ascii = capture("/cafe/x.php/more").await;
+        for (key, value) in [
+            ("DOCUMENT_URI", "/cafe/x.php"),
+            ("PATH_INFO", "/more"),
+            ("SCRIPT_FILENAME", "/srv/www/cafe/x.php"),
+        ] {
+            assert_eq!(ascii[key], value, "{key}: {ascii:?}");
+        }
+        assert_eq!(
+            format!("{}{}", multibyte["DOCUMENT_URI"], multibyte["PATH_INFO"]),
+            "/caf\u{e9}/x.php/more"
+        );
+        assert_eq!(
+            format!("{}{}", ascii["DOCUMENT_URI"], ascii["PATH_INFO"]),
+            "/cafe/x.php/more"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
