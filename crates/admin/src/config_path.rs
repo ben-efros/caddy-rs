@@ -158,8 +158,10 @@ fn mutate_at(
             if array_destination {
                 let index_part = parts[depth + 1];
                 let Value::Array(array) =
+                    // INFEASIBLE: `array_destination` just checked that this entry is an array.
                     map.get_mut(part).expect("array destination checked above")
                 else {
+                    // INFEASIBLE: same entry as the `expect` above.
                     unreachable!("array destination checked above");
                 };
                 return mutate_array_element(array, method, index_part, ellipses, body, full_path);
@@ -304,6 +306,7 @@ fn mutate_array_element(
         Mutation::Delete => {
             array.remove(index);
         }
+        // INFEASIBLE: POST appends instead of indexing, before this function is called.
         Mutation::Post => unreachable!("POST handled above"),
     }
     Ok(())
