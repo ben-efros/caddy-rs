@@ -25,16 +25,13 @@ let config = AuthnConfig {
 | `TotpWindow::PlusMinusOne` | `current - 1`, `current`, `current + 1` | Users type codes by hand and small clock skew is unavoidable. |
 | `TotpWindow::CurrentAndNext` | `current`, `current + 1` | Compatibility with clients that pre-compute the next code. |
 
-Each step is 30 seconds, so a window covers `30s * (2 * N + 1)` of wall clock
-time. A wider window is *slightly* weaker: an attacker who observes a code has
-more time in which it is still cryptographically valid.
+Each step is 30 seconds. A wider window is *slightly* weaker: an attacker who
+observes a code has more time in which it is still cryptographically valid.
+Concretely, the window spans 30 seconds for `Current`, 90 seconds for
+`PlusMinusOne`, and 60 seconds for `CurrentAndNext`.
 
-`TotpWindow` serialises as a plain enum value, so it can be carried in JSON
-configuration:
-
-```json
-{ "totp_window": "PlusMinusOne" }
-```
+`AuthnConfig` is not `serde`-serialisable: it holds the JWT signing key source and
+durations. Set `totp_window` programmatically where the config is built.
 
 ## Replay protection
 
@@ -51,6 +48,12 @@ accepted** (`User::totp_last_step`) and applies two rules:
 Both cases return `AuthError::TotpReplay` and are never treated as a plain
 `InvalidTotpCode`. That distinction is deliberate: it is the signal an operator
 needs to tell a typo apart from an attack.
+
+Replay classification is bounded. The service inspects
+`TOTP_REPLAY_LOOKBACK_STEPS` (10 steps, five minutes) behind the accepted window.
+A code older than that horizon is indistinguishable from a wrong guess and is
+reported as `Ok(false)`; without the bound a caller could force an unbounded
+number of HMAC computations per attempt.
 
 Because the rule is monotonic, accepting a `current + 1` code in
 `PlusMinusOne`/`CurrentAndNext` mode consumes the *current* step as well. A
@@ -72,7 +75,7 @@ secret starts from a clean slate.
 | --- | --- | --- |
 | `Ok(true)` | Code accepted and step consumed. | Continue with login. |
 | `Ok(false)` | Code does not match any step in the configured window. | Ask the user to retry; apply the usual login rate limit. |
-| `Err(AuthError::TotpReplay)` | Code is correct for a step at or below the last accepted step. | **Do not retry.** Treat as an impersonation/replay attempt: log the user id, source address and timestamp at `warn`, count it against the account's brute-force budget, and consider locking the account after repeated occurrences. |
+| `Err(AuthError::TotpReplay)` | Code is correct for a step at or below the last accepted step, or for a stale step within the replay lookback horizon. | **Do not retry.** Treat as an impersonation/replay attempt: log the user id, source address and timestamp at `warn`, count it against the account's brute-force budget, and consider locking the account after repeated occurrences. |
 | `Err(AuthError::TotpNotConfigured)` | The user has no TOTP secret. | Configuration error; do not prompt for a code. |
 | `Err(AuthError::UserNotFound)` | Unknown user id. | Do not reveal which of the two conditions failed. |
 
