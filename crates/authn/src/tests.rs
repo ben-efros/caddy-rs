@@ -680,15 +680,15 @@ fn debug_redacts_secrets() {
 
 #[test]
 fn user_record_serde_roundtrip() {
+    use chrono::Utc;
     use serde_json;
-    use chrono::{Utc, Duration};
 
     let now = Utc::now();
-    
+
     let user_id = UserId::new();
     let username = "testuser".to_string();
     let role = Role::viewer();
-    
+
     let record = UserRecord {
         id: user_id.clone(),
         username: username.clone(),
@@ -699,11 +699,11 @@ fn user_record_serde_roundtrip() {
         created_at: now,
         updated_at: now,
     };
-    
+
     // Serialize and deserialize
     let json = serde_json::to_string(&record).expect("UserRecord serializes");
     let deserialized: UserRecord = serde_json::from_str(&json).expect("UserRecord deserializes");
-    
+
     // Verify all fields round-trip correctly
     assert_eq!(deserialized.id, user_id);
     assert_eq!(deserialized.username, username);
@@ -717,13 +717,13 @@ fn user_record_serde_roundtrip() {
 
 #[test]
 fn refresh_token_record_serde_roundtrip() {
+    use chrono::{Duration, Utc};
     use serde_json;
-    use chrono::{Utc, Duration};
 
     let now = Utc::now();
     let user_id = UserId::new();
     let token_id = "refresh-token-123".to_string();
-    
+
     let record = RefreshTokenRecord {
         token_hash: "token-hash".to_string(),
         user_id: user_id.clone(),
@@ -732,11 +732,12 @@ fn refresh_token_record_serde_roundtrip() {
         revoked_at: Some(now.timestamp()),
         token_id: token_id.clone(),
     };
-    
+
     // Serialize and deserialize
     let json = serde_json::to_string(&record).expect("RefreshTokenRecord serializes");
-    let deserialized: RefreshTokenRecord = serde_json::from_str(&json).expect("RefreshTokenRecord deserializes");
-    
+    let deserialized: RefreshTokenRecord =
+        serde_json::from_str(&json).expect("RefreshTokenRecord deserializes");
+
     // Verify all fields round-trip correctly
     assert_eq!(deserialized.token_hash, record.token_hash);
     assert_eq!(deserialized.user_id, user_id);
@@ -748,11 +749,11 @@ fn refresh_token_record_serde_roundtrip() {
 
 #[test]
 fn user_public_view_no_secrets() {
+    use chrono::Utc;
     use serde_json;
-    use chrono::{Utc, Duration};
 
     let now = Utc::now();
-    
+
     let user = User {
         id: UserId::new(),
         username: "testuser".to_string(),
@@ -764,19 +765,28 @@ fn user_public_view_no_secrets() {
         created_at: now,
         updated_at: now,
     };
-    
-    // UserRecord::from_user creates a record without secrets
-    let record = UserRecord::from_user(
-        user.clone(),
-        "SECRET_HASH".to_string(),
-        Some("SECRET_TOTP".to_string())
+
+    // A record built from the user omits both secrets; only `totp_enabled` is stored.
+    let record = user.to_record();
+    assert!(
+        record.totp_enabled,
+        "UserRecord should record that TOTP is enabled"
     );
-    
+
     // Serialize - should not contain secrets
     let json = serde_json::to_string_pretty(&record).expect("UserRecord serializes");
-    assert!(!json.contains("SECRET_HASH"), "UserRecord should not contain password hash");
-    assert!(!json.contains("SECRET_TOTP"), "UserRecord should not contain TOTP secret");
-    
+    assert!(
+        !json.contains("SECRET_HASH"),
+        "UserRecord should not contain password hash"
+    );
+    assert!(
+        !json.contains("SECRET_TOTP"),
+        "UserRecord should not contain TOTP secret"
+    );
+
     // Verify totp_enabled is present
-    assert!(json.contains("\"totp_enabled\""), "UserRecord should contain totp_enabled field");
+    assert!(
+        json.contains("\"totp_enabled\""),
+        "UserRecord should contain totp_enabled field"
+    );
 }
