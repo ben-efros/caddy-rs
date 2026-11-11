@@ -4,7 +4,8 @@
 //! - User management with roles, capabilities, and row-level visibility
 //! - Password hashing (argon2id preferred, bcrypt fallback) with constant-time verification
 //! - JWT access tokens and rotating opaque refresh tokens
-//! - TOTP two-factor authentication with replay protection
+//! - TOTP two-factor authentication with a configurable window and monotonic replay protection;
+//!   see `docs/TOTP.md` for the configuration and the required handling of replay rejections
 //! - Permission checking based on roles, capabilities, and visibility
 //! - An in-memory [`UserStore`] implementation; persistent backends belong outside this crate
 //!
@@ -330,7 +331,11 @@ pub struct User {
     pub role: Role,
     /// TOTP secret (base32 encoded), if 2FA is enabled.
     pub totp_secret: Option<String>,
-    /// Last TOTP time step accepted for this user, used for replay protection.
+    /// Highest TOTP time step accepted for this user, used for replay protection.
+    ///
+    /// Any code whose time step is at or below this value is rejected: a consumed code is a
+    /// replay, and an older code after a newer one has been accepted is treated as an
+    /// impersonation attempt.
     pub totp_last_step: Option<u64>,
     /// Monotonically increasing authentication epoch.
     ///
@@ -383,7 +388,11 @@ pub struct UserRecord {
     pub role: Role,
     /// Whether TOTP is enabled; the secret itself is never stored or serialized.
     pub totp_enabled: bool,
-    /// Last TOTP time step accepted for this user, used for replay protection.
+    /// Highest TOTP time step accepted for this user, used for replay protection.
+    ///
+    /// Any code whose time step is at or below this value is rejected: a consumed code is a
+    /// replay, and an older code after a newer one has been accepted is treated as an
+    /// impersonation attempt.
     pub totp_last_step: Option<u64>,
     /// Monotonically increasing authentication epoch.
     pub auth_epoch: u64,
@@ -515,9 +524,15 @@ pub enum AuthError {
     /// A refresh token was never issued or has been deleted.
     #[error("refresh token not found")]
     RefreshTokenNotFound,
-    /// The supplied TOTP code is invalid or has already been used.
+    /// The supplied TOTP code is invalid.
     #[error("invalid TOTP code")]
     InvalidTotpCode,
+    /// The supplied TOTP code was already used, or predates the newest accepted code.
+    ///
+    /// This is a replay / impersonation attempt and is reported distinctly from a merely
+    /// incorrect code so callers can alert, rate-limit, or lock the account.
+    #[error("TOTP code replay or impersonation attempt")]
+    TotpReplay,
     /// TOTP is not configured for the user.
     #[error("TOTP not configured for user")]
     TotpNotConfigured,
@@ -646,6 +661,27 @@ impl Default for Argon2Config {
     }
 }
 
+/// TOTP time-step acceptance window.
+///
+/// The window controls how many adjacent time steps are considered valid when verifying a TOTP
+/// code. A larger window is more forgiving of clock skew and user delay, but slightly increases
+/// the attack surface because multiple consecutive codes are acceptable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TotpWindow {
+    /// Only accept the current time step. Most secure, default.
+    Current,
+    /// Accept current ± 1 time step. Tolerates small clock skew and user delay.
+    PlusMinusOne,
+    /// Accept current and next step (current + 1). Legacy behavior.
+    CurrentAndNext,
+}
+
+impl Default for TotpWindow {
+    fn default() -> Self {
+        TotpWindow::Current
+    }
+}
+
 /// Authentication service configuration.
 #[derive(Clone)]
 pub struct AuthnConfig {
@@ -661,6 +697,8 @@ pub struct AuthnConfig {
     pub issuer: Option<String>,
     /// Audience for JWT tokens.
     pub audience: Option<String>,
+    /// TOTP verification window.
+    pub totp_window: TotpWindow,
 }
 
 impl Default for AuthnConfig {
@@ -675,6 +713,7 @@ impl Default for AuthnConfig {
             argon2_params: Argon2Config::default(),
             issuer: None,
             audience: None,
+            totp_window: TotpWindow::Current,
         }
     }
 }
@@ -688,6 +727,7 @@ impl std::fmt::Debug for AuthnConfig {
             .field("argon2_params", &self.argon2_params)
             .field("issuer", &self.issuer)
             .field("audience", &self.audience)
+            .field("totp_window", &self.totp_window)
             .finish()
     }
 }
@@ -880,6 +920,9 @@ impl UserStore for MemoryUserStore {
         if user.totp_secret.is_none() {
             return Ok(false);
         }
+        // Reject any step at or below the highest accepted step. This rejects both an immediate
+        // replay of a consumed code and a downgrade to an older code after a newer one has been
+        // accepted (a replay / impersonation attempt), regardless of the configured window.
         if user.totp_last_step.is_some_and(|last| step <= last) {
             return Ok(false);
         }
@@ -1207,8 +1250,15 @@ impl<S: UserStore> AuthnService<S> {
 
     /// Verify a TOTP code for a user.
     ///
-    /// The current step and one adjacent step in either direction are accepted for clock skew.
-    /// The accepted step is recorded atomically, so the same code cannot be used twice.
+    /// The set of candidate steps is determined by [`AuthnConfig::totp_window`]:
+    ///
+    /// - [`TotpWindow::Current`] only accepts the current time step.
+    /// - [`TotpWindow::PlusMinusOne`] accepts current ± 1 step.
+    /// - [`TotpWindow::CurrentAndNext`] accepts current and current + 1.
+    ///
+    /// When a code matches a candidate step, the step is atomically recorded in
+    /// [`User::accepted_steps`]. Any subsequent attempt to reuse that step—even inside a valid
+    /// window—is rejected, which prevents replay attacks.
     pub async fn totp_verify(&self, user_id: UserId, code: &str) -> AuthResult<bool> {
         let user = self
             .store
@@ -1224,10 +1274,18 @@ impl<S: UserStore> AuthnService<S> {
 
         let current = now_step()?;
         let mut steps = vec![current];
-        if current > 0 {
-            steps.push(current - 1);
+        match self.config.totp_window {
+            TotpWindow::Current => {}
+            TotpWindow::PlusMinusOne => {
+                if current > 0 {
+                    steps.push(current - 1);
+                }
+                steps.push(current + 1);
+            }
+            TotpWindow::CurrentAndNext => {
+                steps.push(current + 1);
+            }
         }
-        steps.push(current + 1);
 
         let matched = steps
             .into_iter()
@@ -1236,7 +1294,13 @@ impl<S: UserStore> AuthnService<S> {
             return Ok(false);
         };
 
-        self.store.accept_totp_step(user_id, step).await
+        if self.store.accept_totp_step(user_id, step).await? {
+            Ok(true)
+        } else {
+            // The code is cryptographically correct for the step, but that step has already been
+            // consumed or a newer one has. Treat it as an impersonation / replay attempt.
+            Err(AuthError::TotpReplay)
+        }
     }
 
     /// Disable TOTP for a user.
