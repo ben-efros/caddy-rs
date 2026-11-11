@@ -233,7 +233,14 @@ impl FileServerHandler {
         request: Request,
         filename: &Path,
         original_name: &str,
+        root: &Path,
     ) -> Result<Outcome> {
+        if path_contains_symlink(filename, root).await? {
+            return Ok(Outcome::Respond(Response::text(
+                StatusCode::FORBIDDEN,
+                "403 Forbidden",
+            )));
+        }
         let original_metadata = fs::metadata(filename)
             .await
             .map_err(|error| Error::Io(error))?;
@@ -260,6 +267,12 @@ impl FileServerHandler {
                 continue;
             };
             let sidecar = PathBuf::from(format!("{}{suffix}", filename.display()));
+            if path_contains_symlink(&sidecar, root).await? {
+                return Ok(Outcome::Respond(Response::text(
+                    StatusCode::FORBIDDEN,
+                    "403 Forbidden",
+                )));
+            }
             let Ok(info) = fs::metadata(&sidecar).await else {
                 continue;
             };
@@ -437,6 +450,7 @@ impl FileServerHandler {
                 ranges = Ok(parsed);
             }
         }
+        // INFEASIBLE: every error arm above returned, so only `Ok` reaches this point.
         let ranges = ranges.expect("range errors handled");
         if ranges.len() == 1 {
             let range = ranges[0];
@@ -447,13 +461,19 @@ impl FileServerHandler {
                     .expect("content range is a valid header value"),
             );
             send_size = range.length as u64;
-            body = Bytes::copy_from_slice(
-                &body[range.start as usize..(range.start + range.length) as usize],
-            );
+            let Some((range_start, range_end)) = range_bounds(&range, body.len()) else {
+                return Ok(Outcome::Respond(serve_error(
+                    request.method == http::Method::HEAD,
+                    headers,
+                    StatusCode::RANGE_NOT_SATISFIABLE,
+                    "invalid range: the file changed while it was being served",
+                )));
+            };
+            body = Bytes::copy_from_slice(&body[range_start..range_end]);
         } else if ranges.len() > 1 {
             status = StatusCode::PARTIAL_CONTENT;
             let boundary = multipart_boundary();
-            let multipart = multipart_body(&ranges, &content_type, size as i64, &boundary, &body);
+            let multipart = multipart_body(&ranges, &content_type, size as i64, &boundary, &body)?;
             headers.insert(
                 header::CONTENT_TYPE,
                 HeaderValue::from_str(&format!("multipart/byteranges; boundary={boundary}"))
@@ -560,6 +580,13 @@ impl Handler for FileServerHandler {
         let full_path = root.join(stat_relative);
         let request_path = request.uri.path().to_string();
 
+        if path_contains_symlink(&full_path, &root).await? {
+            return Ok(Outcome::Respond(Response::text(
+                StatusCode::FORBIDDEN,
+                "403 Forbidden",
+            )));
+        }
+
         let metadata = match fs::metadata(&full_path).await {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -579,6 +606,12 @@ impl Handler for FileServerHandler {
                     continue;
                 }
                 let candidate = filename.join(index);
+                if path_contains_symlink(&candidate, &root).await? {
+                    return Ok(Outcome::Respond(Response::text(
+                        StatusCode::FORBIDDEN,
+                        "403 Forbidden",
+                    )));
+                }
                 if let Ok(index_metadata) = fs::metadata(&candidate).await {
                     if index_metadata.is_file() {
                         filename = candidate;
@@ -637,7 +670,8 @@ impl Handler for FileServerHandler {
             }
         }
         let original_name = filename.to_string_lossy().to_string();
-        self.serve_file(request, &filename, &original_name).await
+        self.serve_file(request, &filename, &original_name, &root)
+            .await
     }
 }
 
@@ -783,6 +817,32 @@ fn calculate_etag(metadata: &std::fs::Metadata) -> String {
         base36(time.unix_nano),
         base36(metadata.len() as i64)
     )
+}
+
+/// Returns `true` if `path` or any directory component between `path` and `root`
+/// is a symbolic link.
+async fn path_contains_symlink(path: &Path, root: &Path) -> Result<bool> {
+    let mut current = path;
+    loop {
+        match fs::symlink_metadata(current).await {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Ok(true);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // The path (or a parent) does not exist; keep checking ancestors.
+            }
+            Err(error) => return Err(Error::Io(error)),
+        }
+        if current == root || current.parent().is_none() {
+            return Ok(false);
+        }
+        let Some(parent) = current.parent() else {
+            return Ok(false);
+        };
+        current = parent;
+    }
 }
 
 /// Read an ETag from a sidecar file (`etag_file_extensions`), removing newlines like Caddy.
@@ -1199,13 +1259,23 @@ fn multipart_boundary() -> String {
     output
 }
 
+/// Clamp a parsed byte range to the bytes actually read from disk. Returns `None` when the range
+/// does not fit, which happens when the file changed between `stat` and `read`; callers must turn
+/// that into a rejection instead of slicing out of bounds.
+fn range_bounds(range: &ByteRange, available: usize) -> Option<(usize, usize)> {
+    let start = usize::try_from(range.start).ok()?;
+    let length = usize::try_from(range.length).ok()?;
+    let end = start.checked_add(length)?;
+    (end <= available).then_some((start, end))
+}
+
 fn multipart_body(
     ranges: &[ByteRange],
     content_type: &str,
     size: i64,
     boundary: &str,
     representation: &[u8],
-) -> Vec<u8> {
+) -> Result<Vec<u8>> {
     let mut body = Vec::new();
     for range in ranges {
         body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
@@ -1214,13 +1284,18 @@ fn multipart_body(
         );
         body.extend_from_slice(format!("Content-Type: {content_type}\r\n").as_bytes());
         body.extend_from_slice(b"\r\n");
-        let start = range.start as usize;
-        let end = (range.start + range.length) as usize;
+        let Some((start, end)) = range_bounds(range, representation.len()) else {
+            return Err(Error::handler(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid range: the file changed while it was being served",
+            ));
+        };
+        // INFEASIBLE: `range_bounds` proved `start..end` lies inside `representation`.
         body.extend_from_slice(&representation[start..end]);
         body.extend_from_slice(b"\r\n");
     }
     body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
-    body
+    Ok(body)
 }
 
 async fn browse_html(root: &Path, uri: Uri, relative: &str) -> Result<Vec<u8>> {
@@ -2170,6 +2245,71 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
+    async fn symlink_to_outside_root_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside.txt");
+        std::fs::write(&outside, b"secret").unwrap();
+        let link = dir.path().join("link.txt");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        let handler = handler(dir.path()).await;
+        let response = respond(&handler, make_request(Method::GET, "/link.txt")).await;
+        assert_eq!(
+            response.status,
+            StatusCode::FORBIDDEN,
+            "symlink pointing outside the root must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn symlink_to_hidden_file_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let hidden = dir.path().join(".htpasswd");
+        std::fs::write(&hidden, b"secret").unwrap();
+        let link = dir.path().join("safe.txt");
+        std::os::unix::fs::symlink(&hidden, &link).unwrap();
+
+        let handler = handler(dir.path()).await;
+        let response = respond(&handler, make_request(Method::GET, "/safe.txt")).await;
+        assert_eq!(
+            response.status,
+            StatusCode::FORBIDDEN,
+            "symlink pointing to a hidden file must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn symlink_directory_to_outside_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside_dir = dir.path().join("outside");
+        std::fs::create_dir(&outside_dir).unwrap();
+        std::fs::write(outside_dir.join("secret.txt"), b"secret").unwrap();
+        let link_dir = dir.path().join("linkdir");
+        std::os::unix::fs::symlink(&outside_dir, &link_dir).unwrap();
+
+        let handler = handler(dir.path()).await;
+        let response = respond(&handler, make_request(Method::GET, "/linkdir/secret.txt")).await;
+        assert_eq!(
+            response.status,
+            StatusCode::FORBIDDEN,
+            "symlink directory pointing outside the root must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn legitimate_file_still_served() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file.txt"), b"hello").unwrap();
+        let handler = handler(dir.path()).await;
+        let response = respond(&handler, make_request(Method::GET, "/file.txt")).await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, Bytes::from_static(b"hello"));
+    }
+
+    #[tokio::test]
     async fn legitimate_filename_with_double_dots_is_allowed() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("foo..bar.txt"), b"hello").unwrap();
@@ -2192,6 +2332,22 @@ mod tests {
             response.status,
             StatusCode::FORBIDDEN,
             "path traversal via .. component should be rejected"
+        );
+    }
+
+    #[test]
+    fn multipart_ranges_beyond_the_read_bytes_are_rejected() {
+        // A file that shrank between `stat` and `read` used to slice the representation out of
+        // bounds and panic.
+        let ranges = [ByteRange {
+            start: 5,
+            length: 10,
+        }];
+        let error = multipart_body(&ranges, "text/plain", 100, "boundary", b"short")
+            .expect_err("range beyond the read bytes must be rejected");
+        assert_eq!(
+            error.handler_status(),
+            Some(StatusCode::INTERNAL_SERVER_ERROR)
         );
     }
 }

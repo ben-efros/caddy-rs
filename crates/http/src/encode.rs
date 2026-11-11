@@ -825,7 +825,14 @@ fn accepted_encodings(header: Option<&str>, preferred_order: &[String]) -> Vec<S
         if !params.is_empty() {
             // Caddy takes the first parameter and only parses it when it starts with `q=`.
             let first = params.split(';').next().unwrap_or("").trim();
-            if first.len() >= 2 && first[..2].eq_ignore_ascii_case("q=") {
+            // `first` comes straight from the client's `Accept-Encoding` header. Check the `q=`
+            // prefix through `get(..)` so a multi-byte character at byte offset 2 cannot make the
+            // slice panic.
+            let has_q_prefix = first
+                .get(..2)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("q="));
+            if has_q_prefix {
+                // INFEASIBLE: the `get(..2)` above proved byte offset 2 is a character boundary.
                 if let Ok(parsed) = first[2..].parse::<f32>() {
                     let parsed = f64::from(parsed);
                     if (0.0..=1.0).contains(&parsed) {
@@ -1476,5 +1483,14 @@ mod tests {
                 checksum: true
             }
         ));
+    }
+
+    #[test]
+    fn accept_encoding_with_multi_byte_quality_parameter_does_not_panic() {
+        // `aé` puts a multi-byte character across byte offset 2 of the first parameter, which used
+        // to make `&first[..2]` panic.
+        let accepted =
+            accepted_encodings(Some("gzip;aé, br"), &["gzip".to_string(), "br".to_string()]);
+        assert_eq!(accepted, vec!["gzip".to_string(), "br".to_string()]);
     }
 }
