@@ -1229,9 +1229,7 @@ impl Parser {
             let text = String::from_utf8(bytes).map_err(|_| {
                 ParseError::syntax(
                     import_position.clone(),
-                    format!(
-                        "Could not read tokens while importing {import_path}: not valid UTF-8"
-                    ),
+                    format!("Could not read tokens while importing {import_path}: not valid UTF-8"),
                 )
             })?;
             if text.trim().is_empty() {
@@ -1385,15 +1383,16 @@ impl Parser {
             ));
         }
 
-        let resolved_text = normalized.display().to_string();
-        if resolved_text.matches('*').count() > 1
-            || resolved_text.matches('?').count() > 1
-            || (resolved_text.contains('[') && resolved_text.contains(']'))
+        // Report the pattern as the user wrote it: `normalized` is the pattern joined with the
+        // importing directory and would leak the absolute path in this diagnostic.
+        if pattern.matches('*').count() > 1
+            || pattern.matches('?').count() > 1
+            || (pattern.contains('[') && pattern.contains(']'))
         {
             return Err(ParseError::syntax(
                 position,
                 format!(
-                    "Glob pattern may only contain one wildcard (*), but has others: {resolved_text}"
+                    "Glob pattern may only contain one wildcard (*), but has others: {pattern}"
                 ),
             ));
         }
