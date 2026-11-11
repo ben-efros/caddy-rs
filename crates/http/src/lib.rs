@@ -19,6 +19,7 @@ pub mod placeholders;
 pub mod rate_limit;
 pub mod regex_lite;
 pub mod router;
+pub mod security_headers;
 #[cfg(feature = "templates")]
 pub mod templates;
 pub mod types;
