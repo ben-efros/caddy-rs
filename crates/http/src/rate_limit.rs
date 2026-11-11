@@ -891,26 +891,53 @@ mod tests {
     fn default_max_keys_is_ten_thousand() {
         let clock: Arc<dyn RateLimitClock> = Arc::new(ManualClock::new());
         let value = serde_json::json!({"handler": "rate_limit", "rate": "10r/s"});
-        let handler =
-            RateLimitHandler::from_json_with_clock(&value, "handler", Arc::clone(&clock))
-                .expect("valid config");
+        let handler = RateLimitHandler::from_json_with_clock(&value, "handler", Arc::clone(&clock))
+            .expect("valid config");
         assert_eq!(handler.config.max_keys, 10_000);
     }
 
-    #[test]
-    fn very_long_key_is_hashed() {
+    #[tokio::test]
+    async fn very_long_key_is_hashed() {
         let clock = Arc::new(ManualClock::new());
         let long_key = "a".repeat(500);
         let handler = config(
             Arc::clone(&clock),
             serde_json::json!({"rate": "1r/s", "burst": 1, "key": "{http.request.header.X-Key}"}),
         );
-        let admission1 = handler.limiter.check(&long_key);
-        assert!(admission1.allowed);
-        let admission2 = handler.limiter.check(&long_key);
-        assert!(!admission2.allowed);
-        // Only one bucket created despite the long key.
+
+        // bucket_key must hash the expanded placeholder to a sha256: prefix.
+        let mut req = request(&long_key);
+        let bucket_key = handler.bucket_key(&req);
+        assert!(
+            bucket_key.starts_with("sha256:"),
+            "long expanded key must be hashed, got {bucket_key:?}"
+        );
+        assert_eq!(
+            bucket_key.len(),
+            71,
+            "sha256: prefix (7) + 64 hex chars = 71"
+        );
+
+        // The handler must use the hashed key, so two requests with the same
+        // 500-byte header share one bucket and are rate-limited correctly.
+        let outcome1 = handler.handle(req.clone()).await.expect("rate limit");
+        assert!(
+            matches!(outcome1, Outcome::Continue(_)),
+            "first request allowed"
+        );
+        let outcome2 = handler.handle(req).await.expect("rate limit");
+        assert!(
+            matches!(outcome2, Outcome::Respond(_)),
+            "second request limited"
+        );
+
+        // The stored bucket key must be the hashed form, not the raw 500-byte string.
         let state = handler.limiter.state.lock().unwrap();
         assert_eq!(state.buckets.len(), 1);
+        let stored_key = state.buckets.keys().next().expect("one bucket");
+        assert!(
+            stored_key.starts_with("sha256:"),
+            "stored key must be hashed, got {stored_key:?}"
+        );
     }
 }
