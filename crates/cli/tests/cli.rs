@@ -3655,3 +3655,710 @@ fn respond_rejects_invalid_headers_arguments_and_templates() {
         assert!(stderr.contains(needle), "args {args:?}: {stderr}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// `caddy storage` (T-CLI-010): parity with `caddy storage export|import`.
+// ---------------------------------------------------------------------------
+
+/// Run the binary and return raw standard output (tar archives are not UTF-8).
+fn run_capture(args: &[&str]) -> (i32, Vec<u8>, String) {
+    let output = Command::new(binary())
+        .args(args)
+        .output()
+        .expect("run caddy-rs");
+    (
+        output.status.code().unwrap_or(-1),
+        output.stdout,
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
+/// Run the binary with raw bytes on standard input, returning raw standard output.
+fn run_with_stdin_capture(args: &[&str], stdin: &[u8]) -> (i32, Vec<u8>, String) {
+    let mut child = Command::new(binary())
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn caddy-rs");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin pipe")
+        .write_all(stdin)
+        .expect("write stdin");
+    let output = child.wait_with_output().expect("wait for caddy-rs");
+    (
+        output.status.code().unwrap_or(-1),
+        output.stdout,
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
+/// Run the binary in `directory` with extra environment variables.
+fn run_with_env(directory: &Path, env: &[(&str, &str)], args: &[&str]) -> (i32, String, String) {
+    let mut command = Command::new(binary());
+    command.current_dir(directory);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let output = command.args(args).output().expect("run caddy-rs");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
+/// One entry read back from a tar archive.
+struct ArchivedEntry {
+    name: String,
+    mode: u32,
+    mtime: u64,
+    contents: Vec<u8>,
+}
+
+fn archive_entries(bytes: &[u8]) -> Vec<ArchivedEntry> {
+    let mut entries = Vec::new();
+    let mut archive = tar::Archive::new(bytes);
+    for entry in archive.entries().expect("tar entries") {
+        let mut entry = entry.expect("tar entry");
+        let header = entry.header().clone();
+        let name = entry
+            .path()
+            .expect("entry path")
+            .to_string_lossy()
+            .into_owned();
+        let mode = header.mode().expect("entry mode");
+        let mtime = header.mtime().expect("entry mtime");
+        let mut contents = Vec::new();
+        entry.read_to_end(&mut contents).expect("entry contents");
+        entries.push(ArchivedEntry {
+            name,
+            mode,
+            mtime,
+            contents,
+        });
+    }
+    entries
+}
+
+fn read_archive(path: &Path) -> Vec<ArchivedEntry> {
+    archive_entries(&std::fs::read(path).expect("read archive"))
+}
+
+/// Write a JSON config whose `storage.root` is `root`.
+fn storage_config(directory: &Path, name: &str, root: &Path) -> std::path::PathBuf {
+    let config = directory.join(name);
+    std::fs::write(
+        &config,
+        format!(
+            "{{\"storage\":{{\"module\":\"file_system\",\"root\":\"{}\"}}}}\n",
+            root.display()
+        ),
+    )
+    .expect("write config");
+    config
+}
+
+/// Populate a Caddy-style storage tree and return its (key, contents) pairs in key order.
+fn populate_storage(root: &Path) -> Vec<(&'static str, &'static str)> {
+    let files = vec![
+        (
+            "certificates/local/example.com/example.com.crt",
+            "CERT-PEM\n",
+        ),
+        (
+            "certificates/local/example.com/example.com.key",
+            "KEY-PEM\n",
+        ),
+        ("pki/authorities/local/root.crt", "ROOT-CA\n"),
+    ];
+    for (relative, contents) in &files {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create storage dir");
+        std::fs::write(&path, contents).expect("write storage file");
+    }
+    files
+}
+
+/// A hand-built tar with one regular-file entry.
+///
+/// The `tar` crate refuses to *write* a name containing `..`, so the archive an attacker could hand
+/// to `storage import` has to be assembled byte by byte.
+fn crafted_tar(name: &str, contents: &[u8]) -> Vec<u8> {
+    fn put(header: &mut [u8; 512], offset: usize, value: &[u8]) {
+        header[offset..offset + value.len()].copy_from_slice(value);
+    }
+    assert!(
+        name.len() <= 100,
+        "fixture name must fit the tar name field"
+    );
+    let mut header = [0u8; 512];
+    put(&mut header, 0, name.as_bytes());
+    put(&mut header, 100, b"0000600\0");
+    put(&mut header, 108, b"0000000\0");
+    put(&mut header, 116, b"0000000\0");
+    put(
+        &mut header,
+        124,
+        format!("{:011o}\0", contents.len()).as_bytes(),
+    );
+    put(&mut header, 136, b"00000000000\0");
+    put(&mut header, 156, b"0");
+    put(&mut header, 257, b"ustar\0");
+    put(&mut header, 263, b"00");
+    header[148..156].fill(b' ');
+    let checksum: u32 = header.iter().map(|byte| u32::from(*byte)).sum();
+    put(&mut header, 148, format!("{checksum:06o}\0 ").as_bytes());
+    let mut archive = header.to_vec();
+    archive.extend_from_slice(contents);
+    archive.resize(archive.len() + (512 - contents.len() % 512) % 512, 0);
+    archive.extend_from_slice(&[0u8; 1024]);
+    archive
+}
+
+#[test]
+fn storage_help_matches_caddys_usage_and_flags() {
+    let (code, stdout, stderr) = run(&["storage", "--help"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    for text in [
+        "Usage: caddy-rs storage [COMMAND]",
+        "combined in a pipeline to transfer directly from one storage to another",
+        "$ caddy-rs storage export --config Caddyfile.old --output - |",
+        "> caddy-rs storage import --config Caddyfile.new --input -",
+        "The - argument refers to stdout and stdin, respectively.",
+        "should be run as the user that owns the associated root path",
+        "EXPERIMENTAL: May be changed or removed.",
+        "Exports storage assets as a tarball",
+        "Imports storage assets from a tarball.",
+    ] {
+        assert!(stdout.contains(text), "missing {text:?} in:\n{stdout}");
+    }
+
+    // Caddy's parent `storage` command has no handler: cobra prints its help and exits 0. A bare
+    // `caddy-rs storage` must do the same instead of a clap "missing subcommand" error.
+    let (code, bare_stdout, stderr) = run(&["storage"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    for text in [
+        "Usage: caddy-rs storage [COMMAND]",
+        "Exports storage assets as a tarball",
+        "Imports storage assets from a tarball.",
+    ] {
+        assert!(
+            bare_stdout.contains(text),
+            "bare: missing {text:?} in:\n{bare_stdout}"
+        );
+    }
+
+    let (code, stdout, stderr) = run(&["storage", "export", "--help"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    for text in [
+        "Usage: caddy-rs storage export --config <path> --output <path>",
+        "The contents of the configured storage module (TLS certificates, etc)",
+        "are exported via a tarball.",
+        "--output is required, - can be given for stdout.",
+        "-c, --config <CONFIG>",
+        "Input configuration file (required)",
+        "-o, --output <OUTPUT>",
+        "Output path",
+    ] {
+        assert!(stdout.contains(text), "missing {text:?} in:\n{stdout}");
+    }
+
+    let (code, stdout, stderr) = run(&["storage", "import", "--help"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    for text in [
+        "Usage: caddy-rs storage import --config <path> --input <path>",
+        "Imports storage assets to the configured storage module. The import file must be",
+        "a tar archive.",
+        "--input is required, - can be given for stdin.",
+        "-c, --config <CONFIG>",
+        "Configuration file to load (required)",
+        "-i, --input <INPUT>",
+        "Tar of assets to load (required)",
+    ] {
+        assert!(stdout.contains(text), "missing {text:?} in:\n{stdout}");
+    }
+
+    // The parent command appears in the top-level command list.
+    let (code, stdout, stderr) = run(&["--help"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        stdout.contains("Commands for working with Caddy's storage (EXPERIMENTAL)"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn storage_export_writes_a_sorted_tar_of_the_storage_tree() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("storage");
+    let files = populate_storage(&root);
+    let config = storage_config(directory.path(), "config.json", &root);
+    let output = directory.path().join("storage.tar");
+    // Caddy truncates the output file: a stale archive must not survive in front of the new one.
+    std::fs::write(&output, b"stale bytes that are not a tar archive").unwrap();
+
+    let (code, stdout, stderr) = run(&[
+        "storage",
+        "export",
+        "--config",
+        config.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+
+    let entries = read_archive(&output);
+    let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+    assert_eq!(
+        names,
+        files.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+        "keys are listed in certmagic's lexical order"
+    );
+    for (entry, (key, contents)) in entries.iter().zip(files.iter()) {
+        assert_eq!(entry.name, *key);
+        assert_eq!(entry.contents, contents.as_bytes(), "contents of {key}");
+        assert_eq!(entry.mode, 0o600, "mode of {key}");
+        assert!(entry.mtime > 0, "mtime of {key} is {}", entry.mtime);
+    }
+}
+
+#[test]
+fn storage_export_to_stdout_and_import_from_stdin_round_trip() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("source");
+    let files = populate_storage(&source);
+    let source_config = storage_config(directory.path(), "source.json", &source);
+
+    // `-` means stdout/stdin, so the documented pipeline works unchanged.
+    let (code, archive, stderr) = run_capture(&[
+        "storage",
+        "export",
+        "-c",
+        source_config.to_str().unwrap(),
+        "-o",
+        "-",
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(!archive.is_empty(), "the archive must be written to stdout");
+    let entries = archive_entries(&archive);
+    assert_eq!(entries.len(), files.len());
+
+    let target = directory.path().join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    let target_config = storage_config(directory.path(), "target.json", &target);
+    let (code, stdout, stderr) = run_with_stdin_capture(
+        &[
+            "storage",
+            "import",
+            "-c",
+            target_config.to_str().unwrap(),
+            "-i",
+            "-",
+        ],
+        &archive,
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&stdout),
+        "Successfully imported storage\n"
+    );
+    assert_eq!(stderr, "");
+    for (key, contents) in &files {
+        assert_eq!(
+            std::fs::read(target.join(key)).expect("imported file"),
+            contents.as_bytes(),
+            "contents of {key}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn storage_import_writes_files_with_owner_only_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("source");
+    let files = populate_storage(&source);
+    let source_config = storage_config(directory.path(), "source.json", &source);
+    let archive = directory.path().join("storage.tar");
+    let (code, _, stderr) = run(&[
+        "storage",
+        "export",
+        "-c",
+        source_config.to_str().unwrap(),
+        "-o",
+        archive.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+
+    let target = directory.path().join("target");
+    let target_config = storage_config(directory.path(), "target.json", &target);
+    for attempt in 0..2 {
+        let (code, stdout, stderr) = run(&[
+            "storage",
+            "import",
+            "-c",
+            target_config.to_str().unwrap(),
+            "-i",
+            archive.to_str().unwrap(),
+        ]);
+        assert_eq!(code, 0, "attempt {attempt}: stderr: {stderr}");
+        assert_eq!(stdout, "Successfully imported storage\n");
+        for (key, contents) in &files {
+            let path = target.join(key);
+            assert_eq!(std::fs::read(&path).unwrap(), contents.as_bytes());
+            // certmagic replaces the target through a 0600 temporary file, so a re-import tightens
+            // an existing key's mode too.
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "mode of {key} on attempt {attempt}");
+        }
+        // Loosen one file between imports to prove the second import resets it.
+        let loosened = target.join(files[0].0);
+        std::fs::set_permissions(&loosened, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+}
+
+#[test]
+fn storage_requires_config_and_output_or_input_flags() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("storage");
+    std::fs::create_dir_all(&root).unwrap();
+    let config = storage_config(directory.path(), "config.json", &root);
+    let missing = directory.path().join("missing.json");
+    let unwritable_output = directory.path().join("out.tar");
+    let missing_archive = directory.path().join("missing.tar");
+    let cases: Vec<(Vec<&str>, i32, &str)> = vec![
+        (vec!["storage", "export"], 1, "--config is required"),
+        (
+            vec!["storage", "export", "-c", config.to_str().unwrap()],
+            1,
+            "--output is required",
+        ),
+        (vec!["storage", "import"], 1, "--config is required"),
+        (
+            vec!["storage", "import", "-c", config.to_str().unwrap()],
+            1,
+            "--input is required",
+        ),
+        (
+            vec![
+                "storage",
+                "export",
+                "-c",
+                missing.to_str().unwrap(),
+                "-o",
+                unwritable_output.to_str().unwrap(),
+            ],
+            1,
+            "cannot read config",
+        ),
+        (
+            vec![
+                "storage",
+                "import",
+                "-c",
+                config.to_str().unwrap(),
+                "-i",
+                missing_archive.to_str().unwrap(),
+            ],
+            1,
+            "opening input file",
+        ),
+    ];
+    for (args, expected, needle) in cases {
+        let (code, stdout, stderr) = run(&args);
+        assert_eq!(code, expected, "args {args:?}: stderr {stderr}");
+        assert_eq!(stdout, "", "args {args:?}");
+        assert!(
+            stderr.contains(needle),
+            "args {args:?}: missing {needle:?} in {stderr}"
+        );
+    }
+}
+
+#[test]
+fn storage_export_fails_when_the_storage_root_is_missing_and_leaves_the_output_alone() {
+    let directory = tempfile::tempdir().unwrap();
+    let missing_root = directory.path().join("does-not-exist");
+    let config = storage_config(directory.path(), "config.json", &missing_root);
+    let output = directory.path().join("storage.tar");
+    let (code, _, stderr) = run(&[
+        "storage",
+        "export",
+        "--config",
+        config.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(
+        stderr.contains("cannot list storage") && stderr.contains("does-not-exist"),
+        "{stderr}"
+    );
+    // Caddy lists the keys before it opens the output, so a listing failure creates nothing.
+    assert!(!output.exists(), "the output file must not be created");
+}
+
+#[test]
+fn storage_export_writes_an_empty_archive_for_an_empty_root() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("empty");
+    std::fs::create_dir_all(&root).unwrap();
+    let config = storage_config(directory.path(), "config.json", &root);
+    let output = directory.path().join("empty.tar");
+    let (code, _, stderr) = run(&[
+        "storage",
+        "export",
+        "-c",
+        config.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let bytes = std::fs::read(&output).unwrap();
+    assert!(archive_entries(&bytes).is_empty());
+    assert!(
+        !bytes.is_empty() && bytes.len() % 512 == 0,
+        "an empty tar is the two zero blocks: {} bytes",
+        bytes.len()
+    );
+}
+
+#[test]
+fn storage_rejects_an_unsupported_storage_module() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config.json");
+    std::fs::write(
+        &config,
+        "{\"storage\":{\"module\":\"s3\",\"root\":\"/x\"}}\n",
+    )
+    .unwrap();
+    let (code, _, stderr) = run(&[
+        "storage",
+        "export",
+        "-c",
+        config.to_str().unwrap(),
+        "-o",
+        directory.path().join("out.tar").to_str().unwrap(),
+    ]);
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(
+        stderr.contains("unsupported storage module `s3`") && stderr.contains("file_system"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn storage_import_refuses_archive_keys_outside_the_root() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("storage");
+    std::fs::create_dir_all(&root).unwrap();
+    let config = storage_config(directory.path(), "config.json", &root);
+
+    for (name, needle) in [
+        ("../escape.txt", "refusing key"),
+        ("/etc/escape.txt", "refusing key"),
+    ] {
+        let archive = crafted_tar(name, b"pwned\n");
+        let (code, _, stderr) = run_with_stdin_capture(
+            &[
+                "storage",
+                "import",
+                "-c",
+                config.to_str().unwrap(),
+                "-i",
+                "-",
+            ],
+            &archive,
+        );
+        assert_eq!(code, 3, "key {name:?}: stderr {stderr}");
+        assert!(
+            stderr.contains("reading archive") && stderr.contains(needle),
+            "key {name:?}: {stderr}"
+        );
+    }
+    // Nothing was written outside the configured root.
+    assert!(!directory.path().join("escape.txt").exists());
+    assert!(!directory.path().join("storage").join("escape.txt").exists());
+}
+
+#[test]
+fn storage_import_reports_a_non_tar_input_and_leaves_the_root_empty() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("storage");
+    std::fs::create_dir_all(&root).unwrap();
+    let config = storage_config(directory.path(), "config.json", &root);
+    let (code, stdout, stderr) = run_with_stdin_capture(
+        &[
+            "storage",
+            "import",
+            "-c",
+            config.to_str().unwrap(),
+            "-i",
+            "-",
+        ],
+        b"this is not a tar archive",
+    );
+    assert_eq!(code, 3, "stderr: {stderr}");
+    assert!(
+        stdout.is_empty(),
+        "stdout: {}",
+        String::from_utf8_lossy(&stdout)
+    );
+    assert!(stderr.contains("reading archive"), "{stderr}");
+    assert_eq!(
+        std::fs::read_dir(&root).unwrap().count(),
+        0,
+        "a broken archive stores nothing"
+    );
+}
+
+#[test]
+fn storage_accepts_an_empty_archive_as_a_successful_no_op() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("storage");
+    std::fs::create_dir_all(&root).unwrap();
+    let config = storage_config(directory.path(), "config.json", &root);
+    // Go's tar.Reader reports EOF for a zero-byte input, so Caddy imports nothing and succeeds.
+    let (code, stdout, stderr) = run_with_stdin_capture(
+        &[
+            "storage",
+            "import",
+            "-c",
+            config.to_str().unwrap(),
+            "-i",
+            "-",
+        ],
+        b"",
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&stdout),
+        "Successfully imported storage\n"
+    );
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+}
+
+#[test]
+fn storage_defaults_to_the_caddy_data_directory() {
+    let directory = tempfile::tempdir().unwrap();
+    let data_home = directory.path().join("xdg");
+    let storage_root = data_home.join("caddy");
+    std::fs::create_dir_all(storage_root.join("acme")).unwrap();
+    std::fs::write(storage_root.join("acme/acme-v02.api.json"), "ACCOUNT\n").unwrap();
+    let config = directory.path().join("config.json");
+    std::fs::write(&config, "{}\n").unwrap();
+    let output = directory.path().join("storage.tar");
+
+    let (code, _, stderr) = run_with_env(
+        directory.path(),
+        &[
+            ("XDG_DATA_HOME", data_home.to_str().unwrap()),
+            ("CADDY_RS_DATA_DIR", ""),
+        ],
+        &[
+            "storage",
+            "export",
+            "-c",
+            config.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let entries = read_archive(&output);
+    let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+    assert_eq!(names, vec!["acme/acme-v02.api.json"]);
+}
+
+#[test]
+fn storage_accepts_a_caddyfile_config() {
+    let directory = tempfile::tempdir().unwrap();
+    let data_home = directory.path().join("xdg");
+    let storage_root = data_home.join("caddy");
+    std::fs::create_dir_all(storage_root.join("pki/authorities/local")).unwrap();
+    std::fs::write(storage_root.join("pki/authorities/local/root.crt"), "CA\n").unwrap();
+    // A `Caddyfile` name selects the Caddyfile adapter, like Caddy's LoadConfig.
+    std::fs::write(
+        directory.path().join("Caddyfile"),
+        ":0 {\n\trespond \"hi\"\n}\n",
+    )
+    .unwrap();
+    let output = directory.path().join("storage.tar");
+
+    let (code, _, stderr) = run_with_env(
+        directory.path(),
+        &[
+            ("XDG_DATA_HOME", data_home.to_str().unwrap()),
+            ("CADDY_RS_DATA_DIR", ""),
+        ],
+        &[
+            "storage",
+            "export",
+            "-c",
+            "Caddyfile",
+            "-o",
+            output.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let entries = read_archive(&output);
+    let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+    assert_eq!(names, vec!["pki/authorities/local/root.crt"]);
+}
+
+#[test]
+fn storage_export_reports_an_unwritable_output_path() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("storage");
+    std::fs::create_dir_all(&root).unwrap();
+    let config = storage_config(directory.path(), "config.json", &root);
+    let output = directory.path().join("no-such-dir").join("storage.tar");
+    let (code, _, stderr) = run(&[
+        "storage",
+        "export",
+        "-c",
+        config.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(stderr.contains("opening output file"), "{stderr}");
+}
+
+#[test]
+fn storage_import_cleans_a_dot_prefixed_archive_key_into_the_root() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("storage");
+    std::fs::create_dir_all(&root).unwrap();
+    let config = storage_config(directory.path(), "config.json", &root);
+    // `./key` names the same file as `key` (Go's `filepath.Join` cleans it away), so it is imported
+    // rather than refused with the unsafe names.
+    let archive = crafted_tar("./acme/account.json", b"ACCOUNT\n");
+    let (code, stdout, stderr) = run_with_stdin_capture(
+        &[
+            "storage",
+            "import",
+            "-c",
+            config.to_str().unwrap(),
+            "-i",
+            "-",
+        ],
+        &archive,
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&stdout),
+        "Successfully imported storage\n"
+    );
+    assert_eq!(
+        std::fs::read(root.join("acme/account.json")).unwrap(),
+        b"ACCOUNT\n"
+    );
+}
