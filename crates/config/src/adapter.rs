@@ -1474,13 +1474,21 @@ pub fn adapt_with_options(
         let mut app = pki
             .take()
             .unwrap_or_else(|| json!({ "certificate_authorities": {} }));
+        // `pki_app_json` always emits an object under `certificate_authorities`, but a panic here
+        // would be a config-triggered abort, so create the container instead of asserting it.
         let authorities = app
-            .get_mut("certificate_authorities")
-            .and_then(Value::as_object_mut)
-            .expect("pki app JSON always contains `certificate_authorities`");
-        for id in directive_cas {
-            if !authorities.contains_key(&id) {
-                authorities.insert(id, json!({}));
+            .as_object_mut()
+            .map(|object| {
+                object
+                    .entry("certificate_authorities".to_string())
+                    .or_insert_with(|| json!({}))
+            })
+            .and_then(Value::as_object_mut);
+        if let Some(authorities) = authorities {
+            for id in directive_cas {
+                if !authorities.contains_key(&id) {
+                    authorities.insert(id, json!({}));
+                }
             }
         }
         pki = Some(app);
@@ -4081,8 +4089,9 @@ fn build_tls_plan(
             }
             let tls = site_tls[block.site_index].clone();
             let hosts = hosts_from_keys(&addresses);
-            let mut policy =
-                base_automation_policy(options, true).expect("always returns a policy");
+            // `always: true` makes this infallible; default instead of asserting so a future
+            // change to the helper cannot abort on user configuration.
+            let mut policy = base_automation_policy(options, true).unwrap_or_default();
             if hosts.is_empty() {
                 if let Some(base) = &catch_all_base {
                     policy = base.clone();
@@ -5340,6 +5349,7 @@ fn route_path_order(left: &Value, right: &Value) -> std::cmp::Ordering {
         let left_length = left_path.map(str::len).unwrap_or(0);
         let right_length = right_path.map(str::len).unwrap_or(0);
         if left_length > 0 && right_length > 0 {
+            // INFEASIBLE: both are `Some` because the lengths above are their `map(str::len)`.
             let left_path = left_path.expect("length checked");
             let right_path = right_path.expect("length checked");
             let left_trimmed = left_path.trim_end_matches('*');
@@ -5591,6 +5601,9 @@ fn keep_alive_object(extra_transport: &mut Map<String, Value>) -> &mut Map<Strin
     extra_transport
         .entry("keep_alive".to_string())
         .or_insert_with(|| json!({}));
+    // INFEASIBLE: the only writer of this key is the `or_insert_with` above, which inserts an
+    // object; `extra_transport` is built by this module and never carries a user-supplied
+    // `keep_alive` value.
     extra_transport
         .get_mut("keep_alive")
         .and_then(Value::as_object_mut)
@@ -5858,7 +5871,12 @@ fn build_php_fastcgi_routes(
     };
     let mut handler = reverse_proxy_handler(&synthetic, &args)?;
     let Value::Object(handler_object) = &mut handler else {
-        unreachable!("reverse_proxy_handler always returns an object")
+        // `reverse_proxy_handler` builds an object; report it as a config error instead of
+        // aborting if that ever stops being true.
+        return Err(adapter_error(
+            directive.position.clone(),
+            "`php_fastcgi` could not build its FastCGI transport",
+        ));
     };
     if handler_object.contains_key("transport") {
         return Err(adapter_error(

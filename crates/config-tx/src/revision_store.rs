@@ -134,35 +134,24 @@ impl InMemoryRevisionStore {
 
 impl RevisionStore for InMemoryRevisionStore {
     fn record(&self, record: RevisionRecord) -> Result<(), RevisionStoreError> {
-        self.data.lock().unwrap().insert(record, None);
+        crate::lock(&self.data).insert(record, None);
         Ok(())
     }
 
     fn get(&self, revision: u64) -> Option<RevisionRecord> {
-        self.data.lock().unwrap().records.get(&revision).cloned()
+        crate::lock(&self.data).records.get(&revision).cloned()
     }
 
     fn get_generation(&self, revision: u64) -> Option<Generation> {
-        self.data
-            .lock()
-            .unwrap()
-            .generations
-            .get(&revision)
-            .cloned()
+        crate::lock(&self.data).generations.get(&revision).cloned()
     }
 
     fn history(&self, limit: usize, offset: usize) -> Vec<RevisionRecord> {
-        self.data.lock().unwrap().history(limit, offset)
+        crate::lock(&self.data).history(limit, offset)
     }
 
     fn latest_revision(&self) -> Option<u64> {
-        self.data
-            .lock()
-            .unwrap()
-            .records
-            .keys()
-            .next_back()
-            .copied()
+        crate::lock(&self.data).records.keys().next_back().copied()
     }
 }
 
@@ -233,7 +222,7 @@ impl PersistentRevisionStore {
         record: RevisionRecord,
         generation: Option<Generation>,
     ) -> Result<(), RevisionStoreError> {
-        let mut data = self.data.lock().unwrap();
+        let mut data = crate::lock(&self.data);
         data.insert(record, generation);
         data.prune(self.max_records);
         self.persist(&data)
@@ -246,30 +235,19 @@ impl RevisionStore for PersistentRevisionStore {
     }
 
     fn get(&self, revision: u64) -> Option<RevisionRecord> {
-        self.data.lock().unwrap().records.get(&revision).cloned()
+        crate::lock(&self.data).records.get(&revision).cloned()
     }
 
     fn get_generation(&self, revision: u64) -> Option<Generation> {
-        self.data
-            .lock()
-            .unwrap()
-            .generations
-            .get(&revision)
-            .cloned()
+        crate::lock(&self.data).generations.get(&revision).cloned()
     }
 
     fn history(&self, limit: usize, offset: usize) -> Vec<RevisionRecord> {
-        self.data.lock().unwrap().history(limit, offset)
+        crate::lock(&self.data).history(limit, offset)
     }
 
     fn latest_revision(&self) -> Option<u64> {
-        self.data
-            .lock()
-            .unwrap()
-            .records
-            .keys()
-            .next_back()
-            .copied()
+        crate::lock(&self.data).records.keys().next_back().copied()
     }
 }
 
@@ -289,7 +267,7 @@ impl RevisionStoreExt for InMemoryRevisionStore {
         record: RevisionRecord,
         generation: Generation,
     ) -> Result<(), RevisionStoreError> {
-        self.data.lock().unwrap().insert(record, Some(generation));
+        crate::lock(&self.data).insert(record, Some(generation));
         Ok(())
     }
 }
@@ -317,6 +295,36 @@ mod tests {
             status: RevisionStatus::Applied,
             error: None,
         }
+    }
+
+    /// L9: a panic in another thread poisons the store mutex. Every later revision lookup and
+    /// record used to panic with it; the store must keep working instead.
+    #[test]
+    fn poisoned_store_mutex_does_not_panic() {
+        let store = InMemoryRevisionStore::new();
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = store.data.lock().unwrap();
+            panic!("poison the revision store mutex");
+        }));
+        assert!(poisoned.is_err(), "the guard must have been poisoned");
+
+        store.record(record(1)).expect("record after poisoning");
+        store
+            .record_generation(
+                record(2),
+                Generation {
+                    config: serde_json::json!({}),
+                    hash: "hash2".to_string(),
+                    revision: 2,
+                    timestamp: Utc::now(),
+                },
+            )
+            .expect("record_generation after poisoning");
+
+        assert_eq!(store.get(1).map(|r| r.revision), Some(1));
+        assert!(store.get_generation(2).is_some());
+        assert_eq!(store.latest_revision(), Some(2));
+        assert_eq!(store.history(2, 0).len(), 2);
     }
 
     #[test]

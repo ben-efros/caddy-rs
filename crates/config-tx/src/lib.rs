@@ -30,6 +30,30 @@ pub use revision_store::{
 };
 pub use validation::{validate_config_structure, ConfigStructureError};
 
+/// Lock a mutex without treating a poisoned lock as fatal.
+///
+/// L9: `.lock().unwrap()` panics once *any* thread panicked while holding the lock, so a single
+/// bug turned every later configuration transaction (and therefore the admin API) into a panic.
+/// The guarded data here is only ever replaced wholesale (`*guard = ...`) or mutated through a
+/// `BTreeMap` insert, so recovering the inner value cannot expose a half-written configuration.
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Read-lock an `RwLock` with the same poison tolerance as [`lock`].
+pub(crate) fn read<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Write-lock an `RwLock` with the same poison tolerance as [`lock`].
+pub(crate) fn write<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Unique identifier for a host route.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HostId(pub String);
@@ -200,12 +224,12 @@ impl<S: RevisionStore + RevisionStoreExt> ConfigTx<S> {
 
     /// Get the currently active generation.
     pub fn active_generation(&self) -> Option<Generation> {
-        self.active_generation.read().unwrap().clone()
+        read(&self.active_generation).clone()
     }
 
     /// Get the currently staged configuration.
     pub fn staged_config(&self) -> Option<StagedConfig> {
-        self.staged.lock().unwrap().clone()
+        lock(&self.staged).clone()
     }
 
     /// Stage a new configuration.
@@ -218,7 +242,7 @@ impl<S: RevisionStore + RevisionStoreExt> ConfigTx<S> {
         validate_config_structure(&config)
             .map_err(|error| TxError::validation(error.path, error.message))?;
         let staged = StagedConfig::new(config);
-        *self.staged.lock().unwrap() = Some(staged.clone());
+        *lock(&self.staged) = Some(staged.clone());
         Ok(staged)
     }
 
@@ -227,8 +251,8 @@ impl<S: RevisionStore + RevisionStoreExt> ConfigTx<S> {
     /// Returns None if there is no staged config or no active generation.
     /// Compares routes by @id to determine added/removed/modified routes.
     pub fn diff(&self) -> Option<Diff> {
-        let staged = self.staged.lock().unwrap().clone()?;
-        let active = self.active_generation.read().unwrap().clone()?;
+        let staged = lock(&self.staged).clone()?;
+        let active = read(&self.active_generation).clone()?;
         Some(diff::compute_diff(&active.config, &staged.config))
     }
 
@@ -240,10 +264,7 @@ impl<S: RevisionStore + RevisionStoreExt> ConfigTx<S> {
     /// generation and the staged configuration untouched, and records a `Failed` revision so the
     /// audit trail shows the attempt.
     pub fn apply(&self, if_match: Option<String>) -> Result<Generation, TxError> {
-        let staged = self
-            .staged
-            .lock()
-            .unwrap()
+        let staged = lock(&self.staged)
             .clone()
             .ok_or_else(|| TxError::precondition_failed("no staged configuration"))?;
 
@@ -253,7 +274,7 @@ impl<S: RevisionStore + RevisionStoreExt> ConfigTx<S> {
             // Hold the write lock through recording: revision allocation and the audit write must
             // be one critical section, otherwise two failed attempts can pick the same number and
             // the BTreeMap record store silently overwrites one.
-            let active = self.active_generation.write().unwrap();
+            let active = write(&self.active_generation);
             let revision = self.next_revision(active.as_ref());
             self.record_failure(
                 revision,
@@ -265,7 +286,7 @@ impl<S: RevisionStore + RevisionStoreExt> ConfigTx<S> {
         }
 
         // One write lock makes "check If-Match then swap" atomic against other applies.
-        let mut active_guard = self.active_generation.write().unwrap();
+        let mut active_guard = write(&self.active_generation);
         let revision = self.next_revision(active_guard.as_ref());
 
         if let Some(expected) = if_match {
@@ -308,7 +329,7 @@ impl<S: RevisionStore + RevisionStoreExt> ConfigTx<S> {
 
         *active_guard = Some(generation.clone());
         drop(active_guard);
-        *self.staged.lock().unwrap() = None;
+        *lock(&self.staged) = None;
         Ok(generation)
     }
 
@@ -321,7 +342,7 @@ impl<S: RevisionStore + RevisionStoreExt> ConfigTx<S> {
         error: impl Into<String>,
     ) -> Result<u64, TxError> {
         // Serialize revision allocation and the durable audit write against concurrent applies.
-        let active = self.active_generation.write().unwrap();
+        let active = write(&self.active_generation);
         let revision = self.next_revision(active.as_ref());
         let staged = StagedConfig::new(config);
         self.record_failure(revision, &staged, error.into())?;
@@ -360,7 +381,7 @@ impl<S: RevisionStore + RevisionStoreExt> ConfigTx<S> {
     /// Marks specific host routes as quarantined by adding a `@id` filter or removing them.
     /// Used when a host has invalid upstream.
     pub fn quarantine(&self, host_ids: &[HostId]) -> Result<(), TxError> {
-        let mut staged_guard = self.staged.lock().unwrap();
+        let mut staged_guard = lock(&self.staged);
         let staged = staged_guard
             .as_mut()
             .ok_or_else(|| TxError::precondition_failed("no staged configuration"))?;
@@ -429,7 +450,7 @@ impl<S: RevisionStore + RevisionStoreExt> ConfigTx<S> {
             .map_err(|e| TxError::validation(e.path, e.message))?;
 
         // Atomically swap
-        let mut active_guard = self.active_generation.write().unwrap();
+        let mut active_guard = write(&self.active_generation);
         let new_revision = self.next_revision(active_guard.as_ref());
         let mut new_generation = generation.clone();
         new_generation.revision = new_revision;
@@ -450,7 +471,7 @@ impl<S: RevisionStore + RevisionStoreExt> ConfigTx<S> {
 
         *active_guard = Some(new_generation.clone());
         drop(active_guard);
-        *self.staged.lock().unwrap() = None;
+        *lock(&self.staged) = None;
 
         Ok(new_generation)
     }
@@ -500,6 +521,36 @@ mod tests {
                 "unknown_app": {}
             }
         })
+    }
+
+    /// L9: a panic in another thread poisons the transaction locks. Staging, diffing and applying
+    /// used to panic as well, taking the admin API down with a single unrelated bug.
+    #[test]
+    fn poisoned_locks_do_not_panic() {
+        let tx = ConfigTx::new(InMemoryRevisionStore::new());
+        let staged_poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = tx.staged.lock().unwrap();
+            panic!("poison the staged mutex");
+        }));
+        assert!(staged_poison.is_err(), "the staged mutex must be poisoned");
+        let active_poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = tx.active_generation.write().unwrap();
+            panic!("poison the active generation lock");
+        }));
+        assert!(
+            active_poison.is_err(),
+            "the active generation lock must be poisoned"
+        );
+
+        assert!(tx.active_generation().is_none());
+        tx.stage(valid_config()).expect("stage after poisoning");
+        assert!(tx.staged_config().is_some());
+        // No active generation yet, so there is nothing to diff against.
+        assert!(tx.diff().is_none());
+        let generation = tx.apply(None).expect("apply after poisoning");
+        assert_eq!(generation.revision, 1);
+        assert!(tx.active_generation().is_some());
+        assert!(tx.staged_config().is_none());
     }
 
     #[test]

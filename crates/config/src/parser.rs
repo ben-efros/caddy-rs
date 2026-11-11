@@ -805,6 +805,7 @@ impl Parser {
         self.skip_newlines();
         let mut options = GlobalOptions::default();
         if matches!(self.peek().map(|t| t.kind), Some(TokenKind::LeftBrace)) {
+            // INFEASIBLE: the branch is taken only after `peek` reported `LeftBrace`.
             let position = self.advance().expect("peeked").position.clone();
             let directives = self.parse_directives(position, true)?;
             options = read_global_options(directives)?;
@@ -836,6 +837,7 @@ impl Parser {
                 }
             }
             if raw_addresses.is_empty() {
+                // INFEASIBLE: the loop above breaks on end of input, so `peek` is still `Some`.
                 let token = self.peek().expect("not eof");
                 return Err(ParseError::syntax(
                     token.position.clone(),
@@ -888,6 +890,7 @@ impl Parser {
                             continue;
                         }
                         if matches!(self.peek().map(|t| t.kind), Some(TokenKind::RightBrace)) {
+                            // INFEASIBLE: guarded by the `matches!` immediately above.
                             let token = self.peek().expect("peeked");
                             return Err(ParseError::syntax(
                                 token.position.clone(),
