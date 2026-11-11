@@ -1207,36 +1207,34 @@ impl Parser {
         let mut imported_tokens = Vec::new();
         let mut imported_contexts = Vec::new();
         for file in &files {
-            let node = absolute_path(file).display().to_string();
+            let node = self.sanitize_import_path(file, &import_position);
             self.import_graph.add_node(&parent_node);
             self.import_graph.add_node(&node);
             if let Err(message) = self.import_graph.add_edge(&parent_node, &node) {
                 return Err(ParseError::syntax(import_position.clone(), message));
             }
+            let import_path = self.sanitize_import_path(file, &import_position);
             if file.is_dir() {
                 return Err(ParseError::syntax(
                     import_position,
-                    format!("Could not import {}: is a directory", file.display()),
+                    format!("Could not import {import_path}: is a directory"),
                 ));
             }
             let bytes = std::fs::read(file).map_err(|error| {
                 ParseError::syntax(
                     import_position.clone(),
-                    format!("Could not import {}: {error}", file.display()),
+                    format!("Could not import {import_path}: {error}"),
                 )
             })?;
             let text = String::from_utf8(bytes).map_err(|_| {
                 ParseError::syntax(
                     import_position.clone(),
-                    format!(
-                        "Could not read tokens while importing {}: not valid UTF-8",
-                        file.display()
-                    ),
+                    format!("Could not read tokens while importing {import_path}: not valid UTF-8"),
                 )
             })?;
             if text.trim().is_empty() {
                 self.warnings
-                    .push(format!("Import file is empty: {}", file.display()));
+                    .push(format!("Import file is empty: {import_path}"));
                 continue;
             }
             let label: Arc<str> = self.import_label(file).into();
@@ -1246,8 +1244,7 @@ impl Parser {
             let mut tokens = lex(&expanded.source).map_err(|error| ParseError::Syntax {
                 position: error.position.clone().with_file(label.clone()),
                 message: format!(
-                    "Could not read tokens while importing {}: {}",
-                    file.display(),
+                    "Could not read tokens while importing {import_path}: {}",
                     error.message
                 ),
             })?;
@@ -1298,6 +1295,22 @@ impl Parser {
             }
         }
         file.display().to_string()
+    }
+
+    /// Sanitize a file path for display in user-facing error messages.
+    /// Returns a path relative to the importing directory when inside it,
+    /// otherwise just the file name (never leaks absolute paths).
+    fn sanitize_import_path(&self, file: &Path, position: &Position) -> String {
+        if let Some(directory) = self.importing_directory(position) {
+            let directory = normalize_path(&directory);
+            let normalized = normalize_path(file);
+            if let Ok(relative) = normalized.strip_prefix(&directory) {
+                return relative.display().to_string();
+            }
+        }
+        file.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| file.display().to_string())
     }
 
     /// Resolve `import <file>`/`<glob>` to existing files relative to the importing file.
@@ -1370,15 +1383,16 @@ impl Parser {
             ));
         }
 
-        let resolved_text = normalized.display().to_string();
-        if resolved_text.matches('*').count() > 1
-            || resolved_text.matches('?').count() > 1
-            || (resolved_text.contains('[') && resolved_text.contains(']'))
+        // Report the pattern as the user wrote it: `normalized` is the pattern joined with the
+        // importing directory and would leak the absolute path in this diagnostic.
+        if pattern.matches('*').count() > 1
+            || pattern.matches('?').count() > 1
+            || (pattern.contains('[') && pattern.contains(']'))
         {
             return Err(ParseError::syntax(
                 position,
                 format!(
-                    "Glob pattern may only contain one wildcard (*), but has others: {resolved_text}"
+                    "Glob pattern may only contain one wildcard (*), but has others: {pattern}"
                 ),
             ));
         }
