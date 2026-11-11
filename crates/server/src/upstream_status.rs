@@ -56,6 +56,15 @@ impl UpstreamStatusSource for ProxyUpstreamStatusSource {
             })
             .collect()
     }
+
+    fn upstream_health(&self) -> Vec<(String, bool)> {
+        self.active
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|sink| sink.upstream_health())
+            .unwrap_or_default()
+    }
 }
 
 #[cfg(test)]

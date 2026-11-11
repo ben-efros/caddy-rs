@@ -320,6 +320,10 @@ pub(crate) struct TlsLogInfo {
     pub(crate) server_name: String,
     /// Whether ECH was accepted (never in this build).
     pub(crate) ech: bool,
+    /// Common name of a presented client certificate (Caddy's `request.tls.client_common_name`).
+    pub(crate) client_common_name: Option<String>,
+    /// Serial number of a presented client certificate (Caddy's `request.tls.client_serial`).
+    pub(crate) client_serial: Option<String>,
 }
 
 impl TlsLogInfo {
@@ -331,8 +335,8 @@ impl TlsLogInfo {
             proto: self.proto.clone(),
             server_name: self.server_name.clone(),
             ech: self.ech,
-            client_common_name: None,
-            client_serial: None,
+            client_common_name: self.client_common_name.clone(),
+            client_serial: self.client_serial.clone(),
         }
     }
 }
@@ -501,13 +505,62 @@ fn proto_name(version: http::Version) -> String {
     .to_string()
 }
 
+/// The request host Caddy uses for `host` metric labels.
+///
+/// Caddy's `metricsInstrumentedRoute` labels with `strings.ToLower(r.Host)`
+/// (`modules/caddyhttp/metrics.go:328`). caddy-rs stores the host in the `Host` header (HTTP/1.x)
+/// or the URI authority (HTTP/2/3), so this helper covers both; the label policy lowercases it.
+pub(crate) fn request_host(headers: &HeaderMap, uri: &http::Uri) -> String {
+    headers
+        .get(http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| uri.authority().map(|authority| authority.to_string()))
+        .unwrap_or_default()
+}
+
+/// Caddy's `computeApproximateRequestSize` for one request (`caddy_http_request_size_bytes`).
+///
+/// The declared `Content-Length` is included when present; a chunked/unknown body contributes
+/// nothing, matching Go's `r.ContentLength == -1` branch.
+pub(crate) fn approximate_request_size(
+    method: &http::Method,
+    version: http::Version,
+    uri: &http::Uri,
+    headers: &HeaderMap,
+) -> u64 {
+    let host = request_host(headers, uri);
+    let uri = uri
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or("/");
+    let proto = proto_name(version);
+    let content_length = headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    caddy_rs_admin::approximate_request_size(
+        method.as_str(),
+        &proto,
+        uri,
+        &host,
+        headers,
+        content_length,
+    )
+}
+
 /// Start recording one request. The caller keeps the guard for the request's lifetime.
+///
+/// `host`/`is_https` feed Caddy's bounded `host` label when `apps.http.metrics.per_host` is on;
+/// they are ignored by recorders without host labels.
 pub(crate) fn request_started(
     recorder: &SharedRequestRecorder,
     server_name: &str,
+    host: &str,
+    is_https: bool,
 ) -> caddy_rs_admin::RequestGuard {
     recorder
-        .request_started(server_name, "")
+        .request_started_for_host(server_name, "", host, is_https)
         .unwrap_or_else(|error| {
             eprintln!("caddy-rs: cannot record request start: {error}");
             caddy_rs_admin::RequestGuard::noop()
@@ -522,8 +575,9 @@ pub(crate) fn request_started(
 /// `responsewriter.go:185-210`). The server attaches this observer to the final response body
 /// (`Body::observe`); hyper calls it exactly once when the body ends, fails, or is dropped.
 ///
-/// Metrics are recorded at the same body-end boundary, so `response_duration`/`response_size`
-/// describe the complete response.
+/// Metrics are recorded at the same body-end boundary for the counters and sizes, while
+/// `response_duration` is the time to response headers (Caddy's time-to-first-byte,
+/// `modules/caddyhttp/metrics.go:343-351`).
 pub(crate) struct PendingObservation {
     recorder: SharedRequestRecorder,
     access_log: Arc<AccessLogRuntime>,
@@ -532,9 +586,17 @@ pub(crate) struct PendingObservation {
     method: String,
     snapshot: Option<RequestSnapshot>,
     started: Instant,
+    /// When the response headers were ready (Caddy's `WriteHeader` moment).
+    response_started: Instant,
     status: u16,
     response_headers: HeaderMap,
     context: Option<Arc<AccessLogContext>>,
+    /// Request host for Caddy's bounded `host` metric label (`per_host`).
+    host: String,
+    /// Whether the request arrived over TLS (Caddy's `r.TLS != nil` for `host` labels).
+    is_https: bool,
+    /// Caddy's `computeApproximateRequestSize` value for `caddy_http_request_size_bytes`.
+    request_size: u64,
     completed: AtomicBool,
 }
 
@@ -542,7 +604,9 @@ impl PendingObservation {
     /// Capture the observation for one response.
     ///
     /// `snapshot` is only present when access logging is enabled; the metrics half works without
-    /// it (falling back to the declared request size).
+    /// it. `request_size` is Caddy's approximate request size (see
+    /// [`caddy_rs_admin::approximate_request_size`]) and `response_started` is when the response
+    /// headers were produced, so the metrics histogram reports time-to-first-byte.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         recorder: &SharedRequestRecorder,
@@ -555,6 +619,10 @@ impl PendingObservation {
         status: u16,
         response_headers: HeaderMap,
         context: Option<Arc<AccessLogContext>>,
+        host: &str,
+        is_https: bool,
+        request_size: u64,
+        response_started: Instant,
     ) -> Self {
         Self {
             recorder: Arc::clone(recorder),
@@ -564,9 +632,13 @@ impl PendingObservation {
             method: method.to_string(),
             snapshot,
             started,
+            response_started,
             status,
             response_headers,
             context,
+            host: host.to_string(),
+            is_https,
+            request_size,
             completed: AtomicBool::new(false),
         }
     }
@@ -621,27 +693,39 @@ impl PendingObservation {
             return;
         }
         let duration = self.started.elapsed();
-        let request_size = self.context.as_ref().map_or_else(
-            || {
-                self.snapshot
-                    .as_ref()
-                    .map_or(0, RequestSnapshot::declared_bytes_read)
+        // Caddy labels the observation with the first handler of the matched route and counts
+        // middleware errors (`modules/caddyhttp/metrics.go:314-384`). Both are published into the
+        // shared request context by the router; the access entry's `bytes_read` still comes from
+        // the request-body counter.
+        let handler = self
+            .context
+            .as_ref()
+            .and_then(|context| context.route_handler())
+            .unwrap_or("");
+        let handler_error = self
+            .context
+            .as_ref()
+            .is_some_and(|context| context.middleware_error());
+        if let Err(error) = self.recorder.request_finished_for_host(
+            &RequestObservation {
+                server: &self.server_name,
+                handler,
+                method: &self.method,
+                status: self.status,
+                duration,
+                request_size: self.request_size,
+                response_size,
+                response_duration: self
+                    .response_started
+                    .saturating_duration_since(self.started),
+                // Caddy counts a handler-chain error; caddy-rs additionally treats a 5xx response
+                // as an error so alerting also covers upstream/limit failures that caddy-rs turns
+                // into responses (documented in DIV-0069).
+                error: handler_error || self.status >= 500,
             },
-            |context| context.request_bytes().get(),
-        );
-        if let Err(error) = self.recorder.request_finished(&RequestObservation {
-            server: &self.server_name,
-            handler: "",
-            method: &self.method,
-            status: self.status,
-            duration,
-            request_size,
-            response_size,
-            response_duration: duration,
-            // Handler errors are mapped to 500 by the connection boundary; counting those as
-            // errors matches Caddy's `request_errors_total` intent closely enough for alerting.
-            error: self.status >= 500,
-        }) {
+            &self.host,
+            self.is_https,
+        ) {
             eprintln!("caddy-rs: cannot record request metrics: {error}");
         }
 
@@ -715,6 +799,10 @@ pub(crate) fn observe_request(
     response_headers: &HeaderMap,
     context: Option<&Arc<AccessLogContext>>,
     write_error: Option<&str>,
+    host: &str,
+    is_https: bool,
+    request_size: u64,
+    response_started: Instant,
 ) {
     PendingObservation::new(
         recorder,
@@ -727,6 +815,10 @@ pub(crate) fn observe_request(
         status,
         response_headers.clone(),
         context.cloned(),
+        host,
+        is_https,
+        request_size,
+        response_started,
     )
     .finish_now(response_size, write_error);
 }
@@ -779,6 +871,7 @@ mod write_error_tests {
     use super::*;
 
     fn pending_observation(method: &str, status: u16) -> PendingObservation {
+        let started = Instant::now();
         PendingObservation::new(
             &caddy_rs_admin::noop_recorder(),
             &AccessLogRuntime::disabled(),
@@ -786,10 +879,14 @@ mod write_error_tests {
             "srv0",
             method,
             None,
-            Instant::now(),
+            started,
             status,
             HeaderMap::new(),
             None,
+            "example.com",
+            false,
+            0,
+            started,
         )
     }
 

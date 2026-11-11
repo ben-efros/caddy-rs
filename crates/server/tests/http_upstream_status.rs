@@ -157,6 +157,36 @@ async fn admin_reports_live_upstream_counters() {
 }
 
 #[tokio::test]
+async fn metrics_report_caddy_reverse_proxy_upstream_health() {
+    let (dial, _shutdown) = spawn_upstream_bound("upstream-ok");
+    let store = Arc::new(GenerationStore::with_builtin_registry());
+    store.load(config(&dial)).unwrap();
+    let mut runtime = ServerRuntime::new(Arc::clone(&store));
+    runtime.apply().await.expect("runtime applies");
+    let admin = runtime.admin_address().expect("admin bound");
+
+    let (status, body) = request(admin, "/metrics").await;
+    assert_eq!(status, 200);
+    let metrics = String::from_utf8_lossy(&body).into_owned();
+    // Caddy registers this family when a reverse_proxy handler is provisioned and refreshes it
+    // from `Upstream.Healthy()` (`modules/caddyhttp/reverseproxy/metrics.go`). A configured
+    // upstream that has not failed a health check starts healthy.
+    assert!(
+        metrics.contains(
+            "# HELP caddy_reverse_proxy_upstreams_healthy Health status of reverse proxy upstreams."
+        ),
+        "missing help line:\n{metrics}"
+    );
+    assert!(
+        metrics.contains(&format!(
+            "caddy_reverse_proxy_upstreams_healthy{{upstream=\"{dial}\"}} 1"
+        )),
+        "healthy upstream gauge missing:\n{metrics}"
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn admin_reports_failed_upstream_attempts() {
     let (dial, shutdown) = spawn_upstream_bound("upstream-ok");
     let store = Arc::new(GenerationStore::with_builtin_registry());

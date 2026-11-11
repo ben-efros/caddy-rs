@@ -48,6 +48,10 @@ fn client_ca_base64() -> String {
 }
 
 fn config(mode: &str, with_ca: bool) -> Config {
+    config_with_log(mode, with_ca, None)
+}
+
+fn config_with_log(mode: &str, with_ca: bool, log_path: Option<&std::path::Path>) -> Config {
     let mut client_authentication = serde_json::json!({"mode": mode});
     if with_ca {
         client_authentication["ca"] = serde_json::json!({
@@ -66,11 +70,19 @@ fn config(mode: &str, with_ca: bool) -> Config {
     let tls = serde_json::json!({
         "certificates": {"load_pem": [{"certificate": SERVER_CERT, "key": SERVER_KEY}]}
     });
-    Config::from_value(serde_json::json!({
+    let mut value = serde_json::json!({
         "admin": {"disabled": true},
         "apps": {"http": http, "tls": tls}
-    }))
-    .expect("test config decodes")
+    });
+    if let Some(path) = log_path {
+        value["logging"] = serde_json::json!({
+            "logs": {"default": {
+                "writer": {"output": "file", "filename": path.to_string_lossy()},
+                "encoder": {"format": "json"}
+            }}
+        });
+    }
+    Config::from_value(value).expect("test config decodes")
 }
 
 async fn start(config: Config) -> (ServerRuntime, SocketAddr) {
@@ -134,6 +146,41 @@ async fn request(address: SocketAddr, identity: Option<(&str, &str)>) -> String 
         .split_once("\r\n\r\n")
         .map(|(_, body)| body.to_string())
         .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn access_log_records_the_presented_client_certificate() {
+    // Caddy's `request.tls` object carries `client_common_name`/`client_serial` from
+    // `PeerCertificates[0]` (`modules/caddyhttp/marshalers.go:81-84`); caddy-rs used to leave both
+    // absent even though the certificate reaches the request placeholders.
+    let directory = tempfile::tempdir().expect("tempdir");
+    let log_path = directory.path().join("access.log");
+    let (mut runtime, address) =
+        start(config_with_log("require_and_verify", true, Some(&log_path))).await;
+    let body = request(address, Some((CLIENT_CERT, CLIENT_KEY))).await;
+    assert!(body.contains("subject=[CN=client.example.com]"), "{body}");
+
+    runtime.shutdown().await;
+    let contents = std::fs::read_to_string(&log_path).expect("access log exists");
+    let entry: serde_json::Value = serde_json::from_str(
+        contents
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .expect("one access entry"),
+    )
+    .expect("access entry is JSON");
+    let tls = &entry["request"]["tls"];
+    assert_eq!(
+        tls["client_common_name"], "client.example.com",
+        "client common name must be logged: {entry}"
+    );
+    assert!(
+        tls["client_serial"]
+            .as_str()
+            .is_some_and(|serial| !serial.is_empty()),
+        "client serial must be logged: {entry}"
+    );
+    assert_eq!(tls["server_name"], "example.com", "{entry}");
 }
 
 #[tokio::test]

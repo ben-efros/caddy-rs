@@ -279,6 +279,7 @@ impl Router {
             // A matcher can record an error (the `file` matcher's `=NNN` fallback); Caddy aborts
             // route evaluation and responds with that status. Error routes do not re-enter.
             if let Some(error) = current.take_matcher_error() {
+                current.mark_middleware_error();
                 if error_status.is_none() && self.error_routes.is_some() {
                     return Box::pin(self.run_error_routes(
                         current.clone(),
@@ -291,6 +292,13 @@ impl Router {
             }
             if !matched {
                 continue;
+            }
+            // Caddy's metrics wrapper labels the observation for a matched route with its first
+            // handler module (`caddy.GetModuleName(route.Handlers[0])`,
+            // `modules/caddyhttp/routes.go:174,320-323`). The shared context keeps the outermost
+            // match, which is the frame Caddy instruments at the top of the route tree.
+            if let Some(handler) = route.handlers.first() {
+                current.set_route_handler(handler.name());
             }
             if let Some(group) = &route.group {
                 matched_groups.insert(group.as_str());
@@ -309,10 +317,12 @@ impl Router {
                             match current.collect_body(Some(limit)).await {
                                 Ok(_) => {}
                                 Err(crate::body::BodyError::TooLarge { .. }) => {
+                                    current.mark_middleware_error();
                                     current.clear_response_transforms();
                                     return Ok(body_limit_response(&current));
                                 }
                                 Err(error) => {
+                                    current.mark_middleware_error();
                                     return Ok(StreamingOutcome::Respond(
                                         StreamingResponse::from_buffered(Response::text(
                                             http::StatusCode::BAD_GATEWAY,
@@ -324,6 +334,7 @@ impl Router {
                                 }
                             }
                         } else if current.body.len() as u64 > limit {
+                            current.mark_middleware_error();
                             current.clear_response_transforms();
                             return Ok(body_limit_response(&current));
                         }
@@ -345,6 +356,10 @@ impl Router {
                             && self.error_routes.is_some()
                             && response.status.as_u16() >= 400
                         {
+                            // caddy-rs routes upstream error responses through `handle_errors`
+                            // like Caddy's HandlerError; count it as a middleware error so the
+                            // request-errors counter matches Caddy's intent.
+                            staged.mark_middleware_error();
                             let message = response
                                 .status
                                 .canonical_reason()
@@ -363,6 +378,7 @@ impl Router {
                         return Ok(StreamingOutcome::Upgrade(response));
                     }
                     Err(error) => {
+                        staged.mark_middleware_error();
                         if error_status.is_none() && self.error_routes.is_some() {
                             return Box::pin(self.run_error_routes(staged, error)).await;
                         }

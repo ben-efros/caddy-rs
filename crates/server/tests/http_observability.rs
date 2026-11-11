@@ -160,6 +160,119 @@ async fn metrics_endpoint_reflects_live_requests() {
 }
 
 #[tokio::test]
+async fn metrics_use_caddy_handler_label_request_size_and_time_to_first_byte() {
+    let (_store, runtime, address) = start(observability_config(
+        serde_json::json!({"listen": "127.0.0.1:0"}),
+        None,
+        "hello",
+    ))
+    .await;
+    let admin = runtime.admin_address().expect("admin bound");
+
+    let (status, _headers, body) = request(address, "GET", "/path?q=1", &[("X-Test", "1")]).await;
+    assert_eq!(status, 200);
+    assert_eq!(body, Bytes::from_static(b"hello"));
+
+    let (status, _headers, metrics) = request(admin, "GET", "/metrics", &[]).await;
+    assert_eq!(status, 200);
+    let metrics = String::from_utf8_lossy(&metrics).into_owned();
+
+    // Caddy labels the route observation with `route.Handlers[0]`, i.e. `static_response`
+    // (`modules/caddyhttp/routes.go:174,320-323`); caddy-rs previously recorded an empty handler.
+    assert!(
+        metrics
+            .contains("caddy_http_requests_total{handler=\"static_response\",server=\"srv0\"} 1"),
+        "missing handler label:\n{metrics}"
+    );
+    // Caddy's `computeApproximateRequestSize`: GET (3) + HTTP/1.1 (8) + "/path?q=1" (9) +
+    // "example.com" (11) + X-Test (6) + "1" (1) = 38, plus any transport-added headers.
+    let request_size_line = metrics
+        .lines()
+        .find(|line| line.starts_with("caddy_http_request_size_bytes_sum{"))
+        .expect("request-size histogram sum");
+    let size: f64 = request_size_line
+        .rsplit_once(' ')
+        .expect("sum value")
+        .1
+        .parse()
+        .expect("numeric sum");
+    assert!(
+        size >= 38.0,
+        "request size must include the request line, host and headers: {request_size_line}"
+    );
+    // `caddy_http_response_duration_seconds` is time-to-first-byte (recorded once), not the
+    // complete body duration.
+    assert!(
+        metrics.contains(
+            "caddy_http_response_duration_seconds_count{code=\"200\",handler=\"static_response\",method=\"GET\",server=\"srv0\"} 1"
+        ),
+        "missing response-duration observation:\n{metrics}"
+    );
+    // `per_host` is off, so no `host` label is added.
+    assert!(
+        !metrics.contains("host=\""),
+        "host label must be absent without per_host:\n{metrics}"
+    );
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn chunked_request_logs_transfer_encoding() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let log_path = directory.path().join("chunked.log");
+    let (_store, runtime, address) = start(observability_config(
+        serde_json::json!({"disabled": true}),
+        Some(logging_section(&log_path)),
+        "hello",
+    ))
+    .await;
+
+    // A raw chunked upload: the request has no Content-Length, only `Transfer-Encoding: chunked`.
+    let mut stream = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("connect");
+    stream
+        .write_all(
+            b"POST /upload HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\
+              Content-Type: text/plain\r\nConnection: close\r\n\r\n\
+              5\r\nhello\r\n0\r\n\r\n",
+        )
+        .await
+        .expect("write request");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .expect("read response");
+    assert!(
+        String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"),
+        "unexpected response: {}",
+        String::from_utf8_lossy(&response)
+    );
+
+    runtime.shutdown().await;
+    let entries = read_log_lines(&log_path);
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    let entry = &entries[0];
+    // Go's net/http lifts `Transfer-Encoding` out of the header map and Caddy logs it as
+    // `request.transfer_encoding` (`modules/caddyhttp/marshalers.go:55-57`).
+    assert_eq!(
+        entry["request"]["transfer_encoding"],
+        serde_json::json!(["chunked"]),
+        "chunked requests must record the transfer encoding: {entry}"
+    );
+    assert!(
+        entry["request"]["headers"]
+            .get("Transfer-Encoding")
+            .is_none(),
+        "the encoding is not repeated in request.headers: {entry}"
+    );
+}
+
+#[tokio::test]
 async fn access_log_file_receives_entry_with_redaction() {
     let directory = tempfile::tempdir().expect("tempdir");
     let log_path = directory.path().join("access.log");
