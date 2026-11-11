@@ -441,7 +441,20 @@ impl FastCgiTransport {
                     .to_string();
             }
         }
-        let script_filename = sanitized_path_join(&root, &script_name);
+        let script_filename = sanitized_path_join(&root, &script_name).ok_or_else(|| {
+            FastCgiError::Request(format!(
+                "SCRIPT_FILENAME escapes root `{}`",
+                root
+            ))
+        })?;
+        let root_path = Path::new(&root);
+        let script_path = Path::new(&script_filename);
+        if !script_path.starts_with(root_path) {
+            return Err(FastCgiError::Request(format!(
+                "SCRIPT_FILENAME `{}` escapes root `{}`",
+                script_filename, root
+            )));
+        }
         if !script_name.is_empty() && !script_name.starts_with('/') {
             script_name.insert(0, '/');
         }
@@ -515,10 +528,9 @@ impl FastCgiTransport {
         env.insert("SCRIPT_NAME".to_string(), script_name);
 
         if !path_info.is_empty() {
-            env.insert(
-                "PATH_TRANSLATED".to_string(),
-                sanitized_path_join(&root, &path_info),
-            );
+            if let Some(path_translated) = sanitized_path_join(&root, &path_info) {
+                env.insert("PATH_TRANSLATED".to_string(), path_translated);
+            }
         }
         if !host_port.is_empty() {
             env.insert("SERVER_PORT".to_string(), host_port);
@@ -910,6 +922,20 @@ fn normalized_script_path(raw: &str) -> Result<String, FastCgiError> {
     let decoded = percent_decode_path(raw)
         .ok_or_else(|| FastCgiError::Request("invalid request path".to_string()))?;
     if decoded.contains('\0') {
+        return Err(FastCgiError::Request("invalid request path".to_string()));
+    }
+    let escapes = decoded
+        .split('/')
+        .scan(0_i32, |depth, component| {
+            match component {
+                "" | "." => {}
+                ".." => *depth -= 1,
+                _ => *depth += 1,
+            }
+            Some(*depth)
+        })
+        .any(|depth| depth < 0);
+    if escapes {
         return Err(FastCgiError::Request("invalid request path".to_string()));
     }
     let cleaned = normalize_slash_path(&decoded);
@@ -1348,10 +1374,9 @@ fn normalize_components(path: &Path) -> PathBuf {
 }
 
 /// Caddy's `caddyhttp.SanitizedPathJoin`: join under `root`, refusing escaping paths.
-fn sanitized_path_join(root: &str, request_path: &str) -> String {
+fn sanitized_path_join(root: &str, request_path: &str) -> Option<String> {
     let mut cleaned = String::from("/");
     cleaned.push_str(request_path);
-    let cleaned = normalize_slash_path(&cleaned);
     let relative = cleaned.trim_start_matches('/');
     let escapes = relative
         .split('/')
@@ -1364,16 +1389,21 @@ fn sanitized_path_join(root: &str, request_path: &str) -> String {
             Some(*depth)
         })
         .any(|depth| depth < 0);
-    if relative.is_empty() || escapes {
-        return root.to_string();
+    if escapes {
+        return None;
     }
+    if relative.is_empty() {
+        return Some(root.to_string());
+    }
+    let cleaned = normalize_slash_path(&cleaned);
+    let relative = cleaned.trim_start_matches('/');
     let mut joined = String::from(root.trim_end_matches('/'));
     joined.push('/');
     joined.push_str(relative);
     if request_path.ends_with('/') && request_path.len() > 1 {
         joined.push('/');
     }
-    joined
+    Some(joined)
 }
 
 fn normalize_slash_path(path: &str) -> String {
@@ -2053,16 +2083,20 @@ mod tests {
     fn sanitized_path_join_prevents_traversal() {
         assert_eq!(
             sanitized_path_join("/srv/www", "/index.php"),
-            "/srv/www/index.php"
+            Some("/srv/www/index.php".to_string())
         );
-        assert_eq!(sanitized_path_join("/srv/www", "/"), "/srv/www");
-        // Go's SanitizedPathJoin cleans `..` before checking locality, so the result stays
-        // under root rather than escaping it.
+        assert_eq!(
+            sanitized_path_join("/srv/www", "/"),
+            Some("/srv/www".to_string())
+        );
         assert_eq!(
             sanitized_path_join("/srv/www", "/../etc/passwd"),
-            "/srv/www/etc/passwd"
+            None
         );
-        assert_eq!(sanitized_path_join("/srv/www", "/a/../b"), "/srv/www/b");
+        assert_eq!(
+            sanitized_path_join("/srv/www", "/a/../b"),
+            Some("/srv/www/b".to_string())
+        );
     }
 
     #[test]
@@ -2350,6 +2384,42 @@ mod tests {
                 "{key}: {captured:?}"
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fastcgi_script_filename_valid_path_within_root() {
+        let (dial, captured) = spawn_tcp_mock(Behavior::responds(0)).await;
+        let handler = build_handler(
+            &dial,
+            transport_json(serde_json::json!({
+                "root": "/var/www",
+                "split_path": [".php"]
+            })),
+        );
+        let request = request(Method::GET, "/index.php");
+        let response = respond(&handler, request);
+        assert_eq!(response.status, StatusCode::OK);
+        let captured = captured.lock().unwrap();
+        let params = &captured.as_ref().expect("mock captured the request").params;
+        assert_eq!(params["SCRIPT_FILENAME"], "/var/www/index.php");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fastcgi_script_filename_escapes_root_is_rejected() {
+        let (dial, captured) = spawn_tcp_mock(Behavior::responds(0)).await;
+        let handler = build_handler(
+            &dial,
+            transport_json(serde_json::json!({
+                "root": "/var/www",
+                "split_path": [".php"]
+            })),
+        );
+        let response = respond(&handler, request(Method::GET, "/../etc/passwd"));
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        assert!(
+            captured.lock().unwrap().is_none(),
+            "an escaping SCRIPT_FILENAME must be rejected before connecting to the upstream"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
