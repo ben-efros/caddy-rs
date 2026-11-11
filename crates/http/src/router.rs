@@ -23,6 +23,7 @@ use crate::handlers::{
 };
 use crate::matchers::build_matcher_set;
 use crate::rate_limit::RateLimitHandler;
+use crate::security_headers::{SecurityHeaders, SecurityHeadersConfig};
 #[cfg(feature = "templates")]
 use crate::templates::TemplatesHandler;
 use crate::types::{
@@ -480,6 +481,14 @@ async fn apply_response_transforms(
     response
 }
 
+/// Apply the response-header mutations staged by middleware handlers (for example `headers` and
+/// `security_headers`) to the outgoing response.
+///
+/// The staged map is the authoritative middleware view, so it overwrites a same-named response
+/// header: this is what lets `headers.response.set` override a handler's implicit defaults (such
+/// as `static_response`'s implicit `Content-Type`) and what gives middleware precedence over
+/// handler-authored headers. Within the staged map the last handler to run wins; the map travels
+/// with the request through `subroute` handlers that continue the chain.
 fn apply_pending_headers(headers: &mut http::HeaderMap, request: &Request) {
     for (name, value) in &request.pending_response_headers {
         headers.insert(name.clone(), value.clone());
@@ -722,6 +731,11 @@ impl RouterBuilder {
             "static_response" => Arc::new(StaticResponseHandler::from_json(value, path)?),
             "error" => Arc::new(ErrorHandler::from_json(value, path)?),
             "headers" => Arc::new(HeadersHandler::from_json(value, path)?),
+            // caddy-rs extension (not a Caddy v2.11.9 built-in): secure response headers with
+            // defaults, staged through the same response middleware path as `headers`.
+            "security_headers" => Arc::new(SecurityHeaders::new(
+                SecurityHeadersConfig::from_json(value, path)?,
+            )?),
             "vars" => Arc::new(VarsHandler::from_json(value, path)?),
             "rewrite" => Arc::new(RewriteHandler::from_json(value, path)?),
             "request_body" => Arc::new(RequestBodyHandler::from_json(value, path)?),
@@ -1716,5 +1730,234 @@ mod tests {
             matches!(buffered_error, Error::UpgradeNotRepresentable { .. }),
             "{buffered_error}"
         );
+    }
+
+    #[tokio::test]
+    async fn security_headers_apply_to_any_handler_response() {
+        let router = RouterBuilder::new()
+            .build(&[json!({
+                "handle": [
+                    {"handler": "security_headers", "content_security_policy": "default-src 'self'"},
+                    {
+                        "handler": "static_response",
+                        "body": "ok",
+                        "headers": {"Content-Type": ["text/plain"]}
+                    }
+                ]
+            })])
+            .unwrap();
+        let response = router.handle(request("/", "example.com")).await.unwrap();
+        assert_eq!(response.status, http::StatusCode::OK);
+        assert_eq!(response.body, bytes::Bytes::from_static(b"ok"));
+        assert_eq!(response.headers["x-frame-options"], "DENY");
+        assert_eq!(response.headers["x-content-type-options"], "nosniff");
+        assert_eq!(
+            response.headers["referrer-policy"],
+            "strict-origin-when-cross-origin"
+        );
+        assert_eq!(
+            response.headers["content-security-policy"],
+            "default-src 'self'"
+        );
+        // A response header the middleware does not configure survives the staging merge.
+        assert_eq!(response.headers[http::header::CONTENT_TYPE], "text/plain");
+    }
+
+    #[tokio::test]
+    async fn security_headers_apply_to_response_produced_in_subroute() {
+        let router = RouterBuilder::new()
+            .build(&[json!({
+                "handle": [
+                    {"handler": "security_headers", "content_security_policy": "default-src 'self'"},
+                    {
+                        "handler": "subroute",
+                        "routes": [{"handle": [{"handler": "static_response", "body": "nested"}]}]
+                    }
+                ]
+            })])
+            .unwrap();
+        let response = router.handle(request("/", "example.com")).await.unwrap();
+        assert_eq!(response.body, bytes::Bytes::from_static(b"nested"));
+        assert_eq!(
+            response.headers["content-security-policy"],
+            "default-src 'self'"
+        );
+        assert_eq!(response.headers["x-frame-options"], "DENY");
+    }
+
+    #[tokio::test]
+    async fn per_route_security_headers_override_global_defaults() {
+        let router = RouterBuilder::new()
+            .build(&[
+                // Global (catch-all) defaults: every request runs this route first.
+                json!({
+                    "handle": [{
+                        "handler": "security_headers",
+                        "content_security_policy": "default-src 'self'",
+                        "permissions_policy": "camera=()"
+                    }]
+                }),
+                json!({
+                    "match": [{"host": ["example.com"]}],
+                    "handle": [
+                        {"handler": "security_headers", "content_security_policy": "default-src 'none'"},
+                        {"handler": "static_response", "body": "ok"}
+                    ]
+                }),
+            ])
+            .unwrap();
+        let response = router.handle(request("/", "example.com")).await.unwrap();
+        // The per-route handler runs after the global one, so its CSP replaces the global value.
+        assert_eq!(
+            response.headers["content-security-policy"],
+            "default-src 'none'"
+        );
+        // A header only the global route configured is inherited by the per-route handler.
+        assert_eq!(response.headers["permissions-policy"], "camera=()");
+        assert_eq!(response.headers["x-frame-options"], "DENY");
+    }
+
+    #[tokio::test]
+    async fn subroute_security_headers_inherit_and_override_parent() {
+        let router = RouterBuilder::new()
+            .build(&[json!({
+                "handle": [
+                    {
+                        "handler": "security_headers",
+                        "content_security_policy": "default-src 'self'",
+                        "permissions_policy": "camera=()"
+                    },
+                    {
+                        "handler": "subroute",
+                        "routes": [{
+                            "handle": [{
+                                "handler": "security_headers",
+                                "content_security_policy": "default-src 'none'"
+                            }]
+                        }]
+                    },
+                    {"handler": "static_response", "body": "nested-config"}
+                ]
+            })])
+            .unwrap();
+        let response = router.handle(request("/", "example.com")).await.unwrap();
+        assert_eq!(response.body, bytes::Bytes::from_static(b"nested-config"));
+        // The child overrides the parent's CSP.
+        assert_eq!(
+            response.headers["content-security-policy"],
+            "default-src 'none'"
+        );
+        // Opt-in headers the child did not configure are inherited from the parent route.
+        assert_eq!(response.headers["permissions-policy"], "camera=()");
+        // The child re-asserts the defaulted headers.
+        assert_eq!(response.headers["x-frame-options"], "DENY");
+    }
+
+    #[tokio::test]
+    async fn security_headers_expand_placeholders_in_values() {
+        let router = RouterBuilder::new()
+            .build(&[json!({
+                "handle": [
+                    {
+                        "handler": "security_headers",
+                        "content_security_policy": "default-src {http.request.host}; report-uri {unknown.placeholder}",
+                        "referrer_policy": "origin-{http.request.host}"
+                    },
+                    {"handler": "static_response", "body": "ok"}
+                ]
+            })])
+            .unwrap();
+        let response = router
+            .handle(request("/page", "example.com"))
+            .await
+            .unwrap();
+        // Known placeholders expand; unknown ones stay visible (ReplaceKnown semantics).
+        assert_eq!(
+            response.headers["content-security-policy"],
+            "default-src example.com; report-uri {unknown.placeholder}"
+        );
+        assert_eq!(response.headers["referrer-policy"], "origin-example.com");
+    }
+
+    #[tokio::test]
+    async fn deeper_middleware_configuration_overrides_outer_security_default() {
+        let router = RouterBuilder::new()
+            .build(&[json!({
+                "handle": [
+                    {"handler": "security_headers", "frame_options": "DENY"},
+                    {
+                        "handler": "subroute",
+                        "routes": [{"handle": [
+                            {"handler": "headers", "response": {"set": {"X-Frame-Options": ["SAMEORIGIN"]}}}
+                        ]}]
+                    },
+                    {"handler": "static_response", "body": "ok"}
+                ]
+            })])
+            .unwrap();
+        let response = router.handle(request("/", "example.com")).await.unwrap();
+        // Route order defines precedence: the deeper `headers` handler stages later and wins.
+        assert_eq!(response.headers["x-frame-options"], "SAMEORIGIN");
+        // Headers the deeper handler did not configure keep the outer middleware value.
+        assert_eq!(response.headers["x-content-type-options"], "nosniff");
+    }
+
+    #[tokio::test]
+    async fn internal_error_responses_are_not_decorated_unless_configured() {
+        // No matching route: no handler runs, so nothing is staged. caddy-rs terminates unmatched
+        // requests with Caddy's empty 200 (DIV-0068), not a 404.
+        let router = RouterBuilder::new()
+            .build(&[json!({
+                "match": [{"host": ["example.com"]}],
+                "handle": [
+                    {"handler": "security_headers"},
+                    {"handler": "static_response", "body": "ok"}
+                ]
+            })])
+            .unwrap();
+        let response = router.handle(request("/", "other.com")).await.unwrap();
+        assert_eq!(response.status, http::StatusCode::OK);
+        assert!(response.body.is_empty());
+        assert_eq!(response.headers.get("x-frame-options"), None);
+
+        // An `error` handler that fails before `security_headers` runs: `handle_errors` answers
+        // 404 without security headers because the middleware never staged them.
+        let error_routes = json!({"routes": [{
+            "handle": [{"handler": "static_response", "status_code": 404, "body": "missing"}]
+        }]});
+        let router = RouterBuilder::new()
+            .with_error_routes(Some(&error_routes), "handle_errors")
+            .unwrap()
+            .build(&[json!({
+                "handle": [
+                    {"handler": "error", "status_code": 404},
+                    {"handler": "security_headers"}
+                ]
+            })])
+            .unwrap();
+        let response = router.handle(request("/", "example.com")).await.unwrap();
+        assert_eq!(response.status, http::StatusCode::NOT_FOUND);
+        assert_eq!(response.headers.get("x-frame-options"), None);
+
+        // Configuring `security_headers` in the error route is the explicit opt-in.
+        let decorated_error_routes = json!({"routes": [{
+            "handle": [
+                {"handler": "security_headers"},
+                {"handler": "static_response", "status_code": 404, "body": "missing"}
+            ]
+        }]});
+        let router = RouterBuilder::new()
+            .with_error_routes(Some(&decorated_error_routes), "handle_errors")
+            .unwrap()
+            .build(&[json!({
+                "handle": [
+                    {"handler": "error", "status_code": 404},
+                    {"handler": "security_headers"}
+                ]
+            })])
+            .unwrap();
+        let response = router.handle(request("/", "example.com")).await.unwrap();
+        assert_eq!(response.status, http::StatusCode::NOT_FOUND);
+        assert_eq!(response.headers["x-frame-options"], "DENY");
     }
 }

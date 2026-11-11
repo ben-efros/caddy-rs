@@ -25,18 +25,65 @@
 //! * `Permissions-Policy` — [`SecurityHeadersConfig::permissions_policy`]. Feature policy is
 //!   site-specific, so it is only emitted when configured.
 //!
-//! # Staging and precedence
+//! # Route integration and ordering
 //!
 //! [`SecurityHeaders`] is a [`Handler`] that stages its headers into
 //! [`Request::pending_response_headers`] and returns [`Outcome::Continue`]; it never touches the
-//! request body or the response body. A header is only staged when the pending response does not
-//! already carry it, so a handler that set the header explicitly (for example the generic
-//! `headers` handler earlier in the chain) wins over the middleware default.
+//! request body or the response body. The router merges the staged map onto the response after a
+//! handler produces it and before the response is sent (response middleware staging, T-ROUTE-011).
+//!
+//! Ordering follows route evaluation order, exactly like every other handler:
+//!
+//! * Handlers run in route order: a global (catch-all) route's handler runs before a more specific
+//!   route's handler, and an outer route's handler runs before a nested `subroute`'s handler.
+//! * [`SecurityHeaders::stage`] **replaces** the value staged for every header it configures, so
+//!   the handler that appears later in the chain wins. A `subroute` that continues the chain shares
+//!   the staged map, so its handler overrides the value its parent staged and inherits the headers
+//!   it does not configure (the opt-in headers); the three defaulted headers are re-asserted with
+//!   their secure default by every handler. A `subroute` that itself produces the response is
+//!   merged at its own level first (T-ROUTE-011), and the outer level then applies its unchanged
+//!   staged map last, so in that shape the outer value wins.
+//! * [`SecurityHeaders::apply`] is the set-if-absent operation for a response header map: it never
+//!   clobbers a header the response already carries. The router's staging merge is the last writer
+//!   instead (T-ROUTE-011), so a staged value replaces a same-named response header; a handler that
+//!   must override the middleware has to stage the header later in the chain (an `headers` handler
+//!   that runs after this one) rather than write it directly on the response.
+//! * Responses that short-circuit before this handler runs are not decorated: a request that
+//!   matches no route, a matcher error, or an `error` handler that fails earlier in the chain never
+//!   stages these headers. Configuring `security_headers` inside the `handle_errors` routes is the
+//!   explicit opt-in that decorates error responses.
+//!
+//! Every configured value is expanded at request time with Caddy's `Replacer.ReplaceKnown`
+//! semantics: known placeholders such as `{http.request.host}` are substituted, unknown
+//! placeholders are left visible verbatim.
+//!
+//! # JSON configuration (`security_headers` handler)
+//!
+//! The handler is a caddy-rs extension (Caddy v2.11.9 has no such module). Its object is
+//! `{"handler": "security_headers", ...}` with these optional keys:
+//!
+//! | Key | Type | Emitted header |
+//! |---|---|---|
+//! | `frame_options` | string or `false` | `X-Frame-Options` (default `DENY`) |
+//! | `content_type_options` | string or `false` | `X-Content-Type-Options` (default `nosniff`) |
+//! | `referrer_policy` | string or `false` | `Referrer-Policy` (default `strict-origin-when-cross-origin`) |
+//! | `content_security_policy` | string or `false` | `Content-Security-Policy` (opt-in) |
+//! | `permissions_policy` | string or `false` | `Permissions-Policy` (opt-in) |
+//! | `strict_transport_security` | object or `false` | `Strict-Transport-Security` (opt-in) |
+//!
+//! A string is the emitted value; the boolean `false` (or the string `"false"`) suppresses the
+//! header. Omitting a defaulted key keeps the secure default, while omitting an opt-in key emits
+//! nothing. `strict_transport_security` is
+//! `{"max_age": <u64>, "include_subdomains": <bool>, "preload": <bool>}`; `max_age` is required
+//! when the object is present and the booleans default to `false`. Unknown keys at either level are
+//! a located [`Error::InvalidConfig`] naming `<json path>.<field>`, as is any configuration the
+//! middleware constructor rejects (for example a `max_age` below 180 days).
 //!
 //! [`Request::pending_response_headers`]: crate::types::Request::pending_response_headers
 
 use async_trait::async_trait;
-use http::HeaderMap;
+use http::{HeaderMap, HeaderName, HeaderValue};
+use serde_json::Value;
 
 use crate::types::{Error, Handler, Outcome, Request, Result};
 
@@ -175,13 +222,138 @@ impl SecurityHeadersConfig {
         }
         Ok(())
     }
+
+    /// Parse the `security_headers` handler object from Caddy JSON.
+    ///
+    /// The accepted keys are documented at the module level. Defaulted keys keep their secure
+    /// default when absent; opt-in keys stay unset. A string is the emitted value and `false` (or
+    /// the string `"false"`) suppresses the header. Unknown keys are rejected with a located error
+    /// naming `<path>.<key>`, including inside `strict_transport_security`.
+    ///
+    /// The result is validated through [`SecurityHeaders::new`] so an invalid configuration (such
+    /// as a `max_age` below [`HSTS_MIN_MAX_AGE`]) is rejected at load time with the JSON path of the
+    /// offending field, not at the first request.
+    pub fn from_json(value: &Value, path: &str) -> Result<Self> {
+        let object = value
+            .as_object()
+            .ok_or_else(|| invalid(path, "security_headers must be an object"))?;
+        let mut config = Self::default();
+        for (field, value) in object {
+            let field_path = format!("{path}.{field}");
+            match field.as_str() {
+                // The handler discriminator is consumed by the router.
+                "handler" => {}
+                "frame_options" => {
+                    config.x_frame_options = parse_optional_string(value, &field_path)?
+                }
+                "content_type_options" => {
+                    config.x_content_type_options = parse_optional_string(value, &field_path)?
+                }
+                "referrer_policy" => {
+                    config.referrer_policy = parse_optional_string(value, &field_path)?
+                }
+                "content_security_policy" => {
+                    config.content_security_policy = parse_optional_string(value, &field_path)?
+                }
+                "permissions_policy" => {
+                    config.permissions_policy = parse_optional_string(value, &field_path)?
+                }
+                "strict_transport_security" => {
+                    config.strict_transport_security = parse_hsts(value, &field_path)?
+                }
+                other => {
+                    return Err(invalid(
+                        &field_path,
+                        format!("unknown security header option `{other}`"),
+                    ))
+                }
+            }
+        }
+        // Re-locate the constructor's relative error paths onto the JSON document.
+        SecurityHeaders::new(config.clone()).map_err(|error| match error {
+            Error::InvalidConfig {
+                path: inner,
+                message,
+            } => invalid(&format!("{path}.{inner}"), message),
+            other => other,
+        })?;
+        Ok(config)
+    }
+}
+
+/// Parse a string-valued header option: a string sets it, `false`/`"false"` suppresses it.
+fn parse_optional_string(value: &Value, path: &str) -> Result<Option<String>> {
+    match value {
+        Value::String(text) if text == "false" => Ok(None),
+        Value::String(text) => Ok(Some(text.clone())),
+        Value::Bool(false) => Ok(None),
+        Value::Bool(true) => Err(invalid(
+            path,
+            "expected a header value string or false; `true` does not name a value",
+        )),
+        other => Err(invalid(
+            path,
+            format!("expected a header value string or false, got {other}"),
+        )),
+    }
+}
+
+/// Parse the opt-in `strict_transport_security` object into an [`HstsConfig`].
+fn parse_hsts(value: &Value, path: &str) -> Result<Option<HstsConfig>> {
+    let object = match value {
+        Value::Null | Value::Bool(false) => return Ok(None),
+        Value::String(text) if text == "false" => return Ok(None),
+        Value::Object(object) => object,
+        other => {
+            return Err(invalid(
+                path,
+                format!("strict_transport_security must be an object or false, got {other}"),
+            ))
+        }
+    };
+    let mut config = HstsConfig::default();
+    let mut max_age_seen = false;
+    for (field, value) in object {
+        let field_path = format!("{path}.{field}");
+        match field.as_str() {
+            "max_age" => {
+                config.max_age = value.as_u64().ok_or_else(|| {
+                    invalid(&field_path, "max_age must be a non-negative integer")
+                })?;
+                max_age_seen = true;
+            }
+            "include_subdomains" => {
+                config.include_subdomains = value
+                    .as_bool()
+                    .ok_or_else(|| invalid(&field_path, "include_subdomains must be a boolean"))?;
+            }
+            "preload" => {
+                config.preload = value
+                    .as_bool()
+                    .ok_or_else(|| invalid(&field_path, "preload must be a boolean"))?;
+            }
+            other => {
+                return Err(invalid(
+                    &field_path,
+                    format!("unknown strict_transport_security option `{other}`"),
+                ))
+            }
+        }
+    }
+    if !max_age_seen {
+        return Err(invalid(
+            &format!("{path}.max_age"),
+            "max_age is required when strict_transport_security is configured",
+        ));
+    }
+    Ok(Some(config))
 }
 
 /// `security_headers`: stage security response headers with secure defaults.
 ///
-/// Construct with [`SecurityHeaders::new`] (validates the configuration) and stage the headers
-/// either by running it as a [`Handler`] or by calling [`SecurityHeaders::apply`] directly on a
-/// [`HeaderMap`] (used by the route engine in T-HTTP-152).
+/// Construct with [`SecurityHeaders::new`] (validates the configuration) and run it as a
+/// [`Handler`] (which calls [`SecurityHeaders::stage`]), or call [`SecurityHeaders::apply`]
+/// directly on an outgoing [`HeaderMap`] to fill in the headers it does not already carry.
 #[derive(Debug, Clone)]
 pub struct SecurityHeaders {
     config: SecurityHeadersConfig,
@@ -224,6 +396,59 @@ impl SecurityHeaders {
             set_if_absent(headers, "permissions-policy", value);
         }
     }
+
+    /// Stage the configured security headers on the request's pending response headers.
+    ///
+    /// Every configured value is expanded with Caddy's `Replacer.ReplaceKnown` semantics (unknown
+    /// placeholders stay visible). Unlike [`SecurityHeaders::apply`], a configured header
+    /// **replaces** the pending value: route and subroute handlers run in order, so the handler
+    /// that runs later in the chain must win.
+    ///
+    /// Returns a located error when an expanded value is not a valid header value (for example a
+    /// request variable containing control bytes). Configured values were validated at construction
+    /// time, so only placeholder expansion can produce such a value.
+    pub fn stage(&self, request: &mut Request) -> Result<()> {
+        let config = &self.config;
+        let mut staged: Vec<(HeaderName, HeaderValue)> = Vec::new();
+        if let Some(value) = &config.x_frame_options {
+            staged.push(expand(request, "x-frame-options", value)?);
+        }
+        if let Some(value) = &config.x_content_type_options {
+            staged.push(expand(request, "x-content-type-options", value)?);
+        }
+        if let Some(value) = &config.referrer_policy {
+            staged.push(expand(request, "referrer-policy", value)?);
+        }
+        if let Some(value) = &config.content_security_policy {
+            staged.push(expand(request, "content-security-policy", value)?);
+        }
+        if let Some(hsts) = &config.strict_transport_security {
+            staged.push(expand(
+                request,
+                "strict-transport-security",
+                &hsts.header_value(),
+            )?);
+        }
+        if let Some(value) = &config.permissions_policy {
+            staged.push(expand(request, "permissions-policy", value)?);
+        }
+        for (name, value) in staged {
+            request.pending_response_headers.insert(name, value);
+        }
+        Ok(())
+    }
+}
+
+/// Expand `{...}` placeholders in `value` (ReplaceKnown) and parse the result for `name`.
+fn expand(request: &Request, name: &'static str, value: &str) -> Result<(HeaderName, HeaderValue)> {
+    let expanded = request.replace_known(value);
+    let value = HeaderValue::from_str(&expanded).map_err(|error| {
+        invalid(
+            name,
+            format!("expanded value `{expanded}` is not a valid header value: {error}"),
+        )
+    })?;
+    Ok((HeaderName::from_static(name), value))
 }
 
 /// Insert `value` under `name` unless the map already carries that header.
@@ -246,7 +471,7 @@ impl Handler for SecurityHeaders {
     }
 
     async fn handle(&self, mut request: Request) -> Result<Outcome> {
-        self.apply(&mut request.pending_response_headers);
+        self.stage(&mut request)?;
         Ok(Outcome::Continue(request))
     }
 }
@@ -256,6 +481,7 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use http::{Method, Uri};
+    use serde_json::json;
 
     fn request() -> Request {
         Request::new(Method::GET, "/".parse::<Uri>().unwrap())
@@ -463,6 +689,158 @@ mod tests {
         assert_eq!(
             header_value(&headers, "x-content-type-options").as_deref(),
             Some("nosniff")
+        );
+    }
+
+    #[test]
+    fn from_json_applies_secure_defaults_and_overrides() {
+        let config =
+            SecurityHeadersConfig::from_json(&json!({"handler": "security_headers"}), "handle[0]")
+                .unwrap();
+        assert_eq!(config, SecurityHeadersConfig::default());
+
+        let config = SecurityHeadersConfig::from_json(
+            &json!({
+                "handler": "security_headers",
+                "frame_options": "SAMEORIGIN",
+                "referrer_policy": "no-referrer",
+                "content_security_policy": "default-src 'self'",
+                "permissions_policy": "camera=()",
+                "strict_transport_security": {
+                    "max_age": 31_536_000,
+                    "include_subdomains": true,
+                    "preload": true
+                }
+            }),
+            "handle[1]",
+        )
+        .unwrap();
+        assert_eq!(config.x_frame_options.as_deref(), Some("SAMEORIGIN"));
+        assert_eq!(config.referrer_policy.as_deref(), Some("no-referrer"));
+        assert_eq!(
+            config.content_security_policy.as_deref(),
+            Some("default-src 'self'")
+        );
+        assert_eq!(config.permissions_policy.as_deref(), Some("camera=()"));
+        assert_eq!(
+            config.strict_transport_security,
+            Some(HstsConfig {
+                max_age: 31_536_000,
+                include_subdomains: true,
+                preload: true,
+            })
+        );
+    }
+
+    #[test]
+    fn from_json_false_suppresses_defaulted_and_opt_in_headers() {
+        let config = SecurityHeadersConfig::from_json(
+            &json!({
+                "frame_options": false,
+                "referrer_policy": "false",
+                "strict_transport_security": false
+            }),
+            "handle[0]",
+        )
+        .unwrap();
+        assert_eq!(config.x_frame_options, None);
+        assert_eq!(config.referrer_policy, None);
+        assert_eq!(config.strict_transport_security, None);
+        // `content_type_options` was not mentioned: the secure default stands.
+        assert_eq!(
+            config.x_content_type_options.as_deref(),
+            Some(DEFAULT_X_CONTENT_TYPE_OPTIONS)
+        );
+    }
+
+    #[test]
+    fn from_json_rejects_unknown_keys_with_located_paths() {
+        let error = SecurityHeadersConfig::from_json(
+            &json!({"x_frame_options": "DENY"}),
+            "apps.http.servers.srv0.routes[0].handle[0]",
+        )
+        .unwrap_err();
+        match error {
+            Error::InvalidConfig { path, message } => {
+                assert_eq!(
+                    path,
+                    "apps.http.servers.srv0.routes[0].handle[0].x_frame_options"
+                );
+                assert!(message.contains("unknown security header option"));
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+
+        let error = SecurityHeadersConfig::from_json(
+            &json!({"strict_transport_security": {"max_age": 31_536_000, "subdomains": true}}),
+            "handle[0]",
+        )
+        .unwrap_err();
+        match error {
+            Error::InvalidConfig { path, message } => {
+                assert_eq!(path, "handle[0].strict_transport_security.subdomains");
+                assert!(message.contains("unknown strict_transport_security option"));
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_json_rejects_invalid_hsts_with_located_path() {
+        for (value, expected_path) in [
+            (
+                json!({"strict_transport_security": {"max_age": 86_400, "include_subdomains": true}}),
+                "route.handlers[1].strict_transport_security.max_age",
+            ),
+            (
+                json!({"strict_transport_security": {"max_age": 31_536_000, "preload": true}}),
+                "route.handlers[1].strict_transport_security.preload",
+            ),
+            (
+                json!({"strict_transport_security": {}}),
+                "route.handlers[1].strict_transport_security.max_age",
+            ),
+        ] {
+            let error = SecurityHeadersConfig::from_json(&value, "route.handlers[1]").unwrap_err();
+            match error {
+                Error::InvalidConfig { path, .. } => assert_eq!(path, expected_path),
+                other => panic!("expected InvalidConfig, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stage_overrides_staged_values_and_expands_placeholders() {
+        let middleware = SecurityHeaders::new(SecurityHeadersConfig {
+            content_security_policy: Some(
+                "default-src {http.request.host}; report-uri {unknown.placeholder}".to_string(),
+            ),
+            referrer_policy: Some("origin-{http.request.host}".to_string()),
+            ..SecurityHeadersConfig::default()
+        })
+        .unwrap();
+        let mut request = request();
+        request
+            .headers
+            .insert(http::header::HOST, "example.com".parse().unwrap());
+        request
+            .pending_response_headers
+            .insert("x-frame-options", "SAMEORIGIN".parse().unwrap());
+
+        middleware.stage(&mut request).unwrap();
+
+        assert_eq!(
+            header_value(&request.pending_response_headers, "content-security-policy").as_deref(),
+            Some("default-src example.com; report-uri {unknown.placeholder}")
+        );
+        assert_eq!(
+            header_value(&request.pending_response_headers, "referrer-policy").as_deref(),
+            Some("origin-example.com")
+        );
+        // A configured default replaces the value an earlier handler staged.
+        assert_eq!(
+            header_value(&request.pending_response_headers, "x-frame-options").as_deref(),
+            Some("DENY")
         );
     }
 }
