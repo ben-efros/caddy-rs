@@ -84,33 +84,9 @@ pub struct GlobalOptions {
     /// Caddy's global `debug` option. Caddy's adapter uses it to set custom loggers to DEBUG and to
     /// add an implicit DEBUG default logger; it is otherwise informational.
     pub debug: bool,
-    /// caddy-rs extension: the `stock_compat` global option (DIV-0130). When true, file/glob
-    /// import resolution mirrors stock Caddy v2.11.9 exactly (DIV-0124); when false (the default)
-    /// imports keep the strict safety checks. The remaining stock-compat profile surfaces are
-    /// tracked by T-CONF-070/T-CONF-071 and are not implemented by this build yet.
-    pub stock_compat: bool,
     /// Non-fatal notes produced while preprocessing the Caddyfile (environment-placeholder
     /// expansion) and while reading options. Adapters surface these to callers.
     pub warnings: Vec<String>,
-}
-
-/// How `import <file>`/`import <glob>` resolves and validates files.
-///
-/// The policy is selected by the `stock_compat` global option (DIV-0124/DIV-0130); the adapter
-/// auto-detects it from the global options block before any import is expanded.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ImportPolicy {
-    /// caddy-rs default ("normal" mode): explicit absolute patterns are allowed, but every
-    /// resolved file must be a regular file that is not writable by group/other, must be owned
-    /// by root or by the owner of the importing Caddyfile, and must be no larger than
-    /// [`MAX_SAFE_IMPORT_BYTES`]. Relative imports may not escape the importing file's directory,
-    /// lexically or through a symbolic link.
-    #[default]
-    Safe,
-    /// Stock Caddy v2.11.9 behaviour (`stock_compat true`): an absolute pattern is used as-is, a
-    /// relative one is joined to the importing file's directory, and neither `..` escapes nor
-    /// symbolic links nor file permissions are restricted.
-    StockCompat,
 }
 
 /// Caddy's global `admin` option: `admin off`, `admin <address>`, or a block with
@@ -124,9 +100,8 @@ pub struct AdminOptions {
     pub listen: Option<String>,
     /// Require the `Origin` header to appear in `origins`.
     pub enforce_origin: bool,
-    /// Allowed admin API origins (`origins <hosts...>`).  
-    /// `None` means not configured; `Some([])` means explicitly empty.
-    pub origins: Option<Vec<String>>,
+    /// Allowed admin API origins (`origins <hosts...>`).
+    pub origins: Vec<String>,
 }
 
 /// A DNS-challenge provider referenced by `acme_dns` or `tls { dns ... }`:
@@ -613,93 +588,15 @@ fn apply_placeholder_shorthands_to_text(text: &str) -> String {
 /// Parse a Caddyfile whose source path is known, so `import <file>`/`import <glob>` resolve
 /// relative to the Caddyfile's directory (Caddy's adapter filename option).
 pub fn parse_with_source(input: &str, source: Option<&Path>) -> Result<Caddyfile, ParseError> {
-    parse_with_source_and_policy(input, source, None)
-}
-
-/// Parse a Caddyfile with an explicit import policy.
-///
-/// `None` auto-detects `stock_compat` from the global options block, which is the adapter path;
-/// `Some(policy)` forces the policy for tests and tooling that has already decided the mode.
-pub fn parse_with_source_and_policy(
-    input: &str,
-    source: Option<&Path>,
-    policy: Option<ImportPolicy>,
-) -> Result<Caddyfile, ParseError> {
     let expansion = expand_env_vars(input);
     let mut tokens = lex(&expansion.source)?;
     apply_placeholder_shorthands(&mut tokens);
-    let policy = policy.unwrap_or_else(|| {
-        if detect_stock_compat(&tokens) {
-            ImportPolicy::StockCompat
-        } else {
-            ImportPolicy::Safe
-        }
-    });
-    let parser = Parser::new(tokens, source.map(Path::to_path_buf), policy);
+    let parser = Parser::new(tokens, source.map(Path::to_path_buf));
     let mut file = parser.parse_file()?;
     let mut warnings = expansion.warnings;
     warnings.append(&mut file.options.warnings);
     file.options.warnings = warnings;
     Ok(file)
-}
-
-/// Pre-scan the global options block for the `stock_compat` switch before imports are expanded.
-///
-/// Import expansion happens while the global options block is being parsed, so the policy must be
-/// known before [`Parser::parse_file`] starts. The scan is deliberately lenient: malformed shapes
-/// are diagnosed later by [`read_global_options`] (a block, extra argument or invalid token), and
-/// only an unambiguous `stock_compat true` selects stock compatibility. Imports inside the global
-/// options block are not expanded for the scan, so `stock_compat` cannot itself be imported.
-fn detect_stock_compat(tokens: &[Token]) -> bool {
-    let mut index = 0;
-    while matches!(
-        tokens.get(index).map(|token| token.kind),
-        Some(TokenKind::Newline)
-    ) {
-        index += 1;
-    }
-    if !matches!(
-        tokens.get(index).map(|token| token.kind),
-        Some(TokenKind::LeftBrace)
-    ) {
-        return false;
-    }
-    index += 1;
-    let mut depth = 1usize;
-    let mut at_line_start = true;
-    while let Some(token) = tokens.get(index) {
-        match token.kind {
-            TokenKind::LeftBrace => {
-                depth += 1;
-                at_line_start = true;
-            }
-            TokenKind::RightBrace => {
-                depth -= 1;
-                if depth == 0 {
-                    return false;
-                }
-                at_line_start = true;
-            }
-            TokenKind::Newline => at_line_start = true,
-            TokenKind::Word | TokenKind::Quoted => {
-                if depth == 1 && at_line_start && token.text == "stock_compat" {
-                    let argument = tokens.get(index + 1);
-                    return match argument.map(|next| (&next.kind, next.text.as_str())) {
-                        None => true,
-                        Some((TokenKind::Word | TokenKind::Quoted, "true")) => true,
-                        Some((TokenKind::Word | TokenKind::Quoted, "false")) => false,
-                        // Bare before a line ending or the block's closing brace.
-                        Some((TokenKind::Newline | TokenKind::RightBrace, _)) => true,
-                        // Malformed: let read_global_options produce the located error.
-                        Some(_) => false,
-                    };
-                }
-                at_line_start = false;
-            }
-        }
-        index += 1;
-    }
-    false
 }
 
 /// Directives that must never be parsed as a site address. Caddy produces a specific diagnostic
@@ -830,12 +727,10 @@ struct Parser {
     /// label stored in [`Position::file`]. Nested imports resolve relative to the file they occur
     /// in (Caddy semantics).
     source_files: BTreeMap<Arc<str>, PathBuf>,
-    /// File/glob import policy selected by `stock_compat` (DIV-0124).
-    import_policy: ImportPolicy,
 }
 
 impl Parser {
-    fn new(tokens: Vec<Token>, source: Option<PathBuf>, import_policy: ImportPolicy) -> Self {
+    fn new(tokens: Vec<Token>, source: Option<PathBuf>) -> Self {
         let contexts = vec![None; tokens.len()];
         Self {
             tokens,
@@ -848,7 +743,6 @@ impl Parser {
             warnings: Vec::new(),
             depth: 0,
             source,
-            import_policy,
         }
     }
 
@@ -910,7 +804,6 @@ impl Parser {
         self.skip_newlines();
         let mut options = GlobalOptions::default();
         if matches!(self.peek().map(|t| t.kind), Some(TokenKind::LeftBrace)) {
-            // INFEASIBLE: the branch is taken only after `peek` reported `LeftBrace`.
             let position = self.advance().expect("peeked").position.clone();
             let directives = self.parse_directives(position, true)?;
             options = read_global_options(directives)?;
@@ -942,7 +835,6 @@ impl Parser {
                 }
             }
             if raw_addresses.is_empty() {
-                // INFEASIBLE: the loop above breaks on end of input, so `peek` is still `Some`.
                 let token = self.peek().expect("not eof");
                 return Err(ParseError::syntax(
                     token.position.clone(),
@@ -995,7 +887,6 @@ impl Parser {
                             continue;
                         }
                         if matches!(self.peek().map(|t| t.kind), Some(TokenKind::RightBrace)) {
-                            // INFEASIBLE: guarded by the `matches!` immediately above.
                             let token = self.peek().expect("peeked");
                             return Err(ParseError::syntax(
                                 token.position.clone(),
@@ -1315,34 +1206,36 @@ impl Parser {
         let mut imported_tokens = Vec::new();
         let mut imported_contexts = Vec::new();
         for file in &files {
-            let node = self.sanitize_import_path(file, &import_position);
+            let node = absolute_path(file).display().to_string();
             self.import_graph.add_node(&parent_node);
             self.import_graph.add_node(&node);
             if let Err(message) = self.import_graph.add_edge(&parent_node, &node) {
                 return Err(ParseError::syntax(import_position.clone(), message));
             }
-            let import_path = self.sanitize_import_path(file, &import_position);
             if file.is_dir() {
                 return Err(ParseError::syntax(
                     import_position,
-                    format!("Could not import {import_path}: is a directory"),
+                    format!("Could not import {}: is a directory", file.display()),
                 ));
             }
             let bytes = std::fs::read(file).map_err(|error| {
                 ParseError::syntax(
                     import_position.clone(),
-                    format!("Could not import {import_path}: {error}"),
+                    format!("Could not import {}: {error}", file.display()),
                 )
             })?;
             let text = String::from_utf8(bytes).map_err(|_| {
                 ParseError::syntax(
                     import_position.clone(),
-                    format!("Could not read tokens while importing {import_path}: not valid UTF-8"),
+                    format!(
+                        "Could not read tokens while importing {}: not valid UTF-8",
+                        file.display()
+                    ),
                 )
             })?;
             if text.trim().is_empty() {
                 self.warnings
-                    .push(format!("Import file is empty: {import_path}"));
+                    .push(format!("Import file is empty: {}", file.display()));
                 continue;
             }
             let label: Arc<str> = self.import_label(file).into();
@@ -1352,7 +1245,8 @@ impl Parser {
             let mut tokens = lex(&expanded.source).map_err(|error| ParseError::Syntax {
                 position: error.position.clone().with_file(label.clone()),
                 message: format!(
-                    "Could not read tokens while importing {import_path}: {}",
+                    "Could not read tokens while importing {}: {}",
+                    file.display(),
                     error.message
                 ),
             })?;
@@ -1405,125 +1299,90 @@ impl Parser {
         file.display().to_string()
     }
 
-    /// Sanitize a file path for display in user-facing error messages.
-    /// Returns a path relative to the importing directory when inside it,
-    /// otherwise just the file name (never leaks absolute paths).
-    fn sanitize_import_path(&self, file: &Path, position: &Position) -> String {
-        if let Some(directory) = self.importing_directory(position) {
-            let directory = normalize_path(&directory);
-            let normalized = normalize_path(file);
-            if let Ok(relative) = normalized.strip_prefix(&directory) {
-                return relative.display().to_string();
-            }
-        }
-        file.file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| file.display().to_string())
-    }
-
-    /// Resolve `import <file>`/`<glob>` to existing files.
-    ///
-    /// The policy comes from the `stock_compat` global option (DIV-0124):
-    ///
-    /// * [`ImportPolicy::Safe`] (the caddy-rs default): an explicit absolute pattern is allowed,
-    ///   but every resolved file must pass [`Parser::check_import_file`]; a relative pattern is
-    ///   resolved against the importing file's directory and may not escape it, lexically or
-    ///   after resolving symbolic links.
-    /// * [`ImportPolicy::StockCompat`]: exactly Caddy v2.11.9 (`parse.go`): an absolute pattern is
-    ///   used as-is, a relative one is joined to the importing file's directory, `..` and
-    ///   symbolic links are not contained, and no file-permission checks run.
+    /// Resolve `import <file>`/`<glob>` to existing files relative to the importing file.
     fn resolve_import_files(
         &mut self,
         pattern: &str,
         position: Position,
     ) -> Result<Vec<PathBuf>, ParseError> {
         let raw = Path::new(pattern);
-        let absolute = raw.is_absolute();
+        if raw.is_absolute() {
+            return Err(ParseError::syntax(
+                position,
+                format!("Import path must be relative, but got absolute path: {pattern}"),
+            ));
+        }
+        let directory = match self.importing_directory(&position) {
+            Some(directory) => directory,
+            None => {
+                // Without a source path there is no directory to anchor relative imports;
+                // fall back to the raw path so the existing "not found" error is emitted.
+                let resolved = raw.to_path_buf();
+                let has_glob = pattern.contains('*')
+                    || pattern.contains('?')
+                    || (pattern.contains('[') && pattern.contains(']'));
+                if !has_glob {
+                    if resolved.is_file() {
+                        return Ok(vec![resolved]);
+                    }
+                    if resolved.is_dir() {
+                        return Err(ParseError::syntax(
+                            position,
+                            format!("Could not import {pattern}: is a directory"),
+                        ));
+                    }
+                }
+                return Err(ParseError::syntax(
+                    position,
+                    format!(
+                        "File to import not found: {pattern} (this requires the Caddyfile's source \
+                         directory for file/glob imports; adapting stdin has no source path)"
+                    ),
+                ));
+            }
+        };
+        let resolved = directory.join(raw);
+        let base = normalize_path(&directory);
+        let normalized = normalize_path(&resolved);
+        if !normalized.starts_with(&base) {
+            return Err(ParseError::syntax(
+                position,
+                format!("Import path escapes the Caddyfile directory: {pattern}"),
+            ));
+        }
         let has_glob = pattern.contains('*')
             || pattern.contains('?')
             || (pattern.contains('[') && pattern.contains(']'));
-        let directory = self.importing_directory(&position);
-        if !absolute && directory.is_none() {
-            // Without a source path there is no directory to anchor relative imports; keep the
-            // loud failure instead of resolving against the process CWD.
-            let resolved = raw.to_path_buf();
-            if !has_glob {
-                if resolved.is_file() {
-                    return Ok(vec![resolved]);
-                }
-                if resolved.is_dir() {
-                    return Err(ParseError::syntax(
-                        position,
-                        format!("Could not import {pattern}: is a directory"),
-                    ));
-                }
+        if !has_glob {
+            if normalized.is_file() {
+                return Ok(vec![normalized]);
+            }
+            if normalized.is_dir() {
+                return Err(ParseError::syntax(
+                    position,
+                    format!("Could not import {pattern}: is a directory"),
+                ));
             }
             return Err(ParseError::syntax(
                 position,
-                format!(
-                    "File to import not found: {pattern} (this requires the Caddyfile's source \
-                     directory for file/glob imports; adapting stdin has no source path)"
-                ),
+                format!("File to import not found: {pattern}"),
             ));
         }
 
-        let resolved = if absolute {
-            normalize_path(raw)
-        } else {
-            let directory = directory.expect("checked above");
-            let joined = normalize_path(&directory.join(raw));
-            if self.import_policy == ImportPolicy::Safe {
-                let base = normalize_path(&directory);
-                if !joined.starts_with(&base) {
-                    return Err(ParseError::syntax(
-                        position,
-                        format!("Import path escapes the Caddyfile directory: {pattern}"),
-                    ));
-                }
-            }
-            joined
-        };
-
-        if !has_glob {
-            return match self.import_policy {
-                ImportPolicy::StockCompat => {
-                    if resolved.is_file() {
-                        Ok(vec![resolved])
-                    } else if resolved.is_dir() {
-                        Err(ParseError::syntax(
-                            position,
-                            format!("Could not import {pattern}: is a directory"),
-                        ))
-                    } else {
-                        Err(ParseError::syntax(
-                            position,
-                            format!("File to import not found: {pattern}"),
-                        ))
-                    }
-                }
-                ImportPolicy::Safe => {
-                    let checked = self.check_import_file(&resolved, &position, pattern)?;
-                    self.check_relative_containment(&checked, &position, pattern, absolute)?;
-                    Ok(vec![checked])
-                }
-            };
-        }
-
-        // Report the pattern as the user wrote it: the joined pattern would leak the absolute path
-        // in this diagnostic.
-        if pattern.matches('*').count() > 1
-            || pattern.matches('?').count() > 1
-            || (pattern.contains('[') && pattern.contains(']'))
+        let resolved_text = normalized.display().to_string();
+        if resolved_text.matches('*').count() > 1
+            || resolved_text.matches('?').count() > 1
+            || (resolved_text.contains('[') && resolved_text.contains(']'))
         {
             return Err(ParseError::syntax(
                 position,
                 format!(
-                    "Glob pattern may only contain one wildcard (*), but has others: {pattern}"
+                    "Glob pattern may only contain one wildcard (*), but has others: {resolved_text}"
                 ),
             ));
         }
-        let parent = resolved.parent().unwrap_or_else(|| Path::new("."));
-        let file_pattern = resolved
+        let parent = normalized.parent().unwrap_or_else(|| Path::new("."));
+        let file_pattern = normalized
             .file_name()
             .map(|name| name.to_string_lossy().to_string())
             .unwrap_or_default();
@@ -1554,172 +1413,8 @@ impl Parser {
         if matches.is_empty() {
             self.warnings
                 .push(format!("No files matching import glob pattern: {pattern}"));
-            return Ok(matches);
         }
-        if self.import_policy == ImportPolicy::StockCompat {
-            return Ok(matches);
-        }
-        // Safe mode: every matched file is validated, and relative globs must stay contained
-        // after symbolic links are resolved.
-        let mut checked = Vec::with_capacity(matches.len());
-        for matched in matches {
-            let display = self.sanitize_import_path(&matched, &position);
-            let file = self.check_import_file(&matched, &position, &display)?;
-            self.check_relative_containment(&file, &position, &display, absolute)?;
-            checked.push(file);
-        }
-        Ok(checked)
-    }
-
-    /// Validate one resolved import file under [`ImportPolicy::Safe`].
-    ///
-    /// The file must exist, be a regular file, be at most [`MAX_SAFE_IMPORT_BYTES`], not be
-    /// writable by group or other, and (on Unix) be owned by root or by the owner of the
-    /// importing Caddyfile. Symbolic links are followed and the *target* is what is validated;
-    /// the canonical target is returned so the caller reads exactly what was checked.
-    fn check_import_file(
-        &self,
-        path: &Path,
-        position: &Position,
-        display: &str,
-    ) -> Result<PathBuf, ParseError> {
-        let resolved = match std::fs::canonicalize(path) {
-            Ok(resolved) => resolved,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(ParseError::syntax(
-                    position.clone(),
-                    format!("File to import not found: {display}"),
-                ))
-            }
-            Err(error) => {
-                return Err(ParseError::syntax(
-                    position.clone(),
-                    format!("Could not import {display}: {error}"),
-                ))
-            }
-        };
-        let metadata = std::fs::metadata(&resolved).map_err(|error| {
-            ParseError::syntax(
-                position.clone(),
-                format!("Could not import {display}: {error}"),
-            )
-        })?;
-        if metadata.is_dir() {
-            return Err(ParseError::syntax(
-                position.clone(),
-                format!("Could not import {display}: is a directory"),
-            ));
-        }
-        if !metadata.is_file() {
-            return Err(ParseError::syntax(
-                position.clone(),
-                format!("Could not import {display}: not a regular file"),
-            ));
-        }
-        if metadata.len() > MAX_SAFE_IMPORT_BYTES {
-            return Err(ParseError::syntax(
-                position.clone(),
-                format!(
-                    "Could not import {display}: file is larger than the {MAX_SAFE_IMPORT_BYTES}-byte \
-                     safe-mode import limit"
-                ),
-            ));
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if metadata.mode() & 0o022 != 0 {
-                return Err(ParseError::syntax(
-                    position.clone(),
-                    format!(
-                        "Could not import {display}: file is writable by group or others (the \
-                         safe-mode import rule requires an owner-only-writable file)"
-                    ),
-                ));
-            }
-            match self.importing_owner(position) {
-                Some(owner) => {
-                    if metadata.uid() != 0 && metadata.uid() != owner {
-                        return Err(ParseError::syntax(
-                            position.clone(),
-                            format!(
-                                "Could not import {display}: file is not owned by root or by the \
-                                 owner of the importing Caddyfile (safe-mode import rule)"
-                            ),
-                        ));
-                    }
-                }
-                None => {
-                    // No importing file on disk (stdin adapt): the owner anchor is unknown, so
-                    // fall back to the strict default (root-owned) instead of skipping the check
-                    // (security review F2).
-                    if metadata.uid() != 0 {
-                        return Err(ParseError::syntax(
-                            position.clone(),
-                            format!(
-                                "Could not import {display}: no importing Caddyfile is available to \
-                                 anchor ownership, so the file must be owned by root (safe-mode \
-                                 import rule)"
-                            ),
-                        ));
-                    }
-                }
-            }
-        }
-        Ok(resolved)
-    }
-
-    /// In safe mode, a relative import must stay inside the importing file's directory even after
-    /// symbolic links are resolved (the lexical check happens before the file is read).
-    fn check_relative_containment(
-        &self,
-        file: &Path,
-        position: &Position,
-        display: &str,
-        absolute_pattern: bool,
-    ) -> Result<(), ParseError> {
-        if absolute_pattern || self.import_policy != ImportPolicy::Safe {
-            return Ok(());
-        }
-        let Some(directory) = self.importing_directory(position) else {
-            return Ok(());
-        };
-        let canonical_directory = std::fs::canonicalize(&directory).map_err(|error| {
-            ParseError::syntax(
-                position.clone(),
-                format!("Could not resolve the importing Caddyfile directory: {error}"),
-            )
-        })?;
-        if !file.starts_with(&canonical_directory) {
-            return Err(ParseError::syntax(
-                position.clone(),
-                format!(
-                    "Import path escapes the Caddyfile directory through a symbolic link: {display}"
-                ),
-            ));
-        }
-        Ok(())
-    }
-
-    /// Owner of the file containing the `import` directive, used as the safe-mode trust anchor.
-    ///
-    /// A relative import's importing file is the root Caddyfile or a file previously spliced in;
-    /// its owner (root or that owner) is who may write the files it imports.
-    #[cfg(unix)]
-    fn importing_owner(&self, position: &Position) -> Option<u32> {
-        use std::os::unix::fs::MetadataExt;
-        let importing = match &position.file {
-            Some(label) => self.source_files.get(label),
-            None => self.source.as_ref(),
-        }?;
-        std::fs::metadata(absolute_path(importing))
-            .ok()
-            .map(|metadata| metadata.uid())
-    }
-
-    #[cfg(not(unix))]
-    fn importing_owner(&self, _position: &Position) -> Option<u32> {
-        None
+        Ok(matches)
     }
 
     /// Apply argument/block substitution to imported tokens and tag them with the import-graph
@@ -1817,14 +1512,20 @@ impl Parser {
     }
 }
 
-/// Largest file the safe-mode import policy will read (8 MiB). Stock Caddy has no limit; the cap
-/// exists because import files are configuration, and a huge file only wastes adapt-time memory.
-pub const MAX_SAFE_IMPORT_BYTES: u64 = 8 * 1024 * 1024;
-
 /// Simple single-wildcard glob matching used for file imports (`*` matches any run, `?` one
 /// character).
 fn glob_match(name: &str, pattern: &str) -> bool {
-    crate::glob::match_import_glob(name, pattern)
+    fn matches(name: &[u8], pattern: &[u8]) -> bool {
+        match pattern.first() {
+            None => name.is_empty(),
+            Some(b'*') => {
+                matches(name, &pattern[1..]) || (!name.is_empty() && matches(&name[1..], pattern))
+            }
+            Some(b'?') => !name.is_empty() && matches(&name[1..], &pattern[1..]),
+            Some(expected) => name.first() == Some(expected) && matches(&name[1..], &pattern[1..]),
+        }
+    }
+    matches(name.as_bytes(), pattern.as_bytes())
 }
 
 fn at_line_start(tokens: &[Token]) -> bool {
@@ -2185,10 +1886,6 @@ fn parse_port(port: &str) -> Result<u16, String> {
 
 fn read_global_options(directives: Vec<Directive>) -> Result<GlobalOptions, ParseError> {
     let mut options = GlobalOptions::default();
-    // `detect_stock_compat` selects the import policy from the first occurrence, so a second
-    // occurrence would let the parsed value and the enforced policy disagree; reject duplicates
-    // instead of resolving them silently (security review F1).
-    let mut stock_compat_seen = false;
     for directive in directives {
         match directive.name.as_str() {
             "auto_https" => {
@@ -2252,13 +1949,13 @@ fn read_global_options(directives: Vec<Directive>) -> Result<GlobalOptions, Pars
                             admin.enforce_origin = true;
                         }
                         "origins" => {
-                            if !item.block.is_empty() {
+                            if item.args.is_empty() || !item.block.is_empty() {
                                 return Err(ParseError::syntax(
                                     item.position.clone(),
-                                    "`origins` does not take a block",
+                                    "`origins` requires at least one origin",
                                 ));
                             }
-                            admin.origins = Some(item.args.clone());
+                            admin.origins = item.args.clone();
                         }
                         other => {
                             return Err(ParseError::syntax(
@@ -2398,42 +2095,6 @@ fn read_global_options(directives: Vec<Directive>) -> Result<GlobalOptions, Pars
                     ));
                 }
                 options.debug = true;
-            }
-            "stock_compat" => {
-                if stock_compat_seen {
-                    return Err(ParseError::syntax(
-                        directive.position.clone(),
-                        "global option `stock_compat` is specified more than once",
-                    ));
-                }
-                stock_compat_seen = true;
-                // caddy-rs extension (DIV-0130): bare means true, and only `true`/`false` are
-                // accepted as arguments. A block or extra argument is a located error.
-                // A non-empty block is a located error. An empty block (`stock_compat {}`) is
-                // indistinguishable from the bare form in the directive model, so it is treated
-                // as bare `true` (documented in DIV-0130).
-                if !directive.block.is_empty() {
-                    return Err(ParseError::syntax(
-                        directive.position.clone(),
-                        "`stock_compat` does not take a block",
-                    ));
-                }
-                if directive.args.len() > 1 {
-                    return Err(ParseError::syntax(
-                        directive.position.clone(),
-                        "wrong argument count or unexpected line ending after `stock_compat`",
-                    ));
-                }
-                options.stock_compat = match directive.args.first().map(String::as_str) {
-                    None | Some("true") => true,
-                    Some("false") => false,
-                    Some(other) => {
-                        return Err(ParseError::syntax(
-                            directive.position.clone(),
-                            format!("stock_compat must be 'true' or 'false', got '{other}'"),
-                        ))
-                    }
-                };
             }
             other if is_caddy_global_option(other) => {
                 return Err(ParseError::unsupported(
