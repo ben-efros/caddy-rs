@@ -655,9 +655,14 @@ impl FastCgiTransport {
             encode_pair(&mut encoded, name, value);
             if encoded.len() > MAX_WRITE {
                 // Caddy truncates over-long values so a record never exceeds the write limit.
+                // The budget is in bytes, but the cut must land on a UTF-8 boundary: `params`
+                // values are `String`s here, and slicing mid-character would panic (SEC-FU-
+                // FASTCGI-WRITE-TRUNC). Cutting on the floor boundary keeps the value valid
+                // UTF-8 and never exceeds `allowed`; ASCII values are unaffected.
                 let allowed = MAX_WRITE.saturating_sub(8 + name.len());
+                let end = floor_char_boundary(value, allowed);
                 let mut truncated = Vec::new();
-                encode_pair(&mut truncated, name, &value[..allowed.min(value.len())]);
+                encode_pair(&mut truncated, name, &value[..end]);
                 encoded = truncated;
             }
             if buffer.len() + encoded.len() > MAX_WRITE && !buffer.is_empty() {
@@ -845,6 +850,18 @@ fn fastcgi_body_allowed(method: &str, status: StatusCode) -> bool {
         && !(status.as_u16() >= 100 && status.as_u16() <= 199)
         && status != StatusCode::NO_CONTENT
         && status != StatusCode::NOT_MODIFIED
+}
+
+/// Largest index `<= max` (and `<= value.len()`) that is a UTF-8 character boundary.
+///
+/// Used to truncate a CGI parameter value to a byte budget without splitting a multibyte
+/// character, which would panic when slicing a `&str`.
+fn floor_char_boundary(value: &str, max: usize) -> usize {
+    let mut end = max.min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
 }
 
 /// Encode a name/value pair using FastCGI's 1-or-4-byte length encoding.
@@ -2485,6 +2502,68 @@ mod tests {
             format!("{}{}", ascii["DOCUMENT_URI"], ascii["PATH_INFO"]),
             "/cafe/x.php/more"
         );
+    }
+
+    /// SEC-FU-FASTCGI-WRITE-TRUNC: `write_request` truncates an over-budget parameter value to
+    /// `MAX_WRITE - 8 - name.len()` bytes. The cut must land on a UTF-8 character boundary
+    /// (slicing a `&str` mid-character panics, which the release profile's `panic = "abort"`
+    /// turns into a process kill) and must never exceed the byte budget.
+    #[tokio::test]
+    async fn fastcgi_over_long_param_values_truncate_on_a_char_boundary() {
+        const NAME: &str = "HTTP_X_LONG";
+        let budget = MAX_WRITE - 8 - NAME.len();
+
+        /// Write one over-long-able parameter and decode what the upstream would receive.
+        async fn write(value: &str) -> String {
+            let transport = FastCgiTransport::from_json(
+                &transport_json(serde_json::json!({ "root": "/srv/www" })),
+                "transport",
+            )
+            .expect("fastcgi transport builds");
+            let params = BTreeMap::from([(NAME.to_string(), value.to_string())]);
+            let mut written = Vec::new();
+            transport
+                .write_request(&mut written, &params, RequestBody::empty(), None)
+                .await
+                .expect("request writes");
+
+            let mut reader: &[u8] = &written;
+            let mut params_bytes = Vec::new();
+            loop {
+                let record = read_record(&mut reader, None).await.expect("record parses");
+                match record.kind {
+                    FCGI_PARAMS => params_bytes.extend_from_slice(&record.content),
+                    FCGI_STDIN => break,
+                    _ => {}
+                }
+            }
+            decode_params(&params_bytes)
+                .remove(NAME)
+                .expect("truncated parameter is present")
+        }
+
+        // (a) ASCII: truncated to exactly the byte budget, byte-for-byte the same as before.
+        let written = write(&"a".repeat(MAX_WRITE)).await;
+        assert_eq!(written, "a".repeat(budget));
+
+        // (b) Multibyte with the cut inside a character: no panic, <= budget, char boundary.
+        // `budget` (65481) is odd, so the trailing half of the last 2-byte `é` does not fit.
+        let multibyte = "\u{e9}".repeat(MAX_WRITE); // 2 bytes each => 131 000 bytes.
+        let written = write(&multibyte).await;
+        assert!(written.len() <= budget, "{} > {budget}", written.len());
+        assert!(written.is_char_boundary(written.len()));
+        assert!(multibyte.starts_with(&written));
+        assert_eq!(written, "\u{e9}".repeat(budget / 2));
+
+        // (c) A value shorter than the budget is untouched.
+        let short = "\u{e9}".repeat(100);
+        assert_eq!(write(&short).await, short);
+
+        // The boundary helper never splits a character and never exceeds `max`.
+        assert_eq!(floor_char_boundary("\u{e9}", 1), 0);
+        assert_eq!(floor_char_boundary("\u{e9}", 2), 2);
+        assert_eq!(floor_char_boundary("abc", 2), 2);
+        assert_eq!(floor_char_boundary("abc", usize::MAX), 3);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
