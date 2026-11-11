@@ -411,6 +411,7 @@ impl FastCgiTransport {
                 .iter()
                 .filter(|split| !split.is_empty() && split.len() <= fpath.len())
                 .find_map(|split| {
+                    // INFEASIBLE: the filter above keeps only splits no longer than fpath.
                     (0..=fpath.len() - split.len())
                         .find(|start| {
                             fpath[*start..*start + split.len()].eq_ignore_ascii_case(split)

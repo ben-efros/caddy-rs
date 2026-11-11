@@ -227,7 +227,12 @@ impl SplitMix64 {
 
     /// Uniformly-distributed integer in `0..n` (Go's `rand.IntN`).
     fn next_below(&self, n: u64) -> u64 {
-        debug_assert!(n > 0);
+        // `% 0` panics (and the release profile aborts on panic). Every caller checks its slice
+        // first, but a total function here keeps a future empty-slice caller from taking the
+        // listener down.
+        if n == 0 {
+            return 0;
+        }
         self.next_u64() % n
     }
 }
@@ -486,6 +491,7 @@ fn cookie_value(raw: &str) -> Option<String> {
         return None;
     }
     let unquoted = if raw.len() > 2 && raw.starts_with('"') && raw.ends_with('"') {
+        // INFEASIBLE: raw.len() > 2 is part of the branch condition.
         raw[1..raw.len() - 1]
             .replace("\\\"", "\"")
             .replace("\\\\", "\\")
@@ -1072,6 +1078,13 @@ fn xxh64(bytes: &[u8]) -> u64 {
 mod tests {
     use super::*;
     use http::Method;
+
+    #[test]
+    fn next_below_zero_returns_zero_instead_of_panicking() {
+        // A zero bound used to be a `% 0` panic (and the release profile aborts on panic).
+        let rng = SplitMix64::with_seed(1);
+        assert_eq!(rng.next_below(0), 0);
+    }
 
     fn pool(count: usize) -> Vec<Arc<Upstream>> {
         (0..count)

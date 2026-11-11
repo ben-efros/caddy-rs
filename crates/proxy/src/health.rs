@@ -455,6 +455,7 @@ fn expand_health_placeholders(
                 continue;
             }
         }
+        // INFEASIBLE: index advances by ch.len_utf8() or past an ASCII '}', so it is a char boundary.
         let ch = input[index..]
             .chars()
             .next()

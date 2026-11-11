@@ -94,6 +94,7 @@ impl Template {
                 }
             }
             // Not a recognised placeholder: keep the byte (including any `{`) verbatim.
+            // INFEASIBLE: index advances by ch.len_utf8() or past an ASCII '}', so it is a char boundary.
             let ch = text[index..]
                 .chars()
                 .next()
