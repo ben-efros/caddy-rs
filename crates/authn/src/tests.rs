@@ -2,7 +2,7 @@ use super::*;
 
 fn test_config() -> AuthnConfig {
     AuthnConfig {
-        jwt_secret: [0x5A; 32],
+        jwt_secret_source: JwtSecretSource::Master("test-secret".to_string()),
         access_ttl: Duration::from_secs(15 * 60),
         refresh_ttl: Duration::from_secs(60 * 60),
         argon2_params: Argon2Config {
@@ -247,7 +247,7 @@ fn password_verification_is_constant_time() {
 
 #[tokio::test]
 async fn create_user_stores_hash_not_plaintext() {
-    let service = AuthnService::new(MemoryUserStore::new(), test_config());
+    let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
     let user = service
         .create_user("alice", "hunter2", Role::viewer())
         .await
@@ -259,7 +259,7 @@ async fn create_user_stores_hash_not_plaintext() {
 
 #[tokio::test]
 async fn login_and_refresh_rotation() {
-    let service = AuthnService::new(MemoryUserStore::new(), test_config());
+    let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
     let user = service
         .create_user("alice", "password", Role::editor())
         .await
@@ -300,7 +300,7 @@ async fn login_and_refresh_rotation() {
 
 #[tokio::test]
 async fn refresh_replay_and_unknown_token_errors() {
-    let service = AuthnService::new(MemoryUserStore::new(), test_config());
+    let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
     service
         .create_user("alice", "password", Role::viewer())
         .await
@@ -321,7 +321,7 @@ async fn refresh_replay_and_unknown_token_errors() {
 async fn expired_refresh_token_is_rejected() {
     let mut config = test_config();
     config.refresh_ttl = Duration::from_secs(0);
-    let service = AuthnService::new(MemoryUserStore::new(), config);
+    let service = AuthnService::new(MemoryUserStore::new(), config).expect("build service");
     service
         .create_user("alice", "password", Role::viewer())
         .await
@@ -335,7 +335,7 @@ async fn expired_refresh_token_is_rejected() {
 
 #[tokio::test]
 async fn expired_access_token_is_rejected() {
-    let service = AuthnService::new(MemoryUserStore::new(), test_config());
+    let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
     let user = service
         .create_user("alice", "password", Role::viewer())
         .await
@@ -366,7 +366,7 @@ async fn expired_access_token_is_rejected() {
 
 #[tokio::test]
 async fn password_change_revokes_access_token_immediately() {
-    let service = AuthnService::new(MemoryUserStore::new(), test_config());
+    let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
     let user = service
         .create_user("charlie", "oldpass", Role::editor())
         .await
@@ -401,7 +401,7 @@ async fn password_change_revokes_access_token_immediately() {
 
 #[tokio::test]
 async fn set_password_revokes_refresh_tokens() {
-    let service = AuthnService::new(MemoryUserStore::new(), test_config());
+    let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
     let user = service
         .create_user("dave", "oldpass", Role::viewer())
         .await
@@ -418,7 +418,7 @@ async fn set_password_revokes_refresh_tokens() {
 #[tokio::test]
 async fn revoke_all_for_user_invalidates_access_and_refresh() {
     let store = MemoryUserStore::new();
-    let service = AuthnService::new(store.clone(), test_config());
+    let service = AuthnService::new(store.clone(), test_config()).expect("build service");
     let user = service
         .create_user("eve", "password", Role::editor())
         .await
@@ -441,7 +441,7 @@ async fn revoke_all_for_user_invalidates_access_and_refresh() {
 
 #[tokio::test]
 async fn role_change_invalidates_access_token() {
-    let service = AuthnService::new(MemoryUserStore::new(), test_config());
+    let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
     let user = service
         .create_user("frank", "password", Role::editor())
         .await
@@ -465,7 +465,7 @@ async fn role_change_invalidates_access_token() {
 
 #[test]
 fn capability_matrix_all_sections_and_four_actions() {
-    let service = AuthnService::new(MemoryUserStore::new(), test_config());
+    let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
     let actions = [Action::View, Action::Create, Action::Update, Action::Delete];
     for section in Section::all() {
         for action in actions {
@@ -498,7 +498,7 @@ fn capability_matrix_all_sections_and_four_actions() {
 
 #[tokio::test]
 async fn unauthenticated_access_is_rejected() {
-    let service = AuthnService::new(MemoryUserStore::new(), test_config());
+    let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
     assert!(matches!(
         service.verify_access_token("not-a-jwt").await,
         Err(AuthError::InvalidToken)
@@ -543,7 +543,7 @@ fn row_visibility_owner_vs_all() {
 
 #[tokio::test]
 async fn totp_setup_verify_skew_and_replay() {
-    let service = AuthnService::new(MemoryUserStore::new(), test_config());
+    let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
     let user = service
         .create_user("grace", "password", Role::viewer())
         .await
@@ -577,7 +577,7 @@ async fn totp_setup_verify_skew_and_replay() {
 
 #[tokio::test]
 async fn totp_login_and_disable() {
-    let service = AuthnService::new(MemoryUserStore::new(), test_config());
+    let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
     let user = service
         .create_user("ivan", "password", Role::viewer())
         .await
@@ -603,7 +603,7 @@ async fn totp_login_and_disable() {
 #[tokio::test]
 async fn refresh_token_is_stored_hashed() {
     let store = MemoryUserStore::new();
-    let service = AuthnService::new(store.clone(), test_config());
+    let service = AuthnService::new(store.clone(), test_config()).expect("build service");
     service
         .create_user("judy", "password", Role::viewer())
         .await
@@ -633,7 +633,7 @@ async fn refresh_token_is_stored_hashed() {
 #[test]
 fn debug_redacts_secrets() {
     let config = AuthnConfig {
-        jwt_secret: [0xAB; 32],
+        jwt_secret_source: JwtSecretSource::Master("other-secret".to_string()),
         ..test_config()
     };
     let config_debug = format!("{config:?}");
@@ -789,4 +789,119 @@ fn user_public_view_no_secrets() {
         json.contains("\"totp_enabled\""),
         "UserRecord should contain totp_enabled field"
     );
+}
+
+// --- L2: JWT secret persistence across graceful restarts -------------------------------------
+
+#[test]
+fn master_secret_produces_deterministic_key() {
+    let a = JwtSecretSource::Master("correct horse battery staple".to_string())
+        .resolve()
+        .expect("master secret resolves");
+    let b = JwtSecretSource::Master("correct horse battery staple".to_string())
+        .resolve()
+        .expect("master secret resolves");
+    let c = JwtSecretSource::Master("another secret".to_string())
+        .resolve()
+        .expect("master secret resolves");
+    assert_eq!(a, b, "the same master secret must yield the same key");
+    assert_ne!(a, c, "different master secrets must yield different keys");
+
+    let expected: [u8; 32] = Sha256::digest(b"correct horse battery staple").into();
+    assert_eq!(a, expected, "master key is SHA-256 of the secret bytes");
+}
+
+#[test]
+fn empty_master_secret_is_rejected() {
+    assert!(matches!(
+        JwtSecretSource::Master(String::new()).resolve(),
+        Err(AuthError::Internal(_))
+    ));
+}
+
+#[test]
+fn ephemeral_secret_changes_each_time() {
+    let a = JwtSecretSource::Ephemeral.resolve().expect("resolve");
+    let b = JwtSecretSource::Ephemeral.resolve().expect("resolve");
+    assert_ne!(a, b, "ephemeral secrets must not be reused");
+}
+
+#[test]
+fn file_secret_persists_across_constructions() {
+    let dir = std::env::temp_dir().join(format!("caddy-rs-jwt-{:?}", UserId::new()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("jwt.key");
+
+    let first = JwtSecretSource::File(path.clone())
+        .resolve()
+        .expect("create");
+    assert_eq!(first.len(), 32);
+    let second = JwtSecretSource::File(path.clone()).resolve().expect("read");
+    assert_eq!(first, second, "the file secret must survive a restart");
+
+    let stored = std::fs::read(&path).expect("read secret file");
+    assert_eq!(stored, first, "the file holds the resolved key");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path)
+            .expect("secret file metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "the secret file must be owner-only");
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn malformed_secret_file_is_rejected() {
+    let dir = std::env::temp_dir().join(format!("caddy-rs-jwt-bad-{:?}", UserId::new()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("jwt.key");
+    std::fs::write(&path, b"too short").expect("write malformed secret");
+
+    assert!(matches!(
+        JwtSecretSource::File(path.clone()).resolve(),
+        Err(AuthError::Internal(_))
+    ));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn sessions_survive_a_restart_with_a_persistent_secret() {
+    let dir = std::env::temp_dir().join(format!("caddy-rs-jwt-restart-{:?}", UserId::new()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("jwt.key");
+
+    let mut config = test_config();
+    config.jwt_secret_source = JwtSecretSource::File(path.clone());
+
+    let store = MemoryUserStore::new();
+    let before = AuthnService::new(store.clone(), config.clone()).expect("build service");
+    let user = before
+        .create_user("dana", "password", Role::viewer())
+        .await
+        .expect("create user");
+    let tokens = before.login("dana", "password", None).await.expect("login");
+
+    // A new service instance stands in for the process that comes back after a restart.
+    let after = AuthnService::new(store, config).expect("build service");
+    let claims = after
+        .verify_access_token(&tokens.access_token)
+        .await
+        .expect("access token must still verify after a restart");
+    assert_eq!(
+        claims.sub, user.id,
+        "the token still belongs to the same user"
+    );
+    after
+        .refresh(&tokens.refresh_token)
+        .await
+        .expect("refresh token must still work after a restart");
+
+    std::fs::remove_dir_all(&dir).ok();
 }

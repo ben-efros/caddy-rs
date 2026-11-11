@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context};
 use base64::Engine;
-use caddy_rs_authn::{AuthnConfig, AuthnService, MemoryUserStore, UserStore};
+use caddy_rs_authn::{AuthnConfig, AuthnService, JwtSecretSource, MemoryUserStore, UserStore};
 use caddy_rs_pm_api::{create_router, ApiState};
 use caddy_rs_pm_runtime::{
     ConfigApplyService, ConfigSettings, HttpCaddyAdmin, PmRuntime, RuntimeConfig,
@@ -785,9 +785,16 @@ async fn serve(global: GlobalArgs, args: ServeArgs) -> Result<(), CliError> {
     info!("certificate inventory source created");
 
     // Create authentication service.
-    let authn_config = AuthnConfig::default();
+    //
+    // The JWT signing secret is persisted under the data directory so that tokens issued before a
+    // graceful restart are still accepted afterwards; otherwise every reload would log every user
+    // out. The file is created owner-only on first start.
+    let authn_config = AuthnConfig {
+        jwt_secret_source: JwtSecretSource::File(runtime.config().data_dir.join("jwt-secret.key")),
+        ..AuthnConfig::default()
+    };
     let authn_store = MemoryUserStore::new();
-    let authn = AuthnService::new(authn_store.clone(), authn_config);
+    let authn = AuthnService::new(authn_store.clone(), authn_config)?;
 
     // Bootstrap admin user if environment variables are set.
     if let (Some(email), Some(password)) = (

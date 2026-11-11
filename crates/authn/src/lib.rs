@@ -16,6 +16,7 @@
 #![warn(missing_docs)]
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -646,11 +647,124 @@ impl Default for Argon2Config {
     }
 }
 
+/// Source for the JWT signing secret.
+///
+/// # Security Warning
+/// Production deployments should **always** use [`JwtSecretSource::Master`] or
+/// [`JwtSecretSource::File`] so that existing sessions remain valid across config
+/// reloads and process restarts. [`JwtSecretSource::Ephemeral`] is provided only
+/// for backwards compatibility and local development.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum JwtSecretSource {
+    /// Derive from a user-provided master secret string.
+    ///
+    /// The 32-byte signing key is produced by hashing the UTF-8 bytes of the
+    /// secret with SHA-256. The same master secret always yields the same key.
+    Master(String),
+    /// Read from / write to a persistent file.
+    ///
+    /// On first start the file does not exist: a random 32-byte secret is
+    /// generated, written atomically (write-temp-then-rename), and reused on
+    /// every subsequent start.
+    File(PathBuf),
+    /// Generate fresh on each start (legacy behavior, **NOT recommended**).
+    Ephemeral,
+}
+
+impl Default for JwtSecretSource {
+    fn default() -> Self {
+        Self::Ephemeral
+    }
+}
+
+impl JwtSecretSource {
+    /// Resolve this source to a 32-byte signing key.
+    ///
+    /// Fails only when a [`JwtSecretSource::File`] secret cannot be read or created; the caller
+    /// must not silently fall back to an ephemeral key, because that would invalidate every
+    /// existing session without telling anyone.
+    fn resolve(&self) -> AuthResult<[u8; 32]> {
+        match self {
+            JwtSecretSource::Master(secret) => {
+                if secret.is_empty() {
+                    return Err(AuthError::Internal(
+                        "JWT master secret must not be empty".to_string(),
+                    ));
+                }
+                Ok(Sha256::digest(secret.as_bytes()).into())
+            }
+            JwtSecretSource::File(path) => {
+                match std::fs::read(path) {
+                    Ok(bytes) if bytes.len() == 32 => {
+                        let mut key = [0u8; 32];
+                        key.copy_from_slice(&bytes);
+                        return Ok(key);
+                    }
+                    Ok(bytes) => {
+                        return Err(AuthError::Internal(format!(
+                            "JWT secret file {} must contain exactly 32 bytes, found {}",
+                            path.display(),
+                            bytes.len()
+                        )));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(AuthError::Internal(format!(
+                            "could not read JWT secret file {}: {error}",
+                            path.display()
+                        )));
+                    }
+                }
+
+                let mut key = [0u8; 32];
+                OsRng.fill_bytes(&mut key);
+                // Write to a sibling temp file that is created owner-only, then rename it into
+                // place. `rename` is atomic on the same filesystem, so a concurrent start never
+                // observes a partially written secret.
+                let temp = path.with_extension("tmp");
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create(true).truncate(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                let mut file = options.open(&temp).map_err(|error| {
+                    AuthError::Internal(format!(
+                        "could not create JWT secret file {}: {error}",
+                        temp.display()
+                    ))
+                })?;
+                use std::io::Write;
+                file.write_all(&key).map_err(|error| {
+                    AuthError::Internal(format!(
+                        "could not write JWT secret file {}: {error}",
+                        temp.display()
+                    ))
+                })?;
+                file.sync_all().ok();
+                std::fs::rename(&temp, path).map_err(|error| {
+                    AuthError::Internal(format!(
+                        "could not install JWT secret file {}: {error}",
+                        path.display()
+                    ))
+                })?;
+                Ok(key)
+            }
+            JwtSecretSource::Ephemeral => {
+                let mut key = [0u8; 32];
+                OsRng.fill_bytes(&mut key);
+                Ok(key)
+            }
+        }
+    }
+}
+
 /// Authentication service configuration.
 #[derive(Clone)]
 pub struct AuthnConfig {
-    /// JWT signing secret (32 bytes for HS256).
-    pub jwt_secret: [u8; 32],
+    /// Source for the JWT signing secret.
+    pub jwt_secret_source: JwtSecretSource,
     /// Access token TTL.
     pub access_ttl: Duration,
     /// Refresh token TTL.
@@ -665,11 +779,8 @@ pub struct AuthnConfig {
 
 impl Default for AuthnConfig {
     fn default() -> Self {
-        let mut jwt_secret = [0u8; 32];
-        OsRng.fill_bytes(&mut jwt_secret);
-
         Self {
-            jwt_secret,
+            jwt_secret_source: JwtSecretSource::Ephemeral,
             access_ttl: Duration::from_secs(15 * 60),
             refresh_ttl: Duration::from_secs(7 * 24 * 60 * 60),
             argon2_params: Argon2Config::default(),
@@ -682,7 +793,7 @@ impl Default for AuthnConfig {
 impl std::fmt::Debug for AuthnConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthnConfig")
-            .field("jwt_secret", &"[redacted]")
+            .field("jwt_secret_source", &"[redacted]")
             .field("access_ttl", &self.access_ttl)
             .field("refresh_ttl", &self.refresh_ttl)
             .field("argon2_params", &self.argon2_params)
@@ -1036,15 +1147,19 @@ pub struct AuthnService<S: UserStore> {
 
 impl<S: UserStore> AuthnService<S> {
     /// Create a new service with the given store and configuration.
-    pub fn new(store: S, config: AuthnConfig) -> Self {
-        let encoding_key = EncodingKey::from_secret(&config.jwt_secret);
-        let decoding_key = DecodingKey::from_secret(&config.jwt_secret);
-        Self {
+    ///
+    /// Fails when the configured [`JwtSecretSource`] cannot produce a signing key, rather than
+    /// silently starting with a different (ephemeral) key that would invalidate every session.
+    pub fn new(store: S, config: AuthnConfig) -> AuthResult<Self> {
+        let secret = config.jwt_secret_source.resolve()?;
+        let encoding_key = EncodingKey::from_secret(&secret);
+        let decoding_key = DecodingKey::from_secret(&secret);
+        Ok(Self {
             store,
             config,
             encoding_key,
             decoding_key,
-        }
+        })
     }
 
     /// Get a reference to the service configuration.
