@@ -151,23 +151,34 @@ impl AutomaticHttpsServing {
             .map(|value| value.as_str())
             .unwrap_or("/");
         let location = redirect.location(&host, path_and_query);
-        Some(
-            hyper::Response::builder()
-                .status(308)
-                .header(hyper::header::LOCATION, location)
-                .header(hyper::header::CONTENT_LENGTH, "0")
-                .body(Body::from_bytes(Bytes::new()))
-                .expect("static redirect response is valid"),
-        )
+        // `location` is built from the request host and target; `http` only accepts visible ASCII
+        // in both, so this cannot fail today. Build the response fallibly anyway: a bad `Location`
+        // must not panic the process, it just means this request is not redirected.
+        let location = hyper::header::HeaderValue::from_str(&location).ok()?;
+        let mut response = hyper::Response::new(Body::from_bytes(Bytes::new()));
+        *response.status_mut() = hyper::StatusCode::PERMANENT_REDIRECT;
+        response
+            .headers_mut()
+            .insert(hyper::header::LOCATION, location);
+        response.headers_mut().insert(
+            hyper::header::CONTENT_LENGTH,
+            hyper::header::HeaderValue::from_static("0"),
+        );
+        Some(response)
     }
 }
 
 fn text_response(status: u16, body: &str) -> hyper::Response<Body> {
-    hyper::Response::builder()
-        .status(status)
-        .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
-        .body(Body::from_bytes(Bytes::from(body.to_string())))
-        .expect("static response is valid")
+    // `status` is a literal owned by this module and `body` is a static string, so no input can
+    // make this fail; build the response directly instead of through a fallible builder.
+    let mut response = hyper::Response::new(Body::from_bytes(Bytes::from(body.to_string())));
+    *response.status_mut() =
+        hyper::StatusCode::from_u16(status).unwrap_or(hyper::StatusCode::INTERNAL_SERVER_ERROR);
+    response.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        hyper::header::HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
 }
 
 fn normalize_host(host: &str) -> String {
@@ -178,4 +189,27 @@ fn normalize_host(host: &str) -> String {
         host.rsplit_once(':').map(|(host, _)| host).unwrap_or(host)
     };
     host.trim_end_matches('.').to_ascii_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_response_falls_back_on_an_out_of_range_status() {
+        // `StatusCode::from_u16(999)` is an error; this used to panic via `Response::builder()`
+        // `.expect("static response is valid")`.
+        let response = text_response(1000, "x");
+        assert_eq!(response.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.headers().get(http::header::CONTENT_TYPE),
+            Some(&http::HeaderValue::from_static("text/plain; charset=utf-8"))
+        );
+    }
+
+    #[test]
+    fn text_response_keeps_the_requested_status_and_body() {
+        let response = text_response(404, "404 Not Found");
+        assert_eq!(response.status(), http::StatusCode::NOT_FOUND);
+    }
 }
