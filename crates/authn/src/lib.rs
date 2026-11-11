@@ -686,7 +686,13 @@ pub enum TotpWindow {
     Current,
     /// Accept current ± 1 time step. Tolerates small clock skew and user delay.
     PlusMinusOne,
-    /// Accept current and next step (current + 1). Legacy behavior.
+    /// Accept the current time step and the next one (current + 1). An older step
+    /// (`current - 1`) is never accepted.
+    ///
+    /// This is *not* the pre-window legacy behaviour: legacy verification accepted
+    /// `current - 1` as well, which is [`TotpWindow::PlusMinusOne`]. Use that variant to
+    /// reproduce the legacy window; `CurrentAndNext` exists for clients that pre-compute the
+    /// next code.
     CurrentAndNext,
 }
 
