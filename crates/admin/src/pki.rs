@@ -561,6 +561,7 @@ pub fn certificate_pem(der: &[u8]) -> String {
     pem.push('\n');
     for chunk in encoded.as_bytes().chunks(64) {
         // base64 output is ASCII.
+        // INFEASIBLE: base64 output is ASCII.
         pem.push_str(std::str::from_utf8(chunk).expect("base64 is ASCII"));
         pem.push('\n');
     }
