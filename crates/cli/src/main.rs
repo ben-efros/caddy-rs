@@ -945,6 +945,7 @@ fn load_env_files(paths: &[PathBuf]) -> anyhow::Result<()> {
                 || !key
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                // INFEASIBLE: `key.is_empty()` short-circuits the chain above, so index 0 exists.
                 || key.as_bytes()[0].is_ascii_digit()
             {
                 bail!(
@@ -1628,6 +1629,7 @@ async fn run_pki(command: PkiCommand) -> anyhow::Result<()> {
             let trust = trust_state(ca.id(), &ca.directory().join("root.crt"), setting);
             if json {
                 let mut value = ca.info_json();
+                // INFEASIBLE: `PkiStore::info_json` always builds a JSON object literal.
                 let object = value.as_object_mut().expect("caInfo is a JSON object");
                 object.insert(
                     "directory".to_string(),
@@ -1649,6 +1651,8 @@ async fn run_pki(command: PkiCommand) -> anyhow::Result<()> {
                                     ca.directory(),
                                     "intermediate.key",
                                 );
+                                // INFEASIBLE: `certificate_json` always builds a JSON object
+                                // literal.
                                 let object =
                                     value.as_object_mut().expect("certificate JSON object");
                                 object.insert("index".to_string(), serde_json::json!(index + 1));
