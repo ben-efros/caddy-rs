@@ -12,6 +12,7 @@ fn test_config() -> AuthnConfig {
         },
         issuer: None,
         audience: None,
+        totp_window: TotpWindow::Current,
     }
 }
 
@@ -543,7 +544,9 @@ fn row_visibility_owner_vs_all() {
 
 #[tokio::test]
 async fn totp_setup_verify_skew_and_replay() {
-    let service = AuthnService::new(MemoryUserStore::new(), test_config());
+    let mut config = test_config();
+    config.totp_window = TotpWindow::PlusMinusOne;
+    let service = AuthnService::new(MemoryUserStore::new(), config);
     let user = service
         .create_user("grace", "password", Role::viewer())
         .await
@@ -557,7 +560,10 @@ async fn totp_setup_verify_skew_and_replay() {
     let current = totp_code(&bytes, now_step());
     assert!(service.totp_verify(user.id, &current).await.unwrap());
     // The same code is still inside its 30-second window, but its step was consumed.
-    assert!(!service.totp_verify(user.id, &current).await.unwrap());
+    assert!(matches!(
+        service.totp_verify(user.id, &current).await,
+        Err(AuthError::TotpReplay)
+    ));
 
     // An adjacent (future) step is accepted for clock skew, but an older step is not.
     let skewed = service
@@ -568,11 +574,16 @@ async fn totp_setup_verify_skew_and_replay() {
     let bytes = decode_secret(&secret);
     let future = totp_code(&bytes, now_step() + 1);
     assert!(service.totp_verify(skewed.id, &future).await.unwrap());
-    assert!(!service
-        .totp_verify(skewed.id, &totp_code(&bytes, now_step()))
-        .await
-        .unwrap());
-    assert!(!service.totp_verify(skewed.id, &future).await.unwrap());
+    assert!(matches!(
+        service
+            .totp_verify(skewed.id, &totp_code(&bytes, now_step()))
+            .await,
+        Err(AuthError::TotpReplay)
+    ));
+    assert!(matches!(
+        service.totp_verify(skewed.id, &future).await,
+        Err(AuthError::TotpReplay)
+    ));
 }
 
 #[tokio::test]
@@ -590,10 +601,10 @@ async fn totp_login_and_disable() {
         Err(AuthError::InvalidTotpCode)
     ));
     assert!(service.login("ivan", "password", Some(&code)).await.is_ok());
-    // Replaying the consumed code is rejected.
+    // Replaying the consumed code is rejected and flagged as a replay attempt.
     assert!(matches!(
         service.login("ivan", "password", Some(&code)).await,
-        Err(AuthError::InvalidTotpCode)
+        Err(AuthError::TotpReplay)
     ));
 
     service.totp_disable(user.id).await.unwrap();
@@ -643,6 +654,7 @@ fn debug_redacts_secrets() {
     let user = User {
         password_hash: "PASSWORD_HASH_SECRET".to_string(),
         totp_secret: Some("TOTP_SECRET_VALUE".to_string()),
+        totp_last_step: None,
         ..test_user("secret-user")
     };
     let user_debug = format!("{user:?}");
@@ -789,4 +801,79 @@ fn user_public_view_no_secrets() {
         json.contains("\"totp_enabled\""),
         "UserRecord should contain totp_enabled field"
     );
+}
+
+#[tokio::test]
+async fn current_window_rejects_previous_step() {
+    let service = AuthnService::new(MemoryUserStore::new(), test_config());
+    let user = service
+        .create_user("alice", "password", Role::viewer())
+        .await
+        .unwrap();
+    let (secret, _) = service.totp_setup(user.id).await.unwrap();
+    let bytes = decode_secret(&secret);
+    let previous = totp_code(&bytes, now_step().saturating_sub(1));
+    assert!(!service.totp_verify(user.id, &previous).await.unwrap());
+}
+
+#[tokio::test]
+async fn plus_minus_one_accepts_adjacent() {
+    let mut config = test_config();
+    config.totp_window = TotpWindow::PlusMinusOne;
+    let service = AuthnService::new(MemoryUserStore::new(), config);
+    let user = service
+        .create_user("bob", "password", Role::viewer())
+        .await
+        .unwrap();
+    let (secret, _) = service.totp_setup(user.id).await.unwrap();
+    let bytes = decode_secret(&secret);
+
+    let prev = totp_code(&bytes, now_step().saturating_sub(1));
+    let cur = totp_code(&bytes, now_step());
+    let next = totp_code(&bytes, now_step() + 1);
+
+    assert!(service.totp_verify(user.id, &prev).await.unwrap());
+    assert!(service.totp_verify(user.id, &cur).await.unwrap());
+    assert!(service.totp_verify(user.id, &next).await.unwrap());
+}
+
+#[tokio::test]
+async fn replay_protection_rejects_same_code_twice() {
+    let service = AuthnService::new(MemoryUserStore::new(), test_config());
+    let user = service
+        .create_user("charlie", "password", Role::viewer())
+        .await
+        .unwrap();
+    let (secret, _) = service.totp_setup(user.id).await.unwrap();
+    let bytes = decode_secret(&secret);
+
+    let cur = totp_code(&bytes, now_step());
+    assert!(service.totp_verify(user.id, &cur).await.unwrap());
+    // Replaying the same code in the same step is rejected as a replay attempt.
+    assert!(matches!(
+        service.totp_verify(user.id, &cur).await,
+        Err(AuthError::TotpReplay)
+    ));
+}
+
+#[tokio::test]
+async fn current_and_next_matches_legacy() {
+    let mut config = test_config();
+    config.totp_window = TotpWindow::CurrentAndNext;
+    let service = AuthnService::new(MemoryUserStore::new(), config);
+    let user = service
+        .create_user("dave", "password", Role::viewer())
+        .await
+        .unwrap();
+    let (secret, _) = service.totp_setup(user.id).await.unwrap();
+    let bytes = decode_secret(&secret);
+
+    let cur = totp_code(&bytes, now_step());
+    let next = totp_code(&bytes, now_step() + 1);
+
+    assert!(service.totp_verify(user.id, &cur).await.unwrap());
+    assert!(service.totp_verify(user.id, &next).await.unwrap());
+    // Previous step is rejected.
+    let prev = totp_code(&bytes, now_step().saturating_sub(1));
+    assert!(!service.totp_verify(user.id, &prev).await.unwrap());
 }
