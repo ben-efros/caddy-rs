@@ -1500,6 +1500,10 @@ fn admin_global_option_block_adapts_like_caddy() {
             json!({"listen": "127.0.0.1:2020", "enforce_origin": true}),
         ),
         ("{\n\tadmin off\n}", json!({"disabled": true})),
+        (
+            "{\n\tadmin {\n\t\torigins\n\t}\n}",
+            json!({"listen": "localhost:2019", "origins": []}),
+        ),
     ] {
         let adapted = adapt(&format!("{option}{site}")).expect("adapt admin option");
         assert_eq!(adapted.config["admin"], expected, "for option: {option}");
@@ -1515,10 +1519,6 @@ fn admin_global_option_block_adapts_like_caddy() {
             "unrecognized parameter 'bogus'",
         ),
         ("{\n\tadmin a:1 b:2\n}", "after `admin`"),
-        (
-            "{\n\tadmin {\n\t\torigins\n\t}\n}",
-            "requires at least one origin",
-        ),
     ] {
         let error = adapt(&format!("{option}{site}")).expect_err("invalid admin option");
         assert!(
