@@ -529,7 +529,15 @@ impl Handler for FileServerHandler {
 
     async fn handle(&self, request: Request) -> Result<Outcome> {
         let decoded_path = percent_decode(request.path());
-        if decoded_path.contains("..") || decoded_path.contains('\0') {
+        for component in decoded_path.split('/') {
+            if component == ".." {
+                return Ok(Outcome::Respond(Response::text(
+                    StatusCode::FORBIDDEN,
+                    "403 Forbidden",
+                )));
+            }
+        }
+        if decoded_path.contains('\0') {
             return Ok(Outcome::Respond(Response::text(
                 StatusCode::FORBIDDEN,
                 "403 Forbidden",
@@ -2158,6 +2166,32 @@ mod tests {
             response.status,
             StatusCode::FORBIDDEN,
             "request-path traversal remains rejected after placeholder expansion"
+        );
+    }
+
+    #[tokio::test]
+    async fn legitimate_filename_with_double_dots_is_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("foo..bar.txt"), b"hello").unwrap();
+        let handler = handler(dir.path()).await;
+        let response = respond(&handler, make_request(Method::GET, "/foo..bar.txt")).await;
+        assert_eq!(
+            response.status,
+            StatusCode::OK,
+            "files with .. in the name should be allowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn path_traversal_with_dotdot_component_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("b.txt"), b"hello").unwrap();
+        let handler = handler(dir.path()).await;
+        let response = respond(&handler, make_request(Method::GET, "/a/../b.txt")).await;
+        assert_eq!(
+            response.status,
+            StatusCode::FORBIDDEN,
+            "path traversal via .. component should be rejected"
         );
     }
 }
