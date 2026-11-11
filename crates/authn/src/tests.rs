@@ -1,5 +1,9 @@
 use super::*;
 
+/// Fixed TOTP time step for tests: the window and replay assertions must not depend on where the
+/// wall clock happens to be inside a 30-second step.
+const TEST_STEP: u64 = 60_000_000;
+
 fn test_config() -> AuthnConfig {
     AuthnConfig {
         jwt_secret: [0x5A; 32],
@@ -12,6 +16,7 @@ fn test_config() -> AuthnConfig {
         },
         issuer: None,
         audience: None,
+        totp_window: TotpWindow::Current,
     }
 }
 
@@ -543,7 +548,9 @@ fn row_visibility_owner_vs_all() {
 
 #[tokio::test]
 async fn totp_setup_verify_skew_and_replay() {
-    let service = AuthnService::new(MemoryUserStore::new(), test_config());
+    let mut config = test_config();
+    config.totp_window = TotpWindow::PlusMinusOne;
+    let service = AuthnService::new(MemoryUserStore::new(), config).with_test_step(TEST_STEP);
     let user = service
         .create_user("grace", "password", Role::viewer())
         .await
@@ -554,13 +561,13 @@ async fn totp_setup_verify_skew_and_replay() {
     let bytes = decode_secret(&secret);
 
     assert!(!service.totp_verify(user.id, "abcdef").await.unwrap());
-    let current = totp_code(
-        &bytes,
-        now_step().expect("system clock is after the Unix epoch"),
-    );
+    let current = totp_code(&bytes, TEST_STEP);
     assert!(service.totp_verify(user.id, &current).await.unwrap());
     // The same code is still inside its 30-second window, but its step was consumed.
-    assert!(!service.totp_verify(user.id, &current).await.unwrap());
+    assert!(matches!(
+        service.totp_verify(user.id, &current).await,
+        Err(AuthError::TotpReplay)
+    ));
 
     // An adjacent (future) step is accepted for clock skew, but an older step is not.
     let skewed = service
@@ -569,46 +576,40 @@ async fn totp_setup_verify_skew_and_replay() {
         .unwrap();
     let (secret, _) = service.totp_setup(skewed.id).await.unwrap();
     let bytes = decode_secret(&secret);
-    let future = totp_code(
-        &bytes,
-        now_step().expect("system clock is after the Unix epoch") + 1,
-    );
+    let future = totp_code(&bytes, TEST_STEP + 1);
     assert!(service.totp_verify(skewed.id, &future).await.unwrap());
-    assert!(!service
-        .totp_verify(
-            skewed.id,
-            &totp_code(
-                &bytes,
-                now_step().expect("system clock is after the Unix epoch")
-            )
-        )
-        .await
-        .unwrap());
-    assert!(!service.totp_verify(skewed.id, &future).await.unwrap());
+    assert!(matches!(
+        service
+            .totp_verify(skewed.id, &totp_code(&bytes, TEST_STEP))
+            .await,
+        Err(AuthError::TotpReplay)
+    ));
+    assert!(matches!(
+        service.totp_verify(skewed.id, &future).await,
+        Err(AuthError::TotpReplay)
+    ));
 }
 
 #[tokio::test]
 async fn totp_login_and_disable() {
-    let service = AuthnService::new(MemoryUserStore::new(), test_config());
+    let service =
+        AuthnService::new(MemoryUserStore::new(), test_config()).with_test_step(TEST_STEP);
     let user = service
         .create_user("ivan", "password", Role::viewer())
         .await
         .unwrap();
     let (secret, _) = service.totp_setup(user.id).await.unwrap();
-    let code = totp_code(
-        &decode_secret(&secret),
-        now_step().expect("system clock is after the Unix epoch"),
-    );
+    let code = totp_code(&decode_secret(&secret), TEST_STEP);
 
     assert!(matches!(
         service.login("ivan", "password", None).await,
         Err(AuthError::InvalidTotpCode)
     ));
     assert!(service.login("ivan", "password", Some(&code)).await.is_ok());
-    // Replaying the consumed code is rejected.
+    // Replaying the consumed code is rejected and flagged as a replay attempt.
     assert!(matches!(
         service.login("ivan", "password", Some(&code)).await,
-        Err(AuthError::InvalidTotpCode)
+        Err(AuthError::TotpReplay)
     ));
 
     service.totp_disable(user.id).await.unwrap();
@@ -658,6 +659,7 @@ fn debug_redacts_secrets() {
     let user = User {
         password_hash: "PASSWORD_HASH_SECRET".to_string(),
         totp_secret: Some("TOTP_SECRET_VALUE".to_string()),
+        totp_last_step: None,
         ..test_user("secret-user")
     };
     let user_debug = format!("{user:?}");
@@ -862,4 +864,127 @@ fn each_auth_entry_point_propagates_clock_error() {
         now_step().is_ok(),
         "the real clock is expected to be post-epoch"
     );
+}
+
+#[tokio::test]
+async fn current_window_rejects_previous_step() {
+    let service =
+        AuthnService::new(MemoryUserStore::new(), test_config()).with_test_step(TEST_STEP);
+    let user = service
+        .create_user("alice", "password", Role::viewer())
+        .await
+        .unwrap();
+    let (secret, _) = service.totp_setup(user.id).await.unwrap();
+    let bytes = decode_secret(&secret);
+    let step = TEST_STEP;
+    let previous = totp_code(&bytes, step.saturating_sub(1));
+    // An older, cryptographically correct code is an impersonation/replay attempt, not a typo.
+    assert!(matches!(
+        service.totp_verify(user.id, &previous).await,
+        Err(AuthError::TotpReplay)
+    ));
+    // The current code is still accepted: a stale code does not consume the current step.
+    assert!(service
+        .totp_verify(user.id, &totp_code(&bytes, step))
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
+async fn plus_minus_one_accepts_adjacent() {
+    let mut config = test_config();
+    config.totp_window = TotpWindow::PlusMinusOne;
+    let service = AuthnService::new(MemoryUserStore::new(), config).with_test_step(TEST_STEP);
+    let user = service
+        .create_user("bob", "password", Role::viewer())
+        .await
+        .unwrap();
+    let (secret, _) = service.totp_setup(user.id).await.unwrap();
+    let bytes = decode_secret(&secret);
+
+    let step = TEST_STEP;
+    let prev = totp_code(&bytes, step.saturating_sub(1));
+    let cur = totp_code(&bytes, step);
+    let next = totp_code(&bytes, step + 1);
+
+    // Every step in the ±1 window is accepted, oldest first, because each acceptance only raises
+    // the monotonic floor.
+    assert!(service.totp_verify(user.id, &prev).await.unwrap());
+    assert!(service.totp_verify(user.id, &cur).await.unwrap());
+    assert!(service.totp_verify(user.id, &next).await.unwrap());
+    // The floor is now `next`: both earlier steps are rejected as replays.
+    assert!(matches!(
+        service.totp_verify(user.id, &cur).await,
+        Err(AuthError::TotpReplay)
+    ));
+    assert!(matches!(
+        service.totp_verify(user.id, &prev).await,
+        Err(AuthError::TotpReplay)
+    ));
+}
+
+#[tokio::test]
+async fn replay_protection_rejects_same_code_twice() {
+    let service =
+        AuthnService::new(MemoryUserStore::new(), test_config()).with_test_step(TEST_STEP);
+    let user = service
+        .create_user("charlie", "password", Role::viewer())
+        .await
+        .unwrap();
+    let (secret, _) = service.totp_setup(user.id).await.unwrap();
+    let bytes = decode_secret(&secret);
+
+    let cur = totp_code(&bytes, TEST_STEP);
+    assert!(service.totp_verify(user.id, &cur).await.unwrap());
+    // Replaying the same code in the same step is rejected as a replay attempt.
+    assert!(matches!(
+        service.totp_verify(user.id, &cur).await,
+        Err(AuthError::TotpReplay)
+    ));
+}
+
+#[tokio::test]
+async fn current_and_next_matches_legacy() {
+    let mut config = test_config();
+    config.totp_window = TotpWindow::CurrentAndNext;
+    let service = AuthnService::new(MemoryUserStore::new(), config).with_test_step(TEST_STEP);
+    let user = service
+        .create_user("dave", "password", Role::viewer())
+        .await
+        .unwrap();
+    let (secret, _) = service.totp_setup(user.id).await.unwrap();
+    let bytes = decode_secret(&secret);
+
+    let step = TEST_STEP;
+    let cur = totp_code(&bytes, step);
+    let next = totp_code(&bytes, step + 1);
+
+    assert!(service.totp_verify(user.id, &cur).await.unwrap());
+    assert!(service.totp_verify(user.id, &next).await.unwrap());
+    // The previous step is outside the window and older than the accepted floor, so it is
+    // reported as an impersonation/replay attempt rather than a plain mismatch.
+    let prev = totp_code(&bytes, step.saturating_sub(1));
+    assert!(matches!(
+        service.totp_verify(user.id, &prev).await,
+        Err(AuthError::TotpReplay)
+    ));
+}
+
+#[tokio::test]
+async fn codes_older_than_the_lookback_are_plain_mismatches() {
+    // A code outside both the accepted window and the bounded replay horizon cannot be told
+    // apart from a wrong guess, so it is `Ok(false)` and never an unbounded HMAC search.
+    let service =
+        AuthnService::new(MemoryUserStore::new(), test_config()).with_test_step(TEST_STEP);
+    let user = service
+        .create_user("erin", "password", Role::viewer())
+        .await
+        .unwrap();
+    let (secret, _) = service.totp_setup(user.id).await.unwrap();
+    let bytes = decode_secret(&secret);
+    let ancient = totp_code(
+        &bytes,
+        TEST_STEP.saturating_sub(TOTP_REPLAY_LOOKBACK_STEPS + 5),
+    );
+    assert!(!service.totp_verify(user.id, &ancient).await.unwrap());
 }
