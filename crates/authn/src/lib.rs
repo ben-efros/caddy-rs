@@ -918,7 +918,17 @@ pub fn hash_password(password: &str, argon2_config: &Argon2Config) -> AuthResult
 /// A wrong password returns `Ok(false)`; only a malformed or unsupported hash is an error.
 /// Argon2's `PasswordVerifier` performs the comparison in constant time.
 pub fn verify_password(password: &str, hash: &str) -> AuthResult<bool> {
-    if hash.starts_with("$argon2") {
+    let hash_bytes = hash.as_bytes();
+    let is_argon2 = hash_bytes
+        .get(..7)
+        .map(|prefix| prefix.ct_eq(b"$argon2").into())
+        .unwrap_or(false);
+    let is_bcrypt = hash_bytes
+        .get(..2)
+        .map(|prefix| prefix.ct_eq(b"$2").into())
+        .unwrap_or(false);
+
+    if is_argon2 {
         let parsed =
             PasswordHash::new(hash).map_err(|err| AuthError::PasswordHash(err.to_string()))?;
         if parsed.version.is_none() || parsed.salt.is_none() || parsed.hash.is_none() {
@@ -933,7 +943,7 @@ pub fn verify_password(password: &str, hash: &str) -> AuthResult<bool> {
         };
     }
 
-    if hash.starts_with("$2") {
+    if is_bcrypt {
         return Ok(bcrypt_verify(password, hash)?);
     }
 
