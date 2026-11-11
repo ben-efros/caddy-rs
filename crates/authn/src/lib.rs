@@ -368,6 +368,72 @@ impl User {
     }
 }
 
+/// A record of a user that is safe to serialize and deserialize.
+///
+/// This type omits the password hash and TOTP secret, which are never serialized.
+/// It is designed for storage and transmission where the full `User` type would expose
+/// sensitive data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserRecord {
+    /// Unique user identifier.
+    pub id: UserId,
+    /// Username (unique).
+    pub username: String,
+    /// User's role with capabilities and visibility.
+    pub role: Role,
+    /// Whether TOTP is enabled; the secret itself is never stored or serialized.
+    pub totp_enabled: bool,
+    /// Last TOTP time step accepted for this user, used for replay protection.
+    pub totp_last_step: Option<u64>,
+    /// Monotonically increasing authentication epoch.
+    pub auth_epoch: u64,
+    /// Account creation timestamp.
+    pub created_at: DateTime<Utc>,
+    /// Last update timestamp.
+    pub updated_at: DateTime<Utc>,
+}
+
+impl User {
+    /// Convert this user to a serializable record suitable for storage.
+    ///
+    /// The password hash and TOTP secret are excluded; use `UserRecord::from_user` in a store
+    /// implementation to create the record from a loaded `User`.
+    pub fn to_record(&self) -> UserRecord {
+        UserRecord {
+            id: self.id,
+            username: self.username.clone(),
+            role: self.role.clone(),
+            totp_enabled: self.has_totp(),
+            totp_last_step: self.totp_last_step,
+            auth_epoch: self.auth_epoch,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+    }
+}
+
+impl UserRecord {
+    /// Create a `User` from a record, populating the password hash and TOTP secret.
+    pub fn from_user(record: UserRecord, password_hash: String, totp_secret: Option<String>) -> User {
+        User {
+            id: record.id,
+            username: record.username,
+            role: record.role,
+            password_hash,
+            totp_secret,
+            totp_last_step: record.totp_last_step,
+            auth_epoch: record.auth_epoch,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+        }
+    }
+
+    /// Convert this record back to a `User`.
+    pub fn to_user(self, password_hash: String, totp_secret: Option<String>) -> User {
+        Self::from_user(self, password_hash, totp_secret)
+    }
+}
+
 /// Safe-to-serialize user view without a password hash or TOTP secret.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PublicUser {
