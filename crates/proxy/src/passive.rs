@@ -154,6 +154,7 @@ impl PassiveHealth {
         if !self.config.is_failure_tracking_enabled() {
             return false;
         }
+        // INFEASIBLE: the guarded section only touches a BTreeMap/Vec, so the mutex cannot be poisoned.
         let mut hosts = self.hosts.lock().expect("passive health state lock");
         let state = hosts.entry(host.to_string()).or_default();
         prune_expired(state, now, self.config.fail_duration);
@@ -188,6 +189,7 @@ impl PassiveHealth {
         if failures == 0 {
             return 0;
         }
+        // INFEASIBLE: the guarded section only touches a BTreeMap/Vec, so the mutex cannot be poisoned.
         let mut hosts = self.hosts.lock().expect("passive health state lock");
         let state = hosts.entry(host.to_string()).or_default();
         prune_expired(state, now, self.config.fail_duration);
@@ -202,6 +204,7 @@ impl PassiveHealth {
         if !self.config.is_failure_tracking_enabled() {
             return 0;
         }
+        // INFEASIBLE: the guarded section only touches a BTreeMap/Vec, so the mutex cannot be poisoned.
         let mut hosts = self.hosts.lock().expect("passive health state lock");
         let Some(state) = hosts.get_mut(host) else {
             return 0;

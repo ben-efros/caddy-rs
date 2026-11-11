@@ -1073,11 +1073,13 @@ impl ReverseProxyHandler {
                 .iter()
                 .position(|candidate| Arc::ptr_eq(candidate, upstream))
             {
+                // INFEASIBLE: clients are built one entry per upstream, so the position above indexes both.
                 let main = self.clients[index]
                     .as_ref()
                     .expect("fixed upstream has a client")
                     .clone();
                 let upgrade = self.upgrade_clients.as_ref().map(|clients| {
+                    // INFEASIBLE: upgrade_clients is built one entry per upstream as well.
                     clients[index]
                         .as_ref()
                         .expect("fixed upstream has an upgrade client")
