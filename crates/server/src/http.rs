@@ -674,16 +674,16 @@ pub fn to_hyper(response: Response) -> hyper::Response<Body> {
 /// left alone (this runs on both the routed path and the pre-routing/error path).
 pub(crate) fn apply_server_identity(
     response: &mut hyper::Response<Body>,
-    identity: &caddy_rs_core::ServerIdentity,
+    identity: &caddy_rs_core::ResolvedIdentity,
 ) {
-    if let Some(value) = identity.http_header_value() {
+    if let Some(value) = identity.http_server_header.as_ref() {
         if !response.headers().contains_key(http::header::SERVER) {
             // Defensive: `ServerIdentity::parse` rejects every custom value that hyper cannot
             // store (`crates/core/src/identity.rs`, DIV-0126), so configuration load fails before
             // this point and this branch is unreachable from a real config. It is kept so a future
             // identity source cannot silently drop the header: skip the header (the old
             // behaviour) rather than fail the response.
-            if let Ok(value) = http::HeaderValue::from_str(&value) {
+            if let Ok(value) = http::HeaderValue::from_str(value) {
                 response.headers_mut().insert(http::header::SERVER, value);
             }
         }
@@ -715,7 +715,7 @@ fn served_response_with_identity(
 /// Convert an internal response and stamp the server identity onto it.
 fn to_hyper_streaming_with_identity(
     response: StreamingResponse,
-    identity: &caddy_rs_core::ServerIdentity,
+    identity: &caddy_rs_core::ResolvedIdentity,
 ) -> hyper::Response<Body> {
     let mut response = to_hyper_streaming(response);
     apply_server_identity(&mut response, identity);

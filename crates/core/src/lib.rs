@@ -48,7 +48,7 @@ pub use error::{Error, Result};
 pub use generation::{
     drain, DrainOutcome, Generation, GenerationStore, LifecycleState, LoadResult, StopResult,
 };
-pub use identity::ServerIdentity;
+pub use identity::{ResolvedIdentity, ServerIdentity};
 pub use lifecycle::{
     CancellationToken, GenerationHooks, GenerationResource, GenerationResources, ResourceLifecycle,
 };

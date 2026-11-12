@@ -492,6 +492,8 @@ impl ServerRuntime {
         }
         let https_port = http.https_port.unwrap_or(DEFAULT_HTTPS_PORT);
         let status_sink = UpstreamStatusSink::new();
+        // ADR-0010 §3 identity matrix input: config-wide `reverse_proxy` detection.
+        let has_reverse_proxy = generation.config().contains_reverse_proxy_handler();
         let acme_server_data_root = self.acme_server_data_root(generation.config())?;
         let ca_pool_context = client_auth_ca_pool_context(
             generation.config(),
@@ -529,7 +531,12 @@ impl ServerRuntime {
             })
             .unwrap_or_default();
         for (server_name, server) in &http.servers {
-            let _limits = ServerLimits::from_http_server(server_name, server)?;
+            let _limits = ServerLimits::from_http_server(
+                server_name,
+                server,
+                generation.config().stock_compat(),
+                has_reverse_proxy,
+            )?;
             let _trusted_proxies = parse_server_trusted_proxies(server, server_name)?;
             let policies = server.tls_connection_policies.as_deref();
             let has_connection_policies = policies.is_some_and(|policies| !policies.is_empty());
@@ -547,6 +554,8 @@ impl ServerRuntime {
                 server_name,
                 server,
                 &status_sink,
+                generation.config().stock_compat(),
+                has_reverse_proxy,
                 acme_server_data_root.as_deref(),
                 &acme_server_authorities,
             )?;
@@ -1661,18 +1670,23 @@ impl ServerRuntime {
         server_name: &str,
         server: &caddy_rs_core::HttpServer,
         status_sink: &Arc<UpstreamStatusSink>,
+        stock_compat: bool,
+        has_reverse_proxy: bool,
         acme_server_data_root: Option<&std::path::Path>,
         acme_server_authorities: &std::collections::BTreeMap<
             String,
             caddy_rs_http::router::AcmeServerAuthority,
         >,
     ) -> Result<Arc<caddy_rs_http::Router>> {
-        // Server identity (caddy-rs extension, T-CONF-060): malformed values are located errors,
-        // and the FastCGI `SERVER_SOFTWARE` parameter follows the configured mode.
+        // Server identity (caddy-rs extension, T-CONF-060; ADR-0010 §3): malformed values are
+        // located errors, and the FastCGI `SERVER_SOFTWARE` parameter follows the resolved matrix
+        // (it stays `caddy-rs/<version>` even when the HTTP `Server` header is suppressed).
+        let configured =
+            caddy_rs_core::ServerIdentity::from_server_extra_opt(server_name, &server.extra)
+                .map_err(Error::Config)?;
         let server_software =
-            caddy_rs_core::ServerIdentity::from_server_extra(server_name, &server.extra)
-                .map_err(Error::Config)?
-                .fastcgi_server_software();
+            caddy_rs_core::ResolvedIdentity::resolve(configured, stock_compat, has_reverse_proxy)
+                .fastcgi_server_software;
         let routes_value = serde_json::to_value(&server.routes).map_err(|error| {
             Error::Config(caddy_rs_core::Error::invalid(
                 format!("apps.http.servers.{server_name}.routes"),
@@ -1698,6 +1712,9 @@ impl ServerRuntime {
                 Arc::clone(status_sink),
                 server_software,
             ))
+            // Secure-by-default response hardening (ADR-0010, EP-PROXY-05): the switch reaches the
+            // `reverse_proxy` handler through `HandlerBuildContext`.
+            .with_stock_compat(stock_compat)
             .with_optional_acme_server_data_root(
                 acme_server_data_root.map(std::path::Path::to_path_buf),
             )
@@ -1750,6 +1767,8 @@ impl ServerRuntime {
             None
         };
         let http_port = http.http_port.unwrap_or(caddy_rs_tls::DEFAULT_HTTP_PORT);
+        // ADR-0010 §3 identity matrix input: config-wide `reverse_proxy` detection.
+        let has_reverse_proxy = generation.config().contains_reverse_proxy_handler();
         let acme_server_data_root = self.acme_server_data_root(generation.config())?;
         // Caddy resolves `acme_server.ca` through the PKI app: `local` is provisioned on demand,
         // every other id has to be declared in `apps.pki.certificate_authorities`. The ACME
@@ -1786,9 +1805,14 @@ impl ServerRuntime {
         // to answer one HTTPS site's automatic-HTTPS responses, so it inherits that site's
         // `server_identity` (DIV-0126). With several automatic-HTTPS servers the first one wins,
         // mirroring Caddy's single derived redirect server.
-        let mut automatic_identity: Option<caddy_rs_core::ServerIdentity> = None;
+        let mut automatic_identity: Option<caddy_rs_core::ResolvedIdentity> = None;
         for (server_name, server) in &http.servers {
-            let limits = Arc::new(ServerLimits::from_http_server(server_name, server)?);
+            let limits = Arc::new(ServerLimits::from_http_server(
+                server_name,
+                server,
+                generation.config().stock_compat(),
+                has_reverse_proxy,
+            )?);
             let trusted_proxies = parse_server_trusted_proxies(server, server_name)?;
             let allow_0rtt = allow_0rtt_enabled(server, server_name)?;
             let policies = server.tls_connection_policies.as_deref();
@@ -1807,6 +1831,8 @@ impl ServerRuntime {
                 server_name,
                 server,
                 status_sink,
+                generation.config().stock_compat(),
+                has_reverse_proxy,
                 acme_server_data_root.as_deref(),
                 &acme_server_authorities,
             )?;

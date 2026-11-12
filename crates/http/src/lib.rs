@@ -21,6 +21,7 @@ pub mod rate_limit;
 pub mod regex_lite;
 pub mod router;
 pub mod security_headers;
+pub mod security_profile;
 #[cfg(feature = "templates")]
 pub mod templates;
 pub mod types;
@@ -40,7 +41,7 @@ pub use handlers::{
 };
 pub use placeholders::{Replacer, UnknownPlaceholders};
 pub use rate_limit::{ManualClock, RateLimitClock, RateLimitHandler, SystemClock};
-pub use router::{CustomHandlerFactory, Route, Router, RouterBuilder};
+pub use router::{CustomHandlerFactory, HandlerBuildContext, Route, Router, RouterBuilder};
 #[cfg(feature = "templates")]
 pub use templates::TemplatesHandler;
 pub use types::{

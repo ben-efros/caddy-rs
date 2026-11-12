@@ -34,7 +34,26 @@ use crate::types::{
 /// A custom handler factory, used by crates outside this one (for example `caddy-rs-proxy`) to
 /// contribute handler modules without creating a dependency cycle.
 pub type CustomHandlerFactory =
-    Arc<dyn Fn(&Value, &str) -> Result<Option<SharedHandler>> + Send + Sync>;
+    Arc<dyn Fn(&Value, &str, &HandlerBuildContext) -> Result<Option<SharedHandler>> + Send + Sync>;
+
+/// Per-route build context passed to custom handler factories.
+///
+/// The context carries facts the factory cannot derive from the handler object alone: the
+/// generation-wide `stock_compat` switch (ADR-0010 / `DIV-0130`) and whether the route chain that
+/// contains this handler object also carries an explicit `security_headers` handler.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HandlerBuildContext {
+    /// The generation's effective `stock_compat` (caddy-rs extension, ADR-0010). `false` is the
+    /// secure-by-default mode.
+    pub stock_compat: bool,
+    /// Whether the same route chain (`handle` array) that contains the handler object being built
+    /// also carries an explicit `security_headers` handler.
+    ///
+    /// Per ADR-0010 §2 precedence 4, an explicit `security_headers` handler in the same route
+    /// chain as a `reverse_proxy` opts that route out of the implicit security profile entirely:
+    /// the operator then owns the header set (the handler's own secure defaults still apply).
+    pub route_has_explicit_security_headers: bool,
+}
 
 /// One route.
 pub struct Route {
@@ -538,6 +557,11 @@ impl Default for AcmeServerAuthority {
 pub struct RouterBuilder {
     custom: Option<CustomHandlerFactory>,
     error_routes: Option<Vec<Value>>,
+    /// The generation's effective `stock_compat` (ADR-0010 / `DIV-0130`), threaded into the
+    /// per-route [`HandlerBuildContext`] so extension handlers (notably `reverse_proxy`) can apply
+    /// the secure-by-default response profile only when the operator did not opt into stock Caddy
+    /// behaviour.
+    stock_compat: bool,
     /// Caddy data directory used by `http.handlers.acme_server` to persist its internal CA
     /// (`<root>/pki/authorities/<ca>/...`). The server runtime sets this per generation; when it
     /// is absent a configuration that uses `acme_server` fails with a located error instead of
@@ -564,6 +588,7 @@ impl RouterBuilder {
         Self {
             custom: None,
             error_routes: None,
+            stock_compat: false,
             acme_server_data_root: None,
             acme_server_authorities: None,
         }
@@ -599,6 +624,17 @@ impl RouterBuilder {
     /// Register a factory for handler modules owned by another crate.
     pub fn with_custom_handler(mut self, factory: CustomHandlerFactory) -> Self {
         self.custom = Some(factory);
+        self
+    }
+
+    /// Set the generation's effective `stock_compat` (ADR-0010 / `DIV-0130`).
+    ///
+    /// `false` (the default) is the secure-by-default mode; `true` restores stock Caddy v2.11.9
+    /// response behaviour where the feature is supported. The flag reaches the custom handler
+    /// factories through the per-route [`HandlerBuildContext`], which is how `reverse_proxy`
+    /// decides whether to apply the implicit security profile.
+    pub fn with_stock_compat(mut self, stock_compat: bool) -> Self {
+        self.stock_compat = stock_compat;
         self
     }
 
@@ -714,8 +750,23 @@ impl RouterBuilder {
             .cloned()
             .unwrap_or_default();
         let mut handlers = Vec::new();
+        // ADR-0010 §2 precedence 4: an explicit `security_headers` handler in the same route chain
+        // as the `reverse_proxy` opts that route out of the implicit security profile entirely.
+        // Detected from the raw handler objects before any are built, so the flag is available
+        // when the extension handlers (built by the custom factory) are constructed.
+        let route_has_explicit_security_headers = handler_values.iter().any(|handler| {
+            handler.get("handler").and_then(Value::as_str) == Some("security_headers")
+        });
+        let context = HandlerBuildContext {
+            stock_compat: self.stock_compat,
+            route_has_explicit_security_headers,
+        };
         for (index, handler) in handler_values.iter().enumerate() {
-            handlers.push(self.build_handler(handler, &format!("{path}.handle[{index}]"))?);
+            handlers.push(self.build_handler(
+                handler,
+                &format!("{path}.handle[{index}]"),
+                &context,
+            )?);
         }
         Ok(Route {
             matcher_sets,
@@ -731,7 +782,12 @@ impl RouterBuilder {
         })
     }
 
-    fn build_handler(&self, value: &Value, path: &str) -> Result<SharedHandler> {
+    fn build_handler(
+        &self,
+        value: &Value,
+        path: &str,
+        context: &HandlerBuildContext,
+    ) -> Result<SharedHandler> {
         let object = value.as_object().ok_or_else(|| Error::InvalidConfig {
             path: path.to_string(),
             message: "handler must be an object".to_string(),
@@ -828,7 +884,7 @@ impl RouterBuilder {
             }
             other => {
                 if let Some(factory) = &self.custom {
-                    if let Some(handler) = factory(value, path)? {
+                    if let Some(handler) = factory(value, path, context)? {
                         handler
                     } else {
                         return Err(Error::InvalidConfig {
@@ -1231,8 +1287,11 @@ mod tests {
     /// body-buffering `reverse_proxy` module so the router-level flag can be exercised without the
     /// proxy crate.
     fn streaming_factory(recorder: Arc<RequestBodyRecorder>) -> CustomHandlerFactory {
-        Arc::new(move |value: &Value, _path: &str| {
-            match value.get("handler").and_then(Value::as_str) {
+        Arc::new(
+            move |value: &Value, _path: &str, _context: &HandlerBuildContext| match value
+                .get("handler")
+                .and_then(Value::as_str)
+            {
                 Some("request_body_recorder") => Ok(Some(Arc::new(RequestBodyRecorder {
                     streaming_chunks: Arc::clone(&recorder.streaming_chunks),
                     buffered_lengths: Arc::clone(&recorder.buffered_lengths),
@@ -1242,8 +1301,8 @@ mod tests {
                 )),
                 Some("retrying_proxy") => Ok(Some(Arc::new(RetryingProxyStub) as SharedHandler)),
                 _ => Ok(None),
-            }
-        })
+            },
+        )
     }
 
     #[tokio::test]
@@ -1392,14 +1451,17 @@ mod tests {
 
     #[tokio::test]
     async fn buffered_compatibility_path_still_sees_the_full_request_body() {
-        let factory: CustomHandlerFactory = Arc::new(|value: &Value, _path: &str| {
-            match value.get("handler").and_then(Value::as_str) {
+        let factory: CustomHandlerFactory = Arc::new(
+            |value: &Value, _path: &str, _context: &HandlerBuildContext| match value
+                .get("handler")
+                .and_then(Value::as_str)
+            {
                 Some("buffered_body_handler") => {
                     Ok(Some(Arc::new(BufferedBodyHandler) as SharedHandler))
                 }
                 _ => Ok(None),
-            }
-        });
+            },
+        );
         let router = RouterBuilder::new()
             .with_custom_handler(factory)
             .build(&[json!({"handle": [{"handler": "buffered_body_handler"}]})])
@@ -1975,5 +2037,54 @@ mod tests {
         let response = router.handle(request("/", "example.com")).await.unwrap();
         assert_eq!(response.status, http::StatusCode::NOT_FOUND);
         assert_eq!(response.headers["x-frame-options"], "DENY");
+    }
+
+    #[tokio::test]
+    async fn build_context_carries_stock_compat_and_the_security_headers_opt_out() {
+        // EP-PROXY-05 / ADR-0010 §2: the router tells extension handler factories (notably
+        // `reverse_proxy`) whether the generation is in secure-by-default mode and whether the same
+        // route chain carries an explicit `security_headers` handler (precedence 4 opt-out).
+        let seen: Arc<std::sync::Mutex<Vec<HandlerBuildContext>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let factory: CustomHandlerFactory = Arc::new(
+            move |_value: &Value, _path: &str, context: &HandlerBuildContext| {
+                recorder.lock().expect("lock").push(*context);
+                Ok(Some(Arc::new(BufferedBodyHandler) as SharedHandler))
+            },
+        );
+        RouterBuilder::new()
+            .with_custom_handler(Arc::clone(&factory))
+            .with_stock_compat(false)
+            .build(&[json!({"handle": [{"handler": "reverse_proxy"}]})])
+            .expect("secure-by-default router builds");
+        RouterBuilder::new()
+            .with_custom_handler(Arc::clone(&factory))
+            .with_stock_compat(true)
+            .build(&[json!({"handle": [{"handler": "reverse_proxy"}]})])
+            .expect("stock-compat router builds");
+        RouterBuilder::new()
+            .with_custom_handler(factory)
+            .with_stock_compat(false)
+            .build(&[json!({"handle": [
+                {"handler": "security_headers"},
+                {"handler": "reverse_proxy"}
+            ]})])
+            .expect("opting-out router builds");
+
+        let seen = seen.lock().expect("lock");
+        assert_eq!(seen.len(), 3);
+        assert!(
+            !seen[0].stock_compat && !seen[0].route_has_explicit_security_headers,
+            "a plain route in secure-by-default mode gets the profile"
+        );
+        assert!(
+            seen[1].stock_compat,
+            "`stock_compat true` must reach the extension handler factory"
+        );
+        assert!(
+            seen[2].route_has_explicit_security_headers && !seen[2].stock_compat,
+            "an explicit `security_headers` handler in the route chain opts it out"
+        );
     }
 }
