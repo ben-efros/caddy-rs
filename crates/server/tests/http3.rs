@@ -224,6 +224,7 @@ fn client_config_with(
             let key = caddy_rs_tls::TlsCertificate::from_pem(certificate, key)
                 .expect("client key")
                 .private_key()
+                .expect("process-held key")
                 .clone_key();
             builder
                 .with_client_auth_cert(chain, key)

@@ -27,6 +27,13 @@ rsa = { version = "0.9.10", default-features = false, features = ["std", "pem", 
 sha2 = { version = "0.10.9", features = ["oid"] }
 rand = "0.8.8"
 
+# PKCS#11 token-held TLS keys (T-TLS-097). Dynamic loading is built in: no features,
+# no build-script/network dependency. cryptoki 0.7.0 pulls cryptoki-sys, libloading,
+# secrecy 0.8, bitflags 1.x and paste, all present in the offline registry cache.
+cryptoki = "0.7.0"
+# Same 0.8 instance cryptoki 0.7 uses, so `AuthPin::expose_secret` (PIN equality) resolves.
+secrecy = "0.8.0"
+
 # ACME order client: production HTTP(S) transport over hyper + rustls.
 # The rustls provider is aws-lc-rs (not ring): it implements the ECDSA P-521 signature scheme
 # Caddy accepts for certificates. aws-lc-rs 1.19 / aws-lc-sys 0.47 are in the workspace offline

@@ -33,8 +33,10 @@
 //! Automatic HTTPS (ACME issuance, HTTP→HTTPS redirects, certificate automation) is not wired
 //! yet; see DIV-0001/DIV-0002 and the divergence entries added with this task.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
@@ -57,6 +59,7 @@ use caddy_rs_core::listen::{ListenAddr, Network};
 
 use crate::certificate::{Certificate, CertificateCache};
 use crate::key_type::{self, classify, KeySupport};
+use crate::pkcs11::TokenPool;
 use crate::storage::{CertificateStorage, StoredCertificate};
 use crate::{Error, Result};
 
@@ -729,12 +732,38 @@ pub struct TlsCertificate {
     names: Vec<String>,
     tags: Vec<String>,
     chain: Vec<CertificateDer<'static>>,
-    private_key: PrivateKeyDer<'static>,
+    /// The process-held private key; `None` for a token-held key (see `external`).
+    private_key: Option<PrivateKeyDer<'static>>,
+    /// Token-held signing key (`apps.tls.certificates.pkcs11[i]`). When set, the private key
+    /// never enters process memory and `private_key` is `None`.
+    external: Option<ExternalKey>,
     /// DER-encoded OCSP response to staple with this certificate (T-TLS-051).
     ocsp_staple: Option<Vec<u8>>,
     /// Configured source of this certificate, used to locate key errors when several
     /// certificates are configured (`apps.tls.certificates.load_files[i]`, a storage key, ...).
     source: Option<String>,
+}
+
+/// A certificate whose private key lives in a PKCS#11 token (T-TLS-097).
+///
+/// The pool is kept so the listener can bound handshakes with the token budget, and the signer
+/// is the rustls bridge for the token-held key. `Debug` is manual: the pool's own `Debug` omits
+/// PIN material and so does this.
+pub struct ExternalKey {
+    /// The token pool that owns the key and its budgets.
+    pub pool: Arc<crate::pkcs11::TokenPool>,
+    /// The rustls signing key backed by the token.
+    pub signer: Arc<dyn rustls::sign::SigningKey>,
+}
+
+impl std::fmt::Debug for ExternalKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExternalKey")
+            .field("pool", &self.pool)
+            .field("signer", &self.signer)
+            .finish()
+    }
 }
 
 impl Clone for TlsCertificate {
@@ -743,7 +772,11 @@ impl Clone for TlsCertificate {
             names: self.names.clone(),
             tags: self.tags.clone(),
             chain: self.chain.clone(),
-            private_key: self.private_key.clone_key(),
+            private_key: self.private_key.as_ref().map(PrivateKeyDer::clone_key),
+            external: self.external.as_ref().map(|external| ExternalKey {
+                pool: Arc::clone(&external.pool),
+                signer: Arc::clone(&external.signer),
+            }),
             ocsp_staple: self.ocsp_staple.clone(),
             source: self.source.clone(),
         }
@@ -782,7 +815,8 @@ impl TlsCertificate {
             names,
             tags: Vec::new(),
             chain,
-            private_key,
+            private_key: Some(private_key),
+            external: None,
             ocsp_staple: None,
             source,
         })
@@ -852,7 +886,8 @@ impl TlsCertificate {
             names,
             tags: Vec::new(),
             chain: chain_der.into_iter().map(CertificateDer::from).collect(),
-            private_key,
+            private_key: Some(private_key),
+            external: None,
             ocsp_staple: None,
             source,
         })
@@ -884,7 +919,8 @@ impl TlsCertificate {
             names,
             tags: Vec::new(),
             chain: chain_der.into_iter().map(CertificateDer::from).collect(),
-            private_key,
+            private_key: Some(private_key),
+            external: None,
             ocsp_staple: None,
             source,
         })
@@ -962,35 +998,67 @@ impl TlsCertificate {
         &self.chain
     }
 
-    /// The DER private key.
-    pub fn private_key(&self) -> &PrivateKeyDer<'static> {
-        &self.private_key
+    /// The DER private key, or `None` for a token-held key (`external`).
+    pub fn private_key(&self) -> Option<&PrivateKeyDer<'static>> {
+        self.private_key.as_ref()
+    }
+
+    /// The token-held key backing this certificate, if any (`apps.tls.certificates.pkcs11`).
+    pub fn external_key(&self) -> Option<&ExternalKey> {
+        self.external.as_ref()
     }
 
     /// Convert to the rustls signing form, validating the key type against the aws-lc-rs provider.
     ///
     /// A failure names the configured source and the first DNS names of this certificate, so a
-    /// configuration with several certificates identifies the offending entry.
+    /// configuration with several certificates identifies the offending entry. Token-held keys
+    /// (`external`) are paired with the chain and checked with `keys_match`, so a certificate
+    /// that does not match the token key fails here instead of at handshake time.
     pub fn certified_key(&self) -> Result<CertifiedKey> {
-        let signing_key =
-            match rustls::crypto::aws_lc_rs::sign::any_supported_type(&self.private_key) {
-                Ok(key) => key,
-                Err(provider_error) => {
-                    let reason = classify_private_key_der(&self.private_key).unwrap_or_else(|| {
-                        format!(
-                            "private key type is not supported by the rustls aws-lc-rs provider: \
+        if let Some(external) = &self.external {
+            let certified = CertifiedKey::new(self.chain.clone(), Arc::clone(&external.signer));
+            if let Err(error) = certified.keys_match() {
+                return Err(Error::TlsConfig {
+                    path: "certificates".to_string(),
+                    message: format!(
+                        "{}: certificate does not match the PKCS#11 token key ({error})",
+                        certificate_identity(self.source.as_deref(), &self.names)
+                    ),
+                });
+            }
+            return Ok(CertifiedKey {
+                cert: self.chain.clone(),
+                key: Arc::clone(&external.signer),
+                ocsp: self.ocsp_staple.clone(),
+            });
+        }
+        let Some(private_key) = self.private_key.as_ref() else {
+            return Err(Error::TlsConfig {
+                path: "certificates".to_string(),
+                message: format!(
+                    "{}: certificate has no private key",
+                    certificate_identity(self.source.as_deref(), &self.names)
+                ),
+            });
+        };
+        let signing_key = match rustls::crypto::aws_lc_rs::sign::any_supported_type(private_key) {
+            Ok(key) => key,
+            Err(provider_error) => {
+                let reason = classify_private_key_der(private_key).unwrap_or_else(|| {
+                    format!(
+                        "private key type is not supported by the rustls aws-lc-rs provider: \
                          {provider_error}"
-                        )
-                    });
-                    return Err(Error::TlsConfig {
-                        path: "certificates".to_string(),
-                        message: format!(
-                            "{}: {reason}",
-                            certificate_identity(self.source.as_deref(), &self.names)
-                        ),
-                    });
-                }
-            };
+                    )
+                });
+                return Err(Error::TlsConfig {
+                    path: "certificates".to_string(),
+                    message: format!(
+                        "{}: {reason}",
+                        certificate_identity(self.source.as_deref(), &self.names)
+                    ),
+                });
+            }
+        };
         Ok(CertifiedKey {
             cert: self.chain.clone(),
             key: signing_key,
@@ -1314,11 +1382,29 @@ impl TaggedCertificateSelector for CertificateResolver {
 pub trait TlsResolver: ResolvesServerCert {
     /// The tag selector for this resolver, if it can select by certificate tags.
     fn tag_selector(&self) -> Option<&dyn TaggedCertificateSelector>;
+
+    /// The PKCS#11 token pool backing this resolver's certificates, if any certificate has a
+    /// token-held key (T-TLS-097). The listener uses it to bound handshakes with the token
+    /// budget; `None` means every certificate key is process-held.
+    fn external_key_pool(&self) -> Option<Arc<crate::pkcs11::TokenPool>> {
+        None
+    }
 }
 
 impl TlsResolver for CertificateResolver {
     fn tag_selector(&self) -> Option<&dyn TaggedCertificateSelector> {
         Some(self)
+    }
+
+    fn external_key_pool(&self) -> Option<Arc<crate::pkcs11::TokenPool>> {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state
+            .sources
+            .iter()
+            .find_map(|certificate| certificate.external_key().map(|key| Arc::clone(&key.pool)))
     }
 }
 
@@ -1593,9 +1679,13 @@ pub fn certificates_from_tls_app(tls: &TlsApp) -> Result<Vec<TlsCertificate>> {
     }
     if let Some(config) = &tls.certificates {
         if let Some(entries) = &config.pkcs11 {
+            // One token pool per (module, token) for this configuration generation: two entries
+            // naming the same token share its session threads and handshake budget. Cross-
+            // generation reuse is phase-1 out of scope — a reload opens a fresh pool per token.
+            let mut pools: HashMap<(PathBuf, Option<String>), SharedTokenPool> = HashMap::new();
             for (index, entry) in entries.iter().enumerate() {
                 let path = format!("apps.tls.certificates.pkcs11[{index}]");
-                certificates.push(load_pkcs11_pair(entry, &path)?);
+                certificates.push(load_pkcs11_pair(entry, &path, &mut pools)?);
             }
         }
     }
@@ -1654,12 +1744,237 @@ fn load_pem_pair(pair: &CertKeyPemPair, path: &str) -> Result<TlsCertificate> {
 /// the PIN, finds the private key object by label or ID, verifies its public key SPKI matches
 /// the certificate chain, and returns a `TlsCertificate` whose key side is a token-backed
 /// `rustls::sign::CertifiedKey` (the private key never enters process memory).
-fn load_pkcs11_pair(_entry: &Pkcs11CertConfig, path: &str) -> Result<TlsCertificate> {
-    Err(Error::Unsupported {
-        path: path.to_string(),
-        feature: "PKCS#11 certificate-key loader (`apps.tls.certificates.pkcs11`)".to_string(),
-        tracking_id: "T-TLS-096",
+fn load_pkcs11_pair(
+    entry: &Pkcs11CertConfig,
+    path: &str,
+    pools: &mut HashMap<(PathBuf, Option<String>), SharedTokenPool>,
+) -> Result<TlsCertificate> {
+    let chain = pkcs11_chain(entry, path)?;
+    let names = certificate_names(chain[0].as_ref()).map_err(|error| Error::TlsConfig {
+        path: format!("{path}.certificate"),
+        message: located_message(error),
+    })?;
+    let pin = pkcs11_pin(entry, path)?;
+    let budget = pkcs11_budget(entry);
+    let module = pkcs11_module(entry, path)?;
+    let token_key = entry
+        .token
+        .clone()
+        .or_else(|| entry.slot.map(|slot| format!("slot:{slot}")));
+    let pool = match pools.get(&(module.clone(), token_key.clone())) {
+        Some(pool) => {
+            // ADR-0009: every entry naming one token shares its pool, so the budget and the PIN
+            // must be identical. A mismatch is a configuration conflict, not a second pool.
+            if *pool.pool.budget() != budget {
+                return Err(Error::TlsConfig {
+                    path: format!("{path}.token"),
+                    message: format!(
+                        "PKCS#11 token {} is configured by an earlier entry with a different \
+                         resource budget; ADR-0009 requires one budget per token (module {}, \
+                         token {})",
+                        token_display(entry),
+                        module.display(),
+                        pool.pool.token_label()
+                    ),
+                });
+            }
+            if !pkcs11_pin_matches(pool, &pin) {
+                return Err(Error::TlsConfig {
+                    path: format!("{path}.pin"),
+                    message: format!(
+                        "PKCS#11 token {} is configured by an earlier entry with a different PIN \
+                         source value; ADR-0009 requires one credential per token",
+                        token_display(entry)
+                    ),
+                });
+            }
+            Arc::clone(&pool.pool)
+        }
+        None => {
+            let pool = crate::pkcs11::open_token(
+                &module,
+                entry.token.as_deref(),
+                entry.slot,
+                pin.clone(),
+                budget,
+            )
+            .map_err(|error| Error::TlsConfig {
+                path: format!("{path}.module"),
+                message: error.to_string(),
+            })?;
+            pools.insert(
+                (module, token_key),
+                SharedTokenPool {
+                    pool: Arc::clone(&pool),
+                    pin,
+                },
+            );
+            pool
+        }
+    };
+    let selector = pkcs11_selector(entry, path)?;
+    let token_key = pool
+        .signing_key(&selector)
+        .map_err(|error| Error::TlsConfig {
+            path: format!("{path}.key_label"),
+            message: error.to_string(),
+        })?;
+    let signer: Arc<dyn rustls::sign::SigningKey> = Arc::clone(&token_key) as Arc<_>;
+    // Fail here, with the entry's path, when the certificate chain does not match the token key
+    // (a wrong `key_label` or a stale certificate), instead of at the first handshake.
+    CertifiedKey::new(chain.clone(), Arc::clone(&signer))
+        .keys_match()
+        .map_err(|error| Error::TlsConfig {
+            path: format!("{path}.certificate"),
+            message: format!(
+                "{}: certificate does not match the PKCS#11 token key ({error})",
+                certificate_identity(Some(path), &names)
+            ),
+        })?;
+    Ok(TlsCertificate {
+        names,
+        tags: entry.tags.clone(),
+        chain,
+        private_key: None,
+        external: Some(ExternalKey { pool, signer }),
+        ocsp_staple: None,
+        source: Some(path.to_string()),
     })
+}
+
+/// How an entry names its token in located errors (never the PIN).
+fn token_display(entry: &Pkcs11CertConfig) -> String {
+    match (&entry.token, entry.slot) {
+        (Some(token), _) => format!("`{token}`"),
+        (None, Some(slot)) => format!("slot {slot}"),
+        (None, None) => "<first token>".to_string(),
+    }
+}
+
+/// Resolve `entry.module` as the PKCS#11 shared library to load.
+fn pkcs11_module(entry: &Pkcs11CertConfig, path: &str) -> Result<PathBuf> {
+    let module = entry.module.as_deref().ok_or_else(|| Error::TlsConfig {
+        path: format!("{path}.module"),
+        message: "PKCS#11 entry requires `module` (path to the PKCS#11 shared library)".to_string(),
+    })?;
+    Ok(PathBuf::from(module))
+}
+
+/// Resolve the certificate chain PEM from `certificate` (file) or `certificate_pem` (inline).
+fn pkcs11_chain(entry: &Pkcs11CertConfig, path: &str) -> Result<Vec<CertificateDer<'static>>> {
+    let pem = match (&entry.certificate, &entry.certificate_pem) {
+        (Some(file), _) => std::fs::read_to_string(file).map_err(|error| Error::TlsConfig {
+            path: format!("{path}.certificate"),
+            message: format!("cannot read `{file}`: {error}"),
+        })?,
+        (None, Some(pem)) => pem.clone(),
+        (None, None) => {
+            return Err(Error::TlsConfig {
+                path: format!("{path}.certificate"),
+                message: "PKCS#11 entry requires `certificate` (PEM file) or `certificate_pem`"
+                    .to_string(),
+            })
+        }
+    };
+    certificate_chain_from_pem(&pem).map_err(|error| Error::TlsConfig {
+        path: format!("{path}.certificate"),
+        message: located_message(error),
+    })
+}
+
+/// Resolve the token PIN from its configured source. The value never reaches a log, a `Debug`
+/// rendering, or an error message: only the *source* is named on failure.
+fn pkcs11_pin(entry: &Pkcs11CertConfig, path: &str) -> Result<cryptoki::types::AuthPin> {
+    use caddy_rs_core::config::PinSource;
+    let secret = match entry.pin_source {
+        PinSource::Env => {
+            let variable = entry.pin.as_deref().ok_or_else(|| Error::TlsConfig {
+                path: format!("{path}.pin"),
+                message: "`pin_source: \"env\"` requires `pin` (the environment variable name)"
+                    .to_string(),
+            })?;
+            std::env::var(variable).map_err(|_| Error::TlsConfig {
+                path: format!("{path}.pin"),
+                message: format!("environment variable `{variable}` holding the PIN is not set"),
+            })?
+        }
+        PinSource::File => {
+            let file = entry.pin_file.as_deref().ok_or_else(|| Error::TlsConfig {
+                path: format!("{path}.pin_file"),
+                message: "`pin_source: \"file\"` requires `pin_file`".to_string(),
+            })?;
+            let contents = std::fs::read_to_string(file).map_err(|error| Error::TlsConfig {
+                path: format!("{path}.pin_file"),
+                message: format!("cannot read PIN file `{file}`: {error}"),
+            })?;
+            // A PIN file conventionally ends with a newline; PKCS#11 compares the PIN bytes, so
+            // strip the line terminator only.
+            contents.trim_end_matches(['\r', '\n']).to_string()
+        }
+    };
+    Ok(cryptoki::types::AuthPin::from(secret))
+}
+
+/// A token pool shared by every entry naming one token, plus the PIN it was opened with so a
+/// conflicting credential is rejected (ADR-0009) instead of silently reusing the first one.
+struct SharedTokenPool {
+    pool: Arc<TokenPool>,
+    pin: cryptoki::types::AuthPin,
+}
+
+/// Compare a resolved PIN with the one the shared pool was opened with, without formatting
+/// either value. Equality is only used to detect a configuration conflict, never to gate access.
+fn pkcs11_pin_matches(shared: &SharedTokenPool, pin: &cryptoki::types::AuthPin) -> bool {
+    use secrecy::ExposeSecret as _;
+    shared.pin.expose_secret() == pin.expose_secret()
+}
+
+/// Map the typed `apps.tls.certificates.pkcs11[i]` budget onto the token runtime budget.
+fn pkcs11_budget(entry: &Pkcs11CertConfig) -> crate::pkcs11::Pkcs11Budget {
+    let budget = entry.budget();
+    crate::pkcs11::Pkcs11Budget {
+        max_sessions: usize::try_from(budget.max_sessions).unwrap_or(usize::MAX),
+        max_inflight_handshakes: usize::try_from(budget.max_inflight_handshakes)
+            .unwrap_or(usize::MAX),
+        handshake_wait: Duration::from_nanos(budget.handshake_wait),
+        queue_depth: usize::try_from(budget.queue_depth).unwrap_or(usize::MAX),
+        queue_wait: Duration::from_nanos(budget.queue_wait),
+        sign_timeout: Duration::from_nanos(budget.sign_timeout),
+        handshake_timeout: Duration::from_nanos(budget.handshake_timeout),
+    }
+}
+
+/// Build the key selector from `key_label` and/or the hex-encoded `key_id`.
+fn pkcs11_selector(entry: &Pkcs11CertConfig, path: &str) -> Result<crate::pkcs11::KeySelector> {
+    if entry.key_label.is_none() && entry.key_id.is_none() {
+        return Err(Error::TlsConfig {
+            path: format!("{path}.key_label"),
+            message: "PKCS#11 entry requires `key_label` or `key_id` to select the private key"
+                .to_string(),
+        });
+    }
+    let id = match entry.key_id.as_deref() {
+        Some(hex) => Some(hex_decode(hex).ok_or_else(|| Error::TlsConfig {
+            path: format!("{path}.key_id"),
+            message: "`key_id` must be an even-length hex string (the DER object ID)".to_string(),
+        })?),
+        None => None,
+    };
+    Ok(crate::pkcs11::KeySelector {
+        label: entry.key_label.clone(),
+        id,
+    })
+}
+
+/// Decode a hex string (`key_id`). Returns `None` for odd length or a non-hex digit.
+fn hex_decode(value: &str) -> Option<Vec<u8>> {
+    if value.len() % 2 != 0 {
+        return None;
+    }
+    (0..value.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(value.get(index..index + 2)?, 16).ok())
+        .collect()
 }
 
 /// Extract the message of a located error, so wrapping at a more precise path does not nest
@@ -2758,6 +3073,114 @@ fn common_name_string(value: &Tlv<'_>) -> Result<String> {
     }
 }
 
+// ---- Token-held key handshake ---------------------------------------------------------------
+
+/// A failure while accepting a TLS handshake whose certificate may sign with a PKCS#11 token
+/// key. Every variant names the budget stage that failed, so an operator can tell a busy token
+/// (`HandshakeWait`) from a slow signer (`HandshakeTimeout`) from a client error (`Handshake`).
+#[derive(Debug)]
+pub enum ExternalKeyHandshakeError {
+    /// No handshake permit was granted within `budget.handshake_wait`.
+    HandshakeWait {
+        /// Token label the permit belongs to.
+        token: String,
+        /// The configured `handshake_wait`.
+        wait: Duration,
+        /// The located token error.
+        detail: String,
+    },
+    /// The handshake did not complete within `budget.handshake_timeout`.
+    HandshakeTimeout {
+        /// Token label the handshake was signing with.
+        token: String,
+        /// The configured `handshake_timeout`.
+        timeout: Duration,
+    },
+    /// The handshake itself failed (I/O or rustls).
+    Handshake {
+        /// Token label the handshake was signing with.
+        token: String,
+        /// The underlying handshake error.
+        error: std::io::Error,
+    },
+}
+
+impl std::fmt::Display for ExternalKeyHandshakeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExternalKeyHandshakeError::HandshakeWait {
+                token,
+                wait,
+                detail,
+            } => write!(
+                formatter,
+                "PKCS#11 token `{token}`: no handshake permit within handshake_wait {}ms: {detail}",
+                wait.as_millis()
+            ),
+            ExternalKeyHandshakeError::HandshakeTimeout { token, timeout } => write!(
+                formatter,
+                "PKCS#11 token `{token}`: handshake exceeded handshake_timeout {}ms",
+                timeout.as_millis()
+            ),
+            ExternalKeyHandshakeError::Handshake { token, error } => {
+                write!(
+                    formatter,
+                    "PKCS#11 token `{token}`: TLS handshake failed: {error}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ExternalKeyHandshakeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ExternalKeyHandshakeError::Handshake { error, .. } => Some(error),
+            _ => None,
+        }
+    }
+}
+
+/// Accept one TLS handshake on a listener whose certificates may use a token-held key.
+///
+/// Holds a token handshake permit for the duration of the handshake (so at most
+/// `max_inflight_handshakes` connections are inside the token at once), waits at most
+/// `budget.handshake_wait` for that permit, and bounds the whole handshake by
+/// `budget.handshake_timeout`. The permit is released before returning, on every path.
+///
+/// The token signature itself runs on the token's own session threads; see
+/// [`crate::pkcs11`] for the sign queue and its `queue_wait`/`sign_timeout` budgets.
+pub async fn accept_external_key_handshake<S>(
+    acceptor: tokio_rustls::TlsAcceptor,
+    stream: S,
+    pool: Arc<TokenPool>,
+) -> std::result::Result<tokio_rustls::server::TlsStream<S>, ExternalKeyHandshakeError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let token = pool.token_label().to_string();
+    let budget = pool.budget().clone();
+    let permit = pool
+        .acquire_handshake(budget.handshake_wait)
+        .await
+        .map_err(|error| ExternalKeyHandshakeError::HandshakeWait {
+            token: token.clone(),
+            wait: budget.handshake_wait,
+            detail: error.to_string(),
+        })?;
+    let handshake = tokio::time::timeout(budget.handshake_timeout, acceptor.accept(stream)).await;
+    // The permit covers the handshake only: release it before the caller serves the connection.
+    drop(permit);
+    match handshake {
+        Err(_elapsed) => Err(ExternalKeyHandshakeError::HandshakeTimeout {
+            token,
+            timeout: budget.handshake_timeout,
+        }),
+        Ok(Err(error)) => Err(ExternalKeyHandshakeError::Handshake { token, error }),
+        Ok(Ok(stream)) => Ok(stream),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3600,7 +4023,7 @@ mod tests {
                 .iter()
                 .map(|der| der.as_ref().to_vec())
                 .collect(),
-            private_key_der: match example.private_key() {
+            private_key_der: match example.private_key().expect("process-held key") {
                 PrivateKeyDer::Pkcs8(key) => key.secret_pkcs8_der().to_vec(),
                 other => panic!("fixture key must be PKCS#8, got {other:?}"),
             },
@@ -5203,5 +5626,146 @@ mod tests {
             rustls::HandshakeKind::Full,
             "a client-auth listener must disable ticket issuance/acceptance"
         );
+    }
+    /// A resolver that only implements the required trait method, to prove the
+    /// [`TlsResolver::external_key_pool`] default.
+    #[derive(Debug)]
+    struct PlainResolver;
+
+    impl ResolvesServerCert for PlainResolver {
+        fn resolve(&self, _client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+            None
+        }
+    }
+
+    impl TlsResolver for PlainResolver {
+        fn tag_selector(&self) -> Option<&dyn TaggedCertificateSelector> {
+            None
+        }
+    }
+
+    #[test]
+    fn external_key_pool_marker_is_none_without_token_certificates() {
+        // A PEM certificate has a process-held key, so the listener must take the plain
+        // `acceptor.accept` path (no token budget).
+        let resolver =
+            CertificateResolver::from_certificates(vec![example()]).expect("resolver builds");
+        assert!(TlsResolver::external_key_pool(&resolver).is_none());
+        // The trait default also reports no pool.
+        assert!(TlsResolver::external_key_pool(&PlainResolver).is_none());
+    }
+
+    /// End-to-end token-marked certificate path: SoftHSM2 module, token `caddy-rs-test`, PIN
+    /// 123456, RSA-2048 key labelled `rsa2048` (fixtures under
+    /// `.scratch/logs/tls097/`). Run with:
+    ///
+    /// ```text
+    /// SOFTHSM2_CONF=/root/caddy-rs/.scratch/logs/tls097/softhsm2.conf \
+    ///   CARGO_HOME=... CARGO_TARGET_DIR=... \
+    ///   cargo test -p caddy-rs-tls --lib -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "requires SoftHSM2"]
+    async fn pkcs11_entry_marks_the_resolver_and_handshakes() {
+        const MODULE: &str = "/root/caddy-rs/.scratch/softhsm-prefix/lib/softhsm/libsofthsm2.so";
+        const CERT: &str = "/root/caddy-rs/.scratch/logs/tls097/keys/rsa2048.crt";
+        const PIN_ENV: &str = "CADDY_RS_TLS097_PKCS11_PIN";
+        if !std::path::Path::new(MODULE).exists() {
+            panic!("SoftHSM2 module missing at {MODULE}");
+        }
+        // SAFETY: single-threaded inside this test before any token is opened.
+        std::env::set_var(PIN_ENV, "123456");
+        let json = serde_json::json!({
+            "apps": { "tls": { "certificates": { "pkcs11": [{
+                "module": MODULE,
+                "token": "caddy-rs-test",
+                "key_label": "rsa2048",
+                "certificate": CERT,
+                "pin_source": "env",
+                "pin": PIN_ENV,
+            }]}}}
+        });
+        let config = Config::from_value(json).expect("valid pkcs11 config");
+        let resolver = resolver_from_config(&config)
+            .expect("token entry loads")
+            .expect("resolver exists");
+        let pool = TlsResolver::external_key_pool(&resolver).expect("token pool marker");
+        assert_eq!(pool.token_label(), "caddy-rs-test");
+        assert!(!pool.is_quarantined());
+
+        // A real HTTP-less TLS handshake through the production helper: the CertificateVerify
+        // signature is produced by the token, inside the pool's handshake permit.
+        let server_config = build_server_config(Arc::new(resolver), &TlsServerOptions::default())
+            .expect("server config");
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("local addr");
+        let server_pool = Arc::clone(&pool);
+        let server = tokio::spawn(async move {
+            let (stream, _peer) = listener.accept().await.expect("accept");
+            accept_external_key_handshake(acceptor, stream, server_pool)
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        });
+
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let mut client = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+            .with_safe_default_protocol_versions()
+            .expect("versions")
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyCertificate(provider)))
+            .with_no_client_auth();
+        client.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
+        let stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect");
+        // The cert fixture's names come from the certificate itself.
+        let server_name = rustls::pki_types::ServerName::try_from("example.com")
+            .expect("server name")
+            .to_owned();
+        let client_result = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            connector.connect(server_name, stream),
+        )
+        .await
+        .expect("client handshake did not stall")
+        .map(|_| ())
+        .map_err(|error| format!("client handshake: {error}"));
+        let server_result = server.await.expect("server task");
+        assert_eq!(client_result, Ok(()), "client side");
+        assert_eq!(server_result, Ok(()), "server side");
+
+        // ADR-0009: a second entry for the same token with a different budget is a located
+        // conflict, not a second pool.
+        let conflict = serde_json::json!({
+            "apps": { "tls": { "certificates": { "pkcs11": [
+                { "module": MODULE, "token": "caddy-rs-test", "key_label": "rsa2048",
+                  "certificate": CERT, "pin_source": "env", "pin": PIN_ENV },
+                { "module": MODULE, "token": "caddy-rs-test", "key_label": "rsa2048",
+                  "certificate": CERT, "pin_source": "env", "pin": PIN_ENV,
+                  "max_sessions": 3 },
+            ]}}}
+        });
+        let conflict_config = Config::from_value(conflict).expect("valid conflict config");
+        let error =
+            resolver_from_config(&conflict_config).expect_err("conflicting budget must fail");
+        match error {
+            Error::TlsConfig { path, message } => {
+                assert_eq!(path, "apps.tls.certificates.pkcs11[1].token");
+                assert!(
+                    message.contains("different resource budget"),
+                    "message: {message}"
+                );
+                assert!(
+                    !message.contains("123456"),
+                    "PIN must never appear in an error"
+                );
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 }
