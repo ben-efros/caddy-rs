@@ -14,7 +14,8 @@
 //! The Caddyfile form is `servers { server_identity <mode> }` (see
 //! [`crate::ServerIdentity::parse`] for the accepted spellings); the JSON config form is
 //! `apps.http.servers.<name>.server_identity: "<mode-or-custom-string>"`. Both are validated with
-//! a located error. This is registered as divergence DIV-0036's sibling extension surface.
+//! a located error. The extension surface is registered as `DIV-0125` in the program compatibility
+//! contract and the custom-value domain / pre-routing parity as `DIV-0126`.
 
 use std::collections::BTreeMap;
 
@@ -45,7 +46,15 @@ impl ServerIdentity {
     /// Parse the JSON config value (`apps.http.servers.<name>.server_identity`).
     ///
     /// Accepted values are the mode keywords `default`, `name-only`, `compatible` and `none`, or
-    /// any other non-empty string, which is used verbatim as a custom identity.
+    /// any other non-empty string of visible ASCII, which is used verbatim as a custom identity.
+    ///
+    /// A custom value must be usable as an HTTP header value: only U+0020..=U+007E (space through
+    /// `~`) is accepted, so control characters, tabs and non-ASCII are a located error naming the
+    /// mode and the offending character instead of being silently dropped by the header writer
+    /// (DIV-0126). Non-ASCII is rejected rather than percent-encoded: the identity is an opaque
+    /// operator string, and re-encoding it would emit something the operator did not configure
+    /// (Caddy never encodes it either — Go's header writer refuses such values), so a located
+    /// configuration error is the honest outcome.
     pub fn parse(text: &str) -> std::result::Result<Self, String> {
         let trimmed = text.trim();
         if trimmed.is_empty() {
@@ -56,7 +65,10 @@ impl ServerIdentity {
             "name-only" => Ok(Self::NameOnly),
             "compatible" => Ok(Self::Compatible),
             "none" => Ok(Self::None),
-            _ => Ok(Self::Custom(trimmed.to_string())),
+            _ => {
+                validate_custom_identity(trimmed)?;
+                Ok(Self::Custom(trimmed.to_string()))
+            }
         }
     }
 
@@ -105,6 +117,26 @@ impl ServerIdentity {
             Self::None => None,
         }
     }
+}
+
+/// Reject custom identity values that cannot be written into an HTTP header value.
+///
+/// The accepted set is exactly the visible ASCII range (U+0020..=U+007E): hyper's
+/// `HeaderValue::from_str` refuses tab and every control character, and obs-text (U+0080..) is
+/// transport-dependent (RFC 9110 deprecates it), so accepting either would reintroduce the silent
+/// drop this check replaces.
+fn validate_custom_identity(identity: &str) -> std::result::Result<(), String> {
+    for (offset, character) in identity.char_indices() {
+        if !matches!(character, ' '..='~') {
+            return Err(format!(
+                "`server_identity custom` value cannot be used as an HTTP `Server` header value: \
+                 character U+{:04X} at byte {offset} is not visible ASCII; use only characters in \
+                 U+0020..=U+007E",
+                character as u32
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -178,6 +210,65 @@ mod tests {
         );
         assert!(ServerIdentity::parse("   ").is_err());
         assert!(ServerIdentity::parse("").is_err());
+    }
+
+    #[test]
+    fn custom_identity_rejects_values_that_cannot_be_a_header_value() {
+        // Control characters, DEL, an interior tab and non-ASCII are all rejected with a message
+        // naming the mode and the offending code point (DIV-0126); the old code accepted them and
+        // the header writer silently dropped the whole identity at runtime.
+        for (value, code_point) in [
+            ("Acme\u{0}Server", "U+0000"),
+            ("Acme\u{7}Server", "U+0007"),
+            ("Acme\u{7f}Server", "U+007F"),
+            ("Acme\tServer", "U+0009"),
+            ("Acme\u{e9}Server", "U+00E9"),
+            ("\u{4e2d}\u{6587}", "U+4E2D"),
+        ] {
+            let error = ServerIdentity::parse(value).expect_err(&format!(
+                "{value:?} must not be accepted as a custom identity"
+            ));
+            assert!(
+                error.contains("`server_identity custom`"),
+                "{value:?} error must name the mode, got {error}"
+            );
+            assert!(
+                error.contains(code_point),
+                "{value:?} error must name {code_point}, got {error}"
+            );
+            assert!(
+                error.contains("HTTP `Server` header"),
+                "{value:?} error must say what the value is for, got {error}"
+            );
+        }
+        // Visible ASCII (including the space the routed-response test uses) still parses verbatim.
+        assert_eq!(
+            ServerIdentity::parse(" Acme Server/2 "),
+            Ok(ServerIdentity::Custom("Acme Server/2".to_string()))
+        );
+        assert_eq!(
+            ServerIdentity::parse("Acme!Server~2"),
+            Ok(ServerIdentity::Custom("Acme!Server~2".to_string()))
+        );
+    }
+
+    #[test]
+    fn custom_identity_is_validated_at_config_load_with_a_located_error() {
+        let mut extra = BTreeMap::new();
+        extra.insert(
+            "server_identity".to_string(),
+            Value::from("Acme\u{1}Server"),
+        );
+        let error = ServerIdentity::from_server_extra("srv0", &extra).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("apps.http.servers.srv0.server_identity"),
+            "located error, got {message}"
+        );
+        assert!(
+            message.contains("U+0001"),
+            "error must name the offending character, got {message}"
+        );
     }
 
     #[test]

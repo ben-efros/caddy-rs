@@ -17,6 +17,9 @@ use hyper_util::rt::TokioExecutor;
 fn config(identity: Option<serde_json::Value>) -> Config {
     let mut server = serde_json::json!({
         "listen": ["127.0.0.1:0"],
+        // A small body limit lets a test force a response the router never sees (a pre-routing
+        // 413), which is the path DIV-0126 covers.
+        "max_request_body_size": 8,
         "routes": [{"handle": [{"handler": "static_response", "body": "ok"}]}]
     });
     if let Some(identity) = identity {
@@ -93,12 +96,57 @@ async fn none_mode_omits_the_header() {
     assert_eq!(server_header(Some(serde_json::json!("none"))).await, None);
 }
 
+async fn pre_router_413_server_header(identity: Option<serde_json::Value>) -> Option<String> {
+    let (runtime, address) = start(identity).await;
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let request = hyper::Request::builder()
+        .method(http::Method::POST)
+        .uri(format!("http://{address}/probe"))
+        .header(http::header::HOST, "example.com")
+        .body(Full::new(Bytes::from_static(&[b'x'; 64])))
+        .expect("request builds");
+    let response = client.request(request).await.expect("request succeeds");
+    // The body limit is enforced before routing, so this response never reaches a handler.
+    assert_eq!(response.status(), 413);
+    let header = response
+        .headers()
+        .get(http::header::SERVER)
+        .map(|value| value.to_str().expect("ascii header").to_string());
+    runtime.shutdown().await;
+    header
+}
+
+#[tokio::test]
+async fn pre_router_413_carries_the_configured_identity() {
+    assert_eq!(
+        pre_router_413_server_header(Some(serde_json::json!("Acme Server/2"))).await,
+        Some("Acme Server/2".to_string()),
+        "a pre-routing 413 must carry the configured `Server` header like Caddy's pre-routing one"
+    );
+}
+
+#[tokio::test]
+async fn pre_router_413_in_none_mode_emits_no_header() {
+    assert_eq!(
+        pre_router_413_server_header(Some(serde_json::json!("none"))).await,
+        None,
+        "`none` mode must stay silent on pre-routing responses too"
+    );
+}
+
 #[test]
 fn malformed_identity_is_a_located_error() {
     for value in [
         serde_json::json!(""),
         serde_json::json!(42),
         serde_json::json!(null),
+        // DIV-0126: a custom value that cannot be a header value is a config error, not a silent
+        // drop at response time.
+        serde_json::json!("Acme\u{7}Server"),
+        serde_json::json!("Acme\u{0}Server"),
+        serde_json::json!("Acme\u{7f}Server"),
+        serde_json::json!("Acme\tServer"),
+        serde_json::json!("caf\u{e9}"),
     ] {
         let store = Arc::new(GenerationStore::with_builtin_registry());
         let error = store

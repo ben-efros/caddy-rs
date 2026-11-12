@@ -677,6 +677,11 @@ fn parse_server_identity(
                     "`server_identity custom` requires a non-empty identity string",
                 ));
             }
+            // Reject values that cannot be an HTTP `Server` header value here, at the directive
+            // position, instead of leaving it to config validation so `adapt` already fails
+            // (DIV-0126). The JSON spelling is still the operator string verbatim.
+            caddy_rs_core::ServerIdentity::parse(value)
+                .map_err(|message| adapter_error(position, message))?;
             Ok(value.clone())
         }
         (Some("custom"), _) => Err(adapter_error(
