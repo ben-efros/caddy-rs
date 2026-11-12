@@ -52,7 +52,7 @@ use rustls::{
 };
 use serde_json::Value;
 
-use caddy_rs_core::config::{CertKeyPemPair, Config, TlsApp};
+use caddy_rs_core::config::{CertKeyPemPair, Config, Pkcs11CertConfig, TlsApp};
 use caddy_rs_core::listen::{ListenAddr, Network};
 
 use crate::certificate::{Certificate, CertificateCache};
@@ -1591,6 +1591,14 @@ pub fn certificates_from_tls_app(tls: &TlsApp) -> Result<Vec<TlsCertificate>> {
         let path = format!("apps.tls.certificates.load_pem[{index}]");
         certificates.push(load_pem_pair(pair, &path)?);
     }
+    if let Some(config) = &tls.certificates {
+        if let Some(entries) = &config.pkcs11 {
+            for (index, entry) in entries.iter().enumerate() {
+                let path = format!("apps.tls.certificates.pkcs11[{index}]");
+                certificates.push(load_pkcs11_pair(entry, &path)?);
+            }
+        }
+    }
     for (index, pair) in tls.load_files().iter().enumerate() {
         let path = format!("apps.tls.certificates.load_files[{index}]");
         let format = pair.format.as_deref().unwrap_or("pem");
@@ -1636,6 +1644,22 @@ fn load_pem_pair(pair: &CertKeyPemPair, path: &str) -> Result<TlsCertificate> {
             },
             other => other,
         })
+}
+
+/// Load a PKCS#11 certificate-key entry (`apps.tls.certificates.pkcs11[i]`).
+///
+/// Blocked on the `cryptoki` dependency (offline in this environment — see
+/// `docs/design/T-TLS-096-pkcs11-implementation-brief.md` §1.4 and §8). When the dependency is
+/// available this function opens the module, selects the token by label or slot, logs in with
+/// the PIN, finds the private key object by label or ID, verifies its public key SPKI matches
+/// the certificate chain, and returns a `TlsCertificate` whose key side is a token-backed
+/// `rustls::sign::CertifiedKey` (the private key never enters process memory).
+fn load_pkcs11_pair(_entry: &Pkcs11CertConfig, path: &str) -> Result<TlsCertificate> {
+    Err(Error::Unsupported {
+        path: path.to_string(),
+        feature: "PKCS#11 certificate-key loader (`apps.tls.certificates.pkcs11`)".to_string(),
+        tracking_id: "T-TLS-096",
+    })
 }
 
 /// Extract the message of a located error, so wrapping at a more precise path does not nest
