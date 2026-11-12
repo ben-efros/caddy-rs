@@ -104,6 +104,7 @@ use async_trait::async_trait;
 use http::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
 
+use crate::csp::CspPolicy;
 use crate::types::{Error, Handler, Outcome, Request, Result};
 
 /// Default `X-Frame-Options` value: refuse framing entirely.
@@ -125,6 +126,48 @@ fn invalid(path: &str, message: impl Into<String>) -> Error {
     Error::InvalidConfig {
         path: path.to_string(),
         message: message.into(),
+    }
+}
+
+/// Configuration-acceptance mode for `security_headers` load-time validation.
+///
+/// This is the JSON-handler counterpart of the Caddyfile adapter's `--adapt-mode` vocabulary
+/// (`compatible`, `warn`, `strict`). Caddy v2.11.9 has no built-in security-header validation at
+/// all, so every rejection here is a caddy-rs extension (DIV-0120, DIV-0121). The mode decides
+/// only the two validation rules that are policy-strength choices rather than malformed values:
+///
+/// * unknown `security_headers` options (typos and future Caddy fields), and
+/// * an HSTS `max_age` below [`HSTS_MIN_MAX_AGE`] (180 days).
+///
+/// In [`Compatible`](Self::Compatible) and [`Warn`](Self::Warn) those are accepted with a warning;
+/// in [`Strict`](Self::Strict) they are located errors. Malformed values — an invalid CSP
+/// directive or source, a non-header value, `preload` without `includeSubdomains`, or
+/// `max_age == 0` — are rejected in **every** mode: a mode never relaxes a security rejection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SecurityHeadersMode {
+    /// Accept Caddy's opaque surface with a warning (the default).
+    #[default]
+    Compatible,
+    /// Same acceptance as [`Compatible`](Self::Compatible); the warning is always emitted, so the
+    /// variant exists only to make the CLI mode vocabulary total.
+    Warn,
+    /// Reject unknown options and an HSTS `max_age` below 180 days with located errors.
+    Strict,
+}
+
+impl SecurityHeadersMode {
+    /// Whether this mode turns the policy-strength rules into errors.
+    pub fn is_strict(self) -> bool {
+        matches!(self, Self::Strict)
+    }
+
+    /// The mode name used in diagnostics (`compatible`, `warn`, `strict`).
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Compatible => "compatible",
+            Self::Warn => "warn",
+            Self::Strict => "strict",
+        }
     }
 }
 
@@ -235,29 +278,32 @@ impl SecurityHeadersConfig {
     /// Valid configurations that cannot be fully checked here (the HSTS preload-list admission
     /// requirements) are reported by [`SecurityHeadersConfig::warnings`] instead of being rejected.
     pub fn validate(&self) -> Result<()> {
+        self.validate_with_mode(SecurityHeadersMode::Strict)
+            .map(|_| ())
+    }
+
+    /// Mode-aware validation for configurations assembled programmatically.
+    ///
+    /// [`SecurityHeadersMode::Strict`] is byte-for-byte [`Self::validate`]. The compatible and
+    /// warn modes downgrade an HSTS `max_age` below [`HSTS_MIN_MAX_AGE`] to a warning (returned,
+    /// not printed): browsers ignore such a value, but Caddy accepts it opaquely and a compatible
+    /// configuration must still load. `max_age == 0`, `preload` without `includeSubdomains` and
+    /// non-header values stay errors in every mode.
+    ///
+    /// The returned warnings are bare diagnostics (no `caddy-rs: warning:` prefix); the load path
+    /// prefixes them. The HSTS preload warnings of [`Self::warnings`] are not included here.
+    pub fn validate_with_mode(&self, mode: SecurityHeadersMode) -> Result<Vec<String>> {
+        let mut warnings = Vec::new();
         if let Some(hsts) = &self.strict_transport_security {
-            if hsts.max_age == 0 {
-                return Err(invalid(
-                    "strict_transport_security.max_age",
-                    "max_age must be greater than 0",
-                ));
-            }
-            if hsts.max_age < HSTS_MIN_MAX_AGE {
-                return Err(invalid(
-                    "strict_transport_security.max_age",
-                    format!(
-                        "max_age must be at least {HSTS_MIN_MAX_AGE} seconds (180 days); \
-                         browsers ignore shorter values"
-                    ),
-                ));
-            }
-            if hsts.preload && !hsts.include_subdomains {
-                return Err(invalid(
-                    "strict_transport_security.preload",
-                    "preload requires include_subdomains to be enabled",
-                ));
-            }
+            warnings.extend(validate_hsts_mode(hsts, "strict_transport_security", mode)?);
         }
+        self.validate_header_values()?;
+        Ok(warnings)
+    }
+
+    /// The mode-independent half of [`Self::validate`]: every configured value must be a valid
+    /// HTTP header value.
+    fn validate_header_values(&self) -> Result<()> {
         for (path, value) in [
             ("content_security_policy", &self.content_security_policy),
             ("permissions_policy", &self.permissions_policy),
@@ -281,14 +327,32 @@ impl SecurityHeadersConfig {
     /// the string `"false"`) suppresses the header. Unknown keys are rejected with a located error
     /// naming `<path>.<key>`, including inside `strict_transport_security`.
     ///
-    /// The result is validated through [`SecurityHeaders::new`] so an invalid configuration (such
-    /// as a `max_age` below [`HSTS_MIN_MAX_AGE`]) is rejected at load time with the JSON path of the
-    /// offending field, not at the first request.
+    /// This is the strict form used by unit tests and callers that want Caddy's opaque surface
+    /// rejected: unknown keys and a `max_age` below [`HSTS_MIN_MAX_AGE`] are located errors. The
+    /// load path uses [`Self::from_json_with_mode`] so `--adapt-mode` decides those two
+    /// policy-strength rules (compatible/warn accept them with a warning — DIV-0160), while
+    /// malformed values are located errors at load time in every mode.
     pub fn from_json(value: &Value, path: &str) -> Result<Self> {
+        Self::from_json_with_mode(value, path, SecurityHeadersMode::Strict)
+            .map(|(config, _)| config)
+    }
+
+    /// Mode-aware [`Self::from_json`].
+    ///
+    /// Unknown options and an HSTS `max_age` below [`HSTS_MIN_MAX_AGE`] are located errors in
+    /// [`SecurityHeadersMode::Strict`] and warnings otherwise; malformed values are errors in every
+    /// mode (see [`SecurityHeadersMode`]). Returns the configuration together with the load-time
+    /// warnings, which the load path (`caddy-rs validate`/`run`) prints.
+    pub fn from_json_with_mode(
+        value: &Value,
+        path: &str,
+        mode: SecurityHeadersMode,
+    ) -> Result<(Self, Vec<String>)> {
         let object = value
             .as_object()
             .ok_or_else(|| invalid(path, "security_headers must be an object"))?;
         let mut config = Self::default();
+        let mut warnings = Vec::new();
         for (field, value) in object {
             let field_path = format!("{path}.{field}");
             match field.as_str() {
@@ -304,31 +368,31 @@ impl SecurityHeadersConfig {
                     config.referrer_policy = parse_optional_string(value, &field_path)?
                 }
                 "content_security_policy" => {
-                    config.content_security_policy = parse_optional_string(value, &field_path)?
+                    config.content_security_policy = parse_csp_block(value, &field_path)?
                 }
                 "permissions_policy" => {
                     config.permissions_policy = parse_optional_string(value, &field_path)?
                 }
                 "strict_transport_security" => {
-                    config.strict_transport_security = parse_hsts(value, &field_path)?
+                    let (hsts, hsts_warnings) = parse_hsts_with_mode(value, &field_path, mode)?;
+                    config.strict_transport_security = hsts;
+                    warnings.extend(hsts_warnings);
                 }
-                other => {
-                    return Err(invalid(
-                        &field_path,
-                        format!("unknown security header option `{other}`"),
-                    ))
-                }
+                other => unknown_security_header_option(
+                    other,
+                    &field_path,
+                    "security header",
+                    mode,
+                    &mut warnings,
+                )?,
             }
         }
         // Re-locate the constructor's relative error paths onto the JSON document.
-        SecurityHeaders::new(config.clone()).map_err(|error| match error {
-            Error::InvalidConfig {
-                path: inner,
-                message,
-            } => invalid(&format!("{path}.{inner}"), message),
-            other => other,
-        })?;
-        Ok(config)
+        config
+            .validate_header_values()
+            .map_err(|error| relocate(error, path))?;
+        warnings.extend(config.warnings());
+        Ok((config, warnings))
     }
 
     /// Warnings for HSTS preload requirements this configuration cannot verify at config time.
@@ -385,11 +449,28 @@ fn parse_optional_string(value: &Value, path: &str) -> Result<Option<String>> {
     }
 }
 
-/// Parse the opt-in `strict_transport_security` object into an [`HstsConfig`].
+/// Parse the opt-in `strict_transport_security` object into an [`HstsConfig`] (strict form).
+///
+/// Kept for the unit tests that exercise the strict parser directly; production parsing goes
+/// through [`SecurityHeadersConfig::from_json_with_mode`].
+#[cfg(test)]
 fn parse_hsts(value: &Value, path: &str) -> Result<Option<HstsConfig>> {
+    parse_hsts_with_mode(value, path, SecurityHeadersMode::Strict).map(|(hsts, _)| hsts)
+}
+
+/// Mode-aware `strict_transport_security` parser for the standalone handler's field names.
+///
+/// Returns the configuration plus the warnings the mode produced (unknown options and a short
+/// `max_age` are warnings unless the mode is [`SecurityHeadersMode::Strict`]; `max_age == 0` and
+/// `preload` without `includeSubdomains` are errors in every mode).
+fn parse_hsts_with_mode(
+    value: &Value,
+    path: &str,
+    mode: SecurityHeadersMode,
+) -> Result<(Option<HstsConfig>, Vec<String>)> {
     let object = match value {
-        Value::Null | Value::Bool(false) => return Ok(None),
-        Value::String(text) if text == "false" => return Ok(None),
+        Value::Null | Value::Bool(false) => return Ok((None, Vec::new())),
+        Value::String(text) if text == "false" => return Ok((None, Vec::new())),
         Value::Object(object) => object,
         other => {
             return Err(invalid(
@@ -400,6 +481,7 @@ fn parse_hsts(value: &Value, path: &str) -> Result<Option<HstsConfig>> {
     };
     let mut config = HstsConfig::default();
     let mut max_age_seen = false;
+    let mut warnings = Vec::new();
     for (field, value) in object {
         let field_path = format!("{path}.{field}");
         match field.as_str() {
@@ -420,10 +502,13 @@ fn parse_hsts(value: &Value, path: &str) -> Result<Option<HstsConfig>> {
                     .ok_or_else(|| invalid(&field_path, "preload must be a boolean"))?;
             }
             other => {
-                return Err(invalid(
+                unknown_security_header_option(
+                    other,
                     &field_path,
-                    format!("unknown strict_transport_security option `{other}`"),
-                ))
+                    "strict_transport_security",
+                    mode,
+                    &mut warnings,
+                )?;
             }
         }
     }
@@ -433,7 +518,51 @@ fn parse_hsts(value: &Value, path: &str) -> Result<Option<HstsConfig>> {
             "max_age is required when strict_transport_security is configured",
         ));
     }
-    Ok(Some(config))
+    warnings.extend(validate_hsts_mode(&config, path, mode)?);
+    Ok((Some(config), warnings))
+}
+
+/// The mode-aware HSTS range checks shared by both parsers and [`SecurityHeadersConfig::validate`].
+///
+/// `path` is the JSON path of the HSTS object (`...strict_transport_security` for the standalone
+/// handler, `...hsts` for the block form); errors are located at its child fields.
+fn validate_hsts_mode(
+    config: &HstsConfig,
+    path: &str,
+    mode: SecurityHeadersMode,
+) -> Result<Vec<String>> {
+    if config.max_age == 0 {
+        return Err(invalid(
+            &format!("{path}.max_age"),
+            "max_age must be greater than 0",
+        ));
+    }
+    let mut warnings = Vec::new();
+    if config.max_age < HSTS_MIN_MAX_AGE {
+        if mode.is_strict() {
+            return Err(invalid(
+                &format!("{path}.max_age"),
+                format!(
+                    "max_age must be at least {HSTS_MIN_MAX_AGE} seconds (180 days); browsers \
+                     ignore shorter values"
+                ),
+            ));
+        }
+        warnings.push(format!(
+            "`max_age` {} is below the browser-enforced minimum {} seconds (180 days); accepted \
+             in `{}` mode, rejected in `strict` mode",
+            config.max_age,
+            HSTS_MIN_MAX_AGE,
+            mode.name()
+        ));
+    }
+    if config.preload && !config.include_subdomains {
+        return Err(invalid(
+            &format!("{path}.preload"),
+            "preload requires include_subdomains to be enabled",
+        ));
+    }
+    Ok(warnings)
 }
 
 /// `Referrer-Policy` tokens defined by the Fetch standard, accepted by
@@ -486,10 +615,27 @@ fn has_placeholder(value: &str) -> bool {
 /// example `route.handle[0].security_headers.x_frame_options`.
 impl SecurityHeadersConfig {
     pub fn from_headers_block(value: &Value, path: &str) -> Result<Self> {
+        Self::from_headers_block_with_mode(value, path, SecurityHeadersMode::Strict)
+            .map(|(config, _)| config)
+    }
+
+    /// Mode-aware [`Self::from_headers_block`].
+    ///
+    /// Unknown options and an HSTS `max_age` below [`HSTS_MIN_MAX_AGE`] are located errors in
+    /// [`SecurityHeadersMode::Strict`] and warnings (with the configuration still accepted)
+    /// otherwise. Invalid CSP, malformed `Permissions-Policy`/header values, `preload` without
+    /// `includeSubdomains` and `max_age == 0` are errors in every mode: a mode never relaxes a
+    /// security rejection. Returns the configuration and the load-time warnings.
+    pub fn from_headers_block_with_mode(
+        value: &Value,
+        path: &str,
+        mode: SecurityHeadersMode,
+    ) -> Result<(Self, Vec<String>)> {
         let object = value
             .as_object()
             .ok_or_else(|| invalid(path, "security_headers must be an object"))?;
         let mut config = Self::default();
+        let mut warnings = Vec::new();
         for (field, value) in object {
             let field_path = format!("{path}.{field}");
             match field.as_str() {
@@ -512,18 +658,27 @@ impl SecurityHeadersConfig {
                     config.permissions_policy = parse_permissions_policy(value, &field_path)?
                 }
                 "hsts" | "strict_transport_security" => {
-                    config.strict_transport_security = parse_hsts_block(value, &field_path)?
+                    let (hsts, hsts_warnings) =
+                        parse_hsts_block_with_mode(value, &field_path, mode)?;
+                    config.strict_transport_security = hsts;
+                    warnings.extend(hsts_warnings);
                 }
-                other => {
-                    return Err(invalid(
-                        &field_path,
-                        format!("unknown security_headers option `{other}`"),
-                    ))
-                }
+                other => unknown_security_header_option(
+                    other,
+                    &field_path,
+                    "security_headers",
+                    mode,
+                    &mut warnings,
+                )?,
             }
         }
-        config.validate().map_err(|error| relocate(error, path))?;
-        Ok(config)
+        // The HSTS object was already validated with the configured mode above; only the
+        // mode-independent header-value checks remain here.
+        config
+            .validate_header_values()
+            .map_err(|error| relocate(error, path))?;
+        warnings.extend(config.warnings());
+        Ok((config, warnings))
     }
 }
 
@@ -531,6 +686,25 @@ impl SecurityHeadersConfig {
 ///
 /// `validate` reports the standalone handler's field names; the block calls HSTS `hsts`, so the
 /// prefix is rewritten before the document path is prepended.
+/// Re-locate a CSP parser error (paths prefixed with `policy`) onto the configured field.
+fn relocate_csp(error: Error, path: &str) -> Error {
+    match error {
+        Error::InvalidConfig {
+            path: inner,
+            message,
+        } => {
+            let inner = inner.strip_prefix("policy").unwrap_or(&inner);
+            let inner = inner.trim_start_matches('.');
+            if inner.is_empty() {
+                invalid(path, message)
+            } else {
+                invalid(&format!("{path}.{inner}"), message)
+            }
+        }
+        other => other,
+    }
+}
+
 fn relocate(error: Error, path: &str) -> Error {
     match error {
         Error::InvalidConfig {
@@ -545,6 +719,34 @@ fn relocate(error: Error, path: &str) -> Error {
         }
         other => other,
     }
+}
+
+/// Handle an unknown option of the security-header surface under the configured mode.
+///
+/// The whole surface is a caddy-rs extension (Caddy has no security-header block), so an unknown
+/// option is either a typo or a field a newer build supports. Compatible/warn modes keep the
+/// configuration loadable and report it; strict mode rejects it with the located JSON path.
+/// `surface` names the object the option belongs to (`security header`,
+/// `strict_transport_security`, ...) so the strict wording stays specific; `path` is the located
+/// path of the option itself.
+fn unknown_security_header_option(
+    option: &str,
+    path: &str,
+    surface: &str,
+    mode: SecurityHeadersMode,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    if mode.is_strict() {
+        return Err(invalid(
+            path,
+            format!("unknown {surface} option `{option}`"),
+        ));
+    }
+    warnings.push(format!(
+        "unknown {surface} option `{option}` is ignored in `{}` mode (rejected in `strict` mode)",
+        mode.name()
+    ));
+    Ok(())
 }
 
 /// Parse `x_frame_options`: `DENY`, `SAMEORIGIN`, or `ALLOW-FROM <origin>`.
@@ -633,30 +835,24 @@ fn parse_referrer_policy(value: &Value, path: &str) -> Result<Option<String>> {
 }
 
 /// Parse `content_security_policy`: a header-value string or a directive object.
+///
+/// Both forms are validated with [`CspPolicy`] at load time — the same grammar
+/// [`crate::csp::CspPolicy::to_header_value`] emits — so an unknown directive, an invalid source or
+/// a `'none'`-with-other-sources combination is a located error instead of an opaque header the
+/// browser silently ignores. The object form is rendered to the canonical
+/// `dir src...; dir2 src...` value; a generic `{...}` request placeholder is kept opaque as one
+/// source and re-validated after expansion at request time.
 fn parse_csp_block(value: &Value, path: &str) -> Result<Option<String>> {
     match value {
         Value::Null | Value::Bool(false) => Ok(None),
         Value::String(text) if text == "false" => Ok(None),
-        Value::String(text) => Ok(Some(text.clone())),
-        Value::Object(object) => {
-            if object.is_empty() {
-                return Err(invalid(
-                    path,
-                    "a CSP policy must declare at least one directive",
-                ));
-            }
-            let mut rendered = Vec::with_capacity(object.len());
-            for (name, sources) in object {
-                let directive_path = format!("{path}.{name}");
-                validate_csp_directive_name(name, &directive_path)?;
-                let sources = parse_csp_sources(sources, &directive_path)?;
-                if sources.is_empty() {
-                    rendered.push(name.clone());
-                } else {
-                    rendered.push(format!("{name} {}", sources.join(" ")));
-                }
-            }
-            Ok(Some(rendered.join("; ")))
+        Value::String(text) => {
+            CspPolicy::parse_header_value(text).map_err(|error| relocate_csp(error, path))?;
+            Ok(Some(text.clone()))
+        }
+        Value::Object(_) => {
+            let policy = CspPolicy::from_json(value, path)?;
+            Ok(Some(policy.to_header_value()))
         }
         other => Err(invalid(
             path,
@@ -674,49 +870,6 @@ fn is_csp_directive_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-}
-
-/// Validate a CSP directive name: an ASCII token without whitespace, `;` or `=`.
-fn validate_csp_directive_name(name: &str, path: &str) -> Result<()> {
-    if !is_csp_directive_name(name) {
-        return Err(invalid(
-            path,
-            format!("`{name}` is not a valid CSP directive name"),
-        ));
-    }
-    Ok(())
-}
-
-/// Parse one CSP directive's source list: a whitespace-separated string or an array of strings.
-fn parse_csp_sources(value: &Value, path: &str) -> Result<Vec<String>> {
-    let sources: Vec<String> = match value {
-        Value::String(text) => text.split_whitespace().map(str::to_string).collect(),
-        Value::Array(items) => {
-            let mut sources = Vec::with_capacity(items.len());
-            for (index, item) in items.iter().enumerate() {
-                let item = item.as_str().ok_or_else(|| {
-                    invalid(&format!("{path}[{index}]"), "expected a source string")
-                })?;
-                sources.push(item.to_string());
-            }
-            sources
-        }
-        other => {
-            return Err(invalid(
-                path,
-                format!("expected a source list string or an array of sources, got {other}"),
-            ))
-        }
-    };
-    for (index, source) in sources.iter().enumerate() {
-        let source_path = if matches!(value, Value::Array(_)) {
-            format!("{path}[{index}]")
-        } else {
-            path.to_string()
-        };
-        validate_allowlist_token(source, &source_path)?;
-    }
-    Ok(sources)
 }
 
 /// Parse `permissions_policy`: a header-value string or a feature object.
@@ -854,13 +1007,17 @@ fn validate_allowlist_token(token: &str, path: &str) -> Result<()> {
 /// `enabled` gates emission: `false` (the default) means no `Strict-Transport-Security` header is
 /// ever emitted, whatever the other fields say. The other fields are still type- and range-checked
 /// so a typo is a load-time error rather than a silently ignored setting.
-fn parse_hsts_block(value: &Value, path: &str) -> Result<Option<HstsConfig>> {
+fn parse_hsts_block_with_mode(
+    value: &Value,
+    path: &str,
+    mode: SecurityHeadersMode,
+) -> Result<(Option<HstsConfig>, Vec<String>)> {
     if matches!(value, Value::Bool(true)) {
-        return Ok(Some(HstsConfig::default()));
+        return Ok((Some(HstsConfig::default()), Vec::new()));
     }
     let object = match value {
-        Value::Null | Value::Bool(false) => return Ok(None),
-        Value::String(text) if text == "false" => return Ok(None),
+        Value::Null | Value::Bool(false) => return Ok((None, Vec::new())),
+        Value::String(text) if text == "false" => return Ok((None, Vec::new())),
         Value::Object(object) => object,
         other => {
             return Err(invalid(
@@ -871,6 +1028,7 @@ fn parse_hsts_block(value: &Value, path: &str) -> Result<Option<HstsConfig>> {
     };
     let mut config = HstsConfig::default();
     let mut enabled = false;
+    let mut warnings = Vec::new();
     for (field, value) in object {
         let field_path = format!("{path}.{field}");
         match field.as_str() {
@@ -895,40 +1053,17 @@ fn parse_hsts_block(value: &Value, path: &str) -> Result<Option<HstsConfig>> {
                     .ok_or_else(|| invalid(&field_path, "preload must be a boolean"))?;
             }
             other => {
-                return Err(invalid(
-                    &field_path,
-                    format!("unknown hsts option `{other}`"),
-                ))
+                unknown_security_header_option(other, &field_path, "hsts", mode, &mut warnings)?;
             }
         }
     }
     // Range checks apply even when `enabled` is false: a mistyped max_age is a configuration bug
     // either way, and silently ignoring it would surface only after the flag is flipped.
-    if config.max_age == 0 {
-        return Err(invalid(
-            &format!("{path}.max_age"),
-            "max_age must be greater than 0",
-        ));
-    }
-    if config.max_age < HSTS_MIN_MAX_AGE {
-        return Err(invalid(
-            &format!("{path}.max_age"),
-            format!(
-                "max_age must be at least {HSTS_MIN_MAX_AGE} seconds (180 days); browsers ignore \
-                 shorter values"
-            ),
-        ));
-    }
-    if config.preload && !config.include_subdomains {
-        return Err(invalid(
-            &format!("{path}.preload"),
-            "preload requires include_subdomains to be enabled",
-        ));
-    }
+    warnings.extend(validate_hsts_mode(&config, path, mode)?);
     if !enabled {
-        return Ok(None);
+        return Ok((None, warnings));
     }
-    Ok(Some(config))
+    Ok((Some(config), warnings))
 }
 
 /// `security_headers`: stage security response headers with secure defaults.
@@ -942,10 +1077,20 @@ pub struct SecurityHeaders {
 }
 
 impl SecurityHeaders {
-    /// Build the middleware, validating the configuration.
+    /// Build the middleware, validating the configuration (strict form).
     pub fn new(config: SecurityHeadersConfig) -> Result<Self> {
         config.validate()?;
         Ok(Self { config })
+    }
+
+    /// Build the middleware from a configuration that was already validated with the configured
+    /// [`SecurityHeadersMode`] by [`validate_security_headers_config`].
+    ///
+    /// This is the router's handler-construction path: the load path decided whether a
+    /// policy-strength rule is an error (strict) or a warning (compatible/warn) before the
+    /// generation was provisioned, so construction must not re-apply the strict rule.
+    pub fn from_validated(config: SecurityHeadersConfig) -> Self {
+        Self { config }
     }
 
     /// The effective configuration.
@@ -1319,6 +1464,86 @@ impl Handler for SecurityHeaders {
     async fn handle(&self, mut request: Request) -> Result<Outcome> {
         self.stage(&mut request)?;
         Ok(Outcome::Continue(request))
+    }
+}
+
+/// Validate every `security_headers` configuration in a whole Caddy JSON document.
+///
+/// This is the load-path entry point used by `caddy-rs validate`/`run` and by the server runtime's
+/// warning sink. It walks the document, finds standalone `security_headers` handlers and the
+/// `security_headers` block of `headers` handlers, validates each with `mode`, and returns the
+/// located warnings the mode produced. A strict error carries the full JSON path of the offending
+/// field, for example
+/// `apps.http.servers.srv0.routes[0].handle[0].content_security_policy.script-src[1]`.
+///
+/// Caddy v2.11.9 has no security-header validation at all (DIV-0120), so `compatible`/`warn`
+/// always load and only report; `strict` turns the policy-strength rules (unknown options, HSTS
+/// `max_age` below 180 days) into errors. Malformed values are errors in every mode.
+///
+/// Caddyfile line/column locations are the Caddyfile adapter's job and are tracked separately
+/// (T-ROUTE-051); a Caddyfile that reaches this walker is already JSON.
+pub fn validate_security_headers_config(
+    config: &Value,
+    mode: SecurityHeadersMode,
+) -> Result<Vec<String>> {
+    let mut warnings = Vec::new();
+    walk_security_headers(config, "", mode, &mut warnings)?;
+    Ok(warnings)
+}
+
+fn walk_security_headers(
+    value: &Value,
+    path: &str,
+    mode: SecurityHeadersMode,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    match value {
+        Value::Object(object) => {
+            match object.get("handler").and_then(Value::as_str) {
+                Some("security_headers") => {
+                    let (_, found) = SecurityHeadersConfig::from_json_with_mode(value, path, mode)?;
+                    extend_located_warnings(warnings, path, found);
+                }
+                Some("headers") => {
+                    if let Some(block) = object.get("security_headers") {
+                        let block_path = join_json_path(path, "security_headers");
+                        let (_, found) = SecurityHeadersConfig::from_headers_block_with_mode(
+                            block,
+                            &block_path,
+                            mode,
+                        )?;
+                        extend_located_warnings(warnings, &block_path, found);
+                    }
+                }
+                _ => {}
+            }
+            for (key, child) in object {
+                let child_path = join_json_path(path, key);
+                walk_security_headers(child, &child_path, mode, warnings)?;
+            }
+        }
+        Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                let child_path = format!("{path}[{index}]");
+                walk_security_headers(child, &child_path, mode, warnings)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn extend_located_warnings(warnings: &mut Vec<String>, path: &str, found: Vec<String>) {
+    for warning in found {
+        warnings.push(format!("security_headers at `{path}`: {warning}"));
+    }
+}
+
+fn join_json_path(path: &str, key: &str) -> String {
+    if path.is_empty() {
+        key.to_string()
+    } else {
+        format!("{path}.{key}")
     }
 }
 
@@ -2030,5 +2255,229 @@ mod tests {
             header_value(&headers, "strict-transport-security").as_deref(),
             Some("max-age=31536000; includeSubDomains; preload")
         );
+    }
+
+    #[test]
+    fn invalid_csp_config_fails_validation_with_a_located_directive_and_source() {
+        // Acceptance (1): an invalid CSP is rejected at load time with the JSON path of the exact
+        // directive/source, for both the string and the object form. (Caddyfile line/column
+        // locations are the adapter's surface, tracked by T-ROUTE-051.)
+        let error = SecurityHeadersConfig::from_json(
+            &json!({"content_security_policy": "default-src 'self'; img-src h\u{e9}llo"}),
+            "routes[0].handle[0]",
+        )
+        .unwrap_err();
+        match error {
+            Error::InvalidConfig { path, message } => {
+                assert_eq!(
+                    path,
+                    "routes[0].handle[0].content_security_policy.img-src[0]"
+                );
+                assert!(message.contains("non-ASCII"), "{message}");
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+
+        let error = SecurityHeadersConfig::from_json(
+            &json!({"content_security_policy": {"frobnicate-src": []}}),
+            "routes[0].handle[0]",
+        )
+        .unwrap_err();
+        match error {
+            Error::InvalidConfig { path, message } => {
+                assert_eq!(
+                    path,
+                    "routes[0].handle[0].content_security_policy.frobnicate-src"
+                );
+                assert!(message.contains("frobnicate-src"), "{message}");
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+
+        // The whole-document walker keeps the full JSON path: the CLI/load path reports exactly
+        // which route and handler owns the invalid directive.
+        let document = json!({"apps": {"http": {"servers": {"srv0": {"routes": [{
+            "handle": [{
+                "handler": "security_headers",
+                "content_security_policy": "default-src 'self'; img-src h\u{e9}llo"
+            }]
+        }]}}}}});
+        let error = validate_security_headers_config(&document, SecurityHeadersMode::Compatible)
+            .unwrap_err();
+        match error {
+            Error::InvalidConfig { path, .. } => assert_eq!(
+                path,
+                "apps.http.servers.srv0.routes[0].handle[0].content_security_policy.img-src[0]"
+            ),
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hsts_short_max_age_warns_in_compatible_and_rejects_in_strict() {
+        // Acceptance (2): below 180 days is a warning in compatible/warn, an error in strict.
+        let value =
+            json!({"strict_transport_security": {"max_age": 86_400, "include_subdomains": true}});
+        for mode in [SecurityHeadersMode::Compatible, SecurityHeadersMode::Warn] {
+            let (config, warnings) =
+                SecurityHeadersConfig::from_json_with_mode(&value, "handle[0]", mode).unwrap();
+            assert_eq!(
+                config
+                    .strict_transport_security
+                    .as_ref()
+                    .map(|hsts| hsts.max_age),
+                Some(86_400)
+            );
+            assert!(
+                warnings
+                    .iter()
+                    .any(|warning| warning.contains("below the browser-enforced minimum")),
+                "mode {mode:?}: {warnings:?}"
+            );
+        }
+
+        let error = SecurityHeadersConfig::from_json_with_mode(
+            &value,
+            "handle[0]",
+            SecurityHeadersMode::Strict,
+        )
+        .unwrap_err();
+        match error {
+            Error::InvalidConfig { path, message } => {
+                assert_eq!(path, "handle[0].strict_transport_security.max_age");
+                assert!(message.contains("15552000"), "{message}");
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+
+        // A mode never relaxes the malformed-value rules.
+        for value in [
+            json!({"strict_transport_security": {"max_age": 0}}),
+            json!({"strict_transport_security": {"max_age": 31_536_000, "preload": true}}),
+        ] {
+            for mode in [
+                SecurityHeadersMode::Compatible,
+                SecurityHeadersMode::Warn,
+                SecurityHeadersMode::Strict,
+            ] {
+                assert!(
+                    SecurityHeadersConfig::from_json_with_mode(&value, "handle[0]", mode).is_err(),
+                    "mode {mode:?} must reject {value}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn strict_mode_rejects_unknown_fields_and_compatible_mode_warns() {
+        // Acceptance (4) and (5): the standalone handler surface.
+        let value = json!({"frame_options": "DENY", "x_frame_options_typo": "SAMEORIGIN"});
+        let (config, warnings) = SecurityHeadersConfig::from_json_with_mode(
+            &value,
+            "handle[0]",
+            SecurityHeadersMode::Compatible,
+        )
+        .unwrap();
+        assert_eq!(config.x_frame_options.as_deref(), Some("DENY"));
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("x_frame_options_typo")
+                    && warning.contains("compatible")),
+            "{warnings:?}"
+        );
+        let error = SecurityHeadersConfig::from_json_with_mode(
+            &value,
+            "handle[0]",
+            SecurityHeadersMode::Strict,
+        )
+        .unwrap_err();
+        match error {
+            Error::InvalidConfig { path, message } => {
+                assert_eq!(path, "handle[0].x_frame_options_typo");
+                assert!(
+                    message.contains("unknown security header option"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+
+        // The `headers.security_headers` block surface, including the HSTS object.
+        let block = json!({"hsts": {
+            "max_age": 63_072_000,
+            "include_subdomains": true,
+            "subdomains": true
+        }});
+        let (_, warnings) = SecurityHeadersConfig::from_headers_block_with_mode(
+            &block,
+            "handle[0].security_headers",
+            SecurityHeadersMode::Compatible,
+        )
+        .unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("unknown hsts option `subdomains`")),
+            "{warnings:?}"
+        );
+        let error = SecurityHeadersConfig::from_headers_block_with_mode(
+            &block,
+            "handle[0].security_headers",
+            SecurityHeadersMode::Strict,
+        )
+        .unwrap_err();
+        match error {
+            Error::InvalidConfig { path, message } => {
+                assert_eq!(path, "handle[0].security_headers.hsts.subdomains");
+                assert!(message.contains("unknown hsts option"), "{message}");
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_walker_reports_located_warnings_for_every_handler_form() {
+        let document = json!({"apps": {"http": {"servers": {"srv0": {"routes": [
+            {"handle": [{"handler": "headers", "security_headers": {
+                "hsts": {"max_age": 86_400, "include_subdomains": true}
+            }}]},
+            {"handle": [{"handler": "security_headers", "typo_option": true,
+                "strict_transport_security": {"max_age": 31_536_000,
+                    "include_subdomains": true, "preload": true}}]}
+        ]}}}}});
+
+        let warnings =
+            validate_security_headers_config(&document, SecurityHeadersMode::Compatible).unwrap();
+        assert!(
+            warnings.iter().any(|warning| warning
+                .contains("apps.http.servers.srv0.routes[0].handle[0].security_headers")
+                && warning.contains("below the browser-enforced minimum")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("routes[1].handle[0]")
+                    && warning.contains("typo_option")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("HSTS preload list cannot be verified")),
+            "{warnings:?}"
+        );
+
+        // Strict mode rejects the first policy-strength violation it meets.
+        let error =
+            validate_security_headers_config(&document, SecurityHeadersMode::Strict).unwrap_err();
+        match error {
+            Error::InvalidConfig { path, .. } => assert_eq!(
+                path,
+                "apps.http.servers.srv0.routes[0].handle[0].security_headers.hsts.max_age"
+            ),
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
     }
 }

@@ -508,6 +508,15 @@ fn validate_directive(name: &str, sources: &[String], path: &str) -> Result<()> 
 }
 
 /// Validate one source token of a source-list directive.
+/// Whether `token` is a generic `{...}` request placeholder.
+///
+/// Configuration-time syntax: the owning handler expands it per request and re-validates the
+/// expansion, so at load time it is kept opaque as a single token. `{csp.nonce}` is handled
+/// separately because the nonce mechanism restricts it to the script-src/style-src families.
+fn is_generic_placeholder(token: &str) -> bool {
+    token.starts_with('{') && token.ends_with('}') && token.len() >= 3
+}
+
 fn validate_source(directive: &str, source: &str, path: &str) -> Result<()> {
     if source.is_empty() {
         return Err(invalid(path, format!("empty source in `{directive}`")));
@@ -539,6 +548,15 @@ fn validate_source(directive: &str, source: &str, path: &str) -> Result<()> {
                 ),
             ));
         }
+        return Ok(());
+    }
+    // A generic `{placeholder}` token is configuration-time syntax expanded per request by the
+    // caller that owns the replacement (the `security_headers` handler's staging path). It is kept
+    // opaque here and validated as a single source token by the ASCII/whitespace/`;` checks above;
+    // the expanded value is re-validated at request time, so a request-controlled placeholder
+    // cannot split or append a directive. `{csp.nonce}` is handled specially above because the
+    // nonce mechanism restricts it to the script-src/style-src families.
+    if is_generic_placeholder(source) {
         return Ok(());
     }
     if source.starts_with('\'') || source.ends_with('\'') {
@@ -756,6 +774,9 @@ fn validate_sandbox_token(directive: &str, token: &str, path: &str) -> Result<()
 }
 
 fn validate_report_uri(uri: &str, path: &str) -> Result<()> {
+    if is_generic_placeholder(uri) {
+        return Ok(());
+    }
     validate_plain_token(uri, "report-uri", path)?;
     let absolute_url = uri
         .split_once(':')
@@ -1294,6 +1315,29 @@ mod tests {
             .to_header_value()
             .parse::<HeaderValue>()
             .expect("valid header value");
+    }
+
+    #[test]
+    fn generic_request_placeholders_are_opaque_valid_sources() {
+        // `security_headers` values are expanded per request; a generic `{...}` token is accepted
+        // as one source at load time, in any directive that takes a source list.
+        let parsed = CspPolicy::parse_header_value(
+            "default-src {http.request.host}; script-src {http.request.uri.path} 'self'",
+        )
+        .expect("generic placeholders are valid sources");
+        assert_eq!(
+            parsed.to_header_value(),
+            "default-src {http.request.host}; script-src {http.request.uri.path} 'self'"
+        );
+        // The nonce placeholder keeps its script-src/style-src restriction; a generic placeholder
+        // does not smuggle it into another family.
+        let error = CspPolicy::parse_header_value("default-src {csp.nonce}").unwrap_err();
+        assert!(
+            format!("{error}").contains("only valid in the script-src and style-src families"),
+            "{error}"
+        );
+        // An unterminated braces token is not a placeholder and still fails normal source rules.
+        assert!(CspPolicy::parse_header_value("default-src {http.request.host").is_err());
     }
 
     #[test]
