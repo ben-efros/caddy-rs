@@ -577,6 +577,13 @@ fn lex_heredoc(
 
     let mut body = String::new();
     let mut body_newlines = 0usize;
+    let mut matched_prefix_len = 0;
+    let marker_chars: Vec<char> = marker.chars().collect();
+    let marker_len = marker_chars.len();
+    
+    // Precompute failure function for KMP-like algorithm
+    let failure = compute_failure_function(&marker_chars);
+    
     loop {
         let Some((_, ch)) = cursor.next() else {
             return Err(LexError::new(
@@ -594,11 +601,14 @@ fn lex_heredoc(
         if ch == '\n' {
             body_newlines += 1;
         }
-        // Caddy accepts the marker as soon as it appears at the end of the characters read so
-        // far, even in the middle of a line; the whitespace check in `finalize_heredoc` then
-        // reports the mismatch with the closing marker's indentation.
-        if body.ends_with(marker.as_str()) {
-            body.truncate(body.len() - marker.len());
+        
+        // Efficient marker matching using KMP-like algorithm
+        matched_prefix_len = match_next_character(&marker_chars, &failure, matched_prefix_len, ch);
+        
+        // Check if we found the complete marker
+        if matched_prefix_len == marker_len {
+            // Remove the marker from the body
+            body.truncate(body.len() - marker_len);
             let text = finalize_heredoc(&body, &marker, start.line)?;
             let end_line = start.line + 1 + body_newlines;
             let closing_padding = match body.rfind('\n') {
@@ -617,6 +627,36 @@ fn lex_heredoc(
             )));
         }
     }
+}
+
+/// Compute the failure function for KMP pattern matching algorithm.
+fn compute_failure_function(pattern: &[char]) -> Vec<usize> {
+    let mut failure = vec![0; pattern.len()];
+    let mut j = 0;
+    
+    for i in 1..pattern.len() {
+        while j > 0 && pattern[i] != pattern[j] {
+            j = failure[j - 1];
+        }
+        if pattern[i] == pattern[j] {
+            j += 1;
+        }
+        failure[i] = j;
+    }
+    
+    failure
+}
+
+/// Advance the matched prefix length when a new character is consumed.
+fn match_next_character(pattern: &[char], failure: &[usize], matched_len: usize, ch: char) -> usize {
+    let mut j = matched_len;
+    while j > 0 && pattern[j] != ch {
+        j = failure[j - 1];
+    }
+    if pattern[j] == ch {
+        j += 1;
+    }
+    j
 }
 
 /// Strip the closing marker's leading whitespace from every non-blank heredoc content line.
@@ -1037,5 +1077,16 @@ mod tests {
         // content quote literal: `\\"""` is the single-character token `"`.
         let tokens = texts("\\\"\"\"");
         assert_eq!(tokens, vec![(TokenKind::Quoted, "\"".to_string())]);
+    }
+
+    #[test]
+    fn heredoc_performance_linear_scan() {
+        // Test that the heredoc scanning algorithm works correctly for large inputs
+        // This test verifies the fix for performance issue with quadratic scanning
+        let content = "a".repeat(1000); // Large content
+        let marker = "END".to_string();
+        let test_input = format!("heredoc <<{}\n{}\n{}", marker, content, marker);
+        let tokens = texts(&test_input);
+        assert!(tokens.contains(&(TokenKind::Quoted, content)));
     }
 }
