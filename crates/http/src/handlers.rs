@@ -3128,7 +3128,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_body_orders_before_a_body_consuming_proxy() {
-        let factory: crate::router::CustomHandlerFactory = Arc::new(|value, _path| {
+        let factory: crate::router::CustomHandlerFactory = Arc::new(|value, _path, _context| {
             Ok(
                 match value.get("handler").and_then(serde_json::Value::as_str) {
                     Some("reverse_proxy") => Some(Arc::new(ProxyBodyStub) as crate::SharedHandler),
@@ -3203,7 +3203,7 @@ mod tests {
     fn streaming_proxy_factory(
         consumed: Arc<std::sync::Mutex<Vec<Bytes>>>,
     ) -> crate::router::CustomHandlerFactory {
-        Arc::new(move |value, _path| {
+        Arc::new(move |value, _path, _context| {
             Ok(
                 match value.get("handler").and_then(serde_json::Value::as_str) {
                     Some("reverse_proxy") => Some(Arc::new(StreamingProxyStub {

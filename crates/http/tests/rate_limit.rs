@@ -15,15 +15,17 @@ use http::{header, Method, StatusCode};
 use serde_json::{json, Value};
 
 fn clocked_router(clock: Arc<ManualClock>, routes: &Value) -> Router {
-    let factory: CustomHandlerFactory = Arc::new(move |value: &Value, path: &str| {
-        if value.get("handler").and_then(Value::as_str) == Some("test_rate_limit") {
-            let clock_dyn = Arc::clone(&clock) as Arc<dyn RateLimitClock>;
-            let handler = RateLimitHandler::from_json_with_clock(value, path, clock_dyn)?;
-            Ok(Some(Arc::new(handler) as SharedHandler))
-        } else {
-            Ok(None)
-        }
-    });
+    let factory: CustomHandlerFactory = Arc::new(
+        move |value: &Value, path: &str, _context: &caddy_rs_http::HandlerBuildContext| {
+            if value.get("handler").and_then(Value::as_str) == Some("test_rate_limit") {
+                let clock_dyn = Arc::clone(&clock) as Arc<dyn RateLimitClock>;
+                let handler = RateLimitHandler::from_json_with_clock(value, path, clock_dyn)?;
+                Ok(Some(Arc::new(handler) as SharedHandler))
+            } else {
+                Ok(None)
+            }
+        },
+    );
     RouterBuilder::new()
         .with_custom_handler(factory)
         .build(routes.as_array().expect("routes array"))
