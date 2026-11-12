@@ -12,6 +12,19 @@
 //! The crate deliberately has no dependency on the process-manager (`pm-*`) crates. A persistent
 //! store can implement [`UserStore`] without pulling process-manager state into the authentication
 //! boundary.
+//!
+//! # JWT signing secret file
+//!
+//! [`JwtSecretSource::File`] keeps the signing key in a file so existing sessions survive a
+//! restart. The file is created owner-only (`0600`) on first start, must be a regular file (a
+//! symlink at the final path is refused), and must contain exactly 32 bytes.
+//!
+//! Only a **zero-byte** file is repaired: it is an unusable leftover from a crash between create
+//! and write, so it is replaced by a fresh random secret. A non-empty file of any other length is
+//! never repaired, truncated or overwritten — the service fails closed with an error that names
+//! the path and the observed length. The operator must then either delete the file (a new secret
+//! is generated on the next start, which invalidates existing sessions) or configure a master
+//! secret.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -673,7 +686,13 @@ pub enum TotpWindow {
     Current,
     /// Accept current ± 1 time step. Tolerates small clock skew and user delay.
     PlusMinusOne,
-    /// Accept current and next step (current + 1). Legacy behavior.
+    /// Accept the current time step and the next one (current + 1). An older step
+    /// (`current - 1`) is never accepted.
+    ///
+    /// This is *not* the pre-window legacy behaviour: legacy verification accepted
+    /// `current - 1` as well, which is [`TotpWindow::PlusMinusOne`]. Use that variant to
+    /// reproduce the legacy window; `CurrentAndNext` exists for clients that pre-compute the
+    /// next code.
     CurrentAndNext,
 }
 
@@ -710,6 +729,14 @@ pub enum JwtSecretSource {
     /// On first start the file does not exist: a random 32-byte secret is
     /// generated, written atomically (write-temp-then-rename), and reused on
     /// every subsequent start.
+    ///
+    /// The final path component must be a regular file: a symlink there is refused, so the signing
+    /// key cannot be redirected to a file an attacker controls.
+    ///
+    /// An existing file must contain exactly 32 bytes. Only a zero-byte file is repaired (it is a
+    /// crash leftover, replaced by a fresh secret); any other non-empty length fails closed with an
+    /// error naming the path and the observed length, and the operator must delete the file or
+    /// configure a master secret.
     File(PathBuf),
     /// Generate fresh on each start (legacy behavior, **NOT recommended**).
     Ephemeral,
@@ -779,26 +806,102 @@ const SECRET_READ_ATTEMPTS: usize = 3;
 
 /// Read a `[u8; 32]` secret file, returning `Ok(None)` when it does not exist yet.
 fn read_secret_file(path: &std::path::Path) -> AuthResult<Option<[u8; 32]>> {
-    match std::fs::read(path) {
-        Ok(bytes) if bytes.len() == 32 => {
+    use std::io::Read as _;
+
+    let Some(mut file) = open_secret_file(path)? else {
+        return Ok(None);
+    };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|error| {
+        AuthError::Internal(format!(
+            "could not read JWT secret file {}: {error}",
+            path.display()
+        ))
+    })?;
+    match bytes.len() {
+        32 => {
             let mut key = [0u8; 32];
             key.copy_from_slice(&bytes);
             Ok(Some(key))
         }
         // An empty file is an unusable leftover (e.g. a crash between create and write), never a
         // valid secret: treat it as absent so the next start repairs it instead of hard-failing.
-        Ok(bytes) if bytes.is_empty() => Ok(None),
-        Ok(bytes) => Err(AuthError::Internal(format!(
-            "JWT secret file {} must contain exactly 32 bytes, found {}",
-            path.display(),
-            bytes.len()
+        0 => Ok(None),
+        found => Err(AuthError::Internal(format!(
+            "JWT secret file {} must contain exactly 32 bytes, found {found}; delete the file to \
+             have a new secret generated, or configure a master secret",
+            path.display()
         ))),
+    }
+}
+
+/// Open the secret file, refusing to follow a symlink at the final path component.
+///
+/// A symlink planted at the configured secret path would redirect the signing key to a file an
+/// attacker controls (or let the process read a file it should not), so the final component must
+/// be a regular file. The check cannot be a bare `symlink_metadata` before `File::open`: the path
+/// could be swapped for a symlink in between. The descriptor's own metadata is therefore compared
+/// with the path metadata *after* the open, and any disagreement means the path changed while it
+/// was being opened, so the read is refused rather than trusted.
+#[cfg(unix)]
+fn open_secret_file(path: &std::path::Path) -> AuthResult<Option<std::fs::File>> {
+    let link_metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(AuthError::Internal(format!(
+                "could not inspect JWT secret file {}: {error}",
+                path.display()
+            )))
+        }
+    };
+    if link_metadata.file_type().is_symlink() {
+        return Err(AuthError::Internal(format!(
+            "refusing to read JWT secret file {}: the final path component is a symlink; replace \
+             it with a regular file or configure a master secret",
+            path.display()
+        )));
+    }
+
+    let file = std::fs::File::open(path).map_err(|error| {
+        AuthError::Internal(format!(
+            "could not read JWT secret file {}: {error}",
+            path.display()
+        ))
+    })?;
+    let opened_metadata = file.metadata().map_err(|error| {
+        AuthError::Internal(format!(
+            "could not inspect opened JWT secret file {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !same_file(&opened_metadata, &link_metadata) {
+        return Err(AuthError::Internal(format!(
+            "refusing to read JWT secret file {}: it was replaced while being opened",
+            path.display()
+        )));
+    }
+    Ok(Some(file))
+}
+
+/// Non-Unix fallback: no `dev`/`ino` to compare, so only the pre-open symlink check is available.
+#[cfg(not(unix))]
+fn open_secret_file(path: &std::path::Path) -> AuthResult<Option<std::fs::File>> {
+    match std::fs::File::open(path) {
+        Ok(file) => Ok(Some(file)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(AuthError::Internal(format!(
             "could not read JWT secret file {}: {error}",
             path.display()
         ))),
     }
+}
+
+/// Whether two metadata snapshots describe the same file (same device and inode).
+#[cfg(unix)]
+fn same_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
 }
 
 /// Re-read the installed secret, retrying briefly so a short or partially written file observed
@@ -1297,6 +1400,22 @@ fn system_time_to_ts(t: SystemTime) -> AuthResult<i64> {
         .map_err(|_| AuthError::Internal("system clock is out of range".to_string()))
 }
 
+/// Compute an expiry timestamp from an issue time and a configured token TTL.
+///
+/// The TTL is configuration input, so a value that does not fit in an `i64` second count, or that
+/// pushes the expiry past the representable range, must fail closed with an actionable error
+/// instead of panicking in a debug build or silently wrapping into the past in a release build.
+fn expiry_after(now: i64, ttl: Duration) -> AuthResult<i64> {
+    let ttl_seconds = i64::try_from(ttl.as_secs()).map_err(|_| {
+        AuthError::Internal(format!(
+            "token TTL of {} seconds is too large",
+            ttl.as_secs()
+        ))
+    })?;
+    now.checked_add(ttl_seconds)
+        .ok_or_else(|| AuthError::Internal("token TTL overflows the expiry timestamp".to_string()))
+}
+
 /// Current TOTP time step.
 fn now_step() -> AuthResult<u64> {
     let now = u64::try_from(now_ts()?)
@@ -1318,6 +1437,8 @@ fn hash_refresh_token(token: &str) -> String {
 
 /// Generate a TOTP code for a time step.
 fn totp_code(secret: &[u8], step: u64) -> String {
+    // INFEASIBLE: every caller derives `step` from `now_step()`, which is at most
+    // `i64::MAX / TOTP_STEP_SECONDS`, so `step * TOTP_STEP_SECONDS` cannot overflow.
     totp_custom::<Sha1>(
         TOTP_STEP_SECONDS,
         TOTP_DIGITS,
@@ -1576,6 +1697,9 @@ impl<S: UserStore> AuthnService<S> {
             .ok_or_else(|| AuthError::Internal("invalid base32 TOTP secret".to_string()))?;
 
         let current = self.current_step()?;
+        // INFEASIBLE: `current` comes from `now_step()`, which is at most
+        // `i64::MAX / TOTP_STEP_SECONDS`, so the `current + 1` steps below cannot overflow, and
+        // `current - 1` is guarded by `current > 0`.
         let mut steps = vec![current];
         match self.config.totp_window {
             TotpWindow::Current => {}
@@ -1744,6 +1868,10 @@ impl<S: UserStore> AuthnService<S> {
     /// Issue a new access/refresh token pair for a user.
     async fn issue_token_pair(&self, user: &User) -> AuthResult<TokenPair> {
         let now = now_ts()?;
+        // Configured TTLs are external input: compute both expiries before issuing anything so a
+        // nonsensical TTL fails closed instead of panicking or wrapping.
+        let access_exp = expiry_after(now, self.config.access_ttl)?;
+        let refresh_expires_at = expiry_after(now, self.config.refresh_ttl)?;
         let claims = Claims {
             sub: user.id,
             role: user.role.name.clone(),
@@ -1751,7 +1879,7 @@ impl<S: UserStore> AuthnService<S> {
             vis: user.role.visibility,
             epoch: user.auth_epoch,
             iat: now,
-            exp: now + self.config.access_ttl.as_secs() as i64,
+            exp: access_exp,
             iss: self.config.issuer.clone(),
             aud: self.config.audience.clone(),
         };
@@ -1767,7 +1895,7 @@ impl<S: UserStore> AuthnService<S> {
             token_hash,
             user_id: user.id,
             iat: now,
-            expires_at: now + self.config.refresh_ttl.as_secs() as i64,
+            expires_at: refresh_expires_at,
             revoked_at: None,
             token_id: generate_token_id(),
         };

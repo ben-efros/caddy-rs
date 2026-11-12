@@ -889,6 +889,39 @@ fn each_auth_entry_point_propagates_clock_error() {
 }
 
 #[tokio::test]
+async fn oversized_token_ttls_fail_closed_instead_of_overflowing() {
+    // A TTL that does not fit in an `i64` second count used to be truncated by `as i64` (a silent
+    // wrap into the past) and a TTL that overflows the expiry addition panicked in debug builds.
+    // Both must be reported as errors and must not issue a token pair.
+    for (access_ttl, refresh_ttl) in [
+        (Duration::from_secs(u64::MAX), Duration::from_secs(60)),
+        (Duration::from_secs(60), Duration::from_secs(u64::MAX)),
+        (
+            Duration::from_secs(i64::MAX as u64),
+            Duration::from_secs(60),
+        ),
+    ] {
+        let mut config = test_config();
+        config.access_ttl = access_ttl;
+        config.refresh_ttl = refresh_ttl;
+        let service = AuthnService::new(MemoryUserStore::new(), config).expect("build service");
+        service
+            .create_user("alice", "password", Role::viewer())
+            .await
+            .unwrap();
+
+        let err = service
+            .login("alice", "password", None)
+            .await
+            .expect_err("an oversized TTL must not issue tokens");
+        assert!(
+            matches!(&err, AuthError::Internal(message) if message.contains("TTL")),
+            "unexpected error: {err:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn current_window_rejects_previous_step() {
     let service = AuthnService::new(MemoryUserStore::new(), test_config())
         .expect("build service")
@@ -1088,12 +1121,136 @@ fn malformed_secret_file_is_rejected() {
     let dir = std::env::temp_dir().join(format!("caddy-rs-jwt-bad-{:?}", UserId::new()));
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let path = dir.join("jwt.key");
-    std::fs::write(&path, b"too short").expect("write malformed secret");
 
-    assert!(matches!(
-        JwtSecretSource::File(path.clone()).resolve(),
-        Err(AuthError::Internal(_))
-    ));
+    // Policy: a non-empty file of any other length fails closed permanently; it is never repaired
+    // or truncated (only a zero-byte file is). The error must name the path, the observed length,
+    // and the operator's two options.
+    for found in [1usize, 7, 31, 33, 64] {
+        std::fs::write(&path, vec![0xABu8; found]).expect("write malformed secret");
+
+        for attempt in 0..2 {
+            let err = JwtSecretSource::File(path.clone())
+                .resolve()
+                .expect_err("a malformed secret file must fail closed");
+            match err {
+                AuthError::Internal(message) => {
+                    assert!(
+                        message.contains(&path.display().to_string()),
+                        "the error must name the path (attempt {attempt}): {message}"
+                    );
+                    assert!(
+                        message.contains(&format!("found {found}")),
+                        "the error must report the observed length (attempt {attempt}): {message}"
+                    );
+                    assert!(
+                        message.contains("delete the file") && message.contains("master secret"),
+                        "the error must state the remediation (attempt {attempt}): {message}"
+                    );
+                }
+                other => panic!("expected AuthError::Internal, got {other:?}"),
+            }
+        }
+
+        // Fail closed means the operator's file is left exactly as it was, not truncated or
+        // replaced by a generated secret.
+        assert_eq!(
+            std::fs::read(&path).expect("secret file still present"),
+            vec![0xABu8; found],
+            "a malformed secret file must not be repaired"
+        );
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn regular_secret_file_still_resolves() {
+    let dir = std::env::temp_dir().join(format!("caddy-rs-jwt-regular-{:?}", UserId::new()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("jwt.key");
+    std::fs::write(&path, [9u8; 32]).expect("write secret");
+
+    assert_eq!(
+        JwtSecretSource::File(path.clone())
+            .resolve()
+            .expect("a regular file must still resolve"),
+        [9u8; 32]
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_secret_file_is_refused() {
+    use std::os::unix::fs::symlink;
+
+    let dir = std::env::temp_dir().join(format!("caddy-rs-jwt-link-{:?}", UserId::new()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let target = dir.join("attacker-controlled.key");
+    std::fs::write(&target, [7u8; 32]).expect("write target secret");
+    let link = dir.join("jwt.key");
+    symlink(&target, &link).expect("create symlink");
+
+    let err = JwtSecretSource::File(link.clone())
+        .resolve()
+        .expect_err("a symlink at the final path must be refused");
+    match err {
+        AuthError::Internal(message) => {
+            assert!(
+                message.contains(&link.display().to_string()),
+                "the error must name the configured path: {message}"
+            );
+            assert!(
+                message.contains("symlink"),
+                "the error must explain the refusal: {message}"
+            );
+            assert!(
+                !message.contains(&target.display().to_string()),
+                "the error must not leak the symlink target: {message}"
+            );
+        }
+        other => panic!("expected AuthError::Internal, got {other:?}"),
+    }
+
+    // Nothing may be written through the link, and the link itself must be left in place.
+    assert!(std::fs::symlink_metadata(&link)
+        .expect("link still present")
+        .file_type()
+        .is_symlink());
+    assert_eq!(
+        std::fs::read(&target).expect("target intact"),
+        [7u8; 32],
+        "the refused resolution must not modify the symlink target"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn same_file_distinguishes_inodes_for_the_swap_check() {
+    let dir = std::env::temp_dir().join(format!("caddy-rs-jwt-ino-{:?}", UserId::new()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let first = dir.join("first.key");
+    let second = dir.join("second.key");
+    let alias = dir.join("alias.key");
+    std::fs::write(&first, [1u8; 32]).expect("write first");
+    std::fs::write(&second, [2u8; 32]).expect("write second");
+    std::fs::hard_link(&first, &alias).expect("hard link");
+
+    let first_meta = std::fs::symlink_metadata(&first).expect("first metadata");
+    let alias_meta = std::fs::symlink_metadata(&alias).expect("alias metadata");
+    let second_meta = std::fs::symlink_metadata(&second).expect("second metadata");
+
+    assert!(
+        same_file(&first_meta, &alias_meta),
+        "two names for the same inode must compare equal"
+    );
+    assert!(
+        !same_file(&first_meta, &second_meta),
+        "a swapped-in file must be detected as a different inode"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }
