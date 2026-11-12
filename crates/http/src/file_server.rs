@@ -450,6 +450,7 @@ impl FileServerHandler {
                 ranges = Ok(parsed);
             }
         }
+        // INFEASIBLE: every error arm above returned, so only `Ok` reaches this point.
         let ranges = ranges.expect("range errors handled");
         if ranges.len() == 1 {
             let range = ranges[0];
@@ -460,13 +461,19 @@ impl FileServerHandler {
                     .expect("content range is a valid header value"),
             );
             send_size = range.length as u64;
-            body = Bytes::copy_from_slice(
-                &body[range.start as usize..(range.start + range.length) as usize],
-            );
+            let Some((range_start, range_end)) = range_bounds(&range, body.len()) else {
+                return Ok(Outcome::Respond(serve_error(
+                    request.method == http::Method::HEAD,
+                    headers,
+                    StatusCode::RANGE_NOT_SATISFIABLE,
+                    "invalid range: the file changed while it was being served",
+                )));
+            };
+            body = Bytes::copy_from_slice(&body[range_start..range_end]);
         } else if ranges.len() > 1 {
             status = StatusCode::PARTIAL_CONTENT;
             let boundary = multipart_boundary();
-            let multipart = multipart_body(&ranges, &content_type, size as i64, &boundary, &body);
+            let multipart = multipart_body(&ranges, &content_type, size as i64, &boundary, &body)?;
             headers.insert(
                 header::CONTENT_TYPE,
                 HeaderValue::from_str(&format!("multipart/byteranges; boundary={boundary}"))
@@ -831,7 +838,10 @@ async fn path_contains_symlink(path: &Path, root: &Path) -> Result<bool> {
         if current == root || current.parent().is_none() {
             return Ok(false);
         }
-        current = current.parent().unwrap();
+        let Some(parent) = current.parent() else {
+            return Ok(false);
+        };
+        current = parent;
     }
 }
 
@@ -1249,13 +1259,23 @@ fn multipart_boundary() -> String {
     output
 }
 
+/// Clamp a parsed byte range to the bytes actually read from disk. Returns `None` when the range
+/// does not fit, which happens when the file changed between `stat` and `read`; callers must turn
+/// that into a rejection instead of slicing out of bounds.
+fn range_bounds(range: &ByteRange, available: usize) -> Option<(usize, usize)> {
+    let start = usize::try_from(range.start).ok()?;
+    let length = usize::try_from(range.length).ok()?;
+    let end = start.checked_add(length)?;
+    (end <= available).then_some((start, end))
+}
+
 fn multipart_body(
     ranges: &[ByteRange],
     content_type: &str,
     size: i64,
     boundary: &str,
     representation: &[u8],
-) -> Vec<u8> {
+) -> Result<Vec<u8>> {
     let mut body = Vec::new();
     for range in ranges {
         body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
@@ -1264,13 +1284,18 @@ fn multipart_body(
         );
         body.extend_from_slice(format!("Content-Type: {content_type}\r\n").as_bytes());
         body.extend_from_slice(b"\r\n");
-        let start = range.start as usize;
-        let end = (range.start + range.length) as usize;
+        let Some((start, end)) = range_bounds(range, representation.len()) else {
+            return Err(Error::handler(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid range: the file changed while it was being served",
+            ));
+        };
+        // INFEASIBLE: `range_bounds` proved `start..end` lies inside `representation`.
         body.extend_from_slice(&representation[start..end]);
         body.extend_from_slice(b"\r\n");
     }
     body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
-    body
+    Ok(body)
 }
 
 async fn browse_html(root: &Path, uri: Uri, relative: &str) -> Result<Vec<u8>> {
@@ -2307,6 +2332,22 @@ mod tests {
             response.status,
             StatusCode::FORBIDDEN,
             "path traversal via .. component should be rejected"
+        );
+    }
+
+    #[test]
+    fn multipart_ranges_beyond_the_read_bytes_are_rejected() {
+        // A file that shrank between `stat` and `read` used to slice the representation out of
+        // bounds and panic.
+        let ranges = [ByteRange {
+            start: 5,
+            length: 10,
+        }];
+        let error = multipart_body(&ranges, "text/plain", 100, "boundary", b"short")
+            .expect_err("range beyond the read bytes must be rejected");
+        assert_eq!(
+            error.handler_status(),
+            Some(StatusCode::INTERNAL_SERVER_ERROR)
         );
     }
 }
