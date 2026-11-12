@@ -6,9 +6,10 @@
 //! of being silently ignored. A later `--compat npm` adapter translates NPM payloads into these
 //! native types.
 
+use crate::SecurityHeadersDto;
 use caddy_rs_pm_core::{
     CertificateId, DeadSpec, Host, HostSpec, HostTls, PolicyId, ProxySpec, RedirectScheme,
-    RedirectSpec, TlsMode, Upstream, UpstreamScheme,
+    RedirectSpec, SecurityHeadersConfig, TlsMode, Upstream, UpstreamScheme,
 };
 use caddy_rs_pm_hosts::StoredHost;
 use caddy_rs_pm_service::HostDraft;
@@ -46,6 +47,7 @@ impl HostWriteRequest {
             tls: self.tls.into(),
             spec: self.spec.into(),
             enabled: self.enabled,
+            security_headers: None,
         }
     }
 }
@@ -62,6 +64,8 @@ pub struct HostPatchRequest {
     pub spec: Option<HostSpecDto>,
     #[serde(default)]
     pub enabled: Option<bool>,
+    #[serde(default)]
+    pub security_headers: Option<SecurityHeadersDto>,
 }
 
 impl HostPatchRequest {
@@ -71,6 +75,7 @@ impl HostPatchRequest {
             && self.tls.is_none()
             && self.spec.is_none()
             && self.enabled.is_none()
+            && self.security_headers.is_none()
     }
 
     /// Merge the patch into an existing host and return the resulting draft.
@@ -81,6 +86,10 @@ impl HostPatchRequest {
             tls: self.tls.map_or_else(|| host.tls.clone(), HostTls::from),
             spec: self.spec.map_or_else(|| host.spec.clone(), HostSpec::from),
             enabled: self.enabled.unwrap_or(host.enabled),
+            security_headers: self
+                .security_headers
+                .map(|dto| SecurityHeadersConfig::from(&dto))
+                .or(host.security_headers.clone()),
         }
     }
 }

@@ -12,7 +12,7 @@
 
 use caddy_rs_pm_core::{
     validate_host_domain_uniqueness, validate_host_id_uniqueness, Host, HostKind, HostSpec,
-    RedirectScheme, TlsMode,
+    RedirectScheme, SecurityHeadersConfig, TlsMode,
 };
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -124,6 +124,13 @@ fn compile_one(entry: PreparedHost<'_>, out: &mut CompiledRoutes) -> Result<(), 
 
 fn host_handle(host: &Host, on_https: bool) -> Result<Vec<Value>, CompileError> {
     let mut handle = Vec::new();
+
+    // Security headers are staged as defaults first, so any explicit `headers` handler
+    // emitted later in the chain can override them.
+    if let Some(security) = &host.security_headers {
+        handle.push(security_headers_handler(security)?);
+    }
+
     if on_https && host.tls.hsts_enabled {
         let value = if host.tls.hsts_subdomains {
             "max-age=63072000; includeSubDomains; preload"
@@ -192,6 +199,44 @@ fn host_handle(host: &Host, on_https: bool) -> Result<Vec<Value>, CompileError> 
         ));
     }
     Ok(handle)
+}
+
+/// Render a [`SecurityHeadersConfig`] as a Caddy `headers` handler with a `security_headers`
+/// block. The block is emitted as a fill-if-absent default stage: explicit `headers` handlers
+/// later in the chain override these values.
+fn security_headers_handler(security: &SecurityHeadersConfig) -> Result<Value, CompileError> {
+    let mut block = serde_json::Map::new();
+
+    if let Some(csp) = &security.content_security_policy {
+        block.insert("content_security_policy".to_string(), json!(csp));
+    }
+    if let Some(hsts) = &security.strict_transport_security {
+        let mut hsts_obj = serde_json::Map::new();
+        hsts_obj.insert("max_age".to_string(), json!(hsts.max_age));
+        hsts_obj.insert(
+            "include_subdomains".to_string(),
+            json!(hsts.include_subdomains),
+        );
+        hsts_obj.insert("preload".to_string(), json!(hsts.preload));
+        block.insert("strict_transport_security".to_string(), json!(hsts_obj));
+    }
+    if let Some(pp) = &security.permissions_policy {
+        block.insert("permissions_policy".to_string(), json!(pp));
+    }
+    if let Some(xfo) = &security.x_frame_options {
+        block.insert("x_frame_options".to_string(), json!(xfo));
+    }
+    if let Some(xcto) = &security.x_content_type_options {
+        block.insert("x_content_type_options".to_string(), json!(xcto));
+    }
+    if let Some(rp) = &security.referrer_policy {
+        block.insert("referrer_policy".to_string(), json!(rp));
+    }
+
+    Ok(json!({
+        "handler": "headers",
+        "security_headers": json!(block)
+    }))
 }
 
 fn route(id: String, domains: &[String], handle: Vec<Value>) -> Value {

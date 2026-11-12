@@ -215,6 +215,7 @@ fn draft_from_host(host: &Host, enabled: bool) -> HostDraft {
         tls: host.tls.clone(),
         spec: host.spec.clone(),
         enabled,
+        security_headers: host.security_headers.clone(),
     }
 }
 

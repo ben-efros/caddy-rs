@@ -59,7 +59,9 @@ use std::sync::Arc;
 
 use caddy_rs_pm_certificates::{CertificateError, CertificateRepository};
 use caddy_rs_pm_compiler::{compile_routes, CompileError, CompiledRoutes};
-use caddy_rs_pm_core::{CoreError, Host, HostId, HostSpec, HostTls, TlsMode};
+use caddy_rs_pm_core::{
+    CoreError, Host, HostId, HostSpec, HostTls, SecurityHeadersConfig, TlsMode,
+};
 use caddy_rs_pm_hosts::{HostError, HostRepository, StoredHost};
 use caddy_rs_pm_policies::{PolicyError, PolicyRepository};
 use caddy_rs_pm_state::{Revision, StateStore};
@@ -76,6 +78,8 @@ pub struct HostDraft {
     pub tls: HostTls,
     pub spec: HostSpec,
     pub enabled: bool,
+    /// Per-host security headers configuration; `None` inherits the global config.
+    pub security_headers: Option<SecurityHeadersConfig>,
 }
 
 impl HostDraft {
@@ -85,6 +89,7 @@ impl HostDraft {
             tls,
             spec,
             enabled: true,
+            security_headers: None,
         }
     }
 
@@ -200,6 +205,7 @@ impl HostService {
         let id = self.repository.next_id()?;
         let mut host = Host::new(HostId(id), draft.domains, draft.tls, draft.spec);
         host.enabled = draft.enabled;
+        host.security_headers = draft.security_headers;
         self.validate_tls(&host)?;
         Ok(self.repository.create(host)?)
     }
@@ -217,6 +223,7 @@ impl HostService {
     ) -> Result<StoredHost, ServiceError> {
         let mut host = Host::new(id, draft.domains, draft.tls, draft.spec);
         host.enabled = draft.enabled;
+        host.security_headers = draft.security_headers;
         self.validate_tls(&host)?;
         Ok(self.repository.update(host, expected_revision)?)
     }
