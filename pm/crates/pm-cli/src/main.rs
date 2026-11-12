@@ -1112,13 +1112,13 @@ impl caddy_rs_pm_api::CertificateInventorySource for CaddyInventorySource {
                 let inventory: CaddyRuntimeInventory = resp.json().await.map_err(|e| {
                     caddy_rs_pm_api::InventoryError::new(format!("JSON decode error: {e}"))
                 })?;
-                Ok(inventory.automatic_https.map(|failure| {
-                    caddy_rs_pm_api::IssuanceFailure {
+                Ok(inventory
+                    .automatic_https
+                    .map(|failure| caddy_rs_pm_api::IssuanceFailure {
                         domains: failure.domains,
                         failed_at_unix: failure.failed_at.unwrap_or(0.0) as i64,
                         error: failure.error,
-                    }
-                }))
+                    }))
             })
         })
     }

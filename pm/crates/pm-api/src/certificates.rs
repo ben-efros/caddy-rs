@@ -105,7 +105,6 @@ pub const DEFAULT_ISSUANCE_POLL_INTERVAL: std::time::Duration =
 /// Maximum recorded error text, in bytes (char-boundary safe when truncated).
 const MAX_JOB_ERROR_BYTES: usize = 1024;
 
-
 /// A certificate reported by the runtime inventory.
 ///
 /// No field contains private-key material: the inventory is a certificate *observation*, not
@@ -1065,8 +1064,9 @@ fn bounded_job_error(message: impl Into<String>) -> String {
 }
 
 fn job_etag(job: &IssuanceJob) -> Result<String, ApiError> {
-    let bytes = serde_json::to_vec(job)
-        .map_err(|error| ApiError::Internal(format!("serialize certificate issuance job: {error}")))?;
+    let bytes = serde_json::to_vec(job).map_err(|error| {
+        ApiError::Internal(format!("serialize certificate issuance job: {error}"))
+    })?;
     Ok(format!("\"j{}-{}\"", job.id, crate::hash_bytes(&bytes)))
 }
 
@@ -1105,9 +1105,9 @@ fn next_job_id(store: &Arc<dyn caddy_rs_pm_state::StateStore>) -> Result<u64, Ap
         .filter_map(|document| document.key.parse::<u64>().ok())
         .max()
         .unwrap_or(0);
-    maximum.checked_add(1).ok_or_else(|| {
-        ApiError::Conflict("certificate issuance job ids are exhausted".to_string())
-    })
+    maximum
+        .checked_add(1)
+        .ok_or_else(|| ApiError::Conflict("certificate issuance job ids are exhausted".to_string()))
 }
 
 fn commit_job(
@@ -1119,25 +1119,20 @@ fn commit_job(
     let key = job_key(job.id);
     let mut transaction = Transaction::new();
     transaction = match expected {
-        Some(revision) => transaction.check_revision(
-            CERTIFICATE_ISSUANCE_JOBS,
-            key.clone(),
-            revision,
-        ),
+        Some(revision) => {
+            transaction.check_revision(CERTIFICATE_ISSUANCE_JOBS, key.clone(), revision)
+        }
         None => transaction.check_missing(CERTIFICATE_ISSUANCE_JOBS, key.clone()),
     };
-    state.runtime.state_store().transact(
-        transaction
-            .put(CERTIFICATE_ISSUANCE_JOBS, key, value),
-    )?;
+    state
+        .runtime
+        .state_store()
+        .transact(transaction.put(CERTIFICATE_ISSUANCE_JOBS, key, value))?;
     Ok(())
 }
 
 /// Record a pending job, allocating its durable id under a missing-key check.
-fn create_issuance_job(
-    state: &ApiState,
-    mut job: IssuanceJob,
-) -> Result<IssuanceJob, ApiError> {
+fn create_issuance_job(state: &ApiState, mut job: IssuanceJob) -> Result<IssuanceJob, ApiError> {
     for _ in 0..8 {
         let id = next_job_id(&state.runtime.state_store())?;
         job.id = id;
@@ -1196,7 +1191,11 @@ fn finish_issuance_job(
 ) -> Result<(), ApiError> {
     let (status, certificate, error) = match outcome {
         Ok(certificate) => (IssuanceJobStatus::Issued, Some(certificate), None),
-        Err(message) => (IssuanceJobStatus::Failed, None, Some(bounded_job_error(message))),
+        Err(message) => (
+            IssuanceJobStatus::Failed,
+            None,
+            Some(bounded_job_error(message)),
+        ),
     };
     for _ in 0..8 {
         let Some((mut job, document_revision)) = read_job(state, job_id)? else {
@@ -1288,10 +1287,7 @@ fn observe_issuance(
 
 /// Apply the current PM configuration (which drives caddy-rs automatic HTTPS through the admin
 /// API) and wait for the data plane to report the certificate or an issuance failure.
-async fn drive_issuance(
-    state: &ApiState,
-    job: &IssuanceJob,
-) -> Result<IssuedCertificate, String> {
+async fn drive_issuance(state: &ApiState, job: &IssuanceJob) -> Result<IssuedCertificate, String> {
     let Some(applier) = state.applier() else {
         return Err(
             "config apply is not configured; the issuance job cannot drive caddy-rs".to_string(),
@@ -1299,8 +1295,7 @@ async fn drive_issuance(
     };
     match applier.apply().await {
         Ok(outcome) => {
-            if let Err(error) =
-                record_job_revision(state, job.id, outcome.revision, &outcome.hash)
+            if let Err(error) = record_job_revision(state, job.id, outcome.revision, &outcome.hash)
             {
                 return Err(format!(
                     "could not record the applied config revision: {error}"
@@ -1331,12 +1326,11 @@ async fn run_issuance_job(state: ApiState, job_id: u64) {
         return;
     }
     let timeout = state.issuance_timeout();
-    let outcome =
-        match tokio::time::timeout(timeout, drive_issuance(&state, &job)).await {
-            Ok(Ok(certificate)) => Ok(certificate),
-            Ok(Err(message)) => Err(message),
-            Err(_) => Err(deadline_message(&job)),
-        };
+    let outcome = match tokio::time::timeout(timeout, drive_issuance(&state, &job)).await {
+        Ok(Ok(certificate)) => Ok(certificate),
+        Ok(Err(message)) => Err(message),
+        Err(_) => Err(deadline_message(&job)),
+    };
     if let Err(error) = finish_issuance_job(&state, job_id, outcome) {
         tracing::warn!(job = job_id, %error, "could not record certificate issuance job result");
     }
@@ -1500,7 +1494,9 @@ pub async fn issue_handler(
     let policy = ensure_auto_policy(&state, &stored)?;
 
     let now = now_unix();
-    let timeout_seconds = state.issuance_timeout().as_secs().min(i64::MAX as u64) as i64;
+    // Round up so a sub-second bound (tests) still yields a positive persisted deadline instead of
+    // a deadline equal to `created_at_unix` that the read path would fail immediately.
+    let timeout_seconds = (state.issuance_timeout().as_secs_f64().ceil() as i64).max(1);
     let job = IssuanceJob {
         id: 0,
         host_id: stored.host.id.0,
