@@ -679,6 +679,19 @@ impl ServerRuntime {
             self.status = RuntimeStatus::default();
             return Ok(self.status.clone());
         };
+        // ADR-0010 section 5: exactly one INFO event per apply names the effective
+        // stock-compatibility mode before any listener starts, so a running instance's security
+        // posture is visible at startup and after every reload (DIV-0130).
+        let stock_compat = generation.config().stock_compat();
+        tracing::info!(
+            stock_compat,
+            "stock compatibility mode: {}",
+            if stock_compat {
+                "stock Caddy v2.11.9 behaviour requested"
+            } else {
+                "caddy-rs secure defaults active"
+            }
+        );
         // Load-time diagnostics for the forwarded-header trust anchor (T-TLS-087). Emit before
         // anything fallible so a permissive range/wrapper is reported even if this apply fails.
         for warning in forwarded_trust_warnings(generation.config())? {
