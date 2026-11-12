@@ -138,6 +138,94 @@ async fn memory_store_user_crud() {
 }
 
 #[tokio::test]
+async fn create_first_admin_succeeds_exactly_once() {
+    let store = MemoryUserStore::new();
+    let first = store
+        .create_first_admin(test_user("root"))
+        .await
+        .expect("the first administrator is created");
+    assert_eq!(store.list_users().await.unwrap().len(), 1);
+
+    let second = store.create_first_admin(test_user("other")).await;
+    assert!(
+        matches!(second, Err(AuthError::UsernameExists)),
+        "a second first-run setup must be a username conflict: {second:?}"
+    );
+    assert_eq!(
+        store.list_users().await.unwrap().len(),
+        1,
+        "only the winning administrator is stored"
+    );
+    assert_eq!(
+        store.get_user(first.id).await.unwrap().unwrap().username,
+        "root"
+    );
+}
+
+/// Two concurrent first-run setups must yield exactly one administrator.
+///
+/// The two service calls are spawned onto a multi-threaded runtime so they really run in parallel:
+/// a store backend that checked "is the store empty?" and then inserted without a lock would let
+/// both callers win, which this test catches. The winning caller is whichever task acquires the
+/// store write lock first, so the assertions are on the outcome multiset, not on a fixed winner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_first_admin_setup_has_exactly_one_winner_over_100_runs() {
+    for iteration in 0..100 {
+        let service = std::sync::Arc::new(
+            AuthnService::new(MemoryUserStore::new(), test_config()).expect("create the service"),
+        );
+
+        let first = {
+            let service = std::sync::Arc::clone(&service);
+            tokio::spawn(async move {
+                service
+                    .create_first_admin(format!("admin-a-{iteration}"), "password-a")
+                    .await
+            })
+        };
+        let second = {
+            let service = std::sync::Arc::clone(&service);
+            tokio::spawn(async move {
+                service
+                    .create_first_admin(format!("admin-b-{iteration}"), "password-b")
+                    .await
+            })
+        };
+        let (first, second) = tokio::join!(first, second);
+        let outcomes = [
+            first.expect("first setup task panicked"),
+            second.expect("second setup task panicked"),
+        ];
+
+        let successes = outcomes.iter().filter(|result| result.is_ok()).count();
+        assert_eq!(
+            successes, 1,
+            "iteration {iteration}: exactly one setup must win, got {outcomes:?}"
+        );
+        let failure = outcomes
+            .iter()
+            .find_map(|result| result.as_ref().err())
+            .expect("the losing setup returns an error");
+        assert!(
+            matches!(failure, AuthError::UsernameExists),
+            "iteration {iteration}: the loser is a conflict, got {failure:?}"
+        );
+
+        let users = service.list_users().await.expect("list the users");
+        assert_eq!(
+            users.len(),
+            1,
+            "iteration {iteration}: exactly one user is stored"
+        );
+        assert!(
+            users[0].username == format!("admin-a-{iteration}")
+                || users[0].username == format!("admin-b-{iteration}"),
+            "iteration {iteration}: the stored user is one of the two candidates"
+        );
+    }
+}
+
+#[tokio::test]
 async fn memory_store_refresh_token_lifecycle() {
     let store = MemoryUserStore::new();
     let user_id = UserId::new();
@@ -1469,4 +1557,34 @@ fn planted_symlink_at_temp_path_is_not_followed() {
     );
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn delete_user_revokes_refresh_tokens_and_removes_the_record() {
+    let authn = AuthnService::new(MemoryUserStore::new(), test_config()).expect("create service");
+    let user = authn
+        .create_user("editor", "password123", Role::editor())
+        .await
+        .expect("create user");
+    let tokens = authn
+        .login("editor", "password123", None)
+        .await
+        .expect("log in");
+
+    authn.delete_user(user.id).await.expect("delete the user");
+    assert!(
+        authn.list_users().await.expect("list users").is_empty(),
+        "the record is gone"
+    );
+    assert!(
+        matches!(
+            authn.delete_user(user.id).await,
+            Err(AuthError::UserNotFound)
+        ),
+        "deleting a missing user reports UserNotFound"
+    );
+    assert!(
+        authn.refresh(&tokens.refresh_token).await.is_err(),
+        "the deleted user's refresh token cannot be replayed"
+    );
 }

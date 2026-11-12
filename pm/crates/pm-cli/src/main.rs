@@ -844,11 +844,11 @@ async fn serve(global: GlobalArgs, args: ServeArgs) -> Result<(), CliError> {
 
     // Build API state.
     //
-    // The API does not consume the authn service yet: the management endpoints that authenticate a
-    // session and authorise a caller are T-PM-128, and the user store is in-memory until T-PM-125.
-    // Until those land, mutations stay behind the loopback-only guard in pm-api, so an unattached
-    // authn service cannot be mistaken for authentication.
-    let state = ApiState::new(runtime)
+    // The API reads the authn service for first-run setup (`POST /auth/setup`), but the endpoints
+    // that authenticate a session and authorise a caller are still T-PM-128, and the user store is
+    // in-memory until T-PM-125. Mutations therefore stay behind the loopback-only guard in
+    // pm-api, and the setup route is guarded the same way, so it cannot be driven remotely.
+    let state = ApiState::new(runtime, authn)
         .with_applier(applier)
         .with_inventory(inventory);
 
@@ -1709,7 +1709,7 @@ mod tests {
             .expect("bind a loopback listener");
         let addr = listener.local_addr().expect("read the bound address");
         let server = tokio::spawn(async move {
-            axum::serve(listener, create_router(ApiState::new(runtime))).await
+            axum::serve(listener, create_router(ApiState::new(runtime, _authn))).await
         });
 
         let body = Client::new()

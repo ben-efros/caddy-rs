@@ -10,21 +10,66 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::*;
 use crate::dto::{HostResponse, HostSpecDto, HostTlsDto, HostWriteRequest};
 use axum_test::TestServer;
+use caddy_rs_authn::{
+    Argon2Config, AuthnConfig, AuthnService, JwtSecretSource, MemoryUserStore, PublicUser,
+};
 use caddy_rs_pm_runtime::{
     ConfigApplyService, ConfigApplyStatus, ConfigRevision, PmRuntime, RuntimeConfig,
 };
 use tempfile::TempDir;
 
+/// Password used by the setup tests. Long enough to be a plausible first administrator secret and
+/// never compared against a hash here, so its value is irrelevant to the assertions.
+const SETUP_PASSWORD: &str = "correct-horse-battery-staple";
+
+fn authn() -> AuthnService<MemoryUserStore> {
+    let authn_config = AuthnConfig {
+        jwt_secret_source: JwtSecretSource::Ephemeral,
+        // Password hashing is deliberately cheap: these tests exercise the compare-and-set on the
+        // user store, not the cost of Argon2, and the race test hashes two passwords per run.
+        argon2_params: Argon2Config {
+            memory_cost: 4096,
+            time_cost: 1,
+            parallelism: 1,
+        },
+        ..AuthnConfig::default()
+    };
+    AuthnService::new(MemoryUserStore::new(), authn_config).expect("create authn service")
+}
+
 fn runtime() -> (TempDir, ApiState) {
     let temp_dir = TempDir::new().expect("create temp dir");
     let config = RuntimeConfig::new(temp_dir.path().join("data"));
     let runtime = PmRuntime::open(config).expect("open runtime");
-    (temp_dir, ApiState::new(runtime))
+    (temp_dir, ApiState::new(runtime, authn()))
 }
 
 fn server() -> (TempDir, TestServer) {
     let (temp_dir, state) = runtime();
     (temp_dir, TestServer::new(create_router(state)))
+}
+
+/// A server plus the authn service whose store the router shares.
+///
+/// The router is served over a real loopback socket (`into_make_service_with_connect_info`), which
+/// the mutation routes require for their loopback guard; the returned service clone shares the
+/// same [`MemoryUserStore`], so a test can assert on the persisted users after driving the HTTP
+/// endpoints.
+fn server_with_authn() -> (TempDir, TestServer, AuthnService<MemoryUserStore>) {
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let config = RuntimeConfig::new(temp_dir.path().join("data"));
+    let runtime = PmRuntime::open(config).expect("open runtime");
+    let authn = authn();
+    let state = ApiState::new(runtime, authn.clone());
+    let app = create_router(state).into_make_service_with_connect_info::<std::net::SocketAddr>();
+    (temp_dir, TestServer::new(app), authn)
+}
+
+fn setup_request(username: &str) -> SetupRequest {
+    SetupRequest {
+        username: username.to_owned(),
+        password: SETUP_PASSWORD.to_owned(),
+    }
 }
 
 #[tokio::test]
@@ -35,17 +80,167 @@ async fn health_reports_ok() {
 
     let body: HealthResponse = response.json();
     assert_eq!(body.status, "ok");
-    assert!(!body.setup, "no user store means setup is not complete");
+    assert!(!body.setup, "a fresh store means setup is not complete");
 }
 
 #[tokio::test]
-async fn setup_is_not_configured_without_a_user_store() {
+async fn setup_is_not_configured_before_the_first_administrator() {
     let (_dir, server) = server();
     let response = server.get("/api/v1/setup").await;
     assert_eq!(response.status_code(), StatusCode::OK);
 
     let body: SetupResponse = response.json();
     assert!(!body.configured);
+}
+
+#[tokio::test]
+async fn setup_creates_the_first_administrator_with_201() {
+    let (_dir, server, authn) = server_with_authn();
+
+    let response = server
+        .post("/api/v1/auth/setup")
+        .json(&setup_request("admin"))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::CREATED);
+
+    let body: CreateUserResponse = response.json();
+    assert!(
+        !body.user_id.is_empty(),
+        "the response names the created user"
+    );
+    assert!(
+        !body.access_token.is_empty(),
+        "the winner receives an access token"
+    );
+    assert!(
+        !body.refresh_token.is_empty(),
+        "the winner receives a refresh token"
+    );
+
+    let users = authn.list_users().await.expect("list the users");
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].username, "admin");
+    assert_eq!(
+        users[0].role.name, "admin",
+        "the first user is an administrator"
+    );
+    assert!(
+        !users[0].password_hash.contains(SETUP_PASSWORD),
+        "the stored user holds a hash, not the plaintext password"
+    );
+}
+
+#[tokio::test]
+async fn setup_reports_configured_after_the_first_administrator() {
+    let (_dir, server, _authn) = server_with_authn();
+    server
+        .post("/api/v1/auth/setup")
+        .json(&setup_request("admin"))
+        .await;
+
+    let response = server.get("/api/v1/setup").await;
+    let body: SetupResponse = response.json();
+    assert!(body.configured);
+
+    let response = server.get("/api/v1/health").await;
+    let body: HealthResponse = response.json();
+    assert!(
+        body.setup,
+        "health and setup agree that the server is configured"
+    );
+}
+
+#[tokio::test]
+async fn setup_conflict_keeps_the_standard_error_body() {
+    let (_dir, server, _authn) = server_with_authn();
+    let first = server
+        .post("/api/v1/auth/setup")
+        .json(&setup_request("admin"))
+        .await;
+    assert_eq!(first.status_code(), StatusCode::CREATED);
+
+    let second = server
+        .post("/api/v1/auth/setup")
+        .json(&setup_request("someone-else"))
+        .await;
+    assert_eq!(second.status_code(), StatusCode::CONFLICT);
+
+    // The existing `ApiError::Conflict` wire contract: typed body, no `location` for a
+    // non-validation error, and the `conflict: ` display prefix that every 409 carries.
+    let body: ApiErrorResponse = second.json();
+    assert_eq!(body.error.code, ErrorCode::Conflict);
+    assert_eq!(
+        body.error.message,
+        "conflict: first-run setup is already complete"
+    );
+    assert_eq!(body.error.location, None);
+}
+
+/// Two concurrent `POST /api/v1/auth/setup` calls with different usernames must produce exactly
+/// one `201 Created` and one `409 Conflict`; the loser must not create a second administrator.
+///
+/// The two requests are kept in flight together with `tokio::join!` against a real loopback HTTP
+/// server on a multi-threaded runtime, so the handlers genuinely run in parallel and race on the
+/// user store. The loop runs 100 times: a store without the atomic compare-and-set (list, then
+/// create) loses this test intermittently, while the compare-and-set implementation is
+/// deterministic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_setup_requests_create_exactly_one_administrator_over_100_runs() {
+    for iteration in 0..100 {
+        let (_dir, server, authn) = server_with_authn();
+        let first_request = server
+            .post("/api/v1/auth/setup")
+            .json(&setup_request(&format!("admin-a-{iteration}")));
+        let second_request = server
+            .post("/api/v1/auth/setup")
+            .json(&setup_request(&format!("admin-b-{iteration}")));
+
+        let (first, second) = tokio::join!(async move { first_request.await }, async move {
+            second_request.await
+        },);
+
+        let statuses = [first.status_code(), second.status_code()];
+        let created = statuses
+            .iter()
+            .filter(|status| **status == StatusCode::CREATED)
+            .count();
+        let conflicted = statuses
+            .iter()
+            .filter(|status| **status == StatusCode::CONFLICT)
+            .count();
+        assert_eq!(
+            created, 1,
+            "iteration {iteration}: exactly one setup returns 201, got {statuses:?}"
+        );
+        assert_eq!(
+            conflicted, 1,
+            "iteration {iteration}: exactly one setup returns 409, got {statuses:?}"
+        );
+
+        let conflict = if first.status_code() == StatusCode::CONFLICT {
+            &first
+        } else {
+            &second
+        };
+        let body: ApiErrorResponse = conflict.json();
+        assert_eq!(body.error.code, ErrorCode::Conflict);
+        assert_eq!(
+            body.error.message,
+            "conflict: first-run setup is already complete"
+        );
+
+        let users = authn.list_users().await.expect("list the users");
+        assert_eq!(
+            users.len(),
+            1,
+            "iteration {iteration}: exactly one administrator is stored"
+        );
+        assert!(
+            users[0].username == format!("admin-a-{iteration}")
+                || users[0].username == format!("admin-b-{iteration}"),
+            "iteration {iteration}: the stored administrator is one of the two candidates"
+        );
+    }
 }
 
 #[tokio::test]
@@ -346,7 +541,7 @@ fn server_with_runtime() -> (TempDir, TestServer, PmRuntime) {
     let temp_dir = TempDir::new().expect("create temp dir");
     let config = RuntimeConfig::new(temp_dir.path().join("data"));
     let runtime = PmRuntime::open(config).expect("open runtime");
-    let state = ApiState::new(runtime.clone());
+    let state = ApiState::new(runtime.clone(), authn());
     let app = create_router(state).into_make_service_with_connect_info::<std::net::SocketAddr>();
     (temp_dir, TestServer::new(app), runtime)
 }
@@ -781,7 +976,8 @@ fn server_with_inventory(records: Vec<CertificateRecord>) -> (TempDir, TestServe
     let temp_dir = TempDir::new().expect("create temp dir");
     let config = RuntimeConfig::new(temp_dir.path().join("data"));
     let runtime = PmRuntime::open(config).expect("open runtime");
-    let state = ApiState::new(runtime.clone()).with_inventory(Arc::new(FakeInventory { records }));
+    let state =
+        ApiState::new(runtime.clone(), authn()).with_inventory(Arc::new(FakeInventory { records }));
     let app = create_router(state).into_make_service_with_connect_info::<std::net::SocketAddr>();
     (temp_dir, TestServer::new(app), runtime)
 }
@@ -1171,7 +1367,7 @@ async fn certificate_detail_etag_tracks_inventory_changes_not_just_policy_revisi
     let inventory = Arc::new(MutableInventory(std::sync::Mutex::new(Vec::new())));
     let temp_dir = TempDir::new().expect("create temp dir");
     let runtime = PmRuntime::open(RuntimeConfig::new(temp_dir.path().join("data"))).expect("open");
-    let state = ApiState::new(runtime).with_inventory(inventory.clone());
+    let state = ApiState::new(runtime, authn()).with_inventory(inventory.clone());
     let server = TestServer::new(
         create_router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
     );
@@ -1517,7 +1713,7 @@ fn server_with_apply() -> (TempDir, TestServer, FakeAdmin) {
         Arc::new(admin.clone()),
         ConfigSettings::default(),
     );
-    let app = create_router(ApiState::new(runtime).with_applier(applier))
+    let app = create_router(ApiState::new(runtime, authn()).with_applier(applier))
         .into_make_service_with_connect_info::<std::net::SocketAddr>();
     (temp_dir, TestServer::new(app), admin)
 }
@@ -1750,4 +1946,364 @@ async fn the_ui_answers_a_non_read_method_with_405() {
     let response = server.post("/").await;
     assert_eq!(response.status_code(), StatusCode::METHOD_NOT_ALLOWED);
     assert_eq!(response.header(header::ALLOW), "GET, HEAD");
+}
+
+// ---------------------------------------------------------------------------------------------
+// User administration (T-PM-128)
+// ---------------------------------------------------------------------------------------------
+
+fn bearer(token: &str) -> String {
+    format!("Bearer {token}")
+}
+
+async fn first_admin(server: &TestServer) -> CreateUserResponse {
+    let response = server
+        .post("/api/v1/auth/setup")
+        .json(&setup_request("admin"))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::CREATED);
+    response.json()
+}
+
+/// Create `username` with `role` directly through the shared authn service and return a token pair
+/// for it, so a test can exercise a non-administrator caller without an HTTP login route.
+async fn user_tokens(
+    authn: &AuthnService<MemoryUserStore>,
+    username: &str,
+    role: caddy_rs_authn::Role,
+) -> (caddy_rs_authn::User, caddy_rs_authn::TokenPair) {
+    let user = authn
+        .create_user(username, SETUP_PASSWORD, role)
+        .await
+        .expect("create the user");
+    let tokens = authn
+        .login(username, SETUP_PASSWORD, None)
+        .await
+        .expect("log the user in");
+    (user, tokens)
+}
+
+#[tokio::test]
+async fn users_list_requires_a_bearer_token() {
+    let (_dir, server, _authn) = server_with_authn();
+    let response = server.get("/api/v1/users").await;
+    assert_eq!(response.status_code(), StatusCode::UNAUTHORIZED);
+    let body: ApiErrorResponse = response.json();
+    assert_eq!(body.error.code, ErrorCode::Unauthorized);
+
+    assert_eq!(
+        response.header("www-authenticate"),
+        "Bearer",
+        "a 401 carries the bearer challenge"
+    );
+
+    let response = server
+        .get("/api/v1/users")
+        .add_header("Authorization", "Bearer not-a-token")
+        .await;
+    assert_eq!(response.status_code(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.header("www-authenticate"), "Bearer");
+}
+
+#[tokio::test]
+async fn users_list_returns_public_views_to_an_editor() {
+    let (_dir, server, authn) = server_with_authn();
+    let _admin = first_admin(&server).await;
+    let (_editor, editor_tokens) =
+        user_tokens(&authn, "editor", caddy_rs_authn::Role::editor()).await;
+
+    let response = server
+        .get("/api/v1/users")
+        .add_header("Authorization", bearer(&editor_tokens.access_token))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::OK);
+
+    let raw: serde_json::Value = response.json();
+    assert_eq!(raw["total"], 2);
+    assert_eq!(raw["limit"], crate::DEFAULT_LIMIT);
+    assert_eq!(raw["offset"], 0);
+    assert_eq!(raw["items"][0]["username"], "admin");
+    assert_eq!(raw["items"][1]["username"], "editor");
+    assert_eq!(raw["items"][1]["role"]["name"], "editor");
+    let text = raw.to_string();
+    assert!(!text.contains("password_hash"), "no password hash is served");
+    assert!(!text.contains("totp_secret"), "no TOTP secret is served");
+
+    let body: PaginatedResponse<PublicUser> = server
+        .get("/api/v1/users")
+        .add_header("Authorization", bearer(&editor_tokens.access_token))
+        .await
+        .json();
+    assert_eq!(body.items.len(), 2);
+    assert_eq!(body.items.len(), 2);
+}
+
+#[tokio::test]
+async fn users_list_paginates_and_clamps_the_limit() {
+    let (_dir, server, authn) = server_with_authn();
+    let admin = first_admin(&server).await;
+    for name in ["viewer-one", "viewer-two"] {
+        user_tokens(&authn, name, caddy_rs_authn::Role::viewer()).await;
+    }
+
+    let response = server
+        .get("/api/v1/users")
+        .add_query_params(serde_json::json!({"limit": 1, "offset": 1}))
+        .add_header("Authorization", bearer(&admin.access_token))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::OK);
+    let raw: serde_json::Value = response.json();
+    assert_eq!(raw["total"], 3);
+    assert_eq!(raw["limit"], 1);
+    assert_eq!(raw["offset"], 1);
+    assert_eq!(raw["items"].as_array().map(Vec::len), Some(1));
+    assert_eq!(raw["items"][0]["username"], "viewer-one");
+
+    let response = server
+        .get("/api/v1/users")
+        .add_query_params(serde_json::json!({"limit": 9999}))
+        .add_header("Authorization", bearer(&admin.access_token))
+        .await;
+    let raw: serde_json::Value = response.json();
+    assert_eq!(raw["limit"], crate::MAX_LIMIT);
+    assert_eq!(raw["items"].as_array().map(Vec::len), Some(3));
+
+    let response = server
+        .get("/api/v1/users")
+        .add_query_params(serde_json::json!({"limit": "many"}))
+        .add_header("Authorization", bearer(&admin.access_token))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    let body: ApiErrorResponse = response.json();
+    assert_eq!(body.error.code, ErrorCode::Validation);
+    assert_eq!(body.error.location.as_deref(), Some("limit"));
+
+    let response = server
+        .get("/api/v1/users")
+        .add_query_params(serde_json::json!({"role": "admin"}))
+        .add_header("Authorization", bearer(&admin.access_token))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    let body: ApiErrorResponse = response.json();
+    assert_eq!(body.error.location.as_deref(), Some("query"));
+}
+
+#[tokio::test]
+async fn role_change_and_delete_require_the_users_capability() {
+    let (_dir, server, authn) = server_with_authn();
+    let _admin = first_admin(&server).await;
+    let (editor, editor_tokens) =
+        user_tokens(&authn, "editor", caddy_rs_authn::Role::editor()).await;
+    let editor_id = editor.id.0.to_string();
+
+    let response = server
+        .patch(&format!("/api/v1/users/{editor_id}"))
+        .add_header("Authorization", bearer(&editor_tokens.access_token))
+        .json(&serde_json::json!({"role": "viewer"}))
+        .await;
+    assert_eq!(
+        response.status_code(),
+        StatusCode::FORBIDDEN,
+        "an editor may list users but not change roles: {}",
+        response.text()
+    );
+    let body: ApiErrorResponse = response.json();
+    assert_eq!(body.error.code, ErrorCode::Forbidden);
+
+    let response = server
+        .delete(&format!("/api/v1/users/{editor_id}"))
+        .add_header("Authorization", bearer(&editor_tokens.access_token))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::FORBIDDEN);
+
+    let users = authn.list_users().await.expect("list users");
+    assert_eq!(users.len(), 2, "the refused requests changed nothing");
+}
+
+#[tokio::test]
+async fn admin_role_change_invalidates_the_old_token() {
+    let (_dir, server, authn) = server_with_authn();
+    let admin = first_admin(&server).await;
+    let (editor, editor_tokens) =
+        user_tokens(&authn, "editor", caddy_rs_authn::Role::editor()).await;
+    let editor_id = editor.id.0.to_string();
+
+    let response = server
+        .patch(&format!("/api/v1/users/{editor_id}"))
+        .add_header("Authorization", bearer(&admin.access_token))
+        .json(&serde_json::json!({"role": "viewer"}))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::OK, "{}", response.text());
+    let body: PublicUser = response.json();
+    assert_eq!(body.username, "editor");
+    assert_eq!(body.role.name, "viewer");
+    assert_eq!(body.auth_epoch, editor.auth_epoch + 1);
+
+    let response = server
+        .get("/api/v1/users")
+        .add_header("Authorization", bearer(&editor_tokens.access_token))
+        .await;
+    assert_eq!(
+        response.status_code(),
+        StatusCode::UNAUTHORIZED,
+        "the pre-change token must stop working"
+    );
+}
+
+#[tokio::test]
+async fn user_mutations_validate_the_id_and_the_role() {
+    let (_dir, server, authn) = server_with_authn();
+    let admin = first_admin(&server).await;
+    let (editor, _) = user_tokens(&authn, "editor", caddy_rs_authn::Role::editor()).await;
+    let editor_id = editor.id.0.to_string();
+
+    let response = server
+        .patch(&format!("/api/v1/users/{editor_id}"))
+        .add_header("Authorization", bearer(&admin.access_token))
+        .json(&serde_json::json!({"role": "superuser"}))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    let body: ApiErrorResponse = response.json();
+    assert_eq!(body.error.code, ErrorCode::Validation);
+    assert_eq!(body.error.location.as_deref(), Some("role"));
+
+    let response = server
+        .patch("/api/v1/users/not-a-uuid")
+        .add_header("Authorization", bearer(&admin.access_token))
+        .json(&serde_json::json!({"role": "admin"}))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    let body: ApiErrorResponse = response.json();
+    assert_eq!(body.error.location.as_deref(), Some("id"));
+
+    let response = server
+        .patch(&format!("/api/v1/users/{}", caddy_rs_authn::UserId::new().0))
+        .add_header("Authorization", bearer(&admin.access_token))
+        .json(&serde_json::json!({"role": "admin"}))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::NOT_FOUND);
+
+    let response = server
+        .delete(&format!("/api/v1/users/{}", caddy_rs_authn::UserId::new().0))
+        .add_header("Authorization", bearer(&admin.access_token))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn users_errors_keep_the_standard_envelope() {
+    let (_dir, server, authn) = server_with_authn();
+    let admin = first_admin(&server).await;
+    let (editor, _) = user_tokens(&authn, "editor", caddy_rs_authn::Role::editor()).await;
+    let editor_id = editor.id.0.to_string();
+
+    // Invalid UTF-8 in the path parameter: axum's PathRejection must become a located 400.
+    let response = server
+        .patch("/api/v1/users/%FF")
+        .add_header("Authorization", bearer(&admin.access_token))
+        .json(&serde_json::json!({"role": "viewer"}))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    let body: ApiErrorResponse = response.json();
+    assert_eq!(body.error.code, ErrorCode::Validation);
+    assert_eq!(body.error.location.as_deref(), Some("id"));
+
+    // Wrong-typed JSON: a located validation error at `body`, not axum's plain-text 422.
+    let response = server
+        .patch(&format!("/api/v1/users/{editor_id}"))
+        .add_header("Authorization", bearer(&admin.access_token))
+        .json(&serde_json::json!({"role": 5}))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    let body: ApiErrorResponse = response.json();
+    assert_eq!(body.error.code, ErrorCode::Validation);
+    assert_eq!(body.error.location.as_deref(), Some("body"));
+
+    // Unknown fields are rejected by deny_unknown_fields and stay in the envelope.
+    let response = server
+        .patch(&format!("/api/v1/users/{editor_id}"))
+        .add_header("Authorization", bearer(&admin.access_token))
+        .json(&serde_json::json!({"role": "viewer", "extra": 1}))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    let body: ApiErrorResponse = response.json();
+    assert_eq!(body.error.location.as_deref(), Some("body"));
+
+    // A non-JSON content type is the typed 415, like every other resource.
+    let response = server
+        .patch(&format!("/api/v1/users/{editor_id}"))
+        .add_header("Authorization", bearer(&admin.access_token))
+        .content_type("text/plain")
+        .text("role=viewer")
+        .await;
+    assert_eq!(response.status_code(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    let body: ApiErrorResponse = response.json();
+    assert_eq!(body.error.code, ErrorCode::UnsupportedMediaType);
+
+    // DELETE's path parameter uses the same envelope.
+    let response = server
+        .delete("/api/v1/users/%FF")
+        .add_header("Authorization", bearer(&admin.access_token))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    let body: ApiErrorResponse = response.json();
+    assert_eq!(body.error.location.as_deref(), Some("id"));
+}
+
+#[tokio::test]
+async fn deleting_a_user_revokes_their_refresh_tokens() {
+    let (_dir, server, authn) = server_with_authn();
+    let admin = first_admin(&server).await;
+    let (editor, editor_tokens) =
+        user_tokens(&authn, "editor", caddy_rs_authn::Role::editor()).await;
+    let editor_id = editor.id.0.to_string();
+
+    let response = server
+        .delete(&format!("/api/v1/users/{editor_id}"))
+        .add_header("Authorization", bearer(&admin.access_token))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::NO_CONTENT);
+    assert!(response.text().is_empty(), "204 carries no body");
+
+    let users = authn.list_users().await.expect("list users");
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].username, "admin");
+
+    let refresh = authn.refresh(&editor_tokens.refresh_token).await;
+    assert!(refresh.is_err(), "the deleted user's refresh token is dead");
+    let login = authn.login("editor", SETUP_PASSWORD, None).await;
+    assert!(login.is_err(), "the deleted user cannot log in");
+}
+
+#[tokio::test]
+async fn deleting_the_last_administrator_is_refused() {
+    let (_dir, server, authn) = server_with_authn();
+    let admin = first_admin(&server).await;
+
+    let response = server
+        .delete(&format!("/api/v1/users/{}", admin.user_id))
+        .add_header("Authorization", bearer(&admin.access_token))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::CONFLICT);
+    let body: ApiErrorResponse = response.json();
+    assert_eq!(body.error.code, ErrorCode::Conflict);
+
+    let users = authn.list_users().await.expect("list users");
+    assert_eq!(users.len(), 1, "the last administrator is still there");
+    assert_eq!(users[0].role.name, "admin");
+}
+
+#[tokio::test]
+async fn a_second_administrator_can_be_deleted() {
+    let (_dir, server, authn) = server_with_authn();
+    let admin = first_admin(&server).await;
+    let (second, _) = user_tokens(&authn, "admin-two", caddy_rs_authn::Role::admin()).await;
+
+    let response = server
+        .delete(&format!("/api/v1/users/{}", second.id.0))
+        .add_header("Authorization", bearer(&admin.access_token))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::NO_CONTENT);
+    let users = authn.list_users().await.expect("list users");
+    assert_eq!(users.len(), 1);
 }

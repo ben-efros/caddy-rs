@@ -10,7 +10,11 @@
 //! | Method | Path | Behaviour |
 //! |---|---|---|
 //! | `GET` | `/api/v1/health` | Liveness probe; always `200` while the process serves requests |
-//! | `GET` | `/api/v1/setup` | Whether first-run setup has completed (no user store yet, so `false`) |
+//! | `GET` | `/api/v1/setup` | Whether first-run setup has completed (at least one user exists) |
+//! | `POST` | `/api/v1/auth/setup` | Create the first administrator; `201` once, then `409 Conflict` |
+//! | `GET` | `/api/v1/users` | Paginated `PublicUser` list; requires the `users:view` capability |
+//! | `PATCH` | `/api/v1/users/{id}` | Change a role; requires `users:update`; the new epoch invalidates old tokens |
+//! | `DELETE` | `/api/v1/users/{id}` | Delete and revoke refresh tokens; requires `users:delete`; the last administrator is `409` |
 //! | `GET` | `/api/v1/version` | API version and the embedded caddy-rs version |
 //! | `GET` | `/api/v1/hosts` | Host summaries, paginated and filterable |
 //! | `POST` | `/api/v1/hosts` | Create a host; `201` plus `Location` and a strong `ETag` |
@@ -53,11 +57,17 @@
 //!
 //! # Scope and exposure
 //!
-//! Mutations are loopback-only until management auth lands: [`create_router`] must be served with
-//! `into_make_service_with_connect_info::<SocketAddr>()`, and a missing or non-loopback socket peer
-//! is `403`. Forwarding headers are never trusted. This is a fail-closed boundary, not
-//! authentication, so the management port must not be published. Errors are typed and carry a
-//! `location` when a field is at fault; no response body contains secret material.
+//! The user-administration routes authenticate with a `Authorization: Bearer <access token>`
+//! header: a missing, malformed, expired or epoch-stale token is `401`, and a valid token without
+//! the required `users` capability is `403` (an editor may list users, but not change a role or
+//! delete one). The token is verified against the store on every request, so a role change or
+//! revocation invalidates previously issued tokens through the authentication epoch.
+//!
+//! Every other mutation stays loopback-only until its management-auth slice lands: [`create_router`]
+//! must be served with `into_make_service_with_connect_info::<SocketAddr>()`, and a missing or
+//! non-loopback socket peer is `403`. Forwarding headers are never trusted. This is a fail-closed
+//! boundary, not authentication, so the management port must not be published. Errors are typed and
+//! carry a `location` when a field is at fault; no response body contains secret material.
 
 #![forbid(unsafe_code)]
 
@@ -73,6 +83,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use caddy_rs_authn::{AuthnService, MemoryUserStore};
 use caddy_rs_pm_config::ConfigSettings;
 use caddy_rs_pm_runtime::{ConfigApplyService, PmRuntime};
 use serde::{Deserialize, Serialize};
@@ -88,6 +99,7 @@ pub const MAX_LIMIT: u32 = 200;
 #[derive(Clone)]
 pub struct ApiState {
     pub runtime: PmRuntime,
+    pub authn: AuthnService<MemoryUserStore>,
     inventory: Option<SharedCertificateInventory>,
     applier: Option<Arc<ConfigApplyService>>,
 }
@@ -95,9 +107,10 @@ pub struct ApiState {
 impl ApiState {
     /// State with no certificate inventory. Every intent is reported as `pending` until the
     /// daemon injects a source with [`ApiState::with_inventory`].
-    pub fn new(runtime: PmRuntime) -> Self {
+    pub fn new(runtime: PmRuntime, authn: AuthnService<MemoryUserStore>) -> Self {
         Self {
             runtime,
+            authn,
             inventory: None,
             applier: None,
         }
@@ -199,6 +212,7 @@ pub enum ErrorCode {
     PreconditionFailed,
     PreconditionRequired,
     Forbidden,
+    Unauthorized,
     UnsupportedMediaType,
     Validation,
     ServiceUnavailable,
@@ -218,6 +232,8 @@ pub enum ApiError {
     PreconditionRequired(String),
     #[error("forbidden: {0}")]
     Forbidden(String),
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
     #[error("unsupported media type: {0}")]
     UnsupportedMediaType(String),
     #[error("validation error: {message}")]
@@ -247,6 +263,7 @@ impl ApiError {
             Self::PreconditionFailed(_) => StatusCode::PRECONDITION_FAILED,
             Self::PreconditionRequired(_) => StatusCode::PRECONDITION_REQUIRED,
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
+            Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::UnsupportedMediaType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Self::Validation { .. } => StatusCode::BAD_REQUEST,
             Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
@@ -262,6 +279,7 @@ impl ApiError {
             Self::PreconditionFailed(_) => ErrorCode::PreconditionFailed,
             Self::PreconditionRequired(_) => ErrorCode::PreconditionRequired,
             Self::Forbidden(_) => ErrorCode::Forbidden,
+            Self::Unauthorized(_) => ErrorCode::Unauthorized,
             Self::UnsupportedMediaType(_) => ErrorCode::UnsupportedMediaType,
             Self::Validation { .. } => ErrorCode::Validation,
             Self::ServiceUnavailable(_) => ErrorCode::ServiceUnavailable,
@@ -296,6 +314,7 @@ pub struct ApiErrorDetail {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.status_code();
+        let unauthorized = matches!(self, Self::Unauthorized(_));
         let body = ApiErrorResponse {
             error: ApiErrorDetail {
                 code: self.error_code(),
@@ -303,7 +322,15 @@ impl IntoResponse for ApiError {
                 location: self.location().map(ToOwned::to_owned),
             },
         };
-        (status, Json(body)).into_response()
+        let mut response = (status, Json(body)).into_response();
+        if unauthorized {
+            // RFC 9110 requires a 401 to carry a challenge; the only scheme this API accepts is
+            // Bearer, so the challenge is not configurable.
+            response
+                .headers_mut()
+                .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+        }
+        response
     }
 }
 
@@ -555,6 +582,12 @@ pub fn create_router(state: ApiState) -> Router {
     let api = Router::new()
         .route("/health", get(health_handler))
         .route("/setup", get(setup_handler))
+        .route("/auth/setup", post(auth_setup_handler))
+        .route("/users", get(users::list_handler))
+        .route(
+            "/users/{id}",
+            axum::routing::patch(users::update_role_handler).delete(users::delete_handler),
+        )
         .route("/version", get(version_handler))
         .route(
             "/hosts",
@@ -620,20 +653,81 @@ async fn api_not_found(OriginalUri(uri): OriginalUri) -> ApiError {
     ApiError::NotFound(format!("no route matches {}", uri.path()))
 }
 
-async fn health_handler(State(_state): State<ApiState>) -> Json<HealthResponse> {
+/// True when at least one user exists, i.e. first-run setup has completed.
+///
+/// A store error is reported as "not configured" on purpose: this is only the setup-wizard hint,
+/// and reporting `true` on a read failure would let a client skip the wizard against a server
+/// whose user store cannot be read.
+async fn setup_complete(state: &ApiState) -> bool {
+    state
+        .authn
+        .list_users()
+        .await
+        .map(|users| !users.is_empty())
+        .unwrap_or(false)
+}
+
+async fn health_handler(State(state): State<ApiState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok".to_owned(),
-        // Keep this consistent with `/setup`: no user store is wired, so the server is not
-        // configured and a client must not skip the setup wizard.
-        setup: false,
+        setup: setup_complete(&state).await,
     })
 }
 
-async fn setup_handler(State(_state): State<ApiState>) -> Json<SetupResponse> {
-    // No user store is wired yet (caddy-rs-authn lands in a later slice), so setup is never
-    // complete. Reporting `true` here would let a client skip the setup wizard against a server
-    // that has no administrator.
-    Json(SetupResponse { configured: false })
+async fn setup_handler(State(state): State<ApiState>) -> Json<SetupResponse> {
+    Json(SetupResponse {
+        configured: setup_complete(&state).await,
+    })
+}
+
+/// Request body for `POST /api/v1/auth/setup`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetupRequest {
+    pub username: String,
+    pub password: String,
+}
+
+/// Response body for `POST /api/v1/auth/setup`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateUserResponse {
+    pub user_id: String,
+    pub access_token: String,
+    pub refresh_token: String,
+}
+
+/// `POST /api/v1/auth/setup` — first-run administrator creation.
+///
+/// Succeeds with `201 Created` exactly once. Every later attempt is `409 Conflict` with the
+/// standard [`ApiError`] body (`{"error":{"code":"CONFLICT","message":...}}`): the store-level
+/// compare-and-set in [`caddy_rs_authn::MemoryUserStore::create_first_admin`] is what makes
+/// concurrent callers collapse to a single winner. The route stays loopback-only: it runs before
+/// any administrator exists, so it cannot require a token.
+async fn auth_setup_handler(
+    State(state): State<ApiState>,
+    _peer: hosts::LocalPeer,
+    Json(request): Json<SetupRequest>,
+) -> Result<(StatusCode, Json<CreateUserResponse>), ApiError> {
+    let (user, token_pair) = state
+        .authn
+        .create_first_admin(&request.username, &request.password)
+        .await
+        .map_err(|error| match error {
+            caddy_rs_authn::AuthError::UsernameExists => {
+                ApiError::Conflict("first-run setup is already complete".to_owned())
+            }
+            other => ApiError::Internal(other.to_string()),
+        })?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateUserResponse {
+            user_id: user.id.0.to_string(),
+            access_token: token_pair.access_token,
+            refresh_token: token_pair.refresh_token,
+        }),
+    ))
 }
 
 async fn version_handler(State(_state): State<ApiState>) -> Json<VersionResponse> {
@@ -706,6 +800,7 @@ mod certificates;
 mod dto;
 mod hosts;
 mod security_headers;
+mod users;
 mod ui;
 
 pub use apply::ApplyResponse;
