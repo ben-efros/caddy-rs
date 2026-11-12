@@ -1028,6 +1028,85 @@ impl Validator<'_> {
                 });
             }
         }
+        // Unknown fields are rejected: ADR-0009 makes this extension stricter than Caddy's
+        // JSON loader on purpose, so a typo in a budget field cannot silently fall back to a
+        // default.
+        if let Some(key) = entry.extra.keys().next() {
+            return Err(Error::Invalid {
+                path: format!("{path}.{key}"),
+                message: format!("unknown field {key:?}"),
+            });
+        }
+        let field_error = |field: &str, message: String| Error::Invalid {
+            path: format!("{path}.{field}"),
+            message,
+        };
+        // Budget ranges from ADR-0009. `max_inflight_handshakes` is independent of
+        // `max_sessions` (1-32 and 1-8 respectively); they are not coupled.
+        for (field, value, min, max) in [
+            ("max_sessions", entry.max_sessions, 1, 8),
+            (
+                "max_inflight_handshakes",
+                entry.max_inflight_handshakes,
+                1,
+                32,
+            ),
+            ("queue_depth", entry.queue_depth, 1, 4096),
+        ] {
+            if let Some(value) = value {
+                if value < min || value > max {
+                    return Err(field_error(
+                        field,
+                        format!("must be between {min} and {max}, got {value}"),
+                    ));
+                }
+            }
+        }
+        for (field, value) in [
+            ("handshake_wait", entry.handshake_wait),
+            ("queue_wait", entry.queue_wait),
+            ("sign_timeout", entry.sign_timeout),
+            ("handshake_timeout", entry.handshake_timeout),
+        ] {
+            if value == Some(0) {
+                return Err(field_error(field, "must be greater than zero".into()));
+            }
+        }
+        // Timeouts must be satisfiable in order, not clamped: the whole handshake must be able
+        // to wait for a permit, wait in the queue and complete one `C_Sign`.
+        let budget = entry.budget();
+        let required = budget
+            .handshake_wait
+            .checked_add(budget.queue_wait)
+            .and_then(|wait| wait.checked_add(budget.sign_timeout));
+        match required {
+            None => {
+                return Err(field_error(
+                    "handshake_timeout",
+                    "handshake_wait + queue_wait + sign_timeout overflows u64".into(),
+                ));
+            }
+            Some(required) if budget.handshake_timeout < required => {
+                return Err(field_error(
+                    "handshake_timeout",
+                    format!(
+                        "must be at least handshake_wait + queue_wait + sign_timeout \
+                         ({required} ns), got {} ns",
+                        budget.handshake_timeout
+                    ),
+                ));
+            }
+            Some(_) => {}
+        }
+        // Tags follow `load_files` semantics: each tag non-empty and unique.
+        if entry.tags.iter().any(|tag| tag.is_empty()) {
+            return Err(field_error("tags", "tags must not be empty".into()));
+        }
+        for (index, tag) in entry.tags.iter().enumerate() {
+            if entry.tags[..index].contains(tag) {
+                return Err(field_error("tags", format!("duplicate tag {tag:?}")));
+            }
+        }
         Ok(())
     }
 
@@ -2534,5 +2613,122 @@ mod tests {
         let error = validate_config(&config, &registry()).expect_err("bad hex key_id must fail");
         let message = error.to_string();
         assert!(message.contains("hex-encoded"), "{message}");
+    }
+
+    fn pkcs11_entry_json(overrides: serde_json::Value) -> serde_json::Value {
+        let mut entry = serde_json::json!({
+            "module": "/usr/lib/libsofthsm2.so",
+            "token": "softhsm-token",
+            "key_label": "server-key",
+            "certificate": "/etc/certs/chain.pem",
+            "pin_source": "env",
+            "pin": "PKCS11_PIN"
+        });
+        for (key, value) in overrides.as_object().expect("overrides object") {
+            entry[key] = value.clone();
+        }
+        entry
+    }
+
+    fn pkcs11_config_with(overrides: serde_json::Value) -> Config {
+        Config::from_value(serde_json::json!({
+            "apps": {"tls": {"certificates": {"pkcs11": [pkcs11_entry_json(overrides)]}}}
+        }))
+        .expect("model decodes")
+    }
+
+    fn pkcs11_error(overrides: serde_json::Value) -> String {
+        validate_config(&pkcs11_config_with(overrides), &registry())
+            .expect_err("pkcs11 entry must be rejected")
+            .to_string()
+    }
+
+    #[test]
+    fn accepts_pkcs11_budget_fields() {
+        let config = pkcs11_config_with(serde_json::json!({
+            "max_sessions": 2,
+            "max_inflight_handshakes": 4,
+            "handshake_wait": 2000000000u64,
+            "queue_depth": 128,
+            "queue_wait": 3000000000u64,
+            "sign_timeout": 6000000000u64,
+            "handshake_timeout": 20000000000u64,
+            "tags": ["example", "tpm"]
+        }));
+        let report = validate_config(&config, &registry())
+            .expect("full pkcs11 budget entry passes validation");
+        assert_eq!(report.servers, 0);
+    }
+
+    #[test]
+    fn rejects_pkcs11_out_of_range_budget_fields() {
+        for (field, value) in [
+            ("max_sessions", 0),
+            ("max_sessions", 9),
+            ("max_inflight_handshakes", 0),
+            ("max_inflight_handshakes", 33),
+            ("queue_depth", 0),
+            ("queue_depth", 4097),
+        ] {
+            let message = pkcs11_error(serde_json::json!({ field: value }));
+            assert!(
+                message.contains(&format!("apps.tls.certificates.pkcs11[0].{field}")),
+                "{field}={value}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_pkcs11_zero_sign_timeout() {
+        let message = pkcs11_error(serde_json::json!({ "sign_timeout": 0 }));
+        assert!(
+            message.contains("apps.tls.certificates.pkcs11[0].sign_timeout"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn rejects_pkcs11_timeout_ordering_violation() {
+        // handshake_wait + queue_wait + sign_timeout = 7s > handshake_timeout = 1ns.
+        let message = pkcs11_error(serde_json::json!({
+            "handshake_wait": 1000000000,
+            "queue_wait": 1000000000,
+            "sign_timeout": 5000000000u64,
+            "handshake_timeout": 1
+        }));
+        assert!(
+            message.contains("apps.tls.certificates.pkcs11[0].handshake_timeout"),
+            "{message}"
+        );
+        assert!(message.contains("at least"), "{message}");
+    }
+
+    #[test]
+    fn rejects_pkcs11_unknown_field() {
+        let message = pkcs11_error(serde_json::json!({ "max_session": 2 }));
+        assert!(
+            message.contains("apps.tls.certificates.pkcs11[0].max_session"),
+            "{message}"
+        );
+        assert!(message.contains("unknown field"), "{message}");
+    }
+
+    #[test]
+    fn rejects_pkcs11_empty_tag() {
+        let message = pkcs11_error(serde_json::json!({ "tags": ["ok", ""] }));
+        assert!(
+            message.contains("apps.tls.certificates.pkcs11[0].tags"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn rejects_pkcs11_duplicate_tag() {
+        let message = pkcs11_error(serde_json::json!({ "tags": ["example", "example"] }));
+        assert!(
+            message.contains("apps.tls.certificates.pkcs11[0].tags"),
+            "{message}"
+        );
+        assert!(message.contains("duplicate tag"), "{message}");
     }
 }

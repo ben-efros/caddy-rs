@@ -32,7 +32,7 @@ use caddy_rs_tls::{
     plan_automatic_https, resolver_from_config, staple_for_certificate, AcmeTlsAlpnResolver,
     AcmeTransport, AutomaticHttpsIssuer, AutomaticHttpsPlan, AutomaticHttpsProvisioner,
     AutomaticHttpsRenewals, CertificateResolver, HyperOcspTransport, HyperTransport,
-    NoAcmeTransport, OcspPolicy, OcspStapler, SharedOcspStapler, TlsAlpn01TokenStore,
+    NoAcmeTransport, OcspPolicy, OcspStapler, SharedOcspStapler, TlsAlpn01TokenStore, TlsResolver,
     TlsServerOptions, DEFAULT_HTTPS_PORT,
 };
 use tokio::sync::watch;
@@ -1906,7 +1906,7 @@ impl ServerRuntime {
                         automatic,
                     )?
                 };
-                let tls = if terminates_tls {
+                let (tls, external_key) = if terminates_tls {
                     match automatic {
                         Some(context) => {
                             // TLS-ALPN-01 overlay: advertise `acme-tls/1` and resolve challenge
@@ -1924,20 +1924,31 @@ impl ServerRuntime {
                                     ))
                                 }
                             };
+                            // Token-held key pools travel with the resolver so the listener can
+                            // bound handshakes with the PKCS#11 budget (T-TLS-097).
+                            let external_key = TlsResolver::external_key_pool(&*fallback);
                             if is_udp {
                                 // QUIC's TLS config is derived from this one by overriding the
                                 // ALPN to `h3`; the ACME TLS-ALPN-01 overlay is TCP-only.
-                                Some(build_server_config_with_cert_resolver(
-                                    fallback,
-                                    &tls_options,
-                                )?)
+                                (
+                                    Some(build_server_config_with_cert_resolver(
+                                        fallback,
+                                        &tls_options,
+                                    )?),
+                                    external_key,
+                                )
                             } else {
                                 let overlay = Arc::new(AcmeTlsAlpnResolver::new(
                                     fallback,
                                     Arc::clone(context.tokens),
                                 ));
                                 let options = tls_options.clone().with_acme_tls_alpn();
-                                Some(build_server_config_with_cert_resolver(overlay, &options)?)
+                                (
+                                    Some(build_server_config_with_cert_resolver(
+                                        overlay, &options,
+                                    )?),
+                                    external_key,
+                                )
                             }
                         }
                         None => {
@@ -1947,11 +1958,14 @@ impl ServerRuntime {
                                 .ok_or_else(|| {
                                     missing_certificates_error(listen, server_name, https_port)
                                 })?;
-                            Some(build_server_config(Arc::clone(resolver), &tls_options)?)
+                            (
+                                Some(build_server_config(Arc::clone(resolver), &tls_options)?),
+                                TlsResolver::external_key_pool(&**resolver),
+                            )
                         }
                     }
                 } else {
-                    None
+                    (None, None)
                 };
                 if terminates_tls && automatic.is_some() && automatic_identity.is_none() {
                     automatic_identity = Some(limits.server_identity.clone());
@@ -1976,6 +1990,7 @@ impl ServerRuntime {
                         limits: Arc::clone(&limits),
                         trusted_proxies: Arc::clone(&trusted_proxies),
                         tls,
+                        external_key,
                         client_auth_verified: tls_options.client_auth.verifies(),
                         allow_0rtt,
                         automatic: automatic_serving,
@@ -2015,6 +2030,7 @@ impl ServerRuntime {
                                 caddy_rs_proxy::trusted_proxies::ServerTrustedProxies::default(),
                             ),
                             tls: None,
+                            external_key: None,
                             client_auth_verified: false,
                             allow_0rtt: true,
                             automatic: Some(Arc::clone(context.serving)),

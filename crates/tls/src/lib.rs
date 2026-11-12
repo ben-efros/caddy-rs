@@ -21,6 +21,7 @@ pub mod internal_ca;
 pub mod issuer;
 mod key_type;
 pub mod ocsp;
+pub mod pkcs11;
 pub mod propagation;
 pub mod renewal;
 pub mod route53;
@@ -76,6 +77,10 @@ pub use ocsp::{
     HyperOcspTransport, OcspCertStatus, OcspError, OcspPolicy, OcspRequest, OcspResponse,
     OcspStapler, OcspTransport, ParsedCertificate, SharedOcspStapler, Staple, StapleOutcome,
     DEFAULT_OCSP_CHECK_INTERVAL, INITIAL_OCSP_RETRY_DELAY, MAX_OCSP_RETRY_DELAY,
+};
+pub use pkcs11::{
+    is_quarantined, open_token, quarantine, HandshakePermit, KeySelector, Pkcs11Budget,
+    Pkcs11Error, Pkcs11Signer, Pkcs11SigningKey, TokenPool,
 };
 pub use propagation::{
     txt_data_matches, DohPropagationChecker, PropagationChecker, CLOUDFLARE_DOH_ENDPOINT,

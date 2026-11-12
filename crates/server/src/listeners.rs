@@ -76,6 +76,10 @@ pub(crate) struct ListenerState {
     pub(crate) trusted_proxies: Arc<ServerTrustedProxies>,
     /// TLS configuration when this listener terminates TLS; `None` for cleartext listeners.
     pub(crate) tls: Option<Arc<rustls::ServerConfig>>,
+    /// PKCS#11 token pool backing this listener's token-held certificate keys, when any
+    /// configured certificate uses one (`apps.tls.certificates.pkcs11`, T-TLS-097). The TLS
+    /// branch of `serve_accepted` bounds such handshakes with the pool's budget.
+    pub(crate) external_key: Option<Arc<caddy_rs_tls::pkcs11::TokenPool>>,
     /// Whether the listener's client-auth mode verifies client certificates (Caddy
     /// `require_and_verify`/`verify_if_given`); used for `{http.request.tls.client.*}`.
     pub(crate) client_auth_verified: bool,
@@ -1165,6 +1169,8 @@ struct ConnectionContext {
     trusted_proxies: Arc<ServerTrustedProxies>,
     /// TLS configuration for this accepted connection, when the listener terminates TLS.
     tls: Option<Arc<rustls::ServerConfig>>,
+    /// Token pool backing this listener's token-held certificate keys, if any.
+    external_key: Option<Arc<caddy_rs_tls::pkcs11::TokenPool>>,
     /// Whether the listener's client-auth mode verifies client certificates.
     client_auth_verified: bool,
     /// Automatic-HTTPS pre-routing for cleartext connections.
@@ -1205,6 +1211,7 @@ fn admit_connection(
             limits: Arc::clone(&state.limits),
             trusted_proxies: Arc::clone(&state.trusted_proxies),
             tls: state.tls.clone(),
+            external_key: state.external_key.clone(),
             client_auth_verified: state.client_auth_verified,
             automatic: state.automatic.clone(),
             server_name: state.server_name.clone(),
@@ -1220,6 +1227,7 @@ fn admit_connection(
             limits: Arc::new(ServerLimits::default()),
             trusted_proxies: Arc::new(ServerTrustedProxies::default()),
             tls: None,
+            external_key: None,
             client_auth_verified: false,
             automatic: None,
             server_name: String::new(),
@@ -1448,20 +1456,40 @@ async fn serve_accepted<I>(
     let activity = Arc::new(ConnectionActivity::default());
     let router = context.router;
     let automatic = context.automatic;
+    let external_key = context.external_key;
     let server_name = context.server_name;
     let recorder = context.recorder;
     let access_log = context.access_log;
     let access_log_policy = context.access_log_policy;
     if let Some(tls) = context.tls {
         let acceptor = TlsAcceptor::from(tls);
-        let tls_stream = match acceptor.accept(stream).await {
-            Ok(stream) => stream,
-            Err(error) => {
-                // TLS handshake failures are client-side errors (wrong SNI, protocol mismatch);
-                // log at debug and drop the connection like Caddy does.
-                tracing::debug!(%error, "TLS handshake failed");
-                return;
+        let tls_stream = match external_key {
+            // A token-held key signs inside the PKCS#11 token: hold a token handshake permit and
+            // bound the whole handshake by the token budget (T-TLS-097).
+            Some(pool) => {
+                match caddy_rs_tls::tls_server::accept_external_key_handshake(
+                    acceptor, stream, pool,
+                )
+                .await
+                {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        // Budget exhaustion and token failures are per-connection errors: log at
+                        // debug and drop the connection, like the handshake failure below.
+                        tracing::debug!(%error, "TLS handshake failed");
+                        return;
+                    }
+                }
             }
+            None => match acceptor.accept(stream).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    // TLS handshake failures are client-side errors (wrong SNI, protocol
+                    // mismatch); log at debug and drop the connection like Caddy does.
+                    tracing::debug!(%error, "TLS handshake failed");
+                    return;
+                }
+            },
         };
         let connection = tls_stream.get_ref().1;
         let alpn = connection

@@ -1173,9 +1173,107 @@ pub struct Pkcs11CertConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_timeout: Option<u64>,
 
+    /// PKCS#11 sessions opened for the token (per token, not per entry), 1-8. Defaults to 1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_sessions: Option<u64>,
+
+    /// Semaphore permits for handshakes on the blocking pool (per token), 1-32. Defaults to
+    /// the resolved `max_sessions`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_inflight_handshakes: Option<u64>,
+
+    /// Maximum time a connection waits for a handshake permit before it is dropped, in
+    /// nanoseconds (Caddy `caddy.Duration` convention). Defaults to 1s.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handshake_wait: Option<u64>,
+
+    /// Hard bound on queued sign jobs for the token, 1-4096. Defaults to 64.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_depth: Option<u64>,
+
+    /// Maximum total time a sign request may wait before a session dispatches it, in
+    /// nanoseconds. Defaults to 1s.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_wait: Option<u64>,
+
+    /// Maximum time from dispatch to reply (the `C_Sign` call), in nanoseconds. Must be greater
+    /// than zero. Defaults to 5s.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sign_timeout: Option<u64>,
+
+    /// Maximum time for the whole TLS handshake, in nanoseconds. Must be at least
+    /// `handshake_wait + queue_wait + sign_timeout`. Defaults to 10s.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handshake_timeout: Option<u64>,
+
+    /// Arbitrary tags associated with this certificate, selectable by
+    /// `certificate_selection.any_tag`. Same shape as `load_files` tags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+
     /// Unknown fields, preserved verbatim for forward compatibility.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+/// Resolved PKCS#11 budget for one token, after defaults are applied.
+///
+/// The values are shared by every `pkcs11` entry naming the same token; ADR-0009 requires them
+/// to be identical per token. Durations are integer nanoseconds (`caddy.Duration` convention).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pkcs11Budget {
+    /// Resolved sessions per token (1-8).
+    pub max_sessions: u64,
+    /// Resolved handshake semaphore permits per token (1-32).
+    pub max_inflight_handshakes: u64,
+    /// Resolved handshake-permit wait, in nanoseconds.
+    pub handshake_wait: u64,
+    /// Resolved sign queue depth (1-4096).
+    pub queue_depth: u64,
+    /// Resolved sign queue admission/delay wait, in nanoseconds.
+    pub queue_wait: u64,
+    /// Resolved dispatch-to-reply `C_Sign` timeout, in nanoseconds.
+    pub sign_timeout: u64,
+    /// Resolved whole-handshake timeout, in nanoseconds.
+    pub handshake_timeout: u64,
+}
+
+impl Default for Pkcs11Budget {
+    fn default() -> Self {
+        Self {
+            max_sessions: 1,
+            max_inflight_handshakes: 1,
+            handshake_wait: 1_000_000_000,
+            queue_depth: 64,
+            queue_wait: 1_000_000_000,
+            sign_timeout: 5_000_000_000,
+            handshake_timeout: 10_000_000_000,
+        }
+    }
+}
+
+impl Pkcs11Budget {
+    /// Resolve `entry`'s budget fields, applying ADR-0009 defaults. Validation still rejects
+    /// out-of-range values; this accessor only fills in what the operator omitted.
+    pub fn from_entry(entry: &Pkcs11CertConfig) -> Self {
+        let max_sessions = entry.max_sessions.unwrap_or(1);
+        Self {
+            max_sessions,
+            max_inflight_handshakes: entry.max_inflight_handshakes.unwrap_or(max_sessions),
+            handshake_wait: entry.handshake_wait.unwrap_or(1_000_000_000),
+            queue_depth: entry.queue_depth.unwrap_or(64),
+            queue_wait: entry.queue_wait.unwrap_or(1_000_000_000),
+            sign_timeout: entry.sign_timeout.unwrap_or(5_000_000_000),
+            handshake_timeout: entry.handshake_timeout.unwrap_or(10_000_000_000),
+        }
+    }
+}
+
+impl Pkcs11CertConfig {
+    /// Returns this entry's resolved budget (defaults applied).
+    pub fn budget(&self) -> Pkcs11Budget {
+        Pkcs11Budget::from_entry(self)
+    }
 }
 
 /// Source of the PKCS#11 PIN.
@@ -2052,5 +2150,149 @@ mod tests {
         // No HTTP app at all.
         let config = Config::from_value(serde_json::json!({"apps": {}})).expect("decodes");
         assert!(!config.contains_reverse_proxy_handler());
+    }
+
+    #[test]
+    fn pkcs11_config_budget_fields_decode_and_round_trip() {
+        let json = serde_json::json!({
+            "apps": {
+                "tls": {
+                    "certificates": {
+                        "pkcs11": [{
+                            "module": "/usr/lib/libsofthsm2.so",
+                            "token": "softhsm-token",
+                            "key_label": "server-key",
+                            "certificate": "/etc/certs/chain.pem",
+                            "pin_source": "env",
+                            "pin": "PKCS11_PIN",
+                            "max_sessions": 2,
+                            "max_inflight_handshakes": 4,
+                            "handshake_wait": 2000000000u64,
+                            "queue_depth": 128,
+                            "queue_wait": 3000000000u64,
+                            "sign_timeout": 6000000000u64,
+                            "handshake_timeout": 20000000000u64,
+                            "tags": ["example", "tpm"]
+                        }]
+                    }
+                }
+            }
+        });
+        let config = Config::from_value(json).expect("valid pkcs11 budget config");
+        let entry = &config
+            .tls()
+            .expect("tls app")
+            .certificates
+            .as_ref()
+            .expect("certificates")
+            .pkcs11
+            .as_ref()
+            .expect("pkcs11 entries")[0];
+        assert_eq!(entry.max_sessions, Some(2));
+        assert_eq!(entry.max_inflight_handshakes, Some(4));
+        assert_eq!(entry.handshake_wait, Some(2_000_000_000));
+        assert_eq!(entry.queue_depth, Some(128));
+        assert_eq!(entry.queue_wait, Some(3_000_000_000u64));
+        assert_eq!(entry.sign_timeout, Some(6_000_000_000u64));
+        assert_eq!(entry.handshake_timeout, Some(20_000_000_000u64));
+        assert_eq!(entry.tags, vec!["example".to_string(), "tpm".to_string()]);
+        assert_eq!(
+            entry.budget(),
+            Pkcs11Budget {
+                max_sessions: 2,
+                max_inflight_handshakes: 4,
+                handshake_wait: 2_000_000_000,
+                queue_depth: 128,
+                queue_wait: 3_000_000_000u64,
+                sign_timeout: 6_000_000_000u64,
+                handshake_timeout: 20_000_000_000u64,
+            }
+        );
+
+        // Round-trips with canonical field names and integer (nanosecond) durations.
+        let value = config.to_value().expect("serializes");
+        let round = &value["apps"]["tls"]["certificates"]["pkcs11"][0];
+        assert_eq!(round["max_sessions"], serde_json::json!(2));
+        assert_eq!(round["max_inflight_handshakes"], serde_json::json!(4));
+        assert_eq!(round["handshake_wait"], serde_json::json!(2_000_000_000));
+        assert_eq!(round["queue_depth"], serde_json::json!(128));
+        assert_eq!(round["queue_wait"], serde_json::json!(3_000_000_000u64));
+        assert_eq!(round["sign_timeout"], serde_json::json!(6_000_000_000u64));
+        assert_eq!(
+            round["handshake_timeout"],
+            serde_json::json!(20_000_000_000u64)
+        );
+        assert_eq!(round["tags"], serde_json::json!(["example", "tpm"]));
+        assert!(round["handshake_wait"].is_number(), "{round}");
+        assert!(round["sign_timeout"].is_number(), "{round}");
+    }
+
+    #[test]
+    fn pkcs11_config_budget_defaults_when_absent() {
+        let json = serde_json::json!({
+            "apps": {
+                "tls": {
+                    "certificates": {
+                        "pkcs11": [{
+                            "module": "/usr/lib/libsofthsm2.so",
+                            "token": "softhsm-token",
+                            "key_label": "server-key",
+                            "certificate": "/etc/certs/chain.pem",
+                            "pin_source": "env",
+                            "pin": "PKCS11_PIN"
+                        }]
+                    }
+                }
+            }
+        });
+        let config = Config::from_value(json).expect("valid minimal pkcs11 config");
+        let entry = &config
+            .tls()
+            .expect("tls app")
+            .certificates
+            .as_ref()
+            .expect("certificates")
+            .pkcs11
+            .as_ref()
+            .expect("pkcs11 entries")[0];
+        assert_eq!(entry.max_sessions, None);
+        assert_eq!(entry.max_inflight_handshakes, None);
+        assert_eq!(entry.handshake_wait, None);
+        assert_eq!(entry.queue_depth, None);
+        assert_eq!(entry.queue_wait, None);
+        assert_eq!(entry.sign_timeout, None);
+        assert_eq!(entry.handshake_timeout, None);
+        assert!(entry.tags.is_empty());
+        let budget = entry.budget();
+        assert_eq!(budget.max_sessions, 1);
+        assert_eq!(budget.max_inflight_handshakes, 1);
+        assert_eq!(budget.handshake_wait, 1_000_000_000);
+        assert_eq!(budget.queue_depth, 64);
+        assert_eq!(budget.queue_wait, 1_000_000_000);
+        assert_eq!(budget.sign_timeout, 5_000_000_000);
+        assert_eq!(budget.handshake_timeout, 10_000_000_000);
+
+        // Omitted budget fields stay omitted on serialisation (serde skip_serializing_if).
+        let value = config.to_value().expect("serializes");
+        let round = &value["apps"]["tls"]["certificates"]["pkcs11"][0];
+        for field in [
+            "max_sessions",
+            "max_inflight_handshakes",
+            "handshake_wait",
+            "queue_depth",
+            "queue_wait",
+            "sign_timeout",
+            "handshake_timeout",
+            "tags",
+        ] {
+            assert!(round.get(field).is_none(), "{field} must stay omitted");
+        }
+
+        // max_inflight_handshakes defaults to the resolved max_sessions.
+        let mut entry = entry.clone();
+        entry.max_sessions = Some(4);
+        assert_eq!(entry.budget().max_inflight_handshakes, 4);
+        entry.max_inflight_handshakes = Some(2);
+        assert_eq!(entry.budget().max_inflight_handshakes, 2);
     }
 }
