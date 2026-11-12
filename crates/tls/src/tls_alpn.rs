@@ -316,6 +316,10 @@ impl crate::tls_server::TlsResolver for AcmeTlsAlpnResolver {
     fn tag_selector(&self) -> Option<&dyn crate::tls_server::TaggedCertificateSelector> {
         crate::tls_server::TlsResolver::tag_selector(&*self.fallback)
     }
+
+    fn external_key_pool(&self) -> Option<std::sync::Arc<crate::pkcs11::TokenPool>> {
+        crate::tls_server::TlsResolver::external_key_pool(&*self.fallback)
+    }
 }
 
 impl ResolvesServerCert for AcmeTlsAlpnResolver {
