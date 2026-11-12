@@ -246,7 +246,7 @@ async fn missing_content_type_is_sniffed_before_the_matcher() {
             {"handler": "test_binary"}
         ]
     }]);
-    let factory: caddy_rs_http::CustomHandlerFactory = Arc::new(move |value, _path| {
+    let factory: caddy_rs_http::CustomHandlerFactory = Arc::new(move |value, _path, _context| {
         if value.get("handler").and_then(|value| value.as_str()) == Some("test_binary") {
             let body = binary.clone();
             Ok(Some(Arc::new(BinaryHandler(body)) as SharedHandler))
@@ -403,7 +403,7 @@ async fn streaming_responses_are_compressed_incrementally() {
             {"handler": "test_stream"}
         ]
     }]);
-    let factory: caddy_rs_http::CustomHandlerFactory = Arc::new(|value, _path| {
+    let factory: caddy_rs_http::CustomHandlerFactory = Arc::new(|value, _path, _context| {
         if value.get("handler").and_then(|value| value.as_str()) == Some("test_stream") {
             Ok(Some(Arc::new(StreamingHandler) as SharedHandler))
         } else {

@@ -382,6 +382,18 @@ impl HeaderOps {
         self.add.is_empty() && self.set.is_empty() && self.delete.is_empty()
     }
 
+    /// Whether the operator explicitly configured this header name (`add`/`set`/a `delete` pattern
+    /// that matches it, including the `*` clear-all form).
+    ///
+    /// The implicit reverse-proxy security profile (ADR-0010 §2) applies after these operations so
+    /// an operator's `header_down` wins; set-if-absent alone cannot honour an explicit `delete`,
+    /// so the profile skips every name the operator configured here.
+    pub fn explicitly_configures(&self, name: &HeaderName) -> bool {
+        self.add.iter().any(|(configured, _)| configured == name)
+            || self.set.iter().any(|(configured, _)| configured == name)
+            || self.delete.iter().any(|pattern| pattern.matches(name))
+    }
+
     /// Apply the operations in Caddy's order: clear-all delete, add, set, then patterned deletes.
     pub fn apply(&self, headers: &mut HeaderMap, context: &TemplateContext<'_>) {
         // Caddy clears everything first if `*` is in the delete list so that added headers are not

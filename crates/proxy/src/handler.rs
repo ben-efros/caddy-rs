@@ -44,11 +44,12 @@ use serde_json::Value;
 
 use hyper_util::rt::TokioIo;
 
+use caddy_rs_http::security_profile::SecurityProfile;
 use caddy_rs_http::{
     body::{Body, RequestBody, StreamingBody, StreamingResponse},
     requested_upgrade_type, AccessLogUpstream, CustomHandlerFactory, Error as HttpError, Handler,
-    Outcome, Request, Response, Result as HttpResult, SharedHandler, StreamingOutcome, Tunnel,
-    UpgradedResponse,
+    HandlerBuildContext, Outcome, Request, Response, Result as HttpResult, SharedHandler,
+    StreamingOutcome, Tunnel, UpgradedResponse,
 };
 
 use crate::balancer::{self, Balancer};
@@ -510,16 +511,27 @@ pub struct ReverseProxyHandler {
     retry_match: RetryMatch,
     trusted_proxies: Vec<IpNet>,
     flush_interval: FlushInterval,
+    /// Whether the implicit reverse-proxy security profile applies to this handler's final
+    /// responses (ADR-0010 §2, `DIV-0131`). `false` under `stock_compat true` and when the route
+    /// chain carries an explicit `security_headers` handler (precedence 4: that handler owns the
+    /// header set instead).
+    security_profile_enabled: bool,
 }
 
 impl ReverseProxyHandler {
     /// Build from Caddy JSON using the system DNS resolver for dynamic upstreams.
+    ///
+    /// The implicit security profile stays off: direct construction is the test/embedder path,
+    /// which asserts raw proxy behaviour. The router factory (`handler_factory`) is the production
+    /// path and passes the generation's decision from [`caddy_rs_http::HandlerBuildContext`] to
+    /// [`Self::from_json_with_profile`].
     pub fn from_json(value: &Value, path: &str) -> HttpResult<Self> {
         Self::from_json_full(
             value,
             path,
             Arc::new(SystemDnsResolver),
             Some(format!("caddy-rs/{}", env!("CARGO_PKG_VERSION"))),
+            false,
         )
     }
 
@@ -535,6 +547,7 @@ impl ReverseProxyHandler {
             path,
             resolver,
             Some(format!("caddy-rs/{}", env!("CARGO_PKG_VERSION"))),
+            false,
         )
     }
 
@@ -545,7 +558,33 @@ impl ReverseProxyHandler {
         path: &str,
         server_software: Option<String>,
     ) -> HttpResult<Self> {
-        Self::from_json_full(value, path, Arc::new(SystemDnsResolver), server_software)
+        Self::from_json_full(
+            value,
+            path,
+            Arc::new(SystemDnsResolver),
+            server_software,
+            false,
+        )
+    }
+
+    /// Build from Caddy JSON with an explicit `server_software` and security-profile decision.
+    ///
+    /// `security_profile_enabled` is resolved by the router build context (ADR-0010 §2/§4):
+    /// `true` in secure-by-default mode for a route chain with no explicit `security_headers`
+    /// handler, `false` under `stock_compat true` or when the route opts out.
+    pub fn from_json_with_profile(
+        value: &Value,
+        path: &str,
+        server_software: Option<String>,
+        security_profile_enabled: bool,
+    ) -> HttpResult<Self> {
+        Self::from_json_full(
+            value,
+            path,
+            Arc::new(SystemDnsResolver),
+            server_software,
+            security_profile_enabled,
+        )
     }
 
     fn from_json_full(
@@ -553,6 +592,7 @@ impl ReverseProxyHandler {
         path: &str,
         resolver: Arc<dyn DnsResolver>,
         server_software: Option<String>,
+        security_profile_enabled: bool,
     ) -> HttpResult<Self> {
         let object = value
             .as_object()
@@ -746,6 +786,7 @@ impl ReverseProxyHandler {
             retry_match,
             trusted_proxies,
             flush_interval,
+            security_profile_enabled,
         })
     }
 
@@ -960,7 +1001,7 @@ impl ReverseProxyHandler {
             return Ok(Forwarded::Upgrade(ForwardedUpgrade {
                 status,
                 latency,
-                headers: upgrade_response_headers(&response_headers),
+                headers: upgrade_response_headers(&response_headers, self.security_profile_enabled),
                 tunnel: Tunnel::new(TokioIo::new(upgraded)),
             }));
         }
@@ -1466,9 +1507,18 @@ impl ReverseProxyHandler {
         Ok(())
     }
 
-    /// Strip hop-by-hop headers from an upstream response and add the `Via` header Caddy adds.
+    /// Strip hop-by-hop headers from an upstream response, remove fingerprint headers when the
+    /// implicit security profile applies (ADR-0010 §2, `DIV-0131`), and add the `Via` header Caddy
+    /// adds.
+    ///
+    /// Fingerprint removal happens here — before the handler's own `headers.response` operations
+    /// run in [`Self::apply_response_headers_to`] — so an operator who deliberately configures
+    /// `header_down Server ...` still wins over the implicit profile.
     fn response_headers(&self, upstream_headers: &HeaderMap, version: Version) -> HeaderMap {
         let mut headers = strip_hop_by_hop(upstream_headers);
+        if self.security_profile_enabled {
+            SecurityProfile::DEFAULT.strip_fingerprints(&mut headers);
+        }
         headers.append(
             http::header::VIA,
             HeaderValue::from_static(via_value(version)),
@@ -1476,8 +1526,14 @@ impl ReverseProxyHandler {
         headers
     }
 
-    /// Apply the configured `headers.response` operations to a response header map (buffered and
-    /// streaming responses share the same semantics).
+    /// Apply the configured `headers.response` operations, then the implicit security profile, to
+    /// a final response header map (buffered and streaming responses share the same semantics).
+    ///
+    /// The profile runs *after* the operator's operations (ADR-0010 §2: "the profile is applied
+    /// after `reverse_proxy`'s own `headers.response` operations, so an operator's `header_down`
+    /// wins") and sets each documented header only when absent. `explicitly_configures` supplies
+    /// the second half of that contract: a header the operator deleted or set is skipped entirely,
+    /// so set-if-absent cannot resurrect an explicitly deleted header.
     fn apply_response_headers_to(
         &self,
         headers: &mut HeaderMap,
@@ -1493,6 +1549,35 @@ impl ReverseProxyHandler {
             vars: Some(&snapshot.vars),
         };
         self.response_header_ops.apply(headers, &context);
+        if self.security_profile_enabled {
+            self.apply_security_profile(headers, request);
+        }
+    }
+
+    /// Apply the implicit reverse-proxy security profile to a final response header map.
+    ///
+    /// Skips every header the operator configured through `headers.response` (add/set/delete), and
+    /// gates `Strict-Transport-Security` on the request being TLS (ADR-0010 §2).
+    fn apply_security_profile(&self, headers: &mut HeaderMap, request: &Request) {
+        let ops = &self.response_header_ops;
+        SecurityProfile::DEFAULT
+            .apply_to_with(headers, request.tls, |name| ops.explicitly_configures(name));
+    }
+
+    /// Apply the implicit security profile to a response the handler returns from a
+    /// `handle_response` action (`copy_response`/`static_response`).
+    ///
+    /// ADR-0010 §2 covers the `handle_response`-synthetic paths explicitly. A `copy_response`
+    /// copies the upstream headers (including `Server`/`X-Powered-By`), so fingerprint removal
+    /// applies here too; a `static_response` is treated the same way, which means an operator who
+    /// deliberately sets `Server` inside `handle_response` must use an explicit `security_headers`
+    /// handler or `stock_compat true` (documented in STOCK-COMPAT.md).
+    fn apply_security_profile_to_synthetic(&self, response: &mut Response, request: &Request) {
+        if !self.security_profile_enabled {
+            return;
+        }
+        SecurityProfile::DEFAULT.strip_fingerprints(&mut response.headers);
+        self.apply_security_profile(&mut response.headers, request);
     }
 
     /// Caddy's `Upstream.Available()`: not actively unhealthy, below the passive failure
@@ -1759,12 +1844,14 @@ impl Handler for ReverseProxyHandler {
                             continue;
                         }
                         // Caddy closes the matched response body and surfaces the upstream status
-                        // once the retry budget is spent (rather than a generic 502).
+                        // once the retry budget is spent (rather than a generic 502). This is still
+                        // a final proxied response, so the security profile applies (ADR-0010 §2).
                         let mut spent = Response {
                             status: forwarded.status,
                             headers: HeaderMap::new(),
                             body: Bytes::new(),
                         };
+                        self.apply_security_profile(&mut spent.headers, &request);
                         merge_selection_cookie(&mut spent, &selection);
                         return Ok(Outcome::Respond(spent));
                     }
@@ -1784,6 +1871,10 @@ impl Handler for ReverseProxyHandler {
                                 }
                                 HandleResponseResult::Respond(response) => {
                                     let mut response = response;
+                                    self.apply_security_profile_to_synthetic(
+                                        &mut response,
+                                        &request,
+                                    );
                                     merge_selection_cookie(&mut response, &selection);
                                     Outcome::Respond(response)
                                 }
@@ -2032,6 +2123,7 @@ impl Handler for ReverseProxyHandler {
                             headers: HeaderMap::new(),
                             body: Bytes::new(),
                         };
+                        self.apply_security_profile(&mut spent.headers, &request);
                         merge_selection_cookie(&mut spent, &selection);
                         return Ok(StreamingOutcome::Respond(StreamingResponse::from_buffered(
                             spent,
@@ -2080,6 +2172,10 @@ impl Handler for ReverseProxyHandler {
                                 }
                                 HandleResponseResult::Respond(response) => {
                                     let mut response = response;
+                                    self.apply_security_profile_to_synthetic(
+                                        &mut response,
+                                        &request,
+                                    );
                                     merge_selection_cookie(&mut response, &selection);
                                     StreamingOutcome::Respond(StreamingResponse::from_buffered(
                                         response,
@@ -2184,12 +2280,23 @@ impl Handler for ReverseProxyHandler {
 /// restored canonically (`Upgrade: <protocol>` and `Connection: Upgrade`). Other hop-by-hop
 /// headers (keep-alive, transfer-encoding, ...) stay stripped. Caddy likewise does not apply
 /// `header.response` operations to 101 responses.
-fn upgrade_response_headers(upstream_headers: &HeaderMap) -> HeaderMap {
+///
+/// When the implicit security profile applies, the upstream fingerprint headers are still removed
+/// from a protocol switch — the five response headers are not added to a 101 (STOCK-COMPAT.md:
+/// "the fingerprint headers are still removed there, but the five response headers are not added
+/// to a protocol switch").
+fn upgrade_response_headers(
+    upstream_headers: &HeaderMap,
+    security_profile_enabled: bool,
+) -> HeaderMap {
     let upgrade = upstream_headers
         .get(http::header::UPGRADE)
         .cloned()
         .unwrap_or_else(|| HeaderValue::from_static("upgrade"));
     let mut headers = strip_hop_by_hop(upstream_headers);
+    if security_profile_enabled {
+        SecurityProfile::DEFAULT.strip_fingerprints(&mut headers);
+    }
     headers.insert(http::header::UPGRADE, upgrade);
     headers.insert(
         http::header::CONNECTION,
@@ -3123,10 +3230,15 @@ fn parse_health_checks(
 
 /// The handler factory installed in the HTTP router builder.
 pub fn handler_factory() -> CustomHandlerFactory {
-    Arc::new(|value: &Value, path: &str| {
+    Arc::new(|value: &Value, path: &str, context: &HandlerBuildContext| {
         let name = value.get("handler").and_then(Value::as_str);
         if name == Some("reverse_proxy") {
-            Ok(Some(Arc::new(ReverseProxyHandler::from_json(value, path)?)))
+            Ok(Some(Arc::new(ReverseProxyHandler::from_json_with_profile(
+                value,
+                path,
+                Some(format!("caddy-rs/{}", env!("CARGO_PKG_VERSION"))),
+                security_profile_enabled(context),
+            )?)))
         } else {
             Ok(None)
         }
@@ -3151,21 +3263,32 @@ pub fn handler_factory_with_status_sink_and_server_software(
     sink: Arc<UpstreamStatusSink>,
     server_software: Option<String>,
 ) -> CustomHandlerFactory {
-    Arc::new(move |value: &Value, path: &str| {
-        let name = value.get("handler").and_then(Value::as_str);
-        if name == Some("reverse_proxy") {
-            let handler = Arc::new(ReverseProxyHandler::from_json_with_server_software(
-                value,
-                path,
-                server_software.clone(),
-            )?);
-            sink.register(&handler);
-            let shared: SharedHandler = handler;
-            Ok(Some(shared))
-        } else {
-            Ok(None)
-        }
-    })
+    Arc::new(
+        move |value: &Value, path: &str, context: &HandlerBuildContext| {
+            let name = value.get("handler").and_then(Value::as_str);
+            if name == Some("reverse_proxy") {
+                let handler = Arc::new(ReverseProxyHandler::from_json_with_profile(
+                    value,
+                    path,
+                    server_software.clone(),
+                    security_profile_enabled(context),
+                )?);
+                sink.register(&handler);
+                let shared: SharedHandler = handler;
+                Ok(Some(shared))
+            } else {
+                Ok(None)
+            }
+        },
+    )
+}
+
+/// Whether the implicit reverse-proxy security profile applies to a handler being built (ADR-0010
+/// §2 and §4): `false` unless both the generation is in secure-by-default mode (the operator did
+/// not set `stock_compat true`) and the route chain does not carry an explicit `security_headers`
+/// handler (which opts the route out of the implicit profile entirely).
+fn security_profile_enabled(context: &HandlerBuildContext) -> bool {
+    !context.stock_compat && !context.route_has_explicit_security_headers
 }
 
 #[cfg(test)]
@@ -3386,8 +3509,12 @@ mod tests {
             "handler": "reverse_proxy",
             "upstreams": [{"dial": dial}]
         });
-        let first = factory(&config, "handler").unwrap().unwrap();
-        let second = factory(&config, "handler").unwrap().unwrap();
+        let first = factory(&config, "handler", &HandlerBuildContext::default())
+            .unwrap()
+            .unwrap();
+        let second = factory(&config, "handler", &HandlerBuildContext::default())
+            .unwrap()
+            .unwrap();
         let Outcome::Respond(response) = first.handle(get_request("/one", None)).await.unwrap()
         else {
             panic!("expected proxied response");
@@ -4186,12 +4313,14 @@ mod tests {
         let built = factory(
             &serde_json::json!({"handler": "reverse_proxy", "upstreams": [{"dial": "localhost:8080"}]}),
             "handler",
+            &HandlerBuildContext::default(),
         )
         .unwrap();
         assert!(built.is_some());
         let declined = factory(
             &serde_json::json!({"handler": "static_response"}),
             "handler",
+            &HandlerBuildContext::default(),
         )
         .unwrap();
         assert!(declined.is_none());

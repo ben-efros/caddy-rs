@@ -102,8 +102,9 @@ pub struct ServerLimits {
     /// caddy-rs extension: maximum concurrent connections. `None` means unlimited.
     pub max_connections: Option<usize>,
 
-    /// Server identity for the HTTP `Server` header (caddy-rs extension, T-CONF-060).
-    pub server_identity: caddy_rs_core::ServerIdentity,
+    /// Resolved server identity for the HTTP `Server` header and FastCGI `SERVER_SOFTWARE`
+    /// (caddy-rs extension, T-CONF-060; ADR-0010 §3 matrix, `DIV-0132`).
+    pub server_identity: caddy_rs_core::ResolvedIdentity,
 }
 
 impl Default for ServerLimits {
@@ -116,7 +117,7 @@ impl Default for ServerLimits {
             max_header_bytes: None,
             max_request_body_size: None,
             max_connections: None,
-            server_identity: caddy_rs_core::ServerIdentity::Default,
+            server_identity: caddy_rs_core::ResolvedIdentity::default(),
         }
     }
 }
@@ -127,7 +128,12 @@ impl ServerLimits {
     /// Errors are located at the offending JSON path, for example
     /// `apps.http.servers.srv0.read_timeout`, so an invalid configuration fails loudly when the
     /// runtime applies the generation instead of silently ignoring the field.
-    pub fn from_http_server(server_name: &str, server: &HttpServer) -> Result<Self, CoreError> {
+    pub fn from_http_server(
+        server_name: &str,
+        server: &HttpServer,
+        stock_compat: bool,
+        has_reverse_proxy: bool,
+    ) -> Result<Self, CoreError> {
         let base = format!("apps.http.servers.{server_name}");
 
         // Caddy v2.11.7 exposes no HTTP/2 tuning fields (Go defaults via `new(http2.Server)`);
@@ -178,8 +184,12 @@ impl ServerLimits {
         )?
         .map(|count| usize::try_from(count).unwrap_or(usize::MAX));
 
+        // ADR-0010 §3 (`DIV-0132`): an explicit `server_identity` wins; absent resolves through
+        // the `stock_compat` / reverse-proxy matrix.
+        let configured =
+            caddy_rs_core::ServerIdentity::from_server_extra_opt(server_name, &server.extra)?;
         let server_identity =
-            caddy_rs_core::ServerIdentity::from_server_extra(server_name, &server.extra)?;
+            caddy_rs_core::ResolvedIdentity::resolve(configured, stock_compat, has_reverse_proxy);
 
         Ok(Self {
             read_timeout,
@@ -454,8 +464,16 @@ mod tests {
     }
 
     fn parse_limits(server: Value) -> Result<ServerLimits, CoreError> {
+        parse_limits_with_context(server, false, false)
+    }
+
+    fn parse_limits_with_context(
+        server: Value,
+        stock_compat: bool,
+        has_reverse_proxy: bool,
+    ) -> Result<ServerLimits, CoreError> {
         let server: HttpServer = serde_json::from_value(server).expect("server decodes");
-        ServerLimits::from_http_server("srv0", &server)
+        ServerLimits::from_http_server("srv0", &server, stock_compat, has_reverse_proxy)
     }
 
     #[test]

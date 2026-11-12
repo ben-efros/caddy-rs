@@ -124,6 +124,25 @@ impl Config {
         self.apps.as_ref().and_then(|apps| apps.http.as_ref())
     }
 
+    /// Whether any HTTP route tree in this configuration contains a `reverse_proxy` handler.
+    ///
+    /// This is the config-wide detection ADR-0010 §3 (`DIV-0132`) uses to decide the absent-
+    /// `server_identity` default: a reverse-proxy deployment suppresses the HTTP `Server` header
+    /// while keeping the FastCGI `SERVER_SOFTWARE` parameter. Detection walks the preserved route
+    /// JSON recursively, so handlers nested in `handle` chains, `subroute`, `handle_errors` and
+    /// named routes are all found. It is deliberately config-wide, not per-response (the internal
+    /// `Response` type carries no extension map).
+    pub fn contains_reverse_proxy_handler(&self) -> bool {
+        self.http().is_some_and(|http| {
+            http.servers.values().any(|server| {
+                server.routes.iter().any(route_contains_reverse_proxy)
+                    || server.errors.as_ref().is_some_and(|errors| {
+                        errors.routes.iter().any(route_contains_reverse_proxy)
+                    })
+            })
+        })
+    }
+
     /// The TLS app, if configured.
     pub fn tls(&self) -> Option<&TlsApp> {
         self.apps.as_ref().and_then(|apps| apps.tls.as_ref())
@@ -486,6 +505,27 @@ pub struct HttpErrorConfig {
     /// Unknown error-config fields, preserved.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+/// Whether one route contains a `reverse_proxy` handler anywhere in its handler tree.
+fn route_contains_reverse_proxy(route: &Route) -> bool {
+    route.handle.iter().any(value_contains_reverse_proxy)
+}
+
+/// Whether a preserved handler JSON value is (or contains, nested) a `reverse_proxy` handler.
+///
+/// `handle` chains hold handler objects; a `subroute` handler nests another `routes` array, and a
+/// `handle_errors`/named route nests the same way, so a recursive walk is the simplest complete
+/// detection. Route nesting is shallow and configurations are small, so no depth limit is needed.
+fn value_contains_reverse_proxy(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => {
+            object.get("handler").and_then(Value::as_str) == Some("reverse_proxy")
+                || object.values().any(value_contains_reverse_proxy)
+        }
+        Value::Array(items) => items.iter().any(value_contains_reverse_proxy),
+        _ => false,
+    }
 }
 
 /// One listener wrapper (`apps.http.servers.*.listener_wrappers[i]`).
@@ -1963,5 +2003,54 @@ mod tests {
         assert!(entry.key_label.is_none());
         assert!(entry.certificate.is_none());
         assert!(entry.pin.is_none());
+    }
+
+    #[test]
+    fn detects_reverse_proxy_handlers_config_wide() {
+        // ADR-0010 §3 / DIV-0132: detection walks the whole route tree, not just top-level routes.
+        let base = |routes: serde_json::Value, errors: Option<serde_json::Value>| {
+            let mut server = serde_json::json!({
+                "listen": [":80"],
+                "routes": routes
+            });
+            if let Some(errors) = errors {
+                server["errors"] = errors;
+            }
+            Config::from_value(serde_json::json!({
+                "apps": {"http": {"servers": {"srv0": server}}}
+            }))
+            .expect("test config decodes")
+        };
+
+        assert!(!base(
+            serde_json::json!([{"handle": [{"handler": "static_response"}]}]),
+            None
+        )
+        .contains_reverse_proxy_handler());
+        assert!(base(
+            serde_json::json!([{"handle": [{"handler": "reverse_proxy", "upstreams": []}]}]),
+            None
+        )
+        .contains_reverse_proxy_handler());
+        // Nested in a `subroute`.
+        assert!(base(
+            serde_json::json!([{"handle": [{
+                "handler": "subroute",
+                "routes": [{"handle": [{"handler": "reverse_proxy", "upstreams": []}]}]
+            }]}]),
+            None
+        )
+        .contains_reverse_proxy_handler());
+        // Nested in `handle_errors`.
+        assert!(base(
+            serde_json::json!([{"handle": [{"handler": "static_response"}]}]),
+            Some(serde_json::json!({"routes": [{"handle": [
+                {"handler": "reverse_proxy", "upstreams": []}
+            ]}]}))
+        )
+        .contains_reverse_proxy_handler());
+        // No HTTP app at all.
+        let config = Config::from_value(serde_json::json!({"apps": {}})).expect("decodes");
+        assert!(!config.contains_reverse_proxy_handler());
     }
 }

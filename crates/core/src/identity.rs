@@ -88,12 +88,25 @@ impl ServerIdentity {
     /// Absent means [`ServerIdentity::Default`]. A malformed value is a located error at
     /// `apps.http.servers.<name>.server_identity`.
     pub fn from_server_extra(server_name: &str, extra: &BTreeMap<String, Value>) -> Result<Self> {
+        Ok(Self::from_server_extra_opt(server_name, extra)?.unwrap_or_default())
+    }
+
+    /// Read the identity, distinguishing "absent" (`None`) from an explicit
+    /// `server_identity default` (`Some(Default)`).
+    ///
+    /// ADR-0010 §3 needs that distinction: absent resolves through the `stock_compat` and
+    /// reverse-proxy matrix, while an explicit value always wins.
+    pub fn from_server_extra_opt(
+        server_name: &str,
+        extra: &BTreeMap<String, Value>,
+    ) -> Result<Option<Self>> {
         match extra.get("server_identity") {
-            None => Ok(Self::Default),
+            None => Ok(None),
             Some(value) => Self::from_config_value(
                 value,
                 &format!("apps.http.servers.{server_name}.server_identity"),
-            ),
+            )
+            .map(Some),
         }
     }
 
@@ -115,6 +128,62 @@ impl ServerIdentity {
             Self::Compatible => Some(format!("Caddy/{CADDY_COMPAT_VERSION}")),
             Self::Custom(identity) => Some(identity.clone()),
             Self::None => None,
+        }
+    }
+}
+
+/// The effective identity for one HTTP server after applying the ADR-0010 §3 matrix.
+///
+/// The two surfaces resolve differently in secure-by-default reverse-proxy mode: the HTTP `Server`
+/// header is suppressed while FastCGI `SERVER_SOFTWARE` keeps `caddy-rs/<version>`, which no single
+/// [`ServerIdentity`] variant can express.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedIdentity {
+    /// The HTTP `Server` response header value, or `None` when the header must not be emitted.
+    pub http_server_header: Option<String>,
+    /// The FastCGI `SERVER_SOFTWARE` parameter value, or `None` when it must not be emitted.
+    pub fastcgi_server_software: Option<String>,
+}
+
+impl Default for ResolvedIdentity {
+    fn default() -> Self {
+        Self::from_configured(ServerIdentity::Default)
+    }
+}
+
+impl ResolvedIdentity {
+    /// Resolve an explicitly configured identity, where both surfaces follow the mode.
+    pub fn from_configured(identity: ServerIdentity) -> Self {
+        Self {
+            http_server_header: identity.http_header_value(),
+            fastcgi_server_software: identity.fastcgi_server_software(),
+        }
+    }
+
+    /// Resolve the effective identity from the configured value and the generation's context
+    /// (ADR-0010 §3, `DIV-0132`).
+    ///
+    /// * an explicit `server_identity` always wins (including explicit `default`, which
+    ///   re-enables `caddy-rs/<version>`);
+    /// * absent + `stock_compat true` resolves to stock Caddy: `Caddy` / `Caddy/2.11.9`;
+    /// * absent + secure-by-default + a `reverse_proxy` handler in the configuration suppresses the
+    ///   HTTP `Server` header but keeps FastCGI `SERVER_SOFTWARE` at `caddy-rs/<version>` (it is an
+    ///   upstream-visible parameter, not a browser fingerprint);
+    /// * absent + secure-by-default without any `reverse_proxy` handler keeps `caddy-rs/<version>`
+    ///   on both surfaces.
+    pub fn resolve(
+        configured: Option<ServerIdentity>,
+        stock_compat: bool,
+        has_reverse_proxy: bool,
+    ) -> Self {
+        match configured {
+            Some(explicit) => Self::from_configured(explicit),
+            None if stock_compat => Self::from_configured(ServerIdentity::Compatible),
+            None if has_reverse_proxy => Self {
+                http_server_header: None,
+                fastcgi_server_software: Some(format!("caddy-rs/{}", crate::VERSION)),
+            },
+            None => Self::from_configured(ServerIdentity::Default),
         }
     }
 }
@@ -286,6 +355,86 @@ mod tests {
                 .to_string()
                 .contains("apps.http.servers.srv0.server_identity"),
             "located error, got {error}"
+        );
+    }
+
+    #[test]
+    fn resolved_identity_follows_the_adr_0010_matrix() {
+        // ADR-0010 §3 / DIV-0132: absent `server_identity` resolves through `stock_compat` and the
+        // config-wide reverse-proxy detection; an explicit value always wins.
+        let native = format!("caddy-rs/{}", crate::VERSION);
+        let default = ResolvedIdentity::resolve(None, false, false);
+        assert_eq!(default.http_server_header.as_deref(), Some(native.as_str()));
+        assert_eq!(
+            default.fastcgi_server_software.as_deref(),
+            Some(native.as_str())
+        );
+
+        // Reverse-proxy deployment in secure-by-default mode: no HTTP `Server` header, but the
+        // upstream-visible FastCGI parameter keeps the build identity.
+        let proxied = ResolvedIdentity::resolve(None, false, true);
+        assert_eq!(proxied.http_server_header, None);
+        assert_eq!(
+            proxied.fastcgi_server_software.as_deref(),
+            Some(native.as_str())
+        );
+
+        // `stock_compat true` is stock Caddy on both surfaces.
+        let stock = ResolvedIdentity::resolve(None, true, true);
+        assert_eq!(stock.http_server_header.as_deref(), Some("Caddy"));
+        assert_eq!(
+            stock.fastcgi_server_software.as_deref(),
+            Some("Caddy/2.11.9")
+        );
+
+        // An explicit identity always wins, including explicit `default`.
+        for (configured, http, fastcgi) in [
+            (
+                ServerIdentity::Default,
+                Some(format!("caddy-rs/{}", crate::VERSION)),
+                Some(format!("caddy-rs/{}", crate::VERSION)),
+            ),
+            (
+                ServerIdentity::NameOnly,
+                Some("Caddy".to_string()),
+                Some("Caddy".to_string()),
+            ),
+            (
+                ServerIdentity::Compatible,
+                Some("Caddy".to_string()),
+                Some("Caddy/2.11.9".to_string()),
+            ),
+            (
+                ServerIdentity::Custom("Acme/1".to_string()),
+                Some("Acme/1".to_string()),
+                Some("Acme/1".to_string()),
+            ),
+            (ServerIdentity::None, None, None),
+        ] {
+            let resolved = ResolvedIdentity::resolve(Some(configured.clone()), false, true);
+            assert_eq!(
+                resolved.http_server_header, http,
+                "HTTP surface for {configured:?}"
+            );
+            assert_eq!(
+                resolved.fastcgi_server_software, fastcgi,
+                "FastCGI surface for {configured:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn absent_and_explicit_default_are_distinguishable() {
+        let empty = BTreeMap::new();
+        assert_eq!(
+            ServerIdentity::from_server_extra_opt("srv0", &empty).unwrap(),
+            None
+        );
+        let mut extra = BTreeMap::new();
+        extra.insert("server_identity".to_string(), Value::from("default"));
+        assert_eq!(
+            ServerIdentity::from_server_extra_opt("srv0", &extra).unwrap(),
+            Some(ServerIdentity::Default)
         );
     }
 }
