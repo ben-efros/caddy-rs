@@ -1017,6 +1017,15 @@ fn adapt_options(value: &str) -> anyhow::Result<AdaptOptions> {
     Ok(AdaptOptions::new(mode))
 }
 
+/// Map the adapter's acceptance mode onto the `security_headers` load-time validation mode.
+fn security_headers_mode(mode: AdaptMode) -> caddy_rs_http::security_headers::SecurityHeadersMode {
+    match mode {
+        AdaptMode::Compatible => caddy_rs_http::security_headers::SecurityHeadersMode::Compatible,
+        AdaptMode::Warn => caddy_rs_http::security_headers::SecurityHeadersMode::Warn,
+        AdaptMode::Strict => caddy_rs_http::security_headers::SecurityHeadersMode::Strict,
+    }
+}
+
 /// Read `config` and adapt it to Caddy JSON, returning the exact JSON bytes of the loaded/adapted
 /// config plus any adapter warnings. For the JSON adapter the bytes are the file contents verbatim
 /// (Caddy autosaves the exact bytes it loaded); for the Caddyfile adapter they are the adapter's
@@ -1064,6 +1073,18 @@ fn load_validated(
     let registry = builtin_module_registry();
     caddy_rs_core::validate_config(&model, &registry)
         .with_context(|| format!("`{}` is not a valid configuration", config.display()))?;
+    // `security_headers` validation is a caddy-rs extension (Caddy has none): apply the configured
+    // `--adapt-mode` to the whole document so `strict` rejects unknown options and a short HSTS
+    // `max_age`, while compatible/warn accept them. Warnings are not collected here: the server
+    // runtime is the single sink that prints them for `validate`, `run` and admin loads, so a
+    // warning is reported exactly once.
+    let document: serde_json::Value = serde_json::from_slice(&json)
+        .with_context(|| format!("`{}` is not valid JSON", config.display()))?;
+    caddy_rs_http::security_headers::validate_security_headers_config(
+        &document,
+        security_headers_mode(options.mode),
+    )
+    .with_context(|| format!("`{}` is not a valid configuration", config.display()))?;
     Ok(LoadedConfig {
         model,
         warnings,
