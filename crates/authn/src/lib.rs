@@ -77,6 +77,15 @@ impl Default for UserId {
     }
 }
 
+impl std::str::FromStr for UserId {
+    type Err = uuid::Error;
+
+    /// Parse a user id from its canonical UUID string, as used in API paths.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Uuid::parse_str(value).map(Self)
+    }
+}
+
 /// Visibility scope for a role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -462,7 +471,7 @@ impl UserRecord {
 }
 
 /// Safe-to-serialize user view without a password hash or TOTP secret.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublicUser {
     /// Unique user identifier.
     pub id: UserId,
@@ -1894,6 +1903,22 @@ impl<S: UserStore> AuthnService<S> {
         self.store
             .revoke_all_refresh_tokens_for_user(user_id, now_ts()?)
             .await
+    }
+
+    /// Delete a user and revoke every refresh token issued to them.
+    ///
+    /// The refresh tokens are revoked before the record disappears so a token cannot be replayed
+    /// against a store that has not yet applied the delete. A missing user is
+    /// [`AuthError::UserNotFound`].
+    pub async fn delete_user(&self, user_id: UserId) -> AuthResult<()> {
+        self.store
+            .get_user(user_id)
+            .await?
+            .ok_or(AuthError::UserNotFound)?;
+        self.store
+            .revoke_all_refresh_tokens_for_user(user_id, now_ts()?)
+            .await?;
+        self.store.delete_user(user_id).await
     }
 
     /// Verify an access token and return its claims.

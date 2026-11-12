@@ -12,6 +12,9 @@
 //! | `GET` | `/api/v1/health` | Liveness probe; always `200` while the process serves requests |
 //! | `GET` | `/api/v1/setup` | Whether first-run setup has completed (at least one user exists) |
 //! | `POST` | `/api/v1/auth/setup` | Create the first administrator; `201` once, then `409 Conflict` |
+//! | `GET` | `/api/v1/users` | Paginated `PublicUser` list; requires the `users:view` capability |
+//! | `PATCH` | `/api/v1/users/{id}` | Change a role; requires `users:update`; the new epoch invalidates old tokens |
+//! | `DELETE` | `/api/v1/users/{id}` | Delete and revoke refresh tokens; requires `users:delete`; the last administrator is `409` |
 //! | `GET` | `/api/v1/version` | API version and the embedded caddy-rs version |
 //! | `GET` | `/api/v1/hosts` | Host summaries, paginated and filterable |
 //! | `POST` | `/api/v1/hosts` | Create a host; `201` plus `Location` and a strong `ETag` |
@@ -54,11 +57,17 @@
 //!
 //! # Scope and exposure
 //!
-//! Mutations are loopback-only until management auth lands: [`create_router`] must be served with
-//! `into_make_service_with_connect_info::<SocketAddr>()`, and a missing or non-loopback socket peer
-//! is `403`. Forwarding headers are never trusted. This is a fail-closed boundary, not
-//! authentication, so the management port must not be published. Errors are typed and carry a
-//! `location` when a field is at fault; no response body contains secret material.
+//! The user-administration routes authenticate with a `Authorization: Bearer <access token>`
+//! header: a missing, malformed, expired or epoch-stale token is `401`, and a valid token without
+//! the required `users` capability is `403` (an editor may list users, but not change a role or
+//! delete one). The token is verified against the store on every request, so a role change or
+//! revocation invalidates previously issued tokens through the authentication epoch.
+//!
+//! Every other mutation stays loopback-only until its management-auth slice lands: [`create_router`]
+//! must be served with `into_make_service_with_connect_info::<SocketAddr>()`, and a missing or
+//! non-loopback socket peer is `403`. Forwarding headers are never trusted. This is a fail-closed
+//! boundary, not authentication, so the management port must not be published. Errors are typed and
+//! carry a `location` when a field is at fault; no response body contains secret material.
 
 #![forbid(unsafe_code)]
 
@@ -203,6 +212,7 @@ pub enum ErrorCode {
     PreconditionFailed,
     PreconditionRequired,
     Forbidden,
+    Unauthorized,
     UnsupportedMediaType,
     Validation,
     ServiceUnavailable,
@@ -222,6 +232,8 @@ pub enum ApiError {
     PreconditionRequired(String),
     #[error("forbidden: {0}")]
     Forbidden(String),
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
     #[error("unsupported media type: {0}")]
     UnsupportedMediaType(String),
     #[error("validation error: {message}")]
@@ -251,6 +263,7 @@ impl ApiError {
             Self::PreconditionFailed(_) => StatusCode::PRECONDITION_FAILED,
             Self::PreconditionRequired(_) => StatusCode::PRECONDITION_REQUIRED,
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
+            Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::UnsupportedMediaType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Self::Validation { .. } => StatusCode::BAD_REQUEST,
             Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
@@ -266,6 +279,7 @@ impl ApiError {
             Self::PreconditionFailed(_) => ErrorCode::PreconditionFailed,
             Self::PreconditionRequired(_) => ErrorCode::PreconditionRequired,
             Self::Forbidden(_) => ErrorCode::Forbidden,
+            Self::Unauthorized(_) => ErrorCode::Unauthorized,
             Self::UnsupportedMediaType(_) => ErrorCode::UnsupportedMediaType,
             Self::Validation { .. } => ErrorCode::Validation,
             Self::ServiceUnavailable(_) => ErrorCode::ServiceUnavailable,
@@ -300,6 +314,7 @@ pub struct ApiErrorDetail {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.status_code();
+        let unauthorized = matches!(self, Self::Unauthorized(_));
         let body = ApiErrorResponse {
             error: ApiErrorDetail {
                 code: self.error_code(),
@@ -307,7 +322,15 @@ impl IntoResponse for ApiError {
                 location: self.location().map(ToOwned::to_owned),
             },
         };
-        (status, Json(body)).into_response()
+        let mut response = (status, Json(body)).into_response();
+        if unauthorized {
+            // RFC 9110 requires a 401 to carry a challenge; the only scheme this API accepts is
+            // Bearer, so the challenge is not configurable.
+            response
+                .headers_mut()
+                .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+        }
+        response
     }
 }
 
@@ -560,6 +583,11 @@ pub fn create_router(state: ApiState) -> Router {
         .route("/health", get(health_handler))
         .route("/setup", get(setup_handler))
         .route("/auth/setup", post(auth_setup_handler))
+        .route("/users", get(users::list_handler))
+        .route(
+            "/users/{id}",
+            axum::routing::patch(users::update_role_handler).delete(users::delete_handler),
+        )
         .route("/version", get(version_handler))
         .route(
             "/hosts",
@@ -674,8 +702,8 @@ pub struct CreateUserResponse {
 /// Succeeds with `201 Created` exactly once. Every later attempt is `409 Conflict` with the
 /// standard [`ApiError`] body (`{"error":{"code":"CONFLICT","message":...}}`): the store-level
 /// compare-and-set in [`caddy_rs_authn::MemoryUserStore::create_first_admin`] is what makes
-/// concurrent callers collapse to a single winner. Like every other mutation, the route is
-/// loopback-only until management authentication lands (T-PM-128).
+/// concurrent callers collapse to a single winner. The route stays loopback-only: it runs before
+/// any administrator exists, so it cannot require a token.
 async fn auth_setup_handler(
     State(state): State<ApiState>,
     _peer: hosts::LocalPeer,
@@ -772,6 +800,7 @@ mod certificates;
 mod dto;
 mod hosts;
 mod security_headers;
+mod users;
 mod ui;
 
 pub use apply::ApplyResponse;

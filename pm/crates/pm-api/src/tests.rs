@@ -10,7 +10,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::*;
 use crate::dto::{HostResponse, HostSpecDto, HostTlsDto, HostWriteRequest};
 use axum_test::TestServer;
-use caddy_rs_authn::{Argon2Config, AuthnConfig, AuthnService, JwtSecretSource, MemoryUserStore};
+use caddy_rs_authn::{
+    Argon2Config, AuthnConfig, AuthnService, JwtSecretSource, MemoryUserStore, PublicUser,
+};
 use caddy_rs_pm_runtime::{
     ConfigApplyService, ConfigApplyStatus, ConfigRevision, PmRuntime, RuntimeConfig,
 };
@@ -1944,4 +1946,364 @@ async fn the_ui_answers_a_non_read_method_with_405() {
     let response = server.post("/").await;
     assert_eq!(response.status_code(), StatusCode::METHOD_NOT_ALLOWED);
     assert_eq!(response.header(header::ALLOW), "GET, HEAD");
+}
+
+// ---------------------------------------------------------------------------------------------
+// User administration (T-PM-128)
+// ---------------------------------------------------------------------------------------------
+
+fn bearer(token: &str) -> String {
+    format!("Bearer {token}")
+}
+
+async fn first_admin(server: &TestServer) -> CreateUserResponse {
+    let response = server
+        .post("/api/v1/auth/setup")
+        .json(&setup_request("admin"))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::CREATED);
+    response.json()
+}
+
+/// Create `username` with `role` directly through the shared authn service and return a token pair
+/// for it, so a test can exercise a non-administrator caller without an HTTP login route.
+async fn user_tokens(
+    authn: &AuthnService<MemoryUserStore>,
+    username: &str,
+    role: caddy_rs_authn::Role,
+) -> (caddy_rs_authn::User, caddy_rs_authn::TokenPair) {
+    let user = authn
+        .create_user(username, SETUP_PASSWORD, role)
+        .await
+        .expect("create the user");
+    let tokens = authn
+        .login(username, SETUP_PASSWORD, None)
+        .await
+        .expect("log the user in");
+    (user, tokens)
+}
+
+#[tokio::test]
+async fn users_list_requires_a_bearer_token() {
+    let (_dir, server, _authn) = server_with_authn();
+    let response = server.get("/api/v1/users").await;
+    assert_eq!(response.status_code(), StatusCode::UNAUTHORIZED);
+    let body: ApiErrorResponse = response.json();
+    assert_eq!(body.error.code, ErrorCode::Unauthorized);
+
+    assert_eq!(
+        response.header("www-authenticate"),
+        "Bearer",
+        "a 401 carries the bearer challenge"
+    );
+
+    let response = server
+        .get("/api/v1/users")
+        .add_header("Authorization", "Bearer not-a-token")
+        .await;
+    assert_eq!(response.status_code(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.header("www-authenticate"), "Bearer");
+}
+
+#[tokio::test]
+async fn users_list_returns_public_views_to_an_editor() {
+    let (_dir, server, authn) = server_with_authn();
+    let _admin = first_admin(&server).await;
+    let (_editor, editor_tokens) =
+        user_tokens(&authn, "editor", caddy_rs_authn::Role::editor()).await;
+
+    let response = server
+        .get("/api/v1/users")
+        .add_header("Authorization", bearer(&editor_tokens.access_token))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::OK);
+
+    let raw: serde_json::Value = response.json();
+    assert_eq!(raw["total"], 2);
+    assert_eq!(raw["limit"], crate::DEFAULT_LIMIT);
+    assert_eq!(raw["offset"], 0);
+    assert_eq!(raw["items"][0]["username"], "admin");
+    assert_eq!(raw["items"][1]["username"], "editor");
+    assert_eq!(raw["items"][1]["role"]["name"], "editor");
+    let text = raw.to_string();
+    assert!(!text.contains("password_hash"), "no password hash is served");
+    assert!(!text.contains("totp_secret"), "no TOTP secret is served");
+
+    let body: PaginatedResponse<PublicUser> = server
+        .get("/api/v1/users")
+        .add_header("Authorization", bearer(&editor_tokens.access_token))
+        .await
+        .json();
+    assert_eq!(body.items.len(), 2);
+    assert_eq!(body.items.len(), 2);
+}
+
+#[tokio::test]
+async fn users_list_paginates_and_clamps_the_limit() {
+    let (_dir, server, authn) = server_with_authn();
+    let admin = first_admin(&server).await;
+    for name in ["viewer-one", "viewer-two"] {
+        user_tokens(&authn, name, caddy_rs_authn::Role::viewer()).await;
+    }
+
+    let response = server
+        .get("/api/v1/users")
+        .add_query_params(serde_json::json!({"limit": 1, "offset": 1}))
+        .add_header("Authorization", bearer(&admin.access_token))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::OK);
+    let raw: serde_json::Value = response.json();
+    assert_eq!(raw["total"], 3);
+    assert_eq!(raw["limit"], 1);
+    assert_eq!(raw["offset"], 1);
+    assert_eq!(raw["items"].as_array().map(Vec::len), Some(1));
+    assert_eq!(raw["items"][0]["username"], "viewer-one");
+
+    let response = server
+        .get("/api/v1/users")
+        .add_query_params(serde_json::json!({"limit": 9999}))
+        .add_header("Authorization", bearer(&admin.access_token))
+        .await;
+    let raw: serde_json::Value = response.json();
+    assert_eq!(raw["limit"], crate::MAX_LIMIT);
+    assert_eq!(raw["items"].as_array().map(Vec::len), Some(3));
+
+    let response = server
+        .get("/api/v1/users")
+        .add_query_params(serde_json::json!({"limit": "many"}))
+        .add_header("Authorization", bearer(&admin.access_token))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    let body: ApiErrorResponse = response.json();
+    assert_eq!(body.error.code, ErrorCode::Validation);
+    assert_eq!(body.error.location.as_deref(), Some("limit"));
+
+    let response = server
+        .get("/api/v1/users")
+        .add_query_params(serde_json::json!({"role": "admin"}))
+        .add_header("Authorization", bearer(&admin.access_token))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    let body: ApiErrorResponse = response.json();
+    assert_eq!(body.error.location.as_deref(), Some("query"));
+}
+
+#[tokio::test]
+async fn role_change_and_delete_require_the_users_capability() {
+    let (_dir, server, authn) = server_with_authn();
+    let _admin = first_admin(&server).await;
+    let (editor, editor_tokens) =
+        user_tokens(&authn, "editor", caddy_rs_authn::Role::editor()).await;
+    let editor_id = editor.id.0.to_string();
+
+    let response = server
+        .patch(&format!("/api/v1/users/{editor_id}"))
+        .add_header("Authorization", bearer(&editor_tokens.access_token))
+        .json(&serde_json::json!({"role": "viewer"}))
+        .await;
+    assert_eq!(
+        response.status_code(),
+        StatusCode::FORBIDDEN,
+        "an editor may list users but not change roles: {}",
+        response.text()
+    );
+    let body: ApiErrorResponse = response.json();
+    assert_eq!(body.error.code, ErrorCode::Forbidden);
+
+    let response = server
+        .delete(&format!("/api/v1/users/{editor_id}"))
+        .add_header("Authorization", bearer(&editor_tokens.access_token))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::FORBIDDEN);
+
+    let users = authn.list_users().await.expect("list users");
+    assert_eq!(users.len(), 2, "the refused requests changed nothing");
+}
+
+#[tokio::test]
+async fn admin_role_change_invalidates_the_old_token() {
+    let (_dir, server, authn) = server_with_authn();
+    let admin = first_admin(&server).await;
+    let (editor, editor_tokens) =
+        user_tokens(&authn, "editor", caddy_rs_authn::Role::editor()).await;
+    let editor_id = editor.id.0.to_string();
+
+    let response = server
+        .patch(&format!("/api/v1/users/{editor_id}"))
+        .add_header("Authorization", bearer(&admin.access_token))
+        .json(&serde_json::json!({"role": "viewer"}))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::OK, "{}", response.text());
+    let body: PublicUser = response.json();
+    assert_eq!(body.username, "editor");
+    assert_eq!(body.role.name, "viewer");
+    assert_eq!(body.auth_epoch, editor.auth_epoch + 1);
+
+    let response = server
+        .get("/api/v1/users")
+        .add_header("Authorization", bearer(&editor_tokens.access_token))
+        .await;
+    assert_eq!(
+        response.status_code(),
+        StatusCode::UNAUTHORIZED,
+        "the pre-change token must stop working"
+    );
+}
+
+#[tokio::test]
+async fn user_mutations_validate_the_id_and_the_role() {
+    let (_dir, server, authn) = server_with_authn();
+    let admin = first_admin(&server).await;
+    let (editor, _) = user_tokens(&authn, "editor", caddy_rs_authn::Role::editor()).await;
+    let editor_id = editor.id.0.to_string();
+
+    let response = server
+        .patch(&format!("/api/v1/users/{editor_id}"))
+        .add_header("Authorization", bearer(&admin.access_token))
+        .json(&serde_json::json!({"role": "superuser"}))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    let body: ApiErrorResponse = response.json();
+    assert_eq!(body.error.code, ErrorCode::Validation);
+    assert_eq!(body.error.location.as_deref(), Some("role"));
+
+    let response = server
+        .patch("/api/v1/users/not-a-uuid")
+        .add_header("Authorization", bearer(&admin.access_token))
+        .json(&serde_json::json!({"role": "admin"}))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    let body: ApiErrorResponse = response.json();
+    assert_eq!(body.error.location.as_deref(), Some("id"));
+
+    let response = server
+        .patch(&format!("/api/v1/users/{}", caddy_rs_authn::UserId::new().0))
+        .add_header("Authorization", bearer(&admin.access_token))
+        .json(&serde_json::json!({"role": "admin"}))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::NOT_FOUND);
+
+    let response = server
+        .delete(&format!("/api/v1/users/{}", caddy_rs_authn::UserId::new().0))
+        .add_header("Authorization", bearer(&admin.access_token))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn users_errors_keep_the_standard_envelope() {
+    let (_dir, server, authn) = server_with_authn();
+    let admin = first_admin(&server).await;
+    let (editor, _) = user_tokens(&authn, "editor", caddy_rs_authn::Role::editor()).await;
+    let editor_id = editor.id.0.to_string();
+
+    // Invalid UTF-8 in the path parameter: axum's PathRejection must become a located 400.
+    let response = server
+        .patch("/api/v1/users/%FF")
+        .add_header("Authorization", bearer(&admin.access_token))
+        .json(&serde_json::json!({"role": "viewer"}))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    let body: ApiErrorResponse = response.json();
+    assert_eq!(body.error.code, ErrorCode::Validation);
+    assert_eq!(body.error.location.as_deref(), Some("id"));
+
+    // Wrong-typed JSON: a located validation error at `body`, not axum's plain-text 422.
+    let response = server
+        .patch(&format!("/api/v1/users/{editor_id}"))
+        .add_header("Authorization", bearer(&admin.access_token))
+        .json(&serde_json::json!({"role": 5}))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    let body: ApiErrorResponse = response.json();
+    assert_eq!(body.error.code, ErrorCode::Validation);
+    assert_eq!(body.error.location.as_deref(), Some("body"));
+
+    // Unknown fields are rejected by deny_unknown_fields and stay in the envelope.
+    let response = server
+        .patch(&format!("/api/v1/users/{editor_id}"))
+        .add_header("Authorization", bearer(&admin.access_token))
+        .json(&serde_json::json!({"role": "viewer", "extra": 1}))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    let body: ApiErrorResponse = response.json();
+    assert_eq!(body.error.location.as_deref(), Some("body"));
+
+    // A non-JSON content type is the typed 415, like every other resource.
+    let response = server
+        .patch(&format!("/api/v1/users/{editor_id}"))
+        .add_header("Authorization", bearer(&admin.access_token))
+        .content_type("text/plain")
+        .text("role=viewer")
+        .await;
+    assert_eq!(response.status_code(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    let body: ApiErrorResponse = response.json();
+    assert_eq!(body.error.code, ErrorCode::UnsupportedMediaType);
+
+    // DELETE's path parameter uses the same envelope.
+    let response = server
+        .delete("/api/v1/users/%FF")
+        .add_header("Authorization", bearer(&admin.access_token))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    let body: ApiErrorResponse = response.json();
+    assert_eq!(body.error.location.as_deref(), Some("id"));
+}
+
+#[tokio::test]
+async fn deleting_a_user_revokes_their_refresh_tokens() {
+    let (_dir, server, authn) = server_with_authn();
+    let admin = first_admin(&server).await;
+    let (editor, editor_tokens) =
+        user_tokens(&authn, "editor", caddy_rs_authn::Role::editor()).await;
+    let editor_id = editor.id.0.to_string();
+
+    let response = server
+        .delete(&format!("/api/v1/users/{editor_id}"))
+        .add_header("Authorization", bearer(&admin.access_token))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::NO_CONTENT);
+    assert!(response.text().is_empty(), "204 carries no body");
+
+    let users = authn.list_users().await.expect("list users");
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].username, "admin");
+
+    let refresh = authn.refresh(&editor_tokens.refresh_token).await;
+    assert!(refresh.is_err(), "the deleted user's refresh token is dead");
+    let login = authn.login("editor", SETUP_PASSWORD, None).await;
+    assert!(login.is_err(), "the deleted user cannot log in");
+}
+
+#[tokio::test]
+async fn deleting_the_last_administrator_is_refused() {
+    let (_dir, server, authn) = server_with_authn();
+    let admin = first_admin(&server).await;
+
+    let response = server
+        .delete(&format!("/api/v1/users/{}", admin.user_id))
+        .add_header("Authorization", bearer(&admin.access_token))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::CONFLICT);
+    let body: ApiErrorResponse = response.json();
+    assert_eq!(body.error.code, ErrorCode::Conflict);
+
+    let users = authn.list_users().await.expect("list users");
+    assert_eq!(users.len(), 1, "the last administrator is still there");
+    assert_eq!(users[0].role.name, "admin");
+}
+
+#[tokio::test]
+async fn a_second_administrator_can_be_deleted() {
+    let (_dir, server, authn) = server_with_authn();
+    let admin = first_admin(&server).await;
+    let (second, _) = user_tokens(&authn, "admin-two", caddy_rs_authn::Role::admin()).await;
+
+    let response = server
+        .delete(&format!("/api/v1/users/{}", second.id.0))
+        .add_header("Authorization", bearer(&admin.access_token))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::NO_CONTENT);
+    let users = authn.list_users().await.expect("list users");
+    assert_eq!(users.len(), 1);
 }
