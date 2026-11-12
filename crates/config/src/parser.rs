@@ -1637,15 +1637,32 @@ impl Parser {
                     ),
                 ));
             }
-            if let Some(owner) = self.importing_owner(position) {
-                if metadata.uid() != 0 && metadata.uid() != owner {
-                    return Err(ParseError::syntax(
-                        position.clone(),
-                        format!(
-                            "Could not import {display}: file is not owned by root or by the \
-                             owner of the importing Caddyfile (safe-mode import rule)"
-                        ),
-                    ));
+            match self.importing_owner(position) {
+                Some(owner) => {
+                    if metadata.uid() != 0 && metadata.uid() != owner {
+                        return Err(ParseError::syntax(
+                            position.clone(),
+                            format!(
+                                "Could not import {display}: file is not owned by root or by the \
+                                 owner of the importing Caddyfile (safe-mode import rule)"
+                            ),
+                        ));
+                    }
+                }
+                None => {
+                    // No importing file on disk (stdin adapt): the owner anchor is unknown, so
+                    // fall back to the strict default (root-owned) instead of skipping the check
+                    // (security review F2).
+                    if metadata.uid() != 0 {
+                        return Err(ParseError::syntax(
+                            position.clone(),
+                            format!(
+                                "Could not import {display}: no importing Caddyfile is available to \
+                                 anchor ownership, so the file must be owned by root (safe-mode \
+                                 import rule)"
+                            ),
+                        ));
+                    }
                 }
             }
         }
@@ -2168,6 +2185,10 @@ fn parse_port(port: &str) -> Result<u16, String> {
 
 fn read_global_options(directives: Vec<Directive>) -> Result<GlobalOptions, ParseError> {
     let mut options = GlobalOptions::default();
+    // `detect_stock_compat` selects the import policy from the first occurrence, so a second
+    // occurrence would let the parsed value and the enforced policy disagree; reject duplicates
+    // instead of resolving them silently (security review F1).
+    let mut stock_compat_seen = false;
     for directive in directives {
         match directive.name.as_str() {
             "auto_https" => {
@@ -2379,6 +2400,13 @@ fn read_global_options(directives: Vec<Directive>) -> Result<GlobalOptions, Pars
                 options.debug = true;
             }
             "stock_compat" => {
+                if stock_compat_seen {
+                    return Err(ParseError::syntax(
+                        directive.position.clone(),
+                        "global option `stock_compat` is specified more than once",
+                    ));
+                }
+                stock_compat_seen = true;
                 // caddy-rs extension (DIV-0130): bare means true, and only `true`/`false` are
                 // accepted as arguments. A block or extra argument is a located error.
                 // A non-empty block is a located error. An empty block (`stock_compat {}`) is

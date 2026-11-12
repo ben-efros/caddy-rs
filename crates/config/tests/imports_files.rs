@@ -617,3 +617,42 @@ fn stock_compat_must_be_a_boolean_in_json() {
         );
     }
 }
+
+#[test]
+fn duplicate_stock_compat_option_is_rejected() {
+    // The policy is detected from the first occurrence; a second occurrence must not let the
+    // parsed value and the enforced policy disagree (security review F1).
+    for input in [
+        "{\n\tstock_compat true\n\tstock_compat false\n}\n:80 {\n\trespond ok\n}\n",
+        "{\n\tstock_compat false\n\tstock_compat true\n}\n:80 {\n\trespond ok\n}\n",
+    ] {
+        let error = caddy_rs_config::adapt(input).expect_err("duplicate stock_compat is rejected");
+        assert!(
+            error.to_string().contains("specified more than once"),
+            "{error}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn stdin_absolute_import_requires_root_ownership() {
+    let external = TempTree::new("stdin-owner-source");
+    let imported = external.write("snippet.conf", "header X-Stdin yes\n");
+    // Root-owned file: the owner anchor is unknown when adapting stdin, so the strict default
+    // (root-owned) applies and the import is accepted.
+    caddy_rs_config::adapt(&format!(":80 {{\n\timport {}\n}}\n", imported.display()))
+        .expect("a root-owned absolute import from stdin adapts");
+    // A third-uid file cannot be anchored to an importing Caddyfile owner, so it is rejected
+    // instead of silently skipping the ownership rule (security review F2).
+    if std::os::unix::fs::chown(&imported, Some(12345), Some(12345)).is_ok() {
+        let error =
+            caddy_rs_config::adapt(&format!(":80 {{\n\timport {}\n}}\n", imported.display()))
+                .expect_err("a non-root-owned absolute import from stdin is rejected");
+        assert!(
+            error.to_string().contains("must be owned by root"),
+            "{error}"
+        );
+        let _ = std::os::unix::fs::chown(&imported, Some(0), Some(0));
+    }
+}
