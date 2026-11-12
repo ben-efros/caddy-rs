@@ -1769,6 +1769,11 @@ impl ServerRuntime {
                     .collect()
             })
             .unwrap_or_default();
+        // The derived challenge/redirect listener has no server config of its own: it exists only
+        // to answer one HTTPS site's automatic-HTTPS responses, so it inherits that site's
+        // `server_identity` (DIV-0126). With several automatic-HTTPS servers the first one wins,
+        // mirroring Caddy's single derived redirect server.
+        let mut automatic_identity: Option<caddy_rs_core::ServerIdentity> = None;
         for (server_name, server) in &http.servers {
             let limits = Arc::new(ServerLimits::from_http_server(server_name, server)?);
             let trusted_proxies = parse_server_trusted_proxies(server, server_name)?;
@@ -1900,6 +1905,9 @@ impl ServerRuntime {
                 } else {
                     None
                 };
+                if terminates_tls && automatic.is_some() && automatic_identity.is_none() {
+                    automatic_identity = Some(limits.server_identity.clone());
+                }
                 let automatic_serving = if !terminates_tls {
                     let listener_port = caddy_rs_core::ListenAddr::parse(listen)
                         .ok()
@@ -1951,7 +1959,10 @@ impl ServerRuntime {
                         listen.clone(),
                         Arc::new(ListenerState {
                             router,
-                            limits: Arc::new(ServerLimits::default()),
+                            limits: Arc::new(ServerLimits {
+                                server_identity: automatic_identity.clone().unwrap_or_default(),
+                                ..ServerLimits::default()
+                            }),
                             trusted_proxies: Arc::new(
                                 caddy_rs_proxy::trusted_proxies::ServerTrustedProxies::default(),
                             ),

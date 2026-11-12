@@ -863,6 +863,31 @@ fn config_with_admin_host(
     admin: serde_json::Value,
     host: &str,
 ) -> Config {
+    config_with_admin_host_identity(
+        listen,
+        http_port,
+        disable_redirects,
+        auto_https_disable,
+        storage_root,
+        admin,
+        host,
+        None,
+    )
+}
+
+/// Same as [`config_with_admin_host`] with the caddy-rs `server_identity` extension set on the
+/// HTTPS site's server; the derived cleartext listener inherits it (DIV-0126).
+#[allow(clippy::too_many_arguments)]
+fn config_with_admin_host_identity(
+    listen: &str,
+    http_port: Option<u16>,
+    disable_redirects: bool,
+    auto_https_disable: bool,
+    storage_root: &str,
+    admin: serde_json::Value,
+    host: &str,
+    identity: Option<serde_json::Value>,
+) -> Config {
     let mut server = serde_json::json!({
         "listen": [listen],
         "tls_connection_policies": [{}],
@@ -871,6 +896,9 @@ fn config_with_admin_host(
             "handle": [{"handler": "static_response", "body": "hello https"}]
         }]
     });
+    if let Some(identity) = identity {
+        server["server_identity"] = identity;
+    }
     if disable_redirects || auto_https_disable {
         let mut automatic_https = serde_json::Map::new();
         if disable_redirects {
@@ -1029,6 +1057,36 @@ async fn apply(
         .listener_address(":0")
         .expect("derived HTTP listener bound");
     (runtime, https, http, directory)
+}
+
+/// Apply the automatic-HTTPS test config with `server_identity` set on the HTTPS site's server,
+/// returning the runtime and the derived cleartext listener (DIV-0126).
+async fn apply_with_identity(
+    identity: serde_json::Value,
+) -> (ServerRuntime, SocketAddr, tempfile::TempDir) {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().to_string_lossy().to_string();
+    let store = Arc::new(GenerationStore::with_builtin_registry());
+    store
+        .load(config_with_admin_host_identity(
+            "127.0.0.1:0",
+            Some(0),
+            false,
+            false,
+            &root,
+            serde_json::json!({"disabled": true}),
+            "example.com",
+            Some(identity),
+        ))
+        .expect("config validates");
+    let mut runtime = ServerRuntime::new(Arc::clone(&store))
+        .with_acme_transport(Arc::new(FakeCa::new(false)))
+        .with_data_root(directory.path());
+    runtime.apply().await.expect("automatic HTTPS apply");
+    let http = runtime
+        .listener_address(":0")
+        .expect("derived HTTP listener bound");
+    (runtime, http, directory)
 }
 
 /// Send `POST <path>` over a fresh connection and return the status code.
@@ -1191,6 +1249,55 @@ async fn http_to_https_redirect_returns_308_preserving_path_and_query() {
     // Hosts not managed by automatic HTTPS are not redirected.
     let (status, _, _) = plain_get(http, "other.example", "/").await;
     assert_ne!(status, 308);
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn derived_http_listener_carries_the_configured_identity() {
+    let (runtime, http, _directory) = apply_with_identity(serde_json::json!("Acme Server/2")).await;
+    runtime
+        .challenge_tokens()
+        .insert("token-1", "token-1.thumbprint", "example.com")
+        .expect("token registers");
+    // The HTTP→HTTPS redirect is a pre-router response from the derived listener.
+    let (status, headers, _body) = plain_get(http, "example.com", "/some/path?x=1").await;
+    assert_eq!(status, 308);
+    assert_eq!(
+        header(&headers, "location"),
+        Some("https://example.com/some/path?x=1")
+    );
+    assert_eq!(
+        header(&headers, "server"),
+        Some("Acme Server/2"),
+        "the automatic-HTTPS redirect must carry the site's configured identity"
+    );
+    // The HTTP-01 challenge answer is the other pre-router response on the same listener.
+    let (status, headers, body) =
+        plain_get(http, "example.com", "/.well-known/acme-challenge/token-1").await;
+    assert_eq!(status, 200);
+    assert_eq!(body, "token-1.thumbprint");
+    assert_eq!(
+        header(&headers, "server"),
+        Some("Acme Server/2"),
+        "the HTTP-01 challenge answer must carry the site's configured identity"
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn derived_http_listener_none_mode_emits_no_identity() {
+    let (runtime, http, _directory) = apply_with_identity(serde_json::json!("none")).await;
+    runtime
+        .challenge_tokens()
+        .insert("token-1", "token-1.thumbprint", "example.com")
+        .expect("token registers");
+    let (status, headers, _body) = plain_get(http, "example.com", "/some/path").await;
+    assert_eq!(status, 308);
+    assert_eq!(header(&headers, "server"), None);
+    let (status, headers, _body) =
+        plain_get(http, "example.com", "/.well-known/acme-challenge/token-1").await;
+    assert_eq!(status, 200);
+    assert_eq!(header(&headers, "server"), None);
     runtime.shutdown().await;
 }
 
