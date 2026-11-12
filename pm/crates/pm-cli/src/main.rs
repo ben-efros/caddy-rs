@@ -1085,6 +1085,43 @@ impl caddy_rs_pm_api::CertificateInventorySource for CaddyInventorySource {
             })
         })
     }
+
+    fn last_issuance_failure(
+        &self,
+    ) -> Result<Option<caddy_rs_pm_api::IssuanceFailure>, caddy_rs_pm_api::InventoryError> {
+        // Same blocking contract as `list_certificates`; the worker calls this from a tokio
+        // worker thread.
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|e| caddy_rs_pm_api::InventoryError::new(format!("no tokio runtime: {e}")))?;
+        tokio::task::block_in_place(|| {
+            handle.block_on(async {
+                let resp = self
+                    .client
+                    .get(self.base_url.clone())
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        caddy_rs_pm_api::InventoryError::new(format!("HTTP error: {e}"))
+                    })?;
+                if !resp.status().is_success() {
+                    return Err(caddy_rs_pm_api::InventoryError::new(format!(
+                        "unexpected status: {}",
+                        resp.status()
+                    )));
+                }
+                let inventory: CaddyRuntimeInventory = resp.json().await.map_err(|e| {
+                    caddy_rs_pm_api::InventoryError::new(format!("JSON decode error: {e}"))
+                })?;
+                Ok(inventory.automatic_https.map(|failure| {
+                    caddy_rs_pm_api::IssuanceFailure {
+                        domains: failure.domains,
+                        failed_at_unix: failure.failed_at.unwrap_or(0.0) as i64,
+                        error: failure.error,
+                    }
+                }))
+            })
+        })
+    }
 }
 
 /// Check if a URL is on a loopback address.
@@ -1135,6 +1172,23 @@ struct CaddyRuntimeInventory {
     certificates: Vec<CaddyInventoryCertificate>,
     #[serde(default)]
     health_checks: Vec<serde_json::Value>,
+    /// Additive caddy-rs extension (DIV-0159): the last failed automatic-HTTPS attempt.
+    #[serde(default)]
+    automatic_https: Option<CaddyAutomaticHttps>,
+}
+
+/// Last failed automatic-HTTPS provisioning attempt in the caddy-rs inventory.
+#[derive(Debug, Deserialize)]
+struct CaddyAutomaticHttps {
+    #[allow(dead_code)]
+    #[serde(default)]
+    generation_id: Option<u64>,
+    #[serde(default)]
+    failed_at: Option<f64>,
+    #[serde(default)]
+    domains: Vec<String>,
+    #[serde(default)]
+    error: String,
 }
 
 /// Certificate entry in caddy-rs inventory response.

@@ -90,6 +90,8 @@ pub struct ApiState {
     pub runtime: PmRuntime,
     inventory: Option<SharedCertificateInventory>,
     applier: Option<Arc<ConfigApplyService>>,
+    issuance_timeout: std::time::Duration,
+    issuance_poll_interval: std::time::Duration,
 }
 
 impl ApiState {
@@ -100,6 +102,8 @@ impl ApiState {
             runtime,
             inventory: None,
             applier: None,
+            issuance_timeout: certificates::DEFAULT_ISSUANCE_TIMEOUT,
+            issuance_poll_interval: certificates::DEFAULT_ISSUANCE_POLL_INTERVAL,
         }
     }
 
@@ -126,6 +130,32 @@ impl ApiState {
     /// The injected apply pipeline, if any.
     pub fn applier(&self) -> Option<&Arc<ConfigApplyService>> {
         self.applier.as_ref()
+    }
+
+    /// Override the bound on one certificate issuance job. The default is
+    /// [`certificates::DEFAULT_ISSUANCE_TIMEOUT`]; tests inject a short bound to exercise the
+    /// timeout failure path deterministically.
+    #[must_use]
+    pub fn with_issuance_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.issuance_timeout = timeout;
+        self
+    }
+
+    /// Override the inventory observation interval while an issuance job is pending.
+    #[must_use]
+    pub fn with_issuance_poll_interval(mut self, interval: std::time::Duration) -> Self {
+        self.issuance_poll_interval = interval;
+        self
+    }
+
+    /// Bound applied to one certificate issuance job.
+    pub fn issuance_timeout(&self) -> std::time::Duration {
+        self.issuance_timeout
+    }
+
+    /// Interval between inventory observations while an issuance job is pending.
+    pub fn issuance_poll_interval(&self) -> std::time::Duration {
+        self.issuance_poll_interval
     }
 }
 
@@ -570,6 +600,11 @@ pub fn create_router(state: ApiState) -> Router {
         .route("/hosts/{id}/enable", post(hosts::enable_handler))
         .route("/hosts/{id}/disable", post(hosts::disable_handler))
         .route("/certificates", get(certificates::list_handler))
+        .route("/certificates/issue", post(certificates::issue_handler))
+        .route(
+            "/certificates/jobs/{id}",
+            get(certificates::get_job_handler),
+        )
         .route("/certificates/intent", post(certificates::create_handler))
         .route(
             "/certificates/intent/{id}",
@@ -712,7 +747,8 @@ pub use apply::ApplyResponse;
 pub use certificates::{
     derive_intent_status, CertificateIntentRequest, CertificateIntentStatus,
     CertificateIntentSummary, CertificateInventorySource, CertificateRecord, CertificateSummary,
-    CustomCertificateRequest, EmptyCertificateInventory, InventoryError, ManualCertificateSummary,
+    CustomCertificateRequest, EmptyCertificateInventory, InventoryError, IssuanceFailure,
+    IssuanceJob, IssuanceJobStatus, IssuedCertificate, ManualCertificateSummary,
     SharedCertificateInventory, EXPIRING_SOON_SECONDS,
 };
 pub use security_headers::{SecurityHeadersDto, SecurityHeadersHstsDto};

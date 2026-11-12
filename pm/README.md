@@ -15,7 +15,7 @@ This is the proxy-manager foundation workspace. It is deliberately independent o
 | `caddy-rs-pm-import` | Native-first NPM v2.16 host-payload import mapping: proxy/redirect/dead hosts to `pm-core`, explicit certificate origins, located errors for unsupported payload features and warnings for flags without a native implementation. |
 | `caddy-rs-pm-runtime` | PM composition root: data-directory preflight (`0700`, writability probe), `<data_dir>/pm` state layout (including `pm/secrets`), legacy Caddy detection (warning only), host/policy/certificate/service wiring, and the loopback-only config apply pipeline (stage/diff/load/verify/record). |
 | `caddy-rs-pm-certificates` | Manual certificate validation and secret store: strict PEM chain/key parsing, key-match proof, expiry/SAN checks, `0600` key files in a `0700` directory, monotonic ids/tombstones, metadata-only state and no key bytes in responses. |
-| `caddy-rs-pm-api` | Native REST API with axum: `/api/v1` router, host CRUD/enable/disable with strong per-host ETags and `If-Match` CAS, certificate intents with inventory-derived status, manual certificate upload/list/delete, config apply/revision history, list filters/pagination, health/setup/version/config, typed error envelope, loopback-only mutation guard, request ID and logging middleware. |
+| `caddy-rs-pm-api` | Native REST API with axum: `/api/v1` router, host CRUD/enable/disable with strong per-host ETags and `If-Match` CAS, certificate intents with inventory-derived status, durable certificate issuance jobs (`pending`/`issued`/`failed` with the exact ACME error text or timeout), manual certificate upload/list/delete, config apply/revision history, list filters/pagination, health/setup/version/config, typed error envelope, loopback-only mutation guard, request ID and logging middleware. |
 
 ## Why a nested workspace
 
@@ -378,14 +378,47 @@ Coverage is per subject: one intent may be covered by several certificates (for 
 SAN plus a wildcard). A record without an expiry is still an issuance observation and is reported
 `issued` with no `expiresAt`; it is never turned into a fabricated epoch date.
 
-**Integration point (deliberately not implemented here).** `pm-api` has no HTTP client. The daemon
-that owns the caddy-rs admin URL implements `CertificateInventorySource` over
-`GET /runtime/inventory` and injects it with `ApiState::with_inventory`. The current caddy-rs
-inventory payload (`crates/admin/src/inventory.rs`) exposes only `subject`, `sans`, `issuer`,
-`source` and optional `not_after`: it has **no issuance-state or renewal-error field**. This slice
-therefore reports `issued`/`expiring_soon`/`expired` from expiry and `pending` when no certificate
-is observed; `renewal_error` is surfaced only when a future source can provide it. It never
-fabricates "issued" from a `201`.
+### Issuance jobs
+
+`POST /certificates/issue` takes exactly `{ "hostId": <id> }` and enqueues one explicit,
+retryable issuance job for a host configured for automatic TLS (`tls.mode: "auto"`). The handler
+ensures the host has an eager `AutoCertificatePolicy` covering its domains - reusing the host's
+existing `tls.autoPolicyId`, or, only when the host is in `auto` mode without one, creating a
+policy (`letsencrypt` + `http01`) and attaching it under a revision-checked host update. It records
+a durable `IssuanceJob { id, hostId, domains, issuer, challenge, policyId, status,
+createdAtUnix, updatedAtUnix, deadlineUnix, revision?, configHash?, certificate?, error? }` in the
+`certificate_issuance_jobs` state collection and returns `202 Accepted` with `Location:
+/api/v1/certificates/jobs/{id}` and a strong ETag. A host that is not `auto` is a typed `409`; a
+missing inventory source or apply pipeline is a typed `503`; a missing host is `404`; unknown
+fields are rejected. Nothing is issued from the request path itself.
+
+A background worker drives the existing config apply pipeline (the job never talks ACME: caddy-rs
+owns certificate management through its admin API) and then polls the injected inventory until:
+
+| Job status | Condition |
+|---|---|
+| `pending` | recorded; the apply and/or the certificate observation is still in flight |
+| `issued` | a record covers every job domain; `certificate { domains, issuer, source, expiresAtUnix? }` is recorded |
+| `failed` | automatic-HTTPS provisioning reported a failure for a job domain (`error` carries the exact ACME error text), the apply failed, or the deadline elapsed (`error` says `timed out after <n>s`) |
+
+`GET /certificates/jobs/{id}` returns that job with a strong ETag and `Cache-Control: no-store`;
+`If-None-Match` gives `304`, a stale `If-Match` gives `412`, an unknown id is `404`. A pending job
+past its persisted deadline is failed lazily on read, so a worker lost with the process cannot
+leave a job pending forever. The worker only transitions `pending` to a terminal state (a lost race
+never overwrites a result); the bound is enforced twice (worker timeout and persisted deadline),
+and the default is 120s (`ApiState::with_issuance_timeout` overrides it, tests use short values).
+No job response contains a private key or PEM.
+
+**Integration point.** `pm-api` has no HTTP client. The daemon that owns the caddy-rs admin URL
+implements `CertificateInventorySource` over `GET /runtime/inventory` and injects it with
+`ApiState::with_inventory`. The same source supplies `last_issuance_failure() ->
+Option<IssuanceFailure { domains, failed_at_unix, error }>` from the inventory's additive
+`automatic_https` field (DIV-0159), which is what turns a failed ACME attempt into a `failed` job
+with the real error text instead of a bare timeout. Sources that predate that field report no
+failure (the trait default). The daemon must also inject the apply pipeline
+(`ApiState::with_applier`); without it issuance jobs are a typed `503`. `renewal_error` is still
+surfaced only when a source provides it, and `issued`/`expiring_soon`/`expired` continue to come
+from expiry.
 
 ### Testing
 

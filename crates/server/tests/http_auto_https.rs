@@ -1382,6 +1382,7 @@ async fn failed_issuance_keeps_the_old_generation_serving() {
         .load(config("127.0.0.1:0", Some(0), false, false, &root))
         .expect("second config validates");
     fake.set_fail_new_order(true);
+    let attempted_generation = store.current().expect("second generation").id();
     let error = runtime
         .apply()
         .await
@@ -1390,11 +1391,36 @@ async fn failed_issuance_keeps_the_old_generation_serving() {
         error.to_string().contains("automatic HTTPS"),
         "error must name automatic HTTPS: {error}"
     );
+    // The failed attempt is reported through the read-only inventory extension (caddy-rs
+    // divergence): a manager job can read the ACME error text after a failed issuance.
+    let snapshot = runtime.inventory_snapshot();
+    let failure = snapshot
+        .automatic_https
+        .as_ref()
+        .expect("inventory records the failed automatic-HTTPS attempt");
+    assert_eq!(failure.generation_id, attempted_generation);
+    assert_eq!(failure.domains, vec!["example.com".to_string()]);
+    assert!(
+        failure.error.contains(&error.to_string()),
+        "inventory error must be the provisioning error: {}",
+        failure.error
+    );
+    assert!(failure.failed_at > 0.0, "{}", failure.failed_at);
     // The old listener and generation remain active.
     assert_eq!(runtime.status().generation_id, old_generation);
     let (status, _, body) = plain_get(old_address, "example.com", "/").await;
     assert_eq!(status, 200);
     assert_eq!(body, "old");
+
+    // A later successful apply clears the recorded failure (no stale error survives it).
+    fake.set_fail_new_order(false);
+    runtime.apply().await.expect("issuance succeeds on retry");
+    let snapshot = runtime.inventory_snapshot();
+    assert!(
+        snapshot.automatic_https.is_none(),
+        "a successful apply must clear the recorded failure: {:?}",
+        snapshot.automatic_https
+    );
     runtime.shutdown().await;
 }
 

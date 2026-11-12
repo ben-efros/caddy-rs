@@ -193,8 +193,8 @@ pub use access_log::{
     HeaderTarget, LogLevel, RedactionPolicy, SamplingConfig, ACCESS_LOG_LOGGER,
 };
 pub use inventory::{
-    InventoryAdminListener, InventoryCertificate, InventoryHealthChecks, InventoryListener,
-    RuntimeIntrospectionSource, RuntimeInventorySnapshot,
+    InventoryAdminListener, InventoryAutomaticHttps, InventoryCertificate, InventoryHealthChecks,
+    InventoryListener, RuntimeIntrospectionSource, RuntimeInventorySnapshot,
 };
 pub use logging_config::{
     AccessLogTarget, BuiltAccessLogSink, LoggingConfig, LoggingConfigError, LOGGING_TRACKING_ID,
@@ -1204,6 +1204,11 @@ impl AdminApi {
     /// [`UpstreamStatusSource`], and an explicit `snapshot.available`/`snapshot.stale` marker so a
     /// missing or mid-reload snapshot is never presented as current. Read-only and non-blocking:
     /// the server runtime installs complete snapshots under a lock.
+    ///
+    /// The top-level `automatic_https` field is the caddy-rs extension that surfaces the last failed
+    /// automatic-HTTPS (ACME/internal-CA) provisioning attempt of the running runtime (generation,
+    /// failure time, attempted subject hostnames, bounded error text), or `null` when the last
+    /// automatic-HTTPS apply succeeded. It is additive: the response shape above is unchanged.
     fn runtime_inventory_response(&self) -> AdminResponse {
         let current = self.store.current();
         let current_id = current.as_ref().map(|generation| generation.id());
@@ -1229,6 +1234,7 @@ impl AdminApi {
         let listeners = snapshot.listeners.clone();
         let certificates = snapshot.certificates.clone();
         let health_checks = snapshot.health_checks.clone();
+        let automatic_https = snapshot.automatic_https.clone();
         let upstreams: Vec<Value> = self
             .upstream_status_source
             .as_ref()
@@ -1254,6 +1260,8 @@ impl AdminApi {
             "upstream `health` is null: the proxy status source exposes counters only (reported hook)"
                 .to_string(),
             "certificates: source `managed` = automatic-HTTPS renewal store; `loaded` = apps.tls.certificates"
+                .to_string(),
+            "automatic_https is the last failed automatic-HTTPS provisioning attempt from the running generation (attempted generation id, failure time, attempted subject hostnames, bounded error text); null when the last automatic-HTTPS apply succeeded"
                 .to_string(),
         ];
         if stale {
@@ -1281,6 +1289,7 @@ impl AdminApi {
                 "certificates": certificates,
                 "upstreams": upstreams,
                 "health_checks": health_checks,
+                "automatic_https": automatic_https,
                 "notes": notes,
             }),
         )
@@ -3410,6 +3419,7 @@ mod tests {
                 generation: 1,
                 checkers: 2,
             }],
+            automatic_https: None,
         }
     }
 
@@ -3464,6 +3474,8 @@ mod tests {
         assert!(value["upstreams"][0]["health"].is_null());
         assert_eq!(value["health_checks"][0]["generation"], 1);
         assert_eq!(value["health_checks"][0]["checkers"], 2);
+        // No failed automatic-HTTPS attempt: the extension field is present and explicitly null.
+        assert!(value["automatic_https"].is_null());
 
         // Read-only extension: non-GET methods are rejected.
         for method in ["POST", "PUT", "PATCH", "DELETE"] {
@@ -3530,6 +3542,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_inventory_reports_last_failed_automatic_https_attempt() {
+        // A failed automatic-HTTPS apply keeps the previous generation serving; the inventory
+        // extension must still carry the ACME/provisioning error text so a manager job can report
+        // it. The rest of the snapshot stays the last completed apply (and is marked stale).
+        let snapshot = RuntimeInventorySnapshot {
+            automatic_https: Some(InventoryAutomaticHttps {
+                generation_id: 2,
+                failed_at: 1_800_000_000.5,
+                domains: vec!["example.com".to_string(), "www.example.com".to_string()],
+                error: "automatic HTTPS: obtaining certificate: acme: newOrder: \
+                        urn:ietf:params:acme:error:rejectedIdentifier: policy forbids issuing \
+                        for example.com"
+                    .to_string(),
+            }),
+            ..inventory_snapshot(Some(1))
+        };
+        let admin =
+            admin().with_runtime_introspection_source(Arc::new(FakeInventorySource { snapshot }));
+        load(&admin, &valid_config()).await;
+        load(&admin, &valid_config().replace(":8080", ":8081")).await;
+        let value: Value = serde_json::from_slice(
+            &admin
+                .handle(request("GET", "/runtime/inventory", ""))
+                .await
+                .body,
+        )
+        .expect("inventory JSON");
+        let failure = &value["automatic_https"];
+        assert_eq!(failure["generation_id"], 2);
+        assert_eq!(failure["failed_at"], 1_800_000_000.5);
+        assert_eq!(
+            failure["domains"],
+            serde_json::json!(["example.com", "www.example.com"])
+        );
+        assert!(
+            failure["error"]
+                .as_str()
+                .expect("error text")
+                .contains("rejectedIdentifier"),
+            "{failure}"
+        );
+        // The failure does not make the snapshot current: it remains the last completed apply.
+        assert_eq!(value["snapshot"]["generation_id"], 1);
+        assert_eq!(value["snapshot"]["stale"], true);
+    }
+
+    #[tokio::test]
     async fn runtime_inventory_enforces_origin_policy_and_handles_large_snapshots() {
         let mut listeners = Vec::new();
         for index in 0..5_000 {
@@ -3550,6 +3609,7 @@ mod tests {
                 listeners,
                 certificates: Vec::new(),
                 health_checks: Vec::new(),
+                automatic_https: None,
             },
         }));
         let started = std::time::Instant::now();

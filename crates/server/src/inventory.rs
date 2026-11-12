@@ -13,8 +13,8 @@
 use std::sync::{Arc, RwLock};
 
 use caddy_rs_admin::inventory::{
-    InventoryAdminListener, InventoryCertificate, InventoryHealthChecks, InventoryListener,
-    RuntimeIntrospectionSource, RuntimeInventorySnapshot,
+    InventoryAdminListener, InventoryAutomaticHttps, InventoryCertificate, InventoryHealthChecks,
+    InventoryListener, RuntimeIntrospectionSource, RuntimeInventorySnapshot,
 };
 
 /// Shared, replaceable runtime-inventory snapshot.
@@ -175,6 +175,55 @@ pub fn admin_inventory(
     Some(InventoryAdminListener { configured, bound })
 }
 
+/// Maximum length, in bytes, of the recorded automatic-HTTPS error text.
+const AUTOMATIC_HTTPS_ERROR_LIMIT: usize = 2048;
+
+/// Record a failed automatic-HTTPS provisioning attempt for the runtime inventory.
+///
+/// `domains` are the subject hostnames the attempt tried to obtain (the pending plan's
+/// `subjects`), and `error` is the provisioning error's `Display` text: it carries the ACME/CA
+/// failure (problem type, detail) or the internal-CA error and never contains private key
+/// material. The text is bounded to [`AUTOMATIC_HTTPS_ERROR_LIMIT`] bytes on a char boundary so a
+/// pathological CA response cannot bloat the admin response.
+pub fn automatic_https_failure(
+    generation_id: u64,
+    domains: Vec<String>,
+    error: &str,
+) -> InventoryAutomaticHttps {
+    let mut text = error.to_string();
+    if text.len() > AUTOMATIC_HTTPS_ERROR_LIMIT {
+        let mut end = AUTOMATIC_HTTPS_ERROR_LIMIT;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push('…');
+    }
+    InventoryAutomaticHttps {
+        generation_id,
+        failed_at: caddy_rs_admin::inventory::unix_seconds(std::time::SystemTime::now())
+            .unwrap_or(0.0),
+        domains,
+        error: text,
+    }
+}
+
+/// Attach the last failed automatic-HTTPS attempt to a snapshot.
+///
+/// The rest of the snapshot stays the last *completed* apply, so the admin endpoint keeps
+/// `snapshot.available`/`stale` honest: after a failed apply the serving generation and its
+/// listener/certificate data are the previous generation's, and `stale` reports the mismatch
+/// between the store's generation and that snapshot.
+pub(crate) fn with_automatic_https_failure(
+    snapshot: RuntimeInventorySnapshot,
+    failure: Option<InventoryAutomaticHttps>,
+) -> RuntimeInventorySnapshot {
+    RuntimeInventorySnapshot {
+        automatic_https: failure,
+        ..snapshot
+    }
+}
+
 /// Build the health-check scheduler inventory entries.
 pub fn health_check_inventory<'a>(
     schedulers: impl Iterator<Item = (&'a u64, &'a Vec<caddy_rs_proxy::HealthCheckScheduler>)>,
@@ -187,4 +236,25 @@ pub fn health_check_inventory<'a>(
         .collect();
     entries.sort_by_key(|entry| entry.generation);
     entries
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn automatic_https_failure_bounds_the_error_text_on_a_char_boundary() {
+        let failure = automatic_https_failure(7, vec!["example.com".to_string()], "acme: boom");
+        assert_eq!(failure.generation_id, 7);
+        assert_eq!(failure.domains, vec!["example.com".to_string()]);
+        assert_eq!(failure.error, "acme: boom");
+        assert!(failure.failed_at > 0.0);
+
+        // Multi-byte text at the limit is truncated without splitting a character.
+        let long = "é".repeat(AUTOMATIC_HTTPS_ERROR_LIMIT);
+        let failure = automatic_https_failure(8, Vec::new(), &long);
+        assert!(failure.error.len() <= AUTOMATIC_HTTPS_ERROR_LIMIT + '…'.len_utf8());
+        assert!(failure.error.ends_with('…'));
+        assert!(failure.error.is_char_boundary(failure.error.len()));
+    }
 }

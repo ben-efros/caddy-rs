@@ -35,10 +35,31 @@
 //! 3. less than [`EXPIRING_SOON_SECONDS`] remaining is `expiring_soon`;
 //! 4. otherwise `issued`.
 //!
-//! The current caddy-rs inventory payload (`crates/admin/src/inventory.rs`) has no issuance-state
-//! or renewal-error field: it reports `subject`, `sans`, `issuer`, `source` and `not_after`. This
-//! slice therefore derives everything it can from expiry and exposes `renewal_error` only when a
-//! future source provides it.
+//! The caddy-rs inventory payload (`crates/admin/src/inventory.rs`) reports `subject`, `sans`,
+//! `issuer`, `source` and `not_after` for issued certificates, plus the additive
+//! `automatic_https` observation (last failed automatic-HTTPS provisioning attempt with its ACME
+//! error text; DIV-0159). Sources that predate that field report no failure and everything is
+//! derived from expiry; `renewal_error` stays `None` until a source provides it.
+//!
+//! # Issuance jobs
+//!
+//! `POST /api/v1/certificates/issue` turns that observation into an explicit, retryable operation.
+//! The body is `{"hostId": <id>}`; the host must be configured for automatic TLS (`tls.mode:
+//! "auto"`). The handler ensures the host has an eager [`AutoCertificatePolicy`] for its domains
+//! (creating one and attaching it under a revision-checked host update only when the host has
+//! none), records a durable [`IssuanceJob`] in `certificate_issuance_jobs`, and returns `202` with
+//! that job. A background worker then:
+//!
+//! 1. runs the existing config apply pipeline ([`crate::ApiState::applier`]) — the job never talks
+//!    ACME itself; caddy-rs owns certificate management through its admin API;
+//! 2. polls the injected inventory until a certificate covering every job domain is reported
+//!    (`issued`), until the data plane reports an automatic-HTTPS failure mentioning a job domain
+//!    (`failed`, with the ACME error text), or until the job deadline elapses (`failed`, timeout).
+//!
+//! `GET /api/v1/certificates/jobs/{id}` reports `pending`, `issued` or `failed`. A pending job
+//! past its deadline is failed lazily on read, so a worker that dies with the process cannot leave
+//! a job pending forever. The worker only ever writes a terminal state over `pending`; a job
+//! response never contains a private key or PEM.
 //!
 //! [`PmRuntime::assemble`]: caddy_rs_pm_runtime::PmRuntime::assemble
 
@@ -57,15 +78,33 @@ use axum::{
 use caddy_rs_pm_certificates::{CertificateError, StoredCertificate};
 use caddy_rs_pm_core::{
     normalize_domain, pattern_covers, AcmeChallenge, AutoCertificatePolicy, AutoMode,
-    CertificateId, CertificateOrigin, KeyType, PolicyId,
+    CertificateId, CertificateOrigin, HostId, KeyType, PolicyId, TlsMode,
 };
+use caddy_rs_pm_hosts::{HostError, StoredHost};
 use caddy_rs_pm_policies::{PolicyError, StoredPolicy};
-use caddy_rs_pm_state::StateError;
+use caddy_rs_pm_service::{HostDraft, ServiceError};
+use caddy_rs_pm_state::{Revision, StateError, Transaction};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::hosts::LocalPeer;
 use crate::{evaluate_get_preconditions, require_if_match, ApiError, ApiState, PaginationParams};
+
+/// State collection holding durable certificate issuance jobs.
+pub const CERTIFICATE_ISSUANCE_JOBS: &str = "certificate_issuance_jobs";
+
+/// Default bound on one issuance job. The worker also enforces this as a real timeout around the
+/// whole apply-plus-observe step; tests inject a shorter value with
+/// [`ApiState::with_issuance_timeout`].
+pub const DEFAULT_ISSUANCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Default interval between inventory observations while a job is pending.
+pub const DEFAULT_ISSUANCE_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(250);
+
+/// Maximum recorded error text, in bytes (char-boundary safe when truncated).
+const MAX_JOB_ERROR_BYTES: usize = 1024;
+
 
 /// A certificate reported by the runtime inventory.
 ///
@@ -107,6 +146,23 @@ impl InventoryError {
     }
 }
 
+/// The last failed automatic-HTTPS provisioning attempt reported by the data plane.
+///
+/// This is an *observation* of an issuance attempt, not certificate storage: it carries the ACME
+/// error text and the subjects the attempt tried to obtain, never a key or PEM. caddy-rs publishes
+/// it as the additive `automatic_https` field of its `/runtime/inventory` extension (DIV-0159;
+/// [`CertificateInventorySource::last_issuance_failure`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IssuanceFailure {
+    /// Subjects the failed automatic-HTTPS attempt tried to obtain certificates for.
+    pub domains: Vec<String>,
+    /// UNIX seconds when the failure was recorded by the data plane.
+    pub failed_at_unix: i64,
+    /// The issuance error text, for example the ACME challenge failure detail.
+    pub error: String,
+}
+
 /// Read-only certificate inventory.
 ///
 /// The daemon that owns the caddy-rs admin endpoint implements this trait over
@@ -115,6 +171,14 @@ impl InventoryError {
 /// its timeouts belong to the daemon.
 pub trait CertificateInventorySource: Send + Sync {
     fn list_certificates(&self) -> Result<Vec<CertificateRecord>, InventoryError>;
+
+    /// Last automatic-HTTPS provisioning failure reported by the data plane, if any.
+    ///
+    /// Defaults to `None` so an inventory source that predates the caddy-rs
+    /// `automatic_https` observation keeps compiling and never fabricates a failure.
+    fn last_issuance_failure(&self) -> Result<Option<IssuanceFailure>, InventoryError> {
+        Ok(None)
+    }
 }
 
 /// Status of one recorded certificate intent.
@@ -918,6 +982,611 @@ pub async fn delete_custom_handler(
         .delete(CertificateId(id), stored.revision)
         .map_err(map_certificate_error)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Certificate issuance jobs
+// ---------------------------------------------------------------------------------------------
+
+/// State of one certificate issuance job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IssuanceJobStatus {
+    /// Recorded; the worker is applying the configuration and/or waiting for the certificate.
+    Pending,
+    /// The data plane reported a certificate covering every job domain.
+    Issued,
+    /// The job failed; [`IssuanceJob::error`] carries the reason (ACME error text or timeout).
+    Failed,
+}
+
+/// Certificate observation recorded on a successful job. Metadata only; no PEM and no key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IssuedCertificate {
+    /// Domains the job requested; every one is covered by the observed certificate(s).
+    pub domains: Vec<String>,
+    /// Issuer reported by the data plane.
+    pub issuer: String,
+    /// Where the certificate lives (`managed`, `loaded`, ...).
+    pub source: String,
+    /// Expiry as a Unix timestamp when the data plane reports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix: Option<i64>,
+}
+
+/// One durable certificate issuance job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IssuanceJob {
+    pub id: u64,
+    pub host_id: u64,
+    pub domains: Vec<String>,
+    pub issuer: String,
+    pub challenge: AcmeChallenge,
+    pub policy_id: u64,
+    pub status: IssuanceJobStatus,
+    pub created_at_unix: i64,
+    pub updated_at_unix: i64,
+    pub deadline_unix: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate: Option<IssuedCertificate>,
+    /// Applied config revision the worker drove, once known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
+    /// Hash of the applied config generation, once known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_hash: Option<String>,
+}
+
+/// `POST /api/v1/certificates/issue` body. Unknown fields are rejected.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IssueCertificateRequest {
+    pub host_id: u64,
+}
+
+fn job_key(id: u64) -> String {
+    id.to_string()
+}
+
+fn bounded_job_error(message: impl Into<String>) -> String {
+    let message = message.into();
+    if message.len() <= MAX_JOB_ERROR_BYTES {
+        return message;
+    }
+    let mut end = MAX_JOB_ERROR_BYTES;
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &message[..end])
+}
+
+fn job_etag(job: &IssuanceJob) -> Result<String, ApiError> {
+    let bytes = serde_json::to_vec(job)
+        .map_err(|error| ApiError::Internal(format!("serialize certificate issuance job: {error}")))?;
+    Ok(format!("\"j{}-{}\"", job.id, crate::hash_bytes(&bytes)))
+}
+
+fn deadline_message(job: &IssuanceJob) -> String {
+    let seconds = job.deadline_unix.saturating_sub(job.created_at_unix);
+    format!(
+        "certificate issuance timed out after {seconds}s; no certificate covering {} was \
+         observed in the caddy-rs runtime inventory",
+        job.domains.join(", ")
+    )
+}
+
+/// Read one job and the store revision it was read at (for compare-and-swap updates).
+fn read_job(state: &ApiState, id: u64) -> Result<Option<(IssuanceJob, Revision)>, ApiError> {
+    let document = state
+        .runtime
+        .state_store()
+        .get(CERTIFICATE_ISSUANCE_JOBS, &job_key(id))
+        .map_err(|error| ApiError::Internal(format!("read certificate issuance job: {error}")))?;
+    let Some(document) = document else {
+        return Ok(None);
+    };
+    let job = serde_json::from_value::<IssuanceJob>(document.value).map_err(|error| {
+        ApiError::Internal(format!(
+            "stored certificate issuance job {id} is invalid: {error}"
+        ))
+    })?;
+    Ok(Some((job, document.revision)))
+}
+
+fn next_job_id(store: &Arc<dyn caddy_rs_pm_state::StateStore>) -> Result<u64, ApiError> {
+    let maximum = store
+        .scan(CERTIFICATE_ISSUANCE_JOBS, "")
+        .map_err(|error| ApiError::Internal(format!("scan certificate issuance jobs: {error}")))?
+        .into_iter()
+        .filter_map(|document| document.key.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0);
+    maximum.checked_add(1).ok_or_else(|| {
+        ApiError::Conflict("certificate issuance job ids are exhausted".to_string())
+    })
+}
+
+fn commit_job(
+    state: &ApiState,
+    job: &IssuanceJob,
+    expected: Option<Revision>,
+) -> Result<(), StateError> {
+    let value = serde_json::to_value(job).expect("issuance job serializes");
+    let key = job_key(job.id);
+    let mut transaction = Transaction::new();
+    transaction = match expected {
+        Some(revision) => transaction.check_revision(
+            CERTIFICATE_ISSUANCE_JOBS,
+            key.clone(),
+            revision,
+        ),
+        None => transaction.check_missing(CERTIFICATE_ISSUANCE_JOBS, key.clone()),
+    };
+    state.runtime.state_store().transact(
+        transaction
+            .put(CERTIFICATE_ISSUANCE_JOBS, key, value),
+    )?;
+    Ok(())
+}
+
+/// Record a pending job, allocating its durable id under a missing-key check.
+fn create_issuance_job(
+    state: &ApiState,
+    mut job: IssuanceJob,
+) -> Result<IssuanceJob, ApiError> {
+    for _ in 0..8 {
+        let id = next_job_id(&state.runtime.state_store())?;
+        job.id = id;
+        match commit_job(state, &job, None) {
+            Ok(()) => return Ok(job),
+            Err(StateError::Conflict { .. }) => continue,
+            Err(error) => {
+                return Err(ApiError::Internal(format!(
+                    "record certificate issuance job: {error}"
+                )))
+            }
+        }
+    }
+    Err(ApiError::Conflict(
+        "certificate issuance job ids are contended; retry the request".to_string(),
+    ))
+}
+
+/// Record the applied config revision on a still-pending job. Best effort: a lost race never
+/// changes a terminal state, and the job stays observable through its status/error fields.
+fn record_job_revision(
+    state: &ApiState,
+    job_id: u64,
+    revision: u64,
+    hash: &str,
+) -> Result<(), ApiError> {
+    for _ in 0..4 {
+        let Some((mut job, document_revision)) = read_job(state, job_id)? else {
+            return Ok(());
+        };
+        if job.status != IssuanceJobStatus::Pending {
+            return Ok(());
+        }
+        job.revision = Some(revision);
+        job.config_hash = Some(hash.to_string());
+        job.updated_at_unix = now_unix();
+        match commit_job(state, &job, Some(document_revision)) {
+            Ok(()) => return Ok(()),
+            Err(StateError::Conflict { .. }) => continue,
+            Err(error) => {
+                return Err(ApiError::Internal(format!(
+                    "record certificate issuance job revision: {error}"
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Write the terminal state of a job. Only a pending job is ever transitioned, so two workers (or
+/// a worker and the lazy read-side timeout) cannot overwrite each other's result.
+fn finish_issuance_job(
+    state: &ApiState,
+    job_id: u64,
+    outcome: Result<IssuedCertificate, String>,
+) -> Result<(), ApiError> {
+    let (status, certificate, error) = match outcome {
+        Ok(certificate) => (IssuanceJobStatus::Issued, Some(certificate), None),
+        Err(message) => (IssuanceJobStatus::Failed, None, Some(bounded_job_error(message))),
+    };
+    for _ in 0..8 {
+        let Some((mut job, document_revision)) = read_job(state, job_id)? else {
+            return Ok(());
+        };
+        if job.status != IssuanceJobStatus::Pending {
+            return Ok(());
+        }
+        job.status = status;
+        job.certificate = certificate.clone();
+        job.error = error.clone();
+        job.updated_at_unix = now_unix();
+        match commit_job(state, &job, Some(document_revision)) {
+            Ok(()) => return Ok(()),
+            Err(StateError::Conflict { .. }) => continue,
+            Err(error) => {
+                return Err(ApiError::Internal(format!(
+                    "record certificate issuance job result: {error}"
+                )))
+            }
+        }
+    }
+    Err(ApiError::Conflict(format!(
+        "certificate issuance job {job_id} could not be updated; it stays pending until its deadline"
+    )))
+}
+
+/// Whether an observed automatic-HTTPS failure belongs to this job.
+///
+/// A failure stays in the inventory until a successful apply, so a job created after it must not
+/// inherit it: the observation has to be at least as new as the job (with a small clock-skew
+/// allowance), and it must name a job domain (exact or a wildcard covering it).
+fn failure_relates_to(failure: &IssuanceFailure, job: &IssuanceJob) -> bool {
+    if failure.failed_at_unix.saturating_add(5) < job.created_at_unix {
+        return false;
+    }
+    job.domains.iter().any(|domain| {
+        failure
+            .domains
+            .iter()
+            .any(|failed| failed == domain || pattern_covers(failed, domain))
+    })
+}
+
+/// One inventory observation for a job: a covering certificate, a failure, or still pending.
+fn observe_issuance(
+    state: &ApiState,
+    job: &IssuanceJob,
+) -> Result<Option<IssuedCertificate>, String> {
+    let Some(source) = state.inventory() else {
+        return Ok(None);
+    };
+    let records = source
+        .list_certificates()
+        .map_err(|error| format!("certificate inventory unavailable: {error}"))?;
+    let (status, record) = derive_intent_status(&job.domains, &records, now_unix());
+    if matches!(
+        status,
+        CertificateIntentStatus::Issued | CertificateIntentStatus::ExpiringSoon
+    ) {
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        return Ok(Some(IssuedCertificate {
+            domains: job.domains.clone(),
+            issuer: record.issuer.clone(),
+            source: record.source.clone(),
+            expires_at_unix: record.expires_at_unix,
+        }));
+    }
+    if status == CertificateIntentStatus::RenewalError {
+        if let Some(renewal_error) = record.and_then(|record| record.renewal_error.clone()) {
+            return Err(format!("automatic HTTPS renewal failed: {renewal_error}"));
+        }
+    }
+    if let Some(failure) = source
+        .last_issuance_failure()
+        .map_err(|error| format!("certificate inventory unavailable: {error}"))?
+    {
+        if failure_relates_to(&failure, job) {
+            return Err(format!(
+                "automatic HTTPS issuance failed: {}",
+                failure.error
+            ));
+        }
+    }
+    Ok(None)
+}
+
+/// Apply the current PM configuration (which drives caddy-rs automatic HTTPS through the admin
+/// API) and wait for the data plane to report the certificate or an issuance failure.
+async fn drive_issuance(
+    state: &ApiState,
+    job: &IssuanceJob,
+) -> Result<IssuedCertificate, String> {
+    let Some(applier) = state.applier() else {
+        return Err(
+            "config apply is not configured; the issuance job cannot drive caddy-rs".to_string(),
+        );
+    };
+    match applier.apply().await {
+        Ok(outcome) => {
+            if let Err(error) =
+                record_job_revision(state, job.id, outcome.revision, &outcome.hash)
+            {
+                return Err(format!(
+                    "could not record the applied config revision: {error}"
+                ));
+            }
+        }
+        Err(error) => return Err(format!("config apply failed: {error}")),
+    }
+    let interval = state.issuance_poll_interval();
+    loop {
+        if let Some(certificate) = observe_issuance(state, job)? {
+            return Ok(certificate);
+        }
+        if now_unix() >= job.deadline_unix {
+            return Err(deadline_message(job));
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+/// Background worker for one job. The deadline is enforced twice: as a real timeout around the
+/// whole step and as the persisted deadline (so a dead worker still yields a failed job on read).
+async fn run_issuance_job(state: ApiState, job_id: u64) {
+    let Ok(Some((job, _))) = read_job(&state, job_id) else {
+        return;
+    };
+    if job.status != IssuanceJobStatus::Pending {
+        return;
+    }
+    let timeout = state.issuance_timeout();
+    let outcome =
+        match tokio::time::timeout(timeout, drive_issuance(&state, &job)).await {
+            Ok(Ok(certificate)) => Ok(certificate),
+            Ok(Err(message)) => Err(message),
+            Err(_) => Err(deadline_message(&job)),
+        };
+    if let Err(error) = finish_issuance_job(&state, job_id, outcome) {
+        tracing::warn!(job = job_id, %error, "could not record certificate issuance job result");
+    }
+}
+
+fn ensure_policy_covers_host(policy: &StoredPolicy, stored: &StoredHost) -> Result<(), ApiError> {
+    if !policy.policy.enabled {
+        return Err(ApiError::Conflict(format!(
+            "auto certificate policy {} is disabled; enable it before requesting issuance",
+            policy.policy.id.0
+        )));
+    }
+    let uncovered: Vec<&str> = stored
+        .host
+        .domains
+        .iter()
+        .filter(|domain| {
+            !policy
+                .policy
+                .subjects
+                .iter()
+                .any(|subject| pattern_covers(subject, domain))
+        })
+        .map(String::as_str)
+        .collect();
+    if !uncovered.is_empty() {
+        return Err(ApiError::Conflict(format!(
+            "auto certificate policy {} does not cover host domain(s) {}; extend the policy before \
+             requesting issuance",
+            policy.policy.id.0,
+            uncovered.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// The host's automatic-TLS binding, creating and attaching an eager policy when the host has
+/// none. An existing binding is reused; this never rewrites an enabled policy or another host.
+fn ensure_auto_policy(state: &ApiState, stored: &StoredHost) -> Result<StoredPolicy, ApiError> {
+    if stored.host.tls.mode != TlsMode::Auto {
+        return Err(ApiError::Conflict(format!(
+            "host {} is not configured for automatic TLS (tls.mode is {:?}); certificate issuance \
+             jobs require tls.mode \"auto\"",
+            stored.host.id.0, stored.host.tls.mode
+        )));
+    }
+    if let Some(policy_id) = stored.host.tls.auto_policy_id {
+        let policy = state
+            .runtime
+            .policies()
+            .get(policy_id)
+            .map_err(map_policy_error)?
+            .ok_or_else(|| {
+                ApiError::Conflict(format!(
+                    "host {} references auto certificate policy {} that does not exist",
+                    stored.host.id.0, policy_id.0
+                ))
+            })?;
+        ensure_policy_covers_host(&policy, stored)?;
+        return Ok(policy);
+    }
+    let policy = create_intent_policy(
+        state,
+        stored.host.domains.clone(),
+        "letsencrypt",
+        AcmeChallenge::Http01,
+    )?;
+    for _ in 0..2 {
+        let current = state
+            .runtime
+            .hosts()
+            .get(stored.host.id)
+            .map_err(map_host_error)?
+            .ok_or_else(|| ApiError::NotFound(format!("host {}", stored.host.id.0)))?;
+        let mut tls = current.host.tls.clone();
+        tls.mode = TlsMode::Auto;
+        tls.certificate_id = None;
+        tls.auto_policy_id = Some(policy.policy.id);
+        let draft = HostDraft {
+            domains: current.host.domains.clone(),
+            tls,
+            spec: current.host.spec.clone(),
+            enabled: current.host.enabled,
+            security_headers: current.host.security_headers.clone(),
+        };
+        match state
+            .runtime
+            .service()
+            .update(current.host.id, current.revision, draft)
+        {
+            Ok(_) => return Ok(policy),
+            Err(ServiceError::Host(HostError::State(StateError::Conflict { .. }))) => continue,
+            Err(error) => return Err(map_service_error(error)),
+        }
+    }
+    Err(ApiError::Conflict(
+        "the host changed while attaching the auto certificate policy; retry the request"
+            .to_string(),
+    ))
+}
+
+fn map_host_error(error: HostError) -> ApiError {
+    match error {
+        HostError::NotFound(id) => ApiError::NotFound(format!("host {id}")),
+        HostError::State(StateError::Conflict { .. }) => ApiError::PreconditionFailed(
+            "the host changed after it was read; retry the request".to_string(),
+        ),
+        HostError::State(error) => ApiError::Internal(error.to_string()),
+        other => ApiError::Internal(other.to_string()),
+    }
+}
+
+fn map_service_error(error: ServiceError) -> ApiError {
+    match error {
+        ServiceError::Host(error) => map_host_error(error),
+        ServiceError::PolicyNotFound { host_id, policy_id } => ApiError::Internal(format!(
+            "host {host_id} references unknown auto certificate policy {policy_id}"
+        )),
+        other => ApiError::Internal(other.to_string()),
+    }
+}
+
+/// `POST /api/v1/certificates/issue`.
+///
+/// Enqueues one issuance job for an automatic-TLS host and returns `202 Accepted` with the job
+/// (and a `Location` header for `GET /certificates/jobs/{id}`). The handler never performs ACME
+/// itself: the worker drives the existing caddy-rs certificate management through the config
+/// apply pipeline and observes the result in the runtime inventory.
+pub async fn issue_handler(
+    State(state): State<ApiState>,
+    _peer: LocalPeer,
+    body: Result<Json<IssueCertificateRequest>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    let request = parse_json(body)?;
+    if request.host_id == 0 {
+        return Err(ApiError::validation(
+            "hostId must be greater than zero",
+            "hostId",
+        ));
+    }
+    if state.applier().is_none() {
+        return Err(ApiError::ServiceUnavailable(
+            "certificate issuance requires the config apply pipeline; start the PM with a \
+             loopback caddy admin URL"
+                .to_owned(),
+        ));
+    }
+    if state.inventory().is_none() {
+        return Err(ApiError::ServiceUnavailable(
+            "certificate issuance requires a certificate inventory source; start the PM with a \
+             caddy admin URL that exposes /runtime/inventory"
+                .to_owned(),
+        ));
+    }
+    let stored = state
+        .runtime
+        .hosts()
+        .get(HostId(request.host_id))
+        .map_err(map_host_error)?
+        .ok_or_else(|| ApiError::NotFound(format!("host {}", request.host_id)))?;
+    let policy = ensure_auto_policy(&state, &stored)?;
+
+    let now = now_unix();
+    let timeout_seconds = state.issuance_timeout().as_secs().min(i64::MAX as u64) as i64;
+    let job = IssuanceJob {
+        id: 0,
+        host_id: stored.host.id.0,
+        domains: stored.host.domains.clone(),
+        issuer: policy
+            .policy
+            .issuer
+            .clone()
+            .unwrap_or_else(|| "letsencrypt".to_string()),
+        challenge: policy.policy.challenge,
+        policy_id: policy.policy.id.0,
+        status: IssuanceJobStatus::Pending,
+        created_at_unix: now,
+        updated_at_unix: now,
+        deadline_unix: now.saturating_add(timeout_seconds),
+        error: None,
+        certificate: None,
+        revision: None,
+        config_hash: None,
+    };
+    let job = create_issuance_job(&state, job)?;
+
+    let worker_state = state.clone();
+    let job_id = job.id;
+    tokio::spawn(async move {
+        run_issuance_job(worker_state, job_id).await;
+    });
+
+    let etag = job_etag(&job)?;
+    let location = format!("/api/v1/certificates/jobs/{}", job.id);
+    let mut response = (StatusCode::ACCEPTED, Json(job)).into_response();
+    set_intent_headers(&mut response, &etag);
+    let value = HeaderValue::from_str(&location)
+        .map_err(|error| ApiError::Internal(format!("location header: {error}")))?;
+    response.headers_mut().insert(header::LOCATION, value);
+    Ok(response)
+}
+
+fn parse_job_id(path: Result<Path<u64>, PathRejection>) -> Result<u64, ApiError> {
+    let Path(id) = path.map_err(|rejection| {
+        ApiError::validation(
+            format!(
+                "invalid certificate issuance job id: {}",
+                rejection.body_text()
+            ),
+            "id",
+        )
+    })?;
+    if id == 0 {
+        return Err(ApiError::validation(
+            "certificate issuance job id must be greater than zero",
+            "id",
+        ));
+    }
+    Ok(id)
+}
+
+/// `GET /api/v1/certificates/jobs/{id}`.
+///
+/// Reports `pending`, `issued` or `failed`; `error` carries the ACME error text (or the timeout
+/// message) on failure, and `certificate` the recorded observation on success. A pending job past
+/// its persisted deadline is failed lazily here so a worker lost with the process cannot leave the
+/// job pending forever.
+pub async fn get_job_handler(
+    State(state): State<ApiState>,
+    path: Result<Path<u64>, PathRejection>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let id = parse_job_id(path)?;
+    let Some((mut job, _)) = read_job(&state, id)? else {
+        return Err(ApiError::NotFound(format!("certificate issuance job {id}")));
+    };
+    if job.status == IssuanceJobStatus::Pending && now_unix() >= job.deadline_unix {
+        finish_issuance_job(&state, id, Err(deadline_message(&job)))?;
+        let Some((reloaded, _)) = read_job(&state, id)? else {
+            return Err(ApiError::NotFound(format!("certificate issuance job {id}")));
+        };
+        job = reloaded;
+    }
+    let etag = job_etag(&job)?;
+    if let Some(response) = evaluate_get_preconditions(&headers, &etag)? {
+        return Ok(response);
+    }
+    let mut response = Json(job).into_response();
+    set_intent_headers(&mut response, &etag);
+    Ok(response)
 }
 
 /// Empty inventory used when no source is injected.

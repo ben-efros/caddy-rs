@@ -76,6 +76,25 @@ pub struct InventoryHealthChecks {
     pub checkers: usize,
 }
 
+/// The last failed automatic-HTTPS (ACME/internal-CA) provisioning attempt of the running runtime.
+///
+/// caddy-rs extension, not Caddy parity: stock Caddy reports a failed certificate issuance only in
+/// the admin `/load` error body and its process log, so a manager that polls the admin API has no
+/// way to see *why* automatic HTTPS is not serving. The runtime records the failed attempt here and
+/// the admin endpoint exposes it as the top-level `automatic_https` field, so a proxy-manager job
+/// can report the ACME error text after a failed issuance.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InventoryAutomaticHttps {
+    /// Generation id whose provisioning failed (the attempted generation, not the one still serving).
+    pub generation_id: u64,
+    /// When the attempt failed, as Unix seconds (fractional), like `unix_seconds`.
+    pub failed_at: f64,
+    /// Subject hostnames the failed attempt tried to obtain, lowercased and deduplicated.
+    pub domains: Vec<String>,
+    /// Bounded provisioning error text (ACME/CA or TLS error); never contains key material.
+    pub error: String,
+}
+
 /// A complete snapshot of the server runtime's inventory as of the last completed apply.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeInventorySnapshot {
@@ -94,6 +113,12 @@ pub struct RuntimeInventorySnapshot {
     /// Active health-check scheduler groups.
     #[serde(default)]
     pub health_checks: Vec<InventoryHealthChecks>,
+    /// Last failed automatic-HTTPS provisioning attempt of the running runtime, when there was one.
+    ///
+    /// The rest of this snapshot stays the last *completed* apply, so a failure is reported
+    /// alongside (and marked `stale` against) the generation that is still serving.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automatic_https: Option<InventoryAutomaticHttps>,
 }
 
 impl RuntimeInventorySnapshot {
@@ -133,6 +158,7 @@ mod tests {
         assert_eq!(value["health_checks"], serde_json::json!([]));
         assert!(value.get("generation_id").is_none());
         assert!(value.get("admin").is_none());
+        assert!(value.get("automatic_https").is_none());
     }
 
     #[test]

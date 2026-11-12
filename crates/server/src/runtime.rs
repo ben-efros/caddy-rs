@@ -17,7 +17,9 @@ use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use caddy_rs_admin::inventory::{RuntimeIntrospectionSource, RuntimeInventorySnapshot};
+use caddy_rs_admin::inventory::{
+    InventoryAutomaticHttps, RuntimeIntrospectionSource, RuntimeInventorySnapshot,
+};
 use caddy_rs_admin::{
     AdminApi, CertificateMetrics, LoggingConfig, MetricsRegistry, SharedRequestRecorder,
     UpstreamStatusSource,
@@ -266,6 +268,13 @@ pub struct ServerRuntime {
     /// (T-ADMIN-023). Refreshed after a successful apply and cleared on shutdown; the admin API
     /// copies it and marks a mismatch with the active generation as stale.
     inventory: Arc<crate::inventory::RuntimeInventorySource>,
+    /// Last failed automatic-HTTPS provisioning attempt of this runtime (caddy-rs extension).
+    ///
+    /// Stock Caddy reports an issuance failure only in the `/load` error body and its log; a
+    /// manager polling the admin API cannot see why automatic HTTPS is not serving. Recorded on a
+    /// failed provisioning phase, exposed through `GET /runtime/inventory` (`automatic_https`),
+    /// and cleared by the next successful apply so a stale error never outlives the failure.
+    last_automatic_https_failure: Option<InventoryAutomaticHttps>,
 }
 
 /// How inherited systemd sockets are discovered for this runtime.
@@ -368,6 +377,7 @@ impl ServerRuntime {
             shutdown_timing: ShutdownTiming::default(),
             upstream_status,
             inventory,
+            last_automatic_https_failure: None,
         }
     }
 
@@ -720,6 +730,9 @@ impl ServerRuntime {
             self.install_health_schedulers(generation.id(), health_schedulers)
                 .await;
             let status = self.finish_apply(&generation);
+            // A generation without automatic HTTPS succeeded: any earlier issuance error is no
+            // longer the runtime's current state.
+            self.last_automatic_https_failure = None;
             self.refresh_inventory();
             return Ok(status);
         };
@@ -743,10 +756,24 @@ impl ServerRuntime {
 
         // Phase 2: provision certificates; the CA can now reach the listeners for HTTP-01 /
         // TLS-ALPN-01 validation.
+        //
+        // The pending plan's subjects are exactly the hostnames this attempt tries to obtain, so
+        // they are recorded with a failure (the plan is consumed by `provision`).
+        let attempted_domains = pending.plan.subjects.clone();
         let prepared = match pending.provision().await {
             Ok(prepared) => prepared,
             Err(error) => {
+                // Report the failed issuance through the read-only inventory extension: the
+                // previous generation keeps serving, so the error would otherwise only be visible
+                // in this apply's error body and the log.
+                self.last_automatic_https_failure =
+                    Some(crate::inventory::automatic_https_failure(
+                        generation.id(),
+                        attempted_domains,
+                        &error.to_string(),
+                    ));
                 self.rollback_states(&previous_states, &newly_bound).await;
+                self.refresh_inventory();
                 return Err(error);
             }
         };
@@ -807,6 +834,8 @@ impl ServerRuntime {
         self.install_health_schedulers(generation.id(), health_schedulers)
             .await;
         let status = self.finish_apply(&generation);
+        // Automatic HTTPS succeeded: a previously recorded issuance failure is resolved.
+        self.last_automatic_https_failure = None;
         self.refresh_inventory();
         Ok(status)
     }
@@ -1078,10 +1107,12 @@ impl ServerRuntime {
     }
 
     /// Record the applied generation in the observable status.
-    /// Rebuild and install the runtime-inventory snapshot after a successful apply.
+    /// Rebuild and install the runtime-inventory snapshot after a successful apply (and after a
+    /// failed automatic-HTTPS provisioning pass, so the extension can report that failure).
     ///
     /// The snapshot is copied from runtime state into the shared source; the admin endpoint only
-    /// reads that copy, so a later reload cannot race the JSON rendering.
+    /// reads that copy, so a later reload cannot race the JSON rendering. A failed apply leaves the
+    /// data of the last completed apply in place and only attaches `automatic_https`.
     fn refresh_inventory(&mut self) {
         let (configured_admin, listeners, certificates) = match self.store.current() {
             Some(generation) => {
@@ -1107,13 +1138,27 @@ impl ServerRuntime {
             self.admin.as_ref().map(|handle| handle.bound.clone()),
         );
         let health_checks = crate::inventory::health_check_inventory(self.health_schedulers.iter());
-        self.inventory.install(RuntimeInventorySnapshot {
+        let snapshot = RuntimeInventorySnapshot {
             generation_id: self.status.generation_id,
             admin,
             listeners,
             certificates,
             health_checks,
-        });
+            automatic_https: None,
+        };
+        self.inventory
+            .install(crate::inventory::with_automatic_https_failure(
+                snapshot,
+                self.last_automatic_https_failure.clone(),
+            ));
+    }
+
+    /// Copy the runtime's current inventory snapshot (caddy-rs `GET /runtime/inventory` data).
+    ///
+    /// Exposes the same snapshot the admin endpoint reads, so tests and embedders can assert the
+    /// last completed apply plus a recorded automatic-HTTPS failure without an admin listener.
+    pub fn inventory_snapshot(&self) -> RuntimeInventorySnapshot {
+        RuntimeIntrospectionSource::snapshot(self.inventory.as_ref())
     }
 
     fn finish_apply(&mut self, generation: &Generation) -> RuntimeStatus {

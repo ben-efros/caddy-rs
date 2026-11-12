@@ -40,3 +40,9 @@ clap = { version = "4.6.7", default-features = false, features = [
 ] }
 sd-notify = "0.2.0"
 url = "2.5.8"
+
+[patch.crates-io]
+# Keep the pm workspace aligned with the root workspace: the caddy-rs crates pulled in as
+# dev-dependencies of `caddy-rs-pm-api` (fake-ACME end-to-end tests) only compile against the
+# vendored `httpdate`, whose `parse_http_date` returns `Option` as `crates/tls` expects.
+httpdate = { path = "../vendor/httpdate" }
