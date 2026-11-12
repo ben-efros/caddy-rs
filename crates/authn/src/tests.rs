@@ -1558,3 +1558,33 @@ fn planted_symlink_at_temp_path_is_not_followed() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[tokio::test]
+async fn delete_user_revokes_refresh_tokens_and_removes_the_record() {
+    let authn = AuthnService::new(MemoryUserStore::new(), test_config()).expect("create service");
+    let user = authn
+        .create_user("editor", "password123", Role::editor())
+        .await
+        .expect("create user");
+    let tokens = authn
+        .login("editor", "password123", None)
+        .await
+        .expect("log in");
+
+    authn.delete_user(user.id).await.expect("delete the user");
+    assert!(
+        authn.list_users().await.expect("list users").is_empty(),
+        "the record is gone"
+    );
+    assert!(
+        matches!(
+            authn.delete_user(user.id).await,
+            Err(AuthError::UserNotFound)
+        ),
+        "deleting a missing user reports UserNotFound"
+    );
+    assert!(
+        authn.refresh(&tokens.refresh_token).await.is_err(),
+        "the deleted user's refresh token cannot be replayed"
+    );
+}
