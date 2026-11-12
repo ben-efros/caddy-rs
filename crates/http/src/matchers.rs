@@ -176,7 +176,13 @@ impl Matcher for PathMatcher {
         self.patterns.iter().any(|pattern| {
             // Caddy: `matchPattern = repl.ReplaceAll(matchPattern, "")` in MatchPath.
             let pattern = request.replace_all(pattern);
-            glob_match(&pattern, &escaped, false) || glob_match(&pattern, path, false)
+            // A '%' in the pattern means that part of the path is compared in raw/escaped space
+            // (Caddy: `if strings.Contains(matchPattern, "%")` in MatchPath.matches).
+            if pattern.contains('%') {
+                match_pattern_with_escape_sequence(path, &pattern)
+            } else {
+                glob_match(&pattern, &escaped, false) || glob_match(&pattern, path, false)
+            }
         })
     }
 
@@ -1690,6 +1696,153 @@ pub fn glob_match(pattern: &str, value: &str, case_insensitive: bool) -> bool {
     p == pattern.len()
 }
 
+/// Match an escaped request path against a pattern containing `%` hints, ported from Caddy
+/// `MatchPath.matchPatternWithEscapeSequence` (upstream c3fab6576f0e).
+///
+/// A `%` in the pattern means the corresponding part of the path is compared in raw/escaped
+/// space. The pattern and path are walked in lock-step; the cursor into the path advances by the
+/// full width of an escape sequence only when that sequence is actually consumed, so a wildcard
+/// span starting at an escape sequence cannot swallow a percent-encoded separator (`%2f`) and
+/// over-match a `path` pattern (a matcher-integrity/access-control bypass).
+fn match_pattern_with_escape_sequence(escaped_path: &str, match_pattern: &str) -> bool {
+    let path = escaped_path.as_bytes();
+    let pattern = match_pattern.as_bytes();
+    let mut matched = Vec::with_capacity(path.len());
+    let (mut i_pattern, mut i_path) = (0usize, 0usize);
+    while i_pattern < pattern.len() && i_path < path.len() {
+        // next character of the request path, decoded when it is an escape sequence
+        let mut path_ch_len = 1;
+        let mut escaped_path_ch: &[u8] = b"";
+        let mut path_ch = path[i_path];
+        if path_ch == b'%' && path.len() >= i_path + 3 {
+            escaped_path_ch = &path[i_path..i_path + 3];
+            match decode_escape_sequence(escaped_path_ch) {
+                Some(decoded) => path_ch = decoded,
+                // should be impossible unless the request path holds an invalid sequence
+                None => return false,
+            }
+            path_ch_len = 3;
+        }
+
+        // now the next character of the pattern
+        let mut normalize = true;
+        if pattern[i_pattern] == b'%' {
+            if pattern.len() >= i_pattern + 3 && pattern[i_pattern + 1] != b'*' {
+                // not a wildcard ("%*"): compare literally, consuming the escape sequence
+                matched.extend_from_slice(escaped_path_ch);
+                i_path += path_ch_len;
+                i_pattern += 3;
+                continue;
+            }
+            // escaped wildcard: consume the '*' only, keeping the span in escaped space
+            i_pattern += 1;
+            normalize = false;
+        }
+        if pattern[i_pattern] == b'*' {
+            // consume up to the character that terminates the wildcard span
+            let remaining = &path[i_path..];
+            let mut until = remaining.len();
+            if i_pattern < pattern.len() - 1 {
+                let next_ch = pattern[i_pattern + 1];
+                match remaining.iter().position(|byte| *byte == next_ch) {
+                    Some(position) => until = position,
+                    // terminating character of the wildcard span not found: definitely no match
+                    None => return false,
+                }
+            }
+            if until > 0 {
+                let span = &remaining[..until];
+                if normalize {
+                    match unescape_path(span) {
+                        Some(unescaped) => matched.extend_from_slice(&unescaped),
+                        None => return false,
+                    }
+                } else {
+                    matched.extend_from_slice(span);
+                }
+                i_path += until;
+            }
+        } else {
+            matched.push(path_ch);
+            i_path += path_ch_len;
+        }
+        i_pattern += 1;
+    }
+
+    // if the pattern was fully consumed before the path, the remaining path still has to be part
+    // of the compared string; otherwise a pattern without a trailing wildcard would behave like a
+    // prefix match. The pattern has no escape hints left here, so compare in normalised space.
+    if i_path < path.len() {
+        let remaining = &path[i_path..];
+        matched.extend_from_slice(&unescape_path(remaining).unwrap_or_else(|| remaining.to_vec()));
+    }
+
+    // the matched string is now in escaped space where the pattern asked for it, so `%*` wildcards
+    // can be treated as regular wildcards
+    let pattern = match_pattern.replace("%*", "*");
+    escaped_path_glob_match(&pattern, &String::from_utf8_lossy(&matched))
+}
+
+/// Glob used by the escaped-path matcher: like [`glob_match`], but a wildcard never crosses a path
+/// separator (Go `path.Match`), so a wildcard span cannot absorb a `/`.
+fn escaped_path_glob_match(pattern: &str, value: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let value: Vec<char> = value.chars().collect();
+    let (mut p, mut v) = (0, 0);
+    // pattern index after the last wildcard, and the start of the span it has consumed so far
+    let mut star: Option<(usize, usize)> = None;
+    loop {
+        if v == value.len() {
+            while p < pattern.len() && pattern[p] == '*' {
+                p += 1;
+            }
+            return p == pattern.len();
+        }
+        if p < pattern.len() && pattern[p] == '*' {
+            star = Some((p + 1, v));
+            p += 1;
+        } else if p < pattern.len()
+            && (pattern[p] == value[v] || (pattern[p] == '?' && value[v] != '/'))
+        {
+            p += 1;
+            v += 1;
+        } else if let Some((star_pattern, star_start)) = star {
+            // extend the wildcard span by one character, but never across a path separator
+            if value[star_start] == '/' {
+                return false;
+            }
+            star = Some((star_pattern, star_start + 1));
+            p = star_pattern;
+            v = star_start + 1;
+        } else {
+            return false;
+        }
+    }
+}
+
+/// Decode the escape sequence `%XX` at the start of `sequence`.
+fn decode_escape_sequence(sequence: &[u8]) -> Option<u8> {
+    let high = hex_value(*sequence.get(1)?)?;
+    let low = hex_value(*sequence.get(2)?)?;
+    Some(high * 16 + low)
+}
+
+/// Decode `%XX` sequences like Go's `url.PathUnescape`, failing on malformed sequences.
+fn unescape_path(input: &[u8]) -> Option<Vec<u8>> {
+    let mut output = Vec::with_capacity(input.len());
+    let mut index = 0;
+    while index < input.len() {
+        if input[index] == b'%' {
+            output.push(decode_escape_sequence(input.get(index..index + 3)?)?);
+            index += 3;
+        } else {
+            output.push(input[index]);
+            index += 1;
+        }
+    }
+    Some(output)
+}
+
 /// Percent-decode a URI component, leaving malformed escapes untouched.
 pub fn percent_decode(input: &str) -> String {
     let bytes = input.as_bytes();
@@ -1815,6 +1968,70 @@ mod tests {
         assert!(matcher.matches(&request("/api/users", "x")));
         assert!(!matcher.matches(&request("/other", "x")));
         assert!(glob_match("/foo*bar", "/foo/baz/bar", false));
+    }
+
+    #[test]
+    fn path_matcher_keeps_escaped_cursor_at_wildcard_span_start() {
+        // Port of upstream Caddy c3fab6576f0e `TestEscapedPathWildcardCursor`.
+        //
+        // A `%` in a `path` pattern means "compare that part of the request path in raw/escaped
+        // space". A wildcard span must never swallow a percent-encoded slash (`%2f`): otherwise an
+        // unauthenticated client can craft a path that matches a `path` pattern it must not match
+        // (e.g. entering a privileged `/admin*`-style route or skipping a `not path` exclusion),
+        // which is a matcher-integrity/access-control bypass.
+        for (pattern, target, want) in [
+            // true: the escaped slash is not inside the wildcard span
+            ("/foo*bar%2f", "/fooXbar%2f", true),
+            ("/foo*bar%2f", "/foobar%2f", true),
+            ("/foo*bar%2f", "/foo%41bar%2f", true),
+            ("/foo*bar%2f", "/foo%252fbar%2f", true),
+            ("/foo%2f*bar%2f", "/foo%2fXbar%2f", true),
+            ("/foo%2f*", "/foo%2f%41", true),
+            ("/foo%*bar%2f", "/foo%2fbar%2f", true),
+            // false: a wildcard span would have to absorb an encoded (or literal) slash
+            ("/foo*bar%2f", "/foo/bar/", false),
+            ("/foo*bar%2f", "/foo/bar%2f", false),
+            ("/foo*bar%2f", "/foo%2fbar%2f", false),
+            ("/foo*bar%2f", "/foo%2Fbar%2F", false),
+            ("/foo%2f*bar%2f", "/foo%2f%2fbar%2f", false),
+            ("/foo%2f*", "/foo%2f%2f", false),
+            ("/foo%*bar%2f", "/foo/bar%2f", false),
+        ] {
+            let matcher = PathMatcher {
+                patterns: vec![pattern.to_string()],
+            };
+            assert_eq!(
+                matcher.matches(&request(target, "example.com")),
+                want,
+                "path {pattern} vs {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_matcher_escaped_patterns_are_exact_and_compare_in_escaped_space() {
+        // Boundary cases for the escape-aware matcher (upstream c3fab6576f0e): a pattern with
+        // escapes is an exact match, an escape only matches the same escape in the request path
+        // (not its decoded form), and a wildcard span never crosses a path separator.
+        for (pattern, target, want) in [
+            ("/foo%2fbar", "/foo%2fbar", true),
+            ("/foo%2fbar", "/foo%2fbarbaz", false),
+            ("/foo%2fbar", "/foo/bar", false),
+            ("/foo%2fbar", "/foo%2fbar%2f", false),
+            ("/foo%*bar", "/foo%2fbar", true),
+            ("/foo%*bar", "/foo/bar", false),
+            ("/foo%2f*", "/foo%2f", true),
+            ("/foo%2f*", "/foo%2fbar/baz", false),
+        ] {
+            let matcher = PathMatcher {
+                patterns: vec![pattern.to_string()],
+            };
+            assert_eq!(
+                matcher.matches(&request(target, "example.com")),
+                want,
+                "path {pattern} vs {target}"
+            );
+        }
     }
 
     #[test]

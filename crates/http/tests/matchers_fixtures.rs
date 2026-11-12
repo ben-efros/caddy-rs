@@ -246,3 +246,63 @@ fn adapted_matcher_configs_validate_with_the_right_registry() {
     validate_config(&oracle, &ModuleRegistry::builtin())
         .expect("protocol/tls matcher JSON validates");
 }
+
+/// Upstream Caddy c3fab6576f0e: a `path` wildcard span must not swallow a percent-encoded slash.
+///
+/// A `%` in a `path` pattern means that part of the request path is compared in raw/escaped space.
+/// Before the port, the wildcard span of `/reports*%2f` absorbed the `/` in `/reports/q1%2f`, so a
+/// crafted path entered a route gated on the escaped form it must not match (matcher-integrity /
+/// access-control bypass).
+#[tokio::test]
+async fn encoded_slash_path_does_not_enter_a_path_gated_route() {
+    let routes = json!([
+        {"match": [{"path": ["/reports%2f*"]}],
+         "handle": [{"handler": "static_response", "body": "escaped-report"}]},
+        {"match": [{"path": ["/reports*%2f"]}],
+         "handle": [{"handler": "static_response", "body": "escaped-suffix"}]},
+        {"handle": [{"handler": "static_response", "body": "public"}]}
+    ]);
+    let router = RouterBuilder::new()
+        .build(routes.as_array().unwrap())
+        .expect("path matcher routes construct");
+
+    // Positive control: the escaped form the gated route asks for is matched.
+    let response = router
+        .handle(request("/reports%2fq1"))
+        .await
+        .expect("serves");
+    assert_eq!(response.body, Bytes::from_static(b"escaped-report"));
+
+    // The crafted path keeps a literal `/` where the pattern requires `%2f`; it must not be
+    // swallowed into the wildcard span, so neither escaped-path route may match.
+    let response = router
+        .handle(request("/reports/q1%2f"))
+        .await
+        .expect("serves");
+    assert_eq!(response.body, Bytes::from_static(b"public"));
+}
+
+/// The same defect seen from a `not path` exclusion: before the port, `/reports/q1%2f` matched the
+/// excluded `/reports*%2f` form, was therefore skipped by the checked route and fell through to the
+/// privileged handler.
+#[tokio::test]
+async fn encoded_slash_path_does_not_skip_a_path_exclusion() {
+    let routes = json!([
+        {"match": [{"not": [{"path": ["/reports*%2f"]}]}],
+         "handle": [{"handler": "static_response", "body": "checked"}]},
+        {"handle": [{"handler": "static_response", "body": "privileged"}]}
+    ]);
+    let router = RouterBuilder::new()
+        .build(routes.as_array().unwrap())
+        .expect("not path matcher routes construct");
+
+    let response = router
+        .handle(request("/reports/q1%2f"))
+        .await
+        .expect("serves");
+    assert_eq!(response.body, Bytes::from_static(b"checked"));
+
+    // A path that is not the excluded escaped form is handled the same way.
+    let response = router.handle(request("/reports/q1")).await.expect("serves");
+    assert_eq!(response.body, Bytes::from_static(b"checked"));
+}
