@@ -411,6 +411,451 @@ fn parse_hsts(value: &Value, path: &str) -> Result<Option<HstsConfig>> {
     Ok(Some(config))
 }
 
+/// `Referrer-Policy` tokens defined by the Fetch standard, accepted by
+/// [`SecurityHeadersConfig::from_headers_block`].
+const REFERRER_POLICY_TOKENS: [&str; 8] = [
+    "no-referrer",
+    "no-referrer-when-downgrade",
+    "origin",
+    "origin-when-cross-origin",
+    "same-origin",
+    "strict-origin",
+    "strict-origin-when-cross-origin",
+    "unsafe-url",
+];
+
+/// Whether `value` carries a `{...}` placeholder that is only resolvable per request.
+///
+/// Values that do are exempt from the closed-set checks below (an operator may legitimately
+/// write `ALLOW-FROM {http.request.host}`), but they are still validated as header values and,
+/// after expansion, at request time by [`SecurityHeaders::stage_defaults`].
+fn has_placeholder(value: &str) -> bool {
+    value.contains('{')
+}
+
+/// Parse the `security_headers` block nested inside a `headers` handler (T-ROUTE-050).
+///
+/// This is the same [`SecurityHeadersConfig`] as the standalone `security_headers` handler, with
+/// the field names the task specifies and a few additive forms:
+///
+/// * `content_security_policy`: a header-value string, or an object mapping directive names to a
+///   source list (a string or an array of strings). The object form is rendered to the canonical
+///   `dir src...; dir2 src...` value; an empty array renders a valueless directive such as
+///   `upgrade-insecure-requests`. Opt-in: absent means no CSP header.
+/// * `x_frame_options`: `DENY`, `SAMEORIGIN`, or `ALLOW-FROM <origin>` (the origin is required and
+///   must be a URI). `false` suppresses the header.
+/// * `x_content_type_options`: `nosniff` (the only valid value). `false` suppresses the header.
+/// * `referrer_policy`: one of the Fetch standard tokens. `false` suppresses the header.
+/// * `hsts`: an object with `enabled` (default `false`), `max_age` (default one year),
+///   `include_subdomains` and `preload`. Emitted only when `enabled` is `true`.
+/// * `permissions_policy`: an object mapping feature names to an allowlist (a string used
+///   verbatim, an array of origins rendered as `(origin ...)`, `true` rendered as `*`, or `false`
+///   rendered as `()`), or a string used verbatim.
+///
+/// The legacy names `frame_options`, `content_type_options` and `strict_transport_security` are
+/// accepted as aliases so a configuration can move between the two handlers unchanged. Unknown
+/// keys and invalid values are rejected at load time with a located error naming the field, for
+/// example `route.handle[0].security_headers.x_frame_options`.
+impl SecurityHeadersConfig {
+    pub fn from_headers_block(value: &Value, path: &str) -> Result<Self> {
+        let object = value
+            .as_object()
+            .ok_or_else(|| invalid(path, "security_headers must be an object"))?;
+        let mut config = Self::default();
+        for (field, value) in object {
+            let field_path = format!("{path}.{field}");
+            match field.as_str() {
+                // The handler discriminator is consumed by the router.
+                "handler" => {}
+                "x_frame_options" | "frame_options" => {
+                    config.x_frame_options = parse_x_frame_options(value, &field_path)?
+                }
+                "x_content_type_options" | "content_type_options" => {
+                    config.x_content_type_options =
+                        parse_x_content_type_options(value, &field_path)?
+                }
+                "referrer_policy" => {
+                    config.referrer_policy = parse_referrer_policy(value, &field_path)?
+                }
+                "content_security_policy" => {
+                    config.content_security_policy = parse_csp_block(value, &field_path)?
+                }
+                "permissions_policy" => {
+                    config.permissions_policy = parse_permissions_policy(value, &field_path)?
+                }
+                "hsts" | "strict_transport_security" => {
+                    config.strict_transport_security = parse_hsts_block(value, &field_path)?
+                }
+                other => {
+                    return Err(invalid(
+                        &field_path,
+                        format!("unknown security_headers option `{other}`"),
+                    ))
+                }
+            }
+        }
+        config.validate().map_err(|error| relocate(error, path))?;
+        Ok(config)
+    }
+}
+
+/// Re-locate a [`SecurityHeadersConfig::validate`] error path onto the `security_headers` block.
+///
+/// `validate` reports the standalone handler's field names; the block calls HSTS `hsts`, so the
+/// prefix is rewritten before the document path is prepended.
+fn relocate(error: Error, path: &str) -> Error {
+    match error {
+        Error::InvalidConfig {
+            path: inner,
+            message,
+        } => {
+            let inner = match inner.strip_prefix("strict_transport_security.") {
+                Some(rest) => format!("hsts.{rest}"),
+                None => inner,
+            };
+            invalid(&format!("{path}.{inner}"), message)
+        }
+        other => other,
+    }
+}
+
+/// Parse `x_frame_options`: `DENY`, `SAMEORIGIN`, or `ALLOW-FROM <origin>`.
+fn parse_x_frame_options(value: &Value, path: &str) -> Result<Option<String>> {
+    let Some(raw) = parse_optional_string(value, path)? else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    let (keyword, rest) = match trimmed.split_once(char::is_whitespace) {
+        Some((keyword, rest)) => (keyword, rest.trim()),
+        None => (trimmed, ""),
+    };
+    match keyword.to_ascii_uppercase().as_str() {
+        "ALLOW-FROM" => {
+            if rest.is_empty() {
+                return Err(invalid(
+                    path,
+                    "ALLOW-FROM requires an origin, for example \
+                     \"ALLOW-FROM https://example.com\"; use DENY or SAMEORIGIN to allow framing",
+                ));
+            }
+            if !has_placeholder(rest) && rest.parse::<http::Uri>().is_err() {
+                return Err(invalid(
+                    path,
+                    format!("ALLOW-FROM value `{rest}` is not a valid URI"),
+                ));
+            }
+            Ok(Some(trimmed.to_string()))
+        }
+        "DENY" | "SAMEORIGIN" => {
+            if !rest.is_empty() {
+                return Err(invalid(
+                    path,
+                    format!("X-Frame-Options `{keyword}` takes no value, got `{trimmed}`"),
+                ));
+            }
+            Ok(Some(keyword.to_ascii_uppercase()))
+        }
+        _ => Err(invalid(
+            path,
+            format!("x_frame_options must be DENY, SAMEORIGIN or ALLOW-FROM <origin>, got `{raw}`"),
+        )),
+    }
+}
+
+/// Parse `x_content_type_options`: the only meaningful value is `nosniff`.
+fn parse_x_content_type_options(value: &Value, path: &str) -> Result<Option<String>> {
+    let Some(raw) = parse_optional_string(value, path)? else {
+        return Ok(None);
+    };
+    // A placeholder is allowed for symmetry with the other fields; it is validated after
+    // expansion at request time, and `nosniff` is the only value a browser acts on.
+    if has_placeholder(&raw) {
+        return Ok(Some(raw));
+    }
+    if !raw
+        .trim()
+        .eq_ignore_ascii_case(DEFAULT_X_CONTENT_TYPE_OPTIONS)
+    {
+        return Err(invalid(
+            path,
+            format!(
+                "x_content_type_options must be `{DEFAULT_X_CONTENT_TYPE_OPTIONS}`, got `{raw}`"
+            ),
+        ));
+    }
+    Ok(Some(DEFAULT_X_CONTENT_TYPE_OPTIONS.to_string()))
+}
+
+/// Parse `referrer_policy`: one of the Fetch standard tokens (or a placeholder).
+fn parse_referrer_policy(value: &Value, path: &str) -> Result<Option<String>> {
+    let Some(raw) = parse_optional_string(value, path)? else {
+        return Ok(None);
+    };
+    let token = raw.trim().to_ascii_lowercase();
+    if !has_placeholder(&raw) && !REFERRER_POLICY_TOKENS.contains(&token.as_str()) {
+        return Err(invalid(
+            path,
+            format!(
+                "referrer_policy `{raw}` is not a known policy; expected one of {}",
+                REFERRER_POLICY_TOKENS.join(", ")
+            ),
+        ));
+    }
+    Ok(Some(raw))
+}
+
+/// Parse `content_security_policy`: a header-value string or a directive object.
+fn parse_csp_block(value: &Value, path: &str) -> Result<Option<String>> {
+    match value {
+        Value::Null | Value::Bool(false) => Ok(None),
+        Value::String(text) if text == "false" => Ok(None),
+        Value::String(text) => Ok(Some(text.clone())),
+        Value::Object(object) => {
+            if object.is_empty() {
+                return Err(invalid(
+                    path,
+                    "a CSP policy must declare at least one directive",
+                ));
+            }
+            let mut rendered = Vec::with_capacity(object.len());
+            for (name, sources) in object {
+                let directive_path = format!("{path}.{name}");
+                validate_csp_directive_name(name, &directive_path)?;
+                let sources = parse_csp_sources(sources, &directive_path)?;
+                if sources.is_empty() {
+                    rendered.push(name.clone());
+                } else {
+                    rendered.push(format!("{name} {}", sources.join(" ")));
+                }
+            }
+            Ok(Some(rendered.join("; ")))
+        }
+        other => Err(invalid(
+            path,
+            format!("content_security_policy must be a string or an object, got {other}"),
+        )),
+    }
+}
+
+/// Validate a CSP directive name: an ASCII token without whitespace, `;` or `=`.
+fn validate_csp_directive_name(name: &str, path: &str) -> Result<()> {
+    let valid = !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-');
+    if !valid {
+        return Err(invalid(
+            path,
+            format!("`{name}` is not a valid CSP directive name"),
+        ));
+    }
+    Ok(())
+}
+
+/// Parse one CSP directive's source list: a whitespace-separated string or an array of strings.
+fn parse_csp_sources(value: &Value, path: &str) -> Result<Vec<String>> {
+    let sources: Vec<String> = match value {
+        Value::String(text) => text.split_whitespace().map(str::to_string).collect(),
+        Value::Array(items) => {
+            let mut sources = Vec::with_capacity(items.len());
+            for (index, item) in items.iter().enumerate() {
+                let item = item.as_str().ok_or_else(|| {
+                    invalid(&format!("{path}[{index}]"), "expected a source string")
+                })?;
+                sources.push(item.to_string());
+            }
+            sources
+        }
+        other => {
+            return Err(invalid(
+                path,
+                format!("expected a source list string or an array of sources, got {other}"),
+            ))
+        }
+    };
+    for (index, source) in sources.iter().enumerate() {
+        let source_path = if matches!(value, Value::Array(_)) {
+            format!("{path}[{index}]")
+        } else {
+            path.to_string()
+        };
+        validate_allowlist_token(source, &source_path)?;
+    }
+    Ok(sources)
+}
+
+/// Parse `permissions_policy`: a header-value string or a feature object.
+fn parse_permissions_policy(value: &Value, path: &str) -> Result<Option<String>> {
+    match value {
+        Value::Null | Value::Bool(false) => Ok(None),
+        Value::String(text) if text == "false" => Ok(None),
+        Value::String(text) => Ok(Some(text.clone())),
+        Value::Object(object) => {
+            if object.is_empty() {
+                return Err(invalid(
+                    path,
+                    "permissions_policy must declare at least one feature",
+                ));
+            }
+            let mut rendered = Vec::with_capacity(object.len());
+            for (feature, allowlist) in object {
+                let feature_path = format!("{path}.{feature}");
+                validate_feature_name(feature, &feature_path)?;
+                let allowlist = match allowlist {
+                    Value::String(text) => {
+                        validate_allowlist_token(text, &feature_path)?;
+                        text.clone()
+                    }
+                    Value::Array(items) => {
+                        let mut origins = Vec::with_capacity(items.len());
+                        for (index, item) in items.iter().enumerate() {
+                            let item = item.as_str().ok_or_else(|| {
+                                invalid(
+                                    &format!("{feature_path}[{index}]"),
+                                    "expected an origin string",
+                                )
+                            })?;
+                            validate_allowlist_token(item, &format!("{feature_path}[{index}]"))?;
+                            origins.push(item.to_string());
+                        }
+                        format!("({})", origins.join(" "))
+                    }
+                    Value::Bool(true) => "*".to_string(),
+                    Value::Bool(false) => "()".to_string(),
+                    other => {
+                        return Err(invalid(
+                            &feature_path,
+                            format!(
+                                "expected an origin list string, an array of origins or a boolean, \
+                                 got {other}"
+                            ),
+                        ))
+                    }
+                };
+                rendered.push(format!("{feature}={allowlist}"));
+            }
+            Ok(Some(rendered.join(", ")))
+        }
+        other => Err(invalid(
+            path,
+            format!("permissions_policy must be a string or an object, got {other}"),
+        )),
+    }
+}
+
+/// Validate a `permissions_policy` feature name: lowercase ASCII letters, digits and `-`.
+fn validate_feature_name(name: &str, path: &str) -> Result<()> {
+    let valid = !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    if !valid {
+        return Err(invalid(
+            path,
+            format!("`{name}` is not a valid permissions policy feature name"),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate one origin/allowlist token: non-empty ASCII, no whitespace or separators.
+fn validate_allowlist_token(token: &str, path: &str) -> Result<()> {
+    let valid = !token.is_empty()
+        && token.is_ascii()
+        && !token
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b';' | b',' | b'(' | b')'));
+    if !valid {
+        return Err(invalid(
+            path,
+            format!("`{token}` is not a valid origin or allowlist token"),
+        ));
+    }
+    Ok(())
+}
+
+/// Parse the `hsts` object of a `headers` handler's `security_headers` block.
+///
+/// `enabled` gates emission: `false` (the default) means no `Strict-Transport-Security` header is
+/// ever emitted, whatever the other fields say. The other fields are still type- and range-checked
+/// so a typo is a load-time error rather than a silently ignored setting.
+fn parse_hsts_block(value: &Value, path: &str) -> Result<Option<HstsConfig>> {
+    if matches!(value, Value::Bool(true)) {
+        return Ok(Some(HstsConfig::default()));
+    }
+    let object = match value {
+        Value::Null | Value::Bool(false) => return Ok(None),
+        Value::String(text) if text == "false" => return Ok(None),
+        Value::Object(object) => object,
+        other => {
+            return Err(invalid(
+                path,
+                format!("hsts must be an object or false, got {other}"),
+            ))
+        }
+    };
+    let mut config = HstsConfig::default();
+    let mut enabled = false;
+    for (field, value) in object {
+        let field_path = format!("{path}.{field}");
+        match field.as_str() {
+            "enabled" => {
+                enabled = value
+                    .as_bool()
+                    .ok_or_else(|| invalid(&field_path, "enabled must be a boolean"))?;
+            }
+            "max_age" => {
+                config.max_age = value.as_u64().ok_or_else(|| {
+                    invalid(&field_path, "max_age must be a non-negative integer")
+                })?;
+            }
+            "include_subdomains" => {
+                config.include_subdomains = value
+                    .as_bool()
+                    .ok_or_else(|| invalid(&field_path, "include_subdomains must be a boolean"))?;
+            }
+            "preload" => {
+                config.preload = value
+                    .as_bool()
+                    .ok_or_else(|| invalid(&field_path, "preload must be a boolean"))?;
+            }
+            other => {
+                return Err(invalid(
+                    &field_path,
+                    format!("unknown hsts option `{other}`"),
+                ))
+            }
+        }
+    }
+    // Range checks apply even when `enabled` is false: a mistyped max_age is a configuration bug
+    // either way, and silently ignoring it would surface only after the flag is flipped.
+    if config.max_age == 0 {
+        return Err(invalid(
+            &format!("{path}.max_age"),
+            "max_age must be greater than 0",
+        ));
+    }
+    if config.max_age < HSTS_MIN_MAX_AGE {
+        return Err(invalid(
+            &format!("{path}.max_age"),
+            format!(
+                "max_age must be at least {HSTS_MIN_MAX_AGE} seconds (180 days); browsers ignore \
+                 shorter values"
+            ),
+        ));
+    }
+    if config.preload && !config.include_subdomains {
+        return Err(invalid(
+            &format!("{path}.preload"),
+            "preload requires include_subdomains to be enabled",
+        ));
+    }
+    if !enabled {
+        return Ok(None);
+    }
+    Ok(Some(config))
+}
+
 /// `security_headers`: stage security response headers with secure defaults.
 ///
 /// Construct with [`SecurityHeaders::new`] (validates the configuration) and run it as a
@@ -483,6 +928,31 @@ impl SecurityHeaders {
     /// request variable containing control bytes). Configured values were validated at construction
     /// time, so only placeholder expansion can produce such a value.
     pub fn stage(&self, request: &mut Request) -> Result<()> {
+        for (name, value) in self.staged(request)? {
+            request.pending_response_headers.insert(name, value);
+        }
+        Ok(())
+    }
+
+    /// Stage the configured security headers only where the pending response does not already
+    /// carry them.
+    ///
+    /// This is the "defaults" form used by the `headers` handler's `security_headers` block: a
+    /// header staged earlier (by another handler, or by an explicit `headers.response.set` in the
+    /// same handler) is never clobbered, so explicit configuration always wins over the security
+    /// defaults.
+    pub fn stage_defaults(&self, request: &mut Request) -> Result<()> {
+        for (name, value) in self.staged(request)? {
+            request
+                .pending_response_headers
+                .entry(name)
+                .or_insert(value);
+        }
+        Ok(())
+    }
+
+    /// Expand and parse every configured header into `(name, value)` pairs.
+    fn staged(&self, request: &Request) -> Result<Vec<(HeaderName, HeaderValue)>> {
         let config = &self.config;
         let mut staged: Vec<(HeaderName, HeaderValue)> = Vec::new();
         if let Some(value) = &config.x_frame_options {
@@ -511,10 +981,7 @@ impl SecurityHeaders {
         if let Some(value) = &config.permissions_policy {
             staged.push(expand(request, "permissions-policy", value)?);
         }
-        for (name, value) in staged {
-            request.pending_response_headers.insert(name, value);
-        }
-        Ok(())
+        Ok(staged)
     }
 }
 
