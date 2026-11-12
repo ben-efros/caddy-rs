@@ -1554,6 +1554,11 @@ pub fn adapt_with_options(
     }
 
     let mut config = Map::new();
+    if options.stock_compat {
+        // caddy-rs extension (DIV-0130): only emitted when enabled, so a configuration that does
+        // not use the switch adapts exactly as before.
+        config.insert("stock_compat".to_string(), json!(true));
+    }
     if options.admin.is_some() || options.persist_config_off {
         let mut admin_object = Map::new();
         let admin = options.admin.clone().unwrap_or_default();
