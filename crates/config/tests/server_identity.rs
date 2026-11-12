@@ -55,6 +55,13 @@ fn malformed_forms_are_located_errors() {
         "server_identity default extra",
         "server_identity custom",
         "server_identity custom \"\"",
+        // DIV-0126: a custom value that cannot be an HTTP header value is refused at adapt time
+        // with the directive's location instead of being silently dropped by the header writer.
+        "server_identity custom \"Acme\u{7}Server\"",
+        "server_identity custom \"Acme\u{0}Server\"",
+        "server_identity custom \"Acme\u{7f}Server\"",
+        "server_identity custom \"Acme\tServer\"",
+        "server_identity custom \"Acme\u{e9}Server\"",
     ] {
         let error = adapt(&caddyfile(directive))
             .err()
@@ -69,4 +76,19 @@ fn malformed_forms_are_located_errors() {
             "{directive:?} error must name the directive, got {message}"
         );
     }
+}
+
+#[test]
+fn invalid_custom_identity_names_the_offending_character() {
+    let caddyfile = "{\n\tservers {\n\t\tserver_identity custom \"Acme\u{7}Server\"\n\t}\n}\n\n:8080 {\n\trespond \"ok\"\n}\n";
+    let error = adapt(caddyfile).err().expect("control character rejected");
+    let message = error.to_string();
+    assert!(
+        message.contains("U+0007") && message.contains("HTTP `Server` header"),
+        "the error must explain the offending character and the target header, got {message}"
+    );
+    assert!(
+        !message.contains("/root/") && !message.contains(".rs:"),
+        "the error must not leak a filesystem path, got {message}"
+    );
 }

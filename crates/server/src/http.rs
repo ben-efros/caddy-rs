@@ -162,9 +162,12 @@ pub(crate) async fn serve_request_with_automatic(
         ServedResponse::Response(response) => response,
         ServedResponse::Upgraded { .. } => {
             // `on_upgrade` is None here, so the upgradable function never returns this variant.
-            status_response(
-                StatusCode::BAD_GATEWAY,
-                "502 Bad Gateway: protocol upgrade requires the connection layer",
+            response_with_identity(
+                limits,
+                status_response(
+                    StatusCode::BAD_GATEWAY,
+                    "502 Bad Gateway: protocol upgrade requires the connection layer",
+                ),
             )
         }
     }
@@ -205,18 +208,24 @@ pub(crate) async fn serve_internal_buffered(
                 path = %path,
                 "request body exceeds max_request_body_size"
             );
-            return ServedResponse::Response(status_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "413 Request Entity Too Large",
-            ));
+            return served_response_with_identity(
+                limits,
+                status_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "413 Request Entity Too Large",
+                ),
+            );
         }
     }
     if let Some(limit) = limit {
         if body.len() as u64 > limit {
-            return ServedResponse::Response(status_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "413 Request Entity Too Large",
-            ));
+            return served_response_with_identity(
+                limits,
+                status_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "413 Request Entity Too Large",
+                ),
+            );
         }
     }
     let mut internal = Request::new(parts.method, parts.uri);
@@ -253,21 +262,27 @@ pub(crate) async fn serve_internal_buffered(
         Ok(ResponseOutcome::Response(response)) => ServedResponse::Response(
             to_hyper_streaming_with_identity(response, &limits.server_identity),
         ),
-        Ok(ResponseOutcome::Upgrade(_)) => ServedResponse::Response(status_response(
-            StatusCode::NOT_IMPLEMENTED,
-            crate::listeners::H3_UPGRADE_UNSUPPORTED_BODY,
-        )),
+        Ok(ResponseOutcome::Upgrade(_)) => served_response_with_identity(
+            limits,
+            status_response(
+                StatusCode::NOT_IMPLEMENTED,
+                crate::listeners::H3_UPGRADE_UNSUPPORTED_BODY,
+            ),
+        ),
         Err(error) => match error.handler_status() {
-            Some(status) => ServedResponse::Response(status_response(
-                status,
-                status.canonical_reason().unwrap_or("error"),
-            )),
+            Some(status) => served_response_with_identity(
+                limits,
+                status_response(status, status.canonical_reason().unwrap_or("error")),
+            ),
             None => {
                 eprintln!("caddy-rs: handler error: {error}");
-                ServedResponse::Response(status_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "500 Internal Server Error",
-                ))
+                served_response_with_identity(
+                    limits,
+                    status_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "500 Internal Server Error",
+                    ),
+                )
             }
         },
     }
@@ -323,7 +338,7 @@ pub(crate) async fn serve_request_with_automatic_upgradable(
                     tracing::debug!(
                         "rejecting HTTP/2 extended CONNECT: GODEBUG=http2xconnect=1 is not set"
                     );
-                    return ServedResponse::Response(status_response(
+                    return served_response_with_identity(limits, status_response(
                         StatusCode::NOT_IMPLEMENTED,
                         "501 Not Implemented: HTTP/2 extended CONNECT is disabled by default                          (Caddy/Go parity; set GODEBUG=http2xconnect=1 to enable it)",
                     ));
@@ -336,21 +351,27 @@ pub(crate) async fn serve_request_with_automatic_upgradable(
                     protocol,
                     "rejecting unsupported HTTP/2 extended CONNECT protocol"
                 );
-                return ServedResponse::Response(status_response_owned(
-                    StatusCode::NOT_IMPLEMENTED,
-                    format!(
-                        "501 Not Implemented: unsupported HTTP/2 extended CONNECT `:protocol` \
+                return served_response_with_identity(
+                    limits,
+                    status_response_owned(
+                        StatusCode::NOT_IMPLEMENTED,
+                        format!(
+                            "501 Not Implemented: unsupported HTTP/2 extended CONNECT `:protocol` \
                          `{protocol}` (only `websocket` is supported)"
+                        ),
                     ),
-                ));
+                );
             }
             None => {
                 tracing::debug!("rejecting HTTP/2 CONNECT without `:protocol`");
-                return ServedResponse::Response(status_response(
-                    StatusCode::NOT_IMPLEMENTED,
-                    "501 Not Implemented: HTTP/2 CONNECT without the RFC 8441 `:protocol` \
+                return served_response_with_identity(
+                    limits,
+                    status_response(
+                        StatusCode::NOT_IMPLEMENTED,
+                        "501 Not Implemented: HTTP/2 CONNECT without the RFC 8441 `:protocol` \
                      pseudo-header",
-                ));
+                    ),
+                );
             }
         }
     }
@@ -397,10 +418,13 @@ pub(crate) async fn serve_request_with_automatic_upgradable(
                 path = %path,
                 "request body exceeds max_request_body_size"
             );
-            return ServedResponse::Response(status_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "413 Request Entity Too Large",
-            ));
+            return served_response_with_identity(
+                limits,
+                status_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "413 Request Entity Too Large",
+                ),
+            );
         }
     }
 
@@ -461,17 +485,20 @@ pub(crate) async fn serve_request_with_automatic_upgradable(
                     path = %path,
                     "request body exceeds max_request_body_size"
                 );
-                return ServedResponse::Response(status_response(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "413 Request Entity Too Large",
-                ));
+                return served_response_with_identity(
+                    limits,
+                    status_response(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "413 Request Entity Too Large",
+                    ),
+                );
             }
             Err(BodyReadError::Read(error)) => {
                 eprintln!("caddy-rs: cannot read request body: {error}");
-                return ServedResponse::Response(status_response(
-                    StatusCode::BAD_REQUEST,
-                    "400 Bad Request",
-                ));
+                return served_response_with_identity(
+                    limits,
+                    status_response(StatusCode::BAD_REQUEST, "400 Bad Request"),
+                );
             }
         };
         // Caddy's `bytes_read` is the actual bytes read from the transport: a buffered body was
@@ -510,10 +537,13 @@ pub(crate) async fn serve_request_with_automatic_upgradable(
                     "caddy-rs: upstream switched protocols but the client connection cannot \
                      upgrade; serving 502"
                 );
-                return ServedResponse::Response(status_response(
-                    StatusCode::BAD_GATEWAY,
-                    "502 Bad Gateway: client connection cannot be upgraded",
-                ));
+                return served_response_with_identity(
+                    limits,
+                    status_response(
+                        StatusCode::BAD_GATEWAY,
+                        "502 Bad Gateway: client connection cannot be upgraded",
+                    ),
+                );
             };
             // RFC 8441: the server answers the extended CONNECT with a 2xx response (no 101 and no
             // WebSocket handshake headers); hyper then keeps the h2 stream open and fulfils
@@ -571,16 +601,19 @@ pub(crate) async fn serve_request_with_automatic_upgradable(
             // Caddy writes the recommended HandlerError status (the error routes, when
             // configured, already had their chance inside the router).
             match error.handler_status() {
-                Some(status) => ServedResponse::Response(status_response(
-                    status,
-                    status.canonical_reason().unwrap_or("error"),
-                )),
+                Some(status) => served_response_with_identity(
+                    limits,
+                    status_response(status, status.canonical_reason().unwrap_or("error")),
+                ),
                 None => {
                     eprintln!("caddy-rs: handler error: {error}");
-                    ServedResponse::Response(status_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "500 Internal Server Error",
-                    ))
+                    served_response_with_identity(
+                        limits,
+                        status_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "500 Internal Server Error",
+                        ),
+                    )
                 }
             }
         }
@@ -634,18 +667,46 @@ pub fn to_hyper(response: Response) -> hyper::Response<Body> {
 /// (caddy-rs extension, T-CONF-060).
 ///
 /// Caddy sets the header before routing, so a handler may override it: an explicit `Server`
-/// header is preserved here. `none` mode adds nothing.
+/// header is preserved here. `none` mode adds nothing, and an identity that is already present is
+/// left alone (this runs on both the routed path and the pre-routing/error path).
 pub(crate) fn apply_server_identity(
     response: &mut hyper::Response<Body>,
     identity: &caddy_rs_core::ServerIdentity,
 ) {
     if let Some(value) = identity.http_header_value() {
         if !response.headers().contains_key(http::header::SERVER) {
+            // Defensive: `ServerIdentity::parse` rejects every custom value that hyper cannot
+            // store (`crates/core/src/identity.rs`, DIV-0126), so configuration load fails before
+            // this point and this branch is unreachable from a real config. It is kept so a future
+            // identity source cannot silently drop the header: skip the header (the old
+            // behaviour) rather than fail the response.
             if let Ok(value) = http::HeaderValue::from_str(&value) {
                 response.headers_mut().insert(http::header::SERVER, value);
             }
         }
     }
+}
+
+/// Apply the configured identity to a response that the router did not produce.
+///
+/// Caddy writes its `Server` header before routing (oracle `server.go:631`), so even its own
+/// synthetic responses (`413`, pre-routing redirects, `5xx`) carry it; caddy-rs used to stamp only
+/// routed responses, which left those responses unidentifiable (DIV-0126). An explicit `Server`
+/// header that a handler already set is preserved, so this is a no-op for routed responses.
+fn response_with_identity(
+    limits: &ServerLimits,
+    mut response: hyper::Response<Body>,
+) -> hyper::Response<Body> {
+    apply_server_identity(&mut response, &limits.server_identity);
+    response
+}
+
+/// Wrap a response built before the router ran in [`ServedResponse`], with the identity stamped.
+fn served_response_with_identity(
+    limits: &ServerLimits,
+    response: hyper::Response<Body>,
+) -> ServedResponse {
+    ServedResponse::Response(response_with_identity(limits, response))
 }
 
 /// Convert an internal response and stamp the server identity onto it.
