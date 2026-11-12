@@ -5662,8 +5662,12 @@ mod tests {
     /// ```text
     /// SOFTHSM2_CONF=/root/caddy-rs/.scratch/logs/tls097/softhsm2.conf \
     ///   CARGO_HOME=... CARGO_TARGET_DIR=... \
-    ///   cargo test -p caddy-rs-tls --lib -- --ignored --nocapture
+    ///   cargo test -p caddy-rs-tls --lib -- --ignored --nocapture --test-threads=1
     /// ```
+    ///
+    /// Run the two token tests single-threaded: both open a pool on the same SoftHSM2 token,
+    /// and a second pool for one token is a configuration error in production (ADR-0009), so
+    /// the tests must not race each other for the token login state.
     #[tokio::test]
     #[ignore = "requires SoftHSM2"]
     async fn pkcs11_entry_marks_the_resolver_and_handshakes() {
@@ -5723,8 +5727,9 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(address)
             .await
             .expect("connect");
-        // The cert fixture's names come from the certificate itself.
-        let server_name = rustls::pki_types::ServerName::try_from("example.com")
+        // The fixture certificate's SAN is `rsa2048.caddy-rs.test`, `localhost`, `127.0.0.1`;
+        // the resolver only hands out the token certificate for a matching SNI.
+        let server_name = rustls::pki_types::ServerName::try_from("localhost")
             .expect("server name")
             .to_owned();
         let client_result = tokio::time::timeout(
