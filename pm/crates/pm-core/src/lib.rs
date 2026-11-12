@@ -708,6 +708,104 @@ impl HostTls {
     }
 }
 
+/// Security headers configuration shared between the PM API and the caddy-rs `headers` handler.
+///
+/// Mirrors `caddy_rs_http::security_headers::SecurityHeadersConfig` so the PM can store and serve
+/// the same schema Caddy consumes. Defaults apply the secure baseline:
+/// `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`,
+/// `Referrer-Policy: strict-origin-when-cross-origin`. CSP, HSTS and `Permissions-Policy` are
+/// opt-in (`None`). HSTS `preload` requires `max_age >= 15_552_000` (180 days).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SecurityHeadersConfig {
+    /// `Content-Security-Policy` value. `None` (default) emits no CSP header. Accepts a string
+    /// header value or a directive object mapping names to `src...` values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_security_policy: Option<String>,
+
+    /// `Strict-Transport-Security` configuration. `None` (default) emits no HSTS header.
+    /// `preload` requires `include_subdomains` and `max_age >= 15_552_000`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict_transport_security: Option<SecurityHeadersHstsConfig>,
+
+    /// `Permissions-Policy` value. `None` (default) emits no header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions_policy: Option<String>,
+
+    /// `X-Frame-Options` value; defaults to `DENY`. `None` suppresses it.
+    #[serde(
+        default = "default_x_frame_options",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub x_frame_options: Option<String>,
+
+    /// `X-Content-Type-Options` value; defaults to `nosniff`. `None` suppresses it.
+    #[serde(
+        default = "default_x_content_type_options",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub x_content_type_options: Option<String>,
+
+    /// `Referrer-Policy` value; defaults to `strict-origin-when-cross-origin`. `None`
+    /// suppresses it.
+    #[serde(
+        default = "default_referrer_policy",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub referrer_policy: Option<String>,
+}
+
+fn default_x_frame_options() -> Option<String> {
+    Some("DENY".to_string())
+}
+
+fn default_x_content_type_options() -> Option<String> {
+    Some("nosniff".to_string())
+}
+
+fn default_referrer_policy() -> Option<String> {
+    Some("strict-origin-when-cross-origin".to_string())
+}
+
+/// `Strict-Transport-Security` configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecurityHeadersHstsConfig {
+    /// `max-age` directive, in seconds. Must be at least 15_552_000 (180 days).
+    pub max_age: u64,
+    /// Emit `includeSubDomains`; required by `preload`.
+    pub include_subdomains: bool,
+    /// Emit the `preload` directive. Requires `include_subdomains`.
+    pub preload: bool,
+}
+
+impl SecurityHeadersConfig {
+    /// Reject configurations that are invalid or unsafe to emit.
+    pub fn validate(&self) -> Result<(), CoreError> {
+        if let Some(hsts) = &self.strict_transport_security {
+            if hsts.max_age == 0 {
+                return Err(CoreError::Invalid(
+                    "security_headers.strict_transport_security.max_age must be greater than 0"
+                        .to_string(),
+                ));
+            }
+            if hsts.max_age < 15_552_000 {
+                return Err(CoreError::Invalid(
+                    "security_headers.strict_transport_security.max_age must be at least \
+                     15552000 seconds (180 days)"
+                        .to_string(),
+                ));
+            }
+            if hsts.preload && !hsts.include_subdomains {
+                return Err(CoreError::Invalid(
+                    "security_headers.strict_transport_security.preload requires \
+                     include_subdomains"
+                        .to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Stable proxy-manager host identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct HostId(pub u64);
@@ -935,6 +1033,9 @@ pub struct Host {
     pub tls: HostTls,
     pub enabled: bool,
     pub spec: HostSpec,
+    /// Security headers configuration, inherited from the global config when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_headers: Option<SecurityHeadersConfig>,
 }
 
 impl Host {
@@ -945,6 +1046,7 @@ impl Host {
             tls,
             enabled: true,
             spec,
+            security_headers: None,
         }
     }
 

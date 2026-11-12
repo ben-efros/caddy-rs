@@ -584,6 +584,14 @@ pub fn create_router(state: ApiState) -> Router {
             get(certificates::get_custom_handler).delete(certificates::delete_custom_handler),
         )
         .route("/certificates/{id}", get(certificates::get_handler))
+        .route(
+            "/security-headers",
+            get(security_headers::get_global_handler).put(security_headers::put_global_handler),
+        )
+        .route(
+            "/hosts/{id}/security-headers",
+            get(security_headers::get_host_handler).put(security_headers::put_host_handler),
+        )
         .route("/config", get(config_handler))
         .route("/config/apply", post(apply::apply_handler))
         .route("/config/revisions", get(apply::revisions_handler))
@@ -697,6 +705,7 @@ mod apply;
 mod certificates;
 mod dto;
 mod hosts;
+mod security_headers;
 mod ui;
 
 pub use apply::ApplyResponse;
@@ -706,6 +715,7 @@ pub use certificates::{
     CustomCertificateRequest, EmptyCertificateInventory, InventoryError, ManualCertificateSummary,
     SharedCertificateInventory, EXPIRING_SOON_SECONDS,
 };
+pub use security_headers::{SecurityHeadersDto, SecurityHeadersHstsDto};
 
 #[cfg(test)]
 mod tests;

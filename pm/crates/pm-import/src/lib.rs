@@ -198,6 +198,7 @@ pub fn import_proxy(
             tls,
             enabled: payload.enabled,
             spec: HostSpec::Proxy(proxy),
+            security_headers: None,
         },
         proxy_warnings(payload),
     )
@@ -233,6 +234,7 @@ pub fn import_redirection(
             tls,
             enabled: payload.enabled,
             spec: HostSpec::Redirect(spec),
+            security_headers: None,
         },
         redirection_warnings(payload),
     )
@@ -262,6 +264,7 @@ pub fn import_dead(
             tls,
             enabled: payload.enabled,
             spec: HostSpec::Dead(DeadSpec),
+            security_headers: None,
         },
         dead_warnings(payload),
     )
