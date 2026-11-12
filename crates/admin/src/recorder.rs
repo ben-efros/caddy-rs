@@ -104,6 +104,34 @@ pub trait RequestRecorder: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Record that a request started, including Caddy's `host` label inputs.
+    ///
+    /// Caddy's `metricsInstrumentedRoute` adds the lowercased request host (or `_other`) when
+    /// `per_host` is configured. Recorders that do not label by host fall back to
+    /// [`RequestRecorder::request_started`], which records the same series without `host`; the
+    /// host/is-HTTPS inputs are then ignored.
+    fn request_started_for_host(
+        &self,
+        server: &str,
+        handler: &str,
+        _host: &str,
+        _is_https: bool,
+    ) -> Result<RequestGuard, MetricsError> {
+        self.request_started(server, handler)
+    }
+
+    /// Record one completed request, including Caddy's `host` label inputs.
+    ///
+    /// The default falls back to [`RequestRecorder::request_finished`] and ignores the host inputs.
+    fn request_finished_for_host(
+        &self,
+        observation: &RequestObservation<'_>,
+        _host: &str,
+        _is_https: bool,
+    ) -> Result<(), MetricsError> {
+        self.request_finished(observation)
+    }
+
     /// Record that a proxy upstream request started. Keep the guard for its lifetime.
     fn proxy_request_started(&self, _upstream: &str) -> Result<ProxyRequestGuard, MetricsError> {
         Ok(ProxyRequestGuard::noop())
@@ -180,6 +208,28 @@ impl RequestRecorder for MetricsRequestRecorder {
 
     fn request_finished(&self, observation: &RequestObservation<'_>) -> Result<(), MetricsError> {
         self.metrics.request_finished(observation)
+    }
+
+    fn request_started_for_host(
+        &self,
+        server: &str,
+        handler: &str,
+        host: &str,
+        is_https: bool,
+    ) -> Result<RequestGuard, MetricsError> {
+        self.metrics
+            .request_started_for_host(server, handler, host, is_https)
+            .map(RequestGuard::instrumented)
+    }
+
+    fn request_finished_for_host(
+        &self,
+        observation: &RequestObservation<'_>,
+        host: &str,
+        is_https: bool,
+    ) -> Result<(), MetricsError> {
+        self.metrics
+            .request_finished_for_host(observation, host, is_https)
     }
 
     fn proxy_request_started(&self, upstream: &str) -> Result<ProxyRequestGuard, MetricsError> {
@@ -290,7 +340,7 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use super::*;
-    use crate::metrics::{HttpMetrics, MetricsRegistry};
+    use crate::metrics::{HostLabelPolicy, HttpMetrics, HttpMetricsPolicy, MetricsRegistry};
 
     fn shared_metrics() -> (MetricsRegistry, Arc<HttpMetrics>) {
         let registry = MetricsRegistry::new();
@@ -387,6 +437,69 @@ mod tests {
         assert!(rendered.contains(
             "caddy_http_request_duration_seconds_count{code=\"500\",handler=\"route0\",method=\"POST\",server=\"srv0\"} 1"
         ));
+    }
+
+    #[test]
+    fn host_aware_recorder_records_caddy_per_host_labels() {
+        let registry = MetricsRegistry::new();
+        let policy = HostLabelPolicy::new(["example.com"], true, false);
+        let metrics = Arc::new(HttpMetrics::with_policy(
+            registry.clone(),
+            HttpMetricsPolicy::with_per_host(policy),
+        ));
+        let recorder = MetricsRequestRecorder::new(metrics);
+
+        // An allow-listed host keeps its label; an unknown cleartext host collapses to `_other`.
+        let first = recorder
+            .request_started_for_host("srv0", "static_response", "Example.COM", true)
+            .expect("start");
+        let second = recorder
+            .request_started_for_host("srv0", "static_response", "unknown.test", false)
+            .expect("start");
+        assert!(first.is_instrumented());
+        assert!(second.is_instrumented());
+        let rendered = registry.render();
+        assert!(
+            rendered.contains(
+                "caddy_http_requests_in_flight{handler=\"static_response\",host=\"example.com\",server=\"srv0\"} 1"
+            ),
+            "got: {rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "caddy_http_requests_in_flight{handler=\"static_response\",host=\"_other\",server=\"srv0\"} 1"
+            ),
+            "got: {rendered}"
+        );
+
+        recorder
+            .request_finished_for_host(
+                &RequestObservation::new(
+                    "srv0",
+                    "static_response",
+                    "GET",
+                    200,
+                    Duration::from_millis(1),
+                ),
+                "example.com",
+                true,
+            )
+            .expect("finish");
+        let rendered = registry.render();
+        assert!(
+            rendered.contains(
+                "caddy_http_requests_total{handler=\"static_response\",host=\"example.com\",server=\"srv0\"} 1"
+            ),
+            "got: {rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "caddy_http_request_duration_seconds_count{code=\"200\",handler=\"static_response\",host=\"example.com\",method=\"GET\",server=\"srv0\"} 1"
+            ),
+            "got: {rendered}"
+        );
+        drop(first);
+        drop(second);
     }
 
     #[test]

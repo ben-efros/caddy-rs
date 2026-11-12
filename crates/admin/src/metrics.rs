@@ -94,6 +94,14 @@ pub const HTTP_RESPONSE_SIZE_BYTES: &str = "caddy_http_response_size_bytes";
 /// Histogram of times to first byte in response bodies (Caddy-compatible name).
 pub const HTTP_RESPONSE_DURATION_SECONDS: &str = "caddy_http_response_duration_seconds";
 
+/// Health of reverse-proxy upstreams (Caddy-compatible name).
+///
+/// Caddy registers one gauge series per configured `reverse_proxy` upstream dial address and
+/// refreshes it every 10 seconds from `Upstream.Healthy()` (`modules/caddyhttp/reverseproxy/metrics.go`:
+/// `initReverseProxyMetrics`/`metricsUpstreamsHealthyUpdater`). It is independent of the
+/// `apps.http.metrics` gate: the family exists whenever a proxy handler was provisioned.
+pub const HTTP_REVERSE_PROXY_UPSTREAMS_HEALTHY: &str = "caddy_reverse_proxy_upstreams_healthy";
+
 /// Label value Caddy uses for every host without its own allowed label.
 ///
 /// `shouldAllowHostMetrics`/`ServeHTTP` collapse unknown hosts into `_other`
@@ -454,6 +462,16 @@ impl MetricsRegistry {
     /// Number of registered metric families.
     pub fn family_count(&self) -> usize {
         self.lock().families.len()
+    }
+
+    /// Remove every series of `name` (Caddy's `prometheus.GaugeVec.Reset`), dropping the family
+    /// when no series remain.
+    ///
+    /// client_golang's `Reset` removes all children of a vec; a vec with no children contributes
+    /// nothing to a scrape, so the family's `HELP`/`TYPE` lines disappear too. Returns whether the
+    /// family existed.
+    pub fn reset_family(&self, name: &str) -> bool {
+        self.lock().families.remove(name).is_some()
     }
 }
 
@@ -850,6 +868,48 @@ pub fn sanitize_status_code(status: u16) -> String {
         0 => "200".to_string(),
         other => other.to_string(),
     }
+}
+
+/// Caddy's `computeApproximateRequestSize` (`modules/caddyhttp/metrics.go`), used for the
+/// `caddy_http_request_size_bytes` histogram.
+///
+/// The value is *not* the body length: Go sums the request-target length, method, protocol,
+/// every header name and value, the Host, and finally `ContentLength` when it is known
+/// (`r.ContentLength != -1`). caddy-rs passes the internal request's path+query as `uri`, the
+/// `HTTP/x.y` protocol name as `proto`, and the declared length (`None` for chunked/unknown,
+/// matching Go's `-1`).
+///
+/// The `Host` header is excluded from the header sum because Go keeps `Host` outside
+/// `http.Header`; it is added once through the `host` argument instead. Header values are counted
+/// as their raw byte length, exactly like Go's `len(value)`.
+pub fn approximate_request_size(
+    method: &str,
+    proto: &str,
+    uri: &str,
+    host: &str,
+    headers: &http::HeaderMap,
+    content_length: Option<u64>,
+) -> u64 {
+    let mut size = (uri.len() + method.len() + proto.len()) as u64;
+    // Go's `http.Header` is a map from one name to a value slice, so each name is counted once.
+    // `http::HeaderMap` yields one item per value, so de-duplicate names here.
+    let mut counted_names = BTreeSet::new();
+    for (name, value) in headers {
+        // Go's `http.Header` never contains Host; caddy-rs's transport header map does for
+        // HTTP/1.x, so skip it here and account for `host` below.
+        if name == http::header::HOST {
+            continue;
+        }
+        if counted_names.insert(name.as_str()) {
+            size += name.as_str().len() as u64;
+        }
+        size += value.as_bytes().len() as u64;
+    }
+    size += host.len() as u64;
+    if let Some(length) = content_length {
+        size += length;
+    }
+    size
 }
 
 /// One completed HTTP request observed by [`HttpMetrics`].
@@ -1302,6 +1362,34 @@ impl HttpMetrics {
         Ok(())
     }
 
+    /// Replace the `caddy_reverse_proxy_upstreams_healthy` series with one gauge per upstream.
+    ///
+    /// Caddy's metrics updater resets the gauge vec and then sets `1` for a healthy upstream and
+    /// `0` for an unhealthy one (`modules/caddyhttp/reverseproxy/metrics.go:88-98`). Passing an
+    /// empty iterator models a generation with no `reverse_proxy` upstreams: the family is removed,
+    /// because Caddy only registers it when a proxy handler provisioned it and an empty gauge vec
+    /// contributes no series to a scrape.
+    ///
+    /// The label is the configured upstream dial address (Caddy's `upstream.Dial`), never a
+    /// resolved peer address, so cardinality stays bounded by configuration.
+    pub fn reverse_proxy_upstreams_healthy<'a>(
+        &self,
+        upstreams: impl IntoIterator<Item = (&'a str, bool)>,
+    ) -> Result<(), MetricsError> {
+        self.registry
+            .reset_family(HTTP_REVERSE_PROXY_UPSTREAMS_HEALTHY);
+        for (upstream, healthy) in upstreams {
+            self.registry
+                .gauge(
+                    HTTP_REVERSE_PROXY_UPSTREAMS_HEALTHY,
+                    "Health status of reverse proxy upstreams.",
+                    &[("upstream", upstream)],
+                )?
+                .set(if healthy { 1.0 } else { 0.0 })?;
+        }
+        Ok(())
+    }
+
     /// Record how many seconds remain until a managed certificate expires.
     pub fn certificate_expiry(
         &self,
@@ -1395,6 +1483,105 @@ impl Drop for ProxyInFlightGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approximate_request_size_matches_caddy_formula() {
+        // Caddy's `computeApproximateRequestSize` sums url+method+proto+headers+host+content
+        // length, with Host outside the header loop (modules/caddyhttp/metrics.go:386-409).
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::HOST, "example.com".parse().unwrap());
+        headers.insert(http::header::USER_AGENT, "test".parse().unwrap());
+        headers.append("x-multi", "a".parse().unwrap());
+        headers.append("x-multi", "b".parse().unwrap());
+
+        // GET (3) + HTTP/1.1 (8) + "/path?x=1" (9) + host (11) + user-agent (10+4) +
+        // x-multi (7+1+1) + Content-Length 5.
+        assert_eq!(
+            approximate_request_size(
+                "GET",
+                "HTTP/1.1",
+                "/path?x=1",
+                "example.com",
+                &headers,
+                Some(5),
+            ),
+            59
+        );
+        // A chunked/unknown body contributes nothing (Go's ContentLength == -1).
+        assert_eq!(
+            approximate_request_size(
+                "GET",
+                "HTTP/1.1",
+                "/path?x=1",
+                "example.com",
+                &headers,
+                None,
+            ),
+            54
+        );
+    }
+
+    #[test]
+    fn reverse_proxy_upstreams_healthy_renders_caddy_family_and_resets() {
+        let registry = MetricsRegistry::new();
+        let metrics = HttpMetrics::new(registry.clone());
+        metrics
+            .reverse_proxy_upstreams_healthy([("10.0.0.1:80", true), ("10.0.0.2:80", false)])
+            .unwrap();
+        let rendered = registry.render();
+        assert!(
+            rendered.contains(
+                "# HELP caddy_reverse_proxy_upstreams_healthy Health status of reverse proxy upstreams."
+            ),
+            "got: {rendered}"
+        );
+        assert!(rendered.contains("# TYPE caddy_reverse_proxy_upstreams_healthy gauge"));
+        assert!(
+            rendered.contains("caddy_reverse_proxy_upstreams_healthy{upstream=\"10.0.0.1:80\"} 1"),
+            "got: {rendered}"
+        );
+        assert!(
+            rendered.contains("caddy_reverse_proxy_upstreams_healthy{upstream=\"10.0.0.2:80\"} 0"),
+            "got: {rendered}"
+        );
+
+        // A later refresh replaces the whole series set (Caddy's GaugeVec.Reset); an empty set
+        // removes the family because an empty vec contributes no series.
+        metrics
+            .reverse_proxy_upstreams_healthy([("10.0.0.1:80", false)])
+            .unwrap();
+        let rendered = registry.render();
+        assert!(
+            !rendered.contains("10.0.0.2:80"),
+            "stale series: {rendered}"
+        );
+        assert!(
+            rendered.contains("caddy_reverse_proxy_upstreams_healthy{upstream=\"10.0.0.1:80\"} 0")
+        );
+
+        metrics.reverse_proxy_upstreams_healthy([]).unwrap();
+        assert!(!registry
+            .render()
+            .contains("caddy_reverse_proxy_upstreams_healthy"));
+    }
+
+    #[test]
+    fn reset_family_removes_every_series() {
+        let registry = MetricsRegistry::new();
+        registry
+            .gauge("g", "Gauge.", &[("a", "1")])
+            .unwrap()
+            .set(1.0)
+            .unwrap();
+        registry
+            .gauge("g", "Gauge.", &[("a", "2")])
+            .unwrap()
+            .set(2.0)
+            .unwrap();
+        assert!(registry.reset_family("g"));
+        assert!(!registry.render().contains("g{"));
+        assert!(!registry.reset_family("g"), "already removed");
+    }
 
     #[test]
     fn renders_counter_and_gauge_deterministically() {

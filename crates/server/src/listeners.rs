@@ -45,7 +45,7 @@ use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 
 use caddy_rs_admin::access_log::AccessLogContext;
-use caddy_rs_admin::{AdminApi, AdminRequest, SharedRequestRecorder};
+use caddy_rs_admin::{common_name_from_subject, AdminApi, AdminRequest, SharedRequestRecorder};
 use caddy_rs_core::{Generation, GenerationStore, ListenAddr, Network};
 use caddy_rs_http::{Body, Router};
 use caddy_rs_proxy::trusted_proxies::ServerTrustedProxies;
@@ -56,8 +56,8 @@ use crate::error::Error;
 use crate::http::{serve_request_with_automatic_upgradable, ServedResponse};
 use crate::limits::ServerLimits;
 use crate::observability::{
-    body_len, observe_request, request_started, AccessLogRuntime, PendingObservation,
-    RequestSnapshot, ServerAccessLogPolicy, TlsLogInfo,
+    approximate_request_size, body_len, observe_request, request_host, request_started,
+    AccessLogRuntime, PendingObservation, RequestSnapshot, ServerAccessLogPolicy, TlsLogInfo,
 };
 use crate::proxy_protocol::{ListenerWrappers, PrefixedStream};
 
@@ -707,7 +707,7 @@ async fn serve_h3_connection(
     let _permit = permit;
     let _generation = generation;
     let _tracked = tracked;
-    let tls_info = h3_tls_info(&connection);
+    let tls_info = h3_tls_info(&connection, context.client_auth_verified);
     let mut h3_connection =
         match h3::server::Connection::new(h3_quinn::Connection::new(connection.clone())).await {
             Ok(connection) => connection,
@@ -743,6 +743,16 @@ async fn serve_h3_connection(
                         };
                         let started = std::time::Instant::now();
                         let method = request.method().as_str().to_string();
+                        // Caddy's metrics labels and request-size histogram are computed before
+                        // the request is consumed (`modules/caddyhttp/metrics.go:314-368`).
+                        let host = request_host(request.headers(), request.uri());
+                        let is_https = true;
+                        let request_size = approximate_request_size(
+                            request.method(),
+                            request.version(),
+                            request.uri(),
+                            request.headers(),
+                        );
                         let mut snapshot = context.access_log.is_enabled().then(|| {
                             RequestSnapshot::capture_http3(
                                 &request,
@@ -753,15 +763,20 @@ async fn serve_h3_connection(
                         if let Some(snapshot) = snapshot.as_mut() {
                             snapshot.resolve_client_ip(&context.trusted_proxies);
                         }
-                        // One access-log context per request when logging is enabled; the same
-                        // clock covers the buffered body read and the response write below.
-                        let access_log_context = context.access_log.is_enabled().then(|| {
+                        // One shared observation context per request: the access logger and the
+                        // metrics recorder both read the handler/error fields the router publishes,
+                        // and the access-log half stays a no-op when no sink is active.
+                        let access_log_context = Some({
                             let access_log = Arc::new(AccessLogContext::new());
                             access_log.start(started);
                             access_log
                         });
-                        let _request_guard =
-                            request_started(&context.recorder, &context.server_name);
+                        let _request_guard = request_started(
+                            &context.recorder,
+                            &context.server_name,
+                            &host,
+                            is_https,
+                        );
                         // RFC 9114 has no HTTP/1.1-style `Upgrade`, and caddy-rs has no HTTP/3
                         // request-stream tunnel for RFC 8441 extended CONNECT. Reject every
                         // upgrade-style request before routing so a WebSocket/extended-CONNECT
@@ -802,6 +817,10 @@ async fn serve_h3_connection(
                                 // per-request access-log context and no body write to report.
                                 None,
                                 None,
+                                &host,
+                                is_https,
+                                request_size,
+                                std::time::Instant::now(),
                             );
                             continue;
                         }
@@ -855,6 +874,10 @@ async fn serve_h3_connection(
                                 &http::HeaderMap::new(),
                                 access_log_context.as_ref(),
                                 None,
+                                &host,
+                                is_https,
+                                request_size,
+                                std::time::Instant::now(),
                             );
                             continue;
                         }
@@ -886,6 +909,10 @@ async fn serve_h3_connection(
                                 &headers,
                                 access_log_context.as_ref(),
                                 None,
+                                &host,
+                                is_https,
+                                request_size,
+                                std::time::Instant::now(),
                             );
                             let response = http::Response::builder()
                                 .status(http::StatusCode::SERVICE_UNAVAILABLE)
@@ -941,6 +968,8 @@ async fn serve_h3_connection(
                             tracing::debug!(%error, "HTTP/3 response headers failed");
                             continue;
                         }
+                        // Caddy's `response_duration_seconds` is time to response headers.
+                        let response_started = std::time::Instant::now();
                         let mut body = std::pin::pin!(response_body);
                         let mut sent = 0_u64;
                         let mut failed = false;
@@ -978,6 +1007,10 @@ async fn serve_h3_connection(
                             &response_headers,
                             access_log_context.as_ref(),
                             write_error.as_deref(),
+                            &host,
+                            is_https,
+                            request_size,
+                            response_started,
                         );
                         if failed {
                             continue;
@@ -1079,7 +1112,7 @@ fn h3_client_certificate(
 /// quinn exposes the rustls handshake data (ALPN, SNI, resumption) but not the negotiated cipher
 /// suite; HTTP/3 is always TLS 1.3. See the compatibility divergence note.
 #[cfg(feature = "http3")]
-fn h3_tls_info(connection: &quinn::Connection) -> TlsLogInfo {
+fn h3_tls_info(connection: &quinn::Connection, client_auth_verified: bool) -> TlsLogInfo {
     let handshake = connection
         .handshake_data()
         .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok());
@@ -1093,6 +1126,15 @@ fn h3_tls_info(connection: &quinn::Connection) -> TlsLogInfo {
         ),
         None => (String::new(), "h3".to_string()),
     };
+    // Caddy logs the presented leaf certificate's common name and serial for every TLS request
+    // with `PeerCertificates` (`modules/caddyhttp/marshalers.go:81-84`).
+    let client_certificate = h3_client_certificate(connection, client_auth_verified);
+    let client_common_name = client_certificate
+        .as_ref()
+        .and_then(|certificate| caddy_rs_admin::common_name_from_subject(&certificate.subject));
+    let client_serial = client_certificate
+        .as_ref()
+        .map(|certificate| certificate.serial.clone());
     TlsLogInfo {
         // quinn-proto's rustls HandshakeData does not expose the resumption flag; HTTP/3 access
         // log TLS metadata is therefore approximate (DIV note).
@@ -1102,6 +1144,8 @@ fn h3_tls_info(connection: &quinn::Connection) -> TlsLogInfo {
         proto,
         server_name,
         ech: false,
+        client_common_name,
+        client_serial,
     }
 }
 
@@ -1423,6 +1467,8 @@ async fn serve_accepted<I>(
         let alpn = connection
             .alpn_protocol()
             .map(|protocol| String::from_utf8_lossy(protocol).into_owned());
+        let client_certificate =
+            client_certificate_for_request(connection, context.client_auth_verified);
         let tls_info = TlsLogInfo {
             resumed: matches!(
                 connection.handshake_kind(),
@@ -1436,9 +1482,15 @@ async fn serve_accepted<I>(
             proto: alpn.clone().unwrap_or_default(),
             server_name: connection.server_name().unwrap_or("").to_string(),
             ech: false,
+            // Caddy's `request.tls.client_common_name`/`client_serial`
+            // (`modules/caddyhttp/marshalers.go:81-84`).
+            client_common_name: client_certificate
+                .as_ref()
+                .and_then(|certificate| common_name_from_subject(&certificate.subject)),
+            client_serial: client_certificate
+                .as_ref()
+                .map(|certificate| certificate.serial.clone()),
         };
-        let client_certificate =
-            client_certificate_for_request(connection, context.client_auth_verified);
         let service = connection_service(
             router,
             Arc::clone(&limits),
@@ -1604,6 +1656,16 @@ async fn serve_one_request(
     let _in_flight = context.activity.begin();
     let started = std::time::Instant::now();
     let method = request.method().as_str().to_string();
+    // Caddy computes the metrics labels and the approximate request size before the handler chain
+    // consumes the request (`modules/caddyhttp/metrics.go:314-368`).
+    let host = request_host(request.headers(), request.uri());
+    let is_https = context.tls;
+    let request_size = approximate_request_size(
+        request.method(),
+        request.version(),
+        request.uri(),
+        request.headers(),
+    );
     // Capture the access-log fields before the request is consumed. Only done when a sink is
     // configured, so the common no-logging path pays nothing.
     let mut snapshot = context.access_log.is_enabled().then(|| {
@@ -1612,14 +1674,15 @@ async fn serve_one_request(
     if let Some(snapshot) = snapshot.as_mut() {
         snapshot.resolve_client_ip(&context.trusted_proxies);
     }
-    // One access-log context per request when logging is enabled. Handlers publish observations
-    // into it; the server applies it to the entry when the response body completes.
-    let access_log_context = context.access_log.is_enabled().then(|| {
+    // One shared observation context per request: the access logger and the metrics recorder both
+    // read the handler/error fields the router publishes, and the access-log half stays inert when
+    // no sink is active.
+    let access_log_context = Some({
         let access_log = Arc::new(AccessLogContext::new());
         access_log.start(started);
         access_log
     });
-    let _request_guard = request_started(&context.recorder, &context.server_name);
+    let _request_guard = request_started(&context.recorder, &context.server_name, &host, is_https);
     // Decide once, before the request is consumed, whether this is a real WebSocket handshake
     // offer. The response side (Sec-WebSocket-Accept) is checked when the 101 is returned; only a
     // complete handshake gets close-frame synthesis.
@@ -1640,6 +1703,10 @@ async fn serve_one_request(
             response.headers(),
             access_log_context.as_ref(),
             None,
+            &host,
+            is_https,
+            request_size,
+            std::time::Instant::now(),
         );
         return Ok(response);
     };
@@ -1685,6 +1752,10 @@ async fn serve_one_request(
             response.headers(),
             access_log_context.as_ref(),
             None,
+            &host,
+            is_https,
+            request_size,
+            std::time::Instant::now(),
         );
         return Ok(response);
     }
@@ -1748,6 +1819,10 @@ async fn serve_one_request(
         status,
         response_headers,
         access_log_context,
+        &host,
+        is_https,
+        request_size,
+        std::time::Instant::now(),
     );
 
     match served {

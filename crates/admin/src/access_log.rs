@@ -271,11 +271,58 @@ impl AccessLogRequest {
     ///
     /// The `Host` request header is omitted: Caddy logs the request host as `request.host` and its
     /// `request.headers` object is Go's `http.Header`, which excludes `Host` by construction.
+    ///
+    /// Go's `net/http` server moves the request's `Transfer-Encoding` header into
+    /// `Request.TransferEncoding` and logs it as `request.transfer_encoding`
+    /// (`modules/caddyhttp/marshalers.go:55-57`); caddy-rs's transport keeps the header, so it is
+    /// lifted into [`AccessLogRequest::transfer_encoding`] here and dropped from the header map.
+    /// `identity` is the only encoding Go omits from the list, so an `identity`-only header leaves
+    /// the array empty.
     pub fn with_headers(mut self, headers: &HeaderMap) -> Self {
+        self.transfer_encoding = transfer_encodings(headers);
         self.headers = headers_to_loggable(headers);
         self.headers.remove("Host");
+        self.headers.remove("Transfer-Encoding");
         self
     }
+}
+
+/// The non-identity transfer encodings of a request, mirroring Go's `Request.TransferEncoding`.
+///
+/// Go reports `["chunked"]` for a chunked request; this reads the wire header so the access entry
+/// can carry the same field even though hyper frames the body itself. Values are comma-separated
+/// (RFC 9112 §7) and case-insensitive; `identity` is never listed.
+fn transfer_encodings(headers: &HeaderMap) -> Vec<String> {
+    let mut encodings = Vec::new();
+    for value in headers.get_all(http::header::TRANSFER_ENCODING) {
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        for token in value.split(',') {
+            let token = token.trim();
+            if token.is_empty() || token.eq_ignore_ascii_case("identity") {
+                continue;
+            }
+            // Go stores the lower-cased coding name.
+            encodings.push(token.to_ascii_lowercase());
+        }
+    }
+    encodings
+}
+
+/// The `CN` attribute of a Go-style subject distinguished name.
+///
+/// Caddy's access entry emits `request.tls.client_common_name` from
+/// `PeerCertificates[0].Subject.CommonName` (`modules/caddyhttp/marshalers.go:81-83`); caddy-rs
+/// keeps the formatted subject DN on the client certificate (`ClientCertificate::subject`), so the
+/// common name is recovered from it. The formatter emits `CN=<value>` components joined by commas
+/// without RFC 2253 escaping, so a literal comma inside a common name is not distinguishable; that
+/// limitation is documented in DIV-0069.
+pub fn common_name_from_subject(subject: &str) -> Option<String> {
+    subject
+        .split(',')
+        .find_map(|component| component.strip_prefix("CN="))
+        .map(str::to_string)
 }
 
 /// The caddy-rs `upstream` extension object of an access entry.
@@ -598,6 +645,10 @@ struct AccessLogContextState {
     /// Caddy's `log_level` request variable: the raw value the last assignment stored. Parsed
     /// leniently at emission time (`DEBUG`..=`ERROR`); `None` keeps the status-derived level.
     log_level: Option<String>,
+    /// First handler module of the matched route (Caddy's metrics `handler` label).
+    route_handler: Option<&'static str>,
+    /// Whether a handler returned an error (Caddy's `caddy_http_request_errors_total`).
+    middleware_error: bool,
     extra_fields: ExtraLogFields,
 }
 
@@ -727,6 +778,38 @@ impl AccessLogContext {
     /// The raw `log_level` request variable value, when a string assignment was stored.
     pub fn log_level(&self) -> Option<String> {
         self.state().log_level.clone()
+    }
+
+    /// Record the first handler module name of the matched route.
+    ///
+    /// Caddy's `metricsInstrumentedRoute` labels the `caddy_http_*` families with
+    /// `caddy.GetModuleName(route.Handlers[0])` (`modules/caddyhttp/routes.go:174,320-323`).
+    /// caddy-rs renders the metrics observation at the connection boundary, after the router has
+    /// consumed the request, so the router publishes the matched route's first handler here and the
+    /// server reads it from the shared context when the response completes. This is a metrics
+    /// input only: it never appears in the access entry.
+    pub fn set_route_handler(&self, handler: &'static str) {
+        self.state().route_handler = Some(handler);
+    }
+
+    /// The matched route's first handler module name, when a route matched.
+    pub fn route_handler(&self) -> Option<&'static str> {
+        self.state().route_handler
+    }
+
+    /// Record that a handler returned an error (Caddy's middleware-error semantics).
+    ///
+    /// Caddy increments `caddy_http_request_errors_total` when the handler chain returns an error
+    /// (`modules/caddyhttp/metrics.go:371-378`), independently of the response status. This is a
+    /// metrics input only; the access entry's level still follows the response status (and the
+    /// `log_level` override).
+    pub fn mark_middleware_error(&self) {
+        self.state().middleware_error = true;
+    }
+
+    /// Whether a handler returned an error during this request.
+    pub fn middleware_error(&self) -> bool {
+        self.state().middleware_error
     }
 
     /// Add an extra top-level field (Caddy's `ExtraLogFields`).
@@ -2523,6 +2606,95 @@ mod tests {
             );
         }
         headers
+    }
+
+    #[test]
+    fn transfer_encoding_is_lifted_out_of_the_request_headers() {
+        // Go's net/http moves `Transfer-Encoding` out of `http.Header` and Caddy logs it as
+        // `request.transfer_encoding` (marshalers.go:55-57); caddy-rs must do the same for a
+        // chunked upload even though hyper decodes the framing itself.
+        let request =
+            AccessLogRequest::new("POST", "example.com", "/upload").with_headers(&headers(&[
+                ("host", "example.com"),
+                ("transfer-encoding", "chunked"),
+                ("user-agent", "curl/8.5.0"),
+            ]));
+        assert_eq!(request.transfer_encoding, vec!["chunked".to_string()]);
+        assert!(
+            !request.headers.contains_key("Transfer-Encoding"),
+            "the encoding header is not part of request.headers: {:?}",
+            request.headers
+        );
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["transfer_encoding"], json!(["chunked"]));
+    }
+
+    #[test]
+    fn identity_and_absent_transfer_encodings_are_omitted_like_go() {
+        for header in ["identity", "IDENTITY"] {
+            let request = AccessLogRequest::new("POST", "example.com", "/")
+                .with_headers(&headers(&[("transfer-encoding", header)]));
+            assert!(
+                request.transfer_encoding.is_empty(),
+                "identity is never listed: {header}"
+            );
+        }
+        let request = AccessLogRequest::new("POST", "example.com", "/")
+            .with_headers(&headers(&[("content-length", "4")]));
+        assert!(request.transfer_encoding.is_empty());
+        let value = serde_json::to_value(&request).unwrap();
+        assert!(
+            value.get("transfer_encoding").is_none(),
+            "empty transfer_encoding is omitted: {value}"
+        );
+    }
+
+    #[test]
+    fn comma_separated_transfer_encodings_are_split_and_lowercased() {
+        let request = AccessLogRequest::new("POST", "example.com", "/")
+            .with_headers(&headers(&[("transfer-encoding", "gzip, Chunked")]));
+        assert_eq!(
+            request.transfer_encoding,
+            vec!["gzip".to_string(), "chunked".to_string()]
+        );
+    }
+
+    #[test]
+    fn common_name_is_recovered_from_the_go_style_subject() {
+        // Caddy emits `PeerCertificates[0].Subject.CommonName`
+        // (modules/caddyhttp/marshalers.go:81-83); caddy-rs formats the DN, so the CN component is
+        // extracted from it.
+        assert_eq!(
+            common_name_from_subject("C=US,O=Example,CN=client-1"),
+            Some("client-1".to_string())
+        );
+        assert_eq!(
+            common_name_from_subject("CN=service.example.com,O=Example"),
+            Some("service.example.com".to_string())
+        );
+        assert_eq!(common_name_from_subject("O=Example,OU=Tests"), None);
+        assert_eq!(common_name_from_subject(""), None);
+    }
+
+    #[test]
+    fn access_log_context_carries_route_handler_and_middleware_error() {
+        // Metrics inputs shared through the request context: the router publishes the matched
+        // route's first handler (Caddy's `handler` label) and whether a handler errored
+        // (Caddy's `caddy_http_request_errors_total`). Clones share the state.
+        let context = AccessLogContext::new();
+        assert_eq!(context.route_handler(), None);
+        assert!(!context.middleware_error());
+        context.set_route_handler("reverse_proxy");
+        context.mark_middleware_error();
+        let clone = context.clone();
+        assert_eq!(clone.route_handler(), Some("reverse_proxy"));
+        assert!(clone.middleware_error());
+        // Neither value leaks into the access entry.
+        let mut entry = AccessLogEntry::new(AccessLogRequest::new("GET", "example.com", "/"));
+        context.apply_to(&mut entry);
+        let value = serde_json::to_value(&entry).unwrap();
+        assert!(value.get("route_handler").is_none());
+        assert!(value.get("middleware_error").is_none());
     }
 
     fn sample_entry() -> AccessLogEntry {
