@@ -303,6 +303,9 @@ impl Handler for ErrorHandler {
 
 /// `headers`: stage response header mutations (and apply request header mutations).
 pub struct HeadersHandler {
+    /// Optional `security_headers` block: staged as defaults before the explicit header
+    /// operations, so explicit `request`/`response` mutations always win.
+    security_headers: Option<crate::security_headers::SecurityHeaders>,
     request_set: Vec<(String, Vec<String>)>,
     response_set: Vec<(String, Vec<String>)>,
     response_add: Vec<(String, Vec<String>)>,
@@ -316,11 +319,20 @@ impl HeadersHandler {
             .as_object()
             .ok_or_else(|| invalid(path, "headers handler must be an object"))?;
         let mut handler = Self {
+            security_headers: None,
             request_set: Vec::new(),
             response_set: Vec::new(),
             response_add: Vec::new(),
             response_delete: Vec::new(),
         };
+        if let Some(security) = object.get("security_headers") {
+            let security_path = format!("{path}.security_headers");
+            let config = crate::security_headers::SecurityHeadersConfig::from_headers_block(
+                security,
+                &security_path,
+            )?;
+            handler.security_headers = Some(crate::security_headers::SecurityHeaders::new(config)?);
+        }
         if let Some(request) = object.get("request") {
             handler.request_set = parse_header_operations(request, &format!("{path}.request"))?;
         }
@@ -400,6 +412,12 @@ impl Handler for HeadersHandler {
             for value in values {
                 request.headers.append(name.clone(), value);
             }
+        }
+        // `security_headers` supplies defaults: a header already staged by an earlier handler is
+        // kept, and the explicit `response` operations below are applied afterwards so they
+        // always win over the security defaults.
+        if let Some(security) = &self.security_headers {
+            security.stage_defaults(&mut request)?;
         }
         for (raw_name, values) in &self.response_set {
             let path = format!("headers.response.set.{raw_name}");
@@ -2281,6 +2299,254 @@ mod tests {
         };
         assert_eq!(request.pending_response_headers["x-frame-options"], "DENY");
         assert_eq!(request.pending_response_headers["vary"], "Accept");
+    }
+
+    fn headers_with_security_headers(block: serde_json::Value) -> HeadersHandler {
+        HeadersHandler::from_json(
+            &serde_json::json!({"handler": "headers", "security_headers": block}),
+            "handler",
+        )
+        .unwrap()
+    }
+
+    fn load_error(block: serde_json::Value) -> (String, String) {
+        match HeadersHandler::from_json(
+            &serde_json::json!({"handler": "headers", "security_headers": block}),
+            "handler",
+        ) {
+            Ok(_) => panic!("expected the configuration to be rejected"),
+            Err(error) => match error {
+                Error::InvalidConfig { path, message } => (path, message),
+                other => panic!("expected an InvalidConfig error, got {other:?}"),
+            },
+        }
+    }
+
+    fn header(request: &Request, name: &str) -> Option<String> {
+        request
+            .pending_response_headers
+            .get(name)
+            .map(|value| value.to_str().unwrap().to_string())
+    }
+
+    #[tokio::test]
+    async fn security_headers_block_emits_secure_defaults() {
+        let handler = headers_with_security_headers(serde_json::json!({}));
+        let Outcome::Continue(request) = handler.handle(request()).await.unwrap() else {
+            panic!("expected continue");
+        };
+        assert_eq!(header(&request, "x-frame-options").as_deref(), Some("DENY"));
+        assert_eq!(
+            header(&request, "x-content-type-options").as_deref(),
+            Some("nosniff")
+        );
+        assert_eq!(
+            header(&request, "referrer-policy").as_deref(),
+            Some("strict-origin-when-cross-origin")
+        );
+        // Opt-in headers stay absent when not configured.
+        assert_eq!(header(&request, "content-security-policy"), None);
+        assert_eq!(header(&request, "strict-transport-security"), None);
+        assert_eq!(header(&request, "permissions-policy"), None);
+    }
+
+    #[tokio::test]
+    async fn security_headers_block_emits_csp_only_when_configured() {
+        let handler = headers_with_security_headers(serde_json::json!({
+            "content_security_policy": {
+                "default-src": ["'self'"],
+                "script-src": ["'self'", "https://cdn.example.com"],
+                "upgrade-insecure-requests": []
+            }
+        }));
+        let Outcome::Continue(request) = handler.handle(request()).await.unwrap() else {
+            panic!("expected continue");
+        };
+        assert_eq!(
+            header(&request, "content-security-policy").as_deref(),
+            Some("default-src 'self'; script-src 'self' https://cdn.example.com; upgrade-insecure-requests")
+        );
+    }
+
+    #[tokio::test]
+    async fn security_headers_block_accepts_string_csp() {
+        let handler = headers_with_security_headers(
+            serde_json::json!({"content_security_policy": "default-src 'none'"}),
+        );
+        let Outcome::Continue(request) = handler.handle(request()).await.unwrap() else {
+            panic!("expected continue");
+        };
+        assert_eq!(
+            header(&request, "content-security-policy").as_deref(),
+            Some("default-src 'none'")
+        );
+    }
+
+    #[tokio::test]
+    async fn security_headers_block_emits_hsts_only_when_enabled() {
+        // Configured but not enabled: nothing is emitted.
+        let disabled = headers_with_security_headers(serde_json::json!({
+            "hsts": {"max_age": 63072000, "include_subdomains": true}
+        }));
+        let mut tls_request = request();
+        tls_request.tls = true;
+        let Outcome::Continue(disabled_request) = disabled.handle(tls_request).await.unwrap()
+        else {
+            panic!("expected continue");
+        };
+        assert_eq!(header(&disabled_request, "strict-transport-security"), None);
+
+        let enabled = headers_with_security_headers(serde_json::json!({
+            "hsts": {
+                "enabled": true,
+                "max_age": 63072000,
+                "include_subdomains": true,
+                "preload": true
+            }
+        }));
+        let mut second_tls_request = request();
+        second_tls_request.tls = true;
+        let Outcome::Continue(enabled_request) = enabled.handle(second_tls_request).await.unwrap()
+        else {
+            panic!("expected continue");
+        };
+        assert_eq!(
+            header(&enabled_request, "strict-transport-security").as_deref(),
+            Some("max-age=63072000; includeSubDomains; preload")
+        );
+    }
+
+    #[tokio::test]
+    async fn security_headers_block_expands_placeholders_per_request() {
+        let handler = headers_with_security_headers(serde_json::json!({
+            "x_frame_options": "ALLOW-FROM {http.request.host}",
+            "content_security_policy": {"default-src": ["{http.request.uri.path}"]},
+            "permissions_policy": {"geolocation": ["{http.request.host}"]}
+        }));
+        let Outcome::Continue(request) = handler.handle(request()).await.unwrap() else {
+            panic!("expected continue");
+        };
+        assert_eq!(
+            header(&request, "x-frame-options").as_deref(),
+            Some("ALLOW-FROM example.com")
+        );
+        assert_eq!(
+            header(&request, "content-security-policy").as_deref(),
+            Some("default-src /old/path")
+        );
+        assert_eq!(
+            header(&request, "permissions-policy").as_deref(),
+            Some("geolocation=(example.com)")
+        );
+    }
+
+    #[tokio::test]
+    async fn security_headers_block_renders_permissions_policy_object() {
+        let handler = headers_with_security_headers(serde_json::json!({
+            "permissions_policy": {
+                "geolocation": ["'self'", "https://maps.example.com"],
+                "camera": true,
+                "microphone": false
+            }
+        }));
+        let Outcome::Continue(request) = handler.handle(request()).await.unwrap() else {
+            panic!("expected continue");
+        };
+        assert_eq!(
+            header(&request, "permissions-policy").as_deref(),
+            Some("camera=*, geolocation=('self' https://maps.example.com), microphone=()")
+        );
+    }
+
+    #[test]
+    fn security_headers_block_rejects_invalid_values_at_load_time() {
+        let (path, message) = load_error(serde_json::json!({"x_frame_options": "ALLOW-FROM"}));
+        assert_eq!(path, "handler.security_headers.x_frame_options");
+        assert!(
+            message.contains("ALLOW-FROM requires an origin"),
+            "{message}"
+        );
+
+        let (path, message) = load_error(serde_json::json!({"x_frame_options": "MAYBE"}));
+        assert_eq!(path, "handler.security_headers.x_frame_options");
+        assert!(
+            message.contains("DENY, SAMEORIGIN or ALLOW-FROM"),
+            "{message}"
+        );
+
+        let (path, message) = load_error(serde_json::json!({"x_content_type_options": "sniff"}));
+        assert_eq!(path, "handler.security_headers.x_content_type_options");
+        assert!(message.contains("nosniff"), "{message}");
+
+        let (path, message) = load_error(serde_json::json!({"referrer_policy": "sometimes"}));
+        assert_eq!(path, "handler.security_headers.referrer_policy");
+
+        let (path, message) =
+            load_error(serde_json::json!({"hsts": {"enabled": true, "max_age": 60}}));
+        assert_eq!(path, "handler.security_headers.hsts.max_age");
+        assert!(message.contains("at least 15552000"), "{message}");
+
+        let (path, message) = load_error(serde_json::json!({
+            "hsts": {"enabled": true, "include_subdomains": false, "preload": true}
+        }));
+        assert_eq!(path, "handler.security_headers.hsts.preload");
+
+        let (path, _message) =
+            load_error(serde_json::json!({"permissions_policy": {"Geolocation": []}}));
+        assert_eq!(
+            path,
+            "handler.security_headers.permissions_policy.Geolocation"
+        );
+
+        let (path, _) = load_error(serde_json::json!({"x_frame_options": "DENY", "nope": 1}));
+        assert_eq!(path, "handler.security_headers.nope");
+    }
+
+    #[tokio::test]
+    async fn security_headers_block_composes_with_explicit_headers() {
+        // Precedence: the security block supplies defaults; explicit `response` operations in the
+        // same handler are applied afterwards and always win (set overrides, delete suppresses).
+        let handler = HeadersHandler::from_json(
+            &serde_json::json!({
+                "handler": "headers",
+                "security_headers": {},
+                "response": {
+                    "set": {"X-Frame-Options": ["SAMEORIGIN"]},
+                    "delete": ["Referrer-Policy"]
+                }
+            }),
+            "handler",
+        )
+        .unwrap();
+        let Outcome::Continue(request) = handler.handle(request()).await.unwrap() else {
+            panic!("expected continue");
+        };
+        assert_eq!(
+            header(&request, "x-frame-options").as_deref(),
+            Some("SAMEORIGIN")
+        );
+        assert_eq!(header(&request, "referrer-policy"), None);
+        // Untouched defaults are still emitted.
+        assert_eq!(
+            header(&request, "x-content-type-options").as_deref(),
+            Some("nosniff")
+        );
+    }
+
+    #[tokio::test]
+    async fn headers_handler_without_security_block_is_unchanged() {
+        let handler = HeadersHandler::from_json(
+            &serde_json::json!({"handler": "headers", "response": {"set": {"X-Thing": ["1"]}}}),
+            "handler",
+        )
+        .unwrap();
+        let Outcome::Continue(request) = handler.handle(request()).await.unwrap() else {
+            panic!("expected continue");
+        };
+        assert_eq!(header(&request, "x-thing").as_deref(), Some("1"));
+        assert_eq!(header(&request, "x-frame-options"), None);
+        assert_eq!(header(&request, "x-content-type-options"), None);
+        assert_eq!(header(&request, "referrer-policy"), None);
     }
 
     #[tokio::test]
