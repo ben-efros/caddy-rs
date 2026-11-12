@@ -128,6 +128,31 @@ fn invalid(path: &str, message: impl Into<String>) -> Error {
     }
 }
 
+/// Render request-controlled text for an error message.
+///
+/// Control characters (CR, LF, NUL, terminal escapes) become `U+FFFD` and long values are
+/// truncated, so a placeholder expansion cannot inject log lines or escape sequences into an
+/// [`Error::InvalidConfig`] message. The message keeps the header name (the error path) and the
+/// configured field, only the expanded bytes are redacted.
+fn redact(value: &str) -> String {
+    const MAX_CHARS: usize = 96;
+    let mut redacted: String = value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                '\u{fffd}'
+            } else {
+                character
+            }
+        })
+        .collect();
+    if redacted.chars().count() > MAX_CHARS {
+        redacted = redacted.chars().take(MAX_CHARS).collect();
+        redacted.push('…');
+    }
+    redacted
+}
+
 /// `Strict-Transport-Security` configuration (opt-in).
 ///
 /// The emitted value is `max-age=<max_age>` plus `; includeSubDomains` when
@@ -427,8 +452,11 @@ const REFERRER_POLICY_TOKENS: [&str; 8] = [
 /// Whether `value` carries a `{...}` placeholder that is only resolvable per request.
 ///
 /// Values that do are exempt from the closed-set checks below (an operator may legitimately
-/// write `ALLOW-FROM {http.request.host}`), but they are still validated as header values and,
-/// after expansion, at request time by [`SecurityHeaders::stage_defaults`].
+/// write `ALLOW-FROM {http.request.host}`), but they are re-validated after expansion at request
+/// time: the structured values (`content-security-policy`, `permissions-policy`,
+/// `x-frame-options`) are re-assembled one source/feature at a time and each expansion must stay a
+/// single token ([`expand_policy_token`]), so a request-controlled placeholder cannot split a
+/// directive or append one. An expansion that violates the rule fails the request closed.
 fn has_placeholder(value: &str) -> bool {
     value.contains('{')
 }
@@ -538,10 +566,10 @@ fn parse_x_frame_options(value: &Value, path: &str) -> Result<Option<String>> {
                      \"ALLOW-FROM https://example.com\"; use DENY or SAMEORIGIN to allow framing",
                 ));
             }
-            if !has_placeholder(rest) && rest.parse::<http::Uri>().is_err() {
+            if !has_placeholder(rest) && !is_valid_frame_origin(rest) {
                 return Err(invalid(
                     path,
-                    format!("ALLOW-FROM value `{rest}` is not a valid URI"),
+                    format!("ALLOW-FROM value `{rest}` is not a valid http(s) URI"),
                 ));
             }
             Ok(Some(trimmed.to_string()))
@@ -637,13 +665,20 @@ fn parse_csp_block(value: &Value, path: &str) -> Result<Option<String>> {
     }
 }
 
-/// Validate a CSP directive name: an ASCII token without whitespace, `;` or `=`.
-fn validate_csp_directive_name(name: &str, path: &str) -> Result<()> {
-    let valid = !name.is_empty()
+/// Whether `name` is a legal CSP directive name: non-empty ASCII letters, digits and `-`.
+///
+/// The same predicate guards request-time re-assembly: a directive name is configuration, never
+/// request data, so an expansion must never be allowed to produce one.
+fn is_csp_directive_name(name: &str) -> bool {
+    !name.is_empty()
         && name
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-');
-    if !valid {
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+/// Validate a CSP directive name: an ASCII token without whitespace, `;` or `=`.
+fn validate_csp_directive_name(name: &str, path: &str) -> Result<()> {
+    if !is_csp_directive_name(name) {
         return Err(invalid(
             path,
             format!("`{name}` is not a valid CSP directive name"),
@@ -743,13 +778,17 @@ fn parse_permissions_policy(value: &Value, path: &str) -> Result<Option<String>>
     }
 }
 
-/// Validate a `permissions_policy` feature name: lowercase ASCII letters, digits and `-`.
-fn validate_feature_name(name: &str, path: &str) -> Result<()> {
-    let valid = !name.is_empty()
+/// Whether `name` is a legal `permissions_policy` feature name: lowercase ASCII, digits and `-`.
+fn is_feature_name(name: &str) -> bool {
+    !name.is_empty()
         && name
             .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
-    if !valid {
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+/// Validate a `permissions_policy` feature name: lowercase ASCII letters, digits and `-`.
+fn validate_feature_name(name: &str, path: &str) -> Result<()> {
+    if !is_feature_name(name) {
         return Err(invalid(
             path,
             format!("`{name}` is not a valid permissions policy feature name"),
@@ -758,14 +797,50 @@ fn validate_feature_name(name: &str, path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Validate one origin/allowlist token: non-empty ASCII, no whitespace or separators.
-fn validate_allowlist_token(token: &str, path: &str) -> Result<()> {
-    let valid = !token.is_empty()
+/// Whether `token` is one legal CSP source / `permissions_policy` allowlist token.
+///
+/// Directives are separated by `;`, permissions features by `,` and sources/origins by
+/// whitespace, so a token carrying any of those (or a quote/parenthesis that could open a new
+/// `( ... )` allowlist) would change the structure of the emitted header. The same predicate is
+/// the load-time check and the request-time re-check after placeholder expansion.
+fn is_allowlist_token(token: &str) -> bool {
+    !token.is_empty()
         && token.is_ascii()
         && !token
             .bytes()
-            .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b';' | b',' | b'(' | b')'));
-    if !valid {
+            .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b';' | b',' | b'(' | b')'))
+}
+
+/// Whether `origin` is an acceptable `X-Frame-Options: ALLOW-FROM` origin.
+///
+/// `javascript:` and `data:` parse as URIs but are not framing origins, so an absolute URI must
+/// use `http`/`https`. An authority-only value such as `example.com` (no scheme) stays accepted
+/// for `ALLOW-FROM {http.request.host}`-style configurations. Used at load time and again after
+/// placeholder expansion, which the load-time check cannot see.
+fn is_valid_frame_origin(origin: &str) -> bool {
+    if origin.parse::<http::Uri>().is_err() {
+        return false;
+    }
+    if origin.starts_with('[') {
+        // An IPv6 authority such as `[::1]:8443`; the parser already validated it.
+        return true;
+    }
+    match origin.split_once(':') {
+        // A scheme is only legal when it is `http(s)://`.
+        Some((prefix, rest)) if rest.starts_with("//") => {
+            prefix.eq_ignore_ascii_case("http") || prefix.eq_ignore_ascii_case("https")
+        }
+        // Otherwise a colon can only introduce a numeric port (`example.com:8443`):
+        // `http::Uri` also accepts `javascript:alert(1)` as an authority-form URI with no scheme,
+        // so `javascript:`, `data:` and friends are rejected here explicitly.
+        Some((_, rest)) => !rest.is_empty() && rest.bytes().all(|byte| byte.is_ascii_digit()),
+        None => true,
+    }
+}
+
+/// Validate one origin/allowlist token: non-empty ASCII, no whitespace or separators.
+fn validate_allowlist_token(token: &str, path: &str) -> Result<()> {
+    if !is_allowlist_token(token) {
         return Err(invalid(
             path,
             format!("`{token}` is not a valid origin or allowlist token"),
@@ -925,8 +1000,11 @@ impl SecurityHeaders {
     /// that runs later in the chain must win.
     ///
     /// Returns a located error when an expanded value is not a valid header value (for example a
-    /// request variable containing control bytes). Configured values were validated at construction
-    /// time, so only placeholder expansion can produce such a value.
+    /// request variable containing control bytes) or when a placeholder expansion would change the
+    /// structure of a policy header (a `;`, `,` or whitespace injected into a CSP source or
+    /// permissions-policy origin). Configured values were validated at construction time, so only
+    /// placeholder expansion can produce such a value. A violating expansion fails the request
+    /// closed: the error is returned and no header is staged, not even a partial one.
     pub fn stage(&self, request: &mut Request) -> Result<()> {
         for (name, value) in self.staged(request)? {
             request.pending_response_headers.insert(name, value);
@@ -956,16 +1034,20 @@ impl SecurityHeaders {
         let config = &self.config;
         let mut staged: Vec<(HeaderName, HeaderValue)> = Vec::new();
         if let Some(value) = &config.x_frame_options {
-            staged.push(expand(request, "x-frame-options", value)?);
+            staged.push(expand_x_frame_options(request, "x-frame-options", value)?);
         }
         if let Some(value) = &config.x_content_type_options {
-            staged.push(expand(request, "x-content-type-options", value)?);
+            staged.push(expand_single_token(
+                request,
+                "x-content-type-options",
+                value,
+            )?);
         }
         if let Some(value) = &config.referrer_policy {
-            staged.push(expand(request, "referrer-policy", value)?);
+            staged.push(expand_single_token(request, "referrer-policy", value)?);
         }
         if let Some(value) = &config.content_security_policy {
-            staged.push(expand(request, "content-security-policy", value)?);
+            staged.push(expand_csp(request, "content-security-policy", value)?);
         }
         // The Handler is the HTTPS gate (T-HTTP-154): HSTS is only staged for a TLS request.
         // `apply`/`stage_headers` remain the unconditional form for callers that already decided.
@@ -979,22 +1061,236 @@ impl SecurityHeaders {
             }
         }
         if let Some(value) = &config.permissions_policy {
-            staged.push(expand(request, "permissions-policy", value)?);
+            staged.push(expand_permissions(request, "permissions-policy", value)?);
         }
         Ok(staged)
     }
 }
 
 /// Expand `{...}` placeholders in `value` (ReplaceKnown) and parse the result for `name`.
+///
+/// Only for headers whose value carries no internal structure (HSTS). Structured values go
+/// through the re-assembling expanders below.
 fn expand(request: &Request, name: &'static str, value: &str) -> Result<(HeaderName, HeaderValue)> {
-    let expanded = request.replace_known(value);
+    finish(name, request.replace_known(value))
+}
+
+/// Parse an already expanded value into a `(name, value)` header pair.
+///
+/// The expanded bytes are request-controlled, so they are redacted from the error message.
+fn finish(name: &'static str, expanded: String) -> Result<(HeaderName, HeaderValue)> {
     let value = HeaderValue::from_str(&expanded).map_err(|error| {
         invalid(
             name,
-            format!("expanded value `{expanded}` is not a valid header value: {error}"),
+            format!(
+                "expanded value `{}` is not a valid header value: {error}",
+                redact(&expanded)
+            ),
         )
     })?;
     Ok((HeaderName::from_static(name), value))
+}
+
+/// Expand one CSP source / `permissions_policy` origin and re-check it as a single token.
+///
+/// Request-time counterpart of [`validate_allowlist_token`]: a placeholder expansion must not
+/// contribute a `;`, `,`, whitespace or quote, otherwise request data could split or extend the
+/// directive structure (`default-src {http.request.uri.path}` with `/a;script-src`, or
+/// `{http.request.header.X}` carrying `script-src * 'unsafe-inline'`).
+fn expand_policy_token(request: &Request, name: &'static str, token: &str) -> Result<String> {
+    let expanded = request.replace_known(token);
+    if !is_allowlist_token(&expanded) {
+        return Err(invalid(
+            name,
+            format!(
+                "placeholder expansion of `{}` produced `{}`, which is not a single legal token; \
+                 refusing to build the header",
+                redact(token),
+                redact(&expanded)
+            ),
+        ));
+    }
+    Ok(expanded)
+}
+
+/// Expand and re-assemble a `Content-Security-Policy` value directive by directive.
+///
+/// Directive names and the `;`/space structure come from the configuration; only sources are
+/// expanded, and each expansion must stay a single token ([`expand_policy_token`]). An expansion
+/// that would add a separator **fails the request closed**: the handler returns this error and no
+/// header (not even a partial one) is staged. Dropping only the offending source was rejected
+/// because the emitted policy would no longer be the operator's policy — a silently shortened
+/// `script-src` is a different, weaker policy — while the request could still steer it.
+fn expand_csp(
+    request: &Request,
+    name: &'static str,
+    template: &str,
+) -> Result<(HeaderName, HeaderValue)> {
+    if !has_placeholder(template) {
+        return expand(request, name, template);
+    }
+    let mut directives: Vec<String> = Vec::new();
+    for directive in template.split(';') {
+        let directive = directive.trim();
+        if directive.is_empty() {
+            continue;
+        }
+        let mut parts = directive.split_whitespace();
+        let directive_name = parts.next().unwrap_or_default();
+        if !is_csp_directive_name(directive_name) {
+            return Err(invalid(
+                name,
+                format!(
+                    "`{}` is not a valid CSP directive name; a directive name cannot come from a \
+                     placeholder",
+                    redact(directive_name)
+                ),
+            ));
+        }
+        let mut sources = Vec::new();
+        for source in parts {
+            sources.push(expand_policy_token(request, name, source)?);
+        }
+        if sources.is_empty() {
+            directives.push(directive_name.to_string());
+        } else {
+            directives.push(format!("{directive_name} {}", sources.join(" ")));
+        }
+    }
+    if directives.is_empty() {
+        return Err(invalid(
+            name,
+            "content_security_policy is empty after placeholder expansion",
+        ));
+    }
+    finish(name, directives.join("; "))
+}
+
+/// Expand and re-assemble a `Permissions-Policy` value feature by feature.
+///
+/// Same rule and failure mode as [`expand_csp`]: `,` separates features and whitespace separates
+/// the origins of a `( ... )` allowlist, so every expanded origin must stay one token.
+fn expand_permissions(
+    request: &Request,
+    name: &'static str,
+    template: &str,
+) -> Result<(HeaderName, HeaderValue)> {
+    if !has_placeholder(template) {
+        return expand(request, name, template);
+    }
+    let mut features: Vec<String> = Vec::new();
+    for item in template.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let Some((feature, allowlist)) = item.split_once('=') else {
+            return Err(invalid(
+                name,
+                format!("`{}` is not a `feature=allowlist` item", redact(item)),
+            ));
+        };
+        let feature = feature.trim();
+        if !is_feature_name(feature) {
+            return Err(invalid(
+                name,
+                format!(
+                    "`{}` is not a valid permissions policy feature name; a feature name cannot \
+                     come from a placeholder",
+                    redact(feature)
+                ),
+            ));
+        }
+        let allowlist = allowlist.trim();
+        let rendered = match allowlist
+            .strip_prefix('(')
+            .and_then(|rest| rest.strip_suffix(')'))
+        {
+            Some(origins) => {
+                let mut expanded = Vec::new();
+                for origin in origins.split_whitespace() {
+                    expanded.push(expand_policy_token(request, name, origin)?);
+                }
+                format!("({})", expanded.join(" "))
+            }
+            None => expand_policy_token(request, name, allowlist)?,
+        };
+        features.push(format!("{feature}={rendered}"));
+    }
+    if features.is_empty() {
+        return Err(invalid(
+            name,
+            "permissions_policy is empty after placeholder expansion",
+        ));
+    }
+    finish(name, features.join(", "))
+}
+
+/// Expand and re-assemble an `X-Frame-Options` value.
+///
+/// `ALLOW-FROM <origin>` is URI-checked at load time, which never sees a placeholder form, so the
+/// expanded origin is checked here again: one token and an `http(s)` URI (or an authority form
+/// without a scheme), which rejects `javascript:` and `data:`.
+fn expand_x_frame_options(
+    request: &Request,
+    name: &'static str,
+    template: &str,
+) -> Result<(HeaderName, HeaderValue)> {
+    if !has_placeholder(template) {
+        return expand(request, name, template);
+    }
+    let trimmed = template.trim();
+    let (keyword, rest) = match trimmed.split_once(char::is_whitespace) {
+        Some((keyword, rest)) => (keyword, rest.trim()),
+        None => (trimmed, ""),
+    };
+    match keyword.to_ascii_uppercase().as_str() {
+        "ALLOW-FROM" => {
+            let origin = request.replace_known(rest);
+            if !is_allowlist_token(&origin) || !is_valid_frame_origin(&origin) {
+                return Err(invalid(
+                    name,
+                    format!(
+                        "ALLOW-FROM origin `{}` is not a single http(s) URI after expansion",
+                        redact(&origin)
+                    ),
+                ));
+            }
+            finish(name, format!("ALLOW-FROM {origin}"))
+        }
+        "DENY" | "SAMEORIGIN" => {
+            if !rest.is_empty() {
+                return Err(invalid(
+                    name,
+                    format!("X-Frame-Options `{keyword}` takes no value after expansion"),
+                ));
+            }
+            finish(name, keyword.to_ascii_uppercase())
+        }
+        _ => Err(invalid(
+            name,
+            format!(
+                "x-frame-options must be DENY, SAMEORIGIN or ALLOW-FROM <origin>, got `{}`",
+                redact(trimmed)
+            ),
+        )),
+    }
+}
+
+/// Expand a header whose value is a single token (`referrer_policy`, `x_content_type_options`).
+///
+/// The load-time checks are closed sets of single tokens; after expansion the value must still be
+/// one token, so a placeholder cannot turn `no-referrer` into a comma-separated list.
+fn expand_single_token(
+    request: &Request,
+    name: &'static str,
+    template: &str,
+) -> Result<(HeaderName, HeaderValue)> {
+    if !has_placeholder(template) {
+        return expand(request, name, template);
+    }
+    let expanded = expand_policy_token(request, name, template.trim())?;
+    finish(name, expanded)
 }
 
 /// Insert `value` under `name` unless the map already carries that header.
@@ -1403,6 +1699,189 @@ mod tests {
             header_value(&request.pending_response_headers, "x-frame-options").as_deref(),
             Some("DENY")
         );
+    }
+
+    /// Assert that staging fails closed with a located error and stages no header.
+    fn assert_expansion_rejected(
+        middleware: &SecurityHeaders,
+        request: &mut Request,
+        header: &str,
+        expected_message: &str,
+    ) {
+        match middleware.stage(request).unwrap_err() {
+            Error::InvalidConfig { path, message } => {
+                assert_eq!(path, header);
+                assert!(message.contains(expected_message), "{message}");
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+        assert!(
+            request.pending_response_headers.get(header).is_none(),
+            "no {header} may be staged when its expansion is rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn csp_placeholder_cannot_add_a_directive_from_the_request_path() {
+        // T-ROUTE-050 blocking defect: `/a;script-src` used to be emitted as
+        // `default-src /a;script-src`, a request-chosen second directive.
+        let middleware =
+            SecurityHeaders::new(config_with_csp("default-src {http.request.uri.path}")).unwrap();
+        let mut request = Request::new(Method::GET, "/a;script-src".parse::<Uri>().unwrap());
+        assert_expansion_rejected(
+            &middleware,
+            &mut request,
+            "content-security-policy",
+            "not a single legal token",
+        );
+    }
+
+    #[tokio::test]
+    async fn csp_placeholder_cannot_append_a_directive_from_a_header() {
+        let middleware =
+            SecurityHeaders::new(config_with_csp("default-src {http.request.header.X-Src}"))
+                .unwrap();
+        let mut request = request();
+        request.headers.insert(
+            "x-src",
+            "https://ok.example script-src * 'unsafe-inline'"
+                .parse()
+                .unwrap(),
+        );
+        assert_expansion_rejected(
+            &middleware,
+            &mut request,
+            "content-security-policy",
+            "not a single legal token",
+        );
+    }
+
+    #[tokio::test]
+    async fn csp_placeholder_expansion_is_neutralised_when_percent_encoded() {
+        // An encoded `;` is not a directive separator, so it stays one source verbatim.
+        let middleware =
+            SecurityHeaders::new(config_with_csp("default-src {http.request.uri.path}")).unwrap();
+        let mut request = Request::new(Method::GET, "/a%3Bscript-src".parse::<Uri>().unwrap());
+        middleware.stage(&mut request).unwrap();
+        assert_eq!(
+            header_value(&request.pending_response_headers, "content-security-policy").as_deref(),
+            Some("default-src /a%3Bscript-src")
+        );
+    }
+
+    #[tokio::test]
+    async fn csp_placeholder_expansion_keeps_legitimate_sources() {
+        let middleware = SecurityHeaders::new(config_with_csp(
+            "default-src 'self' https://{http.request.host}; img-src {http.request.uri.path}",
+        ))
+        .unwrap();
+        let mut request = Request::new(Method::GET, "/img/logo.png".parse::<Uri>().unwrap());
+        request
+            .headers
+            .insert(http::header::HOST, "example.com".parse().unwrap());
+        middleware.stage(&mut request).unwrap();
+        assert_eq!(
+            header_value(&request.pending_response_headers, "content-security-policy").as_deref(),
+            Some("default-src 'self' https://example.com; img-src /img/logo.png")
+        );
+    }
+
+    #[tokio::test]
+    async fn permissions_policy_placeholder_cannot_add_a_feature() {
+        let middleware = SecurityHeaders::new(SecurityHeadersConfig {
+            permissions_policy: Some("geolocation=({http.request.header.X-Origin})".to_string()),
+            ..SecurityHeadersConfig::default()
+        })
+        .unwrap();
+        let mut injected = request();
+        injected.headers.insert(
+            "x-origin",
+            "self) , camera=* , microphone=*".parse().unwrap(),
+        );
+        assert_expansion_rejected(
+            &middleware,
+            &mut injected,
+            "permissions-policy",
+            "not a single legal token",
+        );
+
+        let mut legitimate = request();
+        legitimate
+            .headers
+            .insert("x-origin", "https://maps.example.com".parse().unwrap());
+        middleware.stage(&mut legitimate).unwrap();
+        assert_eq!(
+            header_value(&legitimate.pending_response_headers, "permissions-policy").as_deref(),
+            Some("geolocation=(https://maps.example.com)")
+        );
+    }
+
+    #[tokio::test]
+    async fn allow_from_placeholder_is_uri_and_scheme_checked_after_expansion() {
+        let middleware = SecurityHeaders::new(SecurityHeadersConfig {
+            x_frame_options: Some("ALLOW-FROM {http.request.header.X-Origin}".to_string()),
+            ..SecurityHeadersConfig::default()
+        })
+        .unwrap();
+        let mut injected = request();
+        injected
+            .headers
+            .insert("x-origin", "javascript:alert(1)".parse().unwrap());
+        assert_expansion_rejected(
+            &middleware,
+            &mut injected,
+            "x-frame-options",
+            "is not a single http(s) URI",
+        );
+
+        let mut legitimate = request();
+        legitimate
+            .headers
+            .insert("x-origin", "https://ok.example".parse().unwrap());
+        middleware.stage(&mut legitimate).unwrap();
+        assert_eq!(
+            header_value(&legitimate.pending_response_headers, "x-frame-options").as_deref(),
+            Some("ALLOW-FROM https://ok.example")
+        );
+    }
+
+    #[test]
+    fn allow_from_rejects_non_http_schemes_at_load_time() {
+        let error = SecurityHeadersConfig::from_headers_block(
+            &json!({"x_frame_options": "ALLOW-FROM javascript:alert(1)"}),
+            "handler.security_headers",
+        )
+        .unwrap_err();
+        match error {
+            Error::InvalidConfig { path, message } => {
+                assert_eq!(path, "handler.security_headers.x_frame_options");
+                assert!(message.contains("not a valid http(s) URI"), "{message}");
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn expansion_error_redacts_request_controlled_bytes() {
+        let middleware = SecurityHeaders::new(SecurityHeadersConfig {
+            referrer_policy: Some("origin-{http.vars.injected}".to_string()),
+            ..SecurityHeadersConfig::default()
+        })
+        .unwrap();
+        let mut request = request();
+        request
+            .vars
+            .insert("injected".to_string(), "ok\r\nX-Injected: 1".to_string());
+        let error = middleware.stage(&mut request).unwrap_err();
+        let Error::InvalidConfig { path, message } = error else {
+            panic!("expected InvalidConfig");
+        };
+        assert_eq!(path, "referrer-policy");
+        assert!(
+            !message.contains('\r') && !message.contains('\n'),
+            "message must not carry raw control bytes: {message:?}"
+        );
+        assert!(message.contains('\u{fffd}'), "{message:?}");
     }
 
     #[tokio::test]
