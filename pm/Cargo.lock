@@ -331,6 +331,7 @@ dependencies = [
  "async-trait",
  "axum",
  "axum-test",
+ "caddy-rs-authn",
  "caddy-rs-core",
  "caddy-rs-pm-certificates",
  "caddy-rs-pm-config",
