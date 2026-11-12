@@ -318,7 +318,10 @@ pub(crate) async fn serve_request_with_automatic_upgradable(
     if !tls {
         if let Some(automatic) = &automatic {
             if let Some(response) = automatic.pre_router_response(&request) {
-                return ServedResponse::Response(response);
+                // The derived automatic-HTTPS listener answers HTTP-01 challenges and the
+                // HTTP→HTTPS redirect before routing, so those responses need the same
+                // pre-routing identity stamp as the other synthetic responses (DIV-0126).
+                return served_response_with_identity(limits, response);
             }
         }
     }
