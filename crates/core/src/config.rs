@@ -37,9 +37,36 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub apps: Option<Apps>,
 
+    /// caddy-rs extension (`stock_compat`, DIV-0130): selects the documented stock-compatibility
+    /// profile. Absent means `false`. The file/glob import policy is implemented (DIV-0124); the
+    /// remaining profile surfaces (response headers, log redaction, identity) are tracked by
+    /// T-CONF-071/T-HTTP-160/T-HTTP-161.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_stock_compat",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub stock_compat: Option<bool>,
+
     /// Unknown top-level keys, preserved for round-tripping and rejected by validation.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+/// Decode `stock_compat` with a field-named error instead of a bare serde type error.
+fn deserialize_stock_compat<'de, D>(deserializer: D) -> std::result::Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Value::deserialize(deserializer)? {
+        Value::Bool(value) => Ok(Some(value)),
+        Value::Null => Err(serde::de::Error::custom(
+            "stock_compat must be a boolean, got null",
+        )),
+        other => Err(serde::de::Error::custom(format!(
+            "stock_compat must be a boolean, got {other}"
+        ))),
+    }
 }
 
 impl Config {
@@ -76,6 +103,15 @@ impl Config {
     /// The logging configuration, if present.
     pub fn logging(&self) -> Option<&Logging> {
         self.logging.as_ref()
+    }
+
+    /// The effective `stock_compat` flag (an absent field means `false`).
+    ///
+    /// This is the caddy-rs stock-compatibility switch (DIV-0130). The import-path policy is the
+    /// first surface it gates (DIV-0124); the remaining profile rows are tracked by
+    /// T-CONF-071/T-HTTP-160/T-HTTP-161.
+    pub fn stock_compat(&self) -> bool {
+        self.stock_compat.unwrap_or(false)
     }
 
     /// The global storage configuration, if present.
