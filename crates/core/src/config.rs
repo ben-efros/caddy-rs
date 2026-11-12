@@ -1001,7 +1001,7 @@ impl TlsApp {
 
 /// Certificate loaders configured on the TLS app (`apps.tls.certificates`).
 ///
-/// Caddy models this as a module map keyed by loader short name. The two loaders with a stable,
+/// Caddy models this as a module map keyed by loader short name. The loaders with a stable,
 /// simple shape are typed here; other loader keys (for example `load_folders`, `load_storage`) are
 /// preserved in [`CertificatesConfig::extra`] and their module names are still validated.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1026,9 +1026,97 @@ pub struct CertificatesConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub automate: Option<Vec<String>>,
 
+    /// `tls.certificates.pkcs11`: certificate chains and token-held private keys loaded through
+    /// PKCS#11 (TPM, SoftHSM, YubiKey PIV, network HSM).
+    ///
+    /// JSON-only: there is no Caddyfile syntax for this loader. Each entry loads a certificate
+    /// chain from PEM and pairs it with a non-extractable private key that stays inside a
+    /// PKCS#11 token. The key itself never enters process memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pkcs11: Option<Vec<Pkcs11CertConfig>>,
+
     /// Other loader module keys, preserved verbatim.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+/// One PKCS#11 certificate-key entry (`tls.certificates.pkcs11[i]`).
+///
+/// Loads a certificate chain from PEM and a private key from a PKCS#11 token. The token holds
+/// the key non-extractably; caddy-rs only ever holds an object handle and the public key.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Pkcs11CertConfig {
+    /// Path to the PKCS#11 module (shared library), for example
+    /// `/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so`, `/usr/lib/libtpm2_pkcs11.so.1`,
+    /// or `ykcs11.dll`. Loaded at runtime via `dlopen`; caddy-rs does not link any vendor
+    /// library at build time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub module: Option<String>,
+
+    /// Token label used to select the PKCS#11 token. Mutually exclusive with `slot`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+
+    /// Slot ID used to select the PKCS#11 token. Mutually exclusive with `token`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slot: Option<u64>,
+
+    /// Object label of the private key on the token. Mutually exclusive with `key_id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_label: Option<String>,
+
+    /// DER-encoded object ID of the private key on the token, hex-encoded. Mutually exclusive
+    /// with `key_label`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
+
+    /// Path to a PEM file containing the certificate chain (leaf first). Mutually exclusive
+    /// with `certificate_pem`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub certificate: Option<String>,
+
+    /// Inline PEM certificate chain (leaf first). Mutually exclusive with `certificate`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub certificate_pem: Option<String>,
+
+    /// PIN source: `"env"` reads from an environment variable named by `pin`, `"file"` reads
+    /// from the path named by `pin_file`.
+    #[serde(default, skip_serializing_if = "PinSource::is_default")]
+    pub pin_source: PinSource,
+
+    /// Name of the environment variable holding the PIN (used when `pin_source` is `env`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pin: Option<String>,
+
+    /// Path to a file containing the PIN (used when `pin_source` is `file`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pin_file: Option<String>,
+
+    /// Optional per-token session reuse window in seconds. When set, sessions are held open
+    /// across handshakes up to this window; otherwise each handshake opens and closes a session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_timeout: Option<u64>,
+
+    /// Unknown fields, preserved verbatim for forward compatibility.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+/// Source of the PKCS#11 PIN.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub enum PinSource {
+    #[default]
+    #[serde(rename = "env")]
+    Env,
+    #[serde(rename = "file")]
+    File,
+}
+
+impl PinSource {
+    /// Returns true when this is the default (`env`), so serde can omit it on serialisation.
+    pub fn is_default(&self) -> bool {
+        matches!(self, PinSource::Env)
+    }
 }
 
 /// One certificate/key file pair (`load_files` entry).
@@ -1752,5 +1840,92 @@ mod tests {
                 "invalid shutdown timing must be rejected: {bad}"
             );
         }
+    }
+
+    #[test]
+    fn pkcs11_config_decodes_and_round_trips() {
+        let json = serde_json::json!({
+            "apps": {
+                "tls": {
+                    "certificates": {
+                        "pkcs11": [{
+                            "module": "/usr/lib/libsofthsm2.so",
+                            "token": "softhsm-token",
+                            "key_label": "server-key",
+                            "certificate": "/etc/certs/chain.pem",
+                            "pin_source": "env",
+                            "pin": "PKCS11_PIN",
+                            "session_timeout": 300
+                        }]
+                    }
+                }
+            }
+        });
+        let config = Config::from_value(json.clone()).expect("valid pkcs11 config");
+        let tls = config.tls().expect("tls app");
+        let certs = tls.certificates.as_ref().expect("certificates configured");
+        let entries = certs.pkcs11.as_ref().expect("pkcs11 entries");
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.module.as_deref(), Some("/usr/lib/libsofthsm2.so"));
+        assert_eq!(entry.token.as_deref(), Some("softhsm-token"));
+        assert_eq!(entry.key_label.as_deref(), Some("server-key"));
+        assert_eq!(entry.certificate.as_deref(), Some("/etc/certs/chain.pem"));
+        assert_eq!(entry.pin_source, PinSource::Env);
+        assert_eq!(entry.pin.as_deref(), Some("PKCS11_PIN"));
+        assert_eq!(entry.session_timeout, Some(300));
+        assert_eq!(entry.key_id, None);
+        assert_eq!(entry.certificate_pem, None);
+        assert_eq!(entry.pin_file, None);
+
+        // Round-trips losslessly (flattened extra preserves unknown fields).
+        let value = config.to_value().expect("serializes");
+        assert_eq!(
+            value["apps"]["tls"]["certificates"]["pkcs11"][0]["module"],
+            serde_json::json!("/usr/lib/libsofthsm2.so")
+        );
+        assert_eq!(
+            value["apps"]["tls"]["certificates"]["pkcs11"][0]["token"],
+            serde_json::json!("softhsm-token")
+        );
+    }
+
+    #[test]
+    fn pkcs11_config_certificate_pem_and_pin_file() {
+        let json = serde_json::json!({
+            "apps": {
+                "tls": {
+                    "certificates": {
+                        "pkcs11": [{
+                            "module": "/usr/lib/ykcs11.dll",
+                            "slot": 3,
+                            "key_id": "deadbeef",
+                            "certificate_pem": "-----BEGIN CERTIFICATE-----\\nMIIB...\\n-----END CERTIFICATE-----\\n",
+                            "pin_source": "file",
+                            "pin_file": "/run/secrets/pin"
+                        }]
+                    }
+                }
+            }
+        });
+        let config = Config::from_value(json).expect("valid pkcs11 pem config");
+        let entry = &config
+            .tls()
+            .expect("tls app")
+            .certificates
+            .as_ref()
+            .expect("certificates")
+            .pkcs11
+            .as_ref()
+            .expect("pkcs11 entries")[0];
+        assert_eq!(entry.slot, Some(3));
+        assert_eq!(entry.key_id.as_deref(), Some("deadbeef"));
+        assert!(entry.certificate_pem.is_some());
+        assert_eq!(entry.pin_source, PinSource::File);
+        assert_eq!(entry.pin_file.as_deref(), Some("/run/secrets/pin"));
+        assert!(entry.token.is_none());
+        assert!(entry.key_label.is_none());
+        assert!(entry.certificate.is_none());
+        assert!(entry.pin.is_none());
     }
 }
