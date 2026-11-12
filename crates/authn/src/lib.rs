@@ -1129,6 +1129,18 @@ pub trait UserStore: Send + Sync {
     /// List all users (for administrative purposes).
     async fn list_users(&self) -> AuthResult<Vec<User>>;
 
+    /// Atomically create the first admin user only if no users exist yet.
+    ///
+    /// The default implementation is not atomic: it lists users and then creates one, which
+    /// allows a race between concurrent callers. Store backends that can provide atomic
+    /// compare-and-set should override this method.
+    async fn create_first_admin(&self, user: User) -> AuthResult<User> {
+        if !self.list_users().await?.is_empty() {
+            return Err(AuthError::UsernameExists);
+        }
+        self.create_user(user).await
+    }
+
     /// Get a refresh token record by the SHA-256 digest of the token.
     async fn get_refresh_token(&self, token_hash: &str) -> AuthResult<Option<RefreshTokenRecord>>;
 
@@ -1158,6 +1170,14 @@ pub trait UserStore: Send + Sync {
 }
 
 /// In-memory user store implementation.
+///
+/// # Lock order
+///
+/// Every method that holds more than one write lock acquires them in this order:
+/// `users` → `users_by_username` → `refresh_tokens`. No method acquires them in reverse, and
+/// readers that need two maps (`get_user_by_username`) release the first guard before taking the
+/// second. Keeping one order is what makes [`MemoryUserStore::create_first_admin`] deadlock-free
+/// while it holds both user maps for the compare-and-set.
 #[derive(Debug, Clone, Default)]
 pub struct MemoryUserStore {
     users: Arc<RwLock<HashMap<UserId, User>>>,
@@ -1195,6 +1215,27 @@ impl UserStore for MemoryUserStore {
         }
         if users.contains_key(&user.id) {
             return Err(AuthError::Store("user id already exists".to_string()));
+        }
+
+        users_by_username.insert(user.username.clone(), user.id);
+        users.insert(user.id, user.clone());
+        Ok(user)
+    }
+
+    /// Atomically create the first admin user only if no users exist yet.
+    ///
+    /// The check for existing users and the insertion happen under a single write lock, so
+    /// concurrent callers cannot both observe an empty store and both create a user. The first
+    /// caller wins; subsequent callers receive [`AuthError::UsernameExists`].
+    async fn create_first_admin(&self, user: User) -> AuthResult<User> {
+        let mut users = self.users.write().await;
+        let mut users_by_username = self.users_by_username.write().await;
+
+        if !users.is_empty() {
+            return Err(AuthError::UsernameExists);
+        }
+        if users_by_username.contains_key(&user.username) {
+            return Err(AuthError::UsernameExists);
         }
 
         users_by_username.insert(user.username.clone(), user.id);
@@ -1485,6 +1526,7 @@ pub fn filter_visible_rows<T>(
 }
 
 /// Main authentication service.
+#[derive(Clone)]
 pub struct AuthnService<S: UserStore> {
     store: S,
     config: AuthnConfig,
@@ -1536,6 +1578,11 @@ impl<S: UserStore> AuthnService<S> {
         &self.config
     }
 
+    /// List all users (delegates to the store).
+    pub async fn list_users(&self) -> AuthResult<Vec<User>> {
+        self.store.list_users().await
+    }
+
     /// Create a new user.
     pub async fn create_user(
         &self,
@@ -1563,6 +1610,36 @@ impl<S: UserStore> AuthnService<S> {
         };
 
         self.store.create_user(user).await
+    }
+
+    /// Create the first administrator atomically.
+    ///
+    /// Only succeeds when no users exist yet. Concurrent callers race on the store-level
+    /// compare-and-set in [`MemoryUserStore::create_first_admin`]; exactly one caller wins and
+    /// receives a fresh token pair, all others get [`AuthError::UsernameExists`].
+    pub async fn create_first_admin(
+        &self,
+        username: impl Into<String>,
+        password: &str,
+    ) -> AuthResult<(User, TokenPair)> {
+        let username = username.into();
+        let password_hash = hash_password(password, &self.config.argon2_params)?;
+        let now = Utc::now();
+        let user = User {
+            id: UserId::new(),
+            username,
+            password_hash,
+            role: Role::admin(),
+            totp_secret: None,
+            totp_last_step: None,
+            auth_epoch: 0,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let user = self.store.create_first_admin(user).await?;
+        let token_pair = self.issue_token_pair(&user).await?;
+        Ok((user, token_pair))
     }
 
     /// Update a user's password after verifying the old password.
