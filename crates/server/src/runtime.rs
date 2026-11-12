@@ -490,6 +490,11 @@ impl ServerRuntime {
         for warning in forwarded_trust_warnings(generation.config())? {
             eprintln!("{warning}");
         }
+        // `security_headers` is a caddy-rs extension: compatible-mode acceptance decisions are
+        // reported here so `caddy validate` and `run` surface them exactly once (T-HTTP-153).
+        for warning in security_headers_warnings(generation.config()) {
+            eprintln!("{warning}");
+        }
         let https_port = http.https_port.unwrap_or(DEFAULT_HTTPS_PORT);
         let status_sink = UpstreamStatusSink::new();
         let acme_server_data_root = self.acme_server_data_root(generation.config())?;
@@ -682,6 +687,10 @@ impl ServerRuntime {
         // Load-time diagnostics for the forwarded-header trust anchor (T-TLS-087). Emit before
         // anything fallible so a permissive range/wrapper is reported even if this apply fails.
         for warning in forwarded_trust_warnings(generation.config())? {
+            eprintln!("{warning}");
+        }
+        // Same for the `security_headers` extension's compatible-mode warnings (T-HTTP-153).
+        for warning in security_headers_warnings(generation.config()) {
             eprintln!("{warning}");
         }
         // Access-log sinks belong to the active generation: build them before touching listeners
@@ -2054,6 +2063,29 @@ fn parse_server_trusted_proxies(
 /// Caddy accepts it, and there is no unsafe-by-default case (with no `trusted_proxies` and no
 /// wrapper the variable is `false`, so forwarded headers are ignored). The messages name the
 /// server, the configured range or listen address, and the tracking id.
+/// Load-time warnings for the `security_headers` extension (T-HTTP-153).
+///
+/// Walks the serialized configuration with the compatible acceptance mode and returns
+/// `caddy-rs: warning: ...` lines for unknown options, a short HSTS `max_age` and the HSTS preload
+/// requirements. This is the single printing sink for `validate`, `run` and admin loads (the CLI
+/// uses the same walker only to enforce `--adapt-mode strict`), so a warning is never duplicated.
+/// A malformed value is not swallowed here: the router build reports it with its own located error.
+fn security_headers_warnings(config: &caddy_rs_core::Config) -> Vec<String> {
+    let Ok(document) = serde_json::to_value(config) else {
+        return Vec::new();
+    };
+    match caddy_rs_http::security_headers::validate_security_headers_config(
+        &document,
+        caddy_rs_http::security_headers::SecurityHeadersMode::Compatible,
+    ) {
+        Ok(warnings) => warnings
+            .into_iter()
+            .map(|warning| format!("caddy-rs: warning: {warning}"))
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 fn forwarded_trust_warnings(config: &caddy_rs_core::Config) -> Result<Vec<String>> {
     let Some(http) = config.http() else {
         return Ok(Vec::new());
@@ -2544,6 +2576,64 @@ mod shutdown_timing_tests {
             timing.shutdown_delay,
             Some(std::time::Duration::from_secs(2))
         );
+    }
+}
+
+#[cfg(test)]
+mod security_headers_warning_tests {
+    use super::security_headers_warnings;
+    use caddy_rs_core::Config;
+
+    fn config(handler: serde_json::Value) -> Config {
+        Config::from_value(serde_json::json!({
+            "admin": {"disabled": true},
+            "apps": {"http": {"servers": {"srv0": {
+                "listen": ["127.0.0.1:0"],
+                "routes": [{"handle": [handler]}]
+            }}}}
+        }))
+        .expect("test config decodes")
+    }
+
+    #[test]
+    fn compatible_acceptance_decisions_are_reported_with_prefix_and_path() {
+        // Acceptance (2), (5): the load path prints the compatible-mode warning for a short HSTS
+        // max-age and for an unknown field, located at the JSON path of the handler.
+        let config = config(serde_json::json!({
+            "handler": "security_headers",
+            "frame_options_typo": "DENY",
+            "strict_transport_security": {"max_age": 86_400, "include_subdomains": true}
+        }));
+        let warnings = security_headers_warnings(&config);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| warning.starts_with("caddy-rs: warning: ")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|warning| warning
+                .contains("apps.http.servers.srv0.routes[0].handle[0]")
+                && warning.contains("`max_age` 86400")
+                && warning.contains("below the browser-enforced minimum")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|warning| warning
+                .contains("apps.http.servers.srv0.routes[0].handle[0]")
+                && warning.contains("frame_options_typo")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn valid_security_headers_configuration_has_no_warnings() {
+        let config = config(serde_json::json!({
+            "handler": "security_headers",
+            "strict_transport_security": {"max_age": 31_536_000, "include_subdomains": true}
+        }));
+        assert_eq!(security_headers_warnings(&config), Vec::<String>::new());
     }
 }
 

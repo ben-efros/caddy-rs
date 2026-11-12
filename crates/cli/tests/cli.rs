@@ -2190,6 +2190,129 @@ fn write_caddyfile(directory: &tempfile::TempDir, body: &str) -> std::path::Path
     config
 }
 
+fn write_json_config(
+    directory: &tempfile::TempDir,
+    name: &str,
+    value: &serde_json::Value,
+) -> std::path::PathBuf {
+    let config = directory.path().join(name);
+    std::fs::write(
+        &config,
+        serde_json::to_string(value).expect("serialize JSON config"),
+    )
+    .expect("write JSON config");
+    config
+}
+
+/// A minimal JSON config whose single route carries one `security_headers` handler with `fields`.
+fn security_headers_json(fields: serde_json::Value) -> serde_json::Value {
+    let mut handler = serde_json::Map::new();
+    handler.insert(
+        "handler".to_string(),
+        serde_json::Value::String("security_headers".to_string()),
+    );
+    if let Some(fields) = fields.as_object() {
+        for (key, value) in fields {
+            handler.insert(key.clone(), value.clone());
+        }
+    }
+    serde_json::json!({
+        "admin": {"disabled": true},
+        "apps": {"http": {"servers": {"srv0": {
+            "listen": [":8080"],
+            "routes": [{"handle": [serde_json::Value::Object(handler)]}]
+        }}}}
+    })
+}
+
+#[test]
+fn validate_applies_adapt_mode_to_security_headers() {
+    let directory = tempfile::tempdir().unwrap();
+
+    // Acceptance (1): an invalid CSP fails validation with the located JSON path of the offending
+    // directive and source (Caddyfile line/column locations belong to the adapter, T-ROUTE-051).
+    let invalid_csp = write_json_config(
+        &directory,
+        "invalid-csp.json",
+        &security_headers_json(serde_json::json!({
+            "content_security_policy": "default-src 'self'; img-src h\u{e9}llo"
+        })),
+    );
+    let (code, _stdout, stderr) = run(&["validate", "--config", invalid_csp.to_str().unwrap()]);
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains(
+            "apps.http.servers.srv0.routes[0].handle[0].content_security_policy.img-src[0]"
+        ),
+        "{stderr}"
+    );
+    assert!(stderr.contains("non-ASCII"), "{stderr}");
+
+    // Acceptance (2): an HSTS max-age below 180 days warns in compatible mode and rejects in
+    // strict mode.
+    let short_hsts = write_json_config(
+        &directory,
+        "short-hsts.json",
+        &security_headers_json(serde_json::json!({
+            "strict_transport_security": {"max_age": 86400, "include_subdomains": true}
+        })),
+    );
+    let (code, stdout, stderr) = run(&["validate", "--config", short_hsts.to_str().unwrap()]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("Valid configuration"), "{stdout}");
+    assert!(stderr.contains("caddy-rs: warning:"), "{stderr}");
+    assert!(
+        stderr.contains("below the browser-enforced minimum"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("compatible"), "{stderr}");
+    let (code, _stdout, stderr) = run(&[
+        "validate",
+        "--config",
+        short_hsts.to_str().unwrap(),
+        "--adapt-mode",
+        "strict",
+    ]);
+    assert_ne!(code, 0);
+    assert!(stderr.contains("15552000"), "{stderr}");
+    assert!(
+        stderr.contains(
+            "apps.http.servers.srv0.routes[0].handle[0].strict_transport_security.max_age"
+        ),
+        "{stderr}"
+    );
+
+    // Acceptance (4) and (5): strict rejects unknown security-header fields, compatible accepts
+    // them with a warning.
+    let unknown = write_json_config(
+        &directory,
+        "unknown.json",
+        &security_headers_json(serde_json::json!({"frame_options_typo": "DENY"})),
+    );
+    let (code, _stdout, stderr) = run(&["validate", "--config", unknown.to_str().unwrap()]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        stderr.contains("caddy-rs: warning:") && stderr.contains("frame_options_typo"),
+        "{stderr}"
+    );
+    let (code, _stdout, stderr) = run(&[
+        "validate",
+        "--config",
+        unknown.to_str().unwrap(),
+        "--adapt-mode",
+        "strict",
+    ]);
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("unknown security header option"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("apps.http.servers.srv0.routes[0].handle[0].frame_options_typo"),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn adapt_mode_flag_controls_deprecated_alias_handling() {
     let directory = tempfile::tempdir().unwrap();
