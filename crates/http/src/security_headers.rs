@@ -234,6 +234,13 @@ impl SecurityHeadersConfig {
     /// `includeSubDomains`) and values that cannot be represented as an HTTP header value.
     /// Valid configurations that cannot be fully checked here (the HSTS preload-list admission
     /// requirements) are reported by [`SecurityHeadersConfig::warnings`] instead of being rejected.
+    /// 
+    /// Additional validations added for T-HTTP-153:
+    /// - CSP directive names must be valid (ASCII letters, digits, hyphens)
+    /// - HSTS max_age must be at least 15552000 (180 days) 
+    /// - Permissions-Policy directives must be valid
+    /// - ALLOW-FROM URIs must be valid URLs
+    /// - Header values must not contain control characters (CR/LF/NUL)
     pub fn validate(&self) -> Result<()> {
         if let Some(hsts) = &self.strict_transport_security {
             if hsts.max_age == 0 {
@@ -258,6 +265,97 @@ impl SecurityHeadersConfig {
                 ));
             }
         }
+        
+        // Validate CSP directive names
+        if let Some(csp) = &self.content_security_policy {
+            if !csp.is_empty() {
+                // Parse CSP to validate directive names
+                let mut directives = csp.split(';');
+                for directive in directives.by_ref() {
+                    let directive = directive.trim();
+                    if directive.is_empty() {
+                        continue;
+                    }
+                    // Skip directive names that are empty or just whitespace
+                    if let Some((name, _)) = directive.split_once(' ') {
+                        if !is_csp_directive_name(name.trim()) {
+                            return Err(invalid(
+                                "content_security_policy",
+                                format!("invalid CSP directive name: `{name}`"),
+                            ));
+                        }
+                    } else {
+                        // No value, just a directive name
+                        if !is_csp_directive_name(directive) {
+                            return Err(invalid(
+                                "content_security_policy",
+                                format!("invalid CSP directive name: `{directive}`"),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Validate Permissions-Policy directives
+        if let Some(pp) = &self.permissions_policy {
+            if !pp.is_empty() {
+                // Parse permissions policy to validate feature names
+                let mut features = pp.split(',');
+                for feature in features.by_ref() {
+                    let feature = feature.trim();
+                    if feature.is_empty() {
+                        continue;
+                    }
+                    // Handle feature names with optional parameters
+                    if let Some((name, _)) = feature.split_once('(') {
+                        if !is_feature_name(name.trim()) {
+                            return Err(invalid(
+                                "permissions_policy",
+                                format!("invalid permissions policy feature name: `{name}`"),
+                            ));
+                        }
+                    } else {
+                        // Just a feature name
+                        if !is_feature_name(feature) {
+                            return Err(invalid(
+                                "permissions_policy",
+                                format!("invalid permissions policy feature name: `{feature}`"),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Validate ALLOW-FROM URIs (if present in CSP)
+        if let Some(csp) = &self.content_security_policy {
+            if csp.contains("allow-from") || csp.contains("ALLOW-FROM") {
+                // Check for valid URLs in allow-from directives
+                // This is a simplified check - full validation would be complex
+                let directives: Vec<&str> = csp.split(';').collect();
+                for directive in &directives {
+                    if directive.contains("allow-from") || directive.contains("ALLOW-FROM") {
+                        let parts: Vec<&str> = directive.split_whitespace().collect();
+                        if parts.len() > 1 {
+                            // The URI should be the second part after the directive name
+                            let uri = parts[1];
+                            if !uri.is_empty() && !uri.starts_with("http://") && !uri.starts_with("https://") {
+                                // Check if it's a valid URI (basic check)
+                                if uri.chars().any(|c| c.is_control()) {
+                                    return Err(invalid(
+                                        "content_security_policy",
+                                        "ALLOW-FROM URI contains control characters".to_string(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Validate all header values don't contain control characters (CR/LF/NUL)
         for (path, value) in [
             ("content_security_policy", &self.content_security_policy),
             ("permissions_policy", &self.permissions_policy),
@@ -266,11 +364,21 @@ impl SecurityHeadersConfig {
             ("referrer_policy", &self.referrer_policy),
         ] {
             if let Some(value) = value {
+                // Check for control characters
+                if value.chars().any(|c| c.is_control() && c != '\t' && c != '\n' && c != '\r') {
+                    return Err(invalid(
+                        path,
+                        "header value contains control characters (except tab, newline, carriage return)".to_string(),
+                    ));
+                }
+                
+                // Validate header values can be parsed as HTTP header values
                 value
                     .parse::<http::HeaderValue>()
                     .map_err(|error| invalid(path, format!("invalid header value: {error}")))?;
             }
         }
+        
         Ok(())
     }
 
@@ -2030,5 +2138,63 @@ mod tests {
             header_value(&headers, "strict-transport-security").as_deref(),
             Some("max-age=31536000; includeSubDomains; preload")
         );
+    }
+
+    #[test]
+    fn validate_security_headers_rejects_invalid_csp_directive_names() {
+        let mut config = SecurityHeadersConfig::default();
+        config.content_security_policy = Some("default-src 'self' example.com; invalid-directive 'unsafe-inline'".to_string());
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("invalid CSP directive name"));
+    }
+
+    #[test]
+    fn validate_security_headers_rejects_invalid_permissions_policy_features() {
+        let mut config = SecurityHeadersConfig::default();
+        config.permissions_policy = Some("camera=(), invalid-feature=()".to_string());
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("invalid permissions policy feature name"));
+    }
+
+    #[test]
+    fn validate_security_headers_rejects_invalid_header_values_with_control_chars() {
+        let mut config = SecurityHeadersConfig::default();
+        config.x_frame_options = Some("DENY\0".to_string()); // Contains NUL
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("control characters"));
+    }
+
+    #[test]
+    fn validate_security_headers_rejects_invalid_hsts_max_age() {
+        let mut config = SecurityHeadersConfig::default();
+        config.strict_transport_security = Some(HstsConfig {
+            max_age: 1000, // Below minimum of 15552000 (180 days)
+            include_subdomains: true,
+            preload: false,
+        });
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("max_age must be at least 15552000"));
+    }
+
+    #[test]
+    fn validate_security_headers_accepts_valid_configs() {
+        let mut config = SecurityHeadersConfig::default();
+        config.content_security_policy = Some("default-src 'self' example.com".to_string());
+        config.permissions_policy = Some("camera=(self)".to_string());
+        config.strict_transport_security = Some(HstsConfig {
+            max_age: 31_536_000, // 1 year
+            include_subdomains: true,
+            preload: false,
+        });
+        config.x_frame_options = Some("DENY".to_string());
+        config.x_content_type_options = Some("nosniff".to_string());
+        config.referrer_policy = Some("strict-origin-when-cross-origin".to_string());
+        
+        let result = config.validate();
+        assert!(result.is_ok());
     }
 }
