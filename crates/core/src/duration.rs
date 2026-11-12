@@ -224,25 +224,29 @@ pub fn parse_caddy_duration(input: &str) -> Result<CaddyDuration, String> {
             .map_err(|_| format!("duration `{input}` has an invalid number `{number}`"))?;
         rest = &rest[digit_end..];
 
-        let (unit_nanos, unit_len) = if rest.starts_with("ns") {
-            (1u128, 2)
-        } else if rest.starts_with("us") || rest.starts_with("µs") || rest.starts_with("μs") {
-            (1_000u128, 2)
-        } else if rest.starts_with("ms") {
-            (1_000_000u128, 2)
-        } else if rest.starts_with('s') {
-            (1_000_000_000u128, 1)
-        } else if rest.starts_with('m') {
-            (60 * 1_000_000_000u128, 1)
-        } else if rest.starts_with('h') {
-            (3_600 * 1_000_000_000u128, 1)
-        } else {
+        // The consumed length must come from the matched unit itself: `µs` and `μs` are three
+        // bytes (a two-byte rune plus `s`), so a hard-coded length left a trailing `s` in `rest`
+        // and reported the misleading "missing a number" for a valid microsecond duration.
+        // Two-byte units are listed before their one-byte prefixes (`ms` before `s`/`m`).
+        const UNITS: [(&str, u128); 8] = [
+            ("ns", 1),
+            ("us", 1_000),
+            ("µs", 1_000),
+            ("μs", 1_000),
+            ("ms", 1_000_000),
+            ("s", 1_000_000_000),
+            ("m", 60 * 1_000_000_000),
+            ("h", 3_600 * 1_000_000_000),
+        ];
+        let Some((unit, unit_nanos)) = UNITS.iter().find(|(unit, _)| rest.starts_with(unit)) else {
             return Err(format!(
-                "duration `{input}` has an unknown unit; use ns, us, µs, ms, s, m or h"
+                "duration `{input}` has an unknown unit; use ns, us, µs, μs, ms, s, m or h"
             ));
         };
+        // `unit` was matched with `starts_with`, so this is always a `char` boundary.
+        let unit_len = unit.len();
         total_nanos = total_nanos
-            .checked_add((value * unit_nanos as f64).round() as u128)
+            .checked_add((value * *unit_nanos as f64).round() as u128)
             .ok_or_else(|| format!("duration `{input}` is too large"))?;
         rest = &rest[unit_len..];
         parsed_any = true;
@@ -431,6 +435,94 @@ mod tests {
                 "duration {input:?} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn parses_every_microsecond_spelling() {
+        // `us` is two bytes; `µs` (U+00B5) and `μs` (U+03BC) are three. All three must parse to
+        // the same value; the multibyte spellings used to fail with "missing a number".
+        for input in ["5us", "5µs", "5μs"] {
+            assert_eq!(
+                parse_caddy_duration(input).unwrap().as_nanos(),
+                5_000,
+                "duration {input:?} must parse as 5 microseconds"
+            );
+            assert_eq!(
+                serde_json::from_value::<CaddyDuration>(serde_json::json!(input))
+                    .unwrap()
+                    .as_nanos(),
+                5_000,
+                "serde path must accept {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn multibyte_microsecond_spellings_are_equivalent() {
+        let micro_sign = parse_caddy_duration("250\u{00B5}s").unwrap();
+        let greek_mu = parse_caddy_duration("250\u{03BC}s").unwrap();
+        let ascii = parse_caddy_duration("250us").unwrap();
+        assert_eq!(micro_sign, greek_mu);
+        assert_eq!(micro_sign, ascii);
+        assert_eq!(micro_sign.as_nanos(), 250_000);
+        // Compound components mixing the spellings stay consistent too.
+        assert_eq!(
+            parse_caddy_duration("1µs500μs").unwrap().as_nanos(),
+            501_000
+        );
+    }
+
+    #[test]
+    fn unit_values_are_exact() {
+        for (input, expected) in [
+            ("5ms", 5_000_000),
+            ("5s", 5_000_000_000),
+            ("5m", 300_000_000_000),
+            ("5h", 18_000_000_000_000),
+            ("5ns", 5),
+        ] {
+            assert_eq!(
+                parse_caddy_duration(input).unwrap().as_nanos(),
+                expected,
+                "duration {input:?}"
+            );
+        }
+        // This parser's documented grammar has no day unit; only the Caddyfile/Go parser adds `d`.
+        assert!(parse_caddy_duration("5d").is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_durations_without_panicking() {
+        let very_long = format!("{}h", "9".repeat(100_000));
+        for input in [
+            "",
+            " ",
+            "5",
+            "5u",
+            "5uss",
+            "µ",
+            "μ",
+            "5µ",
+            "5μ",
+            "us",
+            "µs",
+            "s",
+            "5 s",
+            "1.2.3s",
+            "5x",
+            "-1s",
+            "18446744073709551616s",
+            "999999999999999999999999999999h",
+            very_long.as_str(),
+        ] {
+            assert!(
+                parse_caddy_duration(input).is_err(),
+                "duration {input:?} must be rejected"
+            );
+        }
+        // A truncated multibyte unit must not be accepted either.
+        assert!(parse_caddy_duration("5\u{00B5}").is_err());
+        assert!(parse_caddy_duration("5\u{03BC}").is_err());
     }
 
     #[test]
