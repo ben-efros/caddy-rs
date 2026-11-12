@@ -10,21 +10,64 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::*;
 use crate::dto::{HostResponse, HostSpecDto, HostTlsDto, HostWriteRequest};
 use axum_test::TestServer;
+use caddy_rs_authn::{Argon2Config, AuthnConfig, AuthnService, JwtSecretSource, MemoryUserStore};
 use caddy_rs_pm_runtime::{
     ConfigApplyService, ConfigApplyStatus, ConfigRevision, PmRuntime, RuntimeConfig,
 };
 use tempfile::TempDir;
 
+/// Password used by the setup tests. Long enough to be a plausible first administrator secret and
+/// never compared against a hash here, so its value is irrelevant to the assertions.
+const SETUP_PASSWORD: &str = "correct-horse-battery-staple";
+
+fn authn() -> AuthnService<MemoryUserStore> {
+    let authn_config = AuthnConfig {
+        jwt_secret_source: JwtSecretSource::Ephemeral,
+        // Password hashing is deliberately cheap: these tests exercise the compare-and-set on the
+        // user store, not the cost of Argon2, and the race test hashes two passwords per run.
+        argon2_params: Argon2Config {
+            memory_cost: 4096,
+            time_cost: 1,
+            parallelism: 1,
+        },
+        ..AuthnConfig::default()
+    };
+    AuthnService::new(MemoryUserStore::new(), authn_config).expect("create authn service")
+}
+
 fn runtime() -> (TempDir, ApiState) {
     let temp_dir = TempDir::new().expect("create temp dir");
     let config = RuntimeConfig::new(temp_dir.path().join("data"));
     let runtime = PmRuntime::open(config).expect("open runtime");
-    (temp_dir, ApiState::new(runtime))
+    (temp_dir, ApiState::new(runtime, authn()))
 }
 
 fn server() -> (TempDir, TestServer) {
     let (temp_dir, state) = runtime();
     (temp_dir, TestServer::new(create_router(state)))
+}
+
+/// A server plus the authn service whose store the router shares.
+///
+/// The router is served over a real loopback socket (`into_make_service_with_connect_info`), which
+/// the mutation routes require for their loopback guard; the returned service clone shares the
+/// same [`MemoryUserStore`], so a test can assert on the persisted users after driving the HTTP
+/// endpoints.
+fn server_with_authn() -> (TempDir, TestServer, AuthnService<MemoryUserStore>) {
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let config = RuntimeConfig::new(temp_dir.path().join("data"));
+    let runtime = PmRuntime::open(config).expect("open runtime");
+    let authn = authn();
+    let state = ApiState::new(runtime, authn.clone());
+    let app = create_router(state).into_make_service_with_connect_info::<std::net::SocketAddr>();
+    (temp_dir, TestServer::new(app), authn)
+}
+
+fn setup_request(username: &str) -> SetupRequest {
+    SetupRequest {
+        username: username.to_owned(),
+        password: SETUP_PASSWORD.to_owned(),
+    }
 }
 
 #[tokio::test]
@@ -35,17 +78,167 @@ async fn health_reports_ok() {
 
     let body: HealthResponse = response.json();
     assert_eq!(body.status, "ok");
-    assert!(!body.setup, "no user store means setup is not complete");
+    assert!(!body.setup, "a fresh store means setup is not complete");
 }
 
 #[tokio::test]
-async fn setup_is_not_configured_without_a_user_store() {
+async fn setup_is_not_configured_before_the_first_administrator() {
     let (_dir, server) = server();
     let response = server.get("/api/v1/setup").await;
     assert_eq!(response.status_code(), StatusCode::OK);
 
     let body: SetupResponse = response.json();
     assert!(!body.configured);
+}
+
+#[tokio::test]
+async fn setup_creates_the_first_administrator_with_201() {
+    let (_dir, server, authn) = server_with_authn();
+
+    let response = server
+        .post("/api/v1/auth/setup")
+        .json(&setup_request("admin"))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::CREATED);
+
+    let body: CreateUserResponse = response.json();
+    assert!(
+        !body.user_id.is_empty(),
+        "the response names the created user"
+    );
+    assert!(
+        !body.access_token.is_empty(),
+        "the winner receives an access token"
+    );
+    assert!(
+        !body.refresh_token.is_empty(),
+        "the winner receives a refresh token"
+    );
+
+    let users = authn.list_users().await.expect("list the users");
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].username, "admin");
+    assert_eq!(
+        users[0].role.name, "admin",
+        "the first user is an administrator"
+    );
+    assert!(
+        !users[0].password_hash.contains(SETUP_PASSWORD),
+        "the stored user holds a hash, not the plaintext password"
+    );
+}
+
+#[tokio::test]
+async fn setup_reports_configured_after_the_first_administrator() {
+    let (_dir, server, _authn) = server_with_authn();
+    server
+        .post("/api/v1/auth/setup")
+        .json(&setup_request("admin"))
+        .await;
+
+    let response = server.get("/api/v1/setup").await;
+    let body: SetupResponse = response.json();
+    assert!(body.configured);
+
+    let response = server.get("/api/v1/health").await;
+    let body: HealthResponse = response.json();
+    assert!(
+        body.setup,
+        "health and setup agree that the server is configured"
+    );
+}
+
+#[tokio::test]
+async fn setup_conflict_keeps_the_standard_error_body() {
+    let (_dir, server, _authn) = server_with_authn();
+    let first = server
+        .post("/api/v1/auth/setup")
+        .json(&setup_request("admin"))
+        .await;
+    assert_eq!(first.status_code(), StatusCode::CREATED);
+
+    let second = server
+        .post("/api/v1/auth/setup")
+        .json(&setup_request("someone-else"))
+        .await;
+    assert_eq!(second.status_code(), StatusCode::CONFLICT);
+
+    // The existing `ApiError::Conflict` wire contract: typed body, no `location` for a
+    // non-validation error, and the `conflict: ` display prefix that every 409 carries.
+    let body: ApiErrorResponse = second.json();
+    assert_eq!(body.error.code, ErrorCode::Conflict);
+    assert_eq!(
+        body.error.message,
+        "conflict: first-run setup is already complete"
+    );
+    assert_eq!(body.error.location, None);
+}
+
+/// Two concurrent `POST /api/v1/auth/setup` calls with different usernames must produce exactly
+/// one `201 Created` and one `409 Conflict`; the loser must not create a second administrator.
+///
+/// The two requests are kept in flight together with `tokio::join!` against a real loopback HTTP
+/// server on a multi-threaded runtime, so the handlers genuinely run in parallel and race on the
+/// user store. The loop runs 100 times: a store without the atomic compare-and-set (list, then
+/// create) loses this test intermittently, while the compare-and-set implementation is
+/// deterministic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_setup_requests_create_exactly_one_administrator_over_100_runs() {
+    for iteration in 0..100 {
+        let (_dir, server, authn) = server_with_authn();
+        let first_request = server
+            .post("/api/v1/auth/setup")
+            .json(&setup_request(&format!("admin-a-{iteration}")));
+        let second_request = server
+            .post("/api/v1/auth/setup")
+            .json(&setup_request(&format!("admin-b-{iteration}")));
+
+        let (first, second) = tokio::join!(async move { first_request.await }, async move {
+            second_request.await
+        },);
+
+        let statuses = [first.status_code(), second.status_code()];
+        let created = statuses
+            .iter()
+            .filter(|status| **status == StatusCode::CREATED)
+            .count();
+        let conflicted = statuses
+            .iter()
+            .filter(|status| **status == StatusCode::CONFLICT)
+            .count();
+        assert_eq!(
+            created, 1,
+            "iteration {iteration}: exactly one setup returns 201, got {statuses:?}"
+        );
+        assert_eq!(
+            conflicted, 1,
+            "iteration {iteration}: exactly one setup returns 409, got {statuses:?}"
+        );
+
+        let conflict = if first.status_code() == StatusCode::CONFLICT {
+            &first
+        } else {
+            &second
+        };
+        let body: ApiErrorResponse = conflict.json();
+        assert_eq!(body.error.code, ErrorCode::Conflict);
+        assert_eq!(
+            body.error.message,
+            "conflict: first-run setup is already complete"
+        );
+
+        let users = authn.list_users().await.expect("list the users");
+        assert_eq!(
+            users.len(),
+            1,
+            "iteration {iteration}: exactly one administrator is stored"
+        );
+        assert!(
+            users[0].username == format!("admin-a-{iteration}")
+                || users[0].username == format!("admin-b-{iteration}"),
+            "iteration {iteration}: the stored administrator is one of the two candidates"
+        );
+    }
 }
 
 #[tokio::test]
@@ -346,7 +539,7 @@ fn server_with_runtime() -> (TempDir, TestServer, PmRuntime) {
     let temp_dir = TempDir::new().expect("create temp dir");
     let config = RuntimeConfig::new(temp_dir.path().join("data"));
     let runtime = PmRuntime::open(config).expect("open runtime");
-    let state = ApiState::new(runtime.clone());
+    let state = ApiState::new(runtime.clone(), authn());
     let app = create_router(state).into_make_service_with_connect_info::<std::net::SocketAddr>();
     (temp_dir, TestServer::new(app), runtime)
 }
@@ -781,7 +974,8 @@ fn server_with_inventory(records: Vec<CertificateRecord>) -> (TempDir, TestServe
     let temp_dir = TempDir::new().expect("create temp dir");
     let config = RuntimeConfig::new(temp_dir.path().join("data"));
     let runtime = PmRuntime::open(config).expect("open runtime");
-    let state = ApiState::new(runtime.clone()).with_inventory(Arc::new(FakeInventory { records }));
+    let state =
+        ApiState::new(runtime.clone(), authn()).with_inventory(Arc::new(FakeInventory { records }));
     let app = create_router(state).into_make_service_with_connect_info::<std::net::SocketAddr>();
     (temp_dir, TestServer::new(app), runtime)
 }
@@ -1171,7 +1365,7 @@ async fn certificate_detail_etag_tracks_inventory_changes_not_just_policy_revisi
     let inventory = Arc::new(MutableInventory(std::sync::Mutex::new(Vec::new())));
     let temp_dir = TempDir::new().expect("create temp dir");
     let runtime = PmRuntime::open(RuntimeConfig::new(temp_dir.path().join("data"))).expect("open");
-    let state = ApiState::new(runtime).with_inventory(inventory.clone());
+    let state = ApiState::new(runtime, authn()).with_inventory(inventory.clone());
     let server = TestServer::new(
         create_router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
     );
@@ -1517,7 +1711,7 @@ fn server_with_apply() -> (TempDir, TestServer, FakeAdmin) {
         Arc::new(admin.clone()),
         ConfigSettings::default(),
     );
-    let app = create_router(ApiState::new(runtime).with_applier(applier))
+    let app = create_router(ApiState::new(runtime, authn()).with_applier(applier))
         .into_make_service_with_connect_info::<std::net::SocketAddr>();
     (temp_dir, TestServer::new(app), admin)
 }

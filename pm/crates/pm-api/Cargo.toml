@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 async-trait.workspace = true
 axum = { version = "0.8", features = ["json"] }
+caddy-rs-authn = { path = "../../../crates/authn" }
 caddy-rs-pm-config = { path = "../pm-config" }
 caddy-rs-pm-core = { path = "../pm-core" }
 caddy-rs-pm-certificates = { path = "../pm-certificates" }
