@@ -647,6 +647,16 @@ pub const BUILTIN_MODULES: &[Module] = &[
         ModuleKind::HttpHandler,
         "Set, add, or delete request/response headers",
     ),
+    // caddy-rs extension (not a Caddy v2.11.9 built-in): secure response headers with defaults,
+    // staged through the same response middleware path as `headers`. Registered so a JSON
+    // configuration naming it passes module validation and reaches the security-header
+    // validation (T-HTTP-153) instead of failing as an unknown handler module.
+    Module::new(
+        "http.handlers.security_headers",
+        "security_headers",
+        ModuleKind::HttpHandler,
+        "Security response headers with secure defaults (caddy-rs extension)",
+    ),
     Module::new(
         "http.handlers.subroute",
         "subroute",

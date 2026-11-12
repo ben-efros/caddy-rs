@@ -30,6 +30,7 @@ bytes = { workspace = true }
 caddy-rs-admin = { workspace = true, default-features = false }
 caddy-rs-config = { workspace = true, default-features = false }
 caddy-rs-core = { workspace = true, default-features = false }
+caddy-rs-http = { workspace = true, default-features = false }
 caddy-rs-server = { workspace = true, default-features = false }
 clap = { workspace = true }
 http = { workspace = true }
