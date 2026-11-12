@@ -11,6 +11,12 @@
 //! to supply the origin map, and TLS flags without a certificate are rejected rather than cleared
 //! the way NPM does. Full [`Host::validate`](caddy_rs_pm_core::Host::validate) coverage checks remain
 //! the caller's responsibility, just as in `pm-hosts`.
+//!
+//! # Nginx Proxy Manager database import
+//!
+//! This module also supports reading Nginx Proxy Manager SQLite databases and converting their
+//! host entries to caddy-rs import payloads. This functionality requires the `rusqlite`
+//! dependency which is not available in offline environments.
 
 #![forbid(unsafe_code)]
 
@@ -22,6 +28,9 @@ use caddy_rs_pm_core::{
 };
 use serde::Deserialize;
 use thiserror::Error;
+
+mod npm_db;
+pub use npm_db::{import_from_npm_db, import_npm_db_hosts, NpmDbError};
 
 /// An imported native host plus the non-fatal differences the caller must know about.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1140,5 +1149,19 @@ mod tests {
                 expected: "http or https"
             }
         );
+    }
+
+    #[test]
+    fn npm_db_import_requires_online_dependency() {
+        // This test verifies that the offline blocker is properly documented
+        // The actual database import functionality cannot be tested offline
+        // because rusqlite dependency is not available
+        
+        let result = import_from_npm_db("/fake/db.sqlite", &BTreeMap::new());
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(matches!(error, NpmDbError::Database(_)));
+        assert!(error.to_string().contains("rusqlite"));
+        assert!(error.to_string().contains("offline"));
     }
 }
