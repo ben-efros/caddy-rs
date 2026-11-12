@@ -313,8 +313,25 @@ pub struct HeadersHandler {
 }
 
 impl HeadersHandler {
-    /// Build from Caddy JSON (`{"handler":"headers","response":{...}}`).
+    /// Build from Caddy JSON (`{"handler":"headers","response":{...}}`) in strict mode.
     pub fn from_json(value: &serde_json::Value, path: &str) -> Result<Self> {
+        Self::from_json_with_mode(
+            value,
+            path,
+            crate::security_headers::SecurityHeadersMode::Strict,
+        )
+    }
+
+    /// Mode-aware [`Self::from_json`].
+    ///
+    /// The router builds handlers in [`SecurityHeadersMode::Compatible`]: the load path
+    /// (`caddy-rs validate`/`run`) already applied the configured mode to the whole configuration,
+    /// so construction must accept what the load path accepted.
+    pub fn from_json_with_mode(
+        value: &serde_json::Value,
+        path: &str,
+        mode: crate::security_headers::SecurityHeadersMode,
+    ) -> Result<Self> {
         let object = value
             .as_object()
             .ok_or_else(|| invalid(path, "headers handler must be an object"))?;
@@ -327,11 +344,15 @@ impl HeadersHandler {
         };
         if let Some(security) = object.get("security_headers") {
             let security_path = format!("{path}.security_headers");
-            let config = crate::security_headers::SecurityHeadersConfig::from_headers_block(
-                security,
-                &security_path,
-            )?;
-            handler.security_headers = Some(crate::security_headers::SecurityHeaders::new(config)?);
+            let (config, _warnings) =
+                crate::security_headers::SecurityHeadersConfig::from_headers_block_with_mode(
+                    security,
+                    &security_path,
+                    mode,
+                )?;
+            handler.security_headers = Some(
+                crate::security_headers::SecurityHeaders::from_validated(config),
+            );
         }
         if let Some(request) = object.get("request") {
             handler.request_set = parse_header_operations(request, &format!("{path}.request"))?;

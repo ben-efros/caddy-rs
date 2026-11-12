@@ -23,7 +23,7 @@ use crate::handlers::{
 };
 use crate::matchers::build_matcher_set;
 use crate::rate_limit::RateLimitHandler;
-use crate::security_headers::{SecurityHeaders, SecurityHeadersConfig};
+use crate::security_headers::{SecurityHeaders, SecurityHeadersConfig, SecurityHeadersMode};
 #[cfg(feature = "templates")]
 use crate::templates::TemplatesHandler;
 use crate::types::{
@@ -746,12 +746,23 @@ impl RouterBuilder {
         let handler: SharedHandler = match name {
             "static_response" => Arc::new(StaticResponseHandler::from_json(value, path)?),
             "error" => Arc::new(ErrorHandler::from_json(value, path)?),
-            "headers" => Arc::new(HeadersHandler::from_json(value, path)?),
-            // caddy-rs extension (not a Caddy v2.11.9 built-in): secure response headers with
-            // defaults, staged through the same response middleware path as `headers`.
-            "security_headers" => Arc::new(SecurityHeaders::new(
-                SecurityHeadersConfig::from_json(value, path)?,
+            "headers" => Arc::new(HeadersHandler::from_json_with_mode(
+                value,
+                path,
+                SecurityHeadersMode::Compatible,
             )?),
+            // caddy-rs extension (not a Caddy v2.11.9 built-in): secure response headers with
+            // defaults, staged through the same response middleware path as `headers`. Handlers are
+            // built in `Compatible` mode: the load path already applied the configured mode to the
+            // whole configuration, so construction must accept what the load path accepted.
+            "security_headers" => {
+                let (config, _warnings) = SecurityHeadersConfig::from_json_with_mode(
+                    value,
+                    path,
+                    SecurityHeadersMode::Compatible,
+                )?;
+                Arc::new(SecurityHeaders::from_validated(config))
+            }
             "vars" => Arc::new(VarsHandler::from_json(value, path)?),
             "rewrite" => Arc::new(RewriteHandler::from_json(value, path)?),
             "request_body" => Arc::new(RequestBodyHandler::from_json(value, path)?),
