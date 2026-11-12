@@ -821,6 +821,15 @@ pub const BUILTIN_MODULES: &[Module] = &[
         ModuleKind::TlsCertificateLoader,
         "Automatically manage certificates for subjects (config only)",
     ),
+    // PKCS#11 certificate-key loader (T-TLS-096). Config schema and validation are in place;
+    // the token-backed signer itself is blocked on the offline `cryptoki` dependency fetch
+    // (see docs/design/T-TLS-096-pkcs11-implementation-brief.md §1.4, §8).
+    Module::new(
+        "tls.certificates.pkcs11",
+        "pkcs11",
+        ModuleKind::TlsCertificateLoader,
+        "Load certificate chains from PEM and private keys from PKCS#11 tokens (config schema only; loader blocked on cryptoki)",
+    ),
     // TLS session ticket key providers
     Module::new(
         "tls.stek.standard",

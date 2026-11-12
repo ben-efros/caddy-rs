@@ -13,8 +13,8 @@ use serde_json::Value;
 
 use crate::config::{
     AutomationPolicy, BaseLog, CertificateAuthority, CertificatesConfig, Config, HttpApp,
-    HttpServer, ListenerWrapperConfig, Logging, ModuleRef, PkiApp, PkiKeyPair, ProxyProtocolConfig,
-    Route, ServerLogConfig, StorageConfig, TlsApp, TlsAutomation,
+    HttpServer, ListenerWrapperConfig, Logging, ModuleRef, PinSource, Pkcs11CertConfig, PkiApp,
+    PkiKeyPair, ProxyProtocolConfig, Route, ServerLogConfig, StorageConfig, TlsApp, TlsAutomation,
 };
 use crate::duration::parse_caddy_duration_json;
 use crate::error::{Error, Result};
@@ -917,10 +917,116 @@ impl Validator<'_> {
         if certificates.automate.is_some() {
             self.certificate_loader("automate", &format!("{path}.automate"))?;
         }
+        if let Some(entries) = &certificates.pkcs11 {
+            self.certificate_loader("pkcs11", &format!("{path}.pkcs11"))?;
+            for (index, entry) in entries.iter().enumerate() {
+                self.pkcs11_entry(entry, &format!("{path}.pkcs11[{index}]"))?;
+            }
+        }
         // Remaining keys are other certificate-loader modules (load_folders, load_storage, and any
         // future loader); the model preserves them, validation resolves them.
         for key in certificates.extra.keys() {
             self.certificate_loader(key, &format!("{path}.{key}"))?;
+        }
+        Ok(())
+    }
+
+    /// Validate one `tls.certificates.pkcs11[i]` entry.
+    ///
+    /// `token`/`slot`, `key_label`/`key_id`, and `certificate`/`certificate_pem` are mutually
+    /// exclusive pairs. PIN source and value must match: `env` needs `pin`, `file` needs
+    /// `pin_file`. PIN values never appear in error messages.
+    fn pkcs11_entry(&self, entry: &Pkcs11CertConfig, path: &str) -> Result<()> {
+        // Exactly one of token / slot.
+        match (entry.token.is_some(), entry.slot.is_some()) {
+            (true, true) => {
+                return Err(Error::Invalid {
+                    path: path.to_string(),
+                    message: "token and slot are mutually exclusive; configure only one".into(),
+                });
+            }
+            (false, false) => {
+                return Err(Error::Invalid {
+                    path: path.to_string(),
+                    message: "one of token or slot is required".into(),
+                });
+            }
+            _ => {}
+        }
+        // Exactly one of key_label / key_id.
+        match (entry.key_label.is_some(), entry.key_id.is_some()) {
+            (true, true) => {
+                return Err(Error::Invalid {
+                    path: path.to_string(),
+                    message: "key_label and key_id are mutually exclusive; configure only one"
+                        .into(),
+                });
+            }
+            (false, false) => {
+                return Err(Error::Invalid {
+                    path: path.to_string(),
+                    message: "one of key_label or key_id is required".into(),
+                });
+            }
+            _ => {}
+        }
+        // Exactly one of certificate / certificate_pem.
+        match (entry.certificate.is_some(), entry.certificate_pem.is_some()) {
+            (true, true) => {
+                return Err(Error::Invalid {
+                    path: path.to_string(),
+                    message:
+                        "certificate and certificate_pem are mutually exclusive; configure only one"
+                            .into(),
+                });
+            }
+            (false, false) => {
+                return Err(Error::Invalid {
+                    path: path.to_string(),
+                    message: "one of certificate or certificate_pem is required".into(),
+                });
+            }
+            _ => {}
+        }
+        // PIN source must be consistent with the PIN value fields.
+        match entry.pin_source {
+            PinSource::Env => {
+                if entry.pin.is_none() {
+                    return Err(Error::Invalid {
+                        path: path.to_string(),
+                        message: "pin_source=env requires pin".into(),
+                    });
+                }
+                if entry.pin_file.is_some() {
+                    return Err(Error::Invalid {
+                        path: path.to_string(),
+                        message: "pin_source=env cannot be combined with pin_file".into(),
+                    });
+                }
+            }
+            PinSource::File => {
+                if entry.pin_file.is_none() {
+                    return Err(Error::Invalid {
+                        path: path.to_string(),
+                        message: "pin_source=file requires pin_file".into(),
+                    });
+                }
+                if entry.pin.is_some() {
+                    return Err(Error::Invalid {
+                        path: path.to_string(),
+                        message: "pin_source=file cannot be combined with pin".into(),
+                    });
+                }
+            }
+        }
+        // Hex-validate key_id if present.
+        if let Some(key_id) = &entry.key_id {
+            if key_id.len() % 2 != 0 || key_id.bytes().any(|b| !b.is_ascii_hexdigit()) {
+                return Err(Error::Invalid {
+                    path: path.to_string(),
+                    message: "key_id must be hex-encoded".into(),
+                });
+            }
         }
         Ok(())
     }
@@ -2238,5 +2344,195 @@ mod tests {
                 "error for {fields} must name the located field, got: {message}"
             );
         }
+    }
+
+    #[test]
+    fn accepts_valid_pkcs11_entry() {
+        let config = Config::from_value(serde_json::json!({
+            "apps": {
+                "tls": {
+                    "certificates": {
+                        "pkcs11": [{
+                            "module": "/usr/lib/libsofthsm2.so",
+                            "token": "softhsm-token",
+                            "key_label": "server-key",
+                            "certificate": "/etc/certs/chain.pem",
+                            "pin_source": "env",
+                            "pin": "PKCS11_PIN"
+                        }]
+                    }
+                }
+            }
+        }))
+        .expect("model decodes");
+        let report =
+            validate_config(&config, &registry()).expect("valid pkcs11 entry passes validation");
+        assert_eq!(report.servers, 0);
+    }
+
+    #[test]
+    fn rejects_pkcs11_token_and_slot() {
+        let config = Config::from_value(serde_json::json!({
+            "apps": {
+                "tls": {
+                    "certificates": {
+                        "pkcs11": [{
+                            "token": "tok",
+                            "slot": 1,
+                            "key_label": "key",
+                            "certificate": "/etc/certs/chain.pem",
+                            "pin_source": "env",
+                            "pin": "pin"
+                        }]
+                    }
+                }
+            }
+        }))
+        .expect("model decodes");
+        let error = validate_config(&config, &registry()).expect_err("token+slot must fail");
+        let message = error.to_string();
+        assert!(message.contains("mutually exclusive"), "{message}");
+        assert!(
+            message.contains("apps.tls.certificates.pkcs11[0]"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn rejects_pkcs11_no_token_no_slot() {
+        let config = Config::from_value(serde_json::json!({
+            "apps": {
+                "tls": {
+                    "certificates": {
+                        "pkcs11": [{
+                            "key_label": "key",
+                            "certificate": "/etc/certs/chain.pem",
+                            "pin_source": "env",
+                            "pin": "pin"
+                        }]
+                    }
+                }
+            }
+        }))
+        .expect("model decodes");
+        let error = validate_config(&config, &registry()).expect_err("no token/slot must fail");
+        let message = error.to_string();
+        assert!(message.contains("one of token or slot"), "{message}");
+    }
+
+    #[test]
+    fn rejects_pkcs11_key_label_and_key_id() {
+        let config = Config::from_value(serde_json::json!({
+            "apps": {
+                "tls": {
+                    "certificates": {
+                        "pkcs11": [{
+                            "token": "tok",
+                            "key_label": "key",
+                            "key_id": "deadbeef",
+                            "certificate": "/etc/certs/chain.pem",
+                            "pin_source": "env",
+                            "pin": "pin"
+                        }]
+                    }
+                }
+            }
+        }))
+        .expect("model decodes");
+        let error = validate_config(&config, &registry()).expect_err("key_label+key_id must fail");
+        let message = error.to_string();
+        assert!(message.contains("mutually exclusive"), "{message}");
+    }
+
+    #[test]
+    fn rejects_pkcs11_certificate_and_certificate_pem() {
+        let config = Config::from_value(serde_json::json!({
+            "apps": {
+                "tls": {
+                    "certificates": {
+                        "pkcs11": [{
+                            "token": "tok",
+                            "key_label": "key",
+                            "certificate": "/etc/certs/chain.pem",
+                            "certificate_pem": "-----BEGIN CERTIFICATE-----\\\\nMIIB...\\\\n-----END CERTIFICATE-----\\\\n",
+                            "pin_source": "env",
+                            "pin": "pin"
+                        }]
+                    }
+                }
+            }
+        })).expect("model decodes");
+        let error = validate_config(&config, &registry())
+            .expect_err("certificate+certificate_pem must fail");
+        let message = error.to_string();
+        assert!(message.contains("mutually exclusive"), "{message}");
+    }
+
+    #[test]
+    fn rejects_pkcs11_env_without_pin() {
+        let config = Config::from_value(serde_json::json!({
+            "apps": {
+                "tls": {
+                    "certificates": {
+                        "pkcs11": [{
+                            "token": "tok",
+                            "key_label": "key",
+                            "certificate": "/etc/certs/chain.pem",
+                            "pin_source": "env"
+                        }]
+                    }
+                }
+            }
+        }))
+        .expect("model decodes");
+        let error = validate_config(&config, &registry()).expect_err("env without pin must fail");
+        let message = error.to_string();
+        assert!(message.contains("requires pin"), "{message}");
+    }
+
+    #[test]
+    fn rejects_pkcs11_file_without_pin_file() {
+        let config = Config::from_value(serde_json::json!({
+            "apps": {
+                "tls": {
+                    "certificates": {
+                        "pkcs11": [{
+                            "token": "tok",
+                            "key_label": "key",
+                            "certificate": "/etc/certs/chain.pem",
+                            "pin_source": "file"
+                        }]
+                    }
+                }
+            }
+        }))
+        .expect("model decodes");
+        let error =
+            validate_config(&config, &registry()).expect_err("file without pin_file must fail");
+        let message = error.to_string();
+        assert!(message.contains("requires pin_file"), "{message}");
+    }
+
+    #[test]
+    fn rejects_pkcs11_bad_hex_key_id() {
+        let config = Config::from_value(serde_json::json!({
+            "apps": {
+                "tls": {
+                    "certificates": {
+                        "pkcs11": [{
+                            "token": "tok",
+                            "key_id": "xyz",
+                            "certificate": "/etc/certs/chain.pem",
+                            "pin_source": "env",
+                            "pin": "pin"
+                        }]
+                    }
+                }
+            }
+        }))
+        .expect("model decodes");
+        let error = validate_config(&config, &registry()).expect_err("bad hex key_id must fail");
+        let message = error.to_string();
+        assert!(message.contains("hex-encoded"), "{message}");
     }
 }
