@@ -441,6 +441,36 @@ CARGO_HOME=/root/caddy-rs/.scratch/cargo-home \
   cargo test --offline --workspace
 ```
 
+## Acceptance testing
+
+End-to-end acceptance is exercised by [`pm/acceptance/tpm-116-acceptance.sh`](acceptance/tpm-116-acceptance.sh),
+tracked by task `T-PM-116`. It starts caddy-rs and caddy-rs-pm, creates a host through
+`POST /api/v1/hosts`, installs a manual certificate through `POST
+/api/v1/certificates/custom`, applies the configuration through `POST
+/api/v1/config/apply`, and asserts:
+
+- a real TLS handshake on port 443 (openssl `s_client`, certificate verified against the fixture CA);
+- an HTTP→HTTPS 308 redirect from `ssl_forced: true`;
+- an HTTP 200 through the proxied backend over HTTPS.
+
+The script is idempotent: it allocates a fresh data directory, starts both processes on loopback-only
+ports, records the applied revision, and cleans up everything on exit (success or failure). Required
+binaries (`caddy-rs` and `caddy-rs-pm`) must be built first:
+
+```sh
+cd caddy-rs
+CARGO_HOME=/root/caddy-rs/.scratch/cargo-home \
+  CARGO_TARGET_DIR=/root/caddy-rs/.scratch/rust-target-caddy \
+  cargo build --offline
+
+cd ../pm
+CARGO_HOME=/root/caddy-rs/.scratch/cargo-home \
+  CARGO_TARGET_DIR=/root/caddy-rs/.scratch/rust-target-pm \
+  cargo build --offline -p caddy-rs-pm-cli
+
+./pm/acceptance/tpm-116-acceptance.sh
+```
+
 ## Not in this slice
 
 - the PM web UI and the NPM compatibility adapter;
