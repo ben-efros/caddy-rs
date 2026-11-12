@@ -15,7 +15,7 @@ This is the proxy-manager foundation workspace. It is deliberately independent o
 | `caddy-rs-pm-import` | Native-first NPM v2.16 host-payload import mapping: proxy/redirect/dead hosts to `pm-core`, explicit certificate origins, located errors for unsupported payload features and warnings for flags without a native implementation. |
 | `caddy-rs-pm-runtime` | PM composition root: data-directory preflight (`0700`, writability probe), `<data_dir>/pm` state layout (including `pm/secrets`), legacy Caddy detection (warning only), host/policy/certificate/service wiring, and the loopback-only config apply pipeline (stage/diff/load/verify/record). |
 | `caddy-rs-pm-certificates` | Manual certificate validation and secret store: strict PEM chain/key parsing, key-match proof, expiry/SAN checks, `0600` key files in a `0700` directory, monotonic ids/tombstones, metadata-only state and no key bytes in responses. |
-| `caddy-rs-pm-api` | Native REST API with axum: `/api/v1` router, host CRUD/enable/disable with strong per-host ETags and `If-Match` CAS, certificate intents with inventory-derived status, manual certificate upload/list/delete, config apply/revision history, list filters/pagination, health/setup/version/config, typed error envelope, loopback-only mutation guard, request ID and logging middleware. |
+| `caddy-rs-pm-api` | Native REST API with axum: `/api/v1` router, host CRUD/enable/disable with strong per-host ETags and `If-Match` CAS, certificate intents with inventory-derived status, manual certificate upload/list/delete, config apply/revision history, list filters/pagination, health/setup/version/config, typed error envelope, loopback-only mutation guard, bearer-authenticated user administration (`GET/PATCH/DELETE /users` with the `users` capability), request ID and logging middleware. |
 
 ## Why a nested workspace
 
@@ -319,6 +319,10 @@ Compile, Config}` and carry the relevant path. No error contains plaintext secre
 | `GET` | `/health` | Returns `{ "status": "ok", "setup": false }`; `setup` stays false until a user store exists |
 | `GET` | `/setup` | Returns `{ "configured": false }` (admin user check deferred to PM-109/CORE-PM-12) |
 | `GET` | `/version` | Returns `{ "version": "<crate version>", "caddy_rs": "<caddy-rs-core VERSION>" }` |
+| `POST` | `/auth/setup` | Create the first administrator atomically (`201` once, then `409`); loopback-only, no token exists yet |
+| `GET` | `/users` | Paginated `PublicUser` list (`{items,total,limit,offset}`), sorted by username; requires `users:view` |
+| `PATCH` | `/users/{id}` | Change a role (`{"role": "admin"|"editor"|"viewer"}`); requires `users:update`; the epoch bump invalidates old tokens |
+| `DELETE` | `/users/{id}` | Delete a user and revoke their refresh tokens (`204`); requires `users:delete`; the last administrator is `409` |
 | `GET` | `/hosts` | Paginated host summaries (`id`, `domains`, `kind`, `enabled`, `revision`, `tlsMode`); filters `enabled`, `kind`, `domain` |
 | `POST` | `/hosts` | Create a native host (`201` + `Location` + strong `ETag`) |
 | `GET` | `/hosts/{id}` | Full native host document; supports `If-None-Match` (`304`) |
@@ -343,13 +347,37 @@ Compile, Config}` and carry the relevant path. No error contains plaintext secre
 - **`ApiState`** — owns a cloneable `PmRuntime`, an optional `Arc<dyn CertificateInventorySource>`
   and an optional `Arc<ConfigApplyService>`; `ApiState::with_inventory` and
   `ApiState::with_applier` inject them, and both default to absent.
-- **Typed error envelope** — `{ "error": { "code": "NOT_FOUND|CONFLICT|PRECONDITION_FAILED|PRECONDITION_REQUIRED|FORBIDDEN|UNSUPPORTED_MEDIA_TYPE|VALIDATION|SERVICE_UNAVAILABLE|INTERNAL", "message": "...", "location": "field.path" } }` via `ApiError::into_response()`.
+- **Typed error envelope** — `{ "error": { "code": "NOT_FOUND|CONFLICT|PRECONDITION_FAILED|PRECONDITION_REQUIRED|FORBIDDEN|UNAUTHORIZED|UNSUPPORTED_MEDIA_TYPE|VALIDATION|SERVICE_UNAVAILABLE|INTERNAL", "message": "...", "location": "field.path" } }` via `ApiError::into_response()`.
 - **Pagination** — `limit` (default 50, max 200) and `offset` (default 0) query params; an out-of-range `limit` is clamped and the effective window is echoed in `{ "items": [...], "total": N, "limit": L, "offset": O }` via `PaginatedResponse<T>`.
 - **Preconditions** — `evaluate_get_preconditions` implements RFC 9110 ordering for the config `GET`: a failing `If-Match` is `412 Precondition Failed`, a matching `If-None-Match` is `304 Not Modified`, and `*` matches any representation. Host mutations require a strong `If-Match`: missing is `428 Precondition Required`; stale, weak `W/"..."` or unparseable is `412`; `*` matches any current revision.
 - **ETags** — config uses a weak `W/"<hash>"` content hash. Hosts use a strong `"h<id>-r<revision>"` tag derived from the stored revision, so the tag is both a cache validator and the CAS token. A mutation reads the host, requires `If-Match` to match that revision, and passes the same revision to `pm-service`; a CAS conflict after the read is `412`, never retried. Certificate details use a strong hash over the whole response body (`"c<id>-<hash>"`): the body includes inventory-derived status/expiry/issuer/source/renewal error, so a policy revision alone would produce a false `304` when a certificate is issued or starts failing.
 - **Native schema** — request/response bodies are camelCase (`preserveHost`, `sslForced`, `autoPolicyId`) and reject unknown fields. NPM names such as `forward_host` are a typed `400`, not silently ignored; the `--compat npm` adapter will translate them.
-- **Middleware** — request ID (`x-request-id`), structured logging, and a loopback-only mutation guard. The guard reads the socket peer from `ConnectInfo<SocketAddr>`; a missing peer or a non-loopback peer is `403`, and `X-Forwarded-For` is never trusted. This is a fail-closed boundary until PM auth lands, not authentication: the management port must stay unpublished and `create_router` must be served with `into_make_service_with_connect_info::<SocketAddr>()`.
-- **No authentication yet** — the loopback guard is temporary; PM management auth is CORE-PM-12/PM-115 work.
+- **Middleware** — request ID (`x-request-id`), structured logging, and a loopback-only guard on every mutation route. The bearer-authenticated `PATCH`/`DELETE /users` keep that peer guard too (a valid token from a non-loopback peer is still `403`); `GET /users` is a read and, like the other reads, has no peer guard. The guard reads the socket peer from `ConnectInfo<SocketAddr>`; a missing peer or a non-loopback peer is `403`, and `X-Forwarded-For` is never trusted. This is a fail-closed boundary until the remaining PM auth slices land, not authentication: the management port must stay unpublished and `create_router` must be served with `into_make_service_with_connect_info::<SocketAddr>()`.
+- **User administration authentication** — `GET/PATCH/DELETE /users` require `Authorization: Bearer <access token>`. The token is verified against the store on every request: a missing, malformed, expired or epoch-stale token is `401 UNAUTHORIZED`; a valid token without the capability is `403 FORBIDDEN` (an editor has `users:view` and may list, but cannot change a role or delete). Changing a role or deleting a user bumps the user's authentication epoch, so previously issued access tokens stop working, and a delete also revokes the user's refresh tokens. Deleting the last administrator is refused with `409 CONFLICT`. The remaining mutations still use the temporary loopback guard (PM management auth is CORE-PM-12/PM-115 work); `/auth/setup` is loopback-only because no administrator exists yet to authenticate it.
+
+### User administration
+
+`GET /users`, `PATCH /users/{id}` and `DELETE /users/{id}` are the first authenticated routes. They
+return `PublicUser` views (`id`, `username`, `role`, `totpEnabled`, `authEpoch`, `createdAt`,
+`updatedAt`) and never a password hash or TOTP secret.
+
+| Route | Capability | Success | Refusals |
+|---|---|---|---|
+| `GET /users?limit=&offset=` | `users:view` | `200 {items,total,limit,offset}` (sorted by username, `limit` clamped to 200) | `401` no/invalid token, `403` no capability |
+| `PATCH /users/{id}` | `users:update` | `200` with the updated `PublicUser` | `400` unknown role or non-UUID id, `401`, `403`, `404` unknown user |
+| `DELETE /users/{id}` | `users:delete` | `204` with no body | `400` non-UUID id, `401`, `403`, `404` unknown user, `409` last administrator |
+
+The bearer token is the access token from `/auth/setup` (or a future login route). `GET /users` is a
+read and follows the other reads' peer policy; `PATCH` and `DELETE` are mutations and keep the
+loopback peer guard in addition to the token, so a valid token from a non-loopback peer is `403`.
+`PATCH` accepts
+exactly `{"role": "admin" | "editor" | "viewer"}` and rejects unknown fields; assigning a custom role
+is not part of this slice. A role change increments the target user's `authEpoch`, which invalidates
+every access token they already hold; `DELETE` also revokes their refresh tokens before the record
+disappears. The last remaining administrator cannot be deleted (`409`); the check and the delete are
+serialized in-process so two concurrent deletes cannot remove the last two administrators. Demoting
+the last administrator through `PATCH` is not refused in this slice — the follow-up users-page slice
+(T-PM-129) owns that policy.
 
 ### Certificate intents and status
 
