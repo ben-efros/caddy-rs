@@ -27,7 +27,7 @@ use std::path::PathBuf;
 
 use caddy_rs_pm_compiler::{compile_routes, CompileError, CompiledRoutes};
 use caddy_rs_pm_core::{
-    normalize_pattern, AcmeChallenge, AutoCertificatePolicy, AutoMode, CoreError, Host, TlsMode,
+    normalize_pattern, AcmeChallenge, AutoCertificatePolicy, AutoMode, CoreError, Host, SecurityHeadersConfig, TlsMode,
 };
 use serde_json::{json, Map, Value};
 use thiserror::Error;
@@ -45,6 +45,9 @@ pub struct ConfigSettings {
     pub http_port: u16,
     /// Port for the `pm_https` server; also written to `apps.http.https_port`.
     pub https_port: u16,
+    /// Global security headers configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_headers: Option<SecurityHeadersConfig>,
 }
 
 impl Default for ConfigSettings {
@@ -52,6 +55,7 @@ impl Default for ConfigSettings {
         Self {
             http_port: DEFAULT_HTTP_PORT,
             https_port: DEFAULT_HTTPS_PORT,
+            security_headers: None,
         }
     }
 }
@@ -61,6 +65,7 @@ impl ConfigSettings {
         Self {
             http_port,
             https_port,
+            security_headers: None,
         }
     }
 }

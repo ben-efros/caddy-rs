@@ -388,6 +388,18 @@ fn compile_and_assemble_use_the_stored_hosts() {
         config["apps"]["http"]["servers"]["pm_https"]["listen"],
         json!([":8443"])
     );
+    
+    // Test that ConfigSettings can be constructed with security headers
+    let settings_with_security = ConfigSettings {
+        http_port: 8080,
+        https_port: 8443,
+        security_headers: None,
+    };
+    let config2 = runtime
+        .assemble(settings_with_security)
+        .expect("assemble config with security headers");
+    assert_eq!(config2["apps"]["http"]["http_port"], json!(8080));
+    assert_eq!(config2["apps"]["http"]["https_port"], json!(8443));
     let https_routes = config["apps"]["http"]["servers"]["pm_https"]["routes"]
         .as_array()
         .expect("https routes");
