@@ -38,6 +38,7 @@ http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 libc = "0.2.189"
+rand = { workspace = true }
 serde_json = { workspace = true }
 tar = { workspace = true }
 tokio = { workspace = true }
