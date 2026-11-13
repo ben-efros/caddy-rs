@@ -1537,6 +1537,15 @@ fn apply_uri_substring(request: &mut Request, substring: &UriSubstring) -> Resul
     if new_path == path && new_query.as_deref() == request.uri.query() {
         return Ok(());
     }
+    // A replacement can remove the component in front of `..` or introduce dot segments, leaving a
+    // relative or dot-segment path that downstream matchers and `file_server` resolve differently
+    // (a path-guard bypass). Canonicalize any changed result like `strip_path_prefix`/`_suffix` do
+    // (upstream fc6c202ea60d); an unchanged path stays byte-identical and rebuilds no RequestURI.
+    let new_path = if new_path != path {
+        canonicalize_rewrite_path(&new_path)
+    } else {
+        new_path
+    };
     set_uri_path_query(
         request,
         &new_path,
@@ -1553,6 +1562,9 @@ fn apply_path_regexp(request: &mut Request, regexp: &PathRegexp) -> Result<()> {
     if new_path == path {
         return Ok(());
     }
+    // `path_regexp` replaces on the escaped path without a pre-clean, so the replacement can expose
+    // a relative path or dot segments; canonicalize the changed result (upstream fc6c202ea60d).
+    let new_path = canonicalize_rewrite_path(&new_path);
     set_uri_path(request, &new_path, "rewrite.path_regexp")
 }
 
@@ -3652,6 +3664,105 @@ mod tests {
         }));
         let request = run_rewrite(&handler, "/x?q=%5C%7D%5C%7B").await;
         assert_eq!(request.uri.query(), Some("q=%7D%7B"));
+    }
+
+    #[tokio::test]
+    async fn rewrite_uri_substring_canonicalizes_the_replaced_path() {
+        // Port of upstream Caddy fc6c202ea60d (scan 65568b0d767b733c): a replacement can remove the
+        // component in front of `..`, exposing a relative path or dot segments; downstream path
+        // matchers and `file_server` would interpret that differently and a later path guard could
+        // be bypassed. The result is canonicalized exactly like `strip_path_prefix`/`_suffix`.
+        let handler = rewrite_handler(serde_json::json!({
+            "handler": "rewrite",
+            "uri_substring": [{"find": "/mount", "replace": ""}]
+        }));
+        // Removing the component in front of `..` exposes a relative path.
+        let request = run_rewrite(&handler, "/mount../secret?keep=yes").await;
+        assert_eq!(request.uri.path(), "/secret");
+        assert_eq!(request.uri.query(), Some("keep=yes"));
+        let matcher = crate::matchers::PathMatcher {
+            patterns: vec!["/secret*".to_string()],
+        };
+        assert!(
+            crate::types::Matcher::matches(&matcher, &request),
+            "a downstream `path` matcher must see the canonical path"
+        );
+        // A dot segment the pre-replacement clean already resolved stays resolved.
+        let request = run_rewrite(&handler, "/mount/../secret").await;
+        assert_eq!(request.uri.path(), "/secret");
+        // Removing the whole path yields the root, not an empty target.
+        let request = run_rewrite(&handler, "/mount").await;
+        assert_eq!(request.uri.path(), "/");
+        // A replacement that removes a middle component keeps the remainder absolute.
+        let request = run_rewrite(&handler, "/mount/public").await;
+        assert_eq!(request.uri.path(), "/public");
+        let request = run_rewrite(&handler, "/mountain").await;
+        assert_eq!(request.uri.path(), "/ain");
+        // Unmatched paths and untouched queries stay byte-identical.
+        let request = run_rewrite(&handler, "/other?q=1").await;
+        assert_eq!(request.uri.path(), "/other");
+        assert_eq!(request.uri.query(), Some("q=1"));
+    }
+
+    #[tokio::test]
+    async fn rewrite_uri_substring_canonicalizes_a_replacement_that_introduces_dot_segments() {
+        let handler = rewrite_handler(serde_json::json!({
+            "handler": "rewrite",
+            "uri_substring": [{"find": "/a", "replace": "/a/../b"}]
+        }));
+        let request = run_rewrite(&handler, "/a/rest").await;
+        assert_eq!(request.uri.path(), "/b/rest");
+    }
+
+    #[tokio::test]
+    async fn rewrite_uri_substring_keeps_the_repeated_slash_rule() {
+        // A `find` containing `//` does not merge the path's repeated slashes before replacing.
+        let handler = rewrite_handler(serde_json::json!({
+            "handler": "rewrite",
+            "uri_substring": [{"find": "//", "replace": "/X/"}]
+        }));
+        let request = run_rewrite(&handler, "/a//b").await;
+        assert_eq!(request.uri.path(), "/a/X/b");
+
+        // A `find` without `//` merges them first, as before.
+        let handler = rewrite_handler(serde_json::json!({
+            "handler": "rewrite",
+            "uri_substring": [{"find": "/b", "replace": "/c"}]
+        }));
+        let request = run_rewrite(&handler, "/a//b").await;
+        assert_eq!(request.uri.path(), "/a/c");
+    }
+
+    #[tokio::test]
+    async fn rewrite_path_regexp_canonicalizes_the_replaced_path() {
+        let handler = rewrite_handler(serde_json::json!({
+            "handler": "rewrite",
+            "path_regexp": [{"find": "^/mount", "replace": ""}]
+        }));
+        // `path_regexp` replaces on the escaped path without a pre-clean, so the replacement can
+        // expose dot segments directly.
+        let request = run_rewrite(&handler, "/mount/../secret?keep=yes").await;
+        assert_eq!(request.uri.path(), "/secret");
+        assert_eq!(request.uri.query(), Some("keep=yes"));
+        let matcher = crate::matchers::PathMatcher {
+            patterns: vec!["/secret*".to_string()],
+        };
+        assert!(
+            crate::types::Matcher::matches(&matcher, &request),
+            "a downstream `path` matcher must see the canonical path"
+        );
+        // A relative result is anchored at the root.
+        let request = run_rewrite(&handler, "/mount../secret").await;
+        assert_eq!(request.uri.path(), "/secret");
+        // Removing the whole path yields the root.
+        let request = run_rewrite(&handler, "/mount").await;
+        assert_eq!(request.uri.path(), "/");
+        let request = run_rewrite(&handler, "/mountain").await;
+        assert_eq!(request.uri.path(), "/ain");
+        // Unmatched paths and untouched queries stay byte-identical.
+        let request = run_rewrite(&handler, "/unmatched?q=1").await;
+        assert_eq!(request.uri.path(), "/unmatched");
+        assert_eq!(request.uri.query(), Some("q=1"));
     }
 
     #[test]
