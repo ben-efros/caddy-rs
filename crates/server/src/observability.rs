@@ -738,10 +738,11 @@ impl PendingObservation {
                 response_duration: self
                     .response_started
                     .saturating_duration_since(self.started),
-                // Caddy counts a handler-chain error; caddy-rs additionally treats a 5xx response
-                // as an error so alerting also covers upstream/limit failures that caddy-rs turns
-                // into responses (documented in DIV-0069).
-                error: handler_error || self.status >= 500,
+                // Caddy increments `caddy_http_request_errors_total` only when the handler chain
+                // returns an error (`modules/caddyhttp/metrics.go:371-378`), not for a response
+                // that merely carries a 5xx status (for example an upstream 500 passed through by
+                // `reverse_proxy` or a 5xx `static_response`).
+                error: handler_error,
             },
             &self.host,
             self.is_https,

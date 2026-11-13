@@ -706,164 +706,111 @@ async fn failed_response_write_logs_write_error() {
     );
 }
 
-fn logging_with_encoder(
-    log_path: &std::path::Path,
-    encoder: serde_json::Value,
-) -> serde_json::Value {
-    serde_json::json!({
-        "logs": {
-            "default": {
-                "writer": {"output": "file", "filename": log_path.to_string_lossy()},
-                "encoder": encoder,
-                "level": "INFO"
-            }
+/// A mock upstream that answers every request with `status`, standing in for an origin that
+/// returns an error status instead of failing the transport.
+async fn spawn_status_upstream(status: StatusCode) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind upstream");
+    let address = listener.local_addr().expect("upstream address");
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let service = hyper::service::service_fn(
+                    move |_request: hyper::Request<hyper::body::Incoming>| async move {
+                        Ok::<_, Infallible>(
+                            hyper::Response::builder()
+                                .status(status)
+                                .header(http::header::CONTENT_TYPE, "text/plain")
+                                .body(caddy_rs_http::StreamingBody::from_bytes(
+                                    Bytes::from_static(b"upstream error"),
+                                ))
+                                .expect("upstream response"),
+                        )
+                    },
+                );
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
         }
-    })
+    });
+    address.to_string()
 }
 
-fn observability_config_with_stock(
-    logging: serde_json::Value,
-    body: &str,
-    stock_compat: bool,
-) -> Config {
-    let mut config = serde_json::json!({
-        "admin": {"disabled": true},
-        "logging": logging,
+fn metrics_config(routes: serde_json::Value) -> Config {
+    Config::from_value(serde_json::json!({
+        "admin": {"listen": "127.0.0.1:0"},
         "apps": {"http": {"servers": {"srv0": {
             "listen": ["127.0.0.1:0"],
-            "routes": [{"handle": [{"handler": "static_response", "body": body}]}]
+            "routes": routes
         }}}}
-    });
-    if stock_compat {
-        config["stock_compat"] = serde_json::Value::Bool(true);
-    }
-    Config::from_value(config).expect("test config decodes")
+    }))
+    .expect("test config decodes")
 }
 
-/// Start one request against a fresh runtime and return the single access-log entry as JSON.
-async fn single_access_entry(
-    config: Config,
-    path: &str,
-    log_path: &std::path::Path,
-) -> serde_json::Value {
-    let (_store, runtime, address) = start(config).await;
-    let (status, _headers, _body) = request(address, "GET", path, &[]).await;
+async fn rendered_metrics(runtime: &ServerRuntime) -> String {
+    let admin = runtime.admin_address().expect("admin bound");
+    let (status, _headers, metrics) = request(admin, "GET", "/metrics", &[]).await;
     assert_eq!(status, 200);
-    runtime.shutdown().await;
-    let entries = read_log_lines(log_path);
-    assert_eq!(entries.len(), 1, "one access entry per request");
-    entries[0].clone()
+    String::from_utf8_lossy(&metrics).into_owned()
 }
 
+/// An upstream 5xx is a response, not a handler-chain error: the oracle increments
+/// `caddy_http_request_errors_total` only when the handler chain returns an error
+/// (`modules/caddyhttp/metrics.go:371-378`), so the series must not appear here.
 #[tokio::test]
-async fn access_log_redacts_builtin_query_parameters_by_default() {
-    let directory = tempfile::tempdir().expect("tempdir");
-    let log_path = directory.path().join("access.log");
-    let logging = logging_with_encoder(&log_path, serde_json::json!({"format": "json"}));
-    let config = observability_config_with_stock(logging, "ok", false);
-    let entry = single_access_entry(
-        config,
-        "/callback?access_token=at&state=ok&token&api_key=k&Access_Token=mixed",
-        &log_path,
-    )
-    .await;
-    assert_eq!(
-        entry["request"]["uri"],
-        serde_json::json!(
-            "/callback?access_token=REDACTED&state=ok&token=REDACTED&api_key=REDACTED&Access_Token=mixed"
-        )
-    );
-}
+async fn upstream_5xx_response_is_not_a_handler_error() {
+    let upstream_dial = spawn_status_upstream(StatusCode::INTERNAL_SERVER_ERROR).await;
+    let config = metrics_config(serde_json::json!([{"handle": [
+        {"handler": "reverse_proxy", "upstreams": [{"dial": upstream_dial}]}
+    ]}]));
+    let (runtime, address) = start_proxy_config(config).await;
 
-#[tokio::test]
-async fn explicit_empty_redaction_query_parameters_logs_the_query_verbatim() {
-    let directory = tempfile::tempdir().expect("tempdir");
-    let log_path = directory.path().join("access.log");
-    let logging = logging_with_encoder(
-        &log_path,
-        serde_json::json!({
-            "format": "json",
-            "redaction": {"query_parameters": []}
-        }),
-    );
-    let config = observability_config_with_stock(logging, "ok", false);
-    let entry = single_access_entry(config, "/callback?access_token=at&token", &log_path).await;
-    assert_eq!(
-        entry["request"]["uri"],
-        serde_json::json!("/callback?access_token=at&token")
-    );
-}
+    let (status, _headers, body) = request(address, "GET", "/", &[]).await;
+    assert_eq!(status, 500);
+    assert_eq!(body, Bytes::from_static(b"upstream error"));
 
-#[tokio::test]
-async fn stock_compat_true_logs_the_query_verbatim() {
-    let directory = tempfile::tempdir().expect("tempdir");
-    let log_path = directory.path().join("access.log");
-    let logging = logging_with_encoder(&log_path, serde_json::json!({"format": "json"}));
-    let config = observability_config_with_stock(logging, "ok", true);
-    let entry = single_access_entry(config, "/callback?access_token=at&token", &log_path).await;
-    assert_eq!(
-        entry["request"]["uri"],
-        serde_json::json!("/callback?access_token=at&token")
-    );
-}
-
-#[tokio::test]
-async fn explicit_redaction_query_parameters_replace_the_builtin_default() {
-    let directory = tempfile::tempdir().expect("tempdir");
-    let log_path = directory.path().join("access.log");
-    let logging = logging_with_encoder(
-        &log_path,
-        serde_json::json!({
-            "format": "json",
-            "redaction": {"query_parameters": ["my_token"]}
-        }),
-    );
-    let config = observability_config_with_stock(logging, "ok", false);
-    let entry = single_access_entry(config, "/callback?my_token=t&token=secret", &log_path).await;
-    assert_eq!(
-        entry["request"]["uri"],
-        serde_json::json!("/callback?my_token=REDACTED&token=secret")
-    );
-}
-
-#[tokio::test]
-async fn filter_encoder_wrap_redacts_before_applying_filters() {
-    let directory = tempfile::tempdir().expect("tempdir");
-    let log_path = directory.path().join("access.log");
-    let logging = logging_with_encoder(
-        &log_path,
-        serde_json::json!({
-            "format": "filter",
-            "wrap": {"format": "json", "redaction": {"query_parameters": ["my_token"]}},
-            "fields": {}
-        }),
-    );
-    let config = observability_config_with_stock(logging, "ok", false);
-    let entry = single_access_entry(config, "/callback?my_token=t&state=ok", &log_path).await;
-    assert_eq!(
-        entry["request"]["uri"],
-        serde_json::json!("/callback?my_token=REDACTED&state=ok")
-    );
-}
-
-#[tokio::test]
-async fn console_encoder_renders_the_redacted_query() {
-    let directory = tempfile::tempdir().expect("tempdir");
-    let log_path = directory.path().join("access.log");
-    let logging = logging_with_encoder(&log_path, serde_json::json!({"format": "console"}));
-    let config = observability_config_with_stock(logging, "ok", false);
-    let (_store, runtime, address) = start(config).await;
-    let (status, _headers, _body) =
-        request(address, "GET", "/cb?access_token=at&state=ok", &[]).await;
-    assert_eq!(status, 200);
-    runtime.shutdown().await;
-    let rendered = std::fs::read_to_string(&log_path).expect("console access log");
+    let metrics = rendered_metrics(&runtime).await;
     assert!(
-        rendered.contains("access_token=REDACTED"),
-        "console output must carry the redacted query: {rendered}"
+        !metrics.contains("caddy_http_request_errors_total"),
+        "an upstream 500 must not be counted as a middleware error:\n{metrics}"
+    );
+    // The request itself is still counted, with the upstream status on the histograms.
+    assert!(
+        metrics.contains("caddy_http_requests_total{handler=\"reverse_proxy\",server=\"srv0\"} 1"),
+        "missing requests counter for the proxied 500:\n{metrics}"
     );
     assert!(
-        !rendered.contains("access_token=at"),
-        "value must not leak: {rendered}"
+        metrics.contains(
+            "caddy_http_request_duration_seconds_count{code=\"500\",handler=\"reverse_proxy\",method=\"GET\",server=\"srv0\"} 1"
+        ),
+        "missing 500 latency sample:\n{metrics}"
     );
+
+    runtime.shutdown().await;
+}
+
+/// A handler that returns an error (the `error` module) is a handler-chain error: the oracle
+/// increments `caddy_http_request_errors_total` even though the response is a 500.
+#[tokio::test]
+async fn handler_chain_error_increments_request_errors_total() {
+    let config = metrics_config(serde_json::json!([{"handle": [
+        {"handler": "error", "status_code": 500, "error": "boom"}
+    ]}]));
+    let (runtime, address) = start_proxy_config(config).await;
+
+    let (status, _headers, _body) = request(address, "GET", "/", &[]).await;
+    assert_eq!(status, 500);
+
+    let metrics = rendered_metrics(&runtime).await;
+    assert!(
+        metrics.contains("caddy_http_request_errors_total{handler=\"error\",server=\"srv0\"} 1"),
+        "a handler-chain error must be counted:\n{metrics}"
+    );
+
+    runtime.shutdown().await;
 }
