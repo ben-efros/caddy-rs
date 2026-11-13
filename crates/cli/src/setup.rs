@@ -221,10 +221,15 @@ pub fn parse_duration(text: &str) -> Result<Duration, SetupError> {
     let value: u64 = digits.parse().map_err(|_| {
         SetupError::InvalidRegistrationTimeout(format!("`{text}` is not a duration"))
     })?;
+    let overflow = || {
+        SetupError::InvalidRegistrationTimeout(format!(
+            "`{text}` does not fit in a duration (overflow)"
+        ))
+    };
     let seconds = match unit {
         "s" | "" => value,
-        "m" => value * 60,
-        "h" => value * 3600,
+        "m" => value.checked_mul(60).ok_or_else(overflow)?,
+        "h" => value.checked_mul(3600).ok_or_else(overflow)?,
         other => {
             return Err(SetupError::InvalidRegistrationTimeout(format!(
                 "`{text}` has unsupported unit `{other}` (expected s, m or h)"
