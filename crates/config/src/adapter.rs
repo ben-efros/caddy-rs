@@ -7200,14 +7200,12 @@ fn build_named_route(
     let matchers = collect_matchers(&named.directives)?;
     let routes = build_routes(&named.directives, &matchers, true, true, warnings)?;
     if routes.len() == 1 && routes[0].get("match").is_none() {
-        // Caddy keeps only the first handler of a single matcher-less route here.
-        let first_handler = routes[0]
-            .get("handle")
-            .and_then(Value::as_array)
-            .and_then(|handlers| handlers.first())
-            .cloned()
-            .unwrap_or_else(|| json!({"handler": "subroute"}));
-        Ok(json!({"handle": [first_handler]}))
+        // Caddy simplifies a named route whose body adapts to one matcher-less route by keeping
+        // that route verbatim (`route = subroute.Routes[0]`, upstream ec849f542c43). Emitting the
+        // whole route preserves every handler and their order; copying only the first handler
+        // dropped e.g. a `basic_auth` that follows a `header`, so an `invoke` of the route ran
+        // unauthenticated while the earlier handler still applied.
+        Ok(routes.into_iter().next().expect("length checked above"))
     } else {
         Ok(json!({"handle": [{"handler": "subroute", "routes": routes}]}))
     }
