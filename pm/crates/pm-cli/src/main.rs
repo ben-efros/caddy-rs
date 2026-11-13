@@ -754,6 +754,14 @@ async fn serve(global: GlobalArgs, args: ServeArgs) -> Result<(), CliError> {
         "starting caddy-rs-pm"
     );
 
+    // Validate compatibility profile
+    if global.compat == "npm" {
+        return Err(CliError::InvalidArg(
+            "compatibility profile 'npm' is not yet implemented; use 'native' or a different profile. \
+             See T-PM-135 for tracking details.".to_string(),
+        ));
+    }
+
     // Validate admin URL.
     let admin_url = url::Url::parse(&args.admin_url)?;
     if !args.allow_non_loopback_admin && !is_loopback_url(&admin_url) {
