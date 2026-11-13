@@ -397,99 +397,33 @@ impl FileServerHandler {
         }
 
         // Range handling, following Go's `parseRange`/`serveContent`.
-        let mut ranges = match request
+        let range_header = request
             .headers
             .get(header::RANGE)
-            .and_then(|value| value.to_str().ok())
-        {
-            Some(range_header) if check_if_range(&request, &etag, modtime, useful_modtime) => {
-                parse_range(range_header, size as i64)
-            }
-            _ => Ok(Vec::new()),
+            .and_then(|value| value.to_str().ok());
+        let if_range_ok = check_if_range(&request, &etag, modtime, useful_modtime);
+        let RangePlan {
+            status,
+            mut headers,
+            body,
+            send_size,
+            ranged,
+        } = match apply_ranges(
+            request.method == http::Method::HEAD,
+            headers,
+            range_header,
+            if_range_ok,
+            size,
+            body,
+        ) {
+            RangeOutcome::Serve(plan) => plan,
+            RangeOutcome::Reject(response) => return Ok(Outcome::Respond(response)),
         };
-        let content_type = headers
-            .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        let mut status = StatusCode::OK;
-        let mut body = body;
-        let mut send_size = size;
-        match ranges {
-            Err(RangeError::NoOverlap) if size == 0 => {
-                // Ignore range requests on empty files (Go's special case).
-                ranges = Ok(Vec::new());
-            }
-            Err(RangeError::NoOverlap) => {
-                headers.insert(
-                    header::CONTENT_RANGE,
-                    HeaderValue::from_str(&format!("bytes */{size}"))
-                        .expect("content range is a valid header value"),
-                );
-                return Ok(Outcome::Respond(serve_error(
-                    request.method == http::Method::HEAD,
-                    headers,
-                    StatusCode::RANGE_NOT_SATISFIABLE,
-                    "invalid range: failed to overlap",
-                )));
-            }
-            Err(RangeError::Invalid) => {
-                return Ok(Outcome::Respond(serve_error(
-                    request.method == http::Method::HEAD,
-                    headers,
-                    StatusCode::RANGE_NOT_SATISFIABLE,
-                    "invalid range",
-                )));
-            }
-            Ok(parsed) => {
-                let mut parsed = parsed;
-                if parsed.iter().map(|range| range.length).sum::<i64>() > size as i64 {
-                    // Total range size exceeds the file: ignore the range request (anti-abuse).
-                    parsed = Vec::new();
-                }
-                ranges = Ok(parsed);
-            }
-        }
-        // INFEASIBLE: every error arm above returned, so only `Ok` reaches this point.
-        let ranges = ranges.expect("range errors handled");
-        if ranges.len() == 1 {
-            let range = ranges[0];
-            status = StatusCode::PARTIAL_CONTENT;
-            headers.insert(
-                header::CONTENT_RANGE,
-                HeaderValue::from_str(&range.content_range(size as i64))
-                    .expect("content range is a valid header value"),
-            );
-            send_size = range.length as u64;
-            let Some((range_start, range_end)) = range_bounds(&range, body.len()) else {
-                return Ok(Outcome::Respond(serve_error(
-                    request.method == http::Method::HEAD,
-                    headers,
-                    StatusCode::RANGE_NOT_SATISFIABLE,
-                    "invalid range: the file changed while it was being served",
-                )));
-            };
-            body = Bytes::copy_from_slice(&body[range_start..range_end]);
-        } else if ranges.len() > 1 {
-            status = StatusCode::PARTIAL_CONTENT;
-            let boundary = multipart_boundary();
-            let multipart = multipart_body(&ranges, &content_type, size as i64, &boundary, &body)?;
-            headers.insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_str(&format!("multipart/byteranges; boundary={boundary}"))
-                    .expect("multipart content type is a valid header value"),
-            );
-            send_size = multipart.len() as u64;
-            body = Bytes::from(multipart);
-            if !content_encoding_present(&headers) {
-                headers.remove(header::CONTENT_RANGE);
-            }
-        }
 
         headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
         // Go: always set Content-Length for range responses; for full responses only when the
         // representation is not content-encoded (Caddy pre-sets it for precompressed files).
-        if !ranges.is_empty() || !content_encoding_present(&headers) {
+        if ranged || !content_encoding_present(&headers) {
             headers.insert(
                 header::CONTENT_LENGTH,
                 HeaderValue::from_str(&send_size.to_string())
@@ -1178,6 +1112,143 @@ enum RangeError {
     NoOverlap,
 }
 
+/// How a `Range` request resolved against the representation's staged size and the bytes that were
+/// actually read from disk.
+enum RangeOutcome {
+    Serve(RangePlan),
+    /// The request must be answered with this response instead of the representation.
+    Reject(Response),
+}
+
+/// The representation slice a successful `Range` request resolved to.
+struct RangePlan {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: Bytes,
+    send_size: u64,
+    /// Whether a byte range was applied (Go always sets `Content-Length` for range responses).
+    ranged: bool,
+}
+
+/// Apply the request's `Range` header to a representation whose `size` was staged from `stat` and
+/// whose contents were read into `body`, following Go's `parseRange`/`serveContent`.
+fn apply_ranges(
+    head: bool,
+    mut headers: HeaderMap,
+    range_header: Option<&str>,
+    if_range_ok: bool,
+    size: u64,
+    body: Bytes,
+) -> RangeOutcome {
+    let mut ranges = match range_header {
+        Some(header) if if_range_ok => parse_range(header, size as i64),
+        _ => Ok(Vec::new()),
+    };
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let mut status = StatusCode::OK;
+    let mut body = body;
+    let mut send_size = size;
+    match ranges {
+        Err(RangeError::NoOverlap) if size == 0 => {
+            // Ignore range requests on empty files (Go's special case).
+            ranges = Ok(Vec::new());
+        }
+        Err(RangeError::NoOverlap) => {
+            return RangeOutcome::Reject(range_not_satisfiable(
+                head,
+                headers,
+                size,
+                "invalid range: failed to overlap",
+            ));
+        }
+        Err(RangeError::Invalid) => {
+            return RangeOutcome::Reject(serve_error(
+                head,
+                headers,
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "invalid range",
+            ));
+        }
+        Ok(parsed) => {
+            let mut parsed = parsed;
+            if parsed.iter().map(|range| range.length).sum::<i64>() > size as i64 {
+                // Total range size exceeds the file: ignore the range request (anti-abuse).
+                parsed = Vec::new();
+            }
+            ranges = Ok(parsed);
+        }
+    }
+    // INFEASIBLE: every error arm above returned, so only `Ok` reaches this point.
+    let ranges = ranges.expect("range errors handled");
+    if ranges.len() == 1 {
+        let range = ranges[0];
+        status = StatusCode::PARTIAL_CONTENT;
+        headers.insert(
+            header::CONTENT_RANGE,
+            HeaderValue::from_str(&range.content_range(size as i64))
+                .expect("content range is a valid header value"),
+        );
+        send_size = range.length as u64;
+        let Some((range_start, range_end)) = range_bounds(&range, body.len()) else {
+            // The file shrank between `stat` and `read`: the `Content-Range` staged above is
+            // stale, so replace it with RFC 7233's unsatisfied form (`bytes */<complete-length>`)
+            // rather than advertising a range the representation no longer has.
+            return RangeOutcome::Reject(range_not_satisfiable(
+                head,
+                headers,
+                size,
+                "invalid range: the file changed while it was being served",
+            ));
+        };
+        body = Bytes::copy_from_slice(&body[range_start..range_end]);
+    } else if ranges.len() > 1 {
+        status = StatusCode::PARTIAL_CONTENT;
+        let boundary = multipart_boundary();
+        let Some(multipart) = multipart_body(&ranges, &content_type, size as i64, &boundary, &body)
+        else {
+            // Same stale-range condition as the single-range arm above: answer 416 with the
+            // unsatisfied `Content-Range` instead of failing the request with a 500.
+            return RangeOutcome::Reject(range_not_satisfiable(
+                head,
+                headers,
+                size,
+                "invalid range: the file changed while it was being served",
+            ));
+        };
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_str(&format!("multipart/byteranges; boundary={boundary}"))
+                .expect("multipart content type is a valid header value"),
+        );
+        send_size = multipart.len() as u64;
+        body = Bytes::from(multipart);
+        if !content_encoding_present(&headers) {
+            headers.remove(header::CONTENT_RANGE);
+        }
+    }
+    RangeOutcome::Serve(RangePlan {
+        status,
+        headers,
+        body,
+        send_size,
+        ranged: !ranges.is_empty(),
+    })
+}
+
+/// A 416 carrying RFC 7233's `Content-Range: bytes */<complete-length>` form.
+fn range_not_satisfiable(head: bool, mut headers: HeaderMap, size: u64, message: &str) -> Response {
+    headers.insert(
+        header::CONTENT_RANGE,
+        HeaderValue::from_str(&format!("bytes */{size}"))
+            .expect("content range is a valid header value"),
+    );
+    serve_error(head, headers, StatusCode::RANGE_NOT_SATISFIABLE, message)
+}
+
 fn parse_range(header: &str, size: i64) -> std::result::Result<Vec<ByteRange>, RangeError> {
     if header.is_empty() {
         return Ok(Vec::new());
@@ -1269,13 +1340,15 @@ fn range_bounds(range: &ByteRange, available: usize) -> Option<(usize, usize)> {
     (end <= available).then_some((start, end))
 }
 
+/// Build a `multipart/byteranges` body, or `None` when a range no longer fits the bytes actually
+/// read from disk (the file shrank between `stat` and `read`).
 fn multipart_body(
     ranges: &[ByteRange],
     content_type: &str,
     size: i64,
     boundary: &str,
     representation: &[u8],
-) -> Result<Vec<u8>> {
+) -> Option<Vec<u8>> {
     let mut body = Vec::new();
     for range in ranges {
         body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
@@ -1285,17 +1358,14 @@ fn multipart_body(
         body.extend_from_slice(format!("Content-Type: {content_type}\r\n").as_bytes());
         body.extend_from_slice(b"\r\n");
         let Some((start, end)) = range_bounds(range, representation.len()) else {
-            return Err(Error::handler(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "invalid range: the file changed while it was being served",
-            ));
+            return None;
         };
         // INFEASIBLE: `range_bounds` proved `start..end` lies inside `representation`.
         body.extend_from_slice(&representation[start..end]);
         body.extend_from_slice(b"\r\n");
     }
     body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
-    Ok(body)
+    Some(body)
 }
 
 async fn browse_html(root: &Path, uri: Uri, relative: &str) -> Result<Vec<u8>> {
@@ -2343,11 +2413,124 @@ mod tests {
             start: 5,
             length: 10,
         }];
-        let error = multipart_body(&ranges, "text/plain", 100, "boundary", b"short")
-            .expect_err("range beyond the read bytes must be rejected");
-        assert_eq!(
-            error.handler_status(),
-            Some(StatusCode::INTERNAL_SERVER_ERROR)
+        assert!(
+            multipart_body(&ranges, "text/plain", 100, "boundary", b"short").is_none(),
+            "range beyond the read bytes must be rejected"
         );
+    }
+
+    /// A single range that fits the `stat` size but not the bytes actually read (the file shrank
+    /// between `stat` and `read`) must answer 416 with RFC 7233's unsatisfied form
+    /// `Content-Range: bytes */<complete-length>`, not the stale `bytes <start>-<end>/<size>`.
+    #[test]
+    fn stale_single_range_is_416_with_unsatisfied_content_range() {
+        let outcome = apply_ranges(
+            false,
+            HeaderMap::new(),
+            Some("bytes=5-9"),
+            true,
+            10,
+            Bytes::from_static(b"short"),
+        );
+        let RangeOutcome::Reject(response) = outcome else {
+            panic!("a stale single range must be rejected");
+        };
+        assert_eq!(response.status, StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            response
+                .headers
+                .get(header::CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok()),
+            Some("bytes */10")
+        );
+        assert_eq!(
+            response.body,
+            Bytes::from_static(b"invalid range: the file changed while it was being served\n")
+        );
+    }
+
+    /// The multipart arm must answer the same stale-range condition exactly like the single-range
+    /// arm: 416 with `Content-Range: bytes */<complete-length>`, never a 500.
+    #[test]
+    fn stale_multipart_range_is_416_with_unsatisfied_content_range() {
+        let outcome = apply_ranges(
+            false,
+            HeaderMap::new(),
+            Some("bytes=0-1,4-5"),
+            true,
+            10,
+            Bytes::from_static(b"short"),
+        );
+        let RangeOutcome::Reject(response) = outcome else {
+            panic!("a stale multipart range must be rejected");
+        };
+        assert_eq!(response.status, StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            response
+                .headers
+                .get(header::CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok()),
+            Some("bytes */10")
+        );
+        assert_eq!(
+            response
+                .headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/plain; charset=utf-8")
+        );
+    }
+
+    /// Guard: a range that fits the bytes actually read still returns 206 with its own
+    /// `Content-Range`.
+    #[test]
+    fn valid_single_range_still_returns_206_with_its_content_range() {
+        let outcome = apply_ranges(
+            false,
+            HeaderMap::new(),
+            Some("bytes=0-1"),
+            true,
+            10,
+            Bytes::from_static(b"0123456789"),
+        );
+        let RangeOutcome::Serve(plan) = outcome else {
+            panic!("a valid range must be served");
+        };
+        assert_eq!(plan.status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            plan.headers
+                .get(header::CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok()),
+            Some("bytes 0-1/10")
+        );
+        assert_eq!(plan.send_size, 2);
+        assert_eq!(plan.body, Bytes::from_static(b"01"));
+        assert!(plan.ranged);
+    }
+
+    /// Guard: a valid multipart range still returns 206 with a `multipart/byteranges` body and no
+    /// top-level `Content-Range`.
+    #[test]
+    fn valid_multipart_range_still_returns_206() {
+        let outcome = apply_ranges(
+            false,
+            HeaderMap::new(),
+            Some("bytes=0-1,4-5"),
+            true,
+            10,
+            Bytes::from_static(b"0123456789"),
+        );
+        let RangeOutcome::Serve(plan) = outcome else {
+            panic!("a valid multipart range must be served");
+        };
+        assert_eq!(plan.status, StatusCode::PARTIAL_CONTENT);
+        assert!(plan
+            .headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("multipart/byteranges; boundary=")));
+        assert!(plan.headers.get(header::CONTENT_RANGE).is_none());
+        assert_eq!(plan.send_size, plan.body.len() as u64);
+        assert!(plan.ranged);
     }
 }
