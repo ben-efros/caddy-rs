@@ -2012,3 +2012,8 @@ impl<S: UserStore> AuthnService<S> {
 
 #[cfg(test)]
 mod tests;
+
+mod cose;
+mod key_registry;
+pub use cose::{parse_cose_key, CoseKey, CoseKeyError};
+pub use key_registry::CoseKeyRegistry;
