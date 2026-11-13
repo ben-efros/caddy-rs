@@ -1318,7 +1318,7 @@ fn strip_path_suffix(request: &mut Request, configured: &str) -> Result<()> {
 
 /// Go `path.Clean` with Caddy's trailing-slash preservation; when `collapse_slashes` is false,
 /// empty segments (repeated slashes) are preserved while dot segments are still resolved.
-fn clean_path(path: &str, collapse_slashes: bool) -> String {
+pub(crate) fn clean_path(path: &str, collapse_slashes: bool) -> String {
     if path.is_empty() {
         return ".".to_string();
     }
