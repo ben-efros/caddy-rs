@@ -27,6 +27,7 @@ tokio-rustls = { version = "0.26.6", default-features = false, features = [
     "aws_lc_rs", "tls12", "logging",
 ] }
 tower-service = "0.3.3"
+tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3.27.0"
