@@ -131,7 +131,7 @@ use serde_json::Value;
 
 use crate::access_log::{
     AccessLogConfig, AccessLogEntry, AccessLogField, HeaderRedaction, HeaderTarget, LogLevel,
-    RedactionPolicy, SamplingConfig, ACCESS_LOG_LOGGER,
+    RedactionPolicy, SamplingConfig, ACCESS_LOG_LOGGER, SENSITIVE_QUERY_PARAMETERS,
 };
 use crate::access_log::{
     FieldFilter, FieldFilterOperation, FilterAction, FilterActionKind, RegexpOperation,
@@ -277,12 +277,27 @@ pub struct LoggingConfig {
 
 impl LoggingConfig {
     /// Map the logging configuration of a full Caddy configuration document.
+    ///
+    /// The global `stock_compat` flag is applied to the built-in query-parameter redaction
+    /// default (`DIV-0134`): `stock_compat true` logs the query verbatim unless the encoder carries
+    /// an explicit `redaction.query_parameters` list.
     pub fn from_config(config: &Config) -> Result<Self, LoggingConfigError> {
-        Self::from_logging(config.logging.as_ref())
+        Self::from_logging_with_stock_compat(config.logging.as_ref(), config.stock_compat())
     }
 
     /// Map a typed Caddy [`Logging`] configuration (`None` means "use Caddy defaults").
+    ///
+    /// This is the stock-compatibility-off mapping; use [`Self::from_config`] (or
+    /// [`Self::from_logging_with_stock_compat`]) when the global `stock_compat` flag is known.
     pub fn from_logging(logging: Option<&Logging>) -> Result<Self, LoggingConfigError> {
+        Self::from_logging_with_stock_compat(logging, false)
+    }
+
+    /// Map a typed Caddy [`Logging`] configuration with an explicit `stock_compat` flag.
+    pub fn from_logging_with_stock_compat(
+        logging: Option<&Logging>,
+        stock_compat: bool,
+    ) -> Result<Self, LoggingConfigError> {
         let empty = Logging::default();
         let logging = logging.unwrap_or(&empty);
         validate_logging(logging)?;
@@ -301,7 +316,7 @@ impl LoggingConfig {
             }
             targets.push(AccessLogTarget {
                 name: name.clone(),
-                config: convert_log(name, log)?,
+                config: convert_log(name, log, stock_compat)?,
                 include: log.include.clone(),
                 exclude: log.exclude.clone(),
             });
@@ -545,12 +560,30 @@ fn logger_allowed(name: &str, include: &[String], exclude: &[String]) -> bool {
     longest_accept > longest_reject || (include.is_empty() && longest_reject == 0)
 }
 
-fn convert_log(name: &str, log: &CustomLog) -> Result<AccessLogSinkConfig, LoggingConfigError> {
+fn convert_log(
+    name: &str,
+    log: &CustomLog,
+    stock_compat: bool,
+) -> Result<AccessLogSinkConfig, LoggingConfigError> {
     let path = format!("logging.logs.{name}");
     let writer = parse_writer(&path, log.base.writer.as_ref())?;
     let encoder = parse_encoder(&path, log.base.encoder.as_ref())?;
     let level = parse_level(&path, log.base.level.as_deref())?;
     let sampling = parse_sampling(&path, log.base.sampling.as_ref())?;
+
+    // Resolve the built-in query-parameter redaction default (`DIV-0134`): an absent encoder
+    // `redaction.query_parameters` means the built-in list, except under `stock_compat true`,
+    // where stock logging is verbatim. An explicit list (including `[]`) always wins, in both
+    // `stock_compat` modes (DIV-0133 / ADR-0012 §3-§4).
+    let mut redaction = encoder.redaction;
+    redaction.query_parameters = match encoder.query_parameters {
+        Some(names) => names,
+        None if stock_compat => Vec::new(),
+        None => SENSITIVE_QUERY_PARAMETERS
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect(),
+    };
 
     let config = AccessLogSinkConfig {
         output: writer.output,
@@ -563,7 +596,7 @@ fn convert_log(name: &str, log: &CustomLog) -> Result<AccessLogSinkConfig, Loggi
             include: Vec::new(),
             exclude: encoder.exclude,
             log_credentials: false,
-            redaction: encoder.redaction,
+            redaction,
             sampling,
             message_key: encoder.message_key,
             level_key: encoder.level_key,
@@ -922,6 +955,11 @@ struct EncoderSelection {
     format: AccessLogFormat,
     exclude: Vec<AccessLogField>,
     redaction: RedactionPolicy,
+    /// Explicit `redaction.query_parameters` (caddy-rs extension, `DIV-0133`).
+    ///
+    /// `None` means the key was absent, so [`convert_log`] applies the built-in default list
+    /// (unless `stock_compat true`); `Some([])` is the documented per-sink opt-out.
+    query_parameters: Option<Vec<String>>,
     filters: Vec<FieldFilter>,
     message_key: Option<String>,
     level_key: Option<String>,
@@ -1008,6 +1046,9 @@ fn parse_json_encoder_options(
                 ))
             }
             "time_format" => selection.time_format = Some(string(true)?.unwrap_or_default()),
+            "redaction" => {
+                selection.query_parameters = parse_redaction_query_parameters(&field_path, value)?
+            }
             "duration_format" => {
                 selection.duration_format = Some(string(true)?.unwrap_or_default())
             }
@@ -1034,6 +1075,62 @@ fn parse_json_encoder_options(
         }
     }
     Ok(selection)
+}
+
+/// Parse the caddy-rs `redaction` encoder option (`DIV-0133`, ADR-0012 §3).
+///
+/// `redaction` must be an object with the single key `query_parameters`, an array of non-empty,
+/// unique parameter names. `None` means the object was present but carried no
+/// `query_parameters` key, which has the same meaning as an absent `redaction` object.
+fn parse_redaction_query_parameters(
+    path: &str,
+    value: &Value,
+) -> Result<Option<Vec<String>>, LoggingConfigError> {
+    let object = value.as_object().ok_or_else(|| {
+        LoggingConfigError::new(
+            path,
+            "`redaction` must be an object with `query_parameters`",
+        )
+    })?;
+    for key in object.keys() {
+        if key != "query_parameters" {
+            return Err(LoggingConfigError::unsupported(
+                format!("{path}.{key}"),
+                format!("unknown `redaction` option `{key}` (supported: `query_parameters`)"),
+            ));
+        }
+    }
+    let Some(parameters) = object.get("query_parameters") else {
+        return Ok(None);
+    };
+    let parameters_path = format!("{path}.query_parameters");
+    let array = parameters.as_array().ok_or_else(|| {
+        LoggingConfigError::new(
+            &parameters_path,
+            "`query_parameters` must be an array of parameter names",
+        )
+    })?;
+    let mut names: Vec<String> = Vec::with_capacity(array.len());
+    for (index, parameter) in array.iter().enumerate() {
+        let entry_path = format!("{parameters_path}[{index}]");
+        let name = parameter.as_str().ok_or_else(|| {
+            LoggingConfigError::new(&entry_path, "query parameter names must be strings")
+        })?;
+        if name.is_empty() {
+            return Err(LoggingConfigError::new(
+                &entry_path,
+                "query parameter names must not be empty",
+            ));
+        }
+        if names.iter().any(|existing| existing == name) {
+            return Err(LoggingConfigError::new(
+                &entry_path,
+                format!("duplicate query parameter `{name}`"),
+            ));
+        }
+        names.push(name.to_string());
+    }
+    Ok(Some(names))
 }
 
 fn parse_filter_encoder(
@@ -1822,6 +1919,123 @@ mod tests {
         assert_eq!(config.level, Some(LogLevel::Info));
         assert_eq!(config.encoder.sampling, None);
         assert!(config.encoder.exclude.is_empty());
+    }
+
+    fn map_logging_with_stock(logging: Value, stock_compat: bool) -> LoggingConfig {
+        let logging: Logging = serde_json::from_value(logging).expect("logging decodes");
+        LoggingConfig::from_logging_with_stock_compat(Some(&logging), stock_compat)
+            .unwrap_or_else(|error| panic!("mapping failed: {error}"))
+    }
+
+    fn query_parameters(logging: &Value, stock_compat: bool) -> Vec<String> {
+        map_logging_with_stock(logging.clone(), stock_compat).targets()[0]
+            .sink_config()
+            .encoder
+            .redaction
+            .query_parameters
+            .clone()
+    }
+
+    fn builtin_query_parameters() -> Vec<String> {
+        SENSITIVE_QUERY_PARAMETERS
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect()
+    }
+
+    #[test]
+    fn absent_redaction_uses_the_builtin_query_parameter_default() {
+        let logging = json!({"logs": {"default": {"encoder": {"format": "json"}}}});
+        assert_eq!(
+            query_parameters(&logging, false),
+            builtin_query_parameters()
+        );
+        // `stock_compat true` restores stock verbatim query logging.
+        assert!(query_parameters(&logging, true).is_empty());
+    }
+
+    #[test]
+    fn explicit_redaction_query_parameters_override_the_default_in_both_modes() {
+        let logging = json!({"logs": {"default": {"encoder": {
+            "format": "json",
+            "redaction": {"query_parameters": ["my_app_token"]}
+        }}}});
+        assert_eq!(
+            query_parameters(&logging, false),
+            vec!["my_app_token".to_string()]
+        );
+        assert_eq!(
+            query_parameters(&logging, true),
+            vec!["my_app_token".to_string()]
+        );
+    }
+
+    #[test]
+    fn empty_redaction_query_parameters_disables_the_default_per_sink() {
+        let logging = json!({"logs": {"default": {"encoder": {
+            "format": "console",
+            "redaction": {"query_parameters": []}
+        }}}});
+        assert!(query_parameters(&logging, false).is_empty());
+        assert!(query_parameters(&logging, true).is_empty());
+    }
+
+    #[test]
+    fn filter_encoder_wrap_accepts_redaction_query_parameters() {
+        let logging = json!({"logs": {"default": {"encoder": {
+            "format": "filter",
+            "wrap": {"format": "json", "redaction": {"query_parameters": ["x"]}},
+            "fields": {}
+        }}}});
+        assert_eq!(query_parameters(&logging, false), vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn invalid_redaction_shapes_fail_loudly_with_located_paths() {
+        let prefix = "logging.logs.default.encoder.redaction";
+        let cases = [
+            (json!([]), prefix.to_string()),
+            (
+                json!({"query_parameters": "token"}),
+                format!("{prefix}.query_parameters"),
+            ),
+            (
+                json!({"query_parameters": [1]}),
+                format!("{prefix}.query_parameters[0]"),
+            ),
+            (
+                json!({"query_parameters": [""]}),
+                format!("{prefix}.query_parameters[0]"),
+            ),
+            (
+                json!({"query_parameters": ["a", "a"]}),
+                format!("{prefix}.query_parameters[1]"),
+            ),
+            (json!({"query": ["a"]}), format!("{prefix}.query")),
+        ];
+        for (redaction, expected) in cases {
+            let logging = json!({"logs": {"default": {"encoder": {
+                "format": "json",
+                "redaction": redaction
+            }}}});
+            let logging: Logging = serde_json::from_value(logging).expect("logging decodes");
+            let error = LoggingConfig::from_logging_with_stock_compat(Some(&logging), false)
+                .expect_err("invalid redaction must be rejected");
+            assert_eq!(error.path(), expected, "case {redaction}");
+        }
+    }
+
+    #[test]
+    fn redaction_on_the_filter_encoder_itself_is_rejected_but_wrap_is_accepted() {
+        let logging = json!({"logs": {"access": {"encoder": {
+            "format": "filter",
+            "wrap": {"format": "json"},
+            "redaction": {"query_parameters": ["x"]}
+        }}}});
+        let logging: Logging = serde_json::from_value(logging).expect("logging decodes");
+        let error = LoggingConfig::from_logging_with_stock_compat(Some(&logging), false)
+            .expect_err("filter top-level redaction must be rejected");
+        assert_eq!(error.path(), "logging.logs.access.encoder.redaction");
     }
 
     #[test]

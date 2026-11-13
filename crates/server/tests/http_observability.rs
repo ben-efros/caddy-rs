@@ -705,3 +705,165 @@ async fn failed_response_write_logs_write_error() {
         "write_error must describe the aborted body: {write_error}"
     );
 }
+
+fn logging_with_encoder(
+    log_path: &std::path::Path,
+    encoder: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "logs": {
+            "default": {
+                "writer": {"output": "file", "filename": log_path.to_string_lossy()},
+                "encoder": encoder,
+                "level": "INFO"
+            }
+        }
+    })
+}
+
+fn observability_config_with_stock(
+    logging: serde_json::Value,
+    body: &str,
+    stock_compat: bool,
+) -> Config {
+    let mut config = serde_json::json!({
+        "admin": {"disabled": true},
+        "logging": logging,
+        "apps": {"http": {"servers": {"srv0": {
+            "listen": ["127.0.0.1:0"],
+            "routes": [{"handle": [{"handler": "static_response", "body": body}]}]
+        }}}}
+    });
+    if stock_compat {
+        config["stock_compat"] = serde_json::Value::Bool(true);
+    }
+    Config::from_value(config).expect("test config decodes")
+}
+
+/// Start one request against a fresh runtime and return the single access-log entry as JSON.
+async fn single_access_entry(
+    config: Config,
+    path: &str,
+    log_path: &std::path::Path,
+) -> serde_json::Value {
+    let (_store, runtime, address) = start(config).await;
+    let (status, _headers, _body) = request(address, "GET", path, &[]).await;
+    assert_eq!(status, 200);
+    runtime.shutdown().await;
+    let entries = read_log_lines(log_path);
+    assert_eq!(entries.len(), 1, "one access entry per request");
+    entries[0].clone()
+}
+
+#[tokio::test]
+async fn access_log_redacts_builtin_query_parameters_by_default() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let log_path = directory.path().join("access.log");
+    let logging = logging_with_encoder(&log_path, serde_json::json!({"format": "json"}));
+    let config = observability_config_with_stock(logging, "ok", false);
+    let entry = single_access_entry(
+        config,
+        "/callback?access_token=at&state=ok&token&api_key=k&Access_Token=mixed",
+        &log_path,
+    )
+    .await;
+    assert_eq!(
+        entry["request"]["uri"],
+        serde_json::json!(
+            "/callback?access_token=REDACTED&state=ok&token=REDACTED&api_key=REDACTED&Access_Token=mixed"
+        )
+    );
+}
+
+#[tokio::test]
+async fn explicit_empty_redaction_query_parameters_logs_the_query_verbatim() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let log_path = directory.path().join("access.log");
+    let logging = logging_with_encoder(
+        &log_path,
+        serde_json::json!({
+            "format": "json",
+            "redaction": {"query_parameters": []}
+        }),
+    );
+    let config = observability_config_with_stock(logging, "ok", false);
+    let entry = single_access_entry(config, "/callback?access_token=at&token", &log_path).await;
+    assert_eq!(
+        entry["request"]["uri"],
+        serde_json::json!("/callback?access_token=at&token")
+    );
+}
+
+#[tokio::test]
+async fn stock_compat_true_logs_the_query_verbatim() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let log_path = directory.path().join("access.log");
+    let logging = logging_with_encoder(&log_path, serde_json::json!({"format": "json"}));
+    let config = observability_config_with_stock(logging, "ok", true);
+    let entry = single_access_entry(config, "/callback?access_token=at&token", &log_path).await;
+    assert_eq!(
+        entry["request"]["uri"],
+        serde_json::json!("/callback?access_token=at&token")
+    );
+}
+
+#[tokio::test]
+async fn explicit_redaction_query_parameters_replace_the_builtin_default() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let log_path = directory.path().join("access.log");
+    let logging = logging_with_encoder(
+        &log_path,
+        serde_json::json!({
+            "format": "json",
+            "redaction": {"query_parameters": ["my_token"]}
+        }),
+    );
+    let config = observability_config_with_stock(logging, "ok", false);
+    let entry = single_access_entry(config, "/callback?my_token=t&token=secret", &log_path).await;
+    assert_eq!(
+        entry["request"]["uri"],
+        serde_json::json!("/callback?my_token=REDACTED&token=secret")
+    );
+}
+
+#[tokio::test]
+async fn filter_encoder_wrap_redacts_before_applying_filters() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let log_path = directory.path().join("access.log");
+    let logging = logging_with_encoder(
+        &log_path,
+        serde_json::json!({
+            "format": "filter",
+            "wrap": {"format": "json", "redaction": {"query_parameters": ["my_token"]}},
+            "fields": {}
+        }),
+    );
+    let config = observability_config_with_stock(logging, "ok", false);
+    let entry = single_access_entry(config, "/callback?my_token=t&state=ok", &log_path).await;
+    assert_eq!(
+        entry["request"]["uri"],
+        serde_json::json!("/callback?my_token=REDACTED&state=ok")
+    );
+}
+
+#[tokio::test]
+async fn console_encoder_renders_the_redacted_query() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let log_path = directory.path().join("access.log");
+    let logging = logging_with_encoder(&log_path, serde_json::json!({"format": "console"}));
+    let config = observability_config_with_stock(logging, "ok", false);
+    let (_store, runtime, address) = start(config).await;
+    let (status, _headers, _body) =
+        request(address, "GET", "/cb?access_token=at&state=ok", &[]).await;
+    assert_eq!(status, 200);
+    runtime.shutdown().await;
+    let rendered = std::fs::read_to_string(&log_path).expect("console access log");
+    assert!(
+        rendered.contains("access_token=REDACTED"),
+        "console output must carry the redacted query: {rendered}"
+    );
+    assert!(
+        !rendered.contains("access_token=at"),
+        "value must not leak: {rendered}"
+    );
+}
