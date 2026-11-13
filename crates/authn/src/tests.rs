@@ -4,6 +4,20 @@ use super::*;
 /// wall clock happens to be inside a 30-second step.
 const TEST_STEP: u64 = 60_000_000;
 
+/// Write a secret file with an explicit POSIX mode on Unix (tests must not depend on the process
+/// umask). Non-Unix has no mode bits, so the argument is ignored there.
+fn write_secret_file(path: &std::path::Path, bytes: &[u8], mode: u32) {
+    std::fs::write(path, bytes).expect("write secret file");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .expect("set secret file mode");
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+}
+
 fn test_config() -> AuthnConfig {
     AuthnConfig {
         jwt_secret_source: JwtSecretSource::Master("test-secret".to_string()),
@@ -1214,7 +1228,7 @@ fn malformed_secret_file_is_rejected() {
     // or truncated (only a zero-byte file is). The error must name the path, the observed length,
     // and the operator's two options.
     for found in [1usize, 7, 31, 33, 64] {
-        std::fs::write(&path, vec![0xABu8; found]).expect("write malformed secret");
+        write_secret_file(&path, &vec![0xABu8; found], 0o600);
 
         for attempt in 0..2 {
             let err = JwtSecretSource::File(path.clone())
@@ -1256,13 +1270,68 @@ fn regular_secret_file_still_resolves() {
     let dir = std::env::temp_dir().join(format!("caddy-rs-jwt-regular-{:?}", UserId::new()));
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let path = dir.join("jwt.key");
-    std::fs::write(&path, [9u8; 32]).expect("write secret");
+    write_secret_file(&path, &[9u8; 32], 0o600);
 
     assert_eq!(
         JwtSecretSource::File(path.clone())
             .resolve()
             .expect("a regular file must still resolve"),
         [9u8; 32]
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn group_or_world_readable_secret_file_is_refused() {
+    let dir = std::env::temp_dir().join(format!("caddy-rs-jwt-mode-{:?}", UserId::new()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("jwt.key");
+
+    // Any bit in the group or other triad lets another local user read the signing key and mint
+    // tokens, so the guard must cover all of them, not just `0o644`.
+    for mode in [0o644u32, 0o640, 0o604, 0o660, 0o606] {
+        write_secret_file(&path, &[5u8; 32], mode);
+        let err = JwtSecretSource::File(path.clone())
+            .resolve()
+            .expect_err("a group/other-readable secret file must be refused");
+        match err {
+            AuthError::Internal(message) => {
+                assert!(
+                    message.contains(&path.display().to_string()),
+                    "the error must name the path (mode 0o{mode:03o}): {message}"
+                );
+                assert!(
+                    message.contains(&format!("0o{mode:03o}")),
+                    "the error must report the observed mode (mode 0o{mode:03o}): {message}"
+                );
+                assert!(
+                    message.contains("group or other"),
+                    "the error must explain the refusal (mode 0o{mode:03o}): {message}"
+                );
+                assert!(
+                    message.contains("chmod 600") && message.contains("master secret"),
+                    "the error must state both remediations (mode 0o{mode:03o}): {message}"
+                );
+            }
+            other => panic!("expected AuthError::Internal, got {other:?}"),
+        }
+        // Fail closed: the operator's file is neither repaired nor replaced.
+        assert_eq!(
+            std::fs::read(&path).expect("secret file still present"),
+            vec![5u8; 32],
+            "a group/other-readable secret file must not be rewritten (mode 0o{mode:03o})"
+        );
+    }
+
+    // Owner-only is still accepted: the guard is about the group/other bits only.
+    write_secret_file(&path, &[5u8; 32], 0o600);
+    assert_eq!(
+        JwtSecretSource::File(path.clone())
+            .resolve()
+            .expect("an owner-only secret file must resolve"),
+        [5u8; 32]
     );
 
     std::fs::remove_dir_all(&dir).ok();
@@ -1405,7 +1474,7 @@ fn empty_secret_file_is_repaired_instead_of_failing_forever() {
     let dir = std::env::temp_dir().join(format!("caddy-rs-jwt-empty-{:?}", UserId::new()));
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let path = dir.join("jwt.key");
-    std::fs::write(&path, b"").expect("write empty secret file");
+    write_secret_file(&path, b"", 0o600);
 
     let key = JwtSecretSource::File(path.clone())
         .resolve()
@@ -1476,31 +1545,76 @@ fn concurrent_creation_does_not_diverge() {
 }
 
 #[test]
-fn existing_world_readable_secret_file_is_read_without_rewriting_it() {
+fn existing_world_readable_secret_file_is_refused_without_rewriting_it() {
     let dir = std::env::temp_dir().join(format!("caddy-rs-jwt-mode-{:?}", UserId::new()));
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let path = dir.join("jwt.key");
     let existing = [0x5Au8; 32];
-    std::fs::write(&path, existing).expect("write pre-existing secret");
+    write_secret_file(&path, &existing, 0o644);
+
+    // A signing key readable by group or other is a misconfiguration, not a usable secret: the
+    // file may be a restored backup or a bad `chmod`, and any local user could read it and mint
+    // tokens. The open-time guard must refuse it instead of silently trusting it.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
-            .expect("make secret world-readable");
+        let err = JwtSecretSource::File(path.clone())
+            .resolve()
+            .expect_err("an existing world-readable secret must be refused");
+        match err {
+            AuthError::Internal(message) => {
+                assert!(
+                    message.contains(&path.display().to_string()),
+                    "the error must name the path: {message}"
+                );
+                assert!(
+                    message.contains("0o644"),
+                    "the error must report the observed mode: {message}"
+                );
+                assert!(
+                    message.contains("group or other"),
+                    "the error must explain the refusal: {message}"
+                );
+                assert!(
+                    message.contains("chmod 600") && message.contains("master secret"),
+                    "the error must state both remediations: {message}"
+                );
+            }
+            other => panic!("expected AuthError::Internal, got {other:?}"),
+        }
+        // Fail closed means the operator's file is left exactly as it was, and every later start
+        // keeps refusing it (it is never repaired into an owner-only file behind their back).
+        assert_eq!(
+            std::fs::read(&path).expect("read secret file"),
+            existing,
+            "a refused secret file is never rewritten"
+        );
+        assert!(
+            JwtSecretSource::File(path.clone()).resolve().is_err(),
+            "the refusal is stable across attempts"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read secret file"),
+            existing,
+            "a refused secret file is still never rewritten"
+        );
     }
 
-    let key = JwtSecretSource::File(path.clone())
-        .resolve()
-        .expect("an existing 32-byte secret is still usable");
-    assert_eq!(
-        key, existing,
-        "the existing secret is honoured, not replaced"
-    );
-    assert_eq!(
-        std::fs::read(&path).expect("read secret file"),
-        existing,
-        "a populated secret file is never rewritten"
-    );
+    // Non-Unix platforms have no POSIX mode bits to enforce, so the file stays usable there.
+    #[cfg(not(unix))]
+    {
+        let key = JwtSecretSource::File(path.clone())
+            .resolve()
+            .expect("an existing 32-byte secret is still usable");
+        assert_eq!(
+            key, existing,
+            "the existing secret is honoured, not replaced"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read secret file"),
+            existing,
+            "a populated secret file is never rewritten"
+        );
+    }
 
     std::fs::remove_dir_all(&dir).ok();
 }

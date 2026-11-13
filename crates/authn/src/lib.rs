@@ -852,6 +852,11 @@ fn read_secret_file(path: &std::path::Path) -> AuthResult<Option<[u8; 32]>> {
 /// could be swapped for a symlink in between. The descriptor's own metadata is therefore compared
 /// with the path metadata *after* the open, and any disagreement means the path changed while it
 /// was being opened, so the read is refused rather than trusted.
+///
+/// The same descriptor metadata carries the file mode: a secret readable by group or other lets
+/// any local user mint tokens, so it is refused too (owner-only `0600` is required). Reading the
+/// mode from the opened descriptor rather than from the path avoids a `chmod` race between a
+/// separate `stat` and the open.
 #[cfg(unix)]
 fn open_secret_file(path: &std::path::Path) -> AuthResult<Option<std::fs::File>> {
     let link_metadata = match std::fs::symlink_metadata(path) {
@@ -890,10 +895,27 @@ fn open_secret_file(path: &std::path::Path) -> AuthResult<Option<std::fs::File>>
             path.display()
         )));
     }
+    // A signing key readable by group or other lets any local user mint tokens, so refuse it. The
+    // mode is read from the opened descriptor (fstat), not from the path before the open: a
+    // `stat`-then-`open` check could be raced by a `chmod` between the two. The wording mirrors
+    // `pm-cli`'s `refuse_group_or_world_readable` so an operator sees the same remediation.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = opened_metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(AuthError::Internal(format!(
+                "JWT secret file {} has mode 0o{mode:03o}, which is readable by group or other; \
+                 restrict it to 0600 with `chmod 600 {}` or configure a master secret",
+                path.display(),
+                path.display()
+            )));
+        }
+    }
     Ok(Some(file))
 }
 
-/// Non-Unix fallback: no `dev`/`ino` to compare, so only the pre-open symlink check is available.
+/// Non-Unix fallback: no `dev`/`ino` to compare and no POSIX mode bits, so only the pre-open
+/// symlink check is available.
 #[cfg(not(unix))]
 fn open_secret_file(path: &std::path::Path) -> AuthResult<Option<std::fs::File>> {
     match std::fs::File::open(path) {
