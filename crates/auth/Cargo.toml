@@ -1,0 +1,16 @@
+[package]
+name = "caddy-rs-auth"
+description = "Static FIDO2/WebAuthn passkey registry (COSE keys) for caddy-rs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+base64 = "0.23.1"
+
+[dev-dependencies]
+tempfile = { workspace = true }
