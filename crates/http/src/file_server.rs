@@ -14,6 +14,7 @@ use bytes::Bytes;
 use http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use tokio::fs;
 
+use crate::handlers::clean_path;
 use crate::matchers::{glob_match, percent_decode};
 use crate::types::{Error, Handler, Outcome, Request, Response, Result};
 
@@ -564,10 +565,14 @@ impl Handler for FileServerHandler {
             )));
         }
         let relative = decoded_path.trim_start_matches('/');
-        // Caddy trims a trailing `/` before stating the path ("remove any trailing `/` as it
-        // breaks fs.ValidPath"); the request path keeps it for the canonical redirect.
-        let stat_relative = relative.trim_end_matches('/');
-        if self.hidden(stat_relative, &request) {
+        // Caddy states the cleaned request path with its trailing separator removed ("remove any
+        // trailing separator as it breaks fs.ValidPath"), except on a filesystem root, which must
+        // keep it: `/` must not become an empty path and `C:\` must not become `C:` (upstream
+        // 5bd0b9355d44). caddy-rs trims only the relative part, so joining it to the root keeps
+        // the root itself; the untrimmed path stays available for the canonical redirect and for
+        // the trailing-separator rejection below.
+        let stat_relative = sanitized_relative(&decoded_path);
+        if self.hidden(&stat_relative, &request) {
             return self.not_found(request);
         }
         // Expand `{http.vars.root}` and friends (Caddy's file_server root supports placeholders).
@@ -577,7 +582,7 @@ impl Handler for FileServerHandler {
         } else {
             PathBuf::from(expanded_root)
         };
-        let full_path = root.join(stat_relative);
+        let full_path = root.join(&stat_relative);
         let request_path = request.uri.path().to_string();
 
         if path_contains_symlink(&full_path, &root).await? {
@@ -669,9 +674,49 @@ impl Handler for FileServerHandler {
                 )));
             }
         }
+        // A trailing separator denotes a directory, and `path` matchers never see `/secret.env/`
+        // as `/secret.env`: serving the regular file here would bypass them. The canonical
+        // redirect above covers the same request when `canonical_uris` is enabled, so this is
+        // reachable with it disabled (or for a decoded separator the redirect path does not
+        // recognise, e.g. `/file%2F`), and it must not serve the file (upstream 5bd0b9355d44).
+        if !implicit_index && has_trailing_separator(&decoded_path) {
+            return self.not_found(request);
+        }
         let original_name = filename.to_string_lossy().to_string();
         self.serve_file(request, &filename, &original_name, &root)
             .await
+    }
+}
+
+/// Caddy's `SanitizedPathJoin` relative part for a decoded request path: `path.Clean` (which drops
+/// `.` segments and repeated separators; `..` is rejected before this) without the trailing
+/// separator. Trimming only the relative part preserves a filesystem root, where `root.join("")` is
+/// the root: trimming the joined string instead turned `/` into an empty path and `C:\` into `C:`,
+/// serving the wrong directory or failing (upstream 5bd0b9355d44).
+fn sanitized_relative(decoded_path: &str) -> String {
+    let cleaned = clean_path(decoded_path, true);
+    let relative = cleaned.strip_prefix('/').unwrap_or(&cleaned);
+    trim_trailing_separators(relative).to_string()
+}
+
+/// Whether the decoded request path ends with a directory separator. On Windows a decoded `\` is a
+/// separator too (Caddy's `NormalizedPath`), so `/file\`, `/file/` and `/file%5c` all denote a
+/// directory; on unix `\` is an ordinary filename byte.
+fn has_trailing_separator(decoded_path: &str) -> bool {
+    if cfg!(windows) {
+        clean_path(&decoded_path.replace('\\', "/"), false).ends_with('/')
+    } else {
+        clean_path(decoded_path, false).ends_with('/')
+    }
+}
+
+/// Trim trailing separators so the target names the file, without turning a filesystem root into an
+/// empty relative path: the result is joined to the configured root by the caller.
+fn trim_trailing_separators(path: &str) -> &str {
+    if cfg!(windows) {
+        path.trim_end_matches(['/', '\\'])
+    } else {
+        path.trim_end_matches('/')
     }
 }
 
@@ -2332,6 +2377,123 @@ mod tests {
             response.status,
             StatusCode::FORBIDDEN,
             "path traversal via .. component should be rejected"
+        );
+    }
+
+    fn configured_handler(root: &Path, extra: serde_json::Value) -> FileServerHandler {
+        let mut config = serde_json::json!({"handler": "file_server", "root": root});
+        let object = config.as_object_mut().expect("handler config object");
+        for (key, value) in extra.as_object().expect("extra handler config") {
+            object.insert(key.clone(), value.clone());
+        }
+        FileServerHandler::from_json(&config, "handler").unwrap()
+    }
+
+    fn trailing_separator_fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("secret.env"), b"secret").unwrap();
+        std::fs::write(dir.path().join("secret.env.gz"), b"gzip-sidecar").unwrap();
+        std::fs::create_dir(dir.path().join("dir")).unwrap();
+        std::fs::write(dir.path().join("dir/index.html"), b"index").unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn canonical_redirect_for_a_trailing_separator_on_a_file_is_kept() {
+        let dir = trailing_separator_fixture();
+        // `canonical_uris` defaults to true, as in Caddy.
+        let handler = handler(dir.path()).await;
+        let response = respond(&handler, make_request(Method::GET, "/secret.env/")).await;
+        assert_eq!(response.status, StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(header(&response, header::LOCATION), "/secret.env");
+    }
+
+    #[tokio::test]
+    async fn a_regular_file_addressed_with_a_trailing_separator_is_not_served() {
+        let dir = trailing_separator_fixture();
+        let handler = configured_handler(dir.path(), serde_json::json!({"canonical_uris": false}));
+        for path in [
+            "/secret.env/",
+            "/secret.env/./",
+            "/secret.env//",
+            "/secret.env%2F",
+            "/secret.env%5c",
+            "/secret.env%5C",
+        ] {
+            let response = respond(&handler, make_request(Method::GET, path)).await;
+            assert_eq!(
+                response.status,
+                StatusCode::NOT_FOUND,
+                "`{path}` addresses a regular file as a directory and must not be served"
+            );
+        }
+        // The file itself still serves: only the trailing-separator forms are rejected.
+        let response = respond(&handler, make_request(Method::GET, "/secret.env")).await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, Bytes::from_static(b"secret"));
+    }
+
+    #[tokio::test]
+    async fn a_precompressed_sidecar_does_not_resurrect_a_trailing_separator() {
+        let dir = trailing_separator_fixture();
+        let handler = configured_handler(
+            dir.path(),
+            serde_json::json!({"canonical_uris": false, "precompressed": {"gzip": {}}}),
+        );
+        let mut request = make_request(Method::GET, "/secret.env/");
+        request
+            .headers
+            .insert(header::ACCEPT_ENCODING, HeaderValue::from_static("gzip"));
+        let response = respond(&handler, request).await;
+        assert_eq!(response.status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_trailing_separator_on_a_file_passes_through_to_the_next_handler() {
+        let dir = trailing_separator_fixture();
+        let handler = configured_handler(
+            dir.path(),
+            serde_json::json!({"canonical_uris": false, "pass_thru": true}),
+        );
+        match handler
+            .handle(make_request(Method::GET, "/secret.env/"))
+            .await
+            .unwrap()
+        {
+            Outcome::Continue(_) => {}
+            Outcome::Respond(response) => {
+                panic!("expected pass-through, got {}", response.status)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn directories_keep_the_implicit_index_and_reject_an_index_file_as_a_directory() {
+        let dir = trailing_separator_fixture();
+        let handler = configured_handler(dir.path(), serde_json::json!({"canonical_uris": false}));
+        for path in ["/dir/", "/dir"] {
+            let response = respond(&handler, make_request(Method::GET, path)).await;
+            assert_eq!(
+                response.status,
+                StatusCode::OK,
+                "`{path}` should serve the index"
+            );
+            assert_eq!(response.body, Bytes::from_static(b"index"), "`{path}`");
+        }
+        let response = respond(&handler, make_request(Method::GET, "/dir/index.html/")).await;
+        assert_eq!(response.status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_filesystem_root_keeps_its_separator_and_still_browses() {
+        let dir = trailing_separator_fixture();
+        let handler = configured_handler(dir.path(), serde_json::json!({"browse": true}));
+        let response = respond(&handler, make_request(Method::GET, "/")).await;
+        assert_eq!(response.status, StatusCode::OK);
+        let body = String::from_utf8(response.body.to_vec()).unwrap();
+        assert!(
+            body.contains("secret.env"),
+            "root listing should list the fixture file: {body}"
         );
     }
 
