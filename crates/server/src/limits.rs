@@ -43,6 +43,12 @@ pub const MAX_REQUEST_BODY_SIZE_FIELD: &str = "max_request_body_size";
 /// caddy-rs extension: maximum concurrent connections on the listener (`0`/absent = unlimited).
 pub const MAX_CONNECTIONS_FIELD: &str = "max_connections";
 
+/// caddy-rs extension: allowed underscore-bearing header names (`None` = delete ALL `_` headers).
+pub const EXPECTED_UNDERSCORE_HEADERS_FIELD: &str = "expected_underscore_headers";
+
+/// caddy-rs extension: allowed dot-bearing header names (`None` = delete ALL `.` headers).
+pub const EXPECTED_DOT_HEADERS_FIELD: &str = "expected_dot_headers";
+
 /// Fields that look like HTTP/2 tuning knobs but do not exist in Caddy v2.11.7's server JSON.
 ///
 /// Caddy hands `new(http2.Server)` to `http2.ConfigureServer`, so h2 streams/frames/windows use Go
@@ -105,6 +111,17 @@ pub struct ServerLimits {
     /// Resolved server identity for the HTTP `Server` header and FastCGI `SERVER_SOFTWARE`
     /// (caddy-rs extension, T-CONF-060; ADR-0010 §3 matrix, `DIV-0132`).
     pub server_identity: caddy_rs_core::ResolvedIdentity,
+
+    /// `expected_underscore_headers`: list of header names whose underscore (`_`) form is
+    /// accepted; all other `_`-containing headers are dropped before any handler runs.
+    /// `None` (default) means ALL underscore headers are deleted (default-secure). Entries are
+    /// ASCII case-insensitive exact tokens; a trailing `*` enables prefix globbing.
+    pub expected_underscore_headers: Option<Vec<(String, bool)>>,
+
+    /// `expected_dot_headers`: list of header names whose dot (`.`) form is accepted; all other
+    /// dot-containing headers are dropped before any handler runs. `None` (default) means ALL dot
+    /// headers are deleted (default-secure).
+    pub expected_dot_headers: Option<Vec<(String, bool)>>,
 }
 
 impl Default for ServerLimits {
@@ -118,6 +135,8 @@ impl Default for ServerLimits {
             max_request_body_size: None,
             max_connections: None,
             server_identity: caddy_rs_core::ResolvedIdentity::default(),
+            expected_underscore_headers: None,
+            expected_dot_headers: None,
         }
     }
 }
@@ -152,6 +171,10 @@ impl ServerLimits {
         let read_timeout = optional_timeout(server.read_timeout.as_ref(), &base, "read_timeout")?;
         let write_timeout =
             optional_timeout(server.write_timeout.as_ref(), &base, "write_timeout")?;
+        let expected_underscore_headers =
+            parse_header_allowlist(&server.extra, &base, "expected_underscore_headers", '_')?;
+        let expected_dot_headers =
+            parse_header_allowlist(&server.extra, &base, "expected_dot_headers", '.')?;
         let idle_timeout = optional_timeout(server.idle_timeout.as_ref(), &base, "idle_timeout")?
             .unwrap_or(DEFAULT_IDLE_TIMEOUT);
         let read_header_timeout = optional_timeout(
@@ -200,6 +223,8 @@ impl ServerLimits {
             max_request_body_size,
             max_connections,
             server_identity,
+            expected_underscore_headers,
+            expected_dot_headers,
         })
     }
 }
@@ -396,6 +421,141 @@ fn json_kind(value: &Value) -> &'static str {
     }
 }
 
+/// Parse a header-alias allowlist entry list.
+///
+/// Validates that each entry:
+/// - is a string (R3)
+/// - is non-empty
+/// - is ASCII only (R3)
+/// - contains its own separator (`_` for underscore list, `.` for dot list) (R3)
+/// - does not contain `*` anywhere but the trailing position (R3)
+/// - contains at least one character besides any trailing `*` separator character (R3)
+/// - is not a duplicate of an earlier entry in the same list (R3)
+///
+/// Returns a Vec of (normalized_name, is_prefix_glob) pairs.
+fn parse_header_allowlist(
+    extra: &BTreeMap<String, Value>,
+    base: &str,
+    field: &str,
+    separator: char,
+) -> Result<Option<Vec<(String, bool)>>, CoreError> {
+    let Some(value) = extra.get(field) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let Some(arr) = value.as_array() else {
+        return Err(CoreError::invalid(
+            format!("{base}.{field}"),
+            format!("`{field}` must be an array of strings, got {}", json_kind(value)),
+        ));
+    };
+    let mut result: Vec<(String, bool)> = Vec::with_capacity(arr.len());
+    let mut seen = std::collections::HashSet::new();
+    for (index, item) in arr.iter().enumerate() {
+        let Some(raw) = item.as_str() else {
+            return Err(CoreError::invalid(
+                format!("{base}.{field}[{index}]"),
+                format!("`{field}[{index}]` must be a string, got {}", json_kind(item)),
+            ));
+        };
+        // R3: entry must be ASCII only
+        if !raw.is_ascii() {
+            return Err(CoreError::invalid(
+                format!("{base}.{field}[{index}]"),
+                format!("`{field}[{index}]` contains non-ASCII bytes: {raw:?}"),
+            ));
+        }
+        // R3: entry must contain its own separator
+        if !raw.contains(separator) {
+            return Err(CoreError::invalid(
+                format!("{base}.{field}[{index}]"),
+                format!("`{field}[{index}]` must contain `{separator}`: {raw:?}"),
+            ));
+        }
+        // R3: reject `*` anywhere but the trailing position
+        let ends_with_star = raw.ends_with('*');
+        let body = if ends_with_star { &raw[..raw.len() - 1] } else { raw };
+        if body.contains('*') {
+            return Err(CoreError::invalid(
+                format!("{base}.{field}[{index}]"),
+                format!("`{field}[{index}]` has `*` in a non-trailing position: {raw:?}"),
+            ));
+        }
+        // R3: entry name must not be empty after removing trailing `*`
+        if body.is_empty() {
+            return Err(CoreError::invalid(
+                format!("{base}.{field}[{index}]"),
+                format!("`{field}[{index}]` must contain at least one non-`*` character"),
+            ));
+        }
+        // R4: entry name must not contain the other separator
+        let other_separator = if separator == '_' { '.' } else { '_' };
+        if raw.contains(other_separator) {
+            return Err(CoreError::invalid(
+                format!("{base}.{field}[{index}]"),
+                format!("`{field}[{index}]` contains `{other_separator}`: {raw:?}"),
+            ));
+        }
+        // R3: reject duplicates
+        let normalized = raw.to_ascii_lowercase();
+        if !seen.insert(normalized.clone()) {
+            return Err(CoreError::invalid(
+                format!("{base}.{field}[{index}]"),
+                format!("`{field}[{index}]` is a duplicate entry: {normalized:?}"),
+            ));
+        }
+        let entry_name = if ends_with_star {
+            &normalized[..normalized.len() - 1]
+        } else {
+            &normalized
+        };
+        result.push((entry_name.to_string(), ends_with_star));
+    }
+    Ok(Some(result))
+}
+
+
+/// Validate that a request header name is allowed by the allowlist configuration.
+///
+/// Returns `true` if the header should be KEPT, `false` if it should be DELETED.
+///
+/// Resolution rules (R1-R7):
+/// - If `allowlist` is `None`: delete ALL headers containing `separator` (default-secure, R1).
+/// - If `allowlist` is `Some(entries)`:
+///   - Exact match: keep (R2)
+///   - Prefix glob (`*` trailing): keep if no `other_separator` in name AND name starts with
+///     the prefix (R4), but never if it contains `other_separator` (R4).
+///   - Hyphenated variant: implicitly deleted because hyphens aren't `_` or `.` (R5).
+///   - Multi-value: caller must drop the entire header entry (R6).
+///   - List independence (R7): underscore list never matches dot names and vice versa.
+fn should_keep_header(name: &str, allowlist: &Option<Vec<(String, bool)>>, separator: char) -> bool {
+    let Some(entries) = allowlist else {
+        // R1: default secure - delete all headers containing separator
+        return !name.contains(separator);
+    };
+    let normalized = name.to_ascii_lowercase();
+    for (entry_name, is_prefix_glob) in entries {
+        if *is_prefix_glob {
+            // R4: prefix glob never matches names containing the other separator
+            let other_separator = if separator == '_' { '.' } else { '_' };
+            if normalized.contains(other_separator) {
+                continue;
+            }
+            if normalized.starts_with(entry_name) {
+                return true;
+            }
+        } else {
+            // R2: exact token match (case-insensitive)
+            if normalized == *entry_name {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,4 +723,154 @@ mod tests {
             .to_string()
             .contains("apps.http.servers.srv0.max_connections"));
     }
+
+    #[test]
+    fn parses_header_allowlist_valid() {
+        let mut extra = BTreeMap::new();
+        extra.insert(
+            "expected_underscore_headers".to_string(),
+            Value::Array(vec![
+                Value::String("Remote_User".to_string()),
+                Value::String("X_My_Header*".to_string()),
+                Value::String("plain_text".to_string()),
+            ]),
+        );
+        extra.insert(
+            "expected_dot_headers".to_string(),
+            Value::Array(vec![
+                Value::String("Remote.User".to_string()),
+                Value::String("X-Dot.Header".to_string()),
+            ]),
+        );
+        let underscore = parse_header_allowlist(&extra, "apps.http.servers.srv0", "expected_underscore_headers", '_')
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            underscore,
+            vec![
+                ("remote_user".to_string(), false),
+                ("x_my_header".to_string(), true), // prefix glob
+                ("plain_text".to_string(), false),
+            ]
+        );
+        let dot = parse_header_allowlist(&extra, "apps.http.servers.srv0", "expected_dot_headers", '.')
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            dot,
+            vec![
+                ("remote.user".to_string(), false),
+                ("x-dot.header".to_string(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_header_allowlist_invalid() {
+        // non-ASCII
+        let mut extra = BTreeMap::new();
+        extra.insert(
+            "expected_underscore_headers".to_string(),
+            Value::Array(vec![Value::String("Remote_Üser".to_string())]),
+        );
+        let err = parse_header_allowlist(&extra, "apps.http.servers.srv0", "expected_underscore_headers", '_')
+            .unwrap_err();
+        assert!(err.to_string().contains("non-ASCII"));
+
+        // `*` anywhere but trailing
+        let mut extra = BTreeMap::new();
+        extra.insert(
+            "expected_underscore_headers".to_string(),
+            Value::Array(vec![Value::String("Remote_*User".to_string())]),
+        );
+        let err = parse_header_allowlist(&extra, "apps.http.servers.srv0", "expected_underscore_headers", '_')
+            .unwrap_err();
+        assert!(err.to_string().contains("non-trailing position"));
+
+        // missing separator
+        let mut extra = BTreeMap::new();
+        extra.insert(
+            "expected_underscore_headers".to_string(),
+            Value::Array(vec![Value::String("RemoteUser".to_string())]),
+        );
+        let err = parse_header_allowlist(&extra, "apps.http.servers.srv0", "expected_underscore_headers", '_')
+            .unwrap_err();
+        assert!(err.to_string().contains("must contain `_`"));
+
+        // duplicate entries
+        let mut extra = BTreeMap::new();
+        extra.insert(
+            "expected_underscore_headers".to_string(),
+            Value::Array(vec![
+                Value::String("Remote_User".to_string()),
+                Value::String("remote_user".to_string()),
+            ]),
+        );
+        let err = parse_header_allowlist(&extra, "apps.http.servers.srv0", "expected_underscore_headers", '_')
+            .unwrap_err();
+        assert!(err.to_string().contains("duplicate entry"));
+
+        // wrong separator for the list
+        let mut extra = BTreeMap::new();
+        extra.insert(
+            "expected_underscore_headers".to_string(),
+            Value::Array(vec![Value::String("Remote.User".to_string())]),
+        );
+        let err = parse_header_allowlist(&extra, "apps.http.servers.srv0", "expected_underscore_headers", '_')
+            .unwrap_err();
+        assert!(err.to_string().contains("`.`"));
+
+        // not a string
+        let mut extra = BTreeMap::new();
+        extra.insert(
+            "expected_underscore_headers".to_string(),
+            Value::Array(vec![Value::Number(42.into())]),
+        );
+        let err = parse_header_allowlist(&extra, "apps.http.servers.srv0", "expected_underscore_headers", '_')
+            .unwrap_err();
+        assert!(err.to_string().contains("must be a string"));
+    }
+
+    #[test]
+    fn should_keep_header_default_secure() {
+        // Default (allowlist is None): all underscore headers deleted
+        assert!(!should_keep_header("Remote_User", &None, '_'));
+        assert!(!should_keep_header("remote.user", &None, '.'));
+        assert!(should_keep_header("Authorization", &None, '_'));
+        assert!(should_keep_header("Content-Type", &None, '_')); // no underscore
+        assert!(!should_keep_header("Content.Type", &None, '.'));
+    }
+
+    #[test]
+    fn should_keep_header_with_allowlist() {
+        let allowlist = Some(vec![
+            ("remote_user".to_string(), false),
+            ("x_my_header".to_string(), true),
+        ]);
+        // Exact match
+        assert!(should_keep_header("Remote_User", &allowlist, '_'));
+        assert!(should_keep_header("REMOTE_USER", &allowlist, '_'));
+        assert!(!should_keep_header("Remote-User", &allowlist, '_')); // hyphen variant dropped
+        assert!(!should_keep_header("Other_Header", &allowlist, '_')); // not in allowlist
+        // Prefix glob match
+        assert!(should_keep_header("X_My_Header_Value", &allowlist, '_'));
+        assert!(should_keep_header("x_my_header_anything", &allowlist, '_'));
+        // R4: prefix glob never matches name containing the other separator
+        assert!(!should_keep_header("Webhook_user.id", &allowlist, '_'));
+        // Dot separator in underscore list never matches
+        assert!(!should_keep_header("remote.user", &allowlist, '_'));
+    }
+
+    #[test]
+    fn should_keep_header_dot_list() {
+        let allowlist = Some(vec![("remote.user".to_string(), false), ("x.dot.header".to_string(), false)]);
+        assert!(should_keep_header("Remote.User", &allowlist, '.'));
+        assert!(!should_keep_header("Remote_User", &allowlist, '.')); // underscore not in dot list
+        assert!(!should_keep_header("x.dot.header.extra", &allowlist, '.'));
+        // Dot prefix glob
+        let allowlist_dot_glob = Some(vec![("x.dot".to_string(), true)]);
+        assert!(should_keep_header("x.dot.anything", &allowlist_dot_glob, '.'));
+        assert!(!should_keep_header("x_dot.anything", &allowlist_dot_glob, '.')); // underscore not in dot list
+    }
 }
+
