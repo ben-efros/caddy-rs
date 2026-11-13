@@ -146,16 +146,42 @@ async fn write_record(stream: &mut TcpStream, kind: u8, content: &[u8]) -> std::
 }
 
 fn config(fastcgi: &str, tls: bool) -> Config {
+    config_with(fastcgi, tls, serde_json::json!({}), serde_json::json!({}))
+}
+
+/// Like [`config`], but merges `extra` into the `srv0` server object (for `max_header_bytes`).
+fn config_with_server_extra(fastcgi: &str, tls: bool, extra: serde_json::Value) -> Config {
+    config_with(fastcgi, tls, extra, serde_json::json!({}))
+}
+
+/// `server_extra` merges into `srv0`; `transport_extra` merges into the FastCGI transport object.
+fn config_with(
+    fastcgi: &str,
+    tls: bool,
+    server_extra: serde_json::Value,
+    transport_extra: serde_json::Value,
+) -> Config {
+    let mut transport = serde_json::json!({"protocol": "fastcgi"});
+    if let Some(transport_extra) = transport_extra.as_object() {
+        for (field, value) in transport_extra {
+            transport[field.clone()] = value.clone();
+        }
+    }
     let mut server = serde_json::json!({
         "listen": ["127.0.0.1:0"],
         "routes": [{"handle": [{
             "handler": "reverse_proxy",
             "upstreams": [{"dial": fastcgi}],
-            "transport": {"protocol": "fastcgi"}
+            "transport": transport
         }]}]
     });
     if tls {
         server["tls_connection_policies"] = serde_json::json!([{}]);
+    }
+    if let Some(extra) = server_extra.as_object() {
+        for (field, value) in extra {
+            server[field.clone()] = value.clone();
+        }
     }
     let mut http = serde_json::json!({"servers": {"srv0": server}});
     // Never bind the default port 80; `http_port: 0` lets the kernel assign the derived
@@ -355,4 +381,81 @@ async fn request_tls_metadata_maps_iana_values() {
         .expect("version maps")
         .cipher_suite
         .is_none());
+}
+
+/// FastCGI's PARAMS record budget is Caddy's `MAX_WRITE` of 65 500 bytes; a value longer than
+/// the record is truncated (Caddy writer.go `writePairs` does `v[:vl]`, and caddy-rs keeps that
+/// parity — SEC-FU-FASTCGI-PARAM-TRUNC-POLICY). The truncation path is reachable through a real
+/// socket when the operator raises `max_header_bytes` above the ~65.5 KiB budget, and through a
+/// configured `env` value at any header cap (HTTP/1's own 65 534-byte request-line cap keeps the
+/// decoded path below the budget). Both routes are covered here; the CGI parameter must be
+/// shortened, never rejected.
+const FCGI_MAX_WRITE: usize = 65_500;
+
+/// ASCII over-long HTTP header: `HTTP_X_BIG` keeps exactly the byte budget, and the response
+/// still succeeds (truncation is a shortened value, not an error).
+#[tokio::test]
+async fn fastcgi_over_long_ascii_header_truncates_param_at_raised_header_cap() {
+    let (fastcgi, captured_params) = spawn_fastcgi_upstream();
+    let (runtime, address) = start(config_with_server_extra(
+        &fastcgi,
+        false,
+        serde_json::json!({"max_header_bytes": 400_000}),
+    ))
+    .await;
+
+    let value = "a".repeat(70_000);
+    let mut stream = TcpStream::connect(address).await.expect("TCP connect");
+    let request = format!(
+        "GET /health HTTP/1.1\r\nHost: example.com\r\nX-Big: {value}\r\nConnection: close\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write request");
+    let (status, _) = read_http_response(&mut stream).await;
+    assert_eq!(status, "HTTP/1.1 200 OK", "{status}");
+
+    let params = captured(&captured_params);
+    let sent = &params["HTTP_X_BIG"];
+    assert_eq!(
+        sent.len(),
+        FCGI_MAX_WRITE - 8 - "HTTP_X_BIG".len(),
+        "ASCII value truncates to the record budget"
+    );
+    assert!(sent.bytes().all(|byte| byte == b'a'));
+
+    runtime.shutdown().await;
+}
+
+/// Multibyte over-long configured `env` value: the cut lands on a UTF-8 boundary (inside the
+/// two-byte `é` for this byte budget) and the shortened value stays within the record budget.
+#[tokio::test]
+async fn fastcgi_over_long_multibyte_env_value_truncates_on_char_boundary() {
+    const NAME: &str = "HUGE_MULTIBYTE";
+    let (fastcgi, captured_params) = spawn_fastcgi_upstream();
+    // 33 000 two-byte characters = 66 000 bytes, which is 522 bytes over this parameter's budget.
+    let value = "\u{e9}".repeat(33_000);
+    let (runtime, address) = start(config_with(
+        &fastcgi,
+        false,
+        serde_json::json!({}),
+        serde_json::json!({"env": {NAME: value}}),
+    ))
+    .await;
+
+    let (status, _) = plain_get(address).await;
+    assert_eq!(status, "HTTP/1.1 200 OK", "{status}");
+
+    let params = captured(&captured_params);
+    let sent = &params[NAME];
+    let budget = FCGI_MAX_WRITE - 8 - NAME.len();
+    assert_eq!(
+        sent.len(),
+        budget,
+        "truncates to the largest boundary <= budget"
+    );
+    assert_eq!(sent, &"\u{e9}".repeat(budget / 2));
+
+    runtime.shutdown().await;
 }

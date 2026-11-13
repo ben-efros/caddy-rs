@@ -665,6 +665,20 @@ impl FastCgiTransport {
         write_record(writer, FCGI_BEGIN_REQUEST, &begin, write_deadline).await?;
 
         // PARAMS records, terminated by an empty PARAMS record.
+        //
+        // Truncation policy (SEC-FU-FASTCGI-PARAM-TRUNC-POLICY): keep Caddy's truncation instead
+        // of rejecting the request. The backend-visible CGI environment has to stay identical to
+        // Caddy v2.11.9 (DIV-0082 documents the 65500-byte record budget and the truncation); the
+        // condition is only reachable when an operator raises `max_header_bytes` above ~65.5 KiB
+        // or configures an over-long `env` value.
+        // Rejecting an over-long value would turn that configuration-dependent edge into a 5xx
+        // with no upstream equivalent, so the divergence is limited to observability: the warning
+        // below makes the silent shortening visible.
+        //
+        // The warning is emitted once per request (not once per parameter) with parameter names
+        // and byte lengths only. The value itself is never logged: it can be operator-supplied or
+        // attacker-controlled and may carry a credential.
+        let mut truncated_params: Vec<(&str, usize, usize)> = Vec::new();
         let mut buffer = Vec::with_capacity(MAX_WRITE);
         for (name, value) in params {
             let mut encoded = Vec::with_capacity(name.len() + value.len() + 8);
@@ -680,6 +694,7 @@ impl FastCgiTransport {
                 let mut truncated = Vec::new();
                 encode_pair(&mut truncated, name, &value[..end]);
                 encoded = truncated;
+                truncated_params.push((name.as_str(), value.len(), end));
             }
             if buffer.len() + encoded.len() > MAX_WRITE && !buffer.is_empty() {
                 write_record(writer, FCGI_PARAMS, &buffer, write_deadline).await?;
@@ -691,6 +706,14 @@ impl FastCgiTransport {
             write_record(writer, FCGI_PARAMS, &buffer, write_deadline).await?;
         }
         write_record(writer, FCGI_PARAMS, &[], write_deadline).await?;
+        if !truncated_params.is_empty() {
+            tracing::warn!(
+                truncated = truncated_params.len(),
+                params = %describe_truncated_params(&truncated_params),
+                "FastCGI CGI parameter value truncated to the 65500-byte record budget; the \
+                 backend receives a shortened value (raise max_header_bytes only if intended)"
+            );
+        }
 
         // STDIN records: stream the body frame by frame (already buffered by policy, but keep the
         // generic Body contract so a future streaming policy can use this unchanged).
@@ -878,6 +901,19 @@ fn floor_char_boundary(value: &str, max: usize) -> usize {
         end -= 1;
     }
     end
+}
+
+/// Render the truncated-parameter warning payload: `NAME originalB->keptB`, joined by commas.
+///
+/// Only names and byte lengths are rendered. The value is deliberately absent: it can be
+/// operator data or an attacker-controlled header and may contain a credential, so it must not
+/// reach the log.
+fn describe_truncated_params(truncated: &[(&str, usize, usize)]) -> String {
+    truncated
+        .iter()
+        .map(|(name, original, kept)| format!("{name} {original}B->{kept}B"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Encode a name/value pair using FastCGI's 1-or-4-byte length encoding.
@@ -2637,6 +2673,135 @@ mod tests {
         assert_eq!(floor_char_boundary("\u{e9}", 2), 2);
         assert_eq!(floor_char_boundary("abc", 2), 2);
         assert_eq!(floor_char_boundary("abc", usize::MAX), 3);
+    }
+
+    /// Records the events tracing emits on the test thread, so the truncation warning can be
+    /// asserted without installing a logging backend.
+    #[derive(Clone, Default)]
+    struct CapturedWarnings(Arc<Mutex<Vec<String>>>);
+
+    impl tracing::Subscriber for CapturedWarnings {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        // Without a level hint a thread-local subscriber may lose the race against the global
+        // level filter (other tests exercise the same callsite concurrently), so declare the
+        // most permissive filter explicitly.
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::TRACE)
+        }
+
+        fn new_span(&self, _attributes: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Visitor {
+                message: String,
+                fields: Vec<String>,
+            }
+            impl tracing::field::Visit for Visitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.message = format!("{value:?}");
+                    } else {
+                        self.fields.push(format!("{}={value:?}", field.name()));
+                    }
+                }
+            }
+            let mut visitor = Visitor {
+                message: String::new(),
+                fields: Vec::new(),
+            };
+            event.record(&mut visitor);
+            self.0.lock().unwrap().push(format!(
+                "{} {} | {}",
+                event.metadata().level(),
+                visitor.message,
+                visitor.fields.join(" ")
+            ));
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// SEC-FU-FASTCGI-PARAM-TRUNC-POLICY: truncation is kept for Caddy parity, so it must not be
+    /// silent. One WARN per request names every shortened parameter and its byte lengths; the
+    /// value itself (which may be a credential or attacker-controlled) must never be logged.
+    #[tokio::test]
+    async fn fastcgi_over_long_params_warn_once_with_names_and_lengths_only() {
+        fn transport() -> FastCgiTransport {
+            FastCgiTransport::from_json(
+                &transport_json(serde_json::json!({ "root": "/srv/www" })),
+                "transport",
+            )
+            .expect("fastcgi transport builds")
+        }
+
+        async fn write(transport: &FastCgiTransport, params: BTreeMap<String, String>) {
+            transport
+                .write_request(&mut Vec::new(), &params, RequestBody::empty(), None)
+                .await
+                .expect("request writes");
+        }
+
+        let warnings = CapturedWarnings::default();
+        let guard = tracing::subscriber::set_default(warnings.clone());
+        // Other truncation tests trigger the same callsite concurrently with no subscriber
+        // installed, which can win the lazy callsite-registration race against this thread-local
+        // dispatch; rebuild the interest cache and retry until the event reaches this subscriber.
+        let mut events = Vec::new();
+        for _ in 0..20 {
+            tracing::callsite::rebuild_interest_cache();
+            let params = BTreeMap::from([
+                ("HTTP_X_LONG".to_string(), "a".repeat(MAX_WRITE)),
+                ("QUERY_STRING".to_string(), "\u{e9}".repeat(MAX_WRITE)),
+            ]);
+            write(&transport(), params).await;
+            events = warnings.0.lock().unwrap().clone();
+            if !events.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        drop(guard);
+
+        let events = warnings.0.lock().unwrap().clone();
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly one warning per request: {events:?}"
+        );
+        let event = &events[0];
+        assert!(event.starts_with("WARN"), "{event}");
+        assert!(event.contains("HTTP_X_LONG 65500B->65481B"), "{event}");
+        assert!(event.contains("QUERY_STRING 131000B->65480B"), "{event}");
+        // Names and lengths only: neither repeated filler value may appear in the event.
+        assert!(!event.contains("aaaaaaaa"), "{event}");
+        assert!(!event.contains('\u{e9}'), "{event}");
+
+        // A request whose parameters all fit emits no warning at all.
+        let warnings = CapturedWarnings::default();
+        let guard = tracing::subscriber::set_default(warnings.clone());
+        tracing::callsite::rebuild_interest_cache();
+        let params = BTreeMap::from([("QUERY_STRING".to_string(), "q=1".to_string())]);
+        write(&transport(), params).await;
+        drop(guard);
+        assert!(
+            warnings.0.lock().unwrap().is_empty(),
+            "no warning without truncation"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
