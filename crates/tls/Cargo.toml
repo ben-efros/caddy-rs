@@ -24,7 +24,7 @@ ring = "0.17.14"
 # dependencies are present in the offline registry cache; feature set avoids network/build-script
 # dependencies.
 rsa = { version = "0.9.10", default-features = false, features = ["std", "pem", "u64_digit"] }
-sha2 = { version = "0.10.9", features = ["oid"] }
+sha2 = { version = "0.11.1", features = ["oid"] }
 rand = "0.8.8"
 
 # PKCS#11 token-held TLS keys (T-TLS-097). Dynamic loading is built in: no features,
