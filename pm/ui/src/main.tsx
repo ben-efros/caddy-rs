@@ -64,7 +64,7 @@ export function App(): JSX.Element {
 const container = document.getElementById('app');
 if (!container) throw new Error('missing #app mount point');
 createRoot(container).render(
-  <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+  <BrowserRouter>
     <App />
   </BrowserRouter>,
 );
