@@ -49,6 +49,9 @@ const DIRECTIVE_ORDER: &[&str] = &[
     "error",
     "copy_response",
     "respond",
+    // caddy-rs extension (DIV-0104, ADR-0011): a non-terminal limiter that runs before the
+    // handlers it protects.
+    "rate_limit",
     "reverse_proxy",
     "php_fastcgi",
     "file_server",
@@ -57,8 +60,7 @@ const DIRECTIVE_ORDER: &[&str] = &[
 
 /// Directives this build recognises as valid Caddyfile constructs but does not implement.
 ///
-/// The list is Caddy v2.11.9's registered directives that [`DIRECTIVE_ORDER`] does not cover,
-/// plus the documented caddy-rs extension `rate_limit` (no Caddyfile adapter yet, T-CONF-013).
+/// The list is Caddy v2.11.9's registered directives that [`DIRECTIVE_ORDER`] does not cover.
 /// A name in this list is a real construct with a known shape, so rejecting it stays
 /// `config.unsupported`. A name in neither list is unknown to Caddy too, so it must be
 /// `config.invalid` with Caddy's `unrecognized directive: <name>` wording.
@@ -69,7 +71,6 @@ const RECOGNISED_UNIMPLEMENTED_DIRECTIVES: &[&str] = &[
     "log_append",
     "metrics",
     "push",
-    "rate_limit",
     "request_header",
     "timeouts",
     "tracing",
@@ -5557,6 +5558,326 @@ fn request_body_handler(directive: &Directive) -> caddy_rs_core::Result<Value> {
     Ok(Value::Object(object))
 }
 
+/// Suffix shared by every `rate_limit` diagnostic: names the extension, the register entry and
+/// the operator page (DIV-0104, ADR-0011).
+const RATE_LIMIT_HINT: &str = "the `rate_limit` directive is the caddy-rs rate-limiting extension \
+(DIV-0104), documented in docs/operations/RATE-LIMITING.md (planned: T-OPS-036)";
+
+/// A located `rate_limit` diagnostic carrying the extension/DIV-0104/operator-page hint.
+fn rate_limit_error(position: Position, message: impl Into<String>) -> CoreError {
+    adapter_error(position, format!("{} ({RATE_LIMIT_HINT})", message.into()))
+}
+
+/// The caddy-rs-only Caddyfile directive `rate_limit <rate> [burst] { ... }` (DIV-0104, ADR-0011).
+///
+/// The mapping to the `http.handlers.rate_limit` handler is 1:1 and every configured option is
+/// emitted verbatim under the same JSON field name, so `caddy-rs adapt` shows exactly what the
+/// directive enables and the documented `(caddy-rs-ratelimit)` snippet adapts to the same JSON a
+/// hand-written configuration would contain. Omitted handler fields are left out of the emitted
+/// object so the handler's own defaults apply (`burst` = `ceil(rate)`, `key` =
+/// `{http.request.remote.host}`, `max_keys` = 10000, `status_code` = 429, no extra headers, empty
+/// body). The community `caddy-ratelimit` plugin's `zone`/`events`/`window` form is not accepted,
+/// translated or emulated: it is a located error naming the extension and the operator page.
+fn rate_limit_handler(directive: &Directive, args: &[String]) -> caddy_rs_core::Result<Value> {
+    let Some(rate) = args.first() else {
+        return Err(rate_limit_error(
+            directive.position.clone(),
+            "directive `rate_limit` requires a rate argument: `rate_limit <rate> [burst]`, \
+             for example `rate_limit 100r/s`",
+        ));
+    };
+    if let Some(extra) = args.get(2) {
+        return Err(rate_limit_error(
+            directive.position.clone(),
+            format!(
+                "directive `rate_limit` takes at most two arguments, `<rate> [burst]` \
+                 (unexpected `{extra}`)"
+            ),
+        ));
+    }
+    validate_rate_limit_rate(rate)
+        .map_err(|message| rate_limit_error(directive.position.clone(), message))?;
+
+    let mut object = Map::new();
+    object.insert("handler".to_string(), json!("rate_limit"));
+    object.insert("rate".to_string(), json!(rate));
+
+    let burst_argument = match args.get(1) {
+        Some(value) => Some(rate_limit_u32(value, "burst", &directive.position)?),
+        None => None,
+    };
+    let mut burst_option: Option<u32> = None;
+    let mut headers: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+
+    for option in &directive.block {
+        let name = option.name.as_str();
+        // The community plugin's configuration surface, rejected by name. Translating it would be
+        // a silent approximation of different burst/refill semantics (ADR-0011 §2 and §6).
+        if matches!(name, "zone" | "events" | "window") {
+            return Err(rate_limit_error(
+                option.position.clone(),
+                format!(
+                    "`rate_limit` option `{name}` is part of the community caddy-ratelimit \
+                     plugin's zone/events/window form, which this build does not accept, \
+                     translate or emulate; configure the extension's handler fields instead"
+                ),
+            ));
+        }
+        if !matches!(
+            name,
+            "burst" | "key" | "max_keys" | "status_code" | "headers" | "body"
+        ) {
+            return Err(rate_limit_error(
+                option.position.clone(),
+                format!(
+                    "unknown `rate_limit` option `{name}` (supported: burst, key, max_keys, \
+                     status_code, headers, body)"
+                ),
+            ));
+        }
+        if !seen.insert(name) {
+            return Err(rate_limit_error(
+                option.position.clone(),
+                format!("`rate_limit` option `{name}` is specified more than once"),
+            ));
+        }
+        match name {
+            "burst" => {
+                let value = rate_limit_option_value(option)?;
+                burst_option = Some(rate_limit_u32(value, "burst", &option.position)?);
+            }
+            "key" => {
+                let key = rate_limit_option_value(option)?;
+                if key.is_empty() {
+                    return Err(rate_limit_error(
+                        option.position.clone(),
+                        "`rate_limit` option `key` must not be empty; use a placeholder such as \
+                         `{http.request.remote.host}` or a literal",
+                    ));
+                }
+                object.insert("key".to_string(), json!(key));
+            }
+            "max_keys" => {
+                let value = rate_limit_option_value(option)?;
+                let parsed: u64 = value.parse().map_err(|_| {
+                    rate_limit_error(
+                        option.position.clone(),
+                        format!("`rate_limit` option `max_keys` requires a positive integer, got `{value}`"),
+                    )
+                })?;
+                if parsed == 0 {
+                    return Err(rate_limit_error(
+                        option.position.clone(),
+                        "`rate_limit` option `max_keys` must be at least 1",
+                    ));
+                }
+                let parsed = usize::try_from(parsed).map_err(|_| {
+                    rate_limit_error(
+                        option.position.clone(),
+                        format!("`rate_limit` option `max_keys` value `{value}` is too large"),
+                    )
+                })?;
+                object.insert("max_keys".to_string(), json!(parsed));
+            }
+            "status_code" => {
+                let value = rate_limit_option_value(option)?;
+                let parsed: u16 = value.parse().map_err(|_| {
+                    rate_limit_error(
+                        option.position.clone(),
+                        format!("`rate_limit` option `status_code` requires an HTTP status integer, got `{value}`"),
+                    )
+                })?;
+                if !(400..=599).contains(&parsed) {
+                    return Err(rate_limit_error(
+                        option.position.clone(),
+                        format!(
+                            "`rate_limit` option `status_code` must be an HTTP error status \
+                             (400-599), got `{parsed}`"
+                        ),
+                    ));
+                }
+                object.insert("status_code".to_string(), json!(parsed));
+            }
+            "headers" => {
+                if !option.args.is_empty() {
+                    return Err(rate_limit_error(
+                        option.position.clone(),
+                        "`rate_limit` option `headers` takes a block of `<header-name> <value...>` \
+                         lines, not arguments",
+                    ));
+                }
+                if option.block.is_empty() {
+                    return Err(rate_limit_error(
+                        option.position.clone(),
+                        "`rate_limit` option `headers` requires a block of \
+                         `<header-name> <value...>` lines",
+                    ));
+                }
+                for header in &option.block {
+                    if header.args.is_empty() || !header.block.is_empty() {
+                        return Err(rate_limit_error(
+                            header.position.clone(),
+                            format!(
+                                "`rate_limit` header `{}` requires a name and at least one value",
+                                header.name
+                            ),
+                        ));
+                    }
+                    headers
+                        .entry(header.name.clone())
+                        .or_default()
+                        .extend(header.args.iter().cloned());
+                }
+            }
+            "body" => {
+                let body = rate_limit_option_value(option)?;
+                object.insert("body".to_string(), json!(body));
+            }
+            _ => unreachable!("option names are matched above"),
+        }
+    }
+
+    match (burst_argument, burst_option) {
+        (Some(_), Some(_)) => {
+            return Err(rate_limit_error(
+                directive.position.clone(),
+                "`rate_limit` burst is specified both as the directive's second argument and as \
+                 a block option; use exactly one form",
+            ))
+        }
+        (Some(burst), None) | (None, Some(burst)) => {
+            object.insert("burst".to_string(), json!(burst));
+        }
+        (None, None) => {}
+    }
+
+    if !headers.is_empty() {
+        let mut map = Map::new();
+        for (name, mut values) in headers {
+            let value = if values.len() == 1 {
+                json!(values.remove(0))
+            } else {
+                json!(values)
+            };
+            map.insert(name, value);
+        }
+        object.insert("headers".to_string(), Value::Object(map));
+    }
+
+    Ok(Value::Object(object))
+}
+
+/// The single value of a `rate_limit` block option, rejecting blocks, missing values and extra
+/// arguments with a located error.
+fn rate_limit_option_value(option: &Directive) -> caddy_rs_core::Result<&str> {
+    if !option.block.is_empty() {
+        return Err(rate_limit_error(
+            option.position.clone(),
+            format!(
+                "`rate_limit` option `{}` does not take a block",
+                option.name
+            ),
+        ));
+    }
+    let Some(value) = option.args.first() else {
+        return Err(rate_limit_error(
+            option.position.clone(),
+            format!("`rate_limit` option `{}` requires a value", option.name),
+        ));
+    };
+    if let Some(extra) = option.args.get(1) {
+        return Err(rate_limit_error(
+            option.position.clone(),
+            format!(
+                "`rate_limit` option `{}` takes exactly one value (unexpected `{extra}`)",
+                option.name
+            ),
+        ));
+    }
+    Ok(value)
+}
+
+/// Parse a positive `u32` (`burst`) with a located error.
+fn rate_limit_u32(value: &str, field: &str, position: &Position) -> caddy_rs_core::Result<u32> {
+    let parsed: u64 = value.parse().map_err(|_| {
+        rate_limit_error(
+            position.clone(),
+            format!("`rate_limit` option `{field}` requires a positive integer, got `{value}`"),
+        )
+    })?;
+    if parsed == 0 {
+        return Err(rate_limit_error(
+            position.clone(),
+            format!("`rate_limit` option `{field}` must be at least 1"),
+        ));
+    }
+    u32::try_from(parsed).map_err(|_| {
+        rate_limit_error(
+            position.clone(),
+            format!("`rate_limit` option `{field}` value `{value}` is too large"),
+        )
+    })
+}
+
+/// Validate a `rate_limit` rate expression (`<count>[/]<duration>`, the `r` suffix optional).
+///
+/// Mirrors `parse_rate` in `crates/http/src/rate_limit.rs`; the handler stays authoritative at
+/// load time, but the adapter validates early so `adapt` fails at the directive's location instead
+/// of leaving the operator with a JSON-time error. Keep the two grammars in sync.
+fn validate_rate_limit_rate(rate: &str) -> std::result::Result<(), String> {
+    let (count, duration) = rate.split_once('/').ok_or_else(|| {
+        format!("invalid `rate_limit` rate `{rate}`: expected `<count>/<duration>`, for example `100r/s`")
+    })?;
+    let count = count.trim();
+    let count = count.strip_suffix('r').unwrap_or(count).trim();
+    let count: f64 = count.parse().map_err(|_| {
+        format!("invalid `rate_limit` rate `{rate}`: request count `{count}` is not a number")
+    })?;
+    if !count.is_finite() || count <= 0.0 {
+        return Err(format!(
+            "invalid `rate_limit` rate `{rate}`: the request count must be a positive number"
+        ));
+    }
+    let duration = duration.trim();
+    let seconds = rate_limit_duration_seconds(duration).ok_or_else(|| {
+        format!(
+            "invalid `rate_limit` rate `{rate}`: duration `{duration}` is not supported \
+             (ms, s, m, h or plain seconds)"
+        )
+    })?;
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return Err(format!(
+            "invalid `rate_limit` rate `{rate}`: the duration must be positive"
+        ));
+    }
+    Ok(())
+}
+
+/// Duration half of the `rate_limit` rate grammar (see [`validate_rate_limit_rate`]).
+fn rate_limit_duration_seconds(input: &str) -> Option<f64> {
+    match input {
+        "ms" => return Some(0.001),
+        "s" => return Some(1.0),
+        "m" => return Some(60.0),
+        "h" => return Some(3600.0),
+        _ => {}
+    }
+    if let Some(value) = input.strip_suffix("ms") {
+        return value.trim().parse::<f64>().ok().map(|value| value / 1000.0);
+    }
+    for (suffix, multiplier) in [("s", 1.0), ("m", 60.0), ("h", 3600.0)] {
+        if let Some(value) = input.strip_suffix(suffix) {
+            return value
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .map(|value| value * multiplier);
+        }
+    }
+    input.parse::<f64>().ok()
+}
+
 /// Insert a numeric JSON field only when it is non-zero (Caddy's `omitempty`).
 fn insert_nonzero(object: &mut Map<String, Value>, key: &str, value: i64) {
     if value != 0 {
@@ -6403,6 +6724,7 @@ fn build_handlers(
         "uri" => vec![uri_handler(directive, args)?],
         "header" => header_handlers(directive, args)?,
         "request_body" => vec![request_body_handler(directive)?],
+        "rate_limit" => vec![rate_limit_handler(directive, args)?],
         "encode" => vec![encode_handler(directive)?],
         "templates" => vec![templates_handler(directive)?],
         "acme_server" => vec![acme_server_handler(directive, args)?],

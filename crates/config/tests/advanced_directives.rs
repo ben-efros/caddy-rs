@@ -2,16 +2,23 @@
 //! runtime module is not implemented must fail with a located error naming the gap.
 //!
 //! `acme_server` was the other residual here; it now adapts faithfully (T-CONF-054 / DIV-0102,
-//! covered by `tests/acme_server.rs`). `rate_limit` remains runtime-unsupported.
+//! covered by `tests/acme_server.rs`). `rate_limit` now adapts as the caddy-rs extension
+//! (T-CONF-072 / DIV-0104, covered by `tests/rate_limit.rs`); the community `caddy-ratelimit`
+//! plugin's `zone`/`events`/`window` form must still fail loudly.
 
 use caddy_rs_config::adapt;
 
 #[test]
-fn rate_limit_reports_the_runtime_gap() {
-    let error = adapt("example.com {\n\trate_limit {\n\t\tzone x\n\t}\n}\n")
-        .expect_err("rate_limit must fail loudly");
+fn rate_limit_community_form_still_fails_loudly() {
+    let error = adapt("example.com {\n\trate_limit 10r/s {\n\t\tzone x\n\t}\n}\n")
+        .expect_err("the community rate_limit form must fail loudly");
     let message = error.to_string();
     assert!(message.contains("rate_limit"), "{message}");
-    assert!(message.contains("not supported by this build"), "{message}");
-    assert!(message.contains("Caddyfile line 2"), "{message}");
+    assert!(message.contains("zone"), "{message}");
+    assert!(message.contains("Caddyfile line "), "{message}");
+    assert!(message.contains("DIV-0104"), "{message}");
+    assert!(
+        message.contains("docs/operations/RATE-LIMITING.md"),
+        "{message}"
+    );
 }
