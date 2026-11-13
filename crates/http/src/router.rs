@@ -376,10 +376,11 @@ impl Router {
                             && self.error_routes.is_some()
                             && response.status.as_u16() >= 400
                         {
-                            // caddy-rs routes upstream error responses through `handle_errors`
-                            // like Caddy's HandlerError; count it as a middleware error so the
-                            // request-errors counter matches Caddy's intent.
-                            staged.mark_middleware_error();
+                            // Caddy's counter is incremented only when the handler chain returns
+                            // an error (`modules/caddyhttp/metrics.go:371-378`). An upstream 5xx
+                            // passed through as a response stays a response here, so it is not
+                            // marked as a middleware error even when caddy-rs routes it through
+                            // `handle_errors`.
                             let message = response
                                 .status
                                 .canonical_reason()

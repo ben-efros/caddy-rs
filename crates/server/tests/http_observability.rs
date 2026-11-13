@@ -705,3 +705,112 @@ async fn failed_response_write_logs_write_error() {
         "write_error must describe the aborted body: {write_error}"
     );
 }
+
+/// A mock upstream that answers every request with `status`, standing in for an origin that
+/// returns an error status instead of failing the transport.
+async fn spawn_status_upstream(status: StatusCode) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind upstream");
+    let address = listener.local_addr().expect("upstream address");
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let service = hyper::service::service_fn(
+                    move |_request: hyper::Request<hyper::body::Incoming>| async move {
+                        Ok::<_, Infallible>(
+                            hyper::Response::builder()
+                                .status(status)
+                                .header(http::header::CONTENT_TYPE, "text/plain")
+                                .body(caddy_rs_http::StreamingBody::from_bytes(
+                                    Bytes::from_static(b"upstream error"),
+                                ))
+                                .expect("upstream response"),
+                        )
+                    },
+                );
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    address.to_string()
+}
+
+fn metrics_config(routes: serde_json::Value) -> Config {
+    Config::from_value(serde_json::json!({
+        "admin": {"listen": "127.0.0.1:0"},
+        "apps": {"http": {"servers": {"srv0": {
+            "listen": ["127.0.0.1:0"],
+            "routes": routes
+        }}}}
+    }))
+    .expect("test config decodes")
+}
+
+async fn rendered_metrics(runtime: &ServerRuntime) -> String {
+    let admin = runtime.admin_address().expect("admin bound");
+    let (status, _headers, metrics) = request(admin, "GET", "/metrics", &[]).await;
+    assert_eq!(status, 200);
+    String::from_utf8_lossy(&metrics).into_owned()
+}
+
+/// An upstream 5xx is a response, not a handler-chain error: the oracle increments
+/// `caddy_http_request_errors_total` only when the handler chain returns an error
+/// (`modules/caddyhttp/metrics.go:371-378`), so the series must not appear here.
+#[tokio::test]
+async fn upstream_5xx_response_is_not_a_handler_error() {
+    let upstream_dial = spawn_status_upstream(StatusCode::INTERNAL_SERVER_ERROR).await;
+    let config = metrics_config(serde_json::json!([{"handle": [
+        {"handler": "reverse_proxy", "upstreams": [{"dial": upstream_dial}]}
+    ]}]));
+    let (runtime, address) = start_proxy_config(config).await;
+
+    let (status, _headers, body) = request(address, "GET", "/", &[]).await;
+    assert_eq!(status, 500);
+    assert_eq!(body, Bytes::from_static(b"upstream error"));
+
+    let metrics = rendered_metrics(&runtime).await;
+    assert!(
+        !metrics.contains("caddy_http_request_errors_total"),
+        "an upstream 500 must not be counted as a middleware error:\n{metrics}"
+    );
+    // The request itself is still counted, with the upstream status on the histograms.
+    assert!(
+        metrics.contains("caddy_http_requests_total{handler=\"reverse_proxy\",server=\"srv0\"} 1"),
+        "missing requests counter for the proxied 500:\n{metrics}"
+    );
+    assert!(
+        metrics.contains(
+            "caddy_http_request_duration_seconds_count{code=\"500\",handler=\"reverse_proxy\",method=\"GET\",server=\"srv0\"} 1"
+        ),
+        "missing 500 latency sample:\n{metrics}"
+    );
+
+    runtime.shutdown().await;
+}
+
+/// A handler that returns an error (the `error` module) is a handler-chain error: the oracle
+/// increments `caddy_http_request_errors_total` even though the response is a 500.
+#[tokio::test]
+async fn handler_chain_error_increments_request_errors_total() {
+    let config = metrics_config(serde_json::json!([{"handle": [
+        {"handler": "error", "status_code": 500, "error": "boom"}
+    ]}]));
+    let (runtime, address) = start_proxy_config(config).await;
+
+    let (status, _headers, _body) = request(address, "GET", "/", &[]).await;
+    assert_eq!(status, 500);
+
+    let metrics = rendered_metrics(&runtime).await;
+    assert!(
+        metrics.contains("caddy_http_request_errors_total{handler=\"error\",server=\"srv0\"} 1"),
+        "a handler-chain error must be counted:\n{metrics}"
+    );
+
+    runtime.shutdown().await;
+}
