@@ -83,6 +83,7 @@ mod environ;
 mod fmt;
 mod manpage;
 mod respond;
+mod setup;
 mod signals;
 mod storage;
 
@@ -116,6 +117,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Zero-config first-boot authentication bootstrap (ADR-0039).
+    Setup(setup::SetupArgs),
     /// Print the version.
     Version {
         /// Machine-readable output.
@@ -574,6 +577,9 @@ fn core_error_code(error: &anyhow::Error) -> Option<&'static str> {
 
 async fn run(command: Command) -> anyhow::Result<()> {
     match command {
+        Command::Setup(args) => {
+            setup::run(args).map_err(|error| anyhow!("{error}"))?;
+        }
         Command::Version { json } => {
             if json {
                 println!(
