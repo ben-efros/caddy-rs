@@ -198,6 +198,21 @@ fn parses_duration_forms() {
 }
 
 #[test]
+fn overflowing_duration_is_rejected_not_a_panic() {
+    // Regression: `value * 60` panicked with "attempt to multiply with overflow" for this input.
+    for text in [
+        "18446744073709551615m",
+        "18446744073709551615h",
+        "99999999999999999999m",
+    ] {
+        match parse_duration(text) {
+            Err(SetupError::InvalidRegistrationTimeout(_)) => {}
+            other => panic!("{text} must be a located error, got {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn token_is_single_use() {
     let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     let mut store = TokenStore::new(Duration::from_secs(900));
