@@ -111,6 +111,26 @@ const CREDENTIAL_HEADERS: &[&str] = &[
     "Proxy-Authorization",
 ];
 
+/// Query parameters whose values the access log redacts by default (`DIV-0134`).
+///
+/// The list is deliberately small, exact and case-sensitive: it covers the OAuth/API/session
+/// names that most often end up in URLs. It is a documented contract (ADR-0012 §1), not a
+/// heuristic — a test pins the list byte-for-byte, and extending it is an ADR/table change.
+/// `stock_compat true` turns the default off; a per-sink `redaction.query_parameters` list
+/// (`DIV-0133`) replaces it or, as `[]`, disables it for that sink.
+pub const SENSITIVE_QUERY_PARAMETERS: [&str; 10] = [
+    "access_token",
+    "api_key",
+    "apikey",
+    "client_secret",
+    "id_token",
+    "password",
+    "refresh_token",
+    "secret",
+    "session_id",
+    "token",
+];
+
 /// Fields owned by the log encoder itself; Caddy's filter encoder cannot remove them.
 const FUNDAMENTAL_FIELDS: &[&str] = &["ts", "level", "logger", "msg"];
 
@@ -1270,17 +1290,33 @@ impl HeaderRedaction {
 }
 
 /// Redaction primitives for access entries.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RedactionPolicy {
     /// Header redaction rules, applied in order after the default credential redaction.
     #[serde(default)]
     pub headers: Vec<HeaderRedaction>,
     /// Query parameters whose values are replaced with [`REDACTED`] in `request.uri`.
+    ///
+    /// The default is [`SENSITIVE_QUERY_PARAMETERS`] (`DIV-0134`); `stock_compat true` or an
+    /// explicit encoder list (`DIV-0133`) replaces it before a sink is built.
     #[serde(default)]
     pub query_parameters: Vec<String>,
     /// Request cookie names whose values are replaced with [`REDACTED`].
     #[serde(default)]
     pub cookies: Vec<String>,
+}
+
+impl Default for RedactionPolicy {
+    fn default() -> Self {
+        Self {
+            headers: Vec::new(),
+            query_parameters: SENSITIVE_QUERY_PARAMETERS
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+            cookies: Vec::new(),
+        }
+    }
 }
 
 /// Sampling configuration mirroring zap's `NewSamplerWithOptions`.
@@ -2859,6 +2895,65 @@ mod tests {
         assert_eq!(
             rendered["request"]["headers"]["Cookie"],
             json!(["session=REDACTED; theme=dark"])
+        );
+    }
+
+    #[test]
+    fn builtin_sensitive_query_parameter_list_is_pinned() {
+        assert_eq!(
+            SENSITIVE_QUERY_PARAMETERS,
+            [
+                "access_token",
+                "api_key",
+                "apikey",
+                "client_secret",
+                "id_token",
+                "password",
+                "refresh_token",
+                "secret",
+                "session_id",
+                "token",
+            ]
+        );
+    }
+
+    #[test]
+    fn default_redaction_redacts_every_builtin_query_parameter() {
+        let mut entry = sample_entry();
+        entry.request.uri = concat!(
+            "/callback?access_token=at&api_key=ak&apikey=ak2&client_secret=cs&id_token=id&",
+            "password=pw&refresh_token=rt&secret=s&session_id=sid&token&token=&state=xyz&",
+            "empty=&Access_Token=mixed&other=token"
+        )
+        .to_string();
+        let rendered = entry.render_default().expect("renders");
+        assert_eq!(
+            rendered["request"]["uri"],
+            json!(concat!(
+                "/callback?access_token=REDACTED&api_key=REDACTED&apikey=REDACTED&",
+                "client_secret=REDACTED&id_token=REDACTED&password=REDACTED&",
+                "refresh_token=REDACTED&secret=REDACTED&session_id=REDACTED&token=REDACTED&",
+                "token=REDACTED&state=xyz&empty=&Access_Token=mixed&other=token"
+            ))
+        );
+    }
+
+    #[test]
+    fn empty_query_parameter_redaction_list_disables_the_default() {
+        let mut entry = sample_entry();
+        entry.request.uri = "/callback?access_token=at&token".to_string();
+        let config = AccessLogConfig {
+            redaction: RedactionPolicy {
+                headers: Vec::new(),
+                query_parameters: Vec::new(),
+                cookies: Vec::new(),
+            },
+            ..AccessLogConfig::default()
+        };
+        let rendered = entry.render(&config).expect("renders");
+        assert_eq!(
+            rendered["request"]["uri"],
+            json!("/callback?access_token=at&token")
         );
     }
 
