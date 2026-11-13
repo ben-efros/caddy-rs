@@ -392,6 +392,10 @@ fn basic_auth_rejects_unknown_hash_algorithm_loudly() {
 fn invoke_named_routes_match_caddy() {
     // `&(name)` definitions become per-server `named_routes`; `invoke` emits the invoke handler.
     assert_adapts_like_caddy("invoke_named_routes.caddyfiletest");
+    // This fixture pins Caddy master's output after ec849f542c43, not the pinned v2.11.9 output:
+    // v2.11.9 dropped every handler after the first in a simplified named route (`a`/`b`/`loop1`/
+    // `loop2` here), so the golden JSON no longer matches the pinned corpus (DIV-0135). The
+    // security port keeps the whole route; `named_route_handlers` covers the behaviour directly.
     assert_adapts_like_caddy("invoke_nested_named_routes.caddyfiletest");
     assert_adapts_like_caddy("import_inside_named_route.caddyfiletest");
     assert_adapts_like_caddy("import_inside_named_route_args.caddyfiletest");
