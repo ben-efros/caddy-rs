@@ -7,6 +7,7 @@ members = [
     "crates/proxy",
     "crates/tls",
     "crates/admin",
+    "crates/auth",
     "crates/server",
     "crates/cli",
     "crates/plug",
@@ -37,6 +38,7 @@ caddy-rs-tls = { path = "crates/tls", default-features = false }
 caddy-rs-admin = { path = "crates/admin", default-features = false }
 caddy-rs-server = { path = "crates/server", default-features = false }
 caddy-rs-plug = { path = "crates/plug", default-features = false }
+caddy-rs-auth = { path = "crates/auth", default-features = false }
 caddy-rs-authn = { path = "crates/authn", default-features = false }
 anyhow = "1.0.104"
 async-trait = "0.1.92"
