@@ -16,6 +16,15 @@
 //! - [`ParseError::Incomplete`] — the peek buffer does not yet hold the whole record; the peek loop
 //!   reads more bytes and retries (all other variants are permanent, typed rejections).
 //!
+//! # Limitation: one record, no reassembly
+//!
+//! The parser requires the whole ClientHello to fit in the **first TLS record** of the peek buffer.
+//! A ClientHello fragmented across several TLS records is not reassembled: once the first record is
+//! complete but cannot hold the declared handshake, the result is
+//! [`ParseError::Malformed`] (not `Incomplete`), so a peek loop fails fast instead of waiting for
+//! bytes that cannot change the verdict. Real-world TLS 1.2/1.3 clients send a ClientHello that
+//! fits one record (a few hundred bytes), and the L4 router peeks at most 16 KiB.
+//!
 //! # Wire format
 //!
 //! ```text
@@ -124,7 +133,8 @@ pub struct ClientHelloInfo<'a> {
     /// `true` when a valid TLS `ClientHello` was parsed.
     pub is_tls: bool,
     /// SNI hostname, lowercased. Borrowed from the input when it was already lowercase; otherwise
-    /// lowercased into an owned string (the only allocation this parser may make).
+    /// lowercased into an owned string. The payload bytes are never copied; the only allocations are
+    /// that optional lowercased SNI string and the (pointer-sized) `alpn` vector.
     pub sni: Option<Cow<'a, str>>,
     /// ALPN protocol names in preference order, borrowed from the input (no payload copy).
     pub alpn: Vec<&'a str>,
@@ -215,9 +225,12 @@ fn parse_tls_client_hello(buf: &[u8]) -> Result<ClientHelloInfo<'_>, ParseError>
         return Err(ParseError::Incomplete);
     };
 
-    // Handshake header: type | length (u24).
+    // Handshake header: type | length (u24). The record is already complete here, so a record that
+    // cannot hold a handshake header is structurally invalid rather than retryable.
     let Some(handshake_header) = record.get(..4) else {
-        return Err(ParseError::Incomplete);
+        return Err(ParseError::Malformed(
+            "record too short for a handshake header",
+        ));
     };
     if handshake_header[0] != HANDSHAKE_CLIENT_HELLO {
         return Err(ParseError::BadHandshakeType(handshake_header[0]));
@@ -229,7 +242,12 @@ fn parse_tls_client_hello(buf: &[u8]) -> Result<ClientHelloInfo<'_>, ParseError>
         handshake_header[3],
     ]) as usize;
     let Some(body) = record.get(4..4 + handshake_len) else {
-        return Err(ParseError::Incomplete);
+        // The record is complete but declares a handshake longer than its payload. Reading more
+        // bytes cannot fix this: TLS fragments handshake messages across records, which this parser
+        // deliberately does not reassemble (see the module docs).
+        return Err(ParseError::Malformed(
+            "handshake exceeds the record payload; ClientHello fragmented across TLS records is unsupported",
+        ));
     };
 
     parse_client_hello_body(body)
@@ -335,9 +353,9 @@ fn lowercase(name: &str) -> Cow<'_, str> {
 
 /// A bounds-checked cursor over a byte slice.
 ///
-/// `take` reports [`ParseError::Incomplete`] only when the cursor is over the *outer* buffer that
-/// the caller may still extend; inner structures inside a complete record report
-/// [`ParseError::Malformed`] through [`Cursor::take_inner`].
+/// Every short read inside the cursor is a structural violation of an already-complete enclosing
+/// structure, so it reports [`ParseError::Malformed`]; retryable [`ParseError::Incomplete`] results
+/// are decided by the record/handshake framing checks before the body is parsed.
 struct Cursor<'a> {
     data: &'a [u8],
     pos: usize,

@@ -127,13 +127,22 @@ fn oversized_declared_lengths_are_typed_errors_not_panics() {
     record_len[3..5].copy_from_slice(&[0xff, 0xff]);
     assert_eq!(parse_client_hello(&record_len), Err(ParseError::Incomplete));
 
-    // Handshake length (u24) says 16777215 bytes: still retryable, not a panic.
+    // Handshake length (u24) says 16777215 bytes in a complete record: a permanent typed
+    // rejection (no reassembly across records), not a retryable Incomplete.
     let mut handshake_len = client_hello(Some("x.example"), &["h2"]);
     handshake_len[6..9].copy_from_slice(&[0xff, 0xff, 0xff]);
-    assert_eq!(
+    assert!(matches!(
         parse_client_hello(&handshake_len),
-        Err(ParseError::Incomplete)
-    );
+        Err(ParseError::Malformed(_))
+    ));
+
+    // A complete record too short to hold even a handshake header is also permanent.
+    let mut short_record = client_hello(None, &[]);
+    short_record[3..5].copy_from_slice(&[0x00, 0x03]);
+    assert!(matches!(
+        parse_client_hello(&short_record),
+        Err(ParseError::Malformed(_))
+    ));
 
     // A complete record whose extensions block claims 65535 bytes: permanent typed rejection.
     // Body layout: version(2) random(32) session_id_len(1)+session(0) cipher_len(2) suites(2)

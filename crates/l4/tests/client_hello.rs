@@ -8,13 +8,18 @@ use std::borrow::Cow;
 
 use caddy_rs_l4::{detect_protocol, parse_client_hello, ParseError, Protocol};
 
-/// Builds a complete TLS record containing a ClientHello with the given SNI/ALPN extensions.
-fn client_hello(sni: Option<&str>, alpn: &[&str]) -> Vec<u8> {
+/// Builds a complete TLS record with a ClientHello. `sni` is `(name_type, raw name bytes)`; `alpn`
+/// holds raw protocol-name bytes (so tests can inject invalid UTF-8 and empty names).
+fn build_client_hello(
+    sni: Option<(u8, &[u8])>,
+    alpn: &[&[u8]],
+    trailing_body_bytes: &[u8],
+) -> Vec<u8> {
     let mut extensions = Vec::new();
-    if let Some(host) = sni {
-        let mut names = vec![0_u8]; // host_name
-        names.extend_from_slice(&(host.len() as u16).to_be_bytes());
-        names.extend_from_slice(host.as_bytes());
+    if let Some((name_type, name)) = sni {
+        let mut names = vec![name_type];
+        names.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        names.extend_from_slice(name);
         let mut ext = Vec::new();
         ext.extend_from_slice(&(names.len() as u16).to_be_bytes());
         ext.extend_from_slice(&names);
@@ -26,7 +31,7 @@ fn client_hello(sni: Option<&str>, alpn: &[&str]) -> Vec<u8> {
         let mut protocols = Vec::new();
         for name in alpn {
             protocols.push(name.len() as u8);
-            protocols.extend_from_slice(name.as_bytes());
+            protocols.extend_from_slice(name);
         }
         let mut ext = Vec::new();
         ext.extend_from_slice(&(protocols.len() as u16).to_be_bytes());
@@ -39,13 +44,14 @@ fn client_hello(sni: Option<&str>, alpn: &[&str]) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&[0x03, 0x03]); // legacy_version
     body.extend_from_slice(&[0x11; 32]); // random
-    body.push(0); // session id
-    body.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]); // cipher suites
-    body.extend_from_slice(&[1, 0]); // compression methods
+    body.push(0); // empty session id
+    body.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]); // one cipher suite
+    body.extend_from_slice(&[1, 0]); // one compression method
     if !extensions.is_empty() {
         body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
         body.extend_from_slice(&extensions);
     }
+    body.extend_from_slice(trailing_body_bytes);
 
     let mut handshake = vec![1_u8]; // client_hello
     handshake.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]); // u24 length
@@ -56,6 +62,12 @@ fn client_hello(sni: Option<&str>, alpn: &[&str]) -> Vec<u8> {
     record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
     record.extend_from_slice(&handshake);
     record
+}
+
+/// Convenience wrapper for a well-formed ClientHello with UTF-8 SNI/ALPN.
+fn client_hello(sni: Option<&str>, alpn: &[&str]) -> Vec<u8> {
+    let alpn: Vec<&[u8]> = alpn.iter().map(|name| name.as_bytes()).collect();
+    build_client_hello(sni.map(|host| (0_u8, host.as_bytes())), &alpn, &[])
 }
 
 #[test]
@@ -110,6 +122,40 @@ fn fragmented_records_report_incomplete_for_every_prefix() {
 }
 
 #[test]
+fn complete_but_unusable_records_are_malformed_not_incomplete() {
+    // Record length 3: the record is fully present but too short for a handshake header.
+    let mut short_record = client_hello(Some("x.example"), &[]);
+    short_record[3..5].copy_from_slice(&[0x00, 0x03]);
+    assert_eq!(
+        parse_client_hello(&short_record),
+        Err(ParseError::Malformed(
+            "record too short for a handshake header"
+        ))
+    );
+
+    // A complete record whose handshake declares more bytes than the record holds: appending more
+    // bytes (for example a second TLS record) cannot change the verdict, so it is not retryable.
+    let mut fragmented = client_hello(None, &[]);
+    let declared = 0x0000_00ff_u32; // 255-byte handshake
+    fragmented[6..9].copy_from_slice(&declared.to_be_bytes()[1..]);
+    assert_eq!(
+        parse_client_hello(&fragmented),
+        Err(ParseError::Malformed(
+            "handshake exceeds the record payload; ClientHello fragmented across TLS records is unsupported"
+        ))
+    );
+    let mut with_second_record = fragmented.clone();
+    with_second_record.extend_from_slice(&client_hello(Some("example.com"), &["h2"]));
+    assert_eq!(
+        parse_client_hello(&with_second_record),
+        Err(ParseError::Malformed(
+            "handshake exceeds the record payload; ClientHello fragmented across TLS records is unsupported"
+        )),
+        "the parser deliberately does not reassemble a ClientHello split across records"
+    );
+}
+
+#[test]
 fn malformed_records_are_typed_errors() {
     let mut wrong_content_type = client_hello(None, &[]);
     wrong_content_type[0] = 0x17; // application_data
@@ -139,6 +185,42 @@ fn malformed_records_are_typed_errors() {
         parse_client_hello(&odd_cipher_list),
         Err(ParseError::Malformed("cipher suite list has an odd length"))
     );
+
+    // Bytes after the declared extensions block are structurally invalid.
+    let trailing = build_client_hello(Some((0, b"x.example")), &[], &[0x00]);
+    assert_eq!(
+        parse_client_hello(&trailing),
+        Err(ParseError::Malformed("trailing bytes after extensions"))
+    );
+}
+
+#[test]
+fn rejects_non_utf8_sni_and_alpn() {
+    let invalid_sni = build_client_hello(Some((0, &[0xff, 0xfe])), &[], &[]);
+    assert_eq!(
+        parse_client_hello(&invalid_sni),
+        Err(ParseError::Malformed("SNI is not UTF-8"))
+    );
+
+    let invalid_alpn = build_client_hello(None, &[b"\xff"], &[]);
+    assert_eq!(
+        parse_client_hello(&invalid_alpn),
+        Err(ParseError::Malformed("ALPN protocol name is not UTF-8"))
+    );
+}
+
+#[test]
+fn edge_cases_in_sni_and_alpn_extensions() {
+    // A non-host_name SNI entry is not an error, but it yields no hostname.
+    let other_name_type = build_client_hello(Some((1, b"x.example")), &[], &[]);
+    let info = parse_client_hello(&other_name_type).expect("unknown SNI name type is tolerated");
+    assert!(info.is_tls);
+    assert_eq!(info.sni, None);
+
+    // An empty ALPN protocol name is legal on the wire and is preserved as an empty slice.
+    let empty_alpn = build_client_hello(None, &[b""], &[]);
+    let info = parse_client_hello(&empty_alpn).expect("empty ALPN name is tolerated");
+    assert_eq!(info.alpn, [""]);
 }
 
 #[test]
