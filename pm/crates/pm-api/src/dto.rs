@@ -245,6 +245,10 @@ pub struct HostResponse {
     pub enabled: bool,
     pub spec: HostSpecDto,
     pub revision: u64,
+    /// Explicit per-host security headers. `null` means "inherit the global configuration"; the
+    /// dashboard needs that distinction to show inherited values dimmed instead of pretending the
+    /// host stores an override.
+    pub security_headers: Option<SecurityHeadersDto>,
 }
 
 impl From<&StoredHost> for HostResponse {
@@ -256,6 +260,11 @@ impl From<&StoredHost> for HostResponse {
             enabled: stored.host.enabled,
             spec: HostSpecDto::from(&stored.host.spec),
             revision: stored.revision,
+            security_headers: stored
+                .host
+                .security_headers
+                .as_ref()
+                .map(SecurityHeadersDto::from),
         }
     }
 }
@@ -317,7 +326,35 @@ mod tests {
         assert_eq!(value["tls"]["certificateId"], 3);
         assert_eq!(value["spec"]["kind"], "proxy");
         assert!(value.get("forwardHost").is_none());
+        assert!(value["securityHeaders"].is_null());
         let decoded: HostResponse = serde_json::from_value(value).unwrap();
         assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn response_exposes_an_explicit_security_headers_override() {
+        let mut host = Host::new(
+            HostId(8),
+            vec!["secure.example.com".to_string()],
+            HostTls::for_auto(PolicyId(1)),
+            HostSpec::Dead(DeadSpec),
+        );
+        host.security_headers = Some(SecurityHeadersConfig {
+            content_security_policy: Some("default-src 'self'".to_string()),
+            referrer_policy: Some("no-referrer".to_string()),
+            ..SecurityHeadersConfig::default()
+        });
+        let stored = StoredHost { host, revision: 2 };
+        let value = serde_json::to_value(HostResponse::from(&stored)).unwrap();
+        assert_eq!(
+            value["securityHeaders"]["content_security_policy"],
+            "default-src 'self'"
+        );
+        assert_eq!(value["securityHeaders"]["referrer_policy"], "no-referrer");
+        let decoded: HostResponse = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            decoded.security_headers,
+            HostResponse::from(&stored).security_headers
+        );
     }
 }

@@ -242,6 +242,8 @@ export interface HostSummary {
 export interface HostDetail extends HostSummary {
   tls: TlsSettings;
   spec: HostSpec;
+  /** Explicit per-host security headers; `null`/absent means "inherit the global config". */
+  securityHeaders?: SecurityHeadersConfig | null;
 }
 
 export interface Page<T> {
@@ -263,6 +265,40 @@ export const hosts = {
     request<HostSummary>(`/hosts/${id}/${enabled ? 'enable' : 'disable'}`, {
       method: 'POST',
       headers: ifMatch(etag),
+    }),
+};
+
+// --- security headers ----------------------------------------------------------------------
+//
+// The JSON keys are snake_case because the Rust DTO (`SecurityHeadersDto`) serializes without a
+// rename attribute; the per-host GET inherits the global config when the host has none.
+
+export interface HstsConfig {
+  max_age: number;
+  include_subdomains: boolean;
+  preload: boolean;
+}
+
+export interface SecurityHeadersConfig {
+  content_security_policy?: string | null;
+  strict_transport_security?: HstsConfig | null;
+  permissions_policy?: string | null;
+  x_frame_options?: string | null;
+  x_content_type_options?: string | null;
+  referrer_policy?: string | null;
+}
+
+export const securityHeaders = {
+  getGlobal: () => request<SecurityHeadersConfig>('/security-headers'),
+  putGlobal: (config: SecurityHeadersConfig) =>
+    request<SecurityHeadersConfig>('/security-headers', { method: 'PUT', body: config }),
+  getHost: (id: number) => request<SecurityHeadersConfig>(`/hosts/${id}/security-headers`),
+  // The per-host PUT is last-write-wins (the API does not require an If-Match here), so no
+  // precondition is sent: faking one would suggest a conflict guarantee the server does not give.
+  putHost: (id: number, config: SecurityHeadersConfig) =>
+    request<SecurityHeadersConfig>(`/hosts/${id}/security-headers`, {
+      method: 'PUT',
+      body: config,
     }),
 };
 

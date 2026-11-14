@@ -54,6 +54,18 @@ const hosts = [
   { id: 2, domains: ['old.example.com'], kind: 'redirect', enabled: false, revision: 2, tlsMode: 'auto' },
 ];
 
+// Global security headers as the API returns them (snake_case DTO keys, defaults applied).
+let globalHeaders = {
+  content_security_policy: "default-src 'self'",
+  x_frame_options: 'DENY',
+  x_content_type_options: 'nosniff',
+  referrer_policy: 'strict-origin-when-cross-origin',
+};
+// Host 2 stores an explicit override; host 1 has none and inherits the global config.
+const hostHeaders = {
+  2: { content_security_policy: "default-src 'none'", referrer_policy: 'no-referrer' },
+};
+
 async function fakeFetch(input, init = {}) {
   const url = new URL(String(input), 'http://127.0.0.1:81');
   const method = init.method || 'GET';
@@ -126,9 +138,56 @@ async function fakeFetch(input, init = {}) {
           spec: { upstream: { scheme: 'http', host: '10.0.0.5', port: 8080 }, websocket: true, preserveHost: true },
         },
         revision: 1,
+        securityHeaders: null,
       },
       { etag: '"h1-r1"' },
     );
+  }
+
+  // Security headers: global config plus one host with an explicit override.
+  if (url.pathname === '/api/v1/security-headers' && method === 'GET') {
+    return json(200, globalHeaders);
+  }
+  if (url.pathname === '/api/v1/security-headers' && method === 'PUT') {
+    if (String(body.content_security_policy || '').includes('forbidden')) {
+      return json(422, {
+        error: {
+          code: 'VALIDATION',
+          message: 'content_security_policy contains a forbidden source',
+          location: 'security_headers.content_security_policy',
+        },
+      });
+    }
+    globalHeaders = body;
+    return json(200, globalHeaders);
+  }
+  if (url.pathname === '/api/v1/hosts/1/security-headers' && method === 'GET') {
+    return json(200, globalHeaders);
+  }
+  if (url.pathname === '/api/v1/hosts/2' && method === 'GET') {
+    return json(
+      200,
+      {
+        id: 2,
+        domains: ['old.example.com'],
+        tls: { mode: 'auto', certificateId: null, autoPolicyId: 1, sslForced: false, hstsEnabled: false, hstsSubdomains: false },
+        enabled: false,
+        spec: {
+          kind: 'redirect',
+          spec: { scheme: 'https', target: 'new.example.com', status: 301, preservePath: true },
+        },
+        revision: 2,
+        securityHeaders: hostHeaders[2],
+      },
+      { etag: '"h2-r2"' },
+    );
+  }
+  if (url.pathname === '/api/v1/hosts/2/security-headers' && method === 'GET') {
+    return json(200, hostHeaders[2]);
+  }
+  if (url.pathname === '/api/v1/hosts/2/security-headers' && method === 'PUT') {
+    hostHeaders[2] = body;
+    return json(200, hostHeaders[2], { etag: '"h2-r3"' });
   }
 
   if (url.pathname === '/api/v1/certificates') {
@@ -210,6 +269,22 @@ const click = (selector) => {
   element.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true, cancelable: true, button: 0 }));
 };
 
+// Controlled React inputs keep a value tracker; a plain `element.value = x` is invisible to React.
+// Write through the prototype setter so the component's onChange fires like a real keystroke.
+const setValue = (selector, value) => {
+  const element = document.querySelector(selector);
+  assert.ok(element, `element ${selector} exists`);
+  const prototype =
+    element instanceof dom.window.HTMLSelectElement
+      ? dom.window.HTMLSelectElement.prototype
+      : element instanceof dom.window.HTMLTextAreaElement
+        ? dom.window.HTMLTextAreaElement.prototype
+        : dom.window.HTMLInputElement.prototype;
+  Object.getOwnPropertyDescriptor(prototype, 'value').set.call(element, value);
+  element.dispatchEvent(new dom.window.Event('input', { bubbles: true }));
+  element.dispatchEvent(new dom.window.Event('change', { bubbles: true }));
+};
+
 // --- run -----------------------------------------------------------------------------------
 
 await import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`);
@@ -267,6 +342,127 @@ await settle();
 const created = calls.find((call) => call.method === 'POST' && call.path === '/api/v1/hosts');
 assert.ok(created, 'host creation was sent');
 assert.equal(created.headers.authorization, 'Bearer access-2', 'bearer token attached');
+
+// --- security headers tab -------------------------------------------------------------------
+click('#security-headers-tab-button');
+await settle();
+await settle();
+
+assert.equal(dom.window.location.pathname, '/hosts', 'security headers tab stays on the hosts route');
+assert.ok(document.querySelector('#global-security-headers'), 'global security headers panel renders');
+for (const id of [
+  'global-csp',
+  'global-xfo',
+  'global-hsts-enabled',
+  'global-referrer',
+  'global-permissions-add',
+  'global-xcto',
+]) {
+  assert.ok(document.querySelector(`#${id}`), `${id} renders in the global panel`);
+}
+assert.ok(
+  document.querySelector('#host-security-headers-inherited'),
+  'host 1 renders inherited values (dimmed) instead of an override',
+);
+assert.ok(
+  document.querySelector('#host-security-headers .security-headers-editor.inherited'),
+  'the inherited per-host editor is dimmed',
+);
+assert.match(document.body.textContent, /Global security headers/);
+
+// CSP: typing updates the generated-header preview.
+setValue('#global-csp', "default-src 'self'; img-src 'self' data:");
+await settle();
+assert.match(
+  document.querySelector('#global-csp-preview').textContent,
+  /Content-Security-Policy/,
+  'CSP preview renders the generated header',
+);
+assert.match(
+  document.querySelector('#global-csp-preview').textContent,
+  /img-src/,
+  'CSP preview reflects the edited value',
+);
+
+// HSTS: enabling preload must render the irreversible warning and the generated header.
+click('#global-hsts-enabled');
+await settle();
+assert.ok(document.querySelector('#global-hsts-max-age'), 'HSTS max-age field appears when enabled');
+click('#global-hsts-preload');
+await settle();
+assert.ok(
+  document.querySelector('#global-hsts-preload-warning'),
+  'preload warning banner renders',
+);
+assert.match(
+  document.querySelector('#global-security-headers').textContent,
+  /Strict-Transport-Security: max-age=/,
+  'HSTS generated header renders',
+);
+
+// Save the global config: the PUT carries the snake_case DTO and the confirmation renders.
+click('#save-global-security-headers');
+await settle();
+await settle();
+const globalSave = calls.find(
+  (call) => call.method === 'PUT' && call.path === '/api/v1/security-headers',
+);
+assert.ok(globalSave, 'saving the global panel sends PUT /api/v1/security-headers');
+assert.equal(globalSave.body.content_security_policy, "default-src 'self'; img-src 'self' data:");
+assert.equal(globalSave.body.strict_transport_security.preload, true);
+assert.ok(document.querySelector('#global-security-headers-saved'), 'global save confirmation renders');
+
+// An API validation failure is shown inline, with the server's location.
+setValue('#global-csp', "default-src 'self' 'forbidden'");
+await settle();
+click('#save-global-security-headers');
+await settle();
+await settle();
+const inlineError = document.querySelector('#global-security-headers .error-message');
+assert.ok(inlineError, 'API validation error renders inline in the global panel');
+assert.match(inlineError.textContent, /forbidden/, 'the server message is shown');
+
+// Per-host override: host 2 stores its own config, so the panel shows an override, not inheritance.
+setValue('#security-headers-host', '2');
+await settle();
+await settle();
+assert.ok(document.querySelector('#host-security-headers-override'), 'host 2 shows its own override');
+assert.equal(document.querySelector('#host-csp').value, "default-src 'none'");
+
+setValue('#host-csp', "default-src 'self'");
+await settle();
+click('#save-host-security-headers');
+await settle();
+await settle();
+const hostSave = calls.find(
+  (call) => call.method === 'PUT' && call.path === '/api/v1/hosts/2/security-headers',
+);
+assert.ok(hostSave, 'saving the per-host panel sends PUT /api/v1/hosts/2/security-headers');
+assert.equal(hostSave.body.content_security_policy, "default-src 'self'");
+assert.ok(document.querySelector('#host-security-headers-saved'), 'host save confirmation renders');
+
+// Client-side validation mirrors the API: the server rejects an HSTS max-age below 180 days
+// unconditionally, so the editor must refuse to send it and explain the floor inline.
+const hostPutsBefore = calls.filter(
+  (call) => call.method === 'PUT' && call.path === '/api/v1/hosts/2/security-headers',
+).length;
+click('#host-hsts-enabled');
+await settle();
+setValue('#host-hsts-max-age', '86400');
+await settle();
+click('#save-host-security-headers');
+await settle();
+assert.match(
+  document.querySelector('#host-security-headers .error-message').textContent,
+  /15552000/,
+  'an HSTS max-age below 180 days is rejected inline',
+);
+assert.equal(
+  calls.filter((call) => call.method === 'PUT' && call.path === '/api/v1/hosts/2/security-headers')
+    .length,
+  hostPutsBefore,
+  'an invalid HSTS max-age is rejected before any request is sent',
+);
 
 // The remaining pages must render against the same fake API: a component that dereferences a
 // missing field throws here instead of in the browser.

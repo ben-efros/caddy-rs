@@ -592,6 +592,43 @@ async fn create_host_returns_201_location_and_a_strong_etag() {
 }
 
 #[tokio::test]
+async fn host_detail_exposes_a_stored_security_headers_override() {
+    let (_dir, server, _runtime) = server_with_runtime();
+    let host = create_dead(&server, "headers.example.com").await;
+    assert!(
+        host.security_headers.is_none(),
+        "a new host inherits the global security headers"
+    );
+
+    let put = server
+        .put(&format!("/api/v1/hosts/{}/security-headers", host.id))
+        .json(&serde_json::json!({
+            "content_security_policy": "default-src 'self'",
+            "referrer_policy": "no-referrer"
+        }))
+        .await;
+    assert_eq!(put.status_code(), StatusCode::OK, "{}", put.text());
+
+    let detail: HostResponse = server
+        .get(&format!("/api/v1/hosts/{}", host.id))
+        .await
+        .json();
+    let headers = detail
+        .security_headers
+        .expect("the host detail carries the explicit override");
+    assert_eq!(
+        headers.content_security_policy.as_deref(),
+        Some("default-src 'self'"),
+        "the dashboard distinguishes an override from inheritance"
+    );
+    assert_eq!(headers.referrer_policy.as_deref(), Some("no-referrer"));
+    assert_eq!(
+        detail.revision, 2,
+        "storing headers bumps the host revision"
+    );
+}
+
+#[tokio::test]
 async fn create_rejects_a_duplicate_domain_with_409() {
     let (_dir, server, _runtime) = server_with_runtime();
     let _ = create_dead(&server, "taken.example.com").await;
