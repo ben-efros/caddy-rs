@@ -174,6 +174,16 @@ pub struct AdminConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origins: Option<Vec<String>>,
 
+    /// This server's identity credentials (`admin.identity`), required by
+    /// [`AdminConfig::remote`]. EXPERIMENTAL, matching Caddy v2.11.9.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<AdminIdentity>,
+
+    /// Remote (mutual-TLS) administration (`admin.remote`). EXPERIMENTAL, matching Caddy
+    /// v2.11.9.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<AdminRemote>,
+
     /// Unknown admin fields, preserved.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
@@ -186,9 +196,136 @@ impl Default for AdminConfig {
             listen: None,
             enforce_origin: false,
             origins: None,
+            identity: None,
+            remote: None,
             extra: BTreeMap::new(),
         }
     }
+}
+
+/// `admin.identity`: management of this server instance's identity credentials.
+///
+/// Mirrors Caddy v2.11.9 `caddy.IdentityConfig` (`external/caddy/admin.go:159`): `identifiers`
+/// and `issuers`. caddy-rs has no certmagic ACME issuance for the admin endpoint, so the
+/// certificate and key are supplied as PEM files (`certificate`/`key`, caddy-rs extensions
+/// documented in the task report); the two fields together are this build's way of resolving
+/// what upstream resolves through `issuers`/the certificate cache.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AdminIdentity {
+    /// Names or IP addresses that refer to this server (`identity.identifiers`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub identifiers: Vec<String>,
+
+    /// PEM file holding the identity certificate (chain). caddy-rs extension: replaces
+    /// upstream's certificate-cache/ACME issuance for the admin endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate: Option<String>,
+
+    /// PEM file holding the identity private key (PKCS#8, PKCS#1 or SEC1). caddy-rs extension,
+    /// paired with [`AdminIdentity::certificate`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+
+    /// Upstream `identity.issuers` (`tls.issuance` modules), preserved opaquely. caddy-rs has no
+    /// issuance modules for the admin identity, so a non-empty list is rejected at validation
+    /// rather than silently ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuers: Option<Vec<Value>>,
+
+    /// Unknown identity fields, preserved.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+/// `admin.remote`: the secure administration endpoint (mutual TLS).
+///
+/// Mirrors Caddy v2.11.9 `caddy.RemoteAdmin` (`external/caddy/admin.go:183`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdminRemote {
+    /// Address of the secure listener. Caddy's default is `:2021`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen: Option<String>,
+
+    /// Access controls: which client certificates are accepted and what each may do.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub access_control: Vec<AdminAccess>,
+
+    /// Unknown remote fields, preserved.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+impl AdminRemote {
+    /// Caddy's default remote admin listen address (`admin.go:535`).
+    pub const DEFAULT_LISTEN: &'static str = ":2021";
+
+    /// Remote admin listen address, applying Caddy's `:2021` default.
+    pub fn listen_addr(&self) -> &str {
+        self.listen.as_deref().unwrap_or(Self::DEFAULT_LISTEN)
+    }
+
+    /// Whether any access-control entry names a certificate/public key, i.e. whether the mutual
+    /// TLS trust pool can be populated at all.
+    pub fn has_public_keys(&self) -> bool {
+        self.access_control
+            .iter()
+            .any(|access| !access.public_keys.is_empty())
+    }
+}
+
+/// One `admin.remote.access_control` entry (Caddy v2.11.9 `caddy.AdminAccess`, `admin.go:203`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdminAccess {
+    /// Base64-encoded DER certificates whose public keys are accepted (and whose clients trust
+    /// chain to them, exactly as upstream builds its client-certificate pool from this list).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub public_keys: Vec<String>,
+
+    /// What the matched identities may do. An empty list grants every permission (upstream
+    /// `len(adminAccess.Permissions) == 0` short-circuit).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub permissions: Vec<AdminPermissions>,
+
+    /// Subject distinguished names (`CN=client,O=ops`, Go `x509.Name.String()` form) accepted by
+    /// this entry. caddy-rs extension: upstream authenticates by public key only; this lets an
+    /// operator name an identity without embedding its certificate.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subjects: Vec<String>,
+
+    /// Serial numbers in decimal (Go `big.Int.String()` form) accepted by this entry.
+    /// caddy-rs extension, paired with [`AdminAccess::subjects`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub serials: Vec<String>,
+
+    /// Unknown access-control fields, preserved.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+impl AdminAccess {
+    /// Whether this entry names any identity selector at all. An entry without selectors matches
+    /// nothing (upstream: an entry with no `public_keys` cannot match a verified chain).
+    pub fn has_selectors(&self) -> bool {
+        !self.public_keys.is_empty() || !self.subjects.is_empty() || !self.serials.is_empty()
+    }
+}
+
+/// One `admin.remote.access_control[].permissions` entry (Caddy v2.11.9
+/// `caddy.AdminPermissions`, `admin.go:221`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdminPermissions {
+    /// Allowed API paths. `None` (field absent) allows every path; `Some([])` (explicit empty
+    /// array) allows none, matching Go's nil-vs-empty slice distinction upstream relies on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paths: Option<Vec<String>>,
+
+    /// Allowed HTTP methods for the paths above. `None` allows every method; `Some([])` none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub methods: Option<Vec<String>>,
+
+    /// Unknown permission fields, preserved.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
 }
 
 impl AdminConfig {
