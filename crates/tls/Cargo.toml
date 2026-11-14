@@ -30,7 +30,7 @@ rand = "0.8.8"
 # PKCS#11 token-held TLS keys (T-TLS-097). Dynamic loading is built in: no features,
 # no build-script/network dependency. cryptoki 0.7.0 pulls cryptoki-sys, libloading,
 # secrecy 0.8, bitflags 1.x and paste, all present in the offline registry cache.
-cryptoki = "0.7.0"
+cryptoki = "0.12.1"
 # Same 0.8 instance cryptoki 0.7 uses, so `AuthPin::expose_secret` (PIN equality) resolves.
 secrecy = "0.8.0"
 
