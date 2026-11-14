@@ -44,7 +44,6 @@ export function SecurityHeadersTab(): JSX.Element {
   const [selectedHost, setSelectedHost] = useState<number | null>(null);
   const [hostValue, setHostValue] = useState<SecurityHeadersConfig | null>(null);
   const [hostDraft, setHostDraft] = useState<SecurityHeadersConfig>(defaultSecurityHeaders());
-  const [hostEtag, setHostEtag] = useState<string | null>(null);
   const [hostInherited, setHostInherited] = useState(false);
   const [hostSaving, setHostSaving] = useState(false);
   const [hostError, setHostError] = useState<unknown>(null);
@@ -97,7 +96,6 @@ export function SecurityHeadersTab(): JSX.Element {
         const detailBody = detail.data as HostDetail;
         const inherited = !detailBody.securityHeaders;
         setHostInherited(inherited);
-        setHostEtag(detail.etag);
         setHostValue(config.data);
         setHostDraft(config.data);
       } catch (error) {
@@ -147,15 +145,12 @@ export function SecurityHeadersTab(): JSX.Element {
     setHostError(null);
     setHostSaved(false);
     try {
-      const { data } = await securityHeaders.putHost(selectedHost, hostDraft, hostEtag);
+      const { data } = await securityHeaders.putHost(selectedHost, hostDraft);
       setHostValue(data);
       setHostDraft(data);
       setHostInherited(false);
       setHostSaved(true);
       toast('Host security headers saved');
-      // The host revision advanced, so refresh the If-Match token.
-      const detail = await hosts.get(selectedHost);
-      setHostEtag(detail.etag);
     } catch (error) {
       setHostError(error);
     } finally {
