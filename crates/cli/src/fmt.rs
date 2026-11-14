@@ -16,36 +16,39 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
 
+use crate::environ::io_error_text;
+
 /// Formats a Caddyfile.
 pub(crate) fn run(
-    config: Option<PathBuf>,
+    config: Option<String>,
     overwrite: bool,
     diff: bool,
-    paths: Vec<PathBuf>,
+    paths: Vec<String>,
 ) -> anyhow::Result<()> {
-    // Caddy treats an empty `--config` value as "not set".
-    let config = config.filter(|path| !path.as_os_str().is_empty());
+    // cmdFmt resolves the file from raw argument strings: the first positional argument wins, and
+    // an empty value means "not set" (Caddy's `fl.Arg(0)` returns "" for both a missing and an
+    // explicitly empty argument), so `fmt ''` and `fmt -c ''` both format ./Caddyfile.
+    let config_flag = config.unwrap_or_default();
+    let config_file_arg = paths.first().cloned().unwrap_or_default();
 
     // cmdFmt rejects multiple inputs before it resolves the default path. The message is
     // Caddy's verbatim text, including the two spaces when `--config` is absent.
-    if paths.len() > 1 || (config.is_some() && !paths.is_empty()) {
-        let config_flag = config
-            .as_deref()
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let joined = paths
-            .iter()
-            .map(|path| path.to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join(" ");
-        bail!("fmt does not support multiple files {config_flag} {joined}");
+    if paths.len() > 1 || (!config_flag.is_empty() && !config_file_arg.is_empty()) {
+        bail!(
+            "fmt does not support multiple files {config_flag} {}",
+            paths.join(" ")
+        );
     }
 
-    let config_file = paths
-        .first()
-        .cloned()
-        .or(config)
-        .unwrap_or_else(|| PathBuf::from("Caddyfile"));
+    let config_file = if config_file_arg.is_empty() {
+        if config_flag.is_empty() {
+            PathBuf::from("Caddyfile")
+        } else {
+            PathBuf::from(config_flag)
+        }
+    } else {
+        PathBuf::from(config_file_arg)
+    };
 
     // `-` is Caddy's stdin special case. `--overwrite`/`--diff` are ignored: stdin is always
     // formatted to stdout, and the formatting-difference check is skipped.
@@ -60,8 +63,15 @@ pub(crate) fn run(
         return Ok(());
     }
 
-    let input = std::fs::read(&config_file)
-        .with_context(|| format!("reading input file: {}", config_file.display()))?;
+    // Caddy reports the raw `os.ReadFile` error, which Go renders as `open <path>: <reason>`;
+    // reuse environ's Go-style wording instead of Rust's `(os error N)` suffix.
+    let input = std::fs::read(&config_file).map_err(|error| {
+        anyhow::anyhow!(
+            "reading input file: open {}: {}",
+            config_file.display(),
+            io_error_text(&error)
+        )
+    })?;
     let output = format(&input);
 
     if overwrite {

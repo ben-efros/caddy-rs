@@ -291,8 +291,11 @@ enum Command {
     )]
     Fmt {
         /// Configuration file.
+        ///
+        /// A `String` rather than a `PathBuf`: clap's path parser rejects an empty value, but
+        /// Caddy treats `-c ''` as "not set" and formats ./Caddyfile.
         #[arg(short, long)]
-        config: Option<PathBuf>,
+        config: Option<String>,
         /// Overwrite the input file with the results.
         #[arg(short = 'w', long)]
         overwrite: bool,
@@ -300,8 +303,10 @@ enum Command {
         #[arg(short, long)]
         diff: bool,
         /// Caddyfile to format; `-` reads standard input.
+        ///
+        /// A `String` for the same reason: an empty positional path is unset in Caddy.
         #[arg(value_name = "PATH")]
-        paths: Vec<PathBuf>,
+        paths: Vec<String>,
     },
     /// Generate or install a shell completion script.
     ///
