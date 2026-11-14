@@ -17,6 +17,7 @@ Commands:
   reload        Load a new configuration into a running server through its admin API
   stop          Stop a running server through its admin API
   respond       Simple, hard-coded HTTP responses for development and testing
+  file-server   Spins up a production-ready file server
   environ       Print the environment as seen by this caddy-rs process
   fmt           Formats a Caddyfile
   completion    Generate a shell completion script
@@ -403,6 +404,66 @@ Differences from Caddy v2.11.9 are recorded in
 
 Exit status is 0 while the server runs and exits cleanly on `SIGINT`/`SIGTERM`. Invalid flags,
 unsupported capabilities and bind failures exit 1 with a message; clap usage errors exit 2.
+
+## file-server
+
+Serves a directory of static files, like Caddy's `caddy file-server`. The command builds the same
+in-memory configuration as Caddy (admin endpoint disabled with `config.persist=false`, one server
+named `static` with Caddy's quick-server limits, and one route with `encode`, optional `templates`
+and `file_server` handlers), starts it with the same runtime as `caddy-rs run`, logs
+`Caddy serving static files on <listen>` to standard error, and blocks until interrupted.
+
+Synopsis: `caddy-rs file-server [--domain <example.com>] [--root <path>] [--listen <addr>] [--browse] [--reveal-symlinks] [--access-log] [--precompressed]`
+
+| Option | Description | Default |
+|---|---|---|
+| `-r, --root <PATH>` | The path to the root of the site. | current directory |
+| `-l, --listen <ADDR>` | The address to which to bind the listener. | `:80` |
+| `-b, --browse` | List directories that have no index file. | off |
+| `-t, --templates` | Render responses as templates (needs the `templates` feature). | off |
+| `-a, --access-log` | Enable the access log (written to standard error). | off |
+| `--no-compress` | Disable the Zstandard and Gzip `encode` handler. | compression on |
+| `-p, --precompressed <EXT>` | Precompressed sidecar formats, in preference order; repeatable or comma-separated (`gzip`, `br`, `zstd`). | none |
+| `-d, --domain <DOMAIN>` | Rejected by this build; see below. | none |
+| `--reveal-symlinks` | Rejected by this build; see below. | off |
+| `-f, --file-limit <N>` | Rejected by this build; see below. | none |
+| `-v, --debug` | Rejected by this build; see below. | off |
+
+```sh
+caddy-rs file-server --root ./public --listen 127.0.0.1:8080
+caddy-rs file-server -r ./public -b                 # directory listings
+caddy-rs file-server -r ./site -p zstd,gzip        # serve .zst/.gz sidecars
+caddy-rs file-server -r ./site -t -a               # template rendering + access log
+```
+
+The server applies Caddy's `buildHTTPServer` read-header timeout (10 s), idle timeout (30 s) and
+`max_header_bytes` 10 KiB, matching the limits the `run` server uses. Compression is on by default
+with Caddy's `zstd`, `gzip` preference order; `--no-compress` omits the `encode` handler entirely.
+`--precompressed` accepts exactly the formats this build's `file_server` ships with (`gzip`, `br`,
+`zstd`); the flag order is emitted as `precompressed_order`, matching stock.
+
+Flags whose capability this build does not have are rejected **before any listener is started**,
+with an exit status of 1 and a located error naming the flag and the missing module or feature.
+None of them is silently ignored:
+
+- `--domain` — stock changes the default listener to `:443` and relies on automatic HTTPS. This
+  command does not wire automatic HTTPS, and it must not silently serve plaintext on `:80`
+  instead, so it fails with `--domain: automatic HTTPS is not supported by 'caddy-rs file-server'...`.
+  Use a Caddyfile/JSON configuration with a site address for HTTPS.
+- `--reveal-symlinks` — the browse page lists entry names only; it cannot show symlink targets.
+- `--file-limit` — the browse implementation has no directory-entry cap. Note the related
+  divergence: stock caps a listing at 10,000 entries by default, while this build's browse page is
+  unbounded.
+- `--debug` — this build has no debug-level internal logging.
+- `--templates` in a minimal build (`--no-default-features`) — the error names the missing
+  `http.handlers.templates` module.
+- compression in a minimal build — the error names the missing `http.handlers.encode` module and
+  suggests `--no-compress`.
+
+The browse page itself is this build's `file_server` browse output (a simple HTML listing), not
+Caddy's browse template, so it has no sort/search controls and no custom template support. The
+`file_server` handler is shared with `run`; its other divergences are documented in
+[`FEATURES.md`](FEATURES.md).
 
 ## pki
 

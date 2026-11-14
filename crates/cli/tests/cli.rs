@@ -4930,3 +4930,276 @@ fn run_pingback_handshake_echoes_the_parent_token() {
         "run --pingback child did not exit after SIGTERM"
     );
 }
+
+// ---- `file-server` command -------------------------------------------------------------------
+//
+// Each test spawns the compiled binary, waits for the listener to accept connections, issues a
+// real HTTP/1.1 request, and asserts the status/body. The helpers kill the child on drop, so a
+// failing assertion cannot leave a listener behind.
+
+/// A spawned `caddy-rs file-server` process; killed on drop.
+struct FileServerProcess {
+    child: Child,
+    log: std::path::PathBuf,
+}
+
+impl FileServerProcess {
+    fn stop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
+    fn stderr(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+}
+
+impl Drop for FileServerProcess {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Spawn `caddy-rs file-server` with `args`.
+fn spawn_file_server(directory: &Path, args: &[&str]) -> FileServerProcess {
+    let log = directory.join("file-server.stderr");
+    let file = std::fs::File::create(&log).expect("create file-server stderr log");
+    let child = Command::new(binary())
+        .arg("file-server")
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(file))
+        .spawn()
+        .expect("spawn caddy-rs file-server");
+    FileServerProcess { child, log }
+}
+
+/// Start `file-server` for `root` on a free loopback port, retrying if the port was taken before
+/// the child could bind it. Returns the running process and the port.
+fn start_file_server(directory: &Path, root: &Path, extra: &[&str]) -> (FileServerProcess, u16) {
+    for attempt in 0..START_ATTEMPTS {
+        let port = free_port();
+        let listen = format!("127.0.0.1:{port}");
+        let mut args: Vec<String> = vec![
+            "--root".to_string(),
+            root.display().to_string(),
+            "--listen".to_string(),
+            listen,
+        ];
+        args.extend(extra.iter().map(|argument| argument.to_string()));
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let mut process = spawn_file_server(directory, &arg_refs);
+        let ready = wait_until(Duration::from_secs(15), || {
+            TcpStream::connect(("127.0.0.1", port)).is_ok()
+        });
+        if ready {
+            return (process, port);
+        }
+        let stderr = process.stderr();
+        let lost_port = is_address_in_use(&stderr);
+        process.stop();
+        if lost_port && attempt + 1 < START_ATTEMPTS {
+            continue;
+        }
+        panic!("file-server did not start on 127.0.0.1:{port}\nstderr:\n{stderr}");
+    }
+    unreachable!("file-server start attempts exhausted")
+}
+
+/// GET `path` from the `file-server` child, returning the parsed response.
+///
+/// A just-started listener can accept and then reset a connection while its runtime is still
+/// finishing `apply` (the readiness probe only proves the socket is bound), so a transient I/O
+/// error is retried before the test fails.
+fn file_server_get(process: &FileServerProcess, port: u16, path: &str) -> HttpResponse {
+    let target = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut response = Vec::new();
+    let mut last_error = None;
+    for _ in 0..100 {
+        let attempt = (|| -> std::io::Result<Vec<u8>> {
+            let mut stream = TcpStream::connect_timeout(&target, Duration::from_secs(5))?;
+            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+            write!(
+                stream,
+                "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            )?;
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response)?;
+            Ok(response)
+        })();
+        match attempt {
+            Ok(bytes) => {
+                response = bytes;
+                last_error = None;
+                break;
+            }
+            Err(error) => {
+                last_error = Some(error);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+    if let Some(error) = last_error {
+        panic!(
+            "file-server request for {path} failed: {error}\nstderr:\n{}",
+            process.stderr()
+        );
+    }
+    let split = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("response header terminator")
+        + 4;
+    let head = String::from_utf8_lossy(&response[..split]);
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .expect("status code");
+    let headers = head
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            Some((name.trim().to_ascii_lowercase(), value.trim().to_string()))
+        })
+        .collect();
+    HttpResponse {
+        status,
+        headers,
+        body: String::from_utf8_lossy(&response[split..]).into_owned(),
+    }
+}
+
+#[test]
+fn file_server_serves_an_existing_file() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let root = directory.path().join("site");
+    std::fs::create_dir_all(&root).expect("create site root");
+    std::fs::write(root.join("hello.txt"), "hello from file-server\n").expect("write file");
+
+    let (_server, port) = start_file_server(directory.path(), &root, &[]);
+    let response = file_server_get(&_server, port, "/hello.txt");
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, "hello from file-server\n");
+    assert!(
+        response
+            .header("content-type")
+            .unwrap_or_default()
+            .starts_with("text/plain"),
+        "content type: {:?}",
+        response.header("content-type")
+    );
+}
+
+#[test]
+fn file_server_returns_404_for_a_missing_file() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let root = directory.path().join("site");
+    std::fs::create_dir_all(&root).expect("create site root");
+
+    let (_server, port) = start_file_server(directory.path(), &root, &[]);
+    let response = file_server_get(&_server, port, "/missing.txt");
+    assert_eq!(response.status, 404);
+}
+
+#[test]
+fn file_server_browse_lists_a_directory() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let root = directory.path().join("site");
+    let sub = root.join("sub");
+    std::fs::create_dir_all(&sub).expect("create sub directory");
+    std::fs::write(sub.join("inner.txt"), "inner\n").expect("write inner file");
+
+    let (_server, port) = start_file_server(directory.path(), &root, &["--browse"]);
+    // A directory request without the trailing slash is redirected first, like stock Caddy.
+    let response = file_server_get(&_server, port, "/sub/");
+    assert_eq!(response.status, 200);
+    assert!(
+        response.body.contains("inner.txt"),
+        "listing body: {}",
+        response.body
+    );
+}
+
+#[test]
+fn file_server_rejects_domain_with_a_located_error_before_starting_a_listener() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let port = free_port();
+    let listen = format!("127.0.0.1:{port}");
+    let output = Command::new(binary())
+        .args([
+            "file-server",
+            "--domain",
+            "example.com",
+            "--listen",
+            &listen,
+        ])
+        .current_dir(directory.path())
+        .output()
+        .expect("run caddy-rs file-server --domain");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr:\n{stderr}");
+    assert!(stderr.contains("--domain"), "stderr:\n{stderr}");
+    assert!(stderr.contains("automatic HTTPS"), "stderr:\n{stderr}");
+    assert!(
+        !stderr.contains("Caddy serving static files"),
+        "the command must not start a server; stderr:\n{stderr}"
+    );
+    assert!(
+        TcpListener::bind(("127.0.0.1", port)).is_ok(),
+        "the listener address must not have been bound"
+    );
+}
+
+#[test]
+fn file_server_rejects_flags_whose_capability_is_missing() {
+    for (flag, expected) in [
+        ("--reveal-symlinks", "--reveal-symlinks"),
+        ("--debug", "--debug"),
+    ] {
+        let (code, _stdout, stderr) = run(&["file-server", flag]);
+        assert_eq!(code, 1, "{flag} should fail; stderr:\n{stderr}");
+        assert!(stderr.contains(expected), "{flag} stderr:\n{stderr}");
+    }
+    let (code, _stdout, stderr) = run(&["file-server", "--file-limit", "5"]);
+    assert_eq!(code, 1, "--file-limit should fail; stderr:\n{stderr}");
+    assert!(stderr.contains("--file-limit"), "stderr:\n{stderr}");
+    let (code, _stdout, stderr) = run(&["file-server", "--precompressed", "brotli"]);
+    assert_eq!(code, 1, "--precompressed should fail; stderr:\n{stderr}");
+    assert!(stderr.contains("--precompressed"), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("http.precompressed.brotli"),
+        "stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn file_server_help_lists_the_command_and_its_flags() {
+    let (code, stdout, stderr) = run(&["--help"]);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert!(stdout.contains("file-server"), "help:\n{stdout}");
+
+    let (code, stdout, stderr) = run(&["file-server", "--help"]);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    for flag in [
+        "--domain",
+        "--root",
+        "--listen",
+        "--browse",
+        "--reveal-symlinks",
+        "--templates",
+        "--access-log",
+        "--debug",
+        "--file-limit",
+        "--no-compress",
+        "--precompressed",
+    ] {
+        assert!(stdout.contains(flag), "help is missing {flag}:\n{stdout}");
+    }
+    assert!(
+        stdout.contains("file-server [--domain"),
+        "usage should follow stock's synopsis:\n{stdout}"
+    );
+}
