@@ -807,6 +807,35 @@ fn parse_certificate_key(
     )))
 }
 
+/// Fail closed when a policy names a token-held `certificate_key` but the issuer that would issue
+/// the certificate has no token signer: generating a process-held key instead would silently
+/// ignore the configured key and write key material to disk (T-TLS-101).
+fn require_token_key_source(
+    plan: &AutomaticHttpsPlan,
+    subject: &str,
+    issuer_token_key: Option<&crate::certificate::TokenKeyRef>,
+) -> Result<()> {
+    if issuer_token_key.is_some() {
+        return Ok(());
+    }
+    let Some((index, policy)) = plan
+        .policies
+        .iter()
+        .enumerate()
+        .find(|(_, policy)| policy_matches(&policy.subjects, subject))
+    else {
+        return Ok(());
+    };
+    let Some(named) = &policy.certificate_key else {
+        return Ok(());
+    };
+    Err(Error::Issuer(format!(
+        "apps.tls.automation.policies[{index}].certificate_key: token-backed certificate key \
+         '{}' has no token signer configured; refusing to fall back to a process-held key",
+        named.key_id
+    )))
+}
+
 fn parse_policy(
     policy: &AutomationPolicy,
     index: usize,
@@ -1477,6 +1506,11 @@ impl AutomaticHttpsProvisioner {
         match &policy.issuer {
             AutomaticHttpsIssuer::Internal => {
                 let issuer = self.internal_issuer().await?;
+                require_token_key_source(
+                    plan,
+                    subject,
+                    issuer.certificate_key_source().token_ref(),
+                )?;
                 issuer
                     .obtain(&IssuanceRequest {
                         domains: vec![subject.to_string()],
@@ -1491,23 +1525,28 @@ impl AutomaticHttpsProvisioner {
                         ))
                     })
             }
-            AutomaticHttpsIssuer::Acme(config) => obtain_acme_certificate(
-                config,
-                &[subject.to_string()],
-                policy.key_type,
-                &self.transport,
-                &self.storage,
-                &self.challenge_tokens,
-                &self.tls_alpn01_tokens,
-                &self.clock,
-                &self.poll_policy,
-            )
-            .await
-            .map_err(|error| {
-                Error::Issuer(format!(
-                    "automatic HTTPS: cannot obtain a certificate for `{subject}`: {error}"
-                ))
-            }),
+            AutomaticHttpsIssuer::Acme(config) => {
+                // The ACME issuer built for this path is process-held; a token-backed policy key
+                // must fail closed instead of silently issuing with a generated key.
+                require_token_key_source(plan, subject, None)?;
+                obtain_acme_certificate(
+                    config,
+                    &[subject.to_string()],
+                    policy.key_type,
+                    &self.transport,
+                    &self.storage,
+                    &self.challenge_tokens,
+                    &self.tls_alpn01_tokens,
+                    &self.clock,
+                    &self.poll_policy,
+                )
+                .await
+                .map_err(|error| {
+                    Error::Issuer(format!(
+                        "automatic HTTPS: cannot obtain a certificate for `{subject}`: {error}"
+                    ))
+                })
+            }
         }
     }
 
@@ -1797,6 +1836,11 @@ impl CertificateIssuer for RenewalIssuer {
         match &policy.issuer {
             AutomaticHttpsIssuer::Internal => {
                 let issuer = self.internal_issuer().await?;
+                require_token_key_source(
+                    &self.plan,
+                    subject,
+                    issuer.certificate_key_source().token_ref(),
+                )?;
                 issuer
                     .obtain(&IssuanceRequest {
                         domains: request.domains.clone(),
@@ -1806,6 +1850,9 @@ impl CertificateIssuer for RenewalIssuer {
                     .await
             }
             AutomaticHttpsIssuer::Acme(config) => {
+                // The ACME issuer built for this path is process-held; a token-backed policy key
+                // must fail closed instead of silently reissuing with a generated key.
+                require_token_key_source(&self.plan, subject, None)?;
                 obtain_acme_certificate(
                     config,
                     &request.domains,
@@ -3118,6 +3165,46 @@ mod tests {
         let keys = FileStorage::new(directory.path()).list("").await.unwrap();
         assert_eq!(keys.len(), 1, "one persisted internal leaf: {keys:?}");
         assert!(keys[0].starts_with("local/"), "{keys:?}");
+    }
+
+    #[tokio::test]
+    async fn token_backed_policy_key_without_a_signer_fails_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut plan = plan(&internal_config()).unwrap().unwrap();
+        plan.policies
+            .first_mut()
+            .expect("the internal policy")
+            .certificate_key = Some(crate::certificate::TokenKeyRef::new(
+            "softHSM",
+            "example.com",
+        ));
+        let provisioner = AutomaticHttpsProvisioner::new(
+            Arc::new(NoopTransport::default()),
+            directory.path(),
+            Arc::new(Http01TokenStore::new()),
+        );
+
+        let error = provisioner
+            .provision(&plan, None)
+            .await
+            .expect_err("a token-backed key must never fall back to a process-held key");
+        let message = error.to_string();
+        assert!(
+            message.contains(
+                "apps.tls.automation.policies[0].certificate_key: token-backed certificate key \
+                 'example.com' has no token signer configured; refusing to fall back to a \
+                 process-held key"
+            ),
+            "{message}"
+        );
+        assert!(
+            FileStorage::new(directory.path())
+                .list("")
+                .await
+                .unwrap()
+                .is_empty(),
+            "no certificate or key may be stored when the token signer is missing"
+        );
     }
 
     #[tokio::test]

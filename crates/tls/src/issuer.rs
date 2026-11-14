@@ -2818,14 +2818,38 @@ mod tests {
         );
         script_finalization(&transport, "http-01");
 
-        let _ = issuer.obtain(&issuance_request()).await;
+        use crate::acme::csr::CsrSigner as _;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine as _;
+
+        // Token-held keys have no PEM form, so issuance fails closed at storage after the CSR was
+        // signed and finalised; the error must be the storage refusal, not an ignored result.
+        let first = issuer
+            .obtain(&issuance_request())
+            .await
+            .expect_err("token-held keys are never written as PKCS#8 PEM");
+        assert!(
+            first
+                .to_string()
+                .contains("token-held keys are never written as PKCS#8 PEM"),
+            "{first}"
+        );
         let session = issuer
             .certificate_key_source()
             .token_key()
             .expect("token key")
             .key()
             .clone();
-        let _ = issuer.obtain(&issuance_request()).await;
+        let renewal = issuer
+            .obtain(&issuance_request())
+            .await
+            .expect_err("token-held keys are never written as PKCS#8 PEM");
+        assert!(
+            renewal
+                .to_string()
+                .contains("token-held keys are never written as PKCS#8 PEM"),
+            "{renewal}"
+        );
         let renewed = issuer
             .certificate_key_source()
             .token_key()
@@ -2838,6 +2862,46 @@ mod tests {
             signer.calls(),
             2,
             "initial issuance and renewal both sign through the same token session"
+        );
+
+        // Both CSRs verify against the stub token key's public key, and the renewal CSR is for the
+        // same key: no fresh process-held key was generated for the second issuance.
+        let csrs: Vec<Vec<u8>> = transport
+            .requests()
+            .into_iter()
+            .filter(|request| request.url == FINALIZE_URL)
+            .map(|request| {
+                let jws: Value = serde_json::from_slice(&request.body).expect("JWS body");
+                let encoded = jws["payload"].as_str().expect("JWS payload");
+                let payload: Value = serde_json::from_slice(
+                    &URL_SAFE_NO_PAD.decode(encoded).expect("base64url payload"),
+                )
+                .expect("finalize JSON payload");
+                URL_SAFE_NO_PAD
+                    .decode(payload["csr"].as_str().expect("csr field"))
+                    .expect("base64url CSR")
+            })
+            .collect();
+        assert_eq!(
+            csrs.len(),
+            2,
+            "initial issuance and renewal each finalise one CSR"
+        );
+        for csr in &csrs {
+            let parsed = crate::acme::csr::parse_csr(csr).expect("CSR self-signature verifies");
+            assert_eq!(
+                parsed.spki_der,
+                signer.spki(),
+                "the CSR must be signed for the token stub public key"
+            );
+        }
+        assert!(
+            certificate_storage
+                .load(STORAGE_KEY)
+                .await
+                .unwrap()
+                .is_none(),
+            "no process-held key or certificate record may be persisted for a token-held key"
         );
     }
 }

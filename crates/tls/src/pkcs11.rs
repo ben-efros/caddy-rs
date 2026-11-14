@@ -1700,21 +1700,31 @@ impl Pkcs11SigningKey {
 
     /// Adapt this token key as a certificate key source for ACME/internal-CA issuance.
     ///
-    /// Returns `None` when the token offers no CSR-compatible mechanism for this key; callers must
-    /// then fail closed instead of generating a process-held PEM key. The recorded key id is the
-    /// selector's `CKA_LABEL`, or its hex `CKA_ID` when no label was given.
-    pub fn certificate_key_source(&self) -> Option<crate::certificate::CertificateKeySource> {
-        let signer = self.csr_signer()?;
+    /// Returns `Ok(None)` when the token offers no CSR-compatible mechanism for this key; callers
+    /// must then fail closed instead of generating a process-held PEM key. The recorded key id is
+    /// the selector's `CKA_LABEL`, or its hex `CKA_ID` when no label was given. A token key whose
+    /// scheme cannot be declared in a PKCS#10 request is a located error, never `None`: silently
+    /// dropping it would let the caller fall back to a process-held key.
+    pub fn certificate_key_source(
+        &self,
+    ) -> crate::Result<Option<crate::certificate::CertificateKeySource>> {
+        let Some(signer) = self.csr_signer() else {
+            return Ok(None);
+        };
         let key_id = match (&self.selector.label, &self.selector.id) {
             (Some(label), _) => label.clone(),
             (None, Some(id)) => id.iter().map(|byte| format!("{byte:02x}")).collect(),
             (None, None) => "unlabelled".to_string(),
         };
-        crate::certificate::CertificateKeySource::token(
-            crate::certificate::TokenKeyRef::new(self.token_label(), key_id),
-            std::sync::Arc::new(signer),
-        )
-        .ok()
+        let key = crate::certificate::TokenKeyRef::new(self.token_label(), key_id);
+        let described = key.describe();
+        crate::certificate::CertificateKeySource::token(key, std::sync::Arc::new(signer))
+            .map(Some)
+            .map_err(|error| {
+                crate::Error::Issuer(format!(
+                    "token key {described} does not support CSR signing: {error}"
+                ))
+            })
     }
 
     /// Adapt this token key for PKCS#10 CSR signing (`crate::acme::csr::CsrSigner`).
