@@ -142,3 +142,7 @@ jobs:
           files: dist/*
           generate_release_notes: true
           fail_on_unmatched_files: true
+          # Trial and release-candidate tags are previews: mark them as GitHub prereleases so they
+          # are excluded from "latest" and from tooling that only follows stable releases. A plain
+          # vX.Y.Z tag is still published as a normal release (T-OPS-030).
+          prerelease: ${{ contains(github.ref_name, '-trial') || contains(github.ref_name, '-rc') }}
