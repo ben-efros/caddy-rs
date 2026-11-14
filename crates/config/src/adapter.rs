@@ -205,6 +205,9 @@ struct GlobalServerOptions {
     /// (`trusted_proxies`, `trusted_proxies_strict`, `trusted_proxies_unix`,
     /// `client_ip_headers`).
     settings: Map<String, Value>,
+    /// Position of a server-level `trust_cdn` option (caddy-rs extension, T-CONF-079), used for the
+    /// located `stock_compat` rejection.
+    trust_cdn_position: Option<Position>,
 }
 
 /// Mask one byte span with spaces (keeping newlines) so parser diagnostics keep their line/column.
@@ -474,10 +477,11 @@ fn parse_servers_block(
     input: &str,
     start: usize,
     end: usize,
-) -> caddy_rs_core::Result<(Vec<Value>, Map<String, Value>)> {
+) -> caddy_rs_core::Result<(Vec<Value>, Map<String, Value>, Option<Position>)> {
     let mut cursor = ServerBlockCursor::new(input, start, end);
     let mut wrappers = Vec::new();
     let mut settings: Map<String, Value> = Map::new();
+    let mut trust_cdn_position: Option<Position> = None;
     loop {
         let Some(token) = cursor.next()? else {
             break;
@@ -635,6 +639,30 @@ fn parse_servers_block(
                             }
                         }
                     }
+                    "trust_cdn" => {
+                        // caddy-rs extension (ADR-013, T-CONF-079): per-server trust_cdn. The
+                        // optional argument names the CDN profile; the adapter only carries the
+                        // configuration (resolving it into `trusted_proxies` is runtime work).
+                        if has_block {
+                            return Err(adapter_error(
+                                position,
+                                "`trust_cdn` does not take a block inside `servers`; write \
+                                 `trust_cdn [<provider>]`",
+                            ));
+                        }
+                        if arguments.len() > 1 {
+                            return Err(adapter_error(
+                                position,
+                                "wrong argument count or unexpected line ending after `trust_cdn`",
+                            ));
+                        }
+                        let value = match arguments.first() {
+                            None => Value::Bool(true),
+                            Some(provider) => json!({ "provider": provider }),
+                        };
+                        settings.insert("trust_cdn".to_string(), value);
+                        trust_cdn_position = Some(position);
+                    }
                     other => {
                         return Err(adapter_error(
                             position,
@@ -642,7 +670,7 @@ fn parse_servers_block(
                                 "`servers` option `{other}` is not supported by this build \
                                  (tracked as T-CONF-036); supported: listener_wrappers, \
                                  trusted_proxies, trusted_proxies_strict, trusted_proxies_unix, \
-                                 client_ip_headers, 0rtt, server_identity"
+                                 client_ip_headers, 0rtt, server_identity, trust_cdn"
                             ),
                         ))
                     }
@@ -650,7 +678,7 @@ fn parse_servers_block(
             }
         }
     }
-    Ok((wrappers, settings))
+    Ok((wrappers, settings, trust_cdn_position))
 }
 
 /// Parse the `server_identity` directive (caddy-rs extension, T-CONF-060).
@@ -961,11 +989,13 @@ fn extract_global_server_options(
         }
         let mut wrappers = Vec::new();
         let mut settings: Map<String, Value> = Map::new();
+        let mut trust_cdn_position: Option<Position> = None;
         let end = if cursor < close && bytes[cursor] == b'{' {
             let block_end = find_matching_brace(input, cursor)?;
             let parsed = parse_servers_block(input, cursor + 1, block_end)?;
             wrappers = parsed.0;
             settings = parsed.1;
+            trust_cdn_position = parsed.2;
             block_end + 1
         } else if cursor < close && !matches!(bytes[cursor], b'\n' | b'\r') {
             return Err(adapter_error(
@@ -983,6 +1013,7 @@ fn extract_global_server_options(
             listener_address,
             listener_wrappers: wrappers,
             settings,
+            trust_cdn_position,
         });
         mask_span(&mut masked, name_start, end);
         index = end;
@@ -1016,28 +1047,42 @@ fn extract_global_server_options(
 }
 
 /// Apply parsed global `servers` options to one generated server object (Caddy's first-match rule).
+///
+/// `trust_cdn` (caddy-rs extension, T-CONF-079) is merged last: a server-level `trust_cdn` wins
+/// over the global default, and an explicit server-level `trusted_proxies` blocks the merge
+/// entirely (the operator's own trusted-proxy configuration wins, ADR-013 §2).
 fn apply_global_server_options(
     object: &mut Map<String, Value>,
     listens: &[String],
     options: &[GlobalServerOptions],
+    global_trust_cdn: Option<&Value>,
 ) {
-    let Some(matching) = options
+    let matching = options
         .iter()
         .find(|option| match &option.listener_address {
             None => true,
             Some(address) => listens.iter().any(|listen| listen == address),
-        })
-    else {
-        return;
-    };
-    if !matching.listener_wrappers.is_empty() {
-        object.insert(
-            "listener_wrappers".to_string(),
-            Value::Array(matching.listener_wrappers.clone()),
-        );
+        });
+    let mut server_trust_cdn: Option<Value> = None;
+    if let Some(matching) = matching {
+        if !matching.listener_wrappers.is_empty() {
+            object.insert(
+                "listener_wrappers".to_string(),
+                Value::Array(matching.listener_wrappers.clone()),
+            );
+        }
+        for (key, value) in &matching.settings {
+            if key == "trust_cdn" {
+                server_trust_cdn = Some(value.clone());
+                continue;
+            }
+            object.insert(key.clone(), value.clone());
+        }
     }
-    for (key, value) in &matching.settings {
-        object.insert(key.clone(), value.clone());
+    if !object.contains_key("trusted_proxies") {
+        if let Some(value) = server_trust_cdn.or_else(|| global_trust_cdn.cloned()) {
+            object.insert("trust_cdn".to_string(), value);
+        }
     }
 }
 
@@ -1141,6 +1186,19 @@ pub fn adapt_with_options(
     let (effective_input, global_server_options) = extract_global_server_options(input)?;
     let file = parser::parse_with_source(&effective_input, source).map_err(parse_error)?;
     let options = &file.options;
+    // `trust_cdn` is a caddy-rs extension with no stock Caddy v2.11.9 equivalent (ADR-013); using
+    // it inside a `servers` block under `stock_compat true` is a located error (T-CONF-079).
+    if options.stock_compat {
+        if let Some(position) = global_server_options
+            .iter()
+            .find_map(|option| option.trust_cdn_position.clone())
+        {
+            return Err(adapter_error(
+                position,
+                "`servers` option `trust_cdn` (caddy-rs extension, not in Caddy v2.11.9) is not                  supported with `stock_compat true`",
+            ));
+        }
+    }
     let http_port = options.http_port.unwrap_or(80);
     let https_port = options.https_port.unwrap_or(443);
     let mut warnings = options.warnings.clone();
@@ -1319,6 +1377,8 @@ pub fn adapt_with_options(
     let tls_plan = build_tls_plan(&file, &site_tls, &servers, http_port, https_port)?;
 
     let mut server_map = Map::new();
+    // Global `trust_cdn` default applied to every server that does not set its own (T-CONF-079).
+    let global_trust_cdn_json = options.trust_cdn.as_ref().map(trust_cdn_json);
     for (index, server) in servers.into_iter().enumerate() {
         let block_count = server.blocks.len();
         let mut routes = Vec::new();
@@ -1445,7 +1505,12 @@ pub fn adapt_with_options(
 
         let mut object = Map::new();
         object.insert("listen".to_string(), json!(server.listens));
-        apply_global_server_options(&mut object, &server.listens, &global_server_options);
+        apply_global_server_options(
+            &mut object,
+            &server.listens,
+            &global_server_options,
+            global_trust_cdn_json.as_ref(),
+        );
         let mut automatic_https = Map::new();
         if options.auto_https.off {
             automatic_https.insert("disable".to_string(), json!(true));
@@ -1559,6 +1624,16 @@ pub fn adapt_with_options(
         // caddy-rs extension (DIV-0130): only emitted when enabled, so a configuration that does
         // not use the switch adapts exactly as before.
         config.insert("stock_compat".to_string(), json!(true));
+    }
+    if let Some(radar) = &options.radar {
+        // caddy-rs extension (ADR-0020, T-CONF-079). Only emitted when configured; every field
+        // carries its ADR-0020 default and there is no `enabled` key (`mode` replaces it).
+        config.insert("radar".to_string(), radar_json(radar));
+    }
+    if let Some(trust_cdn) = &options.trust_cdn {
+        // caddy-rs extension (ADR-013, T-CONF-079): configuration only; resolving the profile
+        // into `trusted_proxies` is runtime work.
+        config.insert("trust_cdn".to_string(), trust_cdn_json(trust_cdn));
     }
     if options.admin.is_some() || options.persist_config_off {
         let mut admin_object = Map::new();
@@ -10123,6 +10198,115 @@ fn parse_error(error: parser::ParseError) -> CoreError {
 /// through `config.unsupported` so a valid Caddyfile is never presented as malformed; the
 /// explanatory suffix and any `(tracked as T-...)` text are preserved. New code should prefer
 /// [`adapter_unsupported`].
+/// Emit the adapted JSON for the global `radar { ... }` option (ADR-0020 §1, T-CONF-079).
+///
+/// Defaults are emitted for `mode`, `protect`, `poll_interval`, `cache_ttl`, the storage type and
+/// all four endpoints, matching the JSON example in ADR-0020. Optional fields are omitted when
+/// unset (`api_token`, storage `path`/`redis_url`/`key_prefix`, and empty `filters` entries) — the
+/// same omit-when-unset convention as the other caddy-rs extension options. There is no `enabled`
+/// key: `mode` replaces it.
+fn radar_json(radar: &parser::RadarOptions) -> Value {
+    let mut object = Map::new();
+    object.insert("mode".to_string(), json!(radar.mode.as_str()));
+    object.insert("protect".to_string(), json!(radar.protect));
+    if let Some(token) = &radar.api_token {
+        object.insert("api_token".to_string(), json!(token));
+    }
+    object.insert(
+        "poll_interval".to_string(),
+        json!(parser::format_duration_ns(radar.poll_interval_ns)),
+    );
+    object.insert(
+        "cache_ttl".to_string(),
+        json!(parser::format_duration_ns(radar.cache_ttl_ns)),
+    );
+    object.insert("storage".to_string(), radar_storage_json(&radar.storage));
+    object.insert(
+        "endpoints".to_string(),
+        json!({
+            "ddos_l7": radar.endpoints.ddos_l7,
+            "ddos_l34": radar.endpoints.ddos_l34,
+            "bgp_hijacks": radar.endpoints.bgp_hijacks,
+            "traffic_anomalies": radar.endpoints.traffic_anomalies,
+        }),
+    );
+    let mut filters = Map::new();
+    if let Some(min_magnitude) = radar.filters.min_magnitude {
+        filters.insert("min_magnitude".to_string(), json!(min_magnitude));
+    }
+    if !radar.filters.countries.is_empty() {
+        filters.insert("countries".to_string(), json!(radar.filters.countries));
+    }
+    if !radar.filters.asns.is_empty() {
+        filters.insert("asns".to_string(), json!(radar.filters.asns));
+    }
+    if !filters.is_empty() {
+        object.insert("filters".to_string(), Value::Object(filters));
+    }
+    Value::Object(object)
+}
+
+/// Emit the `storage` object of the `radar` option (ADR-0020 §1).
+fn radar_storage_json(storage: &parser::RadarStorage) -> Value {
+    let mut object = Map::new();
+    match storage {
+        parser::RadarStorage::File { path } => {
+            object.insert("type".to_string(), json!("file"));
+            if let Some(path) = path {
+                object.insert("path".to_string(), json!(path));
+            }
+        }
+        parser::RadarStorage::Redis {
+            redis_url,
+            key_prefix,
+        } => {
+            object.insert("type".to_string(), json!("redis"));
+            if let Some(redis_url) = redis_url {
+                object.insert("redis_url".to_string(), json!(redis_url));
+            }
+            if let Some(key_prefix) = key_prefix {
+                object.insert("key_prefix".to_string(), json!(key_prefix));
+            }
+        }
+        parser::RadarStorage::Memory => {
+            object.insert("type".to_string(), json!("memory"));
+        }
+    }
+    Value::Object(object)
+}
+
+/// Emit the JSON for `trust_cdn` (ADR-013, T-CONF-079).
+///
+/// The bare form is the boolean marker `true`; a provider (and any extension overrides) becomes the
+/// ADR-013 object. The same value is used for the global option and for a server-level override.
+fn trust_cdn_json(options: &parser::TrustCdnOptions) -> Value {
+    if options.provider.is_none()
+        && options.client_ip_header.is_none()
+        && options.ipv4_cidrs.is_empty()
+        && options.ipv6_cidrs.is_empty()
+        && options.strict.is_none()
+    {
+        return Value::Bool(true);
+    }
+    let mut object = Map::new();
+    if let Some(provider) = &options.provider {
+        object.insert("provider".to_string(), json!(provider));
+    }
+    if let Some(header) = &options.client_ip_header {
+        object.insert("client_ip_header".to_string(), json!(header));
+    }
+    if !options.ipv4_cidrs.is_empty() {
+        object.insert("ipv4_cidrs".to_string(), json!(options.ipv4_cidrs));
+    }
+    if !options.ipv6_cidrs.is_empty() {
+        object.insert("ipv6_cidrs".to_string(), json!(options.ipv6_cidrs));
+    }
+    if let Some(strict) = options.strict {
+        object.insert("strict".to_string(), json!(strict));
+    }
+    Value::Object(object)
+}
+
 fn adapter_error(position: Position, message: impl Into<String>) -> CoreError {
     let message = message.into();
     match unsupported_construct(&message) {
