@@ -1064,7 +1064,7 @@ fn rewritten_uri(request: &Request, template: &str) -> Result<Uri> {
             ),
         ));
     }
-    if !options_star && percent_decode(&new_path) != percent_decode(&original_path) {
+    if !options_star && percent_decode_bytes(&new_path) != percent_decode_bytes(&original_path) {
         new_path = canonicalize_rewrite_path(&new_path);
     }
     let mut rebuilt = new_path;
@@ -1377,6 +1377,29 @@ pub(crate) fn clean_path(path: &str, collapse_slashes: bool) -> String {
     }
     if trailing && output != "/" && !output.ends_with('/') {
         output.push('/');
+    }
+    output
+}
+
+/// Decode valid percent escapes into raw bytes, without `from_utf8_lossy`. Go compares the decoded
+/// `URL.Path` bytes when deciding whether a rewrite changed the path; a lossy String would treat
+/// two different invalid-UTF-8 paths (`%FE` vs `%FF`) as equal and skip canonicalization.
+fn percent_decode_bytes(input: &str) -> Vec<u8> {
+    let bytes = input.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let high = (bytes[index + 1] as char).to_digit(16);
+            let low = (bytes[index + 2] as char).to_digit(16);
+            if let (Some(high), Some(low)) = (high, low) {
+                output.push(((high << 4) | low) as u8);
+                index += 3;
+                continue;
+            }
+        }
+        output.push(bytes[index]);
+        index += 1;
     }
     output
 }
@@ -2742,6 +2765,34 @@ mod tests {
             };
             assert_eq!(request.uri.path(), "/secret", "for {value}");
         }
+    }
+
+    #[tokio::test]
+    async fn rewrite_uri_detects_a_change_that_differs_only_in_invalid_utf8() {
+        // Byte-exact change detection: `%FE` and `%FF` decode to different bytes but the same
+        // replacement character, so a lossy comparison would call the path unchanged, skip
+        // canonicalization, and leave the dot segments that bypass a downstream `path` guard.
+        let handler = RewriteHandler::from_json(
+            &serde_json::json!({
+                "handler": "rewrite",
+                "uri": "{http.request.header.X-Path}"
+            }),
+            "handler",
+        )
+        .unwrap();
+        let mut request = test_request(Method::GET, "/a%FF/../secret");
+        request.headers.insert(
+            HeaderName::from_static("x-path"),
+            HeaderValue::from_static("/a%FE/../secret"),
+        );
+        let Outcome::Continue(request) = handler.handle(request).await.unwrap() else {
+            panic!("expected continue");
+        };
+        assert_eq!(request.uri.path(), "/secret");
+        let matcher = crate::matchers::PathMatcher {
+            patterns: vec!["/secret*".to_string()],
+        };
+        assert!(crate::types::Matcher::matches(&matcher, &request));
     }
 
     #[tokio::test]
