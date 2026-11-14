@@ -18,7 +18,10 @@ pub mod handlers;
 pub mod matchers;
 pub mod placeholders;
 pub mod radar_client;
+pub mod radar_matcher;
+pub mod radar_protect;
 pub mod radar_store;
+pub mod radar_vars;
 pub mod rate_limit;
 pub mod regex_lite;
 pub mod router;
@@ -48,9 +51,24 @@ pub use radar_client::{
     RadarMetricsSnapshot, RadarMode, RadarTransport, StderrRadarLog, DEFAULT_BASE_URL,
     DEFAULT_CACHE_TTL, DEFAULT_POLL_INTERVAL, MIN_POLL_INTERVAL,
 };
+pub use radar_matcher::{
+    resolve_client_ip, AsnSelector, CountrySelector, GeoIpProvider, GeoLocation, NoopGeoIp,
+    NoopTrustCdn, RadarClientIdentity, RadarContext, RadarMatcher, RadarPredicate, RadarSnapshot,
+    RadarState, RadarTransition, StaticGeoIp, StaticTrustCdn, TrustCdnResolver,
+    TRUSTED_CLIENT_IP_HEADERS,
+};
+pub use radar_protect::{
+    default_rules, ProtectionAction, ProtectionConfig, ProtectionDecision, ProtectionRule,
+    RadarProtection, RadarRuntime, RuleOverride, RuleSource, DEFAULT_RATE_LIMIT_BURST,
+    DEFAULT_RATE_LIMIT_RATE, DEFAULT_TARPIT_MIN_MAGNITUDE, RULE_HIJACKED_PREFIX,
+    RULE_POW_CHALLENGE_ANOMALOUS, RULE_RATE_LIMIT_SUSPICIOUS, RULE_TARPIT_ATTACKER,
+};
 pub use radar_store::{
     FileStorage, MemoryStorage, RadarStorage, RedisStorage, StorageError, StorageSpec,
     DEFAULT_CACHE_PATH,
+};
+pub use radar_vars::{
+    resolve_radar_variable, variable_names, RadarVars, RADAR_VARIABLES, VARIABLE_PREFIX,
 };
 pub use rate_limit::{ManualClock, RateLimitClock, RateLimitHandler, SystemClock};
 pub use router::{CustomHandlerFactory, HandlerBuildContext, Route, Router, RouterBuilder};
