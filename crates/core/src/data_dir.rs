@@ -154,8 +154,40 @@ pub fn resolve_server_data_dir_with(
     }
 }
 
-/// Caddy's `AppDataDir()`-equivalent path: `$XDG_DATA_HOME/caddy`, then
-/// `$HOME/.local/share/caddy`, then `./caddy`.
+/// Caddy's `AppDataDir()` in its raw form: `$XDG_DATA_HOME/caddy`, then
+/// `$HOME/.local/share/caddy`, then the relative `./caddy` fallback (returned as `caddy`, not
+/// resolved against the working directory).
+///
+/// This is the layout the file server needs when it decides whether the directory is relative:
+/// Caddy hides a relative app data directory because it sits under the working directory, and it
+/// skips an absolute one (`caddy@a97bc460cfe5`). The Linux/Unix branches are implemented; the
+/// macOS/Windows/Plan 9 variants of `AppDataDir` are not reachable from the platforms this build
+/// ships on.
+pub fn app_data_dir() -> PathBuf {
+    app_data_dir_with(
+        std::env::var_os(XDG_DATA_HOME_ENV),
+        std::env::var_os(HOME_ENV),
+    )
+}
+
+/// Testable form of [`app_data_dir`] with the environment values supplied explicitly.
+///
+/// An empty base variable is treated as unset, matching Caddy's `if basedir != ""` checks.
+pub fn app_data_dir_with(xdg_data_home: Option<OsString>, home: Option<OsString>) -> PathBuf {
+    if let Some(base) = xdg_data_home.filter(|value| !value.is_empty()) {
+        PathBuf::from(base).join(CADDY_DATA_SUBDIR)
+    } else if let Some(home) = home.filter(|value| !value.is_empty()) {
+        PathBuf::from(home)
+            .join(".local")
+            .join("share")
+            .join(CADDY_DATA_SUBDIR)
+    } else {
+        PathBuf::from(CADDY_DATA_SUBDIR)
+    }
+}
+
+/// Caddy's `AppDataDir()`-resolved path: `$XDG_DATA_HOME/caddy`, then
+/// `$HOME/.local/share/caddy`, then `./caddy` resolved against the working directory.
 pub fn caddy_data_dir() -> PathBuf {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     caddy_data_dir_with(
