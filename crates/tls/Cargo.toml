@@ -49,7 +49,7 @@ hyper-rustls = { version = "0.27.10", default-features = false, features = ["htt
 # CONNECT tunnel with rustls before handing it to hyper (T-TLS-070).
 tower-service = "0.3"
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["aws_lc_rs", "tls12", "logging"] }
-hmac = "0.12.1"
+hmac = "0.13.0"
 hex = "0.4.3"
 percent-encoding = "2.3.2"
 quick-xml = "0.41.0"

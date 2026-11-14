@@ -446,7 +446,7 @@ dependencies = [
  "caddy-rs-core",
  "cryptoki",
  "hex",
- "hmac",
+ "hmac 0.13.0",
  "http-body-util",
  "httpdate",
  "hyper",
@@ -1318,6 +1318,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
 dependencies = [
  "digest 0.10.7",
+]
+
+[[package]]
+name = "hmac"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6303bc9732ae41b04cb554b844a762b4115a61bfaa81e3e83050991eeb56863f"
+dependencies = [
+ "digest 0.11.3",
 ]
 
 [[package]]
@@ -2809,7 +2818,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8e43134db17199f7f721803383ac5854edd0d3d523cc34dba321d6acfbe76c3"
 dependencies = [
  "digest 0.10.7",
- "hmac",
+ "hmac 0.12.1",
  "sha1",
  "sha2",
 ]
