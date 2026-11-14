@@ -867,3 +867,259 @@ async fn console_encoder_renders_the_redacted_query() {
         "value must not leak: {rendered}"
     );
 }
+
+/// A mock upstream that answers every request with `status`, standing in for an origin that
+/// returns an error status instead of failing the transport.
+async fn spawn_status_upstream(status: StatusCode) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind upstream");
+    let address = listener.local_addr().expect("upstream address");
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let service = hyper::service::service_fn(
+                    move |_request: hyper::Request<hyper::body::Incoming>| async move {
+                        Ok::<_, Infallible>(
+                            hyper::Response::builder()
+                                .status(status)
+                                .header(http::header::CONTENT_TYPE, "text/plain")
+                                .body(caddy_rs_http::StreamingBody::from_bytes(
+                                    Bytes::from_static(b"upstream error"),
+                                ))
+                                .expect("upstream response"),
+                        )
+                    },
+                );
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    address.to_string()
+}
+
+fn metrics_config(routes: serde_json::Value) -> Config {
+    Config::from_value(serde_json::json!({
+        "admin": {"listen": "127.0.0.1:0"},
+        "apps": {"http": {"servers": {"srv0": {
+            "listen": ["127.0.0.1:0"],
+            "routes": routes
+        }}}}
+    }))
+    .expect("test config decodes")
+}
+
+async fn rendered_metrics(runtime: &ServerRuntime) -> String {
+    let admin = runtime.admin_address().expect("admin bound");
+    let (status, _headers, metrics) = request(admin, "GET", "/metrics", &[]).await;
+    assert_eq!(status, 200);
+    String::from_utf8_lossy(&metrics).into_owned()
+}
+
+/// An upstream 5xx is a response, not a handler-chain error: the oracle increments
+/// `caddy_http_request_errors_total` only when the handler chain returns an error
+/// (`modules/caddyhttp/metrics.go:371-378`), so the series must not appear here.
+#[tokio::test]
+async fn upstream_5xx_response_is_not_a_handler_error() {
+    let upstream_dial = spawn_status_upstream(StatusCode::INTERNAL_SERVER_ERROR).await;
+    let config = metrics_config(serde_json::json!([{"handle": [
+        {"handler": "reverse_proxy", "upstreams": [{"dial": upstream_dial}]}
+    ]}]));
+    let (runtime, address) = start_proxy_config(config).await;
+
+    let (status, _headers, body) = request(address, "GET", "/", &[]).await;
+    assert_eq!(status, 500);
+    assert_eq!(body, Bytes::from_static(b"upstream error"));
+
+    let metrics = rendered_metrics(&runtime).await;
+    assert!(
+        !metrics.contains("caddy_http_request_errors_total"),
+        "an upstream 500 must not be counted as a middleware error:\n{metrics}"
+    );
+    // The request itself is still counted, with the upstream status on the histograms.
+    assert!(
+        metrics.contains("caddy_http_requests_total{handler=\"reverse_proxy\",server=\"srv0\"} 1"),
+        "missing requests counter for the proxied 500:\n{metrics}"
+    );
+    assert!(
+        metrics.contains(
+            "caddy_http_request_duration_seconds_count{code=\"500\",handler=\"reverse_proxy\",method=\"GET\",server=\"srv0\"} 1"
+        ),
+        "missing 500 latency sample:\n{metrics}"
+    );
+
+    runtime.shutdown().await;
+}
+
+/// A handler that returns an error (the `error` module) is a handler-chain error: the oracle
+/// increments `caddy_http_request_errors_total` even though the response is a 500.
+#[tokio::test]
+async fn handler_chain_error_increments_request_errors_total() {
+    let config = metrics_config(serde_json::json!([{"handle": [
+        {"handler": "error", "status_code": 500, "error": "boom"}
+    ]}]));
+    let (runtime, address) = start_proxy_config(config).await;
+
+    let (status, _headers, _body) = request(address, "GET", "/", &[]).await;
+    assert_eq!(status, 500);
+
+    let metrics = rendered_metrics(&runtime).await;
+    assert!(
+        metrics.contains("caddy_http_request_errors_total{handler=\"error\",server=\"srv0\"} 1"),
+        "a handler-chain error must be counted:\n{metrics}"
+    );
+
+    runtime.shutdown().await;
+}
+
+/// A loopback address nothing listens on. Port 1 is outside the ephemeral range, so parallel
+/// tests cannot rebind it and a dial is refused immediately.
+fn refused_dial_address() -> String {
+    "127.0.0.1:1".to_string()
+}
+
+/// `reverse_proxy` reports an unreachable upstream as a Caddy `HandlerError`, so even though
+/// caddy-rs serves the failure as a 502 *response* the request is still a handler-chain error and
+/// `caddy_http_request_errors_total` must be incremented (`modules/caddyhttp/metrics.go:371-378`).
+#[tokio::test]
+async fn upstream_dial_failure_increments_request_errors_total() {
+    let config = metrics_config(serde_json::json!([{"handle": [
+        {"handler": "reverse_proxy", "upstreams": [{"dial": refused_dial_address()}]}
+    ]}]));
+    let (runtime, address) = start_proxy_config(config).await;
+
+    let (status, _headers, _body) = request(address, "GET", "/", &[]).await;
+    assert_eq!(status, 502);
+
+    let metrics = rendered_metrics(&runtime).await;
+    assert!(
+        metrics.contains(
+            "caddy_http_request_errors_total{handler=\"reverse_proxy\",server=\"srv0\"} 1"
+        ),
+        "a dial failure is a handler-chain error and must be counted:\n{metrics}"
+    );
+
+    runtime.shutdown().await;
+}
+
+/// With error routes configured, caddy-rs routes an upstream 5xx *response* through
+/// `handle_errors`; that response is not a handler error and must not be counted. A dial failure,
+/// which is a handler error, must be counted even though both paths produce a 5xx response. This
+/// pins the counter's source to `reverse_proxy`'s own error, not to the router's error-route arm.
+#[tokio::test]
+async fn error_routes_count_dial_failures_but_not_upstream_5xx() {
+    let upstream_dial = spawn_status_upstream(StatusCode::INTERNAL_SERVER_ERROR).await;
+    let refused = refused_dial_address();
+    let config = Config::from_value(serde_json::json!({
+        "admin": {"listen": "127.0.0.1:0"},
+        "apps": {"http": {"servers": {"srv0": {
+            "listen": ["127.0.0.1:0"],
+            "routes": [
+                {
+                    "match": [{"path": ["/upstream"]}],
+                    "handle": [{"handler": "reverse_proxy", "upstreams": [{"dial": upstream_dial}]}]
+                },
+                {
+                    "match": [{"path": ["/refused"]}],
+                    "handle": [{"handler": "reverse_proxy", "upstreams": [{"dial": refused}]}]
+                }
+            ],
+            "errors": {"routes": [
+                {"handle": [{"handler": "static_response", "status_code": 500, "body": "handled"}]}
+            ]}
+        }}}}
+    }))
+    .expect("test config decodes");
+    let (runtime, address) = start_proxy_config(config).await;
+
+    // The upstream 500 is routed through `handle_errors` and stays a response.
+    let (status, _headers, body) = request(address, "GET", "/upstream", &[]).await;
+    assert_eq!(status, 500);
+    assert_eq!(body, Bytes::from_static(b"handled"));
+    let metrics = rendered_metrics(&runtime).await;
+    assert!(
+        !metrics.contains("caddy_http_request_errors_total"),
+        "an upstream 500 routed through error routes must not be counted:\n{metrics}"
+    );
+
+    // The dial failure is a handler error even though its 502 response is likewise routed
+    // through `handle_errors`.
+    let (status, _headers, body) = request(address, "GET", "/refused", &[]).await;
+    assert_eq!(status, 500);
+    assert_eq!(body, Bytes::from_static(b"handled"));
+    let metrics = rendered_metrics(&runtime).await;
+    assert!(
+        metrics.contains(
+            "caddy_http_request_errors_total{handler=\"reverse_proxy\",server=\"srv0\"} 1"
+        ),
+        "a dial failure must be counted even with error routes configured:\n{metrics}"
+    );
+
+    runtime.shutdown().await;
+}
+
+/// A dial address whose placeholder expands to nothing makes target resolution fail. Caddy reports
+/// that as a `HandlerError` (`modules/caddyhttp/reverseproxy/reverseproxy.go:677-680`), so the 502
+/// caddy-rs renders must still be counted as a handler-chain error
+/// (`modules/caddyhttp/metrics.go:371-380`).
+#[tokio::test]
+async fn placeholder_dial_expansion_failure_increments_request_errors_total() {
+    let config = metrics_config(serde_json::json!([{"handle": [
+        {
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": "{http.request.header.X-Upstream}"}]
+        }
+    ]}]));
+    let (runtime, address) = start_proxy_config(config).await;
+
+    // No `X-Upstream` header: the dial address expands to an empty string.
+    let (status, _headers, _body) = request(address, "GET", "/", &[]).await;
+    assert_eq!(status, 502);
+
+    let metrics = rendered_metrics(&runtime).await;
+    assert!(
+        metrics.contains(
+            "caddy_http_request_errors_total{handler=\"reverse_proxy\",server=\"srv0\"} 1"
+        ),
+        "a dial placeholder-expansion failure is a handler-chain error and must be counted:\n{metrics}"
+    );
+
+    runtime.shutdown().await;
+}
+
+/// Passive health checks can empty the upstream pool. Caddy reports "no available upstreams" as a
+/// `HandlerError` (`modules/caddyhttp/reverseproxy/reverseproxy.go:666-670`), so the 503 must be
+/// counted exactly like the 502 that took the only upstream out of rotation.
+#[tokio::test]
+async fn no_available_upstream_increments_request_errors_total() {
+    let config = metrics_config(serde_json::json!([{"handle": [
+        {
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": refused_dial_address()}],
+            "health_checks": {"passive": {"fail_duration": 10_000_000_000u64, "max_fails": 1}}
+        }
+    ]}]));
+    let (runtime, address) = start_proxy_config(config).await;
+
+    // The refused dial is a 502 (counted) and takes the only upstream out of rotation.
+    let (status, _headers, _body) = request(address, "GET", "/", &[]).await;
+    assert_eq!(status, 502);
+    // With no available upstream the proxy answers 503, which is a handler error too.
+    let (status, _headers, _body) = request(address, "GET", "/", &[]).await;
+    assert_eq!(status, 503);
+
+    let metrics = rendered_metrics(&runtime).await;
+    assert!(
+        metrics.contains(
+            "caddy_http_request_errors_total{handler=\"reverse_proxy\",server=\"srv0\"} 2"
+        ),
+        "both the dial failure and the no-available-upstream 503 must be counted:\n{metrics}"
+    );
+
+    runtime.shutdown().await;
+}

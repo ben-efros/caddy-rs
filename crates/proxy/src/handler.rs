@@ -1704,6 +1704,19 @@ fn merge_selection_cookie(response: &mut Response, selection: &Response) {
     merge_selection_cookie_headers(&mut response.headers, selection);
 }
 
+/// Mark a request whose proxy attempt failed internally before the failure is turned into a
+/// response.
+///
+/// Caddy's `reverse_proxy` returns a `HandlerError` for every internal proxy failure — no available
+/// upstream (`reverseproxy.go:666-670`), target resolution/placeholder-expansion failure
+/// (`reverseproxy.go:677-680`) and transport failure — and the server counts a handler-chain error
+/// when the chain returns one (`modules/caddyhttp/metrics.go:371-380`). caddy-rs renders those
+/// failures as responses, so each failure arm calls this helper to keep the counter aligned with the
+/// oracle. Success paths (including a retried-out upstream response) must not call it.
+fn mark_proxy_failure(request: &Request) {
+    request.mark_middleware_error();
+}
+
 /// Append the `Set-Cookie` headers accumulated in `selection` onto an arbitrary header map.
 fn merge_selection_cookie_headers(headers: &mut HeaderMap, selection: &Response) {
     for value in selection.headers.get_all(http::header::SET_COOKIE) {
@@ -1741,10 +1754,14 @@ impl Handler for ReverseProxyHandler {
                     )))
                 }
                 Err(error) => {
+                    // The proxy cannot read the request body, so it fails the attempt itself
+                    // rather than relaying a response: a handler-chain error (see
+                    // `mark_proxy_failure`).
+                    mark_proxy_failure(&request);
                     return Ok(Outcome::Respond(Response::text(
                         StatusCode::BAD_GATEWAY,
                         format!("502 Bad Gateway: cannot read request body: {error}"),
-                    )))
+                    )));
                 }
             }
         }
@@ -1774,6 +1791,9 @@ impl Handler for ReverseProxyHandler {
                 // No upstream is available. Caddy retries this state (an upstream may recover)
                 // and surfaces 503 when the retry budget is spent.
                 if !self.retry_allowed(attempts, deadline) {
+                    // No available upstream is a Caddy `HandlerError`
+                    // (`reverseproxy.go:666-670`), so the 503 counts as a handler-chain error.
+                    mark_proxy_failure(&request);
                     let mut response =
                         Response::text(StatusCode::SERVICE_UNAVAILABLE, "503 Service Unavailable");
                     merge_selection_cookie(&mut response, &selection);
@@ -1787,6 +1807,9 @@ impl Handler for ReverseProxyHandler {
                 match self.resolve_target(&upstream, &request) {
                     Ok(resolved) => resolved,
                     Err(error) => {
+                        // A target that cannot be resolved (dial placeholder expansion, malformed
+                        // address) is a Caddy `HandlerError` (`reverseproxy.go:677-680`).
+                        mark_proxy_failure(&request);
                         let mut response = Response::text(
                             StatusCode::BAD_GATEWAY,
                             format!("502 Bad Gateway: {error}"),
@@ -1805,6 +1828,10 @@ impl Handler for ReverseProxyHandler {
             let body = match self.attempt_body(&mut request, buffered_body, &mut stream_taken) {
                 Ok(body) => body,
                 Err(message) => {
+                    // The request body cannot be replayed for this attempt, so the proxy fails it
+                    // itself: a handler-chain error (see `mark_proxy_failure`). Unreachable today
+                    // because retries imply a buffered body, marked for uniformity.
+                    mark_proxy_failure(&request);
                     let mut response = Response::text(
                         StatusCode::BAD_GATEWAY,
                         format!("502 Bad Gateway: {message}"),
@@ -1920,7 +1947,12 @@ impl Handler for ReverseProxyHandler {
                         "caddy-rs: reverse_proxy upstream `{}` failed: {error}",
                         upstream.dial
                     );
+                    // Caddy's `reverse_proxy` reports an upstream failure as a `HandlerError`, so
+                    // the server increments `caddy_http_request_errors_total` whenever this arm
+                    // turns that error into a response instead of propagating it
+                    // (`modules/caddyhttp/metrics.go:371-378`).
                     if let Some(status) = error.explicit_status() {
+                        mark_proxy_failure(&request);
                         let mut response = Response::text(status, format!("{status}"));
                         merge_selection_cookie(&mut response, &selection);
                         return Ok(Outcome::Respond(response));
@@ -1932,6 +1964,7 @@ impl Handler for ReverseProxyHandler {
                     let retryable =
                         error.is_dial_error() || self.retry_match.matches_transport_error(&request);
                     if !retryable || !self.retry_allowed(attempts, deadline) {
+                        mark_proxy_failure(&request);
                         let mut response =
                             Response::text(StatusCode::BAD_GATEWAY, "502 Bad Gateway");
                         merge_selection_cookie(&mut response, &selection);
@@ -1965,12 +1998,15 @@ impl Handler for ReverseProxyHandler {
                     )))
                 }
                 Err(error) => {
+                    // Same handler-chain-error classification as the buffered path
+                    // (see `mark_proxy_failure`).
+                    mark_proxy_failure(&request);
                     return Ok(StreamingOutcome::Respond(StreamingResponse::from_buffered(
                         Response::text(
                             StatusCode::BAD_GATEWAY,
                             format!("502 Bad Gateway: cannot read request body: {error}"),
                         ),
-                    )))
+                    )));
                 }
             }
         }
@@ -1995,6 +2031,9 @@ impl Handler for ReverseProxyHandler {
                 .collect();
             let Some(upstream) = self.balancer.select(&candidates, &request, &mut selection) else {
                 if !self.retry_allowed(attempts, deadline) {
+                    // No available upstream is a Caddy `HandlerError`
+                    // (`reverseproxy.go:666-670`), so the 503 counts as a handler-chain error.
+                    mark_proxy_failure(&request);
                     let mut response =
                         Response::text(StatusCode::SERVICE_UNAVAILABLE, "503 Service Unavailable");
                     merge_selection_cookie(&mut response, &selection);
@@ -2010,6 +2049,9 @@ impl Handler for ReverseProxyHandler {
                 match self.resolve_target(&upstream, &request) {
                     Ok(resolved) => resolved,
                     Err(error) => {
+                        // A target that cannot be resolved (dial placeholder expansion, malformed
+                        // address) is a Caddy `HandlerError` (`reverseproxy.go:677-680`).
+                        mark_proxy_failure(&request);
                         let mut response = Response::text(
                             StatusCode::BAD_GATEWAY,
                             format!("502 Bad Gateway: {error}"),
@@ -2030,6 +2072,9 @@ impl Handler for ReverseProxyHandler {
             let body = match self.attempt_body(&mut request, buffered_body, &mut stream_taken) {
                 Ok(body) => body,
                 Err(message) => {
+                    // Same as the buffered path: an unreplayable body fails the attempt, which is
+                    // a handler-chain error (see `mark_proxy_failure`).
+                    mark_proxy_failure(&request);
                     let mut response = Response::text(
                         StatusCode::BAD_GATEWAY,
                         format!("502 Bad Gateway: {message}"),
@@ -2143,6 +2188,10 @@ impl Handler for ReverseProxyHandler {
                             match forwarded.body.into_bytes().await {
                                 Ok(body) => (Some(body), None),
                                 Err(error) => {
+                                    // `copy_response` could not read the upstream body, so the
+                                    // response handler fails the request: a handler-chain error
+                                    // (see `mark_proxy_failure`).
+                                    mark_proxy_failure(&request);
                                     let mut response = Response::text(
                                         StatusCode::BAD_GATEWAY,
                                         format!("502 Bad Gateway: cannot read upstream response body: {error}"),
@@ -2245,7 +2294,12 @@ impl Handler for ReverseProxyHandler {
                         "caddy-rs: reverse_proxy upstream `{}` failed: {error}",
                         upstream.dial
                     );
+                    // Caddy's `reverse_proxy` reports an upstream failure as a `HandlerError`, so
+                    // the server increments `caddy_http_request_errors_total` whenever this arm
+                    // turns that error into a response instead of propagating it
+                    // (`modules/caddyhttp/metrics.go:371-378`).
                     if let Some(status) = error.explicit_status() {
+                        mark_proxy_failure(&request);
                         let mut response = Response::text(status, format!("{status}"));
                         merge_selection_cookie(&mut response, &selection);
                         return Ok(StreamingOutcome::Respond(StreamingResponse::from_buffered(
@@ -2259,6 +2313,7 @@ impl Handler for ReverseProxyHandler {
                     let retryable =
                         error.is_dial_error() || self.retry_match.matches_transport_error(&request);
                     if !retryable || !self.retry_allowed(attempts, deadline) {
+                        mark_proxy_failure(&request);
                         let mut response =
                             Response::text(StatusCode::BAD_GATEWAY, "502 Bad Gateway");
                         merge_selection_cookie(&mut response, &selection);
