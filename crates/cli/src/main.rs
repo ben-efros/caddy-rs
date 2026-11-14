@@ -339,25 +339,7 @@ enum Command {
     /// A quick and production-ready reverse proxy
     #[command(
         about = "A quick and production-ready reverse proxy",
-        long_about = "A simple but production-ready reverse proxy. Useful for quick deployments,\n\
-                      demos, and development.\n\n\
-                      Simply shuttles HTTP(S) traffic from the --from address to the --to address.\n\
-                      Multiple --to addresses may be specified by repeating the flag.\n\n\
-                      Unless otherwise specified in the addresses, the --from address will be\n\
-                      assumed to be HTTPS if a hostname is given, and the --to address will be\n\
-                      assumed to be HTTP.\n\n\
-                      If the --from address resolves to HTTPS, this build requires\n\
-                      --internal-certs and a host: it issues a certificate from the local CA via\n\
-                      an explicit apps.tls.automation policy. Stock relies on Caddy's implicit\n\
-                      automatic HTTPS instead (DIV-0001); other HTTPS modes are rejected with a\n\
-                      located error rather than silently serving plaintext.\n\n\
-                      For proxying:\n\
-                        --header-up can be used to set a request header to send to the upstream.\n\
-                        --header-down can be used to set a response header to send back to the client.\n\
-                        --insecure disables TLS verification with the upstream. WARNING: THIS\n\
-                          DISABLES SECURITY BY NOT VERIFYING THE UPSTREAM'S CERTIFICATE.\n\n\
-                      --change-host-header is rejected because this build's replacer does not\n\
-                      implement the http.reverse_proxy.* placeholder namespace (DIV-0007).",
+        long_about = "A simple but production-ready reverse proxy. Useful for quick deployments,\ndemos, and development.\n\nSimply shuttles HTTP(S) traffic from the --from address to the --to address.\nMultiple --to addresses may be specified by repeating the flag.\n\nUnless otherwise specified in the addresses, the --from address will be\nassumed to be HTTPS if a hostname is given, and the --to address will be\nassumed to be HTTP.\n\nIf the --from address has a host or IP, Caddy will attempt to serve the\nproxy over HTTPS with a certificate (unless overridden by the HTTP scheme\nor port). This build derives automatic HTTPS from the host matcher on the\nTLS listener: local/internal names are issued by the local CA offline,\nwhile public names need reachable ACME and fail closed otherwise (DIV-0001).\nAn HTTPS --from that names no host is rejected with a located error.\n\nIf serving HTTPS:\n  --disable-redirects can be used to avoid binding to the HTTP port.\n  --internal-certs can be used to force issuance certs using the internal\n    CA instead of attempting to issue a public certificate.\n\nFor proxying:\n  --header-up can be used to set a request header to send to the upstream.\n  --header-down can be used to set a response header to send back to the client.\n  --insecure disables TLS verification with the upstream. WARNING: THIS\n    DISABLES SECURITY BY NOT VERIFYING THE UPSTREAM'S CERTIFICATE.\n\n--change-host-header is rejected because this build's replacer does not\nimplement the http.reverse_proxy.* placeholder namespace (DIV-0007).",
         override_usage = "caddy-rs reverse-proxy [--from <addr>] [--to <addr>] [--change-host-header] [--insecure] [--internal-certs] [--disable-redirects] [--header-up \"Field: value\"] [--header-down \"Field: value\"] [--access-log] [--debug]"
     )]
     ReverseProxy {
