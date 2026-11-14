@@ -1301,6 +1301,188 @@ async fn derived_http_listener_none_mode_emits_no_identity() {
     runtime.shutdown().await;
 }
 
+/// Two automatic-HTTPS servers that share one derived cleartext listener but resolve different
+/// `server_identity` values (DIV-0126).
+fn config_with_two_identities(storage_root: &str) -> Config {
+    // Distinct listen addresses: several servers may not share one listener, and each one
+    // terminates TLS on its own ephemeral port.
+    let server = |listen: &str, identity: &str| {
+        serde_json::json!({
+            "listen": [listen],
+            "tls_connection_policies": [{}],
+            "server_identity": identity,
+            "routes": [{
+                "match": [{"host": ["example.com"]}],
+                "handle": [{"handler": "static_response", "body": "hello https"}]
+            }]
+        })
+    };
+    Config::from_value(serde_json::json!({
+        "admin": {"disabled": true},
+        "storage": {"module": "file_system", "root": storage_root},
+        "apps": {
+            "tls": {"automation": {"policies": [{
+                "subjects": ["example.com"],
+                "issuers": [{"module": "acme", "ca": DIRECTORY, "email": "ops@example.com"}]
+            }]}},
+            "http": {
+                "http_port": 0,
+                "servers": {
+                    "srv0": server("127.0.0.1:0", "Alpha Server/1"),
+                    "srv1": server("127.0.0.2:0", "Beta Server/2")
+                }
+            }
+        }
+    }))
+    .expect("test config decodes")
+}
+
+/// Records the events tracing emits on the test thread, so the load-time identity warning can be
+/// asserted without installing a logging backend.
+#[derive(Clone, Default)]
+struct CapturedWarnings(Arc<Mutex<Vec<String>>>);
+
+impl CapturedWarnings {
+    fn events(&self) -> Vec<String> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+impl tracing::Subscriber for CapturedWarnings {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    // Without a level hint a thread-local subscriber may lose the race against the global
+    // level filter (other tests exercise the same callsite concurrently), so declare the
+    // most permissive filter explicitly.
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        Some(tracing::level_filters::LevelFilter::TRACE)
+    }
+
+    fn new_span(&self, _attributes: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Visitor {
+            message: String,
+            fields: Vec<String>,
+        }
+        impl tracing::field::Visit for Visitor {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.message = format!("{value:?}");
+                } else {
+                    self.fields.push(format!("{}={value:?}", field.name()));
+                }
+            }
+        }
+        let mut visitor = Visitor {
+            message: String::new(),
+            fields: Vec::new(),
+        };
+        event.record(&mut visitor);
+        self.0.lock().unwrap().push(format!(
+            "{} {} | {}",
+            event.metadata().level(),
+            visitor.message,
+            visitor.fields.join(" ")
+        ));
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+/// The single derived cleartext listener cannot carry two identities: the first automatic-HTTPS
+/// server (`srv0`, `apps.http.servers` order) wins everywhere on it, and the apply warns once so
+/// the operator is not left believing `srv1`'s identity is in effect for its HTTP-01/redirect
+/// responses (DIV-0126).
+#[tokio::test]
+async fn derived_http_listener_warns_when_automatic_servers_disagree_on_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().to_string_lossy().to_string();
+    let store = Arc::new(GenerationStore::with_builtin_registry());
+    store
+        .load(config_with_two_identities(&root))
+        .expect("config validates");
+    let mut runtime = ServerRuntime::new(Arc::clone(&store))
+        .with_acme_transport(Arc::new(FakeCa::new(false)))
+        .with_data_root(directory.path());
+
+    let warnings = CapturedWarnings::default();
+    let guard = tracing::subscriber::set_default(warnings.clone());
+    // Other tests touch the same callsites concurrently, so a stale interest cache could swallow
+    // the warning before this thread-local subscriber sees it.
+    tracing::callsite::rebuild_interest_cache();
+    runtime.apply().await.expect("automatic HTTPS apply");
+    drop(guard);
+
+    runtime
+        .challenge_tokens()
+        .insert("token-1", "token-1.thumbprint", "example.com")
+        .expect("token registers");
+    let http = runtime
+        .listener_address(":0")
+        .expect("derived HTTP listener bound");
+
+    // The redirect is a pre-router response from the derived listener: srv0's identity is used.
+    let (status, headers, _body) = plain_get(http, "example.com", "/some/path?x=1").await;
+    assert_eq!(status, 308);
+    assert_eq!(
+        header(&headers, "location"),
+        Some("https://example.com/some/path?x=1")
+    );
+    assert_eq!(
+        header(&headers, "server"),
+        Some("Alpha Server/1"),
+        "the first automatic-HTTPS server's identity wins on the shared derived listener"
+    );
+
+    // The HTTP-01 answer is the other pre-router response on the same listener and cannot switch
+    // identities per host, so it also carries srv0's identity.
+    let (status, headers, body) =
+        plain_get(http, "example.com", "/.well-known/acme-challenge/token-1").await;
+    assert_eq!(status, 200);
+    assert_eq!(body, "token-1.thumbprint");
+    assert_eq!(
+        header(&headers, "server"),
+        Some("Alpha Server/1"),
+        "srv1's identity must not be used on the derived listener"
+    );
+
+    let events = warnings.events();
+    // Apply also emits unrelated warnings (for example an issuer with no OCSP responder), so the
+    // per-apply count is asserted on the identity events rather than on every captured event.
+    let conflicts: Vec<&String> = events
+        .iter()
+        .filter(|event| event.contains("`server_identity`"))
+        .collect();
+    assert_eq!(
+        conflicts.len(),
+        1,
+        "exactly one identity-conflict warning per apply, got {events:?}"
+    );
+    assert!(
+        conflicts[0].starts_with("WARN"),
+        "the identity conflict must be logged at WARN, got {events:?}"
+    );
+    for expected in ["srv0", "Alpha Server/1", "srv1", "Beta Server/2"] {
+        assert!(
+            conflicts[0].contains(expected),
+            "warning must mention {expected:?}: {events:?}"
+        );
+    }
+
+    runtime.shutdown().await;
+}
+
 #[tokio::test]
 async fn disable_redirects_serves_http_without_redirect() {
     let directory = tempfile::tempdir().unwrap();

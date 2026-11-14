@@ -56,3 +56,4 @@ caddy-rs-config = { workspace = true }
 base64 = "0.23.1"
 ring = "0.17.14"
 tempfile = "3.27.0"
+tracing = { workspace = true }
