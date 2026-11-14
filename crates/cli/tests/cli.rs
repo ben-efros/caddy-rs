@@ -4568,3 +4568,288 @@ fn storage_import_cleans_a_dot_prefixed_archive_key_into_the_root() {
         b"ACCOUNT\n"
     );
 }
+
+// ---- `start` (background run with pingback) ---------------------------------------------------
+
+/// Write a valid JSON config with a random admin port, used by the `start`/`--pingback` tests.
+fn start_config(directory: &Path) -> std::path::PathBuf {
+    let path = directory.join("config.json");
+    std::fs::write(
+        &path,
+        r#"{"admin":{"listen":"127.0.0.1:0"},"apps":{"http":{"servers":{}}}}"#,
+    )
+    .expect("write start config");
+    path
+}
+
+/// Write a valid `Caddyfile` with random listener/admin ports, used by the no-flag `start` test.
+fn start_caddyfile(directory: &Path) -> std::path::PathBuf {
+    let path = directory.join("Caddyfile");
+    std::fs::write(
+        &path,
+        "{\n\tadmin 127.0.0.1:0\n}\n\n:0 {\n\trespond \"ok\"\n}\n",
+    )
+    .expect("write start Caddyfile");
+    path
+}
+
+/// The pid printed by `start` on success.
+fn start_pid(stdout: &str) -> i32 {
+    let rest = stdout
+        .split("pid=")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no pid in start output: {stdout}"));
+    rest.split(')')
+        .next()
+        .expect("pid closing parenthesis")
+        .trim()
+        .parse()
+        .expect("numeric pid")
+}
+
+/// Liveness via `kill(pid, 0)`, ignoring a zombie that a non-reaping PID 1 has not collected.
+fn process_alive(pid: i32) -> bool {
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        return false;
+    }
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => {
+            let state = stat
+                .rfind(')')
+                .and_then(|end| stat[end + 1..].trim_start().chars().next());
+            state != Some('Z')
+        }
+        Err(_) => false,
+    }
+}
+
+fn wait_for_process_exit(pid: i32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !process_alive(pid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    !process_alive(pid)
+}
+
+#[test]
+fn start_reports_success_and_runs_in_the_background() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = start_config(directory.path());
+    let stdout_path = directory.path().join("start.stdout");
+    let stderr_path = directory.path().join("start.stderr");
+    // Redirect to files rather than pipes: the background child inherits both streams, so a pipe
+    // would stay open (and `output()` would block) until the child exits.
+    let status = Command::new(binary())
+        .current_dir(directory.path())
+        .args(["start", "--config", config.to_str().unwrap()])
+        .env("XDG_CONFIG_HOME", directory.path())
+        .env("XDG_DATA_HOME", directory.path())
+        .stdout(Stdio::from(
+            std::fs::File::create(&stdout_path).expect("create stdout"),
+        ))
+        .stderr(Stdio::from(
+            std::fs::File::create(&stderr_path).expect("create stderr"),
+        ))
+        .status()
+        .expect("run caddy-rs start");
+    let stdout = std::fs::read_to_string(&stdout_path).expect("read start stdout");
+    let stderr = std::fs::read_to_string(&stderr_path).expect("read start stderr");
+    assert!(status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("Successfully started Caddy (pid="),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("Caddy is running in the background"),
+        "stdout: {stdout}"
+    );
+    let pid = start_pid(&stdout);
+    assert!(process_alive(pid), "child {pid} is not running: {stderr}");
+    // The child reports its admin address on the inherited stderr; after SIGTERM that endpoint
+    // must be gone too, not just the process.
+    let admin = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("caddy-rs: admin API listening on "))
+        .map(str::to_string);
+    assert!(admin.is_some(), "child reported no admin API: {stderr}");
+    assert_eq!(
+        unsafe { libc::kill(pid, libc::SIGTERM) },
+        0,
+        "SIGTERM {pid}"
+    );
+    assert!(
+        wait_for_process_exit(pid, Duration::from_secs(5)),
+        "child {pid} survived SIGTERM"
+    );
+    if let Some(admin) = admin {
+        assert!(
+            TcpStream::connect(&admin).is_err(),
+            "admin endpoint {admin} outlived the process"
+        );
+    }
+}
+
+#[test]
+fn start_without_config_loads_caddyfile_in_the_working_directory() {
+    let directory = tempfile::tempdir().unwrap();
+    start_caddyfile(directory.path());
+    let stdout_path = directory.path().join("start.stdout");
+    let stderr_path = directory.path().join("start.stderr");
+    let status = Command::new(binary())
+        .current_dir(directory.path())
+        .args(["start"])
+        .env("XDG_CONFIG_HOME", directory.path())
+        .env("XDG_DATA_HOME", directory.path())
+        .stdout(Stdio::from(
+            std::fs::File::create(&stdout_path).expect("create stdout"),
+        ))
+        .stderr(Stdio::from(
+            std::fs::File::create(&stderr_path).expect("create stderr"),
+        ))
+        .status()
+        .expect("run caddy-rs start");
+    let stdout = std::fs::read_to_string(&stdout_path).expect("read start stdout");
+    let stderr = std::fs::read_to_string(&stderr_path).expect("read start stderr");
+    assert!(status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("Successfully started Caddy (pid="),
+        "stdout: {stdout}"
+    );
+    let pid = start_pid(&stdout);
+    assert!(process_alive(pid), "child {pid} is not running: {stderr}");
+    assert_eq!(
+        unsafe { libc::kill(pid, libc::SIGTERM) },
+        0,
+        "SIGTERM {pid}"
+    );
+    assert!(
+        wait_for_process_exit(pid, Duration::from_secs(5)),
+        "child {pid} survived SIGTERM"
+    );
+}
+
+#[test]
+fn start_without_config_or_caddyfile_reports_child_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    let (code, stdout, stderr) = run_in(directory.path(), &["start"]);
+    assert_eq!(code, 1, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stderr.contains("no configuration to load"),
+        "child error not surfaced: {stderr}"
+    );
+    assert!(
+        stderr.contains("caddy process exited with error"),
+        "start did not report the child exit: {stderr}"
+    );
+    assert!(
+        !stdout.contains("Successfully started Caddy") && !stdout.contains("pid="),
+        "start reported an orphan as running: {stdout}"
+    );
+}
+
+#[test]
+fn start_reports_child_failure_without_leaving_an_orphan() {
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("missing.json");
+    let (code, stdout, stderr) = run_in(
+        directory.path(),
+        &["start", "--config", missing.to_str().unwrap()],
+    );
+    assert_eq!(code, 1, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stderr.contains("caddy process exited with error") || stderr.contains("cannot"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains("Successfully started Caddy") && !stdout.contains("pid="),
+        "start reported an orphan as running: {stdout}"
+    );
+}
+
+#[test]
+fn start_rejects_watch_and_pidfile_before_spawning() {
+    let directory = tempfile::tempdir().unwrap();
+    for (args, flag) in [
+        (vec!["start", "--watch"], "--watch"),
+        (vec!["start", "--pidfile", "caddy.pid"], "--pidfile"),
+    ] {
+        let (code, stdout, stderr) = run_in(directory.path(), &args);
+        assert_eq!(code, 1, "{flag}: stdout: {stdout}\nstderr: {stderr}");
+        assert!(stderr.contains(flag), "{flag}: stderr: {stderr}");
+        assert!(
+            stderr.contains("not supported") || stderr.contains("not implemented"),
+            "{flag}: stderr: {stderr}"
+        );
+        assert!(!stdout.contains("pid="), "{flag} spawned a child: {stdout}");
+    }
+}
+
+#[test]
+fn run_pingback_handshake_echoes_the_parent_token() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = start_config(directory.path());
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind pingback listener");
+    let address = listener.local_addr().expect("pingback address");
+    let mut child = Command::new(binary())
+        .current_dir(directory.path())
+        .args([
+            "run",
+            "--config",
+            config.to_str().unwrap(),
+            "--pingback",
+            &address.to_string(),
+        ])
+        .env("XDG_CONFIG_HOME", directory.path())
+        .env("XDG_DATA_HOME", directory.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn caddy-rs run --pingback");
+    let token: Vec<u8> = (0u8..32).collect();
+    child
+        .stdin
+        .as_mut()
+        .expect("piped stdin")
+        .write_all(&token)
+        .expect("write pingback token");
+    drop(child.stdin.take());
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut connection = None;
+    while Instant::now() < deadline {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                connection = Some(stream);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!("accept pingback connection: {error}"),
+        }
+    }
+    let mut connection = connection.expect("run --pingback did not connect back");
+    connection
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("read timeout");
+    let mut confirmation = [0u8; 32];
+    connection
+        .read_exact(&mut confirmation)
+        .expect("read pingback confirmation");
+    assert_eq!(confirmation.as_slice(), token.as_slice());
+    assert_eq!(
+        unsafe { libc::kill(child.id() as libc::c_int, libc::SIGTERM) },
+        0,
+        "SIGTERM pingback child"
+    );
+    assert!(
+        wait_for_child_exit(&mut child, Duration::from_secs(10)).is_some(),
+        "run --pingback child did not exit after SIGTERM"
+    );
+}
