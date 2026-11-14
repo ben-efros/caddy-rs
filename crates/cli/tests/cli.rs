@@ -6108,8 +6108,10 @@ fn reload_and_stop_reach_a_unix_socket_admin_endpoint() {
         status.expect("server exit status").success(),
         "server exited unsuccessfully"
     );
+    // The socket is unlinked during shutdown; allow the filesystem a moment to reflect that
+    // instead of racing the kernel/FS right after the child is reaped.
     assert!(
-        !socket.exists(),
+        wait_until(Duration::from_secs(5), || !socket.exists()),
         "the admin Unix socket is removed when the server exits"
     );
 }

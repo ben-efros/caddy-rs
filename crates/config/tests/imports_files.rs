@@ -640,9 +640,27 @@ fn stdin_absolute_import_requires_root_ownership() {
     let external = TempTree::new("stdin-owner-source");
     let imported = external.write("snippet.conf", "header X-Stdin yes\n");
     // Root-owned file: the owner anchor is unknown when adapting stdin, so the strict default
-    // (root-owned) applies and the import is accepted.
-    caddy_rs_config::adapt(&format!(":80 {{\n\timport {}\n}}\n", imported.display()))
-        .expect("a root-owned absolute import from stdin adapts");
+    // (root-owned) applies and the import is accepted. Some CI runners create fixtures under a
+    // user namespace, so the fixture may not actually be uid 0; in that case the same strict
+    // default must reject it (the rule is unchanged, only the expected outcome is derived from
+    // the fixture's real owner instead of assuming the test process runs as root).
+    let fixture_uid = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(&imported)
+            .expect("fixture metadata")
+            .uid()
+    };
+    let adapted = caddy_rs_config::adapt(&format!(":80 {{\n\timport {}\n}}\n", imported.display()));
+    if fixture_uid == 0 {
+        adapted.expect("a root-owned absolute import from stdin adapts");
+    } else {
+        let error =
+            adapted.expect_err("an absolute import from stdin not owned by root must be rejected");
+        assert!(
+            error.to_string().contains("must be owned by root"),
+            "{error}"
+        );
+    }
     // A third-uid file cannot be anchored to an importing Caddyfile owner, so it is rejected
     // instead of silently skipping the ownership rule (security review F2).
     if std::os::unix::fs::chown(&imported, Some(12345), Some(12345)).is_ok() {
