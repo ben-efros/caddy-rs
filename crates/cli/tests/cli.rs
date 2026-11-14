@@ -6016,3 +6016,100 @@ fn reverse_proxy_help_lists_the_command_and_its_flags() {
         "usage should follow stock's synopsis:\n{stdout}"
     );
 }
+
+/// Send one HTTP/1.1 request to the admin API over a Unix domain socket.
+#[cfg(unix)]
+fn unix_admin_request(socket: &std::path::Path, method: &str, target: &str) -> Option<String> {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    let mut stream = UnixStream::connect(socket).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    stream
+        .write_all(
+            format!("{method} {target} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .ok()?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).ok()?;
+    Some(response)
+}
+
+/// `admin.listen` may be a Unix domain socket, and `reload`/`stop --address unix/<path>` must reach
+/// the running server over it (and the server must remove the socket when it exits).
+#[cfg(unix)]
+#[test]
+fn reload_and_stop_reach_a_unix_socket_admin_endpoint() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let socket = directory.path().join("admin.sock");
+    let config = directory.path().join("config.json");
+    let listen = format!("unix/{}", socket.display());
+    std::fs::write(
+        &config,
+        serde_json::json!({
+            "admin": {"listen": listen},
+            "apps": {"http": {"servers": {"srv0": {
+                "listen": ["127.0.0.1:0"],
+                "routes": [{"handle": [{"handler": "static_response", "body": "ok"}]}]
+            }}}}
+        })
+        .to_string(),
+    )
+    .expect("write config");
+    let log = directory.path().join("server.stderr");
+    let stderr = std::fs::File::create(&log).expect("create child log");
+    let mut child = Command::new(binary())
+        .args([
+            "run",
+            "--config",
+            config.to_str().expect("utf-8 config path"),
+        ])
+        .env("CADDY_RS_DATA_DIR", directory.path().join("data"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .expect("spawn caddy-rs run");
+
+    let ready = wait_until(Duration::from_secs(15), || {
+        unix_admin_request(&socket, "GET", "/config/")
+            .is_some_and(|response| response.starts_with("HTTP/1.1 200"))
+    });
+    if !ready {
+        let contents = std::fs::read_to_string(&log).unwrap_or_default();
+        child_failure(
+            &mut child,
+            &log,
+            &format!("the unix-socket admin endpoint never answered:\n{contents}"),
+        );
+    }
+
+    let (code, stdout, stderr) = run(&[
+        "reload",
+        "--config",
+        config.to_str().expect("utf-8 config path"),
+        "--address",
+        &listen,
+    ]);
+    assert_eq!(code, 0, "reload stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    let (code, stdout, stderr) = run(&["stop", "--address", &listen]);
+    assert_eq!(code, 0, "stop stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    let status = wait_for_child_exit(&mut child, Duration::from_secs(15));
+    if status.is_none() {
+        let contents = std::fs::read_to_string(&log).unwrap_or_default();
+        child_failure(
+            &mut child,
+            &log,
+            &format!("the server did not exit after stop:\n{contents}"),
+        );
+    }
+    assert!(
+        status.expect("server exit status").success(),
+        "server exited unsuccessfully"
+    );
+    assert!(
+        !socket.exists(),
+        "the admin Unix socket is removed when the server exits"
+    );
+}

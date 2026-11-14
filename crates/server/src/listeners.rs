@@ -2357,12 +2357,180 @@ fn error_response() -> hyper::Response<Body> {
         .expect("static response is valid")
 }
 
+/// The hyper service that answers admin API requests on one connection.
+///
+/// Shared by the TCP and Unix listeners so both transports apply the same request conversion and
+/// the same [`caddy_rs_admin::ClientIdentity::NotPresented`] identity. The origin policy is applied
+/// inside [`AdminApi::handle`]. The future is boxed to name a `Send` type: the listeners spawn the
+/// connection task, and an anonymous `service_fn` type cannot express that bound.
+struct AdminService {
+    api: AdminApi,
+}
+
+impl Clone for AdminService {
+    fn clone(&self) -> Self {
+        Self {
+            api: self.api.clone(),
+        }
+    }
+}
+
+impl hyper::service::Service<hyper::Request<Incoming>> for AdminService {
+    type Response = hyper::Response<Body>;
+    type Error = std::convert::Infallible;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>,
+    >;
+
+    fn call(&self, request: hyper::Request<Incoming>) -> Self::Future {
+        let api = self.api.clone();
+        Box::pin(async move {
+            let (parts, body) = request.into_parts();
+            let body = match body.collect().await {
+                Ok(collected) => collected.to_bytes(),
+                Err(_) => Bytes::new(),
+            };
+            let path = parts
+                .uri
+                .path_and_query()
+                .map(|value| value.as_str().to_string())
+                .unwrap_or_else(|| "/".to_string());
+            let response = api
+                .handle(AdminRequest {
+                    method: parts.method,
+                    path,
+                    headers: parts.headers,
+                    body,
+                    client_identity: caddy_rs_admin::ClientIdentity::NotPresented,
+                })
+                .await;
+            let mut builder = hyper::Response::builder().status(response.status);
+            for (name, value) in &response.headers {
+                builder = builder.header(name, value);
+            }
+            Ok::<_, std::convert::Infallible>(
+                builder
+                    .body(Body::from_bytes(response.body))
+                    .expect("admin response is valid"),
+            )
+        })
+    }
+}
+
+/// Removes an admin Unix socket file when its accept loop ends.
+///
+/// The guard lives inside the listener task, so it runs after the reload/shutdown signal stops the
+/// loop and before `ListenerHandle::stop` returns - the next bind on the same path never sees a
+/// stale socket. A path another process has already recreated is removed too: Caddy owns its
+/// configured admin socket path for the lifetime of the listener.
+struct AdminSocketPath(std::path::PathBuf);
+
+impl Drop for AdminSocketPath {
+    fn drop(&mut self) {
+        match std::fs::remove_file(&self.0) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(path = %self.0.display(), %error, "cannot remove admin Unix socket");
+            }
+        }
+    }
+}
+
+/// Set the admin Unix socket to owner-only access (not Caddy's `0200` default).
+///
+/// Clients only need write permission to `connect(2)`, but an owner-only socket keeps the admin
+/// API unreachable for other users of the host, which is the reason to use a Unix socket instead
+/// of a loopback TCP port.
+fn set_admin_socket_permissions(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+/// Bind the admin API to a Unix domain socket.
+async fn bind_admin_unix(
+    configured: &str,
+    path: &str,
+    api: AdminApi,
+) -> Result<ListenerHandle, Error> {
+    let socket_path = std::path::Path::new(path);
+    // Unlike an inherited socket, a path we bind ourselves may hold a stale file from a killed
+    // process; `bind(2)` refuses an existing path, so remove it first (Caddy does the same).
+    if socket_path.exists() {
+        std::fs::remove_file(socket_path).map_err(|error| Error::bind(configured, error))?;
+    }
+    let listener =
+        UnixListener::bind(socket_path).map_err(|error| Error::bind(configured, error))?;
+    if let Err(error) = set_admin_socket_permissions(socket_path) {
+        let _ = std::fs::remove_file(socket_path);
+        return Err(Error::bind(configured, error));
+    }
+    let (shutdown, mut receiver) = watch::channel(false);
+    let (force, mut force_receiver) = watch::channel(false);
+    let tracker = Arc::new(ConnectionTracker::default());
+    let loop_tracker = Arc::clone(&tracker);
+    let cleanup = AdminSocketPath(socket_path.to_path_buf());
+    let task = tokio::spawn(async move {
+        let _cleanup = cleanup;
+        loop {
+            tokio::select! {
+                changed = receiver.changed() => {
+                    if changed.is_err() || *receiver.borrow() {
+                        break;
+                    }
+                }
+                changed = force_receiver.changed() => {
+                    if changed.is_err() || *force_receiver.borrow() {
+                        break;
+                    }
+                }
+                accepted = listener.accept() => {
+                    let Ok((stream, _peer)) = accepted else { continue };
+                    let connection_shutdown = receiver.clone();
+                    let connection_force = force_receiver.clone();
+                    let tracked = loop_tracker.guard();
+                    let service = AdminService { api: api.clone() };
+                    tokio::spawn(async move {
+                        let _tracked = tracked;
+                        let limits = Arc::new(ServerLimits::default());
+                        let activity = Arc::new(ConnectionActivity::default());
+                        serve_connection(
+                            stream,
+                            service,
+                            connection_shutdown,
+                            connection_force,
+                            limits,
+                            activity,
+                        )
+                        .await;
+                    });
+                }
+            }
+        }
+    });
+    Ok(ListenerHandle {
+        shutdown,
+        force,
+        tracker,
+        task,
+        bound: configured.to_string(),
+        socket_addr: None,
+    })
+}
+
 /// Bind the admin API listener.
+///
+/// Supports the same transports as Caddy's `admin.listen`: TCP (`[host]:port`) and Unix domain
+/// sockets (`unix/<absolute path>`, bound with owner-only permissions). The Unix socket file is
+/// removed when the listener stops, so reloads never leave stale sockets behind.
 pub(crate) async fn bind_admin(configured: &str, api: AdminApi) -> Result<ListenerHandle, Error> {
     let address = ListenAddr::parse(configured).map_err(|reason| Error::Listen {
         listen: configured.to_string(),
         reason,
     })?;
+    if address.network == Network::Unix {
+        return bind_admin_unix(configured, &address.address, api).await;
+    }
     if address.network != Network::Tcp {
         return Err(Error::NotImplemented {
             feature: "admin API on non-TCP listeners",
@@ -2396,41 +2564,9 @@ pub(crate) async fn bind_admin(configured: &str, api: AdminApi) -> Result<Listen
                     let connection_shutdown = receiver.clone();
                     let connection_force = force_receiver.clone();
                     let tracked = loop_tracker.guard();
+                    let service = AdminService { api };
                     tokio::spawn(async move {
                         let _tracked = tracked;
-                        let service = service_fn(move |request: hyper::Request<Incoming>| {
-                            let api = api.clone();
-                            async move {
-                                let (parts, body) = request.into_parts();
-                                let body = match body.collect().await {
-                                    Ok(collected) => collected.to_bytes(),
-                                    Err(_) => Bytes::new(),
-                                };
-                                let path = parts
-                                    .uri
-                                    .path_and_query()
-                                    .map(|value| value.as_str().to_string())
-                                    .unwrap_or_else(|| "/".to_string());
-                                let response = api
-                                    .handle(AdminRequest {
-                                        method: parts.method,
-                                        path,
-                                        headers: parts.headers,
-                                        body,
-                                        client_identity: caddy_rs_admin::ClientIdentity::NotPresented,
-                                    })
-                                    .await;
-                                let mut builder = hyper::Response::builder().status(response.status);
-                                for (name, value) in &response.headers {
-                                    builder = builder.header(name, value);
-                                }
-                                Ok::<_, std::convert::Infallible>(
-                                    builder
-                                        .body(Body::from_bytes(response.body))
-                                        .expect("admin response is valid"),
-                                )
-                            }
-                        });
                         let limits = Arc::new(ServerLimits::default());
                         let activity = Arc::new(ConnectionActivity::default());
                         serve_connection(
@@ -3280,5 +3416,87 @@ mod client_certificate_tests {
             !unverified.verified,
             "an unverified listener must not claim verification"
         );
+    }
+}
+
+/// Tests for the Unix-domain-socket admin listener (`admin.listen: "unix/<path>"`).
+#[cfg(test)]
+mod admin_unix_tests {
+    use super::bind_admin;
+    use caddy_rs_admin::AdminApi;
+    use caddy_rs_core::GenerationStore;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixStream;
+
+    fn api() -> AdminApi {
+        AdminApi::new(Arc::new(GenerationStore::with_builtin_registry()))
+    }
+
+    fn unix_listen(directory: &Path) -> (String, PathBuf) {
+        let path = directory.join("admin.sock");
+        (format!("unix/{}", path.display()), path)
+    }
+
+    #[tokio::test]
+    async fn serves_the_admin_api_over_a_unix_socket_with_owner_only_permissions() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (configured, path) = unix_listen(directory.path());
+        let handle = bind_admin(&configured, api())
+            .await
+            .expect("bind Unix admin listener");
+        assert_eq!(
+            handle.bound, configured,
+            "the handle reports the configured address"
+        );
+        let mode = std::fs::metadata(&path)
+            .expect("socket metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "admin socket is owner-only");
+        let mut stream = UnixStream::connect(&path)
+            .await
+            .expect("connect to the admin socket");
+        stream
+            .write_all(b"GET /config/ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write request");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .expect("read response");
+        let response = String::from_utf8_lossy(&response);
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "unix admin endpoint answers 200: {response}"
+        );
+        handle.stop().await;
+        assert!(
+            !path.exists(),
+            "the socket file is removed when the listener stops"
+        );
+    }
+
+    #[tokio::test]
+    async fn replaces_a_stale_path_and_can_rebind_after_stop() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (configured, path) = unix_listen(directory.path());
+        // A crashed process leaves the path behind; binding must reclaim it.
+        std::fs::write(&path, b"stale").expect("plant stale path");
+        let handle = bind_admin(&configured, api())
+            .await
+            .expect("bind over a stale path");
+        assert!(path.exists());
+        handle.stop().await;
+        assert!(!path.exists());
+        let handle = bind_admin(&configured, api())
+            .await
+            .expect("rebind after stop");
+        handle.stop().await;
+        assert!(!path.exists());
     }
 }
