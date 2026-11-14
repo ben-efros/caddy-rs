@@ -90,6 +90,7 @@ mod file_server;
 mod fmt;
 mod manpage;
 mod respond;
+mod reverse_proxy;
 mod setup;
 mod signals;
 mod storage;
@@ -334,6 +335,62 @@ enum Command {
         /// Specify precompression file extensions. Compression preference implied from flag order.
         #[arg(short = 'p', long, value_delimiter = ',', value_name = "EXT")]
         precompressed: Vec<String>,
+    },
+    /// A quick and production-ready reverse proxy
+    #[command(
+        about = "A quick and production-ready reverse proxy",
+        long_about = "A simple but production-ready reverse proxy. Useful for quick deployments,\n\
+                      demos, and development.\n\n\
+                      Simply shuttles HTTP(S) traffic from the --from address to the --to address.\n\
+                      Multiple --to addresses may be specified by repeating the flag.\n\n\
+                      Unless otherwise specified in the addresses, the --from address will be\n\
+                      assumed to be HTTPS if a hostname is given, and the --to address will be\n\
+                      assumed to be HTTP.\n\n\
+                      If the --from address resolves to HTTPS, this build requires\n\
+                      --internal-certs and a host: it issues a certificate from the local CA via\n\
+                      an explicit apps.tls.automation policy. Stock relies on Caddy's implicit\n\
+                      automatic HTTPS instead (DIV-0001); other HTTPS modes are rejected with a\n\
+                      located error rather than silently serving plaintext.\n\n\
+                      For proxying:\n\
+                        --header-up can be used to set a request header to send to the upstream.\n\
+                        --header-down can be used to set a response header to send back to the client.\n\
+                        --insecure disables TLS verification with the upstream. WARNING: THIS\n\
+                          DISABLES SECURITY BY NOT VERIFYING THE UPSTREAM'S CERTIFICATE.\n\n\
+                      --change-host-header is rejected because this build's replacer does not\n\
+                      implement the http.reverse_proxy.* placeholder namespace (DIV-0007).",
+        override_usage = "caddy-rs reverse-proxy [--from <addr>] [--to <addr>] [--change-host-header] [--insecure] [--internal-certs] [--disable-redirects] [--header-up \"Field: value\"] [--header-down \"Field: value\"] [--access-log] [--debug]"
+    )]
+    ReverseProxy {
+        /// Address on which to receive traffic
+        #[arg(short = 'f', long, value_name = "ADDR", default_value = "localhost")]
+        from: String,
+        /// Upstream address(es) to which traffic should be sent
+        #[arg(short = 't', long, value_delimiter = ',', value_name = "ADDR")]
+        to: Vec<String>,
+        /// Set upstream Host header to address of upstream (unsupported by this build)
+        #[arg(short = 'c', long)]
+        change_host_header: bool,
+        /// Disable TLS verification (WARNING: DISABLES SECURITY BY NOT VERIFYING TLS CERTIFICATES!)
+        #[arg(long)]
+        insecure: bool,
+        /// Disable HTTP->HTTPS redirects
+        #[arg(short = 'r', long)]
+        disable_redirects: bool,
+        /// Use internal CA for issuing certs
+        #[arg(short = 'i', long)]
+        internal_certs: bool,
+        /// Set a request header to send to the upstream (format: "Field: value")
+        #[arg(short = 'H', long, value_name = "FIELD: VALUE")]
+        header_up: Vec<String>,
+        /// Set a response header to send back to the client (format: "Field: value")
+        #[arg(short = 'd', long, value_name = "FIELD: VALUE")]
+        header_down: Vec<String>,
+        /// Enable the access log
+        #[arg(long)]
+        access_log: bool,
+        /// Enable verbose debug logs (unsupported by this build)
+        #[arg(short = 'v', long)]
+        debug: bool,
     },
     /// Print the environment as seen by this caddy-rs process.
     ///
@@ -1127,6 +1184,32 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 file_limit,
                 no_compress,
                 precompressed,
+            })
+            .await?;
+        }
+        Command::ReverseProxy {
+            from,
+            to,
+            change_host_header,
+            insecure,
+            disable_redirects,
+            internal_certs,
+            header_up,
+            header_down,
+            access_log,
+            debug,
+        } => {
+            reverse_proxy::run(reverse_proxy::Args {
+                from,
+                to,
+                change_host_header,
+                insecure,
+                disable_redirects,
+                internal_certs,
+                header_up,
+                header_down,
+                access_log,
+                debug,
             })
             .await?;
         }

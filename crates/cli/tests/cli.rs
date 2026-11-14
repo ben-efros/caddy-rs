@@ -5294,3 +5294,588 @@ fn file_server_help_lists_the_command_and_its_flags() {
         "usage should follow stock's synopsis:\n{stdout}"
     );
 }
+
+// ---- `reverse-proxy` command -----------------------------------------------------------------
+//
+// Each test spawns the compiled binary against a real local upstream (`std::net::TcpListener` in
+// a thread), issues a real HTTP/1.1 request, and asserts the proxied status/headers/body. The
+// helpers kill the child on drop, so a failing assertion cannot leave a listener behind.
+
+use std::sync::Arc;
+
+/// A spawned `caddy-rs reverse-proxy` process; killed on drop.
+struct ProxyProcess {
+    child: Child,
+    log: PathBuf,
+}
+
+impl ProxyProcess {
+    fn stop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
+    /// Send SIGTERM and wait for a graceful exit, then return the child's stderr.
+    ///
+    /// A graceful shutdown flushes the buffered access-log sink; SIGKILL would not.
+    fn terminate(&mut self) -> String {
+        // SAFETY: `child.id()` is this live child's pid; SIGTERM is a valid signal.
+        unsafe { libc::kill(self.child.id() as libc::c_int, libc::SIGTERM) };
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if self
+                .child
+                .try_wait()
+                .expect("poll reverse-proxy child")
+                .is_some()
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                self.stop();
+                panic!(
+                    "reverse-proxy did not exit after SIGTERM\nstderr:\n{}",
+                    std::fs::read_to_string(&self.log).unwrap_or_default()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        self.stderr()
+    }
+
+    fn stderr(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+}
+
+impl Drop for ProxyProcess {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Spawn `caddy-rs reverse-proxy` with `args`, optionally pointing it at `data_dir`.
+fn spawn_reverse_proxy(directory: &Path, args: &[&str], data_dir: Option<&Path>) -> ProxyProcess {
+    let log = directory.join("reverse-proxy.stderr");
+    let file = std::fs::File::create(&log).expect("create reverse-proxy stderr log");
+    let mut command = Command::new(binary());
+    command
+        .current_dir(directory)
+        .arg("reverse-proxy")
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(file));
+    match data_dir {
+        Some(data_dir) => command.env("CADDY_RS_DATA_DIR", data_dir),
+        None => command.env_remove("CADDY_RS_DATA_DIR"),
+    };
+    let child = command.spawn().expect("spawn caddy-rs reverse-proxy");
+    ProxyProcess { child, log }
+}
+
+/// Start `reverse-proxy` on a free loopback cleartext port, retrying if the port was taken before
+/// the child could bind it. Returns the running process and the port.
+fn start_reverse_proxy(directory: &Path, to: &[&str], extra: &[&str]) -> (ProxyProcess, u16) {
+    for attempt in 0..START_ATTEMPTS {
+        let port = free_port();
+        let from = format!("http://127.0.0.1:{port}");
+        let mut args: Vec<String> = vec!["--from".to_string(), from];
+        for upstream in to {
+            args.push("--to".to_string());
+            args.push((*upstream).to_string());
+        }
+        args.extend(extra.iter().map(|argument| argument.to_string()));
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let mut process = spawn_reverse_proxy(directory, &arg_refs, None);
+        // The banner is printed only after `apply` succeeded; requiring it (not just a connect)
+        // keeps a port claimed by another process from being mistaken for this child's listener.
+        let ready = wait_until(Duration::from_secs(15), || {
+            process.stderr().contains("caddy proxying from=")
+                && TcpStream::connect(("127.0.0.1", port)).is_ok()
+        });
+        if ready {
+            return (process, port);
+        }
+        let stderr = process.stderr();
+        let lost_port = is_address_in_use(&stderr);
+        process.stop();
+        if lost_port && attempt + 1 < START_ATTEMPTS {
+            continue;
+        }
+        panic!("reverse-proxy did not start on 127.0.0.1:{port}\nstderr:\n{stderr}");
+    }
+    unreachable!("reverse-proxy start attempts exhausted")
+}
+
+/// A local upstream: a thread answering every request with a fixed body and recording the
+/// request head it received.
+struct Upstream {
+    port: u16,
+    requests: Arc<Mutex<Vec<String>>>,
+}
+
+fn spawn_upstream(body: &'static str) -> Upstream {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind upstream listener");
+    let port = listener
+        .local_addr()
+        .expect("upstream local address")
+        .port();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&requests);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut byte) {
+                    Ok(1) => head.push(byte[0]),
+                    _ => break,
+                }
+            }
+            recorded
+                .lock()
+                .expect("record upstream request")
+                .push(String::from_utf8_lossy(&head).into_owned());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nX-Upstream: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body,
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    Upstream { port, requests }
+}
+
+/// GET `/` from the `reverse-proxy` child, retrying transient accept/reset races.
+fn proxy_get(process: &ProxyProcess, port: u16, headers: &[(&str, &str)]) -> HttpResponse {
+    let target = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut response = Vec::new();
+    let mut last_error = None;
+    for _ in 0..100 {
+        let attempt = (|| -> std::io::Result<Vec<u8>> {
+            let mut stream = TcpStream::connect_timeout(&target, Duration::from_secs(5))?;
+            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+            write!(stream, "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n")?;
+            for (name, value) in headers {
+                write!(stream, "{name}: {value}\r\n")?;
+            }
+            write!(stream, "Connection: close\r\n\r\n")?;
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response)?;
+            Ok(response)
+        })();
+        match attempt {
+            Ok(bytes) => {
+                response = bytes;
+                last_error = None;
+                break;
+            }
+            Err(error) => {
+                last_error = Some(error);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+    if let Some(error) = last_error {
+        panic!(
+            "reverse-proxy request failed: {error}\nstderr:\n{}",
+            process.stderr()
+        );
+    }
+    let split = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("response header terminator")
+        + 4;
+    let head = String::from_utf8_lossy(&response[..split]);
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .expect("status code");
+    let headers = head
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            Some((name.trim().to_ascii_lowercase(), value.trim().to_string()))
+        })
+        .collect();
+    HttpResponse {
+        status,
+        headers,
+        body: String::from_utf8_lossy(&response[split..]).into_owned(),
+    }
+}
+
+#[test]
+fn reverse_proxy_forwards_to_a_local_upstream() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let upstream = spawn_upstream("proxied body");
+    let (_server, port) = start_reverse_proxy(
+        directory.path(),
+        &[&format!("127.0.0.1:{}", upstream.port)],
+        &[],
+    );
+
+    let response = proxy_get(&_server, port, &[]);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, "proxied body");
+    assert_eq!(response.header("x-upstream"), Some("proxied body"));
+    assert!(
+        _server
+            .stderr()
+            .contains("caddy proxying from=http://127.0.0.1:"),
+        "stderr:\n{}",
+        _server.stderr()
+    );
+}
+
+#[test]
+fn reverse_proxy_distributes_across_multiple_upstreams() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let alpha = spawn_upstream("alpha-body");
+    let beta = spawn_upstream("beta-body");
+    let (_server, port) = start_reverse_proxy(
+        directory.path(),
+        &[
+            &format!("127.0.0.1:{}", alpha.port),
+            &format!("127.0.0.1:{}", beta.port),
+        ],
+        &[],
+    );
+    assert!(
+        _server
+            .stderr()
+            .contains("using default load balancing policy random"),
+        "stderr:\n{}",
+        _server.stderr()
+    );
+
+    let mut bodies = std::collections::BTreeSet::new();
+    for _ in 0..12 {
+        bodies.insert(proxy_get(&_server, port, &[]).body);
+    }
+    assert!(bodies.contains("alpha-body"), "bodies: {bodies:?}");
+    assert!(bodies.contains("beta-body"), "bodies: {bodies:?}");
+}
+
+#[test]
+fn reverse_proxy_sets_request_and_response_headers() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let upstream = spawn_upstream("headers");
+    let (_server, port) = start_reverse_proxy(
+        directory.path(),
+        &[&format!("127.0.0.1:{}", upstream.port)],
+        &[
+            "--header-up",
+            "X-From-Proxy: yes",
+            "--header-down",
+            "X-Down: from-down",
+        ],
+    );
+
+    let response = proxy_get(&_server, port, &[("X-Client", "yes")]);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.header("x-down"), Some("from-down"));
+    let requests = upstream.requests.lock().expect("upstream requests");
+    let head = requests.last().expect("upstream received the request");
+    assert!(
+        head.to_ascii_lowercase().contains("x-from-proxy: yes"),
+        "upstream request head:\n{head}"
+    );
+}
+
+#[test]
+fn reverse_proxy_access_log_is_written_to_stderr() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let upstream = spawn_upstream("logged");
+    let (mut server, port) = start_reverse_proxy(
+        directory.path(),
+        &[&format!("127.0.0.1:{}", upstream.port)],
+        &["--access-log"],
+    );
+
+    assert_eq!(proxy_get(&server, port, &[]).status, 200);
+    // A graceful shutdown flushes the buffered access-log sink; SIGKILL would not.
+    let stderr = server.terminate();
+    assert!(
+        stderr.contains("http.log.access") && stderr.contains("\"status\":200"),
+        "access log not written:\n{stderr}"
+    );
+}
+
+#[test]
+fn reverse_proxy_requires_to() {
+    let (code, _stdout, stderr) = run(&["reverse-proxy"]);
+    assert_eq!(code, 1, "stderr:\n{stderr}");
+    assert!(stderr.contains("--to"), "stderr:\n{stderr}");
+    assert!(stderr.contains("required"), "stderr:\n{stderr}");
+}
+
+#[test]
+fn reverse_proxy_rejects_invalid_addresses() {
+    for (args, expected) in [
+        (
+            vec![
+                "reverse-proxy",
+                "--from",
+                "http://localhost/path",
+                "--to",
+                "127.0.0.1:1",
+            ],
+            "paths are not allowed",
+        ),
+        (
+            vec![
+                "reverse-proxy",
+                "--from",
+                "ftp://localhost",
+                "--to",
+                "127.0.0.1:1",
+            ],
+            "unsupported scheme",
+        ),
+        (
+            vec![
+                "reverse-proxy",
+                "--from",
+                "http://localhost:8080",
+                "--to",
+                "ftp://example.com",
+            ],
+            "unsupported scheme",
+        ),
+        (
+            vec![
+                "reverse-proxy",
+                "--from",
+                "http://localhost:8080",
+                "--to",
+                "http://example.com:443",
+            ],
+            "conflicting scheme",
+        ),
+        (
+            vec![
+                "reverse-proxy",
+                "--from",
+                "http://localhost:8080",
+                "--to",
+                "example.com:70000",
+            ],
+            "invalid port",
+        ),
+    ] {
+        let (code, _stdout, stderr) = run(&args);
+        assert_eq!(code, 1, "{args:?} should fail; stderr:\n{stderr}");
+        assert!(
+            stderr.contains(expected),
+            "{args:?} stderr is missing {expected:?}:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("--from") || stderr.contains("--to"),
+            "{args:?} error is not located:\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn reverse_proxy_rejects_https_without_internal_certs_before_binding() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let port = free_port();
+    let from = format!("localhost:{port}");
+    let to = format!("127.0.0.1:{}", free_port());
+    let output = Command::new(binary())
+        .args(["reverse-proxy", "--from", &from, "--to", &to])
+        .current_dir(directory.path())
+        .env_remove("CADDY_RS_DATA_DIR")
+        .output()
+        .expect("run caddy-rs reverse-proxy");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr:\n{stderr}");
+    assert!(stderr.contains("--from"), "stderr:\n{stderr}");
+    assert!(stderr.contains("automatic HTTPS"), "stderr:\n{stderr}");
+    assert!(stderr.contains("DIV-0001"), "stderr:\n{stderr}");
+    assert!(stderr.contains("--internal-certs"), "stderr:\n{stderr}");
+    assert!(
+        !stderr.contains("caddy proxying"),
+        "the command must not start a server; stderr:\n{stderr}"
+    );
+    assert!(
+        TcpListener::bind(("127.0.0.1", port)).is_ok(),
+        "the listener address must not have been bound"
+    );
+}
+
+#[test]
+fn reverse_proxy_rejects_unsupported_flags() {
+    let to = format!("127.0.0.1:{}", free_port());
+    for (args, expected) in [
+        (vec!["reverse-proxy", "--debug"], "--debug"),
+        (
+            vec!["reverse-proxy", "--change-host-header"],
+            "--change-host-header",
+        ),
+        (
+            vec![
+                "reverse-proxy",
+                "--header-up",
+                "Host: {http.reverse_proxy.upstream.hostport}",
+            ],
+            "http.reverse_proxy",
+        ),
+        (
+            vec!["reverse-proxy", "--header-up", "no-colon"],
+            "--header-up",
+        ),
+        (
+            vec!["reverse-proxy", "--header-down", ": empty"],
+            "--header-down",
+        ),
+    ] {
+        let mut args = args;
+        args.push("--to");
+        args.push(&to);
+        let (code, _stdout, stderr) = run(&args);
+        assert_eq!(code, 1, "{args:?} should fail; stderr:\n{stderr}");
+        assert!(
+            stderr.contains(expected),
+            "{args:?} stderr is missing {expected:?}:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("caddy proxying"),
+            "{args:?} must not start a server; stderr:\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn reverse_proxy_https_with_internal_certs_starts_and_provisions_the_ca() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let data_dir = directory.path().join(".caddy-rs");
+    let upstream = spawn_upstream("tls upstream");
+    let port = free_port();
+    let from = format!("https://localhost:{port}");
+    let to = format!("127.0.0.1:{}", upstream.port);
+    let mut server = spawn_reverse_proxy(
+        directory.path(),
+        &[
+            "--from",
+            &from,
+            "--to",
+            &to,
+            "--internal-certs",
+            "--disable-redirects",
+        ],
+        None,
+    );
+    let ready = wait_until(Duration::from_secs(20), || {
+        server
+            .stderr()
+            .contains("caddy proxying from=https://localhost:")
+            && TcpStream::connect(("127.0.0.1", port)).is_ok()
+    });
+    assert!(
+        ready,
+        "reverse-proxy HTTPS did not start\nstderr:\n{}",
+        server.stderr()
+    );
+    let stderr = server.stderr();
+    assert!(
+        stderr.contains(&format!("caddy proxying from=https://localhost:{port}")),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("caddy proxying from=http://"),
+        "stderr:\n{stderr}"
+    );
+
+    // The listener is TLS, not cleartext: a plaintext HTTP request gets no HTTP response.
+    let mut stream =
+        TcpStream::connect(("127.0.0.1", port)).expect("connect to the HTTPS listener");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .expect("write plaintext request");
+    let mut plaintext = Vec::new();
+    let _ = stream.read_to_end(&mut plaintext);
+    assert!(
+        !String::from_utf8_lossy(&plaintext).starts_with("HTTP/1.1"),
+        "the HTTPS listener answered a cleartext request: {:?}",
+        String::from_utf8_lossy(&plaintext)
+    );
+
+    // The internal CA and a certificate for the `--from` host were provisioned under the data
+    // directory, which is the config-level evidence that the explicit automation policy ran.
+    let files = files_under(&data_dir);
+    assert!(
+        files
+            .iter()
+            .any(|path| path.to_string_lossy().contains("pki")),
+        "no CA material under {}: {files:?}",
+        data_dir.display()
+    );
+    assert!(
+        files
+            .iter()
+            .any(|path| path.to_string_lossy().contains("localhost")),
+        "no localhost certificate under {}: {files:?}",
+        data_dir.display()
+    );
+    assert_eq!(upstream.requests.lock().expect("upstream").len(), 0);
+    server.terminate();
+}
+
+/// Every file below `root`, recursively.
+fn files_under(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return files;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            files.extend(files_under(&path));
+        } else {
+            files.push(path);
+        }
+    }
+    files
+}
+
+#[test]
+fn reverse_proxy_help_lists_the_command_and_its_flags() {
+    let (code, stdout, stderr) = run(&["--help"]);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert!(stdout.contains("reverse-proxy"), "help:\n{stdout}");
+
+    let (code, stdout, stderr) = run(&["reverse-proxy", "--help"]);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    for flag in [
+        "--from",
+        "--to",
+        "--change-host-header",
+        "--insecure",
+        "--disable-redirects",
+        "--internal-certs",
+        "--header-up",
+        "--header-down",
+        "--access-log",
+        "--debug",
+    ] {
+        assert!(stdout.contains(flag), "help is missing {flag}:\n{stdout}");
+    }
+    assert!(
+        stdout.contains("reverse-proxy [--from"),
+        "usage should follow stock's synopsis:\n{stdout}"
+    );
+}
