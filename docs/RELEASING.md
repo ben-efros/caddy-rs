@@ -53,7 +53,11 @@ version string, which builds the same artefacts without creating a tag.
    ```sh
    cargo set-version --workspace 0.1.0          # or edit Cargo.toml directly
    cargo check --workspace                      # refreshes Cargo.lock
-   ( cd pm && cargo check --workspace --locked )  # refreshes pm/Cargo.lock
+   # `cargo set-version --workspace` edits only the root workspace manifest: set
+   # `[workspace.package] version` in `pm/Cargo.toml` by hand, then refresh the sidecar lockfile
+   # *without* `--locked` (a version bump is exactly the update `--locked` refuses) and prove the
+   # result with a locked check:
+   ( cd pm && cargo check --workspace && cargo check --workspace --locked )
    git commit -am "release: v0.1.0"
    ```
 
@@ -126,8 +130,9 @@ sudo install -m 0755 caddy-rs-pm /usr/local/bin/caddy-rs-pm
 caddy-rs-pm version
 ```
 
-`caddy-rs-pm install` then writes the systemd unit (the default `ExecStart` is the `caddy-rs-pm`
-binary on `PATH`), so installing both binaries from one archive is the supported deployment.
+`caddy-rs-pm install` then writes the systemd unit (the default `ExecStart` is the absolute path of
+the `caddy-rs-pm` binary that ran `install`; override it with `--binary-path`), so installing both
+binaries from one archive is the supported deployment.
 
 A container image is not published yet; the static archive is the portable option and runs on a
 distroless or `scratch` base image.

@@ -84,7 +84,9 @@ caddy-rs-pm 0.1.0-trial.6 (caddy-rs 0.1.0-trial.6)
 
 Release archives carry both binaries: `caddy-rs` and `caddy-rs-pm` are built from the same tag and
 the same target, so a sidecar never pairs with a mismatched data plane. Install both (the sidecar's
-`install` subcommand writes a systemd unit whose default `ExecStart` is `caddy-rs-pm` on `PATH`):
+`install` subcommand writes a systemd unit whose default `ExecStart` is the absolute path of the
+`caddy-rs-pm` binary that ran `install`; pass `--binary-path` or set `PM_BINARY_PATH` to point the
+unit at a different copy):
 
 ```sh
 sudo install -m 0755 caddy-rs /usr/local/bin/caddy-rs
