@@ -198,4 +198,11 @@ mod tests {
         assert_eq!(addr.port(), Some(8443));
         assert_eq!(addr.socket_addr(), Some("[::1]:8443".parse().unwrap()));
     }
+
+    /// Display impl for Unix addresses includes the network prefix for round-trip fidelity.
+    #[test]
+    fn displays_unix_address_with_network_prefix() {
+        let addr = ListenAddr::parse("unix//run/caddy.sock").unwrap();
+        assert_eq!(addr.to_string(), "unix//run/caddy.sock");
+    }
 }

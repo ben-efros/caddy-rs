@@ -2094,6 +2094,31 @@ mod tests {
         assert!(matcher.matches(&request));
     }
 
+    /// Header matcher values are compared exactly (case-sensitive), matching Caddy
+    /// `matchHeaders`' `actualFieldVal == allowedFieldVal`
+    /// (`external/caddy/modules/caddyhttp/matchers.go:1258`).
+    #[test]
+    fn header_matcher_values_are_case_sensitive() {
+        let matcher = HeaderMatcher {
+            fields: vec![(
+                "content-type".to_string(),
+                vec!["application/json".to_string()],
+            )],
+        };
+        let mut request = request("/", "x");
+        request
+            .headers
+            .insert("content-type", "application/json".parse().unwrap());
+        assert!(matcher.matches(&request));
+        request
+            .headers
+            .insert("content-type", "APPLICATION/JSON".parse().unwrap());
+        assert!(
+            !matcher.matches(&request),
+            "header values are case-sensitive: Caddy compares them with =="
+        );
+    }
+
     #[test]
     fn query_matcher_decodes_and_wildcards() {
         let matcher = QueryMatcher {
