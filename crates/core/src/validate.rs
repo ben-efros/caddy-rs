@@ -130,17 +130,19 @@ fn validate_admin_listen(listen: &str) -> Result<()> {
 ///
 /// caddy-rs resolves the admin endpoint's identity from PEM files (a documented deviation from
 /// upstream's certmagic issuance: this build has no ACME issuance path for the admin endpoint).
+/// `identifiers` selects a certificate to issue/obtain upstream; with a fixed PEM identity it has
+/// no meaning, so a non-empty list is rejected instead of being accepted and ignored (T-ADMIN-061).
 fn validate_admin_identity(identity: Option<&AdminIdentity>) -> Result<()> {
     let Some(identity) = identity else {
         return Ok(());
     };
-    for (index, identifier) in identity.identifiers.iter().enumerate() {
-        if identifier.trim().is_empty() {
-            return Err(Error::invalid(
-                format!("admin.identity.identifiers[{index}]"),
-                "identity identifier must not be empty",
-            ));
-        }
+    if !identity.identifiers.is_empty() {
+        return Err(Error::invalid(
+            "admin.identity.identifiers",
+            "admin identity `identifiers` are not supported: this build binds the admin endpoint \
+             identity to `admin.identity.certificate` and `admin.identity.key` (PEM files) and \
+             never issues or selects a certificate by name; remove `identifiers`",
+        ));
     }
     if let Some(issuers) = &identity.issuers {
         if !issuers.is_empty() {
@@ -302,8 +304,8 @@ fn validate_admin_access(index: usize, access: &AdminAccess) -> Result<()> {
     if !access.has_selectors() {
         return Err(Error::invalid(
             format!("admin.remote.access_control[{index}]"),
-            "access-control entry names no identities; list `public_keys` certificates \
-             (and/or this build's `subjects`/`serials` selectors)",
+            "access-control entry names no identities; list `public_keys` trust anchors \
+             (`subjects`/`serials` only filter a public-key match and never authorize alone)",
         ));
     }
     for (permission_index, permission) in access.permissions.iter().enumerate() {
@@ -312,7 +314,11 @@ fn validate_admin_access(index: usize, access: &AdminAccess) -> Result<()> {
     Ok(())
 }
 
-/// Decode one base64 DER certificate and check it is a DER SEQUENCE (an X.509 certificate).
+/// Decode one base64 DER certificate and check it parses as an X.509 certificate.
+///
+/// A shape check of the outer SEQUENCE alone accepted any DER SEQUENCE (for example
+/// `30 03 02 01 01`), which then failed only when the listener built its trust pool. The parse
+/// below rejects non-certificate DER at load time with a located error (T-ADMIN-061).
 fn validate_admin_public_key(key: &str) -> std::result::Result<(), String> {
     use base64::Engine as _;
     let der = base64::engine::general_purpose::STANDARD
@@ -320,32 +326,109 @@ fn validate_admin_public_key(key: &str) -> std::result::Result<(), String> {
         .map_err(|error| {
             format!("public key is not base64-encoded DER (the contents of a PEM block): {error}")
         })?;
-    if der.len() < 4 || der[0] != 0x30 {
-        return Err(
-            "public key is not a DER certificate: expected a SEQUENCE (X.509 certificate)"
-                .to_string(),
-        );
-    }
-    // Definite-form length must fit inside the buffer.
-    let mut position = 1;
-    let first = der[position];
-    position += 1;
-    let content_length = if first & 0x80 == 0 {
-        usize::from(first)
+    parse_x509_certificate(&der)
+        .map_err(|reason| format!("public key is not a DER X.509 certificate: {reason}"))
+}
+
+/// One DER TLV: the tag, its content, and the bytes following the element.
+fn read_der_element(input: &[u8]) -> std::result::Result<(u8, &[u8], &[u8]), String> {
+    let Some((&tag, rest)) = input.split_first() else {
+        return Err("truncated DER element".to_string());
+    };
+    let Some((&first, rest)) = rest.split_first() else {
+        return Err("truncated DER length".to_string());
+    };
+    let (length, rest) = if first & 0x80 == 0 {
+        (usize::from(first), rest)
     } else {
         let octets = usize::from(first & 0x7f);
-        if octets == 0 || octets > std::mem::size_of::<usize>() || position + octets > der.len() {
-            return Err("public key is not a DER certificate: malformed length".to_string());
+        if octets == 0 {
+            return Err("indefinite DER length is not allowed".to_string());
+        }
+        if octets > std::mem::size_of::<usize>() || rest.len() < octets {
+            return Err("truncated DER length".to_string());
         }
         let mut length = 0usize;
-        for _ in 0..octets {
-            length = (length << 8) | usize::from(der[position]);
-            position += 1;
+        for byte in &rest[..octets] {
+            length = (length << 8) | usize::from(*byte);
         }
-        length
+        (length, &rest[octets..])
     };
-    if position + content_length > der.len() {
-        return Err("public key is not a DER certificate: truncated".to_string());
+    if rest.len() < length {
+        return Err("DER element length runs past the buffer".to_string());
+    }
+    Ok((tag, &rest[..length], &rest[length..]))
+}
+
+/// Structural parse of `Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm,
+/// signatureValue }` (`RFC 5280` §4.1).
+///
+/// This checks the fields that make the DER a certificate rather than an arbitrary SEQUENCE; it is
+/// deliberately not a signature or extension validator (the TLS layer performs full WebPKI
+/// verification when the anchor is used).
+fn parse_x509_certificate(der: &[u8]) -> std::result::Result<(), String> {
+    let (tag, certificate, trailing) = read_der_element(der)?;
+    if tag != 0x30 {
+        return Err("certificate is not a SEQUENCE".to_string());
+    }
+    if !trailing.is_empty() {
+        return Err("trailing data after the certificate SEQUENCE".to_string());
+    }
+    let (tag, tbs, rest) = read_der_element(certificate)?;
+    if tag != 0x30 {
+        return Err("tbsCertificate is not a SEQUENCE".to_string());
+    }
+    let (tag, algorithm, rest) = read_der_element(rest)?;
+    if tag != 0x30 {
+        return Err("signatureAlgorithm is not a SEQUENCE".to_string());
+    }
+    let (oid_tag, oid, _) = read_der_element(algorithm)?;
+    if oid_tag != 0x06 || oid.is_empty() {
+        return Err("signatureAlgorithm has no algorithm OBJECT IDENTIFIER".to_string());
+    }
+    let (tag, signature, rest) = read_der_element(rest)?;
+    if tag != 0x03 || signature.is_empty() {
+        return Err("signatureValue is not a BIT STRING".to_string());
+    }
+    if !rest.is_empty() {
+        return Err("trailing data after signatureValue".to_string());
+    }
+
+    let mut fields = tbs;
+    // version [0] EXPLICIT Version OPTIONAL.
+    if fields.first() == Some(&0xa0) {
+        fields = read_der_element(fields)?.2;
+    }
+    for (name, expected) in [
+        ("serialNumber", 0x02),
+        ("signature", 0x30),
+        ("issuer", 0x30),
+        ("validity", 0x30),
+        ("subject", 0x30),
+        ("subjectPublicKeyInfo", 0x30),
+    ] {
+        let (tag, content, rest) = read_der_element(fields)
+            .map_err(|error| format!("tbsCertificate has no {name}: {error}"))?;
+        if tag != expected {
+            return Err(format!(
+                "tbsCertificate {name} has DER tag {tag:#04x}, expected {expected:#04x}"
+            ));
+        }
+        if content.is_empty() {
+            return Err(format!("tbsCertificate {name} is empty"));
+        }
+        fields = rest;
+    }
+    // Optional trailing fields: issuerUniqueID [1], subjectUniqueID [2], extensions [3]
+    // (RFC 5280 §4.1.2.1; the implicit tags are 0x81/0x82, extensions are explicit 0xa3).
+    while !fields.is_empty() {
+        let (tag, _, rest) = read_der_element(fields)?;
+        if !matches!(tag, 0x81 | 0x82 | 0xa1 | 0xa2 | 0xa3) {
+            return Err(format!(
+                "tbsCertificate has an unexpected trailing field with DER tag {tag:#04x}"
+            ));
+        }
+        fields = rest;
     }
     Ok(())
 }
@@ -3286,7 +3369,8 @@ mod admin_remote_tests {
     use super::*;
 
     /// `SEQUENCE { INTEGER 1 }`, the smallest DER certificate stand-in for shape checks.
-    const DER_CERT_BASE64: &str = "MAMCAQE=";
+    /// A real (EC P-256) CA certificate in base64 DER; the validator now parses certificates.
+    const DER_CERT_BASE64: &str = "MIIBojCCAUegAwIBAgIUXSrE1Zqi5YWnIICTe2JQhvgwGFcwCgYIKoZIzj0EAwIwHTEbMBkGA1UEAwwSY2FkZHktcnMgdGVzdCBDQSBhMCAXDTI2MTExNDEyNTYwNVoYDzIxMjYxMDIxMTI1NjA1WjAdMRswGQYDVQQDDBJjYWRkeS1ycyB0ZXN0IENBIGEwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASCu7Q8D1ZJhWt8Wzp+B28nV/VI/4vTUwNyqbjL7ZWVQXu0Qw0jw2Av6dzQPHHtZkufXJgbbpt5/edxLZ+WAMSco2MwYTAdBgNVHQ4EFgQUAogDsh8dKTftXNVR0vKCiKCJZlIwHwYDVR0jBBgwFoAUAogDsh8dKTftXNVR0vKCiKCJZlIwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAQYwCgYIKoZIzj0EAwIDSQAwRgIhAL1JeHt2LYukeNl/SEozXS1I/t9rU/1KUT2qXXGEeQ9IAiEA6NmP85W91vFvM+0jjafum65hzdMDeoFJF7T9RcDRmeU=";
 
     struct Fixture {
         directory: std::path::PathBuf,
@@ -3343,7 +3427,6 @@ mod admin_remote_tests {
 
     fn identity(fixture: &Fixture) -> Value {
         serde_json::json!({
-            "identifiers": ["admin.example.com"],
             "certificate": fixture.certificate(),
             "key": fixture.key(),
         })
@@ -3475,6 +3558,44 @@ mod admin_remote_tests {
         }));
         let error = validate(&config).expect_err("base64 DER is required");
         assert!(error.to_string().contains("base64"), "{error}");
+    }
+
+    #[test]
+    fn non_certificate_der_public_key_is_rejected() {
+        let fixture = Fixture::new("non-cert-der");
+        let config = config(serde_json::json!({
+            "identity": identity(&fixture),
+            "remote": remote_with(serde_json::json!([{
+                // A DER SEQUENCE containing an INTEGER: valid DER, not a certificate.
+                "public_keys": ["MAMCAQE="]
+            }]))
+        }));
+        let error = validate(&config).expect_err("a DER SEQUENCE is not a certificate");
+        assert!(
+            error
+                .to_string()
+                .contains("admin.remote.access_control[0].public_keys[0]"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("X.509 certificate"), "{error}");
+    }
+
+    #[test]
+    fn identity_identifiers_are_rejected() {
+        let fixture = Fixture::new("identifiers");
+        let config = config(serde_json::json!({
+            "identity": {
+                "identifiers": ["admin.example.com"],
+                "certificate": fixture.certificate(),
+                "key": fixture.key(),
+            },
+            "remote": remote_with(serde_json::json!([{ "public_keys": [DER_CERT_BASE64] }]))
+        }));
+        let error = validate(&config).expect_err("identifiers are inert with a PEM identity");
+        assert!(
+            error.to_string().contains("admin.identity.identifiers"),
+            "{error}"
+        );
     }
 
     #[test]

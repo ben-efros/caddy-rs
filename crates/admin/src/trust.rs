@@ -856,7 +856,6 @@ fn is_executable(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -873,12 +872,34 @@ mod tests {
     }
 
     fn write_executable(path: &Path, script: &str) {
-        let mut file = std::fs::File::create(path).unwrap();
-        file.write_all(script.as_bytes()).unwrap();
-        drop(file);
-        let mut permissions = std::fs::metadata(path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(path, permissions).unwrap();
+        // Stage in a unique sibling and rename into place: the path that is later executed is
+        // never open for writing, which avoids the `ETXTBSY` race with parallel test threads.
+        let staging = path.with_extension(format!(
+            "staging-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&staging, script).unwrap();
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(&staging, path).unwrap();
+    }
+
+    /// Run a plan, retrying the `ETXTBSY` race that parallel test threads can still trigger: a
+    /// `fork` in another test can inherit a just-written stub's descriptor, so `exec` of that
+    /// script briefly reports "Text file busy" even though the file itself is unchanged.
+    fn execute(plan: &TrustPlan) -> Result<TrustReport, TrustError> {
+        for attempt in 0..100 {
+            match plan.execute() {
+                Err(error) if error.to_string().contains("Text file busy") && attempt < 99 => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                result => return result,
+            }
+        }
+        unreachable!("the retry loop always returns")
     }
 
     fn root_certificate(directory: &Path) -> PathBuf {
@@ -904,7 +925,7 @@ mod tests {
         assert_eq!(plan.targets.len(), 1);
         let target = &plan.targets[0];
         assert!(target.status.is_ready());
-        let report = plan.execute().unwrap();
+        let report = execute(&plan).unwrap();
         assert_eq!(report.installed, vec![TrustStoreKind::Platform]);
         let installed = directory.join("usr/local/share/ca-certificates/caddy-rs-local.crt");
         assert!(installed.is_file(), "{}", installed.display());
@@ -928,7 +949,7 @@ mod tests {
             limitation.contains("update-ca-certificates"),
             "{limitation}"
         );
-        let report = plan.execute().unwrap();
+        let report = execute(&plan).unwrap();
         assert_eq!(report.skipped.len(), 1);
         assert!(report.skipped[0].1.contains("update-ca-certificates"));
         assert!(!report.any_trusted());
@@ -977,7 +998,7 @@ mod tests {
             .collect();
         assert_eq!(plan.targets.len(), 4, "{kinds:?}"); // platform + 2 NSS + Java
         assert!(plan.targets.iter().all(|target| target.status.is_ready()));
-        let report = plan.execute().unwrap();
+        let report = execute(&plan).unwrap();
         assert_eq!(report.installed.len(), 4, "{report:?}");
         let log = std::fs::read_to_string(&calls).unwrap();
         assert!(log.contains("certutil -d sql:"), "{log}");
@@ -1012,12 +1033,12 @@ mod tests {
         )
         .with_platform_prefix(&directory);
         let plan = TrustPlan::detect("local", &root, &environment);
-        let first = plan.execute().unwrap();
+        let first = execute(&plan).unwrap();
         assert!(first
             .installed
             .iter()
             .any(|kind| matches!(kind, TrustStoreKind::Nss { .. })));
-        let second = plan.execute().unwrap();
+        let second = execute(&plan).unwrap();
         assert!(
             second
                 .already_installed
@@ -1065,7 +1086,7 @@ mod tests {
                 .any(|limitation| limitation.contains("keytool")),
             "{limitations:?}"
         );
-        let report = plan.execute().unwrap();
+        let report = execute(&plan).unwrap();
         assert!(report.installed.contains(&TrustStoreKind::Platform));
         assert_eq!(report.skipped.len(), 2, "{report:?}");
     }
@@ -1079,7 +1100,7 @@ mod tests {
             let plan = TrustPlan::detect("local", &root, &environment);
             let limitation = plan.targets[0].status.limitation().unwrap();
             assert!(!limitation.is_empty(), "{platform:?}");
-            let report = plan.execute().unwrap();
+            let report = execute(&plan).unwrap();
             assert_eq!(report.skipped.len(), 1);
             assert!(!report.any_trusted());
         }
