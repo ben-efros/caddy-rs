@@ -44,6 +44,10 @@ hyper = { workspace = true }
 hyper-util = { workspace = true }
 httpdate = "1.0.3"
 rustls = { version = "0.23.45", default-features = false, features = ["std", "aws_lc_rs", "tls12", "logging"] }
+# WebPKI path validation of a presented client-certificate chain against one configured
+# `admin.remote.access_control` anchor (T-ADMIN-061). Same crate/version rustls already uses;
+# the provider feature matches rustls's aws-lc-rs provider so no second crypto backend is added.
+rustls-webpki = { version = "0.103.16", default-features = false, features = ["std", "aws-lc-rs"] }
 hyper-rustls = { version = "0.27.10", default-features = false, features = ["http1", "http2", "tls12", "logging", "aws-lc-rs"] }
 # Proxy support for ACME `network_proxy`: a tower-service connector that upgrades the proxy
 # CONNECT tunnel with rustls before handing it to hyper (T-TLS-070).

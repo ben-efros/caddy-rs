@@ -29,12 +29,31 @@ impl Drop for Certificates {
     }
 }
 
+/// Whether the `openssl` CLI is available to mint the test certificates.
+///
+/// The workspace carries no certificate-generation crate, so this integration test shells out.
+/// A missing binary skips the test with an explicit message instead of panicking inside a helper.
+fn openssl_available() -> bool {
+    std::process::Command::new("openssl")
+        .arg("version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 fn openssl(directory: &Path, arguments: &[&str]) {
     let output = std::process::Command::new("openssl")
         .current_dir(directory)
         .args(arguments)
         .output()
-        .expect("openssl is available for this integration test");
+        .unwrap_or_else(|error| {
+            panic!(
+                "the `openssl` CLI is required to mint remote-admin test certificates and could \
+                 not be run ({error}); install openssl or skip this test"
+            )
+        });
     assert!(
         output.status.success(),
         "openssl {arguments:?} failed: {}",
@@ -146,7 +165,6 @@ fn config(certificates: &Certificates) -> Config {
         "admin": {
             "listen": "127.0.0.1:0",
             "identity": {
-                "identifiers": ["localhost"],
                 "certificate": certificates.server_pem.to_string_lossy(),
                 "key": certificates.server_key_pem.to_string_lossy(),
             },
@@ -200,6 +218,13 @@ async fn plaintext_status(address: SocketAddr, request: &[u8]) -> String {
 
 #[tokio::test]
 async fn runtime_starts_remote_admin_beside_the_plaintext_listener() {
+    if !openssl_available() {
+        eprintln!(
+            "skipping runtime_starts_remote_admin_beside_the_plaintext_listener: the `openssl` \
+             CLI is not available to mint the test certificates"
+        );
+        return;
+    }
     let certificates = certificates("runtime");
     let store = Arc::new(GenerationStore::with_builtin_registry());
     store

@@ -16,7 +16,52 @@
 
 use std::collections::BTreeMap;
 
-use rustls::pki_types::CertificateDer;
+use rustls::pki_types::{CertificateDer, UnixTime};
+
+/// Whether a presented certificate chain verifies to a configured trust anchor.
+///
+/// `presented` is the peer chain as rustls reports it (DER, leaf first, then any intermediates;
+/// the trust anchor is normally not included). `anchor_der` is one configured trust anchor — for
+/// the remote admin endpoint, one `admin.remote.access_control[*].public_keys` entry.
+///
+/// This is the identity-binding operation for remote administration (T-ADMIN-061): the mutual-TLS
+/// listener accepts any client whose chain verifies against the *union* of configured anchors, so
+/// application-layer identity matching must re-verify the presented chain against the individual
+/// anchor that an access-control entry names. The verification is the same WebPKI path validation
+/// (signature chain, validity, client-auth EKU) rustls performs during the handshake, so a
+/// configured root or intermediate key authorizes exactly the clients it issued.
+///
+/// Residual: the check runs after the handshake and uses the wall clock at decision time; a
+/// certificate that expired between handshake and request fails here (fail closed). No
+/// distinguished-name information participates in the result.
+pub fn chain_anchored_by(anchor_der: &[u8], presented: &[Vec<u8>]) -> bool {
+    let Some((leaf, intermediates)) = presented.split_first() else {
+        return false;
+    };
+    let leaf = CertificateDer::from(leaf.clone());
+    let Ok(end_entity) = webpki::EndEntityCert::try_from(&leaf) else {
+        return false;
+    };
+    let anchor_der = CertificateDer::from(anchor_der.to_vec());
+    let Ok(anchor) = webpki::anchor_from_trusted_cert(&anchor_der) else {
+        return false;
+    };
+    let intermediates: Vec<CertificateDer<'static>> = intermediates
+        .iter()
+        .map(|der| CertificateDer::from(der.clone()))
+        .collect();
+    end_entity
+        .verify_for_usage(
+            webpki::ALL_VERIFICATION_ALGS,
+            &[anchor],
+            &intermediates,
+            UnixTime::now(),
+            webpki::KeyUsage::client_auth(),
+            None,
+            None,
+        )
+        .is_ok()
+}
 
 /// Client-certificate field extraction errors.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

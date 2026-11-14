@@ -213,6 +213,11 @@ impl Default for AdminConfig {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AdminIdentity {
     /// Names or IP addresses that refer to this server (`identity.identifiers`).
+    ///
+    /// Upstream uses this list to obtain/select an issued identity certificate. caddy-rs resolves
+    /// the admin identity from the PEM files below and never issues by name, so a non-empty list is
+    /// rejected at validation with a located `admin.identity.identifiers` error (T-ADMIN-061)
+    /// rather than accepted and ignored.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub identifiers: Vec<String>,
 
@@ -286,14 +291,18 @@ pub struct AdminAccess {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub permissions: Vec<AdminPermissions>,
 
-    /// Subject distinguished names (`CN=client,O=ops`, Go `x509.Name.String()` form) accepted by
-    /// this entry. caddy-rs extension: upstream authenticates by public key only; this lets an
-    /// operator name an identity without embedding its certificate.
+    /// Subject distinguished names (`CN=client,O=ops`, Go `x509.Name.String()` form) that filter
+    /// this entry's identities. caddy-rs extension: upstream authenticates by public key only.
+    ///
+    /// Advisory only. A distinguished name is chosen by the issuing CA, so it never authorizes a
+    /// client: when this list is non-empty it can only narrow the entry to clients whose chain
+    /// already matches [`AdminAccess::public_keys`] (T-ADMIN-061).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subjects: Vec<String>,
 
-    /// Serial numbers in decimal (Go `big.Int.String()` form) accepted by this entry.
-    /// caddy-rs extension, paired with [`AdminAccess::subjects`].
+    /// Serial numbers in decimal (Go `big.Int.String()` form) that filter this entry's identities.
+    /// caddy-rs extension, paired with [`AdminAccess::subjects`]; advisory only, it can narrow but
+    /// never authorize on its own.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub serials: Vec<String>,
 
@@ -303,8 +312,9 @@ pub struct AdminAccess {
 }
 
 impl AdminAccess {
-    /// Whether this entry names any identity selector at all. An entry without selectors matches
-    /// nothing (upstream: an entry with no `public_keys` cannot match a verified chain).
+    /// Whether this entry names any identity selector at all. An entry without `public_keys`
+    /// matches nothing: `subjects`/`serials` only narrow a public-key match (upstream: an entry
+    /// with no `public_keys` cannot match a verified chain).
     pub fn has_selectors(&self) -> bool {
         !self.public_keys.is_empty() || !self.subjects.is_empty() || !self.serials.is_empty()
     }

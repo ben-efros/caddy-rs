@@ -2417,7 +2417,7 @@ pub(crate) async fn bind_admin(configured: &str, api: AdminApi) -> Result<Listen
                                         path,
                                         headers: parts.headers,
                                         body,
-                                        client_identity: None,
+                                        client_identity: caddy_rs_admin::ClientIdentity::NotPresented,
                                     })
                                     .await;
                                 let mut builder = hyper::Response::builder().status(response.status);
@@ -2535,13 +2535,22 @@ pub(crate) fn remote_admin_tls_config(
 ///
 /// The verifier has already chained the leaf to one of the access-control certificates, so the
 /// identity is trustworthy; it feeds `admin.remote.access_control` matching in `caddy-rs-admin`.
+/// A missing certificate or one whose metadata cannot be parsed yields
+/// [`caddy_rs_admin::ClientIdentity::Unparsable`], which the admin API denies with 401: a request
+/// on this listener never falls through to the plaintext origin policy.
 fn remote_admin_client_identity(
     certificates: Option<&[rustls::pki_types::CertificateDer<'_>]>,
-) -> Option<caddy_rs_admin::AdminClientIdentity> {
-    let certificates = certificates?;
-    let leaf = certificates.first()?;
-    let info = caddy_rs_tls::ClientCertificateInfo::parse(leaf.as_ref(), true).ok()?;
-    Some(caddy_rs_admin::AdminClientIdentity {
+) -> caddy_rs_admin::ClientIdentity {
+    let Some(certificates) = certificates else {
+        return caddy_rs_admin::ClientIdentity::Unparsable;
+    };
+    let Some(leaf) = certificates.first() else {
+        return caddy_rs_admin::ClientIdentity::Unparsable;
+    };
+    let Ok(info) = caddy_rs_tls::ClientCertificateInfo::parse(leaf.as_ref(), true) else {
+        return caddy_rs_admin::ClientIdentity::Unparsable;
+    };
+    caddy_rs_admin::ClientIdentity::Verified(caddy_rs_admin::AdminClientIdentity {
         certificates: certificates
             .iter()
             .map(|certificate| certificate.as_ref().to_vec())
@@ -2710,12 +2719,29 @@ mod remote_admin_tests {
         }
     }
 
+    /// Whether the `openssl` CLI is available to mint the test certificates. A missing binary
+    /// skips each test with an explicit message instead of panicking inside a helper.
+    fn openssl_available() -> bool {
+        std::process::Command::new("openssl")
+            .arg("version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
     fn openssl(directory: &Path, arguments: &[&str]) {
         let output = std::process::Command::new("openssl")
             .current_dir(directory)
             .args(arguments)
             .output()
-            .expect("openssl is available for the mTLS integration test");
+            .unwrap_or_else(|error| {
+                panic!(
+                    "the `openssl` CLI is required to mint the mTLS test certificates and could \
+                     not be run ({error}); install openssl or skip this test"
+                )
+            });
         assert!(
             output.status.success(),
             "openssl {arguments:?} failed: {}",
@@ -2891,7 +2917,7 @@ mod remote_admin_tests {
 
     fn identity(certificates: &Certificates) -> AdminIdentity {
         AdminIdentity {
-            identifiers: vec!["localhost".to_string()],
+            identifiers: Vec::new(),
             certificate: Some(
                 certificates
                     .directory
@@ -3013,7 +3039,7 @@ mod remote_admin_tests {
                 path: "/load".to_string(),
                 headers,
                 body: bytes::Bytes::from(config.to_string()),
-                client_identity: None,
+                client_identity: caddy_rs_admin::ClientIdentity::NotPresented,
             })
             .await;
         assert_eq!(
@@ -3059,6 +3085,13 @@ mod remote_admin_tests {
 
     #[tokio::test]
     async fn valid_client_certificate_reaches_authorized_endpoint() {
+        if !openssl_available() {
+            eprintln!(
+                "skipping {}: the `openssl` CLI is not available to mint the test certificates",
+                "valid_client_certificate_reaches_authorized_endpoint"
+            );
+            return;
+        }
         let certificates = test_certificates("valid");
         let (_api, port, handle) = start_remote(&certificates).await;
         let mut stream = connect(
@@ -3079,6 +3112,13 @@ mod remote_admin_tests {
 
     #[tokio::test]
     async fn missing_client_certificate_fails_the_handshake() {
+        if !openssl_available() {
+            eprintln!(
+                "skipping {}: the `openssl` CLI is not available to mint the test certificates",
+                "missing_client_certificate_fails_the_handshake"
+            );
+            return;
+        }
         let certificates = test_certificates("missing");
         let (_api, port, handle) = start_remote(&certificates).await;
         let stream = connect(&certificates, None, port).await;
@@ -3108,6 +3148,13 @@ mod remote_admin_tests {
 
     #[tokio::test]
     async fn untrusted_client_certificate_fails_the_handshake() {
+        if !openssl_available() {
+            eprintln!(
+                "skipping {}: the `openssl` CLI is not available to mint the test certificates",
+                "untrusted_client_certificate_fails_the_handshake"
+            );
+            return;
+        }
         let certificates = test_certificates("untrusted");
         let (_api, port, handle) = start_remote(&certificates).await;
         let stream = connect(
@@ -3138,6 +3185,13 @@ mod remote_admin_tests {
 
     #[tokio::test]
     async fn authenticated_but_unauthorized_path_and_method_are_403() {
+        if !openssl_available() {
+            eprintln!(
+                "skipping {}: the `openssl` CLI is not available to mint the test certificates",
+                "authenticated_but_unauthorized_path_and_method_are_403"
+            );
+            return;
+        }
         let certificates = test_certificates("unauthorized");
         let (_api, port, handle) = start_remote(&certificates).await;
         let mut stream = connect(

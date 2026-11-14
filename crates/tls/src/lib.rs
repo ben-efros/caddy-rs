@@ -49,7 +49,7 @@ pub use automatic_https::{
 };
 pub use certificate::{renewal_queue, Certificate, CertificateCache, RenewalItem};
 pub use client_auth::{
-    client_certificate_infos, ClientCertificateInfo, ClientCertificateInfoError,
+    chain_anchored_by, client_certificate_infos, ClientCertificateInfo, ClientCertificateInfoError,
 };
 pub use cloudflare::{
     resolve_env_placeholders, CloudflareConfig, CloudflareProvider, CLOUDFLARE_API_BASE,

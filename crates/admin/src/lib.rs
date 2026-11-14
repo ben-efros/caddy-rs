@@ -246,10 +246,28 @@ pub struct AdminRequest {
     pub headers: HeaderMap,
     /// Request body.
     pub body: Bytes,
-    /// Authenticated client identity when the request arrived on the mutual-TLS remote admin
-    /// listener (`admin.remote`). `None` on the plaintext (local) listener, where the origin
-    /// policy applies instead.
-    pub client_identity: Option<AdminClientIdentity>,
+    /// How the transport established the client identity. The mutual-TLS remote admin listener
+    /// (`admin.remote`) reports [`ClientIdentity::Verified`] or, when the verified certificate
+    /// cannot be parsed, [`ClientIdentity::Unparsable`] (fail closed with 401). The plaintext
+    /// (local) listener reports [`ClientIdentity::NotPresented`], where the origin policy applies.
+    pub client_identity: ClientIdentity,
+}
+
+/// How an [`AdminRequest`]'s client identity was established by its transport.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ClientIdentity {
+    /// Plaintext (local) listener: no client certificate was requested or verified, so the
+    /// origin/host policy applies.
+    #[default]
+    NotPresented,
+    /// Mutual-TLS remote listener: the handshake verified a client certificate anchored in the
+    /// configured `public_keys` pool and its metadata parsed. Access control decides from this
+    /// identity.
+    Verified(AdminClientIdentity),
+    /// Mutual-TLS remote listener: the handshake verified a client certificate but the
+    /// certificate metadata could not be parsed. The request must fail closed with 401; the
+    /// plaintext origin policy is never applied to a remote request.
+    Unparsable,
 }
 
 /// An admin API response.
@@ -811,25 +829,27 @@ impl AdminApi {
         // that endpoint (`admin.go:226-229`, `admin.go:852-858`). The plaintext listener keeps
         // the origin policy unchanged.
         let origin = match &request.client_identity {
-            Some(identity) => {
+            ClientIdentity::NotPresented => match self.origin_policy().check(&request.headers) {
+                Ok(origin) => origin,
+                Err(violation) => {
+                    return AdminResponse::api_error(violation.status, violation.message)
+                }
+            },
+            client => {
+                // Fail closed: an unparsable verified certificate is denied here, never handed to
+                // the plaintext origin policy, where a forged `Host`/`Origin` could pass.
                 let remote = self
                     .store
                     .current()
                     .and_then(|generation| generation.config().admin.clone())
                     .and_then(|admin| admin.remote);
                 if let Err(denial) =
-                    access::decide(remote.as_ref(), Some(identity), &request.method, path)
+                    access::decide_client(remote.as_ref(), client, &request.method, path)
                 {
                     return AdminResponse::api_error(denial.status, denial.message);
                 }
                 None
             }
-            None => match self.origin_policy().check(&request.headers) {
-                Ok(origin) => origin,
-                Err(violation) => {
-                    return AdminResponse::api_error(violation.status, violation.message)
-                }
-            },
         };
 
         let mut response = self.dispatch(path, &request).await;
@@ -1803,7 +1823,7 @@ mod tests {
             path: path.to_string(),
             headers: HeaderMap::new(),
             body: Bytes::from(body.to_string()),
-            client_identity: None,
+            client_identity: ClientIdentity::NotPresented,
         }
     }
 
@@ -1857,6 +1877,34 @@ mod tests {
 
     fn body_string(response: &AdminResponse) -> String {
         String::from_utf8_lossy(&response.body).into_owned()
+    }
+
+    #[tokio::test]
+    async fn unparsable_client_certificate_fails_closed_with_401() {
+        // A remote-listener request whose verified certificate metadata could not be parsed must
+        // not fall through to the plaintext origin policy (a forged Origin would otherwise pass
+        // and be echoed back).
+        let admin = admin();
+        let mut request = request("GET", "/config/", "");
+        request.client_identity = ClientIdentity::Unparsable;
+        request.headers.insert(
+            http::header::ORIGIN,
+            HeaderValue::from_static("http://evil.example"),
+        );
+        let response = admin.handle(request).await;
+        assert_eq!(response.status, StatusCode::UNAUTHORIZED);
+        assert!(
+            body_string(&response).contains("client certificate could not be parsed"),
+            "{}",
+            body_string(&response)
+        );
+        assert!(
+            response
+                .headers
+                .get(http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none(),
+            "the origin policy must not run for an unparsable remote identity"
+        );
     }
 
     #[tokio::test]
