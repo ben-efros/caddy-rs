@@ -44,7 +44,7 @@ fn load_env_file(path: &Path) -> Result<()> {
 }
 
 /// Render an I/O error with Go's lowercase wording, keeping the affected path elsewhere.
-fn io_error_text(error: &std::io::Error) -> String {
+pub(crate) fn io_error_text(error: &std::io::Error) -> String {
     match error.kind() {
         std::io::ErrorKind::NotFound => "no such file or directory".to_string(),
         std::io::ErrorKind::PermissionDenied => "permission denied".to_string(),

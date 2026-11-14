@@ -150,6 +150,8 @@ Behaviour matches Caddy's `cmdFmt`:
   the input and `+ ` when only in the output. This is not a valid patch format, matching Caddy.
 - A path of `-` reads stdin, prints to stdout, and ignores `--overwrite`/`--diff`; the
   "not formatted" check is skipped and the exit status is 0.
+- An empty `--config` value or an empty positional path is treated as unset, as in Caddy's
+  `cmdFmt`: `caddy-rs fmt -c ''` and `caddy-rs fmt ''` both format `./Caddyfile`.
 - Otherwise the formatted result is printed first. If the input was not already formatted, the
   command then fails with exit 1 and a located message:
 
@@ -159,8 +161,9 @@ Behaviour matches Caddy's `cmdFmt`:
 
   The line number is the first byte at which the normalized input (CRLF is compared as LF) differs
   from its formatted form.
-- A missing/unreadable file fails with `reading input file: ...`; more than one input (positional
-  or `--config` plus a positional) fails with Caddy's `fmt does not support multiple files ...`.
+- A missing/unreadable file fails with Caddy's `reading input file: open <path>: <reason>` wording;
+  more than one input (positional or `--config` plus a positional) fails with Caddy's
+  `fmt does not support multiple files ...`.
 
 Exit status is 0 on success (including `--overwrite`), 1 when the file cannot be read, when the
 input is not formatted, or when multiple inputs are given, and 2 for a clap usage error.
