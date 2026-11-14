@@ -12,7 +12,9 @@ builds, a first run, and where the server keeps its state.
 | Crate source | crates.io for the first build, or a primed local Cargo cache for [offline builds](#offline-builds). |
 | External services | None. Building and serving a local configuration need no database, container runtime or other service. |
 
-The workspace uses Rust edition 2021 and declares `rust-version = "1.85"`.
+The workspace crates use Rust edition 2021 and declare `rust-version = "1.88"`; a
+dependency (`jsonwebtoken` 10.4) itself requires 1.88. The optional plug `wasm-runtime`
+feature has the same floor via `wat` 1.263, so build it with rustc >= 1.88.
 
 ## Build from source
 
