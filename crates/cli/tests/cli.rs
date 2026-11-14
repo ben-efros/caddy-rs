@@ -246,6 +246,54 @@ fn fmt_defaults_to_the_caddyfile_in_the_working_directory() {
 }
 
 #[test]
+fn fmt_treats_an_empty_value_as_unset() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("Caddyfile"), "  a   b\n").unwrap();
+
+    // Caddy's cmdFmt resolves an empty `--config` value to the default Caddyfile.
+    let (code, stdout, stderr) = run_in(directory.path(), &["fmt", "-c", ""]);
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert_eq!(stdout, "a b\n");
+    assert!(
+        stderr.contains(&format!("Caddyfile:1: {FMT_LINT}")),
+        "{stderr}"
+    );
+
+    // The same is true for an explicitly empty positional path.
+    std::fs::write(directory.path().join("Caddyfile"), "a b\n").unwrap();
+    let (code, stdout, stderr) = run_in(directory.path(), &["fmt", ""]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "a b\n");
+
+    // Caddy also allows `--config <path> ''`: the empty positional path is unset, so the config
+    // flag supplies the file instead of triggering the multiple-inputs error.
+    let config = directory.path().join("site.caddy");
+    std::fs::write(&config, "a b\n").unwrap();
+    let (code, stdout, stderr) = run(&["fmt", "--config", config.to_str().unwrap(), ""]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "a b\n");
+
+    // Two empty positional arguments are still two inputs, and Caddy rejects them with its
+    // verbatim message (an absent `--config` leaves the two spaces before the joined paths).
+    let (code, _stdout, stderr) = run(&["fmt", "", ""]);
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(
+        stderr.contains("fmt does not support multiple files   "),
+        "{stderr}"
+    );
+
+    // An empty value with no ./Caddyfile still reports the default path as the open target.
+    let empty = tempfile::tempdir().unwrap();
+    let (code, stdout, stderr) = run_in(empty.path(), &["fmt", "-c", ""]);
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(stdout.is_empty(), "stdout: {stdout}");
+    assert!(
+        stderr.contains("reading input file: open Caddyfile: no such file or directory"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn fmt_rejects_multiple_inputs_like_caddy() {
     let directory = tempfile::tempdir().unwrap();
     let first = directory.path().join("a.caddy");
@@ -275,15 +323,23 @@ fn fmt_rejects_multiple_inputs_like_caddy() {
 }
 
 #[test]
-fn fmt_reports_an_unreadable_file_with_its_path() {
+fn fmt_reports_an_unreadable_file_with_caddys_io_wording() {
     let directory = tempfile::tempdir().unwrap();
     let missing = directory.path().join("missing.caddy");
 
     let (code, stdout, stderr) = run(&["fmt", missing.to_str().unwrap()]);
     assert_eq!(code, 1, "stderr: {stderr}");
     assert!(stdout.is_empty(), "stdout: {stdout}");
-    assert!(stderr.contains("reading input file"), "stderr: {stderr}");
-    assert!(stderr.contains("missing.caddy"), "stderr: {stderr}");
+    // Caddy prints `reading input file: open <path>: no such file or directory` (the Go
+    // `os.ReadFile` error), not Rust's `(os error 2)` rendering.
+    assert!(
+        stderr.contains(&format!(
+            "reading input file: open {}: no such file or directory",
+            missing.display()
+        )),
+        "stderr: {stderr}"
+    );
+    assert!(!stderr.contains("os error"), "stderr: {stderr}");
 }
 
 #[test]
