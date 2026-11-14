@@ -1,0 +1,71 @@
+{
+  "apps": {
+    "http": {
+      "servers": {
+        "srv0": {
+          "listen": [
+            ":443"
+          ],
+          "routes": [
+            {
+              "handle": [
+                {
+                  "handler": "subroute",
+                  "routes": [
+                    {
+                      "handle": [
+                        {
+                          "handler": "headers",
+                          "security_headers": {
+                            "content_security_policy": {
+                              "default-src": [
+                                "'self'"
+                              ],
+                              "img-src": [
+                                "'self'",
+                                "data:"
+                              ],
+                              "script-src": [
+                                "'self'",
+                                "{csp.nonce}"
+                              ]
+                            },
+                            "hsts": {
+                              "enabled": true,
+                              "include_subdomains": true,
+                              "max_age": 31536000,
+                              "preload": true
+                            },
+                            "permissions_policy": {
+                              "geolocation": false,
+                              "microphone": false
+                            },
+                            "referrer_policy": "strict-origin-when-cross-origin",
+                            "x_content_type_options": "nosniff",
+                            "x_frame_options": "DENY"
+                          }
+                        },
+                        {
+                          "body": "ok",
+                          "handler": "static_response"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ],
+              "match": [
+                {
+                  "host": [
+                    "example.com"
+                  ]
+                }
+              ],
+              "terminal": true
+            }
+          ]
+        }
+      }
+    }
+  }
+}
