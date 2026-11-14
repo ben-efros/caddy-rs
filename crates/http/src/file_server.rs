@@ -6,7 +6,8 @@
 //! If-Unmodified-Since, If-None-Match, If-Modified-Since, If-Range), single and multipart byte
 //! ranges, 206/304/412/416 responses, HEAD, and `Accept-Ranges: bytes`.
 
-use std::path::{Path, PathBuf};
+use std::ffi::OsString;
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -23,6 +24,81 @@ fn invalid(path: &str, message: impl Into<String>) -> Error {
         path: path.to_string(),
         message: message.into(),
     }
+}
+
+/// Environment the file server resolves its automatic hide entries against, mirroring Caddy's
+/// `FileServer.Provision`: both directories are looked up from the process environment and the
+/// working directory once, when the module is provisioned.
+#[derive(Debug, Clone)]
+struct AutoHideEnv {
+    cwd: PathBuf,
+    xdg_config_home: Option<OsString>,
+    home: Option<OsString>,
+    xdg_data_home: Option<OsString>,
+}
+
+impl AutoHideEnv {
+    fn from_process() -> Self {
+        Self {
+            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            xdg_config_home: std::env::var_os(caddy_rs_core::autosave::XDG_CONFIG_HOME_ENV),
+            home: std::env::var_os(caddy_rs_core::autosave::HOME_ENV),
+            xdg_data_home: std::env::var_os(caddy_rs_core::data_dir::XDG_DATA_HOME_ENV),
+        }
+    }
+}
+
+/// Lexically clean an absolute path like Go's `filepath.Clean`, keeping the root. Used for
+/// Caddy's `FastAbs` comparisons, which never touch the filesystem. (The request-path
+/// `clean_path` of the trailing-separator rejection is a separate, string-based helper.)
+fn cleaned_absolute_path(path: &Path) -> PathBuf {
+    let absolute = path.is_absolute();
+    let mut cleaned = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !cleaned.pop() && !absolute {
+                    cleaned.push("..");
+                }
+            }
+            other => cleaned.push(other.as_os_str()),
+        }
+    }
+    cleaned
+}
+
+/// Caddy's `FastAbs`: lexical absolute form against the working directory.
+fn fast_abs(path: &Path, cwd: &Path) -> PathBuf {
+    if path.is_absolute() {
+        cleaned_absolute_path(path)
+    } else {
+        cleaned_absolute_path(&cwd.join(path))
+    }
+}
+
+/// The absolute hide entries Caddy's `FileServer.Provision` adds for a relative app data directory
+/// (which holds private keys) or app config directory (which holds `autosave.json`, the loaded
+/// configuration): both sit under the working directory when their XDG/HOME base is unavailable,
+/// so serving `.` must not expose them (`caddy@a97bc460cfe5`, follow-up to #8327). Absolute
+/// directories are skipped, and an entry is added once even when both directories resolve to the
+/// same path.
+fn auto_hide_entries(env: &AutoHideEnv) -> Vec<String> {
+    let data =
+        caddy_rs_core::data_dir::app_data_dir_with(env.xdg_data_home.clone(), env.home.clone());
+    let config =
+        caddy_rs_core::autosave::config_dir_with(env.xdg_config_home.clone(), env.home.clone());
+    let mut entries: Vec<String> = Vec::new();
+    for dir in [data, config] {
+        if dir.is_absolute() {
+            continue;
+        }
+        let entry = fast_abs(&dir, &env.cwd).to_string_lossy().into_owned();
+        if !entries.contains(&entry) {
+            entries.push(entry);
+        }
+    }
+    entries
 }
 
 /// Precompressed sidecar encodings supported by this build, with their file suffixes (Caddy's
@@ -54,6 +130,14 @@ enum StatusOverride {
 impl FileServerHandler {
     /// Build from Caddy JSON.
     pub fn from_json(value: &serde_json::Value, path: &str) -> Result<Self> {
+        Self::from_json_with_env(value, path, &AutoHideEnv::from_process())
+    }
+
+    fn from_json_with_env(
+        value: &serde_json::Value,
+        path: &str,
+        env: &AutoHideEnv,
+    ) -> Result<Self> {
         let object = value
             .as_object()
             .ok_or_else(|| invalid(path, "file_server must be an object"))?;
@@ -72,7 +156,7 @@ impl FileServerHandler {
                 });
             }
         }
-        let hide = object
+        let mut hide = object
             .get("hide")
             .map(|hide| {
                 hide.as_array()
@@ -87,6 +171,13 @@ impl FileServerHandler {
             })
             .transpose()?
             .unwrap_or_else(|| vec!["./Caddyfile".to_string()]);
+        // Caddy appends the automatically hidden app data/config directories in `Provision`, after
+        // the configured entries; an explicit entry with the same absolute path is not repeated.
+        for entry in auto_hide_entries(env) {
+            if !hide.contains(&entry) {
+                hide.push(entry);
+            }
+        }
         let index_names = object
             .get("index_names")
             .map(|names| {
@@ -210,21 +301,44 @@ impl FileServerHandler {
         }
     }
 
-    fn hidden(&self, relative: &str, request: &Request) -> bool {
-        let name = Path::new(relative)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(relative);
+    /// Caddy's `fileHidden`: hide entries are filesystem paths whose base is the working directory,
+    /// not the site root (`staticfiles.go`). An entry without a separator hides every path
+    /// component with that name; an entry with a separator is made absolute (`FastAbs`) and hides
+    /// itself and everything below it (prefix match on a separator boundary) or glob-matches the
+    /// absolute filename. Automatic entries from [`auto_hide_entries`] are absolute, so this is
+    /// where the relative app data/config directories become effective.
+    fn hidden(&self, filename: &str, request: &Request) -> bool {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let filename_abs = fast_abs(Path::new(filename), &cwd)
+            .to_string_lossy()
+            .into_owned();
         self.hide.iter().any(|pattern| {
             // Caddy: `hide[i] = repl.ReplaceAll(fsrv.Hide[i], "")` (staticfiles.go).
             let expanded = request.replace_all(pattern);
             if expanded.is_empty() {
-                // Caddy compares hide patterns against path components, so an empty expansion
-                // (for example a missing placeholder) never hides anything.
+                // An empty expansion (for example a missing placeholder) never hides anything.
                 return false;
             }
-            let pattern = expanded.strip_prefix("./").unwrap_or(&expanded);
-            glob_match(pattern, relative, false) || glob_match(pattern, name, false)
+            let pattern = if expanded.contains('/') {
+                fast_abs(Path::new(&expanded), &cwd)
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                expanded
+            };
+            if !pattern.contains('/') {
+                if filename_abs
+                    .split('/')
+                    .any(|component| glob_match(&pattern, component, false))
+                {
+                    return true;
+                }
+            } else if let Some(rest) = filename_abs.strip_prefix(pattern.as_str()) {
+                if rest.starts_with('/') {
+                    return true;
+                }
+            }
+            glob_match(&pattern, &filename_abs, false)
         })
     }
 
@@ -506,9 +620,6 @@ impl Handler for FileServerHandler {
         // the root itself; the untrimmed path stays available for the canonical redirect and for
         // the trailing-separator rejection below.
         let stat_relative = sanitized_relative(&decoded_path);
-        if self.hidden(&stat_relative, &request) {
-            return self.not_found(request);
-        }
         // Expand `{http.vars.root}` and friends (Caddy's file_server root supports placeholders).
         let expanded_root = request.replace_all(&self.root);
         let root = if expanded_root.is_empty() {
@@ -517,6 +628,11 @@ impl Handler for FileServerHandler {
             PathBuf::from(expanded_root)
         };
         let full_path = root.join(&stat_relative);
+        // Caddy hides against the file's filesystem path (absolute when possible), so this runs
+        // after the root is expanded.
+        if self.hidden(&full_path.to_string_lossy(), &request) {
+            return self.not_found(request);
+        }
         let request_path = request.uri.path().to_string();
 
         if path_contains_symlink(&full_path, &root).await? {
@@ -2277,6 +2393,155 @@ mod tests {
             Err(RangeError::Invalid),
             "start > end is invalid"
         );
+    }
+
+    #[test]
+    fn auto_hide_adds_relative_app_config_and_data_dirs_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("site");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let data_home = temp.path().join("data-home");
+
+        // The acceptance environment for `caddy@a97bc460cfe5`: XDG_DATA_HOME is absolute, so the
+        // data directory is skipped; XDG_CONFIG_HOME and HOME are unset, so the config directory
+        // falls back to the relative `./caddy` under the working directory and must be hidden.
+        let env = AutoHideEnv {
+            cwd: cwd.clone(),
+            xdg_config_home: None,
+            home: None,
+            xdg_data_home: Some(data_home.into_os_string()),
+        };
+        let mut handler = FileServerHandler::from_json_with_env(
+            &serde_json::json!({"handler": "file_server", "root": cwd, "hide": []}),
+            "handler",
+            &env,
+        )
+        .unwrap();
+        let expected = cwd.join("caddy");
+        let expected = expected.to_string_lossy().into_owned();
+        assert_eq!(
+            handler
+                .hide
+                .iter()
+                .filter(|entry| **entry == expected)
+                .count(),
+            1,
+            "the relative config directory is hidden exactly once: {:?}",
+            handler.hide
+        );
+        assert_eq!(auto_hide_entries(&env), vec![expected.clone()]);
+
+        // Both directories fall back to `./caddy`: the effective hide list still holds one entry.
+        let same_env = AutoHideEnv {
+            xdg_config_home: None,
+            home: None,
+            xdg_data_home: None,
+            ..env.clone()
+        };
+        assert_eq!(auto_hide_entries(&same_env), vec![expected.clone()]);
+
+        // Absolute directories are skipped, as upstream does.
+        let absolute_env = AutoHideEnv {
+            cwd: cwd.clone(),
+            xdg_config_home: Some(temp.path().join("config-home").into_os_string()),
+            home: None,
+            xdg_data_home: Some(temp.path().join("data-home-2").into_os_string()),
+        };
+        assert!(auto_hide_entries(&absolute_env).is_empty());
+
+        // An explicit entry that already names the absolute directory is not duplicated.
+        handler = FileServerHandler::from_json_with_env(
+            &serde_json::json!({"handler": "file_server", "root": cwd, "hide": [expected.clone()]}),
+            "handler",
+            &env,
+        )
+        .unwrap();
+        assert_eq!(
+            handler
+                .hide
+                .iter()
+                .filter(|entry| **entry == expected)
+                .count(),
+            1,
+            "an explicit absolute entry is not repeated: {:?}",
+            handler.hide
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_hidden_config_dir_files_are_not_served() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("site");
+        std::fs::create_dir_all(root.join("caddy")).unwrap();
+        std::fs::write(root.join("caddy/autosave.json"), b"{\"admin\":{}}").unwrap();
+        std::fs::write(root.join("caddyfile.go"), b"not the config dir").unwrap();
+
+        let env = AutoHideEnv {
+            cwd: root.clone(),
+            xdg_config_home: None,
+            home: None,
+            xdg_data_home: Some(temp.path().join("data-home").into_os_string()),
+        };
+        let handler = FileServerHandler::from_json_with_env(
+            &serde_json::json!({"handler": "file_server", "root": root, "hide": []}),
+            "handler",
+            &env,
+        )
+        .unwrap();
+
+        let response = respond(&handler, make_request(Method::GET, "/caddy/autosave.json")).await;
+        assert_eq!(
+            response.status,
+            StatusCode::NOT_FOUND,
+            "the relative config directory is hidden, like upstream Provision"
+        );
+
+        // A sibling whose name merely starts with the hidden directory's name stays visible: the
+        // prefix match requires a separator boundary.
+        let response = respond(&handler, make_request(Method::GET, "/caddyfile.go")).await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, Bytes::from_static(b"not the config dir"));
+    }
+
+    #[tokio::test]
+    async fn hide_entries_follow_caddy_file_hidden_semantics() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("site");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::create_dir_all(root.join("subdir")).unwrap();
+        std::fs::write(root.join("sub/secret.txt"), b"secret").unwrap();
+        std::fs::write(root.join("subdir/secret.txt"), b"visible").unwrap();
+        std::fs::write(root.join("visible.txt"), b"visible").unwrap();
+        std::fs::create_dir_all(root.join("hidden")).unwrap();
+        std::fs::write(root.join("hidden/file.txt"), b"component").unwrap();
+
+        let env = AutoHideEnv {
+            cwd: root.clone(),
+            xdg_config_home: Some(temp.path().join("config-home").into_os_string()),
+            home: None,
+            xdg_data_home: Some(temp.path().join("data-home").into_os_string()),
+        };
+        let sub = root.join("sub").to_string_lossy().into_owned();
+        let handler = FileServerHandler::from_json_with_env(
+            &serde_json::json!({"handler": "file_server", "root": root, "hide": [sub, "hidden"]}),
+            "handler",
+            &env,
+        )
+        .unwrap();
+
+        // An absolute entry with a separator hides its subtree ...
+        let response = respond(&handler, make_request(Method::GET, "/sub/secret.txt")).await;
+        assert_eq!(response.status, StatusCode::NOT_FOUND);
+        // ... but not a sibling whose name only shares the prefix ("sub" vs "subdir").
+        let response = respond(&handler, make_request(Method::GET, "/subdir/secret.txt")).await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, Bytes::from_static(b"visible"));
+        // An entry without a separator hides every path component with that name.
+        let response = respond(&handler, make_request(Method::GET, "/hidden/file.txt")).await;
+        assert_eq!(response.status, StatusCode::NOT_FOUND);
+        let response = respond(&handler, make_request(Method::GET, "/visible.txt")).await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, Bytes::from_static(b"visible"));
     }
 
     #[tokio::test]
