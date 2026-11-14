@@ -12,13 +12,16 @@
 //!
 //! - Upstream scans `r.TLS.VerifiedChains`, which includes the trust anchor; rustls
 //!   `peer_certificates()` omits the root. [`public_key_matches`] therefore compares the
-//!   configured certificate's SubjectPublicKeyInfo with every presented certificate (which covers
-//!   a configured leaf/intermediate that the client presents, exactly upstream's
-//!   `VerifiedChains[0]` scan) *and* re-verifies the presented chain against the configured anchor
-//!   with WebPKI path validation (`caddy_rs_tls::chain_anchored_by`), which covers a configured
-//!   root that the client does not present. Distinguished names never authorize a client: a
-//!   certificate from another configured CA that copies a configured subject DN stays bound to
-//!   its own CA and does not inherit that identity's permissions.
+//!   configured certificate's SubjectPublicKeyInfo with the presented **leaf** only (the
+//!   configured-leaf anchor case, which WebPKI cannot express because it rejects an anchor that is
+//!   itself the end entity) *and* re-verifies the presented chain against the configured anchor
+//!   with WebPKI path validation (`caddy_rs_tls::chain_anchored_by`), which covers configured
+//!   roots and intermediates that the client does not present. Certificates the client appends
+//!   after the leaf are never inspected by key: they are not proven path members, and scanning
+//!   them would let any client borrow another entry's permissions by appending that entry's
+//!   public certificate (the T-ADMIN-061 review finding). Distinguished names never authorize a
+//!   client: a certificate from another configured CA that copies a configured subject DN stays
+//!   bound to its own CA and does not inherit that identity's permissions.
 //! - `subjects`/`serials` are caddy-rs extensions and are **advisory filters only**: CA-chosen
 //!   values that can narrow, never widen, an entry's `public_keys` match. They are never the sole
 //!   basis for authorizing a client; an entry without `public_keys` matches no one (upstream
@@ -201,10 +204,16 @@ fn access_matches_identity(access: &AdminAccess, identity: &AdminClientIdentity)
 /// Whether one configured base64 DER certificate authorizes the presented client chain.
 ///
 /// Cryptographic binding only; distinguished names are never consulted. Matches when:
-/// - the configured certificate's SubjectPublicKeyInfo equals that of a presented certificate
-///   (upstream's `VerifiedChains` scan over leaf and intermediates), or
+/// - the presented **leaf** certificate's SubjectPublicKeyInfo equals the configured
+///   certificate's (configured-leaf anchor), or
 /// - the presented chain verifies to the configured certificate as its trust anchor (upstream's
 ///   scan over the root, which rustls does not expose via `peer_certificates()`).
+///
+/// Intermediate anchors are supported through the verified path: WebPKI tries the configured
+/// trust anchor before any presented intermediate, so a configured intermediate that issued the
+/// leaf verifies directly (whether or not the client presents that intermediate), and one above
+/// the leaf verifies through the client-presented intermediates. Nothing else is accepted for
+/// them, so an intermediate anchor never authorizes a leaf it did not issue.
 fn public_key_matches(configured: &str, identity: &AdminClientIdentity) -> bool {
     use base64::Engine as _;
 
@@ -215,25 +224,27 @@ fn public_key_matches(configured: &str, identity: &AdminClientIdentity) -> bool 
     let Ok(der) = base64::engine::general_purpose::STANDARD.decode(trimmed) else {
         return false;
     };
-    if presented_spki_matches(&der, &identity.certificates) {
-        return true;
-    }
-    caddy_rs_tls::chain_anchored_by(&der, &identity.certificates)
+    leaf_spki_matches(&der, identity)
+        || caddy_rs_tls::chain_anchored_by(&der, &identity.certificates)
 }
 
-/// Whether any presented certificate carries the same SubjectPublicKeyInfo as `configured_der`.
-fn presented_spki_matches(configured_der: &[u8], presented: &[Vec<u8>]) -> bool {
+/// Whether the presented leaf certificate carries the same SubjectPublicKeyInfo as `configured_der`.
+///
+/// Only `certificates[0]` is compared: the TLS layer verified it as the end entity. Certificates
+/// appended after it are unverified extras and must never be used to bind an identity.
+fn leaf_spki_matches(configured_der: &[u8], identity: &AdminClientIdentity) -> bool {
+    let Some(leaf) = identity.leaf_der() else {
+        return false;
+    };
     let Ok(configured) = caddy_rs_tls::ClientCertificateInfo::parse(configured_der, false) else {
         return false;
     };
     if configured.public_key_der.is_empty() {
         return false;
     }
-    presented.iter().any(|der| {
-        caddy_rs_tls::ClientCertificateInfo::parse(der, false)
-            .map(|info| info.public_key_der == configured.public_key_der)
-            .unwrap_or(false)
-    })
+    caddy_rs_tls::ClientCertificateInfo::parse(leaf, false)
+        .map(|info| info.public_key_der == configured.public_key_der)
+        .unwrap_or(false)
 }
 
 /// Upstream `adminPathAllowed` (`external/caddy/admin.go:742`).
