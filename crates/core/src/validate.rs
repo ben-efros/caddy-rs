@@ -2812,19 +2812,33 @@ mod tests {
         assert!(message.contains("duplicate tag"), "{message}");
     }
 
-    /// A private directory under the system temp dir, removed by the caller.
-    fn admin_socket_temp_dir(label: &str) -> std::path::PathBuf {
+    /// Name of the socket file the admin-socket tests describe inside their temp directory.
+    const ADMIN_SOCKET_FILE: &str = "caddy-admin.sock";
+
+    /// A private directory for an admin-socket test, removed by the caller.
+    ///
+    /// The directory comes from `root` unless that would push `root/<name>/{ADMIN_SOCKET_FILE}`
+    /// past [`UNIX_SOCKET_PATH_MAX`] — a long `TMPDIR` would then make the test fail for a
+    /// path-length reason instead of the behaviour under test — in which case the short fixed
+    /// parent `/tmp` is used instead.
+    fn admin_socket_temp_dir_in(root: &std::path::Path, label: &str) -> std::path::PathBuf {
         use std::time::{SystemTime, UNIX_EPOCH};
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "caddy-rs-admin-sock-{label}-{}-{nonce}",
-            std::process::id()
-        ));
+        let name = format!("caddy-rs-admin-sock-{label}-{}-{nonce}", std::process::id());
+        let mut path = root.join(&name);
+        let socket_len = 1 + ADMIN_SOCKET_FILE.len();
+        if path.to_string_lossy().len() + socket_len > UNIX_SOCKET_PATH_MAX {
+            path = std::path::PathBuf::from("/tmp").join(&name);
+        }
         std::fs::create_dir_all(&path).expect("temp dir");
         path
+    }
+
+    fn admin_socket_temp_dir(label: &str) -> std::path::PathBuf {
+        admin_socket_temp_dir_in(&std::env::temp_dir(), label)
     }
 
     fn admin_listen_error(listen: &str) -> String {
@@ -2833,6 +2847,22 @@ mod tests {
         validate_config(&config, &registry())
             .expect_err("invalid admin listen must fail")
             .to_string()
+    }
+
+    #[test]
+    fn admin_socket_temp_dir_falls_back_when_temp_root_is_too_long() {
+        // A `TMPDIR` long enough to overflow `sockaddr_un` must not make the admin-socket tests
+        // fail for the wrong reason: the helper falls back to the short fixed parent `/tmp`.
+        let long_root =
+            std::path::PathBuf::from(format!("/tmp/{}", "t".repeat(UNIX_SOCKET_PATH_MAX)));
+        let dir = admin_socket_temp_dir_in(&long_root, "fallback");
+        let socket = format!("unix/{}/{ADMIN_SOCKET_FILE}", dir.display());
+        assert!(
+            socket.len() - "unix/".len() <= UNIX_SOCKET_PATH_MAX,
+            "socket path not bindable: {socket}"
+        );
+        assert_eq!(dir.parent(), Some(std::path::Path::new("/tmp")));
+        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     #[test]
