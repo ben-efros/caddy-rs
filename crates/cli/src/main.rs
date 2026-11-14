@@ -1,9 +1,9 @@
 //! `caddy-rs` command-line interface.
 //!
 //! Command surface follows Caddy's CLI where it is meaningful for this build: `adapt`, `validate`,
-//! `run`, `reload`, `stop`, `list-modules`, `version`, `build-info`, `environ`, `completion`,
-//! `manpage` and `storage export`/`storage import`. `pki list`/`pki show`/`pki export` and `trust`
-//! expose the local CA material persisted by automatic HTTPS
+//! `run`, `start`, `reload`, `stop`, `list-modules`, `version`, `build-info`, `environ`,
+//! `completion`, `manpage` and `storage export`/`storage import`. `pki list`/`pki show`/`pki
+//! export` and `trust` expose the local CA material persisted by automatic HTTPS
 //! (`<data-dir>/pki/authorities/<id>/`); see `docs/compatibility/CADDYFILE.md` for the supported
 //! configuration surface.
 //!
@@ -203,6 +203,28 @@ enum Command {
         /// Environment file(s) in KEY=VALUE form, loaded before config adaptation.
         #[arg(long = "envfile", value_name = "PATH")]
         envfile: Vec<PathBuf>,
+        /// Echo confirmation bytes to this address on success (stock Caddy's usage text; used by
+        /// `start`'s handshake).
+        #[arg(long)]
+        pingback: Option<String>,
+    },
+    /// Start the server in the background (stock Caddy's `caddy start`).
+    Start {
+        /// Configuration file passed to the background `run` process.
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+        /// Adapter name (`caddyfile` or `json`).
+        #[arg(short = 'a', long)]
+        adapter: Option<String>,
+        /// Environment file(s) in KEY=VALUE form, passed to the background `run` process.
+        #[arg(long = "envfile", value_name = "PATH")]
+        envfile: Vec<PathBuf>,
+        /// Watch the configuration file for changes (not implemented; rejected).
+        #[arg(short, long)]
+        watch: bool,
+        /// Write the process ID to a file (not implemented; rejected).
+        #[arg(long)]
+        pidfile: Option<PathBuf>,
     },
     /// Load a new configuration into a running server through its admin API.
     Reload {
@@ -589,6 +611,106 @@ fn core_error_code(error: &anyhow::Error) -> Option<&'static str> {
     })
 }
 
+/// `start`: spawn `run` in the background and wait for its pingback confirmation.
+///
+/// Mirrors stock Caddy's `cmdStart`: the parent binds a loopback listener, spawns `caddy-rs run`
+/// with the internal `--pingback <address>` flag, writes a random 32-byte token to the child's stdin,
+/// and reports success only once the child connects back and echoes that token. If the child exits
+/// first, its inherited stderr already shows the real error, so the parent just reports the exit
+/// status.
+async fn run_start(
+    config: Option<PathBuf>,
+    adapter: Option<String>,
+    envfile: Vec<PathBuf>,
+    watch: bool,
+    pidfile: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    // Stock Caddy's `start` supports these; `run` does not, so reject them before spawning
+    // anything rather than leaving an unsupported server running in the background.
+    if watch {
+        bail!("--watch is not supported: caddy-rs run does not implement config file watching");
+    }
+    if pidfile.is_some() {
+        bail!("--pidfile is not supported: caddy-rs run does not implement PID file writing");
+    }
+    let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+        Ok(listener) => listener,
+        Err(_) => tokio::net::TcpListener::bind("[::1]:0")
+            .await
+            .context("cannot bind a loopback listener for the start handshake")?,
+    };
+    let address = listener
+        .local_addr()
+        .context("cannot read the start handshake address")?;
+    let executable = std::env::current_exe().context("cannot locate the caddy-rs executable")?;
+    let mut command = tokio::process::Command::new(executable);
+    command
+        .arg("run")
+        .arg("--pingback")
+        .arg(address.to_string());
+    if let Some(config) = &config {
+        command.arg("--config").arg(config);
+    }
+    if let Some(adapter) = &adapter {
+        command.arg("--adapter").arg(adapter);
+    }
+    for path in &envfile {
+        command.arg("--envfile").arg(path);
+    }
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("spawning caddy process")?;
+    let pid = child
+        .id()
+        .ok_or_else(|| anyhow!("caddy process has no process ID"))?;
+    use rand::RngCore;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut token = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut token);
+    {
+        let mut stdin = child.stdin.take().context("caddy process has no stdin")?;
+        stdin
+            .write_all(&token)
+            .await
+            .context("cannot write the start handshake to caddy process stdin")?;
+    }
+    // Stock Caddy keeps accepting until the child echoes the token or exits; a stray local
+    // connection (or a wrong token) is logged and ignored rather than treated as the answer.
+    let mut exit = Box::pin(child.wait());
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (mut stream, _) = accepted.context("cannot accept the start handshake")?;
+                let mut confirmation = [0u8; 32];
+                match stream.read_exact(&mut confirmation).await {
+                    Ok(_) if confirmation == token => {
+                        println!(
+                            "Successfully started Caddy (pid={pid}) - Caddy is running in the \
+                             background"
+                        );
+                        break;
+                    }
+                    Ok(_) => {
+                        eprintln!("caddy-rs: warning: wrong start confirmation from a local connection; still waiting for the caddy process");
+                    }
+                    Err(error) => {
+                        eprintln!("caddy-rs: warning: unreadable start confirmation ({error}); still waiting for the caddy process");
+                    }
+                }
+            }
+            status = &mut exit => {
+                let status = status.context("cannot wait for caddy process")?;
+                bail!("caddy process exited with error: {status}");
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn run(command: Command) -> anyhow::Result<()> {
     match command {
         Command::Setup(args) => {
@@ -699,6 +821,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
             data_dir,
             environ,
             envfile,
+            pingback,
         } => {
             let options = adapt_options(&adapt_mode)?;
             load_env_files(&envfile)?;
@@ -844,11 +967,37 @@ async fn run(command: Command) -> anyhow::Result<()> {
             if let Some(admin) = &status.admin {
                 eprintln!("caddy-rs: admin API listening on {admin}");
             }
+            // Child half of stock Caddy's `start` pingback (cmdRun): `start` pipes a random
+            // 32-byte token to our stdin and waits for us to connect back and echo it. Do this
+            // only after the listeners and admin endpoint are active, so the parent's success
+            // message really means the server is up. Errors are fatal (stock exits 1).
+            if let Some(address) = pingback {
+                use std::io::{Read, Write};
+
+                let mut confirmation = Vec::new();
+                io::stdin()
+                    .read_to_end(&mut confirmation)
+                    .context("cannot read pingback confirmation from stdin")?;
+                let mut connection = std::net::TcpStream::connect(&address)
+                    .with_context(|| format!("cannot connect to pingback address `{address}`"))?;
+                connection
+                    .write_all(&confirmation)
+                    .context("cannot write pingback confirmation")?;
+            }
             let channels = signals::shutdown_channels()?;
             runtime
                 .run_with_force(channels.shutdown, channels.force)
                 .await
                 .context("runtime failed")?;
+        }
+        Command::Start {
+            config,
+            adapter,
+            envfile,
+            watch,
+            pidfile,
+        } => {
+            run_start(config, adapter, envfile, watch, pidfile).await?;
         }
         Command::Reload {
             config,

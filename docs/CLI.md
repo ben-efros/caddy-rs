@@ -13,6 +13,7 @@ Commands:
   adapt         Adapt a user-facing config to Caddy JSON
   validate      Validate a configuration without running it
   run           Run the server with a configuration
+  start         Start the server in the background
   reload        Load a new configuration into a running server through its admin API
   stop          Stop a running server through its admin API
   respond       Simple, hard-coded HTTP responses for development and testing
@@ -210,6 +211,7 @@ Synopsis: `caddy-rs run [OPTIONS]`
 | `--data-dir <PATH>` | Certificate/account/pki data directory. | Caddy's `$XDG_DATA_HOME/caddy`/`$HOME/.local/share/caddy`, with legacy `.caddy-rs` fallback |
 | `--envfile <PATH>` | Load `KEY=VALUE` environment file(s) before adaptation. | none |
 | `-e, --environ` | Print the environment before starting. | off |
+| `--pingback <ADDR>` | Echo the confirmation bytes read from standard input to this address on success; used by `start`'s handshake (stock Caddy registers the same flag). | none |
 
 ```sh
 caddy-rs run --config ./Caddyfile --adapter caddyfile
@@ -230,6 +232,56 @@ option `admin off` (or `admin.disabled: true` in JSON) turns the admin API off.
 
 Exit status is 0 after a clean shutdown and 1 when the configuration cannot be loaded or a listener
 cannot be started.
+
+## start
+
+Starts the server in the background and returns once it is running.
+
+Synopsis: `caddy-rs start [OPTIONS]`
+
+| Option | Description | Default |
+|---|---|---|
+| `-c, --config <CONFIG>` | Configuration file passed to the background `run` process. | none |
+| `-a, --adapter <ADAPTER>` | `caddyfile` or `json`; inferred from the file name when omitted. | inferred |
+| `--envfile <PATH>` | Environment file(s) in `KEY=VALUE` form, loaded by the background process; repeatable. | none |
+| `-w, --watch` | Rejected: config file watching is not implemented. | n/a |
+| `--pidfile <PATH>` | Rejected: PID file writing is not implemented. | n/a |
+
+```sh
+caddy-rs start --config ./Caddyfile --adapter caddyfile
+```
+
+On success it prints exactly:
+
+```text
+Successfully started Caddy (pid=12345) - Caddy is running in the background
+```
+
+`start` mirrors stock Caddy's `start`: it binds a loopback listener, spawns `caddy-rs run` with the
+internal `--pingback <address>` flag, writes a random 32-byte token to the child's standard input, and
+reports success only after the child connects back and echoes that token. The child inherits
+standard output and standard error, so its startup lines (listeners, admin API address, autosave)
+appear on the same terminal; its standard input is the handshake pipe.
+
+Exit status is 0 when the child confirms it is running, and 1 when the child exits before the
+handshake (`caddy process exited with error: <status>`, printed after the child's own error line) or
+when an unsupported flag is rejected. A connection that sends the wrong confirmation bytes (another
+local process racing the handshake) is logged and ignored, exactly as stock Caddy does: `start` keeps
+waiting for the child's own confirmation or exit.
+
+Documented limitations in this build:
+
+* `--watch` and `--pidfile` are rejected as unsupported before anything is spawned
+  (`--watch is not supported: caddy-rs run does not implement config file watching`,
+  `--pidfile is not supported: caddy-rs run does not implement PID file writing`), because `run`
+  implements neither config file watching nor PID file writing.
+* `start` has no `--resume`. Without `--config` it loads `./Caddyfile` from the working directory
+  when that file exists (the same special case as `run`); otherwise the child exits 1 with
+  `no configuration to load: pass --config <path> or use --resume ...`, which `start` reports as
+  `caddy process exited with error: exit status: 1`. Stock Caddy would instead start an empty
+  configuration; this is a documented CLI limitation.
+* `--pingback` is visible in `run --help` because stock Caddy v2.11.9 registers it without hiding it;
+  it is an internal handshake flag used by `start`, not a supported way to run a server.
 
 ## reload
 
