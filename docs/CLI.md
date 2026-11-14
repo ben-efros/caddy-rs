@@ -446,10 +446,11 @@ Flags whose capability this build does not have are rejected **before any listen
 with an exit status of 1 and a located error naming the flag and the missing module or feature.
 None of them is silently ignored:
 
-- `--domain` — stock changes the default listener to `:443` and relies on automatic HTTPS. This
-  command does not wire automatic HTTPS, and it must not silently serve plaintext on `:80`
-  instead, so it fails with `--domain: automatic HTTPS is not supported by 'caddy-rs file-server'...`.
-  Use a Caddyfile/JSON configuration with a site address for HTTPS.
+- `--domain` — stock changes the default listener to `:443` and relies on Caddy's implicit
+  automatic HTTPS for the host matcher; caddy-rs activates automatic HTTPS only from an explicit
+  `apps.tls.automation` configuration (DIV-0001), which this quick command does not build. It must
+  not silently serve plaintext on `:80` instead, so it fails with a located `--domain:` error. Use
+  a Caddyfile/JSON configuration with a site address for HTTPS.
 - `--reveal-symlinks` — the browse page lists entry names only; it cannot show symlink targets.
 - `--file-limit` — the browse implementation has no directory-entry cap. Note the related
   divergence: stock caps a listing at 10,000 entries by default, while this build's browse page is

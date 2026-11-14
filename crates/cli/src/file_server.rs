@@ -10,8 +10,10 @@
 //! Flags whose capability this build does not have are rejected before anything is started, with
 //! a located error naming the flag and the missing module/feature; none of them is silently
 //! ignored. `--domain` is rejected because this command does not wire automatic HTTPS: stock
-//! switches the default listener to `:443` and relies on Caddy's automatic HTTPS, and this build
-//! must not silently serve plaintext on `:80` instead.
+//! switches the default listener to `:443` and relies on Caddy's implicit automatic HTTPS for the
+//! host matcher, while caddy-rs activates automatic HTTPS only from an explicit
+//! `apps.tls.automation` configuration (DIV-0001); the command must not silently serve plaintext
+//! on `:80` instead.
 //!
 //! Supported: `--root`, `--listen` (default `:80`), `--browse`, `--templates` (when the
 //! `http.handlers.templates` module is compiled in), `--access-log`, `--no-compress`,
@@ -118,10 +120,12 @@ fn check_flags(args: &Args, registry: &ModuleRegistry) -> Result<()> {
     if !args.domain.is_empty() {
         return Err(located(
             "--domain",
-            "automatic HTTPS is not supported by `caddy-rs file-server`: stock switches the \
-             default listener to :443 and obtains a certificate for the domain, which this \
-             command does not wire. Serve the files from a Caddyfile/JSON configuration with a \
-             site address instead, or re-run without --domain",
+            "this command does not wire automatic HTTPS: stock switches the default listener to \
+             :443 and relies on Caddy's implicit automatic HTTPS for the host matcher, while \
+             caddy-rs activates automatic HTTPS only from an explicit `apps.tls.automation` \
+             configuration (DIV-0001) that this quick command does not build. Serve the files \
+             from a Caddyfile/JSON configuration with a site address instead, or re-run without \
+             --domain",
         ));
     }
     if args.debug {

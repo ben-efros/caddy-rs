@@ -4949,6 +4949,34 @@ impl FileServerProcess {
         let _ = self.child.wait();
     }
 
+    /// Send SIGTERM and wait for a graceful exit, then return the child's stderr.
+    ///
+    /// A graceful shutdown flushes the buffered access-log sink; SIGKILL would not.
+    fn terminate(&mut self) -> String {
+        // SAFETY: `child.id()` is this live child's pid; SIGTERM is a valid signal.
+        unsafe { libc::kill(self.child.id() as libc::c_int, libc::SIGTERM) };
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if self
+                .child
+                .try_wait()
+                .expect("poll file-server child")
+                .is_some()
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                self.stop();
+                panic!(
+                    "file-server did not exit after SIGTERM\nstderr:\n{}",
+                    std::fs::read_to_string(&self.log).unwrap_or_default()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        self.stderr()
+    }
+
     fn stderr(&self) -> String {
         std::fs::read_to_string(&self.log).unwrap_or_default()
     }
@@ -4989,8 +5017,11 @@ fn start_file_server(directory: &Path, root: &Path, extra: &[&str]) -> (FileServ
         args.extend(extra.iter().map(|argument| argument.to_string()));
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let mut process = spawn_file_server(directory, &arg_refs);
+        // The banner is printed only after `apply` succeeded; requiring it (not just a connect)
+        // keeps a port claimed by another process from being mistaken for this child's listener.
         let ready = wait_until(Duration::from_secs(15), || {
-            TcpStream::connect(("127.0.0.1", port)).is_ok()
+            process.stderr().contains("Caddy serving static files on")
+                && TcpStream::connect(("127.0.0.1", port)).is_ok()
         });
         if ready {
             return (process, port);
@@ -5012,6 +5043,16 @@ fn start_file_server(directory: &Path, root: &Path, extra: &[&str]) -> (FileServ
 /// finishing `apply` (the readiness probe only proves the socket is bound), so a transient I/O
 /// error is retried before the test fails.
 fn file_server_get(process: &FileServerProcess, port: u16, path: &str) -> HttpResponse {
+    file_server_get_with_headers(process, port, path, &[])
+}
+
+/// GET `path` with extra request headers (e.g. `Accept-Encoding`), returning the parsed response.
+fn file_server_get_with_headers(
+    process: &FileServerProcess,
+    port: u16,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> HttpResponse {
     let target = SocketAddr::from(([127, 0, 0, 1], port));
     let mut response = Vec::new();
     let mut last_error = None;
@@ -5019,10 +5060,11 @@ fn file_server_get(process: &FileServerProcess, port: u16, path: &str) -> HttpRe
         let attempt = (|| -> std::io::Result<Vec<u8>> {
             let mut stream = TcpStream::connect_timeout(&target, Duration::from_secs(5))?;
             stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-            write!(
-                stream,
-                "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-            )?;
+            write!(stream, "GET {path} HTTP/1.1\r\nHost: localhost\r\n")?;
+            for (name, value) in headers {
+                write!(stream, "{name}: {value}\r\n")?;
+            }
+            write!(stream, "Connection: close\r\n\r\n")?;
             let mut response = Vec::new();
             stream.read_to_end(&mut response)?;
             Ok(response)
@@ -5121,6 +5163,55 @@ fn file_server_browse_lists_a_directory() {
         "listing body: {}",
         response.body
     );
+}
+
+#[test]
+fn file_server_access_log_is_written_to_stderr() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let root = directory.path().join("site");
+    std::fs::create_dir_all(&root).expect("create site root");
+    std::fs::write(root.join("hello.txt"), "hello\n").expect("write file");
+
+    let (mut server, port) = start_file_server(directory.path(), &root, &["--access-log"]);
+    let response = file_server_get(&server, port, "/hello.txt");
+    assert_eq!(response.status, 200);
+    // A graceful shutdown flushes the buffered access-log sink; SIGKILL would not.
+    let stderr = server.terminate();
+    assert!(
+        stderr.contains("http.log.access") && stderr.contains("\"status\":200"),
+        "access log not written:\n{stderr}"
+    );
+}
+
+#[test]
+fn file_server_precompressed_serves_the_sidecar_with_its_encoding() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let root = directory.path().join("site");
+    std::fs::create_dir_all(&root).expect("create site root");
+    std::fs::write(root.join("app.js"), "plain body").expect("write plain file");
+    // The precompressed handler serves the sidecar bytes verbatim with the format's
+    // Content-Encoding; it does not inspect or decompress them, so any marker bytes will do.
+    std::fs::write(root.join("app.js.gz"), "GZIP-SIDECAR-BYTES").expect("write gzip sidecar");
+
+    let (_server, port) = start_file_server(directory.path(), &root, &["--precompressed", "gzip"]);
+    let response =
+        file_server_get_with_headers(&_server, port, "/app.js", &[("Accept-Encoding", "gzip")]);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.header("content-encoding"), Some("gzip"));
+    assert_eq!(response.body, "GZIP-SIDECAR-BYTES");
+}
+
+#[test]
+fn file_server_templates_renders_the_served_page() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let root = directory.path().join("site");
+    std::fs::create_dir_all(&root).expect("create site root");
+    std::fs::write(root.join("index.html"), "host={{.Host}}\n").expect("write template");
+
+    let (_server, port) = start_file_server(directory.path(), &root, &["--templates"]);
+    let response = file_server_get(&_server, port, "/");
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, "host=localhost\n");
 }
 
 #[test]
