@@ -3009,6 +3009,83 @@ fn completion_install_refuses_to_overwrite_a_foreign_file() {
     assert_eq!(std::fs::read_to_string(&bash).unwrap(), "# user managed\n");
 }
 
+#[cfg(unix)]
+#[test]
+fn completion_install_refuses_a_dangling_symlink() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let data = temp.path().join("xdg-data");
+    let config = temp.path().join("xdg-config");
+    std::fs::create_dir_all(&home).unwrap();
+    let bash = data.join("bash-completion/completions/caddy-rs");
+    std::fs::create_dir_all(bash.parent().unwrap()).unwrap();
+    let destination = temp.path().join("outside-completions/caddy-rs");
+    std::os::unix::fs::symlink(&destination, &bash).unwrap();
+    assert!(!destination.exists(), "the symlink must start dangling");
+
+    let (code, _stdout, stderr) = run_with_layout(
+        &["completion", "install", "--shell", "bash"],
+        &home,
+        &data,
+        &config,
+        "/bin/bash",
+    );
+    assert_eq!(code, 1, "{stderr}");
+    assert!(
+        stderr.contains(&format!("refusing to replace {}", bash.display())),
+        "{stderr}"
+    );
+    assert!(stderr.contains("symbolic link"), "{stderr}");
+    assert!(
+        !destination.exists(),
+        "install followed the dangling link and created {}",
+        destination.display()
+    );
+    assert!(
+        std::fs::symlink_metadata(&bash)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "install replaced the link instead of refusing"
+    );
+}
+
+#[test]
+fn completion_install_writes_atomically_and_leaves_no_temporary_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let data = temp.path().join("xdg-data");
+    let config = temp.path().join("xdg-config");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let (code, _stdout, stderr) = run_with_layout(
+        &["completion", "install", "--shell", "bash"],
+        &home,
+        &data,
+        &config,
+        "/bin/bash",
+    );
+    assert_eq!(code, 0, "{stderr}");
+
+    let directory = data.join("bash-completion/completions");
+    let bash = directory.join("caddy-rs");
+    let (_, script, _) = run(&["completion", "bash"]);
+    let installed = std::fs::read_to_string(&bash).unwrap();
+    assert!(
+        installed.ends_with(&script),
+        "installed file is not the complete generated script"
+    );
+    let leftovers: Vec<String> = std::fs::read_dir(&directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name != "caddy-rs")
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "atomic write left temporary files: {leftovers:?}"
+    );
+}
+
 #[test]
 fn completion_install_and_uninstall_dry_run_write_nothing() {
     let temp = tempfile::tempdir().unwrap();

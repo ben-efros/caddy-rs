@@ -647,8 +647,16 @@ updating or deleting anything.
 | fish | `${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions/caddy-rs.fish` |
 | powershell | `${XDG_CONFIG_HOME:-$HOME/.config}/powershell/Completions/caddy-rs.ps1` |
 
-Parent directories are created as needed. The zsh default is `site-functions`, which standard
-distributions put on `$fpath`. Oh My Zsh users may instead need
+Parent directories are created as needed. The zsh default is the per-user `site-functions`
+directory. Stock zsh does **not** put that directory on `$fpath` — it only adds the system
+`site-functions` (for example `/usr/share/zsh/site-functions`) — so zsh completions are not loaded
+until the user adds it before `compinit`, for example in `~/.zshrc`:
+
+```zsh
+fpath=("${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions" $fpath)
+```
+
+`completion install` never edits `~/.zshrc`. Oh My Zsh users may instead need
 `~/.oh-my-zsh/completions/_caddy-rs`; the command detects `~/.oh-my-zsh` as evidence that zsh is in
 use but deliberately keeps `site-functions` as the write target. PowerShell users must dot-source
 the installed file from their own `$PROFILE`, for example:
@@ -686,6 +694,11 @@ Every installed file starts with this first line:
 
 `install` is idempotent: re-running over identical bytes reports `already up to date` and writes
 nothing; a file whose first line is not the marker is never overwritten (exit 1, naming the path).
+`install` also refuses a target path that is a symbolic link — including a dangling link, which
+would otherwise cause the write to create the file at the link's destination — with exit 1 and a
+message naming the link. A write goes to a temporary sibling file that is renamed over the target,
+so an interrupted or failed write cannot leave a partial file that `status`/`uninstall` would later
+misread as foreign.
 `uninstall` removes a file only when that marker is its first line; otherwise it refuses with exit 1
 and prints `refusing to remove <path>: not installed by caddy-rs`. A refused file is left untouched,
 and a bare `uninstall` still removes the other owned files it finds.
