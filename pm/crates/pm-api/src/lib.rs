@@ -621,6 +621,11 @@ pub fn create_router(state: ApiState) -> Router {
             "/security-headers",
             get(security_headers::get_global_handler).put(security_headers::put_global_handler),
         )
+        // Documentation for every option above, served from the same registry the UI page renders.
+        .route(
+            "/security-headers/docs",
+            get(security_headers_docs::docs_handler),
+        )
         .route(
             "/hosts/{id}/security-headers",
             get(security_headers::get_host_handler).put(security_headers::put_host_handler),
@@ -638,6 +643,13 @@ pub fn create_router(state: ApiState) -> Router {
 
     Router::new()
         .nest("/api/v1", api)
+        // The security-headers documentation is rendered from the same registry as
+        // `/api/v1/security-headers/docs`, so the page operators read and the JSON their tooling
+        // reads cannot drift. It is linked from the API payload and served on the UI origin.
+        .route(
+            "/security-headers/docs",
+            get(security_headers_docs::docs_page_handler),
+        )
         // The web UI is served from the same origin as the API so the browser never needs CORS or
         // a second port. It is embedded at build time (see `build.rs`); without a built bundle the
         // fallback answers with an explanatory page instead of a 404.
@@ -800,8 +812,9 @@ mod certificates;
 mod dto;
 mod hosts;
 mod security_headers;
-mod users;
+mod security_headers_docs;
 mod ui;
+mod users;
 
 pub use apply::ApplyResponse;
 pub use certificates::{
@@ -814,3 +827,6 @@ pub use security_headers::{SecurityHeadersDto, SecurityHeadersHstsDto};
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod tests_security_headers_docs;
