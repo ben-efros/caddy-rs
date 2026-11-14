@@ -373,6 +373,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "caddy-rs-l4"
+version = "0.1.0-trial.6"
+dependencies = [
+ "bytes",
+ "tokio",
+]
+
+[[package]]
 name = "caddy-rs-plug"
 version = "0.1.0-trial.6"
 dependencies = [

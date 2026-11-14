@@ -4,6 +4,7 @@ members = [
     "crates/core",
     "crates/config",
     "crates/http",
+    "crates/l4",
     "crates/proxy",
     "crates/tls",
     "crates/admin",
@@ -33,6 +34,7 @@ caddy-rs-core = { path = "crates/core", default-features = false }
 caddy-rs-config = { path = "crates/config", default-features = false }
 caddy-rs-config-tx = { path = "crates/config-tx", default-features = false }
 caddy-rs-http = { path = "crates/http", default-features = false }
+caddy-rs-l4 = { path = "crates/l4", default-features = false }
 caddy-rs-proxy = { path = "crates/proxy", default-features = false }
 caddy-rs-tls = { path = "crates/tls", default-features = false }
 caddy-rs-admin = { path = "crates/admin", default-features = false }
