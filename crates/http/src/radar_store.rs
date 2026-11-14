@@ -39,6 +39,12 @@ pub const DEFAULT_CACHE_PATH: &str = "radar-cache.json";
 /// Connect/read/write timeout applied to every Redis operation.
 const REDIS_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Upper bound on one buffered Radar payload, shared by the Redis `$<len>` bulk reader below and the
+/// HTTP response reader in [`crate::radar_client`]. A Radar page or cached document is a few KiB, so
+/// 1 MiB leaves generous headroom for growth while keeping a hostile or broken peer from forcing an
+/// unbounded allocation.
+pub const MAX_RADAR_BYTES: usize = 1024 * 1024;
+
 /// A storage operation failed. The message is user-facing and names the backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageError {
@@ -603,6 +609,12 @@ async fn read_reply(reader: &mut BufReader<TcpStream>) -> Result<Reply, StorageE
             })?;
             if length < 0 {
                 return Ok(Reply::Bulk(None));
+            }
+            if length > MAX_RADAR_BYTES as i64 {
+                // Refuse before allocating or reading: the advertised length is attacker-controlled.
+                return Err(StorageError::new(format!(
+                    "radar storage: redis bulk reply of {length} bytes exceeds the {MAX_RADAR_BYTES}-byte limit"
+                )));
             }
             let mut buffer = vec![0u8; length as usize];
             reader.read_exact(&mut buffer).await.map_err(|error| {
