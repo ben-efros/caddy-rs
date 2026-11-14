@@ -1392,6 +1392,14 @@ pub struct AutomationPolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_type: Option<String>,
 
+    /// Certificate key source for this policy, e.g. a token-held PKCS#11 key
+    /// (`{"token": {"label": "softHSM", "key_id": "example.com"}}`).
+    ///
+    /// Absent means a fresh process-held key per issuance (Caddy's behaviour). Validated by the
+    /// TLS layer, which owns the token/signer semantics (T-TLS-101).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate_key: Option<Value>,
+
     /// Policy-specific storage backend; falls back to the global storage when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage: Option<StorageConfig>,
