@@ -5854,7 +5854,7 @@ fn reverse_proxy_https_with_internal_certs_forces_the_internal_issuer_for_any_ho
 #[test]
 fn reverse_proxy_disable_redirects_does_not_bind_the_http_port() {
     // This asserts the child does *not* take :80, which only means something when :80 is free.
-    match TcpListener::bind(("127.0.0.1", 80)) {
+    match TcpListener::bind(("0.0.0.0", 80)) {
         Ok(probe) => drop(probe),
         Err(error) => {
             eprintln!("skipping: port 80 is not available in this environment ({error})");
@@ -5873,10 +5873,15 @@ fn reverse_proxy_disable_redirects_does_not_bind_the_http_port() {
         &["--disable-redirects"],
     );
     let stderr = server.stderr();
-    assert!(
-        !stderr.contains("listening on :80"),
-        "`--disable-redirects` bound the HTTP redirect listener; stderr:\n{stderr}"
-    );
+    // The command does not log listener lines, so prove the absence of the redirect listener by
+    // taking :80 ourselves while the child is still running: a successful bind means the child
+    // never bound the wildcard redirect address.
+    match TcpListener::bind(("0.0.0.0", 80)) {
+        Ok(probe) => drop(probe),
+        Err(error) => panic!(
+            "`--disable-redirects` left the HTTP redirect port bound ({error}); stderr:\n{stderr}"
+        ),
+    }
     server.terminate();
 }
 
