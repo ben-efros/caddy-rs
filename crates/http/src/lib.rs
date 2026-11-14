@@ -17,6 +17,8 @@ pub mod file_server;
 pub mod handlers;
 pub mod matchers;
 pub mod placeholders;
+pub mod radar_client;
+pub mod radar_store;
 pub mod rate_limit;
 pub mod regex_lite;
 pub mod router;
@@ -40,6 +42,16 @@ pub use handlers::{
     SubrouteHandler, VarsHandler,
 };
 pub use placeholders::{Replacer, UnknownPlaceholders};
+pub use radar_client::{
+    is_internet_routable, parse_entries, HyperRadarTransport, PollOutcome, RadarClient,
+    RadarConfig, RadarConfigError, RadarEndpoint, RadarEntry, RadarFilters, RadarLog, RadarMetrics,
+    RadarMetricsSnapshot, RadarMode, RadarTransport, StderrRadarLog, DEFAULT_BASE_URL,
+    DEFAULT_CACHE_TTL, DEFAULT_POLL_INTERVAL, MIN_POLL_INTERVAL,
+};
+pub use radar_store::{
+    FileStorage, MemoryStorage, RadarStorage, RedisStorage, StorageError, StorageSpec,
+    DEFAULT_CACHE_PATH,
+};
 pub use rate_limit::{ManualClock, RateLimitClock, RateLimitHandler, SystemClock};
 pub use router::{CustomHandlerFactory, HandlerBuildContext, Route, Router, RouterBuilder};
 #[cfg(feature = "templates")]

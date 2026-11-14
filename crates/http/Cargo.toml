@@ -36,10 +36,19 @@ http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 ring = "0.17.14"
+# Radar client: hyper HTTP/1 over rustls for https://, platform trust store for the API host.
+rustls = { version = "0.23.45", default-features = false, features = [
+    "std", "aws_lc_rs", "tls12", "logging",
+] }
+rustls-platform-verifier = "0.7.1"
+serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-rustls = { version = "0.26.6", default-features = false, features = [
+    "aws_lc_rs", "tls12", "logging",
+] }
 zstd = { version = "0.13", optional = true }
 
 [dev-dependencies]
