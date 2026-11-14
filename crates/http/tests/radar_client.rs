@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use caddy_rs_http::radar_store::MAX_RADAR_BYTES;
 use caddy_rs_http::{
     FileStorage, HyperRadarTransport, MemoryStorage, RadarClient, RadarConfig, RadarEndpoint,
     RadarFilters, RadarLog, RadarMode, RadarStorage, RadarTransport, RedisStorage, StorageSpec,
@@ -746,4 +747,90 @@ async fn read_resp_command(reader: &mut BufReader<TcpStream>) -> std::io::Result
         arguments.push(String::from_utf8_lossy(&buffer[..length]).into_owned());
     }
     Ok(arguments)
+}
+
+/// HTTP/1.1 stub whose body is one byte over the accepted cap.
+async fn spawn_oversized_http_stub() -> (SocketAddr, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind oversized http stub");
+    let address = listener.local_addr().expect("stub addr");
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_task = Arc::clone(&hits);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let hits = Arc::clone(&hits_task);
+            tokio::spawn(async move {
+                let mut buffer = vec![0u8; 4096];
+                let _ = stream.read(&mut buffer).await;
+                hits.fetch_add(1, Ordering::SeqCst);
+                let body = vec![b'x'; MAX_RADAR_BYTES + 1];
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                // The client rejects the body at the cap and closes: a short write here is expected.
+                let _ = stream.write_all(&body).await;
+                let _ = stream.flush().await;
+            });
+        }
+    });
+    (address, hits)
+}
+
+/// RESP stub that advertises a bulk reply over the cap and then sends no payload, so a client that
+/// allocated and read the advertised length would hang instead of returning an error.
+async fn spawn_oversized_bulk_redis_stub() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind oversized redis stub");
+    let address = listener.local_addr().expect("redis stub addr");
+    tokio::spawn(async move {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        let mut reader = BufReader::new(stream);
+        if read_resp_command(&mut reader).await.is_err() {
+            return;
+        }
+        let mut stream = reader.into_inner();
+        let _ = stream
+            .write_all(format!("${}\r\n", MAX_RADAR_BYTES + 1).as_bytes())
+            .await;
+        let _ = stream.flush().await;
+    });
+    address
+}
+
+#[tokio::test]
+async fn http_transport_refuses_a_body_over_the_size_cap() {
+    let (address, hits) = spawn_oversized_http_stub().await;
+    let transport = HyperRadarTransport;
+    let error = transport
+        .get(&format!("http://{address}/radar/ddos/l7"), None)
+        .await
+        .expect_err("oversized response body must be rejected");
+    assert!(error.contains("exceeds"), "{error}");
+    assert!(error.contains(&MAX_RADAR_BYTES.to_string()), "{error}");
+    assert!(error.contains(&address.to_string()), "{error}");
+    wait_until(|| hits.load(Ordering::SeqCst) >= 1).await;
+}
+
+#[tokio::test]
+async fn redis_storage_refuses_a_bulk_reply_over_the_size_cap() {
+    let address = spawn_oversized_bulk_redis_stub().await;
+    let storage = RedisStorage::new(format!("redis://{address}"), "radar:").expect("redis storage");
+    let error = storage
+        .load("ddos/l7")
+        .await
+        .expect_err("oversized redis bulk reply must be rejected");
+    assert!(error.to_string().contains("exceeds"), "{error}");
+    assert!(
+        error.to_string().contains(&MAX_RADAR_BYTES.to_string()),
+        "{error}"
+    );
 }

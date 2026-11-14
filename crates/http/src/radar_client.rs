@@ -69,7 +69,7 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
-use crate::radar_store::{RadarStorage, StorageError, StorageSpec};
+use crate::radar_store::{RadarStorage, StorageError, StorageSpec, MAX_RADAR_BYTES};
 
 /// Default Radar API base URL.
 pub const DEFAULT_BASE_URL: &str = "https://api.cloudflare.com/client/v4/radar";
@@ -699,16 +699,33 @@ where
         .await
         .map_err(|error| format!("radar: request failed: {error}"))?;
     let status = response.status().as_u16();
-    let body = response
-        .into_body()
-        .collect()
-        .await
-        .map_err(|error| format!("radar: reading response body failed: {error}"))?
-        .to_bytes()
-        .to_vec();
+    let body = read_body(response.into_body(), uri).await;
     drop(sender);
     driver.abort();
-    Ok((status, body))
+    Ok((status, body?))
+}
+
+/// Collect a response body, refusing to buffer more than [`MAX_RADAR_BYTES`].
+///
+/// [`HTTP_TIMEOUT`] bounds how long a peer may trickle bytes, not how many it may send, so the size
+/// cap is what keeps a hostile or broken endpoint from growing this buffer without limit. The error
+/// names the request URI so a log line locates the failing endpoint.
+async fn read_body(mut body: hyper::body::Incoming, uri: &Uri) -> Result<Vec<u8>, String> {
+    let mut collected: Vec<u8> = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame
+            .map_err(|error| format!("radar: reading response body for {uri} failed: {error}"))?;
+        let Some(chunk) = frame.data_ref() else {
+            continue;
+        };
+        if collected.len() + chunk.len() > MAX_RADAR_BYTES {
+            return Err(format!(
+                "radar: response body for {uri} exceeds the {MAX_RADAR_BYTES}-byte limit"
+            ));
+        }
+        collected.extend_from_slice(chunk);
+    }
+    Ok(collected)
 }
 
 /// TLS handshake with platform-verifier roots.
@@ -942,24 +959,21 @@ impl Inner {
     }
 
     fn spawn_poller(self: &Arc<Self>) {
-        if self
-            .poller
-            .lock()
-            .map(|poller| poller.is_some())
-            .unwrap_or(false)
-        {
+        let Ok(mut poller) = self.poller.lock() else {
+            return;
+        };
+        if poller.is_some() {
             return;
         }
         let inner = Arc::clone(self);
-        let handle = tokio::spawn(async move {
+        // Store the handle under the same lock that guards the `is_some` check: the check and the
+        // transition are one step, so two concurrent callers cannot both spawn a polling loop.
+        *poller = Some(tokio::spawn(async move {
             loop {
                 inner.poll_once().await;
                 tokio::time::sleep(inner.config.interval).await;
             }
-        });
-        if let Ok(mut poller) = self.poller.lock() {
-            *poller = Some(handle);
-        }
+        }));
     }
 
     fn stop_poller(&self) {
