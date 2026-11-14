@@ -18,6 +18,7 @@ Commands:
   stop          Stop a running server through its admin API
   respond       Simple, hard-coded HTTP responses for development and testing
   file-server   Spins up a production-ready file server
+  reverse-proxy A quick and production-ready reverse proxy
   environ       Print the environment as seen by this caddy-rs process
   fmt           Formats a Caddyfile
   completion    Generate a shell completion script
@@ -465,6 +466,79 @@ The browse page itself is this build's `file_server` browse output (a simple HTM
 Caddy's browse template, so it has no sort/search controls and no custom template support. The
 `file_server` handler is shared with `run`; its other divergences are documented in
 [`FEATURES.md`](FEATURES.md).
+
+## reverse-proxy
+
+Shuttles HTTP(S) traffic from a downstream address to one or more upstreams, like Caddy's
+`caddy reverse-proxy`. The command builds the same in-memory configuration as Caddy (admin endpoint
+disabled with `config.persist=false`, one server named `proxy` listening on `:<port>`, one route
+with a `host` matcher when `--from` names a host and a `reverse_proxy` handler), starts it with the
+same runtime as `caddy-rs run`, logs `caddy proxying from=<addr> to=[<upstream>...]` (plus
+`using default load balancing policy random` when more than one upstream is configured) to standard
+error, and blocks until interrupted.
+
+Synopsis: `caddy-rs reverse-proxy [--from <addr>] [--to <addr>] [--change-host-header] [--insecure] [--internal-certs] [--disable-redirects] [--header-up "Field: value"] [--header-down "Field: value"] [--access-log] [--debug]`
+
+| Option | Description | Default |
+|---|---|---|
+| `-f, --from <ADDR>` | Address on which to receive traffic (a path is rejected). | `localhost` |
+| `-t, --to <ADDR>` | Upstream address(es) to which traffic should be sent; repeatable or comma-separated. | required |
+| `-H, --header-up <FIELD: VALUE>` | Set a request header sent to the upstream; repeatable. | none |
+| `-d, --header-down <FIELD: VALUE>` | Set a response header sent back to the client; repeatable. | none |
+| `--insecure` | Skip TLS verification with HTTPS upstreams. | off |
+| `-r, --disable-redirects` | Keep automatic HTTPS but do not bind the HTTP redirect listener. | off |
+| `-i, --internal-certs` | Issue the HTTPS certificate from the local CA (needs a host in `--from`). | off |
+| `--access-log` | Enable the access log (written to standard error). | off |
+| `-c, --change-host-header` | Rejected by this build; see below. | off |
+| `-v, --debug` | Rejected by this build; see below. | off |
+
+```sh
+caddy-rs reverse-proxy --from :8080 --to 127.0.0.1:9000
+caddy-rs reverse-proxy -f http://127.0.0.1:8080 -t localhost:9000 -t localhost:9001
+caddy-rs reverse-proxy -f :8080 -t unix//run/app.sock -H "X-Forwarded-Proto: http"
+caddy-rs reverse-proxy -f :8080 -t 127.0.0.1:9000 -d "X-Served-By: caddy-rs" --access-log
+caddy-rs reverse-proxy -f https://localhost:8443 -i -r -t 127.0.0.1:9000
+```
+
+`--from` is parsed like Caddy's `httpcaddyfile.ParseAddress` plus stock's inference: a path is
+rejected; with no scheme, an explicit port 80 or an empty host means `http`, anything else means
+`https`; an empty port becomes 80 for HTTP and 443 for HTTPS. `--to` is parsed like
+`parseUpstreamDialAddress`: `host[:port]` (port 80 when omitted), `http://host[:port]`,
+`https://host[:port]`, `unix//path`, and a numeric port range (`host:8000-8005`), which expands to
+one upstream per port. Mixing schemes uses the first defined scheme, exactly like stock. HTTPS
+upstreams set the HTTP transport's `tls` object (`insecure_skip_verify` with `--insecure`); stock's
+default random load-balancing policy is used and, like stock, no `load_balancing` object is
+emitted. `--header-up`/`--header-down` become the handler's inline
+`headers.request.set`/`headers.response.set`.
+
+Flags and values whose capability this build does not have are rejected **before any listener is
+started**, with an exit status of 1 and a located error naming the flag and the missing feature.
+None of them is silently ignored:
+
+- `--from` resolving to HTTPS **without** `--internal-certs` — stock relies on Caddy's implicit
+  automatic HTTPS for the host matcher, while caddy-rs activates automatic HTTPS only from an
+  explicit `apps.tls.automation` configuration (DIV-0001). The error names `--from` and suggests
+  `--internal-certs` or an explicit `http://` address; the command never serves plaintext on an
+  HTTPS address.
+- `--from` resolving to HTTPS **with** `--internal-certs` but no host — there is no certificate
+  subject to issue for, so the handshake could never succeed.
+- `--change-host-header` — it is a shortcut for `--header-up "Host:
+  {http.reverse_proxy.upstream.hostport}"`, and this build's replacer does not implement the
+  `http.reverse_proxy.*` placeholder namespace (DIV-0007), so the Host header could not name the
+  selected upstream.
+- `--header-up`/`--header-down` values containing an `http.reverse_proxy.*` placeholder, for the
+  same reason.
+- `--debug` — this build has no debug-level internal logging.
+
+HTTPS downstreams are supported only through the explicit internal-CA path
+(`--internal-certs` plus a host in `--from`), which emits stock's
+`apps.tls.automation.policies` entry `{subjects:[host], issuers:[{"module":"internal"}]}` and serves
+TLS on the `--from` port. Stock instead relies on implicit automatic HTTPS for any HTTPS `--from`;
+that mode is the DIV-0001 gap described above. Because this build has no ACME issuance in a quick
+command, public-name HTTPS (and therefore stock's implicit certificate acquisition) is not
+available here; use a Caddyfile/JSON configuration for public certificates. With
+`--internal-certs` and without `--disable-redirects`, automatic HTTPS also binds the HTTP redirect
+listener on port 80, like stock.
 
 ## pki
 
