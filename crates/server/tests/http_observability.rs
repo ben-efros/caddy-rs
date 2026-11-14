@@ -900,3 +900,64 @@ async fn error_routes_count_dial_failures_but_not_upstream_5xx() {
 
     runtime.shutdown().await;
 }
+
+/// A dial address whose placeholder expands to nothing makes target resolution fail. Caddy reports
+/// that as a `HandlerError` (`modules/caddyhttp/reverseproxy/reverseproxy.go:677-680`), so the 502
+/// caddy-rs renders must still be counted as a handler-chain error
+/// (`modules/caddyhttp/metrics.go:371-380`).
+#[tokio::test]
+async fn placeholder_dial_expansion_failure_increments_request_errors_total() {
+    let config = metrics_config(serde_json::json!([{"handle": [
+        {
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": "{http.request.header.X-Upstream}"}]
+        }
+    ]}]));
+    let (runtime, address) = start_proxy_config(config).await;
+
+    // No `X-Upstream` header: the dial address expands to an empty string.
+    let (status, _headers, _body) = request(address, "GET", "/", &[]).await;
+    assert_eq!(status, 502);
+
+    let metrics = rendered_metrics(&runtime).await;
+    assert!(
+        metrics.contains(
+            "caddy_http_request_errors_total{handler=\"reverse_proxy\",server=\"srv0\"} 1"
+        ),
+        "a dial placeholder-expansion failure is a handler-chain error and must be counted:\n{metrics}"
+    );
+
+    runtime.shutdown().await;
+}
+
+/// Passive health checks can empty the upstream pool. Caddy reports "no available upstreams" as a
+/// `HandlerError` (`modules/caddyhttp/reverseproxy/reverseproxy.go:666-670`), so the 503 must be
+/// counted exactly like the 502 that took the only upstream out of rotation.
+#[tokio::test]
+async fn no_available_upstream_increments_request_errors_total() {
+    let config = metrics_config(serde_json::json!([{"handle": [
+        {
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": refused_dial_address()}],
+            "health_checks": {"passive": {"fail_duration": 10_000_000_000u64, "max_fails": 1}}
+        }
+    ]}]));
+    let (runtime, address) = start_proxy_config(config).await;
+
+    // The refused dial is a 502 (counted) and takes the only upstream out of rotation.
+    let (status, _headers, _body) = request(address, "GET", "/", &[]).await;
+    assert_eq!(status, 502);
+    // With no available upstream the proxy answers 503, which is a handler error too.
+    let (status, _headers, _body) = request(address, "GET", "/", &[]).await;
+    assert_eq!(status, 503);
+
+    let metrics = rendered_metrics(&runtime).await;
+    assert!(
+        metrics.contains(
+            "caddy_http_request_errors_total{handler=\"reverse_proxy\",server=\"srv0\"} 2"
+        ),
+        "both the dial failure and the no-available-upstream 503 must be counted:\n{metrics}"
+    );
+
+    runtime.shutdown().await;
+}
