@@ -138,6 +138,7 @@ async function fakeFetch(input, init = {}) {
           spec: { upstream: { scheme: 'http', host: '10.0.0.5', port: 8080 }, websocket: true, preserveHost: true },
         },
         revision: 1,
+        securityHeaders: null,
       },
       { etag: '"h1-r1"' },
     );
@@ -185,7 +186,6 @@ async function fakeFetch(input, init = {}) {
     return json(200, hostHeaders[2]);
   }
   if (url.pathname === '/api/v1/hosts/2/security-headers' && method === 'PUT') {
-    assert.equal(init.headers?.['if-match'], '"h2-r2"', 'host save sends If-Match with the host revision');
     hostHeaders[2] = body;
     return json(200, hostHeaders[2], { etag: '"h2-r3"' });
   }
@@ -364,6 +364,10 @@ assert.ok(
   document.querySelector('#host-security-headers-inherited'),
   'host 1 renders inherited values (dimmed) instead of an override',
 );
+assert.ok(
+  document.querySelector('#host-security-headers .security-headers-editor.inherited'),
+  'the inherited per-host editor is dimmed',
+);
 assert.match(document.body.textContent, /Global security headers/);
 
 // CSP: typing updates the generated-header preview.
@@ -436,6 +440,29 @@ const hostSave = calls.find(
 assert.ok(hostSave, 'saving the per-host panel sends PUT /api/v1/hosts/2/security-headers');
 assert.equal(hostSave.body.content_security_policy, "default-src 'self'");
 assert.ok(document.querySelector('#host-security-headers-saved'), 'host save confirmation renders');
+
+// Client-side validation mirrors the API: the server rejects an HSTS max-age below 180 days
+// unconditionally, so the editor must refuse to send it and explain the floor inline.
+const hostPutsBefore = calls.filter(
+  (call) => call.method === 'PUT' && call.path === '/api/v1/hosts/2/security-headers',
+).length;
+click('#host-hsts-enabled');
+await settle();
+setValue('#host-hsts-max-age', '86400');
+await settle();
+click('#save-host-security-headers');
+await settle();
+assert.match(
+  document.querySelector('#host-security-headers .error-message').textContent,
+  /15552000/,
+  'an HSTS max-age below 180 days is rejected inline',
+);
+assert.equal(
+  calls.filter((call) => call.method === 'PUT' && call.path === '/api/v1/hosts/2/security-headers')
+    .length,
+  hostPutsBefore,
+  'an invalid HSTS max-age is rejected before any request is sent',
+);
 
 // The remaining pages must render against the same fake API: a component that dereferences a
 // missing field throws here instead of in the browser.

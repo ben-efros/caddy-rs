@@ -293,11 +293,12 @@ export const securityHeaders = {
   putGlobal: (config: SecurityHeadersConfig) =>
     request<SecurityHeadersConfig>('/security-headers', { method: 'PUT', body: config }),
   getHost: (id: number) => request<SecurityHeadersConfig>(`/hosts/${id}/security-headers`),
-  putHost: (id: number, config: SecurityHeadersConfig, etag: string | null) =>
+  // The per-host PUT is last-write-wins (the API does not require an If-Match here), so no
+  // precondition is sent: faking one would suggest a conflict guarantee the server does not give.
+  putHost: (id: number, config: SecurityHeadersConfig) =>
     request<SecurityHeadersConfig>(`/hosts/${id}/security-headers`, {
       method: 'PUT',
       body: config,
-      headers: ifMatch(etag),
     }),
 };
 

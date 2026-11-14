@@ -246,12 +246,12 @@ export function validateSecurityHeaders(config: SecurityHeadersConfig): Record<s
   }
   const hsts = config.strict_transport_security;
   if (hsts) {
-    if (!Number.isFinite(hsts.max_age) || hsts.max_age <= 0) {
-      errors.strict_transport_security = 'HSTS max-age must be greater than 0.';
+    // The API rejects max-age below 180 days unconditionally (pm-core `validate`), not only when
+    // preload is requested, so the editor must enforce the same floor before sending.
+    if (!Number.isFinite(hsts.max_age) || hsts.max_age < HSTS_PRELOAD_MIN_MAX_AGE) {
+      errors.strict_transport_security = `HSTS max-age must be at least ${HSTS_PRELOAD_MIN_MAX_AGE} seconds (180 days).`;
     } else if (hsts.preload && !hsts.include_subdomains) {
       errors.strict_transport_security = 'HSTS preload requires includeSubDomains.';
-    } else if (hsts.preload && hsts.max_age < HSTS_PRELOAD_MIN_MAX_AGE) {
-      errors.strict_transport_security = `HSTS preload requires max-age of at least ${HSTS_PRELOAD_MIN_MAX_AGE} seconds (180 days).`;
     }
   }
   const xfo = (config.x_frame_options || '').trim();
@@ -487,7 +487,7 @@ export function SecurityHeadersEditor({
               id={`${idPrefix}-hsts-max-age`}
               name="hsts_max_age"
               type="number"
-              min={1}
+              min={HSTS_PRELOAD_MIN_MAX_AGE}
               value={hsts.max_age}
               onChange={(event) =>
                 setHsts({ max_age: Number(event.target.value) || 0 })
