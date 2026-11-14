@@ -992,6 +992,7 @@ fn rewritten_uri(request: &Request, template: &str) -> Result<Uri> {
     };
 
     let mut new_path = request.uri.path().to_string();
+    let original_path = new_path.clone();
     let mut new_query = request.uri.query().map(str::to_string);
     let mut query_was_set = false;
 
@@ -1049,6 +1050,23 @@ fn rewritten_uri(request: &Request, template: &str) -> Result<Uri> {
     }
 
     let _ = query_was_set;
+    // A direct `uri` rewrite can install dot segments (often from a placeholder) or a relative
+    // result, so downstream matchers would see a different path than `file_server` resolves (a
+    // path-guard bypass). Mirror upstream f4c634f0ed3d: anchor and clean a changed absolute path
+    // (repeated slashes preserved, unchanged path left byte-identical), leave an explicit
+    // `OPTIONS *` target alone, and keep the documented loud rejection for relative targets.
+    let options_star = request.method == Method::OPTIONS && new_path == "*";
+    if !options_star && !new_path.starts_with('/') {
+        return Err(invalid(
+            "rewrite.uri",
+            format!(
+                "relative rewrite URI `{new_path}` is not representable by the caddy-rs URI model; Caddy accepts relative rewrite targets (documented divergence)"
+            ),
+        ));
+    }
+    if !options_star && percent_decode(&new_path) != percent_decode(&original_path) {
+        new_path = canonicalize_rewrite_path(&new_path);
+    }
     let mut rebuilt = new_path;
     if let Some(query) = &new_query {
         rebuilt.push('?');
@@ -1121,6 +1139,7 @@ fn canonical_path_from_uri_setter(input: &str) -> String {
             || matches!(
                 character,
                 '-' | '_'
+                    | '.'
                     | '~'
                     | '!'
                     | '$'
@@ -2673,6 +2692,161 @@ mod tests {
         };
         assert_eq!(request.uri.path(), "/old/path");
         assert_eq!(request.uri.query(), Some("q=1"));
+    }
+
+    #[tokio::test]
+    async fn rewrite_uri_canonicalizes_a_changed_path() {
+        // Port of upstream Caddy f4c634f0ed3d (`TestRewriteURICanonicalizesChangedPath`): a direct
+        // `uri` rewrite can install dot segments from a placeholder, so a downstream path matcher
+        // would see one path while `file_server` resolves another (a path-guard bypass).
+        let handler = RewriteHandler::from_json(
+            &serde_json::json!({
+                "handler": "rewrite",
+                "uri": "{http.request.header.X-Path}"
+            }),
+            "handler",
+        )
+        .unwrap();
+        let mut request = test_request(Method::GET, "/x?a=b");
+        request.headers.insert(
+            HeaderName::from_static("x-path"),
+            HeaderValue::from_static("/public/../secret"),
+        );
+        let Outcome::Continue(request) = handler.handle(request).await.unwrap() else {
+            panic!("expected continue");
+        };
+        assert_eq!(request.uri.path(), "/secret");
+        assert_eq!(request.uri.query(), Some("a=b"));
+        let secret = crate::matchers::PathMatcher {
+            patterns: vec!["/secret*".to_string()],
+        };
+        assert!(crate::types::Matcher::matches(&secret, &request));
+        let public_guard = crate::matchers::PathMatcher {
+            patterns: vec!["/public/*".to_string()],
+        };
+        assert!(
+            !crate::types::Matcher::matches(&public_guard, &request),
+            "dot segments must not let a `/public/*` guard cover a file outside it"
+        );
+
+        // Encoded dot segments in the placeholder value are decoded by the URI setter and then
+        // resolved, like upstream `TestRewriteURICanonicalizesChangedPath`.
+        for value in ["/public/%2E%2E/secret", "/public/%2e%2e/secret"] {
+            let mut request = test_request(Method::GET, "/x");
+            request.headers.insert(
+                HeaderName::from_static("x-path"),
+                HeaderValue::from_str(value).unwrap(),
+            );
+            let Outcome::Continue(request) = handler.handle(request).await.unwrap() else {
+                panic!("expected continue");
+            };
+            assert_eq!(request.uri.path(), "/secret", "for {value}");
+        }
+    }
+
+    #[tokio::test]
+    async fn rewrite_uri_canonicalizes_a_literal_path_with_dot_segments() {
+        let handler = RewriteHandler::from_json(
+            &serde_json::json!({"handler": "rewrite", "uri": "/public/../secret"}),
+            "handler",
+        )
+        .unwrap();
+        let Outcome::Continue(request) = handler
+            .handle(test_request(Method::GET, "/x"))
+            .await
+            .unwrap()
+        else {
+            panic!("expected continue");
+        };
+        assert_eq!(request.uri.path(), "/secret");
+
+        // A literal dot in a path segment is not a dot segment and keeps Caddy's unescaped form.
+        let handler = RewriteHandler::from_json(
+            &serde_json::json!({"handler": "rewrite", "uri": "/file.txt"}),
+            "handler",
+        )
+        .unwrap();
+        let Outcome::Continue(request) = handler
+            .handle(test_request(Method::GET, "/x"))
+            .await
+            .unwrap()
+        else {
+            panic!("expected continue");
+        };
+        assert_eq!(request.uri.path(), "/file.txt");
+    }
+
+    #[tokio::test]
+    async fn rewrite_uri_preserves_repeated_slashes_and_leaves_an_unchanged_path_alone() {
+        let handler = RewriteHandler::from_json(
+            &serde_json::json!({"handler": "rewrite", "uri": "/a//b/"}),
+            "handler",
+        )
+        .unwrap();
+        let Outcome::Continue(request) = handler
+            .handle(test_request(Method::GET, "/x"))
+            .await
+            .unwrap()
+        else {
+            panic!("expected continue");
+        };
+        assert_eq!(request.uri.path(), "/a//b/");
+
+        // `{http.request.uri.path}` reproduces the current path exactly, so it is not touched.
+        let handler = RewriteHandler::from_json(
+            &serde_json::json!({"handler": "rewrite", "uri": "{http.request.uri.path}"}),
+            "handler",
+        )
+        .unwrap();
+        let Outcome::Continue(request) = handler
+            .handle(test_request(Method::GET, "/a/../b"))
+            .await
+            .unwrap()
+        else {
+            panic!("expected continue");
+        };
+        assert_eq!(request.uri.path(), "/a/../b");
+    }
+
+    #[tokio::test]
+    async fn rewrite_uri_leaves_an_explicit_options_asterisk_target_alone() {
+        let handler = RewriteHandler::from_json(
+            &serde_json::json!({"handler": "rewrite", "uri": "*"}),
+            "handler",
+        )
+        .unwrap();
+        let Outcome::Continue(request) = handler
+            .handle(test_request(Method::OPTIONS, "*"))
+            .await
+            .unwrap()
+        else {
+            panic!("expected continue");
+        };
+        assert_eq!(request.uri.to_string(), "*");
+
+        // A `*` produced by an OPTIONS rewrite is an explicit asterisk target, not a path.
+        let Outcome::Continue(request) = handler
+            .handle(test_request(Method::OPTIONS, "/x"))
+            .await
+            .unwrap()
+        else {
+            panic!("expected continue");
+        };
+        assert_eq!(request.uri.to_string(), "*");
+    }
+
+    #[tokio::test]
+    async fn rewrite_uri_keeps_rejecting_relative_targets() {
+        let handler = RewriteHandler::from_json(
+            &serde_json::json!({"handler": "rewrite", "uri": "secret"}),
+            "handler",
+        )
+        .unwrap();
+        let error = handler
+            .handle(test_request(Method::GET, "/x"))
+            .await
+            .expect_err("relative rewrite targets stay a located error");
+        assert!(error.to_string().contains("relative rewrite URI"));
     }
 
     #[tokio::test]
