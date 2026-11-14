@@ -103,6 +103,10 @@ changing host semantics.
 
 - `ConfigSettings` defaults to 80/443; the ports are written to both `http_port`/`https_port` and
   the `pm_http`/`pm_https` `listen` addresses;
+- `ConfigSettings::security_headers` is an optional global `security_headers` block; a host
+  inherits it unless it sets its own `Host::security_headers` (the host block wins), and the
+  effective block is validated during assembly (`ConfigError::InvalidSecurityHeaders`) before any
+  JSON is produced;
 - HTTP routes stay on `pm_http` with `automatic_https.disable_redirects` set, so host-level
   redirects remain authoritative; HTTPS routes stay on `pm_https`;
 - route order is the compiler order; the JSON is deterministic and contains no private-key
