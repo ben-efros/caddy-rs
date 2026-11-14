@@ -694,6 +694,19 @@ pub const BUILTIN_MODULES: &[Module] = &[
         ModuleKind::HttpHandler,
         "Abort with a recommended status and message handled by the server's error routes",
     ),
+    // Reverse proxy transports
+    Module::new(
+        "http.reverse_proxy.transport.http",
+        "http",
+        ModuleKind::Other,
+        "HTTP transport for reverse proxy upstreams (HTTP/1.1, HTTP/2, h2c, TLS)",
+    ),
+    Module::new(
+        "http.reverse_proxy.transport.fastcgi",
+        "fastcgi",
+        ModuleKind::Other,
+        "FastCGI transport for reverse proxy upstreams",
+    ),
     // HTTP matchers
     Module::new(
         "http.matchers.host",
@@ -972,6 +985,22 @@ mod tests {
         assert!(registry.resolve_handler("not_a_real_handler").is_none());
         assert!(registry.get("apps.http").is_none());
         assert!(registry.contains("http"));
+    }
+
+    #[test]
+    fn builtin_registry_registers_reverse_proxy_transports() {
+        let registry = ModuleRegistry::builtin();
+        for (id, json_key) in [
+            ("http.reverse_proxy.transport.http", "http"),
+            ("http.reverse_proxy.transport.fastcgi", "fastcgi"),
+        ] {
+            let module = registry
+                .get(id)
+                .unwrap_or_else(|| panic!("missing built-in transport module `{id}`"));
+            assert_eq!(module.json_key, json_key);
+            assert_eq!(module.kind, ModuleKind::Other);
+            assert!(registry.is_builtin_module(id));
+        }
     }
 
     #[test]
