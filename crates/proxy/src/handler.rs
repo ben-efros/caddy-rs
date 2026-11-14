@@ -1920,7 +1920,12 @@ impl Handler for ReverseProxyHandler {
                         "caddy-rs: reverse_proxy upstream `{}` failed: {error}",
                         upstream.dial
                     );
+                    // Caddy's `reverse_proxy` reports an upstream failure as a `HandlerError`, so
+                    // the server increments `caddy_http_request_errors_total` whenever this arm
+                    // turns that error into a response instead of propagating it
+                    // (`modules/caddyhttp/metrics.go:371-378`).
                     if let Some(status) = error.explicit_status() {
+                        request.mark_middleware_error();
                         let mut response = Response::text(status, format!("{status}"));
                         merge_selection_cookie(&mut response, &selection);
                         return Ok(Outcome::Respond(response));
@@ -1932,6 +1937,7 @@ impl Handler for ReverseProxyHandler {
                     let retryable =
                         error.is_dial_error() || self.retry_match.matches_transport_error(&request);
                     if !retryable || !self.retry_allowed(attempts, deadline) {
+                        request.mark_middleware_error();
                         let mut response =
                             Response::text(StatusCode::BAD_GATEWAY, "502 Bad Gateway");
                         merge_selection_cookie(&mut response, &selection);
@@ -2245,7 +2251,12 @@ impl Handler for ReverseProxyHandler {
                         "caddy-rs: reverse_proxy upstream `{}` failed: {error}",
                         upstream.dial
                     );
+                    // Caddy's `reverse_proxy` reports an upstream failure as a `HandlerError`, so
+                    // the server increments `caddy_http_request_errors_total` whenever this arm
+                    // turns that error into a response instead of propagating it
+                    // (`modules/caddyhttp/metrics.go:371-378`).
                     if let Some(status) = error.explicit_status() {
+                        request.mark_middleware_error();
                         let mut response = Response::text(status, format!("{status}"));
                         merge_selection_cookie(&mut response, &selection);
                         return Ok(StreamingOutcome::Respond(StreamingResponse::from_buffered(
@@ -2259,6 +2270,7 @@ impl Handler for ReverseProxyHandler {
                     let retryable =
                         error.is_dial_error() || self.retry_match.matches_transport_error(&request);
                     if !retryable || !self.retry_allowed(attempts, deadline) {
+                        request.mark_middleware_error();
                         let mut response =
                             Response::text(StatusCode::BAD_GATEWAY, "502 Bad Gateway");
                         merge_selection_cookie(&mut response, &selection);
