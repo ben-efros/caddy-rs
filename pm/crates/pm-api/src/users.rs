@@ -264,15 +264,15 @@ async fn require_capability(
 
 /// The `Authorization: Bearer <token>` value, with the scheme matched case-insensitively.
 fn bearer_token(headers: &HeaderMap) -> Result<&str, ApiError> {
-    let value = headers.get(header::AUTHORIZATION).ok_or_else(|| {
-        ApiError::Unauthorized("a bearer access token is required".to_owned())
-    })?;
+    let value = headers
+        .get(header::AUTHORIZATION)
+        .ok_or_else(|| ApiError::Unauthorized("a bearer access token is required".to_owned()))?;
     let text = value
         .to_str()
         .map_err(|_| ApiError::Unauthorized("the Authorization header is not valid".to_owned()))?;
-    let (scheme, token) = text
-        .split_once(' ')
-        .ok_or_else(|| ApiError::Unauthorized("the Authorization header is not valid".to_owned()))?;
+    let (scheme, token) = text.split_once(' ').ok_or_else(|| {
+        ApiError::Unauthorized("the Authorization header is not valid".to_owned())
+    })?;
     if !scheme.eq_ignore_ascii_case("bearer") || token.is_empty() {
         return Err(ApiError::Unauthorized(
             "the Authorization header must use the Bearer scheme".to_owned(),

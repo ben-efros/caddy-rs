@@ -2063,7 +2063,10 @@ async fn users_list_returns_public_views_to_an_editor() {
     assert_eq!(raw["items"][1]["username"], "editor");
     assert_eq!(raw["items"][1]["role"]["name"], "editor");
     let text = raw.to_string();
-    assert!(!text.contains("password_hash"), "no password hash is served");
+    assert!(
+        !text.contains("password_hash"),
+        "no password hash is served"
+    );
     assert!(!text.contains("totp_secret"), "no TOTP secret is served");
 
     let body: PaginatedResponse<PublicUser> = server
@@ -2170,7 +2173,12 @@ async fn admin_role_change_invalidates_the_old_token() {
         .add_header("Authorization", bearer(&admin.access_token))
         .json(&serde_json::json!({"role": "viewer"}))
         .await;
-    assert_eq!(response.status_code(), StatusCode::OK, "{}", response.text());
+    assert_eq!(
+        response.status_code(),
+        StatusCode::OK,
+        "{}",
+        response.text()
+    );
     let body: PublicUser = response.json();
     assert_eq!(body.username, "editor");
     assert_eq!(body.role.name, "viewer");
@@ -2214,14 +2222,20 @@ async fn user_mutations_validate_the_id_and_the_role() {
     assert_eq!(body.error.location.as_deref(), Some("id"));
 
     let response = server
-        .patch(&format!("/api/v1/users/{}", caddy_rs_authn::UserId::new().0))
+        .patch(&format!(
+            "/api/v1/users/{}",
+            caddy_rs_authn::UserId::new().0
+        ))
         .add_header("Authorization", bearer(&admin.access_token))
         .json(&serde_json::json!({"role": "admin"}))
         .await;
     assert_eq!(response.status_code(), StatusCode::NOT_FOUND);
 
     let response = server
-        .delete(&format!("/api/v1/users/{}", caddy_rs_authn::UserId::new().0))
+        .delete(&format!(
+            "/api/v1/users/{}",
+            caddy_rs_authn::UserId::new().0
+        ))
         .add_header("Authorization", bearer(&admin.access_token))
         .await;
     assert_eq!(response.status_code(), StatusCode::NOT_FOUND);
