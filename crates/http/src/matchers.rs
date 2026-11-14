@@ -501,18 +501,13 @@ impl FileMatcher {
     /// only; a glob pattern with a trailing separator matches nothing).
     fn candidates(&self, root: &str, request: &Request, pattern: &str) -> Vec<FileCandidate> {
         let expanded = expand_glob_safe(request, pattern);
-        // Caddy cleans the *expanded* path and restores its trailing slash before splitting and
-        // joining under the root (so `{path}` for `/dir/` still identifies a directory), then
-        // rejects directory candidates whose pattern did not end in `/` (so `/dir/` falls through
-        // to a later `{path}/index.php` entry).
-        let mut cleaned = path_clean(&expanded);
-        if expanded.ends_with('/') && !cleaned.ends_with('/') {
-            cleaned.push('/');
-        }
-        let (before_split, remainder) = first_split(&cleaned, &self.split_path);
-        if before_split != "/" && before_split.ends_with('/') && !pattern.ends_with('/') {
+        // Caddy's `cleanSplit`: clean the *expanded* path with its trailing slash restored before
+        // splitting and joining under the root (so `{path}` for `/dir/` still identifies a
+        // directory), and reject directory candidates whose pattern did not end in `/` (so
+        // `/dir/` falls through to a later `{path}/index.php` entry).
+        let Some((before_split, remainder)) = self.clean_split(pattern, &expanded) else {
             return Vec::new();
-        }
+        };
         let fullpath = sanitized_join(root, &before_split);
         let trailing = fullpath.ends_with('/');
         let glob_pattern = if trailing {
@@ -553,24 +548,42 @@ impl FileMatcher {
 
     /// Caddy's `makeLiteralCandidate`: the final `first_exist_fallback` entry matches
     /// unconditionally, even when the file (or glob) does not exist. It does not glob or escape
-    /// placeholder values.
-    fn literal_candidate(&self, root: &str, request: &Request, pattern: &str) -> FileCandidate {
+    /// placeholder values, but it applies the same `cleanSplit` slash rules as `makeCandidates`
+    /// so a trailing-slash request cannot match a regular file through the fallback entry.
+    fn literal_candidate(
+        &self,
+        root: &str,
+        request: &Request,
+        pattern: &str,
+    ) -> Option<FileCandidate> {
         let expanded = expand_placeholders_raw(request, pattern);
-        let cleaned = path_clean(&expanded);
-        let (mut before_split, remainder) = first_split(&cleaned, &self.split_path);
-        if pattern.ends_with('/') {
-            before_split.push('/');
-        }
+        let (before_split, remainder) = self.clean_split(pattern, &expanded)?;
         let fullpath = sanitized_join(root, &before_split);
         let relative = fullpath
             .strip_prefix(root)
             .map(str::to_string)
             .unwrap_or_else(|| fullpath.clone());
-        FileCandidate {
+        Some(FileCandidate {
             fullpath,
             relative,
             remainder,
+        })
+    }
+
+    /// Caddy's `cleanSplit`: clean the expansion of `pattern` keeping its trailing slash, split it
+    /// on `split_path`, and report no candidate when the cleaned result ends in `/` but the
+    /// pattern does not, because only a pattern ending in `/` may match a directory.
+    fn clean_split(&self, pattern: &str, expanded: &str) -> Option<(String, String)> {
+        let mut cleaned = normalized_path(expanded);
+        if cleaned.is_empty() {
+            // Preserve `path.Clean`'s result for an empty path (Caddy sets "." explicitly).
+            cleaned.push('.');
         }
+        let (before_split, after_split) = first_split(&cleaned, &self.split_path);
+        if before_split != "/" && before_split.ends_with('/') && !pattern.ends_with('/') {
+            return None;
+        }
+        Some((before_split, after_split))
     }
 
     fn select(&self, request: &Request) -> std::result::Result<Option<SelectedFile>, MatcherError> {
@@ -596,8 +609,10 @@ impl FileMatcher {
                     let is_fallback = Some(index) == fallback_index;
                     if is_fallback && candidates.is_empty() {
                         // Caddy's last `first_exist_fallback` entry is a literal fallback that
-                        // matches even when the file is absent.
-                        candidates.push(self.literal_candidate(&root, request, pattern));
+                        // matches even when the file is absent, unless the slash rules reject it.
+                        if let Some(candidate) = self.literal_candidate(&root, request, pattern) {
+                            candidates.push(candidate);
+                        }
                     }
                     for candidate in candidates {
                         if is_fallback {
@@ -1555,6 +1570,38 @@ fn expand_root_placeholders(request: &Request, root: &str) -> String {
     output
 }
 
+/// Caddy's `caddyhttp.NormalizedPath(path, true)`: clean `.`/`..` and repeated slashes while
+/// keeping a trailing slash (except for the root). On Windows a decoded `\` is a path separator
+/// and trailing dots/spaces are ignored on every component, so matchers cannot be bypassed there.
+fn normalized_path(path: &str) -> String {
+    normalized_path_for(path, cfg!(windows))
+}
+
+/// Testable form of `normalized_path`; `windows` selects the Windows path rewriting explicitly.
+fn normalized_path_for(path: &str, windows: bool) -> String {
+    if path.is_empty() {
+        return String::new();
+    }
+    let normalized = if windows {
+        let replaced = path.replace('\\', "/");
+        replaced
+            .split('/')
+            .map(|segment| match segment {
+                "." | ".." => segment.to_string(),
+                other => other.trim_end_matches(['.', ' ']).to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("/")
+    } else {
+        path.to_string()
+    };
+    let mut cleaned = path_clean(&normalized);
+    if cleaned != "/" && normalized.ends_with('/') && !cleaned.ends_with('/') {
+        cleaned.push('/');
+    }
+    cleaned
+}
+
 /// A lexical `path.Clean` for slash-separated paths (Go's `path.Clean` semantics).
 fn path_clean(path: &str) -> String {
     if path.is_empty() {
@@ -2213,6 +2260,93 @@ mod tests {
             "try_files": ["/missing.txt", "/also-missing.html"]
         }));
         assert!(!first_exist.matches(&file_request("/anything", directory.path())));
+    }
+
+    #[test]
+    fn file_matcher_fallback_rejects_trailing_slash_for_regular_file() {
+        // Port of upstream Caddy fcfdef43c566 (#8387): the literal candidate built for the final
+        // `first_exist_fallback` entry applies the same slash rules as the glob candidate builder,
+        // so `/.env/` and `/.env/./` cannot match the regular file `/.env` and bypass path
+        // matchers that see the trailing slash.
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join(".env"), b"SECRET=1").unwrap();
+        let root = directory.path().to_string_lossy().to_string();
+        for policy in ["first_exist", "first_exist_fallback"] {
+            let matcher = file_matcher(serde_json::json!({
+                "root": root,
+                "try_files": ["{http.request.uri.path}"],
+                "try_policy": policy
+            }));
+            assert!(
+                matcher.matches(&file_request("/.env", directory.path())),
+                "{policy}: the plain path must still match the regular file"
+            );
+            for path in ["/.env/", "/.env/./"] {
+                assert!(
+                    !matcher.matches(&file_request(path, directory.path())),
+                    "{policy}: {path} must not match the regular file .env"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn file_matcher_fallback_slash_rules_keep_absent_and_directory_candidates() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_string_lossy().to_string();
+        let fallback = file_matcher(serde_json::json!({
+            "root": root,
+            "try_files": ["{http.request.uri.path}"],
+            "try_policy": "first_exist_fallback"
+        }));
+        // The fallback still matches an absent file without a trailing slash...
+        assert!(fallback.matches(&file_request("/missing.txt", directory.path())));
+        // ...but a trailing slash asks for a directory, so the literal candidate is rejected and
+        // the fallback does not match at all.
+        assert!(!fallback.matches(&file_request("/missing.txt/", directory.path())));
+        // A pattern ending in `/` may still match a directory (or an absent directory through the
+        // unconditional fallback).
+        let directory_pattern = file_matcher(serde_json::json!({
+            "root": root,
+            "try_files": ["/missing-dir/"],
+            "try_policy": "first_exist_fallback"
+        }));
+        let mut request = file_request("/anything", directory.path());
+        assert!(directory_pattern.matches_mut(&mut request));
+        assert_eq!(
+            request
+                .vars
+                .get("matchers.file.relative")
+                .map(String::as_str),
+            Some("/missing-dir/")
+        );
+    }
+
+    #[test]
+    fn normalized_path_matches_caddy_normalized_path() {
+        // Caddy's `caddyhttp.NormalizedPath(path, true)` keeps a trailing slash and cleans `.`,
+        // `..` and repeated slashes.
+        for (input, want) in [
+            ("/a/b/", "/a/b/"),
+            ("/a//b", "/a/b"),
+            ("/a/./b/", "/a/b/"),
+            ("/a/b/..", "/a"),
+            ("/", "/"),
+            ("", ""),
+        ] {
+            assert_eq!(normalized_path_for(input, false), want, "input {input}");
+        }
+        // On Windows a decoded backslash is a separator and trailing dots/spaces are ignored on
+        // every path component (Caddy's `normalizeWindowsPath`).
+        assert_eq!(normalized_path_for("/foo.txt\\", true), "/foo.txt/");
+        assert_eq!(normalized_path_for("/foo.txt\\.\\", true), "/foo.txt/");
+        assert_eq!(normalized_path_for("/foo.txt ", true), "/foo.txt");
+        assert_eq!(
+            normalized_path_for("/private./secret", true),
+            "/private/secret"
+        );
+        // On unix a backslash is an ordinary filename byte.
+        assert_eq!(normalized_path_for("/foo.txt\\", false), "/foo.txt\\");
     }
 
     #[test]
