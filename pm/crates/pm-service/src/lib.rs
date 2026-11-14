@@ -347,6 +347,7 @@ mod tests {
             tls: HostTls::disabled(),
             spec: proxy_spec(),
             enabled: true,
+            security_headers: None,
         }
     }
 
@@ -356,6 +357,7 @@ mod tests {
             tls: HostTls::for_auto(PolicyId(policy_id)),
             spec: proxy_spec(),
             enabled: true,
+            security_headers: None,
         }
     }
 
@@ -365,6 +367,7 @@ mod tests {
             tls: HostTls::for_explicit(CertificateId(1), CertificateOrigin::Manual),
             spec: proxy_spec(),
             enabled: true,
+            security_headers: None,
         }
     }
 
@@ -767,6 +770,7 @@ mod manual_certificate_tests {
                 8080,
             ))),
             enabled: true,
+            security_headers: None,
         }
     }
 

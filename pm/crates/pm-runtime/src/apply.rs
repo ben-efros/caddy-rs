@@ -237,7 +237,7 @@ impl ConfigApplyService {
     /// record. If the durable record fails after the core pipeline activated a generation, the
     /// previous generation is restored before returning the error.
     pub async fn apply(&self) -> Result<ApplyOutcome, ApplyError> {
-        let config = self.runtime.assemble(self.settings)?;
+        let config = self.runtime.assemble(self.settings.clone())?;
         let previous = self.pipeline.tx().active_generation();
         match self
             .pipeline
@@ -380,6 +380,9 @@ fn bounded_error(message: &str) -> String {
 mod tests {
     use super::*;
     use caddy_rs_config_tx::ApplyFailureKind;
+    use caddy_rs_pm_core::{HostSpec, HostTls, ProxySpec, Upstream, UpstreamScheme};
+    use caddy_rs_pm_service::HostDraft;
+    use serde_json::json;
     use std::sync::Mutex as StdMutex;
     use tempfile::TempDir;
 
@@ -469,6 +472,82 @@ mod tests {
         let revisions = reopened.revisions().expect("revisions");
         assert_eq!(revisions.len(), 1);
         assert_eq!(revisions[0].status, ConfigApplyStatus::Applied);
+    }
+
+    #[tokio::test]
+    async fn apply_merges_global_security_headers_into_compiled_routes() {
+        let dir = TempDir::new().expect("temp dir");
+        let runtime =
+            PmRuntime::open(crate::RuntimeConfig::new(dir.path().join("data"))).expect("runtime");
+        let spec = || {
+            HostSpec::Proxy(ProxySpec::new(Upstream::new(
+                UpstreamScheme::Http,
+                "10.0.0.5",
+                8080,
+            )))
+        };
+        runtime
+            .service()
+            .create(HostDraft::new(
+                vec!["plain.example.com".to_string()],
+                HostTls::disabled(),
+                spec(),
+            ))
+            .expect("create plain host");
+        let mut overridden = HostDraft::new(
+            vec!["override.example.com".to_string()],
+            HostTls::disabled(),
+            spec(),
+        );
+        overridden.security_headers = Some(
+            serde_json::from_value(json!({ "referrer_policy": "no-referrer" }))
+                .expect("deserialize host headers"),
+        );
+        runtime
+            .service()
+            .create(overridden)
+            .expect("create overriding host");
+
+        let settings = ConfigSettings::default().with_security_headers(
+            serde_json::from_value(json!({ "content_security_policy": "default-src 'self'" }))
+                .expect("deserialize global headers"),
+        );
+        let admin = FakeAdmin::default();
+        let service = ConfigApplyService::new(runtime, Arc::new(admin.clone()), settings);
+        service.apply().await.expect("apply");
+
+        let loaded = admin.state.lock().unwrap().current.clone();
+        let routes = loaded["apps"]["http"]["servers"]["pm_http"]["routes"]
+            .as_array()
+            .expect("pm_http routes")
+            .clone();
+        let route = |id: &str| {
+            routes
+                .iter()
+                .find(|route| route["@id"] == json!(id))
+                .unwrap_or_else(|| panic!("missing route {id}"))
+                .clone()
+        };
+
+        // The host without its own headers inherits the global block.
+        let plain = route("pm-host-1-http");
+        assert_eq!(plain["handle"][0]["handler"], json!("headers"));
+        assert_eq!(
+            plain["handle"][0]["security_headers"]["content_security_policy"],
+            json!("default-src 'self'")
+        );
+        // The host with its own headers wins over the global block.
+        let overridden = route("pm-host-2-http");
+        assert_eq!(
+            overridden["handle"][0]["security_headers"]["referrer_policy"],
+            json!("no-referrer")
+        );
+        assert!(
+            overridden["handle"][0]["security_headers"]
+                .get("content_security_policy")
+                .is_none(),
+            "host headers replace the global block"
+        );
     }
 
     #[tokio::test]
