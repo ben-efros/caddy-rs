@@ -745,6 +745,54 @@ async fn run(cli: Cli) -> Result<(), CliError> {
     }
 }
 
+/// Create the initial administrator from `PM_BOOTSTRAP_ADMIN_*`.
+///
+/// A no-op unless both the email and the password are configured, and a no-op when any user
+/// already exists (the store is the source of truth, never the environment). The optional TOTP
+/// code enables TOTP on the new account and proves the seed before the daemon starts serving.
+async fn bootstrap_admin(
+    authn: &AuthnService<MemoryUserStore>,
+    store: &MemoryUserStore,
+    email: Option<&str>,
+    password: Option<&str>,
+    totp_code: Option<&str>,
+) -> Result<(), CliError> {
+    let (Some(email), Some(password)) = (email, password) else {
+        return Ok(());
+    };
+    info!(email = %email, "checking for bootstrap admin setup");
+    if !store.list_users().await?.is_empty() {
+        info!("users already exist, skipping bootstrap admin creation");
+        return Ok(());
+    }
+
+    info!("no users found, creating bootstrap admin user");
+    let user = authn
+        .create_user(email.to_owned(), password, caddy_rs_authn::Role::admin())
+        .await
+        .map_err(|error| {
+            CliError::InvalidArg(format!("failed to create bootstrap admin: {error}"))
+        })?;
+
+    if let Some(totp_code) = totp_code {
+        authn
+            .totp_verify(user.id, totp_code)
+            .await
+            .map_err(|error| {
+                CliError::InvalidArg(format!("failed to verify bootstrap TOTP: {error}"))
+            })?;
+        info!("bootstrap admin TOTP configured");
+    }
+
+    // The session endpoints read this store, so the admin can log in immediately; the store is
+    // still in-memory until PM-109, so the environment recreates it on every start.
+    warn!(
+        "bootstrap admin created in the in-memory user store; it is recreated from this \
+         environment on every start until PM-109 (persistent users) lands"
+    );
+    Ok(())
+}
+
 async fn serve(global: GlobalArgs, args: ServeArgs) -> Result<(), CliError> {
     info!(
         data_dir = %global.data_dir.display(),
@@ -801,41 +849,14 @@ async fn serve(global: GlobalArgs, args: ServeArgs) -> Result<(), CliError> {
     let authn = AuthnService::new(authn_store.clone(), authn_config)?;
 
     // Bootstrap admin user if environment variables are set.
-    if let (Some(email), Some(password)) = (
-        &global.bootstrap_admin_email,
-        &global.bootstrap_admin_password,
-    ) {
-        info!(email = %email, "checking for bootstrap admin setup");
-        // Check if any users exist
-        let users = authn_store.list_users().await?;
-        if users.is_empty() {
-            info!("no users found, creating bootstrap admin user");
-            let role = caddy_rs_authn::Role::admin();
-            let _user = authn
-                .create_user(email.clone(), password, role)
-                .await
-                .map_err(|e| {
-                    CliError::InvalidArg(format!("failed to create bootstrap admin: {}", e))
-                })?;
-
-            // If TOTP code provided, verify it
-            if let Some(totp_code) = &global.bootstrap_admin_totp {
-                authn.totp_verify(_user.id, totp_code).await.map_err(|e| {
-                    CliError::InvalidArg(format!("failed to verify bootstrap TOTP: {}", e))
-                })?;
-                info!("bootstrap admin TOTP configured");
-            }
-
-            // The store is in-memory and no endpoint reads it yet, so say that instead of implying
-            // a working login: T-PM-125 replaces the store, T-PM-128 adds the endpoints.
-            warn!(
-                "bootstrap admin created in the in-memory user store; no management endpoint can \
-                 use it until T-PM-125 (persistent users) and T-PM-128 (auth endpoints) land"
-            );
-        } else {
-            info!("users already exist, skipping bootstrap admin creation");
-        }
-    }
+    bootstrap_admin(
+        &authn,
+        &authn_store,
+        global.bootstrap_admin_email.as_deref(),
+        global.bootstrap_admin_password.as_deref(),
+        global.bootstrap_admin_totp.as_deref(),
+    )
+    .await?;
 
     info!(
         env_override,
@@ -844,10 +865,11 @@ async fn serve(global: GlobalArgs, args: ServeArgs) -> Result<(), CliError> {
 
     // Build API state.
     //
-    // The API reads the authn service for first-run setup (`POST /auth/setup`), but the endpoints
-    // that authenticate a session and authorise a caller are still T-PM-128, and the user store is
-    // in-memory until T-PM-125. Mutations therefore stay behind the loopback-only guard in
-    // pm-api, and the setup route is guarded the same way, so it cannot be driven remotely.
+    // Session endpoints (`/auth/login`, `/auth/refresh`, `/auth/logout`, `/auth/me`) and the
+    // capability gate on mutations live in pm-api. The user store is in-memory until PM-109, so
+    // `ApiState::new` leaves the mutation gate fail-closed: after a restart, mutations answer 401
+    // until `POST /auth/setup` (loopback-only) or the bootstrap environment variables recreate an
+    // administrator. The loopback peer guard stays in place as defense in depth.
     let state = ApiState::new(runtime, authn)
         .with_applier(applier)
         .with_inventory(inventory);
@@ -1693,6 +1715,54 @@ mod tests {
             message.contains("0o640"),
             "the error names the observed mode: {message}"
         );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_admin_creates_the_first_administrator_and_is_idempotent() {
+        let dir = tempfile::tempdir().expect("create the test directory");
+        let data_dir = dir.path().join("data");
+        let store = MemoryUserStore::new();
+        let authn = boot_authn(&data_dir, store.clone()).await;
+
+        bootstrap_admin(
+            &authn,
+            &store,
+            Some("admin@example.com"),
+            Some("correct horse battery staple"),
+            None,
+        )
+        .await
+        .expect("create the bootstrap admin");
+
+        let users = authn.list_users().await.expect("list users");
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].username, "admin@example.com");
+        assert_eq!(users[0].role.name, "admin");
+
+        // The bootstrap admin can sign in through the session service the API uses.
+        let tokens = authn
+            .login("admin@example.com", "correct horse battery staple", None)
+            .await
+            .expect("login as the bootstrap admin");
+        assert!(!tokens.access_token.is_empty());
+
+        // Existing users win over the environment: a later start never rewrites the store.
+        bootstrap_admin(
+            &authn,
+            &store,
+            Some("other@example.com"),
+            Some("another strong password"),
+            None,
+        )
+        .await
+        .expect("skip the second bootstrap");
+        assert_eq!(authn.list_users().await.expect("list users").len(), 1);
+
+        // No credentials configured is a no-op.
+        bootstrap_admin(&authn, &store, None, None, None)
+            .await
+            .expect("no bootstrap credentials");
+        assert_eq!(authn.list_users().await.expect("list users").len(), 1);
     }
 
     #[tokio::test]

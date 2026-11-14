@@ -46,7 +46,7 @@ pub async fn list_handler(
         .authn
         .list_users()
         .await
-        .map_err(|error| ApiError::Internal(error.to_string()))?;
+        .map_err(|error| crate::auth::internal_error(error))?;
     users.sort_by(|left, right| left.username.cmp(&right.username));
     let total = users.len() as u64;
     let items = users
@@ -97,7 +97,7 @@ pub async fn update_role_handler(
         .await
         .map_err(|error| match error {
             AuthError::UserNotFound => ApiError::NotFound(format!("user {id}")),
-            other => ApiError::Internal(other.to_string()),
+            other => crate::auth::internal_error(other),
         })?;
 
     Ok(Json(user.public()))
@@ -123,7 +123,7 @@ pub async fn delete_handler(
         .authn
         .list_users()
         .await
-        .map_err(|error| ApiError::Internal(error.to_string()))?;
+        .map_err(|error| crate::auth::internal_error(error))?;
     let target = users
         .iter()
         .find(|user| user.id == user_id)
@@ -144,7 +144,7 @@ pub async fn delete_handler(
         .await
         .map_err(|error| match error {
             AuthError::UserNotFound => ApiError::NotFound(format!("user {id}")),
-            other => ApiError::Internal(other.to_string()),
+            other => crate::auth::internal_error(other),
         })?;
 
     Ok(StatusCode::NO_CONTENT)
@@ -226,19 +226,17 @@ fn parse_role(name: &str) -> Result<Role, ApiError> {
     }
 }
 
-/// Extract the bearer token, verify it and require `action` in `section`.
+/// Verify the bearer token and return its claims.
 ///
-/// The error split is deliberate: a missing, malformed, expired or epoch-stale token is `401` (the
-/// caller is not authenticated), while a valid token that lacks the capability is `403` (the
-/// caller is authenticated but not allowed).
-async fn require_capability(
+/// This is the authentication half of [`require_capability`]; the session routes (`/auth/me`) stop
+/// here because describing yourself needs no capability. A store failure is a `500`, not a `401`:
+/// telling an operator to re-authenticate when the store is broken sends them to the wrong fix.
+pub(crate) async fn require_claims(
     state: &ApiState,
     headers: &HeaderMap,
-    section: Section,
-    action: Action,
 ) -> Result<Claims, ApiError> {
     let token = bearer_token(headers)?;
-    let claims = state
+    state
         .authn
         .verify_access_token(token)
         .await
@@ -247,11 +245,22 @@ async fn require_capability(
             AuthError::InvalidToken | AuthError::InvalidSignature | AuthError::UserNotFound => {
                 ApiError::Unauthorized("invalid access token".to_owned())
             }
-            // A store failure is not the caller's fault; reporting it as 401 would tell an
-            // operator to re-authenticate instead of fixing the store.
-            other => ApiError::Internal(other.to_string()),
-        })?;
+            other => crate::auth::internal_error(other),
+        })
+}
 
+/// Extract the bearer token, verify it and require `action` in `section`.
+///
+/// The error split is deliberate: a missing, malformed, expired or epoch-stale token is `401` (the
+/// caller is not authenticated), while a valid token that lacks the capability is `403` (the
+/// caller is authenticated but not allowed).
+pub(crate) async fn require_capability(
+    state: &ApiState,
+    headers: &HeaderMap,
+    section: Section,
+    action: Action,
+) -> Result<Claims, ApiError> {
+    let claims = require_claims(state, headers).await?;
     if !claims.has_capability(section, action) {
         return Err(ApiError::Forbidden(format!(
             "the {} capability is required on {}",
@@ -264,9 +273,17 @@ async fn require_capability(
 
 /// The `Authorization: Bearer <token>` value, with the scheme matched case-insensitively.
 fn bearer_token(headers: &HeaderMap) -> Result<&str, ApiError> {
-    let value = headers.get(header::AUTHORIZATION).ok_or_else(|| {
+    let mut values = headers.get_all(header::AUTHORIZATION).iter();
+    let value = values.next().ok_or_else(|| {
         ApiError::Unauthorized("a bearer access token is required".to_owned())
     })?;
+    if values.next().is_some() {
+        // Two headers are ambiguous: a proxy may forward both and an upstream may read a
+        // different one than this server. Refuse instead of silently picking one.
+        return Err(ApiError::Unauthorized(
+            "exactly one Authorization header is allowed".to_owned(),
+        ));
+    }
     let text = value
         .to_str()
         .map_err(|_| ApiError::Unauthorized("the Authorization header is not valid".to_owned()))?;
@@ -302,5 +319,30 @@ fn action_name(action: Action) -> &'static str {
         Action::Delete => "delete",
         Action::Manage => "manage",
         Action::Admin => "admin",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bearer_token;
+    use axum::http::{header, HeaderMap, HeaderValue};
+
+    #[test]
+    fn duplicate_authorization_headers_are_rejected() {
+        let mut headers = HeaderMap::new();
+        headers.append(header::AUTHORIZATION, HeaderValue::from_static("Bearer first"));
+        headers.append(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer second"),
+        );
+        let error = bearer_token(&headers).expect_err("two headers are ambiguous");
+        assert_eq!(error.status_code(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn one_authorization_header_is_accepted() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer token"));
+        assert_eq!(bearer_token(&headers).expect("one header"), "token");
     }
 }

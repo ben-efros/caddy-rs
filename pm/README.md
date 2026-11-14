@@ -324,6 +324,10 @@ Compile, Config}` and carry the relevant path. No error contains plaintext secre
 | `GET` | `/setup` | Returns `{ "configured": false }` (admin user check deferred to PM-109/CORE-PM-12) |
 | `GET` | `/version` | Returns `{ "version": "<crate version>", "caddy_rs": "<caddy-rs-core VERSION>" }` |
 | `POST` | `/auth/setup` | Create the first administrator atomically (`201` once, then `409`); loopback-only, no token exists yet |
+| `POST` | `/auth/login` | Exchange username + password (+ `totp_code` when TOTP is enabled) for a token pair |
+| `POST` | `/auth/refresh` | Consume the refresh token and return a rotated pair; a reused token is `401` |
+| `POST` | `/auth/logout` | Revoke the presented refresh token (body optional); always `204`, so it is idempotent |
+| `GET` | `/auth/me` | The caller's own `{id, username, role, totp_enabled, auth_epoch}`; needs a bearer token |
 | `GET` | `/users` | Paginated `PublicUser` list (`{items,total,limit,offset}`), sorted by username; requires `users:view` |
 | `PATCH` | `/users/{id}` | Change a role (`{"role": "admin"|"editor"|"viewer"}`); requires `users:update`; the epoch bump invalidates old tokens |
 | `DELETE` | `/users/{id}` | Delete a user and revoke their refresh tokens (`204`); requires `users:delete`; the last administrator is `409` |
@@ -356,14 +360,15 @@ Compile, Config}` and carry the relevant path. No error contains plaintext secre
 - **Preconditions** — `evaluate_get_preconditions` implements RFC 9110 ordering for the config `GET`: a failing `If-Match` is `412 Precondition Failed`, a matching `If-None-Match` is `304 Not Modified`, and `*` matches any representation. Host mutations require a strong `If-Match`: missing is `428 Precondition Required`; stale, weak `W/"..."` or unparseable is `412`; `*` matches any current revision.
 - **ETags** — config uses a weak `W/"<hash>"` content hash. Hosts use a strong `"h<id>-r<revision>"` tag derived from the stored revision, so the tag is both a cache validator and the CAS token. A mutation reads the host, requires `If-Match` to match that revision, and passes the same revision to `pm-service`; a CAS conflict after the read is `412`, never retried. Certificate details use a strong hash over the whole response body (`"c<id>-<hash>"`): the body includes inventory-derived status/expiry/issuer/source/renewal error, so a policy revision alone would produce a false `304` when a certificate is issued or starts failing.
 - **Native schema** — request/response bodies are camelCase (`preserveHost`, `sslForced`, `autoPolicyId`) and reject unknown fields. NPM names such as `forward_host` are a typed `400`, not silently ignored; the `--compat npm` adapter will translate them.
-- **Middleware** — request ID (`x-request-id`), structured logging, and a loopback-only guard on every mutation route. The bearer-authenticated `PATCH`/`DELETE /users` keep that peer guard too (a valid token from a non-loopback peer is still `403`); `GET /users` is a read and, like the other reads, has no peer guard. The guard reads the socket peer from `ConnectInfo<SocketAddr>`; a missing peer or a non-loopback peer is `403`, and `X-Forwarded-For` is never trusted. This is a fail-closed boundary until the remaining PM auth slices land, not authentication: the management port must stay unpublished and `create_router` must be served with `into_make_service_with_connect_info::<SocketAddr>()`.
-- **User administration authentication** — `GET/PATCH/DELETE /users` require `Authorization: Bearer <access token>`. The token is verified against the store on every request: a missing, malformed, expired or epoch-stale token is `401 UNAUTHORIZED`; a valid token without the capability is `403 FORBIDDEN` (an editor has `users:view` and may list, but cannot change a role or delete). Changing a role or deleting a user bumps the user's authentication epoch, so previously issued access tokens stop working, and a delete also revokes the user's refresh tokens. Deleting the last administrator is refused with `409 CONFLICT`. The remaining mutations still use the temporary loopback guard (PM management auth is CORE-PM-12/PM-115 work); `/auth/setup` is loopback-only because no administrator exists yet to authenticate it.
+- **Middleware** — request ID (`x-request-id`), structured logging, a fail-closed bearer-capability gate on every mutating route (including unknown paths, via a default-deny fallback), a loopback peer guard on every mutation *and* session route, and a loopback `Host` guard on the whole API. All conditions apply independently (defense in depth): a valid token from a non-loopback peer is still `403`, and a loopback peer without a token is `401`. `GET` routes are not capability-gated. The gate maps the request to a `(section, action)` pair (`/hosts` → `hosts:create|update|delete`, `/config/apply` → `settings:admin`, `/security-headers` → `settings:update`, `/certificates` → `certificates:create|delete`, `/users` → `users:*`, unrecognised mutations → `settings:admin`); the `/users` handlers check the same capability, so the two paths cannot drift. There is no unauthenticated window: an empty in-memory store (every restart) does not open mutations — `POST /auth/setup` is the only unauthenticated write, and it is loopback-only. Login failures are rate limited per username (5 per minute, then `429` + `Retry-After`). The peer guard reads `ConnectInfo<SocketAddr>`; a missing peer or a non-loopback peer is `403`, and `X-Forwarded-For` is never trusted. The management port must stay unpublished and `create_router` must be served with `into_make_service_with_connect_info::<SocketAddr>()`.
+- **Authentication and authorization** — `POST /auth/login` returns `{access_token, refresh_token}` (snake_case, the shape `pm/ui/src/api.ts` reads); `/auth/refresh` rotates the pair and `/auth/logout` revokes the presented refresh token. Access tokens are short-lived HS256 JWTs verified against the store on every request: a missing, malformed, expired or epoch-stale token is `401 UNAUTHORIZED` with a `WWW-Authenticate: Bearer` challenge (the UI's trigger to refresh and retry); a valid token without the capability is `403 FORBIDDEN`. Changing a role, setting a password or deleting a user bumps the authentication epoch, so previously issued access tokens stop working, and a delete also revokes the user's refresh tokens. Deleting the last administrator is refused with `409 CONFLICT`. `/auth/setup` stays loopback-only and `409`s after the first administrator because no token exists yet to authenticate it. The user store is in-memory (PM-109 persistence is a separate slice), so a restart returns the daemon to the setup wizard.
 
 ### User administration
 
-`GET /users`, `PATCH /users/{id}` and `DELETE /users/{id}` are the first authenticated routes. They
-return `PublicUser` views (`id`, `username`, `role`, `totpEnabled`, `authEpoch`, `createdAt`,
-`updatedAt`) and never a password hash or TOTP secret.
+`GET /users`, `PATCH /users/{id}` and `DELETE /users/{id}` require a bearer token with the matching
+`users` capability, like every other authenticated route. They return `PublicUser` views (`id`,
+`username`, `role`, `totpEnabled`, `authEpoch`, `createdAt`, `updatedAt`) and never a password hash
+or TOTP secret.
 
 | Route | Capability | Success | Refusals |
 |---|---|---|---|
@@ -371,9 +376,10 @@ return `PublicUser` views (`id`, `username`, `role`, `totpEnabled`, `authEpoch`,
 | `PATCH /users/{id}` | `users:update` | `200` with the updated `PublicUser` | `400` unknown role or non-UUID id, `401`, `403`, `404` unknown user |
 | `DELETE /users/{id}` | `users:delete` | `204` with no body | `400` non-UUID id, `401`, `403`, `404` unknown user, `409` last administrator |
 
-The bearer token is the access token from `/auth/setup` (or a future login route). `GET /users` is a
-read and follows the other reads' peer policy; `PATCH` and `DELETE` are mutations and keep the
-loopback peer guard in addition to the token, so a valid token from a non-loopback peer is `403`.
+The bearer token is the access token returned by `POST /auth/setup`, `/auth/login` or
+`/auth/refresh`. `GET /users` is a read and is not capability-gated by the mutation middleware, but
+the handler still requires `users:view`; `PATCH` and `DELETE` are mutations and keep the loopback
+peer guard in addition to the token, so a valid token from a non-loopback peer is `403`.
 `PATCH` accepts
 exactly `{"role": "admin" | "editor" | "viewer"}` and rejects unknown fields; assigning a custom role
 is not part of this slice. A role change increments the target user's `authEpoch`, which invalidates

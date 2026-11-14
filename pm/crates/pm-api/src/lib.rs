@@ -12,6 +12,10 @@
 //! | `GET` | `/api/v1/health` | Liveness probe; always `200` while the process serves requests |
 //! | `GET` | `/api/v1/setup` | Whether first-run setup has completed (at least one user exists) |
 //! | `POST` | `/api/v1/auth/setup` | Create the first administrator; `201` once, then `409 Conflict` |
+//! | `POST` | `/api/v1/auth/login` | Exchange username, password and optional TOTP code for a token pair |
+//! | `POST` | `/api/v1/auth/refresh` | Rotate the session: consume the refresh token, return a new pair |
+//! | `POST` | `/api/v1/auth/logout` | Revoke the presented refresh token; idempotent `204` |
+//! | `GET` | `/api/v1/auth/me` | The caller's own account; requires a valid bearer token |
 //! | `GET` | `/api/v1/users` | Paginated `PublicUser` list; requires the `users:view` capability |
 //! | `PATCH` | `/api/v1/users/{id}` | Change a role; requires `users:update`; the new epoch invalidates old tokens |
 //! | `DELETE` | `/api/v1/users/{id}` | Delete and revoke refresh tokens; requires `users:delete`; the last administrator is `409` |
@@ -57,17 +61,25 @@
 //!
 //! # Scope and exposure
 //!
-//! The user-administration routes authenticate with a `Authorization: Bearer <access token>`
-//! header: a missing, malformed, expired or epoch-stale token is `401`, and a valid token without
-//! the required `users` capability is `403` (an editor may list users, but not change a role or
-//! delete one). The token is verified against the store on every request, so a role change or
-//! revocation invalidates previously issued tokens through the authentication epoch.
+//! Session routes issue tokens: `POST /auth/login` and `POST /auth/refresh` return a short-lived
+//! bearer access token plus a rotating refresh token, `POST /auth/logout` revokes the presented
+//! refresh token (idempotently) and `GET /auth/me` describes the caller. `GET /auth/me` and the
+//! user-administration routes require a valid bearer token, and every mutation requires one too:
+//! the gate is fail-closed, with no unauthenticated window even when the in-memory user store is
+//! empty after a restart. Configuration reads (`GET /hosts`, `/certificates`, `/config`) stay
+//! loopback-only and untokened in this slice. Missing, malformed, expired or
+//! epoch-stale tokens are `401` with a `WWW-Authenticate: Bearer` challenge; a valid token without
+//! the required capability is `403`. The token is verified against the store on every request, so a
+//! role change or revocation invalidates previously issued tokens through the authentication epoch.
 //!
-//! Every other mutation stays loopback-only until its management-auth slice lands: [`create_router`]
-//! must be served with `into_make_service_with_connect_info::<SocketAddr>()`, and a missing or
-//! non-loopback socket peer is `403`. Forwarding headers are never trusted. This is a fail-closed
-//! boundary, not authentication, so the management port must not be published. Errors are typed and
-//! carry a `location` when a field is at fault; no response body contains secret material.
+//! Mutations are *also* loopback-only: [`create_router`] must be served with
+//! `into_make_service_with_connect_info::<SocketAddr>()`, and a missing or non-loopback socket peer
+//! is `403`. Forwarding headers are never trusted. Authentication and the socket peer are
+//! independent conditions (defense in depth), not alternatives; the management port must not be
+//! published. A non-loopback `Host` header is also `403`, which blocks DNS-rebinding pages from
+//! reading the untokened configuration routes through the operator's browser, and login failures
+//! are rate limited per username (`429` with `Retry-After`). Errors are typed and carry a
+//! `location` when a field is at fault; no response body contains secret material.
 
 #![forbid(unsafe_code)]
 
@@ -102,6 +114,11 @@ pub struct ApiState {
     pub authn: AuthnService<MemoryUserStore>,
     inventory: Option<SharedCertificateInventory>,
     applier: Option<Arc<ConfigApplyService>>,
+    /// Test-only switch that re-opens mutations before first-run setup. Production never sets it:
+    /// the mutation gate is fail-closed, and the only bypass (creating the first administrator) is
+    /// the loopback-only `POST /auth/setup` route.
+    bootstrap_window: bool,
+    login_limiter: Arc<crate::auth::LoginLimiter>,
 }
 
 impl ApiState {
@@ -113,7 +130,19 @@ impl ApiState {
             authn,
             inventory: None,
             applier: None,
+            bootstrap_window: false,
+            login_limiter: Arc::new(crate::auth::LoginLimiter::new()),
         }
+    }
+
+    /// Re-open the pre-setup mutation window. Test-only: the production constructor leaves it
+    /// closed, so a deployment with no administrator fails mutations closed instead of trusting a
+    /// process-local user store that may have been wiped by a restart.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn open_bootstrap_window(mut self) -> Self {
+        self.bootstrap_window = true;
+        self
     }
 
     /// Inject the certificate inventory the daemon reads from the caddy-rs admin endpoint.
@@ -213,6 +242,7 @@ pub enum ErrorCode {
     PreconditionRequired,
     Forbidden,
     Unauthorized,
+    RateLimited,
     UnsupportedMediaType,
     Validation,
     ServiceUnavailable,
@@ -234,6 +264,8 @@ pub enum ApiError {
     Forbidden(String),
     #[error("unauthorized: {0}")]
     Unauthorized(String),
+    #[error("too many requests: retry after {retry_after_seconds} seconds")]
+    RateLimited { retry_after_seconds: u64 },
     #[error("unsupported media type: {0}")]
     UnsupportedMediaType(String),
     #[error("validation error: {message}")]
@@ -264,6 +296,7 @@ impl ApiError {
             Self::PreconditionRequired(_) => StatusCode::PRECONDITION_REQUIRED,
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            Self::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::UnsupportedMediaType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Self::Validation { .. } => StatusCode::BAD_REQUEST,
             Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
@@ -280,6 +313,7 @@ impl ApiError {
             Self::PreconditionRequired(_) => ErrorCode::PreconditionRequired,
             Self::Forbidden(_) => ErrorCode::Forbidden,
             Self::Unauthorized(_) => ErrorCode::Unauthorized,
+            Self::RateLimited { .. } => ErrorCode::RateLimited,
             Self::UnsupportedMediaType(_) => ErrorCode::UnsupportedMediaType,
             Self::Validation { .. } => ErrorCode::Validation,
             Self::ServiceUnavailable(_) => ErrorCode::ServiceUnavailable,
@@ -315,6 +349,12 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.status_code();
         let unauthorized = matches!(self, Self::Unauthorized(_));
+        let retry_after = match self {
+            Self::RateLimited {
+                retry_after_seconds,
+            } => Some(retry_after_seconds),
+            _ => None,
+        };
         let body = ApiErrorResponse {
             error: ApiErrorDetail {
                 code: self.error_code(),
@@ -329,6 +369,12 @@ impl IntoResponse for ApiError {
             response
                 .headers_mut()
                 .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+        }
+        if let Some(seconds) = retry_after {
+            // RFC 9110 section 10.2.3: the client is told when a retry may succeed.
+            if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
+                response.headers_mut().insert(header::RETRY_AFTER, value);
+            }
         }
         response
     }
@@ -556,10 +602,12 @@ async fn capture_peer_middleware(mut request: axum::extract::Request, next: Next
     next.run(request).await
 }
 
-/// Mutations are local-only until the management authentication slice is wired.
+/// Reject a mutation whose socket peer is not loopback.
 ///
-/// A loopback socket is not authentication, but it is a fail-closed boundary: the management port
-/// must not be published, and a future auth layer replaces this guard rather than relaxing it.
+/// This is defense in depth, not authentication: the capability gate in [`authz`] decides *who*
+/// may mutate, and this guard decides *from where*. A loopback socket is still a fail-closed
+/// boundary because the management port must not be published; a future transport must keep both
+/// conditions rather than replace one with the other.
 pub(crate) fn require_local_peer(peer: PeerAddr) -> Result<(), ApiError> {
     match peer.0 {
         Some(address) if address.ip().is_loopback() => Ok(()),
@@ -583,6 +631,10 @@ pub fn create_router(state: ApiState) -> Router {
         .route("/health", get(health_handler))
         .route("/setup", get(setup_handler))
         .route("/auth/setup", post(auth_setup_handler))
+        .route("/auth/login", post(auth::login_handler))
+        .route("/auth/refresh", post(auth::refresh_handler))
+        .route("/auth/logout", post(auth::logout_handler))
+        .route("/auth/me", get(auth::me_handler))
         .route("/users", get(users::list_handler))
         .route(
             "/users/{id}",
@@ -637,6 +689,20 @@ pub fn create_router(state: ApiState) -> Router {
         // single-page shell. An API client must never receive HTML, so the nested API router claims
         // its own fallback and keeps the typed JSON error contract for a mistyped route.
         .fallback(api_not_found)
+        // Mutating routes need a bearer token; the gate is fail-closed and default-deny. It is
+        // layered after the fallback so an unknown mutating path is gated too (401 without a
+        // token, 404 with one), and inside the observation and peer layers so a rejected request
+        // still carries its request id and the handlers keep their own peer guard as defense in
+        // depth.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            authz::require_mutation_auth,
+        ))
+        // The API is same-origin with the embedded UI on a loopback listener. Rejecting a
+        // non-loopback Host header blocks DNS-rebinding pages from reading the unauthenticated
+        // configuration reads through the operator's browser. It runs inside the observation
+        // layer so the rejection carries a request id and appears in the request log.
+        .layer(middleware::from_fn(authz::require_loopback_host))
         .layer(middleware::from_fn(observe_middleware))
         .layer(middleware::from_fn(capture_peer_middleware))
         .with_state(state);
@@ -669,7 +735,9 @@ async fn api_not_found(OriginalUri(uri): OriginalUri) -> ApiError {
 ///
 /// A store error is reported as "not configured" on purpose: this is only the setup-wizard hint,
 /// and reporting `true` on a read failure would let a client skip the wizard against a server
-/// whose user store cannot be read.
+/// whose user store cannot be read. The mutation gate deliberately does not use this predicate:
+/// authentication must fail closed, so it cannot inherit a permissive "probably unconfigured"
+/// answer.
 async fn setup_complete(state: &ApiState) -> bool {
     state
         .authn
@@ -701,12 +769,26 @@ pub struct SetupRequest {
 }
 
 /// Response body for `POST /api/v1/auth/setup`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+///
+/// Field names are snake_case because that is the shape the embedded UI client reads
+/// (`pm/ui/src/api.ts`). This is also the body login and refresh return, so all three session
+/// endpoints stay interchangeable for the client.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct CreateUserResponse {
     pub user_id: String,
     pub access_token: String,
     pub refresh_token: String,
+}
+
+impl std::fmt::Debug for CreateUserResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CreateUserResponse")
+            .field("user_id", &self.user_id)
+            .field("access_token", &"[redacted]")
+            .field("refresh_token", &"[redacted]")
+            .finish()
+    }
 }
 
 /// `POST /api/v1/auth/setup` — first-run administrator creation.
@@ -714,8 +796,9 @@ pub struct CreateUserResponse {
 /// Succeeds with `201 Created` exactly once. Every later attempt is `409 Conflict` with the
 /// standard [`ApiError`] body (`{"error":{"code":"CONFLICT","message":...}}`): the store-level
 /// compare-and-set in [`caddy_rs_authn::MemoryUserStore::create_first_admin`] is what makes
-/// concurrent callers collapse to a single winner. The route stays loopback-only: it runs before
-/// any administrator exists, so it cannot require a token.
+/// concurrent callers collapse to a single winner. The route stays loopback-only and is the only
+/// unauthenticated write: it runs before any administrator exists, and every other mutation fails
+/// closed until a credential can be obtained.
 async fn auth_setup_handler(
     State(state): State<ApiState>,
     _peer: hosts::LocalPeer,
@@ -729,7 +812,7 @@ async fn auth_setup_handler(
             caddy_rs_authn::AuthError::UsernameExists => {
                 ApiError::Conflict("first-run setup is already complete".to_owned())
             }
-            other => ApiError::Internal(other.to_string()),
+            other => auth::internal_error(other),
         })?;
 
     Ok((
@@ -808,6 +891,8 @@ fn hash_bytes(bytes: &[u8]) -> String {
 }
 
 mod apply;
+mod auth;
+mod authz;
 mod certificates;
 mod dto;
 mod hosts;
