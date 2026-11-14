@@ -66,7 +66,7 @@ Validation reports the first error it finds, not a list.
 
 ## A tour of the JSON shape
 
-The top level accepts four keys. Unknown top-level keys and unknown app names are rejected by
+The top level accepts five keys. Unknown top-level keys and unknown app names are rejected by
 validation; each module's own fields are validated against its schema.
 
 | Key | Purpose |
@@ -75,6 +75,7 @@ validation; each module's own fields are validated against its schema.
 | `logging` | Structured logging targets. `logs.<name>` selects a writer, encoder, level, sampling and include/exclude filters, and the `default` log is where access entries normally go. |
 | `storage` | The certificate and ACME storage backend. It is a module object: `{"module": "file_system", "root": "/var/lib/caddy-rs"}` selects the filesystem backend and its root. |
 | `apps` | Applications keyed by module name. |
+| `stock_compat` | caddy-rs extension: boolean stock-compatibility profile, default `false` when absent; a non-boolean value is a located error. See [Compatibility modes](#compatibility-modes). |
 
 `apps.http` holds the HTTP app: `http_port` and `https_port` (defaults 80 and 443),
 `grace_period` and `shutdown_delay`, the experimental `metrics` object, and `servers`. Each entry
@@ -153,6 +154,59 @@ Durations in JSON are either Caddy duration strings (`"5s"`, `"250ms"`, `"1m30s"
 integer nanoseconds. Modules are named by their short JSON key in a `handler` field or as the key
 of a module map; the qualified module ID (for example `http.handlers.reverse_proxy`) is not the
 JSON spelling. Full per-area details are in [FEATURES.md](FEATURES.md).
+
+## Compatibility modes
+
+Three independent switches tune how closely this build reproduces stock Caddy v2.11.9.
+`--adapt-mode` governs configuration *acceptance*, `stock_compat` selects the compatibility
+*profile*, and `server_identity` overrides the two identity surfaces. None of them changes the JSON
+runtime format.
+
+| Switch | Forms | Default | Scope in this build |
+|---|---|---|---|
+| `--adapt-mode` | `adapt`, `validate`, `run`: `compatible`, `warn`, `strict` | `compatible` | Caddyfile acceptance of deprecated directive spellings only. `compatible` accepts them and prints Caddy's deprecation warning, `warn` adds warnings for future ambiguity gates, `strict` rejects them with a located error naming both spellings. It is a caddy-rs extension (`DIV-0112`), is ignored by the JSON adapter, and never relaxes a security rejection. |
+| `stock_compat` | JSON top-level `"stock_compat": true\|false`; Caddyfile global option `stock_compat` (bare = true, `stock_compat true`/`false` as written) | `false` (absent field = `false`) | One value per configuration. It restores the whole compatibility profile in one generation: stock file/glob import policy (`crates/config/src/adapter.rs`, `crates/config/src/parser.rs`), an inert implicit security profile with no added headers and no fingerprint stripping (`crates/http/src/security_profile.rs`, `crates/proxy/src/handler.rs`), stock identity when `server_identity` is absent (`crates/core/src/identity.rs`, `crates/server/src/runtime.rs`), and verbatim query logging (`crates/admin/src/logging_config.rs`). An explicit `server_identity` and a per-sink `redaction.query_parameters` list still win. See status below. |
+| `server_identity` | JSON `apps.http.servers.<name>.server_identity`; Caddyfile `servers { server_identity <mode> }` | `default` when absent | The HTTP `Server` response header and the FastCGI `SERVER_SOFTWARE` parameter. Values: `default`, `name-only`, `compatible`, `none`, or any other non-empty string as a custom identity (validated as an HTTP header value, located error otherwise). |
+
+| `server_identity` | HTTP `Server` header | FastCGI `SERVER_SOFTWARE` |
+|---|---|---|
+| `default` | `caddy-rs/<build version>` | `caddy-rs/<build version>` |
+| `name-only` | `Caddy` | `Caddy` |
+| `compatible` | `Caddy` | `Caddy/2.11.9` |
+| `none` | not sent | not sent |
+| custom string | the string | the string |
+
+Precedence, highest first:
+
+1. An explicit `server_identity` (including explicit `default`) always wins for the `Server` and
+   FastCGI surfaces.
+2. `stock_compat true`: an absent `server_identity` resolves to `compatible`.
+3. Secure default (`stock_compat false`, the default): an absent `server_identity` in a
+   configuration containing a `reverse_proxy` handler suppresses the HTTP `Server` header (FastCGI
+   still reports `caddy-rs/<version>`); without a `reverse_proxy` handler both surfaces keep
+   `caddy-rs/<version>`.
+4. `--adapt-mode` and `stock_compat` are independent: the mode governs deprecated spellings, the
+   switch governs stock compatibility, and neither implies the other.
+
+Status and portability: `stock_compat` is a caddy-rs extension (`DIV-0130`). Every configuration
+apply (process start and each reload) logs one INFO event with the structured field
+`stock_compat = true|false` and a message naming the consequence, before the listeners start; it is
+filtered by the configured logging settings like any other log line. Stock Caddy v2.11.9 itself
+rejects the Caddyfile option as an unknown global option and silently ignores the JSON key, so a
+configuration carrying it is not portable to stock. The four `stock_compat` surfaces named in its
+row are implemented and covered by `crates/server/tests/http_stock_compat.rs`
+(`stock_compat_true_makes_the_profile_inert`, `stock_compat_true_resolves_the_stock_caddy_identity`);
+the always-on credential-header redaction (`Cookie`, `Set-Cookie`, `Authorization`,
+`Proxy-Authorization`) is unaffected by the verbatim-query-logging row. An explicit
+`server_identity` and a per-sink `redaction.query_parameters` list still take precedence.
+`server_identity` values are parsed and validated at config load and their mapping is defined in
+`crates/core/src/identity.rs`.
+
+The normative table is
+[STOCK-COMPAT.md](https://github.com/ben-efros/caddy-rs-project/blob/main/docs/compatibility/STOCK-COMPAT.md);
+each divergence id is registered in
+[BEHAVIOR-DIVERGENCES.md](https://github.com/ben-efros/caddy-rs-project/blob/main/docs/compatibility/BEHAVIOR-DIVERGENCES.md).
+`--adapt-mode` is described in [CLI.md](CLI.md).
 
 ## Environment placeholders
 
