@@ -44,6 +44,8 @@ use rustls::sign::{Signer, SigningKey};
 use rustls::{SignatureAlgorithm, SignatureScheme};
 use sha2::{Digest, Sha256, Sha384, Sha512};
 
+use crate::acme::csr::CsrSigner;
+
 // ---------------------------------------------------------------------------
 // Budget, selector, errors
 // ---------------------------------------------------------------------------
@@ -1688,6 +1690,41 @@ impl Pkcs11SigningKey {
     pub fn selector(&self) -> &KeySelector {
         &self.selector
     }
+
+    /// The DER `SubjectPublicKeyInfo` of the token key's public components.
+    ///
+    /// Only public material is returned; the private key stays in the token.
+    pub fn public_key_der(&self) -> &[u8] {
+        &self.spki
+    }
+
+    /// Adapt this token key for PKCS#10 CSR signing (`crate::acme::csr::CsrSigner`).
+    ///
+    /// The scheme is pinned to what a CSR builder can encode: RSA PKCS#1 v1.5 (never RSA-PSS,
+    /// which this runtime only offers for TLS handshakes) or ECDSA P-256/SHA-256. Returns `None`
+    /// when the token supports no CSR-compatible mechanism for this key. Signing goes through the
+    /// same per-token sign queue, `queue_wait`/`sign_timeout` budgets and quarantine latch as TLS
+    /// handshakes; there is no software-key fallback.
+    pub fn csr_signer(&self) -> Option<Pkcs11CsrSigner> {
+        let plan = match self.kind {
+            KeyKind::Rsa => self
+                .plans
+                .iter()
+                .copied()
+                .find(|plan| matches!(plan, PlanKind::RsaPkcs1Sha256))?,
+            KeyKind::EcP256 => self
+                .plans
+                .iter()
+                .copied()
+                .find(|plan| matches!(plan, PlanKind::EcdsaP256Sha256))?,
+        };
+        Some(Pkcs11CsrSigner {
+            pool: Arc::clone(&self.pool),
+            plan,
+            selector: self.selector.clone(),
+            spki: self.spki.clone(),
+        })
+    }
 }
 
 impl SigningKey for Pkcs11SigningKey {
@@ -1734,26 +1771,87 @@ impl Signer for Pkcs11Signer {
     }
 
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rustls::Error> {
-        // rustls' signer is synchronous. On a multi-thread Tokio runtime the token wait
-        // must not stall an async worker: `block_in_place` hands this worker's other
-        // tasks to another thread while the token dispatch/reply budget is spent.
-        // The wait is bounded by the per-token queue and sign budgets, and there is at
-        // most one such wait per in-flight handshake (bounded by
-        // `max_inflight_handshakes`). On other runtimes (current-thread, no runtime) the
-        // caller is already a blocking context, so the call runs inline.
-        let raw = match tokio::runtime::Handle::try_current() {
-            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-                tokio::task::block_in_place(|| self.pool.sign(self.plan, &self.selector, message))
-            }
-            _ => self.pool.sign(self.plan, &self.selector, message),
-        }
-        .map_err(|error| rustls::Error::General(error.to_string()))?;
+        let raw = dispatch_sign(&self.pool, self.plan, &self.selector, message)
+            .map_err(|error| rustls::Error::General(error.to_string()))?;
         if self.plan.is_ecdsa() {
             raw_ecdsa_to_der(&self.token, &raw, 32)
                 .map_err(|error| rustls::Error::General(error.to_string()))
         } else {
             Ok(raw)
         }
+    }
+}
+
+/// A token-backed key adapted to PKCS#10 CSR signing.
+///
+/// Obtained from [`Pkcs11SigningKey::csr_signer`]; the private key never leaves the token and no
+/// key-export path exists. The CSR builder only sees the public SPKI, the pinned scheme and the
+/// signature bytes.
+#[derive(Clone)]
+pub struct Pkcs11CsrSigner {
+    pool: Arc<PoolInner>,
+    plan: PlanKind,
+    selector: KeySelector,
+    spki: Vec<u8>,
+}
+
+impl fmt::Debug for Pkcs11CsrSigner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Pkcs11CsrSigner")
+            .field("token", &self.pool.token)
+            .field("selector", &self.selector)
+            .field("scheme", &self.plan.scheme())
+            .field("mechanism", &self.plan.mechanism_label())
+            .finish()
+    }
+}
+
+impl CsrSigner for Pkcs11CsrSigner {
+    fn spki(&self) -> &[u8] {
+        &self.spki
+    }
+
+    fn signature_scheme(&self) -> SignatureScheme {
+        self.plan.scheme()
+    }
+
+    fn sign(&self, message: &[u8]) -> crate::Result<Vec<u8>> {
+        let raw = dispatch_sign(&self.pool, self.plan, &self.selector, message)
+            .map_err(|error| csr_signing_error(&self.pool.token, &error))?;
+        if self.plan.is_ecdsa() {
+            raw_ecdsa_to_der(&self.pool.token, &raw, 32)
+                .map_err(|error| csr_signing_error(&self.pool.token, &error))
+        } else {
+            Ok(raw)
+        }
+    }
+}
+
+fn csr_signing_error(token: &str, error: &Pkcs11Error) -> crate::Error {
+    crate::Error::Issuer(format!(
+        "signing certificate request on PKCS#11 token {token}: {error}"
+    ))
+}
+
+/// Dispatch one sign to the token, never stalling an async worker.
+///
+/// rustls' signer (and the CSR signer) is synchronous. On a multi-thread Tokio runtime the token
+/// wait must not stall an async worker: `block_in_place` hands this worker's other tasks to
+/// another thread while the token dispatch/reply budget is spent. The wait is bounded by the
+/// per-token queue and sign budgets, and there is at most one such wait per in-flight handshake
+/// (bounded by `max_inflight_handshakes`). On other runtimes (current-thread, no runtime) the
+/// caller is already a blocking context, so the call runs inline.
+fn dispatch_sign(
+    pool: &PoolInner,
+    plan: PlanKind,
+    selector: &KeySelector,
+    message: &[u8],
+) -> Result<Vec<u8>, Pkcs11Error> {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| pool.sign(plan, selector, message))
+        }
+        _ => pool.sign(plan, selector, message),
     }
 }
 

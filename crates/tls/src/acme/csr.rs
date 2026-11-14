@@ -12,8 +12,15 @@
 //!   entries for IP identifiers, wrapped in the `extensionRequest` attribute;
 //! * ECDSA-with-SHA256/384 or SHA-256-with-RSA signatures matching the key type.
 //!
-//! The private key is returned as PKCS#8 PEM next to the CSR so the caller can store it with the
-//! certificate it receives.
+//! The DER builder is independent of where the signature comes from: [`CsrSigner`] supplies the
+//! DER `SubjectPublicKeyInfo`, the signature scheme to declare and the signature bytes. The
+//! process-held ring/RSA path ([`CertificateRequest::generate`] /
+//! [`CertificateRequest::generate_with_key_type`]) is the default implementation; a PKCS#11
+//! token-held key signs through the same builder in
+//! [`crate::pkcs11::Pkcs11SigningKey::csr_signer`], so the private key never leaves the token.
+//!
+//! For process-held keys the private key is returned as PKCS#8 PEM next to the CSR so the caller
+//! can store it with the certificate it receives. Token-held CSRs carry no PEM.
 
 use std::net::IpAddr;
 
@@ -28,6 +35,7 @@ use ring::signature::{
 };
 use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::pkcs8::DecodePrivateKey;
+use rustls::SignatureScheme;
 
 use super::AcmeError;
 use crate::Result;
@@ -136,6 +144,25 @@ impl CertificateKeyType {
     }
 }
 
+/// A signature source for a PKCS#10 `CertificationRequest`.
+///
+/// The builder owns all DER encoding; an implementation only reports its public key, the
+/// signature scheme to declare in the CSR's `AlgorithmIdentifier`, and the signature itself.
+/// There is deliberately no key-export method: token-backed implementations sign inside the
+/// token (see [`crate::pkcs11::Pkcs11SigningKey`]) and never expose private key material.
+pub trait CsrSigner {
+    /// DER `SubjectPublicKeyInfo` of the certificate key that signs the request.
+    fn spki(&self) -> &[u8];
+
+    /// The scheme to declare in the CSR signature `AlgorithmIdentifier`.
+    ///
+    /// Supported: ECDSA P-256/SHA-256, ECDSA P-384/SHA-384, RSA PKCS#1 v1.5 SHA-256/SHA-384.
+    fn signature_scheme(&self) -> SignatureScheme;
+
+    /// Sign `message`, which is the DER `certificationRequestInfo`.
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>>;
+}
+
 /// A generated certificate signing request and its private key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CertificateRequest {
@@ -168,9 +195,55 @@ impl CertificateRequest {
         }
     }
 
+    /// Build a CSR for `domains` signed by `signer`.
+    ///
+    /// This is the shared PKCS#10 builder: the DER `certificationRequestInfo` is encoded from the
+    /// signer's SPKI, signed by `signer`, and wrapped with the declared signature algorithm. It is
+    /// used by both the process-held key path ([`Self::generate_with_key_type`]) and token-held
+    /// keys, so both emit the same structure for the same identifiers and key.
+    ///
+    /// The returned request carries an **empty** [`Self::private_key_pem`]: a token-held signer
+    /// never exports key material.
+    pub fn build_with_signer(
+        domains: &[String],
+        key_type: CertificateKeyType,
+        signer: &dyn CsrSigner,
+    ) -> Result<Self> {
+        let domains = normalize_domains(domains)?;
+        let certification_request_info =
+            certification_request_info(&domains, signer.spki().to_vec())?;
+        let signature = signer.sign(&certification_request_info)?;
+        let signature_algorithm = signature_algorithm(signer.signature_scheme())?;
+        let der = der_sequence(&[
+            certification_request_info,
+            signature_algorithm,
+            der_bit_string(&signature),
+        ]);
+        let public_key = subject_public_key_bytes(signer.spki())?.to_vec();
+        Ok(Self {
+            der,
+            private_key_pem: String::new(),
+            public_key,
+            key_type,
+            domains,
+        })
+    }
+
+    /// Build a CSR with `signer` and attach the private key PEM of a process-held key.
+    fn assemble(
+        domains: &[String],
+        key_type: CertificateKeyType,
+        signer: &dyn CsrSigner,
+        private_key_pem: String,
+    ) -> Result<Self> {
+        let mut request = Self::build_with_signer(domains, key_type, signer)?;
+        request.private_key_pem = private_key_pem;
+        Ok(request)
+    }
+
     fn generate_ec(domains: &[String], key_type: CertificateKeyType) -> Result<Self> {
         let rng = SystemRandom::new();
-        let (pkcs8, key_pair, public_key, spki, signature_algorithm) = match key_type {
+        let (pkcs8, key, spki, scheme) = match key_type {
             CertificateKeyType::P256 => {
                 let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng)
                     .map_err(|error| {
@@ -190,10 +263,9 @@ impl CertificateRequest {
                 ]);
                 (
                     pkcs8.as_ref().to_vec(),
-                    EcKeyPair::P256(key_pair),
-                    public_key,
+                    ProcessHeldKey::P256(key_pair),
                     spki,
-                    der_sequence(&[der_oid(OID_ECDSA_WITH_SHA256)]),
+                    SignatureScheme::ECDSA_NISTP256_SHA256,
                 )
             }
             CertificateKeyType::P384 => {
@@ -215,44 +287,21 @@ impl CertificateRequest {
                 ]);
                 (
                     pkcs8.as_ref().to_vec(),
-                    EcKeyPair::P384(key_pair),
-                    public_key,
+                    ProcessHeldKey::P384(key_pair),
                     spki,
-                    der_sequence(&[der_oid(OID_ECDSA_WITH_SHA384)]),
+                    SignatureScheme::ECDSA_NISTP384_SHA384,
                 )
             }
             // INFEASIBLE: generate_ec is only called for the P256/P384 key types.
             _ => unreachable!(),
         };
-        let certification_request_info = certification_request_info(&domains, spki)?;
-        let signature = match &key_pair {
-            EcKeyPair::P256(key_pair) => key_pair
-                .sign(&rng, &certification_request_info)
-                .map_err(|error| {
-                    AcmeError::CertificateRequest(format!("signing certification request: {error}"))
-                })?
-                .as_ref()
-                .to_vec(),
-            EcKeyPair::P384(key_pair) => key_pair
-                .sign(&rng, &certification_request_info)
-                .map_err(|error| {
-                    AcmeError::CertificateRequest(format!("signing certification request: {error}"))
-                })?
-                .as_ref()
-                .to_vec(),
-        };
-        let der = der_sequence(&[
-            certification_request_info,
-            signature_algorithm,
-            der_bit_string(&signature),
-        ]);
-        Ok(Self {
-            der,
-            private_key_pem: pem_encode("PRIVATE KEY", &pkcs8),
-            public_key,
+        let signer = ProcessHeldSigner { spki, scheme, key };
+        Self::assemble(
+            domains,
             key_type,
-            domains: domains.to_vec(),
-        })
+            &signer,
+            pem_encode("PRIVATE KEY", &pkcs8),
+        )
     }
 
     fn generate_rsa(domains: &[String], key_type: CertificateKeyType) -> Result<Self> {
@@ -284,8 +333,6 @@ impl CertificateRequest {
         key_type: CertificateKeyType,
         private_key: rsa::RsaPrivateKey,
     ) -> Result<Self> {
-        use rsa::pkcs1v15::SigningKey;
-        use rsa::signature::{SignatureEncoding, Signer};
         use rsa::traits::PublicKeyParts;
         let public_key = private_key.to_public_key();
         let rsa_public_der = der_sequence(&[
@@ -296,26 +343,21 @@ impl CertificateRequest {
             der_sequence(&[der_oid(OID_RSA_ENCRYPTION), der_null()]),
             der_bit_string(&rsa_public_der),
         ]);
-        let certification_request_info = certification_request_info(&domains, spki)?;
-        let signing_key = SigningKey::<sha2::Sha256>::new(private_key.clone());
-        let signature = signing_key.sign(&certification_request_info).to_vec();
-        let signature_algorithm = der_sequence(&[der_oid(OID_SHA256_WITH_RSA), der_null()]);
-        let der = der_sequence(&[
-            certification_request_info,
-            signature_algorithm,
-            der_bit_string(&signature),
-        ]);
+        let signer = ProcessHeldSigner {
+            spki,
+            scheme: SignatureScheme::RSA_PKCS1_SHA256,
+            key: ProcessHeldKey::Rsa(private_key.clone()),
+        };
         use rsa::pkcs8::EncodePrivateKey;
         let pkcs8 = private_key.to_pkcs8_der().map_err(|error| {
             AcmeError::CertificateRequest(format!("encoding RSA certificate key: {error}"))
         })?;
-        Ok(Self {
-            der,
-            private_key_pem: pem_encode("PRIVATE KEY", pkcs8.as_bytes()),
-            public_key: rsa_public_der,
+        Self::assemble(
+            domains,
             key_type,
-            domains: domains.to_vec(),
-        })
+            &signer,
+            pem_encode("PRIVATE KEY", pkcs8.as_bytes()),
+        )
     }
 
     /// The certificate key type.
@@ -372,9 +414,72 @@ fn normalize_domains(domains: &[String]) -> Result<Vec<String>> {
     Ok(normalized)
 }
 
-enum EcKeyPair {
+enum ProcessHeldKey {
     P256(EcdsaKeyPair),
     P384(EcdsaKeyPair),
+    Rsa(rsa::RsaPrivateKey),
+}
+
+/// The default [`CsrSigner`]: a certificate key generated and held in process memory.
+struct ProcessHeldSigner {
+    spki: Vec<u8>,
+    scheme: SignatureScheme,
+    key: ProcessHeldKey,
+}
+
+impl CsrSigner for ProcessHeldSigner {
+    fn spki(&self) -> &[u8] {
+        &self.spki
+    }
+
+    fn signature_scheme(&self) -> SignatureScheme {
+        self.scheme
+    }
+
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>> {
+        match &self.key {
+            ProcessHeldKey::P256(key_pair) => sign_ecdsa(key_pair, message),
+            ProcessHeldKey::P384(key_pair) => sign_ecdsa(key_pair, message),
+            ProcessHeldKey::Rsa(private_key) => {
+                use rsa::pkcs1v15::SigningKey;
+                use rsa::signature::{SignatureEncoding, Signer as _};
+                let signing_key = SigningKey::<sha2::Sha256>::new(private_key.clone());
+                Ok(signing_key.sign(message).to_vec())
+            }
+        }
+    }
+}
+
+fn sign_ecdsa(key_pair: &EcdsaKeyPair, message: &[u8]) -> Result<Vec<u8>> {
+    key_pair
+        .sign(&SystemRandom::new(), message)
+        .map(|signature| signature.as_ref().to_vec())
+        .map_err(|error| {
+            AcmeError::CertificateRequest(format!("signing certification request: {error}")).into()
+        })
+}
+
+/// DER `AlgorithmIdentifier` for a CSR signature scheme.
+fn signature_algorithm(scheme: SignatureScheme) -> Result<Vec<u8>> {
+    let oid = match scheme {
+        SignatureScheme::ECDSA_NISTP256_SHA256 => OID_ECDSA_WITH_SHA256,
+        SignatureScheme::ECDSA_NISTP384_SHA384 => OID_ECDSA_WITH_SHA384,
+        SignatureScheme::RSA_PKCS1_SHA256 => OID_SHA256_WITH_RSA,
+        SignatureScheme::RSA_PKCS1_SHA384 => OID_SHA384_WITH_RSA,
+        other => {
+            return Err(AcmeError::CertificateRequest(format!(
+                "unsupported certificate request signature scheme {other:?}; expected ECDSA-SHA256/SHA384 or RSA-PKCS1-SHA256/SHA384"
+            ))
+            .into())
+        }
+    };
+    Ok(match scheme {
+        // RSA `AlgorithmIdentifier` carries an explicit NULL parameter; ECDSA does not.
+        SignatureScheme::RSA_PKCS1_SHA256 | SignatureScheme::RSA_PKCS1_SHA384 => {
+            der_sequence(&[der_oid(oid), der_null()])
+        }
+        _ => der_sequence(&[der_oid(oid)]),
+    })
 }
 
 fn certification_request_info(domains: &[String], spki: Vec<u8>) -> Result<Vec<u8>> {
@@ -1270,5 +1375,176 @@ EVdZ8IcAQzAPk1jBxj0YDC0rR5d09Q==
         assert_eq!(der_length(127), vec![127]);
         assert_eq!(der_length(128), vec![0x81, 0x80]);
         assert_eq!(der_length(300), vec![0x82, 0x01, 0x2C]);
+    }
+
+    /// A [`CsrSigner`] backed by a process-held key. It exercises the pluggable builder without a
+    /// token: only the SPKI, scheme and signature bytes are visible to the builder.
+    enum StubKey {
+        P256(EcdsaKeyPair),
+        Rsa(rsa::RsaPrivateKey),
+    }
+
+    struct StubSigner {
+        spki: Vec<u8>,
+        scheme: SignatureScheme,
+        key: StubKey,
+    }
+
+    impl CsrSigner for StubSigner {
+        fn spki(&self) -> &[u8] {
+            &self.spki
+        }
+
+        fn signature_scheme(&self) -> SignatureScheme {
+            self.scheme
+        }
+
+        fn sign(&self, message: &[u8]) -> Result<Vec<u8>> {
+            match &self.key {
+                StubKey::P256(key_pair) => key_pair
+                    .sign(&SystemRandom::new(), message)
+                    .map(|signature| signature.as_ref().to_vec())
+                    .map_err(|error| csr_error(format!("stub ECDSA signing failed: {error}"))),
+                StubKey::Rsa(private_key) => {
+                    use rsa::pkcs1v15::SigningKey;
+                    use rsa::signature::{SignatureEncoding, Signer as _};
+                    Ok(SigningKey::<sha2::Sha256>::new(private_key.clone())
+                        .sign(message)
+                        .to_vec())
+                }
+            }
+        }
+    }
+
+    fn p256_stub_signer() -> StubSigner {
+        let rng = SystemRandom::new();
+        let pkcs8 =
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).expect("P-256 key");
+        let key_pair =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
+                .expect("reload P-256 key");
+        let point = key_pair.public_key().as_ref().to_vec();
+        let spki = der_sequence(&[
+            der_sequence(&[der_oid(OID_EC_PUBLIC_KEY), der_oid(OID_PRIME256V1)]),
+            der_bit_string(&point),
+        ]);
+        StubSigner {
+            spki,
+            scheme: SignatureScheme::ECDSA_NISTP256_SHA256,
+            key: StubKey::P256(key_pair),
+        }
+    }
+
+    fn rsa_2048_stub_signer() -> StubSigner {
+        use rsa::traits::PublicKeyParts;
+        let private_key = rsa::RsaPrivateKey::new(&mut OsRng, 2048).expect("RSA-2048 key");
+        let public_key = private_key.to_public_key();
+        let rsa_public_der = der_sequence(&[
+            der_integer_from_bytes(&public_key.n().to_bytes_be()),
+            der_integer_from_bytes(&public_key.e().to_bytes_be()),
+        ]);
+        let spki = der_sequence(&[
+            der_sequence(&[der_oid(OID_RSA_ENCRYPTION), der_null()]),
+            der_bit_string(&rsa_public_der),
+        ]);
+        StubSigner {
+            spki,
+            scheme: SignatureScheme::RSA_PKCS1_SHA256,
+            key: StubKey::Rsa(private_key),
+        }
+    }
+
+    /// Split a PKCS#10 DER into `certificationRequestInfo` bytes and the signature BIT STRING bytes.
+    fn csr_signature_parts(der: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let (tag, body, consumed) = read_der(der).expect("CSR SEQUENCE");
+        assert_eq!(tag, 0x30);
+        assert_eq!(consumed, der.len());
+        let (info_tag, _, info_len) = read_der(body).expect("certificationRequestInfo");
+        assert_eq!(info_tag, 0x30);
+        let info = body[..info_len].to_vec();
+        let (algorithm_tag, _, algorithm_len) = read_der(&body[info_len..]).expect("algorithm");
+        assert_eq!(algorithm_tag, 0x30);
+        let signature_offset = info_len + algorithm_len;
+        let (signature_tag, signature, signature_len) =
+            read_der(&body[signature_offset..]).expect("signature BIT STRING");
+        assert_eq!(signature_tag, 0x03);
+        assert_eq!(signature_offset + signature_len, body.len());
+        assert_eq!(signature[0], 0, "signature BIT STRING has no unused bits");
+        (info, signature[1..].to_vec())
+    }
+
+    #[test]
+    fn signs_csrs_through_a_pluggable_signer() {
+        let domains = vec![
+            "signer.example".to_string(),
+            "www.signer.example".to_string(),
+        ];
+
+        // ECDSA P-256 / SHA-256 through the abstraction.
+        let p256 = p256_stub_signer();
+        let csr = CertificateRequest::build_with_signer(&domains, CertificateKeyType::P256, &p256)
+            .expect("P-256 CSR");
+        assert_eq!(csr.key_type(), CertificateKeyType::P256);
+        assert!(
+            csr.private_key_pem().is_empty(),
+            "a token-held signer exports no key material"
+        );
+        assert_eq!(
+            csr.public_key_bytes(),
+            subject_public_key_bytes(p256.spki()).unwrap()
+        );
+        assert!(lookup(csr.der(), b"www.signer.example").is_some());
+        let (info, signature) = csr_signature_parts(csr.der());
+        let public_key = subject_public_key_bytes(p256.spki()).unwrap();
+        UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, public_key)
+            .verify(&info, &signature)
+            .expect("P-256 CSR signature verifies against the signer's public key");
+        parse_csr(csr.der()).expect("P-256 CSR parses and self-verifies");
+
+        // RSA-2048 / PKCS#1 v1.5 SHA-256 through the abstraction.
+        let rsa = rsa_2048_stub_signer();
+        let csr =
+            CertificateRequest::build_with_signer(&domains, CertificateKeyType::Rsa2048, &rsa)
+                .expect("RSA CSR");
+        assert_eq!(csr.key_type(), CertificateKeyType::Rsa2048);
+        assert!(csr.private_key_pem().is_empty());
+        assert!(lookup(csr.der(), b"www.signer.example").is_some());
+        let (info, signature) = csr_signature_parts(csr.der());
+        let public_key = subject_public_key_bytes(rsa.spki()).unwrap();
+        assert_eq!(signature.len(), 256, "RSA-2048 PKCS#1 v1.5 signature");
+        UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, public_key)
+            .verify(&info, &signature)
+            .expect("RSA-2048 PKCS#1 v1.5 SHA-256 CSR signature verifies");
+        parse_csr(csr.der()).expect("RSA CSR parses and self-verifies");
+    }
+
+    #[test]
+    fn rejects_unsupported_signer_scheme() {
+        struct UnsupportedSigner(Vec<u8>);
+        impl CsrSigner for UnsupportedSigner {
+            fn spki(&self) -> &[u8] {
+                &self.0
+            }
+            fn signature_scheme(&self) -> SignatureScheme {
+                SignatureScheme::ED25519
+            }
+            fn sign(&self, _message: &[u8]) -> Result<Vec<u8>> {
+                Ok(vec![0u8; 64])
+            }
+        }
+        let signer = p256_stub_signer();
+        let unsupported = UnsupportedSigner(signer.spki.clone());
+        let error = CertificateRequest::build_with_signer(
+            &["unsupported.example".to_string()],
+            CertificateKeyType::P256,
+            &unsupported,
+        )
+        .expect_err("Ed25519 has no PKCS#10 path here");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported certificate request signature scheme"),
+            "{error}"
+        );
     }
 }
