@@ -98,6 +98,7 @@ fn stored_certificate() -> crate::storage::StoredCertificate {
     crate::storage::StoredCertificate {
         certificate_pem: crate::storage::certificate_chain_pem(CERT_PEM).unwrap(),
         private_key_pem: crate::storage::private_key_pem(CERT_KEY_PEM).unwrap(),
+        token_key: None,
         domains: vec!["example.com".to_string()],
         not_after_unix: crate::storage::certificate_not_after_unix(CERT_PEM).unwrap(),
         issuer_data: Some(serde_json::json!({

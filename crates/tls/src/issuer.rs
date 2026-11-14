@@ -48,7 +48,7 @@ use crate::acme::{
     ChallengePolicy, ChallengeType, HyperTransport, IssuedCertificate, NewOrderRequest,
     OrderHandle, OrderStatus, PollPolicy, TokioClock,
 };
-use crate::certificate::Certificate;
+use crate::certificate::{Certificate, CertificateKeySource};
 use crate::dns::{DnsChallengeConfig, DnsProvider};
 use crate::solver::{
     key_authorization, ChallengeHandle, ChallengeSolver, Dns01Solver, Http01Solver,
@@ -423,6 +423,9 @@ pub struct AcmeIssuer<T: AcmeTransport> {
     poll_policy: PollPolicy,
     challenge_policy: Option<ChallengePolicy>,
     challenge_selector: AdaptiveChallengeSelector,
+    /// Where the certificate key comes from: a fresh process-held key (default) or a token-held
+    /// key whose CSR signature is produced inside the PKCS#11 token (T-TLS-101).
+    certificate_key: CertificateKeySource,
 }
 
 /// Production ACME issuer using the hyper/rustls HTTP transport.
@@ -464,6 +467,7 @@ impl<T: AcmeTransport> AcmeIssuer<T> {
             poll_policy: PollPolicy::default(),
             challenge_policy: None,
             challenge_selector: AdaptiveChallengeSelector::default(),
+            certificate_key: CertificateKeySource::ProcessHeld,
         }
     }
 
@@ -511,6 +515,20 @@ impl<T: AcmeTransport> AcmeIssuer<T> {
     pub fn with_clock(mut self, clock: Arc<dyn AcmeClock>) -> Self {
         self.clock = clock;
         self
+    }
+
+    /// Issue certificates for a token-held key: the CSR is signed inside the PKCS#11 token
+    /// through [`crate::acme::csr::CsrSigner`] and no private key is generated or exported
+    /// (T-TLS-101). The same source is reused for every renewal, so the token key and its session
+    /// are reused instead of a new key being generated.
+    pub fn with_certificate_key_source(mut self, source: CertificateKeySource) -> Self {
+        self.certificate_key = source;
+        self
+    }
+
+    /// The configured certificate key source.
+    pub fn certificate_key_source(&self) -> &CertificateKeySource {
+        &self.certificate_key
     }
 
     /// Override the order/authorization polling policy.
@@ -627,7 +645,13 @@ impl<T: AcmeTransport> AcmeIssuer<T> {
 
         let mut presented: Vec<(Arc<dyn ChallengeSolver>, ChallengeHandle)> = Vec::new();
         let result = self
-            .run_order(&account_client, &domains, request.key_type, &mut presented)
+            .run_order(
+                &account_client,
+                &domains,
+                request.key_type,
+                &self.certificate_key,
+                &mut presented,
+            )
             .await;
         // Withdraw challenge evidence in reverse order, whether issuance succeeded or not.
         for (solver, handle) in presented.iter().rev() {
@@ -641,6 +665,7 @@ impl<T: AcmeTransport> AcmeIssuer<T> {
         account_client: &AcmeAccountClient<&U>,
         domains: &[String],
         key_type: CertificateKeyType,
+        certificate_key: &CertificateKeySource,
         presented: &mut Vec<(Arc<dyn ChallengeSolver>, ChallengeHandle)>,
     ) -> Result<Certificate> {
         let order_request = NewOrderRequest::for_domains(domains);
@@ -709,7 +734,14 @@ impl<T: AcmeTransport> AcmeIssuer<T> {
         account_client
             .poll_order_ready(&order.url, &self.poll_policy, self.clock.as_ref())
             .await?;
-        let csr = CertificateRequest::generate_with_key_type(domains, key_type)?;
+        // Token-held keys sign the CSR inside the token; no process-held key is generated and
+        // there is no PEM fallback when the signer is unavailable or the sign times out.
+        let csr = match certificate_key.token_key() {
+            Some(token) => {
+                CertificateRequest::build_with_signer(domains, token.key_type(), token.signer())?
+            }
+            None => CertificateRequest::generate_with_key_type(domains, key_type)?,
+        };
         account_client.finalize_order(&order, &csr).await?;
         let issued = account_client
             .wait_for_certificate(&order.url, &self.poll_policy, self.clock.as_ref())
@@ -723,7 +755,7 @@ impl<T: AcmeTransport> AcmeIssuer<T> {
             "ca": self.config.ca,
             "account": account_client.account_url(),
         }));
-        let stored = stored_certificate(&issued, &csr, domains, issuer_data)?;
+        let stored = stored_certificate(&issued, &csr, domains, issuer_data, certificate_key)?;
         self.certificate_storage
             .store(&self.storage_key(domains), &stored)
             .await?;
@@ -927,7 +959,11 @@ impl<T: AcmeTransport> AcmeIssuer<T> {
         Ok(Certificate {
             domains: domains.to_vec(),
             cert_chain_der: certificate_chain_der(&issued.certificates_pem)?,
-            private_key_der: private_key_der(csr.private_key_pem())?,
+            // Token-held keys stay in the token: there is no DER private key to hand out.
+            private_key_der: match self.certificate_key.token_key() {
+                Some(_) => Vec::new(),
+                None => private_key_der(csr.private_key_pem())?,
+            },
             not_before: UNIX_EPOCH + Duration::from_secs(not_before),
             not_after: UNIX_EPOCH + Duration::from_secs(not_after),
             issuer: self.config.ca.clone(),
@@ -996,6 +1032,7 @@ fn stored_certificate(
     csr: &CertificateRequest,
     domains: &[String],
     issuer_data: Option<serde_json::Value>,
+    certificate_key: &CertificateKeySource,
 ) -> Result<StoredCertificate> {
     let leaf = issued.certificates_pem.first().ok_or_else(|| {
         Error::Issuer("ACME certificate download returned no PEM certificates".to_string())
@@ -1007,7 +1044,12 @@ fn stored_certificate(
     })?;
     Ok(StoredCertificate {
         certificate_pem: issued.certificates_pem.clone(),
-        private_key_pem: csr.private_key_pem().to_string(),
+        private_key_pem: match certificate_key.token_key() {
+            // Token-held keys have no PEM form; storage refuses to write this record.
+            Some(_) => String::new(),
+            None => csr.private_key_pem().to_string(),
+        },
+        token_key: certificate_key.token_ref().cloned(),
         domains: domains.to_vec(),
         not_after_unix,
         issuer_data,
@@ -2642,5 +2684,160 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("T-TLS-070"), "{error}");
+    }
+    // ---- token-held certificate keys (T-TLS-101) -----------------------------------------
+
+    fn token_key_source(
+        signer: Arc<crate::acme::csr::test_support::StubCsrSigner>,
+    ) -> CertificateKeySource {
+        CertificateKeySource::token(
+            crate::certificate::TokenKeyRef::new("softHSM", "example.com"),
+            signer,
+        )
+        .expect("P-256 token signer is CSR-compatible")
+    }
+
+    #[tokio::test]
+    async fn token_signer_signs_the_acme_csr_and_no_pem_key_is_generated() {
+        let transport = TestTransport::new();
+        let account_storage = Arc::new(MemoryAcmeStorage::new());
+        let certificate_storage = Arc::new(MemoryStorage::new());
+        let signer = crate::acme::csr::test_support::StubCsrSigner::p256("session-1");
+        let issuer = issuer_with(
+            transport.clone(),
+            http_config(),
+            Arc::clone(&account_storage),
+            &certificate_storage,
+        )
+        .with_certificate_key_source(token_key_source(Arc::clone(&signer)));
+        script_account_and_order(&transport, &["http-01"]);
+        script_finalization(&transport, "http-01");
+
+        // The CSR is signed through the token signer; storage then refuses to write the
+        // token-held key as PKCS#8 PEM, so issuance fails closed instead of persisting a key.
+        let error = issuer
+            .obtain(&issuance_request())
+            .await
+            .expect_err("a token-held key must never be written as a PEM key");
+        assert_eq!(
+            signer.calls(),
+            1,
+            "the ACME CSR must be signed through the token signer"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("token-held keys are never written as PKCS#8 PEM"),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("pkcs11 token softHSM"),
+            "{error}"
+        );
+        assert!(
+            certificate_storage
+                .load(STORAGE_KEY)
+                .await
+                .unwrap()
+                .is_none(),
+            "no certificate/key record may be persisted for a token-held key"
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_token_signer_fails_closed_before_any_csr() {
+        let transport = TestTransport::new();
+        let account_storage = Arc::new(MemoryAcmeStorage::new());
+        let certificate_storage = Arc::new(MemoryStorage::new());
+        let signer = crate::acme::csr::test_support::StubCsrSigner::failing(
+            "session-1",
+            "token is not present",
+        );
+        let issuer = issuer_with(
+            transport.clone(),
+            http_config(),
+            Arc::clone(&account_storage),
+            &certificate_storage,
+        )
+        .with_certificate_key_source(token_key_source(Arc::clone(&signer)));
+        script_account_and_order(&transport, &["http-01"]);
+        script_finalization(&transport, "http-01");
+
+        let error = issuer
+            .obtain(&issuance_request())
+            .await
+            .expect_err("an unavailable token signer must fail closed");
+        assert!(
+            error.to_string().contains("token is not present"),
+            "{error}"
+        );
+        assert_eq!(signer.calls(), 0);
+        assert!(certificate_storage
+            .load(STORAGE_KEY)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn renewal_reuses_the_token_key_and_session() {
+        let transport = TestTransport::new();
+        let account_storage = Arc::new(MemoryAcmeStorage::new());
+        let certificate_storage = Arc::new(MemoryStorage::new());
+        let signer = crate::acme::csr::test_support::StubCsrSigner::p256("session-7");
+        let issuer = issuer_with(
+            transport.clone(),
+            http_config(),
+            Arc::clone(&account_storage),
+            &certificate_storage,
+        )
+        .with_certificate_key_source(token_key_source(Arc::clone(&signer)));
+        script_account_and_order(&transport, &["http-01"]);
+        script_finalization(&transport, "http-01");
+        // Renewal reuses the stored account, so only the directory and a fresh order are scripted.
+        transport.expect(
+            HttpMethod::Get,
+            DIRECTORY_URL,
+            with_nonce(json_response(200, directory_document()), "nonce-0"),
+        );
+        transport.expect(
+            HttpMethod::Post,
+            NEW_ORDER_URL,
+            with_nonce(
+                with_location(json_response(201, order_document("pending")), ORDER_URL),
+                "nonce-2",
+            ),
+        );
+        transport.expect(
+            HttpMethod::Post,
+            AUTHZ_URL,
+            with_nonce(
+                json_response(200, authorization_document("pending", &["http-01"])),
+                "nonce-3",
+            ),
+        );
+        script_finalization(&transport, "http-01");
+
+        let _ = issuer.obtain(&issuance_request()).await;
+        let session = issuer
+            .certificate_key_source()
+            .token_key()
+            .expect("token key")
+            .key()
+            .clone();
+        let _ = issuer.obtain(&issuance_request()).await;
+        let renewed = issuer
+            .certificate_key_source()
+            .token_key()
+            .expect("token key")
+            .key()
+            .clone();
+        assert_eq!(session, renewed, "renewal must reuse the token key");
+        assert_eq!(signer.session(), "session-7");
+        assert_eq!(
+            signer.calls(),
+            2,
+            "initial issuance and renewal both sign through the same token session"
+        );
     }
 }

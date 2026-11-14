@@ -136,6 +136,10 @@ pub struct AutomaticHttpsPolicy {
     pub on_demand: bool,
     /// Certificate key type from Caddy's automation policy `key_type` (default P-256).
     pub key_type: CertificateKeyType,
+    /// Token-held certificate key named by the policy's `certificate_key`
+    /// (`{"token": {"label": ..., "key_id": ...}}`); `None` = a fresh process-held key per
+    /// issuance (T-TLS-101).
+    pub certificate_key: Option<crate::certificate::TokenKeyRef>,
     /// Caddy's policy-level `disable_ocsp_stapling` (T-TLS-051).
     pub disable_ocsp_stapling: bool,
     /// Caddy's policy-level `must_staple` (requires a staple; validated by the OCSP stapler).
@@ -545,6 +549,7 @@ pub fn plan(config: &Config) -> Result<Option<AutomaticHttpsPlan>> {
             issuer: AutomaticHttpsIssuer::Internal,
             on_demand: false,
             key_type: CertificateKeyType::P256,
+            certificate_key: None,
             disable_ocsp_stapling: false,
             must_staple: false,
         });
@@ -558,6 +563,7 @@ pub fn plan(config: &Config) -> Result<Option<AutomaticHttpsPlan>> {
             issuer: AutomaticHttpsIssuer::Acme(Box::default()),
             on_demand: false,
             key_type: CertificateKeyType::P256,
+            certificate_key: None,
             disable_ocsp_stapling: false,
             must_staple: false,
         });
@@ -728,6 +734,79 @@ fn ocsp_check_interval(tls: &TlsApp) -> Result<Duration> {
     Ok(duration)
 }
 
+/// Parse `apps.tls.automation.policies[i].certificate_key` into a token key reference.
+///
+/// Only a token-held key can be named; a fresh process-held key is expressed by omitting the
+/// field. Anything else is rejected with a located error naming the config path (T-TLS-101).
+fn parse_certificate_key(
+    value: Option<&Value>,
+    path: &str,
+) -> Result<Option<crate::certificate::TokenKeyRef>> {
+    let path = format!("{path}.certificate_key");
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let object = value.as_object().ok_or_else(|| {
+        Error::Issuer(format!(
+            "{path}: expected an object naming the certificate key source, e.g. \
+             {{\"token\": {{\"label\": \"softHSM\", \"key_id\": \"example.com\"}}}}"
+        ))
+    })?;
+    if object.contains_key("token") {
+        for unknown in object.keys().filter(|key| key.as_str() != "token") {
+            return Err(Error::Issuer(format!(
+                "{path}.{unknown}: unsupported certificate key source field; \
+                 `certificate_key` accepts only a `token` object"
+            )));
+        }
+        let token = object
+            .get("token")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                Error::Issuer(format!(
+                    "{path}.token: expected an object with `label` and `key_id`"
+                ))
+            })?;
+        for unknown in token
+            .keys()
+            .filter(|key| !matches!(key.as_str(), "label" | "key_id"))
+        {
+            return Err(Error::Issuer(format!(
+                "{path}.token.{unknown}: unsupported token certificate key field; \
+                 expected `label` and `key_id`"
+            )));
+        }
+        let label = token
+            .get("label")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|label| !label.is_empty())
+            .ok_or_else(|| {
+                Error::Issuer(format!(
+                    "{path}.token.label: expected a non-empty PKCS#11 token label"
+                ))
+            })?;
+        let key_id = token
+            .get("key_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|key_id| !key_id.is_empty())
+            .ok_or_else(|| {
+                Error::Issuer(format!(
+                    "{path}.token.key_id: expected a non-empty PKCS#11 key id (`CKA_LABEL` or \
+                     hex `CKA_ID`)"
+                ))
+            })?;
+        return Ok(Some(crate::certificate::TokenKeyRef::new(label, key_id)));
+    }
+    let named: Vec<&str> = object.keys().map(String::as_str).collect();
+    Err(Error::Issuer(format!(
+        "{path}: unsupported certificate key source `{}`; supported: a `token` object \
+         ({{\"token\": {{\"label\": \"softHSM\", \"key_id\": \"example.com\"}}}})",
+        named.join(", ")
+    )))
+}
+
 fn parse_policy(
     policy: &AutomationPolicy,
     index: usize,
@@ -808,11 +887,13 @@ fn parse_policy(
             .map_err(|error| Error::Issuer(format!("{path}.key_type: {error}")))?,
         None => CertificateKeyType::P256,
     };
+    let certificate_key = parse_certificate_key(policy.certificate_key.as_ref(), &path)?;
     Ok(AutomaticHttpsPolicy {
         subjects: policy.subjects.clone(),
         issuer,
         on_demand: policy.on_demand,
         key_type,
+        certificate_key,
         disable_ocsp_stapling: !ocsp_policy.enabled,
         must_staple: ocsp_policy.must_staple,
     })
@@ -2902,6 +2983,7 @@ mod tests {
         let stored = StoredCertificate {
             certificate_pem: vec![cert_pem],
             private_key_pem: include_str!("../testdata/https/example.com.key").to_string(),
+            token_key: None,
             domains: vec![domain.to_string()],
             not_after_unix,
             issuer_data: None,
@@ -3179,6 +3261,7 @@ mod tests {
         let stored = crate::storage::StoredCertificate {
             certificate_pem: vec![CERT_PEM.to_string()],
             private_key_pem: CERT_KEY_PEM.to_string(),
+            token_key: None,
             domains: vec!["example.com".to_string()],
             not_after_unix: u64::MAX,
             issuer_data: None,
@@ -4012,6 +4095,82 @@ mod tests {
         assert!(
             reload_transport.inner.requests.lock().unwrap().is_empty(),
             "reload must not touch the ACME transport"
+        );
+    }
+    #[test]
+    fn plan_parses_a_token_held_certificate_key() {
+        let value = json!({
+            "apps": {
+                "tls": {"automation": {"policies": [{
+                    "subjects": ["example.com"],
+                    "certificate_key": {"token": {"label": "softHSM", "key_id": "example.com"}},
+                    "issuers": [{"module": "acme", "ca": "https://acme.test/directory"}]
+                }]}},
+                "http": {"servers": {"srv0": {
+                    "listen": ["127.0.0.1:0"],
+                    "tls_connection_policies": [{}],
+                    "routes": [{"match": [{"host": ["example.com"]}],
+                                "handle": [{"handler": "static_response", "body": "ok"}]}]
+                }}}
+            }
+        });
+        let parsed_plan = plan(&config(value)).unwrap().unwrap();
+        let policy = parsed_plan.policy_for("example.com").unwrap();
+        let token = policy
+            .certificate_key
+            .as_ref()
+            .expect("token-held certificate key");
+        assert_eq!(token.label, "softHSM");
+        assert_eq!(token.key_id, "example.com");
+    }
+
+    #[test]
+    fn plan_rejects_unknown_certificate_key_references() {
+        let plan_error = |certificate_key: serde_json::Value| {
+            let value = json!({
+                "apps": {
+                    "tls": {"automation": {"policies": [{
+                        "subjects": ["example.com"],
+                        "certificate_key": certificate_key,
+                        "issuers": [{"module": "acme", "ca": "https://acme.test/directory"}]
+                    }]}},
+                    "http": {"servers": {"srv0": {
+                        "listen": ["127.0.0.1:0"],
+                        "tls_connection_policies": [{}],
+                        "routes": [{"match": [{"host": ["example.com"]}],
+                                    "handle": [{"handler": "static_response", "body": "ok"}]}]
+                    }}}
+                }
+            });
+            plan(&config(value)).unwrap_err().to_string()
+        };
+
+        let error = plan_error(json!({"hsm": {"slot": 0}}));
+        assert!(
+            error.contains("apps.tls.automation.policies[0].certificate_key"),
+            "{error}"
+        );
+        assert!(
+            error.contains("unsupported certificate key source"),
+            "{error}"
+        );
+
+        let error = plan_error(json!({"token": {"label": "softHSM"}}));
+        assert!(
+            error.contains("apps.tls.automation.policies[0].certificate_key.token.key_id"),
+            "{error}"
+        );
+
+        let error = plan_error(json!({"token": {"label": "softHSM", "key_id": "k", "pin": "x"}}));
+        assert!(
+            error.contains("apps.tls.automation.policies[0].certificate_key.token.pin"),
+            "{error}"
+        );
+
+        let error = plan_error(json!("softHSM"));
+        assert!(
+            error.contains("apps.tls.automation.policies[0].certificate_key"),
+            "{error}"
         );
     }
 }

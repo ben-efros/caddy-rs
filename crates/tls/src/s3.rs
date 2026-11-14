@@ -641,6 +641,7 @@ impl crate::storage::CertificateStorage for S3Storage {
         Ok(Some(crate::storage::StoredCertificate {
             certificate_pem,
             private_key_pem,
+            token_key: None,
             domains,
             not_after_unix,
             issuer_data,
