@@ -4128,6 +4128,10 @@ mod tests {
         std::fs::write(directory.join("parts/glob/two.conf"), "header X-Two two\n")
             .expect("write import file");
         let caddyfile = ":80 {\n import parts/respond.conf hello\n import parts/glob/*.conf\n}\n";
+        // The importing Caddyfile must exist on disk: the safe-mode import rule anchors the owner
+        // of the imported files on the owner of the file that imports them, and a source path that
+        // does not exist leaves no anchor (the strict root-owned fallback then applies).
+        std::fs::write(directory.join("Caddyfile"), caddyfile).expect("write importing Caddyfile");
         let file = parse_with_source(caddyfile, Some(&directory.join("Caddyfile")))
             .expect("file and glob imports parse");
         let names: Vec<&str> = file.sites[0]
@@ -4168,6 +4172,12 @@ mod tests {
         std::fs::create_dir_all(&directory).expect("create temp dir");
         std::fs::write(directory.join("a.conf"), "import b.conf\n").expect("write a");
         std::fs::write(directory.join("b.conf"), "import a.conf\n").expect("write b");
+        // Write the importing Caddyfile so the safe-mode import rule has an ownership anchor.
+        std::fs::write(
+            directory.join("Caddyfile"),
+            "import a.conf\n:80 {\n respond ok\n}\n",
+        )
+        .expect("write importing Caddyfile");
         let error = parse_with_source(
             "import a.conf\n:80 {\n respond ok\n}\n",
             Some(&directory.join("Caddyfile")),

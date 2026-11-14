@@ -110,10 +110,7 @@ impl std::fmt::Debug for LoginRequest {
             .debug_struct("LoginRequest")
             .field("username", &self.username)
             .field("password", &"[redacted]")
-            .field(
-                "totp_code",
-                &self.totp_code.as_ref().map(|_| "[redacted]"),
-            )
+            .field("totp_code", &self.totp_code.as_ref().map(|_| "[redacted]"))
             .finish()
     }
 }
@@ -303,7 +300,10 @@ pub(crate) async fn logout_handler(
             Err(other) => return Err(internal_error(other)),
         }
     }
-    Ok(([(header::CACHE_CONTROL, "no-store")], StatusCode::NO_CONTENT))
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        StatusCode::NO_CONTENT,
+    ))
 }
 
 /// `GET /api/v1/auth/me` — describe the caller.
@@ -313,11 +313,15 @@ pub(crate) async fn me_handler(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
     let Claims { sub, .. } = require_claims(&state, &headers).await?;
-    let user = state.authn.get_user(sub).await.map_err(|error| match error {
-        // The token verified but its user is gone: treat it as an invalid token, not a 500.
-        AuthError::UserNotFound => ApiError::Unauthorized("invalid access token".to_owned()),
-        other => internal_error(other),
-    })?;
+    let user = state
+        .authn
+        .get_user(sub)
+        .await
+        .map_err(|error| match error {
+            // The token verified but its user is gone: treat it as an invalid token, not a 500.
+            AuthError::UserNotFound => ApiError::Unauthorized("invalid access token".to_owned()),
+            other => internal_error(other),
+        })?;
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
         Json(MeResponse {

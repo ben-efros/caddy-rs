@@ -31,7 +31,7 @@ use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use cryptoki::context::{CInitializeArgs, Pkcs11};
+use cryptoki::context::{CInitializeArgs, CInitializeFlags, Pkcs11};
 use cryptoki::error::{Error as CryptokiError, RvError};
 use cryptoki::mechanism::rsa::{PkcsMgfType, PkcsPssParams};
 use cryptoki::mechanism::{Mechanism, MechanismType};
@@ -1516,10 +1516,11 @@ fn open_module(module: &Path) -> Result<Pkcs11, Pkcs11Error> {
         return Ok(pkcs11.clone());
     }
     let pkcs11 = load_module(module)?;
-    match pkcs11.initialize(CInitializeArgs::OsThreads) {
+    // `CInitializeArgs::OsThreads` is gone in cryptoki 0.12; the equivalent request is the
+    // OS-locking flag alone, which asks the module to use native threads and return an error
+    // instead of spawning its own (OsThreads set exactly this flag).
+    match pkcs11.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK)) {
         Ok(()) => {}
-        // This handle initialized the module.
-        Err(CryptokiError::AlreadyInitialized) => {}
         // Some other code path in this process initialized the module first; the module is
         // initialized and this handle is usable.
         Err(CryptokiError::Pkcs11(RvError::CryptokiAlreadyInitialized, _)) => {}
@@ -2152,7 +2153,7 @@ mod tests {
         if !module.exists() {
             return;
         }
-        let pin = AuthPin::new("123456".to_string());
+        let pin = AuthPin::new("123456".to_string().into());
         let pool = open_token(
             module,
             Some("caddy-rs-test"),

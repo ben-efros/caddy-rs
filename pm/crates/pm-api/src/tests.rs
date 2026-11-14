@@ -2423,7 +2423,9 @@ async fn setup_returns_the_snake_case_session_shape_the_ui_reads() {
     let body: serde_json::Value = response.json();
     for field in ["user_id", "access_token", "refresh_token"] {
         assert!(
-            body.get(field).and_then(serde_json::Value::as_str).is_some_and(|value| !value.is_empty()),
+            body.get(field)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| !value.is_empty()),
             "setup returns a non-empty `{field}`: {body}"
         );
     }
@@ -2440,7 +2442,10 @@ async fn login_returns_a_pair_and_hides_which_usernames_exist() {
 
     let session = login(&server, "admin", SETUP_PASSWORD).await;
     assert!(
-        authn.verify_access_token(&session.access_token).await.is_ok(),
+        authn
+            .verify_access_token(&session.access_token)
+            .await
+            .is_ok(),
         "the returned access token verifies against the same store"
     );
     assert!(!session.refresh_token.is_empty());
@@ -2494,10 +2499,7 @@ async fn login_is_rate_limited_after_repeated_failures() {
         .json(&serde_json::json!({"username": "admin", "password": "wrong-password"}))
         .await;
     assert_eq!(blocked.status_code(), StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(
-        error_envelope(&blocked).error.code,
-        ErrorCode::RateLimited
-    );
+    assert_eq!(error_envelope(&blocked).error.code, ErrorCode::RateLimited);
     let retry_after = blocked
         .header("retry-after")
         .to_str()
@@ -2531,7 +2533,10 @@ async fn login_requires_a_totp_code_when_the_account_has_one() {
         .json(&serde_json::json!({"username": "admin", "password": SETUP_PASSWORD}))
         .await;
     assert_eq!(missing.status_code(), StatusCode::UNAUTHORIZED);
-    assert!(error_envelope(&missing).error.message.contains("invalid TOTP code"));
+    assert!(error_envelope(&missing)
+        .error
+        .message
+        .contains("invalid TOTP code"));
 
     let rejected = server
         .post("/api/v1/auth/login")
@@ -2542,7 +2547,10 @@ async fn login_requires_a_totp_code_when_the_account_has_one() {
         }))
         .await;
     assert_eq!(rejected.status_code(), StatusCode::UNAUTHORIZED);
-    assert!(error_envelope(&rejected).error.message.contains("invalid TOTP code"));
+    assert!(error_envelope(&rejected)
+        .error
+        .message
+        .contains("invalid TOTP code"));
 }
 
 #[tokio::test]
@@ -2562,7 +2570,10 @@ async fn refresh_rotates_the_pair_and_rejects_reuse() {
         "the refresh token rotates on every exchange"
     );
     assert!(
-        authn.verify_access_token(&rotated.access_token).await.is_ok(),
+        authn
+            .verify_access_token(&rotated.access_token)
+            .await
+            .is_ok(),
         "the rotated access token verifies (it may be byte-identical within the same second)"
     );
 
@@ -2649,7 +2660,10 @@ async fn me_describes_the_caller_and_requires_a_bearer_token() {
         body["id"].as_str().is_some_and(|id| !id.is_empty()),
         "the id is the user UUID as a string"
     );
-    assert!(body.get("password_hash").is_none(), "no credential material");
+    assert!(
+        body.get("password_hash").is_none(),
+        "no credential material"
+    );
 
     let missing = server.get("/api/v1/auth/me").await;
     assert_eq!(missing.status_code(), StatusCode::UNAUTHORIZED);
@@ -2698,8 +2712,8 @@ async fn me_rejects_a_token_issued_before_an_authentication_epoch_change() {
 #[tokio::test]
 async fn me_reports_an_expired_access_token_as_401() {
     let temp_dir = TempDir::new().expect("create temp dir");
-    let runtime = PmRuntime::open(RuntimeConfig::new(temp_dir.path().join("data")))
-        .expect("open runtime");
+    let runtime =
+        PmRuntime::open(RuntimeConfig::new(temp_dir.path().join("data"))).expect("open runtime");
     let authn_config = AuthnConfig {
         jwt_secret_source: JwtSecretSource::Ephemeral,
         access_ttl: std::time::Duration::from_millis(1),
@@ -2710,8 +2724,8 @@ async fn me_reports_an_expired_access_token_as_401() {
         },
         ..AuthnConfig::default()
     };
-    let authn = AuthnService::new(MemoryUserStore::new(), authn_config)
-        .expect("create authn service");
+    let authn =
+        AuthnService::new(MemoryUserStore::new(), authn_config).expect("create authn service");
     let state = ApiState::new(runtime, authn.clone()).open_bootstrap_window();
     let app = create_router(state).into_make_service_with_connect_info::<std::net::SocketAddr>();
     let server = TestServer::new(app);
@@ -2753,7 +2767,10 @@ async fn mutations_require_a_bearer_token_once_an_administrator_exists() {
             .json(&dead_body("blocked.example.com"))
             .await,
         server.delete("/api/v1/hosts/1").await,
-        server.patch("/api/v1/hosts/1").json(&serde_json::json!({})).await,
+        server
+            .patch("/api/v1/hosts/1")
+            .json(&serde_json::json!({}))
+            .await,
         server.post("/api/v1/hosts/1/enable").await,
         server.post("/api/v1/hosts/1/disable").await,
         server.put("/api/v1/hosts/1/security-headers").await,
@@ -2762,7 +2779,10 @@ async fn mutations_require_a_bearer_token_once_an_administrator_exists() {
     for response in requests {
         assert_eq!(response.status_code(), StatusCode::UNAUTHORIZED);
         assert_eq!(response.header("www-authenticate"), "Bearer");
-        assert_eq!(error_envelope(&response).error.code, ErrorCode::Unauthorized);
+        assert_eq!(
+            error_envelope(&response).error.code,
+            ErrorCode::Unauthorized
+        );
     }
 
     let read = server.get("/api/v1/hosts").await;
@@ -2969,7 +2989,11 @@ async fn configuration_reads_reject_a_non_loopback_host_header() {
         "",
     ] {
         let response = server.get("/api/v1/hosts").add_header("Host", host).await;
-        assert_eq!(response.status_code(), StatusCode::FORBIDDEN, "Host: {host}");
+        assert_eq!(
+            response.status_code(),
+            StatusCode::FORBIDDEN,
+            "Host: {host}"
+        );
         assert_eq!(error_envelope(&response).error.code, ErrorCode::Forbidden);
     }
 
@@ -2983,8 +3007,14 @@ async fn session_endpoints_require_a_known_loopback_peer() {
     // also produces; every session handler refuses it before parsing the body.
     let (_dir, server) = server();
     for (path, body) in [
-        ("/api/v1/auth/login", serde_json::json!({"username": "a", "password": "b"})),
-        ("/api/v1/auth/refresh", serde_json::json!({"refresh_token": "x"})),
+        (
+            "/api/v1/auth/login",
+            serde_json::json!({"username": "a", "password": "b"}),
+        ),
+        (
+            "/api/v1/auth/refresh",
+            serde_json::json!({"refresh_token": "x"}),
+        ),
         ("/api/v1/auth/logout", serde_json::json!({})),
     ] {
         let response = server.post(path).json(&body).await;
@@ -2993,4 +3023,3 @@ async fn session_endpoints_require_a_known_loopback_peer() {
     let response = server.get("/api/v1/auth/me").await;
     assert_eq!(response.status_code(), StatusCode::FORBIDDEN);
 }
-

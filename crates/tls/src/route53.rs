@@ -838,7 +838,7 @@ mod tests {
         let requests = provider.transport.requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].method, HttpMethod::Get);
-        assert_eq!(requests[0].header("X-Amz-Date").is_some(), true);
+        assert!(requests[0].header("X-Amz-Date").is_some());
         assert!(requests[0]
             .header("Authorization")
             .unwrap()
