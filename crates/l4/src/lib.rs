@@ -17,10 +17,21 @@
 
 #![forbid(unsafe_code)]
 
+pub mod actions;
 pub mod client_hello;
+pub mod handler;
 pub mod prefixed_stream;
+pub mod router;
 
+pub use actions::{
+    ActionConfigError, FallbackConfig, FallbackReason, HttpConfig, PassthroughConfig, SniAction,
+    TerminateConfig,
+};
 pub use client_hello::{
     detect_protocol, parse_client_hello, ClientHelloInfo, ParseError, Protocol,
 };
+pub use handler::{
+    BoxedStream, HandlerContext, HandlerError, HandlerPipeline, L4Handler, L4Stream,
+};
 pub use prefixed_stream::{BufferPool, PrefixedStream, POOL_BUFFER_SIZE};
+pub use router::{Route, RouteDefinition, RouteError, SniRouter, SniTable};
