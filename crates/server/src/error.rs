@@ -93,6 +93,18 @@ impl Error {
             cause: source,
         }
     }
+
+    /// The configuration-model error behind [`Error::Config`], if this is a configuration failure.
+    ///
+    /// `Config` is not `#[from]` (T-OPS-033), so the [`caddy_rs_core::Error`] is no longer reachable
+    /// through [`std::error::Error::source`]; the CLI uses this accessor to keep its stable
+    /// `error[code]` prefix for configuration errors raised while the server is starting.
+    pub fn core_error(&self) -> Option<&caddy_rs_core::Error> {
+        match self {
+            Self::Config(error) => Some(error),
+            _ => None,
+        }
+    }
 }
 
 /// A listener's actual bound address (useful for `:0` in tests).

@@ -563,16 +563,25 @@ async fn main() -> ExitCode {
     }
 }
 
-/// The stable, machine-readable code of the first [`caddy_rs_core::Error`] in the chain, if any.
+/// The stable, machine-readable code of the first configuration-model error in the chain, if any.
 ///
 /// The code is what scripts and editors match on (`error[module.unknown]`), so it must survive
-/// message rewording; see [`caddy_rs_core::Error::code`]. Errors that do not originate in the
-/// configuration/validation layer (I/O, TLS, runtime) keep the plain `error:` form.
+/// message rewording; see [`caddy_rs_core::Error::code`]. Most commands put the
+/// [`caddy_rs_core::Error`] in the chain directly; the server wraps it in
+/// [`caddy_rs_server::Error::Config`], which is not a `#[from]` variant (T-OPS-033), so its
+/// [`caddy_rs_server::Error::core_error`] accessor is the second place the code can come from.
+/// Errors that do not originate in the configuration/validation layer (I/O, TLS, runtime) keep the
+/// plain `error:` form.
 fn core_error_code(error: &anyhow::Error) -> Option<&'static str> {
-    error
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<caddy_rs_core::Error>())
-        .map(caddy_rs_core::Error::code)
+    error.chain().find_map(|cause| {
+        if let Some(core) = cause.downcast_ref::<caddy_rs_core::Error>() {
+            return Some(core.code());
+        }
+        cause
+            .downcast_ref::<caddy_rs_server::Error>()
+            .and_then(caddy_rs_server::Error::core_error)
+            .map(caddy_rs_core::Error::code)
+    })
 }
 
 async fn run(command: Command) -> anyhow::Result<()> {
@@ -1935,6 +1944,19 @@ fn trust_installation_disabled(config: &Config, ca_id: &str) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_server_wrapped_configuration_error_keeps_its_stable_code() {
+        let core = caddy_rs_core::Error::invalid("apps.tls.certificates", "no certs");
+        let expected = core.code();
+        let wrapped = anyhow::Error::new(caddy_rs_server::Error::Config(core));
+        assert_eq!(core_error_code(&wrapped), Some(expected));
+
+        // Configuration/validation commands still put the core error in the chain directly.
+        let direct = anyhow::Error::new(caddy_rs_core::Error::invalid("apps", "boom"));
+        assert_eq!(core_error_code(&direct), Some("config.invalid"));
+        assert_eq!(core_error_code(&anyhow::anyhow!("boom")), None);
+    }
 
     #[test]
     fn install_trust_false_is_reported_as_a_disabled_no_op() {
