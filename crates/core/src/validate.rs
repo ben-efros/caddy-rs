@@ -1904,6 +1904,29 @@ mod tests {
         assert!(error.to_string().contains("events"));
     }
 
+    /// Unknown top-level configuration fields are rejected with a located error.
+    #[test]
+    fn rejects_unknown_top_level_fields() {
+        let config = Config::from_value(serde_json::json!({
+            "foo": "bar",
+            "apps": {
+                "http": {
+                    "servers": {
+                        "srv0": {
+                            "listen": [":443"],
+                            "routes": [{"handle": [{"handler": "static_response", "body": "ok"}]}]
+                        }
+                    }
+                }
+            }
+        }))
+        .expect("model decodes");
+        let error = validate_config(&config, &registry()).expect_err("unknown top-level field");
+        let message = error.to_string();
+        assert!(message.contains("foo"), "{message}");
+        assert!(message.contains("unknown top-level"), "{message}");
+    }
+
     #[test]
     fn rejects_duplicate_route_ids() {
         let config = Config::from_value(serde_json::json!({

@@ -2099,4 +2099,64 @@ mod tests {
             "an explicit `security_headers` handler in the route chain opts it out"
         );
     }
+
+    /// Matcher sets: OR between sets — any matching set triggers the route.
+    #[tokio::test]
+    async fn matcher_sets_are_or_combined() {
+        let router = RouterBuilder::new()
+            .build(&[json!({
+                "match": [
+                    {"host": ["example.com"]},
+                    {"host": ["example.org"]}
+                ],
+                "handle": [{"handler": "static_response", "body": "matched"}]
+            })])
+            .unwrap();
+        // Either host matches
+        let response = router.handle(request("/", "example.com")).await.unwrap();
+        assert_eq!(response.body, bytes::Bytes::from_static(b"matched"));
+        let response = router.handle(request("/", "example.org")).await.unwrap();
+        assert_eq!(response.body, bytes::Bytes::from_static(b"matched"));
+        // Neither matches → 200 empty (implicit termination)
+        let response = router.handle(request("/", "other.com")).await.unwrap();
+        assert_eq!(response.status, http::StatusCode::OK);
+        assert!(response.body.is_empty());
+    }
+
+    /// `terminal: true` stops evaluation after a matching route that staged headers,
+    /// even when a later route also matches; the staged headers ride the terminal empty
+    /// response. The non-terminal control makes removing terminal handling fail here.
+    #[tokio::test]
+    async fn terminal_route_stops_evaluation() {
+        let routes = [
+            json!({
+                "match": [{"host": ["example.com"]}],
+                "handle": [{"handler": "headers", "response": {"set": {"X-First": ["yes"]}}}],
+                "terminal": true
+            }),
+            json!({
+                "match": [{"host": ["example.com"]}],
+                "handle": [{"handler": "static_response", "body": "second"}]
+            }),
+        ];
+        let router = RouterBuilder::new().build(&routes).unwrap();
+        let response = router.handle(request("/", "example.com")).await.unwrap();
+        assert_eq!(response.status, http::StatusCode::OK);
+        assert!(response.body.is_empty(), "terminal route produced no body");
+        assert_eq!(
+            response
+                .headers
+                .get("x-first")
+                .map(|value| value.as_bytes()),
+            Some(b"yes".as_slice()),
+            "route 1 ran and staged X-First onto the terminal response"
+        );
+
+        // Control: without `terminal`, the later responding route wins.
+        let mut non_terminal = routes.clone();
+        non_terminal[0].as_object_mut().unwrap().remove("terminal");
+        let router = RouterBuilder::new().build(&non_terminal).unwrap();
+        let response = router.handle(request("/", "example.com")).await.unwrap();
+        assert_eq!(response.body, bytes::Bytes::from_static(b"second"));
+    }
 }
