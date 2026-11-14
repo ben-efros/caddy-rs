@@ -35,9 +35,11 @@
 //!
 //! With `per_host` configured, [`HostLabelPolicy`] adds Caddy's bounded `host` label: only hosts
 //! named by a non-fuzzy host matcher are individually labelled, unknown hosts aggregate under
-//! [`CATCHALL_HOST_LABEL`] (`_other`), and `observe_catchall_hosts` (or an HTTPS request on a
-//! server with TLS connection policies) lets a catch-all host keep its own label. The scan and the
-//! rules mirror `scanConfigForHosts`/`shouldAllowHostMetrics` (metrics.go:232-285) and
+//! [`CATCHALL_HOST_LABEL`] (`_other`), and `observe_catchall_hosts` lets a catch-all host keep its
+//! own label. HTTPS is not an exemption: the Host header is not bound to the TLS certificate, so
+//! every scheme follows the same rule (upstream `fe69f5da2d74`). Host labels are normalised
+//! (lowercase, no port, brackets trimmed) so port/case variants collapse to one series. The scan
+//! and the rules mirror `scanConfigForHosts`/`shouldAllowHostMetrics` (metrics.go:232-298) and
 //! `MatchHost.fuzzy` (`matchers.go:395`).
 //!
 //! Proxy and certificate series (`caddy_rs_proxy_*`, `caddy_rs_tls_*`) are caddy-rs extensions
@@ -975,43 +977,35 @@ pub struct ProxyObservation<'a> {
 
 /// Caddy's bounded `host` label policy (`per_host`).
 ///
-/// Mirrors `Metrics.shouldAllowHostMetrics` (`modules/caddyhttp/metrics.go:270-285`): a request host
-/// is individually labelled when it names an explicitly configured host matcher, when
-/// `observe_catchall_hosts` is set, or when it arrives over HTTPS and the configuration has at
-/// least one server with TLS connection policies. Everything else is labelled
-/// [`CATCHALL_HOST_LABEL`].
+/// Mirrors `Metrics.shouldAllowHostMetrics` (`modules/caddyhttp/metrics.go:281-292`): a request
+/// host is individually labelled when it names an explicitly configured host matcher, or when
+/// `observe_catchall_hosts` is set. Everything else is labelled [`CATCHALL_HOST_LABEL`], whatever
+/// the scheme: HTTPS does not bound the host set, because the Host header is not bound to the TLS
+/// certificate (On-Demand TLS and catch-all certificates may serve arbitrary names).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HostLabelPolicy {
     allowed_hosts: BTreeSet<String>,
-    has_https_server: bool,
     observe_catchall_hosts: bool,
 }
 
 impl HostLabelPolicy {
-    /// Build a policy from Caddy's scanned state (`scanConfigForHosts`, metrics.go:232-263).
+    /// Build a policy from the configuration host scan (`scanConfigForHosts`, metrics.go:232-276).
     ///
-    /// `allowed_hosts` are the non-fuzzy matcher hosts already lowercased by the scanner;
-    /// `has_https_server` is true when any server has a non-empty `tls_connection_policies` list.
+    /// `allowed_hosts` are the non-fuzzy matcher hosts, already normalised by [`metrics_host`];
+    /// `observe_catchall_hosts` is Caddy's `observe_catchall_hosts`.
     pub fn new(
         allowed_hosts: impl IntoIterator<Item = impl Into<String>>,
-        has_https_server: bool,
         observe_catchall_hosts: bool,
     ) -> Self {
         Self {
             allowed_hosts: allowed_hosts.into_iter().map(Into::into).collect(),
-            has_https_server,
             observe_catchall_hosts,
         }
     }
 
-    /// The explicitly allowed (non-fuzzy, lowercased) host matcher values.
+    /// The explicitly allowed (non-fuzzy, normalised) host matcher values.
     pub fn allowed_hosts(&self) -> &BTreeSet<String> {
         &self.allowed_hosts
-    }
-
-    /// Whether any server has TLS connection policies (Caddy's `hasHTTPSServer`).
-    pub fn has_https_server(&self) -> bool {
-        self.has_https_server
     }
 
     /// Whether catch-all hosts get their own label (`observe_catchall_hosts`).
@@ -1021,22 +1015,49 @@ impl HostLabelPolicy {
 
     /// Whether `host` keeps its own label instead of aggregating under `_other`.
     ///
-    /// `is_https` is Caddy's `r.TLS != nil` test.
-    pub fn should_label(&self, host: &str, is_https: bool) -> bool {
-        if self.allowed_hosts.contains(&host.to_lowercase()) {
-            return true;
-        }
-        self.observe_catchall_hosts || (is_https && self.has_https_server)
+    /// The host is normalised with [`metrics_host`] before the allow-list lookup. The request
+    /// scheme is deliberately irrelevant: Caddy's pre-fix `r.TLS` exemption was removed because it
+    /// allowed unbounded HTTPS label cardinality (upstream `fe69f5da2d74`).
+    pub fn should_label(&self, host: &str) -> bool {
+        self.allowed_hosts.contains(&metrics_host(host)) || self.observe_catchall_hosts
     }
 
-    /// The `host` label value: the lowercased request host, or `_other` when it is not allowed.
-    pub fn label_for(&self, host: &str, is_https: bool) -> String {
-        if self.should_label(host, is_https) {
-            host.to_lowercase()
+    /// The `host` label value: the normalised request host, or `_other` when it is not allowed.
+    pub fn label_for(&self, host: &str) -> String {
+        if self.should_label(host) {
+            metrics_host(host)
         } else {
             CATCHALL_HOST_LABEL.to_string()
         }
     }
+}
+
+/// Caddy's `metricsHost` (`modules/caddyhttp/metrics.go:293-298`): strip a port, trim brackets and
+/// lowercase, so port/case variants of one host collapse to a single label.
+pub(crate) fn metrics_host(host: &str) -> String {
+    let host = match split_host_port(host) {
+        Some((hostname, _port)) => hostname,
+        None => host,
+    };
+    host.trim_matches(['[', ']']).to_lowercase()
+}
+
+/// Go's `net.SplitHostPort` for the shapes Caddy passes to `metricsHost`.
+///
+/// Only the hostname half is used and the error is ignored, so this returns `None` exactly where
+/// Go reports one: no colon, a bracket without a trailing `:port`, or more than one colon outside
+/// brackets.
+fn split_host_port(host_port: &str) -> Option<(&str, &str)> {
+    if let Some(rest) = host_port.strip_prefix('[') {
+        let end = rest.find(']')?;
+        let port = rest[end + 1..].strip_prefix(':')?;
+        return Some((&rest[..end], port));
+    }
+    let colon = host_port.rfind(':')?;
+    if host_port[..colon].contains(':') {
+        return None;
+    }
+    Some((&host_port[..colon], &host_port[colon + 1..]))
 }
 
 /// Caddy's `apps.http.metrics` runtime gate and per-host policy.
@@ -1141,10 +1162,8 @@ impl HttpMetrics {
         self.policy.per_host().is_some()
     }
 
-    fn host_label(&self, host: &str, is_https: bool) -> Option<String> {
-        self.policy
-            .per_host()
-            .map(|policy| policy.label_for(host, is_https))
+    fn host_label(&self, host: &str) -> Option<String> {
+        self.policy.per_host().map(|policy| policy.label_for(host))
     }
 
     fn basic_labels<'a>(
@@ -1198,12 +1217,12 @@ impl HttpMetrics {
         server: &str,
         handler: &str,
         host: &str,
-        is_https: bool,
+        _is_https: bool,
     ) -> Result<InFlightGuard, MetricsError> {
         if !self.is_http_recording() {
             return Ok(InFlightGuard::noop());
         }
-        let host_label = self.host_label(host, is_https);
+        let host_label = self.host_label(host);
         let labels = self.basic_labels(server, handler, host_label.as_deref());
         let gauge = self.registry.gauge(
             HTTP_REQUESTS_IN_FLIGHT,
@@ -1230,14 +1249,14 @@ impl HttpMetrics {
         &self,
         observation: &RequestObservation<'_>,
         host: &str,
-        is_https: bool,
+        _is_https: bool,
     ) -> Result<(), MetricsError> {
         if !self.is_http_recording() {
             return Ok(());
         }
         let code = sanitize_status_code(observation.status);
         let method = sanitize_method(observation.method);
-        let host_label = self.host_label(host, is_https);
+        let host_label = self.host_label(host);
         let basic = self.basic_labels(
             observation.server,
             observation.handler,
@@ -1483,6 +1502,42 @@ impl Drop for ProxyInFlightGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metrics_host_matches_caddy_normalization() {
+        // Caddy's metricsHost: net.SplitHostPort (hostname only, error ignored), then lowercase
+        // and trim brackets. Port/case variants of one host must collapse to one label.
+        for (input, expected) in [
+            ("example.com", "example.com"),
+            ("Example.COM", "example.com"),
+            ("Example.COM:8443", "example.com"),
+            ("[::1]:443", "::1"),
+            ("[::1]", "::1"),
+            ("::1", "::1"),
+            ("foo:bar", "foo"),
+            ("host:", "host"),
+            (":8080", ""),
+            ("a:b:c", "a:b:c"),
+            ("", ""),
+        ] {
+            assert_eq!(metrics_host(input), expected, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn host_label_policy_is_scheme_independent_and_bounded() {
+        let policy = HostLabelPolicy::new(["example.com"], false);
+        // An allow-listed host keeps its label, including a port/case variant.
+        assert!(policy.should_label("Example.COM:8443"));
+        assert_eq!(policy.label_for("Example.COM:8443"), "example.com");
+        // Unknown hosts aggregate under `_other`, whatever the request scheme: upstream
+        // fe69f5da2d74 removed the HTTPS/TLS exemption.
+        assert!(!policy.should_label("unknown.test"));
+        assert_eq!(policy.label_for("unknown.test"), CATCHALL_HOST_LABEL);
+        // `observe_catchall_hosts` is the only escape hatch, and the label stays normalised.
+        let policy = HostLabelPolicy::new(["example.com"], true);
+        assert_eq!(policy.label_for("Unknown.Test:8443"), "unknown.test");
+    }
 
     #[test]
     fn approximate_request_size_matches_caddy_formula() {

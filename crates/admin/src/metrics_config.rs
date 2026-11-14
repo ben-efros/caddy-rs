@@ -35,11 +35,13 @@
 //! handle record no `caddy_http_*` families. An empty object (`"metrics": {}`, the Caddyfile
 //! `metrics` global option with no block) opts in and records the families without a `host` label.
 //! With `per_host`, [`HttpMetricsConfig::host_label_policy`] scans the configuration exactly like
-//! `Metrics.scanConfigForHosts` (`modules/caddyhttp/metrics.go:232-263`): only non-fuzzy host
-//! matcher values (`MatchHost.fuzzy`, `matchers.go:395`, treats any host containing `{` or `*` as
-//! fuzzy) are allow-listed, and a server with non-empty `tls_connection_policies` marks the config
-//! as HTTPS. Unknown hosts therefore collapse under `_other` unless `observe_catchall_hosts` is
-//! set or the request arrived over HTTPS on such a server.
+//! `Metrics.scanConfigForHosts` after upstream `fe69f5da2d74` (`modules/caddyhttp/metrics.go:232-276`):
+//! only non-fuzzy host matcher values (`MatchHost.fuzzy`, `matchers.go:395`, treats any host
+//! containing `{` or `*` as fuzzy) are allow-listed, recursively through `subroute` handlers
+//! (including their error routes), server error routes and `named_routes`, and each value is
+//! normalised like Caddy's `metricsHost` (lowercase, no port, brackets trimmed). Unknown hosts
+//! therefore collapse under `_other` unless `observe_catchall_hosts` is set; HTTPS is not an
+//! exemption, because the Host header is not bound to the TLS certificate.
 //!
 //! Wiring: the core configuration model keeps `apps.http.metrics` (`HttpApp::metrics`), but
 //! `core::validate` still rejects `per_host` (`MetricsApp::unsupported_field`, T-ADMIN-031) and
@@ -50,7 +52,11 @@
 //! recording remains unconditional and `per_host` configurations are rejected by the core
 //! validator (DIV-0006).
 
+use std::collections::BTreeSet;
+
 use serde_json::Value;
+
+use crate::metrics::{metrics_host, HostLabelPolicy};
 
 /// Default JSON location of the HTTP app metrics config.
 pub const HTTP_METRICS_CONFIG_PATH: &str = "apps.http.metrics";
@@ -118,6 +124,33 @@ impl HttpMetricsConfig {
         Ok(merged)
     }
 
+    /// Scan a decoded configuration for the `host` label allow-list (`per_host`).
+    ///
+    /// Mirrors Caddy's `scanConfigForHosts` after upstream `fe69f5da2d74`
+    /// (`modules/caddyhttp/metrics.go:232-276`): every server's routes, error routes and
+    /// `named_routes` are walked, descending into `subroute` handlers and their error routes, and
+    /// each non-fuzzy `host` matcher value is normalised with [`metrics_host`]. Fuzzy matchers
+    /// (`*`/`{` placeholders) never pin a label, so they are skipped.
+    ///
+    /// The core validator still rejects `per_host` (DIV-0006, the T-ADMIN-031 residual), so the
+    /// server runtime does not yet consult this policy; it is the policy the runtime will use once
+    /// the metrics opt-in gate is wired, and it is covered by unit tests here.
+    pub fn host_label_policy(&self, config: &caddy_rs_core::Config) -> HostLabelPolicy {
+        let mut allowed_hosts = BTreeSet::new();
+        if let Some(http) = config.http() {
+            for server in http.servers.values() {
+                scan_routes(&server.routes, &mut allowed_hosts);
+                if let Some(errors) = &server.errors {
+                    scan_routes(&errors.routes, &mut allowed_hosts);
+                }
+                if let Some(named_routes) = server.extra.get("named_routes") {
+                    scan_named_routes(named_routes, &mut allowed_hosts);
+                }
+            }
+        }
+        HostLabelPolicy::new(allowed_hosts, self.observe_catchall_hosts)
+    }
+
     /// Parse the same shape at an explicit JSON location.
     ///
     /// Use this for Caddy's deprecated per-server spelling
@@ -170,6 +203,76 @@ impl HttpMetricsConfig {
             ));
         }
         Ok(Some(config))
+    }
+}
+
+/// Walk decoded routes collecting non-fuzzy `host` matcher values.
+fn scan_routes(routes: &[caddy_rs_core::Route], allowed_hosts: &mut BTreeSet<String>) {
+    for route in routes {
+        for matcher_set in &route.matcher_sets {
+            scan_matcher_set(matcher_set, allowed_hosts);
+        }
+        scan_handlers(&route.handle, allowed_hosts);
+    }
+}
+
+/// Walk routes preserved as JSON (`subroute`/error routes and `named_routes`).
+fn scan_route_values(routes: &[Value], allowed_hosts: &mut BTreeSet<String>) {
+    for route in routes {
+        if let Some(matcher_sets) = route.get("match").and_then(Value::as_array) {
+            for matcher_set in matcher_sets {
+                scan_matcher_set(matcher_set, allowed_hosts);
+            }
+        }
+        if let Some(handlers) = route.get("handle").and_then(Value::as_array) {
+            scan_handlers(handlers, allowed_hosts);
+        }
+    }
+}
+
+/// Walk Caddy's `apps.http.servers.*.named_routes` map (preserved in the server `extra` map).
+fn scan_named_routes(named_routes: &Value, allowed_hosts: &mut BTreeSet<String>) {
+    let Some(named_routes) = named_routes.as_object() else {
+        return;
+    };
+    for route in named_routes.values() {
+        scan_route_values(std::slice::from_ref(route), allowed_hosts);
+    }
+}
+
+/// Descend into `subroute` handlers (and their `errors` route lists).
+fn scan_handlers(handlers: &[Value], allowed_hosts: &mut BTreeSet<String>) {
+    for handler in handlers {
+        let Some(handler) = handler.as_object() else {
+            continue;
+        };
+        if handler.get("handler").and_then(Value::as_str) != Some("subroute") {
+            continue;
+        }
+        if let Some(routes) = handler.get("routes").and_then(Value::as_array) {
+            scan_route_values(routes, allowed_hosts);
+        }
+        if let Some(errors) = handler.get("errors") {
+            if let Some(routes) = errors.get("routes").and_then(Value::as_array) {
+                scan_route_values(routes, allowed_hosts);
+            }
+        }
+    }
+}
+
+/// Collect one matcher set's non-fuzzy `host` values, normalised like Caddy's `metricsHost`.
+fn scan_matcher_set(matcher_set: &Value, allowed_hosts: &mut BTreeSet<String>) {
+    let Some(hosts) = matcher_set.get("host").and_then(Value::as_array) else {
+        return;
+    };
+    for host in hosts {
+        let Some(host) = host.as_str() else {
+            continue;
+        };
+        if host.contains('*') || host.contains('{') {
+            continue;
+        }
+        allowed_hosts.insert(metrics_host(host));
     }
 }
 
@@ -440,5 +543,76 @@ mod tests {
         );
         let error = MetricsHandlerConfig::from_json(&json!(true)).unwrap_err();
         assert_eq!(error.path(), "http.handlers.metrics");
+    }
+
+    #[test]
+    fn host_label_policy_scan_walks_nested_routes_errors_and_named_routes() {
+        // Caddy scans after handlers are provisioned, so host matchers behind `subroute`
+        // handlers (with their error routes), server error routes and `named_routes` are
+        // allow-listed. Fuzzy matchers never pin a label, and every value is normalised like
+        // Caddy's metricsHost.
+        let config = caddy_rs_core::Config::from_value(json!({
+            "apps": {"http": {"servers": {"srv0": {
+                "listen": [":443"],
+                "routes": [
+                    {
+                        "match": [{"host": ["Top.Example.COM:8443", "*.wild.test", "{env}.test"]}],
+                        "handle": [{
+                            "handler": "subroute",
+                            "routes": [
+                                {"match": [{"host": ["nested.test"]}],
+                                 "handle": [{"handler": "static_response"}]},
+                                {"handle": [{"handler": "subroute", "routes": [
+                                    {"match": [{"host": ["deep.test"]}],
+                                     "handle": [{"handler": "static_response"}]}
+                                ]}]}
+                            ],
+                            "errors": {"routes": [{"match": [{"host": ["subroute-error.test"]}]}]}
+                        }]
+                    },
+                    {"handle": [{"handler": "subroute", "routes": [
+                        {"match": [{"host": ["handle-nested.test"]}]}
+                    ]}]}
+                ],
+                "errors": {"routes": [{"match": [{"host": ["server-error.test"]}]}]},
+                "named_routes": {"app.route": {
+                    "match": [{"host": ["named.test"]}],
+                    "handle": [{"handler": "static_response"}]
+                }}
+            }}}}
+        }))
+        .expect("config parses");
+        let metrics_config = HttpMetricsConfig {
+            per_host: true,
+            observe_catchall_hosts: false,
+            otlp: false,
+        };
+        let policy = metrics_config.host_label_policy(&config);
+        let allowed: Vec<&str> = policy.allowed_hosts().iter().map(String::as_str).collect();
+        assert_eq!(
+            allowed,
+            vec![
+                "deep.test",
+                "handle-nested.test",
+                "named.test",
+                "nested.test",
+                "server-error.test",
+                "subroute-error.test",
+                "top.example.com",
+            ]
+        );
+        assert_eq!(policy.label_for("top.example.com:443"), "top.example.com");
+        assert_eq!(
+            policy.label_for("unknown.test"),
+            crate::metrics::CATCHALL_HOST_LABEL
+        );
+
+        let catchall = HttpMetricsConfig {
+            observe_catchall_hosts: true,
+            ..metrics_config
+        };
+        let policy = catchall.host_label_policy(&config);
+        assert!(policy.observe_catchall_hosts());
+        assert_eq!(policy.label_for("unknown.test"), "unknown.test");
     }
 }
