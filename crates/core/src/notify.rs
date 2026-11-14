@@ -155,15 +155,43 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn temp_socket() -> std::path::PathBuf {
+    /// Path for a temporary notify socket under `root`.
+    ///
+    /// A long `TMPDIR` can push `root/<name>.sock` past `sockaddr_un.sun_path`, which would make
+    /// these tests fail in `UnixDatagram::bind` for a path-length reason instead of the behaviour
+    /// under test; in that case the short fixed parent `/tmp` is used instead.
+    fn temp_socket_in(root: &std::path::Path) -> std::path::PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!(
-            "caddy-rs-notify-{}-{nonce}.sock",
-            std::process::id()
-        ))
+        let name = format!("caddy-rs-notify-{}-{nonce}.sock", std::process::id());
+        let mut path = root.join(&name);
+        if path.to_string_lossy().len() > crate::validate::UNIX_SOCKET_PATH_MAX {
+            path = std::path::PathBuf::from("/tmp").join(&name);
+        }
+        path
+    }
+
+    fn temp_socket() -> std::path::PathBuf {
+        temp_socket_in(&std::env::temp_dir())
+    }
+
+    #[test]
+    fn temp_socket_falls_back_when_temp_root_is_too_long() {
+        // A `TMPDIR` long enough to overflow `sockaddr_un` must not make the notify tests fail
+        // for the wrong reason: the helper falls back to the short fixed parent `/tmp`.
+        let long_root = std::path::PathBuf::from(format!(
+            "/tmp/{}",
+            "t".repeat(crate::validate::UNIX_SOCKET_PATH_MAX)
+        ));
+        let path = temp_socket_in(&long_root);
+        assert!(
+            path.to_string_lossy().len() <= crate::validate::UNIX_SOCKET_PATH_MAX,
+            "socket path not bindable: {}",
+            path.display()
+        );
+        assert_eq!(path.parent(), Some(std::path::Path::new("/tmp")));
     }
 
     #[test]
