@@ -89,9 +89,157 @@ pub struct GlobalOptions {
     /// imports keep the strict safety checks. The remaining stock-compat profile surfaces are
     /// tracked by T-CONF-070/T-CONF-071 and are not implemented by this build yet.
     pub stock_compat: bool,
+    /// caddy-rs extension: the global `radar { ... }` option (ADR-0020, T-CONF-079). The adapter
+    /// carries the configuration only; polling, matchers and handlers are runtime work
+    /// (T-ROUTE-059/T-ROUTE-060).
+    pub radar: Option<RadarOptions>,
+    /// caddy-rs extension: the global `trust_cdn [<provider>] { ... }` option (ADR-013,
+    /// T-CONF-079). The adapter carries the configuration only; resolving a profile into
+    /// `trusted_proxies` is runtime work.
+    pub trust_cdn: Option<TrustCdnOptions>,
     /// Non-fatal notes produced while preprocessing the Caddyfile (environment-placeholder
     /// expansion) and while reading options. Adapters surface these to callers.
     pub warnings: Vec<String>,
+}
+
+/// caddy-rs extension: the global `radar { ... }` option (ADR-0020, T-CONF-079).
+///
+/// Every field carries the ADR-0020 defaults, so `radar {}` adapts to the documented default
+/// configuration. There is deliberately no `enabled` flag: `mode` replaces it (ADR-0020 §1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RadarOptions {
+    /// `mode auto|on|off` (default `auto`: no polling until an Internet-routable client IP).
+    pub mode: RadarMode,
+    /// `protect true|false` (default `true`): default protection handlers.
+    pub protect: bool,
+    /// `api_token <token>` (optional): public Radar endpoints work without one.
+    pub api_token: Option<String>,
+    /// `poll_interval <duration>` (default 60s, minimum 30s), in nanoseconds.
+    pub poll_interval_ns: i64,
+    /// `cache_ttl <duration>` (default 120s), in nanoseconds.
+    pub cache_ttl_ns: i64,
+    /// `storage "file"|"redis"|"memory"` (default `file`).
+    pub storage: RadarStorage,
+    /// `endpoints { ... }` (default: all four enabled).
+    pub endpoints: RadarEndpoints,
+    /// `filters { ... }` (default: no filters).
+    pub filters: RadarFilters,
+}
+
+impl Default for RadarOptions {
+    fn default() -> Self {
+        Self {
+            mode: RadarMode::Auto,
+            protect: true,
+            api_token: None,
+            poll_interval_ns: 60_000_000_000,
+            cache_ttl_ns: 120_000_000_000,
+            storage: RadarStorage::default(),
+            endpoints: RadarEndpoints::default(),
+            filters: RadarFilters::default(),
+        }
+    }
+}
+
+/// Radar polling mode (`radar { mode ... }`, ADR-0020 §1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RadarMode {
+    /// `auto` (default): idle until the first Internet-routable client IP is observed.
+    #[default]
+    Auto,
+    /// `on`: poll the Radar API from startup.
+    On,
+    /// `off`: the Radar client is disabled, as if the option were absent.
+    Off,
+}
+
+impl RadarMode {
+    /// The JSON/Caddyfile spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+}
+
+/// Radar cache backend (`radar { storage ... }`, ADR-0020 §1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RadarStorage {
+    /// `storage "file" { path <file> }` (the default backend; `path` is optional).
+    File {
+        /// `path`: the cache file. Defaults at runtime when unset.
+        path: Option<String>,
+    },
+    /// `storage "redis" { redis_url <url>; key_prefix <prefix> }`.
+    Redis {
+        /// `redis_url`: the Redis endpoint.
+        redis_url: Option<String>,
+        /// `key_prefix`: the key prefix for Radar entries.
+        key_prefix: Option<String>,
+    },
+    /// `storage "memory"`: ephemeral, no persistence.
+    Memory,
+}
+
+impl Default for RadarStorage {
+    fn default() -> Self {
+        Self::File { path: None }
+    }
+}
+
+/// Radar API endpoints to enable (`radar { endpoints { ... } }`, ADR-0020 §1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RadarEndpoints {
+    /// `ddos_l7`: Layer 7 DDoS attacks.
+    pub ddos_l7: bool,
+    /// `ddos_l34`: Layer 3/4 DDoS attacks.
+    pub ddos_l34: bool,
+    /// `bgp_hijacks`: BGP hijacks and route leaks.
+    pub bgp_hijacks: bool,
+    /// `traffic_anomalies`: unusual traffic patterns.
+    pub traffic_anomalies: bool,
+}
+
+impl Default for RadarEndpoints {
+    fn default() -> Self {
+        Self {
+            ddos_l7: true,
+            ddos_l34: true,
+            bgp_hijacks: true,
+            traffic_anomalies: true,
+        }
+    }
+}
+
+/// Radar data filters (`radar { filters { ... } }`, ADR-0020 §1).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RadarFilters {
+    /// `min_magnitude`: minimum attack magnitude.
+    pub min_magnitude: Option<i64>,
+    /// `countries`: only track these countries (ISO 3166-1 alpha-2).
+    pub countries: Vec<String>,
+    /// `asns`: only track these ASNs.
+    pub asns: Vec<i64>,
+}
+
+/// caddy-rs extension: the global `trust_cdn [<provider>] { ... }` option (ADR-013, T-CONF-079).
+///
+/// The provider name is kept verbatim: the built-in profile table (cloudflare, akamai, imperva,
+/// fastly) is runtime data, so the adapter does not restrict the name to those four.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrustCdnOptions {
+    /// `trust_cdn <provider>`: the CDN profile name; `None` for the bare `trust_cdn` form.
+    pub provider: Option<String>,
+    /// `client_ip_header`: override the profile's client-IP header.
+    pub client_ip_header: Option<String>,
+    /// `ipv4_cidrs`: additive IPv4 ranges.
+    pub ipv4_cidrs: Vec<String>,
+    /// `ipv6_cidrs`: additive IPv6 ranges.
+    pub ipv6_cidrs: Vec<String>,
+    /// `strict`: override the profile's right-to-left walk strictness.
+    pub strict: Option<bool>,
 }
 
 /// How `import <file>`/`import <glob>` resolves and validates files.
@@ -2189,6 +2337,9 @@ fn read_global_options(directives: Vec<Directive>) -> Result<GlobalOptions, Pars
     // occurrence would let the parsed value and the enforced policy disagree; reject duplicates
     // instead of resolving them silently (security review F1).
     let mut stock_compat_seen = false;
+    // caddy-rs extensions rejected when `stock_compat true` is active (T-CONF-079).
+    let mut radar_position: Option<Position> = None;
+    let mut trust_cdn_position: Option<Position> = None;
     for directive in directives {
         match directive.name.as_str() {
             "auto_https" => {
@@ -2435,6 +2586,17 @@ fn read_global_options(directives: Vec<Directive>) -> Result<GlobalOptions, Pars
                     }
                 };
             }
+            "radar" => {
+                // caddy-rs extension (ADR-0020, T-CONF-079): not a stock Caddy global option, so
+                // it is a plain match arm rather than an `is_caddy_global_option` entry.
+                radar_position = Some(directive.position.clone());
+                options.radar = Some(parse_radar_option(&directive)?);
+            }
+            "trust_cdn" => {
+                // caddy-rs extension (ADR-013, T-CONF-079).
+                trust_cdn_position = Some(directive.position.clone());
+                options.trust_cdn = Some(parse_trust_cdn_option(&directive)?);
+            }
             other if is_caddy_global_option(other) => {
                 return Err(ParseError::unsupported(
                     directive.position.clone(),
@@ -2448,6 +2610,25 @@ fn read_global_options(directives: Vec<Directive>) -> Result<GlobalOptions, Pars
                     format!("unknown global option `{other}`"),
                 ))
             }
+        }
+    }
+    // `stock_compat true` restores stock Caddy v2.11.9 behaviour (ADR-0010/DIV-0130). `radar` and
+    // `trust_cdn` are caddy-rs extensions with no stock equivalent, so using them under the switch
+    // is a located error naming the option (T-CONF-079; documented by T-COMPAT-059).
+    if options.stock_compat {
+        if let Some(position) = radar_position {
+            return Err(ParseError::unsupported(
+                position,
+                "global option `radar` (caddy-rs extension, not in Caddy v2.11.9)",
+                None,
+            ));
+        }
+        if let Some(position) = trust_cdn_position {
+            return Err(ParseError::unsupported(
+                position,
+                "global option `trust_cdn` (caddy-rs extension, not in Caddy v2.11.9)",
+                None,
+            ));
         }
     }
     Ok(options)
@@ -2666,6 +2847,408 @@ fn duration_argument(directive: &Directive) -> Result<i64, ParseError> {
         ));
     }
     Ok(nanoseconds)
+}
+
+/// Format nanoseconds back into a Caddy duration string for the adapted JSON (`60s`, `1m30s`,
+/// `500ms`), so durations stay strings as ADR-0020 shows them.
+pub(crate) fn format_duration_ns(nanoseconds: i64) -> String {
+    let mut rest = nanoseconds.max(0);
+    let mut out = String::new();
+    // Seconds (and sub-second units) only: ADR-0020 spells the defaults as `60s`/`120s`, so the
+    // emitted strings stay in that form rather than collapsing to `1m`/`2m`.
+    for (unit, size) in [("s", 1_000_000_000_i64), ("ms", 1_000_000)] {
+        if rest >= size {
+            out.push_str(&format!("{}{unit}", rest / size));
+            rest %= size;
+        }
+    }
+    if rest > 0 {
+        out.push_str(&format!("{rest}ns"));
+    }
+    if out.is_empty() {
+        out.push_str("0s");
+    }
+    out
+}
+
+/// Require one `true`/`false` argument (caddy-rs extension options, T-CONF-079).
+fn bool_argument(directive: &Directive) -> Result<bool, ParseError> {
+    let value = single_argument(directive, &format!("`{}`", directive.name))?;
+    match value.as_str() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(ParseError::syntax(
+            directive.position.clone(),
+            format!(
+                "`{}` must be 'true' or 'false', got '{other}'",
+                directive.name
+            ),
+        )),
+    }
+}
+
+/// Split a list-valued option's arguments.
+///
+/// ADR-0020 writes lists as `["CN", "RU"]` / `[12345, 67890]`; Caddyfile tokens are whitespace
+/// separated, so the bracketed, comma-separated spelling and the bare `CN RU` spelling are both
+/// accepted and yield the same entries.
+fn list_arguments(directive: &Directive) -> Vec<String> {
+    let joined = directive.args.join(" ");
+    let trimmed = joined.trim();
+    let inner = match trimmed.strip_prefix('[') {
+        Some(rest) => rest.strip_suffix(']').unwrap_or(rest),
+        None => trimmed,
+    };
+    inner
+        .split([',', ' ', '\t'])
+        .map(|part| {
+            part.trim_matches(|character| character == '"' || character == '[' || character == ']')
+        })
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Parse the global `radar { ... }` option (caddy-rs extension, ADR-0020, T-CONF-079).
+fn parse_radar_option(directive: &Directive) -> Result<RadarOptions, ParseError> {
+    if !directive.args.is_empty() {
+        return Err(ParseError::syntax(
+            directive.position.clone(),
+            "global option `radar` does not take arguments; write `radar { ... }`",
+        ));
+    }
+    let mut radar = RadarOptions::default();
+    let mut seen: Vec<String> = Vec::new();
+    for item in &directive.block {
+        let duplicate = seen.iter().any(|name| name == &item.name);
+        if duplicate {
+            return Err(ParseError::syntax(
+                item.position.clone(),
+                format!("radar option `{}` is specified more than once", item.name),
+            ));
+        }
+        seen.push(item.name.clone());
+        match item.name.as_str() {
+            "mode" => {
+                let value = single_argument(item, "`mode`")?;
+                radar.mode = match value.as_str() {
+                    "auto" => RadarMode::Auto,
+                    "on" => RadarMode::On,
+                    "off" => RadarMode::Off,
+                    other => {
+                        return Err(ParseError::syntax(
+                            item.position.clone(),
+                            format!("unknown radar mode `{other}`; supported: auto, on, off"),
+                        ))
+                    }
+                };
+            }
+            "protect" => radar.protect = bool_argument(item)?,
+            "api_token" => radar.api_token = Some(single_argument(item, "`api_token`")?),
+            "poll_interval" => {
+                let nanoseconds = duration_argument(item)?;
+                if nanoseconds < MIN_RADAR_POLL_INTERVAL_NS {
+                    return Err(ParseError::syntax(
+                        item.position.clone(),
+                        format!(
+                            "`poll_interval` must be at least 30s, got `{}`",
+                            format_duration_ns(nanoseconds)
+                        ),
+                    ));
+                }
+                radar.poll_interval_ns = nanoseconds;
+            }
+            "cache_ttl" => radar.cache_ttl_ns = duration_argument(item)?,
+            "storage" => radar.storage = parse_radar_storage(item)?,
+            "endpoints" => radar.endpoints = parse_radar_endpoints(item)?,
+            "filters" => radar.filters = parse_radar_filters(item)?,
+            // `enabled` is the pre-ADR spelling: `mode` replaces it (ADR-0020 §1). Reject it
+            // instead of accepting an ignored key, so no adapted JSON ever carries `enabled`.
+            "enabled" => {
+                return Err(ParseError::syntax(
+                    item.position.clone(),
+                    "`enabled` is not a radar option; use `mode auto|on|off` (radar has no \
+                     `enabled` field)",
+                ))
+            }
+            other => {
+                return Err(ParseError::syntax(
+                    item.position.clone(),
+                    format!("unknown radar option `{other}`"),
+                ))
+            }
+        }
+    }
+    Ok(radar)
+}
+
+/// `radar { poll_interval }` floor (ADR-0020 §1: minimum 30s).
+const MIN_RADAR_POLL_INTERVAL_NS: i64 = 30_000_000_000;
+
+/// Parse `radar { storage <backend> { ... } }` (ADR-0020 §1).
+fn parse_radar_storage(directive: &Directive) -> Result<RadarStorage, ParseError> {
+    let Some(backend) = directive.args.first() else {
+        return Err(ParseError::syntax(
+            directive.position.clone(),
+            "radar `storage` expects a backend name: `file`, `redis` or `memory`",
+        ));
+    };
+    if directive.args.len() > 1 {
+        return Err(ParseError::syntax(
+            directive.position.clone(),
+            "wrong argument count or unexpected line ending after `storage`",
+        ));
+    }
+    if !matches!(backend.as_str(), "file" | "redis" | "memory") {
+        return Err(ParseError::syntax(
+            directive.position.clone(),
+            format!("unknown radar storage backend `{backend}`; supported: file, redis, memory"),
+        ));
+    }
+    let mut path: Option<String> = None;
+    let mut redis_url: Option<String> = None;
+    let mut key_prefix: Option<String> = None;
+    for item in &directive.block {
+        let slot = match (backend.as_str(), item.name.as_str()) {
+            ("file", "path") => &mut path,
+            ("redis", "redis_url") => &mut redis_url,
+            ("redis", "key_prefix") => &mut key_prefix,
+            ("memory", _) => {
+                return Err(ParseError::syntax(
+                    item.position.clone(),
+                    "radar `storage memory` does not take options",
+                ))
+            }
+            ("file", other) => {
+                return Err(ParseError::syntax(
+                    item.position.clone(),
+                    format!("unknown radar storage `file` option `{other}`; supported: path"),
+                ))
+            }
+            ("redis", other) => {
+                return Err(ParseError::syntax(
+                    item.position.clone(),
+                    format!(
+                        "unknown radar storage `redis` option `{other}`; supported: redis_url, \
+                         key_prefix"
+                    ),
+                ))
+            }
+            _ => unreachable!("backend checked below"),
+        };
+        if slot.is_some() {
+            return Err(ParseError::syntax(
+                item.position.clone(),
+                format!(
+                    "radar storage option `{}` is specified more than once",
+                    item.name
+                ),
+            ));
+        }
+        *slot = Some(single_argument(item, &format!("`{}`", item.name))?);
+    }
+    match backend.as_str() {
+        "file" => Ok(RadarStorage::File { path }),
+        "redis" => Ok(RadarStorage::Redis {
+            redis_url,
+            key_prefix,
+        }),
+        "memory" => Ok(RadarStorage::Memory),
+        other => Err(ParseError::syntax(
+            directive.position.clone(),
+            format!("unknown radar storage backend `{other}`; supported: file, redis, memory"),
+        )),
+    }
+}
+
+/// Parse `radar { endpoints { ... } }` (ADR-0020 §1); every endpoint defaults to `true`.
+fn parse_radar_endpoints(directive: &Directive) -> Result<RadarEndpoints, ParseError> {
+    if !directive.args.is_empty() {
+        return Err(ParseError::syntax(
+            directive.position.clone(),
+            "radar `endpoints` does not take arguments; write `endpoints { ... }`",
+        ));
+    }
+    let mut endpoints = RadarEndpoints::default();
+    let mut seen: Vec<String> = Vec::new();
+    for item in &directive.block {
+        if seen.iter().any(|name| name == &item.name) {
+            return Err(ParseError::syntax(
+                item.position.clone(),
+                format!("radar endpoint `{}` is specified more than once", item.name),
+            ));
+        }
+        seen.push(item.name.clone());
+        let enabled = bool_argument(item)?;
+        match item.name.as_str() {
+            "ddos_l7" => endpoints.ddos_l7 = enabled,
+            "ddos_l34" => endpoints.ddos_l34 = enabled,
+            "bgp_hijacks" => endpoints.bgp_hijacks = enabled,
+            "traffic_anomalies" => endpoints.traffic_anomalies = enabled,
+            other => {
+                return Err(ParseError::syntax(
+                    item.position.clone(),
+                    format!(
+                        "unknown radar endpoint `{other}`; supported: ddos_l7, ddos_l34, \
+                         bgp_hijacks, traffic_anomalies"
+                    ),
+                ))
+            }
+        }
+    }
+    Ok(endpoints)
+}
+
+/// Parse `radar { filters { ... } }` (ADR-0020 §1).
+fn parse_radar_filters(directive: &Directive) -> Result<RadarFilters, ParseError> {
+    if !directive.args.is_empty() {
+        return Err(ParseError::syntax(
+            directive.position.clone(),
+            "radar `filters` does not take arguments; write `filters { ... }`",
+        ));
+    }
+    let mut filters = RadarFilters::default();
+    for item in &directive.block {
+        match item.name.as_str() {
+            "min_magnitude" => {
+                if filters.min_magnitude.is_some() {
+                    return Err(ParseError::syntax(
+                        item.position.clone(),
+                        "radar filter `min_magnitude` is specified more than once",
+                    ));
+                }
+                let value = single_argument(item, "`min_magnitude`")?;
+                let magnitude: i64 = value.parse().map_err(|_| {
+                    ParseError::syntax(
+                        item.position.clone(),
+                        format!("`min_magnitude` must be a non-negative integer, got `{value}`"),
+                    )
+                })?;
+                if magnitude < 0 {
+                    return Err(ParseError::syntax(
+                        item.position.clone(),
+                        format!("`min_magnitude` must be a non-negative integer, got `{value}`"),
+                    ));
+                }
+                filters.min_magnitude = Some(magnitude);
+            }
+            "countries" => {
+                if !filters.countries.is_empty() {
+                    return Err(ParseError::syntax(
+                        item.position.clone(),
+                        "radar filter `countries` is specified more than once",
+                    ));
+                }
+                let countries = list_arguments(item);
+                if countries.is_empty() {
+                    return Err(ParseError::syntax(
+                        item.position.clone(),
+                        "radar filter `countries` expects at least one country code",
+                    ));
+                }
+                filters.countries = countries;
+            }
+            "asns" => {
+                if !filters.asns.is_empty() {
+                    return Err(ParseError::syntax(
+                        item.position.clone(),
+                        "radar filter `asns` is specified more than once",
+                    ));
+                }
+                let asns = list_arguments(item);
+                if asns.is_empty() {
+                    return Err(ParseError::syntax(
+                        item.position.clone(),
+                        "radar filter `asns` expects at least one ASN",
+                    ));
+                }
+                for argument in &asns {
+                    let asn: i64 = argument.parse().map_err(|_| {
+                        ParseError::syntax(
+                            item.position.clone(),
+                            format!("`asns` entries must be integers, got `{argument}`"),
+                        )
+                    })?;
+                    filters.asns.push(asn);
+                }
+            }
+            other => {
+                return Err(ParseError::syntax(
+                    item.position.clone(),
+                    format!(
+                        "unknown radar filter `{other}`; supported: min_magnitude, countries, asns"
+                    ),
+                ))
+            }
+        }
+    }
+    Ok(filters)
+}
+
+/// Parse the global `trust_cdn [<provider>] { ... }` option (caddy-rs extension, ADR-013,
+/// T-CONF-079).
+fn parse_trust_cdn_option(directive: &Directive) -> Result<TrustCdnOptions, ParseError> {
+    if directive.args.len() > 1 {
+        return Err(ParseError::syntax(
+            directive.position.clone(),
+            "wrong argument count or unexpected line ending after `trust_cdn`",
+        ));
+    }
+    let mut options = TrustCdnOptions {
+        provider: directive.args.first().cloned(),
+        ..TrustCdnOptions::default()
+    };
+    if !directive.block.is_empty() && options.provider.is_none() {
+        return Err(ParseError::syntax(
+            directive.position.clone(),
+            "`trust_cdn` needs a provider name before its block, e.g. `trust_cdn cloudflare \
+             { ... }`",
+        ));
+    }
+    for item in &directive.block {
+        match item.name.as_str() {
+            "client_ip_header" => {
+                if options.client_ip_header.is_some() {
+                    return Err(ParseError::syntax(
+                        item.position.clone(),
+                        "`client_ip_header` is specified more than once",
+                    ));
+                }
+                options.client_ip_header = Some(single_argument(item, "`client_ip_header`")?);
+            }
+            "ipv4_cidrs" | "ipv6_cidrs" => {
+                if !item.block.is_empty() {
+                    return Err(ParseError::syntax(
+                        item.position.clone(),
+                        format!("`{}` does not take a block", item.name),
+                    ));
+                }
+                let cidrs = list_arguments(item);
+                if cidrs.is_empty() {
+                    return Err(ParseError::syntax(
+                        item.position.clone(),
+                        format!("`{}` expects at least one CIDR", item.name),
+                    ));
+                }
+                if item.name == "ipv4_cidrs" {
+                    options.ipv4_cidrs.extend(cidrs);
+                } else {
+                    options.ipv6_cidrs.extend(cidrs);
+                }
+            }
+            "strict" => options.strict = Some(bool_argument(item)?),
+            other => {
+                return Err(ParseError::syntax(
+                    item.position.clone(),
+                    format!(
+                        "unknown `trust_cdn` option `{other}`; supported: client_ip_header, \
+                         ipv4_cidrs, ipv6_cidrs, strict"
+                    ),
+                ))
+            }
+        }
+    }
+    Ok(options)
 }
 
 /// Parse Caddy duration syntax into nanoseconds: a sequence of number/unit components such as
