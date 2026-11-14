@@ -1,8 +1,10 @@
 name: release
 
 # Builds the distributable binaries when a version tag is pushed and attaches them to a
-# GitHub release. Artifacts are self-contained: every archive carries the binary, the
-# licence and notice files, and a matching line in SHA256SUMS.
+# GitHub release. Artifacts are self-contained: every archive carries both the data-plane
+# binary (`caddy-rs`) and the proxy-manager sidecar (`caddy-rs-pm`), the licence and notice
+# files, and a matching line in SHA256SUMS. The two workspaces are built in the same job so a
+# release can never ship a sidecar that does not match the data plane it drives.
 on:
   push:
     tags: ["v*"]
@@ -100,6 +102,10 @@ jobs:
       - name: Build
         run: |
           cargo build --locked --profile ${{ matrix.profile }} --target ${{ matrix.target }} ${{ matrix.features }} -p caddy-rs
+          # The proxy manager is a separate nested workspace with its own lockfile; build it with
+          # the same target so both binaries in an archive are built for the same platform. pm has
+          # no release-minimal profile, so it always uses `--release`.
+          ( cd pm && cargo build --locked --release --target ${{ matrix.target }} )
 
       - name: Package
         shell: bash
@@ -112,6 +118,9 @@ jobs:
           bin="target/${{ matrix.target }}/${{ matrix.profile }}/caddy-rs"
           strip "$bin" 2>/dev/null || true
           cp "$bin" "$dir/caddy-rs"
+          pm_bin="pm/target/${{ matrix.target }}/release/caddy-rs-pm"
+          strip "$pm_bin" 2>/dev/null || true
+          cp "$pm_bin" "$dir/caddy-rs-pm"
           cp LICENSE NOTICE.md README.md "$dir/"
           tar -czf "dist/${name}.tar.gz" -C dist "$name"
           rm -rf "$dir"

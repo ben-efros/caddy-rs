@@ -473,6 +473,14 @@ CARGO_HOME=/root/caddy-rs/.scratch/cargo-home \
   cargo test --offline --workspace
 ```
 
+## Release packaging
+
+`caddy-rs-pm` is released with the data plane: every archive from a `v*` tag contains both
+`caddy-rs` and `caddy-rs-pm`, built from the same commit and target. The nested workspace version is
+kept equal to the `caddy-rs` workspace version at every cut, and `caddy-rs-pm version` prints both
+versions. The sidecar has no `release-minimal` profile; it is built with `--release` for every
+target in the release matrix. See [`../docs/RELEASING.md`](../docs/RELEASING.md) for the packaging and verification steps.
+
 ## Acceptance testing
 
 End-to-end acceptance is exercised by [`pm/acceptance/tpm-116-acceptance.sh`](acceptance/tpm-116-acceptance.sh),

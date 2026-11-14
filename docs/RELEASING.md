@@ -17,8 +17,10 @@ Each release publishes one archive per platform, plus a checksum file:
 | `caddy-rs-<version>-aarch64-static-minimal.tar.gz` | Linux arm64 | **static, minimal** (no HTTP/3, compression, templates) |
 | `caddy-rs-<version>-aarch64-macos.tar.gz` | macOS arm64 | dynamic |
 
-Every archive contains the `caddy-rs` binary, `LICENSE`, `NOTICE.md` and `README.md`.
-`SHA256SUMS` covers all archives in the release.
+Every archive contains both binaries — `caddy-rs` (data plane) and `caddy-rs-pm` (proxy-manager
+sidecar) — plus `LICENSE`, `NOTICE.md` and `README.md`. `SHA256SUMS` covers all archives in the
+release. The two binaries are built from the same commit and the same target in one workflow job,
+so an archive can never pair a sidecar with a mismatched data plane.
 
 The **minimal** archives are built from the same targets with `--no-default-features`, which leaves
 out HTTP/3, the compression handler and the templates handler — a 6.5 MiB binary instead of 19.7 MiB.
@@ -45,14 +47,22 @@ version string, which builds the same artefacts without creating a tag.
    cargo test --workspace
    ```
 
-2. **Check the version.** `Cargo.toml` carries `version` under `[workspace.package]`; bump it in the
-   same commit that updates `Cargo.lock`:
+2. **Check the version.** Both workspaces carry `version` under `[workspace.package]`; bump
+   `Cargo.toml` and `pm/Cargo.toml` in the same commit that updates both lockfiles:
 
    ```sh
    cargo set-version --workspace 0.1.0          # or edit Cargo.toml directly
    cargo check --workspace                      # refreshes Cargo.lock
+   # `cargo set-version --workspace` edits only the root workspace manifest: set
+   # `[workspace.package] version` in `pm/Cargo.toml` by hand, then refresh the sidecar lockfile
+   # *without* `--locked` (a version bump is exactly the update `--locked` refuses) and prove the
+   # result with a locked check:
+   ( cd pm && cargo check --workspace && cargo check --workspace --locked )
    git commit -am "release: v0.1.0"
    ```
+
+   The sidecar reports the same release version as the data plane: `caddy-rs-pm version` prints the
+   PM version and the embedded caddy-rs version.
 
 3. **Build the artefacts locally first** — at least the target you are on, to catch packaging
    mistakes before CI spends the matrix:
@@ -61,6 +71,9 @@ version string, which builds the same artefacts without creating a tag.
    cargo build --locked --profile release -p caddy-rs
    strip target/release/caddy-rs
    target/release/caddy-rs version
+   ( cd pm && cargo build --locked --release )
+   strip pm/target/release/caddy-rs-pm
+   pm/target/release/caddy-rs-pm version
    ```
 
 4. **Tag and push.** The tag drives the workflow:
@@ -113,7 +126,13 @@ sha256sum -c SHA256SUMS --ignore-missing
 tar -xzf caddy-rs-v0.1.0-x86_64-static.tar.gz
 sudo install -m 0755 caddy-rs /usr/local/bin/caddy-rs
 caddy-rs version
+sudo install -m 0755 caddy-rs-pm /usr/local/bin/caddy-rs-pm
+caddy-rs-pm version
 ```
+
+`caddy-rs-pm install` then writes the systemd unit (the default `ExecStart` is the absolute path of
+the `caddy-rs-pm` binary that ran `install`; override it with `--binary-path`), so installing both
+binaries from one archive is the supported deployment.
 
 A container image is not published yet; the static archive is the portable option and runs on a
 distroless or `scratch` base image.
@@ -121,9 +140,10 @@ distroless or `scratch` base image.
 ## Release checklist
 
 - [ ] `cargo fmt --all --check` and `cargo test --workspace` pass.
-- [ ] Workspace version and `Cargo.lock` updated together.
-- [ ] `caddy-rs version` reports the release version and the Caddy baseline.
-- [ ] At least one archive built and smoke-tested locally.
+- [ ] Both workspace versions and both lockfiles updated together (root and `pm/`).
+- [ ] `caddy-rs version` reports the release version and the Caddy baseline; `caddy-rs-pm version`
+      reports the same release version and the embedded caddy-rs version.
+- [ ] At least one archive built and smoke-tested locally, and it contains both binaries.
 - [ ] Tag pushed; workflow green on all seven targets.
 - [ ] `SHA256SUMS` verified against a downloaded archive.
 - [ ] Release notes mention any behaviour change since the previous tag.

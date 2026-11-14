@@ -67,6 +67,33 @@ be deleted at any time.
 Setting `CARGO_TARGET_DIR` moves build artifacts out of `target/`; with
 `CARGO_TARGET_DIR="$PWD/.build"` the binary is `.build/release/caddy-rs`.
 
+## Proxy manager sidecar
+
+`caddy-rs-pm` is the proxy-manager daemon. It is a separate nested workspace (`pm/`) with its own
+lockfile, and it is built from source in the same tree:
+
+```sh
+cd pm
+cargo build --release
+./target/release/caddy-rs-pm version
+```
+
+```text
+caddy-rs-pm 0.1.0-trial.6 (caddy-rs 0.1.0-trial.6)
+```
+
+Release archives carry both binaries: `caddy-rs` and `caddy-rs-pm` are built from the same tag and
+the same target, so a sidecar never pairs with a mismatched data plane. Install both (the sidecar's
+`install` subcommand writes a systemd unit whose default `ExecStart` is the absolute path of the
+`caddy-rs-pm` binary that ran `install`; pass `--binary-path` or set `PM_BINARY_PATH` to point the
+unit at a different copy):
+
+```sh
+sudo install -m 0755 caddy-rs /usr/local/bin/caddy-rs
+sudo install -m 0755 caddy-rs-pm /usr/local/bin/caddy-rs-pm
+caddy-rs-pm install
+```
+
 ## First run
 
 Create a Caddyfile:
