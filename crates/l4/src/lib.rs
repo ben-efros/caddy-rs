@@ -17,6 +17,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod client_hello;
 pub mod prefixed_stream;
 
+pub use client_hello::{
+    detect_protocol, parse_client_hello, ClientHelloInfo, ParseError, Protocol,
+};
 pub use prefixed_stream::{BufferPool, PrefixedStream, POOL_BUFFER_SIZE};
