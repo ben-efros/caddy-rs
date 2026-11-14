@@ -6116,3 +6116,71 @@ fn reload_and_stop_reach_a_unix_socket_admin_endpoint() {
         panic!("the admin Unix socket is removed when the server exits:\n{contents}");
     }
 }
+
+/// `POST /stop` must order its `process::exit` *after* the runtime loop's shutdown.
+///
+/// Regression: the exit used to fire from a fixed 100 ms timer while the runtime loop noticed the
+/// stopped configuration on its 200 ms poll, so under load the process exited first - and
+/// `process::exit` runs no destructors, leaving the admin Unix socket file behind (and, when the
+/// exit won early, no shutdown log line at all).
+#[cfg(unix)]
+#[test]
+fn stop_orders_the_process_exit_after_the_shutdown() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let socket = directory.path().join("admin.sock");
+    let config = directory.path().join("config.json");
+    let listen = format!("unix/{}", socket.display());
+    std::fs::write(
+        &config,
+        serde_json::json!({
+            "admin": {"listen": listen},
+            "apps": {"http": {"servers": {"srv0": {
+                "listen": ["127.0.0.1:0"],
+                "routes": [{"handle": [{"handler": "static_response", "body": "ok"}]}]
+            }}}}
+        })
+        .to_string(),
+    )
+    .expect("write config");
+    let log = directory.path().join("server.stderr");
+    let stderr = std::fs::File::create(&log).expect("create child log");
+    let mut child = Command::new(binary())
+        .args([
+            "run",
+            "--config",
+            config.to_str().expect("utf-8 config path"),
+        ])
+        .env("CADDY_RS_DATA_DIR", directory.path().join("data"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .expect("spawn caddy-rs run");
+    let ready = wait_until_serving(&mut child, Duration::from_secs(15), || {
+        unix_admin_request(&socket, "GET", "/config/")
+            .is_some_and(|response| response.starts_with("HTTP/1.1 200"))
+    });
+    if !ready {
+        let contents = std::fs::read_to_string(&log).unwrap_or_default();
+        child_failure(
+            &mut child,
+            &log,
+            &format!("the unix-socket admin endpoint never answered:\n{contents}"),
+        );
+    }
+
+    let (code, stdout, stderr) = run(&["stop", "--address", &listen]);
+    assert_eq!(code, 0, "stop stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    let status = wait_for_child_exit(&mut child, Duration::from_secs(15));
+    assert!(
+        status.is_some_and(|status| status.success()),
+        "the server exits successfully after /stop"
+    );
+    // Ordering: the runtime loop ran its shutdown before `process::exit`, which is what unlinks
+    // the socket. `process::exit` skips destructors, so nothing else can remove it afterwards.
+    let contents = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !socket.exists(),
+        "the admin Unix socket is unlinked before the process exits:\n{contents}"
+    );
+}

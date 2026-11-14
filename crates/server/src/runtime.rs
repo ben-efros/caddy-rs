@@ -210,6 +210,8 @@ struct AutomaticHttpsContext<'a> {
 pub struct ServerRuntime {
     store: Arc<GenerationStore>,
     reload: Arc<tokio::sync::Notify>,
+    /// Reports shutdown completion to the admin API, whose `/stop` exit path waits for it.
+    shutdown_latch: Arc<caddy_rs_admin::ShutdownLatch>,
     /// Injected ACME transport for automatic HTTPS (tests and embedders); production builds a
     /// [`HyperTransport`] when certificates must be obtained.
     acme_transport: Option<Arc<dyn AcmeTransport>>,
@@ -339,10 +341,14 @@ impl ServerRuntime {
     /// Create a runtime for a generation store.
     pub fn new(store: Arc<GenerationStore>) -> Self {
         let reload = Arc::new(tokio::sync::Notify::new());
+        // `/stop` exits the process without running destructors, so it must not do so before this
+        // loop has finished its shutdown (which is what unlinks the admin Unix socket).
+        let shutdown_latch = Arc::new(caddy_rs_admin::ShutdownLatch::new());
         let upstream_status = ProxyUpstreamStatusSource::new();
         let inventory = crate::inventory::RuntimeInventorySource::new();
         let admin_api = AdminApi::new(Arc::clone(&store))
             .with_reload_notify(Arc::clone(&reload))
+            .with_shutdown_latch(Arc::clone(&shutdown_latch))
             .with_upstream_status_source(
                 Arc::clone(&upstream_status) as Arc<dyn UpstreamStatusSource>
             )
@@ -354,6 +360,7 @@ impl ServerRuntime {
         Self {
             store,
             reload,
+            shutdown_latch,
             acme_transport: None,
             data_root: None,
             challenge_tokens: Arc::new(caddy_rs_tls::Http01TokenStore::new()),
@@ -1308,6 +1315,9 @@ impl ServerRuntime {
         );
         notify_warn(caddy_rs_core::notify::stopping(), "stopping");
         self.graceful_stop(force).await;
+        // Every listener task has ended by now, so the admin Unix socket is unlinked; release the
+        // `/stop` exit path only after that, because `process::exit` skips destructors.
+        caddy_rs_admin::ShutdownLatchHandle::new(Arc::clone(&self.shutdown_latch)).mark_finished();
         Ok(())
     }
 
