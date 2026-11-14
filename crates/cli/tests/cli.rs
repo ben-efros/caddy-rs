@@ -6110,8 +6110,9 @@ fn reload_and_stop_reach_a_unix_socket_admin_endpoint() {
     );
     // The socket is unlinked during shutdown; allow the filesystem a moment to reflect that
     // instead of racing the kernel/FS right after the child is reaped.
-    assert!(
-        wait_until(Duration::from_secs(5), || !socket.exists()),
-        "the admin Unix socket is removed when the server exits"
-    );
+    let removed = wait_until(Duration::from_secs(5), || !socket.exists());
+    if !removed {
+        let contents = std::fs::read_to_string(&log).unwrap_or_default();
+        panic!("the admin Unix socket is removed when the server exits:\n{contents}");
+    }
 }
