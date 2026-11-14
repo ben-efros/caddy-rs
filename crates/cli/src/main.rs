@@ -86,6 +86,7 @@ mod build_info;
 mod completion;
 mod completion_install;
 mod environ;
+mod file_server;
 mod fmt;
 mod manpage;
 mod respond;
@@ -281,6 +282,58 @@ enum Command {
         /// A status code (a 3-digit number) or the response body
         #[arg(value_name = "BODY|STATUS")]
         argument: Vec<String>,
+    },
+    /// Spins up a production-ready file server
+    #[command(
+        about = "Spins up a production-ready file server",
+        long_about = "A simple but production-ready file server. Useful for quick deployments,\n\
+                      demos, and development.\n\n\
+                      The listener's socket address can be customized with the --listen flag; it\n\
+                      defaults to :80.\n\n\
+                      If a domain name is specified with --domain, stock Caddy changes the default\n\
+                      listener address to the HTTPS port and serves HTTPS. This build does not\n\
+                      wire automatic HTTPS for this command, so --domain is rejected with a\n\
+                      located error instead of silently serving plaintext.\n\n\
+                      By default, Zstandard and Gzip compression are enabled. Use --no-compress\n\
+                      to disable compression.\n\n\
+                      If --browse is enabled, requests for folders without an index file will\n\
+                      respond with a file listing.",
+        override_usage = "caddy-rs file-server [--domain <example.com>] [--root <path>] [--listen <addr>] [--browse] [--reveal-symlinks] [--access-log] [--precompressed]"
+    )]
+    FileServer {
+        /// Domain name at which to serve the files (unsupported: implies automatic HTTPS)
+        #[arg(short = 'd', long, value_name = "DOMAIN")]
+        domain: Option<String>,
+        /// The path to the root of the site
+        #[arg(short = 'r', long, value_name = "PATH")]
+        root: Option<String>,
+        /// The address to which to bind the listener
+        #[arg(short = 'l', long, value_name = "ADDR")]
+        listen: Option<String>,
+        /// Enable directory browsing
+        #[arg(short = 'b', long)]
+        browse: bool,
+        /// Show symlink paths when browse is enabled (unsupported by this build)
+        #[arg(long)]
+        reveal_symlinks: bool,
+        /// Enable template rendering
+        #[arg(short = 't', long)]
+        templates: bool,
+        /// Enable the access log
+        #[arg(short = 'a', long)]
+        access_log: bool,
+        /// Enable verbose debug logs (unsupported by this build)
+        #[arg(short = 'v', long)]
+        debug: bool,
+        /// Max directories to read (unsupported by this build)
+        #[arg(short = 'f', long, value_name = "N")]
+        file_limit: Option<usize>,
+        /// Disable Zstandard and Gzip compression
+        #[arg(long)]
+        no_compress: bool,
+        /// Specify precompression file extensions. Compression preference implied from flag order.
+        #[arg(short = 'p', long, value_delimiter = ',', value_name = "EXT")]
+        precompressed: Vec<String>,
     },
     /// Print the environment as seen by this caddy-rs process.
     ///
@@ -1046,6 +1099,34 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 debug,
                 headers: header,
                 arguments: argument,
+            })
+            .await?;
+        }
+        Command::FileServer {
+            domain,
+            root,
+            listen,
+            browse,
+            reveal_symlinks,
+            templates,
+            access_log,
+            debug,
+            file_limit,
+            no_compress,
+            precompressed,
+        } => {
+            file_server::run(file_server::Args {
+                domain: domain.unwrap_or_default(),
+                root: root.unwrap_or_default(),
+                listen: listen.unwrap_or_default(),
+                browse,
+                reveal_symlinks,
+                templates,
+                access_log,
+                debug,
+                file_limit,
+                no_compress,
+                precompressed,
             })
             .await?;
         }
