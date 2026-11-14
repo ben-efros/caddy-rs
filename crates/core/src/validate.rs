@@ -18,7 +18,7 @@ use crate::config::{
 };
 use crate::duration::parse_caddy_duration_json;
 use crate::error::{Error, Result};
-use crate::listen::ListenAddr;
+use crate::listen::{ListenAddr, Network};
 use crate::module::{ModuleKind, ModuleRegistry};
 
 /// Counts produced by a successful validation walk.
@@ -58,7 +58,7 @@ pub fn validate_config(config: &Config, registry: &ModuleRegistry) -> Result<Val
 
     if let Some(admin) = &config.admin {
         if let Some(listen) = &admin.listen {
-            ListenAddr::parse_at(listen, "admin.listen")?;
+            validate_admin_listen(listen)?;
         }
     }
 
@@ -97,6 +97,84 @@ pub fn validate_config(config: &Config, registry: &ModuleRegistry) -> Result<Val
     }
 
     Ok(validator.report)
+}
+
+/// Longest Unix domain socket path, in bytes, that fits in `sockaddr_un.sun_path`.
+///
+/// `sun_path` is 108 bytes on Linux (including the terminating NUL) and 104 on the BSDs; this
+/// implementation uses the larger, more permissive bound so a path this build accepts is
+/// accepted by every supported platform that allows 108.
+pub const UNIX_SOCKET_PATH_MAX: usize = 108;
+
+/// Validate the `admin.listen` address, applying the Unix socket rules to `unix/...` values.
+///
+/// `unix//run/caddy-admin.sock` denotes the absolute path `/run/caddy-admin.sock` (the first
+/// slash separates the network from the address); `unix/run/caddy-admin.sock` denotes a
+/// relative path and is rejected.
+fn validate_admin_listen(listen: &str) -> Result<()> {
+    let address = ListenAddr::parse_at(listen, "admin.listen")?;
+    if address.network == Network::Unix {
+        validate_unix_socket_path(&address.address, "admin.listen")?;
+    }
+    Ok(())
+}
+
+/// Validate a Unix domain socket path against the rules the admin endpoint needs to bind.
+///
+/// The path must be absolute, must contain no null byte, must fit in the OS `sockaddr_un` limit
+/// ([`UNIX_SOCKET_PATH_MAX`]), and its parent directory must exist and be writable. Writability
+/// is read from the parent's permission bits rather than probed with a write, so the verdict does
+/// not depend on the uid running validation (root can bind inside a `0555` directory).
+///
+/// Failures are located at `located` (for example `admin.listen`) and name both the rule and the
+/// offending value.
+pub fn validate_unix_socket_path(path: &str, located: impl Into<String>) -> Result<()> {
+    let located = located.into();
+    let invalid = |reason: String| Error::InvalidListen {
+        value: path.to_string(),
+        path: located.clone(),
+        reason,
+    };
+
+    if path.contains('\0') {
+        return Err(invalid(
+            "unix socket path must not contain a null byte".to_string(),
+        ));
+    }
+    if !path.starts_with('/') {
+        return Err(invalid("unix socket path must be absolute".to_string()));
+    }
+    let length = path.len();
+    if length > UNIX_SOCKET_PATH_MAX {
+        return Err(invalid(format!(
+            "unix socket path is {length} bytes, exceeding the {UNIX_SOCKET_PATH_MAX}-byte \
+             `sockaddr_un` limit"
+        )));
+    }
+
+    let parent = std::path::Path::new(path)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("/"));
+    let metadata = std::fs::metadata(parent).map_err(|error| {
+        invalid(format!(
+            "parent directory `{}` does not exist or is not accessible: {error}",
+            parent.display()
+        ))
+    })?;
+    if !metadata.is_dir() {
+        return Err(invalid(format!(
+            "parent `{}` is not a directory",
+            parent.display()
+        )));
+    }
+    if metadata.permissions().readonly() {
+        return Err(invalid(format!(
+            "parent directory `{}` is not writable",
+            parent.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Validate one server's `listener_wrappers` list.
@@ -2730,5 +2808,91 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("duplicate tag"), "{message}");
+    }
+
+    /// A private directory under the system temp dir, removed by the caller.
+    fn admin_socket_temp_dir(label: &str) -> std::path::PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "caddy-rs-admin-sock-{label}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).expect("temp dir");
+        path
+    }
+
+    fn admin_listen_error(listen: &str) -> String {
+        let config = Config::from_value(serde_json::json!({ "admin": { "listen": listen } }))
+            .expect("model decodes");
+        validate_config(&config, &registry())
+            .expect_err("invalid admin listen must fail")
+            .to_string()
+    }
+
+    #[test]
+    fn accepts_admin_unix_socket_path_in_writable_directory() {
+        let dir = admin_socket_temp_dir("accept");
+        let listen = format!("unix/{}/caddy-admin.sock", dir.display());
+        let config = Config::from_value(serde_json::json!({ "admin": { "listen": listen } }))
+            .expect("model decodes");
+        validate_config(&config, &registry()).expect("writable parent must validate");
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn rejects_relative_admin_unix_socket_path() {
+        // `unix/run/caddy.sock` is the relative spelling; `unix//run/caddy.sock` would be the
+        // absolute `/run/caddy.sock`.
+        let message = admin_listen_error("unix/caddy-admin.sock");
+        assert!(message.contains("admin.listen"), "{message}");
+        assert!(message.contains("unix/caddy-admin.sock"), "{message}");
+        assert!(message.contains("must be absolute"), "{message}");
+    }
+
+    #[test]
+    fn rejects_admin_unix_socket_path_with_missing_parent() {
+        let message = admin_listen_error("unix//nonexistent-caddy-admin-dir/caddy-admin.sock");
+        assert!(message.contains("admin.listen"), "{message}");
+        assert!(message.contains("nonexistent-caddy-admin-dir"), "{message}");
+        assert!(message.contains("does not exist"), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_admin_unix_socket_path_with_non_writable_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = admin_socket_temp_dir("readonly");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555))
+            .expect("chmod read-only");
+        let listen = format!("unix/{}/caddy-admin.sock", dir.display());
+        let message = admin_listen_error(&listen);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod writable");
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+
+        assert!(message.contains("admin.listen"), "{message}");
+        assert!(message.contains("not writable"), "{message}");
+        assert!(message.contains(&dir.display().to_string()), "{message}");
+    }
+
+    #[test]
+    fn rejects_admin_unix_socket_path_over_sockaddr_un_limit() {
+        let long = format!("unix//run/{}.sock", "a".repeat(UNIX_SOCKET_PATH_MAX));
+        let message = admin_listen_error(&long);
+        assert!(message.contains("admin.listen"), "{message}");
+        assert!(message.contains("sockaddr_un"), "{message}");
+        assert!(message.contains("108"), "{message}");
+    }
+
+    #[test]
+    fn rejects_admin_unix_socket_path_with_null_byte() {
+        let message = admin_listen_error("unix//run/caddy\0-admin.sock");
+        assert!(message.contains("admin.listen"), "{message}");
+        assert!(message.contains("null byte"), "{message}");
     }
 }
