@@ -109,6 +109,8 @@ use caddy_rs_admin::pki::{CertificateInfo, PkiError, PkiStore, DEFAULT_CA_ID, DE
 use caddy_rs_admin::trust::{TrustEnvironment, TrustPlan, TrustStatus, TrustStep};
 use caddy_rs_admin::AdminResponse;
 use caddy_rs_config::{AdaptMode, AdaptOptions};
+use caddy_rs_core::listen::{ListenAddr, Network};
+use caddy_rs_core::validate::UNIX_SOCKET_PATH_MAX;
 use caddy_rs_core::{Config, GenerationStore, VERSION};
 use caddy_rs_server::ServerRuntime;
 
@@ -243,6 +245,9 @@ enum Command {
         #[arg(long)]
         adapter: Option<String>,
         /// Admin API address (stock Caddy calls this `--address`).
+        ///
+        /// Accepts a TCP `host:port` (the default) or `unix/<absolute path>` for a server whose
+        /// admin listener is a Unix domain socket, e.g. `unix//run/caddy-admin.sock`.
         #[arg(long = "address", alias = "admin", default_value = "localhost:2019")]
         admin: String,
         /// Force the reload even when the configuration is byte-identical (stock `--force`).
@@ -252,6 +257,9 @@ enum Command {
     /// Stop a running server through its admin API.
     Stop {
         /// Admin API address (stock Caddy calls this `--address`).
+        ///
+        /// Accepts a TCP `host:port` (the default) or `unix/<absolute path>` for a server whose
+        /// admin listener is a Unix domain socket, e.g. `unix//run/caddy-admin.sock`.
         #[arg(long = "address", alias = "admin", default_value = "localhost:2019")]
         admin: String,
     },
@@ -1422,6 +1430,40 @@ async fn admin_request(
     admin_request_with(admin, method, path, body, false).await
 }
 
+/// How the CLI reaches a running server's admin API.
+#[derive(Debug)]
+enum AdminEndpoint {
+    /// Stock TCP admin listener (`host:port`).
+    Tcp(String),
+    /// Unix domain socket at an absolute path.
+    Unix(String),
+}
+
+/// Resolve an admin address (`host:port` or `unix/<absolute path>`) into a transport endpoint.
+fn admin_endpoint(admin: &str) -> anyhow::Result<AdminEndpoint> {
+    let address = admin
+        .strip_prefix("http://")
+        .or_else(|| admin.strip_prefix("https://"))
+        .unwrap_or(admin);
+    let parsed = ListenAddr::parse(address)
+        .map_err(|reason| anyhow!("invalid admin address `{admin}`: {reason}"))?;
+    match parsed.network {
+        Network::Tcp => Ok(AdminEndpoint::Tcp(parsed.address)),
+        Network::Unix => {
+            let path = parsed.address;
+            if path.len() > UNIX_SOCKET_PATH_MAX {
+                bail!(
+                    "invalid admin address `{admin}`: unix socket path is {} bytes, exceeding the \
+                     {UNIX_SOCKET_PATH_MAX}-byte `sockaddr_un` limit",
+                    path.len()
+                );
+            }
+            Ok(AdminEndpoint::Unix(path))
+        }
+        Network::Udp => bail!("invalid admin address `{admin}`: `udp/` is not an admin transport"),
+    }
+}
+
 async fn admin_request_with(
     admin: &str,
     method: &str,
@@ -1429,27 +1471,34 @@ async fn admin_request_with(
     body: Bytes,
     force_reload: bool,
 ) -> anyhow::Result<AdminResponse> {
-    let admin = admin
-        .strip_prefix("http://")
-        .or_else(|| admin.strip_prefix("https://"))
-        .unwrap_or(admin);
-    let client: hyper_util::client::legacy::Client<_, Full<Bytes>> =
-        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-            .build_http();
+    let endpoint = admin_endpoint(admin)?;
+    // A Unix connection carries no authority: use the origin-form path and an explicit Host, so the
+    // request line is the same one the TCP transport sends.
     let mut builder = hyper::Request::builder()
         .method(method)
-        .uri(format!("http://{admin}{path}"))
         .header(http::header::CONTENT_TYPE, "application/json");
+    builder = match &endpoint {
+        AdminEndpoint::Tcp(address) => builder.uri(format!("http://{address}{path}")),
+        AdminEndpoint::Unix(_) => builder.uri(path).header(http::header::HOST, "localhost"),
+    };
     if force_reload {
         builder = builder.header(http::header::CACHE_CONTROL, "must-revalidate");
     }
     let request = builder
         .body(Full::new(body))
         .context("cannot build admin request")?;
-    let response = client
-        .request(request)
-        .await
-        .with_context(|| format!("cannot reach admin API at `{admin}`"))?;
+    let response = match &endpoint {
+        AdminEndpoint::Tcp(address) => {
+            let client: hyper_util::client::legacy::Client<_, Full<Bytes>> =
+                hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                    .build_http();
+            client
+                .request(request)
+                .await
+                .with_context(|| format!("cannot reach admin API at `{address}`"))?
+        }
+        AdminEndpoint::Unix(socket) => admin_unix_request(socket, request).await?,
+    };
     let status = response.status();
     let body = response
         .into_body()
@@ -1467,6 +1516,41 @@ async fn admin_request_with(
         headers,
         body,
     })
+}
+
+/// Send one HTTP/1 request over a Unix domain socket.
+#[cfg(unix)]
+async fn admin_unix_request(
+    socket: &str,
+    request: hyper::Request<Full<Bytes>>,
+) -> anyhow::Result<hyper::Response<hyper::body::Incoming>> {
+    let stream = tokio::net::UnixStream::connect(socket)
+        .await
+        .with_context(|| format!("cannot reach admin API at unix socket `{socket}`"))?;
+    let (mut sender, connection) =
+        hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
+            .await
+            .with_context(|| format!("cannot speak HTTP to admin Unix socket `{socket}`"))?;
+    // The connection future drives the socket while the request is in flight. The request call
+    // reports the actionable error, so the task result is deliberately not surfaced separately.
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    sender
+        .send_request(request)
+        .await
+        .with_context(|| format!("cannot reach admin API at unix socket `{socket}`"))
+}
+
+#[cfg(not(unix))]
+async fn admin_unix_request(
+    socket: &str,
+    _request: hyper::Request<Full<Bytes>>,
+) -> anyhow::Result<hyper::Response<hyper::body::Incoming>> {
+    bail!(
+        "cannot reach admin API at unix socket `{socket}`: Unix domain sockets are not supported \
+         on this platform"
+    )
 }
 
 fn ensure_admin_success(response: &AdminResponse) -> anyhow::Result<()> {
@@ -2321,5 +2405,150 @@ mod tests {
             .limitation()
             .unwrap()
             .contains("update-ca-certificates"));
+    }
+
+    #[test]
+    fn admin_endpoint_accepts_tcp_and_unix_addresses() {
+        assert!(matches!(
+            admin_endpoint("localhost:2019").expect("tcp"),
+            AdminEndpoint::Tcp(address) if address == "localhost:2019"
+        ));
+        assert!(matches!(
+            admin_endpoint("http://127.0.0.1:2019").expect("tcp with scheme"),
+            AdminEndpoint::Tcp(address) if address == "127.0.0.1:2019"
+        ));
+        assert!(matches!(
+            admin_endpoint("unix//run/caddy-admin.sock").expect("unix"),
+            AdminEndpoint::Unix(path) if path == "/run/caddy-admin.sock"
+        ));
+
+        let relative = admin_endpoint("unix/run/caddy-admin.sock").expect_err("relative path");
+        assert!(
+            relative.to_string().contains("invalid admin address"),
+            "{relative}"
+        );
+        assert!(
+            relative.to_string().contains("must be absolute"),
+            "{relative}"
+        );
+
+        let udp = admin_endpoint("udp/:2019").expect_err("udp is not an admin transport");
+        assert!(udp.to_string().contains("`udp/`"), "{udp}");
+
+        let too_long = format!("unix//run/{}.sock", "a".repeat(UNIX_SOCKET_PATH_MAX));
+        let too_long = admin_endpoint(&too_long).expect_err("over-long socket path");
+        assert!(too_long.to_string().contains("sockaddr_un"), "{too_long}");
+    }
+
+    #[cfg(unix)]
+    fn short_temp_socket(label: &str) -> std::path::PathBuf {
+        // Unix socket paths are limited to ~107 bytes, so the temp name is deliberately short.
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "caddy-rs-admin-{label}-{}-{nonce}.sock",
+            std::process::id()
+        ))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn admin_request_speaks_http_over_a_unix_socket() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let socket = short_temp_socket("roundtrip");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind unix socket");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut request = Vec::new();
+            let mut buf = [0u8; 256];
+            loop {
+                let read = stream.read(&mut buf).await.expect("read request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..read]);
+                if String::from_utf8_lossy(&request).contains("\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+                )
+                .await
+                .expect("write response");
+            stream.flush().await.expect("flush response");
+            String::from_utf8_lossy(&request).into_owned()
+        });
+
+        let address = format!("unix/{}", socket.display());
+        let response = admin_request(&address, "POST", "/stop", Bytes::new())
+            .await
+            .expect("unix admin request");
+        let request = server.await.expect("server task");
+        std::fs::remove_file(&socket).expect("cleanup socket");
+
+        assert_eq!(response.status, http::StatusCode::OK);
+        assert_eq!(response.body.as_ref(), b"{}");
+        assert!(request.starts_with("POST /stop HTTP/1.1"), "{request}");
+        assert!(
+            request.to_ascii_lowercase().contains("host: localhost"),
+            "{request}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn missing_unix_admin_socket_is_a_clear_error() {
+        let socket = short_temp_socket("missing");
+        let address = format!("unix/{}", socket.display());
+        let error = admin_request(&address, "POST", "/stop", Bytes::new())
+            .await
+            .expect_err("missing socket must fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("cannot reach admin API at unix socket"),
+            "{message}"
+        );
+        assert!(
+            message.contains(socket.file_name().unwrap().to_str().unwrap()),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_request_still_speaks_tcp() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind tcp listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buf = [0u8; 4096];
+            let read = stream.read(&mut buf).await.expect("read request");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                .await
+                .expect("write response");
+            stream.flush().await.expect("flush response");
+            String::from_utf8_lossy(&buf[..read]).into_owned()
+        });
+
+        let response = admin_request(
+            &address.to_string(),
+            "POST",
+            "/load",
+            Bytes::from_static(b"{}"),
+        )
+        .await
+        .expect("tcp admin request");
+        let request = server.await.expect("server task");
+        assert_eq!(response.status, http::StatusCode::OK);
+        assert!(request.starts_with("POST /load HTTP/1.1"), "{request}");
     }
 }
