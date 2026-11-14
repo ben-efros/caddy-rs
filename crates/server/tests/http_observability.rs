@@ -814,3 +814,89 @@ async fn handler_chain_error_increments_request_errors_total() {
 
     runtime.shutdown().await;
 }
+
+/// A loopback address nothing listens on. Port 1 is outside the ephemeral range, so parallel
+/// tests cannot rebind it and a dial is refused immediately.
+fn refused_dial_address() -> String {
+    "127.0.0.1:1".to_string()
+}
+
+/// `reverse_proxy` reports an unreachable upstream as a Caddy `HandlerError`, so even though
+/// caddy-rs serves the failure as a 502 *response* the request is still a handler-chain error and
+/// `caddy_http_request_errors_total` must be incremented (`modules/caddyhttp/metrics.go:371-378`).
+#[tokio::test]
+async fn upstream_dial_failure_increments_request_errors_total() {
+    let config = metrics_config(serde_json::json!([{"handle": [
+        {"handler": "reverse_proxy", "upstreams": [{"dial": refused_dial_address()}]}
+    ]}]));
+    let (runtime, address) = start_proxy_config(config).await;
+
+    let (status, _headers, _body) = request(address, "GET", "/", &[]).await;
+    assert_eq!(status, 502);
+
+    let metrics = rendered_metrics(&runtime).await;
+    assert!(
+        metrics.contains(
+            "caddy_http_request_errors_total{handler=\"reverse_proxy\",server=\"srv0\"} 1"
+        ),
+        "a dial failure is a handler-chain error and must be counted:\n{metrics}"
+    );
+
+    runtime.shutdown().await;
+}
+
+/// With error routes configured, caddy-rs routes an upstream 5xx *response* through
+/// `handle_errors`; that response is not a handler error and must not be counted. A dial failure,
+/// which is a handler error, must be counted even though both paths produce a 5xx response. This
+/// pins the counter's source to `reverse_proxy`'s own error, not to the router's error-route arm.
+#[tokio::test]
+async fn error_routes_count_dial_failures_but_not_upstream_5xx() {
+    let upstream_dial = spawn_status_upstream(StatusCode::INTERNAL_SERVER_ERROR).await;
+    let refused = refused_dial_address();
+    let config = Config::from_value(serde_json::json!({
+        "admin": {"listen": "127.0.0.1:0"},
+        "apps": {"http": {"servers": {"srv0": {
+            "listen": ["127.0.0.1:0"],
+            "routes": [
+                {
+                    "match": [{"path": ["/upstream"]}],
+                    "handle": [{"handler": "reverse_proxy", "upstreams": [{"dial": upstream_dial}]}]
+                },
+                {
+                    "match": [{"path": ["/refused"]}],
+                    "handle": [{"handler": "reverse_proxy", "upstreams": [{"dial": refused}]}]
+                }
+            ],
+            "errors": {"routes": [
+                {"handle": [{"handler": "static_response", "status_code": 500, "body": "handled"}]}
+            ]}
+        }}}}
+    }))
+    .expect("test config decodes");
+    let (runtime, address) = start_proxy_config(config).await;
+
+    // The upstream 500 is routed through `handle_errors` and stays a response.
+    let (status, _headers, body) = request(address, "GET", "/upstream", &[]).await;
+    assert_eq!(status, 500);
+    assert_eq!(body, Bytes::from_static(b"handled"));
+    let metrics = rendered_metrics(&runtime).await;
+    assert!(
+        !metrics.contains("caddy_http_request_errors_total"),
+        "an upstream 500 routed through error routes must not be counted:\n{metrics}"
+    );
+
+    // The dial failure is a handler error even though its 502 response is likewise routed
+    // through `handle_errors`.
+    let (status, _headers, body) = request(address, "GET", "/refused", &[]).await;
+    assert_eq!(status, 500);
+    assert_eq!(body, Bytes::from_static(b"handled"));
+    let metrics = rendered_metrics(&runtime).await;
+    assert!(
+        metrics.contains(
+            "caddy_http_request_errors_total{handler=\"reverse_proxy\",server=\"srv0\"} 1"
+        ),
+        "a dial failure must be counted even with error routes configured:\n{metrics}"
+    );
+
+    runtime.shutdown().await;
+}
