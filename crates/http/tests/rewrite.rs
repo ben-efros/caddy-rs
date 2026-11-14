@@ -235,3 +235,76 @@ async fn file_matcher_path_placeholder_is_escaped_when_inserted() {
         "/dir/a%20b%3Fc%25"
     );
 }
+
+fn build_guarded_router(matcher: Value, handler: Value) -> Router {
+    let routes = json!([{
+        "match": [matcher],
+        "handle": [
+            handler,
+            {"handler": "static_response", "body": "{http.request.uri}"}
+        ]
+    }]);
+    RouterBuilder::new()
+        .build(routes.as_array().expect("routes"))
+        .expect("routes build")
+}
+
+fn pub_matcher() -> Value {
+    json!({"path_regexp": {"name": "pub", "pattern": "^/pub/(.*)$"}})
+}
+
+#[tokio::test]
+async fn regexp_capture_double_encoded_traversal_stays_data() {
+    // Port of upstream 7591cff1fb03 (`TestRewriteEscapesRegexpCaptures`): `path_regexp` captures
+    // the once-decoded path, so a capture must be percent-encoded (slashes preserved) before it is
+    // inserted into the rewritten path; otherwise a second decode turns the capture into a real
+    // path separator after route guards have already run.
+    let router = build_guarded_router(
+        pub_matcher(),
+        json!({"handler": "rewrite", "uri": "/files/{http.regexp.pub.1}"}),
+    );
+    assert_eq!(
+        rewritten(&router, "/pub/%252e%252e%252fsecret").await,
+        "/files/%252e%252e%252fsecret"
+    );
+}
+
+#[tokio::test]
+async fn regexp_capture_decoded_question_mark_stays_in_path() {
+    // A capture that decodes to `?` must not start a real query string.
+    let router = build_guarded_router(
+        pub_matcher(),
+        json!({"handler": "rewrite", "uri": "/files/{http.regexp.pub.1}"}),
+    );
+    assert_eq!(rewritten(&router, "/pub/a%3Fx=1").await, "/files/a%3Fx=1");
+}
+
+#[tokio::test]
+async fn regexp_capture_slashes_are_preserved() {
+    let router = build_guarded_router(
+        pub_matcher(),
+        json!({"handler": "rewrite", "uri": "/files/{http.regexp.pub.1}"}),
+    );
+    assert_eq!(rewritten(&router, "/pub/a/b").await, "/files/a/b");
+}
+
+#[tokio::test]
+async fn regexp_capture_configured_query_is_unaffected() {
+    // Only the path part escapes captures; the query builder keeps its own query escaping.
+    let router = build_guarded_router(
+        pub_matcher(),
+        json!({"handler": "rewrite", "uri": "/files?id={http.regexp.pub.1}"}),
+    );
+    assert_eq!(rewritten(&router, "/pub/a").await, "/files?id=a");
+}
+
+#[tokio::test]
+async fn regexp_capture_unnamed_and_named_forms_agree() {
+    // The unnamed capture is the same code path; the Caddyfile shorthand `{re.pub.1}` is adapted to
+    // `{http.regexp.pub.1}` by `crates/config/src/parser.rs` before it reaches the handler.
+    let unnamed = build_guarded_router(
+        json!({"path_regexp": {"pattern": "^/pub/(.*)$"}}),
+        json!({"handler": "rewrite", "uri": "/files/{http.regexp.1}"}),
+    );
+    assert_eq!(rewritten(&unnamed, "/pub/a%3Fx=1").await, "/files/a%3Fx=1");
+}
