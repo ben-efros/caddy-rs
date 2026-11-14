@@ -1975,6 +1975,13 @@ mod tests {
         request
             .headers
             .insert("remote_user", "a, admin".parse().unwrap());
+        // The policy is about one comma-containing field line, not repeated fields: prove the
+        // fixture really is a single value (R6's repeated-field drop is a different rule).
+        assert_eq!(
+            request.headers.get_all("remote_user").iter().count(),
+            1,
+            "fixture must be a single comma-containing field line"
+        );
         let response = respond(&handler, request);
         assert_eq!(response.status, StatusCode::OK);
         let params = captured
