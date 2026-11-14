@@ -343,6 +343,31 @@ mod tests {
     }
 
     #[test]
+    fn security_headers_round_trip_through_the_repository() {
+        let repo = repo();
+        let mut host = proxy(1, &["headers.example.com"]);
+        host.security_headers = Some(
+            serde_json::from_value(serde_json::json!({
+                "content_security_policy": "default-src 'self'",
+                "referrer_policy": "no-referrer"
+            }))
+            .expect("deserialize security headers"),
+        );
+
+        let created = repo.create(host.clone()).expect("create");
+        let stored = repo.get(HostId(1)).expect("get").expect("present");
+        assert_eq!(stored.host, host);
+        assert_eq!(stored.revision, created.revision);
+        assert_eq!(
+            repo.snapshot_hosts().expect("snapshot")[0]
+                .security_headers
+                .as_ref()
+                .and_then(|security| security.referrer_policy.as_deref()),
+            Some("no-referrer")
+        );
+    }
+
+    #[test]
     fn duplicate_id_is_rejected() {
         let repo = repo();
         repo.create(proxy(1, &["one.example.com"])).expect("create");

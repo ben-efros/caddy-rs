@@ -27,7 +27,8 @@ use std::path::PathBuf;
 
 use caddy_rs_pm_compiler::{compile_routes, CompileError, CompiledRoutes};
 use caddy_rs_pm_core::{
-    normalize_pattern, AcmeChallenge, AutoCertificatePolicy, AutoMode, CoreError, Host, TlsMode,
+    normalize_pattern, AcmeChallenge, AutoCertificatePolicy, AutoMode, CoreError, Host,
+    SecurityHeadersConfig, TlsMode,
 };
 use serde_json::{json, Map, Value};
 use thiserror::Error;
@@ -38,13 +39,18 @@ pub const DEFAULT_HTTP_PORT: u16 = 80;
 /// Default HTTPS listener port.
 pub const DEFAULT_HTTPS_PORT: u16 = 443;
 
-/// Listener ports used by the assembled Caddy configuration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Listener ports and global defaults used by the assembled Caddy configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigSettings {
     /// Port for the `pm_http` server; also written to `apps.http.http_port`.
     pub http_port: u16,
     /// Port for the `pm_https` server; also written to `apps.http.https_port`.
     pub https_port: u16,
+    /// Global security headers applied to every host that does not configure its own.
+    ///
+    /// `None` (the default) emits no global `security_headers` block: hosts opt in either here
+    /// (global) or in their own `Host::security_headers` (host wins, see [`effective_hosts`]).
+    pub security_headers: Option<SecurityHeadersConfig>,
 }
 
 impl Default for ConfigSettings {
@@ -52,6 +58,7 @@ impl Default for ConfigSettings {
         Self {
             http_port: DEFAULT_HTTP_PORT,
             https_port: DEFAULT_HTTPS_PORT,
+            security_headers: None,
         }
     }
 }
@@ -61,8 +68,45 @@ impl ConfigSettings {
         Self {
             http_port,
             https_port,
+            security_headers: None,
         }
     }
+
+    /// Set the global security headers inherited by hosts without their own configuration.
+    #[must_use]
+    pub fn with_security_headers(mut self, security_headers: SecurityHeadersConfig) -> Self {
+        self.security_headers = Some(security_headers);
+        self
+    }
+}
+
+/// Resolve the effective hosts for assembly: a host inherits the global `security_headers`
+/// when it does not configure its own (the host wins when it does), and every effective
+/// configuration is validated before any JSON is produced.
+///
+/// The returned hosts are what the assembler compiles, so validation failures surface as
+/// [`ConfigError::InvalidSecurityHeaders`] instead of a half-configured `headers` handler.
+pub fn effective_hosts(
+    hosts: &[Host],
+    settings: &ConfigSettings,
+) -> Result<Vec<Host>, ConfigError> {
+    let mut effective = Vec::with_capacity(hosts.len());
+    for host in hosts {
+        let mut host = host.clone();
+        if host.security_headers.is_none() {
+            host.security_headers = settings.security_headers.clone();
+        }
+        if let Some(security) = &host.security_headers {
+            security
+                .validate()
+                .map_err(|source| ConfigError::InvalidSecurityHeaders {
+                    host_id: host.id.0,
+                    source,
+                })?;
+        }
+        effective.push(host);
+    }
+    Ok(effective)
 }
 
 /// Files and names for one stored manual certificate, as seen by the config assembler.
@@ -126,6 +170,14 @@ pub enum ConfigError {
     /// A stored manual certificate has an unusable id, domain or file path.
     #[error("manual certificate {certificate_id} cannot be assembled: {reason}")]
     InvalidCertificate { certificate_id: u64, reason: String },
+    /// A host's effective security headers are invalid; assembly rejects the configuration
+    /// instead of emitting a `headers` handler that would serve unsafe values.
+    #[error("security headers for host {host_id} are invalid: {source}")]
+    InvalidSecurityHeaders {
+        host_id: u64,
+        #[source]
+        source: CoreError,
+    },
 }
 
 /// Assemble compiled routes into a complete Caddy configuration value.
@@ -165,7 +217,8 @@ pub fn assemble_from_hosts(
     hosts: &[Host],
     settings: &ConfigSettings,
 ) -> Result<Value, ConfigError> {
-    let compiled = compile_routes(hosts)?;
+    let effective = effective_hosts(hosts, settings)?;
+    let compiled = compile_routes(&effective)?;
     Ok(assemble(&compiled, settings))
 }
 
@@ -194,8 +247,9 @@ pub fn assemble_with_tls(
     policies: &[AutoCertificatePolicy],
     settings: &ConfigSettings,
 ) -> Result<Value, ConfigError> {
-    let compiled = compile_routes(hosts)?;
-    assemble_routes_with_tls(&compiled, hosts, policies, settings)
+    let effective = effective_hosts(hosts, settings)?;
+    let compiled = compile_routes(&effective)?;
+    assemble_routes_with_tls(&compiled, &effective, policies, settings)
 }
 
 /// Compile hosts and assemble routes, certificate automation **and** manual certificate loaders.
@@ -217,8 +271,15 @@ pub fn assemble_with_tls_and_certificates(
     certificates: &[CertificateFiles],
     settings: &ConfigSettings,
 ) -> Result<Value, ConfigError> {
-    let compiled = compile_routes(hosts)?;
-    assemble_routes_with_tls_and_certificates(&compiled, hosts, policies, certificates, settings)
+    let effective = effective_hosts(hosts, settings)?;
+    let compiled = compile_routes(&effective)?;
+    assemble_routes_with_tls_and_certificates(
+        &compiled,
+        &effective,
+        policies,
+        certificates,
+        settings,
+    )
 }
 
 /// Assemble already-compiled routes plus certificate automation.
@@ -1007,6 +1068,110 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&first).expect("serialize"),
             serde_json::to_string(&second).expect("serialize")
+        );
+    }
+
+    fn headers_config(value: Value) -> SecurityHeadersConfig {
+        serde_json::from_value(value).expect("deserialize security headers")
+    }
+
+    fn route_handle<'a>(config: &'a Value, server: &'a str) -> &'a Value {
+        &config["apps"]["http"]["servers"][server]["routes"][0]["handle"][0]
+    }
+
+    #[test]
+    fn global_security_headers_apply_to_hosts_without_override() {
+        let hosts = vec![proxy_host(1, &["example.com"], HostTls::disabled())];
+        let settings = ConfigSettings::default().with_security_headers(headers_config(json!({
+            "content_security_policy": "default-src 'self'"
+        })));
+
+        let config = assemble_from_hosts(&hosts, &settings).expect("assemble");
+        let headers = route_handle(&config, "pm_http");
+
+        assert_eq!(headers["handler"], json!("headers"));
+        assert_eq!(
+            headers["security_headers"]["content_security_policy"],
+            json!("default-src 'self'")
+        );
+        // Fields omitted from the global object keep the secure baseline defaults.
+        assert_eq!(
+            headers["security_headers"]["x_frame_options"],
+            json!("DENY")
+        );
+        assert_eq!(
+            headers["security_headers"]["x_content_type_options"],
+            json!("nosniff")
+        );
+        assert_eq!(
+            headers["security_headers"]["referrer_policy"],
+            json!("strict-origin-when-cross-origin")
+        );
+    }
+
+    #[test]
+    fn host_security_headers_win_over_global() {
+        let mut host = proxy_host(1, &["example.com"], HostTls::disabled());
+        host.security_headers = Some(headers_config(json!({
+            "referrer_policy": "no-referrer"
+        })));
+        let settings = ConfigSettings::default().with_security_headers(headers_config(json!({
+            "content_security_policy": "default-src 'self'"
+        })));
+
+        let config = assemble_from_hosts(&[host], &settings).expect("assemble");
+        let headers = route_handle(&config, "pm_http");
+
+        assert_eq!(
+            headers["security_headers"]["referrer_policy"],
+            json!("no-referrer")
+        );
+        // The host object replaces the global one instead of merging field by field.
+        assert!(
+            headers["security_headers"]
+                .get("content_security_policy")
+                .is_none(),
+            "the global CSP must not leak into the host block"
+        );
+    }
+
+    #[test]
+    fn invalid_global_security_headers_reject_assembly() {
+        let hosts = vec![proxy_host(1, &["example.com"], HostTls::disabled())];
+        let settings = ConfigSettings::default().with_security_headers(headers_config(json!({
+            "strict_transport_security": {
+                "max_age": 3600,
+                "include_subdomains": false,
+                "preload": true
+            }
+        })));
+
+        let error = assemble_from_hosts(&hosts, &settings).expect_err("invalid headers rejected");
+        assert!(matches!(
+            error,
+            ConfigError::InvalidSecurityHeaders { host_id: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn empty_security_headers_object_uses_secure_defaults() {
+        let security = headers_config(json!({}));
+        assert_eq!(security.x_frame_options.as_deref(), Some("DENY"));
+        assert_eq!(security.x_content_type_options.as_deref(), Some("nosniff"));
+        assert_eq!(
+            security.referrer_policy.as_deref(),
+            Some("strict-origin-when-cross-origin")
+        );
+        assert!(security.content_security_policy.is_none());
+        assert!(security.strict_transport_security.is_none());
+        assert!(security.permissions_policy.is_none());
+
+        let mut host = proxy_host(1, &["example.com"], HostTls::disabled());
+        host.security_headers = Some(security);
+        let config = assemble_from_hosts(&[host], &ConfigSettings::default()).expect("assemble");
+        assert_eq!(
+            route_handle(&config, "pm_http")["security_headers"]["x_frame_options"],
+            json!("DENY")
         );
     }
 }
