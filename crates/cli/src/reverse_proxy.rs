@@ -22,19 +22,21 @@
 //!   load-balancing policy (stock emits no `load_balancing` object either).
 //! * `--header-up`/`--header-down` (`"Field: value"`, repeatable), emitted as the `reverse_proxy`
 //!   handler's inline `headers.request.set`/`headers.response.set`.
-//! * HTTPS downstreams **with `--internal-certs` and a host**: the explicit
+//! * HTTPS downstreams: the server is built exactly like stock (listen `:<port>` plus the `host`
+//!   matcher when `--from` names one), so caddy-rs derives automatic HTTPS from the matcher and
+//!   provisions a certificate for it — from the local CA for local/internal names, offline, and
+//!   from the default ACME issuer for public names (which needs a reachable ACME server; that
+//!   issuance fails closed, DIV-0001). With `--internal-certs` and a host, the explicit
 //!   `apps.tls.automation.policies` entry `{subjects:[host], issuers:[{"module":"internal"}]}`
-//!   that stock emits for that flag combination, which is the only HTTPS path this build can
-//!   wire without relying on implicit automatic HTTPS (DIV-0001).
+//!   that stock emits is added as well, which forces the internal issuer for any host.
+//!   `--disable-redirects` keeps automatic HTTPS but sets `automatic_https.disable_redirects`
+//!   (stock's `AutoHTTPS.DisableRedir`); a cleartext `--from` sets `automatic_https.disable`
+//!   (stock's `AutoHTTPS.Disabled`).
 //!
 //! # Rejected (located errors, exit 1, before anything is bound)
 //!
-//! * `--from` that resolves to HTTPS without `--internal-certs`: stock relies on Caddy's implicit
-//!   automatic HTTPS for the host matcher, while caddy-rs activates automatic HTTPS only from an
-//!   explicit `apps.tls.automation` configuration (DIV-0001); the command must not silently serve
-//!   plaintext instead. The error names `--from` and the gap.
-//! * `--from` that resolves to HTTPS with `--internal-certs` but no host: there is no subject to
-//!   issue a certificate for, so the listener could never complete a handshake.
+//! * `--from` that resolves to HTTPS but names no host (e.g. `https://:8443`): a certificate
+//!   needs a name, so the listener could never complete a handshake.
 //! * `--change-host-header`: it is a shortcut for `--header-up
 //!   "Host: {http.reverse_proxy.upstream.hostport}"`, and this build's replacer does not implement
 //!   the `http.reverse_proxy.*` namespace (DIV-0007), so the header would be written literally
@@ -153,11 +155,21 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     validate_config(&config, &registry)
         .context("the reverse-proxy configuration is not valid in this build")?;
 
+    // Certificate and CA material is written under the data directory; resolve it the way `run`
+    // does so `$CADDY_RS_DATA_DIR` and Caddy's data path are honoured (`reverse-proxy` has no
+    // `--data-dir` flag, and the generated configuration declares no `storage.root`).
+    let data_dir = caddy_rs_core::data_dir::resolve_server_data_dir(None, None);
+    for warning in &data_dir.warnings {
+        eprintln!("caddy-rs: warning: {warning}");
+    }
+
     let store = Arc::new(GenerationStore::new(Arc::new(registry)));
     store
         .load(config)
         .context("cannot activate the reverse-proxy configuration")?;
-    let mut runtime = ServerRuntime::new(Arc::clone(&store)).without_socket_activation();
+    let mut runtime = ServerRuntime::new(Arc::clone(&store))
+        .with_data_root(data_dir.path)
+        .without_socket_activation();
     runtime
         .apply()
         .await
@@ -230,31 +242,17 @@ fn check_flags(args: &Args, from: &FromAddress, registry: &ModuleRegistry) -> Re
             }
         }
     }
-    if from.scheme == "https" {
-        if !args.internal_certs {
-            return Err(located(
-                "--from",
-                &format!(
-                    "{} resolves to HTTPS: stock relies on Caddy's implicit automatic HTTPS for \
-                     the host matcher, while caddy-rs activates automatic HTTPS only from an \
-                     explicit `apps.tls.automation` configuration (DIV-0001). Re-run with \
-                     --internal-certs to issue a certificate from the local CA, or use an explicit \
-                     http:// address to serve cleartext (this command never serves plaintext on an \
-                     HTTPS address)",
-                    from.display()
-                ),
-            ));
-        }
-        if from.host.is_empty() {
-            return Err(located(
-                "--from",
-                &format!(
-                    "{} resolves to HTTPS but names no host, so there is no certificate subject \
-                     to issue for; give a host in --from",
-                    from.display()
-                ),
-            ));
-        }
+    // Stock's HTTPS path is driven by the host matcher (implicit automatic HTTPS), so the only
+    // address shape it cannot serve is an HTTPS listener with nothing to issue a certificate for.
+    if from.scheme == "https" && from.host.is_empty() {
+        return Err(located(
+            "--from",
+            &format!(
+                "{} resolves to HTTPS but names no host, so there is no certificate subject to \
+                 issue for; give a host in --from",
+                from.display()
+            ),
+        ));
     }
     if !registry.contains("http.handlers.reverse_proxy") {
         return Err(located(

@@ -5407,6 +5407,75 @@ fn start_reverse_proxy(directory: &Path, to: &[&str], extra: &[&str]) -> (ProxyP
     unreachable!("reverse-proxy start attempts exhausted")
 }
 
+/// Start `reverse-proxy` on a free loopback HTTPS port for `host`, writing certificate material
+/// under `data_dir` and retrying if the port was taken before the child could bind it.
+fn start_https_reverse_proxy(
+    directory: &Path,
+    data_dir: &Path,
+    host: &str,
+    to: &[&str],
+    extra: &[&str],
+) -> (ProxyProcess, u16) {
+    for attempt in 0..START_ATTEMPTS {
+        let port = free_port();
+        let from = format!("https://{host}:{port}");
+        let mut args: Vec<String> = vec!["--from".to_string(), from.clone()];
+        for upstream in to {
+            args.push("--to".to_string());
+            args.push((*upstream).to_string());
+        }
+        args.extend(extra.iter().map(|argument| argument.to_string()));
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let mut process = spawn_reverse_proxy(directory, &arg_refs, Some(data_dir));
+        // The banner is printed only after `apply` succeeded, so it (not a bare connect) proves
+        // this child owns the listener.
+        let ready = wait_until(Duration::from_secs(20), || {
+            process
+                .stderr()
+                .contains(&format!("caddy proxying from={from}"))
+                && TcpStream::connect(("127.0.0.1", port)).is_ok()
+        });
+        if ready {
+            return (process, port);
+        }
+        let stderr = process.stderr();
+        let lost_port = is_address_in_use(&stderr);
+        process.stop();
+        if lost_port && attempt + 1 < START_ATTEMPTS {
+            continue;
+        }
+        panic!("reverse-proxy HTTPS did not start on 127.0.0.1:{port}\nstderr:\n{stderr}");
+    }
+    unreachable!("reverse-proxy HTTPS start attempts exhausted")
+}
+
+/// Assert the child's `--from` listener is TLS: a cleartext request gets no HTTP response.
+fn assert_listener_is_tls(port: u16) {
+    let mut stream =
+        TcpStream::connect(("127.0.0.1", port)).expect("connect to the HTTPS listener");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .expect("write plaintext request");
+    let mut plaintext = Vec::new();
+    let _ = stream.read_to_end(&mut plaintext);
+    assert!(
+        !String::from_utf8_lossy(&plaintext).starts_with("HTTP/1.1"),
+        "the HTTPS listener answered a cleartext request: {:?}",
+        String::from_utf8_lossy(&plaintext)
+    );
+}
+
+/// The `/`-separated path suffix of every file below `root`, for asserting the data-dir layout.
+fn file_suffixes_under(root: &Path) -> Vec<String> {
+    files_under(root)
+        .iter()
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .collect()
+}
+
 /// A local upstream: a thread answering every request with a fixed body and recording the
 /// request head it received.
 struct Upstream {
@@ -5672,6 +5741,16 @@ fn reverse_proxy_rejects_invalid_addresses() {
             ],
             "invalid port",
         ),
+        (
+            vec![
+                "reverse-proxy",
+                "--from",
+                "https://:8443",
+                "--to",
+                "127.0.0.1:1",
+            ],
+            "names no host",
+        ),
     ] {
         let (code, _stdout, stderr) = run(&args);
         assert_eq!(code, 1, "{args:?} should fail; stderr:\n{stderr}");
@@ -5687,31 +5766,118 @@ fn reverse_proxy_rejects_invalid_addresses() {
 }
 
 #[test]
-fn reverse_proxy_rejects_https_without_internal_certs_before_binding() {
+fn reverse_proxy_https_without_internal_certs_provisions_a_local_certificate() {
     let directory = tempfile::tempdir().expect("tempdir");
-    let port = free_port();
-    let from = format!("localhost:{port}");
-    let to = format!("127.0.0.1:{}", free_port());
-    let output = Command::new(binary())
-        .args(["reverse-proxy", "--from", &from, "--to", &to])
-        .current_dir(directory.path())
-        .env_remove("CADDY_RS_DATA_DIR")
-        .output()
-        .expect("run caddy-rs reverse-proxy");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(1), "stderr:\n{stderr}");
-    assert!(stderr.contains("--from"), "stderr:\n{stderr}");
-    assert!(stderr.contains("automatic HTTPS"), "stderr:\n{stderr}");
-    assert!(stderr.contains("DIV-0001"), "stderr:\n{stderr}");
-    assert!(stderr.contains("--internal-certs"), "stderr:\n{stderr}");
+    let data_dir = directory.path().join("data");
+    let upstream = spawn_upstream("implicit tls upstream");
+    let to = format!("127.0.0.1:{}", upstream.port);
+    // No `--internal-certs`: like stock, the `host` matcher on a TLS listener is enough for the
+    // runtime to derive automatic HTTPS and provision the certificate itself.
+    let (mut server, port) = start_https_reverse_proxy(
+        directory.path(),
+        &data_dir,
+        "localhost",
+        &[&to],
+        &["--disable-redirects"],
+    );
+    let stderr = server.stderr();
     assert!(
-        !stderr.contains("caddy proxying"),
-        "the command must not start a server; stderr:\n{stderr}"
+        stderr.contains(&format!("caddy proxying from=https://localhost:{port}")),
+        "stderr:\n{stderr}"
     );
     assert!(
-        TcpListener::bind(("127.0.0.1", port)).is_ok(),
-        "the listener address must not have been bound"
+        !stderr.contains("caddy proxying from=http://"),
+        "the HTTPS address must not be served as cleartext; stderr:\n{stderr}"
     );
+    assert_listener_is_tls(port);
+
+    // The implicit plan provisioned the local CA and a certificate for the `--from` host under
+    // the data directory, with no `apps.tls` in the generated configuration.
+    let files = file_suffixes_under(&data_dir);
+    assert!(
+        files
+            .iter()
+            .any(|path| path.ends_with("pki/authorities/local/root.crt")),
+        "no local CA root under {}: {files:?}",
+        data_dir.display()
+    );
+    assert!(
+        files
+            .iter()
+            .any(|path| path.ends_with("certificates/local/localhost/localhost.crt")),
+        "no localhost certificate under {}: {files:?}",
+        data_dir.display()
+    );
+    assert_eq!(upstream.requests.lock().expect("upstream").len(), 0);
+    server.terminate();
+}
+
+#[test]
+fn reverse_proxy_https_with_internal_certs_forces_the_internal_issuer_for_any_host() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let data_dir = directory.path().join("data");
+    let upstream = spawn_upstream("internal cert upstream");
+    let to = format!("127.0.0.1:{}", upstream.port);
+    // `example.test` is not a local name: only the explicit internal-issuer policy stock emits
+    // for `--internal-certs` can issue for it offline.
+    let (mut server, port) = start_https_reverse_proxy(
+        directory.path(),
+        &data_dir,
+        "example.test",
+        &[&to],
+        &["--internal-certs", "--disable-redirects"],
+    );
+    let stderr = server.stderr();
+    assert!(
+        stderr.contains(&format!("caddy proxying from=https://example.test:{port}")),
+        "stderr:\n{stderr}"
+    );
+    let files = file_suffixes_under(&data_dir);
+    assert!(
+        files
+            .iter()
+            .any(|path| path.ends_with("certificates/local/example.test/example.test.crt")),
+        "no example.test certificate under {}: {files:?}",
+        data_dir.display()
+    );
+    assert_eq!(upstream.requests.lock().expect("upstream").len(), 0);
+    server.terminate();
+
+    // The proxy path itself is unchanged: a cleartext `--from` still reaches the upstream.
+    let (mut cleartext, cleartext_port) = start_reverse_proxy(directory.path(), &[&to], &[]);
+    let response = proxy_get(&cleartext, cleartext_port, &[]);
+    assert_eq!(response.status, 200, "body: {}", response.body);
+    assert_eq!(response.body, "internal cert upstream");
+    cleartext.terminate();
+}
+
+#[test]
+fn reverse_proxy_disable_redirects_does_not_bind_the_http_port() {
+    // This asserts the child does *not* take :80, which only means something when :80 is free.
+    match TcpListener::bind(("127.0.0.1", 80)) {
+        Ok(probe) => drop(probe),
+        Err(error) => {
+            eprintln!("skipping: port 80 is not available in this environment ({error})");
+            return;
+        }
+    }
+    let directory = tempfile::tempdir().expect("tempdir");
+    let data_dir = directory.path().join("data");
+    let upstream = spawn_upstream("redirect upstream");
+    let to = format!("127.0.0.1:{}", upstream.port);
+    let (mut server, _port) = start_https_reverse_proxy(
+        directory.path(),
+        &data_dir,
+        "localhost",
+        &[&to],
+        &["--disable-redirects"],
+    );
+    let stderr = server.stderr();
+    assert!(
+        !stderr.contains("listening on :80"),
+        "`--disable-redirects` bound the HTTP redirect listener; stderr:\n{stderr}"
+    );
+    server.terminate();
 }
 
 #[test]
@@ -5759,33 +5925,15 @@ fn reverse_proxy_rejects_unsupported_flags() {
 #[test]
 fn reverse_proxy_https_with_internal_certs_starts_and_provisions_the_ca() {
     let directory = tempfile::tempdir().expect("tempdir");
-    let data_dir = directory.path().join(".caddy-rs");
+    let data_dir = directory.path().join("data");
     let upstream = spawn_upstream("tls upstream");
-    let port = free_port();
-    let from = format!("https://localhost:{port}");
     let to = format!("127.0.0.1:{}", upstream.port);
-    let mut server = spawn_reverse_proxy(
+    let (mut server, port) = start_https_reverse_proxy(
         directory.path(),
-        &[
-            "--from",
-            &from,
-            "--to",
-            &to,
-            "--internal-certs",
-            "--disable-redirects",
-        ],
-        None,
-    );
-    let ready = wait_until(Duration::from_secs(20), || {
-        server
-            .stderr()
-            .contains("caddy proxying from=https://localhost:")
-            && TcpStream::connect(("127.0.0.1", port)).is_ok()
-    });
-    assert!(
-        ready,
-        "reverse-proxy HTTPS did not start\nstderr:\n{}",
-        server.stderr()
+        &data_dir,
+        "localhost",
+        &[&to],
+        &["--internal-certs", "--disable-redirects"],
     );
     let stderr = server.stderr();
     assert!(
@@ -5796,38 +5944,22 @@ fn reverse_proxy_https_with_internal_certs_starts_and_provisions_the_ca() {
         !stderr.contains("caddy proxying from=http://"),
         "stderr:\n{stderr}"
     );
-
-    // The listener is TLS, not cleartext: a plaintext HTTP request gets no HTTP response.
-    let mut stream =
-        TcpStream::connect(("127.0.0.1", port)).expect("connect to the HTTPS listener");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .expect("read timeout");
-    stream
-        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-        .expect("write plaintext request");
-    let mut plaintext = Vec::new();
-    let _ = stream.read_to_end(&mut plaintext);
-    assert!(
-        !String::from_utf8_lossy(&plaintext).starts_with("HTTP/1.1"),
-        "the HTTPS listener answered a cleartext request: {:?}",
-        String::from_utf8_lossy(&plaintext)
-    );
+    assert_listener_is_tls(port);
 
     // The internal CA and a certificate for the `--from` host were provisioned under the data
     // directory, which is the config-level evidence that the explicit automation policy ran.
-    let files = files_under(&data_dir);
+    let files = file_suffixes_under(&data_dir);
     assert!(
         files
             .iter()
-            .any(|path| path.to_string_lossy().contains("pki")),
+            .any(|path| path.ends_with("pki/authorities/local/root.crt")),
         "no CA material under {}: {files:?}",
         data_dir.display()
     );
     assert!(
         files
             .iter()
-            .any(|path| path.to_string_lossy().contains("localhost")),
+            .any(|path| path.ends_with("certificates/local/localhost/localhost.crt")),
         "no localhost certificate under {}: {files:?}",
         data_dir.display()
     );

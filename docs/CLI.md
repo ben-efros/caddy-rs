@@ -515,13 +515,8 @@ Flags and values whose capability this build does not have are rejected **before
 started**, with an exit status of 1 and a located error naming the flag and the missing feature.
 None of them is silently ignored:
 
-- `--from` resolving to HTTPS **without** `--internal-certs` — stock relies on Caddy's implicit
-  automatic HTTPS for the host matcher, while caddy-rs activates automatic HTTPS only from an
-  explicit `apps.tls.automation` configuration (DIV-0001). The error names `--from` and suggests
-  `--internal-certs` or an explicit `http://` address; the command never serves plaintext on an
-  HTTPS address.
-- `--from` resolving to HTTPS **with** `--internal-certs` but no host — there is no certificate
-  subject to issue for, so the handshake could never succeed.
+- `--from` resolving to HTTPS but naming no host (e.g. `https://:8443`) — a certificate needs a
+  name to be issued for, so the handshake could never succeed.
 - `--change-host-header` — it is a shortcut for `--header-up "Host:
   {http.reverse_proxy.upstream.hostport}"`, and this build's replacer does not implement the
   `http.reverse_proxy.*` placeholder namespace (DIV-0007), so the Host header could not name the
@@ -530,15 +525,19 @@ None of them is silently ignored:
   same reason.
 - `--debug` — this build has no debug-level internal logging.
 
-HTTPS downstreams are supported only through the explicit internal-CA path
-(`--internal-certs` plus a host in `--from`), which emits stock's
-`apps.tls.automation.policies` entry `{subjects:[host], issuers:[{"module":"internal"}]}` and serves
-TLS on the `--from` port. Stock instead relies on implicit automatic HTTPS for any HTTPS `--from`;
-that mode is the DIV-0001 gap described above. Because this build has no ACME issuance in a quick
-command, public-name HTTPS (and therefore stock's implicit certificate acquisition) is not
-available here; use a Caddyfile/JSON configuration for public certificates. With
-`--internal-certs` and without `--disable-redirects`, automatic HTTPS also binds the HTTP redirect
-listener on port 80, like stock.
+HTTPS downstreams follow stock without an explicit TLS app: the server is built with the `host`
+matcher on a non-HTTP port, and caddy-rs derives automatic HTTPS from that matcher, exactly like
+Caddy. Implicit provisioning covers local/internal names offline (a `--from` of
+`https://localhost:8443` gets a certificate from the local CA) and uses the default ACME issuer for
+public names, which needs a reachable ACME server; offline, that issuance fails closed — the
+DIV-0001 divergence, not something this command works around. For public certificates, use a
+Caddyfile/JSON configuration. `--internal-certs` additionally emits stock's
+`apps.tls.automation.policies` entry `{subjects:[host], issuers:[{"module":"internal"}]}`, which
+forces the internal issuer for any host (local or not). `--disable-redirects` keeps automatic HTTPS
+but sets `automatic_https.disable_redirects` (stock's `AutoHTTPS.DisableRedir`), so the HTTP
+redirect listener is not bound; for a cleartext `--from`, automatic HTTPS is disabled outright
+(`automatic_https.disable`, stock's `AutoHTTPS.Disabled`). Without `--disable-redirects`, an HTTPS
+`--from` also binds the HTTP redirect listener on port 80, like stock.
 
 ## pki
 
