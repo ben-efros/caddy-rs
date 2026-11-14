@@ -442,7 +442,7 @@ mod tests {
     #[test]
     fn host_aware_recorder_records_caddy_per_host_labels() {
         let registry = MetricsRegistry::new();
-        let policy = HostLabelPolicy::new(["example.com"], true, false);
+        let policy = HostLabelPolicy::new(["example.com"], false);
         let metrics = Arc::new(HttpMetrics::with_policy(
             registry.clone(),
             HttpMetricsPolicy::with_per_host(policy),
@@ -454,7 +454,7 @@ mod tests {
             .request_started_for_host("srv0", "static_response", "Example.COM", true)
             .expect("start");
         let second = recorder
-            .request_started_for_host("srv0", "static_response", "unknown.test", false)
+            .request_started_for_host("srv0", "static_response", "unknown.test:8443", true)
             .expect("start");
         assert!(first.is_instrumented());
         assert!(second.is_instrumented());
