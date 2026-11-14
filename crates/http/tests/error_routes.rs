@@ -104,6 +104,51 @@ async fn error_routes_run_for_error_status_responses() {
 }
 
 #[tokio::test]
+async fn error_routes_see_the_same_request_headers_as_the_primary_chain() {
+    // Ordering invariant for the header-alias sanitisation (T-HTTP-155 R8, T-HTTP-165 RR4):
+    // every error-chain entry point re-enters with a clone of the routed request, header map
+    // included (crates/http/src/router.rs evaluate_routes -> run_error_routes). A client-supplied
+    // `_`/`.` alias is therefore visible to an error-route proxy/FastCGI handler exactly as it is
+    // to the primary chain, so the only place that can keep aliases out of both chains is a
+    // construction-time hook. This test pins that inheritance by observing the header through an
+    // error-route placeholder.
+    let routes = json!([
+        {
+            "match": [{"path": ["/boom*"]}],
+            "handle": [{"handler": "error", "status_code": 403, "error": "blocked"}]
+        },
+        {"handle": [{"handler": "static_response", "body": "ok"}]}
+    ]);
+    let error_routes = json!({
+        "routes": [{
+            "handle": [{
+                "handler": "static_response",
+                "status_code": 200,
+                "body": "alias={http.request.header.X-Alias}"
+            }]
+        }]
+    });
+    let router = RouterBuilder::new()
+        .with_error_routes(Some(&error_routes), "errors")
+        .expect("error routes parse")
+        .build(routes.as_array().unwrap())
+        .expect("routes build");
+
+    let mut request = request("/boom");
+    request
+        .headers
+        .insert("x-alias", "client-supplied".parse().unwrap());
+    match router.handle_upgradable(request).await.expect("serves") {
+        ResponseOutcome::Response(response) => {
+            let response = response.into_buffered().await.expect("buffers");
+            assert_eq!(response.status, StatusCode::OK);
+            assert_eq!(response.body, Bytes::from_static(b"alias=client-supplied"));
+        }
+        ResponseOutcome::Upgrade(_) => panic!("unexpected upgrade"),
+    }
+}
+
+#[tokio::test]
 async fn unmatched_error_routes_fall_back_to_the_error_status() {
     // The status route matches 403/410; an error with 502 falls through to Caddy's
     // `errorEmptyHandler`, which writes the original error status with an empty body.
