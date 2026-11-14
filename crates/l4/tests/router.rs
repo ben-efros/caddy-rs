@@ -162,6 +162,22 @@ fn duplicate_patterns_and_invalid_configs_are_typed_errors() {
     .expect_err("duplicate exact host");
     assert!(matches!(duplicate, RouteError::DuplicateHost(_)));
 
+    // Equal-length wildcards are not adjacent after the stable sort when another wildcard of the
+    // same length sits between them; duplicates must still be rejected.
+    let duplicate_wildcard = SniRouter::new(
+        vec![
+            route("*.a.example", terminate("a.example")),
+            route("*.b.example", passthrough("127.0.0.1:9443")),
+            route("*.a.example", passthrough("127.0.0.1:9444")),
+        ],
+        fallback(),
+    )
+    .expect_err("non-adjacent duplicate wildcard host");
+    assert_eq!(
+        duplicate_wildcard,
+        RouteError::DuplicateHost("*.a.example".to_string())
+    );
+
     let invalid = RouteDefinition::new("*.", terminate("example.com"));
     assert!(matches!(invalid, Err(RouteError::InvalidHost { .. })));
 

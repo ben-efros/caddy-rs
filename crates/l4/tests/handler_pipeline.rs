@@ -246,7 +246,7 @@ async fn in_flight_connection_keeps_its_route_across_a_reload() {
 }
 
 #[tokio::test]
-async fn empty_pipeline_leaves_the_stream_open_for_the_caller() {
+async fn empty_pipeline_is_a_noop_returning_ok() {
     let router = SniRouter::new(
         vec![route("example.com", terminate("example.com"))],
         fallback(),

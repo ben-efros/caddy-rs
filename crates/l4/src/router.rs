@@ -157,7 +157,9 @@ impl SniTable {
     /// Builds a table from validated definitions, with `fallback` used for unmatched lookups.
     fn build(routes: &[RouteDefinition], fallback: Arc<Route>) -> Result<Self, RouteError> {
         let mut exact = HashMap::new();
-        let mut wildcards: Vec<(String, Arc<Route>)> = Vec::new();
+        // Insert wildcards through a map so a duplicate is rejected wherever it appears in the
+        // definition list, not just next to its twin after the length sort.
+        let mut wildcard_map: HashMap<String, Arc<Route>> = HashMap::new();
         for definition in routes {
             let (normalized, suffix) = validate_route_host(&definition.host)?;
             let route = Arc::new(Route {
@@ -166,7 +168,11 @@ impl SniTable {
                 action: definition.action.clone(),
             });
             match suffix {
-                Some(suffix) => wildcards.push((suffix, route)),
+                Some(suffix) => {
+                    if wildcard_map.insert(suffix.clone(), route).is_some() {
+                        return Err(RouteError::DuplicateHost(format!("*{suffix}")));
+                    }
+                }
                 None => {
                     if exact.insert(normalized.clone(), route).is_some() {
                         return Err(RouteError::DuplicateHost(normalized));
@@ -174,12 +180,8 @@ impl SniTable {
                 }
             }
         }
+        let mut wildcards: Vec<(String, Arc<Route>)> = wildcard_map.into_iter().collect();
         wildcards.sort_by_key(|(suffix, _)| std::cmp::Reverse(suffix.len()));
-        for pair in wildcards.windows(2) {
-            if pair[0].0 == pair[1].0 {
-                return Err(RouteError::DuplicateHost(format!("*{}", pair[0].0)));
-            }
-        }
         Ok(Self {
             exact,
             wildcards,
@@ -202,9 +204,16 @@ impl SniTable {
             return Arc::clone(route);
         }
         for (suffix, route) in &self.wildcards {
-            // Only match at a label boundary and require at least one label before the suffix.
-            if sni.len() > suffix.len() && sni.ends_with(suffix.as_str()) {
-                return Arc::clone(route);
+            if let Some(prefix) = sni.strip_suffix(suffix.as_str()) {
+                // Only match at a label boundary and require at least one well-formed label
+                // before the suffix: "a.b.example.com" matches, ".example.com" and
+                // "a..example.com" (empty labels) do not.
+                let well_formed_prefix = !prefix.is_empty()
+                    && !prefix.ends_with('.')
+                    && !prefix.split('.').any(|label| label.is_empty());
+                if well_formed_prefix {
+                    return Arc::clone(route);
+                }
             }
         }
         Arc::clone(&self.fallback)
@@ -444,6 +453,63 @@ mod tests {
         )
         .expect_err("duplicate wildcard route");
         assert!(matches!(error, RouteError::DuplicateHost(_)));
+
+        // Equal-length wildcards separated by another same-length wildcard: the stable length
+        // sort does not make them adjacent, so duplicates must be detected on insert.
+        let error = SniRouter::new(
+            vec![
+                route("*.a.example", terminate("a.example")),
+                route("*.b.example", passthrough("127.0.0.1:9443")),
+                route("*.a.example", passthrough("127.0.0.1:9444")),
+            ],
+            fallback(),
+        )
+        .expect_err("non-adjacent duplicate wildcard route");
+        assert_eq!(error, RouteError::DuplicateHost("*.a.example".to_string()));
+
+        let error = SniRouter::new(
+            vec![
+                route("*.a.example", terminate("a.example")),
+                route("*.b.example", terminate("b.example")),
+                route("*.c.example", terminate("c.example")),
+                route("*.a.example", terminate("a.example")),
+            ],
+            fallback(),
+        )
+        .expect_err("non-adjacent duplicate wildcard at the end");
+        assert_eq!(error, RouteError::DuplicateHost("*.a.example".to_string()));
+    }
+
+    #[test]
+    fn wildcard_lookup_rejects_malformed_label_prefixes() {
+        let router = SniRouter::new(
+            vec![route("*.example.com", terminate("example.com"))],
+            fallback(),
+        )
+        .unwrap();
+        // Well-formed names at a label boundary match...
+        assert_eq!(
+            router.lookup(Some("www.example.com")).host(),
+            "*.example.com"
+        );
+        assert_eq!(
+            router.lookup(Some("a.b.example.com")).host(),
+            "*.example.com"
+        );
+        // ...while empty labels / missing labels do not.
+        for malformed in [
+            "example.com",
+            ".example.com",
+            "..example.com",
+            "a..example.com",
+            "a..b.example.com",
+        ] {
+            assert_eq!(
+                router.lookup(Some(malformed)).action_kind(),
+                "fallback",
+                "{malformed:?} must not match *.example.com"
+            );
+        }
     }
 
     #[test]
