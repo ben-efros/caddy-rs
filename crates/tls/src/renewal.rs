@@ -1244,6 +1244,7 @@ fn stored_certificate(certificate: &Certificate) -> Result<StoredCertificate> {
             .map(|der| pem_encode("CERTIFICATE", der))
             .collect(),
         private_key_pem: pem_encode("PRIVATE KEY", &certificate.private_key_der),
+        token_key: None,
         domains: certificate.domains.clone(),
         not_after_unix: unix_seconds(certificate.not_after)?,
         issuer_data: None,

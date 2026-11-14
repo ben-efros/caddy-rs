@@ -3683,6 +3683,7 @@ mod tests {
         StoredCertificate {
             certificate_pem: vec![cert_pem.to_string()],
             private_key_pem: key_pem.to_string(),
+            token_key: None,
             domains: domains.iter().map(|domain| domain.to_string()).collect(),
             not_after_unix: 2_000_000_000,
             issuer_data: None,

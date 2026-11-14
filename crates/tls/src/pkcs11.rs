@@ -1698,6 +1698,25 @@ impl Pkcs11SigningKey {
         &self.spki
     }
 
+    /// Adapt this token key as a certificate key source for ACME/internal-CA issuance.
+    ///
+    /// Returns `None` when the token offers no CSR-compatible mechanism for this key; callers must
+    /// then fail closed instead of generating a process-held PEM key. The recorded key id is the
+    /// selector's `CKA_LABEL`, or its hex `CKA_ID` when no label was given.
+    pub fn certificate_key_source(&self) -> Option<crate::certificate::CertificateKeySource> {
+        let signer = self.csr_signer()?;
+        let key_id = match (&self.selector.label, &self.selector.id) {
+            (Some(label), _) => label.clone(),
+            (None, Some(id)) => id.iter().map(|byte| format!("{byte:02x}")).collect(),
+            (None, None) => "unlabelled".to_string(),
+        };
+        crate::certificate::CertificateKeySource::token(
+            crate::certificate::TokenKeyRef::new(self.token_label(), key_id),
+            std::sync::Arc::new(signer),
+        )
+        .ok()
+    }
+
     /// Adapt this token key for PKCS#10 CSR signing (`crate::acme::csr::CsrSigner`).
     ///
     /// The scheme is pinned to what a CSR builder can encode: RSA PKCS#1 v1.5 (never RSA-PSS,

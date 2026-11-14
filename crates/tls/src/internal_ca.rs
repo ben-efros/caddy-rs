@@ -62,8 +62,10 @@ use rsa::RsaPrivateKey;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
+use crate::acme::csr::{subject_public_key_bytes, CertificateRequest};
 use crate::acme::AcmeStorage;
 use crate::certificate::Certificate;
+use crate::certificate::CertificateKeySource;
 use crate::issuer::{CertificateIssuer, IssuanceRequest};
 use crate::renewal::{RenewalClock, SystemClock};
 use crate::storage::{
@@ -374,6 +376,9 @@ pub struct InternalIssuer {
     clock: Arc<dyn RenewalClock>,
     lifetimes: CaLifetimes,
     ca: Mutex<Option<Arc<LocalCa>>>,
+    /// Where leaf certificate keys come from: a fresh process-held key (default) or a token-held
+    /// key whose CSR signature is produced inside the PKCS#11 token (T-TLS-101).
+    certificate_key: CertificateKeySource,
 }
 
 impl Default for InternalIssuer {
@@ -386,6 +391,7 @@ impl Default for InternalIssuer {
             clock: Arc::new(SystemClock),
             lifetimes: CaLifetimes::default(),
             ca: Mutex::new(None),
+            certificate_key: CertificateKeySource::ProcessHeld,
         }
     }
 }
@@ -441,6 +447,20 @@ impl InternalIssuer {
     pub fn with_clock(mut self, clock: Arc<dyn RenewalClock>) -> Self {
         self.clock = clock;
         self
+    }
+
+    /// Issue leaf certificates for a token-held key: the CSR is signed inside the PKCS#11 token
+    /// through [`crate::acme::csr::CsrSigner`] and no private key is generated or exported
+    /// (T-TLS-101). The same source is reused for every renewal, so the token key and its session
+    /// are reused instead of a new key being generated.
+    pub fn with_certificate_key_source(mut self, source: CertificateKeySource) -> Self {
+        self.certificate_key = source;
+        self
+    }
+
+    /// The configured leaf certificate key source.
+    pub fn certificate_key_source(&self) -> &CertificateKeySource {
+        &self.certificate_key
     }
 
     /// Override root/intermediate/leaf lifetimes.
@@ -864,12 +884,45 @@ impl InternalIssuer {
                     .to_string(),
             )
         })?;
-        let key = generate_leaf_key(key_type)?;
+        // Token-held keys sign the CSR inside the token; no process-held key is generated and
+        // there is no PEM fallback when the signer is unavailable or the sign times out.
+        let (spki, subject_key_id, private_key_pem, private_key_der, token_key) = match self
+            .certificate_key
+            .token_key()
+        {
+            Some(token) => {
+                // Build the CSR through the token signer: this proves the signer is usable (queue
+                // budget, sign timeout, quarantine) and fails closed before anything is stored.
+                CertificateRequest::build_with_signer(domains, token.key_type(), token.signer())?;
+                let spki = token.signer().spki().to_vec();
+                let public_key = subject_public_key_bytes(&spki).map_err(|error| {
+                    Error::Issuer(format!(
+                        "certificate key {}: unreadable token public key: {error}",
+                        token.key().describe()
+                    ))
+                })?;
+                let subject_key_id = key_identifier(&public_key);
+                (
+                    spki,
+                    subject_key_id,
+                    String::new(),
+                    Vec::new(),
+                    Some(token.key().clone()),
+                )
+            }
+            None => {
+                let key = generate_leaf_key(key_type)?;
+                (
+                    key.spki.clone(),
+                    key.subject_key_id.clone(),
+                    pem_encode("PRIVATE KEY", &key.pkcs8_der),
+                    key.pkcs8_der,
+                    None,
+                )
+            }
+        };
         let not_before = now - self.lifetimes.backdate;
         let not_after = not_before + self.lifetimes.leaf;
-
-        let spki = key.spki.clone();
-        let subject_key_id = key.subject_key_id.clone();
         let issuer_key_id = issuer_key_identifier(&ca.intermediate);
         let der = create_certificate(
             &CertSpec {
@@ -891,10 +944,10 @@ impl InternalIssuer {
         )?;
 
         let leaf_pem = pem_encode("CERTIFICATE", &der);
-        let key_pem = pem_encode("PRIVATE KEY", &key.pkcs8_der);
         let stored = StoredCertificate {
             certificate_pem: vec![leaf_pem, ca.intermediate_certificate_pem.clone()],
-            private_key_pem: key_pem,
+            private_key_pem,
+            token_key,
             domains: domains.to_vec(),
             not_after_unix: system_time_to_unix(not_after)?,
             issuer_data: None,
@@ -918,7 +971,8 @@ impl InternalIssuer {
         Ok(Certificate {
             domains: domains.to_vec(),
             cert_chain_der: vec![der, ca.intermediate_certificate_der.clone()],
-            private_key_der: key.pkcs8_der,
+            // Token-held keys stay in the token: there is no DER private key to hand out.
+            private_key_der: private_key_der,
             not_before,
             not_after,
             issuer: self.name.clone(),
@@ -2598,5 +2652,145 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(default.chain_der, signed.chain_der);
+    }
+    // ---- token-held certificate keys (T-TLS-101) -----------------------------------------
+
+    /// Certificate storage that captures the record instead of refusing it, so the token-held
+    /// leaf's key source can be asserted before storage's own refusal (proved in storage tests).
+    struct CapturingStorage {
+        stored: std::sync::Mutex<Option<crate::storage::StoredCertificate>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage::CertificateStorage for std::sync::Arc<CapturingStorage> {
+        fn name(&self) -> &'static str {
+            "capturing"
+        }
+
+        async fn load(
+            &self,
+            _key: &str,
+        ) -> crate::Result<Option<crate::storage::StoredCertificate>> {
+            Ok(None)
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            certificate: &crate::storage::StoredCertificate,
+        ) -> crate::Result<()> {
+            *self.stored.lock().expect("capturing storage lock") = Some(certificate.clone());
+            Ok(())
+        }
+
+        async fn delete(&self, _key: &str) -> crate::Result<()> {
+            Ok(())
+        }
+
+        async fn list(&self, _prefix: &str) -> crate::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn token_key_source(
+        signer: std::sync::Arc<crate::acme::csr::test_support::StubCsrSigner>,
+    ) -> crate::certificate::CertificateKeySource {
+        crate::certificate::CertificateKeySource::token(
+            crate::certificate::TokenKeyRef::new("softHSM", "example.com"),
+            signer,
+        )
+        .expect("P-256 token signer is CSR-compatible")
+    }
+
+    async fn token_issuer(
+        signer: std::sync::Arc<crate::acme::csr::test_support::StubCsrSigner>,
+    ) -> (
+        InternalIssuer,
+        std::sync::Arc<CapturingStorage>,
+        std::sync::Arc<MemoryAcmeStorage>,
+    ) {
+        let ca_storage = std::sync::Arc::new(MemoryAcmeStorage::new());
+        let capturing = std::sync::Arc::new(CapturingStorage {
+            stored: std::sync::Mutex::new(None),
+        });
+        let clock = std::sync::Arc::new(ManualClock::new(at(Duration::ZERO)));
+        let issuer = InternalIssuer::new(
+            ca_storage.clone(),
+            Box::new(std::sync::Arc::clone(&capturing)),
+        )
+        .with_clock(clock)
+        .with_certificate_key_source(token_key_source(signer));
+        (issuer, capturing, ca_storage)
+    }
+
+    #[tokio::test]
+    async fn token_signer_signs_the_internal_ca_csr_and_leaf_uses_the_token_key() {
+        let signer = crate::acme::csr::test_support::StubCsrSigner::p256("session-1");
+        let (issuer, capturing, _ca_storage) = token_issuer(std::sync::Arc::clone(&signer)).await;
+
+        let certificate = issuer.obtain(&issuance(&["token.example"])).await.unwrap();
+        assert_eq!(
+            signer.calls(),
+            1,
+            "the internal CA must obtain the CSR signature through the token signer"
+        );
+
+        let stored = capturing
+            .stored
+            .lock()
+            .expect("capturing storage lock")
+            .clone()
+            .expect("leaf record captured");
+        assert!(
+            stored.private_key_pem.is_empty(),
+            "no PEM key may be generated for a token-held key"
+        );
+        assert_eq!(
+            stored
+                .token_key
+                .as_ref()
+                .map(|key| (key.label.as_str(), key.key_id.as_str())),
+            Some(("softHSM", "example.com"))
+        );
+        assert!(
+            certificate.private_key_der.is_empty(),
+            "the token key must not be exported as DER"
+        );
+        let leaf = crate::ocsp::ParsedCertificate::parse(&certificate.cert_chain_der[0]).unwrap();
+        assert_eq!(
+            leaf.subject_public_key,
+            crate::acme::csr::subject_public_key_bytes(crate::acme::csr::CsrSigner::spki(
+                signer.as_ref()
+            ))
+            .unwrap(),
+            "the leaf must certify the token key"
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_token_signer_fails_closed_without_generating_a_key() {
+        let signer = crate::acme::csr::test_support::StubCsrSigner::failing(
+            "session-1",
+            "sign timed out after 5s",
+        );
+        let (issuer, capturing, _ca_storage) = token_issuer(std::sync::Arc::clone(&signer)).await;
+
+        let error = issuer
+            .obtain(&issuance(&["token.example"]))
+            .await
+            .expect_err("an unavailable token signer must fail closed");
+        assert!(
+            error.to_string().contains("sign timed out after 5s"),
+            "{error}"
+        );
+        assert_eq!(signer.calls(), 0);
+        assert!(
+            capturing
+                .stored
+                .lock()
+                .expect("capturing storage lock")
+                .is_none(),
+            "no leaf may be issued without a working token signer"
+        );
     }
 }

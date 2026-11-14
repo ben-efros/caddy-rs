@@ -9,7 +9,9 @@ use std::collections::BTreeMap;
 use std::sync::RwLock;
 use std::time::{Duration, SystemTime};
 
+use crate::acme::csr::{CertificateKeyType, CsrSigner};
 use crate::Error;
+use rustls::SignatureScheme;
 
 /// A certificate and its private key, in DER form.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -247,5 +249,156 @@ mod tests {
         let queue = renewal_queue(vec![later, sooner, expired], now);
         assert_eq!(queue.len(), 2);
         assert_eq!(queue[0].domains, vec!["a.example"]);
+    }
+}
+
+/// Identity of a token-held certificate key, as recorded with a certificate.
+///
+/// The private key never leaves the token, so this reference (not key material) is what a
+/// certificate record can carry.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TokenKeyRef {
+    /// PKCS#11 token label (`CK_TOKEN_INFO.label`, trimmed).
+    pub label: String,
+    /// Key identifier on the token (`CKA_LABEL` or `CKA_ID`).
+    pub key_id: String,
+}
+
+impl TokenKeyRef {
+    /// Reference a token-held key by token label and key id.
+    pub fn new(label: impl Into<String>, key_id: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            key_id: key_id.into(),
+        }
+    }
+
+    /// Human-readable key source used by located errors.
+    pub fn describe(&self) -> String {
+        format!(
+            "pkcs11 token {} (key {})",
+            self.label.trim(),
+            self.key_id.trim()
+        )
+    }
+}
+
+/// A token-held certificate key adapted to PKCS#10 signing.
+///
+/// Only the token's public key, the pinned signature scheme and a signing handle are held; there
+/// is deliberately no key-export path (see [`crate::acme::csr::CsrSigner`]).
+#[derive(Clone)]
+pub struct TokenCertificateKey {
+    key: TokenKeyRef,
+    key_type: CertificateKeyType,
+    signer: std::sync::Arc<dyn CsrSigner + Send + Sync>,
+}
+
+impl std::fmt::Debug for TokenCertificateKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TokenCertificateKey")
+            .field("key", &self.key)
+            .field("key_type", &self.key_type)
+            .field("scheme", &self.signer.signature_scheme())
+            .finish_non_exhaustive()
+    }
+}
+
+impl TokenCertificateKey {
+    /// The recorded token key identity.
+    pub fn key(&self) -> &TokenKeyRef {
+        &self.key
+    }
+
+    /// The certificate key type this token key produces.
+    pub fn key_type(&self) -> CertificateKeyType {
+        self.key_type
+    }
+
+    /// The token-backed CSR signer.
+    pub fn signer(&self) -> &(dyn CsrSigner + Send + Sync) {
+        self.signer.as_ref()
+    }
+}
+
+/// Where the certificate key for one issuance comes from.
+///
+/// `ProcessHeld` keeps the historical behaviour: a fresh key is generated in this process for the
+/// CSR and its PKCS#8 PEM is stored with the certificate. `Token` signs the CSR inside a PKCS#11
+/// token, never exports key material and must never be written as a PEM file.
+#[derive(Clone, Default)]
+pub enum CertificateKeySource {
+    /// A fresh key generated in-process for this issuance.
+    #[default]
+    ProcessHeld,
+    /// A key held by a PKCS#11 token.
+    Token(TokenCertificateKey),
+}
+
+impl std::fmt::Debug for CertificateKeySource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProcessHeld => formatter.write_str("CertificateKeySource::ProcessHeld"),
+            Self::Token(key) => formatter
+                .debug_tuple("CertificateKeySource::Token")
+                .field(key)
+                .finish(),
+        }
+    }
+}
+
+impl CertificateKeySource {
+    /// A token-held key source for `key` signed through `signer`.
+    ///
+    /// Fails with a located error when the signer's pinned scheme cannot be declared in a PKCS#10
+    /// request, so an unsupported token key is rejected before any order is created.
+    pub fn token(
+        key: TokenKeyRef,
+        signer: std::sync::Arc<dyn CsrSigner + Send + Sync>,
+    ) -> Result<Self, Error> {
+        let scheme = signer.signature_scheme();
+        let key_type = match scheme {
+            SignatureScheme::ECDSA_NISTP256_SHA256 => CertificateKeyType::P256,
+            SignatureScheme::RSA_PKCS1_SHA256 => CertificateKeyType::Rsa2048,
+            other => {
+                return Err(Error::Issuer(format!(
+                    "certificate key {}: token signature scheme {other:?} cannot sign a PKCS#10 \
+                     certificate request; supported: ECDSA P-256/SHA-256, RSA PKCS#1 v1.5 SHA-256",
+                    key.describe()
+                )))
+            }
+        };
+        Ok(Self::Token(TokenCertificateKey {
+            key,
+            key_type,
+            signer,
+        }))
+    }
+
+    /// The token-held key, when this source is token-backed.
+    pub fn token_key(&self) -> Option<&TokenCertificateKey> {
+        match self {
+            Self::ProcessHeld => None,
+            Self::Token(key) => Some(key),
+        }
+    }
+
+    /// The recorded token key identity, when this source is token-backed.
+    pub fn token_ref(&self) -> Option<&TokenKeyRef> {
+        self.token_key().map(TokenCertificateKey::key)
+    }
+
+    /// Whether the key is generated in this process (the default).
+    pub fn is_process_held(&self) -> bool {
+        matches!(self, Self::ProcessHeld)
+    }
+
+    /// Human-readable key source used by located errors.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::ProcessHeld => "process-held key".to_string(),
+            Self::Token(key) => key.key.describe(),
+        }
     }
 }

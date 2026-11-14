@@ -947,7 +947,7 @@ fn verify_csr_signature(
 }
 
 /// Extract the key bit string from a SubjectPublicKeyInfo.
-fn subject_public_key_bytes(spki_der: &[u8]) -> Result<&[u8]> {
+pub(crate) fn subject_public_key_bytes(spki_der: &[u8]) -> Result<&[u8]> {
     let (tag, body, consumed) = read_der(spki_der)?;
     if tag != 0x30 || consumed != spki_der.len() {
         return Err(csr_error("SubjectPublicKeyInfo must be a SEQUENCE"));
@@ -965,6 +965,93 @@ fn subject_public_key_bytes(spki_der: &[u8]) -> Result<&[u8]> {
         ));
     }
     Ok(&bits[1..])
+}
+
+/// Stub CSR signers for tests that exercise the token-signer path without a PKCS#11 token.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// A stub [`CsrSigner`]: a process-held P-256 key exposed only through the signer interface,
+    /// with a call counter, a fake token session id and an optional injected failure (token
+    /// absent/closed, or a sign timeout).
+    pub(crate) struct StubCsrSigner {
+        spki: Vec<u8>,
+        key: EcdsaKeyPair,
+        calls: AtomicUsize,
+        failure: Option<String>,
+        session: String,
+    }
+
+    impl StubCsrSigner {
+        /// A working P-256 stub signer bound to `session`.
+        pub(crate) fn p256(session: &str) -> Arc<Self> {
+            Self::build(session, None)
+        }
+
+        /// A stub signer that always fails, modelling an unavailable token or a sign timeout.
+        pub(crate) fn failing(session: &str, message: &str) -> Arc<Self> {
+            Self::build(session, Some(message.to_string()))
+        }
+
+        fn build(session: &str, failure: Option<String>) -> Arc<Self> {
+            let rng = SystemRandom::new();
+            let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng)
+                .expect("P-256 key");
+            let key =
+                EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
+                    .expect("reload P-256 key");
+            let point = key.public_key().as_ref().to_vec();
+            let spki = der_sequence(&[
+                der_sequence(&[der_oid(OID_EC_PUBLIC_KEY), der_oid(OID_PRIME256V1)]),
+                der_bit_string(&point),
+            ]);
+            Arc::new(Self {
+                spki,
+                key,
+                calls: AtomicUsize::new(0),
+                failure,
+                session: session.to_string(),
+            })
+        }
+
+        /// Number of signing operations this stub performed.
+        pub(crate) fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        /// The fake token session id, used to prove a renewal reuses the same session.
+        pub(crate) fn session(&self) -> &str {
+            &self.session
+        }
+    }
+
+    impl CsrSigner for StubCsrSigner {
+        fn spki(&self) -> &[u8] {
+            &self.spki
+        }
+
+        fn signature_scheme(&self) -> SignatureScheme {
+            SignatureScheme::ECDSA_NISTP256_SHA256
+        }
+
+        fn sign(&self, message: &[u8]) -> Result<Vec<u8>> {
+            if let Some(failure) = &self.failure {
+                return Err(crate::Error::Issuer(format!(
+                    "signing certificate request on PKCS#11 token softHSM: {failure}"
+                )));
+            }
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.key
+                .sign(&SystemRandom::new(), message)
+                .map(|signature| signature.as_ref().to_vec())
+                .map_err(|error| {
+                    crate::Error::Issuer(format!("stub ECDSA signing failed: {error}"))
+                })
+        }
+    }
 }
 
 #[cfg(test)]

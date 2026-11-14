@@ -122,8 +122,14 @@ pub const CERTIFICATES_DIRECTORY: &str = "certificates";
 pub struct StoredCertificate {
     /// PEM-encoded certificate chain, leaf first.
     pub certificate_pem: Vec<String>,
-    /// PEM-encoded private key.
+    /// PEM-encoded private key. Empty for token-held keys, which are never serialised.
     pub private_key_pem: String,
+    /// Token-held certificate key identity, when the private key lives in a PKCS#11 token.
+    ///
+    /// A record with `token_key` set is refused by [`CertificateStorage::store`]: token-held keys
+    /// are never written as PKCS#8 PEM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_key: Option<crate::certificate::TokenKeyRef>,
     /// Domains covered.
     pub domains: Vec<String>,
     /// Unix timestamp (seconds) after which the certificate is not valid.
@@ -157,6 +163,22 @@ pub trait CertificateStorage: Send + Sync {
     async fn list(&self, prefix: &str) -> Result<Vec<String>>;
 }
 
+/// Refuse to serialise a token-held certificate key as PKCS#8 PEM.
+///
+/// Token-held keys never leave the PKCS#11 token, so there is nothing to write: a record that
+/// names a token key is rejected with a located error instead of silently writing an empty or
+/// fabricated PEM file.
+pub fn ensure_writable_private_key(key: &str, certificate: &StoredCertificate) -> Result<()> {
+    if let Some(token) = &certificate.token_key {
+        return Err(Error::Storage(format!(
+            "certificate key {key}: token-held keys are never written as PKCS#8 PEM (source: \
+             pkcs11 token {})",
+            token.label.trim()
+        )));
+    }
+    Ok(())
+}
+
 /// In-memory storage, used by tests and ephemeral deployments.
 #[derive(Debug, Default)]
 pub struct MemoryStorage {
@@ -186,6 +208,7 @@ impl CertificateStorage for MemoryStorage {
     }
 
     async fn store(&self, key: &str, certificate: &StoredCertificate) -> Result<()> {
+        ensure_writable_private_key(key, certificate)?;
         self.values
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -317,6 +340,7 @@ impl CertificateStorage for FileStorage {
         Ok(Some(StoredCertificate {
             certificate_pem,
             private_key_pem,
+            token_key: None,
             domains,
             not_after_unix,
             issuer_data,
@@ -325,6 +349,7 @@ impl CertificateStorage for FileStorage {
     }
 
     async fn store(&self, key: &str, certificate: &StoredCertificate) -> Result<()> {
+        ensure_writable_private_key(key, certificate)?;
         if certificate.certificate_pem.is_empty() {
             return Err(Error::Storage(format!(
                 "certificate `{key}` has an empty PEM chain"
@@ -1221,6 +1246,7 @@ mod tests {
             ],
             private_key_pem: "-----BEGIN PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----"
                 .to_string(),
+            token_key: None,
             domains: vec!["example.com".to_string()],
             not_after_unix: 4_000_000_000,
             issuer_data: None,
@@ -1243,6 +1269,7 @@ mod tests {
         StoredCertificate {
             certificate_pem: fixture_chain(),
             private_key_pem: fixture_key(),
+            token_key: None,
             domains: vec!["example.com".to_string(), "www.example.com".to_string()],
             not_after_unix: 1_775_001_600, // 2026-04-01T00:00:00Z
             issuer_data: None,
@@ -1553,6 +1580,7 @@ mod tests {
         let stored = StoredCertificate {
             certificate_pem: fixture_chain(),
             private_key_pem: fixture_key(),
+            token_key: None,
             domains: vec!["example.com".to_string(), "www.example.com".to_string()],
             not_after_unix: 1_775_001_600,
             issuer_data: Some(serde_json::json!({
@@ -1928,5 +1956,50 @@ mod tests {
             .build()
             .unwrap()
             .block_on(future)
+    }
+    #[tokio::test]
+    async fn token_held_keys_are_never_written_as_pem() {
+        let directory =
+            std::env::temp_dir().join(format!("caddy-rs-token-held-key-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let storage = FileStorage::new(&directory);
+        let mut stored = example();
+        stored.private_key_pem = String::new();
+        stored.token_key = Some(crate::certificate::TokenKeyRef::new(
+            "softHSM",
+            "example.com",
+        ));
+
+        let error = storage
+            .store("acme.test-directory/example.com", &stored)
+            .await
+            .expect_err("token-held keys must never be serialised");
+        assert_eq!(
+            error.to_string(),
+            "certificate storage error: certificate key acme.test-directory/example.com: \
+             token-held keys are never written as PKCS#8 PEM (source: pkcs11 token softHSM)"
+        );
+        let paths = storage
+            .certificate_paths("acme.test-directory/example.com")
+            .expect("storage paths");
+        assert!(
+            !paths.private_key.exists(),
+            "a token-held key must not create a key file"
+        );
+        assert!(
+            !paths.certificate.exists(),
+            "a refused token-held certificate must not be persisted"
+        );
+
+        let memory = MemoryStorage::new();
+        let error = memory
+            .store("acme.test-directory/example.com", &stored)
+            .await
+            .expect_err("memory storage refuses token-held keys too");
+        assert!(error
+            .to_string()
+            .contains("token-held keys are never written"));
+
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }
