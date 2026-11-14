@@ -420,7 +420,9 @@ impl FastCgiTransport {
         // (`NormalizedPath`); a NUL byte anywhere in the path is a 400 before any dialing.
         let fpath = normalized_script_path(path)?;
 
-        // Caddy's `splitPos`: an empty split-path list yields index 0 (whole path is PATH_INFO).
+        // Caddy's `splitPos`: a match must end the path or be followed by `/` (segment boundary),
+        // so the CGI script and the route/file matcher agree on the file; an empty split-path list
+        // yields index 0 (whole path is PATH_INFO).
         let split_pos: Option<usize> = cgi_split_pos(&self.split_path, &fpath);
         let (document_uri, mut path_info, mut script_name) = match split_pos {
             Some(pos) => {
@@ -968,6 +970,13 @@ fn find_cgi_header_end(buffer: &[u8]) -> Option<(usize, usize)> {
 /// Caddy's `splitPos`: index just past the first case-insensitive `split_path` match in `fpath`
 /// (0 when the split list is empty), or `None` when nothing matches.
 ///
+/// A match must end the path or be followed by `/`, as in Caddy's file matcher (upstream
+/// `caddy@b30c01934116`, "split script path at segment boundary"). Without that rule
+/// `/admin.php.php` would split at the first `.php` and run `/admin.php` while route/file matchers
+/// judged the whole path — a matcher/execution mismatch that can bypass access rules. A rejected
+/// candidate does not end the scan: the next candidate start is tried, so `/admin.php.php` still
+/// splits at its final `.php` while `/test.php.bak` has no boundary match at all.
+///
 /// `fpath` is the percent-decoded request path and may contain multibyte UTF-8, so the scan
 /// compares `as_bytes()` (like Go's byte-oriented `strings.Index`) instead of slicing `&str` at
 /// raw byte offsets. The returned offset is always a char boundary: `split_path` entries are
@@ -991,6 +1000,7 @@ fn cgi_split_pos(split_path: &[String], fpath: &str) -> Option<usize> {
                         .is_some_and(|candidate| candidate.eq_ignore_ascii_case(needle))
                         && fpath.is_char_boundary(*start)
                         && fpath.is_char_boundary(end)
+                        && (end == fpath.len() || fpath.as_bytes().get(end) == Some(&b'/'))
                 })
                 .map(|start| start + split.len())
         })
@@ -2250,6 +2260,33 @@ mod tests {
     }
 
     #[test]
+    fn cgi_split_pos_requires_a_segment_boundary() {
+        // Upstream caddy@b30c01934116: a split candidate is accepted only when it ends the path
+        // or is followed by `/`. A rejected candidate must not stop the scan (last `.php` wins).
+        let split_path = [".php".to_string()];
+        assert_eq!(
+            cgi_split_pos(&split_path, "/admin.php.php"),
+            Some(14),
+            "the final .php ends the path, so it wins over the earlier one"
+        );
+        assert_eq!(
+            cgi_split_pos(&split_path, "/admin.phpx/y.php"),
+            Some(17),
+            "the first .php is mid-segment; the final one ends the path"
+        );
+        assert_eq!(
+            cgi_split_pos(&split_path, "/a.phpx/b.php/info"),
+            Some(13),
+            "a .php followed by / is a segment boundary"
+        );
+        assert_eq!(
+            cgi_split_pos(&split_path, "/test.php.bak"),
+            None,
+            "a .php in the middle of a segment is not a match, and there is no later one"
+        );
+    }
+
+    #[test]
     fn cgi_split_pos_ascii_paths_keep_existing_behaviour() {
         // SEC-L9-PROXY regression guard: plain ASCII keeps the exact offsets the existing
         // integration tests assert (`/index.php/extra` -> DOCUMENT_URI `/index.php`,
@@ -2550,6 +2587,81 @@ mod tests {
                 captured.params.get(key).map(String::as_str),
                 Some(expected),
                 "{key}: {captured:?}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fastcgi_script_path_split_requires_a_segment_boundary() {
+        // Upstream caddy@b30c01934116: SCRIPT_NAME/PATH_INFO must agree with what the route/file
+        // matcher judged. `/admin.php.php` is one script (empty PATH_INFO), not `/admin.php` plus
+        // a `.php` PATH_INFO.
+        async fn capture(uri: &str) -> BTreeMap<String, String> {
+            let (dial, captured) = spawn_tcp_mock(Behavior::responds(0)).await;
+            let handler = build_handler(
+                &dial,
+                transport_json(serde_json::json!({
+                    "root": "/srv/www",
+                    "split_path": [".php"]
+                })),
+            );
+            assert_eq!(
+                respond(&handler, request(Method::GET, uri)).status,
+                StatusCode::OK
+            );
+            let captured = captured.lock().unwrap();
+            captured
+                .as_ref()
+                .expect("mock captured the request")
+                .params
+                .clone()
+        }
+
+        let double_extension = capture("/admin.php.php").await;
+        for (key, expected) in [
+            ("SCRIPT_NAME", "/admin.php.php"),
+            ("DOCUMENT_URI", "/admin.php.php"),
+            ("PATH_INFO", ""),
+            ("SCRIPT_FILENAME", "/srv/www/admin.php.php"),
+        ] {
+            assert_eq!(
+                double_extension[key], expected,
+                "{key}: {double_extension:?}"
+            );
+        }
+
+        let mid_segment = capture("/admin.phpx/y.php").await;
+        for (key, expected) in [
+            ("SCRIPT_NAME", "/admin.phpx/y.php"),
+            ("PATH_INFO", ""),
+            ("SCRIPT_FILENAME", "/srv/www/admin.phpx/y.php"),
+        ] {
+            assert_eq!(mid_segment[key], expected, "{key}: {mid_segment:?}");
+        }
+
+        let followed_by_slash = capture("/a.phpx/b.php/info").await;
+        for (key, expected) in [
+            ("SCRIPT_NAME", "/a.phpx/b.php"),
+            ("DOCUMENT_URI", "/a.phpx/b.php"),
+            ("PATH_INFO", "/info"),
+            ("SCRIPT_FILENAME", "/srv/www/a.phpx/b.php"),
+        ] {
+            assert_eq!(
+                followed_by_slash[key], expected,
+                "{key}: {followed_by_slash:?}"
+            );
+        }
+
+        let no_boundary_match = capture("/test.php.bak").await;
+        for (key, expected) in [
+            ("SCRIPT_NAME", "/test.php.bak"),
+            ("DOCUMENT_URI", "/test.php.bak"),
+            ("PATH_INFO", ""),
+            ("SCRIPT_FILENAME", "/srv/www/test.php.bak"),
+        ] {
+            assert_eq!(
+                no_boundary_match[key], expected,
+                "{key}: {no_boundary_match:?}"
             );
         }
     }
