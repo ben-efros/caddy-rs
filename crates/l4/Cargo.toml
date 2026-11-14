@@ -1,0 +1,15 @@
+[package]
+name = "caddy-rs-l4"
+description = "Layer-4 stream primitives: replayable prefixed streams and the fixed-size buffer pool used for TCP ClientHello peeking."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "net", "time"] }
