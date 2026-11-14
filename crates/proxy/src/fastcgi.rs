@@ -1961,6 +1961,31 @@ mod tests {
         assert_eq!(captured.stdin, Bytes::from_static(b"body-bytes"));
     }
 
+    /// `T-HTTP-162` (RR1) policy decision: comma-combined values in a *single* field line are
+    /// accepted and forwarded verbatim, matching stock Caddy v2.11.9 (whose env builder joins field
+    /// values with ", " as well). The alias allowlist's R6 rule drops *repeated* field lines, never
+    /// a single comma-containing value, and comma-combining is how list-valued headers legally
+    /// travel. Recorded as DIV-0137; rejecting these values would break legitimate combined
+    /// headers and depart from the oracle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fastcgi_single_comma_combined_remote_user_reaches_cgi() {
+        let (dial, captured) = spawn_tcp_mock(Behavior::responds(0)).await;
+        let handler = build_handler(&dial, transport_json(serde_json::json!({})));
+        let mut request = request(Method::GET, "/index.php");
+        request
+            .headers
+            .insert("remote_user", "a, admin".parse().unwrap());
+        let response = respond(&handler, request);
+        assert_eq!(response.status, StatusCode::OK);
+        let params = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("captured request")
+            .params;
+        assert_eq!(params["HTTP_REMOTE_USER"], "a, admin");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fastcgi_head_and_get_content_length_semantics() {
         let (dial, captured) = spawn_tcp_mock(Behavior::responds(0)).await;
