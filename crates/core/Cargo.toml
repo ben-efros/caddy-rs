@@ -24,4 +24,7 @@ serde = { workspace = true }
 regex = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# `admin.remote.access_control[].public_keys` are base64-encoded DER certificates (Caddy
+# `admin.go:205`); validation decodes them. Already in the workspace lock file.
+base64 = "0.23.1"
 tokio = { workspace = true }

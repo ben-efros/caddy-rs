@@ -12,9 +12,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::Value;
 
 use crate::config::{
-    AutomationPolicy, BaseLog, CertificateAuthority, CertificatesConfig, Config, HttpApp,
-    HttpServer, ListenerWrapperConfig, Logging, ModuleRef, PinSource, Pkcs11CertConfig, PkiApp,
-    PkiKeyPair, ProxyProtocolConfig, Route, ServerLogConfig, StorageConfig, TlsApp, TlsAutomation,
+    AdminAccess, AdminIdentity, AdminPermissions, AdminRemote, AutomationPolicy, BaseLog,
+    CertificateAuthority, CertificatesConfig, Config, HttpApp, HttpServer, ListenerWrapperConfig,
+    Logging, ModuleRef, PinSource, Pkcs11CertConfig, PkiApp, PkiKeyPair, ProxyProtocolConfig,
+    Route, ServerLogConfig, StorageConfig, TlsApp, TlsAutomation,
 };
 use crate::duration::parse_caddy_duration_json;
 use crate::error::{Error, Result};
@@ -59,6 +60,10 @@ pub fn validate_config(config: &Config, registry: &ModuleRegistry) -> Result<Val
     if let Some(admin) = &config.admin {
         if let Some(listen) = &admin.listen {
             validate_admin_listen(listen)?;
+        }
+        validate_admin_identity(admin.identity.as_ref())?;
+        if let Some(remote) = &admin.remote {
+            validate_admin_remote(remote, admin.identity.as_ref())?;
         }
     }
 
@@ -119,6 +124,330 @@ fn validate_admin_listen(listen: &str) -> Result<()> {
         validate_unix_socket_path(&address.address, "admin.listen")?;
     }
     Ok(())
+}
+
+/// Validate `admin.identity`: the identity certificate/key material and `identifiers`.
+///
+/// caddy-rs resolves the admin endpoint's identity from PEM files (a documented deviation from
+/// upstream's certmagic issuance: this build has no ACME issuance path for the admin endpoint).
+fn validate_admin_identity(identity: Option<&AdminIdentity>) -> Result<()> {
+    let Some(identity) = identity else {
+        return Ok(());
+    };
+    for (index, identifier) in identity.identifiers.iter().enumerate() {
+        if identifier.trim().is_empty() {
+            return Err(Error::invalid(
+                format!("admin.identity.identifiers[{index}]"),
+                "identity identifier must not be empty",
+            ));
+        }
+    }
+    if let Some(issuers) = &identity.issuers {
+        if !issuers.is_empty() {
+            return Err(Error::invalid(
+                "admin.identity.issuers",
+                "admin identity issuance modules are not supported; supply the identity \
+                 certificate and key as PEM files with `admin.identity.certificate` and \
+                 `admin.identity.key`",
+            ));
+        }
+    }
+    match (&identity.certificate, &identity.key) {
+        (None, None) => {}
+        (Some(_), None) => return Err(Error::invalid(
+            "admin.identity.key",
+            "`admin.identity.certificate` requires `admin.identity.key` (a PEM private key file)",
+        )),
+        (None, Some(_)) => return Err(Error::invalid(
+            "admin.identity.certificate",
+            "`admin.identity.key` requires `admin.identity.certificate` (a PEM certificate file)",
+        )),
+        (Some(certificate), Some(key)) => {
+            validate_admin_identity_pem(
+                certificate,
+                "admin.identity.certificate",
+                "CERTIFICATE",
+                "a PEM certificate chain",
+            )?;
+            validate_admin_identity_pem(
+                key,
+                "admin.identity.key",
+                "PRIVATE KEY",
+                "a PEM private key (PKCS#8 `PRIVATE KEY`, `RSA PRIVATE KEY` or `EC PRIVATE KEY`)",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Read an identity PEM file and require at least one block of the expected kind.
+///
+/// The full cryptographic load (chain/key pairing, key type) happens when the remote listener is
+/// built (`crates/server/src/listeners.rs`), which has the TLS primitives; this check makes a
+/// missing or unreadable/mistyped file a configuration error instead of a startup failure.
+fn validate_admin_identity_pem(
+    path: &str,
+    located: &str,
+    label: &str,
+    expectation: &str,
+) -> Result<()> {
+    let contents = std::fs::read_to_string(path).map_err(|error| {
+        Error::invalid(
+            located,
+            format!("cannot read `{path}` as {expectation}: {error}"),
+        )
+    })?;
+    let has_block = contents.lines().any(|line| {
+        let line = line.trim();
+        line.starts_with("-----BEGIN ") && line.contains(label) && line.ends_with("-----")
+    });
+    if !has_block {
+        return Err(Error::invalid(
+            located,
+            format!("`{path}` does not contain {expectation}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate `admin.remote` (`RemoteAdmin`, `external/caddy/admin.go:183`).
+fn validate_admin_remote(remote: &AdminRemote, identity: Option<&AdminIdentity>) -> Result<()> {
+    let listen = remote.listen_addr();
+    let address = ListenAddr::parse_at(listen, "admin.remote.listen")?;
+    if address.network != Network::Tcp {
+        return Err(Error::invalid(
+            "admin.remote.listen",
+            format!(
+                "remote administration requires a TCP listen address, `{listen}` names the \
+                 `{:?}` network",
+                address.network
+            ),
+        ));
+    }
+
+    let Some(identity) = identity else {
+        return Err(Error::invalid(
+            "admin.remote",
+            "remote administration requires `admin.identity`; the secure listener authenticates \
+             clients with mutual TLS against this server's identity",
+        ));
+    };
+    let (Some(_), Some(_)) = (&identity.certificate, &identity.key) else {
+        return Err(Error::invalid(
+            "admin.identity",
+            "remote administration requires an identity certificate and key \
+             (`admin.identity.certificate` and `admin.identity.key`)",
+        ));
+    };
+
+    if remote.access_control.is_empty() {
+        return Err(Error::invalid(
+            "admin.remote.access_control",
+            "remote administration requires at least one access-control entry; without one no \
+             client certificate is trusted",
+        ));
+    }
+    // rustls refuses to build a client-certificate verifier without trust anchors, so a remote
+    // listener with only subject/serial selectors cannot start. Upstream accepts such a config
+    // and rejects every handshake; caddy-rs fails validation with a located error instead.
+    if !remote.has_public_keys() {
+        return Err(Error::invalid(
+            "admin.remote.access_control",
+            "at least one access-control entry must list a `public_keys` certificate; the mutual \
+             TLS trust pool is built from those certificates",
+        ));
+    }
+    for (index, access) in remote.access_control.iter().enumerate() {
+        validate_admin_access(index, access)?;
+    }
+    Ok(())
+}
+
+/// Validate one `admin.remote.access_control` entry.
+fn validate_admin_access(index: usize, access: &AdminAccess) -> Result<()> {
+    for (key_index, key) in access.public_keys.iter().enumerate() {
+        validate_admin_public_key(key).map_err(|reason| {
+            Error::invalid(
+                format!("admin.remote.access_control[{index}].public_keys[{key_index}]"),
+                reason,
+            )
+        })?;
+    }
+    for (subject_index, subject) in access.subjects.iter().enumerate() {
+        let valid = !subject.trim().is_empty()
+            && subject
+                .chars()
+                .all(|character| !character.is_control() && character != '\0');
+        if !valid {
+            return Err(Error::invalid(
+                format!("admin.remote.access_control[{index}].subjects[{subject_index}]"),
+                format!(
+                    "`{subject}` is not a well-formed subject distinguished name; use Go's \
+                     `x509.Name.String()` form such as `CN=client,O=ops`"
+                ),
+            ));
+        }
+    }
+    for (serial_index, serial) in access.serials.iter().enumerate() {
+        if serial.is_empty() || !serial.chars().all(|character| character.is_ascii_digit()) {
+            return Err(Error::invalid(
+                format!("admin.remote.access_control[{index}].serials[{serial_index}]"),
+                format!(
+                    "`{serial}` is not a decimal certificate serial number (Go's \
+                     `big.Int.String()` form)"
+                ),
+            ));
+        }
+    }
+    if !access.has_selectors() {
+        return Err(Error::invalid(
+            format!("admin.remote.access_control[{index}]"),
+            "access-control entry names no identities; list `public_keys` certificates \
+             (and/or this build's `subjects`/`serials` selectors)",
+        ));
+    }
+    for (permission_index, permission) in access.permissions.iter().enumerate() {
+        validate_admin_permission(index, permission_index, permission)?;
+    }
+    Ok(())
+}
+
+/// Decode one base64 DER certificate and check it is a DER SEQUENCE (an X.509 certificate).
+fn validate_admin_public_key(key: &str) -> std::result::Result<(), String> {
+    use base64::Engine as _;
+    let der = base64::engine::general_purpose::STANDARD
+        .decode(key.trim())
+        .map_err(|error| {
+            format!("public key is not base64-encoded DER (the contents of a PEM block): {error}")
+        })?;
+    if der.len() < 4 || der[0] != 0x30 {
+        return Err(
+            "public key is not a DER certificate: expected a SEQUENCE (X.509 certificate)"
+                .to_string(),
+        );
+    }
+    // Definite-form length must fit inside the buffer.
+    let mut position = 1;
+    let first = der[position];
+    position += 1;
+    let content_length = if first & 0x80 == 0 {
+        usize::from(first)
+    } else {
+        let octets = usize::from(first & 0x7f);
+        if octets == 0 || octets > std::mem::size_of::<usize>() || position + octets > der.len() {
+            return Err("public key is not a DER certificate: malformed length".to_string());
+        }
+        let mut length = 0usize;
+        for _ in 0..octets {
+            length = (length << 8) | usize::from(der[position]);
+            position += 1;
+        }
+        length
+    };
+    if position + content_length > der.len() {
+        return Err("public key is not a DER certificate: truncated".to_string());
+    }
+    Ok(())
+}
+
+/// Validate one `permissions` entry: absolute, canonical paths and valid HTTP methods.
+fn validate_admin_permission(
+    access_index: usize,
+    permission_index: usize,
+    permission: &AdminPermissions,
+) -> Result<()> {
+    if let Some(paths) = &permission.paths {
+        for (path_index, path) in paths.iter().enumerate() {
+            let located = format!(
+                "admin.remote.access_control[{access_index}].permissions[{permission_index}].\
+                 paths[{path_index}]"
+            );
+            if path.is_empty() || path == "/" {
+                // Upstream `adminPathAllowed` treats these as "every path" (`admin.go:757`).
+                continue;
+            }
+            if !path.starts_with('/') {
+                return Err(Error::invalid(
+                    located,
+                    format!("access-control path `{path}` must be absolute (start with `/`)"),
+                ));
+            }
+            let cleaned = clean_admin_path(path);
+            let trailing_slash = path != "/" && path.ends_with('/');
+            if cleaned != *path && !(trailing_slash && cleaned == path.trim_end_matches('/')) {
+                return Err(Error::invalid(
+                    located,
+                    format!(
+                        "access-control path `{path}` is not canonical (did you mean \
+                         `{cleaned}`?)"
+                    ),
+                ));
+            }
+        }
+    }
+    if let Some(methods) = &permission.methods {
+        for (method_index, method) in methods.iter().enumerate() {
+            let located = format!(
+                "admin.remote.access_control[{access_index}].permissions[{permission_index}].\
+                 methods[{method_index}]"
+            );
+            if !is_valid_http_method(method) {
+                return Err(Error::invalid(
+                    located,
+                    format!(
+                        "`{method}` is not a valid HTTP method token (for example `GET`, `POST`, \
+                         `PATCH`)"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether `method` is an RFC 9110 token and not obviously a sentence.
+fn is_valid_http_method(method: &str) -> bool {
+    !method.is_empty()
+        && method.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(
+                    character,
+                    '!' | '#'
+                        | '$'
+                        | '%'
+                        | '&'
+                        | '\''
+                        | '*'
+                        | '+'
+                        | '-'
+                        | '.'
+                        | '^'
+                        | '_'
+                        | '`'
+                        | '|'
+                        | '~'
+                )
+        })
+}
+
+/// Lexically clean an absolute path the way Go's `path.Clean` does (`admin.go:742`).
+fn clean_admin_path(path: &str) -> String {
+    let trailing_slash = path.len() > 1 && path.ends_with('/');
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            segment => segments.push(segment),
+        }
+    }
+    let mut cleaned = format!("/{}", segments.join("/"));
+    if trailing_slash && cleaned != "/" {
+        cleaned.push('/');
+    }
+    cleaned
 }
 
 /// Validate a Unix domain socket path against the rules the admin endpoint needs to bind.
@@ -2949,5 +3278,279 @@ mod tests {
         let message = admin_listen_error("unix//run/caddy\0-admin.sock");
         assert!(message.contains("admin.listen"), "{message}");
         assert!(message.contains("null byte"), "{message}");
+    }
+}
+
+#[cfg(test)]
+mod admin_remote_tests {
+    use super::*;
+
+    /// `SEQUENCE { INTEGER 1 }`, the smallest DER certificate stand-in for shape checks.
+    const DER_CERT_BASE64: &str = "MAMCAQE=";
+
+    struct Fixture {
+        directory: std::path::PathBuf,
+        certificate: std::path::PathBuf,
+        key: std::path::PathBuf,
+    }
+
+    impl Fixture {
+        fn new(name: &str) -> Self {
+            let directory = std::env::temp_dir()
+                .join(format!("caddy-rs-core-admin-{}-{name}", std::process::id()));
+            std::fs::create_dir_all(&directory).expect("temp directory");
+            let certificate = directory.join("identity.pem");
+            let key = directory.join("identity.key");
+            std::fs::write(
+                &certificate,
+                "-----BEGIN CERTIFICATE-----\nMAMCAQE=\n-----END CERTIFICATE-----\n",
+            )
+            .expect("certificate fixture");
+            std::fs::write(
+                &key,
+                "-----BEGIN PRIVATE KEY-----\nMAMCAQE=\n-----END PRIVATE KEY-----\n",
+            )
+            .expect("key fixture");
+            Self {
+                directory,
+                certificate,
+                key,
+            }
+        }
+
+        fn certificate(&self) -> String {
+            self.certificate.to_string_lossy().into_owned()
+        }
+
+        fn key(&self) -> String {
+            self.key.to_string_lossy().into_owned()
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    fn config(admin: Value) -> Config {
+        Config::from_value(serde_json::json!({ "admin": admin })).expect("model decodes")
+    }
+
+    fn remote_with(access_control: Value) -> Value {
+        serde_json::json!({ "listen": ":2021", "access_control": access_control })
+    }
+
+    fn identity(fixture: &Fixture) -> Value {
+        serde_json::json!({
+            "identifiers": ["admin.example.com"],
+            "certificate": fixture.certificate(),
+            "key": fixture.key(),
+        })
+    }
+
+    fn validate(config: &Config) -> Result<ValidationReport> {
+        validate_config(config, &ModuleRegistry::builtin())
+    }
+
+    #[test]
+    fn accepts_identity_and_remote_with_access_control() {
+        let fixture = Fixture::new("accepts");
+        let config = config(serde_json::json!({
+            "identity": identity(&fixture),
+            "remote": remote_with(serde_json::json!([{
+                "public_keys": [DER_CERT_BASE64],
+                "permissions": [{ "paths": ["/config/", "/id/"], "methods": ["GET", "POST"] }]
+            }]))
+        }));
+        validate(&config).expect("admin.identity + admin.remote loads through validation");
+
+        // Defaults: remote listen is `:2021`, permissions round-trip.
+        let admin = config.admin.as_ref().expect("admin");
+        let remote = admin.remote.as_ref().expect("remote");
+        assert_eq!(remote.listen_addr(), ":2021");
+        assert_eq!(remote.access_control.len(), 1);
+        assert_eq!(
+            remote.access_control[0].permissions[0].paths.as_deref(),
+            Some(["/config/".to_string(), "/id/".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn remote_without_identity_is_rejected() {
+        let config = config(serde_json::json!({
+            "remote": remote_with(serde_json::json!([{ "public_keys": [DER_CERT_BASE64] }]))
+        }));
+        let error = validate(&config).expect_err("identity is required");
+        assert_eq!(error.code(), "config.invalid");
+        assert!(
+            error.to_string().contains("admin.remote"),
+            "error names admin.remote: {error}"
+        );
+    }
+
+    #[test]
+    fn remote_without_access_control_is_rejected() {
+        let fixture = Fixture::new("no-access");
+        let config = config(serde_json::json!({
+            "identity": identity(&fixture),
+            "remote": serde_json::json!({ "listen": ":2021" })
+        }));
+        let error = validate(&config).expect_err("access_control is required");
+        assert!(
+            error.to_string().contains("admin.remote.access_control"),
+            "error names the JSON path: {error}"
+        );
+    }
+
+    #[test]
+    fn access_control_without_public_keys_is_rejected() {
+        let fixture = Fixture::new("no-keys");
+        let config = config(serde_json::json!({
+            "identity": identity(&fixture),
+            "remote": remote_with(serde_json::json!([{ "subjects": ["CN=client"] }]))
+        }));
+        let error = validate(&config).expect_err("the TLS trust pool needs anchors");
+        assert!(
+            error.to_string().contains("admin.remote.access_control"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn non_canonical_permission_path_is_rejected() {
+        let fixture = Fixture::new("path");
+        let config = config(serde_json::json!({
+            "identity": identity(&fixture),
+            "remote": remote_with(serde_json::json!([{
+                "public_keys": [DER_CERT_BASE64],
+                "permissions": [{ "paths": ["/config//apps"] }]
+            }]))
+        }));
+        let error = validate(&config).expect_err("path must be canonical");
+        assert!(
+            error
+                .to_string()
+                .contains("admin.remote.access_control[0].permissions[0].paths[0]"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn relative_permission_path_is_rejected() {
+        let fixture = Fixture::new("relative");
+        let config = config(serde_json::json!({
+            "identity": identity(&fixture),
+            "remote": remote_with(serde_json::json!([{
+                "public_keys": [DER_CERT_BASE64],
+                "permissions": [{ "paths": ["config/"] }]
+            }]))
+        }));
+        let error = validate(&config).expect_err("path must be absolute");
+        assert!(error.to_string().contains("must be absolute"), "{error}");
+    }
+
+    #[test]
+    fn invalid_method_is_rejected() {
+        let fixture = Fixture::new("method");
+        let config = config(serde_json::json!({
+            "identity": identity(&fixture),
+            "remote": remote_with(serde_json::json!([{
+                "public_keys": [DER_CERT_BASE64],
+                "permissions": [{ "paths": ["/load"], "methods": ["GET /load"] }]
+            }]))
+        }));
+        let error = validate(&config).expect_err("method must be a token");
+        assert!(error.to_string().contains("valid HTTP method"), "{error}");
+    }
+
+    #[test]
+    fn malformed_public_key_is_rejected() {
+        let fixture = Fixture::new("base64");
+        let config = config(serde_json::json!({
+            "identity": identity(&fixture),
+            "remote": remote_with(serde_json::json!([{
+                "public_keys": ["not base64!!"]
+            }]))
+        }));
+        let error = validate(&config).expect_err("base64 DER is required");
+        assert!(error.to_string().contains("base64"), "{error}");
+    }
+
+    #[test]
+    fn malformed_selector_is_rejected() {
+        let fixture = Fixture::new("selectors");
+        let config = config(serde_json::json!({
+            "identity": identity(&fixture),
+            "remote": remote_with(serde_json::json!([{
+                "public_keys": [DER_CERT_BASE64],
+                "serials": ["not-a-serial"]
+            }]))
+        }));
+        let error = validate(&config).expect_err("serials are decimal");
+        assert!(
+            error.to_string().contains("decimal certificate serial"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn identity_without_key_is_rejected() {
+        let fixture = Fixture::new("identity-key");
+        let config = config(serde_json::json!({
+            "identity": { "certificate": fixture.certificate() },
+            "remote": remote_with(serde_json::json!([{ "public_keys": [DER_CERT_BASE64] }]))
+        }));
+        let error = validate(&config).expect_err("key is required");
+        assert!(error.to_string().contains("admin.identity.key"), "{error}");
+    }
+
+    #[test]
+    fn unreadable_identity_certificate_is_rejected() {
+        let fixture = Fixture::new("missing-file");
+        let config = config(serde_json::json!({
+            "identity": {
+                "certificate": "/nonexistent/admin-identity.pem",
+                "key": fixture.key()
+            },
+            "remote": remote_with(serde_json::json!([{ "public_keys": [DER_CERT_BASE64] }]))
+        }));
+        let error = validate(&config).expect_err("certificate must be readable");
+        assert!(
+            error.to_string().contains("admin.identity.certificate"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn non_tcp_remote_listen_is_rejected() {
+        let fixture = Fixture::new("listen");
+        let config = config(serde_json::json!({
+            "identity": identity(&fixture),
+            "remote": serde_json::json!({
+                "listen": "unix//run/caddy-remote.sock",
+                "access_control": [{ "public_keys": [DER_CERT_BASE64] }]
+            })
+        }));
+        let error = validate(&config).expect_err("remote admin is TCP only");
+        assert!(error.to_string().contains("admin.remote.listen"), "{error}");
+    }
+
+    #[test]
+    fn unsupported_identity_issuers_are_rejected() {
+        let fixture = Fixture::new("issuers");
+        let config = config(serde_json::json!({
+            "identity": {
+                "certificate": fixture.certificate(),
+                "key": fixture.key(),
+                "issuers": [{ "module": "acme" }]
+            },
+            "remote": remote_with(serde_json::json!([{ "public_keys": [DER_CERT_BASE64] }]))
+        }));
+        let error = validate(&config).expect_err("issuance modules are unsupported");
+        assert!(
+            error.to_string().contains("admin.identity.issuers"),
+            "{error}"
+        );
     }
 }

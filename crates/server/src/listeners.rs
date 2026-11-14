@@ -2417,6 +2417,7 @@ pub(crate) async fn bind_admin(configured: &str, api: AdminApi) -> Result<Listen
                                         path,
                                         headers: parts.headers,
                                         body,
+                                        client_identity: None,
                                     })
                                     .await;
                                 let mut builder = hyper::Response::builder().status(response.status);
@@ -2454,6 +2455,751 @@ pub(crate) async fn bind_admin(configured: &str, api: AdminApi) -> Result<Listen
         bound: socket_addr.to_string(),
         socket_addr: Some(socket_addr),
     })
+}
+
+/// Build the rustls server configuration for the mutual-TLS remote admin listener
+/// (`admin.remote`), from the configured server identity and access-control certificates.
+///
+/// This mirrors Caddy's `replaceRemoteAdminServer` (`external/caddy/admin.go:509-560`): the
+/// client-certificate pool is built from every `access_control[].public_keys` entry and the mode
+/// is `RequireAndVerifyClientCert` (rustls `ClientAuthMode::RequireAndVerify`). The identity
+/// comes from `admin.identity` (PEM files, a documented caddy-rs deviation from certmagic
+/// issuance). The listener speaks HTTP/1.1 only, like the plaintext admin endpoint.
+pub(crate) fn remote_admin_tls_config(
+    identity: &caddy_rs_core::AdminIdentity,
+    remote: &caddy_rs_core::AdminRemote,
+) -> Result<Arc<rustls::ServerConfig>, Error> {
+    use base64::Engine as _;
+
+    let (Some(certificate_path), Some(key_path)) = (&identity.certificate, &identity.key) else {
+        return Err(Error::Config(caddy_rs_core::Error::invalid(
+            "admin.identity",
+            "remote administration requires `admin.identity.certificate` and `admin.identity.key`",
+        )));
+    };
+    let certificate_pem = std::fs::read_to_string(certificate_path).map_err(|source| {
+        Error::Config(caddy_rs_core::Error::invalid(
+            "admin.identity.certificate",
+            format!("cannot read `{certificate_path}`: {source}"),
+        ))
+    })?;
+    let key_pem = std::fs::read_to_string(key_path).map_err(|source| {
+        Error::Config(caddy_rs_core::Error::invalid(
+            "admin.identity.key",
+            format!("cannot read `{key_path}`: {source}"),
+        ))
+    })?;
+    let certificate =
+        caddy_rs_tls::TlsCertificate::from_pem(&certificate_pem, &key_pem).map_err(|error| {
+            Error::Config(caddy_rs_core::Error::invalid(
+                "admin.identity",
+                format!("admin identity certificate/key pair is not loadable: {error}"),
+            ))
+        })?;
+    let resolver =
+        caddy_rs_tls::CertificateResolver::from_certificates([certificate]).map_err(|error| {
+            Error::Config(caddy_rs_core::Error::invalid(
+                "admin.identity.certificate",
+                format!("admin identity certificate is not usable for TLS: {error}"),
+            ))
+        })?;
+
+    let mut roots = Vec::new();
+    for (access_index, access) in remote.access_control.iter().enumerate() {
+        for (key_index, public_key) in access.public_keys.iter().enumerate() {
+            let located =
+                format!("admin.remote.access_control[{access_index}].public_keys[{key_index}]");
+            let der = base64::engine::general_purpose::STANDARD
+                .decode(public_key.trim())
+                .map_err(|error| {
+                    Error::Config(caddy_rs_core::Error::invalid(
+                        &located,
+                        format!("public key is not base64-encoded DER: {error}"),
+                    ))
+                })?;
+            roots.push(rustls::pki_types::CertificateDer::from(der));
+        }
+    }
+
+    let mut options = caddy_rs_tls::TlsServerOptions::default();
+    // The admin API is HTTP/1.1; do not negotiate HTTP/2 or solve ACME challenges here.
+    options.alpn = vec![b"http/1.1".to_vec()];
+    options.client_auth = caddy_rs_tls::ClientAuthMode::RequireAndVerify;
+    options.client_auth_configured = true;
+    options.client_auth_roots = roots;
+    let config = caddy_rs_tls::build_server_config(Arc::new(resolver), &options)?;
+    Ok(config)
+}
+
+/// Extract the authenticated client identity from a completed mutual-TLS handshake.
+///
+/// The verifier has already chained the leaf to one of the access-control certificates, so the
+/// identity is trustworthy; it feeds `admin.remote.access_control` matching in `caddy-rs-admin`.
+fn remote_admin_client_identity(
+    certificates: Option<&[rustls::pki_types::CertificateDer<'_>]>,
+) -> Option<caddy_rs_admin::AdminClientIdentity> {
+    let certificates = certificates?;
+    let leaf = certificates.first()?;
+    let info = caddy_rs_tls::ClientCertificateInfo::parse(leaf.as_ref(), true).ok()?;
+    Some(caddy_rs_admin::AdminClientIdentity {
+        certificates: certificates
+            .iter()
+            .map(|certificate| certificate.as_ref().to_vec())
+            .collect(),
+        subject: info.subject,
+        issuer: info.issuer,
+        serial: info.serial,
+    })
+}
+
+/// Bind the mutual-TLS remote admin listener (`admin.remote.listen`) and serve the admin API.
+///
+/// Accepts exactly like [`bind_admin`]; the difference is the mandatory TLS handshake, after
+/// which the verified client identity is attached to every [`AdminRequest`]. A failed handshake
+/// (no certificate, or a certificate outside the access-control pool) never reaches the API.
+pub(crate) async fn bind_admin_remote(
+    configured: &str,
+    api: AdminApi,
+    server_config: Arc<rustls::ServerConfig>,
+) -> Result<ListenerHandle, Error> {
+    let address = ListenAddr::parse(configured).map_err(|reason| Error::Listen {
+        listen: configured.to_string(),
+        reason,
+    })?;
+    if address.network != Network::Tcp {
+        return Err(Error::Listen {
+            listen: configured.to_string(),
+            reason: "remote administration requires a TCP listen address".to_string(),
+        });
+    }
+    let listener = bind_configured_tcp(configured, &address).await?;
+    let socket_addr = listener
+        .local_addr()
+        .map_err(|error| Error::bind(configured, error))?;
+    let acceptor = TlsAcceptor::from(server_config);
+    let (shutdown, mut receiver) = watch::channel(false);
+    let (force, mut force_receiver) = watch::channel(false);
+    let tracker = Arc::new(ConnectionTracker::default());
+    let loop_tracker = Arc::clone(&tracker);
+    let task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                changed = receiver.changed() => {
+                    if changed.is_err() || *receiver.borrow() {
+                        break;
+                    }
+                }
+                changed = force_receiver.changed() => {
+                    if changed.is_err() || *force_receiver.borrow() {
+                        break;
+                    }
+                }
+                accepted = listener.accept() => {
+                    let Ok((stream, _peer)) = accepted else { continue };
+                    let api = api.clone();
+                    let acceptor = acceptor.clone();
+                    let connection_shutdown = receiver.clone();
+                    let connection_force = force_receiver.clone();
+                    let tracked = loop_tracker.guard();
+                    tokio::spawn(async move {
+                        let _tracked = tracked;
+                        // Mandatory mutual TLS: a missing or untrusted client certificate fails
+                        // here and the connection is dropped before any admin request is parsed.
+                        let tls = match acceptor.accept(stream).await {
+                            Ok(tls) => tls,
+                            Err(error) => {
+                                tracing::debug!(%error, "remote admin TLS handshake failed");
+                                return;
+                            }
+                        };
+                        let identity = remote_admin_client_identity(
+                            tls.get_ref().1.peer_certificates(),
+                        );
+                        let service = service_fn(move |request: hyper::Request<Incoming>| {
+                            let api = api.clone();
+                            let identity = identity.clone();
+                            async move {
+                                let (parts, body) = request.into_parts();
+                                let body = match body.collect().await {
+                                    Ok(collected) => collected.to_bytes(),
+                                    Err(_) => Bytes::new(),
+                                };
+                                let path = parts
+                                    .uri
+                                    .path_and_query()
+                                    .map(|value| value.as_str().to_string())
+                                    .unwrap_or_else(|| "/".to_string());
+                                let response = api
+                                    .handle(AdminRequest {
+                                        method: parts.method,
+                                        path,
+                                        headers: parts.headers,
+                                        body,
+                                        client_identity: identity,
+                                    })
+                                    .await;
+                                let mut builder = hyper::Response::builder().status(response.status);
+                                for (name, value) in &response.headers {
+                                    builder = builder.header(name, value);
+                                }
+                                Ok::<_, std::convert::Infallible>(
+                                    builder
+                                        .body(Body::from_bytes(response.body))
+                                        .expect("admin response is valid"),
+                                )
+                            }
+                        });
+                        let limits = Arc::new(ServerLimits::default());
+                        let activity = Arc::new(ConnectionActivity::default());
+                        serve_connection(
+                            tls,
+                            service,
+                            connection_shutdown,
+                            connection_force,
+                            limits,
+                            activity,
+                        )
+                        .await;
+                    });
+                }
+            }
+        }
+    });
+    Ok(ListenerHandle {
+        shutdown,
+        force,
+        tracker,
+        task,
+        bound: socket_addr.to_string(),
+        socket_addr: Some(socket_addr),
+    })
+}
+
+/// End-to-end tests for the mutual-TLS remote admin listener (`admin.remote`).
+///
+/// Certificates are minted with the `openssl` CLI from the test (it is present in this
+/// environment); the workspace carries no certificate-generation crate in `Cargo.lock`, and the
+/// internal CA in `crates/tls` issues server certificates, not client-auth test material.
+#[cfg(test)]
+mod remote_admin_tests {
+    use super::{bind_admin, bind_admin_remote, remote_admin_tls_config};
+    use caddy_rs_admin::AdminApi;
+    use caddy_rs_core::{
+        AdminAccess, AdminIdentity, AdminPermissions, AdminRemote, GenerationStore,
+    };
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+    use tokio_rustls::TlsConnector;
+
+    struct Certificates {
+        directory: PathBuf,
+        ca_pem: String,
+        client_pem: String,
+        client_key_pem: String,
+        untrusted_client_pem: String,
+        untrusted_client_key_pem: String,
+        server_pem: String,
+        server_key_pem: String,
+    }
+
+    impl Drop for Certificates {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    fn openssl(directory: &Path, arguments: &[&str]) {
+        let output = std::process::Command::new("openssl")
+            .current_dir(directory)
+            .args(arguments)
+            .output()
+            .expect("openssl is available for the mTLS integration test");
+        assert!(
+            output.status.success(),
+            "openssl {arguments:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn write_extensions(directory: &Path, name: &str, contents: &str) -> String {
+        let path = directory.join(name);
+        std::fs::write(&path, contents).expect("extension file");
+        path.to_string_lossy().into_owned()
+    }
+
+    fn mint(
+        certificates: &Certificates,
+        prefix: &str,
+        ca_prefix: &str,
+        extensions: &str,
+        cn: &str,
+    ) {
+        let directory = &certificates.directory;
+        let extension_file = write_extensions(directory, &format!("{prefix}.ext"), extensions);
+        openssl(
+            directory,
+            &[
+                "req",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-keyout",
+                &format!("{prefix}.key"),
+                "-out",
+                &format!("{prefix}.csr"),
+                "-subj",
+                &format!("/CN={cn}"),
+            ],
+        );
+        openssl(
+            directory,
+            &[
+                "x509",
+                "-req",
+                "-in",
+                &format!("{prefix}.csr"),
+                "-CA",
+                &format!("{ca_prefix}.pem"),
+                "-CAkey",
+                &format!("{ca_prefix}.key"),
+                "-CAcreateserial",
+                "-out",
+                &format!("{prefix}.pem"),
+                "-days",
+                "2",
+                "-sha256",
+                "-extfile",
+                &extension_file,
+            ],
+        );
+    }
+
+    fn mint_ca(directory: &Path, prefix: &str) {
+        openssl(
+            directory,
+            &[
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-keyout",
+                &format!("{prefix}.key"),
+                "-out",
+                &format!("{prefix}.pem"),
+                "-days",
+                "2",
+                "-subj",
+                &format!("/CN={prefix}"),
+                "-addext",
+                "basicConstraints=critical,CA:TRUE",
+            ],
+        );
+    }
+
+    fn read(directory: &Path, name: &str) -> String {
+        std::fs::read_to_string(directory.join(name)).expect("PEM file")
+    }
+
+    fn test_certificates(name: &str) -> Certificates {
+        let directory =
+            std::env::temp_dir().join(format!("caddy-rs-admin-mtls-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("temp directory");
+        mint_ca(&directory, "ca");
+        mint_ca(&directory, "other-ca");
+        let mut certificates = Certificates {
+            ca_pem: read(&directory, "ca.pem"),
+            client_pem: String::new(),
+            client_key_pem: String::new(),
+            untrusted_client_pem: String::new(),
+            untrusted_client_key_pem: String::new(),
+            server_pem: String::new(),
+            server_key_pem: String::new(),
+            directory,
+        };
+        mint(
+            &certificates,
+            "server",
+            "ca",
+            "subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n",
+            "localhost",
+        );
+        mint(
+            &certificates,
+            "client",
+            "ca",
+            "extendedKeyUsage=clientAuth\n",
+            "client-ok",
+        );
+        mint(
+            &certificates,
+            "untrusted-client",
+            "other-ca",
+            "extendedKeyUsage=clientAuth\n",
+            "client-untrusted",
+        );
+        let directory = certificates.directory.clone();
+        certificates.server_pem = read(&directory, "server.pem");
+        certificates.server_key_pem = read(&directory, "server.key");
+        certificates.client_pem = read(&directory, "client.pem");
+        certificates.client_key_pem = read(&directory, "client.key");
+        certificates.untrusted_client_pem = read(&directory, "untrusted-client.pem");
+        certificates.untrusted_client_key_pem = read(&directory, "untrusted-client.key");
+        certificates
+    }
+
+    fn der_base64(pem: &str) -> String {
+        use base64::Engine as _;
+        let chain = caddy_rs_tls::certificates_from_pem(pem).expect("PEM certificate");
+        base64::engine::general_purpose::STANDARD.encode(chain[0].as_ref())
+    }
+
+    /// The remote configuration used by the tests: the client certificate may GET `/config/`,
+    /// while the CA entry may only GET `/id/` (so a different path/method is denied).
+    fn remote(certificates: &Certificates) -> AdminRemote {
+        AdminRemote {
+            listen: None,
+            access_control: vec![
+                AdminAccess {
+                    public_keys: vec![der_base64(&certificates.client_pem)],
+                    permissions: vec![AdminPermissions {
+                        paths: Some(vec!["/config/".to_string()]),
+                        methods: Some(vec!["GET".to_string()]),
+                        extra: Default::default(),
+                    }],
+                    subjects: Vec::new(),
+                    serials: Vec::new(),
+                    extra: Default::default(),
+                },
+                AdminAccess {
+                    public_keys: vec![der_base64(&certificates.ca_pem)],
+                    permissions: vec![AdminPermissions {
+                        paths: Some(vec!["/id/".to_string()]),
+                        methods: Some(vec!["GET".to_string()]),
+                        extra: Default::default(),
+                    }],
+                    subjects: Vec::new(),
+                    serials: Vec::new(),
+                    extra: Default::default(),
+                },
+            ],
+            extra: Default::default(),
+        }
+    }
+
+    fn identity(certificates: &Certificates) -> AdminIdentity {
+        AdminIdentity {
+            identifiers: vec!["localhost".to_string()],
+            certificate: Some(
+                certificates
+                    .directory
+                    .join("server.pem")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            key: Some(
+                certificates
+                    .directory
+                    .join("server.key")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            issuers: None,
+            extra: Default::default(),
+        }
+    }
+
+    fn api() -> AdminApi {
+        AdminApi::new(Arc::new(GenerationStore::with_builtin_registry()))
+    }
+
+    fn client_config(
+        certificates: &Certificates,
+        client_certificate: Option<(&str, &str)>,
+    ) -> rustls::ClientConfig {
+        let _ = caddy_rs_tls::install_default_crypto_provider();
+        let mut roots = rustls::RootCertStore::empty();
+        let ca = caddy_rs_tls::certificates_from_pem(&certificates.ca_pem).expect("CA PEM");
+        roots.add(ca[0].clone()).expect("CA is a trust anchor");
+        let builder = rustls::ClientConfig::builder().with_root_certificates(roots);
+        match client_certificate {
+            None => builder.with_no_client_auth(),
+            Some((certificate_pem, key_pem)) => {
+                let chain = caddy_rs_tls::certificates_from_pem(certificate_pem)
+                    .expect("client certificate");
+                let key = private_key(certificate_pem, key_pem);
+                builder
+                    .with_client_auth_cert(chain, key)
+                    .expect("client certificate matches its key")
+            }
+        }
+    }
+
+    fn private_key(
+        certificate_pem: &str,
+        key_pem: &str,
+    ) -> rustls::pki_types::PrivateKeyDer<'static> {
+        let certificate = caddy_rs_tls::TlsCertificate::from_pem(certificate_pem, key_pem)
+            .expect("client certificate and key");
+        certificate
+            .private_key()
+            .expect("client private key")
+            .clone_key()
+    }
+
+    /// One HTTP/1.1 request over an established TLS stream, returning the status code.
+    async fn request_status(
+        stream: &mut tokio_rustls::client::TlsStream<TcpStream>,
+        request: &str,
+    ) -> u16 {
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write request");
+        stream.flush().await.expect("flush request");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .expect("read response");
+        let response = String::from_utf8_lossy(&response);
+        let status = response
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or_else(|| panic!("no status line in {response:?}"));
+        status.parse().expect("numeric status")
+    }
+
+    async fn connect(
+        certificates: &Certificates,
+        client_certificate: Option<(&str, &str)>,
+        port: u16,
+    ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, std::io::Error> {
+        let config = client_config(certificates, client_certificate);
+        let connector = TlsConnector::from(Arc::new(config));
+        let stream = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect to the remote admin listener");
+        let server_name =
+            rustls::pki_types::ServerName::try_from("localhost").expect("server name");
+        connector
+            .connect(server_name, stream)
+            .await
+            .map_err(std::io::Error::other)
+    }
+
+    /// Load `admin.identity` + `admin.remote` through the normal config path (the same `/load`
+    /// endpoint operators use) so the API's access-control decision reads the live configuration,
+    /// and prove the configuration validates cleanly.
+    async fn load_remote_admin_config(api: &AdminApi, certificates: &Certificates) {
+        let remote = remote(certificates);
+        let identity = identity(certificates);
+        let config = serde_json::json!({
+            "admin": {
+                "identity": serde_json::to_value(&identity).expect("identity serializes"),
+                "remote": serde_json::to_value(&remote).expect("remote serializes"),
+            }
+        });
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/json"),
+        );
+        let response = api
+            .handle(caddy_rs_admin::AdminRequest {
+                method: http::Method::POST,
+                path: "/load".to_string(),
+                headers,
+                body: bytes::Bytes::from(config.to_string()),
+                client_identity: None,
+            })
+            .await;
+        assert_eq!(
+            response.status,
+            200,
+            "admin.identity + admin.remote loads through /load: {}",
+            String::from_utf8_lossy(&response.body)
+        );
+    }
+
+    async fn start_remote(
+        certificates: &Certificates,
+    ) -> (caddy_rs_admin::AdminApi, u16, super::ListenerHandle) {
+        let identity = identity(certificates);
+        let remote = remote(certificates);
+        let tls = remote_admin_tls_config(&identity, &remote).expect("remote admin TLS config");
+        let api = api();
+        load_remote_admin_config(&api, certificates).await;
+        let handle = bind_admin_remote("127.0.0.1:0", api.clone(), tls)
+            .await
+            .expect("bind remote admin listener");
+        let port = handle.socket_addr.expect("bound address").port();
+        (api, port, handle)
+    }
+
+    /// Issue one request and report whether the server refused to serve it (TLS 1.3 completes the
+    /// client handshake before the server validates the client certificate, so rejection shows up
+    /// on the first read rather than in `connect`).
+    async fn request_refused(
+        stream: tokio_rustls::client::TlsStream<TcpStream>,
+        request: &'static [u8],
+    ) -> bool {
+        let mut stream = stream;
+        if stream.write_all(request).await.is_err() {
+            return true;
+        }
+        let mut response = Vec::new();
+        match stream.read_to_end(&mut response).await {
+            Err(_) => true,
+            Ok(_) => response.is_empty(),
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_client_certificate_reaches_authorized_endpoint() {
+        let certificates = test_certificates("valid");
+        let (_api, port, handle) = start_remote(&certificates).await;
+        let mut stream = connect(
+            &certificates,
+            Some((&certificates.client_pem, &certificates.client_key_pem)),
+            port,
+        )
+        .await
+        .expect("valid client certificate completes the handshake");
+        let status = request_status(
+            &mut stream,
+            "GET /config/ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_eq!(status, 200);
+        handle.stop().await;
+    }
+
+    #[tokio::test]
+    async fn missing_client_certificate_fails_the_handshake() {
+        let certificates = test_certificates("missing");
+        let (_api, port, handle) = start_remote(&certificates).await;
+        let stream = connect(&certificates, None, port).await;
+        let refused = match stream {
+            Err(error) => {
+                assert!(
+                    error.to_string().to_lowercase().contains("certificate")
+                        || error.to_string().to_lowercase().contains("alert"),
+                    "unexpected handshake error: {error}"
+                );
+                true
+            }
+            Ok(stream) => {
+                request_refused(
+                    stream,
+                    b"GET /config/ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                )
+                .await
+            }
+        };
+        assert!(
+            refused,
+            "mutual TLS must refuse a request without a client certificate"
+        );
+        handle.stop().await;
+    }
+
+    #[tokio::test]
+    async fn untrusted_client_certificate_fails_the_handshake() {
+        let certificates = test_certificates("untrusted");
+        let (_api, port, handle) = start_remote(&certificates).await;
+        let stream = connect(
+            &certificates,
+            Some((
+                &certificates.untrusted_client_pem,
+                &certificates.untrusted_client_key_pem,
+            )),
+            port,
+        )
+        .await;
+        let refused = match stream {
+            Err(_) => true,
+            Ok(stream) => {
+                request_refused(
+                    stream,
+                    b"GET /config/ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                )
+                .await
+            }
+        };
+        assert!(
+            refused,
+            "a certificate outside the access-control pool is rejected"
+        );
+        handle.stop().await;
+    }
+
+    #[tokio::test]
+    async fn authenticated_but_unauthorized_path_and_method_are_403() {
+        let certificates = test_certificates("unauthorized");
+        let (_api, port, handle) = start_remote(&certificates).await;
+        let mut stream = connect(
+            &certificates,
+            Some((&certificates.client_pem, &certificates.client_key_pem)),
+            port,
+        )
+        .await
+        .expect("valid client certificate");
+
+        // `/load` is not allowed by any entry that matches this identity.
+        let status = request_status(
+            &mut stream,
+            "POST /load HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_eq!(status, 403);
+        drop(stream);
+
+        // The path is allowed somewhere but only for GET, so the method is what is missing.
+        let mut stream = connect(
+            &certificates,
+            Some((&certificates.client_pem, &certificates.client_key_pem)),
+            port,
+        )
+        .await
+        .expect("valid client certificate");
+        let status = request_status(
+            &mut stream,
+            "DELETE /config/ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_eq!(status, 403);
+        handle.stop().await;
+    }
+
+    #[tokio::test]
+    async fn plaintext_admin_listener_still_serves_its_endpoints() {
+        let api = api();
+        let handle = bind_admin("127.0.0.1:0", api)
+            .await
+            .expect("bind plaintext admin listener");
+        let port = handle.socket_addr.expect("bound address").port();
+        let mut stream = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect to the plaintext admin listener");
+        stream
+            .write_all(b"GET /config/ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write request");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .expect("read response");
+        let response = String::from_utf8_lossy(&response);
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "plaintext admin endpoint still answers 200: {response}"
+        );
+        handle.stop().await;
+    }
 }
 
 #[cfg(test)]

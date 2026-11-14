@@ -164,6 +164,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod access;
 pub mod access_log;
 mod config_path;
 pub mod inventory;
@@ -187,6 +188,7 @@ use caddy_rs_core::{drain, Config, Generation, GenerationStore, LifecycleState};
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use serde_json::{json, Value};
 
+pub use access::{decide as decide_admin_access, AccessDenial, AdminClientIdentity};
 pub use access_log::{
     common_name_from_subject, AccessLogConfig, AccessLogEntry, AccessLogError, AccessLogField,
     AccessLogRequest, AccessLogSampler, AccessLogTls, AccessLogUpstream, HeaderRedaction,
@@ -244,6 +246,10 @@ pub struct AdminRequest {
     pub headers: HeaderMap,
     /// Request body.
     pub body: Bytes,
+    /// Authenticated client identity when the request arrived on the mutual-TLS remote admin
+    /// listener (`admin.remote`). `None` on the plaintext (local) listener, where the origin
+    /// policy applies instead.
+    pub client_identity: Option<AdminClientIdentity>,
 }
 
 /// An admin API response.
@@ -800,9 +806,30 @@ impl AdminApi {
             None => (request.path.as_str(), None),
         };
 
-        let origin = match self.origin_policy().check(&request.headers) {
-            Ok(origin) => origin,
-            Err(violation) => return AdminResponse::api_error(violation.status, violation.message),
+        // A request that arrived on the mutual-TLS remote listener carries a verified client
+        // identity: Caddy replaces the origin/host policy with access-control enforcement for
+        // that endpoint (`admin.go:226-229`, `admin.go:852-858`). The plaintext listener keeps
+        // the origin policy unchanged.
+        let origin = match &request.client_identity {
+            Some(identity) => {
+                let remote = self
+                    .store
+                    .current()
+                    .and_then(|generation| generation.config().admin.clone())
+                    .and_then(|admin| admin.remote);
+                if let Err(denial) =
+                    access::decide(remote.as_ref(), Some(identity), &request.method, path)
+                {
+                    return AdminResponse::api_error(denial.status, denial.message);
+                }
+                None
+            }
+            None => match self.origin_policy().check(&request.headers) {
+                Ok(origin) => origin,
+                Err(violation) => {
+                    return AdminResponse::api_error(violation.status, violation.message)
+                }
+            },
         };
 
         let mut response = self.dispatch(path, &request).await;
@@ -1776,6 +1803,7 @@ mod tests {
             path: path.to_string(),
             headers: HeaderMap::new(),
             body: Bytes::from(body.to_string()),
+            client_identity: None,
         }
     }
 

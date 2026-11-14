@@ -14,6 +14,9 @@ zstd = "0.13"
 bytes = { workspace = true }
 caddy-rs-config = { workspace = true, default-features = false }
 caddy-rs-core = { workspace = true, default-features = false }
+# Client-certificate metadata for `admin.remote.access_control` identity matching: the configured
+# `public_keys` are DER certificates and are parsed with the same helper as the TLS layer.
+caddy-rs-tls = { workspace = true, default-features = false }
 http = { workspace = true }
 ring = "0.17.14"
 serde = { workspace = true }

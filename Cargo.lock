@@ -258,6 +258,7 @@ dependencies = [
  "bytes",
  "caddy-rs-config",
  "caddy-rs-core",
+ "caddy-rs-tls",
  "flate2",
  "http",
  "ring",
@@ -331,6 +332,7 @@ name = "caddy-rs-core"
 version = "0.1.0-trial.6"
 dependencies = [
  "async-trait",
+ "base64 0.23.1",
  "regex",
  "serde",
  "serde_json",

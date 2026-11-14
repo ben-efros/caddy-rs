@@ -41,7 +41,10 @@ use crate::activation::{plan_activation, ActivationError, ActivationPlan, Socket
 use crate::auto_https::{PreparedAutomaticHttps, RedirectPolicy};
 use crate::error::{Error, Result};
 use crate::limits::ServerLimits;
-use crate::listeners::{bind, bind_admin, ListenerHandle, ListenerState, SharedListeners};
+use crate::listeners::{
+    bind, bind_admin, bind_admin_remote, remote_admin_tls_config, ListenerHandle, ListenerState,
+    SharedListeners,
+};
 use crate::observability::{record_certificate_metrics, AccessLogRuntime, ServerAccessLogPolicy};
 use crate::proxy_protocol::ListenerWrappers;
 use crate::upstream_status::ProxyUpstreamStatusSource;
@@ -219,6 +222,11 @@ pub struct ServerRuntime {
     states: SharedListeners,
     listeners: BTreeMap<String, ListenerHandle>,
     admin: Option<ListenerHandle>,
+    /// The mutual-TLS remote admin listener (`admin.remote`), independent of the plaintext one.
+    admin_remote: Option<ListenerHandle>,
+    /// The `admin.identity`/`admin.remote` pair the running remote listener was built from, so a
+    /// reload only rebinds when the secure endpoint's configuration actually changed.
+    admin_remote_config: Option<(caddy_rs_core::AdminIdentity, caddy_rs_core::AdminRemote)>,
     admin_api: AdminApi,
     status: RuntimeStatus,
     /// Socket-activation resolution state; resolved once on the first apply.
@@ -352,6 +360,8 @@ impl ServerRuntime {
             states: SharedListeners::new(RwLock::new(std::collections::HashMap::new())),
             listeners: BTreeMap::new(),
             admin: None,
+            admin_remote: None,
+            admin_remote_config: None,
             admin_api,
             status: RuntimeStatus::default(),
             activation: ActivationState::Environment,
@@ -1105,7 +1115,38 @@ impl ServerRuntime {
                 self.admin = Some(handle);
             }
         }
+
+        // Caddy starts the secure endpoint from `admin.remote` alone (`caddy.go:605`), even when
+        // the plaintext endpoint is disabled (`replaceRemoteAdminServer` only checks
+        // `cfg.Admin.Remote`). It always runs beside the local endpoint, never instead of it.
+        let desired_remote = admin_config
+            .remote
+            .clone()
+            .map(|remote| (admin_config.identity.clone().unwrap_or_default(), remote));
+        if desired_remote != self.admin_remote_config {
+            if let Some(handle) = self.admin_remote.take() {
+                handle.stop().await;
+            }
+            self.admin_remote_config = None;
+            if let Some((identity, remote)) = desired_remote {
+                let listen = remote.listen_addr().to_string();
+                let tls_config = remote_admin_tls_config(&identity, &remote)?;
+                let handle = bind_admin_remote(&listen, self.admin_api.clone(), tls_config).await?;
+                tracing::info!(
+                    listen,
+                    bound = %handle.bound,
+                    "secure admin remote endpoint listening"
+                );
+                self.admin_remote = Some(handle);
+                self.admin_remote_config = Some((identity, remote));
+            }
+        }
         Ok(())
+    }
+
+    /// Every running admin listener (plaintext first, then the mutual-TLS one).
+    fn admin_handles(&self) -> impl Iterator<Item = &ListenerHandle> {
+        self.admin.iter().chain(self.admin_remote.iter())
     }
 
     /// Record the applied generation in the observable status.
@@ -1170,6 +1211,13 @@ impl ServerRuntime {
     /// The admin API's actual bound address.
     pub fn admin_address(&self) -> Option<SocketAddr> {
         self.admin.as_ref().and_then(|handle| handle.socket_addr)
+    }
+
+    /// The mutual-TLS remote admin listener's actual bound address (`admin.remote`).
+    pub fn remote_admin_address(&self) -> Option<SocketAddr> {
+        self.admin_remote
+            .as_ref()
+            .and_then(|handle| handle.socket_addr)
     }
 
     /// Serve until `shutdown` becomes true or the configuration is stopped, reconciling
@@ -1292,7 +1340,7 @@ impl ServerRuntime {
         }
 
         // Stop accepting new connections before draining in-flight work.
-        if let Some(admin) = &self.admin {
+        for admin in self.admin_handles() {
             admin.begin_graceful();
         }
         for handle in self.listeners.values() {
@@ -1341,8 +1389,7 @@ impl ServerRuntime {
 
     /// Trackers for every current listener and the admin endpoint.
     fn trackers(&self) -> Vec<Arc<crate::listeners::ConnectionTracker>> {
-        self.admin
-            .iter()
+        self.admin_handles()
             .map(crate::listeners::ListenerHandle::tracker)
             .chain(
                 self.listeners
@@ -1354,7 +1401,7 @@ impl ServerRuntime {
 
     /// Force-close connections on every listener and the admin endpoint.
     fn force_all(&self) {
-        if let Some(admin) = &self.admin {
+        for admin in self.admin_handles() {
             admin.begin_force();
         }
         for handle in self.listeners.values() {
@@ -1364,8 +1411,7 @@ impl ServerRuntime {
 
     /// Number of currently active connections across all listeners (including the admin endpoint).
     pub fn active_connections(&self) -> usize {
-        self.admin
-            .iter()
+        self.admin_handles()
             .map(crate::listeners::ListenerHandle::active_connections)
             .chain(
                 self.listeners
@@ -1396,6 +1442,9 @@ impl ServerRuntime {
         }
         if let Some(admin) = self.admin.take() {
             admin.stop_forcibly().await;
+        }
+        if let Some(admin_remote) = self.admin_remote.take() {
+            admin_remote.stop_forcibly().await;
         }
         let listeners = std::mem::take(&mut self.listeners);
         for (_, handle) in listeners {
