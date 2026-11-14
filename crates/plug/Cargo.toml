@@ -8,9 +8,11 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-# The in-process WASM host runtime (T-PLUG-011). Off by default: the pinned Wasmtime release has
-# open sandbox advisories (tracked by T-PLUG-030), so the secure baseline and `minimal` do not
-# compile a guest runtime. Enable explicitly (`--features wasm-runtime`) only for trusted plugins.
+# The in-process WASM host runtime (T-PLUG-011). Off by default: the secure baseline and `minimal`
+# profiles compile no guest runtime; enabling it is an explicit opt-in for trusted plugins. The
+# pinned Wasmtime 36.0.20 has no open sandbox advisories (the previous 34.0.2 pin did, tracked by
+# T-PLUG-030), but the feature still raises the effective MSRV to 1.88 (wat 1.263), so build it
+# with rustc >= 1.88.
 default = []
 wasm-runtime = ["dep:wasmtime"]
 
