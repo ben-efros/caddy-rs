@@ -998,20 +998,10 @@ fn rewritten_uri(request: &Request, template: &str) -> Result<Uri> {
     if let Some(configured_path) = configured_path {
         if !configured_path.is_empty() {
             // Path-valued placeholders must be inserted in escaped form so a literal `?`, `%` or
-            // `#` in a path cannot be reinterpreted as a delimiter/escape by the URI parser.
-            let mut configured_path = configured_path.to_string();
-            for placeholder in [
-                "{http.matchers.file.relative}",
-                "{http.matchers.file.remainder}",
-            ] {
-                let name = placeholder.trim_start_matches('{').trim_end_matches('}');
-                if configured_path.contains(placeholder) {
-                    if let Some(value) = request.get_placeholder(name) {
-                        configured_path = configured_path
-                            .replace(placeholder, &escape_path_preserving_slashes(&value));
-                    }
-                }
-            }
+            // `#` in a path cannot be reinterpreted as a delimiter/escape by the URI parser. Regexp
+            // captures (`{http.regexp.*}`) hold text from the decoded path for `path_regexp`, so
+            // they must be escaped the same way (upstream 7591cff1fb03).
+            let configured_path = escape_decoded_path_placeholders(configured_path, request);
             let escaped_path = request
                 .replace_all(&configured_path)
                 .replace("{http.request.uri.path}", request.uri.path());
@@ -1089,6 +1079,44 @@ fn escape_path_preserving_slashes(value: &str) -> String {
             output.push_str(&format!("%{byte:02X}"));
         }
     }
+    output
+}
+
+/// Placeholder names whose value is decoded path text: Caddy inserts them percent-encoded (slashes
+/// preserved) before the `?` so a `?`, `%` or `#` from the request stays path data. Names ending in
+/// `_escaped` are inserted unchanged (handled by `escape_decoded_path_placeholders`).
+fn is_decoded_path_placeholder(name: &str) -> bool {
+    name == "http.matchers.file.relative"
+        || name == "http.matchers.file.remainder"
+        || name.starts_with("http.regexp.")
+}
+
+/// Substitute every decoded-path placeholder in a configured `uri` path part with its
+/// percent-encoded (slashes preserved) value. `path_regexp` captures the once-decoded path, so
+/// inserting a capture verbatim lets a second decode turn it into a real path separator or query
+/// delimiter after route guards have run; escaping it first keeps it data (upstream 7591cff1fb03).
+/// `_escaped` names and all other placeholders are left for the normal expansion pass.
+fn escape_decoded_path_placeholders(configured_path: &str, request: &Request) -> String {
+    let mut output = String::with_capacity(configured_path.len());
+    let mut rest = configured_path;
+    while let Some(open) = rest.find('{') {
+        let Some(relative_close) = rest[open + 1..].find('}') else {
+            break;
+        };
+        let close = open + 1 + relative_close;
+        let name = &rest[open + 1..close];
+        output.push_str(&rest[..open]);
+        if is_decoded_path_placeholder(name) && !name.ends_with("_escaped") {
+            match request.get_placeholder(name) {
+                Some(value) => output.push_str(&escape_path_preserving_slashes(&value)),
+                None => output.push_str(&rest[open..=close]),
+            }
+        } else {
+            output.push_str(&rest[open..=close]);
+        }
+        rest = &rest[close + 1..];
+    }
+    output.push_str(rest);
     output
 }
 
