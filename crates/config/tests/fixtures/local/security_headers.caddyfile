@@ -1,0 +1,24 @@
+example.com {
+	header {
+		security_headers {
+			x_frame_options DENY
+			x_content_type_options nosniff
+			referrer_policy strict-origin-when-cross-origin
+			content_security_policy {
+				default_src 'self'
+				script_src 'self' 'nonce-{csp.nonce}'
+				img_src 'self' data:
+			}
+			hsts {
+				max_age 31536000
+				include_subdomains
+				preload
+			}
+			permissions_policy {
+				geolocation=()
+				microphone=()
+			}
+		}
+	}
+	respond "ok"
+}

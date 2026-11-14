@@ -7654,6 +7654,10 @@ struct HeaderOpsPlan {
     replace: BTreeMap<String, Vec<(String, String)>>,
     require: Option<Map<String, Value>>,
     deferred: bool,
+    /// `security_headers { ... }` block: a caddy-rs extension to the `header` directive that the
+    /// `headers` handler consumes as secure defaults (T-ROUTE-050). Kept as the already-shaped
+    /// handler JSON so the adapter never re-implements the handler's validation.
+    security_headers: Option<Value>,
 }
 
 impl HeaderOpsPlan {
@@ -7663,6 +7667,7 @@ impl HeaderOpsPlan {
             && self.delete.is_empty()
             && self.replace.is_empty()
             && self.require.is_none()
+            && self.security_headers.is_none()
     }
 
     /// Caddy's `applyHeaderOp`.
@@ -7754,7 +7759,15 @@ impl HeaderOpsPlan {
         if self.is_empty() {
             return None;
         }
-        Some(json!({"handler": "headers", "response": self.response()}))
+        let mut handler = Map::new();
+        handler.insert("handler".to_string(), json!("headers"));
+        if !self.response().is_empty() {
+            handler.insert("response".to_string(), Value::Object(self.response()));
+        }
+        if let Some(security_headers) = &self.security_headers {
+            handler.insert("security_headers".to_string(), security_headers.clone());
+        }
+        Some(Value::Object(handler))
     }
 }
 
@@ -7781,6 +7794,33 @@ fn header_handlers(directive: &Directive, args: &[String]) -> caddy_rs_core::Res
 
     for item in &directive.block {
         match item.name.as_str() {
+            "security_headers" => {
+                if has_inline {
+                    return Err(adapter_error(
+                        item.position.clone(),
+                        "cannot specify headers in both arguments and block",
+                    ));
+                }
+                if !item.args.is_empty() {
+                    return Err(adapter_error(
+                        item.position.clone(),
+                        "`security_headers` does not take arguments; declare options in its block",
+                    ));
+                }
+                if item.block.is_empty() {
+                    return Err(adapter_error(
+                        item.position.clone(),
+                        "`security_headers` requires a block",
+                    ));
+                }
+                if handler.security_headers.is_some() {
+                    return Err(adapter_error(
+                        item.position.clone(),
+                        "duplicate `security_headers` block in one `header` directive",
+                    ));
+                }
+                handler.security_headers = Some(parse_security_headers_block(item)?);
+            }
             "defer" => {
                 if !item.args.is_empty() {
                     return Err(adapter_error(
@@ -7837,6 +7877,316 @@ fn header_handlers(directive: &Directive, args: &[String]) -> caddy_rs_core::Res
         handlers.push(handler);
     }
     Ok(handlers)
+}
+
+/// Parse a `security_headers { ... }` block inside `header` into the handler's JSON shape.
+///
+/// The emitted object is exactly the `security_headers` block the `headers` handler accepts
+/// (T-ROUTE-050), so a Caddyfile and a hand-written JSON configuration produce the same document.
+/// Semantic checks (CSP grammar, HSTS admission, header-value safety) stay in the handler: the
+/// adapter only rejects malformed *Caddyfile* structure, and each such error carries the line of
+/// the offending option.
+fn parse_security_headers_block(item: &Directive) -> caddy_rs_core::Result<Value> {
+    let mut block = Map::new();
+    for option in &item.block {
+        let key = match option.name.as_str() {
+            "x_frame_options" | "frame_options" => "x_frame_options",
+            "x_content_type_options" | "content_type_options" => "x_content_type_options",
+            "referrer_policy" => "referrer_policy",
+            "content_security_policy" | "csp" => "content_security_policy",
+            "hsts" | "strict_transport_security" => "hsts",
+            "permissions_policy" => "permissions_policy",
+            other => {
+                return Err(adapter_error(
+                    option.position.clone(),
+                    format!(
+                        "unknown `security_headers` option `{other}` (expected `x_frame_options`, \
+                         `x_content_type_options`, `referrer_policy`, `content_security_policy`, \
+                         `hsts` or `permissions_policy`)"
+                    ),
+                ))
+            }
+        };
+        if block.contains_key(key) {
+            return Err(adapter_error(
+                option.position.clone(),
+                format!("duplicate `security_headers` option `{key}`"),
+            ));
+        }
+        let value = match key {
+            "content_security_policy" => parse_csp_option(option)?,
+            "hsts" => parse_hsts_option(option)?,
+            "permissions_policy" => parse_permissions_policy_option(option)?,
+            _ => json!(single_option_value(option)?),
+        };
+        block.insert(key.to_string(), value);
+    }
+    Ok(Value::Object(block))
+}
+
+/// One scalar option of a `security_headers` block (`x_frame_options`, `referrer_policy`, ...).
+fn single_option_value(option: &Directive) -> caddy_rs_core::Result<String> {
+    if !option.block.is_empty() {
+        return Err(adapter_error(
+            option.position.clone(),
+            format!("`{}` does not take a block", option.name),
+        ));
+    }
+    match option.args.as_slice() {
+        [value] => Ok(value.clone()),
+        [] => Err(adapter_error(
+            option.position.clone(),
+            format!("`{}` requires a value", option.name),
+        )),
+        _ => Err(adapter_error(
+            option.position.clone(),
+            format!("`{}` takes exactly one value", option.name),
+        )),
+    }
+}
+
+/// `content_security_policy` as a header-value string or a block of `directive sources...` lines.
+///
+/// Block directive names may be written with underscores (`default_src`) or hyphens
+/// (`default-src`); both emit the hyphenated JSON key the CSP parser expects. Every directive name
+/// is accepted here and validated by the handler, so a new CSP directive does not need an adapter
+/// change.
+fn parse_csp_option(option: &Directive) -> caddy_rs_core::Result<Value> {
+    if !option.args.is_empty() && !option.block.is_empty() {
+        return Err(adapter_error(
+            option.position.clone(),
+            "`content_security_policy` takes either one header value or a block of directives, not \
+             both",
+        ));
+    }
+    if !option.args.is_empty() {
+        return match option.args.as_slice() {
+            [value] => Ok(json!(value)),
+            _ => Err(adapter_error(
+                option.position.clone(),
+                "`content_security_policy` takes exactly one header value; quote values containing \
+                 spaces",
+            )),
+        };
+    }
+    if option.block.is_empty() {
+        return Err(adapter_error(
+            option.position.clone(),
+            "`content_security_policy` requires a header value or a block of directives",
+        ));
+    }
+    let mut directives = Map::new();
+    for directive in &option.block {
+        if !directive.block.is_empty() {
+            return Err(adapter_error(
+                directive.position.clone(),
+                format!(
+                    "CSP directive `{}` takes sources on its line, not a block",
+                    directive.name
+                ),
+            ));
+        }
+        let name = directive.name.replace('_', "-");
+        if directives.contains_key(&name) {
+            return Err(adapter_error(
+                directive.position.clone(),
+                format!("duplicate CSP directive `{name}`"),
+            ));
+        }
+        let sources: Vec<String> = directive
+            .args
+            .iter()
+            .map(|source| normalize_csp_source(source))
+            .collect();
+        directives.insert(name, json!(sources));
+    }
+    Ok(Value::Object(directives))
+}
+
+/// Translate the Caddyfile nonce spelling to the handler's placeholder token.
+///
+/// The CSP surface documents `{csp.nonce}` as a source token that the handler replaces with
+/// `'nonce-<random>'` per response; a Caddyfile author who writes the expanded-looking
+/// `'nonce-{csp.nonce}'` (the form used in the task/plan example) means the same thing, so the
+/// adapter emits the opaque token instead of a value the strict CSP parser rejects as malformed
+/// base64. Any other source is passed through verbatim for the handler to validate.
+fn normalize_csp_source(source: &str) -> String {
+    if source == "'nonce-{csp.nonce}'" {
+        "{csp.nonce}".to_string()
+    } else {
+        source.to_string()
+    }
+}
+
+/// `hsts { max_age <seconds>; include_subdomains; preload }` as the handler's HSTS object.
+fn parse_hsts_option(option: &Directive) -> caddy_rs_core::Result<Value> {
+    if !option.args.is_empty() {
+        return Err(adapter_error(
+            option.position.clone(),
+            "`hsts` options are declared in its block",
+        ));
+    }
+    if option.block.is_empty() {
+        return Err(adapter_error(
+            option.position.clone(),
+            "`hsts` requires at least one option (`max_age`, `include_subdomains` or `preload`)",
+        ));
+    }
+    // The handler's `hsts` object is inert unless `enabled` is true; a Caddyfile `hsts { ... }`
+    // block is the opt-in, so emit the gate rather than silently configuring nothing.
+    let mut hsts = Map::new();
+    hsts.insert("enabled".to_string(), json!(true));
+    for flag in &option.block {
+        let key = match flag.name.as_str() {
+            "max_age" => "max_age",
+            "include_subdomains" => "include_subdomains",
+            "preload" => "preload",
+            other => {
+                return Err(adapter_error(
+                    flag.position.clone(),
+                    format!(
+                        "unknown `hsts` option `{other}` (expected `max_age`, `include_subdomains` \
+                         or `preload`)"
+                    ),
+                ))
+            }
+        };
+        if hsts.contains_key(key) {
+            return Err(adapter_error(
+                flag.position.clone(),
+                format!("duplicate `hsts` option `{key}`"),
+            ));
+        }
+        if key == "max_age" {
+            let value = single_option_value(flag)?;
+            let max_age: u64 = value.parse().map_err(|_| {
+                adapter_error(
+                    flag.position.clone(),
+                    format!("`hsts max_age` must be a non-negative integer, got `{value}`"),
+                )
+            })?;
+            hsts.insert(key.to_string(), json!(max_age));
+        } else {
+            if !flag.args.is_empty() || !flag.block.is_empty() {
+                return Err(adapter_error(
+                    flag.position.clone(),
+                    format!("`hsts {key}` is a flag and does not take arguments"),
+                ));
+            }
+            hsts.insert(key.to_string(), json!(true));
+        }
+    }
+    Ok(Value::Object(hsts))
+}
+
+/// `permissions_policy` as inline `feature=allowlist` tokens or a block of them.
+///
+/// The handler accepts a header-value string or a feature object; the block form maps onto the
+/// object so `geolocation=()` becomes `{"geolocation": false}` and `geolocation=(self https://x)`
+/// becomes `{"geolocation": ["self", "https://x"]}` — exactly the JSON a hand-written
+/// configuration would use.
+fn parse_permissions_policy_option(option: &Directive) -> caddy_rs_core::Result<Value> {
+    if !option.args.is_empty() && !option.block.is_empty() {
+        return Err(adapter_error(
+            option.position.clone(),
+            "`permissions_policy` takes either inline features or a block, not both",
+        ));
+    }
+    let mut features = Map::new();
+    if !option.block.is_empty() {
+        for item in &option.block {
+            let mut tokens = Vec::with_capacity(item.args.len() + 1);
+            tokens.push(item.name.clone());
+            tokens.extend(item.args.iter().cloned());
+            insert_permissions_tokens(&mut features, &tokens, &item.position)?;
+        }
+    } else if !option.args.is_empty() {
+        insert_permissions_tokens(&mut features, &option.args, &option.position)?;
+    } else {
+        return Err(adapter_error(
+            option.position.clone(),
+            "`permissions_policy` requires at least one feature",
+        ));
+    }
+    Ok(Value::Object(features))
+}
+
+fn insert_permissions_tokens(
+    features: &mut Map<String, Value>,
+    tokens: &[String],
+    position: &Position,
+) -> caddy_rs_core::Result<()> {
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = &tokens[index];
+        let Some((feature, first_value)) = token.split_once('=') else {
+            return Err(adapter_error(
+                position.clone(),
+                format!(
+                    "permissions policy token `{token}` must be written as `feature=allowlist` \
+                     (use `feature=()` to disable a feature)"
+                ),
+            ));
+        };
+        if feature.is_empty() {
+            return Err(adapter_error(
+                position.clone(),
+                format!("permissions policy token `{token}` has an empty feature name"),
+            ));
+        }
+        if features.contains_key(feature) {
+            return Err(adapter_error(
+                position.clone(),
+                format!("duplicate permissions policy feature `{feature}`"),
+            ));
+        }
+        let mut value = first_value.to_string();
+        index += 1;
+        // The lexer splits an unquoted parenthesised allowlist into several tokens
+        // (`geolocation=(self https://example.com)`), so rejoin it until the closing parenthesis.
+        if value.starts_with('(') && !value.ends_with(')') {
+            while index < tokens.len() && !value.ends_with(')') {
+                value.push(' ');
+                value.push_str(&tokens[index]);
+                index += 1;
+            }
+            if !value.ends_with(')') {
+                return Err(adapter_error(
+                    position.clone(),
+                    format!("unterminated allowlist for permissions policy feature `{feature}`"),
+                ));
+            }
+        }
+        features.insert(feature.to_string(), permission_value(&value, position)?);
+    }
+    Ok(())
+}
+
+fn permission_value(value: &str, position: &Position) -> caddy_rs_core::Result<Value> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(adapter_error(
+            position.clone(),
+            "permissions policy allowlist is empty; write `()` to disable a feature",
+        ));
+    }
+    if value == "()" {
+        return Ok(json!(false));
+    }
+    if value == "*" {
+        return Ok(json!(true));
+    }
+    if let Some(inner) = value
+        .strip_prefix('(')
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        let origins: Vec<&str> = inner.split_whitespace().collect();
+        if origins.is_empty() {
+            return Ok(json!(false));
+        }
+        return Ok(json!(origins));
+    }
+    Ok(json!(value))
 }
 
 /// Parse Caddy's response matcher used by `header { match ... }`.
