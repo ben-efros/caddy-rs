@@ -7,26 +7,27 @@
 Usage: caddy-rs <COMMAND>
 
 Commands:
-  version       Print the version
-  build-info    Print information about this build
-  list-modules  List modules compiled into this build
-  adapt         Adapt a user-facing config to Caddy JSON
-  validate      Validate a configuration without running it
-  run           Run the server with a configuration
-  start         Start the server in the background
-  reload        Load a new configuration into a running server through its admin API
-  stop          Stop a running server through its admin API
-  respond       Simple, hard-coded HTTP responses for development and testing
-  file-server   Spins up a production-ready file server
-  reverse-proxy A quick and production-ready reverse proxy
-  environ       Print the environment as seen by this caddy-rs process
-  fmt           Formats a Caddyfile
-  completion    Generate a shell completion script
-  manpage       Generates the manual pages for caddy-rs commands
-  pki           Inspect, show and export the local certificate authority material
-  trust         Install the local CA root certificate into the host trust stores
-  storage       Commands for working with Caddy's storage (EXPERIMENTAL)
-  help          Print this message or the help of the given subcommand(s)
+  setup          Zero-config first-boot authentication bootstrap (ADR-0039)
+  version        Print the version
+  build-info     Print information about this build
+  list-modules   List modules compiled into this build
+  adapt          Adapt a user-facing config to Caddy JSON
+  validate       Validate a configuration without running it
+  run            Run the server with a configuration
+  start          Start the server in the background (stock Caddy's `caddy start`)
+  reload         Load a new configuration into a running server through its admin API
+  stop           Stop a running server through its admin API
+  respond        Simple, hard-coded HTTP responses for development and testing
+  file-server    Spins up a production-ready file server
+  reverse-proxy  A quick and production-ready reverse proxy
+  environ        Print the environment as seen by this caddy-rs process
+  fmt            Formats a Caddyfile
+  completion     Generate or install a shell completion script
+  manpage        Generates the manual pages for caddy-rs commands
+  pki            Inspect, show and export the local certificate authority material
+  trust          Install the local CA root certificate into the host trust stores
+  storage        Commands for working with Caddy's storage (EXPERIMENTAL)
+  help           Print this message or the help of the given subcommand(s)
 ```
 
 There is no global `--version` flag; use the `version` subcommand.
@@ -45,6 +46,56 @@ them with a located error naming both the deprecated and the current spelling. T
 configuration-acceptance strictness only and never relaxes a security rejection. It is available on
 `adapt`, `validate` and `run`; the JSON adapter ignores it.
 
+## setup
+
+Zero-config first-boot authentication bootstrap (ADR-0039). `setup` generates a temporary
+Caddyfile, starts `caddy-rs run` on it, and prints one activation URL per host carrying a single-use
+token. It is a caddy-rs extension: stock Caddy has no `setup` subcommand.
+
+Synopsis: `caddy-rs setup [OPTIONS] --domain <DOMAIN>`
+
+| Option | Description | Default |
+|---|---|---|
+| `--domain <DOMAIN>` | Valid hostname used for the site address and activation URLs, and as the WebAuthn relying-party ID. | required |
+| `--auth-method <METHOD>` | `webauthn` (WebAuthn/Passkey, FIDO2) or `totp` (time-based one-time password, RFC 6238). | `webauthn` |
+| `--storage <STORAGE>` | Storage backend for credential persistence: `file_system`, `redis`, `postgres` or `consul` (validated; persistence is not implemented yet). | `file_system` |
+| `--registration-timeout <DURATION>` | Activation-token TTL; must be between 5m and 60m. | `15m` |
+| `--data-dir <PATH>` | Data directory. The generated Caddyfile is written to `<data-dir>/setup/Caddyfile`. | `$CADDY_RS_DATA_DIR`, else `./.caddy-rs` |
+| `--host <HOST>` | Additional host name; repeatable. Each becomes a site address and an activation URL; duplicates are dropped. | none |
+| `--listen-address <ADDR>` | Only the port is used: the generated site is `https://<host>:<port>`, the listener binds `:port` on all interfaces, and automatic HTTPS also binds `:80`. The supplied IP is not used as a bind address (bind-address bug, T-SETUP-007); the port appears in the activation URL (omitted when 443). | `:443` |
+| `--acme` | Accepted but not wired: the generated configuration only omits `local_certs`; it adds no ACME issuer or automation policy, so the server falls back to automatic HTTPS's default ACME attempt (T-SETUP-008). | off |
+| `--cloudflare` | Accepted but not wired: only the presence of a token source (`--cf-api-token` or `CF_API_TOKEN`) is validated; no `dns.providers.cloudflare` configuration is generated (T-SETUP-008). It also suppresses `local_certs`, so the server falls back to automatic HTTPS. | off |
+| `--cf-api-token <SOURCE>` | Cloudflare API-token source: omitted reads `CF_API_TOKEN`, `/path` reads the first line of that file, `-` reads standard input. The token value is never accepted as an argument. | `CF_API_TOKEN` |
+
+The generated Caddyfile has a global block (`admin localhost:2019`, plus `local_certs` unless
+`--acme` or `--cloudflare` is given) and one `https://<host>:<port>` site per host
+containing a `route /_caddy-pm/activate*` block and a catch-all `respond`. The text is adapted
+before boot, so a generation bug is reported as a located error. The activation URL is
+`https://<host>[:<port>]/_caddy-pm/activate?token=<hex>`.
+
+`--data-dir` only chooses where the generated Caddyfile is written
+(`<data-dir>/setup/Caddyfile`). The boot runner invokes `caddy-rs run --config <path> --adapter
+caddyfile` without `--data-dir`, so the running server resolves its data directory normally (see
+`run` above); the flag does not control the server's data directory.
+
+The token is 128 random bits rendered as 32 hex characters and held in memory. The token store
+records a single use and rejects an elapsed TTL or a second use, but the activation route does not
+consult it yet (T-SETUP-002), so no printed token is currently redeemable. `setup` prints the auth
+method, storage, token lifetime, expiry (Unix seconds) and each activation URL, then runs
+`caddy-rs run --config <data-dir>/setup/Caddyfile --adapter caddyfile` in the foreground.
+
+Documented limits of this build (T-SETUP-002/T-SETUP-003/T-SETUP-004/T-SETUP-005):
+
+* The activation route is a placeholder `respond "caddy-pm-rs activation layer is not running" 503`;
+  no enrollment UI is served. WebAuthn/TOTP enrollment is not implemented yet, and the token store
+  is not wired to the route, so a printed token cannot actually be redeemed.
+* `setup` does not spawn `caddy-rs-pm` (the literal 503 message still says `caddy-pm-rs`); only `caddy-rs` itself is started.
+  Per-backend credential persistence is not implemented.
+* In the stock-compatibility profile (`CADDY_RS_STOCK_COMPAT=1`, `true` or `yes`) `setup` is
+  rejected as an unknown command, because stock Caddy has no `setup` subcommand.
+
+See [AUTHN.md](AUTHN.md), [TOTP.md](TOTP.md), [WEBAUTHN.md](WEBAUTHN.md) and [INSTALL.md](INSTALL.md).
+
 ## version
 
 Prints the build version and the Caddy configuration baseline it targets.
@@ -60,7 +111,7 @@ caddy-rs version
 ```
 
 ```text
-caddy-rs 0.1.0 (Caddy configuration baseline v2.11.9)
+caddy-rs 0.1.0-trial.6 (Caddy configuration baseline v2.11.9)
 ```
 
 ```sh
@@ -68,7 +119,7 @@ caddy-rs version --json
 ```
 
 ```json
-{"caddy_compat_baseline":"v2.11.9","version":"0.1.0"}
+{"caddy_compat_baseline":"v2.11.9","version":"0.1.0-trial.6"}
 ```
 
 Exit status is 0.
@@ -108,6 +159,7 @@ Synopsis: `caddy-rs adapt [OPTIONS] --config <CONFIG>`
 |---|---|---|
 | `-c, --config <CONFIG>` | Configuration file to read. | required |
 | `--adapter <ADAPTER>` | `caddyfile` or `json`; inferred from the file name when omitted. | inferred |
+| `--envfile <PATH>` | Environment file(s) in `KEY=VALUE` form, loaded before adaptation; repeatable. | none |
 | `--adapt-mode <MODE>` | Caddyfile acceptance mode: `compatible`, `warn` or `strict`. | `compatible` |
 | `--pretty` | Indent the JSON output. | off |
 | `-o, --output <OUTPUT>` | Write the JSON to a file instead of standard output. | standard output |
@@ -957,6 +1009,8 @@ Warnings go to standard error and do not change the exit status.
 | Variable | Read by | Effect |
 |---|---|---|
 | `CADDY_RS_DATA_DIR` | `run`, `pki`, `trust`, `storage` | Data directory when `--data-dir` is absent; `storage` uses it when the config sets no `storage.root`. |
+| `CADDY_RS_STOCK_COMPAT` | `setup` | Stock-compatibility profile for the CLI: `1`, `true` or `yes` (case-insensitive, surrounding whitespace ignored) makes `setup` refuse as an unknown command, because stock Caddy has no `setup` subcommand. Unset or any other value means off. |
+| `CF_API_TOKEN` | `setup` | Cloudflare API token used by `--cloudflare` when `--cf-api-token` is omitted; if both are absent, `setup` fails before starting the server. |
 | `XDG_DATA_HOME` | `run`, `completion`, `storage` | Base for Caddy's default data directory; bash/zsh completion install location. |
 | `XDG_CONFIG_HOME` | `run`, `completion` | Base for the default autosave path; fish/PowerShell completion install location. |
 | `HOME` | `run`, `trust`, `completion`, `storage` | Fallback base for the autosave path; home directory for NSS/Firefox discovery in `trust`; base for completion paths and detection dot-directories. |

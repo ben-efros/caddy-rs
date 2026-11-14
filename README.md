@@ -149,7 +149,8 @@ configuration fails before any listener changes.
 | [Installation](docs/INSTALL.md) | requirements, building, offline builds, where state lives |
 | [Command line](docs/CLI.md) | every subcommand, option and exit-code convention |
 | [Features](docs/FEATURES.md) | everything the server does, by area |
-| [Configuration](docs/CONFIGURATION.md) | Caddyfile vs JSON, validation, admin API |
+| [Configuration](docs/CONFIGURATION.md) | Caddyfile vs JSON, validation, admin API, compatibility modes |
+| [Authentication](docs/AUTHN.md) | proxy-manager passwords, JWT/refresh tokens, TOTP ([details](docs/TOTP.md)), passkeys ([details](docs/WEBAUTHN.md)) |
 | [Plugins](docs/PLUGINS.md) | runtime module models and how to write one |
 | [Design](docs/DESIGN.md) | crate layout and runtime architecture |
 | [Testing](docs/TESTING.md) | test layers and how to run them |
@@ -157,7 +158,7 @@ configuration fails before any listener changes.
 
 ## Status
 
-This is a **preview release** (`0.1.0-trial.1`). It is suitable for evaluation, internal services and
+This is a **preview release** (`0.1.0-trial.6`). It is suitable for evaluation, internal services and
 deployments you can afford to debug. Before relying on it for public traffic, read the release notes
 that accompany the preview and prefer certificate sources you control (pre-loaded certificates or the
 internal CA) over public ACME issuance.
