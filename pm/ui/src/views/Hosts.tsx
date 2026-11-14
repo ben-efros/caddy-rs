@@ -29,6 +29,7 @@ import {
   parseDomains,
   toast,
 } from '../ui';
+import { SecurityHeadersTab } from '../pages/Hosts/SecurityHeadersTab';
 
 const PAGE_SIZE = 25;
 
@@ -46,6 +47,7 @@ interface HostFormState {
 }
 
 export function Hosts(): JSX.Element {
+  const [tab, setTab] = useState<'hosts' | 'security-headers'>('hosts');
   const [filters, setFilters] = useState<Filters>({ domain: '', kind: '', enabled: '' });
   const [offset, setOffset] = useState(0);
   const [page, setPage] = useState<Page<HostSummary> | null>(null);
@@ -155,7 +157,30 @@ export function Hosts(): JSX.Element {
         </button>
       </div>
 
-      <div className="card">
+      <div className="tabs">
+        <button
+          type="button"
+          className={`tab${tab === 'hosts' ? ' active' : ''}`}
+          data-tab="hosts"
+          id="hosts-tab"
+          onClick={() => setTab('hosts')}
+        >
+          Hosts
+        </button>
+        <button
+          type="button"
+          className={`tab${tab === 'security-headers' ? ' active' : ''}`}
+          data-tab="security-headers"
+          id="security-headers-tab-button"
+          onClick={() => setTab('security-headers')}
+        >
+          Security headers
+        </button>
+      </div>
+
+      {tab === 'security-headers' ? <SecurityHeadersTab /> : null}
+
+      <div className={tab === 'hosts' ? 'card' : 'card hidden'}>
         <div className="card-header">
           <form className="filters" id="filters" onSubmit={onFilterSubmit}>
             <input name="domain" placeholder="Filter by domain" defaultValue={filters.domain} />

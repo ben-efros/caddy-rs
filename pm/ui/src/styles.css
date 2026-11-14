@@ -749,3 +749,80 @@ fieldset legend {
   white-space: nowrap;
   vertical-align: middle;
 }
+
+/* --- security headers ------------------------------------------------------------------- */
+
+.security-headers-editor {
+  display: grid;
+  gap: 4px;
+}
+
+.security-headers-editor.inherited {
+  opacity: 0.62;
+}
+
+.inherited-note {
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.warning-banner {
+  margin: 8px 0;
+  padding: 8px 12px;
+  border-left: 3px solid #d9a520;
+  border-radius: 4px;
+  background: rgba(217, 165, 32, 0.12);
+  color: var(--text);
+  font-size: 13px;
+}
+
+.inline-error {
+  margin: 6px 0 0;
+  color: #e5534b;
+  font-size: 13px;
+}
+
+.preview-block {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-elevated);
+  font-size: 13px;
+}
+
+.preview-block code {
+  display: block;
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+}
+
+.preview-label {
+  display: block;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.header-preview-list {
+  margin: 6px 0 0;
+  padding-left: 18px;
+}
+
+.permissions-row {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) minmax(220px, 2fr) auto;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.field-docs code {
+  font-size: 12px;
+}
