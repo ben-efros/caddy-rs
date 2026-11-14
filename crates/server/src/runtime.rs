@@ -1810,11 +1810,14 @@ impl ServerRuntime {
                     .collect()
             })
             .unwrap_or_default();
-        // The derived challenge/redirect listener has no server config of its own: it exists only
-        // to answer one HTTPS site's automatic-HTTPS responses, so it inherits that site's
-        // `server_identity` (DIV-0126). With several automatic-HTTPS servers the first one wins,
-        // mirroring Caddy's single derived redirect server.
+        // The derived challenge/redirect listener has no server config of its own and can carry
+        // only one identity (DIV-0126), mirroring Caddy's single derived redirect server. The first
+        // TLS-terminating automatic-HTTPS server in `apps.http.servers` order wins; when another
+        // such server resolves to a different identity the final (non-bootstrap) apply logs a
+        // warning, because that site's HTTP-01 challenge and redirect responses still carry the
+        // selected identity rather than its own.
         let mut automatic_identity: Option<caddy_rs_core::ResolvedIdentity> = None;
+        let mut automatic_identities: Vec<(String, caddy_rs_core::ResolvedIdentity)> = Vec::new();
         for (server_name, server) in &http.servers {
             let limits = Arc::new(ServerLimits::from_http_server(
                 server_name,
@@ -1967,8 +1970,17 @@ impl ServerRuntime {
                 } else {
                     (None, None)
                 };
-                if terminates_tls && automatic.is_some() && automatic_identity.is_none() {
-                    automatic_identity = Some(limits.server_identity.clone());
+                if terminates_tls && automatic.is_some() {
+                    if automatic_identity.is_none() {
+                        automatic_identity = Some(limits.server_identity.clone());
+                    }
+                    if !automatic_identities
+                        .iter()
+                        .any(|(name, _)| name == server_name)
+                    {
+                        automatic_identities
+                            .push((server_name.clone(), limits.server_identity.clone()));
+                    }
                 }
                 let automatic_serving = if !terminates_tls {
                     let listener_port = caddy_rs_core::ListenAddr::parse(listen)
@@ -2018,12 +2030,25 @@ impl ServerRuntime {
                             .build(&[])
                             .map_err(Error::Http)?,
                     );
+                    // One identity for the whole derived listener: the first TLS-terminating
+                    // automatic-HTTPS server's (DIV-0126). Conflicting servers are warned about
+                    // once per apply, in the final phase only so bootstrap does not duplicate it.
+                    let selected_identity = automatic_identity.clone().unwrap_or_default();
+                    if !context.bootstrap {
+                        if let Some(warning) = automatic_identity_conflict_warning(
+                            &automatic_identities,
+                            &selected_identity,
+                        ) {
+                            tracing::warn!("{warning}");
+                            eprintln!("caddy-rs: warning: {warning}");
+                        }
+                    }
                     states.insert(
                         listen.clone(),
                         Arc::new(ListenerState {
                             router,
                             limits: Arc::new(ServerLimits {
-                                server_identity: automatic_identity.clone().unwrap_or_default(),
+                                server_identity: selected_identity,
                                 ..ServerLimits::default()
                             }),
                             trusted_proxies: Arc::new(
@@ -2048,6 +2073,51 @@ impl ServerRuntime {
         }
         Ok(states)
     }
+}
+
+/// Human-readable form of one identity surface for the conflict warning: the HTTP `Server`
+/// value, or the fact that the header is suppressed.
+fn describe_server_identity(identity: &caddy_rs_core::ResolvedIdentity) -> String {
+    match &identity.http_server_header {
+        Some(value) => format!("Server: {value}"),
+        None => "no Server header".to_string(),
+    }
+}
+
+/// Load-time warning for automatic-HTTPS servers whose resolved `server_identity` values
+/// differ while sharing the single derived cleartext listener (DIV-0126).
+///
+/// The listener has no server config of its own and can carry only one identity, so the
+/// selected (first) server's identity is stamped on every HTTP-01 challenge and HTTP→HTTPS
+/// redirect response. `servers` is collected in `apps.http.servers` order (a `BTreeMap`), so
+/// the message is deterministic. Returns `None` when every automatic-HTTPS server resolves to
+/// the selected identity, which is the common case because the default identity is uniform.
+fn automatic_identity_conflict_warning(
+    servers: &[(String, caddy_rs_core::ResolvedIdentity)],
+    selected: &caddy_rs_core::ResolvedIdentity,
+) -> Option<String> {
+    let selected_name = servers
+        .iter()
+        .find(|(_, identity)| identity == selected)
+        .map(|(name, _)| name.as_str())?;
+    let conflicting: Vec<String> = servers
+        .iter()
+        .filter(|(_, identity)| identity != selected)
+        .map(|(name, identity)| format!("`{name}` ({})", describe_server_identity(identity)))
+        .collect();
+    if conflicting.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "the derived cleartext automatic-HTTPS listener can carry only one \
+         `server_identity` (DIV-0126): `{selected_name}` ({}) wins and every HTTP-01 \
+         challenge and HTTP→HTTPS redirect response on that listener uses its identity, while \
+         the following servers are configured with a different identity: {}; those servers keep \
+         their own identity only on their HTTPS listeners. Give every automatic-HTTPS server the same \
+         `server_identity`, or configure the HTTP port explicitly, to silence this warning",
+        describe_server_identity(selected),
+        conflicting.join(", ")
+    ))
 }
 
 /// Parse Caddy's `apps.http.servers.<name>.allow_0rtt` QUIC early-data switch.
@@ -2814,6 +2884,78 @@ mod forwarded_trust_warning_tests {
         assert!(
             !listen_address_is_exposed("not-a-listen-address"),
             "a malformed address must not produce a bogus warning"
+        );
+    }
+}
+
+#[cfg(test)]
+mod automatic_identity_warning_tests {
+    use caddy_rs_core::{ResolvedIdentity, ServerIdentity};
+
+    use super::automatic_identity_conflict_warning;
+
+    fn custom(value: &str) -> ResolvedIdentity {
+        ResolvedIdentity::resolve(
+            Some(ServerIdentity::Custom(value.to_string())),
+            false,
+            false,
+        )
+    }
+
+    fn servers(pairs: &[(&str, ResolvedIdentity)]) -> Vec<(String, ResolvedIdentity)> {
+        pairs
+            .iter()
+            .map(|(name, identity)| ((*name).to_string(), identity.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn uniform_identities_do_not_warn() {
+        let identity = custom("Alpha Server/1");
+        let entries = servers(&[("srv0", identity.clone()), ("srv1", identity.clone())]);
+        assert_eq!(
+            automatic_identity_conflict_warning(&entries, &identity),
+            None,
+            "identical identities must stay silent"
+        );
+    }
+
+    #[test]
+    fn conflicting_custom_identities_name_the_selected_and_the_other_server() {
+        let alpha = custom("Alpha Server/1");
+        let beta = custom("Beta Server/2");
+        let entries = servers(&[("srv0", alpha.clone()), ("srv1", beta)]);
+        let warning = automatic_identity_conflict_warning(&entries, &alpha)
+            .expect("conflicting identities must warn");
+        // The first server in `apps.http.servers` order wins, and the message names both sides
+        // deterministically so the operator can tell which site is affected.
+        for expected in ["srv0", "Alpha Server/1", "srv1", "Beta Server/2"] {
+            assert!(
+                warning.contains(expected),
+                "warning must mention {expected:?}: {warning}"
+            );
+        }
+    }
+
+    #[test]
+    fn suppressed_header_is_described_explicitly() {
+        let suppressed = ResolvedIdentity::resolve(Some(ServerIdentity::None), false, false);
+        let beta = custom("Beta Server/2");
+        let entries = servers(&[("srv0", suppressed.clone()), ("srv1", beta)]);
+        let warning = automatic_identity_conflict_warning(&entries, &suppressed)
+            .expect("a suppressed header is a distinct identity");
+        assert!(
+            warning.contains("no Server header"),
+            "warning must spell out the suppressed header: {warning}"
+        );
+    }
+
+    #[test]
+    fn no_automatic_servers_do_not_warn() {
+        let entries: Vec<(String, ResolvedIdentity)> = Vec::new();
+        assert_eq!(
+            automatic_identity_conflict_warning(&entries, &ResolvedIdentity::default()),
+            None
         );
     }
 }
