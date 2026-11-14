@@ -41,12 +41,25 @@ fn runtime() -> (TempDir, ApiState) {
     let temp_dir = TempDir::new().expect("create temp dir");
     let config = RuntimeConfig::new(temp_dir.path().join("data"));
     let runtime = PmRuntime::open(config).expect("open runtime");
-    (temp_dir, ApiState::new(runtime, authn()))
+    // These helpers back tests written before authentication existed; production never opens the
+    // window (`ApiState::new` leaves it closed), so the fail-closed tests use `server_with_authn`.
+    (
+        temp_dir,
+        ApiState::new(runtime, authn()).open_bootstrap_window(),
+    )
 }
 
 fn server() -> (TempDir, TestServer) {
     let (temp_dir, state) = runtime();
     (temp_dir, TestServer::new(create_router(state)))
+}
+
+/// A loopback server whose mutation window is explicitly open, standing in for the pre-setup
+/// legacy tests. New tests that care about authentication use `server_with_authn`, which is closed.
+fn server_with_open_bootstrap() -> (TempDir, TestServer) {
+    let (temp_dir, state) = runtime();
+    let app = create_router(state).into_make_service_with_connect_info::<std::net::SocketAddr>();
+    (temp_dir, TestServer::new(app))
 }
 
 /// A server plus the authn service whose store the router shares.
@@ -60,6 +73,7 @@ fn server_with_authn() -> (TempDir, TestServer, AuthnService<MemoryUserStore>) {
     let config = RuntimeConfig::new(temp_dir.path().join("data"));
     let runtime = PmRuntime::open(config).expect("open runtime");
     let authn = authn();
+    // Deliberately closed: these tests exercise the production fail-closed gate.
     let state = ApiState::new(runtime, authn.clone());
     let app = create_router(state).into_make_service_with_connect_info::<std::net::SocketAddr>();
     (temp_dir, TestServer::new(app), authn)
@@ -541,7 +555,7 @@ fn server_with_runtime() -> (TempDir, TestServer, PmRuntime) {
     let temp_dir = TempDir::new().expect("create temp dir");
     let config = RuntimeConfig::new(temp_dir.path().join("data"));
     let runtime = PmRuntime::open(config).expect("open runtime");
-    let state = ApiState::new(runtime.clone(), authn());
+    let state = ApiState::new(runtime.clone(), authn()).open_bootstrap_window();
     let app = create_router(state).into_make_service_with_connect_info::<std::net::SocketAddr>();
     (temp_dir, TestServer::new(app), runtime)
 }
@@ -1013,8 +1027,9 @@ fn server_with_inventory(records: Vec<CertificateRecord>) -> (TempDir, TestServe
     let temp_dir = TempDir::new().expect("create temp dir");
     let config = RuntimeConfig::new(temp_dir.path().join("data"));
     let runtime = PmRuntime::open(config).expect("open runtime");
-    let state =
-        ApiState::new(runtime.clone(), authn()).with_inventory(Arc::new(FakeInventory { records }));
+    let state = ApiState::new(runtime.clone(), authn())
+        .with_inventory(Arc::new(FakeInventory { records }))
+        .open_bootstrap_window();
     let app = create_router(state).into_make_service_with_connect_info::<std::net::SocketAddr>();
     (temp_dir, TestServer::new(app), runtime)
 }
@@ -1404,7 +1419,9 @@ async fn certificate_detail_etag_tracks_inventory_changes_not_just_policy_revisi
     let inventory = Arc::new(MutableInventory(std::sync::Mutex::new(Vec::new())));
     let temp_dir = TempDir::new().expect("create temp dir");
     let runtime = PmRuntime::open(RuntimeConfig::new(temp_dir.path().join("data"))).expect("open");
-    let state = ApiState::new(runtime, authn()).with_inventory(inventory.clone());
+    let state = ApiState::new(runtime, authn())
+        .with_inventory(inventory.clone())
+        .open_bootstrap_window();
     let server = TestServer::new(
         create_router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
     );
@@ -1750,8 +1767,10 @@ fn server_with_apply() -> (TempDir, TestServer, FakeAdmin) {
         Arc::new(admin.clone()),
         ConfigSettings::default(),
     );
-    let app = create_router(ApiState::new(runtime, authn()).with_applier(applier))
-        .into_make_service_with_connect_info::<std::net::SocketAddr>();
+    let state = ApiState::new(runtime, authn())
+        .with_applier(applier)
+        .open_bootstrap_window();
+    let app = create_router(state).into_make_service_with_connect_info::<std::net::SocketAddr>();
     (temp_dir, TestServer::new(app), admin)
 }
 
@@ -2358,3 +2377,620 @@ async fn a_second_administrator_can_be_deleted() {
     let users = authn.list_users().await.expect("list users");
     assert_eq!(users.len(), 1);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Session endpoints and mutation authentication (T-PM-060)
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Debug, serde::Deserialize)]
+struct SessionTokens {
+    access_token: String,
+    refresh_token: String,
+}
+
+async fn login(server: &TestServer, username: &str, password: &str) -> SessionTokens {
+    let response = server
+        .post("/api/v1/auth/login")
+        .json(&serde_json::json!({"username": username, "password": password}))
+        .await;
+    assert_eq!(
+        response.status_code(),
+        StatusCode::OK,
+        "login {username}: {}",
+        response.text()
+    );
+    assert_eq!(
+        response.header("cache-control"),
+        "no-store",
+        "a token pair must never be cached"
+    );
+    response.json()
+}
+
+fn error_envelope(response: &axum_test::TestResponse) -> ApiErrorResponse {
+    response.json()
+}
+
+#[tokio::test]
+async fn setup_returns_the_snake_case_session_shape_the_ui_reads() {
+    let (_dir, server, _authn) = server_with_authn();
+    let response = server
+        .post("/api/v1/auth/setup")
+        .json(&setup_request("admin"))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::CREATED);
+
+    let body: serde_json::Value = response.json();
+    for field in ["user_id", "access_token", "refresh_token"] {
+        assert!(
+            body.get(field).and_then(serde_json::Value::as_str).is_some_and(|value| !value.is_empty()),
+            "setup returns a non-empty `{field}`: {body}"
+        );
+    }
+    assert!(
+        body.get("accessToken").is_none(),
+        "the embedded UI client reads snake_case, not camelCase"
+    );
+}
+
+#[tokio::test]
+async fn login_returns_a_pair_and_hides_which_usernames_exist() {
+    let (_dir, server, authn) = server_with_authn();
+    first_admin(&server).await;
+
+    let session = login(&server, "admin", SETUP_PASSWORD).await;
+    assert!(
+        authn.verify_access_token(&session.access_token).await.is_ok(),
+        "the returned access token verifies against the same store"
+    );
+    assert!(!session.refresh_token.is_empty());
+
+    let wrong_password = server
+        .post("/api/v1/auth/login")
+        .json(&serde_json::json!({"username": "admin", "password": "not-the-password"}))
+        .await;
+    assert_eq!(wrong_password.status_code(), StatusCode::UNAUTHORIZED);
+    assert_eq!(wrong_password.header("www-authenticate"), "Bearer");
+
+    let unknown_user = server
+        .post("/api/v1/auth/login")
+        .json(&serde_json::json!({"username": "ghost", "password": SETUP_PASSWORD}))
+        .await;
+    assert_eq!(unknown_user.status_code(), StatusCode::UNAUTHORIZED);
+
+    let wrong_body = error_envelope(&wrong_password);
+    let unknown_body = error_envelope(&unknown_user);
+    assert_eq!(wrong_body.error.code, ErrorCode::Unauthorized);
+    assert_eq!(
+        wrong_body.error.message, unknown_body.error.message,
+        "wrong password and unknown user must not be distinguishable"
+    );
+
+    let malformed = server
+        .post("/api/v1/auth/login")
+        .json(&serde_json::json!({"username": "admin"}))
+        .await;
+    assert_eq!(
+        malformed.status_code(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a login body without a password is a typed extraction failure"
+    );
+}
+
+#[tokio::test]
+async fn login_is_rate_limited_after_repeated_failures() {
+    let (_dir, server, _authn) = server_with_authn();
+    first_admin(&server).await;
+
+    for _ in 0..5 {
+        let response = server
+            .post("/api/v1/auth/login")
+            .json(&serde_json::json!({"username": "admin", "password": "wrong-password"}))
+            .await;
+        assert_eq!(response.status_code(), StatusCode::UNAUTHORIZED);
+    }
+    let blocked = server
+        .post("/api/v1/auth/login")
+        .json(&serde_json::json!({"username": "admin", "password": "wrong-password"}))
+        .await;
+    assert_eq!(blocked.status_code(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        error_envelope(&blocked).error.code,
+        ErrorCode::RateLimited
+    );
+    let retry_after = blocked
+        .header("retry-after")
+        .to_str()
+        .expect("a Retry-After header")
+        .parse::<u64>()
+        .expect("seconds");
+    assert!((1..=60).contains(&retry_after), "{retry_after}");
+
+    // The budget is per account: another username still reaches the credential check.
+    let other = server
+        .post("/api/v1/auth/login")
+        .json(&serde_json::json!({"username": "nobody", "password": "x"}))
+        .await;
+    assert_eq!(other.status_code(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn login_requires_a_totp_code_when_the_account_has_one() {
+    let (_dir, server, authn) = server_with_authn();
+    let user = authn
+        .create_user("admin", SETUP_PASSWORD, caddy_rs_authn::Role::admin())
+        .await
+        .expect("create the administrator");
+    authn
+        .totp_setup(user.id)
+        .await
+        .expect("enable TOTP for the user");
+
+    let missing = server
+        .post("/api/v1/auth/login")
+        .json(&serde_json::json!({"username": "admin", "password": SETUP_PASSWORD}))
+        .await;
+    assert_eq!(missing.status_code(), StatusCode::UNAUTHORIZED);
+    assert!(error_envelope(&missing).error.message.contains("invalid TOTP code"));
+
+    let rejected = server
+        .post("/api/v1/auth/login")
+        .json(&serde_json::json!({
+            "username": "admin",
+            "password": SETUP_PASSWORD,
+            "totp_code": "000000"
+        }))
+        .await;
+    assert_eq!(rejected.status_code(), StatusCode::UNAUTHORIZED);
+    assert!(error_envelope(&rejected).error.message.contains("invalid TOTP code"));
+}
+
+#[tokio::test]
+async fn refresh_rotates_the_pair_and_rejects_reuse() {
+    let (_dir, server, authn) = server_with_authn();
+    first_admin(&server).await;
+    let session = login(&server, "admin", SETUP_PASSWORD).await;
+
+    let rotated = server
+        .post("/api/v1/auth/refresh")
+        .json(&serde_json::json!({"refresh_token": session.refresh_token}))
+        .await;
+    assert_eq!(rotated.status_code(), StatusCode::OK);
+    let rotated: SessionTokens = rotated.json();
+    assert_ne!(
+        rotated.refresh_token, session.refresh_token,
+        "the refresh token rotates on every exchange"
+    );
+    assert!(
+        authn.verify_access_token(&rotated.access_token).await.is_ok(),
+        "the rotated access token verifies (it may be byte-identical within the same second)"
+    );
+
+    let replay = server
+        .post("/api/v1/auth/refresh")
+        .json(&serde_json::json!({"refresh_token": session.refresh_token}))
+        .await;
+    assert_eq!(replay.status_code(), StatusCode::UNAUTHORIZED);
+    assert_eq!(error_envelope(&replay).error.code, ErrorCode::Unauthorized);
+
+    let garbage = server
+        .post("/api/v1/auth/refresh")
+        .json(&serde_json::json!({"refresh_token": "never-issued"}))
+        .await;
+    assert_eq!(garbage.status_code(), StatusCode::UNAUTHORIZED);
+
+    let empty = server
+        .post("/api/v1/auth/refresh")
+        .json(&serde_json::json!({"refresh_token": ""}))
+        .await;
+    assert_eq!(empty.status_code(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn logout_revokes_one_refresh_token_and_is_idempotent() {
+    let (_dir, server, _authn) = server_with_authn();
+    first_admin(&server).await;
+    let session = login(&server, "admin", SETUP_PASSWORD).await;
+
+    // The UI sends the camelCase field; the API accepts it as an alias so the client contract holds.
+    let logout = server
+        .post("/api/v1/auth/logout")
+        .json(&serde_json::json!({"refreshToken": session.refresh_token}))
+        .await;
+    assert_eq!(logout.status_code(), StatusCode::NO_CONTENT);
+
+    let reuse = server
+        .post("/api/v1/auth/refresh")
+        .json(&serde_json::json!({"refresh_token": session.refresh_token}))
+        .await;
+    assert_eq!(
+        reuse.status_code(),
+        StatusCode::UNAUTHORIZED,
+        "a logged-out refresh token cannot mint a new pair"
+    );
+
+    for body in [
+        serde_json::json!({"refresh_token": session.refresh_token}),
+        serde_json::json!({"refresh_token": "never-issued"}),
+        serde_json::json!({}),
+    ] {
+        let again = server.post("/api/v1/auth/logout").json(&body).await;
+        assert_eq!(
+            again.status_code(),
+            StatusCode::NO_CONTENT,
+            "logout is idempotent and never an oracle: {body}"
+        );
+    }
+
+    let without_body = server.post("/api/v1/auth/logout").await;
+    assert_eq!(
+        without_body.status_code(),
+        StatusCode::NO_CONTENT,
+        "a client that posts no body still clears its session"
+    );
+}
+
+#[tokio::test]
+async fn me_describes_the_caller_and_requires_a_bearer_token() {
+    let (_dir, server, _authn) = server_with_authn();
+    let admin = first_admin(&server).await;
+
+    let response = server
+        .get("/api/v1/auth/me")
+        .add_header("Authorization", bearer(&admin.access_token))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::OK);
+    let body: serde_json::Value = response.json();
+    assert_eq!(body["username"], "admin");
+    assert_eq!(body["role"]["name"], "admin");
+    assert_eq!(body["totp_enabled"], false);
+    assert_eq!(body["auth_epoch"], 0);
+    assert!(
+        body["id"].as_str().is_some_and(|id| !id.is_empty()),
+        "the id is the user UUID as a string"
+    );
+    assert!(body.get("password_hash").is_none(), "no credential material");
+
+    let missing = server.get("/api/v1/auth/me").await;
+    assert_eq!(missing.status_code(), StatusCode::UNAUTHORIZED);
+    assert_eq!(missing.header("www-authenticate"), "Bearer");
+
+    for header in ["Basic abc", "Bearer", "bearer", "bearer not-a-token"] {
+        let response = server
+            .get("/api/v1/auth/me")
+            .add_header("Authorization", header)
+            .await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::UNAUTHORIZED,
+            "Authorization `{header}` is rejected"
+        );
+    }
+}
+
+#[tokio::test]
+async fn me_rejects_a_token_issued_before_an_authentication_epoch_change() {
+    let (_dir, server, authn) = server_with_authn();
+    let admin = first_admin(&server).await;
+    let user = authn
+        .list_users()
+        .await
+        .expect("list users")
+        .into_iter()
+        .next()
+        .expect("the administrator exists");
+    authn
+        .revoke_all_for_user(user.id)
+        .await
+        .expect("bump the authentication epoch");
+
+    let response = server
+        .get("/api/v1/auth/me")
+        .add_header("Authorization", bearer(&admin.access_token))
+        .await;
+    assert_eq!(
+        response.status_code(),
+        StatusCode::UNAUTHORIZED,
+        "an epoch-stale token is invalidated even though it has not expired"
+    );
+}
+
+#[tokio::test]
+async fn me_reports_an_expired_access_token_as_401() {
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let runtime = PmRuntime::open(RuntimeConfig::new(temp_dir.path().join("data")))
+        .expect("open runtime");
+    let authn_config = AuthnConfig {
+        jwt_secret_source: JwtSecretSource::Ephemeral,
+        access_ttl: std::time::Duration::from_millis(1),
+        argon2_params: Argon2Config {
+            memory_cost: 4096,
+            time_cost: 1,
+            parallelism: 1,
+        },
+        ..AuthnConfig::default()
+    };
+    let authn = AuthnService::new(MemoryUserStore::new(), authn_config)
+        .expect("create authn service");
+    let state = ApiState::new(runtime, authn.clone()).open_bootstrap_window();
+    let app = create_router(state).into_make_service_with_connect_info::<std::net::SocketAddr>();
+    let server = TestServer::new(app);
+
+    authn
+        .create_user("admin", SETUP_PASSWORD, caddy_rs_authn::Role::admin())
+        .await
+        .expect("create the administrator");
+    let session = login(&server, "admin", SETUP_PASSWORD).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+
+    let response = server
+        .get("/api/v1/auth/me")
+        .add_header("Authorization", bearer(&session.access_token))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::UNAUTHORIZED);
+    assert!(error_envelope(&response)
+        .error
+        .message
+        .contains("access token expired"));
+}
+
+#[tokio::test]
+async fn mutations_require_a_bearer_token_once_an_administrator_exists() {
+    let (_dir, server, _authn) = server_with_authn();
+    first_admin(&server).await;
+
+    let requests = [
+        server
+            .post("/api/v1/hosts")
+            .json(&dead_body("blocked.example.com"))
+            .await,
+        server.post("/api/v1/config/apply").await,
+        server.put("/api/v1/security-headers").await,
+        server.post("/api/v1/certificates/intent").await,
+        server.post("/api/v1/certificates/custom").await,
+        server
+            .put("/api/v1/hosts/1")
+            .json(&dead_body("blocked.example.com"))
+            .await,
+        server.delete("/api/v1/hosts/1").await,
+        server.patch("/api/v1/hosts/1").json(&serde_json::json!({})).await,
+        server.post("/api/v1/hosts/1/enable").await,
+        server.post("/api/v1/hosts/1/disable").await,
+        server.put("/api/v1/hosts/1/security-headers").await,
+        server.delete("/api/v1/certificates/custom/1").await,
+    ];
+    for response in requests {
+        assert_eq!(response.status_code(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.header("www-authenticate"), "Bearer");
+        assert_eq!(error_envelope(&response).error.code, ErrorCode::Unauthorized);
+    }
+
+    let read = server.get("/api/v1/hosts").await;
+    assert_eq!(
+        read.status_code(),
+        StatusCode::OK,
+        "reads stay available; only mutations are gated"
+    );
+}
+
+#[tokio::test]
+async fn mutations_accept_authorized_tokens_and_forbid_a_viewer() {
+    let (_dir, server, authn) = server_with_authn();
+    let admin = first_admin(&server).await;
+
+    let created = server
+        .post("/api/v1/hosts")
+        .add_header("Authorization", bearer(&admin.access_token))
+        .json(&dead_body("admin.example.com"))
+        .await;
+    assert_eq!(created.status_code(), StatusCode::CREATED);
+
+    let (_, viewer) = user_tokens(&authn, "viewer", caddy_rs_authn::Role::viewer()).await;
+    let forbidden = server
+        .post("/api/v1/hosts")
+        .add_header("Authorization", bearer(&viewer.access_token))
+        .json(&dead_body("viewer.example.com"))
+        .await;
+    assert_eq!(forbidden.status_code(), StatusCode::FORBIDDEN);
+    assert_eq!(error_envelope(&forbidden).error.code, ErrorCode::Forbidden);
+
+    let apply = server
+        .post("/api/v1/config/apply")
+        .add_header("Authorization", bearer(&viewer.access_token))
+        .await;
+    assert_eq!(
+        apply.status_code(),
+        StatusCode::FORBIDDEN,
+        "applying a config needs settings:admin, which a viewer does not have"
+    );
+
+    let (_, editor) = user_tokens(&authn, "editor", caddy_rs_authn::Role::editor()).await;
+    let created = server
+        .post("/api/v1/hosts")
+        .add_header("Authorization", bearer(&editor.access_token))
+        .json(&dead_body("editor.example.com"))
+        .await;
+    assert_eq!(
+        created.status_code(),
+        StatusCode::CREATED,
+        "an editor may create hosts"
+    );
+
+    let apply = server
+        .post("/api/v1/config/apply")
+        .add_header("Authorization", bearer(&editor.access_token))
+        .await;
+    assert_eq!(
+        apply.status_code(),
+        StatusCode::FORBIDDEN,
+        "an editor may view settings but not apply a config"
+    );
+}
+
+#[tokio::test]
+async fn mutations_fail_closed_before_setup_by_default() {
+    // The in-memory store is empty after every restart. This is exactly the state a wiped store
+    // produces, so it must not be reachable without a credential: the only way back in is the
+    // loopback-only setup route (or the bootstrap environment variables).
+    let (_dir, server, _authn) = server_with_authn();
+    let response = server
+        .post("/api/v1/hosts")
+        .json(&dead_body("bootstrap.example.com"))
+        .await;
+    assert_eq!(
+        response.status_code(),
+        StatusCode::UNAUTHORIZED,
+        "a restarted daemon with no administrator must not open its mutations"
+    );
+    assert_eq!(response.header("www-authenticate"), "Bearer");
+}
+
+#[tokio::test]
+async fn the_bootstrap_window_is_an_explicit_test_only_opt_in() {
+    // Guards the legacy helpers above: the escape hatch works, but only when a caller asks for it,
+    // which no production constructor does.
+    let (_dir, server) = server_with_open_bootstrap();
+    let response = server
+        .post("/api/v1/hosts")
+        .json(&dead_body("bootstrap.example.com"))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn unknown_mutating_paths_are_gated_before_the_404() {
+    let (_dir, server, _authn) = server_with_authn();
+    let admin = first_admin(&server).await;
+
+    // Default-deny: a mutating path the capability table does not know still needs a credential,
+    // so a route added later cannot ship unauthenticated by omission.
+    let unauthenticated = server.post("/api/v1/nope").await;
+    assert_eq!(unauthenticated.status_code(), StatusCode::UNAUTHORIZED);
+
+    let authenticated = server
+        .post("/api/v1/nope")
+        .add_header("Authorization", bearer(&admin.access_token))
+        .await;
+    assert_eq!(authenticated.status_code(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        error_envelope(&authenticated).error.code,
+        ErrorCode::NotFound
+    );
+}
+
+#[tokio::test]
+async fn mutating_path_variants_do_not_bypass_the_gate() {
+    let (_dir, server, _authn) = server_with_authn();
+    let admin = first_admin(&server).await;
+
+    // Trailing slash and percent-encoded spellings: the gate must see a mutation in each case, and
+    // an authenticated request must fall through to the typed 404 rather than reaching a handler.
+    for path in ["/api/v1/hosts/", "/api/v1/%68osts", "/api/v1/hosts%2F1"] {
+        let unauthenticated = server.post(path).await;
+        assert_eq!(
+            unauthenticated.status_code(),
+            StatusCode::UNAUTHORIZED,
+            "{path} must be gated"
+        );
+        let authenticated = server
+            .post(path)
+            .add_header("Authorization", bearer(&admin.access_token))
+            .await;
+        assert_eq!(
+            authenticated.status_code(),
+            StatusCode::NOT_FOUND,
+            "{path} must not reach a mutation handler"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_viewer_is_forbidden_on_update_and_delete_shaped_mutations() {
+    let (_dir, server, authn) = server_with_authn();
+    first_admin(&server).await;
+    let (_, viewer) = user_tokens(&authn, "viewer", caddy_rs_authn::Role::viewer()).await;
+
+    for (method, path) in [
+        ("PUT", "/api/v1/hosts/1"),
+        ("PATCH", "/api/v1/hosts/1"),
+        ("POST", "/api/v1/hosts/1/enable"),
+        ("POST", "/api/v1/hosts/1/disable"),
+        ("PUT", "/api/v1/hosts/1/security-headers"),
+        ("DELETE", "/api/v1/hosts/1"),
+        ("DELETE", "/api/v1/certificates/custom/1"),
+    ] {
+        let request = match method {
+            "PUT" => server.put(path),
+            "PATCH" => server.patch(path),
+            "POST" => server.post(path),
+            _ => server.delete(path),
+        };
+        let response = request
+            .add_header("Authorization", bearer(&viewer.access_token))
+            .await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::FORBIDDEN,
+            "{method} {path}"
+        );
+        assert_eq!(
+            error_envelope(&response).error.code,
+            ErrorCode::Forbidden,
+            "{method} {path}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_malformed_logout_body_is_a_client_error_not_a_success() {
+    let (_dir, server, _authn) = server_with_authn();
+    let response = server
+        .post("/api/v1/auth/logout")
+        .add_header("Content-Type", "application/json")
+        .text("not-json")
+        .await;
+    assert!(
+        response.status_code().is_client_error(),
+        "got {}",
+        response.status_code()
+    );
+    assert_ne!(response.status_code(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn configuration_reads_reject_a_non_loopback_host_header() {
+    // DNS rebinding: a page served from an attacker-controlled name can point requests at
+    // 127.0.0.1, but the browser still sends the attacker name in Host.
+    let (_dir, server) = server();
+    for host in [
+        "evil.example.com",
+        "127.0.0.1.evil.example.com",
+        "localhost.evil.example.com",
+        "",
+    ] {
+        let response = server.get("/api/v1/hosts").add_header("Host", host).await;
+        assert_eq!(response.status_code(), StatusCode::FORBIDDEN, "Host: {host}");
+        assert_eq!(error_envelope(&response).error.code, ErrorCode::Forbidden);
+    }
+
+    let loopback = server.get("/api/v1/hosts").await;
+    assert_eq!(loopback.status_code(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn session_endpoints_require_a_known_loopback_peer() {
+    // `server()` serves without connect info, the state a request from a non-loopback socket
+    // also produces; every session handler refuses it before parsing the body.
+    let (_dir, server) = server();
+    for (path, body) in [
+        ("/api/v1/auth/login", serde_json::json!({"username": "a", "password": "b"})),
+        ("/api/v1/auth/refresh", serde_json::json!({"refresh_token": "x"})),
+        ("/api/v1/auth/logout", serde_json::json!({})),
+    ] {
+        let response = server.post(path).json(&body).await;
+        assert_eq!(response.status_code(), StatusCode::FORBIDDEN, "{path}");
+    }
+    let response = server.get("/api/v1/auth/me").await;
+    assert_eq!(response.status_code(), StatusCode::FORBIDDEN);
+}
+

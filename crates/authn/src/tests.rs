@@ -1702,3 +1702,68 @@ async fn delete_user_revokes_refresh_tokens_and_removes_the_record() {
         "the deleted user's refresh token cannot be replayed"
     );
 }
+
+#[tokio::test]
+async fn revoke_refresh_token_ends_one_session_and_is_replay_safe() {
+    let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
+    service
+        .create_user("alice", "password", Role::viewer())
+        .await
+        .unwrap();
+    let first = service.login("alice", "password", None).await.unwrap();
+    let second = service.login("alice", "password", None).await.unwrap();
+
+    service
+        .revoke_refresh_token(&first.refresh_token)
+        .await
+        .expect("revoke the first session");
+    assert!(
+        matches!(
+            service.refresh(&first.refresh_token).await,
+            Err(AuthError::RefreshTokenRevoked)
+        ),
+        "a revoked refresh token cannot be exchanged"
+    );
+    service
+        .refresh(&second.refresh_token)
+        .await
+        .expect("other sessions are untouched");
+
+    assert!(
+        matches!(
+            service.revoke_refresh_token("never-issued-token").await,
+            Err(AuthError::RefreshTokenNotFound)
+        ),
+        "an unknown token is reported, not silently accepted"
+    );
+}
+
+#[tokio::test]
+async fn get_user_returns_the_public_view_without_credentials() {
+    let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
+    let user = service
+        .create_user("alice", "password", Role::editor())
+        .await
+        .unwrap();
+
+    let public = service.get_user(user.id).await.expect("fetch the user");
+    assert_eq!(public.id, user.id);
+    assert_eq!(public.username, "alice");
+    assert_eq!(public.role, Role::editor());
+    assert!(!public.totp_enabled);
+    assert_eq!(public.auth_epoch, 0);
+    assert!(
+        !format!("{public:?}").contains(&user.password_hash),
+        "the public view carries no password material"
+    );
+
+    let missing = service
+        .create_user("bob", "password", Role::viewer())
+        .await
+        .unwrap();
+    service.delete_user(missing.id).await.unwrap();
+    assert!(matches!(
+        service.get_user(missing.id).await,
+        Err(AuthError::UserNotFound)
+    ));
+}

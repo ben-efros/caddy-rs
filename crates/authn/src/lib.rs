@@ -1563,6 +1563,10 @@ pub struct AuthnService<S: UserStore> {
     config: AuthnConfig,
     encoding_key: EncodingKey,
     decoding_key: DecodingKey,
+    /// Hash of a fixed, unusable password. A login for an unknown username verifies against it so
+    /// the miss path costs the same Argon2 work as the hit path and cannot be timed to enumerate
+    /// accounts.
+    dummy_password_hash: String,
     /// Fixed TOTP time step for tests, so window and replay assertions cannot flake across a
     /// 30-second boundary.
     #[cfg(test)]
@@ -1578,11 +1582,16 @@ impl<S: UserStore> AuthnService<S> {
         let secret = config.jwt_secret_source.resolve()?;
         let encoding_key = EncodingKey::from_secret(&secret);
         let decoding_key = DecodingKey::from_secret(&secret);
+        // Fixed dummy secret: no account can authenticate against it, it exists only to spend the
+        // same verification work on the unknown-username branch.
+        let dummy_password_hash =
+            hash_password("caddy-rs-login-timing-equalizer", &config.argon2_params)?;
         Ok(Self {
             store,
             config,
             encoding_key,
             decoding_key,
+            dummy_password_hash,
             #[cfg(test)]
             test_step: None,
         })
@@ -1873,11 +1882,12 @@ impl<S: UserStore> AuthnService<S> {
         password: &str,
         totp_code: Option<&str>,
     ) -> AuthResult<TokenPair> {
-        let user = self
-            .store
-            .get_user_by_username(username)
-            .await?
-            .ok_or(AuthError::InvalidCredentials)?;
+        let Some(user) = self.store.get_user_by_username(username).await? else {
+            // Spend the same password-verification work as the hit path before failing, so the
+            // response time does not reveal whether the username exists.
+            let _verified = verify_password(password, &self.dummy_password_hash)?;
+            return Err(AuthError::InvalidCredentials);
+        };
 
         if !verify_password(password, &user.password_hash)? {
             return Err(AuthError::InvalidCredentials);
@@ -1909,6 +1919,33 @@ impl<S: UserStore> AuthnService<S> {
             .await?
             .ok_or(AuthError::UserNotFound)?;
         self.issue_token_pair(&user).await
+    }
+
+    /// Revoke one refresh token, as a single-device logout does.
+    ///
+    /// The token is consumed exactly like [`refresh`](Self::refresh) consumes it, so a replay is
+    /// rejected with [`AuthError::RefreshTokenRevoked`]. A caller that must stay idempotent (a
+    /// logout that has already been processed) maps that error, and
+    /// [`AuthError::RefreshTokenNotFound`], to success itself; this method keeps the distinction so
+    /// it cannot hide a real store failure.
+    pub async fn revoke_refresh_token(&self, refresh_token: &str) -> AuthResult<()> {
+        let token_hash = hash_refresh_token(refresh_token);
+        self.store
+            .consume_refresh_token(&token_hash, now_ts()?)
+            .await
+            .map(|_record| ())
+    }
+
+    /// Fetch the credential-free public view of a user.
+    ///
+    /// Used by session endpoints that must describe the caller without exposing the password hash
+    /// or TOTP seed; [`AuthError::UserNotFound`] covers a user deleted after the token was issued.
+    pub async fn get_user(&self, user_id: UserId) -> AuthResult<PublicUser> {
+        self.store
+            .get_user(user_id)
+            .await?
+            .ok_or(AuthError::UserNotFound)
+            .map(|user| user.public())
     }
 
     /// Revoke every refresh token for a user and invalidate existing access tokens.
