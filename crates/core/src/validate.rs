@@ -101,10 +101,11 @@ pub fn validate_config(config: &Config, registry: &ModuleRegistry) -> Result<Val
 
 /// Longest Unix domain socket path, in bytes, that fits in `sockaddr_un.sun_path`.
 ///
-/// `sun_path` is 108 bytes on Linux (including the terminating NUL) and 104 on the BSDs; this
-/// implementation uses the larger, more permissive bound so a path this build accepts is
-/// accepted by every supported platform that allows 108.
-pub const UNIX_SOCKET_PATH_MAX: usize = 108;
+/// `sun_path` is 108 bytes on Linux, but the kernel also requires the terminating NUL to fit, so
+/// at most 107 bytes of path can bind (a 108-byte path fails with `ENAMETOOLONG`). This uses that
+/// 107-byte bound. The BSDs use a smaller array (104 bytes); a path accepted here can still be too
+/// long there, so the admin listener reports the platform error at bind time.
+pub const UNIX_SOCKET_PATH_MAX: usize = 107;
 
 /// Validate the `admin.listen` address, applying the Unix socket rules to `unix/...` values.
 ///
@@ -2886,7 +2887,32 @@ mod tests {
         let message = admin_listen_error(&long);
         assert!(message.contains("admin.listen"), "{message}");
         assert!(message.contains("sockaddr_un"), "{message}");
-        assert!(message.contains("108"), "{message}");
+        assert!(message.contains("107"), "{message}");
+    }
+
+    #[test]
+    fn unix_socket_path_length_boundary_matches_sockaddr_un() {
+        // The limit applies to the absolute path (after `unix/`), and `sun_path` must also hold
+        // the terminating NUL: exactly `UNIX_SOCKET_PATH_MAX` bytes bind, one more does not.
+        let dir = admin_socket_temp_dir("limit");
+        let prefix = dir.display().to_string();
+        let pad = |length: usize| "a".repeat(length - prefix.len() - 1);
+
+        let fits = pad(UNIX_SOCKET_PATH_MAX);
+        let listen = format!("unix/{prefix}/{fits}");
+        assert_eq!(prefix.len() + 1 + fits.len(), UNIX_SOCKET_PATH_MAX);
+        let config = Config::from_value(serde_json::json!({ "admin": { "listen": listen } }))
+            .expect("model decodes");
+        validate_config(&config, &registry()).expect("path at the limit must validate");
+
+        let too_long = pad(UNIX_SOCKET_PATH_MAX + 1);
+        let listen = format!("unix/{prefix}/{too_long}");
+        let message = admin_listen_error(&listen);
+        assert!(message.contains("admin.listen"), "{message}");
+        assert!(message.contains("108 bytes"), "{message}");
+        assert!(message.contains("107-byte"), "{message}");
+
+        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     #[test]
