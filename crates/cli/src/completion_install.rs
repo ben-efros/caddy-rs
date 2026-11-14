@@ -9,7 +9,7 @@
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
-use std::io;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -297,6 +297,7 @@ pub(crate) fn install(requested: &[String], dry_run: bool) -> Result<()> {
     for shell in shells {
         let target = shell.target(&layout);
         let contents = install_contents(shell)?;
+        refuse_symlink(&target)?;
         match fs::read(&target) {
             Ok(existing) if existing == contents.as_bytes() => {
                 println!("{}: already up to date {}", shell.name(), target.display());
@@ -435,12 +436,51 @@ fn select_shells(requested: &[String], layout: &Layout, default: Selection) -> R
     Ok(shells)
 }
 
-/// Write `contents` to `path`, creating parent directories as needed.
-fn write_file(path: &Path, contents: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("cannot create directory `{}`", parent.display()))?;
+/// Refuse a target path that is a symbolic link.
+///
+/// Following a link would either create the file at the link's destination (a dangling link) or
+/// overwrite a file the user reached through the link. Only a real file at the exact target path is
+/// something this command may own, so the link itself is never replaced.
+fn refuse_symlink(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => bail!(
+            "refusing to replace {}: it is a symbolic link; remove the link first",
+            path.display()
+        ),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("cannot inspect `{}`", path.display())),
     }
-    fs::write(path, contents).with_context(|| format!("cannot write `{}`", path.display()))?;
-    Ok(())
+}
+
+/// Write `contents` to `path` atomically, creating parent directories as needed.
+///
+/// The bytes are written to a sibling temporary file and then renamed over the target, so a failed
+/// or interrupted write cannot leave a truncated file that a later `status`/`uninstall` would
+/// misread as foreign. The temporary file is removed when any step fails.
+fn write_file(path: &Path, contents: &str) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .with_context(|| format!("cannot create directory `{}`", parent.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or("completion");
+    let temporary = parent.join(format!(".{file_name}.tmp-{}", std::process::id()));
+    let written = (|| -> Result<()> {
+        let mut file = fs::File::create(&temporary)
+            .with_context(|| format!("cannot create `{}`", temporary.display()))?;
+        file.write_all(contents.as_bytes())
+            .with_context(|| format!("cannot write `{}`", temporary.display()))?;
+        file.sync_all()
+            .with_context(|| format!("cannot flush `{}`", temporary.display()))?;
+        drop(file);
+        fs::rename(&temporary, path)
+            .with_context(|| format!("cannot replace `{}`", path.display()))?;
+        Ok(())
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    written
 }
