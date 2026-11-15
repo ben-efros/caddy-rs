@@ -76,8 +76,10 @@ leaves from the address the datagram arrived on.
   labels follow ADR-029's cardinality rule: a route reports its configured name only when it is in the
   allowlist and reports the static `_other` value otherwise, so a peer address cannot become a label.
 
-A UDP listener cannot yet be configured: `layer4`'s UDP address forms are still rejected with a
-located error naming T-L4-011, which adapts configuration onto these tables.
+Routing a datagram yields a dispatch verdict — forward to a named upstream, or drop — which is what a
+socket-bound caller executes. Binding the socket, executing the verdict, and accepting `layer4`'s UDP
+address forms are T-L4-011, which is why a UDP listener is still rejected with a located error naming
+that task.
 
 ## Routing
 

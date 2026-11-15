@@ -12,11 +12,14 @@
 //! QUIC ClientHello sniffing is deliberately absent: it is gated on the UDP/QUIC ADR (T-L4-012), so a
 //! UDP route here matches on address metadata only and never inspects the payload.
 //!
-//! These tables are the routing and metering engine, not the listener. Binding a UDP socket and
-//! adapting `layer4`'s `udp/<addr>` and `<addr>/udp` forms onto [`UdpRouteTable`] belongs to T-L4-011
-//! (the full layer4 config adapter), which is why `crates/config/src/layer4.rs` still rejects a UDP
-//! listener with a located error naming that task. Nothing here is reachable from a Caddyfile until
-//! then; the engine is built and tested first so T-L4-011 has a target to adapt onto.
+//! These tables are the routing and metering engine, not the listener. [`UdpRouteTable::dispatch`]
+//! decides *what* to do with a datagram — forward it to a named upstream or drop it — and returns
+//! that verdict as a [`UdpDispatch`], so the decision is verifiable without a socket; performing the
+//! I/O does not live here. Binding a UDP socket, executing the verdict, and adapting `layer4`'s
+//! `udp/<addr>` and `<addr>/udp` forms onto [`UdpRouteTable`] belong to T-L4-011 (the full layer4
+//! config adapter), which is why `crates/config/src/layer4.rs` still rejects a UDP listener with a
+//! located error naming that task. Nothing here is reachable from a Caddyfile until then; the engine
+//! is built and tested first so T-L4-011 has a target to adapt onto.
 
 use std::fmt;
 use std::net::IpAddr;
@@ -298,6 +301,23 @@ impl UdpRouteTable {
         self.routes.iter().position(|route| route.matches(peer))
     }
 
+    /// Decides what to do with a datagram from `peer`: the first matching route's action, as a
+    /// [`UdpDispatch`] a socket-binding caller can execute.
+    ///
+    /// Returns `None` when no route matches, which is a drop with no route to attribute it to — the
+    /// caller decides whether to count it as unmatched rather than silently applying a fallback.
+    pub fn dispatch(&self, peer: &ConnectionMeta) -> Option<UdpDispatch> {
+        let index = self.lookup_index(peer)?;
+        let route = self.routes.get(index)?;
+        Some(match route.action() {
+            UdpAction::Proxy(config) => UdpDispatch::Proxy {
+                upstream: config.upstream().to_string(),
+                route_index: index,
+            },
+            UdpAction::Close => UdpDispatch::Close { route_index: index },
+        })
+    }
+
     /// The number of routes.
     pub fn len(&self) -> usize {
         self.routes.len()
@@ -306,6 +326,56 @@ impl UdpRouteTable {
     /// Whether the table has no routes.
     pub fn is_empty(&self) -> bool {
         self.routes.is_empty()
+    }
+}
+
+/// What the caller should do with one datagram, as decided by [`UdpRouteTable::dispatch`].
+///
+/// This is the routing verdict, deliberately not the I/O: it names the action and the route so a
+/// caller binding a socket (T-L4-011) executes it, while routing stays testable without a socket.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UdpDispatch {
+    /// Forward the datagram to this upstream and relay replies.
+    Proxy {
+        /// The upstream `host:port`.
+        upstream: String,
+        /// The matched route's index, for telemetry.
+        route_index: usize,
+    },
+    /// Drop the datagram without replying.
+    Close {
+        /// The matched route's index, for telemetry.
+        route_index: usize,
+    },
+}
+
+impl UdpDispatch {
+    /// The action's short name: `proxy` or `close`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Proxy { .. } => "proxy",
+            Self::Close { .. } => "close",
+        }
+    }
+
+    /// The matched route's index.
+    pub fn route_index(&self) -> usize {
+        match self {
+            Self::Proxy { route_index, .. } | Self::Close { route_index } => *route_index,
+        }
+    }
+
+    /// The upstream for a proxied datagram.
+    pub fn upstream(&self) -> Option<&str> {
+        match self {
+            Self::Proxy { upstream, .. } => Some(upstream),
+            Self::Close { .. } => None,
+        }
+    }
+
+    /// Whether the datagram is dropped.
+    pub fn is_close(&self) -> bool {
+        matches!(self, Self::Close { .. })
     }
 }
 
