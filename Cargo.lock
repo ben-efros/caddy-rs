@@ -383,8 +383,11 @@ dependencies = [
  "async-trait",
  "bytes",
  "caddy-rs-admin",
+ "caddy-rs-tls",
+ "rustls",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-rustls",
  "tracing",
 ]
 

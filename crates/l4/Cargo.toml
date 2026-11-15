@@ -12,9 +12,14 @@ arc-swap = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 caddy-rs-admin = { workspace = true, default-features = false }
+caddy-rs-tls = { workspace = true, default-features = false }
+# The termination stage drives the acceptor the TLS layer builds; same crate/features as
+# caddy-rs-tls, so no second crypto backend is added.
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["aws_lc_rs", "tls12", "logging"] }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "net", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "net", "time", "sync"] }
+rustls = { version = "0.23.45", default-features = false, features = ["std", "aws_lc_rs", "tls12", "logging"] }

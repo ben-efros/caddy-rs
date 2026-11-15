@@ -21,6 +21,7 @@ pub mod actions;
 pub mod client_hello;
 pub mod context;
 pub mod handler;
+pub mod handlers;
 pub mod matchers;
 pub mod metered_copy;
 pub mod metrics;
@@ -36,6 +37,12 @@ pub use client_hello::{
 };
 pub use handler::{
     BoxedStream, HandlerContext, HandlerError, HandlerPipeline, L4Handler, L4Stream,
+};
+pub use handlers::{
+    proxy_connection, proxy_route, render_proxy_header, validate_stage_order, ProxyError,
+    ProxyHeaderAddresses, ProxyHeaderError, ProxyOptions, ProxyProtocolVersion, RateLimit,
+    RateLimitError, StageOrderError, TerminateError, ThrottledStream, TlsTerminator,
+    DEFAULT_IDLE_TIMEOUT, STAGE_ORDER, THROTTLE_BURST_BYTES, V2_SIGNATURE,
 };
 pub use metered_copy::{
     metered_copy_bidirectional, AtomicByteMeter, ByteMeter, CopyTotals, NullMeter, SharedMeter,
