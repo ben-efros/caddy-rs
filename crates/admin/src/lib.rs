@@ -634,11 +634,13 @@ pub struct AdminApi {
 /// How long the `POST /stop` exit path waits for the runtime loop to finish before exiting
 /// anyway.
 ///
-/// The graceful stop is itself bounded by the configured shutdown delay/grace period and the
-/// runtime's own forced-close timeouts, so this only bounds a runtime that never reports back.
-/// Caddy's `/stop` is a synchronous `exitProcess`, so exceeding the bound must still exit: the
-/// process may not hang on `/stop`.
-const STOP_EXIT_WAIT: Duration = Duration::from_secs(10);
+/// The wait only has to cover *noticing* the stopped store (the runtime's 200 ms poll, which a
+/// `/stop` also wakes through the reload notification) and tearing the admin listener down; the
+/// graceful drain that follows runs after the exit path is released, and the configured shutdown
+/// delay/grace period still apply to it. The bound must stay short: a runtime that never reports
+/// (one that was still starting up, or whose loop already ended) must not hold the exit, because
+/// Caddy's `/stop` is a synchronous `exitProcess` and the process may not hang on it.
+const STOP_EXIT_WAIT: Duration = Duration::from_secs(2);
 
 /// Completion signal from the hosting runtime's shutdown, used to order `POST /stop`'s process
 /// exit after the runtime loop.
@@ -648,7 +650,7 @@ const STOP_EXIT_WAIT: Duration = Duration::from_secs(10);
 /// listener teardown - including the unlink of the admin Unix socket, which is a `Drop` guard
 /// inside the admin listener task. The runtime therefore holds the matching
 /// [`ShutdownLatchHandle`] and reports completion at the end of its loop; the exit path waits for
-/// that (bounded by [`STOP_EXIT_WAIT`] and by `drain_timeout`) instead of racing a fixed timer.
+/// that (bounded by [`STOP_EXIT_WAIT`]) instead of racing a fixed timer.
 #[derive(Debug, Default)]
 pub struct ShutdownLatch {
     state: std::sync::Mutex<ShutdownLatchState>,
@@ -1771,8 +1773,8 @@ impl AdminApi {
     /// The exit is *ordered after* the runtime loop's shutdown rather than after a fixed delay:
     /// `std::process::exit` runs no destructors, so exiting first would leak everything the
     /// shutdown path tears down (the admin Unix socket file, listener sockets). The wait is
-    /// bounded by [`STOP_EXIT_WAIT`] and `drain_timeout`, and a runtime that never reports
-    /// completion (or an embedded host that supplies no [`ShutdownLatch`]) still exits.
+    /// bounded by [`STOP_EXIT_WAIT`], so a runtime that never reports completion (or an embedded
+    /// host that supplies no [`ShutdownLatch`]) still exits.
     fn unload(&self) -> AdminResponse {
         self.stop_generation();
         if self.exit_process_on_stop {
@@ -1780,7 +1782,7 @@ impl AdminApi {
             // because a missing/broken NOTIFY_SOCKET must not change /stop semantics.
             let _ = caddy_rs_core::notify::stopping();
             let latch = self.shutdown_latch.clone();
-            let budget = STOP_EXIT_WAIT.max(self.drain_timeout);
+            let budget = STOP_EXIT_WAIT;
             // Use an OS thread, not a tokio task: the runtime may already be shutting down (that is
             // precisely the stuck state this exits from), and a spawned task could be dropped
             // before its timer fires.
