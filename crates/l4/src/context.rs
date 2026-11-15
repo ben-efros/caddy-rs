@@ -43,8 +43,8 @@ pub const DEFAULT_PEEK_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct PeekLimits {
     /// Maximum buffered bytes; peeking stops with [`PeekError::LimitExceeded`] past it.
     pub max_peek_bytes: usize,
-    /// Deadline for the whole peek loop (`None` disables it); exceeding it yields
-    /// [`PeekError::Timeout`].
+    /// Deadline for the whole peek loop of one connection, measured from its first read (`None`
+    /// disables it); repeated peek calls share it, and exceeding it yields [`PeekError::Timeout`].
     pub timeout: Option<Duration>,
 }
 
@@ -156,6 +156,9 @@ pub struct StreamContext<S> {
     peer: Option<SocketAddr>,
     local: Option<SocketAddr>,
     limits: PeekLimits,
+    /// The deadline for the *whole* peek of this connection, pinned on the first read and reused by
+    /// every later peek call, so a peer that trickles one byte per read cannot extend it.
+    peek_deadline: Option<tokio::time::Instant>,
     stats: Option<PeekStats>,
 }
 
@@ -173,6 +176,7 @@ impl<S> StreamContext<S> {
             peer: None,
             local: None,
             limits,
+            peek_deadline: None,
             stats: None,
         }
     }
@@ -293,8 +297,13 @@ impl<S: AsyncRead + Unpin> StreamContext<S> {
         if let Some(stats) = &self.stats {
             stats.buffers_acquired.fetch_add(1, Ordering::Relaxed);
         }
+        // The deadline belongs to the connection, not to one call: pin it on the first read and
+        // reuse the same instant for every later peek, otherwise each call would hand a trickling
+        // peer a fresh budget (ADR-030: "5s deadline on peek; connection dropped if incomplete").
         let deadline = self.limits.timeout.map(|limit| {
-            let at = tokio::time::Instant::now() + limit;
+            let at = *self
+                .peek_deadline
+                .get_or_insert_with(|| tokio::time::Instant::now() + limit);
             (at, limit)
         });
         // Read at most `target - buffered` bytes per read so the buffer never overshoots `target`.
@@ -554,6 +563,72 @@ mod tests {
         let seen = ctx.peek_available(1024).await.expect("short peek");
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(seen, b"SSH-2.0-test\r\n");
+    }
+
+    #[tokio::test]
+    async fn the_peek_deadline_belongs_to_the_connection_not_to_one_call() {
+        // A trickling peer: one byte every 100 ms. Each peek call asks for one more byte, so a
+        // per-call deadline would hand the peer a fresh budget every time and let it hold the
+        // connection far past the configured 300 ms; the deadline must be pinned once per
+        // connection (ADR-030: "5s deadline on peek; connection dropped if incomplete").
+        let (mut client, server) = tokio::io::duplex(64);
+        let limits = PeekLimits {
+            max_peek_bytes: 1024,
+            timeout: Some(Duration::from_millis(300)),
+        };
+        let mut ctx = StreamContext::with_limits(server, limits);
+        let started = std::time::Instant::now();
+        let writer = tokio::spawn(async move {
+            for _ in 0..40 {
+                if client.write_all(b"x").await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+        let mut outcome = None;
+        for target in 1..=40 {
+            match ctx.peek_to(target).await {
+                Ok(_) => {}
+                Err(error) => {
+                    outcome = Some(error);
+                    break;
+                }
+            }
+        }
+        let elapsed = started.elapsed();
+        let error = outcome.expect("a trickling peer must outrun the per-connection deadline");
+        assert!(
+            matches!(
+                error,
+                PeekError::Timeout { .. } | PeekError::LimitExceeded { .. }
+            ),
+            "expected a typed failure, got {error}"
+        );
+        assert!(
+            elapsed <= Duration::from_millis(1200),
+            "repeated peeks must not extend the deadline: took {elapsed:?} for a 300 ms budget"
+        );
+        assert!(
+            ctx.buffered_len() <= 4,
+            "only the bytes that fit the deadline may be buffered, got {}",
+            ctx.buffered_len()
+        );
+        writer.abort();
+    }
+
+    #[tokio::test]
+    async fn take_prefix_clears_the_buffer_so_later_reads_do_not_replay_it() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        client.write_all(b"banner").await.unwrap();
+        let mut ctx = StreamContext::new(server);
+        ctx.peek_to(6).await.expect("peek banner");
+        assert_eq!(ctx.take_prefix().as_ref(), b"banner");
+        assert_eq!(ctx.buffered_len(), 0, "take_prefix must clear the buffer");
+        // The next bytes come from the socket, never from the already-taken prefix.
+        client.write_all(b"next").await.unwrap();
+        let seen = ctx.peek_to(4).await.expect("peek next");
+        assert_eq!(seen, b"next");
     }
 
     #[tokio::test]
