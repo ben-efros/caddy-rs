@@ -27,6 +27,9 @@ pub mod metered_copy;
 pub mod metrics;
 pub mod prefixed_stream;
 pub mod router;
+pub mod udp;
+pub mod udp_metrics;
+pub mod udp_session;
 
 pub use actions::{
     ActionConfigError, FallbackConfig, FallbackReason, HttpConfig, PassthroughConfig, SniAction,
