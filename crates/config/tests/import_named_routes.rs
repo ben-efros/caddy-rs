@@ -210,6 +210,9 @@ fn file_imports_resolve_through_the_adapter_source_path() {
     )
     .expect("write import file");
     let caddyfile = ":80 {\n import respond.conf hi\n}\n";
+    // The safe-mode import rule anchors the owner of an imported file on the owner of the file that
+    // imports it, so the importing Caddyfile has to exist on disk.
+    std::fs::write(directory.join("Caddyfile"), caddyfile).expect("write importing Caddyfile");
     let adapted = caddy_rs_config::adapt_with_source(caddyfile, Some(&directory.join("Caddyfile")))
         .expect("adapts with source path");
     assert_eq!(

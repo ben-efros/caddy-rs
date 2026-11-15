@@ -171,7 +171,8 @@ fn host_is_loopback(host: &str) -> bool {
                 IpAddr::V4(v4) => v4.is_loopback(),
                 IpAddr::V6(v6) => {
                     v6.is_loopback()
-                        || v6.to_ipv4_mapped()
+                        || v6
+                            .to_ipv4_mapped()
                             .is_some_and(|mapped| mapped.is_loopback())
                 }
             })
@@ -192,10 +193,7 @@ mod tests {
             None,
             "login must be reachable without a token"
         );
-        assert_eq!(
-            required_capability(&Method::POST, "/auth/refresh"),
-            None
-        );
+        assert_eq!(required_capability(&Method::POST, "/auth/refresh"), None);
         assert_eq!(
             required_capability(&Method::POST, "/auth/password"),
             Some((Section::Settings, Action::Admin)),

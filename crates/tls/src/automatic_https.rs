@@ -753,7 +753,7 @@ fn parse_certificate_key(
         ))
     })?;
     if object.contains_key("token") {
-        for unknown in object.keys().filter(|key| key.as_str() != "token") {
+        if let Some(unknown) = object.keys().find(|key| key.as_str() != "token") {
             return Err(Error::Issuer(format!(
                 "{path}.{unknown}: unsupported certificate key source field; \
                  `certificate_key` accepts only a `token` object"
@@ -767,9 +767,9 @@ fn parse_certificate_key(
                     "{path}.token: expected an object with `label` and `key_id`"
                 ))
             })?;
-        for unknown in token
+        if let Some(unknown) = token
             .keys()
-            .filter(|key| !matches!(key.as_str(), "label" | "key_id"))
+            .find(|key| !matches!(key.as_str(), "label" | "key_id"))
         {
             return Err(Error::Issuer(format!(
                 "{path}.token.{unknown}: unsupported token certificate key field; \

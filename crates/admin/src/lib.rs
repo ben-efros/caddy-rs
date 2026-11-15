@@ -618,6 +618,8 @@ pub struct AdminApi {
     /// library behaviour of unloading the generation only. Override with
     /// [`AdminApi::with_process_exit_on_stop`].
     exit_process_on_stop: bool,
+    /// Completion signal of the hosting runtime's shutdown, used to order the `/stop` exit.
+    shutdown_latch: Option<Arc<ShutdownLatch>>,
     /// Autosave file for configs activated through this API, mirroring Caddy's autosave of every
     /// non-nil config transition (`caddy.go` `unsyncedDecodeAndRun`, `admin.config.persist`).
     ///
@@ -627,6 +629,116 @@ pub struct AdminApi {
     /// same file `--resume` reads back. This default keeps standalone/embedded uses (and tests)
     /// write-free unless they opt in.
     autosave_path: Option<PathBuf>,
+}
+
+/// How long the `POST /stop` exit path waits for the runtime loop to finish before exiting
+/// anyway.
+///
+/// What the wait covers is bounded by the code, not by the operator's configuration:
+///
+/// * noticing the stop - one 200 ms poll, which `/stop` also cuts short through the reload
+///   notification;
+/// * `stop_all`, which force-closes connections and waits at most 2 s for their tracker guards to
+///   drop (the same constant the runtime already uses for that wait).
+///
+/// It deliberately does *not* cover the graceful drain: `run_loop` ends the drain (shutdown delay,
+/// grace period, and the unbounded eternal grace period when neither is configured) *before* it
+/// releases the latch, so `STOP_EXIT_WAIT` must not scale with `drain_timeout` (30 s default) or
+/// with `shutdown_delay`/`grace_period` - Caddy's `/stop` is a synchronous `exitProcess` and an
+/// operator-configured 30 s drain must not become a 30 s `/stop`. The bound must stay short for
+/// the state it exists to escape: a runtime that never reports (one still starting up, or whose
+/// loop already ended) must not hold the exit.
+const STOP_EXIT_WAIT: Duration = Duration::from_secs(2);
+
+/// Completion signal from the hosting runtime's shutdown, used to order `POST /stop`'s process
+/// exit after the runtime loop.
+///
+/// `POST /stop` must terminate the process (Caddy's `handleStop` calls `exitProcess`), but
+/// `std::process::exit` runs no destructors, so exiting before the runtime loop finishes skips
+/// listener teardown - including the unlink of the admin Unix socket, which is a `Drop` guard
+/// inside the admin listener task. The runtime therefore holds the matching
+/// [`ShutdownLatchHandle`] and reports completion at the end of its loop; the exit path waits for
+/// that (bounded by [`STOP_EXIT_WAIT`]) instead of racing a fixed timer.
+#[derive(Debug, Default)]
+pub struct ShutdownLatch {
+    state: std::sync::Mutex<ShutdownLatchState>,
+    finished: std::sync::Condvar,
+}
+
+#[derive(Debug, Default)]
+struct ShutdownLatchState {
+    finished: bool,
+    waiters: usize,
+}
+
+impl ShutdownLatch {
+    /// Create a latch that no runtime has reported on yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether the runtime loop has finished shutting down.
+    pub fn is_finished(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .finished
+    }
+
+    /// Wait until [`ShutdownLatchHandle::mark_finished`] is called, the runtime is dropped, or
+    /// `timeout` elapses. Returns whether the shutdown completed.
+    pub fn wait(&self, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.waiters += 1;
+        let mut finished = state.finished;
+        while !finished {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let (next, _) = self
+                .finished
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next;
+            finished = state.finished;
+        }
+        state.waiters -= 1;
+        finished
+    }
+}
+
+/// Runtime half of a [`ShutdownLatch`]: reports shutdown completion, and on drop reports it too
+/// so an exit path never waits on a runtime that is gone.
+#[derive(Debug)]
+pub struct ShutdownLatchHandle(Arc<ShutdownLatch>);
+
+impl ShutdownLatchHandle {
+    /// Attach a runtime to a latch.
+    pub fn new(latch: Arc<ShutdownLatch>) -> Self {
+        Self(latch)
+    }
+
+    /// Report that the runtime loop has finished shutting down.
+    pub fn mark_finished(&self) {
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.finished = true;
+        self.0.finished.notify_all();
+    }
+}
+
+impl Drop for ShutdownLatchHandle {
+    fn drop(&mut self) {
+        self.mark_finished();
+    }
 }
 
 impl AdminApi {
@@ -644,6 +756,7 @@ impl AdminApi {
             // The CLI `run` command is the only process that announces an autosave path; for it,
             // `/stop` must terminate the process like Caddy. Library uses/tests opt out.
             exit_process_on_stop: std::env::var_os(AUTOSAVE_PATH_ENV).is_some(),
+            shutdown_latch: None,
             autosave_path: std::env::var_os(AUTOSAVE_PATH_ENV).map(PathBuf::from),
         }
     }
@@ -765,6 +878,17 @@ impl AdminApi {
     /// for its poll interval.
     pub fn with_reload_notify(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
         self.reload_notify = Some(notify);
+        self
+    }
+
+    /// Complete `POST /stop`'s process exit only after the hosting runtime reports that its
+    /// shutdown has finished (see [`ShutdownLatch`]).
+    ///
+    /// Without a latch the exit path has no ordering relationship to the runtime loop and can
+    /// preempt it. The CLI `run` command always supplies one; embedded hosts that own the process
+    /// lifecycle may omit it.
+    pub fn with_shutdown_latch(mut self, latch: Arc<ShutdownLatch>) -> Self {
+        self.shutdown_latch = Some(latch);
         self
     }
 
@@ -1650,10 +1774,58 @@ impl AdminApi {
     ///
     /// Caddy's admin `/stop` calls `exitProcess`, so the CLI process terminates. The library keeps
     /// that opt-in (`exit_process_on_stop`) so embedded hosts and unit tests can unload a
-    /// generation without exiting; when enabled, the exit runs asynchronously after a short delay
-    /// so the `200 OK` response has time to be written (Caddy likewise shuts its admin listener
-    /// down from a goroutine after the handler returns).
+    /// generation without exiting; when enabled, the exit runs asynchronously so the `200 OK`
+    /// response has time to be written (Caddy likewise shuts its admin listener down from a
+    /// goroutine after the handler returns).
+    ///
+    /// The exit is *ordered after* the runtime loop's shutdown rather than after a fixed delay:
+    /// `std::process::exit` runs no destructors, so exiting first would leak everything the
+    /// shutdown path tears down (the admin Unix socket file, listener sockets). The wait is
+    /// bounded by [`STOP_EXIT_WAIT`], so a runtime that never reports completion (or an embedded
+    /// host that supplies no [`ShutdownLatch`]) still exits.
     fn unload(&self) -> AdminResponse {
+        self.stop_generation();
+        if self.exit_process_on_stop {
+            // Tell a systemd `Type=notify` unit before the delayed process exit; best-effort,
+            // because a missing/broken NOTIFY_SOCKET must not change /stop semantics.
+            let _ = caddy_rs_core::notify::stopping();
+            let latch = self.shutdown_latch.clone();
+            let budget = STOP_EXIT_WAIT;
+            // Use an OS thread, not a tokio task: the runtime may already be shutting down (that is
+            // precisely the stuck state this exits from), and a spawned task could be dropped
+            // before its timer fires.
+            std::thread::spawn(move || {
+                match latch {
+                    Some(latch) => {
+                        // The binary installs no tracing subscriber, so report the outcome of the
+                        // ordered exit on stderr: it is the only evidence that the exit waited for
+                        // the shutdown (`cli/tests/cli.rs` asserts on it).
+                        if latch.wait(budget) {
+                            eprintln!("caddy-rs: runtime shutdown finished; exiting on /stop");
+                        } else {
+                            eprintln!(
+                                "caddy-rs: shutdown did not complete within {}s of /stop; \
+                                 exiting anyway",
+                                budget.as_secs()
+                            );
+                        }
+                    }
+                    // No runtime reports completion to this API (embedded host that opted into
+                    // exiting): keep the original short delay so the response is flushed.
+                    None => std::thread::sleep(Duration::from_millis(100)),
+                }
+                std::process::exit(0);
+            });
+        }
+        AdminResponse::empty(StatusCode::OK)
+    }
+
+    /// Deactivate the running configuration without waiting for it to drain.
+    ///
+    /// The drain runs on a spawned task, never inside the request: draining blocks until the
+    /// previous generation's in-flight work ends (up to `drain_timeout`), while `/stop` must
+    /// answer promptly and the graceful stop itself is what ends those connections.
+    fn stop_generation(&self) {
         if let Some(generation) = self.store.stop() {
             let timeout = self.drain_timeout;
             tokio::spawn(async move {
@@ -1661,19 +1833,6 @@ impl AdminApi {
             });
         }
         self.notify_reload();
-        if self.exit_process_on_stop {
-            // Tell a systemd `Type=notify` unit before the delayed process exit; best-effort,
-            // because a missing/broken NOTIFY_SOCKET must not change /stop semantics.
-            let _ = caddy_rs_core::notify::stopping();
-            // Use an OS thread, not a tokio task: the runtime may already be shutting down (that is
-            // precisely the stuck state this exits from), and a spawned task could be dropped
-            // before its timer fires.
-            std::thread::spawn(|| {
-                std::thread::sleep(Duration::from_millis(100));
-                std::process::exit(0);
-            });
-        }
-        AdminResponse::empty(StatusCode::OK)
     }
 }
 
@@ -1815,6 +1974,61 @@ mod tests {
 
     fn admin() -> AdminApi {
         AdminApi::new(Arc::new(GenerationStore::with_builtin_registry()))
+    }
+
+    #[test]
+    fn shutdown_latch_releases_only_after_the_runtime_reports_completion() {
+        let latch = Arc::new(ShutdownLatch::new());
+        let handle = ShutdownLatchHandle::new(Arc::clone(&latch));
+        let started = std::time::Instant::now();
+        // Nothing reported yet: the wait must time out instead of returning early.
+        assert!(!latch.wait(Duration::from_millis(50)));
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        assert!(!latch.is_finished());
+
+        // A waiter blocked before completion is released by the runtime's report, not by its
+        // timeout - the ordering `/stop` relies on (shutdown first, `process::exit` second).
+        let waiter = std::thread::spawn(move || latch.wait(Duration::from_secs(30)));
+        std::thread::sleep(Duration::from_millis(50));
+        let report = std::time::Instant::now();
+        handle.mark_finished();
+        assert!(
+            waiter.join().expect("waiter thread"),
+            "released by completion"
+        );
+        assert!(report.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn shutdown_latch_handle_drop_reports_completion() {
+        let latch = Arc::new(ShutdownLatch::new());
+        drop(ShutdownLatchHandle::new(Arc::clone(&latch)));
+        // A runtime that is gone can never finish its loop; the exit path must not hang on it.
+        assert!(latch.wait(Duration::from_millis(10)));
+        assert!(latch.is_finished());
+    }
+
+    #[test]
+    fn stop_returns_ok_and_leaves_exit_to_the_configured_path() {
+        let store = Arc::new(GenerationStore::with_builtin_registry());
+        let latch = Arc::new(ShutdownLatch::new());
+        let admin = AdminApi::new(Arc::clone(&store))
+            .with_process_exit_on_stop(true)
+            .with_shutdown_latch(Arc::clone(&latch));
+        // Unit tests must never reach `process::exit`; the latch is only *observed* here, so
+        // `/stop` keeps its synchronous contract: 200 plus an unloaded store.
+        assert!(admin.exit_process_on_stop);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let response = runtime.block_on(admin.handle(request("POST", "/stop", "")));
+        assert_eq!(response.status, StatusCode::OK);
+        assert!(store.current().is_none(), "/stop unloads the generation");
+        assert!(
+            !latch.is_finished(),
+            "the runtime loop owns the completion report"
+        );
     }
 
     fn request(method: &str, path: &str, body: &str) -> AdminRequest {
