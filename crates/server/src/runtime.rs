@@ -1303,7 +1303,11 @@ impl ServerRuntime {
                 break;
             }
             seen_active_generation |= self.store.current().is_some();
-            let current_id = self.store.current().as_deref().map(Generation::id);
+            // Hold the generation this iteration works with (`apply` builds from it), so a `/stop`
+            // that lands after the apply and before the wait below is still seen by the next
+            // iteration instead of leaving the store empty while the loop sleeps on a local.
+            let observed = self.store.current();
+            let current_id = observed.as_deref().map(Generation::id);
             if current_id != applied_generation {
                 if let Err(error) = self.apply().await {
                     eprintln!("caddy-rs: cannot apply configuration: {error}");
@@ -1321,8 +1325,8 @@ impl ServerRuntime {
                     break;
                 }
             }
-            applied_generation = self.store.current().as_deref().map(Generation::id);
-            if let Some(generation) = self.store.current() {
+            applied_generation = current_id;
+            if let Some(generation) = observed {
                 self.shutdown_timing = ShutdownTiming::from_config(generation.config());
             }
             tokio::select! {
