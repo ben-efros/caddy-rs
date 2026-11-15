@@ -54,6 +54,31 @@ a forwarded host without a forwarded proto falls back to the backend connection 
 `http`), and `X-Forwarded-Proto: http` advertises a cleartext origin. Malformed forwarded values
 are rejected even from untrusted peers, so an intermediary must not synthesize them.
 
+## Layer 4 (UDP sessions)
+
+The `caddy-rs-l4` crate models UDP proxying separately from HTTP, because a datagram socket has no
+connection: `crates/l4/src/udp_session.rs` invents one. A UDP session is the association between one
+peer and the upstream its datagram was routed to, keyed by the `(source, destination)` pair so a reply
+leaves from the address the datagram arrived on.
+
+* A session is created on a peer's first datagram, reused for that peer's later datagrams (packet and
+  byte counts accumulate), and expired once it has been idle for its route's timeout, 30s by default.
+* A datagram is routed by the first route in `layer4` whose matchers all match. UDP can match on
+  `ip` and `asn` only — there is no TLS handshake to match and no `tls`/`ssh`/`http` matcher, and QUIC
+  ClientHello sniffing is out of scope until the UDP/QUIC ADR (T-L4-012).
+* Matched datagrams take one of two actions: `proxy` forwards to an upstream and relays replies;
+  `close` drops them, which is UDP's spelling of refusing service, since there is no close handshake
+  and a silent drop just lets the peer's own timer expire.
+* Memory is bounded. When a new session would exceed the table's capacity the least-recently-used
+  session is evicted first, and every eviction is reported, so a flood of spoofed sources is visible
+  as a stream of capacity evictions instead of only as a process that grew until it died.
+* Counters are exported per route as `caddy_l4_udp_packets_total` and `caddy_l4_udp_bytes_total`. Route
+  labels follow ADR-029's cardinality rule: a route reports its configured name only when it is in the
+  allowlist and reports the static `_other` value otherwise, so a peer address cannot become a label.
+
+A UDP listener cannot yet be configured: `layer4`'s UDP address forms are still rejected with a
+located error naming T-L4-011, which adapts configuration onto these tables.
+
 ## Routing
 
 A server owns an ordered list of routes. Each route has a list of matcher sets, a handler chain,
