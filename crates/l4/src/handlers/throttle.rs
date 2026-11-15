@@ -117,6 +117,13 @@ impl Bucket {
             return bytes;
         }
         let taken = bytes.min(self.available.floor().max(0.0) as usize);
+        if taken == 0 {
+            // A live bucket that cannot pay for a single byte still holds a positive but
+            // sub-unit allowance. The caller waits `delay_for(1)` and comes back; keep the
+            // fraction instead of discarding it, or a bucket refilling slower than one byte per
+            // call never pays out at all and the stream stalls forever.
+            return 0;
+        }
         self.available -= taken as f64;
         taken
     }

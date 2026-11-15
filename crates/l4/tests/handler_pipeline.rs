@@ -268,3 +268,46 @@ fn route_definition(host: &str, action: SniAction) -> RouteDefinition {
 fn passthrough(upstream: &str) -> SniAction {
     SniAction::Passthrough(PassthroughConfig::new(upstream).unwrap())
 }
+
+#[tokio::test]
+async fn a_pipeline_whose_order_is_forbidden_never_runs_a_stage() {
+    // The validator is only worth having if `run` consults it before the first stage touches the
+    // stream: a PROXY header written after the payload it must precede is unrecoverable.
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let router = SniRouter::new(
+        vec![route("example.com", terminate("example.com"))],
+        fallback(),
+    )
+    .unwrap();
+    let (mut client, server) = tokio::io::duplex(64);
+    let pipeline = HandlerPipeline::new(vec![
+        Arc::new(Recorder {
+            name: "proxy",
+            calls: Arc::clone(&calls),
+            fail: false,
+        }),
+        Arc::new(Recorder {
+            name: "proxy_protocol",
+            calls: Arc::clone(&calls),
+            fail: false,
+        }),
+    ]);
+
+    let error = pipeline
+        .run(context(Box::new(server), &router, "example.com"))
+        .await
+        .expect_err("forbidden order");
+    assert!(
+        error.to_string().contains("proxy_protocol"),
+        "the error names the offending stage: {error}"
+    );
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "no stage may run: {:?}",
+        calls.lock().unwrap()
+    );
+    // The stream is closed, not served in the wrong order.
+    let mut seen = Vec::new();
+    client.read_to_end(&mut seen).await.unwrap();
+    assert!(seen.is_empty(), "nothing was forwarded: {seen:?}");
+}
