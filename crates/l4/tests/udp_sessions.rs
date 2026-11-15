@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use caddy_rs_admin::metrics::MetricsRegistry;
 use caddy_rs_l4::matchers::ConnectionMeta;
 use caddy_rs_l4::udp::{
-    AsnMatcher, IpMatcher, UdpAction, UdpMatcher, UdpProxyConfig, UdpRoute, UdpRouteError,
-    UdpRouteTable,
+    AsnMatcher, IpMatcher, UdpAction, UdpDispatch, UdpMatcher, UdpProxyConfig, UdpRoute,
+    UdpRouteError, UdpRouteTable,
 };
 use caddy_rs_l4::udp_metrics::{RouteAllowlist, UdpMetrics, OTHER_LABEL};
 use caddy_rs_l4::udp_session::{
@@ -520,4 +520,55 @@ impl ContainsAddr for IpMatcher {
         let meta = peer(addr);
         <IpMatcher as UdpMatcher>::matches(self, &meta)
     }
+}
+
+#[test]
+fn dispatch_resolves_proxy_and_close_for_a_matched_datagram() {
+    let table = UdpRouteTable::from_routes(vec![
+        // Unmatched by the peer used below, so it must be skipped.
+        UdpRoute::new(
+            vec![Arc::new(AsnMatcher::new(64999)) as Arc<dyn UdpMatcher>],
+            UdpAction::Proxy(UdpProxyConfig::new("wrong:1").unwrap()),
+        ),
+        UdpRoute::new(
+            vec![Arc::new(IpMatcher::parse("10.0.0.0/8").unwrap()) as Arc<dyn UdpMatcher>],
+            UdpAction::Proxy(UdpProxyConfig::new("upstream:9000").unwrap()),
+        ),
+        UdpRoute::new(Vec::new(), UdpAction::Close),
+    ]);
+
+    let dispatch = table.dispatch(&peer("10.1.2.3")).expect("a route matches");
+    assert_eq!(
+        dispatch,
+        UdpDispatch::Proxy {
+            upstream: "upstream:9000".to_string(),
+            route_index: 1,
+        },
+        "dispatch must name the matched route's action, its index and its upstream"
+    );
+    assert_eq!(dispatch.kind(), "proxy");
+    assert_eq!(dispatch.upstream(), Some("upstream:9000"));
+    assert!(!dispatch.is_close());
+    assert_eq!(dispatch.route_index(), 1);
+}
+
+#[test]
+fn dispatch_resolves_close_for_a_catch_all_and_none_when_nothing_matches() {
+    let catch_all = UdpRouteTable::from_routes(vec![UdpRoute::new(Vec::new(), UdpAction::Close)]);
+    let dispatch = catch_all
+        .dispatch(&peer("203.0.113.9"))
+        .expect("the catch-all matches");
+    assert_eq!(dispatch, UdpDispatch::Close { route_index: 0 });
+    assert_eq!(dispatch.kind(), "close");
+    assert!(dispatch.is_close());
+    assert_eq!(dispatch.upstream(), None, "a close action has no upstream");
+
+    let narrow = UdpRouteTable::from_routes(vec![UdpRoute::new(
+        vec![Arc::new(AsnMatcher::new(64512)) as Arc<dyn UdpMatcher>],
+        UdpAction::Close,
+    )]);
+    assert!(
+        narrow.dispatch(&peer("10.1.2.3")).is_none(),
+        "no matching route means no dispatch verdict, not a silent fallback"
+    );
 }
