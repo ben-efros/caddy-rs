@@ -7,6 +7,8 @@
 
 #[path = "../src/activation.rs"]
 mod activation;
+#[path = "../src/enrollment.rs"]
+mod enrollment;
 #[path = "../src/setup.rs"]
 mod setup;
 

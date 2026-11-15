@@ -16,7 +16,7 @@ are documented in [AUTHN.md](AUTHN.md); passkeys and the `caddy-rs setup` comman
 | PM API login with a TOTP second factor | Implemented (`totp_code` field, JSON alias `totpCode`) |
 | `pm-cli` bootstrap admin with `PM_BOOTSTRAP_ADMIN_TOTP` | **Broken**: `bootstrap_admin` calls `totp_verify` before any secret is enrolled, so it can only fail with `TotpNotConfigured` (tracked as T-AUTH-002) |
 | TOTP enrolment HTTP endpoints | Not implemented — no PM API route calls `totp_setup` |
-| `caddy-rs setup --auth-method totp` | Shell only: the generated activation route is a placeholder 503 (see [WEBAUTHN.md](WEBAUTHN.md)) |
+| `caddy-rs setup --auth-method totp` | **Implemented** for first boot (T-SETUP-003): `step=begin` mints the secret and returns the `otpauth://` URI, `step=verify` proves possession and enrols the admin credential, closing the activation window. The credential is in process memory only (DIV-0152); persistence is T-SETUP-005. See [CLI.md](CLI.md#first-boot-enrollment) |
 
 ## Parameters and defaults
 

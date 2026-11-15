@@ -23,7 +23,7 @@ Related: [AUTHN.md](AUTHN.md) (passwords, JWT, tokens), [TOTP.md](TOTP.md) (TOTP
 | WebAuthn assertion verification (challenge, signature, sign counter) | **Not implemented** |
 | Credential persistence, revocation API, enrollment UI | **Not implemented** |
 | PM API WebAuthn support | **Not used** — `pm-api` has no passkey/WebAuthn code |
-| `caddy-rs setup --auth-method webauthn` | **Shell only** — the activation route is a placeholder that responds `503`; see below |
+| `caddy-rs setup --auth-method webauthn` | **Not enrolled yet**: the activation route is live (T-SETUP-002) and TOTP enrollment works behind it (T-SETUP-003), but a `webauthn` enrollment request is refused with `501 method_unsupported` naming T-SETUP-010 rather than pretending to enrol; see below |
 
 Because signature verification is not wired up, the registry is currently an allowlist **data
 model**, not an authentication mechanism. Do not advertise it as working passkey login.
