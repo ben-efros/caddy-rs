@@ -22,6 +22,8 @@ pub mod client_hello;
 pub mod context;
 pub mod handler;
 pub mod matchers;
+pub mod metered_copy;
+pub mod metrics;
 pub mod prefixed_stream;
 pub mod router;
 
@@ -34,6 +36,13 @@ pub use client_hello::{
 };
 pub use handler::{
     BoxedStream, HandlerContext, HandlerError, HandlerPipeline, L4Handler, L4Stream,
+};
+pub use metered_copy::{
+    metered_copy_bidirectional, AtomicByteMeter, ByteMeter, CopyTotals, NullMeter, SharedMeter,
+};
+pub use metrics::{
+    route_label, L4Connection, L4Metrics, SharedL4Metrics, CONNECTIONS_ACTIVE,
+    HANDSHAKE_DURATION_SECONDS, OTHER_LABEL, READ_BYTES_TOTAL, SNI_LABEL, WRITE_BYTES_TOTAL,
 };
 pub use prefixed_stream::{BufferPool, PrefixedStream, POOL_BUFFER_SIZE};
 pub use router::{Route, RouteDefinition, RouteError, SniRouter, SniTable};
