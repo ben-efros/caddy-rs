@@ -147,7 +147,24 @@ impl HandlerPipeline {
     /// Runs every stage in order. On the first failure the connection is closed (the stream is
     /// dropped) and the error is returned; a successful pipeline leaves the terminal stage to
     /// consume the stream.
+    ///
+    /// The stage order is validated before any stage runs, so a route that would inject a PROXY
+    /// header after the payload it must precede, or terminate TLS after proxying started, fails
+    /// loudly instead of serving traffic in an order ADR-030 forbids.
     pub async fn run(&self, mut ctx: HandlerContext) -> Result<(), HandlerError> {
+        let names = self.names();
+        if let Err(error) = crate::handlers::tls::validate_stage_order(&names) {
+            tracing::error!(
+                route = ctx.route().host(),
+                error = %error,
+                "l4 handler order is invalid; closing the connection"
+            );
+            ctx.close();
+            return Err(HandlerError::new(
+                names.first().copied().unwrap_or("pipeline"),
+                error.to_string(),
+            ));
+        }
         for handler in &self.handlers {
             if let Err(error) = handler.handle(&mut ctx).await {
                 tracing::error!(
