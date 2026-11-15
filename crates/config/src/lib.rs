@@ -8,6 +8,7 @@
 
 pub mod adapter;
 mod glob;
+pub mod layer4;
 pub mod lexer;
 pub mod parser;
 

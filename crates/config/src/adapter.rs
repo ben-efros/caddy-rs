@@ -1195,7 +1195,7 @@ pub fn adapt_with_options(
         {
             return Err(adapter_error(
                 position,
-                "`servers` option `trust_cdn` (caddy-rs extension, not in Caddy v2.11.9) is not                  supported with `stock_compat true`",
+                "`servers` option `trust_cdn` (caddy-rs extension, not in Caddy v2.11.9) is not supported with `stock_compat true`",
             ));
         }
     }
@@ -1586,6 +1586,24 @@ pub fn adapt_with_options(
     }
     if let Some(tls) = tls_plan.app.clone() {
         apps.insert("tls".to_string(), tls);
+    }
+    // A global `layer4 { ... }` option becomes `apps.layer4` (ADR-030, T-L4-004). The `layer4`
+    // Caddyfile is a caddy-l4 surface that stock Caddy v2.11.9 has no plugin for, so emitting the
+    // app - with located errors for the parts of the subset not implemented yet - is the
+    // advertised contract: the configuration is carried, the TCP runtime is the other T-L4-* tasks.
+    if let Some(layer4) = &options.layer4 {
+        // A caddy-l4-only surface (no stock Caddy v2.11.9 equivalent, like `radar`/`trust_cdn`):
+        // under `stock_compat true` the option is a located error rather than silently accepted.
+        if options.stock_compat {
+            return Err(adapter_error(
+                layer4.position.clone(),
+                "global option `layer4` (caddy-l4 extension, not in Caddy v2.11.9) is not supported with `stock_compat true`",
+            ));
+        }
+        apps.insert(
+            "layer4".to_string(),
+            crate::layer4::layer4_app_json(layer4)?,
+        );
     }
     // `acme_server`'s `ca` option also contributes a `pki.ca` configuration value (Caddy's
     // `buildPKIApp`): add any CA the global `pki` option did not already define, with the CA's

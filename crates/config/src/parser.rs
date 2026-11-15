@@ -89,6 +89,9 @@ pub struct GlobalOptions {
     /// imports keep the strict safety checks. The remaining stock-compat profile surfaces are
     /// tracked by T-CONF-070/T-CONF-071 and are not implemented by this build yet.
     pub stock_compat: bool,
+    /// The global `layer4 { ... }` option (ADR-030, T-L4-004): the raw L4 listener blocks that
+    /// adapt to `apps.layer4`. See [`Layer4Options`].
+    pub layer4: Option<Layer4Options>,
     /// caddy-rs extension: the global `radar { ... }` option (ADR-0020, T-CONF-079). The adapter
     /// carries the configuration only; polling, matchers and handlers are runtime work
     /// (T-ROUTE-059/T-ROUTE-060).
@@ -100,6 +103,21 @@ pub struct GlobalOptions {
     /// Non-fatal notes produced while preprocessing the Caddyfile (environment-placeholder
     /// expansion) and while reading options. Adapters surface these to callers.
     pub warnings: Vec<String>,
+}
+
+/// The global `layer4 { ... }` option (ADR-030, T-L4-004).
+///
+/// `layer4` is not a stock Caddy global option - it belongs to the `caddy-l4` plugin - so it is a
+/// plain match arm rather than an `is_caddy_global_option` entry, like `radar` and `trust_cdn`.
+/// The parser keeps the listener blocks verbatim and [`crate::layer4`] validates and converts them
+/// to Caddy's `apps.layer4` JSON, reporting located errors for anything the TCP subset (T-L4-004)
+/// does not support yet (UDP listeners and the remaining handlers are T-L4-011).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Layer4Options {
+    /// The `layer4` block body: one entry per listener block, in source order.
+    pub directives: Vec<Directive>,
+    /// Position of the `layer4` option, for located errors.
+    pub position: Position,
 }
 
 /// caddy-rs extension: the global `radar { ... }` option (ADR-0020, T-CONF-079).
@@ -2596,6 +2614,17 @@ fn read_global_options(directives: Vec<Directive>) -> Result<GlobalOptions, Pars
                 // caddy-rs extension (ADR-013, T-CONF-079).
                 trust_cdn_position = Some(directive.position.clone());
                 options.trust_cdn = Some(parse_trust_cdn_option(&directive)?);
+            }
+            "layer4" => {
+                // `caddy-l4` global option (ADR-030, T-L4-004): parsed verbatim, validated by
+                // `crate::layer4` during adaptation. An empty block configures nothing, so it is
+                // not recorded (upstream's global options block is allowed to be empty).
+                if !directive.block.is_empty() {
+                    options.layer4 = Some(Layer4Options {
+                        directives: directive.block.clone(),
+                        position: directive.position.clone(),
+                    });
+                }
             }
             other if is_caddy_global_option(other) => {
                 return Err(ParseError::unsupported(
