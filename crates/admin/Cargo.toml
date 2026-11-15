@@ -10,7 +10,7 @@ repository.workspace = true
 [dependencies]
 base64 = "0.23.1"
 flate2 = "1"
-zstd = "0.13"
+zstd = "0.14"
 bytes = { workspace = true }
 caddy-rs-config = { workspace = true, default-features = false }
 caddy-rs-core = { workspace = true, default-features = false }
