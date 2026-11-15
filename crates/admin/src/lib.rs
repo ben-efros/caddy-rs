@@ -1774,13 +1774,7 @@ impl AdminApi {
     /// bounded by [`STOP_EXIT_WAIT`] and `drain_timeout`, and a runtime that never reports
     /// completion (or an embedded host that supplies no [`ShutdownLatch`]) still exits.
     fn unload(&self) -> AdminResponse {
-        if let Some(generation) = self.store.stop() {
-            let timeout = self.drain_timeout;
-            tokio::spawn(async move {
-                let _ = drain(&generation, timeout).await;
-            });
-        }
-        self.notify_reload();
+        self.stop_generation();
         if self.exit_process_on_stop {
             // Tell a systemd `Type=notify` unit before the delayed process exit; best-effort,
             // because a missing/broken NOTIFY_SOCKET must not change /stop semantics.
@@ -1809,6 +1803,21 @@ impl AdminApi {
             });
         }
         AdminResponse::empty(StatusCode::OK)
+    }
+
+    /// Deactivate the running configuration without waiting for it to drain.
+    ///
+    /// The drain runs on a spawned task, never inside the request: draining blocks until the
+    /// previous generation's in-flight work ends (up to `drain_timeout`), while `/stop` must
+    /// answer promptly and the graceful stop itself is what ends those connections.
+    fn stop_generation(&self) {
+        if let Some(generation) = self.store.stop() {
+            let timeout = self.drain_timeout;
+            tokio::spawn(async move {
+                let _ = drain(&generation, timeout).await;
+            });
+        }
+        self.notify_reload();
     }
 }
 
