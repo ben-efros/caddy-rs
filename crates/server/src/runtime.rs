@@ -217,6 +217,12 @@ pub struct ServerRuntime {
     /// Injected ACME transport for automatic HTTPS (tests and embedders); production builds a
     /// [`HyperTransport`] when certificates must be obtained.
     acme_transport: Option<Arc<dyn AcmeTransport>>,
+    /// Handler modules contributed by the embedding binary on top of the proxy crate's factory.
+    ///
+    /// Used by `caddy-rs setup` for its process-local activation handler (T-SETUP-002), whose
+    /// token store cannot live in a normal `caddy-rs run` generation. `None` is the production
+    /// behaviour: the router consults only the built-in handlers and `reverse_proxy`.
+    extension_handler_factory: Option<caddy_rs_http::CustomHandlerFactory>,
     /// Caddy data directory override for account/certificate storage (defaults to the configured
     /// `storage` root, then `.caddy-rs`).
     data_root: Option<std::path::PathBuf>,
@@ -339,6 +345,32 @@ fn client_auth_ca_pool_context(
     context
 }
 
+/// The router's custom-handler factory: the embedder's contributed modules first, then the proxy
+/// crate's `reverse_proxy` factory.
+///
+/// The contributed factory is consulted first but falls through on `Ok(None)`, so it can only add
+/// handler names; every built-in handler and `reverse_proxy` keep their existing behaviour.
+fn extension_handler_factory(
+    extension: Option<&caddy_rs_http::CustomHandlerFactory>,
+    status_sink: Arc<UpstreamStatusSink>,
+    server_software: Option<String>,
+) -> caddy_rs_http::CustomHandlerFactory {
+    let proxy = handler_factory_with_status_sink_and_server_software(status_sink, server_software);
+    let Some(extension) = extension.cloned() else {
+        return proxy;
+    };
+    Arc::new(
+        move |value: &serde_json::Value,
+              path: &str,
+              context: &caddy_rs_http::HandlerBuildContext| {
+            if let Some(handler) = extension(value, path, context)? {
+                return Ok(Some(handler));
+            }
+            proxy(value, path, context)
+        },
+    )
+}
+
 impl ServerRuntime {
     /// Release a [`caddy_rs_admin::ShutdownLatch`] exactly once, from whichever path ends this
     /// runtime's loop. `POST /stop` exits the process as soon as it is released, so every path that
@@ -379,6 +411,7 @@ impl ServerRuntime {
             shutdown_latch,
             shutdown_released: std::sync::atomic::AtomicBool::new(false),
             acme_transport: None,
+            extension_handler_factory: None,
             data_root: None,
             challenge_tokens: Arc::new(caddy_rs_tls::Http01TokenStore::new()),
             states: SharedListeners::new(RwLock::new(std::collections::HashMap::new())),
@@ -431,6 +464,21 @@ impl ServerRuntime {
     ///
     /// Tests inject a fake local CA; production leaves this unset so a [`HyperTransport`] (platform
     /// trust store) is created only when certificates actually need to be obtained.
+    /// Register handler modules contributed by the embedding binary.
+    ///
+    /// The factory is consulted *before* the proxy crate's factory, so a contributed module name
+    /// wins over a built-in one only if it claims it explicitly (returning `Ok(None)` falls through
+    /// to the normal handlers). Contributed handlers are not registered in the module registry by
+    /// this call; the embedder registers the module itself, so a configuration that names a
+    /// contributed handler is still rejected by a generation that did not register it.
+    pub fn with_extension_handler_factory(
+        mut self,
+        factory: caddy_rs_http::CustomHandlerFactory,
+    ) -> Self {
+        self.extension_handler_factory = Some(factory);
+        self
+    }
+
     pub fn with_acme_transport(mut self, transport: Arc<dyn AcmeTransport>) -> Self {
         self.acme_transport = Some(transport);
         self
@@ -593,6 +641,7 @@ impl ServerRuntime {
                 server_name,
                 server,
                 &status_sink,
+                self.extension_handler_factory.as_ref(),
                 generation.config().stock_compat(),
                 has_reverse_proxy,
                 acme_server_data_root.as_deref(),
@@ -1781,6 +1830,7 @@ impl ServerRuntime {
         server_name: &str,
         server: &caddy_rs_core::HttpServer,
         status_sink: &Arc<UpstreamStatusSink>,
+        extension_factory: Option<&caddy_rs_http::CustomHandlerFactory>,
         stock_compat: bool,
         has_reverse_proxy: bool,
         acme_server_data_root: Option<&std::path::Path>,
@@ -1819,7 +1869,8 @@ impl ServerRuntime {
                 ))
             })?;
         let router_builder = RouterBuilder::new()
-            .with_custom_handler(handler_factory_with_status_sink_and_server_software(
+            .with_custom_handler(extension_handler_factory(
+                extension_factory,
                 Arc::clone(status_sink),
                 server_software,
             ))
@@ -1945,6 +1996,7 @@ impl ServerRuntime {
                 server_name,
                 server,
                 status_sink,
+                self.extension_handler_factory.as_ref(),
                 generation.config().stock_compat(),
                 has_reverse_proxy,
                 acme_server_data_root.as_deref(),

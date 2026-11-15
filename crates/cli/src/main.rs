@@ -82,6 +82,7 @@
 //! Running the command with elevated privileges (root, `docker exec -u root`, `sudo`) installs
 //! files for root's home, not the user's; run it as the user who will use the shell.
 
+mod activation;
 mod build_info;
 mod completion;
 mod completion_install;
@@ -820,7 +821,30 @@ async fn run_start(
 async fn run(command: Command) -> anyhow::Result<()> {
     match command {
         Command::Setup(args) => {
-            setup::run(args).map_err(|error| anyhow!("{error}"))?;
+            // The stock-compatibility check must come first: `setup` is a caddy-rs extension, so
+            // the rejection has to happen before anything is generated, bound or booted.
+            setup::ensure_not_stock_compat(setup::stock_compat_requested())
+                .map_err(|error| anyhow!("{error}"))?;
+            // The activation layer is part of the boot: mint the token, then serve the endpoint on
+            // the same listener the activation URLs point at (T-SETUP-002).
+            let config = setup::generate_config(&args).map_err(|error| anyhow!("{error}"))?;
+            let mut tokens = setup::TokenStore::new(config.registration_timeout);
+            let token = tokens.mint(std::time::SystemTime::now());
+            for url in &config.activation_urls {
+                println!("{}", setup::activation_url_with_token(url, &token.value));
+            }
+            let service = std::sync::Arc::new(activation::ActivationService::new(
+                tokens,
+                config.auth_method,
+            ));
+            activation::serve_with(
+                &config.activation_listen,
+                service,
+                builtin_module_registry(),
+                crate::signals::shutdown_channels()?.shutdown,
+                crate::signals::shutdown_channels()?.force,
+            )
+            .await?;
         }
         Command::Version { json } => {
             if json {
