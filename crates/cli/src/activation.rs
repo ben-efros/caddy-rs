@@ -111,25 +111,34 @@ pub enum ActivationOutcome {
     NotFound,
     /// The method is neither `GET` nor `POST`.
     MethodNotAllowed,
+    /// The token was valid and enrollment completed (T-SETUP-003): the credential is enrolled and
+    /// the activation window is now closed.
+    Enrolled,
+    /// The token was valid but the enrollment step was refused; carries the HTTP status and the
+    /// stable machine-readable code so the refusal keeps its own status rather than collapsing to
+    /// one value.
+    EnrollmentRefused { status: u16, code: &'static str },
 }
 
 impl ActivationOutcome {
     /// HTTP status for the outcome.
     pub fn status(self) -> u16 {
         match self {
-            Self::Activated => 200,
+            Self::Activated | Self::Enrolled => 200,
             Self::Expired => 410,
             Self::Unknown | Self::NotFound => 404,
             Self::MissingToken | Self::MalformedToken => 400,
             Self::MethodNotAllowed => 405,
+            Self::EnrollmentRefused { status, .. } => status,
         }
     }
 
     /// Stable machine-readable error code, or `None` for a successful activation.
     pub fn error_code(self) -> Option<&'static str> {
         match self {
-            Self::Activated => None,
+            Self::Activated | Self::Enrolled => None,
             Self::Expired => Some("token_expired"),
+            Self::EnrollmentRefused { code, .. } => Some(code),
             Self::Unknown => Some("token_unknown"),
             Self::MissingToken => Some("token_missing"),
             Self::MalformedToken => Some("token_malformed"),
@@ -151,14 +160,24 @@ impl ActivationOutcome {
     pub fn body(self, auth_method: AuthMethod) -> String {
         let mut object = Map::new();
         match self.error_code() {
+            None if self == Self::Enrolled => {
+                object.insert("status".into(), Value::String("enrolled".into()));
+                object.insert(
+                    "auth_method".into(),
+                    Value::String(auth_method.as_str().to_string()),
+                );
+                // The credential exists now and the window is closed; saying "pending" here would
+                // understate what happened (T-SETUP-003).
+                object.insert("enrollment".into(), Value::String("complete".into()));
+            }
             None => {
                 object.insert("status".into(), Value::String("activated".into()));
                 object.insert(
                     "auth_method".into(),
                     Value::String(auth_method.as_str().to_string()),
                 );
-                // Enrollment is T-SETUP-003; naming the state keeps the response honest instead of
-                // claiming credentials exist.
+                // A plain activation has redeemed the token but not enrolled anything yet; naming
+                // the state keeps the response honest instead of claiming credentials exist.
                 object.insert("enrollment".into(), Value::String("pending".into()));
             }
             Some(code) => {
@@ -185,6 +204,14 @@ fn split_target(target: &str) -> (&str, &str) {
     }
 }
 
+/// Whether the query selects an enrollment step (an enrollment request rather than a plain
+/// activation).
+fn is_enrollment_request(query: &str) -> bool {
+    query
+        .split('&')
+        .any(|pair| pair.split_once('=').is_some_and(|(key, _)| key == "step"))
+}
+
 /// Value of the `token` query parameter, if present (first occurrence wins, like Go's `Query()`).
 fn query_token(query: &str) -> Option<&str> {
     query.split('&').find_map(|pair| {
@@ -200,6 +227,8 @@ fn query_token(query: &str) -> Option<&str> {
 pub struct ActivationService {
     tokens: Mutex<TokenStore>,
     auth_method: AuthMethod,
+    /// First-boot enrollment, once T-SETUP-003 wired it behind the token check.
+    enrollment: Option<Arc<crate::enrollment::EnrollmentService>>,
 }
 
 impl ActivationService {
@@ -208,13 +237,32 @@ impl ActivationService {
         Self {
             tokens: Mutex::new(tokens),
             auth_method,
+            enrollment: None,
         }
     }
 
+    /// Attach the first-boot enrollment service (T-SETUP-003).
+    pub fn with_enrollment(
+        mut self,
+        enrollment: Arc<crate::enrollment::EnrollmentService>,
+    ) -> Self {
+        self.enrollment = Some(enrollment);
+        self
+    }
+
     /// Handle one request: `(method, request_target)` -> outcome.
+    ///
+    /// This is the synchronous path used for plain activation, and by the T-SETUP-002 tests. A
+    /// request that carries a `step` is an enrollment request: it needs the async enrollment
+    /// service, so it is dispatched by [`Self::handle_async`]. Passing one here reports
+    /// [`ActivationOutcome::NotFound`] rather than silently activating without enrolling, so a
+    /// caller cannot mistake a dropped enrollment for a success.
     pub fn handle(&self, method: &str, target: &str) -> ActivationOutcome {
         let (path, query) = split_target(target);
         if path != ACTIVATION_PATH {
+            return ActivationOutcome::NotFound;
+        }
+        if is_enrollment_request(query) && self.enrollment.is_some() {
             return ActivationOutcome::NotFound;
         }
         if !method.eq_ignore_ascii_case("GET") && !method.eq_ignore_ascii_case("POST") {
@@ -235,6 +283,62 @@ impl ActivationService {
             Err(TokenError::Expired) => ActivationOutcome::Expired,
             Err(TokenError::Unknown) => ActivationOutcome::Unknown,
         }
+    }
+
+    /// Handle one request, awaiting the enrollment step when the request selects one.
+    ///
+    /// The token check is the same single-use `consume` as [`Self::handle`]. Enrollment is two
+    /// steps behind one link, so the token admits the enrollment *session*: the first step consumes
+    /// it and the session it opens is remembered, which lets the later step through without making
+    /// the link reusable for a second activation. The enrollment service closes the window.
+    pub async fn handle_async(&self, method: &str, target: &str) -> ActivationOutcome {
+        let (path, query) = split_target(target);
+        if path != ACTIVATION_PATH {
+            return ActivationOutcome::NotFound;
+        }
+        if !method.eq_ignore_ascii_case("GET") && !method.eq_ignore_ascii_case("POST") {
+            return ActivationOutcome::MethodNotAllowed;
+        }
+        let Some(enrollment) = self.enrollment.as_ref() else {
+            return self.handle(method, target);
+        };
+        if !is_enrollment_request(query) {
+            return self.handle(method, target);
+        }
+        let Some(token) = query_token(query) else {
+            return ActivationOutcome::MissingToken;
+        };
+        if !is_well_formed_token(token) {
+            return ActivationOutcome::MalformedToken;
+        }
+        // Once a session is open, ONLY the token that opened it may continue it. This is checked
+        // before the store is touched, because a second minted token is still unconsumed and would
+        // otherwise consume cleanly and join someone else's enrollment.
+        if enrollment.has_session() && !enrollment.is_session(token) {
+            return ActivationOutcome::Unknown;
+        }
+        let consumed = {
+            let mut tokens = self
+                .tokens
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            tokens.consume(token, std::time::SystemTime::now())
+        };
+        match consumed {
+            Ok(()) => enrollment.open_session(token),
+            Err(TokenError::Unknown) if enrollment.is_session(token) => {}
+            Err(TokenError::Expired) => return ActivationOutcome::Expired,
+            Err(TokenError::Unknown) => return ActivationOutcome::Unknown,
+        }
+        match enrollment.handle(query).await {
+            Ok(_) => ActivationOutcome::Enrolled,
+            Err(error) => error.outcome(),
+        }
+    }
+
+    /// The enrollment service, when one is attached.
+    pub fn enrollment(&self) -> Option<&Arc<crate::enrollment::EnrollmentService>> {
+        self.enrollment.as_ref()
     }
 
     /// The enrollment method announced to the browser.
@@ -268,7 +372,7 @@ impl Handler for ActivationHandler {
             .path_and_query()
             .map(|path| path.as_str().to_string())
             .unwrap_or_else(|| request.uri.path().to_string());
-        let outcome = self.service.handle(&method, &target);
+        let outcome = self.service.handle_async(&method, &target).await;
         let mut headers = http::HeaderMap::new();
         for (name, value) in outcome.headers() {
             // `HeaderName` is lowercase by construction (`HeaderName::from_static` panics on
@@ -278,10 +382,27 @@ impl Handler for ActivationHandler {
             headers.insert(name, value);
         }
         let status = http::StatusCode::from_u16(outcome.status()).unwrap_or(http::StatusCode::OK);
+        // A successful `begin` must hand back the scannable URI; the outcome is `Copy` so the URI
+        // is read from the service rather than carried in it.
+        let body = match (&outcome, self.service.enrollment()) {
+            // Once the credential exists the response reports completion; before that, a `begin`
+            // returns the scannable URI.
+            (ActivationOutcome::Enrolled, Some(enrollment)) if enrollment.is_enrolled() => {
+                outcome.body(self.service.auth_method())
+            }
+            (ActivationOutcome::Enrolled, Some(enrollment)) => match enrollment.issued_uri() {
+                Some(uri) => format!(
+                    "{{\"status\":\"enrollment_started\",\"otpauth_uri\":{}}}",
+                    Value::String(uri)
+                ),
+                None => outcome.body(self.service.auth_method()),
+            },
+            _ => outcome.body(self.service.auth_method()),
+        };
         Ok(Outcome::Respond(Response {
             status,
             headers,
-            body: bytes::Bytes::from(outcome.body(self.service.auth_method())),
+            body: bytes::Bytes::from(body),
         }))
     }
 }

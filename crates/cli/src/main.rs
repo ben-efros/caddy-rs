@@ -86,6 +86,7 @@ mod activation;
 mod build_info;
 mod completion;
 mod completion_install;
+mod enrollment;
 mod environ;
 mod file_server;
 mod fmt;
@@ -833,10 +834,13 @@ async fn run(command: Command) -> anyhow::Result<()> {
             for url in &config.activation_urls {
                 println!("{}", setup::activation_url_with_token(url, &token.value));
             }
-            let service = std::sync::Arc::new(activation::ActivationService::new(
-                tokens,
-                config.auth_method,
-            ));
+            // First-boot enrollment (T-SETUP-003) rides on the same activation link: the token
+            // admits the enrollment session, and a completed proof closes the window.
+            let enrollment = enrollment::shared(config.auth_method.as_str());
+            let service = std::sync::Arc::new(
+                activation::ActivationService::new(tokens, config.auth_method)
+                    .with_enrollment(enrollment),
+            );
             activation::serve_with(
                 &config.activation_listen,
                 service,

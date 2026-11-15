@@ -106,10 +106,46 @@ of every outcome is checked by test to be token-free.
 Tokens stay process-local until T-SETUP-005 gives them shared storage, so a restart discards any
 outstanding token and the operator must mint a new one.
 
+### First-boot enrollment
+
+With `--auth-method totp`, redeeming the activation link opens a two-step enrollment behind that same
+single-use token (T-SETUP-003):
+
+```sh
+# 1. Mint the secret. Returns the otpauth:// URI to scan, once per activation.
+curl "http://127.0.0.1:<port>/_caddy-pm/activate?token=<token>&step=begin"
+# 2. Prove possession. A correct code enrols the credential and closes the window.
+curl "http://127.0.0.1:<port>/_caddy-pm/activate?token=<token>&step=verify&code=<6 digits>"
+```
+
+The link admits the *session*, not each request: the first step consumes the token and only that same
+token may continue the session, so a second minted token cannot join it. A successful `verify`
+enrols exactly one admin credential and disables the endpoint — every later request, with any token,
+is refused with `409 already_enrolled`, because closing the window is the point of enrolling. The
+`begin` step is idempotent within an activation so a browser refresh cannot invalidate a secret the
+operator has already scanned.
+
+| Refusal | Status | `error` |
+|---|---|---|
+| already enrolled | `409` | `already_enrolled` |
+| `--auth-method webauthn` in this build | `501` | `method_unsupported` |
+| missing, repeated or unknown `step`, or `verify` before `begin` | `400` | `invalid_step` |
+| `code` absent, not 6 digits, or repeated | `400` | `invalid_code` |
+| well-formed but wrong code | `401` | `code_rejected` |
+| correct for a step already used | `401` | `code_replayed` |
+
+A well-formed code from an out-of-window step is refused rather than reported as a typo: a correct
+code for a stale step is a captured code being replayed, not a mistype. The TOTP secret is returned
+once and never logged.
+
 Documented limits of this build (T-SETUP-003/T-SETUP-004/T-SETUP-005):
 
-* A successful activation does not yet serve an enrollment UI: WebAuthn/TOTP enrollment is T-SETUP-003.
-  The endpoint completes the hand-off and reports success; there is no page behind it yet.
+* `--auth-method totp` enrols a TOTP credential; `--auth-method webauthn` does not enrol anything yet
+  and every enrollment request is refused with `501 method_unsupported` naming T-SETUP-010, rather
+  than pretending to enrol. There is no HTML enrollment page for either method: the flow is the two
+  endpoint steps described above.
+* The enrolled credential is held in process memory for the activation window and does not survive a
+  restart (T-SETUP-005 owns persistence); DIV-0152 records the gap.
 * The activation endpoint is cleartext HTTP on the loopback address, and the generated configuration
   sets `apps.http.https_port = 0` for it, because the printed `https://` URL cannot be served without
   the `caddy-rs-pm` service (T-SETUP-004). Do not treat the printed scheme as TLS on this endpoint.

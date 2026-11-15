@@ -1519,6 +1519,38 @@ fn totp_code(secret: &[u8], step: u64) -> String {
     )
 }
 
+/// The TOTP time-step length in seconds.
+pub const fn totp_step_seconds() -> u64 {
+    TOTP_STEP_SECONDS
+}
+
+/// The number of digits in a TOTP code.
+pub const fn totp_digits() -> u32 {
+    TOTP_DIGITS
+}
+
+/// Decode a base32 TOTP secret as produced by [`AuthnService::totp_setup`].
+///
+/// Returns `None` when `secret` is not unpadded RFC 4648 base32.
+pub fn decode_totp_secret(secret: &str) -> Option<Vec<u8>> {
+    base32::decode(Alphabet::Rfc4648 { padding: false }, secret)
+}
+
+/// Generate the TOTP code for `secret` at the given time step.
+///
+/// This is the same code the server compares against, exposed so a caller that holds the secret can
+/// complete a possession proof without reimplementing the algorithm. It is *not* a verification
+/// path: verification is [`AuthnService::totp_verify`], which applies the accepted window and the
+/// replay rule.
+pub fn totp_code_for_step(secret: &str, step: u64) -> Option<String> {
+    decode_totp_secret(secret).map(|bytes| totp_code(&bytes, step))
+}
+
+/// The current TOTP time step for a Unix timestamp in seconds.
+pub const fn totp_step_at(unix_seconds: u64) -> u64 {
+    unix_seconds / TOTP_STEP_SECONDS
+}
+
 /// Constant-time comparison for fixed-length TOTP codes.
 fn constant_time_eq(left: &str, right: &str) -> bool {
     if left.len() != right.len() {

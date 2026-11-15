@@ -236,6 +236,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "caddy-rs-admin",
+ "caddy-rs-authn",
  "caddy-rs-config",
  "caddy-rs-core",
  "caddy-rs-http",
