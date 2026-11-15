@@ -18,14 +18,15 @@
 //! | any other path | `404 Not Found` | `{"error":"not_found"}` |
 //! | any other method | `405 Method Not Allowed` | `{"error":"method_not_allowed"}`, `Allow: GET, POST` |
 //!
-//! The token is consumed by the *first* request that presents it, whatever the method, and it is
-//! consumed before enrollment is reached, so a replay can never reach enrollment twice. Consuming is
-//! one locked store operation, which is what makes "exactly once" true under concurrent requests
-//! rather than only in a sequential test.
+//! The token is consumed by the *first* `GET` or `POST` that presents it. A request with any other
+//! method is refused before the store is touched, so it neither consumes the token nor reveals
+//! whether one exists. Consumption happens before enrollment is reached, so a replay can never reach
+//! enrollment twice. Consuming is one locked store operation, which is what makes "exactly once"
+//! true under concurrent requests rather than only in a sequential test.
 //!
-//! Tokens are process-local (T-SETUP-005 moves them into `caddy-pm-rs` storage). The endpoint writes
-//! no log lines and never echoes a token value in a response, so a token cannot leak through the
-//! activation layer.
+//! Tokens are process-local (T-SETUP-005 moves them into `caddy-pm-rs` storage). The endpoint never
+//! echoes a token value in a response, and the one line it writes to stderr on start-up names the
+//! bound address only, so a token cannot leak through the activation layer.
 //!
 //! # How it is served
 //!
