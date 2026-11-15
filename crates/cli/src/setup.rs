@@ -203,6 +203,8 @@ pub struct SetupConfig {
     pub activation_urls: Vec<String>,
     /// Effective TTL for the activation token.
     pub registration_timeout: Duration,
+    /// Listener the activation endpoint binds (`host:port`; cleartext, see DIV-0151).
+    pub activation_listen: String,
     /// Enrollment method.
     pub auth_method: AuthMethod,
     /// Storage backend requested by the operator.
@@ -292,6 +294,29 @@ fn listen_port(addr: Option<&str>) -> Result<u16, SetupError> {
             .parse()
             .map_err(|_| SetupError::InvalidListenAddress(addr.to_string())),
         None => Ok(443),
+    }
+}
+
+/// The concrete `host:port` the activation endpoint binds.
+///
+/// ADR-0039 listen addresses are `IP`, `IP:port`, `[IPv6]`, `[IPv6]:port` or `:port`; a bare address
+/// means port 443 (the default the activation URLs use), and a host-less `:port` binds the
+/// wildcard. The endpoint is served over cleartext HTTP for now (DIV-0151), so the default host is
+/// the loopback interface rather than `0.0.0.0`: a temporary activation endpoint with no TLS must
+/// not be reachable from the network.
+pub fn activation_listen(addr: Option<&str>, port: u16) -> String {
+    match addr {
+        None => format!("127.0.0.1:{port}"),
+        Some(addr) if addr.starts_with(':') => format!("127.0.0.1:{port}"),
+        Some(addr) if addr.starts_with('[') => {
+            // `[IPv6]` or `[IPv6]:port`: keep the bracketed literal and append the resolved port.
+            let end = addr.find(']').map(|index| index + 1).unwrap_or(addr.len());
+            format!("{}:{port}", &addr[..end])
+        }
+        Some(addr) => {
+            let host = addr.rsplit_once(':').map(|(host, _)| host).unwrap_or(addr);
+            format!("{host}:{port}")
+        }
     }
 }
 
@@ -411,6 +436,7 @@ pub fn generate_config(args: &SetupArgs) -> Result<SetupConfig, SetupError> {
         json: adapted.config,
         config_path,
         activation_urls,
+        activation_listen: activation_listen(args.listen_address.as_deref(), port),
         registration_timeout: timeout,
         auth_method: args.auth_method,
         storage: args.storage.clone(),

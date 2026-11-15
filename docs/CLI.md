@@ -79,17 +79,41 @@ caddyfile` without `--data-dir`, so the running server resolves its data directo
 `run` above); the flag does not control the server's data directory.
 
 The token is 128 random bits rendered as 32 hex characters and held in memory. The token store
-records a single use and rejects an elapsed TTL or a second use, but the activation route does not
-consult it yet (T-SETUP-002), so no printed token is currently redeemable. `setup` prints the auth
-method, storage, token lifetime, expiry (Unix seconds) and each activation URL, then runs
+records a single use and rejects an elapsed TTL or a second use, and the activation route consults
+it: `setup` prints the auth method, storage, token lifetime, expiry (Unix seconds) and each
+activation URL, then runs
 `caddy-rs run --config <data-dir>/setup/Caddyfile --adapter caddyfile` in the foreground.
 
-Documented limits of this build (T-SETUP-002/T-SETUP-003/T-SETUP-004/T-SETUP-005):
+### The activation endpoint
 
-* The activation route is a placeholder `respond "caddy-pm-rs activation layer is not running" 503`;
-  no enrollment UI is served. WebAuthn/TOTP enrollment is not implemented yet, and the token store
-  is not wired to the route, so a printed token cannot actually be redeemed.
-* `setup` does not spawn `caddy-rs-pm` (the literal 503 message still says `caddy-pm-rs`); only `caddy-rs` itself is started.
+A setup boot serves `GET`/`POST /_caddy-pm/activate` on the activation listener, loopback by default.
+The token is read from the `token` query parameter, for example
+`http://127.0.0.1:<port>/_caddy-pm/activate?token=<32 hex chars>`; if the parameter repeats, the first
+occurrence wins. The endpoint is a single-use hand-off: a valid token returns `200` and is consumed, so
+a replay of the same token is rejected. A token value is never written to a log line; the response body
+of every outcome is checked by test to be token-free.
+
+| Outcome | Status | `error` code |
+|---|---|---|
+| first use of a live token | `200` | — |
+| token past its TTL | `410` | `token_expired` |
+| token not in the store, or replay after use | `404` | `token_unknown` |
+| no `token` parameter | `400` | `token_missing` |
+| `token` that is not 32 lowercase hex characters | `400` | `token_malformed` |
+| any path other than `/_caddy-pm/activate` | `404` | `not_found` |
+| a method other than `GET`/`POST` | `405` | `method_not_allowed` |
+
+Tokens stay process-local until T-SETUP-005 gives them shared storage, so a restart discards any
+outstanding token and the operator must mint a new one.
+
+Documented limits of this build (T-SETUP-003/T-SETUP-004/T-SETUP-005):
+
+* A successful activation does not yet serve an enrollment UI: WebAuthn/TOTP enrollment is T-SETUP-003.
+  The endpoint completes the hand-off and reports success; there is no page behind it yet.
+* The activation endpoint is cleartext HTTP on the loopback address, and the generated configuration
+  sets `apps.http.https_port = 0` for it, because the printed `https://` URL cannot be served without
+  the `caddy-rs-pm` service (T-SETUP-004). Do not treat the printed scheme as TLS on this endpoint.
+* `setup` does not spawn `caddy-rs-pm`; only `caddy-rs` itself is started.
   Per-backend credential persistence is not implemented.
 * In the stock-compatibility profile (`CADDY_RS_STOCK_COMPAT=1`, `true` or `yes`) `setup` is
   rejected as an unknown command, because stock Caddy has no `setup` subcommand.

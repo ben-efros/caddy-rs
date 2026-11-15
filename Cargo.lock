@@ -233,6 +233,7 @@ name = "caddy-rs"
 version = "0.1.0-trial.6"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bytes",
  "caddy-rs-admin",
  "caddy-rs-config",

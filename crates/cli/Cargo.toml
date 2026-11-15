@@ -26,6 +26,7 @@ minimal = []
 
 [dependencies]
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 bytes = { workspace = true }
 caddy-rs-admin = { workspace = true, default-features = false }
 caddy-rs-config = { workspace = true, default-features = false }
