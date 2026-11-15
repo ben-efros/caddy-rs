@@ -19,7 +19,9 @@
 
 pub mod actions;
 pub mod client_hello;
+pub mod context;
 pub mod handler;
+pub mod matchers;
 pub mod prefixed_stream;
 pub mod router;
 
@@ -35,3 +37,11 @@ pub use handler::{
 };
 pub use prefixed_stream::{BufferPool, PrefixedStream, POOL_BUFFER_SIZE};
 pub use router::{Route, RouteDefinition, RouteError, SniRouter, SniTable};
+
+pub use context::{sniff, PeekError, PeekLimits, PeekStats, ProtocolInfo, Sniffed, StreamContext};
+pub use matchers::{
+    matched, unmatched, AsnMatcher, BoxedMatcher, ConnMatcher, ConnMatcherErased, ConnectionMeta,
+    EvaluateContext, IpMatcher, IpRange, IpRangeError, L7Matcher, L7Protocol, MatchContext,
+    MatchError, MatchOutcome, MatcherError, MatcherSet, MatcherStats, SniPattern, SniPatternError,
+    StreamMatcher, TlsMatcher,
+};
