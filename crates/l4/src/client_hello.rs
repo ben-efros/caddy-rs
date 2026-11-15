@@ -308,6 +308,10 @@ fn parse_client_hello_body(body: &[u8]) -> Result<ClientHelloInfo<'_>, ParseErro
 }
 
 /// Parses the `server_name` extension, returning the lowercased hostname.
+///
+/// `parse_client_hello_body` hands this function the bytes *after* the extension's own two-byte
+/// length prefix, so `data` starts at the `server_name_list` length field (RFC 6066 s3):
+/// `list_len(u16) | name_type(u8) | name_len(u16) | name`, where `list_len = 1 + 2 + name_len`.
 fn parse_server_name(data: &[u8]) -> Result<Option<Cow<'_, str>>, ParseError> {
     let mut cursor = Cursor::new(data);
     let list_len = cursor.u16()? as usize;
