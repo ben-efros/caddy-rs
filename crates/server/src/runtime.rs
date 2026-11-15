@@ -1292,6 +1292,13 @@ impl ServerRuntime {
                 tracing::info!(
                     "configuration stopped; ending the server runtime loop (Caddy /stop semantics)"
                 );
+                // The binary has no tracing subscriber, so this branch's outcome is invisible to
+                // `crates/cli/tests/cli.rs`: report the stop reached with the listeners still up,
+                // which is what `stop_orders_the_process_exit_after_the_shutdown` relies on.
+                eprintln!(
+                    "caddy-rs: configuration stopped; ending the server runtime loop (Caddy /stop \
+                     semantics)"
+                );
                 store_stopped = true;
                 break;
             }
@@ -2792,6 +2799,59 @@ mod shutdown_timing_tests {
             timing.shutdown_delay,
             Some(std::time::Duration::from_secs(2))
         );
+    }
+}
+
+#[cfg(test)]
+mod shutdown_latch_tests {
+    use std::sync::Arc;
+
+    use caddy_rs_core::{Config, GenerationStore};
+
+    use super::ServerRuntime;
+
+    /// The `/stop` latch must be released by the `apply` that observes the stop, not only by
+    /// `run_loop`'s own exit: `apply` tears the admin listener down (and with it the Unix socket),
+    /// so `POST /stop` may exit as soon as it reports completion.
+    #[tokio::test]
+    async fn stopping_the_store_releases_the_shutdown_latch() {
+        let store = Arc::new(GenerationStore::with_builtin_registry());
+        let mut runtime = ServerRuntime::new(Arc::clone(&store));
+        store
+            .load(
+                Config::from_value(serde_json::json!({
+                    "admin": {"listen": "127.0.0.1:0"},
+                    "apps": {"http": {"servers": {"srv0": {"listen": ["127.0.0.1:0"]}}}}
+                }))
+                .expect("configuration decodes"),
+            )
+            .expect("configuration loads");
+        runtime.apply().await.expect("initial apply");
+        assert!(
+            runtime.admin.is_some(),
+            "the admin listener is up before the stop"
+        );
+        assert!(
+            !runtime.listeners.is_empty(),
+            "the HTTP listener is up before the stop"
+        );
+        assert!(
+            !runtime.shutdown_latch.is_finished(),
+            "an apply of a live generation must not release the /stop latch"
+        );
+
+        store.stop().expect("stopped generation");
+        runtime.apply().await.expect("empty-generation apply");
+        assert!(
+            runtime.admin.is_none() && runtime.listeners.is_empty(),
+            "the empty-generation apply tears every listener down"
+        );
+        assert!(
+            runtime.shutdown_latch.is_finished(),
+            "the apply that tears the admin listener down releases the /stop latch"
+        );
+        // Release is idempotent, because `run_loop`'s exit path may reach it too.
+        runtime.release_shutdown_latch();
     }
 }
 

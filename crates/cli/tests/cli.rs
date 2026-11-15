@@ -6117,31 +6117,61 @@ fn reload_and_stop_reach_a_unix_socket_admin_endpoint() {
     }
 }
 
-/// `POST /stop` must order its `process::exit` *after* the runtime loop's shutdown.
+/// `POST /stop` must order its `process::exit` *after* the runtime loop's finished shutdown.
 ///
-/// Regression: the exit used to fire from a fixed 100 ms timer while the runtime loop noticed the
-/// stopped configuration on its 200 ms poll, so under load the process exited first - and
-/// `process::exit` runs no destructors, leaving the admin Unix socket file behind (and, when the
-/// exit won early, no shutdown log line at all).
+/// Regression: the exit used to fire from a fixed 100 ms timer while the runtime loop was still
+/// draining, so it could run first. `process::exit` runs no destructors, so exiting first cut the
+/// graceful drain short and left everything the shutdown path tears down behind.
+///
+/// The configuration below makes the runtime loop's shutdown *slow and observable*: a 1 s
+/// `shutdown_delay` inside `graceful_stop` (Caddy's `/stop` handler never waits for it) plus a
+/// 500 ms grace period on a server with one request in flight. TMPDIR points at a directory that
+/// is deliberately removed, so the runtime's own shutdown notice ("removing socket file ...") is a
+/// syscall that fails and prints to stderr exactly when the listeners are torn down - after the
+/// grace period. Waiting on the shutdown latch makes the exit follow that notice; exiting on a
+/// fixed timer lands during the shutdown delay and the notice never appears, because
+/// `process::exit` skips the listener teardown. Nothing here depends on a 100 ms/200 ms race.
 #[cfg(unix)]
 #[test]
 fn stop_orders_the_process_exit_after_the_shutdown() {
+    use std::io::Write;
+
+    const GRACE_PERIOD: Duration = Duration::from_millis(500);
     let directory = tempfile::tempdir().expect("temporary directory");
     let socket = directory.path().join("admin.sock");
     let config = directory.path().join("config.json");
     let listen = format!("unix/{}", socket.display());
+    let tmpdir = directory.path().join("gone-tmpdir");
+    std::fs::create_dir(&tmpdir).expect("create TMPDIR");
+    // Two inline unix listeners: one is torn down by `stop_all` (empty-generation apply) and the
+    // other by `graceful_stop` - whichever runs last is what the notice below reports.
+    let teardown_a = tmpdir.join("teardown-a.sock");
+    let teardown_b = tmpdir.join("teardown-b.sock");
     std::fs::write(
         &config,
         serde_json::json!({
             "admin": {"listen": listen},
-            "apps": {"http": {"servers": {"srv0": {
-                "listen": ["127.0.0.1:0"],
-                "routes": [{"handle": [{"handler": "static_response", "body": "ok"}]}]
-            }}}}
+            "apps": {"http": {
+                "shutdown_delay": 1_000_000_000_u64,
+                "grace_period": GRACE_PERIOD.as_nanos() as u64,
+                "servers": {
+                    "srv0": {
+                        "listen": [format!("unix/{}", teardown_a.display())],
+                        "routes": [{"handle": [{"handler": "static_response", "body": "ok"}]}]
+                    },
+                    "srv1": {
+                        "listen": [format!("unix/{}", teardown_b.display())],
+                        "routes": [{"handle": [{"handler": "static_response", "body": "ok"}]}]
+                    }
+                }
+            }}
         })
         .to_string(),
     )
     .expect("write config");
+    // The runtime logs the disappearance of a socket listener it tears down by `stat`ing it, not by
+    // unlinking it, so the failure has to come from a directory of its own: TMPDIR is removed once
+    // the listeners are bound, which makes that `stat` fail beneath the active listener.
     let log = directory.path().join("server.stderr");
     let stderr = std::fs::File::create(&log).expect("create child log");
     let mut child = Command::new(binary())
@@ -6151,6 +6181,9 @@ fn stop_orders_the_process_exit_after_the_shutdown() {
             config.to_str().expect("utf-8 config path"),
         ])
         .env("CADDY_RS_DATA_DIR", directory.path().join("data"))
+        .env("TMPDIR", &tmpdir)
+        .env("TMP", &tmpdir)
+        .env("TEMP", &tmpdir)
         .stdout(Stdio::null())
         .stderr(Stdio::from(stderr))
         .spawn()
@@ -6158,29 +6191,59 @@ fn stop_orders_the_process_exit_after_the_shutdown() {
     let ready = wait_until_serving(&mut child, Duration::from_secs(15), || {
         unix_admin_request(&socket, "GET", "/config/")
             .is_some_and(|response| response.starts_with("HTTP/1.1 200"))
+            && teardown_a.exists()
+            && teardown_b.exists()
     });
     if !ready {
         let contents = std::fs::read_to_string(&log).unwrap_or_default();
         child_failure(
             &mut child,
             &log,
-            &format!("the unix-socket admin endpoint never answered:\n{contents}"),
+            &format!("the unix-socket listeners never came up:\n{contents}"),
         );
     }
+
+    // Keep one request in flight on srv0, so the runtime's connection tracker is busy when `/stop`
+    // lands and `graceful_stop` has to wait out the grace period before tearing listeners down.
+    let mut held = std::os::unix::net::UnixStream::connect(&teardown_a).expect("in-flight socket");
+    held.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .expect("write in-flight request");
+    std::thread::sleep(Duration::from_millis(250));
+
+    // From here on the runtime cannot report its teardown: the directory it removes the sockets in
+    // is gone, so that step prints "caddy-rs: removing socket file ..." to stderr.
+    std::fs::remove_dir_all(&tmpdir).expect("remove TMPDIR");
 
     let (code, stdout, stderr) = run(&["stop", "--address", &listen]);
     assert_eq!(code, 0, "stop stdout:\n{stdout}\nstderr:\n{stderr}");
 
-    let status = wait_for_child_exit(&mut child, Duration::from_secs(15));
-    assert!(
-        status.is_some_and(|status| status.success()),
-        "the server exits successfully after /stop"
-    );
-    // Ordering: the runtime loop ran its shutdown before `process::exit`, which is what unlinks
-    // the socket. `process::exit` skips destructors, so nothing else can remove it afterwards.
+    let status = wait_for_child_exit(&mut child, Duration::from_secs(30));
     let contents = std::fs::read_to_string(&log).unwrap_or_default();
+    let Some(status) = status else {
+        child_failure(
+            &mut child,
+            &log,
+            &format!("the server did not exit after /stop:\n{contents}"),
+        );
+    };
     assert!(
-        !socket.exists(),
-        "the admin Unix socket is unlinked before the process exits:\n{contents}"
+        status.success(),
+        "the server exits successfully after /stop:\n{contents}"
+    );
+    // Ordering: the exit path observed the runtime's shutdown *completion*, and the runtime's own
+    // teardown (the failing socket removal the dead TMPDIR forces) had already run when it did. A
+    // `/stop` that exits on a fixed timer lands inside the shutdown delay: it prints the timeout
+    // line instead, and `process::exit` skips the listener teardown, so nothing below appears.
+    assert!(
+        contents.contains("caddy-rs: runtime shutdown finished; exiting on /stop"),
+        "the /stop exit must wait for the runtime shutdown to finish; it exited without one:\n{contents}"
+    );
+    assert!(
+        !contents.contains("shutdown did not complete"),
+        "the /stop exit hit its timeout instead of waiting for the shutdown:\n{contents}"
+    );
+    assert!(
+        contents.contains("caddy-rs: admin API listening"),
+        "/stop must land with the admin listener up, so the runtime tears it down itself:\n{contents}"
     );
 }

@@ -634,12 +634,20 @@ pub struct AdminApi {
 /// How long the `POST /stop` exit path waits for the runtime loop to finish before exiting
 /// anyway.
 ///
-/// The wait only has to cover *noticing* the stopped store (the runtime's 200 ms poll, which a
-/// `/stop` also wakes through the reload notification) and tearing the admin listener down; the
-/// graceful drain that follows runs after the exit path is released, and the configured shutdown
-/// delay/grace period still apply to it. The bound must stay short: a runtime that never reports
-/// (one that was still starting up, or whose loop already ended) must not hold the exit, because
-/// Caddy's `/stop` is a synchronous `exitProcess` and the process may not hang on it.
+/// What the wait covers is bounded by the code, not by the operator's configuration:
+///
+/// * noticing the stop - one 200 ms poll, which `/stop` also cuts short through the reload
+///   notification;
+/// * `stop_all`, which force-closes connections and waits at most 2 s for their tracker guards to
+///   drop (the same constant the runtime already uses for that wait).
+///
+/// It deliberately does *not* cover the graceful drain: `run_loop` ends the drain (shutdown delay,
+/// grace period, and the unbounded eternal grace period when neither is configured) *before* it
+/// releases the latch, so `STOP_EXIT_WAIT` must not scale with `drain_timeout` (30 s default) or
+/// with `shutdown_delay`/`grace_period` - Caddy's `/stop` is a synchronous `exitProcess` and an
+/// operator-configured 30 s drain must not become a 30 s `/stop`. The bound must stay short for
+/// the state it exists to escape: a runtime that never reports (one still starting up, or whose
+/// loop already ended) must not hold the exit.
 const STOP_EXIT_WAIT: Duration = Duration::from_secs(2);
 
 /// Completion signal from the hosting runtime's shutdown, used to order `POST /stop`'s process
@@ -1789,7 +1797,12 @@ impl AdminApi {
             std::thread::spawn(move || {
                 match latch {
                     Some(latch) => {
-                        if !latch.wait(budget) {
+                        // The binary installs no tracing subscriber, so report the outcome of the
+                        // ordered exit on stderr: it is the only evidence that the exit waited for
+                        // the shutdown (`cli/tests/cli.rs` asserts on it).
+                        if latch.wait(budget) {
+                            eprintln!("caddy-rs: runtime shutdown finished; exiting on /stop");
+                        } else {
                             eprintln!(
                                 "caddy-rs: shutdown did not complete within {}s of /stop; \
                                  exiting anyway",
