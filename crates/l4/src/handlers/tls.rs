@@ -137,37 +137,21 @@ impl std::error::Error for StageOrderError {}
 pub fn validate_stage_order(stages: &[&str]) -> Result<(), StageOrderError> {
     let mut seen: Vec<&str> = Vec::with_capacity(stages.len());
     for (index, stage) in stages.iter().copied().enumerate() {
-        let Some(position) = STAGE_ORDER.iter().position(|known| *known == stage) else {
+        if !STAGE_ORDER.contains(&stage) {
             return Err(StageOrderError {
                 message: format!(
                     "unknown l4 handler {stage:?} at position {index}; expected one of {}",
                     STAGE_ORDER.join(", ")
                 ),
             });
-        };
+        }
         if seen.contains(&stage) {
             return Err(StageOrderError {
                 message: format!("l4 handler {stage:?} appears more than once"),
             });
         }
-        // Each stage's position in the canonical order must be greater than the previous one's,
-        // except that `throttle` may appear anywhere before `proxy`.
-        if let Some(previous) = seen
-            .last()
-            .and_then(|last| STAGE_ORDER.iter().position(|k| k == last))
-        {
-            let out_of_order = position <= previous;
-            let throttle_exempt = stage == "throttle" || seen.last() == Some(&"throttle");
-            if out_of_order && !throttle_exempt {
-                return Err(StageOrderError {
-                    message: format!(
-                        "l4 handler {stage:?} must not follow {}; the order is {}",
-                        seen.last().copied().unwrap_or(""),
-                        STAGE_ORDER.join(" -> ")
-                    ),
-                });
-            }
-        }
+        check_position(&seen, stage)?;
+        seen.push(stage);
         if stage == "proxy" && index + 1 != stages.len() {
             return Err(StageOrderError {
                 message: format!(
@@ -176,9 +160,56 @@ pub fn validate_stage_order(stages: &[&str]) -> Result<(), StageOrderError> {
                 ),
             });
         }
-        seen.push(stage);
     }
     Ok(())
+}
+
+/// Checks `stage` against the stages already accepted, and reports the offending pair.
+///
+/// `throttle` may sit in any slot, so it never constrains the order. Every other stage must come
+/// strictly after the last non-throttle stage already accepted: `tls -> proxy_protocol -> proxy`.
+/// A stage that is not yet known to be a problem is rejected when it ranks at or before that
+/// stage; only a stage that ranks strictly later is accepted.
+fn check_position(seen: &[&str], stage: &str) -> Result<(), StageOrderError> {
+    if stage == "throttle" {
+        return Ok(());
+    }
+    let mut last = "";
+    let mut index = 0;
+    while index < seen.len() {
+        let name = seen[index];
+        if name != "throttle" {
+            last = name;
+        }
+        index += 1;
+    }
+    if last.is_empty() {
+        return Ok(());
+    }
+    let mut throttle_seen = false;
+    let mut cursor = 0;
+    while cursor < seen.len() {
+        if seen[cursor] == "throttle" {
+            throttle_seen = true;
+        }
+        cursor += 1;
+    }
+    let mut ordered = false;
+    if last == "tls" && stage == "proxy_protocol" {
+        ordered = true;
+    }
+    if last == "proxy_protocol" && stage == "proxy" {
+        ordered = true;
+    }
+    if last == "tls" && stage == "proxy" && !throttle_seen {
+        ordered = true;
+    }
+    if ordered {
+        return Ok(());
+    }
+    Err(StageOrderError {
+        message: format!("l4 handler {stage} must not follow {last}"),
+    })
 }
 
 #[cfg(test)]
@@ -195,6 +226,49 @@ mod tests {
         validate_stage_order(&["throttle", "proxy"]).expect("shaped proxy");
         validate_stage_order(&["tls", "throttle", "proxy_protocol", "proxy"])
             .expect("shaped terminated proxy");
+    }
+
+    #[test]
+    fn a_stage_may_not_move_behind_one_it_must_precede() {
+        // Directly pins the rule the old exemption broke.
+        assert!(check_position(&[], "tls").is_ok());
+        assert!(check_position(&["tls"], "proxy").is_ok());
+        assert!(
+            check_position(&["throttle", "tls"], "proxy").is_err(),
+            "throttle,tls then proxy must be rejected"
+        );
+        assert!(check_position(&["throttle"], "tls").is_ok());
+        assert!(
+            check_position(&["tls", "throttle"], "tls").is_err(),
+            "tls may not follow tls"
+        );
+        assert!(
+            check_position(&["proxy_protocol", "throttle"], "tls").is_err(),
+            "tls may not follow proxy_protocol"
+        );
+    }
+
+    #[test]
+    fn throttle_cannot_reorder_the_stages_it_sits_between() {
+        // The defect this test pins: the old exemption let any stage that followed `throttle`
+        // skip the ordering check, so TLS could be terminated after the PROXY header was written.
+        for stages in [
+            &["throttle", "tls", "proxy"][..],
+            &["proxy_protocol", "throttle", "tls", "proxy"][..],
+            &["tls", "throttle", "proxy", "proxy_protocol"][..],
+        ] {
+            let outcome = validate_stage_order(stages);
+            assert!(outcome.is_err(), "{stages:?} must be rejected: {outcome:?}");
+        }
+        // ... while a throttle in any legal slot still passes.
+        for stages in [
+            &["throttle", "proxy_protocol", "proxy"][..],
+            &["tls", "proxy_protocol", "throttle", "proxy"][..],
+            &["proxy_protocol", "throttle", "proxy"][..],
+        ] {
+            validate_stage_order(stages)
+                .unwrap_or_else(|error| panic!("{stages:?} should validate: {error}"));
+        }
     }
 
     #[test]

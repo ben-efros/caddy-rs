@@ -34,6 +34,9 @@ impl L4Handler for Recorder {
 }
 
 /// A stage that writes a marker to the stream (like PROXY protocol would).
+///
+/// It reports the real stage name `proxy_protocol`, so a pipeline that places it where the
+/// canonical order puts the PROXY header still validates.
 struct WriteMarker {
     marker: &'static [u8],
 }
@@ -41,17 +44,20 @@ struct WriteMarker {
 #[async_trait]
 impl L4Handler for WriteMarker {
     fn name(&self) -> &'static str {
-        "write_marker"
+        "proxy_protocol"
     }
 
     async fn handle(&self, ctx: &mut HandlerContext) -> Result<(), HandlerError> {
         let Some(stream) = ctx.stream() else {
-            return Err(HandlerError::new("write_marker", "stream already consumed"));
+            return Err(HandlerError::new(
+                "proxy_protocol",
+                "stream already consumed",
+            ));
         };
         stream
             .write_all(self.marker)
             .await
-            .map_err(|error| HandlerError::new("write_marker", error.to_string()))
+            .map_err(|error| HandlerError::new("proxy_protocol", error.to_string()))
     }
 }
 
@@ -63,12 +69,12 @@ struct Drain {
 #[async_trait]
 impl L4Handler for Drain {
     fn name(&self) -> &'static str {
-        "drain"
+        "proxy"
     }
 
     async fn handle(&self, ctx: &mut HandlerContext) -> Result<(), HandlerError> {
         let Some(mut stream) = ctx.take_stream() else {
-            return Err(HandlerError::new("drain", "stream already consumed"));
+            return Err(HandlerError::new("proxy", "stream already consumed"));
         };
         let mut buffer = [0_u8; 256];
         loop {
@@ -77,7 +83,7 @@ impl L4Handler for Drain {
                 Ok(read) => {
                     self.bytes.fetch_add(read, Ordering::SeqCst);
                 }
-                Err(error) => return Err(HandlerError::new("drain", error.to_string())),
+                Err(error) => return Err(HandlerError::new("proxy", error.to_string())),
             }
         }
         Ok(())
@@ -122,7 +128,7 @@ async fn components_compose_in_tls_proxy_protocol_proxy_order() {
             fail: false,
         }),
     ]);
-    assert_eq!(pipeline.names(), ["tls", "write_marker", "proxy"]);
+    assert_eq!(pipeline.names(), ["tls", "proxy_protocol", "proxy"]);
 
     pipeline
         .run(context(Box::new(server), &router, "example.com"))
@@ -148,14 +154,9 @@ async fn failing_stage_closes_the_stream_with_a_logged_reason() {
     let pipeline = HandlerPipeline::new(vec![
         Arc::new(WriteMarker { marker: b"partial" }),
         Arc::new(Recorder {
-            name: "proxy_protocol",
-            calls: Arc::clone(&calls),
-            fail: true,
-        }),
-        Arc::new(Recorder {
             name: "proxy",
             calls: Arc::clone(&calls),
-            fail: false,
+            fail: true,
         }),
     ]);
 
@@ -163,14 +164,14 @@ async fn failing_stage_closes_the_stream_with_a_logged_reason() {
         .run(context(Box::new(server), &router, "example.com"))
         .await
         .expect_err("stage failure");
-    assert_eq!(error.handler(), "proxy_protocol");
-    assert!(error.to_string().contains("proxy_protocol"));
+    assert_eq!(error.handler(), "proxy");
+    assert!(error.to_string().contains("proxy"));
 
     // The connection was closed after the error: partial bytes then EOF, no later-stage output.
     let mut seen = Vec::new();
     client.read_to_end(&mut seen).await.unwrap();
     assert_eq!(seen, b"partial");
-    assert_eq!(*calls.lock().unwrap(), ["proxy_protocol"]);
+    assert_eq!(*calls.lock().unwrap(), ["proxy"]);
 }
 
 #[tokio::test]

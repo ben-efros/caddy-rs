@@ -8,6 +8,7 @@
 //! `0` disables the timeout, matching Caddy's `dial_timeout`/`read_timeout` zero-is-unlimited
 //! convention; the default is Caddy's 30 s.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -131,20 +132,91 @@ where
             .await
             .map_err(|error| ProxyError::Header(error.to_string()))?;
     }
-    let copy = metered_copy_bidirectional(&mut client, &mut upstream, &meter);
-    match options.idle_timeout() {
-        Some(timeout) => tokio::time::timeout(timeout, copy)
+    // The idle timeout measures INACTIVITY, not the age of the connection: a watchdog aborts the
+    // copy only when no chunk has completed for `timeout`, so a long-lived connection that keeps
+    // moving bytes is never cut (ADR-030 Q5).
+    let Some(timeout) = options.idle_timeout() else {
+        return metered_copy_bidirectional(&mut client, &mut upstream, &meter)
             .await
-            .map_err(|_| {
-                ProxyError::Copy(format!(
-                    "no byte moved in either direction for {}s",
-                    timeout.as_secs()
-                ))
-            })?
-            .map_err(|error| ProxyError::Copy(error.to_string())),
-        None => copy
-            .await
-            .map_err(|error| ProxyError::Copy(error.to_string())),
+            .map_err(|error| ProxyError::Copy(error.to_string()));
+    };
+    let activity = Arc::new(Activity::start());
+    let metered: Arc<dyn ByteMeter> = Arc::new(ActivityMeter {
+        inner: meter,
+        activity: Arc::clone(&activity),
+    });
+    let copy = metered_copy_bidirectional(&mut client, &mut upstream, &metered);
+    let mut watchdog = Box::pin(watch(activity, timeout));
+    tokio::select! {
+        result = copy => result.map_err(|error| ProxyError::Copy(error.to_string())),
+        idle = &mut watchdog => Err(ProxyError::Copy(idle)),
+    }
+}
+
+/// Milliseconds since the process started, used as the inactivity clock.
+fn now_millis() -> u64 {
+    use std::sync::OnceLock;
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    let start = START.get_or_init(std::time::Instant::now);
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// The last instant a chunk completed, in [`now_millis`] units.
+#[derive(Debug)]
+struct Activity {
+    last: AtomicU64,
+}
+
+impl Activity {
+    /// Starts the clock at the moment the connection begins proxying.
+    fn start() -> Self {
+        Self {
+            last: AtomicU64::new(now_millis()),
+        }
+    }
+
+    /// Records a completed chunk.
+    fn touch(&self) {
+        self.last.store(now_millis(), Ordering::Relaxed);
+    }
+
+    /// Milliseconds since the last chunk.
+    fn idle_millis(&self) -> u64 {
+        now_millis().saturating_sub(self.last.load(Ordering::Relaxed))
+    }
+}
+
+/// Wraps a meter so every completed chunk also stamps the inactivity clock.
+struct ActivityMeter {
+    inner: Arc<dyn ByteMeter>,
+    activity: Arc<Activity>,
+}
+
+impl ByteMeter for ActivityMeter {
+    fn record_read(&self, bytes: u64) {
+        self.inner.record_read(bytes);
+    }
+
+    fn record_write(&self, bytes: u64) {
+        self.inner.record_write(bytes);
+    }
+
+    fn touch(&self) {
+        self.activity.touch();
+    }
+}
+
+/// Resolves with a description of the idle window once `activity` has been quiet for `timeout`.
+async fn watch(activity: Arc<Activity>, timeout: Duration) -> String {
+    let timeout_millis = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+    loop {
+        let idle = activity.idle_millis();
+        if idle >= timeout_millis {
+            return format!(
+                "no byte moved in either direction for {idle}ms (idle timeout {timeout_millis}ms)"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(timeout_millis - idle)).await;
     }
 }
 

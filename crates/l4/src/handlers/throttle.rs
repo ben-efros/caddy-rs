@@ -111,6 +111,30 @@ impl Bucket {
         self.last_refill = now;
     }
 
+    /// Takes up to `bytes` from the bucket, returning how many were actually taken.
+    fn take_budget(&mut self, bytes: usize) -> usize {
+        if self.bytes_per_second == 0 {
+            return bytes;
+        }
+        let taken = bytes.min(self.available.floor().max(0.0) as usize);
+        self.available -= taken as f64;
+        taken
+    }
+
+    /// Returns unspent tokens after a partial read or write.
+    fn refund(&mut self, bytes: usize) {
+        if self.bytes_per_second == 0 {
+            return;
+        }
+        self.available = (self.available + bytes as f64).min(THROTTLE_BURST_BYTES as f64);
+    }
+
+    /// How many of `bytes` the bucket can pay for right now, refilling first.
+    fn affordable(&mut self, bytes: usize, now: Instant) -> usize {
+        self.refill(now);
+        self.take_budget(bytes)
+    }
+
     /// How long until `bytes` are available, or zero when they already are.
     fn delay_for(&mut self, bytes: usize, now: Instant) -> Duration {
         self.refill(now);
@@ -126,11 +150,19 @@ impl Bucket {
 }
 
 /// A stream wrapper that shapes both directions.
+///
+/// The shaping contract is a **ceiling**: a read is only issued once the bucket can pay for it, so
+/// bytes reach the caller's buffer at most at the configured rate. Charging after delivery would
+/// let a fast peer deliver a whole window per poll — the rate would be an average, not a limit.
 #[derive(Debug)]
 pub struct ThrottledStream<S> {
     inner: S,
     upstream: Bucket,
     downstream: Bucket,
+    /// When the next read may be issued; `None` means immediately.
+    read_ready_at: Option<Instant>,
+    /// When the next write may be issued; `None` means immediately.
+    write_ready_at: Option<Instant>,
 }
 
 impl<S> ThrottledStream<S> {
@@ -140,6 +172,8 @@ impl<S> ThrottledStream<S> {
             inner,
             upstream: Bucket::new(limit.upstream_bytes_per_second),
             downstream: Bucket::new(limit.downstream_bytes_per_second),
+            read_ready_at: None,
+            write_ready_at: None,
         }
     }
 
@@ -159,6 +193,22 @@ impl<S> ThrottledStream<S> {
     }
 }
 
+/// Registers `cx` to be woken at `deadline`, so a paced stream sleeps instead of spinning.
+fn wake_at(cx: &mut Context<'_>, deadline: Instant) {
+    let delay = deadline.saturating_duration_since(Instant::now());
+    let waker = cx.waker().clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        waker.wake();
+    });
+}
+
+/// The most bytes a single read may request: the bucket's burst, so one poll can never be charged
+/// more than the burst allows.
+fn read_budget(buffer_len: usize) -> usize {
+    buffer_len.min(THROTTLE_BURST_BYTES as usize)
+}
+
 impl<S: AsyncRead + Unpin> AsyncRead for ThrottledStream<S> {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -167,29 +217,50 @@ impl<S: AsyncRead + Unpin> AsyncRead for ThrottledStream<S> {
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
         let now = Instant::now();
-        // Charge the *previous* read's bytes: the bytes were only known after the read completed,
-        // and charging before it would need a guess about the future read size.
-        let delay = this.upstream.delay_for(0, now);
-        if !delay.is_zero() {
-            cx.waker().wake_by_ref();
+        if let Some(deadline) = this.read_ready_at {
+            if deadline > now {
+                wake_at(cx, deadline);
+                return Poll::Pending;
+            }
+            this.read_ready_at = None;
+        }
+        if this.upstream.bytes_per_second != 0 && this.upstream.available < 1.0 {
+            // Nothing left in the bucket: wait for the next token rather than reading.
+            let delay = this.upstream.delay_for(1, now);
+            this.read_ready_at = Some(now + delay);
+            wake_at(cx, now + delay);
             return Poll::Pending;
         }
-        let before = buf.filled().len();
-        match Pin::new(&mut this.inner).poll_read(cx, buf) {
+        // Read at most what the bucket can pay for; the charge happens before the bytes exist, so
+        // the caller can never receive more than the configured rate.
+        let budget = read_budget(buf.remaining());
+        let limit = this.upstream.take_budget(budget).min(buf.remaining());
+        if limit == 0 {
+            let delay = this.upstream.delay_for(1, now);
+            this.read_ready_at = Some(now + delay);
+            wake_at(cx, now + delay);
+            return Poll::Pending;
+        }
+        let mut scratch = vec![0u8; limit];
+        let mut limited = ReadBuf::new(&mut scratch);
+        match Pin::new(&mut this.inner).poll_read(cx, &mut limited) {
             Poll::Ready(Ok(())) => {
-                let read = buf.filled().len().saturating_sub(before);
-                if read > 0 {
-                    let delay = this.upstream.delay_for(read, Instant::now());
-                    if !delay.is_zero() {
-                        // The bytes are already delivered to the caller; the *next* read waits.
-                        // Scheduling the wakeup here keeps the connection honest without holding
-                        // back data that is already in the caller's buffer.
-                        this.upstream.available = 0.0;
-                    }
+                let filled = limited.filled().len();
+                buf.put_slice(limited.filled());
+                if filled < limit {
+                    // Return the unspent tokens.
+                    this.upstream.refund(limit - filled);
                 }
                 Poll::Ready(Ok(()))
             }
-            other => other,
+            Poll::Ready(Err(error)) => {
+                this.upstream.refund(limit);
+                Poll::Ready(Err(error))
+            }
+            Poll::Pending => {
+                this.upstream.refund(limit);
+                Poll::Pending
+            }
         }
     }
 }
@@ -202,19 +273,42 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ThrottledStream<S> {
     ) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
         let now = Instant::now();
-        this.downstream.refill(now);
-        if this.downstream.available <= 0.0 {
-            let delay = this.downstream.delay_for(0, now);
-            if !delay.is_zero() {
-                cx.waker().wake_by_ref();
+        if let Some(deadline) = this.write_ready_at {
+            if deadline > now {
+                wake_at(cx, deadline);
                 return Poll::Pending;
             }
+            this.write_ready_at = None;
         }
-        let poll = Pin::new(&mut this.inner).poll_write(cx, buf);
-        if let Poll::Ready(Ok(written)) = poll {
-            this.downstream.delay_for(written, Instant::now());
+        if buf.is_empty() {
+            return Pin::new(&mut this.inner).poll_write(cx, buf);
         }
-        poll
+        let affordable = this.downstream.affordable(buf.len(), now);
+        if affordable == 0 {
+            let delay = this.downstream.delay_for(1, now);
+            this.write_ready_at = Some(now + delay);
+            wake_at(cx, now + delay);
+            return Poll::Pending;
+        }
+        // Never hand the inner stream more than the bucket paid for: the write is charged up
+        // front, so an accepted byte is always a paid-for byte.
+        let poll = Pin::new(&mut this.inner).poll_write(cx, &buf[..affordable]);
+        match poll {
+            Poll::Ready(Ok(written)) => {
+                if written < affordable {
+                    this.downstream.refund(affordable - written);
+                }
+                Poll::Ready(Ok(written))
+            }
+            Poll::Ready(Err(error)) => {
+                this.downstream.refund(affordable);
+                Poll::Ready(Err(error))
+            }
+            Poll::Pending => {
+                this.downstream.refund(affordable);
+                Poll::Pending
+            }
+        }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -228,9 +322,9 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ThrottledStream<S> {
 
 /// Validates a configured limit pair.
 pub fn validate_rate_limit(limit: &RateLimit) -> Result<(), RateLimitError> {
-    // Zero is the "unlimited" spelling; any other value is a rate in bytes per second. There is no
-    // upper bound to enforce, but a limit below one byte per second can never make progress, so it
-    // is rejected rather than silently stalling a route.
+    // Zero is the "unlimited" spelling; any other value is a bytes-per-second rate. A rate below
+    // one byte per second could never make progress, so it is rejected rather than silently
+    // stalling a route.
     for (direction, rate) in [
         ("upstream", limit.upstream_bytes_per_second),
         ("downstream", limit.downstream_bytes_per_second),

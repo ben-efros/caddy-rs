@@ -27,6 +27,12 @@ pub trait ByteMeter: Send + Sync {
 
     /// Records `bytes` read from the upstream and written back to the client.
     fn record_write(&self, bytes: u64);
+
+    /// Called once after every completed chunk in either direction.
+    ///
+    /// This is the copy's activity signal: an idle timeout measures the time since the last call,
+    /// not the age of the connection, so a connection that keeps moving bytes is never cut.
+    fn touch(&self) {}
 }
 
 /// A [`ByteMeter`] that counts bytes in two atomics and nothing else.
@@ -149,6 +155,7 @@ where
         } else {
             meter.record_write(read);
         }
+        meter.touch();
     }
     writer.shutdown().await?;
     Ok(copied)
