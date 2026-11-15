@@ -212,6 +212,8 @@ pub struct ServerRuntime {
     reload: Arc<tokio::sync::Notify>,
     /// Reports shutdown completion to the admin API, whose `/stop` exit path waits for it.
     shutdown_latch: Arc<caddy_rs_admin::ShutdownLatch>,
+    /// Whether the shutdown latch was already released (release is idempotent).
+    shutdown_released: std::sync::atomic::AtomicBool,
     /// Injected ACME transport for automatic HTTPS (tests and embedders); production builds a
     /// [`HyperTransport`] when certificates must be obtained.
     acme_transport: Option<Arc<dyn AcmeTransport>>,
@@ -338,6 +340,20 @@ fn client_auth_ca_pool_context(
 }
 
 impl ServerRuntime {
+    /// Release a [`caddy_rs_admin::ShutdownLatch`] exactly once, from whichever path ends this
+    /// runtime's loop. `POST /stop` exits the process as soon as it is released, so every path that
+    /// tears the listeners down must release it: `run_loop`'s own exit and an `apply` that observes
+    /// the stop (an empty generation stops the admin listener via `stop_all`).
+    fn release_shutdown_latch(&self) {
+        if !self
+            .shutdown_released
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            caddy_rs_admin::ShutdownLatchHandle::new(Arc::clone(&self.shutdown_latch))
+                .mark_finished();
+        }
+    }
+
     /// Create a runtime for a generation store.
     pub fn new(store: Arc<GenerationStore>) -> Self {
         let reload = Arc::new(tokio::sync::Notify::new());
@@ -361,6 +377,7 @@ impl ServerRuntime {
             store,
             reload,
             shutdown_latch,
+            shutdown_released: std::sync::atomic::AtomicBool::new(false),
             acme_transport: None,
             data_root: None,
             challenge_tokens: Arc::new(caddy_rs_tls::Http01TokenStore::new()),
@@ -708,6 +725,9 @@ impl ServerRuntime {
         let Some(generation) = self.store.current() else {
             self.stop_all().await;
             self.status = RuntimeStatus::default();
+            // The admin listener (and the Unix socket it unlinks) is gone: a pending `/stop` exit
+            // may proceed now.
+            self.release_shutdown_latch();
             return Ok(self.status.clone());
         };
         // ADR-0010 section 5: exactly one INFO event per apply names the effective
@@ -1281,6 +1301,18 @@ impl ServerRuntime {
                 if let Err(error) = self.apply().await {
                     eprintln!("caddy-rs: cannot apply configuration: {error}");
                 }
+                // The stop may have landed while `apply` was running: an empty generation makes
+                // `apply` tear every listener down (including the admin endpoint and its Unix
+                // socket), and re-applying would leave the loop idling on a stopped store. Exit
+                // now instead, so `graceful_stop` and the `/stop` latch see a finished shutdown
+                // instead of an empty-generation apply racing them.
+                if seen_active_generation && self.store.current().is_none() {
+                    tracing::info!(
+                        "configuration stopped while applying; ending the server runtime loop"
+                    );
+                    store_stopped = true;
+                    break;
+                }
             }
             applied_generation = self.store.current().as_deref().map(Generation::id);
             if let Some(generation) = self.store.current() {
@@ -1317,7 +1349,7 @@ impl ServerRuntime {
         self.graceful_stop(force).await;
         // Every listener task has ended by now, so the admin Unix socket is unlinked; release the
         // `/stop` exit path only after that, because `process::exit` skips destructors.
-        caddy_rs_admin::ShutdownLatchHandle::new(Arc::clone(&self.shutdown_latch)).mark_finished();
+        self.release_shutdown_latch();
         Ok(())
     }
 
