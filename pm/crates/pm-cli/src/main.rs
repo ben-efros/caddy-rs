@@ -750,20 +750,62 @@ async fn run(cli: Cli) -> Result<(), CliError> {
 /// A no-op unless both the email and the password are configured, and a no-op when any user
 /// already exists (the store is the source of truth, never the environment). The optional TOTP
 /// code enables TOTP on the new account and proves the seed before the daemon starts serving.
+/// Enrol a TOTP secret for the bootstrap admin and prove possession of it.
+///
+/// T-AUTH-002: this used to be an inline `totp_verify` call on a user with no enrolled secret, which
+/// can only ever fail with `TotpNotConfigured`, so every deployment that set
+/// `PM_BOOTSTRAP_ADMIN_TOTP` failed to start.
+///
+/// Enrolment comes first because possession cannot be proven against a secret that does not exist
+/// yet. `totp_setup` leaves the secret *pending*, so until `totp_confirm` succeeds the factor does
+/// not gate login: an abandoned bootstrap cannot lock the operator out of an account whose secret
+/// they never scanned.
+///
+/// On a rejected code the admin created by the caller is rolled back rather than left behind with an
+/// unconfirmed factor, and the returned error carries the enrolment URI so the operator can retry
+/// with a fresh code. Returns the enrolment URI on success.
+async fn enrol_and_confirm_bootstrap_totp(
+    authn: &AuthnService<MemoryUserStore>,
+    user_id: caddy_rs_authn::UserId,
+    totp_code: &str,
+) -> Result<String, CliError> {
+    let (_secret, uri) = authn.totp_setup(user_id).await.map_err(|error| {
+        CliError::InvalidArg(format!("failed to enrol bootstrap TOTP: {error}"))
+    })?;
+    if let Err(error) = authn.totp_confirm(user_id, totp_code).await {
+        // Report which of the two outcomes actually happened rather than assuming the rollback
+        // worked: leaving an administrator with an unconfirmed secret is a security problem the
+        // operator has to act on.
+        let rollback = match authn.delete_user(user_id).await {
+            Ok(()) => "the bootstrap admin was removed".to_string(),
+            Err(delete_error) => format!(
+                "the bootstrap admin could not be removed ({delete_error}) and now exists with an \
+                 UNCONFIRMED TOTP secret; remove it before starting the service"
+            ),
+        };
+        return Err(CliError::InvalidArg(format!(
+            "bootstrap TOTP code rejected: {error}; {rollback}. Re-run with a fresh code from the \
+             authenticator for this enrolment URI: {uri}"
+        )));
+    }
+    info!("bootstrap admin TOTP enrolled and confirmed");
+    Ok(uri)
+}
+
 async fn bootstrap_admin(
     authn: &AuthnService<MemoryUserStore>,
     store: &MemoryUserStore,
     email: Option<&str>,
     password: Option<&str>,
     totp_code: Option<&str>,
-) -> Result<(), CliError> {
+) -> Result<Option<String>, CliError> {
     let (Some(email), Some(password)) = (email, password) else {
-        return Ok(());
+        return Ok(None);
     };
     info!(email = %email, "checking for bootstrap admin setup");
     if !store.list_users().await?.is_empty() {
         info!("users already exist, skipping bootstrap admin creation");
-        return Ok(());
+        return Ok(None);
     }
 
     info!("no users found, creating bootstrap admin user");
@@ -774,15 +816,10 @@ async fn bootstrap_admin(
             CliError::InvalidArg(format!("failed to create bootstrap admin: {error}"))
         })?;
 
-    if let Some(totp_code) = totp_code {
-        authn
-            .totp_verify(user.id, totp_code)
-            .await
-            .map_err(|error| {
-                CliError::InvalidArg(format!("failed to verify bootstrap TOTP: {error}"))
-            })?;
-        info!("bootstrap admin TOTP configured");
-    }
+    let totp_uri = match totp_code {
+        Some(code) => Some(enrol_and_confirm_bootstrap_totp(authn, user.id, code).await?),
+        None => None,
+    };
 
     // The session endpoints read this store, so the admin can log in immediately; the store is
     // still in-memory until PM-109, so the environment recreates it on every start.
@@ -790,7 +827,7 @@ async fn bootstrap_admin(
         "bootstrap admin created in the in-memory user store; it is recreated from this \
          environment on every start until PM-109 (persistent users) lands"
     );
-    Ok(())
+    Ok(totp_uri)
 }
 
 async fn serve(global: GlobalArgs, args: ServeArgs) -> Result<(), CliError> {
@@ -849,14 +886,22 @@ async fn serve(global: GlobalArgs, args: ServeArgs) -> Result<(), CliError> {
     let authn = AuthnService::new(authn_store.clone(), authn_config)?;
 
     // Bootstrap admin user if environment variables are set.
-    bootstrap_admin(
+    if let Some(totp_uri) = bootstrap_admin(
         &authn,
         &authn_store,
         global.bootstrap_admin_email.as_deref(),
         global.bootstrap_admin_password.as_deref(),
         global.bootstrap_admin_totp.as_deref(),
     )
-    .await?;
+    .await?
+    {
+        // The URI carries the secret, so it is logged only here, once, and only because the
+        // operator must scan it to keep using the factor they just proved possession of.
+        warn!(
+            totp_uri = %totp_uri,
+            "bootstrap admin TOTP enrolled; scan this enrolment URI to keep receiving codes"
+        );
+    }
 
     info!(
         env_override,
@@ -1724,7 +1769,7 @@ mod tests {
         let store = MemoryUserStore::new();
         let authn = boot_authn(&data_dir, store.clone()).await;
 
-        bootstrap_admin(
+        let totp_uri = bootstrap_admin(
             &authn,
             &store,
             Some("admin@example.com"),
@@ -1733,6 +1778,10 @@ mod tests {
         )
         .await
         .expect("create the bootstrap admin");
+        assert!(
+            totp_uri.is_none(),
+            "no TOTP code was supplied, so no enrolment URI is produced"
+        );
 
         let users = authn.list_users().await.expect("list users");
         assert_eq!(users.len(), 1);
@@ -1763,6 +1812,141 @@ mod tests {
             .await
             .expect("no bootstrap credentials");
         assert_eq!(authn.list_users().await.expect("list users").len(), 1);
+    }
+
+    /// Current TOTP time step, computed the way the server does.
+    fn current_totp_step() -> u64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock is after the epoch")
+            .as_secs();
+        caddy_rs_authn::totp_step_at(now)
+    }
+
+    #[tokio::test]
+    async fn enrol_and_confirm_enrols_before_checking_the_code_and_rolls_back_on_rejection() {
+        // T-AUTH-002: the bug was that possession was checked BEFORE a secret existed, so this
+        // success path was unreachable and no deployment could use PM_BOOTSTRAP_ADMIN_TOTP. The
+        // helper is the exact sequence the bootstrap runs, so testing it covers the fixed branch.
+        //
+        // The helper mints its own secret, so a valid code cannot be computed before the call. What
+        // this test pins is the ORDERING that was the bug: enrolment must happen before the code is
+        // checked, and a rejection must roll the admin back. The positive case is the test below.
+        let dir = tempfile::tempdir().expect("create the test directory");
+        let data_dir = dir.path().join("data");
+        let store = MemoryUserStore::new();
+        let authn = boot_authn(&data_dir, store.clone()).await;
+        let user = authn
+            .create_user(
+                "admin@example.com".to_owned(),
+                "correct horse battery staple",
+                caddy_rs_authn::Role::admin(),
+            )
+            .await
+            .expect("create the admin");
+
+        // A valid code requires the helper's own secret, which it does not reveal until it succeeds.
+        // Assert the failure is specifically the CODE (not enrolment), which is what proves the
+        // secret was enrolled before the code was checked.
+        let error = enrol_and_confirm_bootstrap_totp(&authn, user.id, "000000")
+            .await
+            .expect_err("a wrong code cannot prove possession");
+        let message = error.to_string();
+        assert!(
+            !message.contains("failed to enrol"),
+            "enrolment must succeed before the code is checked, got: {message}"
+        );
+        assert!(
+            message.contains("bootstrap TOTP code rejected"),
+            "the failure must be the code check, got: {message}"
+        );
+        assert!(
+            message.contains("otpauth://totp/"),
+            "the error must hand the operator the enrolment URI, got: {message}"
+        );
+        assert!(
+            store.list_users().await.expect("list users").is_empty(),
+            "the rejected admin is rolled back, not left with an unconfirmed factor"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_valid_code_activates_the_factor_through_enrol_then_confirm() {
+        // The positive half of the T-AUTH-002 contract, driven directly: enrol, read the pending
+        // secret, confirm with a real code. This is the ordering the bootstrap now uses, and it is
+        // what the old `totp_verify`-first code could never do.
+        let dir = tempfile::tempdir().expect("create the test directory");
+        let data_dir = dir.path().join("data");
+        let store = MemoryUserStore::new();
+        let authn = boot_authn(&data_dir, store.clone()).await;
+        let user = authn
+            .create_user(
+                "admin@example.com".to_owned(),
+                "correct horse battery staple",
+                caddy_rs_authn::Role::admin(),
+            )
+            .await
+            .expect("create the admin");
+
+        let (secret, uri) = authn.totp_setup(user.id).await.expect("enrol TOTP");
+        assert!(
+            uri.contains(&secret),
+            "the enrolment URI must carry the secret so the operator can scan it"
+        );
+        // While pending, the factor must not gate login - an abandoned enrolment cannot lock out.
+        assert!(
+            !store.list_users().await.expect("list users")[0].has_totp(),
+            "a pending secret must not gate login"
+        );
+
+        let code =
+            caddy_rs_authn::totp_code_for_step(&secret, current_totp_step()).expect("a real code");
+        authn
+            .totp_confirm(user.id, &code)
+            .await
+            .expect("a valid code activates the factor");
+
+        let users = store.list_users().await.expect("list users");
+        assert!(
+            !users[0].totp_pending,
+            "the factor is active, not left pending, once the code is confirmed"
+        );
+        assert!(
+            users[0].has_totp(),
+            "the confirmed factor must gate login for the bootstrap admin"
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_admin_with_a_bad_totp_code_rolls_the_admin_back() {
+        let dir = tempfile::tempdir().expect("create the test directory");
+        let data_dir = dir.path().join("data");
+        let store = MemoryUserStore::new();
+        let authn = boot_authn(&data_dir, store.clone()).await;
+
+        let error = bootstrap_admin(
+            &authn,
+            &store,
+            Some("admin@example.com"),
+            Some("correct horse battery staple"),
+            Some("000000"),
+        )
+        .await
+        .expect_err("a code that cannot be proven must fail the bootstrap");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("bootstrap TOTP code rejected"),
+            "the error must name the TOTP rejection, got: {message}"
+        );
+        assert!(
+            message.contains("otpauth://totp/"),
+            "the error must give the operator the enrolment URI to retry with, got: {message}"
+        );
+        assert!(
+            store.list_users().await.expect("list users").is_empty(),
+            "a rejected bootstrap must remove the admin it created, not leave a pending factor"
+        );
     }
 
     #[tokio::test]
