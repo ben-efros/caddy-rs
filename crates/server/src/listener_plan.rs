@@ -226,7 +226,18 @@ where
 /// This is the entry point for a caller that has already parsed a range (for example
 /// `caddy respond`, whose parser accepts `host:8000-8005`). Each spec expands to one
 /// [`PlannedListener`] per port in its inclusive range, so a range never leaks downstream as an
-/// opaque entry. Port `0` is rejected, as in [`plan_listeners`], and Unix specs are excluded.
+/// opaque entry.
+///
+/// Port `0` is **rejected here, and deliberately NOT rejected by [`plan_listeners`]** — the two entry
+/// points differ on purpose. This entry point exists for callers that need a stable planned identity
+/// (the `bind-fds` output in `T-CORE-132`), and a kernel-chosen port has none: it cannot be named in
+/// a pre-bind plan, matched against an inherited socket, or inherited across an exec. The
+/// configuration entry point accepts port `0` because a configured `:0` is a legitimate caddy-rs
+/// listener that asks the kernel for a free port and then binds it, and refusing it there would break
+/// the documented `unmatched_configured_listener_falls_back_to_binding` behaviour. Do not "align" the
+/// two: the divergence is the design, and each choice has a test pinning it.
+///
+/// Unix specs are excluded.
 pub fn plan_listen_specs<I>(specs: I) -> Result<ListenerPlan, ListenerPlanError>
 where
     I: IntoIterator<Item = ListenSpec>,
