@@ -354,7 +354,7 @@ dependencies = [
 name = "caddy-rs-pm-certificates"
 version = "0.1.0-trial.6"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "caddy-rs-pm-core",
  "caddy-rs-pm-state",
  "ring",
@@ -371,7 +371,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "caddy-rs-authn",
  "caddy-rs-core",
  "caddy-rs-pm-api",
