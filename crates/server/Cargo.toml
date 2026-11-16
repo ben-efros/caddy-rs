@@ -18,8 +18,33 @@ http3 = ["dep:quinn", "dep:h3", "dep:h3-quinn", "caddy-rs-core/http3"]
 # Forwarded so the HTTP engine's handler set matches the binary's feature selection.
 compression = ["caddy-rs-http/compression"]
 templates = ["caddy-rs-http/templates"]
+# Graceful process restart (binary upgrade) via `ecdysis` (ADR-0044). Default-OFF: when this
+# feature is disabled, `ecdysis` is not built at all, so the dependency set, the binary and the
+# reproducible-build gate are byte-identical to a workspace that never had this feature. See
+# docs/adr/0044-process-graceful-restart.md OQ-2 for the decider's dependency decision.
+#
+# KNOWN COST, accepted and measured (T-CORE-101): `ecdysis` 1.1.1 requires socket2 ^0.5 while this
+# workspace pins 0.6.5, so enabling this feature makes the lockfile carry TWO socket2 versions
+# (0.5.10 and 0.6.5). The cost is bounded and does not reach a default build:
+#   - feature OFF: `cargo tree -p caddy-rs-server` resolves socket2 0.6.5 only; 0.5.10 is not in
+#     the graph and is never compiled, so default builds are unaffected.
+#   - feature ON: both versions compile; the extra one is socket2 0.5.10 (332 KiB of source).
+# A second degree-duplicate arrives the same way: `nix` 0.26 pulls bitflags 1.3.2 while the rest
+# of the workspace is on bitflags 2.13.2, so the feature-on lockfile carries both. Same bound:
+# neither is in a feature-off graph. Both are transitive through ecdysis and disappear when it
+# updates.
+# It was NOT eliminated by vendoring-forcing ecdysis onto socket2 0.6 even though that builds
+# clean: ecdysis is the process-restart/descriptor-inheritance library this feature depends on, and
+# carrying a locally patched fork of it would mean owning its correctness and security updates.
+# The existing `vendor/httpdate` patch is a narrow workaround for an unavailable crate, not a
+# precedent for forking a security-sensitive dependency. Revisit if upstream ecdysis moves to
+# socket2 0.6, at which point the duplicate disappears with no change here.
+graceful-restart = ["dep:ecdysis"]
 
 [dependencies]
+# Optional: only compiled with the `graceful-restart` feature. Unix-only - the feature requires
+# fork/exec and file-descriptor inheritance, which do not exist on Windows.
+ecdysis = { version = "1.1.1", optional = true }
 base64 = "0.23.1"
 bytes = { workspace = true }
 caddy-rs-admin = { workspace = true, default-features = false }

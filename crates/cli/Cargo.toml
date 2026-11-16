@@ -23,6 +23,10 @@ compression = ["caddy-rs-server/compression"]
 templates = ["caddy-rs-server/templates"]
 # Convenience marker for a minimal build: `--no-default-features --features minimal`.
 minimal = []
+# Graceful process restart (binary upgrade, ADR-0044). Default-OFF and Unix-only: on Windows and
+# any other non-Unix target the feature fails to compile with a named error instead of silently
+# falling back to stop-then-start (ADR-0044 section 5).
+graceful-restart = ["caddy-rs-server/graceful-restart"]
 
 [dependencies]
 anyhow = { workspace = true }
