@@ -327,6 +327,7 @@ name = "caddy-rs-config"
 version = "0.1.0-trial.7"
 dependencies = [
  "caddy-rs-core",
+ "libc",
  "serde_json",
  "thiserror 2.0.21",
 ]
