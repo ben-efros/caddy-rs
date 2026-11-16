@@ -15,6 +15,8 @@
 pub mod activation;
 pub(crate) mod auto_https;
 pub mod error;
+#[cfg(feature = "graceful-restart")]
+pub mod graceful_restart;
 pub mod http;
 mod inventory;
 pub mod limits;
