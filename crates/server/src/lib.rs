@@ -20,6 +20,7 @@ pub mod graceful_restart;
 pub mod http;
 mod inventory;
 pub mod limits;
+pub mod listener_plan;
 pub mod listeners;
 mod observability;
 mod proxy_protocol;

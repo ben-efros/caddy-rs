@@ -53,6 +53,7 @@ use std::path::{Path, PathBuf};
 use caddy_rs_core::{ListenAddr, Network};
 
 use crate::error::Error;
+use crate::listener_plan::{plan_listeners, ListenerPlan, ListenerPlanError, PlannedListener};
 
 /// First file descriptor passed by systemd (`SD_LISTEN_FDS_START`).
 pub const SD_LISTEN_FDS_START: RawFd = 3;
@@ -86,6 +87,20 @@ impl ActivationError {
     /// Human-readable diagnosis naming the offending value.
     pub fn message(&self) -> &str {
         &self.message
+    }
+}
+
+impl From<ListenerPlanError> for ActivationError {
+    /// Keep a listener-plan failure located and worded exactly as the activation path reported it
+    /// before the plan existed, so existing error expectations are unchanged.
+    fn from(error: ListenerPlanError) -> Self {
+        Self::new(
+            "listen",
+            format!(
+                "cannot parse configured listener `{}`: {}",
+                error.listen, error.reason
+            ),
+        )
     }
 }
 
@@ -537,21 +552,20 @@ where
     let mut listen_keys: Vec<&String> = listens.into_iter().collect();
     listen_keys.sort();
 
+    // Match inherited sockets through the shared listener plan rather than a bespoke comparison
+    // (ADR-0047 §1): a second matcher here would drift from the plan, and drift means a socket
+    // uploaded under one identity and looked up under another.
+    let plan = plan_listeners(listen_keys.iter().copied())?;
+
     let mut slots: Vec<Option<InheritedSocket>> =
         activation.sockets.into_iter().map(Some).collect();
     let inherited = slots.len();
     let mut claims = BTreeMap::new();
 
     for listen in listen_keys {
-        let parsed = ListenAddr::parse(listen).map_err(|reason| {
-            ActivationError::new(
-                "listen",
-                format!("cannot parse configured listener `{listen}`: {reason}"),
-            )
-        })?;
         let matching = slots.iter().position(|slot| {
             slot.as_ref()
-                .is_some_and(|socket| listen_matches(&parsed, socket.local()))
+                .is_some_and(|socket| plan_matches(listen, &plan, socket.local()))
         });
         if let Some(index) = matching {
             if let Some(socket) = slots[index].take() {
@@ -587,20 +601,50 @@ where
     Ok(ActivationPlan { claims, inherited })
 }
 
-/// Whether a configured listen address can be served by an inherited socket.
-fn listen_matches(listen: &ListenAddr, local: &LocalSocket) -> bool {
-    match (listen.network, local) {
-        (Network::Tcp, LocalSocket::Tcp(address)) => tcp_matches(listen, *address),
-        (Network::Unix, LocalSocket::Unix(path)) => Path::new(&listen.address) == path.as_path(),
-        _ => false,
+/// Whether the configured listener `listen` can be served by an inherited socket.
+///
+/// TCP listeners are matched through the shared [`ListenerPlan`], which is what keeps this the only
+/// matcher (ADR-0047 §1). The lookup is keyed on the **configured** listener's own planned port, not
+/// on the inherited socket's port: a configured `:0` asks the kernel for a free port and must never
+/// claim an inherited socket that happens to carry a concrete port, or the activation would hijack
+/// a listener that is meant to fall back to a normal bind.
+///
+/// Unix sockets are outside the plan and keep their path comparison.
+fn plan_matches(listen: &str, plan: &ListenerPlan, local: &LocalSocket) -> bool {
+    let Ok(parsed) = ListenAddr::parse(listen) else {
+        return false;
+    };
+    matches_in_plan(&parsed, plan, local)
+}
+
+/// Whether an already-parsed configured listen address can be served by an inherited socket,
+/// looked up through `plan`.
+///
+/// The plan is the single source of the listener's identity (ADR-0047 §1); this decides only
+/// whether an inherited socket serves that identity.
+fn matches_in_plan(listen: &ListenAddr, plan: &ListenerPlan, local: &LocalSocket) -> bool {
+    let parsed = listen;
+    match local {
+        LocalSocket::Tcp(address) => {
+            let Some(port) = parsed.port() else {
+                return false;
+            };
+            let Some(planned) = plan.find(parsed.network, parsed.host(), port) else {
+                return false;
+            };
+            tcp_matches(planned, *address)
+        }
+        LocalSocket::Unix(path) => {
+            parsed.network == Network::Unix && Path::new(&parsed.address) == path.as_path()
+        }
     }
 }
 
-fn tcp_matches(listen: &ListenAddr, address: SocketAddr) -> bool {
-    if listen.port() != Some(address.port()) {
+fn tcp_matches(listen: &PlannedListener, address: SocketAddr) -> bool {
+    if listen.port != address.port() {
         return false;
     }
-    let host = listen.host();
+    let host = listen.host.as_str();
     let inherited_ip = normalize_ip(address.ip());
     if host.is_empty() {
         // A wildcard config listener needs a wildcard socket: serving only one interface when the
@@ -622,6 +666,20 @@ fn tcp_matches(listen: &ListenAddr, address: SocketAddr) -> bool {
             .any(|candidate| normalize_ip(candidate.ip()) == inherited_ip),
         Err(_) => false,
     }
+}
+
+/// Test-facing wrapper: match a single parsed listener against an inherited socket by planning just
+/// that listener.
+///
+/// The identity rules under test (wildcard, IPv4-mapped IPv6, hostname resolution) live in
+/// [`matches_in_plan`]; this composes it with a one-entry plan so the tests exercise the production
+/// comparison rather than a copy of it, and adding a second matcher is not an option (ADR-0047 §1).
+#[cfg(test)]
+fn listen_matches(listen: &ListenAddr, local: &LocalSocket) -> bool {
+    let Ok(plan) = plan_listeners([&listen.to_string()]) else {
+        return false;
+    };
+    matches_in_plan(listen, &plan, local)
 }
 
 /// Normalize IPv4-mapped IPv6 addresses so `[::ffff:127.0.0.1]` matches `127.0.0.1`.
