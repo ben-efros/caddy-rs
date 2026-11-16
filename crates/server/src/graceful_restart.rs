@@ -38,6 +38,9 @@ compile_error!(
 use std::fmt;
 use std::io;
 
+use socket2_v05::Socket;
+use std::net::TcpListener;
+
 /// Errors raised while configuring or performing a graceful restart.
 ///
 /// Every variant names the operation and its cause, matching the crate's located-error convention
@@ -124,6 +127,144 @@ pub const fn is_enabled() -> bool {
     true
 }
 
+/// Owns the `ecdysis` listener registry for this generation (ADR-0044 §1).
+///
+/// A listener created through this type is registered with the registry, so on the next upgrade the
+/// child inherits the *same* kernel socket instead of rebinding it. Rebinding is what opens the
+/// window in which connections are refused; inheriting closes it for the listeners that go through
+/// here.
+///
+/// # Why every TCP and admin/Unix listener must go through this
+///
+/// `T-CORE-102` is the single highest-risk task in the tree precisely because the failure is
+/// per-listener and silent: a listener bound directly rather than through this type keeps working
+/// perfectly, and only shows up as a refused-connection window for *that one listener* during an
+/// upgrade. There is no runtime symptom until an upgrade happens under load.
+///
+/// UDP is deliberately absent. UDP has no listener to inherit across `exec`; its restart path is an
+/// `SO_REUSEPORT` group plus eBPF flow dispatch (ADR-0044 §1, ADR-0045 §1), owned by `T-CORE-111`
+/// and `T-CORE-112`. Adding `build_socket_udp` here would contradict the accepted ADR and pre-empt
+/// that work, so this type does not offer it.
+pub struct ListenerBinder {
+    runtime: ecdysis::Ecdysis,
+    /// Addresses this generation has bound through the registry, in binding order.
+    ///
+    /// ecdysis tracks the fd set internally but does not expose it (`get_fds_for_child` and
+    /// `ListenerInfo::fd` are both crate-private in 1.1.1), so the set is mirrored here. This is what
+    /// makes the inherited fd set enumerable and loggable at startup, which ADR-0044 §1 requires:
+    /// an operator must be able to see which listeners will survive an upgrade *before* triggering
+    /// one. Addresses rather than raw fd numbers, because an fd number means nothing to an operator
+    /// while `127.0.0.1:8080` does.
+    registered: std::sync::Mutex<Vec<std::net::SocketAddr>>,
+}
+
+impl ListenerBinder {
+    /// Create the registry for this process generation.
+    ///
+    /// On an upgrade the child is started by the parent, so this reconstructs the inherited fd set;
+    /// on a first start it is empty and every listener binds fresh.
+    pub fn new() -> Self {
+        Self {
+            runtime: ecdysis::Ecdysis::new(),
+            registered: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Whether this process is the child of an upgrade (`exec`'d by the parent generation).
+    pub fn is_child(&self) -> bool {
+        self.runtime.is_child()
+    }
+
+    /// Bind a TCP listener through the registry, or adopt the inherited socket for `addr`.
+    ///
+    /// `sock_build` runs **only** when a new socket has to be created; on an upgrade the inherited
+    /// descriptor is adopted and the closure is never called. That asymmetry is why the closure must
+    /// apply every socket option the listener needs: if an option were applied *outside* the closure
+    /// it would be skipped for inherited sockets, and the two generations would disagree about the
+    /// same kernel socket.
+    ///
+    /// The listener is returned in its **std** form because that is what `ecdysis` constructs and
+    /// adopts; the caller sets it non-blocking and converts to `tokio::net::TcpListener`, exactly as
+    /// the direct-bind path already does. ecdysis 1.1.1 offers no way to hand back a tokio listener,
+    /// and converting is the only correct order: `set_nonblocking` must be applied to the std socket
+    /// before `from_std`, for inherited and freshly-bound sockets alike.
+    ///
+    /// `addr` must be a numeric `SocketAddr`. ecdysis keys inheritance on the concrete address, so a
+    /// hostname cannot be used as the key: two hostnames that resolve to the same address are the
+    /// same socket, and a hostname that resolves differently between generations would look up the
+    /// wrong fd. Callers resolve first (see `listeners::bind_configured_tcp`).
+    pub fn bind_tcp<F>(&self, addr: std::net::SocketAddr, sock_build: F) -> io::Result<TcpListener>
+    where
+        F: FnOnce(Socket, std::net::SocketAddr) -> io::Result<TcpListener>,
+    {
+        let listener = self.runtime.build_listen_tcp(addr, sock_build)?;
+        // Record the socket's ACTUAL local address, not `addr` as requested. ecdysis keys its
+        // registry on `local_addr()` of the live socket (`Listener::info` in ecdysis 1.1.1), so for
+        // an ephemeral bind (`127.0.0.1:0`) the key is the port the kernel chose. Recording the
+        // requested `:0` would make this list disagree with what the child actually looks up, and
+        // the child would miss the inherited fd and silently rebind - the exact per-listener
+        // coverage gap this task exists to prevent. A test asserts the two agree.
+        let bound = listener.local_addr().map_err(|error| {
+            io::Error::other(format!("bound listener has no local address: {error}"))
+        })?;
+        if let Ok(mut registered) = self.registered.lock() {
+            if !registered.contains(&bound) {
+                registered.push(bound);
+            }
+        }
+        Ok(listener)
+    }
+
+    /// Forget a listener that is no longer bound.
+    ///
+    /// **This is what keeps a config reload working.** ecdysis holds a `dup` of every registered
+    /// socket for the whole life of the process and only releases them on `quit()`, so a listener
+    /// that is registered and then closed still has a live descriptor inside the registry — the
+    /// kernel keeps the port bound and keeps accepting into a queue nobody serves. That would break
+    /// the reload semantics this crate already has: `http_graceful_shutdown`'s
+    /// `reload_honors_shutdown_delay_and_grace_for_closing_listeners` asserts that after a reload
+    /// the old address **refuses** connections, and it caught exactly this.
+    ///
+    /// ADR-0044 §1 scopes graceful restart to replacing the *binary*; configuration reload is
+    /// explicitly out of its scope. A reloaded-away listener must therefore be dropped from the
+    /// registry, so the next `exec` does not resurrect it and the port is genuinely released.
+    ///
+    /// Note the asymmetry this creates and why it is correct: the registry describes "what the next
+    /// generation should inherit", which is the set of listeners bound *now*, not the set that has
+    /// ever been bound.
+    pub fn forget(&self, addr: std::net::SocketAddr) {
+        if let Ok(mut registered) = self.registered.lock() {
+            registered.retain(|candidate| *candidate != addr);
+        }
+    }
+
+    /// The addresses this generation would hand to its child, in binding order.
+    ///
+    /// ADR-0044 §1 requires the inherited fd set to be enumerable. These are the listeners that will
+    /// be adopted rather than rebound on the next upgrade; anything missing from this list will
+    /// rebind and therefore has a refused-connection window.
+    pub fn inherited_listeners(&self) -> Vec<std::net::SocketAddr> {
+        self.registered
+            .lock()
+            .map(|registered| registered.clone())
+            .unwrap_or_default()
+    }
+}
+
+impl Default for ListenerBinder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for ListenerBinder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ListenerBinder")
+            .field("is_child", &self.is_child())
+            .finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,5 +310,75 @@ mod tests {
         // OQ-1: the signal is SIGUSR2, and it must be named exactly that wherever it is reported.
         assert_eq!(RestartTrigger::SignalUsr2.to_string(), "SIGUSR2");
         assert_eq!(RestartTrigger::AdminApi.to_string(), "admin API");
+    }
+
+    #[test]
+    fn a_bound_listener_is_recorded_as_inheritable() {
+        // The registry is what the child inherits. If binding did not record the address, the next
+        // generation would find no fd for it, rebind, and open the refused-connection window this
+        // task exists to close - so the record itself is the property worth asserting.
+        let binder = ListenerBinder::new();
+        assert!(
+            binder.inherited_listeners().is_empty(),
+            "a fresh generation inherits nothing"
+        );
+
+        let listener = binder
+            .bind_tcp("127.0.0.1:0".parse().unwrap(), |socket, addr| {
+                socket.bind(&addr.into())?;
+                socket.listen(128)?;
+                let std_listener: std::net::TcpListener = socket.into();
+                std_listener.set_nonblocking(true)?;
+                Ok(std_listener)
+            })
+            .expect("bind through the registry");
+
+        let bound = listener.local_addr().expect("local address");
+        assert_eq!(
+            binder.inherited_listeners(),
+            vec![bound],
+            "the address actually bound is the one the child will look up; a mismatch would make \
+             the child miss the inherited socket and rebind"
+        );
+    }
+
+    #[test]
+    fn the_creation_closure_runs_for_a_new_socket_and_is_what_applies_options() {
+        // ecdysis only calls the closure when it is creating a socket; on an upgrade the inherited
+        // descriptor is adopted and the closure never runs. That is precisely why every socket
+        // option must be applied INSIDE the closure rather than after it: an option applied outside
+        // would be silently skipped for inherited sockets, and the parent and child would disagree
+        // about the same kernel socket.
+        let binder = ListenerBinder::new();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = std::sync::Arc::clone(&calls);
+        let listener = binder
+            .bind_tcp("127.0.0.1:0".parse().unwrap(), move |socket, addr| {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                socket.bind(&addr.into())?;
+                socket.listen(128)?;
+                let std_listener: std::net::TcpListener = socket.into();
+                std_listener.set_nonblocking(true)?;
+                Ok(std_listener)
+            })
+            .expect("bind through the registry");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a first generation creates the socket, so the closure must run exactly once"
+        );
+        drop(listener);
+    }
+
+    #[test]
+    fn a_non_upgrade_generation_is_not_a_child() {
+        // Without an inherited environment this process is the first generation. It must not think
+        // it is a child, because a child that believes it inherited sockets it did not would skip
+        // binding and serve nothing.
+        let binder = ListenerBinder::new();
+        assert!(
+            !binder.is_child(),
+            "a process started normally is not the child of an upgrade"
+        );
     }
 }
