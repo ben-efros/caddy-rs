@@ -207,14 +207,10 @@ fn confirm_registration(
     socket: &UdpSocket,
     generation: u32,
 ) -> Result<SocketGeneration, UdpgrmError> {
-    let mut last = SocketGeneration {
-        socket_gen: 0,
-        socket_idx: SOCKET_IDX_NOT_YET,
-    };
     for _ in 0..REGISTRATION_ATTEMPTS {
-        last = read_socket_generation(socket)?;
-        if last.is_registered() {
-            return Ok(last);
+        let read = read_socket_generation(socket)?;
+        if read.is_registered() {
+            return Ok(read);
         }
         std::thread::sleep(REGISTRATION_INTERVAL);
     }
