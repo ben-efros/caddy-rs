@@ -16,8 +16,8 @@ use std::time::{Duration, UNIX_EPOCH};
 use clap::{Args, FromArgMatches};
 use setup::{
     activation_url_with_token, ensure_not_stock_compat, generate_config, parse_duration,
-    run_with_runner, AuthMethod, BootRunner, SetupArgs, SetupConfig, SetupError, TokenError,
-    TokenStore,
+    registration_timeout, run_with_runner, AuthMethod, BootRunner, SetupArgs, SetupConfig,
+    SetupError, TokenError, TokenStore, DEFAULT_REGISTRATION_TIMEOUT,
 };
 
 /// Parse `setup` arguments exactly as clap sees them on the command line.
@@ -195,6 +195,59 @@ fn parses_duration_forms() {
     assert_eq!(parse_duration("900s").unwrap(), Duration::from_secs(900));
     assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
     assert!(parse_duration("15x").is_err());
+}
+
+#[test]
+fn an_empty_registration_timeout_defaults_to_fifteen_minutes() {
+    // ADR-0039: omitting the flag means 15m, so an operator who says nothing gets a bounded window
+    // rather than an unbounded or zero-length one.
+    assert_eq!(
+        registration_timeout(&args_with("example.com")).unwrap(),
+        Duration::from_secs(900)
+    );
+    assert_eq!(DEFAULT_REGISTRATION_TIMEOUT, Duration::from_secs(900));
+}
+
+#[test]
+fn the_registration_timeout_bounds_are_inclusive() {
+    // 300s and 3600s are the exact edges of the 5m..=60m window and must be ACCEPTED: an off-by-one
+    // here would reject a value the documented range allows.
+    for (text, secs) in [
+        ("300s", 300u64),
+        ("5m", 300),
+        ("3600s", 3600),
+        ("60m", 3600),
+    ] {
+        let args = parse(&["--domain", "example.com", "--registration-timeout", text])
+            .unwrap_or_else(|e| panic!("{text} must parse: {e}"));
+        assert_eq!(
+            registration_timeout(&args).unwrap_or_else(|e| panic!("{text} must be accepted: {e}")),
+            Duration::from_secs(secs),
+            "{text} must be accepted as {secs}s"
+        );
+    }
+}
+
+#[test]
+fn a_registration_timeout_outside_the_bounds_is_rejected_not_clamped() {
+    // One second outside either edge. Rejection is deliberate: clamping would silently misrepresent
+    // the window the operator asked for, and a widened window keeps a live token redeemable longer.
+    for (text, fragment) in [
+        ("299s", "below the 5m minimum"),
+        ("3601s", "above the 60m maximum"),
+    ] {
+        let args = parse(&["--domain", "example.com", "--registration-timeout", text])
+            .unwrap_or_else(|e| panic!("{text} must parse: {e}"));
+        match registration_timeout(&args) {
+            Err(SetupError::InvalidRegistrationTimeout(reason)) => {
+                assert!(
+                    reason.contains(fragment),
+                    "{text} must be rejected as {fragment}, got {reason}"
+                );
+            }
+            other => panic!("{text} must be rejected with a located error, got {other:?}"),
+        }
+    }
 }
 
 #[test]
