@@ -249,6 +249,108 @@ impl ListenerBinder {
             .map(|registered| registered.clone())
             .unwrap_or_default()
     }
+
+    /// Declare this generation ready to take over (ADR-0044 §2.3).
+    ///
+    /// **The child calls this, and only after it has fully initialised** — config parsed, TLS
+    /// loaded, routes compiled, listeners bound. ecdysis's `ready()` then writes `OK` down the pipe
+    /// to the parent, whose `upgrade()` returns; the parent is what closes its listener copies and
+    /// begins draining.
+    ///
+    /// This is the single most important ordering in the whole restart path, and the reason it is a
+    /// separate method rather than being folded into `upgrade`: if the child signalled readiness
+    /// before it could actually serve, the parent would exit and the new generation would be
+    /// half-initialised with nobody listening — a bad config would take the service down, which is
+    /// exactly what §2.4 forbids. Calling this too early is worse than not calling it at all,
+    /// because the parent times out and keeps serving if it is never called.
+    ///
+    /// Returns an error if the readiness pipe cannot be written; the parent then treats the upgrade
+    /// as failed and keeps serving.
+    pub fn ready(&mut self) -> Result<(), GracefulRestartError> {
+        if !self.is_child() {
+            // Not an error: a first generation has no parent to notify, and `ready()` on a
+            // non-child is a no-op in ecdysis. Returning Ok keeps the CLI's startup path
+            // unconditional rather than branching on `is_child()`.
+            tracing::debug!(
+                "graceful restart: not an upgrade child, so there is no parent to notify of readiness"
+            );
+            return Ok(());
+        }
+        self.runtime
+            .ready()
+            .map_err(|e| GracefulRestartError::Io(e))
+    }
+
+    /// Ask the parent to fork+exec a new generation (ADR-0044 §2.1-§2.2, §2.6).
+    ///
+    /// **Blocks until the child either declares ready or exits**, which is what makes the §2
+    /// ordering hold: ecdysis's `upgrade()` waits on the readiness pipe and reports
+    /// [`GracefulRestartError::ChildNotReady`] when the child dies first, so the caller learns the
+    /// outcome before it decides whether to drain. The parent must keep serving on every error path
+    /// — that is the whole point of doing it this way round.
+    ///
+    /// The single-upgrade invariant (§2.6) is enforced inside `ecdysis::upgrade` by an atomic swap,
+    /// so a second call while one is in flight returns [`GracefulRestartError::UpgradeInFlight`]
+    /// instead of forking a second child. A second request is **refused, not queued**: queueing
+    /// repeated requests turns them into a fork storm, which §5 names as a denial-of-service
+    /// primitive.
+    ///
+    /// This runs the fork/exec on the calling thread. Callers on an async runtime must therefore
+    /// call it from a blocking context (`tokio::task::spawn_blocking`), never directly from a task
+    /// that also drives listeners — `exec` after `fork` is not async-signal-safe.
+    pub fn upgrade(&self) -> Result<(), GracefulRestartError> {
+        if !self.registered_any_listener() {
+            // Forking a child that inherits nothing would produce a second generation with no
+            // sockets: the new process would try to bind the same addresses, fail, and exit —
+            // while the parent had already been asked to hand over. Refusing here keeps the old
+            // generation serving and says why.
+            return Err(GracefulRestartError::ChildNotReady {
+                cause: "no listeners are registered to inherit, so a new generation could not \
+                        serve; refusing to start an upgrade that would leave nothing listening"
+                    .to_string(),
+            });
+        }
+        match self.runtime.upgrade() {
+            Ok(()) => {
+                tracing::info!(
+                    listeners = self.inherited_listeners().len(),
+                    "graceful restart: the new generation is ready; this generation will now \
+                     stop accepting and drain"
+                );
+                Ok(())
+            }
+            Err(error) => {
+                // ecdysis 1.1.1 returns `UpgradeFinished`, but neither `UpgradeError` nor
+                // `UpgradeFinished` is re-exported (`lib.rs` imports them with a private `use`), so
+                // the variants cannot be matched on. The distinction that matters is recoverable
+                // from the `Display` text, which is stable and documented: a concurrent request
+                // renders "upgrade not started: Already in upgrade", while every other variant
+                // means the child never took over.
+                let reason = error.to_string();
+                if reason.contains("upgrade not started") {
+                    // The single-upgrade invariant (§2.6) refused a second concurrent upgrade.
+                    // Refused rather than queued, so repeated requests cannot become a fork storm.
+                    tracing::warn!(%reason, "graceful restart: refused a second concurrent upgrade");
+                    return Err(GracefulRestartError::UpgradeInFlight);
+                }
+                // The child exited or never signalled ready. The parent is still serving, and must
+                // say so loudly (§2.4).
+                tracing::error!(
+                    %reason,
+                    "graceful restart failed; the current process is still serving"
+                );
+                Err(GracefulRestartError::ChildNotReady { cause: reason })
+            }
+        }
+    }
+
+    /// Whether any listener is registered to be inherited.
+    fn registered_any_listener(&self) -> bool {
+        self.registered
+            .lock()
+            .map(|registered| !registered.is_empty())
+            .unwrap_or(false)
+    }
 }
 
 impl Default for ListenerBinder {
@@ -379,6 +481,53 @@ mod tests {
         assert!(
             !binder.is_child(),
             "a process started normally is not the child of an upgrade"
+        );
+    }
+
+    #[test]
+    fn ready_on_a_first_generation_is_a_no_op_rather_than_an_error() {
+        // Startup calls `ready()` unconditionally. A first generation has no parent to notify, so
+        // the call must succeed silently instead of forcing every caller to branch on `is_child()`.
+        let mut binder = ListenerBinder::new();
+        assert!(!binder.is_child());
+        binder
+            .ready()
+            .expect("ready() on a first generation must not fail");
+    }
+
+    #[test]
+    fn an_upgrade_with_no_registered_listeners_is_refused_before_forking() {
+        // Forking a child that inherits nothing would produce a generation with no sockets: it
+        // would try to rebind, fail, and exit - after the parent had already been asked to hand
+        // over. The refusal must name that, and must not claim the child merely "was not ready".
+        let binder = ListenerBinder::new();
+        let error = binder
+            .upgrade()
+            .expect_err("an upgrade with nothing to inherit must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("nothing listening"),
+            "the refusal must say why it would leave nothing serving; got: {message}"
+        );
+        assert!(
+            message.contains("still serving"),
+            "the message must say the current process is still serving; got: {message}"
+        );
+    }
+
+    #[test]
+    fn the_in_flight_refusal_maps_onto_the_single_upgrade_invariant() {
+        // ecdysis 1.1.1 does not export `UpgradeError`, so the concurrent-upgrade case is
+        // recognised from its `Display` text ("upgrade not started: ..."). This test pins the
+        // mapping so a dependency bump that changes the wording fails here rather than silently
+        // turning a refusal into a "child not ready" report.
+        let error = GracefulRestartError::UpgradeInFlight;
+        let message = error.to_string();
+        assert!(message.contains("already in flight"), "got: {message}");
+        // The text this recognises:
+        assert!(
+            "upgrade not started: Already in upgrade".contains("upgrade not started"),
+            "the sentinel this module matches on must be the one ecdysis emits"
         );
     }
 }
