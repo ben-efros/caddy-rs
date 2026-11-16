@@ -19,6 +19,8 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1004,20 +1006,111 @@ async fn resolve_upstream(
     }
 }
 
-/// Connect to one resolved address, binding `local_address` first when configured.
+/// The single place egress TCP sockets are created (ADR-0043 §1).
+///
+/// `local` selects one of three documented cases:
+///
+/// * `None` — a vanilla connect with **no socket options added**. The kernel already chooses both
+///   halves of the 2-tuple and already shares it across destinations, so touching this path could
+///   only change behaviour for the worse.
+/// * `Some(local)` with port `0` — `IP_BIND_ADDRESS_NO_PORT` is set before `bind`, so the kernel
+///   defers the source-port choice to `connect()` and may share one source port across distinct
+///   destinations. Without the option, `bind()` must reserve a unique 2-tuple and each concurrent
+///   connection burns a port from `net.ipv4.ip_local_port_range` (DIV-0153).
+/// * `Some(local)` with an explicit port — `SO_REUSEADDR` then `bind`, and a contended source port
+///   surfaces as the named error from [`contended_source_port_error`]. `IP_BIND_ADDRESS_NO_PORT` is
+///   explicitly invalid for a non-zero port, so this case cannot use it.
+///
+/// Non-Linux targets take the pre-change path (see [`bind_before_connect`]) rather than pretending:
+/// the fallback is registered as a divergence, never a silent redefinition.
 async fn connect_address(address: SocketAddr, local: Option<SocketAddr>) -> io::Result<TcpStream> {
-    let stream = match local {
-        None => TcpStream::connect(address).await?,
-        Some(local) => {
-            let socket = match local {
-                SocketAddr::V4(_) => TcpSocket::new_v4()?,
-                SocketAddr::V6(_) => TcpSocket::new_v6()?,
-            };
-            socket.bind(local)?;
-            socket.connect(address).await?
-        }
+    let Some(local) = local else {
+        return TcpStream::connect(address).await;
     };
-    Ok(stream)
+    let socket = match local {
+        SocketAddr::V4(_) => TcpSocket::new_v4()?,
+        SocketAddr::V6(_) => TcpSocket::new_v6()?,
+    };
+    // The contention can surface at either step: `bind` rejects an already-reserved 2-tuple, and
+    // `connect` rejects a 4-tuple the kernel cannot reuse. Both are the explicit-port case's named
+    // error (ADR-0043 §2), so neither is allowed to leak as a bare OS error.
+    bind_before_connect(&socket, local).map_err(|error| {
+        if local.port() == 0 {
+            error
+        } else {
+            contended_source_port_error(local, address, error)
+        }
+    })?;
+    socket.connect(address).await.map_err(|error| {
+        if local.port() == 0 {
+            error
+        } else {
+            contended_source_port_error(local, address, error)
+        }
+    })
+}
+
+/// Bind `local` on `socket`, applying the option ADR-0043 §1 assigns to this case.
+///
+/// On non-Linux targets only the plain `bind` happens: `IP_BIND_ADDRESS_NO_PORT` is Linux-only, and
+/// `SO_REUSEADDR` before an outbound `bind` is not the documented technique elsewhere.
+fn bind_before_connect(socket: &TcpSocket, local: SocketAddr) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        if local.port() == 0 {
+            set_ip_bind_address_no_port(socket)?;
+        } else {
+            socket.set_reuseaddr(true)?;
+        }
+    }
+    socket.bind(local)
+}
+
+/// Set `IP_BIND_ADDRESS_NO_PORT` (Linux 4.2+) on an unbound socket.
+///
+/// `socket2` 0.6.5 has no setter for this option and keeps its `setsockopt` private, so the raw fd
+/// is the only route.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)] // The one raw syscall in this crate; see the SAFETY note inside.
+fn set_ip_bind_address_no_port(socket: &TcpSocket) -> io::Result<()> {
+    let fd = socket.as_raw_fd();
+    let one: libc::c_int = 1;
+    // SAFETY: `fd` is a live socket owned by `socket` for the duration of the call, and `one` is a
+    // valid `c_int` whose address/size pair matches what `IP_BIND_ADDRESS_NO_PORT` expects.
+    let result = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IP,
+            libc::IP_BIND_ADDRESS_NO_PORT,
+            std::ptr::addr_of!(one).cast(),
+            std::mem::size_of_val(&one) as libc::socklen_t,
+        )
+    };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The named error for a contended explicit source port (ADR-0043 §2).
+///
+/// `SO_REUSEADDR` makes the application responsible for detecting that the 4-tuple is taken, so this
+/// must name the local address, the destination and the contended port rather than retrying
+/// invisibly or silently falling back to an unshared socket.
+fn contended_source_port_error(
+    local: SocketAddr,
+    address: SocketAddr,
+    error: io::Error,
+) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!(
+            "upstream `{address}` connect failed from configured source address `{local}`: the \
+             configured source port {} is contended (another socket already uses this 4-tuple); \
+             set `transport.local_address` to port 0 to let the kernel share the source port: {error}",
+            local.port()
+        ),
+    )
 }
 
 /// Race resolved addresses: start the next attempt after `delay` (or immediately after a
@@ -1274,6 +1367,35 @@ pub fn build_upstream_client_for_tuned(
 
 #[cfg(test)]
 mod tests {
+    /// Read an `IPPROTO_IP`/`IP_BIND_ADDRESS_NO_PORT` int option back off a live socket.
+    ///
+    /// Test-only: the crate's `deny(unsafe_code)` is relaxed for this one read the same way the
+    /// production setter is, so the assertion proves what the kernel actually holds.
+    #[cfg(target_os = "linux")]
+    #[allow(unsafe_code)]
+    fn ip_bind_address_no_port(socket: &TcpSocket) -> libc::c_int {
+        let fd = socket.as_raw_fd();
+        let mut value: libc::c_int = 0;
+        let mut len = std::mem::size_of_val(&value) as libc::socklen_t;
+        // SAFETY: `fd` is live and owned by `socket`, and `value`/`len` are a valid out-parameter
+        // pair of the size `getsockopt` writes.
+        let result = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::IPPROTO_IP,
+                libc::IP_BIND_ADDRESS_NO_PORT,
+                std::ptr::addr_of_mut!(value).cast(),
+                &mut len,
+            )
+        };
+        assert_eq!(
+            result,
+            0,
+            "getsockopt failed: {}",
+            io::Error::last_os_error()
+        );
+        value
+    }
     use super::*;
     use hyper::service::service_fn;
     use std::convert::Infallible;
@@ -1548,6 +1670,101 @@ mod tests {
         config.max_idle_conns = None;
         config.enabled = false;
         assert_eq!(config.pool_max_idle_per_host(), 0);
+    }
+
+    /// Case (b): a port-0 local address must reach the kernel with `IP_BIND_ADDRESS_NO_PORT` set, so
+    /// the source port is chosen at `connect()` and may be shared across destinations (DIV-0153).
+    ///
+    /// This fails against the pre-change code, which bound without the option.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn port_zero_local_address_sets_ip_bind_address_no_port_before_bind() {
+        let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let socket = TcpSocket::new_v4().unwrap();
+        bind_before_connect(&socket, local).unwrap();
+
+        assert_eq!(
+            ip_bind_address_no_port(&socket),
+            1,
+            "IP_BIND_ADDRESS_NO_PORT must be enabled for a port-0 local address"
+        );
+    }
+
+    /// Case (c): an explicit source port must take `SO_REUSEADDR` and must *not* take
+    /// `IP_BIND_ADDRESS_NO_PORT`, which the kernel rejects for a non-zero port (ADR-0043 §1).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn explicit_port_local_address_sets_reuseaddr_and_not_no_port() {
+        let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let socket = TcpSocket::new_v4().unwrap();
+        // Use a concrete port so the case-(c) branch runs; nothing is listening on it.
+        let explicit = SocketAddr::new(local.ip(), 45678);
+        bind_before_connect(&socket, explicit).unwrap();
+
+        assert_eq!(
+            ip_bind_address_no_port(&socket),
+            0,
+            "IP_BIND_ADDRESS_NO_PORT is invalid for a non-zero port and must stay unset"
+        );
+        let sock = socket2::SockRef::from(&socket);
+        assert!(
+            sock.reuse_address().unwrap(),
+            "SO_REUSEADDR must be set on the explicit-port path"
+        );
+    }
+
+    /// Case (a): with no local address, no socket option is added at all — the vanilla connect path
+    /// must stay byte-identical, and `bind_before_connect` is not reached.
+    #[tokio::test]
+    async fn no_local_address_takes_the_vanilla_connect_path() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let stream = connect_address(address, None).await.unwrap();
+        let _ = accept.await.unwrap();
+        assert!(stream.peer_addr().is_ok());
+    }
+
+    /// Case (c) error contract (ADR-0043 §2): a contended explicit source port surfaces as a named
+    /// error naming the local address, the destination and the contended port — never silently
+    /// retried or fallen back to an unshared socket.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn contended_explicit_source_port_names_the_local_address_and_port() {
+        // Occupy a 4-tuple first: bind a listener and connect to it from a fixed source port.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.map(|_| ()) });
+
+        let source = SocketAddr::new(std::net::IpAddr::from([127, 0, 0, 1]), 0);
+        let first = TcpSocket::new_v4().unwrap();
+        first.bind(source).unwrap();
+        let taken = first.local_addr().unwrap().port();
+        let _held = first.connect(address).await.unwrap();
+        let _ = accept.await.unwrap();
+
+        // A second connect from the same explicit source port contends for the same 4-tuple.
+        let local = SocketAddr::new(source.ip(), taken);
+        let error = connect_address(address, Some(local))
+            .await
+            .expect_err("a contended explicit source port must fail loudly");
+        let message = error.to_string();
+        assert!(
+            message.contains(&taken.to_string()),
+            "error must name the contended source port {taken}: {message}"
+        );
+        assert!(
+            message.contains(&address.to_string()),
+            "error must name the destination: {message}"
+        );
+        assert!(
+            message.contains("contended"),
+            "error must say the source port is contended: {message}"
+        );
+        assert!(
+            message.contains("port 0"),
+            "error must tell the operator which knob to change: {message}"
+        );
     }
 
     #[tokio::test]
