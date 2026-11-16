@@ -3031,6 +3031,64 @@ mod shutdown_timing_tests {
     }
 }
 
+/// Proves that readiness is the point at which the deferred UDP socket generations are promoted.
+///
+/// The CLI calls `mark_ready` once the listeners and admin endpoint are active. In a build with
+/// `udpgrm` but without `graceful-restart` this is the *only* path that promotes, and it was
+/// previously gated on `graceful-restart` alone at the call site, so a udpgrm-only build registered
+/// sockets and never promoted them. Compiling is not calling: this asserts the promotion is
+/// actually attempted when readiness is declared.
+#[cfg(all(test, feature = "udpgrm"))]
+mod udpgrm_readiness_tests {
+    use std::sync::Arc;
+
+    use caddy_rs_core::{Config, GenerationStore};
+
+    use super::ServerRuntime;
+
+    #[tokio::test]
+    async fn mark_ready_promotes_the_deferred_udp_generations() {
+        let store = Arc::new(GenerationStore::with_builtin_registry());
+        let mut runtime = ServerRuntime::new(Arc::clone(&store));
+        store
+            .load(
+                Config::from_value(serde_json::json!({
+                    "admin": {"listen": "127.0.0.1:0"},
+                    "apps": {"http": {"servers": {"srv0": {"listen": ["127.0.0.1:0"]}}}}
+                }))
+                .expect("configuration decodes"),
+            )
+            .expect("configuration loads");
+        runtime.apply().await.expect("initial apply");
+
+        // Stage one deferred generation by hand: no udpgrm daemon is available here, so the real
+        // bind path cannot register one. The registry is process-wide, so count the delta.
+        let before = crate::udpgrm::registry().attempts();
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind a probe socket");
+        let owned = crate::udpgrm::duplicate_for_promotion(&socket).expect("duplicate");
+        crate::udpgrm::defer_promotion(
+            "udp/127.0.0.1:0",
+            owned,
+            crate::udpgrm::PendingGeneration {
+                generation: 1,
+                confirmed: crate::udpgrm::SocketGeneration {
+                    socket_gen: 1,
+                    socket_idx: 0,
+                },
+            },
+        );
+
+        runtime.mark_ready().expect("readiness is declared");
+
+        assert!(
+            crate::udpgrm::registry().attempts() > before,
+            "declaring readiness must promote the deferred UDP socket generations - this is the \
+             only promotion point, so a build that reaches here without promoting never advances \
+             the working generation at all"
+        );
+    }
+}
+
 #[cfg(test)]
 mod shutdown_latch_tests {
     use std::sync::Arc;

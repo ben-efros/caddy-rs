@@ -1113,7 +1113,13 @@ async fn run(command: Command) -> anyhow::Result<()> {
             // earlier would let the parent exit while this generation could not yet serve, which is
             // precisely the "bad config takes the service down" failure §2.4 forbids. A first
             // generation is not an upgrade child, and `ready()` is then a no-op.
-            #[cfg(feature = "graceful-restart")]
+            // Also gated on `udpgrm`: UDP graceful restart is independent of process restart, and
+            // `mark_ready` is the only place that promotes the UDP socket generations registered
+            // during `apply`. With this gate at `graceful-restart` alone, a udpgrm-only build would
+            // register sockets and never promote them - the working generation would never advance
+            // and the deferred registry would hold a duplicated descriptor per UDP listener for the
+            // process lifetime. Promoting here is the same readiness point the TCP path uses.
+            #[cfg(any(feature = "graceful-restart", feature = "udpgrm"))]
             runtime
                 .mark_ready()
                 .context("cannot signal readiness to the parent process")?;

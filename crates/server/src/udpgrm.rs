@@ -249,7 +249,6 @@ fn read_socket_generation(socket: &UdpSocket) -> Result<SocketGeneration, Udpgrm
 
 /// Step 4: promote `generation` so it receives new flows.
 pub fn promote_generation(socket: &UdpSocket, generation: u32) -> Result<(), UdpgrmError> {
-    PROMOTION_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
     let value: libc::c_int = generation as libc::c_int;
     // SAFETY: as in `register_socket`.
     let rc = unsafe {
@@ -267,15 +266,7 @@ pub fn promote_generation(socket: &UdpSocket, generation: u32) -> Result<(), Udp
     Ok(())
 }
 
-/// Counts real calls into [`promote_generation`].
-///
-/// The ordering contract of ADR-0045 §2 is that promotion happens *later*, at readiness - so the
-/// property worth asserting is that no promotion is *attempted* while a socket is only being
-/// registered. Without a udpgrm daemon the call always fails, so counting attempts is the only
-/// observable that separates "registered and waiting" from "registered and already promoted".
-static PROMOTION_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
-
-/// Process-wide registry of UDP sockets registered into a socket generation but not yet promoted.
+/// Registry of UDP sockets registered into a socket generation but not yet promoted.
 ///
 /// The bind path ([`crate::listeners`]) is far from the runtime and has no handle to it, while the
 /// promotion point is the runtime's readiness signal (`ServerRuntime::mark_ready`). A registry is
@@ -283,62 +274,110 @@ static PROMOTION_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
 /// sockets register here as they are bound, and the runtime drains and promotes the whole set once,
 /// at the moment the instance is fully initialised.
 ///
-/// Entries are keyed by the socket's local address so a rebind of the same address replaces rather
+/// The registry is an ordinary owned value rather than a bare global so that tests can construct
+/// their own and exercise the ordering contract without sharing mutable state. The production path
+/// uses the process-wide [`registry`] below; tests that used that global concurrently were
+/// genuinely flaky (a test could drain another test's entry, or observe its counter movement), and
+/// a test that fails a fraction of the time is eventually dismissed as noise, which is how a real
+/// regression gets waved through.
+///
+/// Entries are keyed by the listener description so a rebind of the same address replaces rather
 /// than duplicates. A socket is held by the entry, keeping the descriptor alive until promotion, so
 /// a dropped entry cannot leave a stale registration pointing at a closed fd.
-static PENDING: OnceLock<Mutex<Vec<(String, UdpSocket, PendingGeneration)>>> = OnceLock::new();
-
-fn pending() -> &'static Mutex<Vec<(String, UdpSocket, PendingGeneration)>> {
-    PENDING.get_or_init(|| Mutex::new(Vec::new()))
+#[derive(Default)]
+pub struct PendingRegistry {
+    entries: Mutex<Vec<(String, UdpSocket, PendingGeneration)>>,
+    /// Counts real calls into [`promote_generation`] made on behalf of this registry.
+    ///
+    /// The ordering contract of ADR-0045 §2 is that promotion happens *later*, at readiness, so the
+    /// property worth asserting is that no promotion is *attempted* while a socket is only being
+    /// registered. Without a udpgrm daemon the call always fails, so counting attempts is the only
+    /// observable that separates "registered and waiting" from "registered and already promoted".
+    attempts: AtomicUsize,
 }
 
-/// Record a registered-but-unpromoted socket for later promotion.
-///
-/// `socket` must be a duplicate of the listener's descriptor (see [`duplicate_for_promotion`]);
-/// ownership moves into the registry.
-pub fn defer_promotion(listen: &str, socket: UdpSocket, pending_generation: PendingGeneration) {
-    let mut entries = pending()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    entries.retain(|(existing, _, _)| existing != listen);
-    entries.push((listen.to_string(), socket, pending_generation));
-}
-
-/// Promote every deferred socket generation. Called once the instance is fully initialised.
-///
-/// Returns the number of generations promoted. An empty registry is not an error: it means no UDP
-/// listener registered (udpgrm absent, or no UDP listeners configured).
-pub fn promote_deferred() -> usize {
-    let drained: Vec<_> = {
-        let mut entries = pending()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        std::mem::take(&mut *entries)
-    };
-    let mut promoted = 0;
-    for (listen, socket, pending_generation) in drained {
-        if promote(&socket, pending_generation, &listen) {
-            promoted += 1;
-        }
+impl PendingRegistry {
+    /// An empty registry.
+    pub fn new() -> Self {
+        Self::default()
     }
-    promoted
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<(String, UdpSocket, PendingGeneration)>> {
+        // A panic while holding the lock cannot corrupt the `Vec` in a way that matters here - the
+        // worst case is a lost entry, which degrades to "not promoted" - so recover rather than
+        // propagate the panic into an unrelated caller.
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Record a registered-but-unpromoted socket for later promotion.
+    ///
+    /// `socket` must be a duplicate of the listener's descriptor (see [`duplicate_for_promotion`]);
+    /// ownership moves into the registry.
+    pub fn defer(&self, listen: &str, socket: UdpSocket, pending_generation: PendingGeneration) {
+        let mut entries = self.lock();
+        entries.retain(|(existing, _, _)| existing != listen);
+        entries.push((listen.to_string(), socket, pending_generation));
+    }
+
+    /// Promote every deferred socket generation, draining the registry.
+    ///
+    /// Returns the number of generations promoted. An empty registry is not an error: it means no
+    /// UDP listener registered (udpgrm absent, or no UDP listeners configured).
+    pub fn promote_all(&self) -> usize {
+        let drained: Vec<_> = std::mem::take(&mut *self.lock());
+        let mut promoted = 0;
+        for (listen, socket, pending_generation) in drained {
+            if promote(&socket, pending_generation, &listen) {
+                promoted += 1;
+            }
+        }
+        promoted
+    }
+
+    /// How many promotions this registry has attempted.
+    pub fn attempts(&self) -> usize {
+        self.attempts.load(Ordering::SeqCst)
+    }
+
+    /// How many sockets are registered but not yet promoted.
+    pub fn len(&self) -> usize {
+        self.lock().len()
+    }
+
+    /// Whether no socket is awaiting promotion.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Drop every entry without promoting.
+    pub fn clear(&self) {
+        self.lock().clear();
+    }
 }
 
-/// How many sockets are registered but not yet promoted. Used by tests and diagnostics.
+/// The process-wide registry used by the real bind and readiness paths.
+static PENDING: OnceLock<PendingRegistry> = OnceLock::new();
+
+/// The process-wide registry, created on first use.
+pub fn registry() -> &'static PendingRegistry {
+    PENDING.get_or_init(PendingRegistry::new)
+}
+
+/// Record a registered-but-unpromoted socket in the process-wide registry.
+pub fn defer_promotion(listen: &str, socket: UdpSocket, pending_generation: PendingGeneration) {
+    registry().defer(listen, socket, pending_generation);
+}
+
+/// Promote every generation deferred in the process-wide registry.
+pub fn promote_deferred() -> usize {
+    registry().promote_all()
+}
+
+/// How many sockets the process-wide registry is holding. Used by diagnostics and tests.
 pub fn deferred_len() -> usize {
-    pending()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .len()
-}
-
-/// Clear the deferred registry without promoting, for tests that need a clean slate.
-#[cfg(test)]
-pub fn clear_deferred() {
-    pending()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clear();
+    registry().len()
 }
 
 /// Duplicate a listener's descriptor so the registry can hold its own handle.
@@ -452,6 +491,7 @@ pub fn register_listener(socket: &UdpSocket, listen: &str) -> Option<PendingGene
 /// Call this only when the instance is **fully initialised** — the same point at which the TCP path
 /// signals `ready()` (ADR-0044 §2). Returns `true` when the promotion succeeded.
 pub fn promote(socket: &UdpSocket, pending: PendingGeneration, listen: &str) -> bool {
+    registry().attempts.fetch_add(1, Ordering::SeqCst);
     match promote_generation(socket, pending.generation) {
         Ok(()) => {
             tracing::debug!(
@@ -567,12 +607,18 @@ mod tests {
         // receive new flows until the working generation is promoted.
         //
         // Without a udpgrm daemon the eBPF dispatch cannot be observed, so this asserts the one
-        // observable that distinguishes "promoted" from "registered": the promotion *attempt*. It
-        // counts real calls into `promote_generation`, which is what `promote` invokes, rather than
-        // registry bookkeeping - an earlier version of this test asserted only that the entry was
-        // recorded, which stayed true even when `defer_promotion` was mutated to promote eagerly,
-        // and so could never have caught the ordering bug it claims to cover.
-        clear_deferred();
+        // observable that distinguishes "registered" from "promoted": whether a promotion was
+        // *attempted*. It counts real calls into `promote_generation` - not registry bookkeeping -
+        // because an earlier version asserted only that the entry was recorded, which stayed true
+        // when `defer` was mutated to promote eagerly and so could never have caught the ordering
+        // bug it claims to cover.
+        //
+        // The registry is constructed locally rather than using the process-wide one. Tests in one
+        // binary run on several threads: a shared registry let this test drain another test's entry
+        // and observe its counter movement, which made the suite fail intermittently. A per-test
+        // registry is the fix - the assertions are unchanged, because weakening them would remove
+        // exactly the check that catches eager promotion.
+        let queue = PendingRegistry::new();
         let listener = UdpSocket::bind("127.0.0.1:0").expect("bind a listener");
         let pending = PendingGeneration {
             generation: 7,
@@ -583,23 +629,23 @@ mod tests {
         };
         let owned = duplicate_for_promotion(&listener).expect("duplicate the listener");
 
-        let before = PROMOTION_ATTEMPTS.load(Ordering::SeqCst);
-        defer_promotion("udp/127.0.0.1:0", owned, pending);
+        let before = registry().attempts();
+        queue.defer("udp/127.0.0.1:0", owned, pending);
         assert_eq!(
-            PROMOTION_ATTEMPTS.load(Ordering::SeqCst),
+            registry().attempts(),
             before,
             "deferring a registration must not attempt a promotion - promoting at bind time is \
              exactly the ordering defect ADR-0045 §2 forbids"
         );
-        assert_eq!(deferred_len(), 1, "the socket is registered and waiting");
+        assert_eq!(queue.len(), 1, "the socket is registered and waiting");
 
         // Promotion drains the set and attempts the promotion once.
-        let promoted = promote_deferred();
+        let promoted = queue.promote_all();
         assert!(
-            PROMOTION_ATTEMPTS.load(Ordering::SeqCst) > before,
+            registry().attempts() > before,
             "promotion must actually attempt to promote the deferred generation"
         );
-        assert_eq!(deferred_len(), 0, "promotion drains the deferred set");
+        assert_eq!(queue.len(), 0, "promotion drains the deferred set");
         // Without a daemon the attempt fails, so nothing is reported as promoted - the call was
         // still made, which is what the ordering contract is about.
         assert_eq!(promoted, 0, "no daemon means no successful promotion");
@@ -607,7 +653,7 @@ mod tests {
 
     #[test]
     fn the_deferred_set_is_keyed_by_listener_so_a_rebind_does_not_duplicate() {
-        clear_deferred();
+        let queue = PendingRegistry::new();
         let listener = UdpSocket::bind("127.0.0.1:0").expect("bind a listener");
         let pending = PendingGeneration {
             generation: 1,
@@ -618,14 +664,25 @@ mod tests {
         };
         for _ in 0..3 {
             let owned = duplicate_for_promotion(&listener).expect("duplicate");
-            defer_promotion("udp/127.0.0.1:0", owned, pending);
+            queue.defer("udp/127.0.0.1:0", owned, pending);
         }
         assert_eq!(
-            deferred_len(),
+            queue.len(),
             1,
             "re-registering the same listener must replace its entry, not accumulate duplicates"
         );
-        clear_deferred();
+    }
+
+    #[test]
+    fn promotion_of_an_empty_set_is_not_an_error() {
+        // With udpgrm absent, or with no UDP listeners, nothing is ever deferred. Readiness must
+        // still succeed - a missing daemon is a degradation, not a startup failure.
+        let queue = PendingRegistry::new();
+        assert_eq!(
+            queue.promote_all(),
+            0,
+            "nothing deferred means nothing promoted"
+        );
     }
 
     #[test]
@@ -641,17 +698,5 @@ mod tests {
         );
         assert_eq!(0u32.wrapping_add(1), 1, "successor of generation 0 is 1");
         assert_eq!(1u32.wrapping_add(1), 2, "successor of generation 1 is 2");
-    }
-
-    #[test]
-    fn promotion_of_an_empty_set_is_not_an_error() {
-        // With udpgrm absent, or with no UDP listeners, nothing is ever deferred. Readiness must
-        // still succeed - a missing daemon is a degradation, not a startup failure.
-        clear_deferred();
-        assert_eq!(
-            promote_deferred(),
-            0,
-            "nothing deferred means nothing promoted"
-        );
     }
 }
