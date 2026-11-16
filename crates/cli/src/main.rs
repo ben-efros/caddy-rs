@@ -841,12 +841,18 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 activation::ActivationService::new(tokens, config.auth_method)
                     .with_enrollment(enrollment),
             );
+            // One `shutdown_channels()` call, not two: it installs the signal handlers as a side
+            // effect, so calling it once per receiver re-installed them and — worse — returned a
+            // `shutdown` and a `force` belonging to *different* channel pairs. The force-quit
+            // signal then fired on a channel nobody was watching, so the second SIGINT/SIGTERM
+            // could not shorten the grace period.
+            let channels = crate::signals::shutdown_channels()?;
             activation::serve_with(
                 &config.activation_listen,
                 service,
                 builtin_module_registry(),
-                crate::signals::shutdown_channels()?.shutdown,
-                crate::signals::shutdown_channels()?.force,
+                channels.shutdown,
+                channels.force,
             )
             .await?;
         }
@@ -1101,6 +1107,16 @@ async fn run(command: Command) -> anyhow::Result<()> {
             if let Some(admin) = &status.admin {
                 eprintln!("caddy-rs: admin API listening on {admin}");
             }
+            // Child half of the graceful restart (ADR-0044 §2.3): everything is initialised at this
+            // point — config parsed, TLS loaded, routes compiled, listeners bound and the admin
+            // endpoint active — so it is now safe to tell the parent it may hand over. Signalling
+            // earlier would let the parent exit while this generation could not yet serve, which is
+            // precisely the "bad config takes the service down" failure §2.4 forbids. A first
+            // generation is not an upgrade child, and `ready()` is then a no-op.
+            #[cfg(feature = "graceful-restart")]
+            runtime
+                .mark_ready()
+                .context("cannot signal readiness to the parent process")?;
             // Child half of stock Caddy's `start` pingback (cmdRun): `start` pipes a random
             // 32-byte token to our stdin and waits for us to connect back and echo it. Do this
             // only after the listeners and admin endpoint are active, so the parent's success
@@ -1119,10 +1135,58 @@ async fn run(command: Command) -> anyhow::Result<()> {
                     .context("cannot write pingback confirmation")?;
             }
             let channels = signals::shutdown_channels()?;
+            // Serve the restart trigger alongside the shutdown signals (ADR-0044 §2).
+            //
+            // `upgrade()` forks and execs, so it must not run on a runtime worker thread: exec
+            // after fork is only async-signal-safe in a process that has not been running a
+            // threaded runtime, so the work is moved to a blocking thread. A failed upgrade leaves
+            // this generation serving, which is why the error is logged and swallowed rather than
+            // propagated — taking the process down on a failed *upgrade* would be exactly the
+            // outage the ordering exists to prevent.
+            #[cfg(feature = "graceful-restart")]
+            let restart_task = {
+                let mut restart = channels.restart;
+                let binder = runtime.restart_handle();
+                restart.take().map(|mut restart| {
+                    tokio::spawn(async move {
+                        loop {
+                            if restart.changed().await.is_err() {
+                                // The sender is gone, so no further requests can arrive.
+                                break;
+                            }
+                            // Edge-triggered: every flip is one request. `changed()` already
+                            // deduplicates bursts, so no extra debounce is needed.
+                            if let Some(binder) = binder.as_ref() {
+                                let binder = Arc::clone(binder);
+                                let outcome = tokio::task::spawn_blocking(move || binder.upgrade())
+                                    .await
+                                    .unwrap_or_else(|join| {
+                                        Err(caddy_rs_server::graceful_restart::GracefulRestartError::ChildNotReady {
+                                            cause: format!("restart task panicked: {join}"),
+                                        })
+                                    });
+                                match outcome {
+                                    Ok(()) => eprintln!(
+                                        "caddy-rs: graceful restart: the new process is ready; \
+                                         this process will now drain and exit"
+                                    ),
+                                    Err(error) => eprintln!(
+                                        "caddy-rs: graceful restart FAILED, still serving: {error:#}"
+                                    ),
+                                }
+                            }
+                        }
+                    })
+                })
+            };
             runtime
                 .run_with_force(channels.shutdown, channels.force)
                 .await
                 .context("runtime failed")?;
+            #[cfg(feature = "graceful-restart")]
+            if let Some(task) = restart_task {
+                task.abort();
+            }
         }
         Command::Start {
             config,

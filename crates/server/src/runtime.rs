@@ -247,7 +247,7 @@ pub struct ServerRuntime {
     /// the sockets survive `exec`. `None` when the feature is off, and the bind path is then exactly
     /// what it was before this field existed.
     #[cfg(feature = "graceful-restart")]
-    binder: Option<crate::graceful_restart::ListenerBinder>,
+    binder: Option<std::sync::Arc<crate::graceful_restart::ListenerBinder>>,
     /// Generation-scoped active health-check schedulers, one vector per generation that
     /// configured `reverse_proxy.health_checks.active`. Health checks start only after the
     /// generation is serving and are stopped when the generation is replaced or the runtime stops,
@@ -430,7 +430,9 @@ impl ServerRuntime {
             status: RuntimeStatus::default(),
             activation: ActivationState::Environment,
             #[cfg(feature = "graceful-restart")]
-            binder: Some(crate::graceful_restart::ListenerBinder::new()),
+            binder: Some(std::sync::Arc::new(
+                crate::graceful_restart::ListenerBinder::new(),
+            )),
             health_schedulers: BTreeMap::new(),
             renewals: BTreeMap::new(),
             ocsp_stapler: None,
@@ -453,13 +455,86 @@ impl ServerRuntime {
     /// lives in [`crate::listeners::bind_tcp_ip`] rather than in three call sites.
     #[cfg(feature = "graceful-restart")]
     fn binder_ref(&self) -> Option<&crate::graceful_restart::ListenerBinder> {
-        self.binder.as_ref()
+        self.binder.as_deref()
     }
 
     /// See the `graceful-restart` variant: with the feature off there is no registry.
     #[cfg(not(feature = "graceful-restart"))]
     fn binder_ref(&self) -> Option<&std::convert::Infallible> {
         None
+    }
+
+    /// Declare this generation ready to take over from its parent (ADR-0044 §2.3).
+    ///
+    /// Call this only once the runtime has fully initialised — after the first successful
+    /// [`ServerRuntime::apply`] has bound every listener and the admin endpoint is active. The
+    /// parent is blocked waiting for exactly this signal, and exits only when it arrives.
+    ///
+    /// A first generation has no parent; the call is then a no-op rather than an error, so startup
+    /// does not have to branch on whether it is an upgrade child.
+    #[cfg(feature = "graceful-restart")]
+    pub fn mark_ready(&mut self) -> Result<()> {
+        // `ready()` needs `&mut`, and the binder is shared with the restart task, so take the
+        // unique reference explicitly. This is called during startup before the restart task can
+        // be running, so the reference is always unique here; if it were not, the safe thing is to
+        // report it rather than silently skip the handover the parent is waiting for.
+        let binder = match self.binder.as_mut() {
+            Some(binder) => binder,
+            None => return Ok(()),
+        };
+        let binder = std::sync::Arc::get_mut(binder).ok_or_else(|| {
+            crate::error::Error::from(
+                crate::graceful_restart::GracefulRestartError::ChildNotReady {
+                    cause: concat!(
+                        "the listener registry is shared with a running restart task, ",
+                        "so readiness cannot be signalled"
+                    )
+                    .to_string(),
+                },
+            )
+        })?;
+        binder.ready()?;
+        if binder.is_child() {
+            tracing::info!(
+                listeners = binder.inherited_listeners().len(),
+                "graceful restart: declared ready to the parent process"
+            );
+        } else {
+            tracing::info!(
+                listeners = binder.inherited_listeners().len(),
+                "graceful restart: first generation, no parent to notify"
+            );
+        }
+        Ok(())
+    }
+
+    /// Ask the parent to start a new generation and wait for it to take over (ADR-0044 §2).
+    ///
+    /// Returns only once the child has declared ready or has failed; on failure the current
+    /// generation keeps serving. Blocking, so call it from a blocking context.
+    #[cfg(feature = "graceful-restart")]
+    pub fn restart(&self) -> Result<()> {
+        match self.binder.as_ref() {
+            Some(binder) => Ok(binder.upgrade()?),
+            None => Ok(()),
+        }
+    }
+
+    /// A shared handle the serve loop uses to trigger a restart from a blocking thread.
+    ///
+    /// `None` when the feature is off, so the caller cannot mistake an unbuildable restart for an
+    /// available one.
+    #[cfg(feature = "graceful-restart")]
+    pub fn restart_handle(
+        &self,
+    ) -> Option<std::sync::Arc<crate::graceful_restart::ListenerBinder>> {
+        self.binder.as_ref().map(std::sync::Arc::clone)
+    }
+
+    /// Whether this process is an upgrade child (its listeners were inherited, not bound).
+    #[cfg(feature = "graceful-restart")]
+    pub fn is_upgrade_child(&self) -> bool {
+        self.binder.as_ref().is_some_and(|binder| binder.is_child())
     }
 
     /// Adopt the given inherited listening sockets instead of reading the process environment.

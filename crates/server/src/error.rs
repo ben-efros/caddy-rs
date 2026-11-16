@@ -78,6 +78,21 @@ pub enum Error {
     /// for recognised-but-unsupported Caddy features, the tracking id.
     #[error("observability configuration: {0}")]
     Observability(String),
+
+    /// A graceful restart could not be performed.
+    ///
+    /// Boxed because the graceful-restart error is only compiled in with the feature, so a plain
+    /// field would either pull the feature into every build or leave the variant unusable.
+    #[cfg(feature = "graceful-restart")]
+    #[error("graceful restart: {0}")]
+    GracefulRestart(Box<crate::graceful_restart::GracefulRestartError>),
+}
+
+#[cfg(feature = "graceful-restart")]
+impl From<crate::graceful_restart::GracefulRestartError> for Error {
+    fn from(error: crate::graceful_restart::GracefulRestartError) -> Self {
+        Self::GracefulRestart(Box::new(error))
+    }
 }
 
 impl From<caddy_rs_admin::LoggingConfigError> for Error {
