@@ -715,7 +715,7 @@ async fn bind_configured_udp(configured: &str, address: &ListenAddr) -> Result<U
             listen: configured.to_string(),
             reason: "expected `host:port`; a hostless address needs a numeric port".to_string(),
         })?;
-        match wildcard_dual_stack_udp(port) {
+        match wildcard_dual_stack_udp(port, configured) {
             Ok(socket) => return Ok(socket),
             Err(error) if ipv6_wildcard_unavailable(&error) => {
                 tracing::debug!(
@@ -780,8 +780,11 @@ fn bind_udp_socket_addr(
     }
     #[cfg(not(feature = "udpgrm"))]
     {
-        // No runtime to block on here; the socket is already bound synchronously below, so this
-        // mirrors the original `UdpSocket::bind` call exactly.
+        // The observable result is identical to the original `UdpSocket::bind(...).await`: both
+        // end with the same descriptor flags (`SOCK_NONBLOCK` set either atomically by mio at
+        // `socket()` or just after bind, which is unobservable for UDP - there is no accept queue)
+        // and the same bound address. No await point is lost: the tokio call only awaited DNS, and
+        // this site already holds a resolved `SocketAddr`. The form differs; the behaviour does not.
         let socket = std::net::UdpSocket::bind(socket_addr)
             .map_err(|error| Error::bind(configured, error))?;
         socket
@@ -797,7 +800,10 @@ fn bind_udp_socket_addr(
 /// unchanged in both configurations: the dual-stack wildcard is still attempted first and the IPv4
 /// fallback still happens only when IPv6 is unavailable.
 #[cfg(feature = "http3")]
-fn wildcard_dual_stack_udp(port: u16) -> io::Result<UdpSocket> {
+fn wildcard_dual_stack_udp(
+    port: u16,
+    #[cfg_attr(not(feature = "udpgrm"), allow(unused_variables))] configured: &str,
+) -> io::Result<UdpSocket> {
     let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_only_v6(false)?;
     #[cfg(feature = "udpgrm")]
@@ -805,8 +811,10 @@ fn wildcard_dual_stack_udp(port: u16) -> io::Result<UdpSocket> {
     socket.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)).into())?;
     socket.set_nonblocking(true)?;
     let std_socket: std::net::UdpSocket = socket.into();
+    // `configured` is the address the operator wrote; it names the listener in the degradation
+    // log line, so the message points at the right config entry.
     #[cfg(feature = "udpgrm")]
-    crate::udpgrm::register_listener(&std_socket, &format!("udp/:{port}"));
+    crate::udpgrm::register_listener(&std_socket, configured);
     UdpSocket::from_std(std_socket)
 }
 
@@ -3760,7 +3768,8 @@ mod udp_reuseport_tests {
 
     #[tokio::test]
     async fn the_dual_stack_wildcard_joins_a_reuseport_group_and_stays_dual_stack() {
-        let socket = super::wildcard_dual_stack_udp(0).expect("bind the dual-stack wildcard");
+        let socket =
+            super::wildcard_dual_stack_udp(0, "udp/:0").expect("bind the dual-stack wildcard");
         assert!(
             reuseport_is_set(socket.as_raw_fd()),
             "the dual-stack UDP wildcard must set SO_REUSEPORT before bind, or udpgrm cannot \

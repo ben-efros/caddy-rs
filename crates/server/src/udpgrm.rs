@@ -341,10 +341,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_transcribed_constants_match_udpgrm_public_header() {
-        // Pinned against `udp_grm_public.h` at cloudflare/udpgrm e5bbb047d489. If udpgrm ever
-        // renumbers these, this test is where a reader finds out - not at runtime, where a wrong
-        // optname would silently set an unrelated socket option.
+    fn the_transcribed_constants_are_the_values_recorded_in_the_module_docs() {
+        // Guards against a *local* edit drifting from the values recorded above - nothing more.
+        //
+        // It deliberately does NOT read udpgrm's header, so it CANNOT detect upstream renumbering:
+        // this assertion would pass unchanged against a udpgrm that had changed 200/201. Do not
+        // read a green run as "our constants still match upstream". The defence against upstream
+        // drift is the runtime one - a renumbered option makes the presence probe fail
+        // `ENOPROTOOPT`, so caddy-rs degrades loudly instead of silently setting an unrelated
+        // socket option - plus a human re-checking `udp_grm_public.h` when udpgrm is upgraded.
         assert_eq!(UDP_GRM_WORKING_GEN, 200);
         assert_eq!(UDP_GRM_SOCKET_GEN, 201);
     }
