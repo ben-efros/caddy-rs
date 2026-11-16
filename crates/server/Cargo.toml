@@ -40,6 +40,16 @@ templates = ["caddy-rs-http/templates"]
 # precedent for forking a security-sensitive dependency. Revisit if upstream ecdysis moves to
 # socket2 0.6, at which point the duplicate disappears with no change here.
 graceful-restart = ["dep:ecdysis", "dep:socket2-v05"]
+# UDP graceful restart via SO_REUSEPORT plus the udpgrm client (ADR-0045). Default-OFF, and
+# independent of `graceful-restart`: the TCP path inherits a listener fd and needs no reuseport
+# group, while UDP has no listener to inherit and needs the reuseport group plus udpgrm's eBPF
+# flow dispatch (ADR-0045 §1). Enabling one does not enable the other.
+#
+# This feature adds NO dependency: the udpgrm protocol is three `setsockopt`/`getsockopt` calls on
+# `SOL_UDP` with option numbers transcribed from udpgrm's out-of-tree header (see `udpgrm.rs`), so
+# there is nothing to link against. It does require `http3`, because the only UDP listeners caddy-rs
+# creates today are the QUIC ones.
+udpgrm = ["http3"]
 
 [dependencies]
 # Optional: only compiled with the `graceful-restart` feature. Unix-only - the feature requires

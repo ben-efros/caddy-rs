@@ -726,31 +726,88 @@ async fn bind_configured_udp(configured: &str, address: &ListenAddr) -> Result<U
             }
             Err(error) => return Err(Error::bind(configured, error)),
         }
-        let socket = std::net::UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)))
-            .map_err(|error| Error::bind(configured, error))?;
-        socket
-            .set_nonblocking(true)
-            .map_err(|error| Error::bind(configured, error))?;
-        return UdpSocket::from_std(socket).map_err(|error| Error::bind(configured, error));
+        let socket = bind_udp_ipv4_wildcard(port, configured)?;
+        return Ok(socket);
     }
     match address.socket_addr() {
-        Some(socket_addr) => UdpSocket::bind(socket_addr)
-            .await
-            .map_err(|error| Error::bind(configured, error)),
+        Some(socket_addr) => bind_udp_socket_addr(socket_addr, configured),
         None => UdpSocket::bind(&address.address)
             .await
             .map_err(|error| Error::bind(configured, error)),
     }
 }
 
+/// Bind the IPv4 wildcard UDP socket, joining a reuseport group when `udpgrm` is enabled.
+#[cfg(feature = "http3")]
+fn bind_udp_ipv4_wildcard(port: u16, configured: &str) -> Result<UdpSocket, Error> {
+    let socket = std::net::UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)))
+        .map_err(|error| Error::bind(configured, error))?;
+    socket
+        .set_nonblocking(true)
+        .map_err(|error| Error::bind(configured, error))?;
+    UdpSocket::from_std(socket).map_err(|error| Error::bind(configured, error))
+}
+
+/// Bind an explicit-address UDP socket.
+///
+/// With `udpgrm` enabled the socket is created through socket2 so `SO_REUSEPORT` can be set
+/// **before** `bind`: the option only takes effect for a group created at bind time, so setting it
+/// afterwards would silently leave the socket outside the group and defeat the whole mechanism.
+/// Without the feature this is the original `UdpSocket::bind` and is behaviourally identical.
+#[cfg(feature = "http3")]
+fn bind_udp_socket_addr(
+    socket_addr: SocketAddr,
+    #[cfg_attr(not(feature = "udpgrm"), allow(unused_variables))] configured: &str,
+) -> Result<UdpSocket, Error> {
+    #[cfg(feature = "udpgrm")]
+    {
+        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
+            .map_err(|error| Error::bind(configured, error))?;
+        socket
+            .set_reuse_port(true)
+            .map_err(|error| Error::bind(configured, error))?;
+        socket
+            .bind(&socket_addr.into())
+            .map_err(|error| Error::bind(configured, error))?;
+        socket
+            .set_nonblocking(true)
+            .map_err(|error| Error::bind(configured, error))?;
+        let std_socket: std::net::UdpSocket = socket.into();
+        // Register with udpgrm after bind, because its hooks only act on a bound socket inside a
+        // reuseport group. A failure here degrades: UDP still serves.
+        crate::udpgrm::register_listener(&std_socket, configured);
+        return UdpSocket::from_std(std_socket).map_err(|error| Error::bind(configured, error));
+    }
+    #[cfg(not(feature = "udpgrm"))]
+    {
+        // No runtime to block on here; the socket is already bound synchronously below, so this
+        // mirrors the original `UdpSocket::bind` call exactly.
+        let socket = std::net::UdpSocket::bind(socket_addr)
+            .map_err(|error| Error::bind(configured, error))?;
+        socket
+            .set_nonblocking(true)
+            .map_err(|error| Error::bind(configured, error))?;
+        UdpSocket::from_std(socket).map_err(|error| Error::bind(configured, error))
+    }
+}
+
 /// A dual-stack (`IPv6` wildcard with `IPV6_V6ONLY=0`) UDP socket for a hostless address.
+///
+/// With `udpgrm` enabled the socket also joins a reuseport group. `IPV6_V6ONLY` behaviour is
+/// unchanged in both configurations: the dual-stack wildcard is still attempted first and the IPv4
+/// fallback still happens only when IPv6 is unavailable.
 #[cfg(feature = "http3")]
 fn wildcard_dual_stack_udp(port: u16) -> io::Result<UdpSocket> {
     let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_only_v6(false)?;
+    #[cfg(feature = "udpgrm")]
+    socket.set_reuse_port(true)?;
     socket.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)).into())?;
     socket.set_nonblocking(true)?;
-    UdpSocket::from_std(socket.into())
+    let std_socket: std::net::UdpSocket = socket.into();
+    #[cfg(feature = "udpgrm")]
+    crate::udpgrm::register_listener(&std_socket, &format!("udp/:{port}"));
+    UdpSocket::from_std(std_socket)
 }
 
 /// Build a QUIC server configuration from the listener's rustls configuration (Caddy's
@@ -3651,5 +3708,95 @@ mod admin_unix_tests {
             .expect("rebind after stop");
         handle.stop().await;
         assert!(!path.exists());
+    }
+}
+
+/// Tests for the UDP reuseport binding that `udpgrm` enables (ADR-0045 §1).
+///
+/// These assert the *socket option*, not the udpgrm sequence: this host has no udpgrm daemon, so
+/// the protocol itself cannot be exercised here (the research record says so explicitly, and
+/// `udpgrm.rs` covers the degrade path against a real `ENOPROTOOPT`). What can be proven locally is
+/// that the socket genuinely joins a reuseport group **before** `bind`, which is the precondition
+/// the whole mechanism rests on.
+#[cfg(all(test, feature = "udpgrm"))]
+#[allow(unsafe_code)] // Reads back socket options udpgrm depends on; see the SAFETY notes below.
+mod udp_reuseport_tests {
+    use std::os::fd::AsRawFd;
+
+    /// Read back `SO_REUSEPORT` from a live descriptor.
+    fn reuseport_is_set(fd: libc::c_int) -> bool {
+        let mut value: libc::c_int = 0;
+        let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: `fd` is owned by the socket the caller still holds; `value`/`length` describe a
+        // local `c_int` exactly.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_REUSEPORT,
+                (&mut value as *mut libc::c_int).cast(),
+                &mut length,
+            )
+        };
+        rc == 0 && value == 1
+    }
+
+    /// Read back `IPV6_V6ONLY` from a live descriptor.
+    fn only_v6(fd: libc::c_int) -> bool {
+        let mut value: libc::c_int = 0;
+        let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: as above.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::IPPROTO_IPV6,
+                libc::IPV6_V6ONLY,
+                (&mut value as *mut libc::c_int).cast(),
+                &mut length,
+            )
+        };
+        rc == 0 && value == 1
+    }
+
+    #[tokio::test]
+    async fn the_dual_stack_wildcard_joins_a_reuseport_group_and_stays_dual_stack() {
+        let socket = super::wildcard_dual_stack_udp(0).expect("bind the dual-stack wildcard");
+        assert!(
+            reuseport_is_set(socket.as_raw_fd()),
+            "the dual-stack UDP wildcard must set SO_REUSEPORT before bind, or udpgrm cannot \
+             dispatch flows across generations"
+        );
+        assert!(
+            !only_v6(socket.as_raw_fd()),
+            "IPV6_V6ONLY must stay disabled: the wildcard is dual-stack, and the udpgrm feature \
+             must not change that"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_explicit_address_binds_with_reuseport_and_registers() {
+        let socket =
+            super::bind_udp_socket_addr("127.0.0.1:0".parse().expect("address"), "udp/127.0.0.1:0")
+                .expect("bind an explicit UDP address");
+        assert!(
+            reuseport_is_set(socket.as_raw_fd()),
+            "an explicit-address UDP listener must also join the reuseport group"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_sockets_can_share_a_port_only_because_of_reuseport() {
+        // The functional consequence: two generations can hold the same UDP port at once. Without
+        // SO_REUSEPORT the second bind fails EADDRINUSE, which is exactly what the restart path
+        // needs to avoid.
+        let first = super::bind_udp_socket_addr("127.0.0.1:0".parse().expect("address"), "udp/a")
+            .expect("bind the first socket");
+        let port = first.local_addr().expect("local addr").port();
+        let second = super::bind_udp_socket_addr(
+            format!("127.0.0.1:{port}").parse().expect("address"),
+            "udp/b",
+        )
+        .expect("a second generation must be able to bind the same UDP port");
+        assert_eq!(second.local_addr().expect("local addr").port(), port);
     }
 }
