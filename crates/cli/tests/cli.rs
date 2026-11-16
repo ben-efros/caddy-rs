@@ -6108,12 +6108,14 @@ fn reload_and_stop_reach_a_unix_socket_admin_endpoint() {
         status.expect("server exit status").success(),
         "server exited unsuccessfully"
     );
-    // The socket is unlinked during shutdown; allow the filesystem a moment to reflect that
-    // instead of racing the kernel/FS right after the child is reaped.
-    let removed = wait_until(Duration::from_secs(5), || !socket.exists());
-    if !removed {
+    // The unlink is ordered *before* the exit, so it must already be visible in the instant the
+    // child is reaped - no retry loop, which would accept an unlink that ran after the process
+    // died (the ordering this test exists to catch). `wait_for_child_exit` polls `try_wait`, so
+    // by the time it returns the kernel has reaped the child and every unlink it performed is
+    // visible to the filesystem; a post-exit wait could not tell the two orderings apart.
+    if socket.exists() {
         let contents = std::fs::read_to_string(&log).unwrap_or_default();
-        panic!("the admin Unix socket is removed when the server exits:\n{contents}");
+        panic!("the admin Unix socket is removed before the server exits:\n{contents}");
     }
 }
 
