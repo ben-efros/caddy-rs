@@ -516,6 +516,62 @@ mod tests {
     }
 
     #[test]
+    fn only_registered_listeners_are_handed_to_the_child() {
+        // ADR-0044 section 2.7 / DIV-0155: only listener and pipe descriptors may cross `exec`.
+        // The claim is structural - the registry holds exactly what was bound through it - so this
+        // proves it by showing that a descriptor opened *outside* the binder is absent from the set
+        // the child would receive, while a listener bound *through* the binder is present.
+        let binder = ListenerBinder::new();
+        assert!(
+            binder.inherited_listeners().is_empty(),
+            "a fresh registry inherits nothing"
+        );
+
+        // A canary descriptor: a plain file that must never reach the child.
+        let canary_path = std::env::temp_dir().join(format!(
+            "caddy-rs-canary-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        let canary = std::fs::File::create(&canary_path).expect("create canary file");
+        let canary_fd = {
+            use std::os::fd::AsRawFd;
+            canary.as_raw_fd()
+        };
+        assert!(
+            binder.inherited_listeners().is_empty(),
+            "opening a file outside the binder must not register anything: fd {canary_fd} must \
+             not cross exec"
+        );
+
+        let listener = binder
+            .bind_tcp("127.0.0.1:0".parse().unwrap(), |socket, addr| {
+                socket.bind(&addr.into())?;
+                socket.listen(128)?;
+                let std_listener: std::net::TcpListener = socket.into();
+                std_listener.set_nonblocking(true)?;
+                Ok(std_listener)
+            })
+            .expect("bind through the registry");
+        let bound = listener.local_addr().expect("local address");
+
+        let inherited = binder.inherited_listeners();
+        assert_eq!(
+            inherited,
+            vec![bound],
+            "exactly the listener bound through the binder is inherited - the canary fd {canary_fd} \
+             is not, and no other descriptor is either"
+        );
+
+        drop(listener);
+        drop(canary);
+        let _ = std::fs::remove_file(&canary_path);
+    }
+
+    #[test]
     fn the_in_flight_refusal_maps_onto_the_single_upgrade_invariant() {
         // ecdysis 1.1.1 does not export `UpgradeError`, so the concurrent-upgrade case is
         // recognised from its `Display` text ("upgrade not started: ..."). This test pins the
