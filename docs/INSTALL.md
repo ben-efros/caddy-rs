@@ -33,7 +33,7 @@ The binary is written to `target/release/caddy-rs`. Check it:
 ```
 
 ```text
-caddy-rs 0.1.0-trial.6 (Caddy configuration baseline v2.11.9)
+caddy-rs 0.1.0-trial.7 (Caddy configuration baseline v2.11.9)
 ```
 
 Run the test suite to verify the build:
@@ -89,14 +89,14 @@ cargo build --release
 ```
 
 ```text
-caddy-rs-pm 0.1.0-trial.6 (caddy-rs 0.1.0-trial.6)
+caddy-rs-pm 0.1.0-trial.7 (caddy-rs 0.1.0-trial.7)
 ```
 
-> **Not yet in the published release archives.** The published `v0.1.0-trial.6` archives contain
-> `caddy-rs` only. The program repository's `version.json` records
-> `sidecar.packaged_in_release_archives` as "from the next cut after 0.1.0-trial.6; the published
-> trial.6 archives contain caddy-rs only". Until then, build `caddy-rs-pm` from source as above.
-> Both workspaces are versioned `0.1.0-trial.6`, so a sidecar built from this tree pairs with the
+> **Historical note on the archives.** The published `v0.1.0-trial.6` archives contain `caddy-rs`
+> only; the sidecar is packaged in release archives from the next cut after `0.1.0-trial.6`, which is
+> the cut this tree is versioned for (`0.1.0-trial.7`). The program repository's `version.json`
+> records this under `sidecar.packaged_in_release_archives`. If you are building from source, both
+> workspaces are versioned `0.1.0-trial.7`, so a sidecar built from this tree pairs with the
 > `caddy-rs` from the same tree.
 
 ### Install as a systemd service
