@@ -1803,33 +1803,15 @@ impl Parser {
                     ),
                 ));
             }
-            match self.importing_owner(position) {
-                Some(owner) => {
-                    if metadata.uid() != 0 && metadata.uid() != owner {
-                        return Err(ParseError::syntax(
-                            position.clone(),
-                            format!(
-                                "Could not import {display}: file is not owned by root or by the \
-                                 owner of the importing Caddyfile (safe-mode import rule)"
-                            ),
-                        ));
-                    }
-                }
-                None => {
-                    // No importing file on disk (stdin adapt): the owner anchor is unknown, so
-                    // fall back to the strict default (root-owned) instead of skipping the check
-                    // (security review F2).
-                    if metadata.uid() != 0 {
-                        return Err(ParseError::syntax(
-                            position.clone(),
-                            format!(
-                                "Could not import {display}: no importing Caddyfile is available to \
-                                 anchor ownership, so the file must be owned by root (safe-mode \
-                                 import rule)"
-                            ),
-                        ));
-                    }
-                }
+            if let Err(violation) = check_import_ownership(
+                metadata.uid(),
+                self.importing_owner(position),
+                crate::uid::effective_uid(),
+            ) {
+                return Err(ParseError::syntax(
+                    position.clone(),
+                    format!("Could not import {display}: {violation}"),
+                ));
             }
         }
         Ok(resolved)
@@ -1986,6 +1968,40 @@ impl Parser {
 /// Largest file the safe-mode import policy will read (8 MiB). Stock Caddy has no limit; the cap
 /// exists because import files are configuration, and a huge file only wastes adapt-time memory.
 pub const MAX_SAFE_IMPORT_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The safe-mode ownership rule, as a pure decision (security review R7).
+///
+/// A safe-mode import is trusted only when its owner is the root user or the owner of the file
+/// that contains the `import` directive (the "owner anchor"). When there is no importing file on
+/// disk — an `adapt` of stdin — the anchor is unknown, so the strict default (root-owned) applies
+/// instead of skipping the check (security review F2).
+///
+/// Deliberately free of filesystem access: it takes the three uids as plain values, so the rule
+/// can be pinned by a unit test in any environment, including a non-root runner where `chown` to a
+/// third uid fails and the end-to-end fixtures cannot build the rejected case.
+///
+/// The parameters are, in order: the imported file's owner, the importing file's owner (`None`
+/// when the Caddyfile came from stdin), and the effective uid of the adapting process.
+#[cfg(unix)]
+#[must_use]
+pub fn check_import_ownership(
+    imported_uid: u32,
+    importing_uid: Option<u32>,
+    _effective_uid: u32,
+) -> Result<(), &'static str> {
+    match importing_uid {
+        Some(anchor) if imported_uid == 0 || imported_uid == anchor => Ok(()),
+        Some(_) => Err(
+            "file is not owned by root or by the owner of the importing Caddyfile \
+                        (safe-mode import rule)",
+        ),
+        None if imported_uid == 0 => Ok(()),
+        None => Err(
+            "no importing Caddyfile is available to anchor ownership, so the file must \
+                     be owned by root (safe-mode import rule)",
+        ),
+    }
+}
 
 /// Simple single-wildcard glob matching used for file imports (`*` matches any run, `?` one
 /// character).
@@ -4410,5 +4426,38 @@ mod tests {
         // The constant is public so callers and docs can reference the bound rather than copying
         // the number; 128 is the value the compatibility doc must advertise.
         assert_eq!(MAX_BLOCK_DEPTH, 128);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn import_ownership_rule_accepts_root_owner_and_the_anchor() {
+        // Root-owned file: always trusted, whether or not an anchor exists.
+        assert!(check_import_ownership(0, Some(1000), 1000).is_ok());
+        assert!(check_import_ownership(0, None, 1000).is_ok());
+        // Owner-anchored: the imported file belongs to the importing Caddyfile's owner, which is
+        // the only other trusted owner besides root.
+        assert!(check_import_ownership(1000, Some(1000), 1000).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn import_ownership_rule_rejects_a_third_uid_with_an_anchor() {
+        let error = check_import_ownership(12345, Some(1000), 1000)
+            .expect_err("a third-uid import must be rejected even when anchored");
+        assert!(
+            error.contains("not owned by root or by the owner of the importing Caddyfile"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn import_ownership_rule_requires_root_without_an_anchor() {
+        // stdin adapt: no importing file on disk, so the strict default applies (review F2).
+        let error = check_import_ownership(1000, None, 1000)
+            .expect_err("an unanchored non-root import must be rejected");
+        assert!(error.contains("must be owned by root"), "{error}");
+        // Even root's own files are fine, but a third uid is not.
+        assert!(check_import_ownership(12345, None, 1000).is_err());
     }
 }

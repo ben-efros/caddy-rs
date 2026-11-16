@@ -637,20 +637,22 @@ fn duplicate_stock_compat_option_is_rejected() {
 #[cfg(unix)]
 #[test]
 fn stdin_absolute_import_requires_root_ownership() {
+    use std::os::unix::fs::MetadataExt;
+
     let external = TempTree::new("stdin-owner-source");
     let imported = external.write("snippet.conf", "header X-Stdin yes\n");
-    // Root-owned file: the owner anchor is unknown when adapting stdin, so the strict default
-    // (root-owned) applies and the import is accepted. Some CI runners create fixtures under a
-    // user namespace, so the fixture may not actually be uid 0; in that case the same strict
-    // default must reject it (the rule is unchanged, only the expected outcome is derived from
-    // the fixture's real owner instead of assuming the test process runs as root).
-    let fixture_uid = {
-        use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(&imported)
-            .expect("fixture metadata")
-            .uid()
-    };
-    let adapted = caddy_rs_config::adapt(&format!(":80 {{\n\timport {}\n}}\n", imported.display()));
+    let fixture_uid = std::fs::metadata(&imported)
+        .expect("fixture metadata")
+        .uid();
+    let caddyfile = format!(":80 {{\n\timport {}\n}}\n", imported.display());
+
+    // Accept half: a root-owned file, and the process's own file (which is owned by the process),
+    // are both accepted from stdin only when the strict root-owned default holds. Some CI runners
+    // create fixtures under a user namespace, so the fixture may not actually be uid 0; in that
+    // case the same strict default must reject it (the rule is unchanged, only the expected
+    // outcome is derived from the fixture's real owner instead of assuming the process runs as
+    // root).
+    let adapted = caddy_rs_config::adapt(&caddyfile);
     if fixture_uid == 0 {
         adapted.expect("a root-owned absolute import from stdin adapts");
     } else {
@@ -661,16 +663,38 @@ fn stdin_absolute_import_requires_root_ownership() {
             "{error}"
         );
     }
-    // A third-uid file cannot be anchored to an importing Caddyfile owner, so it is rejected
-    // instead of silently skipping the ownership rule (security review F2).
-    if std::os::unix::fs::chown(&imported, Some(12345), Some(12345)).is_ok() {
-        let error =
-            caddy_rs_config::adapt(&format!(":80 {{\n\timport {}\n}}\n", imported.display()))
-                .expect_err("a non-root-owned absolute import from stdin is rejected");
+
+    // Rejection half. Security review R7: this must never be skipped, so the assertion runs in
+    // every environment instead of only where `chown` succeeds.
+    let third_uid = 12345;
+    let chowned = std::os::unix::fs::chown(&imported, Some(third_uid), Some(third_uid)).is_ok();
+    if chowned {
+        // Privileged environment (root): the rule is exercised end to end through the adapter.
+        let error = caddy_rs_config::adapt(&caddyfile)
+            .expect_err("a third-uid absolute import from stdin is rejected");
         assert!(
             error.to_string().contains("must be owned by root"),
             "{error}"
         );
         let _ = std::os::unix::fs::chown(&imported, Some(0), Some(0));
+    } else {
+        // Unprivileged environment: the fixture cannot be handed to a third uid, so pin the same
+        // decision through the predicate the parser calls. This is the whole point of the split
+        // (review R7): the rejection is asserted here rather than silently skipped.
+        let error = caddy_rs_config::check_import_ownership(third_uid, None, fixture_uid)
+            .expect_err("a third-uid import with no owner anchor must be rejected");
+        assert!(error.contains("must be owned by root"), "{error}");
     }
+
+    // The anchored half is environment-independent too: a third uid is rejected even when the
+    // importing Caddyfile's owner anchors the check, and the anchor itself is accepted.
+    let anchor = if fixture_uid == 0 { 1000 } else { fixture_uid };
+    let error = caddy_rs_config::check_import_ownership(third_uid, Some(anchor), fixture_uid)
+        .expect_err("a third-uid import is rejected even with an owner anchor");
+    assert!(
+        error.contains("not owned by root or by the owner of the importing Caddyfile"),
+        "{error}"
+    );
+    caddy_rs_config::check_import_ownership(anchor, Some(anchor), fixture_uid)
+        .expect("an owner-anchored import is accepted");
 }
