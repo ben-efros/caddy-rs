@@ -371,7 +371,7 @@ pub fn report_absent_once(listen: &str) {
 /// A socket registered into a udpgrm socket generation but **not yet promoted**.
 ///
 /// This is the mapping boundary between the two generation vocabularies (ADR-0045 §2, and the design
-/// note `docs/operations/research/2026-11-udp-socket-generations.md`):
+/// section "Configuration generations" -> "UDP socket generations", `docs/DESIGN.md`):
 ///
 /// * the caddy-rs **config generation** (`caddy_rs_core::Generation::id()`) identifies a loaded
 ///   configuration and is **not** an input to the socket generation number;
@@ -630,7 +630,7 @@ mod tests {
 
     #[test]
     fn the_next_generation_is_working_plus_one_including_the_no_group_sentinel() {
-        // The mapping documented in docs/operations/research/2026-11-udp-socket-generations.md:
+        // The mapping documented in docs/DESIGN.md, section "UDP socket generations":
         // `-1` is udpgrm's "no reuseport group yet" sentinel and doubles as the default working
         // generation, so the first process to bind a group registers into generation 0. This pins
         // the arithmetic so a future reader cannot "fix" the wrapping_add into a checked add.
