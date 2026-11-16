@@ -143,11 +143,22 @@ the email is); it records the password and TOTP globals, while the email is writ
 `ExecStart` as `--bootstrap-admin-email`. It is root-owned, mode 0600, and
 when written the unit references it as `EnvironmentFile=-/etc/caddy-rs-pm.env`: the leading `-`
 makes a missing file non-fatal, so a plain install starts without credentials. Installing without
-credentials deletes a stale file left by an earlier install. Only the password source
-(`PM_BOOTSTRAP_ADMIN_PASSWORD`) is usable today: `serve` creates no administrator unless the email
-is also set, and the TOTP bootstrap path fails because it verifies a code before enrolling a secret
-(T-AUTH-002). Supply the email and password together; do not rely on
-`PM_BOOTSTRAP_ADMIN_TOTP` yet. [pm/README.md](../pm/README.md) describes
+credentials deletes a stale file left by an earlier install. Supply the email and password together:
+`serve` creates no administrator unless both are set.
+
+`PM_BOOTSTRAP_ADMIN_TOTP` also works (fixed in T-AUTH-002). The bootstrap enrols a TOTP secret and
+then confirms the supplied code against it, so the code must come from the same enrolment. Because
+the secret is minted at bootstrap time, the enrolment URI is printed in the log line
+`bootstrap admin TOTP enrolled` on success and in the error if the code is rejected; scan it to keep
+receiving codes. A rejected code removes the administrator it created rather than leaving an account
+with an unconfirmed factor.
+
+Two operational constraints follow from the code being time-based. The bootstrap only runs when no
+users exist, so this is a first-start-only path: if the code is rejected the administrator is gone
+and the next start retries from scratch, which is what makes a retry possible. And a code is valid
+only for its 30-second step (plus or minus one step with `totp_window = PlusMinusOne`), so the
+service must start within that window of when the code was generated - set the variable and start
+the unit immediately, rather than leaving a code in the environment file across a later boot. [pm/README.md](../pm/README.md) describes
 the workspace's crate layout; the operator-facing configuration is the unit file and the environment
 variables above.
 
