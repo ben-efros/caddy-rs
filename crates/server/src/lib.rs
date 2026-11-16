@@ -25,6 +25,8 @@ pub mod listeners;
 mod observability;
 mod proxy_protocol;
 pub mod runtime;
+#[cfg(feature = "udpgrm")]
+pub mod udpgrm;
 pub mod upstream_status;
 
 pub use activation::{
