@@ -171,7 +171,7 @@ caddy-rs version
 ```
 
 ```text
-caddy-rs 0.1.0-trial.6 (Caddy configuration baseline v2.11.9)
+caddy-rs 0.1.0-trial.7 (Caddy configuration baseline v2.11.9)
 ```
 
 ```sh
@@ -179,7 +179,7 @@ caddy-rs version --json
 ```
 
 ```json
-{"caddy_compat_baseline":"v2.11.9","version":"0.1.0-trial.6"}
+{"caddy_compat_baseline":"v2.11.9","version":"0.1.0-trial.7"}
 ```
 
 Exit status is 0.
