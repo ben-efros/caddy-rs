@@ -134,10 +134,14 @@ retire previously minted tokens, a successful call is followed by a fresh login 
 factor is active, requires the current code.
 
 **Recovery path.** If the authenticator is lost, there is no bypass through the API by design:
-`disable` needs a live code, so a stolen session token cannot strip the factor. Recovery is an
-operator action on the host — stop the proxy manager and clear the account's `totp_secret`/
-`totp_pending` in the user store (or delete and recreate the account), then enrol again. An
-abandoned (pending, unconfirmed) enrolment needs no such step: it never gated login on its own.
+`disable` needs a live code, so a stolen session token cannot strip the factor. The proxy manager's
+user store is in-memory (`MemoryUserStore`, PM-109 persistence is a separate slice), so restarting
+the daemon clears it and returns to the setup wizard, where a new administrator is created and can
+enrol a fresh authenticator. That works because the restart wipes the whole store, not because any
+per-account reset exists — there is no way to clear one account's TOTP state without loss of the
+others, and no recovery-code route ships in this build. An abandoned (pending, unconfirmed)
+enrolment needs no recovery at all: it never gated login, so the operator simply logs in by password
+and calls `totp_setup` again.
 
 ## Related documentation
 

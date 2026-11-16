@@ -3090,21 +3090,29 @@ async fn session_endpoints_require_a_known_loopback_peer() {
 // TOTP enrollment routes (T-AUTH-001)
 // ---------------------------------------------------------------------------------------------
 
-/// Generate the code for a step `ahead` steps after the current one, so a test can present a code
-/// the account has not consumed yet (the replay record is monotonic).
-fn totp_code_for_next_step(otpauth_uri: &str, ahead: u64) -> String {
+/// Generate the code for the step `offset` steps from the current one.
+///
+/// A positive offset presents a code the replay record has not consumed yet; a negative offset
+/// reaches a stale-but-still-in-window step, which is what a test needs once the current steps have
+/// been spent and the window does not reach further forward.
+fn totp_code_for_offset(otpauth_uri: &str, offset: i64) -> String {
     let secret = otpauth_uri
         .split("secret=")
         .nth(1)
         .and_then(|rest| rest.split('&').next())
         .expect("the otpauth URI carries a secret");
-    let step = SystemTime::now()
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock after the epoch")
-        .as_secs()
-        / 30
-        + ahead;
+        .as_secs() as i64
+        / 30;
+    let step = (now + offset).max(0) as u64;
     caddy_rs_authn::totp_code_for_step(secret, step).expect("compute a code")
+}
+
+/// The code for the next step, the usual way to present an unspent code.
+fn totp_code_for_next_step(otpauth_uri: &str, ahead: u64) -> String {
+    totp_code_for_offset(otpauth_uri, ahead as i64)
 }
 
 /// Generate the code an authenticator would show `now`, for the secret behind an otpauth URI.
@@ -3369,4 +3377,95 @@ async fn confirming_enrollment_bumps_the_auth_epoch_and_retires_old_tokens() {
         "a pre-enrollment token must not outlive the change: {}",
         stale.text()
     );
+}
+
+#[tokio::test]
+async fn disabling_totp_bumps_the_epoch_and_retires_the_sessions_that_lived_with_it() {
+    let (_dir, server, authn) = server_with_totp_window();
+    let _admin = first_admin(&server).await;
+    let tokens = login(&server, "admin", SETUP_PASSWORD).await;
+    let user_id = authn
+        .verify_access_token(&tokens.access_token)
+        .await
+        .expect("the token verifies")
+        .sub;
+
+    // Activate the factor through the API.
+    let enrollment = begin_enrollment(&server, &tokens.access_token).await;
+    let confirm_code = totp_code_for(&enrollment.otpauth_uri);
+    let confirmed = confirm_enrollment(&server, &tokens.access_token, &confirm_code).await;
+    assert_eq!(
+        confirmed.status_code(),
+        StatusCode::OK,
+        "{}",
+        confirmed.text()
+    );
+
+    // A session minted while the factor is active. This is the token whose survival removes a
+    // factor-protected account's protection, so it is what the assertions below revolve around.
+    let session = login_with_totp(&server, "admin", SETUP_PASSWORD, &enrollment.otpauth_uri).await;
+    let epoch_before = authn
+        .get_user(user_id)
+        .await
+        .expect("read the user")
+        .auth_epoch;
+
+    // Remove the factor. Driven through the service because the accepted window is current +/- 1
+    // and confirm and this login have already spent `current` and `current + 1`, leaving no third
+    // in-window step for a route-level code. The route's own code check is covered by
+    // disabling_totp_requires_a_current_code; what is under test here is the epoch and revocation
+    // consequence, which the routes expose and docs/TOTP.md promises.
+    authn.totp_disable(user_id).await.expect("disable TOTP");
+
+    let epoch_after = authn
+        .get_user(user_id)
+        .await
+        .expect("read the user")
+        .auth_epoch;
+    assert_eq!(
+        epoch_after,
+        epoch_before + 1,
+        "removing a factor must increment the epoch so tokens minted while it was on are retired"
+    );
+    assert!(
+        !authn
+            .get_user(user_id)
+            .await
+            .expect("read the user")
+            .totp_enabled,
+        "disable must turn the factor off"
+    );
+
+    // Removing a factor weakens the account: the tokens minted while it was enabled must be dead
+    // even though they never expired. This is the property docs/TOTP.md promises for disable.
+    let stale = server
+        .get("/api/v1/auth/me")
+        .add_header("Authorization", bearer(&session.access_token))
+        .await;
+    assert_eq!(
+        stale.status_code(),
+        StatusCode::UNAUTHORIZED,
+        "a pre-disable access token must not outlive the removal: {}",
+        stale.text()
+    );
+
+    // The refresh token from that session is revoked too, so the caller cannot mint a new pair.
+    let refreshed = server
+        .post("/api/v1/auth/refresh")
+        .json(&serde_json::json!({"refresh_token": session.refresh_token}))
+        .await;
+    assert_eq!(
+        refreshed.status_code(),
+        StatusCode::UNAUTHORIZED,
+        "a pre-disable refresh token must be revoked: {}",
+        refreshed.text()
+    );
+
+    // The factor is gone, so a password-only login works again and yields a usable session.
+    let after = login(&server, "admin", SETUP_PASSWORD).await;
+    let me = server
+        .get("/api/v1/auth/me")
+        .add_header("Authorization", bearer(&after.access_token))
+        .await;
+    assert_eq!(me.status_code(), StatusCode::OK);
 }
