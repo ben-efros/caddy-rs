@@ -23,7 +23,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use caddy_rs_authn::{AuthError, Claims, TokenPair};
+use caddy_rs_authn::{AuthError, Claims, TokenPair, UserId};
 use serde::{Deserialize, Serialize};
 
 use crate::{hosts::LocalPeer, users::require_claims, ApiError, ApiState};
@@ -197,6 +197,44 @@ pub struct RoleView {
     pub name: String,
 }
 
+/// Body of `POST /api/v1/auth/totp/setup` and `POST /api/v1/auth/totp/confirm`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TotpConfirmRequest {
+    /// The six-digit code from the authenticator, proving the secret was stored.
+    pub totp_code: String,
+}
+
+/// Body of `POST /api/v1/auth/totp/disable`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TotpDisableRequest {
+    /// The caller's current code. Disabling needs a live factor, not just a live session, so a
+    /// stolen access token alone cannot strip the second factor off the account.
+    pub totp_code: String,
+}
+
+/// Response of `POST /api/v1/auth/totp/setup`.
+///
+/// This is the only response that ever carries `secret`, and only once: after a successful
+/// `confirm` the secret is never returned again, so a caller cannot re-read it from the API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TotpSetupResponse {
+    /// The base32 secret to key into an authenticator. Shown exactly once.
+    pub secret: String,
+    /// The `otpauth://` URI, usually rendered as a QR code.
+    pub otpauth_uri: String,
+}
+
+/// Response of `POST /api/v1/auth/totp/confirm`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TotpStatusResponse {
+    pub totp_enabled: bool,
+    /// The new epoch. Enabling or disabling a factor retires previously minted tokens, so the
+    /// caller must log in again to obtain one that carries this epoch.
+    pub auth_epoch: u64,
+}
+
 /// `POST /api/v1/auth/login` — exchange credentials for a token pair.
 ///
 /// `Cache-Control: no-store` keeps the token pair out of any browser or intermediary cache; the
@@ -341,6 +379,126 @@ pub(crate) async fn me_handler(
 pub(crate) fn internal_error(error: impl std::fmt::Display) -> ApiError {
     tracing::error!(error = %error, "session endpoint failed");
     ApiError::Internal("internal error".to_owned())
+}
+
+/// `POST /api/v1/auth/totp/setup` — begin enrollment, returning a fresh secret and otpauth URI.
+///
+/// The secret is stored on the user but is not yet *activated* for login purposes in the sense the
+/// caller cares about: `confirm` must succeed before the operator trusts the account to be
+/// protected. Calling setup twice is allowed and simply replaces the pending secret.
+pub(crate) async fn totp_setup_handler(
+    State(state): State<ApiState>,
+    _peer: LocalPeer,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    let Claims { sub, .. } = require_claims(&state, &headers).await?;
+    let (secret, otpauth_uri) = state
+        .authn
+        .totp_setup(sub)
+        .await
+        .map_err(|error| match error {
+            AuthError::UserNotFound => ApiError::Unauthorized("invalid access token".to_owned()),
+            other => internal_error(other),
+        })?;
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(TotpSetupResponse {
+            secret,
+            otpauth_uri,
+        }),
+    ))
+}
+
+/// `POST /api/v1/auth/totp/confirm` — prove the secret is stored, activating the factor.
+pub(crate) async fn totp_confirm_handler(
+    State(state): State<ApiState>,
+    _peer: LocalPeer,
+    headers: HeaderMap,
+    Json(body): Json<TotpConfirmRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Claims { sub, .. } = require_claims(&state, &headers).await?;
+    // Confirmation both verifies the code and activates the factor, and it retires the tokens
+    // minted while the factor was pending.
+    let user = state
+        .authn
+        .totp_confirm(sub, &body.totp_code)
+        .await
+        .map_err(|error| match error {
+            AuthError::TotpNotConfigured => {
+                ApiError::Conflict("no TOTP enrollment is pending".to_owned())
+            }
+            AuthError::TotpAlreadyEnabled => {
+                ApiError::Conflict("TOTP is already enabled".to_owned())
+            }
+            AuthError::InvalidTotpCode => ApiError::Unauthorized("invalid TOTP code".to_owned()),
+            AuthError::TotpReplay => {
+                tracing::warn!(user = %sub.0, "TOTP replay refused at confirm");
+                ApiError::Unauthorized("invalid TOTP code".to_owned())
+            }
+            AuthError::UserNotFound => ApiError::Unauthorized("invalid access token".to_owned()),
+            other => internal_error(other),
+        })?;
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(TotpStatusResponse {
+            totp_enabled: user.has_totp(),
+            auth_epoch: user.auth_epoch,
+        }),
+    ))
+}
+
+/// `POST /api/v1/auth/totp/disable` — remove the factor, requiring a current code.
+pub(crate) async fn totp_disable_handler(
+    State(state): State<ApiState>,
+    _peer: LocalPeer,
+    headers: HeaderMap,
+    Json(body): Json<TotpDisableRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Claims { sub, .. } = require_claims(&state, &headers).await?;
+    verify_totp(&state, sub, &body.totp_code).await?;
+    state
+        .authn
+        .totp_disable(sub)
+        .await
+        .map_err(|error| match error {
+            AuthError::UserNotFound => ApiError::Unauthorized("invalid access token".to_owned()),
+            other => internal_error(other),
+        })?;
+    let user = state
+        .authn
+        .get_user(sub)
+        .await
+        .map_err(|error| match error {
+            AuthError::UserNotFound => ApiError::Unauthorized("invalid access token".to_owned()),
+            other => internal_error(other),
+        })?;
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(TotpStatusResponse {
+            totp_enabled: user.totp_enabled,
+            auth_epoch: user.auth_epoch,
+        }),
+    ))
+}
+
+/// Verify a submitted TOTP code, mapping every failure to a refusal.
+///
+/// A wrong code, an unusable code and a replay all answer the same `401`: telling the caller which
+/// of those it was would help an attacker calibrate. `TotpReplay` is called out in the log path
+/// because it is evidence of impersonation rather than a typo, but the client sees one refusal.
+async fn verify_totp(state: &ApiState, user_id: UserId, code: &str) -> Result<(), ApiError> {
+    match state.authn.totp_verify(user_id, code).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(ApiError::Unauthorized("invalid TOTP code".to_owned())),
+        Err(AuthError::TotpReplay) => {
+            tracing::warn!(user = %user_id.0, "TOTP replay refused");
+            Err(ApiError::Unauthorized("invalid TOTP code".to_owned()))
+        }
+        Err(AuthError::UserNotFound) => {
+            Err(ApiError::Unauthorized("invalid access token".to_owned()))
+        }
+        Err(other) => Err(internal_error(other)),
+    }
 }
 
 #[cfg(test)]

@@ -37,6 +37,33 @@ fn authn() -> AuthnService<MemoryUserStore> {
     AuthnService::new(MemoryUserStore::new(), authn_config).expect("create authn service")
 }
 
+/// Like [`server_with_authn`], but with a `PlusMinusOne` TOTP window.
+///
+/// The default window accepts only the current step, so a test that confirms enrollment and then
+/// logs in would have to reuse a spent step, which the replay rule refuses. A real authenticator
+/// tolerates a little clock skew; `PlusMinusOne` models that and lets a test present a genuinely
+/// different, still-accepted step.
+fn server_with_totp_window() -> (TempDir, TestServer, AuthnService<MemoryUserStore>) {
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let config = RuntimeConfig::new(temp_dir.path().join("data"));
+    let runtime = PmRuntime::open(config).expect("open runtime");
+    let authn_config = AuthnConfig {
+        jwt_secret_source: JwtSecretSource::Ephemeral,
+        argon2_params: Argon2Config {
+            memory_cost: 4096,
+            time_cost: 1,
+            parallelism: 1,
+        },
+        totp_window: caddy_rs_authn::TotpWindow::PlusMinusOne,
+        ..AuthnConfig::default()
+    };
+    let authn =
+        AuthnService::new(MemoryUserStore::new(), authn_config).expect("create authn service");
+    let state = ApiState::new(runtime, authn.clone());
+    let app = create_router(state).into_make_service_with_connect_info::<std::net::SocketAddr>();
+    (temp_dir, TestServer::new(app), authn)
+}
+
 fn runtime() -> (TempDir, ApiState) {
     let temp_dir = TempDir::new().expect("create temp dir");
     let config = RuntimeConfig::new(temp_dir.path().join("data"));
@@ -2388,6 +2415,35 @@ struct SessionTokens {
     refresh_token: String,
 }
 
+/// Log in with a code from a step the account has not spent yet, for a TOTP-enabled account.
+///
+/// The replay record is monotonic: once a step is used, every code for a step at or below it is
+/// refused. A test that confirmed enrollment with the current step therefore cannot also log in
+/// with it, and walking forward a step here is what a real authenticator does a moment later.
+async fn login_with_totp(
+    server: &TestServer,
+    username: &str,
+    password: &str,
+    otpauth_uri: &str,
+) -> SessionTokens {
+    let code = totp_code_for_next_step(otpauth_uri, 1);
+    let response = server
+        .post("/api/v1/auth/login")
+        .json(&serde_json::json!({
+            "username": username,
+            "password": password,
+            "totp_code": code,
+        }))
+        .await;
+    assert_eq!(
+        response.status_code(),
+        StatusCode::OK,
+        "login with code for {username}: {}",
+        response.text()
+    );
+    response.json()
+}
+
 async fn login(server: &TestServer, username: &str, password: &str) -> SessionTokens {
     let response = server
         .post("/api/v1/auth/login")
@@ -2523,10 +2579,16 @@ async fn login_requires_a_totp_code_when_the_account_has_one() {
         .create_user("admin", SETUP_PASSWORD, caddy_rs_authn::Role::admin())
         .await
         .expect("create the administrator");
-    authn
+    let (_secret, uri) = authn
         .totp_setup(user.id)
         .await
-        .expect("enable TOTP for the user");
+        .expect("begin TOTP enrollment for the user");
+    // A setup on its own only leaves a pending secret; the factor gates login once a code has
+    // confirmed it.
+    authn
+        .totp_confirm(user.id, &totp_code_for(&uri))
+        .await
+        .expect("confirm the enrollment");
 
     let missing = server
         .post("/api/v1/auth/login")
@@ -3022,4 +3084,289 @@ async fn session_endpoints_require_a_known_loopback_peer() {
     }
     let response = server.get("/api/v1/auth/me").await;
     assert_eq!(response.status_code(), StatusCode::FORBIDDEN);
+}
+
+// ---------------------------------------------------------------------------------------------
+// TOTP enrollment routes (T-AUTH-001)
+// ---------------------------------------------------------------------------------------------
+
+/// Generate the code for a step `ahead` steps after the current one, so a test can present a code
+/// the account has not consumed yet (the replay record is monotonic).
+fn totp_code_for_next_step(otpauth_uri: &str, ahead: u64) -> String {
+    let secret = otpauth_uri
+        .split("secret=")
+        .nth(1)
+        .and_then(|rest| rest.split('&').next())
+        .expect("the otpauth URI carries a secret");
+    let step = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after the epoch")
+        .as_secs()
+        / 30
+        + ahead;
+    caddy_rs_authn::totp_code_for_step(secret, step).expect("compute a code")
+}
+
+/// Generate the code an authenticator would show `now`, for the secret behind an otpauth URI.
+fn totp_code_for(otpauth_uri: &str) -> String {
+    let secret = otpauth_uri
+        .split("secret=")
+        .nth(1)
+        .and_then(|rest| rest.split('&').next())
+        .expect("the otpauth URI carries a secret");
+    let step = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after the epoch")
+        .as_secs()
+        / 30;
+    caddy_rs_authn::totp_code_for_step(secret, step).expect("compute the current code")
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SetupEnrollment {
+    secret: String,
+    otpauth_uri: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct EnrollmentStatus {
+    totp_enabled: bool,
+    auth_epoch: u64,
+}
+
+async fn begin_enrollment(server: &TestServer, token: &str) -> SetupEnrollment {
+    let response = server
+        .post("/api/v1/auth/totp/setup")
+        .add_header("Authorization", bearer(token))
+        .await;
+    assert_eq!(
+        response.status_code(),
+        StatusCode::OK,
+        "begin enrollment: {}",
+        response.text()
+    );
+    assert_eq!(
+        response.header("cache-control"),
+        "no-store",
+        "an enrollment secret must never be cached"
+    );
+    response.json()
+}
+
+async fn confirm_enrollment(
+    server: &TestServer,
+    token: &str,
+    code: &str,
+) -> axum_test::TestResponse {
+    server
+        .post("/api/v1/auth/totp/confirm")
+        .add_header("Authorization", bearer(token))
+        .json(&serde_json::json!({"totpCode": code}))
+        .await
+}
+
+#[tokio::test]
+async fn an_admin_can_enable_totp_and_the_next_login_requires_the_code() {
+    let (_dir, server, _authn) = server_with_totp_window();
+    let admin = first_admin(&server).await;
+    let tokens = login(&server, "admin", SETUP_PASSWORD).await;
+
+    let enrollment = begin_enrollment(&server, &tokens.access_token).await;
+    assert!(
+        enrollment.otpauth_uri.starts_with("otpauth://totp/"),
+        "the URI must be an otpauth totp URI, got {}",
+        enrollment.otpauth_uri
+    );
+    assert!(
+        !enrollment.secret.is_empty(),
+        "setup must return a secret to key in"
+    );
+
+    let code = totp_code_for(&enrollment.otpauth_uri);
+    let response = confirm_enrollment(&server, &tokens.access_token, &code).await;
+    assert_eq!(response.status_code(), StatusCode::OK);
+    let status: EnrollmentStatus = response.json();
+    assert!(status.totp_enabled, "confirm must leave TOTP enabled");
+
+    // Enabling a factor changes the account's security posture, so it retires the tokens minted
+    // before it. Log in again, which now requires the code.
+    let without_code = server
+        .post("/api/v1/auth/login")
+        .json(&serde_json::json!({"username": "admin", "password": SETUP_PASSWORD}))
+        .await;
+    assert_eq!(
+        without_code.status_code(),
+        StatusCode::UNAUTHORIZED,
+        "a password alone must no longer be enough: {}",
+        without_code.text()
+    );
+
+    let fresh = login_with_totp(&server, "admin", SETUP_PASSWORD, &enrollment.otpauth_uri).await;
+    assert!(
+        !fresh.access_token.is_empty(),
+        "the session shape is unchanged once the code is supplied"
+    );
+    assert!(
+        !fresh.refresh_token.is_empty(),
+        "a TOTP login still issues a refresh token"
+    );
+    assert!(!admin.user_id.is_empty(), "the administrator was created");
+}
+
+#[tokio::test]
+async fn confirm_refuses_a_wrong_code_and_enabling_retires_the_old_token() {
+    let (_dir, server, _authn) = server_with_authn();
+    let _admin = first_admin(&server).await;
+    let tokens = login(&server, "admin", SETUP_PASSWORD).await;
+    let _enrollment = begin_enrollment(&server, &tokens.access_token).await;
+
+    let wrong = confirm_enrollment(&server, &tokens.access_token, "000000").await;
+    assert_eq!(
+        wrong.status_code(),
+        StatusCode::UNAUTHORIZED,
+        "a wrong code must be refused: {}",
+        wrong.text()
+    );
+    let body: ApiErrorResponse = wrong.json();
+    assert_eq!(body.error.code, ErrorCode::Unauthorized);
+
+    // A failed confirm must not activate the factor, and the pending secret must not gate login:
+    // an operator who abandons enrollment is not locked out of the account they were protecting.
+    let after_wrong = server
+        .post("/api/v1/auth/login")
+        .json(&serde_json::json!({"username": "admin", "password": SETUP_PASSWORD}))
+        .await;
+    assert_eq!(
+        after_wrong.status_code(),
+        StatusCode::OK,
+        "a failed confirm must leave the account reachable by password: {}",
+        after_wrong.text()
+    );
+}
+
+#[tokio::test]
+async fn a_replayed_confirm_code_is_refused() {
+    let (_dir, server, _authn) = server_with_authn();
+    let _admin = first_admin(&server).await;
+    let tokens = login(&server, "admin", SETUP_PASSWORD).await;
+    let enrollment = begin_enrollment(&server, &tokens.access_token).await;
+    let code = totp_code_for(&enrollment.otpauth_uri);
+
+    let first = confirm_enrollment(&server, &tokens.access_token, &code).await;
+    assert_eq!(first.status_code(), StatusCode::OK, "{}", first.text());
+
+    // The same code again is a replay, not a fresh login: it must not succeed twice.
+    let replay = confirm_enrollment(&server, &tokens.access_token, &code).await;
+    assert_eq!(
+        replay.status_code(),
+        StatusCode::UNAUTHORIZED,
+        "a replayed code must be refused: {}",
+        replay.text()
+    );
+}
+
+#[tokio::test]
+async fn disabling_totp_requires_a_current_code() {
+    let (_dir, server, _authn) = server_with_totp_window();
+    let _admin = first_admin(&server).await;
+    let tokens = login(&server, "admin", SETUP_PASSWORD).await;
+    let enrollment = begin_enrollment(&server, &tokens.access_token).await;
+    let code = totp_code_for(&enrollment.otpauth_uri);
+    let confirmed = confirm_enrollment(&server, &tokens.access_token, &code).await;
+    assert_eq!(confirmed.status_code(), StatusCode::OK);
+
+    // The factor is live now, so a password alone no longer authenticates.
+    let without_code = server
+        .post("/api/v1/auth/login")
+        .json(&serde_json::json!({"username": "admin", "password": SETUP_PASSWORD}))
+        .await;
+    assert_eq!(without_code.status_code(), StatusCode::UNAUTHORIZED);
+
+    // A session token alone must not be able to strip the factor: disabling needs a live code.
+    let session = login_with_totp(&server, "admin", SETUP_PASSWORD, &enrollment.otpauth_uri).await;
+    let bad = server
+        .post("/api/v1/auth/totp/disable")
+        .add_header("Authorization", bearer(&session.access_token))
+        .json(&serde_json::json!({"totpCode": "000000"}))
+        .await;
+    assert_eq!(
+        bad.status_code(),
+        StatusCode::UNAUTHORIZED,
+        "disable must require a live code, not just a session: {}",
+        bad.text()
+    );
+
+    // The factor is still in place after the refused attempt.
+    let still_required = server
+        .post("/api/v1/auth/login")
+        .json(&serde_json::json!({"username": "admin", "password": SETUP_PASSWORD}))
+        .await;
+    assert_eq!(still_required.status_code(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn totp_routes_require_a_bearer_token() {
+    let (_dir, server, _authn) = server_with_authn();
+
+    let setup = server.post("/api/v1/auth/totp/setup").await;
+    assert_eq!(setup.status_code(), StatusCode::UNAUTHORIZED);
+
+    let confirm = server
+        .post("/api/v1/auth/totp/confirm")
+        .json(&serde_json::json!({"totpCode": "123456"}))
+        .await;
+    assert_eq!(confirm.status_code(), StatusCode::UNAUTHORIZED);
+
+    let disable = server
+        .post("/api/v1/auth/totp/disable")
+        .json(&serde_json::json!({"totpCode": "123456"}))
+        .await;
+    assert_eq!(disable.status_code(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn confirming_enrollment_bumps_the_auth_epoch_and_retires_old_tokens() {
+    let (_dir, server, authn) = server_with_totp_window();
+    let _admin = first_admin(&server).await;
+    let tokens = login(&server, "admin", SETUP_PASSWORD).await;
+    let epoch_before = authn
+        .get_user(
+            authn
+                .verify_access_token(&tokens.access_token)
+                .await
+                .expect("the token verifies")
+                .sub,
+        )
+        .await
+        .expect("read the user")
+        .auth_epoch;
+
+    let enrollment = begin_enrollment(&server, &tokens.access_token).await;
+    let code = totp_code_for(&enrollment.otpauth_uri);
+    let response = confirm_enrollment(&server, &tokens.access_token, &code).await;
+    assert_eq!(
+        response.status_code(),
+        StatusCode::OK,
+        "{}",
+        response.text()
+    );
+    let status: EnrollmentStatus = response.json();
+
+    assert_eq!(
+        status.auth_epoch,
+        epoch_before + 1,
+        "activating a factor must increment the epoch so older tokens are rejected"
+    );
+
+    // The token minted before the factor existed no longer works, even though it never expired.
+    let stale = server
+        .get("/api/v1/auth/me")
+        .add_header("Authorization", bearer(&tokens.access_token))
+        .await;
+    assert_eq!(
+        stale.status_code(),
+        StatusCode::UNAUTHORIZED,
+        "a pre-enrollment token must not outlive the change: {}",
+        stale.text()
+    );
 }

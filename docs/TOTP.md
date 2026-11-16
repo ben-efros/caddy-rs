@@ -96,18 +96,48 @@ case to a generic error, but logs and metrics should keep the distinction.
 
 ## Enrolment
 
-1. `AuthnService::totp_setup(user_id)` generates the secret, stores it on the user, clears
-   `totp_last_step`, and returns `(secret, otpauth_uri)`. Show the URI as a QR code and the secret
-   as text.
-2. **There is no pending-enrolment state**: the secret is active as soon as `totp_setup` returns, so
-   the user must save it before the response is lost. If the response is lost, call `totp_setup`
-   again (it replaces the secret and resets the replay state).
-3. `totp_verify` proves possession and consumes the submitted step.
-4. `totp_disable(user_id)` removes the secret and clears the replay state.
+1. `AuthnService::totp_setup(user_id)` generates the secret, stores it on the user as **pending**
+   (`totp_pending = true`), clears `totp_last_step`, and returns `(secret, otpauth_uri)`. Show the
+   URI as a QR code and the secret as text.
+2. **Pending is not active.** While `totp_pending` is set the factor does not gate login, because
+   the operator has not yet proved they can produce a code. This is deliberate: if they abandon
+   enrolment — wrong QR scan, lost phone, closed tab — a pending secret that gated login would lock
+   them out of the very account they were trying to protect. The secret is never returned again,
+   so a lost response means calling `totp_setup` again (it replaces the secret and resets the
+   replay state) rather than recovering the old one.
+3. `AuthnService::totp_confirm(user_id, code)` verifies the code against the pending secret and, on
+   success, clears `totp_pending` — this is the step that actually enables the factor. It consumes
+   the submitted step, increments `auth_epoch` and revokes refresh tokens, so a session token minted
+   before the factor existed cannot outlive the change. Confirming an account whose factor is
+   already active returns `TotpAlreadyEnabled`.
+4. `totp_verify` proves possession and consumes the submitted step (used at login).
+5. `totp_disable(user_id)` removes the secret and clears the replay state. It also increments
+   `auth_epoch` and revokes refresh tokens, because removing a factor weakens the account.
 
 The service methods do not authenticate the caller — the embedding layer must ensure that only the
-user themselves (or an administrator) can call `totp_setup`/`totp_disable`. Neither method is
-exposed as a PM API route in this build.
+user themselves (or an administrator) can call `totp_setup`/`totp_confirm`/`totp_disable`.
+`caddy-rs-pm-api` is that layer for the proxy manager; see the routes below.
+
+### PM API routes
+
+The proxy manager exposes enrolment to a logged-in operator, each `Cache-Control: no-store`:
+
+| Route | Body | Effect |
+|---|---|---|
+| `POST /api/v1/auth/totp/setup` | none | Begins enrolment, returns `{secret, otpauth_uri}` once. The only response that ever carries the secret. |
+| `POST /api/v1/auth/totp/confirm` | `{totpCode}` | Verifies the code and activates the factor. Returns `{totp_enabled, auth_epoch}`. |
+| `POST /api/v1/auth/totp/disable` | `{totpCode}` | Requires a current code, then removes the factor. Returns `{totp_enabled, auth_epoch}`. |
+
+All three require a bearer token (`401` without one). A wrong, unusable or replayed code is refused
+with `401` and the same message, so a caller cannot tell which it was. Because confirm and disable
+retire previously minted tokens, a successful call is followed by a fresh login — which, once the
+factor is active, requires the current code.
+
+**Recovery path.** If the authenticator is lost, there is no bypass through the API by design:
+`disable` needs a live code, so a stolen session token cannot strip the factor. Recovery is an
+operator action on the host — stop the proxy manager and clear the account's `totp_secret`/
+`totp_pending` in the user store (or delete and recreate the account), then enrol again. An
+abandoned (pending, unconfirmed) enrolment needs no such step: it never gated login on its own.
 
 ## Related documentation
 
