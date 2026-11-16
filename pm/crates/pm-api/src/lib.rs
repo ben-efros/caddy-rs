@@ -635,6 +635,9 @@ pub fn create_router(state: ApiState) -> Router {
         .route("/auth/refresh", post(auth::refresh_handler))
         .route("/auth/logout", post(auth::logout_handler))
         .route("/auth/me", get(auth::me_handler))
+        .route("/auth/totp/setup", post(auth::totp_setup_handler))
+        .route("/auth/totp/confirm", post(auth::totp_confirm_handler))
+        .route("/auth/totp/disable", post(auth::totp_disable_handler))
         .route("/users", get(users::list_handler))
         .route(
             "/users/{id}",

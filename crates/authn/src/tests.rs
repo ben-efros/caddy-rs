@@ -57,6 +57,7 @@ fn test_user(username: &str) -> User {
         password_hash: "hash".to_string(),
         role: Role::viewer(),
         totp_secret: None,
+        totp_pending: false,
         totp_last_step: None,
         auth_epoch: 0,
         created_at: now,
@@ -696,9 +697,15 @@ async fn totp_setup_verify_skew_and_replay() {
 
 #[tokio::test]
 async fn totp_login_and_disable() {
-    let service = AuthnService::new(MemoryUserStore::new(), test_config())
+    let store = MemoryUserStore::new();
+    let service = AuthnService::new(store.clone(), test_config())
         .expect("build service")
         .with_test_step(TEST_STEP);
+    // A second handle over the same store, pinned one step later, so the post-confirmation logins
+    // are not replays of the step the confirmation spent.
+    let later = AuthnService::new(store, test_config())
+        .expect("build service")
+        .with_test_step(TEST_STEP + 1);
     let user = service
         .create_user("ivan", "password", Role::viewer())
         .await
@@ -706,19 +713,30 @@ async fn totp_login_and_disable() {
     let (secret, _) = service.totp_setup(user.id).await.unwrap();
     let code = totp_code(&decode_secret(&secret), TEST_STEP);
 
+    // A secret that has been issued but not confirmed leaves the account reachable by password:
+    // abandoning enrollment must not lock the operator out.
+    assert!(service.login("ivan", "password", None).await.is_ok());
+    // Confirming with the supplied code activates the factor. This also consumes TEST_STEP, so the
+    // logins below run against a later step, as a real authenticator would a moment later.
+    service.totp_confirm(user.id, &code).await.unwrap();
+
     assert!(matches!(
-        service.login("ivan", "password", None).await,
+        later.login("ivan", "password", None).await,
         Err(AuthError::InvalidTotpCode)
     ));
-    assert!(service.login("ivan", "password", Some(&code)).await.is_ok());
+    let login_code = totp_code(&decode_secret(&secret), TEST_STEP + 1);
+    assert!(later
+        .login("ivan", "password", Some(&login_code))
+        .await
+        .is_ok());
     // Replaying the consumed code is rejected and flagged as a replay attempt.
     assert!(matches!(
-        service.login("ivan", "password", Some(&code)).await,
+        later.login("ivan", "password", Some(&login_code)).await,
         Err(AuthError::TotpReplay)
     ));
 
     service.totp_disable(user.id).await.unwrap();
-    assert!(service.login("ivan", "password", None).await.is_ok());
+    assert!(later.login("ivan", "password", None).await.is_ok());
 }
 
 #[tokio::test]
@@ -901,6 +919,7 @@ fn user_public_view_no_secrets() {
         password_hash: "SECRET_HASH".to_string(),
         role: Role::viewer(),
         totp_secret: Some("SECRET_TOTP".to_string()),
+        totp_pending: false,
         totp_last_step: Some(12345),
         auth_epoch: 42,
         created_at: now,

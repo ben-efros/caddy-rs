@@ -354,6 +354,12 @@ pub struct User {
     pub role: Role,
     /// TOTP secret (base32 encoded), if 2FA is enabled.
     pub totp_secret: Option<String>,
+    /// True while an enrollment secret has been issued but no code has confirmed it yet.
+    ///
+    /// A pending secret must not gate login: the operator has not proved possession, and gating on
+    /// it would lock them out of the account they were trying to protect if they abandoned
+    /// enrollment. Confirmation clears this flag, which is what actually activates the factor.
+    pub totp_pending: bool,
     /// Highest TOTP time step accepted for this user, used for replay protection.
     ///
     /// Any code whose time step is at or below this value is rejected: a consumed code is a
@@ -373,8 +379,12 @@ pub struct User {
 
 impl User {
     /// Check if user has TOTP enabled.
+    ///
+    /// A secret issued by [`AuthnService::totp_setup`] but not yet confirmed through
+    /// [`AuthnService::totp_confirm`] does not count: the factor is active only once the operator
+    /// has proved they can produce a code from it.
     pub fn has_totp(&self) -> bool {
-        self.totp_secret.is_some()
+        self.totp_secret.is_some() && !self.totp_pending
     }
 
     /// A serializable view with no credential material.
@@ -457,6 +467,7 @@ impl UserRecord {
             role: record.role,
             password_hash,
             totp_secret,
+            totp_pending: false,
             totp_last_step: record.totp_last_step,
             auth_epoch: record.auth_epoch,
             created_at: record.created_at,
@@ -559,6 +570,9 @@ pub enum AuthError {
     /// TOTP is not configured for the user.
     #[error("TOTP not configured for user")]
     TotpNotConfigured,
+    /// TOTP is already active, so there is no pending enrollment to confirm.
+    #[error("TOTP is already enabled for this account")]
+    TotpAlreadyEnabled,
     /// A password hash is malformed or uses an unsupported format.
     #[error("password hash error: {0}")]
     PasswordHash(String),
@@ -1675,6 +1689,7 @@ impl<S: UserStore> AuthnService<S> {
             password_hash,
             role,
             totp_secret: None,
+            totp_pending: false,
             totp_last_step: None,
             auth_epoch: 0,
             created_at: now,
@@ -1703,6 +1718,7 @@ impl<S: UserStore> AuthnService<S> {
             password_hash,
             role: Role::admin(),
             totp_secret: None,
+            totp_pending: false,
             totp_last_step: None,
             auth_epoch: 0,
             created_at: now,
@@ -1807,11 +1823,65 @@ impl<S: UserStore> AuthnService<S> {
         );
 
         user.totp_secret = Some(secret.clone());
+        user.totp_pending = true;
         user.totp_last_step = None;
         user.updated_at = Utc::now();
         self.store.update_user(user).await?;
 
         Ok((secret, uri))
+    }
+
+    /// Confirm a pending TOTP enrollment with a code from the authenticator.
+    ///
+    /// This is the step that activates the factor. Until it succeeds the secret does not gate
+    /// login (see [`User::has_totp`]), so an abandoned enrollment cannot lock the operator out.
+    /// The confirmation consumes the code's time step through the same replay record a login uses,
+    /// so the code cannot be presented again.
+    ///
+    /// Enabling a factor changes the account's security posture, so the authentication epoch is
+    /// incremented and refresh tokens are revoked: a session token minted before the factor existed
+    /// must not outlive the change.
+    ///
+    /// Returns the authenticated user with the factor active.
+    pub async fn totp_confirm(&self, user_id: UserId, code: &str) -> AuthResult<User> {
+        let pending = self
+            .store
+            .get_user(user_id)
+            .await?
+            .ok_or(AuthError::UserNotFound)?;
+        if pending.totp_secret.is_none() {
+            return Err(AuthError::TotpNotConfigured);
+        }
+        if !pending.totp_pending {
+            // Confirming an already-active factor is not an escalation, but it is a no-op the caller
+            // should be able to see rather than a silent success.
+            return Err(AuthError::TotpAlreadyEnabled);
+        }
+        // Verify against the pending secret before activating it. `totp_verify` does not consult
+        // `has_totp`, so it works while the factor is still pending; it records the step, which is
+        // what makes the confirmation code non-replayable.
+        if !self.totp_verify(user_id, code).await? {
+            return Err(AuthError::InvalidTotpCode);
+        }
+
+        let mut user = self
+            .store
+            .get_user(user_id)
+            .await?
+            .ok_or(AuthError::UserNotFound)?;
+        user.totp_pending = false;
+        bump_epoch(&mut user)?;
+        user.updated_at = Utc::now();
+        let user_id = user.id;
+        self.store.update_user(user).await?;
+        self.store
+            .revoke_all_refresh_tokens_for_user(user_id, now_ts()?)
+            .await?;
+
+        self.store
+            .get_user(user_id)
+            .await?
+            .ok_or(AuthError::UserNotFound)
     }
 
     /// Verify a TOTP code for a user.
@@ -1902,8 +1972,15 @@ impl<S: UserStore> AuthnService<S> {
 
         user.totp_secret = None;
         user.totp_last_step = None;
+        // Removing a factor weakens the account, so tokens minted while it was enabled are
+        // retired rather than allowed to outlive the downgrade.
+        bump_epoch(&mut user)?;
         user.updated_at = Utc::now();
+        let user_id = user.id;
         self.store.update_user(user).await?;
+        self.store
+            .revoke_all_refresh_tokens_for_user(user_id, now_ts()?)
+            .await?;
         Ok(())
     }
 
