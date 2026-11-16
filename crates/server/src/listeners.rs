@@ -774,8 +774,10 @@ fn bind_udp_socket_addr(
             .map_err(|error| Error::bind(configured, error))?;
         let std_socket: std::net::UdpSocket = socket.into();
         // Register with udpgrm after bind, because its hooks only act on a bound socket inside a
-        // reuseport group. A failure here degrades: UDP still serves.
-        crate::udpgrm::register_listener(&std_socket, configured);
+        // reuseport group. Registration and promotion are separate steps (ADR-0045 §2): the socket
+        // joins the new generation here, but new flows keep reaching the old generation until the
+        // runtime is fully initialised and promotes. A failure here degrades: UDP still serves.
+        defer_udpgrm_promotion(&std_socket, configured);
         return UdpSocket::from_std(std_socket).map_err(|error| Error::bind(configured, error));
     }
     #[cfg(not(feature = "udpgrm"))]
@@ -788,6 +790,30 @@ fn bind_udp_socket_addr(
             .set_nonblocking(true)
             .map_err(|error| Error::bind(configured, error))?;
         UdpSocket::from_std(socket).map_err(|error| Error::bind(configured, error))
+    }
+}
+
+/// Register a bound UDP socket into the next udpgrm socket generation and defer its promotion.
+///
+/// Promotion is deliberately *not* done here: a socket bound during `apply` must not attract new
+/// flows before the instance is fully initialised, which is the ordering ADR-0044 §2 fixes for TCP
+/// and which `ServerRuntime::mark_ready` enforces for UDP by draining the deferred set. Registering
+/// and promoting in one step at bind time would send new flows to a process that is not yet serving.
+#[cfg(all(feature = "http3", feature = "udpgrm"))]
+fn defer_udpgrm_promotion(socket: &std::net::UdpSocket, configured: &str) {
+    let Some(pending) = crate::udpgrm::register_listener(socket, configured) else {
+        return;
+    };
+    // The registry keeps its own handle; both descriptors refer to the same kernel socket, so a
+    // socket option set through either applies to the listener.
+    match crate::udpgrm::duplicate_for_promotion(socket) {
+        Ok(owned) => crate::udpgrm::defer_promotion(configured, owned, pending),
+        Err(error) => tracing::warn!(
+            listen = configured,
+            %error,
+            "udpgrm registered the UDP socket generation but its handle could not be retained; \
+             the generation will not be promoted and UDP keeps serving on the previous one"
+        ),
     }
 }
 
@@ -806,7 +832,7 @@ fn wildcard_dual_stack_udp(port: u16) -> io::Result<UdpSocket> {
     socket.set_nonblocking(true)?;
     let std_socket: std::net::UdpSocket = socket.into();
     #[cfg(feature = "udpgrm")]
-    crate::udpgrm::register_listener(&std_socket, &format!("udp/:{port}"));
+    defer_udpgrm_promotion(&std_socket, &format!("udp/:{port}"));
     UdpSocket::from_std(std_socket)
 }
 

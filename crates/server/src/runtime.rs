@@ -464,6 +464,36 @@ impl ServerRuntime {
         None
     }
 
+    /// Promote the UDP socket generations registered during `apply` (ADR-0045 §2).
+    ///
+    /// This is the UDP half of the readiness contract: sockets join their new generation when they
+    /// are bound, but new flows keep reaching the previous generation until this runs. It must
+    /// therefore happen only once the instance is fully initialised, at the same point the TCP path
+    /// signals `ready()`.
+    #[cfg(feature = "udpgrm")]
+    fn promote_udp_generations(&self) {
+        let promoted = crate::udpgrm::promote_deferred();
+        if promoted > 0 {
+            tracing::info!(
+                generations = promoted,
+                "udpgrm: promoted the new UDP socket generation(s); new flows dispatch to them"
+            );
+        }
+    }
+
+    /// Declare this instance ready for UDP traffic by promoting its socket generations.
+    ///
+    /// The `udpgrm` feature is independent of `graceful-restart`, so this is a separate entry point
+    /// for builds that enable UDP graceful restart without process restart: call it once
+    /// `apply` has bound every listener and the admin endpoint is active. With `graceful-restart`
+    /// also enabled, [`ServerRuntime::mark_ready`] calls the same promotion, so a caller that uses
+    /// `mark_ready` does not need this as well.
+    #[cfg(all(feature = "udpgrm", not(feature = "graceful-restart")))]
+    pub fn mark_ready(&mut self) -> Result<()> {
+        self.promote_udp_generations();
+        Ok(())
+    }
+
     /// Declare this generation ready to take over from its parent (ADR-0044 §2.3).
     ///
     /// Call this only once the runtime has fully initialised — after the first successful
@@ -478,33 +508,39 @@ impl ServerRuntime {
         // unique reference explicitly. This is called during startup before the restart task can
         // be running, so the reference is always unique here; if it were not, the safe thing is to
         // report it rather than silently skip the handover the parent is waiting for.
-        let binder = match self.binder.as_mut() {
-            Some(binder) => binder,
-            None => return Ok(()),
-        };
-        let binder = std::sync::Arc::get_mut(binder).ok_or_else(|| {
-            crate::error::Error::from(
-                crate::graceful_restart::GracefulRestartError::ChildNotReady {
-                    cause: concat!(
-                        "the listener registry is shared with a running restart task, ",
-                        "so readiness cannot be signalled"
-                    )
-                    .to_string(),
-                },
-            )
-        })?;
-        binder.ready()?;
-        if binder.is_child() {
-            tracing::info!(
-                listeners = binder.inherited_listeners().len(),
-                "graceful restart: declared ready to the parent process"
-            );
-        } else {
-            tracing::info!(
-                listeners = binder.inherited_listeners().len(),
-                "graceful restart: first generation, no parent to notify"
-            );
+        //
+        // Scoped so the mutable borrow of `self.binder` ends before the UDP promotion below, which
+        // needs `&self`.
+        if let Some(binder) = self.binder.as_mut() {
+            let binder = std::sync::Arc::get_mut(binder).ok_or_else(|| {
+                crate::error::Error::from(
+                    crate::graceful_restart::GracefulRestartError::ChildNotReady {
+                        cause: concat!(
+                            "the listener registry is shared with a running restart task, ",
+                            "so readiness cannot be signalled"
+                        )
+                        .to_string(),
+                    },
+                )
+            })?;
+            binder.ready()?;
+            if binder.is_child() {
+                tracing::info!(
+                    listeners = binder.inherited_listeners().len(),
+                    "graceful restart: declared ready to the parent process"
+                );
+            } else {
+                tracing::info!(
+                    listeners = binder.inherited_listeners().len(),
+                    "graceful restart: first generation, no parent to notify"
+                );
+            }
         }
+        // UDP promotion is part of readiness whether or not there is a binder: `udpgrm` is
+        // independent of `graceful-restart`, so a build with UDP restart but no process restart
+        // still has generations to promote. A missing binder is not a reason to skip it.
+        #[cfg(feature = "udpgrm")]
+        self.promote_udp_generations();
         Ok(())
     }
 
