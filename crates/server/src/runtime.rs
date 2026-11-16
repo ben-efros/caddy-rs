@@ -483,10 +483,15 @@ impl ServerRuntime {
             None => return Ok(()),
         };
         let binder = std::sync::Arc::get_mut(binder).ok_or_else(|| {
-            crate::error::Error::from(crate::graceful_restart::GracefulRestartError::ChildNotReady {
-                cause: "the listener registry is shared with a running restart task, so readiness                         cannot be signalled"
+            crate::error::Error::from(
+                crate::graceful_restart::GracefulRestartError::ChildNotReady {
+                    cause: concat!(
+                        "the listener registry is shared with a running restart task, ",
+                        "so readiness cannot be signalled"
+                    )
                     .to_string(),
-            })
+                },
+            )
         })?;
         binder.ready()?;
         if binder.is_child() {

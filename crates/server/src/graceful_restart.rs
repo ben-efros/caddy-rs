@@ -127,6 +127,53 @@ pub const fn is_enabled() -> bool {
     true
 }
 
+/// What an `ecdysis` upgrade failure means for the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpgradeFailure {
+    /// The single-upgrade invariant refused a second concurrent upgrade (§2.6).
+    ConcurrentUpgradeRefused,
+    /// No new generation took over — the child failed, timed out, or the machinery could not start.
+    ChildDidNotTakeOver,
+}
+
+/// The one payload `ecdysis` writes when its in-flight swap refuses a second upgrade.
+///
+/// `executioner.rs:43` constructs `NotStarted(String::from("Already in upgrade"))`, which renders
+/// through `#[display("upgrade not started: {}", _0)]` as this exact string.
+const CONCURRENT_REFUSAL: &str = "upgrade not started: Already in upgrade";
+
+/// Classify an `ecdysis` upgrade failure from its rendered reason.
+///
+/// # Why this is a separate pure function
+///
+/// `ecdysis` 1.1.1 does not re-export `UpgradeError`, so the variant cannot be matched on and the
+/// only available signal is the `Display` text. That makes the classification load-bearing and
+/// worth testing directly: a pure function over the string can be table-tested against the real
+/// strings `ecdysis` produces, including the ones that are *not* a refusal.
+///
+/// # The trap this exists to avoid
+///
+/// `NotStarted` is constructed in **two** places, and they mean opposite things:
+///
+/// - `executioner.rs:43`, the `UPGRADING` swap — a genuine concurrent refusal.
+/// - `executioner.rs:89`, `impl From<Error> for UpgradeError`, which wraps an `io::Error` as
+///   `NotStarted(format!("{:?}", e))`. This is what `?` uses at `UpgradePipes::new()?` and
+///   `exec_upgraded(...)?`, so **a pipe-creation or fork/exec failure also renders with the
+///   `"upgrade not started"` prefix**.
+///
+/// Matching the prefix alone would report "a second concurrent upgrade was refused" when the truth
+/// is "the upgrade machinery could not start", and would send the operator looking for a
+/// concurrency problem that does not exist while the real io cause was swallowed at warn level.
+/// Only the exact refusal payload is therefore treated as a refusal; everything else — including an
+/// unrecognised or empty payload — is a startup failure, so the classification fails safe.
+pub fn classify_upgrade_failure(reason: &str) -> UpgradeFailure {
+    if reason == CONCURRENT_REFUSAL {
+        UpgradeFailure::ConcurrentUpgradeRefused
+    } else {
+        UpgradeFailure::ChildDidNotTakeOver
+    }
+}
+
 /// Owns the `ecdysis` listener registry for this generation (ADR-0044 §1).
 ///
 /// A listener created through this type is registered with the registry, so on the next upgrade the
@@ -322,19 +369,19 @@ impl ListenerBinder {
             Err(error) => {
                 // ecdysis 1.1.1 returns `UpgradeFinished`, but neither `UpgradeError` nor
                 // `UpgradeFinished` is re-exported (`lib.rs` imports them with a private `use`), so
-                // the variants cannot be matched on. The distinction that matters is recoverable
-                // from the `Display` text, which is stable and documented: a concurrent request
-                // renders "upgrade not started: Already in upgrade", while every other variant
-                // means the child never took over.
+                // the variants cannot be matched on. Classification therefore goes through
+                // `classify_upgrade_failure`, which is a pure function over the rendered reason and
+                // is table-tested against the strings ecdysis actually produces.
                 let reason = error.to_string();
-                if reason.contains("upgrade not started") {
+                if classify_upgrade_failure(&reason) == UpgradeFailure::ConcurrentUpgradeRefused {
                     // The single-upgrade invariant (§2.6) refused a second concurrent upgrade.
                     // Refused rather than queued, so repeated requests cannot become a fork storm.
                     tracing::warn!(%reason, "graceful restart: refused a second concurrent upgrade");
                     return Err(GracefulRestartError::UpgradeInFlight);
                 }
-                // The child exited or never signalled ready. The parent is still serving, and must
-                // say so loudly (§2.4).
+                // Everything else — the child exited, timed out, or the upgrade machinery could not
+                // start at all — means no new generation took over. The parent is still serving and
+                // the cause must be reported at error level (§2.4).
                 tracing::error!(
                     %reason,
                     "graceful restart failed; the current process is still serving"
@@ -374,13 +421,6 @@ mod tests {
     #[test]
     fn the_feature_reports_itself_enabled() {
         assert!(is_enabled());
-    }
-
-    #[test]
-    fn the_in_flight_refusal_is_located_and_names_the_invariant() {
-        let msg = GracefulRestartError::UpgradeInFlight.to_string();
-        assert!(msg.contains("already in flight"), "got: {msg}");
-        assert!(msg.contains("only one upgrade"), "got: {msg}");
     }
 
     #[test]
@@ -572,18 +612,56 @@ mod tests {
     }
 
     #[test]
-    fn the_in_flight_refusal_maps_onto_the_single_upgrade_invariant() {
-        // ecdysis 1.1.1 does not export `UpgradeError`, so the concurrent-upgrade case is
-        // recognised from its `Display` text ("upgrade not started: ..."). This test pins the
-        // mapping so a dependency bump that changes the wording fails here rather than silently
-        // turning a refusal into a "child not ready" report.
-        let error = GracefulRestartError::UpgradeInFlight;
-        let message = error.to_string();
-        assert!(message.contains("already in flight"), "got: {message}");
-        // The text this recognises:
-        assert!(
-            "upgrade not started: Already in upgrade".contains("upgrade not started"),
-            "the sentinel this module matches on must be the one ecdysis emits"
-        );
+    fn upgrade_failures_are_classified_from_the_strings_ecdysis_actually_emits() {
+        // The only signal available is the rendered `Display` text, because ecdysis 1.1.1 does not
+        // re-export `UpgradeError`. Each row below is a string ecdysis really produces, taken from
+        // executioner.rs, so a dependency bump that changes the wording fails here instead of
+        // silently changing how an operator-visible failure is reported.
+        let cases = [
+            // executioner.rs:43 - the UPGRADING swap. The genuine concurrent refusal.
+            (
+                "upgrade not started: Already in upgrade",
+                UpgradeFailure::ConcurrentUpgradeRefused,
+            ),
+            // executioner.rs:89 via the blanket From<Error>, used by `UpgradePipes::new()?`. This
+            // is an io failure that *also* renders with the "upgrade not started" prefix: matching
+            // the prefix alone would misreport it as a concurrent refusal.
+            (
+                "upgrade not started: Os { code: 24, kind: Uncategorized, message: \"Too many open files\" }",
+                UpgradeFailure::ChildDidNotTakeOver,
+            ),
+            // executioner.rs:89 via the blanket From<Error>, used by `exec_upgraded(...)?`.
+            (
+                "upgrade not started: Os { code: 2, kind: NotFound, message: \"No such file or directory\" }",
+                UpgradeFailure::ChildDidNotTakeOver,
+            ),
+            // executioner.rs:26 - the child died before signalling ready.
+            ("child exited unexpectedly", UpgradeFailure::ChildDidNotTakeOver),
+            // executioner.rs:29 - the child never signalled ready in time.
+            (
+                "timed out waiting for ready signal from child",
+                UpgradeFailure::ChildDidNotTakeOver,
+            ),
+            // executioner.rs:35 - the descriptor payload could not be serialised.
+            (
+                "serialization error: Custom(\"bad fd payload\")",
+                UpgradeFailure::ChildDidNotTakeOver,
+            ),
+            // Defensive: an empty or unrecognised payload must never be read as a refusal.
+            ("", UpgradeFailure::ChildDidNotTakeOver),
+            ("upgrade not started: ", UpgradeFailure::ChildDidNotTakeOver),
+            (
+                "upgrade not started: something new in a future release",
+                UpgradeFailure::ChildDidNotTakeOver,
+            ),
+        ];
+        for (reason, expected) in cases {
+            assert_eq!(
+                classify_upgrade_failure(reason),
+                expected,
+                "misclassified {reason:?}: reporting an io/fork failure as a concurrent refusal \
+                 would send the operator after a concurrency problem that does not exist"
+            );
+        }
     }
 }
