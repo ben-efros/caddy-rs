@@ -45,7 +45,7 @@ graceful-restart = ["dep:ecdysis"]
 # Optional: only compiled with the `graceful-restart` feature. Unix-only - the feature requires
 # fork/exec and file-descriptor inheritance, which do not exist on Windows.
 ecdysis = { version = "1.1.1", optional = true }
-base64 = "0.23.1"
+base64 = { workspace = true }
 bytes = { workspace = true }
 caddy-rs-admin = { workspace = true, default-features = false }
 caddy-rs-core = { workspace = true, default-features = false }
@@ -78,7 +78,7 @@ caddy-rs-test-support = { path = "../test-support" }
 async-trait = { workspace = true }
 h2 = "0.4.19"
 caddy-rs-config = { workspace = true }
-base64 = "0.23.1"
+base64 = { workspace = true }
 ring = "0.17.14"
 tempfile = "3.27.0"
 tracing = { workspace = true }
