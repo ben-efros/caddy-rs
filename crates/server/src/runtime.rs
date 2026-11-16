@@ -241,6 +241,13 @@ pub struct ServerRuntime {
     status: RuntimeStatus,
     /// Socket-activation resolution state; resolved once on the first apply.
     activation: ActivationState,
+    /// The ecdysis listener registry, when the `graceful-restart` feature is enabled.
+    ///
+    /// Present for the life of the runtime, so every generation binds through the same registry and
+    /// the sockets survive `exec`. `None` when the feature is off, and the bind path is then exactly
+    /// what it was before this field existed.
+    #[cfg(feature = "graceful-restart")]
+    binder: Option<crate::graceful_restart::ListenerBinder>,
     /// Generation-scoped active health-check schedulers, one vector per generation that
     /// configured `reverse_proxy.health_checks.active`. Health checks start only after the
     /// generation is serving and are stopped when the generation is replaced or the runtime stops,
@@ -422,6 +429,8 @@ impl ServerRuntime {
             admin_api,
             status: RuntimeStatus::default(),
             activation: ActivationState::Environment,
+            #[cfg(feature = "graceful-restart")]
+            binder: Some(crate::graceful_restart::ListenerBinder::new()),
             health_schedulers: BTreeMap::new(),
             renewals: BTreeMap::new(),
             ocsp_stapler: None,
@@ -436,6 +445,21 @@ impl ServerRuntime {
             upstream_status,
             inventory,
         }
+    }
+
+    /// The ecdysis registry for this runtime, or `None` when the feature is off.
+    ///
+    /// Returning `Option` in both builds keeps every bind signature identical, so the feature split
+    /// lives in [`crate::listeners::bind_tcp_ip`] rather than in three call sites.
+    #[cfg(feature = "graceful-restart")]
+    fn binder_ref(&self) -> Option<&crate::graceful_restart::ListenerBinder> {
+        self.binder.as_ref()
+    }
+
+    /// See the `graceful-restart` variant: with the feature off there is no registry.
+    #[cfg(not(feature = "graceful-restart"))]
+    fn binder_ref(&self) -> Option<&std::convert::Infallible> {
+        None
     }
 
     /// Adopt the given inherited listening sockets instead of reading the process environment.
@@ -1089,11 +1113,27 @@ impl ServerRuntime {
                 Arc::clone(&self.states),
                 Arc::clone(&self.store),
                 inherited,
+                self.binder_ref(),
             )
             .await?;
             tracing::info!(listen, bound = %handle.bound, "listening");
             self.listeners.insert(listen.clone(), handle);
             newly_bound.push(listen.clone());
+        }
+        // ADR-0044 section 1 requires the inherited fd set to be enumerable. Log it once the whole
+        // generation has bound, so an operator can see which listeners will be adopted rather than
+        // rebound on the next upgrade - the ones missing from this list are the ones that would
+        // have a refused-connection window, which is the per-listener failure this task guards
+        // against.
+        #[cfg(feature = "graceful-restart")]
+        if let Some(binder) = self.binder.as_ref() {
+            let inherited = binder.inherited_listeners();
+            tracing::debug!(
+                is_child_of_upgrade = binder.is_child(),
+                listeners = inherited.len(),
+                addresses = ?inherited,
+                "graceful restart: these listeners will be inherited across exec rather than rebound"
+            );
         }
         // Once every inherited socket has been adopted the remaining applies bind normally.
         if let ActivationState::Planned(plan) = &self.activation {
@@ -1137,6 +1177,16 @@ impl ServerRuntime {
         for listen in removed {
             if let Some(handle) = self.listeners.remove(&listen) {
                 tracing::info!(%listen, "closing listener");
+                // Drop it from the inheritance set: this listener is gone, so the next generation
+                // must not adopt it. (The kernel port stays bound until the process exits because
+                // ecdysis holds a CLOEXEC dup it cannot release one socket from - see the note in
+                // `ListenerBinder::forget`.)
+                #[cfg(feature = "graceful-restart")]
+                if let Some(binder) = self.binder.as_ref() {
+                    if let Some(addr) = handle.socket_addr {
+                        binder.forget(addr);
+                    }
+                }
                 handle.begin_graceful();
                 if let Some(grace) = timing.grace_period {
                     // Bound the drain like Caddy's grace-period context: force-close the closing
@@ -1186,7 +1236,7 @@ impl ServerRuntime {
                 handle.stop().await;
             }
             if let Some(listen) = &desired_admin {
-                let handle = bind_admin(listen, self.admin_api.clone()).await?;
+                let handle = bind_admin(listen, self.admin_api.clone(), self.binder_ref()).await?;
                 tracing::info!(listen, bound = %handle.bound, "admin API listening");
                 // The `/stop` exit path removes this file itself if the runtime has not finished
                 // shutting down within its budget: `process::exit` skips the listener task's
@@ -1213,7 +1263,13 @@ impl ServerRuntime {
             if let Some((identity, remote)) = desired_remote {
                 let listen = remote.listen_addr().to_string();
                 let tls_config = remote_admin_tls_config(&identity, &remote)?;
-                let handle = bind_admin_remote(&listen, self.admin_api.clone(), tls_config).await?;
+                let handle = bind_admin_remote(
+                    &listen,
+                    self.admin_api.clone(),
+                    tls_config,
+                    self.binder_ref(),
+                )
+                .await?;
                 tracing::info!(
                     listen,
                     bound = %handle.bound,

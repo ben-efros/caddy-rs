@@ -290,6 +290,19 @@ impl ListenerHandle {
     }
 }
 
+/// The optional ecdysis registry handed to the bind path.
+///
+/// With the `graceful-restart` feature this borrows the runtime's [`ListenerBinder`]; without it the
+/// type is a never-constructible placeholder so every signature is identical in both builds and the
+/// bind path reads the same either way. That keeps the feature split in exactly one place
+/// ([`bind_tcp_ip`]) instead of duplicating every signature behind a `cfg`.
+#[cfg(feature = "graceful-restart")]
+type BinderRef<'a> = Option<&'a crate::graceful_restart::ListenerBinder>;
+
+/// See the `graceful-restart` variant above: with the feature off there is no registry to pass.
+#[cfg(not(feature = "graceful-restart"))]
+type BinderRef<'a> = Option<&'a std::convert::Infallible>;
+
 /// Bind the listener for a Caddy listen address, or adopt an inherited systemd socket.
 ///
 /// When `inherited` is `Some`, the descriptor passed by systemd is adopted instead of binding a
@@ -300,6 +313,7 @@ pub(crate) async fn bind(
     listeners: SharedListeners,
     store: Arc<GenerationStore>,
     inherited: Option<InheritedSocket>,
+    #[cfg_attr(not(feature = "graceful-restart"), allow(unused_variables))] binder: BinderRef<'_>,
 ) -> Result<ListenerHandle, Error> {
     let address = ListenAddr::parse(configured).map_err(|reason| Error::Listen {
         listen: configured.to_string(),
@@ -326,7 +340,7 @@ pub(crate) async fn bind(
                     );
                     adopt_tcp(socket, configured)?
                 }
-                None => bind_configured_tcp(configured, &address).await?,
+                None => bind_configured_tcp(configured, &address, binder).await?,
             };
             let socket_addr = listener
                 .local_addr()
@@ -494,14 +508,101 @@ pub(crate) async fn bind(
 ///
 /// Explicit wildcard literals (`0.0.0.0:port`, `[::]:port`) keep their family; IP literals and
 /// hostnames behave exactly as Caddy's resolved bind.
-async fn bind_configured_tcp(configured: &str, address: &ListenAddr) -> Result<TcpListener, Error> {
+async fn bind_configured_tcp(
+    configured: &str,
+    address: &ListenAddr,
+    #[cfg_attr(not(feature = "graceful-restart"), allow(unused_variables))] binder: BinderRef<'_>,
+) -> Result<TcpListener, Error> {
     if address.host().is_empty() {
         let port = address.port().ok_or_else(|| Error::Listen {
             listen: configured.to_string(),
             reason: "expected `host:port`; a hostless address needs a numeric port".to_string(),
         })?;
-        match wildcard_dual_stack_listener(port) {
-            Ok(listener) => return Ok(listener),
+        // The dual-stack wildcard is a TCP listener like any other, so it goes through the same
+        // ecdysis routing: a hostless listener is the common case for a public site, and missing it
+        // here would reintroduce the refused-connection window on exactly the busiest listener.
+        return bind_tcp_wildcard(configured, port, binder);
+    }
+    match address.socket_addr() {
+        // IP literal: bind exactly that address/family, through ecdysis when the graceful-restart
+        // feature is on so the socket is inherited across `exec` rather than rebound.
+        Some(socket_addr) => bind_tcp_ip(configured, socket_addr, binder),
+        // Hostname: resolve and bind like Caddy's `net.Listen("tcp", "host:port")`. Bind the
+        // address without a `tcp/`/`udp/` network prefix (the prefix is already parsed above).
+        None => TcpListener::bind(&address.address)
+            .await
+            .map_err(|error| Error::bind(configured, error)),
+    }
+}
+
+/// Bind a TCP listener to a numeric address, through ecdysis when the feature is enabled.
+///
+/// This is the single point where the graceful-restart feature changes listener creation. With the
+/// feature off it is exactly the `TcpListener::bind` it replaced, so behaviour is bit-identical;
+/// with it on the socket is registered with ecdysis and the next generation inherits it.
+///
+/// The two paths must apply the same socket options, so both go through [`tcp_socket_options`]
+/// rather than duplicating the calls: if they diverged, an inherited socket would carry different
+/// options from a freshly-bound one and the generations would disagree about the same kernel socket.
+fn bind_tcp_ip(
+    configured: &str,
+    socket_addr: SocketAddr,
+    #[cfg_attr(not(feature = "graceful-restart"), allow(unused_variables))] binder: BinderRef<'_>,
+) -> Result<TcpListener, Error> {
+    #[cfg(feature = "graceful-restart")]
+    if let Some(binder) = binder {
+        let listener = binder
+            .bind_tcp(socket_addr, |socket, addr| {
+                tcp_socket_options(&socket)?;
+                socket.bind(&addr.into())?;
+                socket.listen(128)?;
+                let listener: std::net::TcpListener = socket.into();
+                listener.set_nonblocking(true)?;
+                Ok(listener)
+            })
+            .map_err(|error| Error::bind(configured, error))?;
+        return TcpListener::from_std(listener).map_err(|error| Error::bind(configured, error));
+    }
+    let listener =
+        std::net::TcpListener::bind(socket_addr).map_err(|error| Error::bind(configured, error))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| Error::bind(configured, error))?;
+    TcpListener::from_std(listener).map_err(|error| Error::bind(configured, error))
+}
+
+/// Bind a hostless (`:port`) TCP listener, through ecdysis when the feature is enabled.
+///
+/// Keeps the existing dual-stack preference: an `IPV6_V6ONLY=0` wildcard when the platform offers
+/// it, falling back to an IPv4 wildcard when IPv6 sockets are unavailable. Both branches are routed
+/// through ecdysis, because both produce a listener that must survive `exec`.
+fn bind_tcp_wildcard(
+    configured: &str,
+    port: u16,
+    #[cfg_attr(not(feature = "graceful-restart"), allow(unused_variables))] binder: BinderRef<'_>,
+) -> Result<TcpListener, Error> {
+    #[cfg(feature = "graceful-restart")]
+    let v6_addr = SocketAddr::from((Ipv6Addr::UNSPECIFIED, port));
+
+    #[cfg(feature = "graceful-restart")]
+    if let Some(binder) = binder {
+        // Try the dual-stack wildcard first. ecdysis keys inheritance on the address it is asked
+        // for, so the key must be the address actually bound: the dual-stack case is keyed on the
+        // IPv6 wildcard, and the IPv4 fallback on the IPv4 wildcard. Trying IPv6 first and only
+        // falling back when the platform refuses it keeps the key correct in both cases.
+        match binder.bind_tcp(v6_addr, |socket, addr| {
+            socket.set_only_v6(false)?;
+            tcp_socket_options(&socket)?;
+            socket.bind(&addr.into())?;
+            socket.listen(128)?;
+            let listener: std::net::TcpListener = socket.into();
+            listener.set_nonblocking(true)?;
+            Ok(listener)
+        }) {
+            Ok(listener) => {
+                return TcpListener::from_std(listener)
+                    .map_err(|error| Error::bind(configured, error))
+            }
             Err(error) if ipv6_wildcard_unavailable(&error) => {
                 tracing::debug!(
                     listen = configured,
@@ -511,24 +612,71 @@ async fn bind_configured_tcp(configured: &str, address: &ListenAddr) -> Result<T
             }
             Err(error) => return Err(Error::bind(configured, error)),
         }
-        let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)))
-            .map_err(|error| Error::bind(configured, error))?;
-        listener
-            .set_nonblocking(true)
+        let v4_addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
+        let listener = binder
+            .bind_tcp(v4_addr, |socket, addr| {
+                tcp_socket_options(&socket)?;
+                socket.bind(&addr.into())?;
+                socket.listen(128)?;
+                let listener: std::net::TcpListener = socket.into();
+                listener.set_nonblocking(true)?;
+                Ok(listener)
+            })
             .map_err(|error| Error::bind(configured, error))?;
         return TcpListener::from_std(listener).map_err(|error| Error::bind(configured, error));
     }
-    match address.socket_addr() {
-        // IP literal: bind exactly that address/family.
-        Some(socket_addr) => TcpListener::bind(socket_addr)
-            .await
-            .map_err(|error| Error::bind(configured, error)),
-        // Hostname: resolve and bind like Caddy's `net.Listen("tcp", "host:port")`. Bind the
-        // address without a `tcp/`/`udp/` network prefix (the prefix is already parsed above).
-        None => TcpListener::bind(&address.address)
-            .await
-            .map_err(|error| Error::bind(configured, error)),
+
+    match wildcard_dual_stack_listener(port) {
+        Ok(listener) => return Ok(listener),
+        Err(error) if ipv6_wildcard_unavailable(&error) => {
+            tracing::debug!(
+                listen = configured,
+                %error,
+                "IPv6 wildcard listener unavailable; binding the IPv4 wildcard"
+            );
+        }
+        Err(error) => return Err(Error::bind(configured, error)),
     }
+    let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)))
+        .map_err(|error| Error::bind(configured, error))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| Error::bind(configured, error))?;
+    TcpListener::from_std(listener).map_err(|error| Error::bind(configured, error))
+}
+
+/// The socket options every caddy-rs TCP listener carries, applied before `bind`.
+///
+/// Kept in one place so the direct-bind path and the ecdysis creation closure cannot drift.
+///
+/// Generic over the socket type because two socket2 versions are in the graph: this crate pins
+/// 0.6.5 while ecdysis 1.1.1 builds its sockets with ^0.5 (the accepted KNOWN COST recorded in
+/// `Cargo.toml`). Both expose `set_reuse_address`, so the options are written once and applied to
+/// whichever socket the caller has; the point of this function is that the two paths cannot
+/// diverge, and splitting it per version would defeat that.
+#[cfg(feature = "graceful-restart")]
+trait TcpSocketOptions {
+    fn set_reuse_address(&self, reuse: bool) -> io::Result<()>;
+}
+
+#[cfg(feature = "graceful-restart")]
+impl TcpSocketOptions for Socket {
+    fn set_reuse_address(&self, reuse: bool) -> io::Result<()> {
+        Socket::set_reuse_address(self, reuse)
+    }
+}
+
+#[cfg(feature = "graceful-restart")]
+impl TcpSocketOptions for socket2_v05::Socket {
+    fn set_reuse_address(&self, reuse: bool) -> io::Result<()> {
+        socket2_v05::Socket::set_reuse_address(self, reuse)
+    }
+}
+
+#[cfg(feature = "graceful-restart")]
+fn tcp_socket_options(socket: &impl TcpSocketOptions) -> io::Result<()> {
+    socket.set_reuse_address(true)?;
+    Ok(())
 }
 
 /// A dual-stack (`IPv6` wildcard with `IPV6_V6ONLY=0`) listening socket for a hostless address.
@@ -2523,7 +2671,11 @@ async fn bind_admin_unix(
 /// Supports the same transports as Caddy's `admin.listen`: TCP (`[host]:port`) and Unix domain
 /// sockets (`unix/<absolute path>`, bound with owner-only permissions). The Unix socket file is
 /// removed when the listener stops, so reloads never leave stale sockets behind.
-pub(crate) async fn bind_admin(configured: &str, api: AdminApi) -> Result<ListenerHandle, Error> {
+pub(crate) async fn bind_admin(
+    configured: &str,
+    api: AdminApi,
+    #[cfg_attr(not(feature = "graceful-restart"), allow(unused_variables))] binder: BinderRef<'_>,
+) -> Result<ListenerHandle, Error> {
     let address = ListenAddr::parse(configured).map_err(|reason| Error::Listen {
         listen: configured.to_string(),
         reason,
@@ -2537,7 +2689,7 @@ pub(crate) async fn bind_admin(configured: &str, api: AdminApi) -> Result<Listen
             tracking_id: "ADMIN-LISTEN",
         });
     }
-    let listener = bind_configured_tcp(configured, &address).await?;
+    let listener = bind_configured_tcp(configured, &address, binder).await?;
     let socket_addr = listener
         .local_addr()
         .map_err(|error| Error::bind(configured, error))?;
@@ -2706,6 +2858,7 @@ pub(crate) async fn bind_admin_remote(
     configured: &str,
     api: AdminApi,
     server_config: Arc<rustls::ServerConfig>,
+    #[cfg_attr(not(feature = "graceful-restart"), allow(unused_variables))] binder: BinderRef<'_>,
 ) -> Result<ListenerHandle, Error> {
     let address = ListenAddr::parse(configured).map_err(|reason| Error::Listen {
         listen: configured.to_string(),
@@ -2717,7 +2870,7 @@ pub(crate) async fn bind_admin_remote(
             reason: "remote administration requires a TCP listen address".to_string(),
         });
     }
-    let listener = bind_configured_tcp(configured, &address).await?;
+    let listener = bind_configured_tcp(configured, &address, binder).await?;
     let socket_addr = listener
         .local_addr()
         .map_err(|error| Error::bind(configured, error))?;
@@ -3194,7 +3347,7 @@ mod remote_admin_tests {
         let tls = remote_admin_tls_config(&identity, &remote).expect("remote admin TLS config");
         let api = api();
         load_remote_admin_config(&api, certificates).await;
-        let handle = bind_admin_remote("127.0.0.1:0", api.clone(), tls)
+        let handle = bind_admin_remote("127.0.0.1:0", api.clone(), tls, None)
             .await
             .expect("bind remote admin listener");
         let port = handle.socket_addr.expect("bound address").port();
@@ -3367,7 +3520,7 @@ mod remote_admin_tests {
     #[tokio::test]
     async fn plaintext_admin_listener_still_serves_its_endpoints() {
         let api = api();
-        let handle = bind_admin("127.0.0.1:0", api)
+        let handle = bind_admin("127.0.0.1:0", api, None)
             .await
             .expect("bind plaintext admin listener");
         let port = handle.socket_addr.expect("bound address").port();
@@ -3444,7 +3597,7 @@ mod admin_unix_tests {
     async fn serves_the_admin_api_over_a_unix_socket_with_owner_only_permissions() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let (configured, path) = unix_listen(directory.path());
-        let handle = bind_admin(&configured, api())
+        let handle = bind_admin(&configured, api(), None)
             .await
             .expect("bind Unix admin listener");
         assert_eq!(
@@ -3487,13 +3640,13 @@ mod admin_unix_tests {
         let (configured, path) = unix_listen(directory.path());
         // A crashed process leaves the path behind; binding must reclaim it.
         std::fs::write(&path, b"stale").expect("plant stale path");
-        let handle = bind_admin(&configured, api())
+        let handle = bind_admin(&configured, api(), None)
             .await
             .expect("bind over a stale path");
         assert!(path.exists());
         handle.stop().await;
         assert!(!path.exists());
-        let handle = bind_admin(&configured, api())
+        let handle = bind_admin(&configured, api(), None)
             .await
             .expect("rebind after stop");
         handle.stop().await;

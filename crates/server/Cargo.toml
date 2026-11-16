@@ -39,12 +39,17 @@ templates = ["caddy-rs-http/templates"]
 # The existing `vendor/httpdate` patch is a narrow workaround for an unavailable crate, not a
 # precedent for forking a security-sensitive dependency. Revisit if upstream ecdysis moves to
 # socket2 0.6, at which point the duplicate disappears with no change here.
-graceful-restart = ["dep:ecdysis"]
+graceful-restart = ["dep:ecdysis", "dep:socket2-v05"]
 
 [dependencies]
 # Optional: only compiled with the `graceful-restart` feature. Unix-only - the feature requires
 # fork/exec and file-descriptor inheritance, which do not exist on Windows.
 ecdysis = { version = "1.1.1", optional = true }
+# ecdysis 1.1.1 builds its sockets with socket2 ^0.5 while this workspace pins 0.6.5, so
+# `build_listen_tcp` hands the closure a socket2-v0.5 `Socket`. Both versions are already in
+# the graph (see the KNOWN COST note above), so this is an alias to the version ecdysis
+# actually uses, not a third copy. Without it the closure signature cannot name the type.
+socket2-v05 = { package = "socket2", version = "0.5.10", optional = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
 caddy-rs-admin = { workspace = true, default-features = false }
