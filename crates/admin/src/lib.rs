@@ -663,6 +663,13 @@ const STOP_EXIT_WAIT: Duration = Duration::from_secs(2);
 pub struct ShutdownLatch {
     state: std::sync::Mutex<ShutdownLatchState>,
     finished: std::sync::Condvar,
+    /// Unix admin socket paths this process owns.
+    ///
+    /// The normal shutdown path unlinks them from the admin listener task's `Drop` guard. When
+    /// the exit budget expires before that guard runs - `std::process::exit` then skips every
+    /// destructor - the exit path removes them itself, so a `/stop` never leaves a stale socket
+    /// behind for the next start to clean up.
+    owned_socket_paths: std::sync::Mutex<Vec<std::path::PathBuf>>,
 }
 
 #[derive(Debug, Default)]
@@ -683,6 +690,44 @@ impl ShutdownLatch {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .finished
+    }
+
+    /// Record a Unix socket path this process owns, to be removed if the ordered exit times out.
+    ///
+    /// The runtime registers the bound admin socket path here after binding it; the admin
+    /// listener's `Drop` guard still does the ordinary unlink on a clean shutdown.
+    pub fn own_socket_path(&self, path: impl Into<std::path::PathBuf>) {
+        let path = path.into();
+        let mut paths = self
+            .owned_socket_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+
+    /// Remove every owned socket path. Best-effort and idempotent.
+    ///
+    /// Used by the `/stop` exit path on its timeout branch: the runtime never reported back, so
+    /// the listener's `Drop` guard will not run before `std::process::exit`.
+    pub fn remove_owned_socket_paths(&self) {
+        let paths = self
+            .owned_socket_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for path in paths.iter() {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    eprintln!(
+                        "caddy-rs: cannot remove admin socket {}: {error}",
+                        path.display()
+                    );
+                }
+            }
+        }
     }
 
     /// Wait until [`ShutdownLatchHandle::mark_finished`] is called, the runtime is dropped, or
@@ -1808,6 +1853,11 @@ impl AdminApi {
                                  exiting anyway",
                                 budget.as_secs()
                             );
+                            // The runtime never reported back, so the admin listener task may not
+                            // have run its `Drop` guard. `std::process::exit` skips destructors,
+                            // so the socket files this process owns would survive it: remove them
+                            // here rather than leave a stale socket behind.
+                            latch.remove_owned_socket_paths();
                         }
                     }
                     // No runtime reports completion to this API (embedded host that opted into

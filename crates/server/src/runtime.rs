@@ -1188,6 +1188,12 @@ impl ServerRuntime {
             if let Some(listen) = &desired_admin {
                 let handle = bind_admin(listen, self.admin_api.clone()).await?;
                 tracing::info!(listen, bound = %handle.bound, "admin API listening");
+                // The `/stop` exit path removes this file itself if the runtime has not finished
+                // shutting down within its budget: `process::exit` skips the listener task's
+                // `Drop` guard, and a stale socket would survive the process.
+                if let Some(path) = listen.strip_prefix("unix/") {
+                    self.shutdown_latch.own_socket_path(path);
+                }
                 self.admin = Some(handle);
             }
         }
@@ -2908,6 +2914,36 @@ mod shutdown_latch_tests {
         );
         // Release is idempotent, because `run_loop`'s exit path may reach it too.
         runtime.release_shutdown_latch();
+    }
+
+    /// A Unix admin socket must be registered on the latch, so the `/stop` exit path can remove
+    /// it when the exit budget expires before the listener task's `Drop` guard runs
+    /// (`std::process::exit` skips destructors).
+    #[tokio::test]
+    async fn a_unix_admin_socket_is_registered_for_the_exit_path() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let socket = directory.path().join("admin.sock");
+        let store = Arc::new(GenerationStore::with_builtin_registry());
+        let mut runtime = ServerRuntime::new(Arc::clone(&store));
+        store
+            .load(
+                Config::from_value(serde_json::json!({
+                    "admin": {"listen": format!("unix/{}", socket.display())},
+                    "apps": {"http": {"servers": {"srv0": {"listen": ["127.0.0.1:0"]}}}}
+                }))
+                .expect("configuration decodes"),
+            )
+            .expect("configuration loads");
+        runtime.apply().await.expect("initial apply");
+        assert!(socket.exists(), "the admin Unix socket was bound");
+
+        // The timeout branch's cleanup must remove the bound socket.
+        runtime.shutdown_latch.remove_owned_socket_paths();
+        assert!(
+            !socket.exists(),
+            "the /stop exit path removes the admin socket the process owns"
+        );
+        runtime.stop_all().await;
     }
 }
 
