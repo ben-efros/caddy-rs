@@ -1,7 +1,11 @@
 //! Reverse proxy: upstream model, load balancing, retries, health checks, and the
 //! `reverse_proxy` handler.
 
-#![forbid(unsafe_code)]
+// `deny`, not `forbid`: egress TCP port sharing needs one raw `setsockopt(IP_BIND_ADDRESS_NO_PORT)`
+// call, because socket2 exposes no safe setter for it (ADR-0043 §1, T-PROXY-064). `deny` keeps the
+// lint an error crate-wide while allowing that single site to carry a scoped, audited
+// `#[allow(unsafe_code)]`. Every other module stays unsafe-free.
+#![deny(unsafe_code)]
 
 pub mod balancer;
 pub mod client;
