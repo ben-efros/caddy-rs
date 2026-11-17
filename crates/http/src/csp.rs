@@ -51,18 +51,18 @@
 //!
 //! # Nonce randomness
 //!
-//! [`generate_nonce`] uses `ring`'s [`ring::rand::SystemRandom`] (already a dependency of this
-//! crate) to fill 16 bytes from the operating system CSPRNG and encodes them with URL-safe base64
-//! without padding (22 characters, no `+`/`/`, so the value is also safe in an HTML attribute).
-//! It panics if the OS CSPRNG is unavailable — there is no safe fallback for a CSP nonce, since a
-//! predictable nonce defeats the nonce mechanism entirely. `ring` is used rather than a new
-//! dependency; the CSP requirement is at least 16 random bytes, which this provides.
+//! [`generate_nonce`] fills 16 bytes from the operating system CSPRNG with `getrandom` (already in
+//! the dependency graph, so this adds no new crate) and encodes them with URL-safe base64 without
+//! padding (22 characters, no `+`/`/`, so the value is also safe in an HTML attribute). It panics if
+//! the OS CSPRNG is unavailable — there is no safe fallback for a CSP nonce, since a predictable
+//! nonce defeats the nonce mechanism entirely. `getrandom` reads the kernel CSPRNG directly with no
+//! seeding and no userspace RNG state; the CSP requirement is at least 16 random bytes, which this
+//! provides. (T-DEPS-014 phase 1 moved this off `ring::rand::SystemRandom`.)
 
 use std::collections::BTreeMap;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use ring::rand::SecureRandom;
 use serde_json::Value;
 
 use crate::types::{Error, Result};
@@ -309,8 +309,8 @@ impl CspPolicy {
 /// unavailable, because there is no safe fallback for a security nonce.
 pub fn generate_nonce() -> String {
     let mut bytes = [0u8; 16];
-    ring::rand::SystemRandom::new()
-        .fill(&mut bytes)
+    // OS-sourced randomness with no fallback and no seed, exactly as `SystemRandom::fill` was.
+    getrandom::getrandom(&mut bytes)
         .expect("the operating system CSPRNG is required to generate a CSP nonce");
     URL_SAFE_NO_PAD.encode(bytes)
 }

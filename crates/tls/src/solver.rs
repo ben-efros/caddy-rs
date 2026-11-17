@@ -24,7 +24,6 @@ use std::time::Duration;
 use async_trait::async_trait;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use ring::digest;
 
 use crate::acme::{Challenge, ChallengeType};
 use crate::dns::{DnsError, DnsProvider, TxtRecord};
@@ -89,8 +88,12 @@ pub fn key_authorization(token: &str, account_key_thumbprint: &str) -> String {
 /// The DNS-01 TXT record value for a key authorization (RFC 8555 §8.4):
 /// `base64url(SHA-256(keyAuthorization))` without padding.
 pub fn dns01_txt_value(key_authorization: &str) -> String {
-    let digest = digest::digest(&digest::SHA256, key_authorization.as_bytes());
-    URL_SAFE_NO_PAD.encode(digest.as_ref())
+    use sha2::{Digest, Sha256};
+
+    // Byte-identical to the previous `ring::digest::digest(&SHA256, ..)` call: SHA-256 is a fixed
+    // algorithm, so the encoded value a CA validates against is unchanged.
+    let digest = Sha256::digest(key_authorization.as_bytes());
+    URL_SAFE_NO_PAD.encode(digest)
 }
 
 /// The TXT record name for `domain` (wildcard names use the base domain).

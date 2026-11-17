@@ -23,6 +23,7 @@
 //!   Must-Staple but disables stapling (or cannot obtain a response) fails loudly instead of
 //!   serving an unstapled chain.
 
+use sha1::{Digest, Sha1};
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -579,14 +580,10 @@ pub fn build_ocsp_request(leaf_der: &[u8], issuer_der: &[u8]) -> Result<OcspRequ
             "leaf certificate has no issuer name".to_string(),
         ));
     }
-    let name_hash = ring::digest::digest(
-        &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
-        &leaf.issuer_name_der,
-    );
-    let key_hash = ring::digest::digest(
-        &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
-        &issuer.subject_public_key,
-    );
+    // SHA-1 is mandated here by RFC 6960 (CertID), not a choice: it must stay SHA-1, so this is a
+    // provider swap only. Byte-identical to the previous `ring::digest::digest(&SHA1, ..)` calls.
+    let name_hash = Sha1::digest(&leaf.issuer_name_der);
+    let key_hash = Sha1::digest(&issuer.subject_public_key);
     let cert_id = der_sequence(&[
         der_sequence(&[der_oid(&[1, 3, 14, 3, 2, 26]), der_null()]),
         der_octet_string(name_hash.as_ref()),

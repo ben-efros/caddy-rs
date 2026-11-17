@@ -44,6 +44,7 @@ rustls-platform-verifier = "0.7.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+getrandom = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { version = "0.26.6", default-features = false, features = [

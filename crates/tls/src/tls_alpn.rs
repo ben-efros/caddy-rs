@@ -34,13 +34,14 @@
 //! Challenge certificates are keyed by the authorization identifier (a wildcard authorization is
 //! validated as its base domain); lookups normalise case and trailing dots.
 
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use ring::rand::{SecureRandom, SystemRandom};
+use ring::rand::SystemRandom;
 use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
@@ -83,9 +84,10 @@ impl TlsAlpn01Challenge {
                     issuer_error(format!("loading generated challenge key: {error}"))
                 })?;
         let public_key = key_pair.public_key().as_ref().to_vec();
-        let digest = ring::digest::digest(&ring::digest::SHA256, key_authorization.as_bytes());
-        let certificate_der =
-            challenge_certificate(&domain, digest.as_ref(), &public_key, &key_pair)?;
+        // Byte-identical to the previous `ring::digest::digest(&SHA256, ..)` call; the ACME
+        // identifier extension the CA validates is unchanged.
+        let digest = Sha256::digest(key_authorization.as_bytes());
+        let certificate_der = challenge_certificate(&domain, &digest, &public_key, &key_pair)?;
         Ok(Self {
             domain,
             key_authorization: key_authorization.to_string(),
@@ -419,8 +421,9 @@ fn challenge_certificate(
         extended_key_usage,
     ]);
     let mut serial = [0_u8; 16];
-    SystemRandom::new()
-        .fill(&mut serial)
+    // OS-sourced randomness with no fallback and no seed, exactly as `SystemRandom::fill` was.
+    // Same operation as internal_ca::random_serial.
+    getrandom::getrandom(&mut serial)
         .map_err(|error| issuer_error(format!("generating challenge serial: {error}")))?;
     serial[0] &= 0x7f;
     if serial.iter().all(|byte| *byte == 0) {
