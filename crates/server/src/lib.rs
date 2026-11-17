@@ -17,12 +17,14 @@ pub(crate) mod auto_https;
 // `CAP_NET_BIND_SERVICE` primitives (ADR-0046, T-CORE-121).
 pub mod bindcap;
 pub mod error;
+pub mod fdstore;
 #[cfg(feature = "graceful-restart")]
 pub mod graceful_restart;
 pub mod http;
 mod inventory;
 pub mod limits;
 pub mod listener_plan;
+pub mod listener_source;
 pub mod listeners;
 mod observability;
 mod proxy_protocol;

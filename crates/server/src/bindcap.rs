@@ -99,12 +99,21 @@ mod imp {
     pub enum CapError {
         /// `capget(2)`/`capset(2)` returned an error; carries the OS error.
         Syscall(std::io::Error),
+        /// `CAP_NET_BIND_SERVICE` was found in at least one set when fdstore mode requires it
+        /// absent (ADR-0047 §6).
+        Present(BindCapabilityPresence),
     }
 
     impl std::fmt::Display for CapError {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
                 Self::Syscall(error) => write!(f, "capability syscall failed: {error}"),
+                Self::Present(presence) => write!(
+                    f,
+                    "CAP_NET_BIND_SERVICE must be absent in fdstore mode (ADR-0047) but is \
+                     present: {}",
+                    presence.describe()
+                ),
             }
         }
     }
@@ -113,6 +122,7 @@ mod imp {
         fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
             match self {
                 Self::Syscall(error) => Some(error),
+                Self::Present(_) => None,
             }
         }
     }
@@ -199,17 +209,119 @@ mod imp {
         }
         set(&header, &data)
     }
+
+    /// `PR_CAP_AMBIENT` (`include/uapi/linux/prctl.h`).
+    pub const PR_CAP_AMBIENT: libc::c_int = 47;
+    /// `PR_CAP_AMBIENT_IS_SET` (`include/uapi/linux/prctl.h`).
+    pub const PR_CAP_AMBIENT_IS_SET: libc::c_int = 1;
+
+    /// Whether `CAP_NET_BIND_SERVICE` is in the calling thread's **ambient** set.
+    ///
+    /// The ambient set is deliberately *not* in what `capget(2)` returns — that syscall reports
+    /// effective, permitted and inheritable only — so it must be read with
+    /// `prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, cap, 0, 0)`, which returns 1 when set, 0 when
+    /// not, or -1 with `errno` set. ADR-0047 §6 requires the fdstore-mode assertion to cover the
+    /// ambient set as well as permitted and effective, so reading only `capget` would silently
+    /// under-report and let a binary with ambient `CAP_NET_BIND_SERVICE` pass the check.
+    pub fn ambient_has_bind_service() -> Result<bool, CapError> {
+        // SAFETY: `prctl` with `PR_CAP_AMBIENT_IS_SET` only reads thread state; all arguments are
+        // plain integers and no pointers are passed.
+        let rc = unsafe {
+            libc::prctl(
+                PR_CAP_AMBIENT,
+                PR_CAP_AMBIENT_IS_SET,
+                CAP_NET_BIND_SERVICE as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+            )
+        };
+        match rc {
+            1 => Ok(true),
+            0 => Ok(false),
+            _ => Err(CapError::Syscall(std::io::Error::last_os_error())),
+        }
+    }
+
+    /// The three capability sets ADR-0047 §6 requires fdstore mode to be free of.
+    ///
+    /// Note the deliberate contrast with ADR-0046: there `CAP_NET_BIND_SERVICE` is legitimately
+    /// *permitted*, because the process raises it on demand. In fdstore mode the capability must be
+    /// absent from all three sets, because the sockets are already bound and the process must never
+    /// need the privilege. The two modes are mutually exclusive.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct BindCapabilityPresence {
+        pub permitted: bool,
+        pub effective: bool,
+        pub ambient: bool,
+    }
+
+    impl BindCapabilityPresence {
+        /// Whether the capability is absent from every set, as fdstore mode requires.
+        pub fn is_absent(&self) -> bool {
+            !self.permitted && !self.effective && !self.ambient
+        }
+
+        /// A human-readable summary for the startup log line.
+        pub fn describe(&self) -> String {
+            format!(
+                "permitted={} effective={} ambient={}",
+                self.permitted, self.effective, self.ambient
+            )
+        }
+    }
+
+    /// Read `CAP_NET_BIND_SERVICE`'s presence across all three sets.
+    pub fn bind_service_presence() -> Result<BindCapabilityPresence, CapError> {
+        let (_, data) = get()?;
+        Ok(BindCapabilityPresence {
+            permitted: data[0].permitted & CAP_NET_BIND_SERVICE_MASK != 0,
+            effective: data[0].effective & CAP_NET_BIND_SERVICE_MASK != 0,
+            ambient: ambient_has_bind_service()?,
+        })
+    }
+
+    /// Assert that fdstore mode is free of `CAP_NET_BIND_SERVICE` (ADR-0047 §6).
+    ///
+    /// Returns the observed presence either way so the caller can log it; the error case carries
+    /// the offending set(s).
+    pub fn assert_bind_service_absent() -> Result<BindCapabilityPresence, CapError> {
+        let presence = bind_service_presence()?;
+        if presence.is_absent() {
+            Ok(presence)
+        } else {
+            Err(CapError::Present(presence))
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
 pub use imp::{
-    CapData, CapDataArray, CapError, CapHeader, CAP_NET_BIND_SERVICE, CAP_NET_BIND_SERVICE_MASK,
+    assert_bind_service_absent, bind_service_presence, BindCapabilityPresence, CapData,
+    CapDataArray, CapError, CapHeader, CAP_NET_BIND_SERVICE, CAP_NET_BIND_SERVICE_MASK,
     LINUX_CAPABILITY_VERSION_3,
 };
 
 #[cfg(test)]
+#[allow(unsafe_code)] // one test calls prctl directly to construct the ambient-true case.
 mod tests {
     use super::*;
+
+    /// Whether `no_new_privs` is set for this process (`/proc/self/status: NoNewPrivs`).
+    ///
+    /// With it set the kernel refuses `PR_CAP_AMBIENT_RAISE` regardless of permissions, so tests
+    /// that need to construct an ambient capability must detect it and say they skipped.
+    #[cfg(target_os = "linux")]
+    fn no_new_privs_is_set() -> bool {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                status
+                    .lines()
+                    .find(|line| line.starts_with("NoNewPrivs:"))
+                    .and_then(|line| line.split_whitespace().nth(1).map(str::to_string))
+            })
+            .is_some_and(|value| value == "1")
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -284,6 +396,170 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn presence_covers_all_three_sets_including_ambient() {
+        // ADR-0047 §6 needs permitted AND effective AND ambient. The ambient set is not in
+        // capget's output, so a check that only read capget would under-report; this asserts the
+        // struct distinguishes all three independently.
+        let none = BindCapabilityPresence {
+            permitted: false,
+            effective: false,
+            ambient: false,
+        };
+        assert!(none.is_absent());
+
+        for presence in [
+            BindCapabilityPresence {
+                permitted: true,
+                effective: false,
+                ambient: false,
+            },
+            BindCapabilityPresence {
+                permitted: false,
+                effective: true,
+                ambient: false,
+            },
+            // ambient alone must NOT count as absent: this is the case a capget-only check misses
+            BindCapabilityPresence {
+                permitted: false,
+                effective: false,
+                ambient: true,
+            },
+        ] {
+            assert!(
+                !presence.is_absent(),
+                "{} must not be treated as absent",
+                presence.describe()
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ambient_read_sees_a_capability_that_is_actually_ambient() {
+        // A stub that always returns false would pass a test written only for the absent case, so
+        // this test RAISES the ambient bit for real and requires the read to observe it. Raising an
+        // ambient capability requires it to be permitted and effective first, so the test does all
+        // three and restores the original state afterwards.
+        let (header, original) = imp::get().expect("capget");
+        let mask = CAP_NET_BIND_SERVICE_MASK;
+        if original[0].permitted & mask == 0 {
+            // Without the capability this test cannot construct the case; say so rather than
+            // silently passing as though it had verified something.
+            eprintln!(
+                "SKIPPED: CAP_NET_BIND_SERVICE is not permitted here, so the ambient-true branch \
+                 cannot be constructed"
+            );
+            return;
+        }
+        // `no_new_privs` forbids raising an ambient capability outright, so in such a sandbox the
+        // true branch is unreachable no matter how privileged the process is. Detect it up front
+        // and report, instead of failing on an EPERM that says nothing about the implementation.
+        if no_new_privs_is_set() {
+            eprintln!(
+                "SKIPPED: no_new_privs is set, so PR_CAP_AMBIENT_RAISE is forbidden by the kernel; \
+                 the ambient-true branch cannot be constructed in this sandbox"
+            );
+            return;
+        }
+
+        // 1. Make it effective and permitted (required before raising it ambient).
+        let mut raised = original;
+        raised[0].effective |= mask;
+        raised[0].permitted |= mask;
+        imp::set(&header, &raised).expect("raise effective+permitted");
+        // 2. Raise it ambient.
+        // SAFETY: PR_CAP_AMBIENT_RAISE only affects the calling thread and takes plain integers.
+        let rc = unsafe {
+            libc::prctl(
+                imp::PR_CAP_AMBIENT,
+                // PR_CAP_AMBIENT_RAISE
+                2,
+                CAP_NET_BIND_SERVICE as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+            )
+        };
+        assert_eq!(
+            rc,
+            0,
+            "raising the ambient capability: {}",
+            std::io::Error::last_os_error()
+        );
+
+        // 3. The read MUST now see it. This is what fails if the implementation is a stub.
+        let observed = imp::ambient_has_bind_service().expect("ambient read");
+        assert!(
+            observed,
+            "the ambient set contains CAP_NET_BIND_SERVICE but the read reported false"
+        );
+        let presence = imp::bind_service_presence().expect("presence");
+        assert!(presence.ambient, "presence must report the ambient bit");
+        assert!(
+            !presence.is_absent(),
+            "with the capability ambient, the fdstore assertion must not report absent"
+        );
+
+        // 4. Restore: lower the ambient bit and the effective bit.
+        // SAFETY: PR_CAP_AMBIENT_LOWER only affects the calling thread.
+        unsafe {
+            libc::prctl(
+                imp::PR_CAP_AMBIENT,
+                // PR_CAP_AMBIENT_LOWER
+                3,
+                CAP_NET_BIND_SERVICE as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+            );
+        }
+        imp::set(&header, &original).expect("restore the original capability sets");
+        assert!(
+            !imp::ambient_has_bind_service().expect("ambient read after lowering"),
+            "the ambient bit must be gone after the test restores state"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ambient_set_is_readable_and_reflects_reality() {
+        // The ambient read must actually work (not error), and its answer must agree with the
+        // kernel rather than being hard-coded false.
+        let ambient = imp::ambient_has_bind_service().expect("prctl PR_CAP_AMBIENT_IS_SET");
+        // A process with no permitted capability cannot have an ambient one, so ambient implies
+        // permitted. Asserting the implication catches a stub that returns true unconditionally.
+        if ambient {
+            let (_, data) = imp::get().expect("capget");
+            assert!(
+                data[0].permitted & CAP_NET_BIND_SERVICE_MASK != 0,
+                "an ambient CAP_NET_BIND_SERVICE implies it is permitted"
+            );
+        }
+        let presence = imp::bind_service_presence().expect("presence");
+        assert_eq!(presence.ambient, ambient);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fdstore_assertion_reports_the_observed_state_either_way() {
+        // The assertion must be usable as a startup gate: on success it returns what it saw so the
+        // caller can log it, and on failure the error names the offending sets. This test asserts
+        // the contract without depending on the test runner's privileges.
+        match imp::assert_bind_service_absent() {
+            Ok(presence) => {
+                assert!(presence.is_absent());
+                assert!(presence.describe().contains("ambient="));
+            }
+            Err(CapError::Present(presence)) => {
+                assert!(!presence.is_absent());
+                let message = CapError::Present(presence).to_string();
+                assert!(message.contains("CAP_NET_BIND_SERVICE"));
+                assert!(message.contains("fdstore"));
+            }
+            Err(other) => panic!("unexpected error from the presence check: {other}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn get_reads_the_calling_threads_capabilities() {
         // Reading must succeed in any ordinary process, and the header must be version 3.
         let (header, _data) = imp::get().expect("capget on the calling thread");
@@ -333,8 +609,10 @@ mod tests {
             // Not permitted: the kernel must refuse.
             let error =
                 imp::set_effective(true).expect_err("raising an unpermitted capability must fail");
-            let CapError::Syscall(io) = error;
-            assert_eq!(io.raw_os_error(), Some(libc::EPERM));
+            match error {
+                CapError::Syscall(io) => assert_eq!(io.raw_os_error(), Some(libc::EPERM)),
+                other => panic!("raising an unpermitted capability must fail with EPERM: {other}"),
+            }
             // And the failed attempt must have left the effective set untouched.
             let (_, unchanged) = imp::get().expect("capget");
             assert!(unchanged[0].effective & CAP_NET_BIND_SERVICE_MASK == 0);
