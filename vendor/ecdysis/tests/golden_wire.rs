@@ -1,20 +1,23 @@
-//! T-OPS-106 golden-bytes wire test.
+//! T-OPS-106c golden-bytes wire test.
 //!
-//! bincode 1.3.3 was replaced by bincode 2.0.1 with `config::legacy()` (see `src/compat.rs`).
-//! A parent and child process exchange the listener registry over a pipe across an upgrade,
-//! so the two versions MUST produce identical bytes. This test does not assume that; it
-//! asserts it against a fixture produced by real bincode 1.3.3.
+//! bincode 1.3.3 (the codec upstream ecdysis 1.1.1 used) was replaced by
+//! `serde-wincode` 0.1.2 + `wincode` 0.6.3 (see `src/compat.rs`), because bincode is
+//! BANNED from this repository: RUSTSEC-2025-0141 has `patched = []`, so no bincode version
+//! can ever satisfy the audit gate. A parent and child process exchange the listener registry
+//! over a pipe across an upgrade, so the old and new encoders MUST produce identical bytes.
+//! This test does not assume that; it asserts it against a fixture produced by real bincode
+//! 1.3.3, and the new codec has to reproduce it exactly.
 //!
 //! GOLDEN_BYTES below was emitted by:
 //!   bincode = "=1.3.3";  bincode::serialize(&registry).unwrap()
 //! over the `registry` value built in `fixture()` with the type definitions copied verbatim
-//! from upstream `src/registry.rs`. Do not regenerate it with bincode 2.x — its whole value
-//! is that it came from the OLD encoder.
+//! from upstream `src/registry.rs`. The oracle came from real bincode 1.3.3; it is now
+//! reproduced by `serde-wincode`. It must NEVER be regenerated from the crate under test --
+//! regenerating it would make the test assert only that the crate equals itself.
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 
-use ecdysis::compat::wire_config;
 use serde::{Deserialize, Serialize};
 
 // Verbatim copies of `src/registry.rs` (upstream ecdysis 1.1.1). The real types are
@@ -71,38 +74,41 @@ fn decode_hex(s: &str) -> Vec<u8> {
         .collect()
 }
 
-/// THE assertion: bincode 2.0.1 + `config::legacy()` encodes the registry to exactly the
-/// bytes bincode 1.3.3 produced. This is the measurement that makes the version bump a
-/// no-op on the wire.
+/// THE assertion: `serde-wincode` + wincode's default configuration encodes the registry to
+/// exactly the 118 bytes bincode 1.3.3 produced. This is the measurement that makes the codec
+/// swap a no-op on the wire.
 #[test]
-fn bincode2_legacy_matches_bincode1_bytes() {
+fn serde_wincode_matches_bincode1_bytes() {
     let expected = decode_hex(GOLDEN_BYTES);
-    let mut out = Vec::new();
-    bincode::serde::encode_into_std_write(fixture(), &mut out, wire_config())
-        .expect("encode failed");
+    let out = <serde_wincode::SerdeCompat<Vec<ListenerInfo>> as wincode::Serialize>::serialize(
+        &fixture(),
+    )
+    .expect("encode failed");
     assert_eq!(
         out,
         expected,
-        "\nbincode 2.0.1 config::legacy() is NOT wire-compatible with bincode 1.3.3\n  got: {}\n  exp: {}",
+        "\nserde-wincode/wincode is NOT wire-compatible with bincode 1.3.3\n  got: {}\n  exp: {}",
         out.iter().map(|b| format!("{:02x}", b)).collect::<String>(),
         GOLDEN_BYTES,
     );
     assert_eq!(out.len(), 118);
 }
 
-/// Round trip through the 1.x bytes: bincode 2.x must decode the fixture bincode 1.3.3 wrote
-/// (this is the parent-1.x -> child-2.x upgrade direction).
+/// Round trip through the 1.x bytes: the new codec must decode the fixture bincode 1.3.3
+/// wrote (this is the parent-1.x -> child-new-codec upgrade direction).
 #[test]
-fn bincode2_decodes_bincode1_bytes() {
+fn wincode_decodes_bincode1_bytes() {
     let bytes = decode_hex(GOLDEN_BYTES);
-    let mut rd: &[u8] = &bytes;
-    let decoded: Vec<ListenerInfo> =
-        bincode::serde::decode_from_std_read(&mut rd, wire_config()).expect("decode failed");
+    let decoded =
+        <serde_wincode::SerdeCompat<Vec<ListenerInfo>> as wincode::Deserialize>::deserialize(
+            &bytes,
+        )
+        .expect("decode failed");
     assert_eq!(decoded, fixture());
 }
 
 /// And the exact helpers ecdysis uses (`compat::serialize_into` / `deserialize_from`), i.e.
-/// the functions actually on the upgrade path, not just the raw bincode calls.
+/// the functions actually on the upgrade path, not just the raw codec calls.
 #[test]
 fn compat_helpers_are_wire_identical() {
     let expected = decode_hex(GOLDEN_BYTES);

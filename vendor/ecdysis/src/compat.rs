@@ -5,43 +5,45 @@
 //! against the dependency versions caddy-rs requires for its audit gate:
 //!
 //!   * `nix` 0.26 -> 0.31.3: `fcntl()` now takes `Fd: AsFd` instead of `RawFd`.
-//!   * `bincode` 1.3.3 -> 2.0.1: `serialize_into` / `deserialize_from` / `bincode::Error`
-//!     were removed in favour of the `Encode`/`Decode` traits and an explicit `Config`.
+//!   * `bincode` 1.3.3 -> `serde-wincode` 0.1.2 + `wincode` 0.6.3 (T-OPS-106c): bincode is
+//!     BANNED from this repository -- RUSTSEC-2025-0141 has `patched = []`, so no bincode
+//!     version can ever satisfy the audit gate. `serde_wincode::SerdeCompat` drives serde's
+//!     own `Serialize`/`Deserialize` impls through wincode's arena-free `SchemaWrite`/
+//!     `SchemaRead`, which defaults to bincode 1.x's wire rules.
 //!
-//! NO behaviour is changed here. The wire format is bincode 1.x's exactly: the
-//! `bincode::config::legacy()` configuration is LittleEndian + Fixint + NoLimit, which is
-//! precisely the bincode 1.3.3 default. That equality is MEASURED, not assumed, by
-//! `tests/golden_wire.rs`, which decodes a fixture produced by real bincode 1.3.3.
+//! NO behaviour is changed here. The wire format is bincode 1.x's exactly: wincode's default
+//! configuration is LittleEndian + Fixint + u64 (BincodeLen) length prefixes + u32 variant
+//! tags + NoLimit, which is precisely the bincode 1.3.3 default. That equality is MEASURED,
+//! not assumed, by `tests/golden_wire.rs`, which compares against a fixture produced by real
+//! bincode 1.3.3 (118 bytes).
 //!
-//! Delete this module when upstream ecdysis ships nix >= 0.31 and bincode 2.x.
+//! Delete this module when upstream ecdysis ships nix >= 0.31 and a bincode-compatible
+//! codec that is not bincode.
 
 use std::{
     io::{Read, Write},
     os::fd::{BorrowedFd, RawFd},
 };
 
-use bincode::config;
-
-/// The bincode 1.x wire configuration, spelled out for bincode 2.x.
+/// The bincode 1.x wire configuration, spelled out for wincode.
 ///
-/// `legacy()` is LittleEndian + Fixint + NoLimit (bincode-2.0.1/src/config.rs:62) and is
-/// documented upstream as "the default config that was present in bincode 1.0".
-#[inline]
-pub fn wire_config() -> config::Configuration<config::LittleEndian, config::Fixint, config::NoLimit>
-{
-    config::legacy()
-}
+/// `wincode::config::Configuration`'s defaults are, per wincode 0.6.3
+/// (`config/mod.rs:45`): `BincodeLen` length prefix (u64 little-endian), `LittleEndian`
+/// byte order, `FixInt` integer encoding, `u32` enum tags. That is exactly the bincode 1.3.3
+/// default (`LittleEndian` + `Fixint` + `NoLimit`), so no non-default knobs are needed.
+pub type WireConfig = wincode::config::Configuration;
 
-/// The bincode 2.x successor of `bincode::Error`.
+/// The wincode successor of `bincode::Error`.
 ///
-/// bincode 1.x had a single boxed error type. bincode 2.x splits encoding and decoding
-/// failures into `EncodeError` and `DecodeError`; both are `std::error::Error`, so this
-/// small enum restores the single error type the ecdysis error enums (`UpgradeError`,
-/// `InheritError`) are declared with. It exists only so those enums need no change.
+/// bincode 1.x had a single boxed error type. wincode splits encoding and decoding failures
+/// into `WriteError` and `ReadError` (`serde-wincode` maps its own `ser::Error`/`de::Error`
+/// into them via `From`); both are `std::error::Error`, so this small enum restores the single
+/// error type the ecdysis error enums (`UpgradeError`, `InheritError`) are declared with. It
+/// exists only so those enums need no change.
 #[derive(Debug)]
 pub enum Error {
-    Encode(bincode::error::EncodeError),
-    Decode(bincode::error::DecodeError),
+    Encode(wincode::WriteError),
+    Decode(wincode::ReadError),
 }
 
 impl std::fmt::Display for Error {
@@ -55,34 +57,43 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-impl From<bincode::error::EncodeError> for Error {
-    fn from(e: bincode::error::EncodeError) -> Self {
+impl From<wincode::WriteError> for Error {
+    fn from(e: wincode::WriteError) -> Self {
         Error::Encode(e)
     }
 }
 
-impl From<bincode::error::DecodeError> for Error {
-    fn from(e: bincode::error::DecodeError) -> Self {
+impl From<wincode::ReadError> for Error {
+    fn from(e: wincode::ReadError) -> Self {
         Error::Decode(e)
     }
 }
 
-/// 1.x `bincode::serialize_into(writer, value)` -> 2.x `encode_into_std_write`.
+/// 1.x `bincode::serialize_into(writer, value)`.
+///
+/// `serde_wincode::SerdeCompat<T>` is `SchemaWrite` for every `T: serde::Serialize`, so the
+/// serde-derived impls of `ListenerInfo` are the ones on the wire -- byte-for-byte what
+/// bincode 1.x wrote. `wincode::Serializer::new` then writes straight into the caller's
+/// `std::io::Write` sink (the upgrade pipe), with no intermediate copy.
 #[inline]
 pub fn serialize_into<W: Write, T: serde::Serialize>(writer: W, value: &T) -> Result<(), Error> {
-    let mut writer = writer;
-    bincode::serde::encode_into_std_write(value, &mut writer, wire_config())?;
+    let adapter = wincode::io::std_write::WriteAdapter::new(writer);
+    let serializer = serde_wincode::Serializer::<_, WireConfig>::new(adapter);
+    value
+        .serialize(serializer)
+        .map_err(|e| Error::Encode(wincode::WriteError::from(e)))?;
     Ok(())
 }
 
-/// 1.x `bincode::deserialize_from(reader)` -> 2.x `decode_from_std_read`.
+/// 1.x `bincode::deserialize_from(reader)`.
+///
+/// The reader is wrapped in `wincode::io::ReadAdapter` so any `std::io::Read` (the inherited
+/// upgrade pipe) can back the deserializer.
 #[inline]
 pub fn deserialize_from<R: Read, T: serde::de::DeserializeOwned>(reader: R) -> Result<T, Error> {
-    let mut reader = reader;
-    Ok(bincode::serde::decode_from_std_read(
-        &mut reader,
-        wire_config(),
-    )?)
+    let adapter = wincode::io::std_read::ReadAdapter::new(reader);
+    let deserializer = serde_wincode::Deserializer::<_, WireConfig>::new(adapter);
+    T::deserialize(deserializer).map_err(|e| Error::Decode(wincode::ReadError::from(e)))
 }
 
 /// nix 0.26 `fcntl(RawFd, _)` -> nix 0.31 `fcntl(impl AsFd, _)`.
