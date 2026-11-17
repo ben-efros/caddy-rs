@@ -10,15 +10,18 @@
 //!
 //! Every `unsafe` block below is annotated with its invariant.
 //!
-//! # Testing note: not every plausible mutant is a valid one
+//! # Testing note: a mutant must change the VALUE, not just the spelling
 //!
-//! When mutation-testing this module, changing `cmsg_type` from `SCM_RIGHTS` to some other value
-//! does NOT break the descriptor transfer and is therefore a **bad mutant**, not a weak test: the
-//! kernel rewrites the received `cmsg_type` to `SCM_RIGHTS` whenever a descriptor is actually
-//! attached, so a receiver observes `SCM_RIGHTS` either way (verified: setting `cmsg_type` to
-//! `SOL_SOCKET` still delivered the descriptor, and the receiver read `cmsg_type == 1`). To test
-//! the transfer, break something the kernel cannot repair — e.g. set `cmsg_len` to
-//! `CMSG_LEN(0)`, which genuinely carries zero descriptors and makes both upload tests fail.
+//! On Linux `SOL_SOCKET` and `SCM_RIGHTS` are the **same integer, both 1** (verified by compiling a
+//! probe against the pinned libc, which printed `SOL_SOCKET=1 SCM_RIGHTS=1`; also
+//! `/usr/include/asm-generic/socket.h:9` defines `SOL_SOCKET 1`). Rewriting `cmsg_type` from
+//! `SCM_RIGHTS` to `SOL_SOCKET` therefore emits an **identical bit pattern** and is not a mutation
+//! at all — the tests keep passing because the code still sends `SCM_RIGHTS`, not because anything
+//! repaired it. Do not read that survival as a coverage gap, and do not conclude that the kernel
+//! rewrites `cmsg_type`; it does not.
+//!
+//! To test the transfer, break a value the kernel cannot compensate for: set `cmsg_len` to
+//! `CMSG_LEN(0)`, which genuinely carries zero descriptors and makes **both** upload tests fail.
 //!
 //! # Why this lives in `crates/server` and not `crates/core`
 //!
