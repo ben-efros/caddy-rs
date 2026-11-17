@@ -773,6 +773,9 @@ fn bind_udp_socket_addr(
             .set_nonblocking(true)
             .map_err(|error| Error::bind(configured, error))?;
         let std_socket: std::net::UdpSocket = socket.into();
+        // The dissector belongs to the reuseport group created by `bind` above, so it is selected
+        // before registration and before any flow can arrive.
+        select_udpgrm_dissector(&std_socket, configured);
         // Register with udpgrm after bind, because its hooks only act on a bound socket inside a
         // reuseport group. Registration and promotion are separate steps (ADR-0045 §2): the socket
         // joins the new generation here, but new flows keep reaching the old generation until the
@@ -790,6 +793,45 @@ fn bind_udp_socket_addr(
             .set_nonblocking(true)
             .map_err(|error| Error::bind(configured, error))?;
         UdpSocket::from_std(socket).map_err(|error| Error::bind(configured, error))
+    }
+}
+
+/// Select the udpgrm flow dissector for the reuseport group this socket just joined.
+///
+/// Called once per socket, immediately after `bind` created (or joined) the group and **before**
+/// registration, because the dissector is a property of the group rather than of the generation:
+/// udpgrm records it when the group is created and answers any later change with `EPERM` (ADR-0045
+/// §3, §4). Setting it here rather than per request is what turns a conflicting group into one
+/// located startup message instead of a stream of failures under load.
+///
+/// A failure **degrades rather than aborts**, for the same reason the presence probe does: on a host
+/// without udpgrm the option does not exist (`ENOPROTOOPT`), which means "graceful UDP restart is
+/// unavailable", not "refuse to serve UDP". The conflict case is reported distinctly so an operator
+/// can tell a genuine dissector mismatch from a missing daemon.
+#[cfg(all(feature = "http3", feature = "udpgrm"))]
+fn select_udpgrm_dissector(socket: &std::net::UdpSocket, configured: &str) {
+    use crate::udpgrm_dissector::{select_dissector, Dissector, DissectorError};
+
+    // DISSECTOR_FLOW is the initial choice (ADR-0045 §4). Its concurrent-flow cap is published in
+    // the operator docs; DISSECTOR_NOOP remains available for stateless UDP use but is not selected
+    // by default because it gives up flow stickiness entirely.
+    match select_dissector(socket, Dissector::Flow) {
+        Ok(()) => {}
+        Err(DissectorError::Conflict { .. }) => tracing::warn!(
+            listen = configured,
+            dissector = Dissector::Flow.as_str(),
+            max_concurrent_flows = Dissector::Flow.max_concurrent_flows().unwrap_or(0),
+            "udpgrm already has a different flow dissector for this reuseport group; the              configured dissector was not applied and new flows may not stay sticky across a              restart. The dissector is fixed for the lifetime of the group"
+        ),
+        Err(DissectorError::Io(error)) if error.raw_os_error() == Some(libc::ENOPROTOOPT) => {
+            // No daemon: identical to the presence probe's outcome. Already reported once, loudly,
+            // by the generation probe, so this stays quiet rather than repeating it per socket.
+        }
+        Err(DissectorError::Io(error)) => tracing::warn!(
+            listen = configured,
+            %error,
+            "udpgrm flow dissector could not be selected; flow stickiness across a restart is not              guaranteed for this listener"
+        ),
     }
 }
 
@@ -832,7 +874,11 @@ fn wildcard_dual_stack_udp(port: u16) -> io::Result<UdpSocket> {
     socket.set_nonblocking(true)?;
     let std_socket: std::net::UdpSocket = socket.into();
     #[cfg(feature = "udpgrm")]
-    defer_udpgrm_promotion(&std_socket, &format!("udp/:{port}"));
+    {
+        let configured = format!("udp/:{port}");
+        select_udpgrm_dissector(&std_socket, &configured);
+        defer_udpgrm_promotion(&std_socket, &configured);
+    }
     UdpSocket::from_std(std_socket)
 }
 
