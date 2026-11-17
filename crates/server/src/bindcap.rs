@@ -363,6 +363,26 @@ fn note_capability_operation() {
     CAPABILITY_OPERATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Count of times the retry seam was **entered** on THIS thread, regardless of whether it acted.
+///
+/// Thread-local rather than global, because the assertion it serves ("a successful bind does not even
+/// consult the seam") would otherwise race: any other test binding a port in parallel enters the seam
+/// on its own thread and moves a shared counter, failing an assertion about this test's binds. The
+/// first version of the counter was global and failed exactly that way in a full parallel run
+/// (`left: 11`) while passing when run alone -- a flaky test is worse than no test.
+thread_local! {
+    static SEAM_ENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times the bind-retry seam has been entered **on the calling thread**.
+pub fn seam_entries() -> usize {
+    SEAM_ENTRIES.with(std::cell::Cell::get)
+}
+
+fn note_seam_entry() {
+    SEAM_ENTRIES.with(|entries| entries.set(entries.get() + 1));
+}
+
 /// Count of times the retry seam was **entered**, regardless of whether it then acted.
 ///
 /// The operations counter above only moves once a capability syscall happens, so a success-path
@@ -371,12 +391,6 @@ fn note_capability_operation() {
 /// returns before raising). That made the "attempt first" criterion unprovable: a mutant that
 /// entered the seam on success survived. This counter closes the hole by recording the entry itself,
 /// so the test asserts the capability path was not even *consulted*.
-static SEAM_ENTRIES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// How many times the bind-retry seam has been entered in this process.
-pub fn seam_entries() -> usize {
-    SEAM_ENTRIES.load(std::sync::atomic::Ordering::Relaxed)
-}
 
 /// The lowering guard: clears `CAP_NET_BIND_SERVICE` from the effective set **when dropped**.
 ///
@@ -454,7 +468,7 @@ where
     T: Send + 'static,
     F: FnOnce() -> std::result::Result<T, std::io::Error> + Send + 'static,
 {
-    SEAM_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    note_seam_entry();
     // Step 2: only EACCES on a TCP/UDP nonzero-port address may touch capabilities.
     if first_error.kind() != std::io::ErrorKind::PermissionDenied || !is_port_bind(address) {
         return Err(first_error);

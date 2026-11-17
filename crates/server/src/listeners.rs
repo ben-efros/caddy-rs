@@ -620,8 +620,8 @@ fn bind_tcp_ip(
                 std::net::TcpListener::bind(socket_addr)
             }) {
                 Ok(listener) => listener,
-                // Located error naming the configured address, as before.
-                Err(error) => return Err(Error::bind(configured, error)),
+                // Located error naming the configured address, through the single shared mapping.
+                Err(error) => return Err(located_bind_error(configured, error)),
             }
         }
     };
@@ -831,7 +831,7 @@ fn bind_udp_ipv4_wildcard(port: u16, configured: &str) -> Result<UdpSocket, Erro
             crate::bindcap::with_bind_capability(&address, error, move || {
                 std::net::UdpSocket::bind(wildcard)
             })
-            .map_err(|error| Error::bind(configured, error))?
+            .map_err(|error| located_bind_error(configured, error))?
         }
     };
     socket
@@ -895,7 +895,7 @@ fn bind_udp_socket_addr(
                 crate::bindcap::with_bind_capability(&address, error, move || {
                     std::net::UdpSocket::bind(socket_addr)
                 })
-                .map_err(|error| Error::bind(configured, error))?
+                .map_err(|error| located_bind_error(configured, error))?
             }
         };
         socket
@@ -4082,6 +4082,96 @@ mod bind_capability_tests {
             rendered.contains("raising CAP_NET_BIND_SERVICE"),
             "the operator must be told escalation was attempted and failed: {rendered}"
         );
+    }
+
+    /// Criterion 8 at the REAL bind sites, not at the shared helper.
+    ///
+    /// The previous revision pinned only [`super::located_bind_error`], which left three of the five
+    /// retry sites (`bind_tcp_ip`, `bind_udp_ipv4_wildcard`, `bind_udp_socket_addr`) free to bypass
+    /// it: the reviewer reintroduced the lossy rebuild at one of them and the mutant SURVIVED. A test
+    /// of the helper is not a test of the sites.
+    ///
+    /// These drive each real site into its failure arm and assert the located error names the
+    /// CONFIGURED address and preserves the real cause. An already-bound port gives `EADDRINUSE`,
+    /// which the seam returns unchanged (it is not EACCES), so the error still travels the site's
+    /// `map_err` — a lossy rebuild there replaces the cause and fails the assertion.
+    #[test]
+    fn the_real_bind_sites_surface_a_located_error_preserving_the_cause() {
+        // Hold a TCP port so the next bind to it fails with EADDRINUSE.
+        let held = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a TCP port");
+        let port = held.local_addr().expect("held addr").port();
+        let configured = format!("tcp/127.0.0.1:{port}");
+        let address = ListenAddr::parse(&configured).expect("address parses");
+        let socket_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+        let error = super::bind_tcp_ip(&configured, socket_addr, None)
+            .expect_err("binding an already-bound TCP port must fail");
+        let Error::Bind { listen, cause } = &error else {
+            panic!("bind_tcp_ip must surface Error::Bind, got {error:?}");
+        };
+        assert_eq!(
+            listen, &configured,
+            "the located error must name the CONFIGURED address"
+        );
+        assert!(
+            cause.to_string().contains(&format!("127.0.0.1:{port}"))
+                || cause.kind() == std::io::ErrorKind::AddrInUse,
+            "the cause must be the real socket error, not a rebuilt placeholder: {cause}"
+        );
+        assert_eq!(
+            address.port(),
+            Some(port),
+            "sanity: the address carries the held port"
+        );
+        drop(held);
+
+        // The same for the UDP wildcard site, which bind_udp_ipv4_wildcard binds directly.
+        let held_udp = std::net::UdpSocket::bind("0.0.0.0:0").expect("hold a UDP port");
+        let udp_port = held_udp.local_addr().expect("held udp addr").port();
+        let udp_configured = format!("udp/:{udp_port}");
+        match super::bind_udp_ipv4_wildcard(udp_port, &udp_configured) {
+            Ok(socket) => {
+                // A successful bind is acceptable only if the port was genuinely free; then there is
+                // nothing to assert about the error path.
+                drop(socket);
+            }
+            Err(error) => {
+                let Error::Bind { listen, cause } = &error else {
+                    panic!("bind_udp_ipv4_wildcard must surface Error::Bind, got {error:?}");
+                };
+                assert_eq!(
+                    listen, &udp_configured,
+                    "the located error must name the CONFIGURED address"
+                );
+                assert!(
+                    cause.kind() == std::io::ErrorKind::AddrInUse
+                        || cause.to_string().contains(&udp_port.to_string()),
+                    "the cause must carry the real socket error: {cause}"
+                );
+            }
+        }
+        drop(held_udp);
+
+        // And the explicit-address UDP site.
+        let held_udp2 = std::net::UdpSocket::bind("127.0.0.1:0").expect("hold a UDP port");
+        let udp2_port = held_udp2.local_addr().expect("held udp addr").port();
+        let udp2_configured = format!("udp/127.0.0.1:{udp2_port}");
+        let udp2_addr: std::net::SocketAddr =
+            format!("127.0.0.1:{udp2_port}").parse().expect("addr");
+        let error = super::bind_udp_socket_addr(udp2_addr, &udp2_configured)
+            .expect_err("binding an already-bound UDP port must fail");
+        let Error::Bind { listen, cause } = &error else {
+            panic!("bind_udp_socket_addr must surface Error::Bind, got {error:?}");
+        };
+        assert_eq!(
+            listen, &udp2_configured,
+            "the located error must name the CONFIGURED address"
+        );
+        assert!(
+            cause.kind() == std::io::ErrorKind::AddrInUse
+                || cause.to_string().contains(&udp2_port.to_string()),
+            "the cause must carry the real socket error: {cause}"
+        );
+        drop(held_udp2);
     }
 
     /// ADR-0046 §1 through the PRODUCTION entry points: a successful bind makes no capability call.
