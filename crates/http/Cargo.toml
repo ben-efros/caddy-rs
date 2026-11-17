@@ -51,6 +51,7 @@ tokio-rustls = { version = "0.26.6", default-features = false, features = [
     "aws_lc_rs", "tls12", "logging",
 ] }
 zstd = { version = "0.14", optional = true }
+maxminddb = "0.33.0"
 
 [dev-dependencies]
 caddy-rs-config = { workspace = true }

@@ -96,6 +96,11 @@ pub struct GlobalOptions {
     /// carries the configuration only; polling, matchers and handlers are runtime work
     /// (T-ROUTE-059/T-ROUTE-060).
     pub radar: Option<RadarOptions>,
+    /// caddy-rs extension: the global `geoip <provider> <path>` option (ADR-0020, DIV-0161,
+    /// T-ROUTE-062). Repeatable: one line per database, because ASN and country live in separate
+    /// `.mmdb` files. The adapter carries the configuration only; opening the databases and
+    /// selecting the provider is runtime work.
+    pub geoip: Vec<GeoIpOptions>,
     /// caddy-rs extension: the global `trust_cdn [<provider>] { ... }` option (ADR-013,
     /// T-CONF-079). The adapter carries the configuration only; resolving a profile into
     /// `trusted_proxies` is runtime work.
@@ -122,6 +127,42 @@ pub struct Layer4Options {
 
 /// caddy-rs extension: the global `radar { ... }` option (ADR-0020, T-CONF-079).
 ///
+/// One `geoip <provider> <path>` global option (ADR-0020, DIV-0161, T-ROUTE-062).
+///
+/// The option is repeatable because ASN and country records live in **different** database files:
+/// a deployment that wants both writes two lines, one for the ASN database and one for the country
+/// database. Supplying only one is valid and leaves the other attribute permanently unknown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeoIpOptions {
+    /// `dbip` or `maxmind` — which product the path names. Affects only how the database is
+    /// obtained and logged; both use the same MaxMind DB format.
+    pub provider: GeoIpProviderKind,
+    /// Path to the `.mmdb` file, as written (not resolved against the Caddyfile's directory, so
+    /// the emitted JSON is byte-identical to the input).
+    pub path: String,
+    /// Where the option appeared, for located errors.
+    pub position: Position,
+}
+
+/// The `geoip` provider word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeoIpProviderKind {
+    /// DB-IP free tier: no license key required. The default product per ADR-0020.
+    DbIp,
+    /// MaxMind `GeoLite2`/`GeoIP2`: opt-in, because downloads need a license key.
+    MaxMind,
+}
+
+impl GeoIpProviderKind {
+    /// The provider word as written in configuration.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DbIp => "dbip",
+            Self::MaxMind => "maxmind",
+        }
+    }
+}
+
 /// Every field carries the ADR-0020 defaults, so `radar {}` adapts to the documented default
 /// configuration. There is deliberately no `enabled` flag: `mode` replaces it (ADR-0020 §1).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2373,6 +2414,7 @@ fn read_global_options(directives: Vec<Directive>) -> Result<GlobalOptions, Pars
     let mut stock_compat_seen = false;
     // caddy-rs extensions rejected when `stock_compat true` is active (T-CONF-079).
     let mut radar_position: Option<Position> = None;
+    let mut geoip_positions: Vec<Position> = Vec::new();
     let mut trust_cdn_position: Option<Position> = None;
     for directive in directives {
         match directive.name.as_str() {
@@ -2631,6 +2673,12 @@ fn read_global_options(directives: Vec<Directive>) -> Result<GlobalOptions, Pars
                 trust_cdn_position = Some(directive.position.clone());
                 options.trust_cdn = Some(parse_trust_cdn_option(&directive)?);
             }
+            "geoip" => {
+                // caddy-rs extension (ADR-0020, DIV-0161, T-ROUTE-062). Repeatable: one line per
+                // database, because ASN and country live in separate files.
+                geoip_positions.push(directive.position.clone());
+                options.geoip.push(parse_geoip_option(&directive)?);
+            }
             "layer4" => {
                 // `caddy-l4` global option (ADR-030, T-L4-004): parsed verbatim, validated by
                 // `crate::layer4` during adaptation. An empty block configures nothing, so it is
@@ -2672,6 +2720,13 @@ fn read_global_options(directives: Vec<Directive>) -> Result<GlobalOptions, Pars
             return Err(ParseError::unsupported(
                 position,
                 "global option `trust_cdn` (caddy-rs extension, not in Caddy v2.11.9)",
+                None,
+            ));
+        }
+        if let Some(position) = geoip_positions.first().cloned() {
+            return Err(ParseError::unsupported(
+                position,
+                "global option `geoip` (caddy-rs extension, not in Caddy v2.11.9)",
                 None,
             ));
         }
@@ -2955,6 +3010,52 @@ fn list_arguments(directive: &Directive) -> Vec<String> {
 }
 
 /// Parse the global `radar { ... }` option (caddy-rs extension, ADR-0020, T-CONF-079).
+/// Parse `geoip <provider> <path>`.
+///
+/// Exactly two arguments and no block: the provider word selects the product and the path names
+/// the database file. An unknown provider is a located error listing the accepted words, rather
+/// than being passed through, because a typo would otherwise become a database that silently never
+/// resolves anything.
+fn parse_geoip_option(directive: &Directive) -> Result<GeoIpOptions, ParseError> {
+    // NOTE: a written-but-empty block cannot be distinguished from no block at all: `Directive`
+    // carries only `block: Vec<Directive>`, so `geoip dbip /path { }` and `geoip dbip /path` are
+    // the same value here. The adapter therefore accepts both and emits identical JSON, which is
+    // the same way the other global options behave. A *non-empty* block is still caught, because
+    // its directives would have to appear as arguments and fail the count check below.
+    let args = &directive.args;
+    if args.len() != 2 {
+        return Err(ParseError::syntax(
+            directive.position.clone(),
+            format!(
+                "global option `geoip` takes exactly two arguments, `<provider> <path>`, got {}",
+                args.len()
+            ),
+        ));
+    }
+    let provider = match args[0].as_str() {
+        "dbip" => GeoIpProviderKind::DbIp,
+        "maxmind" => GeoIpProviderKind::MaxMind,
+        other => {
+            return Err(ParseError::syntax(
+                directive.position.clone(),
+                format!("geoip provider must be 'dbip' or 'maxmind', got '{other}'"),
+            ))
+        }
+    };
+    let path = args[1].clone();
+    if path.is_empty() {
+        return Err(ParseError::syntax(
+            directive.position.clone(),
+            "geoip database path must not be empty",
+        ));
+    }
+    Ok(GeoIpOptions {
+        provider,
+        path,
+        position: directive.position.clone(),
+    })
+}
+
 fn parse_radar_option(directive: &Directive) -> Result<RadarOptions, ParseError> {
     if !directive.args.is_empty() {
         return Err(ParseError::syntax(

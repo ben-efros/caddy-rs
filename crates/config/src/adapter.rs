@@ -1653,6 +1653,11 @@ pub fn adapt_with_options(
         // into `trusted_proxies` is runtime work.
         config.insert("trust_cdn".to_string(), trust_cdn_json(trust_cdn));
     }
+    if !options.geoip.is_empty() {
+        // caddy-rs extension (ADR-0020, DIV-0161, T-ROUTE-062). An array, because ASN and country
+        // live in separate database files and the option is therefore repeatable.
+        config.insert("geoip".to_string(), geoip_json(&options.geoip));
+    }
     if options.admin.is_some() || options.persist_config_off {
         let mut admin_object = Map::new();
         let admin = options.admin.clone().unwrap_or_default();
@@ -10223,6 +10228,25 @@ fn parse_error(error: parser::ParseError) -> CoreError {
 /// unset (`api_token`, storage `path`/`redis_url`/`key_prefix`, and empty `filters` entries) — the
 /// same omit-when-unset convention as the other caddy-rs extension options. There is no `enabled`
 /// key: `mode` replaces it.
+/// Render the `geoip` global option as a JSON array of `{provider, path}` objects.
+///
+/// The order is the order the operator wrote the lines in, so a round trip preserves it. Paths are
+/// emitted verbatim: resolving them against the Caddyfile directory would make the JSON depend on
+/// where the file happened to live.
+fn geoip_json(entries: &[parser::GeoIpOptions]) -> Value {
+    Value::Array(
+        entries
+            .iter()
+            .map(|entry| {
+                let mut object = Map::new();
+                object.insert("provider".to_string(), json!(entry.provider.as_str()));
+                object.insert("path".to_string(), json!(entry.path));
+                Value::Object(object)
+            })
+            .collect(),
+    )
+}
+
 fn radar_json(radar: &parser::RadarOptions) -> Value {
     let mut object = Map::new();
     object.insert("mode".to_string(), json!(radar.mode.as_str()));

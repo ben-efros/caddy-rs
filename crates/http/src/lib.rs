@@ -14,6 +14,7 @@ pub mod csp;
 pub mod encode;
 mod expression;
 pub mod file_server;
+pub mod geoip;
 pub mod handlers;
 pub mod matchers;
 pub mod placeholders;
