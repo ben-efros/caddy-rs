@@ -177,8 +177,12 @@ fn listener_without_routing_gets_the_implicit_close_route() {
 #[test]
 fn unsupported_layer4_input_is_a_located_error() {
     let cases = [
+        // UDP listeners were the first case here while they were unimplemented. T-L4-011
+        // implements all three UDP spellings, so this now pins a matcher that is still genuinely
+        // unsupported: the case keeps its purpose (an unsupported feature must be located AND
+        // carry its tracking id) without asserting behaviour that no longer exists.
         (
-            "{\n\tlayer4 {\n\t\tudp/0.0.0.0:443 {\n\t\t\tclose\n\t\t}\n\t}\n}\n",
+            "{\n\tlayer4 {\n\t\t0.0.0.0:443 {\n\t\t\t@p postgres\n\t\t\troute @p {\n\t\t\t\tclose\n\t\t\t}\n\t\t}\n\t}\n}\n",
             "T-L4-011",
         ),
         (

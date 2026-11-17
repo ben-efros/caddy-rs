@@ -41,7 +41,23 @@ use crate::parser::{Directive, Layer4Options};
 
 /// Handler directives supported by the TCP subset (`close`, `http`, `tls`, `proxy_protocol`,
 /// `proxy`).
-const HANDLERS: &[&str] = &["tls", "proxy_protocol", "proxy", "http", "close"];
+const HANDLERS: &[&str] = &[
+    "tls",
+    "proxy_protocol",
+    "proxy",
+    "http",
+    "close",
+    "throttle",
+];
+
+/// The `client_auth` modes `caddy-l4` accepts, in its own spelling.
+const CLIENT_AUTH_MODES: &[&str] = &[
+    "require_and_verify",
+    "require",
+    "request",
+    "verify_if_given",
+    "request_and_verify",
+];
 
 /// Convert the global `layer4 { ... }` option to Caddy's `apps.layer4` JSON.
 ///
@@ -399,6 +415,7 @@ fn handler_json(directive: &Directive) -> Result<Value> {
         "tls" => tls_handler_json(directive),
         "proxy_protocol" => proxy_protocol_handler_json(directive),
         "proxy" => proxy_handler_json(directive),
+        "throttle" => throttle_handler_json(directive),
         other => Err(unknown("handler", other, &directive.position)),
     }
 }
@@ -411,10 +428,7 @@ fn handler_json(directive: &Directive) -> Result<Value> {
 /// dropped option.
 fn tls_handler_json(directive: &Directive) -> Result<Value> {
     if !directive.block.is_empty() {
-        return Err(unsupported(
-            directive.position.clone(),
-            "layer4: inline `tls { ... }` options",
-        ));
+        return tls_handler_block_json(directive);
     }
     if directive.args.is_empty() {
         return Ok(json!({ "handler": "tls" }));
@@ -467,6 +481,117 @@ fn tls_handler_json(directive: &Directive) -> Result<Value> {
     Ok(json!({ "handler": "tls", "client_auth": Value::Object(client_auth) }))
 }
 
+/// `tls { client_auth { ... } }` -> `{"handler": "tls", "client_auth": {...}}`.
+///
+/// This is the block form ADR-031's configuration example uses, and it is the only way to express
+/// `client_auth` as an object rather than the one-line `tls client_auth <ca>...` shorthand. The
+/// emitted shape is `client_auth.mode` plus `client_auth.trusted_ca_cert_file`, matching the
+/// `apps.layer4` JSON in ADR-031 §"JSON (`apps.layer4`)".
+///
+/// Accepted sub-options:
+/// * `client_auth { mode <mode>; trusted_ca_cert_file <path>... }` — `mode` defaults to
+///   `require_and_verify` when omitted, which is what the shorthand form also defaults to, so the
+///   two spellings of the same intent agree.
+///
+/// Anything else is a located error naming the sub-option, never a silently dropped key: an
+/// unknown `tls` option that loaded quietly would leave an operator believing a handshake
+/// constraint was applied when it was not.
+fn tls_handler_block_json(directive: &Directive) -> Result<Value> {
+    if !directive.args.is_empty() {
+        return Err(error(
+            directive.position.clone(),
+            format!(
+                "layer4: `tls` handler takes either arguments or a block, not both (got `{}`)",
+                directive.args.join(" ")
+            ),
+        ));
+    }
+    let mut handler = Map::new();
+    handler.insert("handler".to_string(), json!("tls"));
+    for inner in &directive.block {
+        match inner.name.as_str() {
+            "client_auth" => {
+                handler.insert("client_auth".to_string(), tls_client_auth_json(inner)?);
+            }
+            other => {
+                return Err(unknown("`tls` handler option", other, &inner.position));
+            }
+        }
+    }
+    Ok(Value::Object(handler))
+}
+
+/// The `client_auth { ... }` sub-block of the `tls` handler.
+///
+/// `mode` accepts the `caddy-l4` mode names (`require_and_verify`, `require`, `request`, `verify_if_given`,
+/// `request_and_verify`); an unrecognised mode is a located error rather than being passed through,
+/// because a typo in a security-relevant mode must not reach the runtime.
+fn tls_client_auth_json(directive: &Directive) -> Result<Value> {
+    if !directive.args.is_empty() {
+        return Err(error(
+            directive.position.clone(),
+            format!(
+                "layer4: `client_auth` takes a block, not arguments (got `{}`)",
+                directive.args.join(" ")
+            ),
+        ));
+    }
+    let mut client_auth = Map::new();
+    let mut mode: Option<String> = None;
+    let mut cas: Vec<Value> = Vec::new();
+    for inner in &directive.block {
+        match inner.name.as_str() {
+            "mode" => {
+                let Some(value) = inner.args.first() else {
+                    return Err(error(
+                        inner.position.clone(),
+                        "layer4: `client_auth mode` needs a value",
+                    ));
+                };
+                if inner.args.len() > 1 {
+                    return Err(error(
+                        inner.position.clone(),
+                        format!(
+                            "layer4: `client_auth mode` takes exactly one value, got `{}`",
+                            inner.args.join(" ")
+                        ),
+                    ));
+                }
+                if !CLIENT_AUTH_MODES.contains(&value.as_str()) {
+                    return Err(error(
+                        inner.position.clone(),
+                        format!(
+                            "layer4: `client_auth mode` `{value}` is not one of {}",
+                            CLIENT_AUTH_MODES.join(", ")
+                        ),
+                    ));
+                }
+                mode = Some(value.clone());
+            }
+            "trusted_ca_cert_file" => {
+                if inner.args.is_empty() {
+                    return Err(error(
+                        inner.position.clone(),
+                        "layer4: `client_auth trusted_ca_cert_file` needs at least one path",
+                    ));
+                }
+                cas.extend(inner.args.iter().map(|ca| json!(ca)));
+            }
+            other => {
+                return Err(unknown("`client_auth` option", other, &inner.position));
+            }
+        }
+    }
+    client_auth.insert(
+        "mode".to_string(),
+        json!(mode.unwrap_or_else(|| "require_and_verify".to_string())),
+    );
+    if !cas.is_empty() {
+        client_auth.insert("trusted_ca_cert_file".to_string(), Value::Array(cas));
+    }
+    Ok(Value::Object(client_auth))
+}
+
 /// `proxy_protocol [v1|v2]` -> `{"handler": "proxy_protocol", "version": "v2"}`.
 ///
 /// The default is `v1`, which the plugin omits: `proxy_protocol` and `proxy_protocol v1` both
@@ -491,6 +616,125 @@ fn proxy_protocol_handler_json(directive: &Directive) -> Result<Value> {
             "layer4: `proxy_protocol` takes at most one argument (`v1` or `v2`)",
         )),
     }
+}
+
+/// `throttle { upstream <rate>; downstream <rate> }` -> `{"handler": "throttle", ...}`.
+///
+/// The emitted keys are exactly the field names of the runtime `RateLimit` handler in
+/// `crates/l4/src/handlers/throttle.rs` (`upstream_bytes_per_second`,
+/// `downstream_bytes_per_second`), so the adapted JSON decodes into that struct without a
+/// translation layer.
+///
+/// Rates are bytes per second. A bare number is taken as bytes per second; an `SI`/`IEC` suffix
+/// (`500KB`, `2MiB`, `1GB`) is accepted because a Caddyfile rate in raw bytes is unreadable and
+/// every operator writes a suffix. A rate of zero is rejected: it would mean "block all traffic",
+/// which is what `close` is for, and silently throttling to zero is never what an operator means.
+fn throttle_handler_json(directive: &Directive) -> Result<Value> {
+    if !directive.args.is_empty() {
+        return Err(error(
+            directive.position.clone(),
+            format!(
+                "layer4: `throttle` takes a block with `upstream` and/or `downstream`, not \
+                 arguments (got `{}`)",
+                directive.args.join(" ")
+            ),
+        ));
+    }
+    if directive.block.is_empty() {
+        return Err(error(
+            directive.position.clone(),
+            "layer4: `throttle` needs a block, e.g. `throttle { upstream 10MB; downstream 50MB }`",
+        ));
+    }
+    let mut handler = Map::new();
+    handler.insert("handler".to_string(), json!("throttle"));
+    for inner in &directive.block {
+        let key = match inner.name.as_str() {
+            "upstream" => "upstream_bytes_per_second",
+            "downstream" => "downstream_bytes_per_second",
+            other => {
+                return Err(unknown("`throttle` option", other, &inner.position));
+            }
+        };
+        if inner.args.len() != 1 {
+            return Err(error(
+                inner.position.clone(),
+                format!(
+                    "layer4: `throttle {}` takes exactly one rate, got `{}`",
+                    inner.name,
+                    inner.args.join(" ")
+                ),
+            ));
+        }
+        let rate = parse_byte_rate(&inner.args[0], &inner.position)?;
+        if handler.contains_key(key) {
+            return Err(error(
+                inner.position.clone(),
+                format!("layer4: `throttle {}` is set more than once", inner.name),
+            ));
+        }
+        handler.insert(key.to_string(), json!(rate));
+    }
+    if handler.len() == 1 {
+        return Err(error(
+            directive.position.clone(),
+            "layer4: `throttle` needs at least one of `upstream` or `downstream`",
+        ));
+    }
+    Ok(Value::Object(handler))
+}
+
+/// Parse a byte rate: a bare byte count, or a number with an `SI` (`KB`/`MB`/`GB`) or `IEC`
+/// (`KiB`/`MiB`/`GiB`) suffix. Case-insensitive, and a trailing `/s` is allowed and ignored so
+/// `10MB/s` reads naturally.
+fn parse_byte_rate(text: &str, position: &Position) -> Result<u64> {
+    let t = text.trim();
+    let t = t.strip_suffix("/s").unwrap_or(t);
+    let split = t.find(|c: char| !c.is_ascii_digit()).unwrap_or(t.len());
+    let (digits, suffix) = t.split_at(split);
+    if digits.is_empty() {
+        return Err(error(
+            position.clone(),
+            format!("layer4: `throttle` rate `{text}` does not start with a number"),
+        ));
+    }
+    let value: u64 = digits.parse().map_err(|_| {
+        error(
+            position.clone(),
+            format!("layer4: `throttle` rate `{text}` has an unparsable number `{digits}`"),
+        )
+    })?;
+    let multiplier: u64 = match suffix.to_ascii_uppercase().as_str() {
+        "" | "B" => 1,
+        "K" | "KB" => 1_000,
+        "M" | "MB" => 1_000_000,
+        "G" | "GB" => 1_000_000_000,
+        "KIB" => 1_024,
+        "MIB" => 1_048_576,
+        "GIB" => 1_073_741_824,
+        other => {
+            return Err(error(
+                position.clone(),
+                format!(
+                    "layer4: `throttle` rate `{text}` has an unknown suffix `{other}`; use B, KB, \
+                     MB, GB or KiB, MiB, GiB"
+                ),
+            ));
+        }
+    };
+    let rate = value.checked_mul(multiplier).ok_or_else(|| {
+        error(
+            position.clone(),
+            format!("layer4: `throttle` rate `{text}` overflows a byte count"),
+        )
+    })?;
+    if rate == 0 {
+        return Err(error(
+            position.clone(),
+            "layer4: `throttle` rate must be greater than zero; use `close` to reject traffic",
+        ));
+    }
+    Ok(rate)
 }
 
 /// `proxy <upstream>...` -> `{"handler": "proxy", "upstreams": [{"dial": "<upstream>"}]}`.
@@ -594,8 +838,18 @@ fn parse_port(port: &str, position: &Position, address: &str) -> Result<u16> {
 
 /// A listener block's address -> the single `listen` element of its server.
 ///
-/// The argument is `host:port` (TCP). The UDP forms (`/udp`, `udp/...`, `udp:`) are rejected with a
-/// located error naming the line until T-L4-011 implements them.
+/// Both the TCP form (`host:port`) and the UDP forms are accepted. `caddy-l4` spells a UDP listener
+/// three ways in a Caddyfile, and all three mean the same thing:
+///
+/// * `host:port/udp` — the network as a suffix, which is the form ADR-031 documents and the form
+///   `listen` itself uses in the emitted JSON (`"0.0.0.0:51820/udp"`);
+/// * `udp/host:port` — the network as a prefix;
+/// * `udp:host:port` — the network as a scheme-like prefix.
+///
+/// All three normalise to the single canonical `host:port/udp` spelling in `listen`, so the adapted
+/// JSON does not depend on which spelling the operator chose. A TCP address that merely mentions
+/// "udp" is not mistaken for one: only these three exact shapes are recognised, and a bare
+/// `host:port` stays TCP.
 fn listen_address(directive: &Directive) -> Result<String> {
     // The Caddyfile lexer ends a word at `:`, so a `host:port` listener arrives split across the
     // directive name and its arguments (`name = "0.0.0.0"`, `args = [":443"]`). Rejoin them exactly
@@ -604,19 +858,25 @@ fn listen_address(directive: &Directive) -> Result<String> {
     let raw = std::iter::once(directive.name.as_str())
         .chain(directive.args.iter().map(String::as_str))
         .collect::<String>();
-    let address = &raw;
-    if address.contains("/udp") || address.starts_with("udp/") || address.starts_with("udp:") {
-        return Err(unsupported(
-            directive.position.clone(),
-            format!("layer4: UDP listener `{address}`"),
-        ));
-    }
+    // Split off a UDP network marker before validating the address, so every accepted spelling
+    // reduces to one canonical form. `udp:` is checked before `udp/` because it is the shorter
+    // prefix and both are unambiguous at position 0.
+    let (address, udp) = if let Some(rest) = raw.strip_suffix("/udp") {
+        (rest.to_string(), true)
+    } else if let Some(rest) = raw.strip_prefix("udp/") {
+        (rest.to_string(), true)
+    } else if let Some(rest) = raw.strip_prefix("udp:") {
+        (rest.to_string(), true)
+    } else {
+        (raw.clone(), false)
+    };
+    let address = address.as_str();
     let Some((host, port)) = split_host_port(address) else {
         return Err(error(
             directive.position.clone(),
             format!(
-                "confusing layer4 listener address `{address}`: expected `host:port` or \
-                 `[ipv6]:port`"
+                "confusing layer4 listener address `{address}`: expected `host:port`, \
+                 `[ipv6]:port`, or a UDP form `host:port/udp`, `udp/host:port`, `udp:host:port`"
             ),
         ));
     };
@@ -633,7 +893,12 @@ fn listen_address(directive: &Directive) -> Result<String> {
             format!("confusing layer4 listener address `{address}`: `{host}` is not a host"),
         ));
     }
-    Ok(address.clone())
+    // Canonicalise to the suffix spelling, which is what `listen` itself uses.
+    Ok(if udp {
+        format!("{address}/udp")
+    } else {
+        address.to_string()
+    })
 }
 
 /// A permissive hostname check for listener hosts (`localhost`, zone-free DNS names).
@@ -843,11 +1108,34 @@ mod tests {
     }
 
     #[test]
-    fn udp_listener_is_unsupported_with_tracking_id() {
-        let err = adapt("{\nlayer4 {\n0.0.0.0:443/udp {\nclose\n}\n}\n}\n").unwrap_err();
-        let text = err.to_string();
-        assert!(text.contains("Caddyfile line 3"), "{text}");
-        assert!(text.contains("T-L4-011"), "{text}");
+    fn udp_listener_adapts_and_normalises_every_spelling() {
+        // T-L4-004 rejected UDP with a tracking id; T-L4-011 implements it. All three caddy-l4
+        // Caddyfile spellings must produce the SAME `listen` element, because the emitted JSON must
+        // not depend on which spelling the operator chose.
+        for spelling in ["0.0.0.0:443/udp", "udp/0.0.0.0:443", "udp:0.0.0.0:443"] {
+            let config = adapt(&format!(
+                "{{\nlayer4 {{\n{spelling} {{\nclose\n}}\n}}\n}}\n"
+            ))
+            .unwrap_or_else(|e| panic!("`{spelling}` must adapt: {e}"));
+            let server = config["servers"]["srv0"].clone();
+            assert_eq!(
+                server["listen"],
+                json!(["0.0.0.0:443/udp"]),
+                "`{spelling}` must normalise to the canonical UDP listen form"
+            );
+            assert_eq!(
+                server["routes"],
+                json!([{ "handle": [{ "handler": "close" }] }]),
+                "`{spelling}` must keep its routes"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tcp_listener_is_not_mistaken_for_udp() {
+        // The normalisation must not fire on an address that merely contains "udp" somewhere.
+        let config = adapt("{\nlayer4 {\n0.0.0.0:443 {\nclose\n}\n}\n}\n").unwrap();
+        assert_eq!(config["servers"]["srv0"]["listen"], json!(["0.0.0.0:443"]));
     }
 
     #[test]
@@ -990,5 +1278,166 @@ mod tests {
             err.to_string().contains("undefined matcher `@missing`"),
             "{err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod t_l4_011_tests {
+    //! The features T-L4-011 adds on top of the T-L4-004 TCP subset: UDP listeners, the inline
+    //! `tls { client_auth { ... } }` block and the `throttle` handler.
+
+    use super::*;
+
+    fn app(source: &str) -> Value {
+        let file = crate::parse(source).expect("parse");
+        layer4_app_json(file.options.layer4.as_ref().expect("layer4 option")).expect("adapt")
+    }
+
+    #[test]
+    fn adr_031_example_adapts_in_full() {
+        // ADR-031's own configuration example, both listeners. A subset that cannot carry the ADR's
+        // example is not the schema the ADR specifies, so this is the headline test.
+        let json = app(concat!(
+            "{\nlayer4 {\n",
+            "0.0.0.0:443 {\n",
+            "@blocked_asns asn 16509 14061\n",
+            "route @blocked_asns {\nclose\n}\n",
+            "@ssh tls sni ssh.example.com\n",
+            "route @ssh {\ntls {\nclient_auth {\nmode require_and_verify\n",
+            "trusted_ca_cert_file /etc/caddy/ssh-ca.pem\n}\n}\n",
+            "proxy_protocol v2\nproxy 127.0.0.1:22\n}\n",
+            "route {\nclose\n}\n}\n",
+            "0.0.0.0:51820/udp {\n",
+            "@wg_peer asn 12345 67890\n",
+            "route @wg_peer {\nproxy 10.0.0.10:51820\n}\n",
+            "route {\nclose\n}\n}\n",
+            "}\n}\n"
+        ));
+        let tcp = &json["servers"]["srv0"];
+        assert_eq!(tcp["listen"], json!(["0.0.0.0:443"]));
+        assert_eq!(tcp["routes"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            tcp["routes"][1]["handle"][0],
+            json!({
+                "handler": "tls",
+                "client_auth": {
+                    "mode": "require_and_verify",
+                    "trusted_ca_cert_file": ["/etc/caddy/ssh-ca.pem"]
+                }
+            }),
+            "the inline tls block must emit client_auth as an object"
+        );
+        let udp = &json["servers"]["srv1"];
+        assert_eq!(udp["listen"], json!(["0.0.0.0:51820/udp"]));
+        assert_eq!(
+            udp["routes"][0],
+            json!({
+                "match": [{ "asn": [12345, 67890] }],
+                "handle": [{ "handler": "proxy", "upstreams": [{ "dial": "10.0.0.10:51820" }] }]
+            })
+        );
+    }
+
+    #[test]
+    fn inline_tls_block_defaults_mode_and_rejects_unknown_options() {
+        let json = app(
+            "{\nlayer4 {\n0.0.0.0:443 {\ntls {\nclient_auth {\ntrusted_ca_cert_file /a.pem\n}\n}\n}\n}\n}\n",
+        );
+        assert_eq!(
+            json["servers"]["srv0"]["routes"][0]["handle"][0]["client_auth"]["mode"],
+            json!("require_and_verify"),
+            "an omitted mode must default to require_and_verify, matching the shorthand form"
+        );
+
+        // An unknown sub-option must be located, not silently dropped: a dropped handshake
+        // constraint would leave the operator believing TLS was restricted when it was not.
+        let file = crate::parse("{\nlayer4 {\n0.0.0.0:443 {\ntls {\nsideways on\n}\n}\n}\n}\n")
+            .expect("parse");
+        let err = layer4_app_json(file.options.layer4.as_ref().unwrap()).unwrap_err();
+        assert!(err.to_string().contains("sideways"), "{err}");
+    }
+
+    #[test]
+    fn inline_tls_block_rejects_an_unknown_client_auth_mode() {
+        let file = crate::parse(
+            "{\nlayer4 {\n0.0.0.0:443 {\ntls {\nclient_auth {\nmode sometimes\n}\n}\n}\n}\n}\n",
+        )
+        .expect("parse");
+        let err = layer4_app_json(file.options.layer4.as_ref().unwrap()).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("sometimes"), "{text}");
+        assert!(text.contains("require_and_verify"), "{text}");
+    }
+
+    #[test]
+    fn throttle_emits_the_runtime_rate_limit_field_names() {
+        // The keys must be exactly the `RateLimit` struct's fields, so the adapted JSON decodes
+        // straight into the runtime handler.
+        let json = app(
+            "{\nlayer4 {\n0.0.0.0:443 {\nthrottle {\nupstream 10MB\ndownstream 50MiB\n}\n}\n}\n}\n",
+        );
+        assert_eq!(
+            json["servers"]["srv0"]["routes"][0]["handle"][0],
+            json!({
+                "handler": "throttle",
+                "upstream_bytes_per_second": 10_000_000u64,
+                "downstream_bytes_per_second": 52_428_800u64,
+            }),
+            "SI and IEC suffixes must scale, and keys must match the runtime struct"
+        );
+    }
+
+    #[test]
+    fn throttle_rate_parsing_covers_the_documented_suffixes() {
+        for (text, expected) in [
+            ("1000", 1000u64),
+            ("1KB", 1_000),
+            ("1KiB", 1_024),
+            ("2MB", 2_000_000),
+            ("2MiB", 2_097_152),
+            ("1GB", 1_000_000_000),
+            ("1GiB", 1_073_741_824),
+            ("10MB/s", 10_000_000),
+        ] {
+            let position = crate::parse("{\nlayer4 {\n0.0.0.0:443 {\nclose\n}\n}\n}\n")
+                .expect("parse")
+                .options
+                .layer4
+                .as_ref()
+                .unwrap()
+                .position
+                .clone();
+            assert_eq!(
+                parse_byte_rate(text, &position).expect(text),
+                expected,
+                "rate `{text}`"
+            );
+        }
+    }
+
+    #[test]
+    fn throttle_rejects_zero_and_unknown_suffixes() {
+        for (source, needle) in [
+            (
+                "{\nlayer4 {\n0.0.0.0:443 {\nthrottle {\ndownstream 0\n}\n}\n}\n}\n",
+                "greater than zero",
+            ),
+            (
+                "{\nlayer4 {\n0.0.0.0:443 {\nthrottle {\ndownstream 5XB\n}\n}\n}\n}\n",
+                "unknown suffix",
+            ),
+            (
+                // The Caddyfile parser collapses an EMPTY block to no block at all, so
+                // `throttle { }` is indistinguishable from a bare `throttle` and reports the
+                // "needs a block" error rather than the "needs at least one option" one. Pinning
+                // the reachable behaviour rather than the tidier unreachable branch.
+                "{\nlayer4 {\n0.0.0.0:443 {\nthrottle {\n}\n}\n}\n}\n",
+                "needs a block",
+            ),
+        ] {
+            let file = crate::parse(source).expect("parse");
+            let err = layer4_app_json(file.options.layer4.as_ref().unwrap()).unwrap_err();
+            assert!(err.to_string().contains(needle), "{source}: {err}");
+        }
     }
 }

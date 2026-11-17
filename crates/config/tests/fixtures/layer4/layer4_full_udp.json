@@ -1,0 +1,89 @@
+{
+  "apps": {
+    "layer4": {
+      "servers": {
+        "srv0": {
+          "listen": [
+            "0.0.0.0:51820/udp"
+          ],
+          "routes": [
+            {
+              "handle": [
+                {
+                  "handler": "proxy",
+                  "upstreams": [
+                    {
+                      "dial": "10.0.0.10:51820"
+                    }
+                  ]
+                }
+              ],
+              "match": [
+                {
+                  "asn": [
+                    12345,
+                    67890
+                  ]
+                }
+              ]
+            },
+            {
+              "handle": [
+                {
+                  "handler": "close"
+                }
+              ]
+            }
+          ]
+        },
+        "srv1": {
+          "listen": [
+            "0.0.0.0:53/udp"
+          ],
+          "routes": [
+            {
+              "handle": [
+                {
+                  "handler": "proxy",
+                  "upstreams": [
+                    {
+                      "dial": "10.0.0.53:53"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "srv2": {
+          "listen": [
+            "0.0.0.0:853/udp"
+          ],
+          "routes": [
+            {
+              "handle": [
+                {
+                  "handler": "close"
+                }
+              ]
+            }
+          ]
+        },
+        "srv3": {
+          "listen": [
+            "0.0.0.0:443"
+          ],
+          "routes": [
+            {
+              "handle": [
+                {
+                  "handler": "close"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

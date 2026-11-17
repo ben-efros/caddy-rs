@@ -1,0 +1,34 @@
+{
+	layer4 {
+		0.0.0.0:443 {
+			@blocked_asns asn 16509 14061
+			@blocked_ips remote_ip 192.0.2.0/24
+			route @blocked_asns @blocked_ips {
+				close
+			}
+			@ssh tls sni ssh.example.com
+			route @ssh {
+				tls {
+					client_auth {
+						mode require_and_verify
+						trusted_ca_cert_file /etc/caddy/ssh-ca.pem
+					}
+				}
+				proxy_protocol v2
+				proxy 127.0.0.1:22
+			}
+			route {
+				close
+			}
+		}
+		0.0.0.0:51820/udp {
+			@wg_peer asn 12345 67890
+			route @wg_peer {
+				proxy 10.0.0.10:51820
+			}
+			route {
+				close
+			}
+		}
+	}
+}

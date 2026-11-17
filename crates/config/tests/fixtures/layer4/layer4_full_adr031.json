@@ -1,0 +1,112 @@
+{
+  "apps": {
+    "layer4": {
+      "servers": {
+        "srv0": {
+          "listen": [
+            "0.0.0.0:443"
+          ],
+          "routes": [
+            {
+              "handle": [
+                {
+                  "handler": "close"
+                }
+              ],
+              "match": [
+                {
+                  "asn": [
+                    16509,
+                    14061
+                  ]
+                },
+                {
+                  "remote_ip": {
+                    "ranges": [
+                      "192.0.2.0/24"
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "handle": [
+                {
+                  "client_auth": {
+                    "mode": "require_and_verify",
+                    "trusted_ca_cert_file": [
+                      "/etc/caddy/ssh-ca.pem"
+                    ]
+                  },
+                  "handler": "tls"
+                },
+                {
+                  "handler": "proxy_protocol",
+                  "version": "v2"
+                },
+                {
+                  "handler": "proxy",
+                  "upstreams": [
+                    {
+                      "dial": "127.0.0.1:22"
+                    }
+                  ]
+                }
+              ],
+              "match": [
+                {
+                  "tls": {
+                    "sni": [
+                      "ssh.example.com"
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "handle": [
+                {
+                  "handler": "close"
+                }
+              ]
+            }
+          ]
+        },
+        "srv1": {
+          "listen": [
+            "0.0.0.0:51820/udp"
+          ],
+          "routes": [
+            {
+              "handle": [
+                {
+                  "handler": "proxy",
+                  "upstreams": [
+                    {
+                      "dial": "10.0.0.10:51820"
+                    }
+                  ]
+                }
+              ],
+              "match": [
+                {
+                  "asn": [
+                    12345,
+                    67890
+                  ]
+                }
+              ]
+            },
+            {
+              "handle": [
+                {
+                  "handler": "close"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

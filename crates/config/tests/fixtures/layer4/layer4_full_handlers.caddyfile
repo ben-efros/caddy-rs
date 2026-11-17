@@ -1,0 +1,27 @@
+{
+	layer4 {
+		0.0.0.0:8443 {
+			@tls_any tls
+			route @tls_any {
+				tls {
+					client_auth {
+						mode request
+						trusted_ca_cert_file /etc/ca/a.pem /etc/ca/b.pem
+					}
+				}
+				proxy_protocol v1
+				throttle {
+					upstream 10MB
+					downstream 50MiB
+				}
+				proxy 10.0.0.1:8443
+			}
+			route {
+				http
+			}
+			route {
+				close
+			}
+		}
+	}
+}
