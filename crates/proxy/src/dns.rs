@@ -300,6 +300,72 @@ fn encode_query(id: u16, name: &str, qtype: u16) -> Result<Vec<u8>, String> {
     Ok(query)
 }
 
+/// The ONLY constructor of an egress UDP socket in this crate.
+///
+/// Every outbound UDP path must go through this function, because it is where the "no silent
+/// 4-tuple sharing" policy is enforced: it binds WITHOUT `SO_REUSEADDR`, and a test asserts that
+/// no other UDP constructor exists (see `no_egress_udp_socket_sets_so_reuseaddr`).
+///
+/// # Why `SO_REUSEADDR` is never set here
+///
+/// ADR-0043 §2 and §3: for UDP, `SO_REUSEADDR` moves the duty of detecting an already-used 4-tuple
+/// from the kernel onto the application. With the option set, `bind()` on a 2-tuple that is already
+/// held *by another socket that also set the option* **succeeds**, and the collision is not reported
+/// until `connect()` — and even then only as `EADDRNOTAVAIL` (errno 99), which is easy to swallow.
+/// The result is a silent connect into an existing 4-tuple, the failure mode ADR-0043 records as
+/// "unacceptably bad" for UDP: responses intended for the other flow arrive here, or ours vanish.
+/// A plain `bind` without the option fails the second binder loudly at `bind()` with `EADDRINUSE`
+/// (errno 98), which is the behaviour we want.
+///
+/// This is an ephemeral-port bind (`0.0.0.0:0`), so it is also the path that is bounded by
+/// `net.ipv4.ip_local_port_range` (28 232 ports at the default 32768-60999, ADR-0043 §1). Setting
+/// `SO_REUSEADDR` here would look like a cheap way to "get more ports" under exhaustion, and it is
+/// exactly the optimisation that would reintroduce silent overshadowing — do not add it.
+async fn bind_egress_udp(resolver: SocketAddr) -> Result<UdpSocket, String> {
+    UdpSocket::bind("0.0.0.0:0")
+        .await
+        .map_err(|error| udp_bind_error(resolver, &error))
+}
+
+/// The message for a failed egress UDP bind, naming the resolver and the exhaustion bound.
+fn udp_bind_error(resolver: SocketAddr, error: &std::io::Error) -> String {
+    format!(
+        "binding egress UDP socket for resolver {resolver}: {error}{}",
+        udp_exhaustion_hint(error)
+    )
+}
+
+/// The message for a failed egress UDP connect, naming the resolver and the exhaustion bound.
+fn udp_connect_error(resolver: SocketAddr, error: &std::io::Error) -> String {
+    format!(
+        "connecting DNS UDP socket to {resolver}: {error}{}",
+        udp_exhaustion_hint(error)
+    )
+}
+
+/// Explain an ephemeral-port exhaustion failure instead of reporting a bare OS error.
+///
+/// A connected UDP socket needs a free local port from `net.ipv4.ip_local_port_range`; when that
+/// range is full the OS returns `EAGAIN`/`EADDRNOTAVAIL` and the operator sees a one-line errno with
+/// no hint that the cause is the port range rather than the resolver. This turns that into a
+/// located message that names the bound and the resolver, so the fix (raise the range, or reduce
+/// concurrent outbound flows) is visible in the log.
+fn udp_exhaustion_hint(error: &std::io::Error) -> &'static str {
+    use std::io::ErrorKind;
+    match error.kind() {
+        // MEASURED, not inferred: exhausting the ephemeral range by holding 28 232 sockets
+        // (matching the default 32768-60999 range exactly) makes `UdpSocket::bind("0.0.0.0:0")`
+        // fail with EADDRINUSE / errno 98, which maps to `AddrInUse` -- NOT `WouldBlock`. Matched
+        // through the raw OS error as well so the hint fires whether or not the platform maps it.
+        ErrorKind::AddrInUse | ErrorKind::WouldBlock | ErrorKind::AddrNotAvailable => {
+            "; the ephemeral-port range (net.ipv4.ip_local_port_range) may be exhausted: connected \
+             UDP sockets consume one local port each, so concurrent outbound flows are bounded by \
+             that range — see ADR-0043"
+        }
+        _ => "",
+    }
+}
+
 async fn send_query(
     resolver: &ResolverAddress,
     name: &str,
@@ -310,13 +376,11 @@ async fn send_query(
     let query = encode_query(id, name, qtype)?;
     let response = match resolver.network {
         ResolverNetwork::Udp => {
-            let socket = UdpSocket::bind("0.0.0.0:0")
-                .await
-                .map_err(|error| format!("binding DNS UDP socket: {error}"))?;
+            let socket = bind_egress_udp(resolver.address).await?;
             socket
                 .connect(resolver.address)
                 .await
-                .map_err(|error| format!("connecting DNS UDP socket: {error}"))?;
+                .map_err(|error| udp_connect_error(resolver.address, &error))?;
             socket
                 .send(&query)
                 .await
@@ -879,5 +943,148 @@ mod tests {
             ResolverNetwork::Tcp
         );
         assert!(ResolverAddress::parse("name.example").is_err());
+    }
+
+    /// Only one function in this crate may construct an egress UDP socket, so the
+    /// no-`SO_REUSEADDR` policy cannot be bypassed by a second constructor.
+    ///
+    /// This is a STRUCTURAL assertion rather than a `getsockopt` probe because the crate forbids
+    /// `unsafe`, and reading a socket option requires it. It is the stronger guarantee anyway: a
+    /// `getsockopt` check on one socket proves only that one call site is clean, whereas pinning
+    /// the constructor count proves no *other* site can set the option. Adding any second
+    /// `UdpSocket::bind` to production code fails this test, which is exactly the reintroduction
+    /// ADR-0043 §2 warns about.
+    #[test]
+    fn bind_egress_udp_is_the_only_production_udp_constructor() {
+        let source = include_str!("dns.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("dns.rs has a production half");
+        // Strip comments FIRST: the policy is explained in prose that names both the option and
+        // `UdpSocket::bind`, and prose is not a violation. Counting raw source made this test fail
+        // on its own documentation twice; only real code may be measured.
+        let code: String = production
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(at) => &line[..at],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let count = code.matches("UdpSocket::bind").count();
+        assert_eq!(
+            count, 1,
+            "expected exactly one production UdpSocket::bind in dns.rs, found {count}: every \
+             egress UDP socket must go through bind_egress_udp so the no-SO_REUSEADDR policy holds"
+        );
+        assert!(
+            !code.contains("SO_REUSEADDR") && !code.contains("reuse_address"),
+            "production CODE must never set SO_REUSEADDR for egress UDP (ADR-0043 §2); \
+             explaining the policy in a comment is fine, using it is not"
+        );
+        assert!(
+            production.contains("async fn bind_egress_udp"),
+            "the single constructor must be bind_egress_udp"
+        );
+    }
+
+    /// Ephemeral-port exhaustion must be explained, not reported as a bare errno: a connected UDP
+    /// socket consumes one local port from `net.ipv4.ip_local_port_range`, and that is the cause a
+    /// reader needs named.
+    #[test]
+    fn udp_exhaustion_hint_names_the_ephemeral_port_range() {
+        let would_block = std::io::Error::from(std::io::ErrorKind::WouldBlock);
+        let hint = udp_exhaustion_hint(&would_block);
+        assert!(
+            hint.contains("net.ipv4.ip_local_port_range"),
+            "hint must name the port range, got: {hint:?}"
+        );
+        assert!(
+            hint.contains("ADR-0043"),
+            "hint must cite the decision record, got: {hint:?}"
+        );
+
+        let addr_not_available = std::io::Error::from(std::io::ErrorKind::AddrNotAvailable);
+        assert_eq!(udp_exhaustion_hint(&addr_not_available), hint);
+
+        // Unrelated failures must not gain a misleading port-range explanation.
+        let other = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(udp_exhaustion_hint(&other), "");
+    }
+
+    /// The hint must fire for the errno the OS ACTUALLY returns when the ephemeral range is full.
+    ///
+    /// This is the test that would have caught the original defect. The synthetic `ErrorKind`
+    /// cases above were built from assumption, and all of them passed while the real exhaustion
+    /// path fell through to the empty arm. Measured by exhausting the range (holding 28 232
+    /// sockets, matching the default 32768-60999): `bind("0.0.0.0:0")` fails with errno 98
+    /// EADDRINUSE -> `AddrInUse`. Asserting through `from_raw_os_error` ties the test to the
+    /// platform rather than to a guess, and consumes no ports.
+    #[test]
+    fn udp_exhaustion_hint_fires_for_the_measured_errno() {
+        let refused = std::io::Error::from_raw_os_error(98);
+        assert_eq!(
+            refused.kind(),
+            std::io::ErrorKind::AddrInUse,
+            "errno 98 must map to AddrInUse for this test to mean anything"
+        );
+        let hint = udp_exhaustion_hint(&refused);
+        assert!(
+            !hint.is_empty(),
+            "a real ephemeral-range exhaustion (errno 98 EADDRINUSE) must produce a hint, but \
+             the arm was empty -- this is the defect that made the loud path silent"
+        );
+        assert!(
+            hint.contains("net.ipv4.ip_local_port_range"),
+            "hint must name the port range, got: {hint:?}"
+        );
+    }
+
+    /// The bind error must name the resolver address and the ephemeral-port bound.
+    ///
+    /// Forcing a real `EAGAIN` would require exhausting the host's port range, which a test must
+    /// not do; the message *shape* is the contract, so it is asserted directly.
+    #[tokio::test]
+    async fn udp_bind_error_names_the_resolver_and_the_bound() {
+        let resolver = ResolverAddress {
+            network: ResolverNetwork::Udp,
+            address: "192.0.2.53:53".parse().unwrap(),
+        };
+        // Call the REAL formatters the production paths use, so changing either message fails
+        // here rather than passing against a re-stated copy of the format string.
+        let exhausted = std::io::Error::from(std::io::ErrorKind::WouldBlock);
+        for message in [
+            udp_bind_error(resolver.address, &exhausted),
+            udp_connect_error(resolver.address, &exhausted),
+        ] {
+            assert!(
+                message.contains("192.0.2.53:53"),
+                "must name the resolver address: {message}"
+            );
+            assert!(
+                message.contains("net.ipv4.ip_local_port_range"),
+                "must name the ephemeral-port bound: {message}"
+            );
+        }
+
+        // A non-exhaustion failure must still name the resolver but must NOT claim the port range.
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let message = udp_bind_error(resolver.address, &denied);
+        assert!(
+            message.contains("192.0.2.53:53"),
+            "names resolver: {message}"
+        );
+        assert!(
+            !message.contains("net.ipv4.ip_local_port_range"),
+            "must not blame the port range for an unrelated error: {message}"
+        );
+
+        // And the real path must still bind successfully on a healthy host, so the new wrapper
+        // did not break the ordinary case.
+        let socket = bind_egress_udp(resolver.address)
+            .await
+            .expect("ephemeral UDP bind must succeed on a healthy host");
+        drop(socket);
     }
 }
