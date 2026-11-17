@@ -41,7 +41,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use ring::rand::{SecureRandom, SystemRandom};
+use ring::rand::SystemRandom;
 use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
@@ -421,8 +421,9 @@ fn challenge_certificate(
         extended_key_usage,
     ]);
     let mut serial = [0_u8; 16];
-    SystemRandom::new()
-        .fill(&mut serial)
+    // OS-sourced randomness with no fallback and no seed, exactly as `SystemRandom::fill` was.
+    // Same operation as internal_ca::random_serial.
+    getrandom::getrandom(&mut serial)
         .map_err(|error| issuer_error(format!("generating challenge serial: {error}")))?;
     serial[0] &= 0x7f;
     if serial.iter().all(|byte| *byte == 0) {
