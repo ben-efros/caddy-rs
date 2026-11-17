@@ -193,3 +193,67 @@ fn stock_compat_rejects_radar_and_geoip_together() {
         "must be the unsupported class: {message}"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// The three documented deployment shapes (dbip, maxmind, no database), adapted in full.
+//
+// These live here rather than in `tests/fixtures/local/` because that harness requires the adapted
+// JSON to pass `caddy_rs_core::validate_config`, and extension keys are deliberately outside the
+// core model (see the header of `radar.rs`): `geoip` is carried by the adapter, not validated by
+// core. Putting these in `local/` would assert something the design does not claim.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn the_dbip_example_adapts_with_both_databases() {
+    let config = adapt(
+        "{\n\
+         \tgeoip dbip /var/lib/caddy-rs/geoip/dbip-asn-lite.mmdb\n\
+         \tgeoip dbip /var/lib/caddy-rs/geoip/dbip-country-lite.mmdb\n\
+         }\n\n\
+         example.com {\n\treverse_proxy localhost:8096\n}\n",
+    )
+    .expect("the documented dbip example must adapt")
+    .config;
+    assert_eq!(
+        config.get("geoip"),
+        Some(&json!([
+            { "provider": "dbip", "path": "/var/lib/caddy-rs/geoip/dbip-asn-lite.mmdb" },
+            { "provider": "dbip", "path": "/var/lib/caddy-rs/geoip/dbip-country-lite.mmdb" },
+        ]))
+    );
+    // The HTTP server must still be emitted alongside the extension key.
+    assert!(config.get("apps").is_some(), "the HTTP app must survive");
+}
+
+#[test]
+fn the_maxmind_example_adapts_with_both_databases() {
+    let config = adapt(
+        "{\n\
+         \tgeoip maxmind /var/lib/caddy-rs/geoip/GeoLite2-ASN.mmdb\n\
+         \tgeoip maxmind /var/lib/caddy-rs/geoip/GeoLite2-Country.mmdb\n\
+         }\n\n\
+         example.com {\n\treverse_proxy localhost:8096\n}\n",
+    )
+    .expect("the documented maxmind example must adapt")
+    .config;
+    assert_eq!(
+        config.get("geoip"),
+        Some(&json!([
+            { "provider": "maxmind", "path": "/var/lib/caddy-rs/geoip/GeoLite2-ASN.mmdb" },
+            { "provider": "maxmind", "path": "/var/lib/caddy-rs/geoip/GeoLite2-Country.mmdb" },
+        ]))
+    );
+}
+
+#[test]
+fn the_no_database_example_adapts_without_a_geoip_key() {
+    // The Noop fallback shape: no `geoip` line at all, so the key is absent and the server runs
+    // with no GeoIP provider. Nothing here fails open - there is simply nothing configured.
+    let config = adapt("example.com {\n\troot * /srv/www\n\tfile_server\n}\n")
+        .expect("the no-database example must adapt")
+        .config;
+    assert!(
+        config.get("geoip").is_none(),
+        "an unconfigured deployment must not emit the key: {config}"
+    );
+}
