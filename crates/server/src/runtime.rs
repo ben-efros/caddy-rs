@@ -670,6 +670,27 @@ impl ServerRuntime {
         self.admin_api.metrics()
     }
 
+    /// Publish the udpgrm flow counters into the registry `/metrics` renders.
+    ///
+    /// The counters live in udpgrm's eBPF state map, which caddy-rs cannot read (see
+    /// [`crate::udpgrm_dissector::FlowMetrics`]): the daemon's client API is five `setsockopt`
+    /// optnames and none of them reports metrics or flow occupancy. So the series are registered
+    /// here, at the point where the admin endpoint becomes reachable, so they exist in the exported
+    /// output with a known value instead of being a constant naming counters that never appear.
+    ///
+    /// The values are supplied by the caller because only a caller that has read them from the
+    /// daemon can supply non-zero ones; `FlowMetrics::default()` registers the series at zero, which
+    /// is the honest state for a build that cannot observe the daemon at all.
+    ///
+    /// Returns the number of series published.
+    #[cfg(feature = "udpgrm")]
+    pub fn publish_udpgrm_flow_metrics(
+        &self,
+        metrics: crate::udpgrm_dissector::FlowMetrics,
+    ) -> std::result::Result<usize, caddy_rs_admin::MetricsError> {
+        metrics.register(&self.metrics())
+    }
+
     /// A clone of the shared request recorder used by every listener.
     pub fn request_recorder(&self) -> SharedRequestRecorder {
         Arc::clone(&self.recorder)

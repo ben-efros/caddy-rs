@@ -27,6 +27,8 @@ mod proxy_protocol;
 pub mod runtime;
 #[cfg(feature = "udpgrm")]
 pub mod udpgrm;
+#[cfg(feature = "udpgrm")]
+pub mod udpgrm_dissector;
 pub mod upstream_status;
 
 pub use activation::{
