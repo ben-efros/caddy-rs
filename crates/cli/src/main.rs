@@ -83,6 +83,7 @@
 //! files for root's home, not the user's; run it as the user who will use the shell.
 
 mod activation;
+mod bind_fds;
 mod build_info;
 mod completion;
 mod completion_install;
@@ -184,6 +185,27 @@ enum Command {
         #[arg(long, default_value = "compatible", value_name = "MODE")]
         adapt_mode: String,
         /// Environment file(s) in KEY=VALUE form, loaded before validation.
+        #[arg(long = "envfile", value_name = "PATH")]
+        envfile: Vec<PathBuf>,
+    },
+    /// Pre-bind the configured listeners and upload them to systemd's fd store (ADR-0047).
+    ///
+    /// Stage 2: computes the plan and the FD names it would create. With `--dry-run` it prints both
+    /// and exits without binding or uploading.
+    BindFds {
+        /// Configuration file.
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Adapter name (`caddyfile` or `json`).
+        #[arg(long)]
+        adapter: Option<String>,
+        /// Configuration-acceptance mode (`compatible`, `warn` or `strict`); default compatible.
+        #[arg(long, default_value = "compatible", value_name = "MODE")]
+        adapt_mode: String,
+        /// Print the plan and the FD names it would create, then exit without binding or uploading.
+        #[arg(long)]
+        dry_run: bool,
+        /// Environment file(s) in KEY=VALUE form, loaded before adaptation.
         #[arg(long = "envfile", value_name = "PATH")]
         envfile: Vec<PathBuf>,
     },
@@ -951,6 +973,38 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 .validate_provisioning()
                 .context("cannot provision configuration")?;
             println!("Valid configuration");
+        }
+        Command::BindFds {
+            config,
+            adapter,
+            adapt_mode,
+            dry_run,
+            envfile,
+        } => {
+            load_env_files(&envfile)?;
+            let options = adapt_options(&adapt_mode)?;
+            // Parse and validate exactly as `run` would (ADR-0047 section 2). Planning a listener
+            // that `run` would reject would upload a socket nothing ever adopts.
+            let loaded = load_validated(&config, adapter.as_deref(), options)?;
+            for warning in &loaded.warnings {
+                eprintln!("warning: {warning}");
+            }
+            let planned = bind_fds::plan_bind_fds(&loaded.model)
+                .map_err(|error| anyhow::anyhow!("cannot plan fd-store listeners: {error}"))?;
+            if dry_run {
+                print!("{}", bind_fds::render_plan(&planned, true));
+                // Stage 2 stops here: no socket is bound and nothing is uploaded (T-CORE-133 owns
+                // the real upload). Exiting successfully is what makes the dry run usable in a
+                // unit's `ExecStartPre` for diagnosis without side effects.
+                return Ok(());
+            }
+            // Stage 3 adds the FDSTORE=1 upload. Until it exists, refusing loudly is correct:
+            // printing a plan and exiting 0 without uploading would let a unit believe the
+            // descriptors exist when they do not.
+            anyhow::bail!(
+                "bind-fds without --dry-run is not implemented yet: the fd-store upload is stage 3 \
+                 (T-CORE-133). Re-run with --dry-run to inspect the plan"
+            );
         }
         Command::Run {
             config,
