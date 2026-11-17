@@ -529,9 +529,36 @@ async fn bind_configured_tcp(
         Some(socket_addr) => bind_tcp_ip(configured, socket_addr, binder),
         // Hostname: resolve and bind like Caddy's `net.Listen("tcp", "host:port")`. Bind the
         // address without a `tcp/`/`udp/` network prefix (the prefix is already parsed above).
-        None => TcpListener::bind(&address.address)
-            .await
-            .map_err(|error| Error::bind(configured, error)),
+        None => {
+            let first = TcpListener::bind(&address.address).await;
+            match first {
+                Ok(listener) => Ok(listener),
+                Err(error) => {
+                    // ADR-0046: retry once under CAP_NET_BIND_SERVICE only for EACCES on a
+                    // TCP/UDP nonzero-port address. Everything else keeps the original error.
+                    let address_owned = address.clone();
+                    let bind_address = address_owned.address.clone();
+                    let reason = error.to_string();
+                    let retried =
+                        crate::bindcap::with_bind_capability(&address_owned, error, move || {
+                            // A fresh single-threaded runtime: this runs on the dedicated thread
+                            // the seam spawned, not on the caller's Tokio runtime.
+                            let runtime = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()?;
+                            runtime.block_on(TcpListener::bind(&bind_address))
+                        })
+                        .map_err(|error| {
+                            // Preserve the existing located error, naming the configured address.
+                            Error::bind(configured, std::io::Error::new(error.kind(), reason))
+                        });
+                    match retried {
+                        Ok(listener) => Ok(listener),
+                        Err(error) => Err(error),
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -563,8 +590,25 @@ fn bind_tcp_ip(
             .map_err(|error| Error::bind(configured, error))?;
         return TcpListener::from_std(listener).map_err(|error| Error::bind(configured, error));
     }
-    let listener =
-        std::net::TcpListener::bind(socket_addr).map_err(|error| Error::bind(configured, error))?;
+    // ADR-0046 §§1-2: attempt with no capability manipulation, then retry ONCE under
+    // CAP_NET_BIND_SERVICE only when the failure is EACCES on a TCP/UDP nonzero-port address and the
+    // capability is permitted-but-not-effective. A second EACCES is genuine and surfaces unchanged.
+    let listener = match std::net::TcpListener::bind(socket_addr) {
+        Ok(listener) => listener,
+        Err(error) => {
+            let address = ListenAddr {
+                network: Network::Tcp,
+                address: socket_addr.to_string(),
+            };
+            match crate::bindcap::with_bind_capability(&address, error, move || {
+                std::net::TcpListener::bind(socket_addr)
+            }) {
+                Ok(listener) => listener,
+                // Located error naming the configured address, as before.
+                Err(error) => return Err(Error::bind(configured, error)),
+            }
+        }
+    };
     listener
         .set_nonblocking(true)
         .map_err(|error| Error::bind(configured, error))?;
@@ -740,8 +784,21 @@ async fn bind_configured_udp(configured: &str, address: &ListenAddr) -> Result<U
 /// Bind the IPv4 wildcard UDP socket, joining a reuseport group when `udpgrm` is enabled.
 #[cfg(feature = "http3")]
 fn bind_udp_ipv4_wildcard(port: u16, configured: &str) -> Result<UdpSocket, Error> {
-    let socket = std::net::UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)))
-        .map_err(|error| Error::bind(configured, error))?;
+    let wildcard = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
+    // ADR-0046: same EACCES-only retry as TCP; a UDP privileged port needs the same capability.
+    let socket = match std::net::UdpSocket::bind(wildcard) {
+        Ok(socket) => socket,
+        Err(error) => {
+            let address = ListenAddr {
+                network: Network::Udp,
+                address: wildcard.to_string(),
+            };
+            crate::bindcap::with_bind_capability(&address, error, move || {
+                std::net::UdpSocket::bind(wildcard)
+            })
+            .map_err(|error| Error::bind(configured, error))?
+        }
+    };
     socket
         .set_nonblocking(true)
         .map_err(|error| Error::bind(configured, error))?;
@@ -787,8 +844,25 @@ fn bind_udp_socket_addr(
     {
         // No runtime to block on here; the socket is already bound synchronously below, so this
         // mirrors the original `UdpSocket::bind` call exactly.
-        let socket = std::net::UdpSocket::bind(socket_addr)
-            .map_err(|error| Error::bind(configured, error))?;
+        //
+        // ADR-0046: the EACCES-only capability retry applies here too. The `udpgrm` branch above
+        // deliberately does NOT use it: that path must set `SO_REUSEPORT` *before* `bind` to join the
+        // reuseport group, so a naive retry would either resurrect an ungrouped socket or need the
+        // whole socket constructed on the dedicated thread. UDP over udpgrm therefore keeps the
+        // pre-ADR-0046 behaviour, which is a documented scope boundary rather than an oversight.
+        let socket = match std::net::UdpSocket::bind(socket_addr) {
+            Ok(socket) => socket,
+            Err(error) => {
+                let address = ListenAddr {
+                    network: Network::Udp,
+                    address: socket_addr.to_string(),
+                };
+                crate::bindcap::with_bind_capability(&address, error, move || {
+                    std::net::UdpSocket::bind(socket_addr)
+                })
+                .map_err(|error| Error::bind(configured, error))?
+            }
+        };
         socket
             .set_nonblocking(true)
             .map_err(|error| Error::bind(configured, error))?;
@@ -3887,5 +3961,56 @@ mod udp_reuseport_tests {
         )
         .expect("a second generation must be able to bind the same UDP port");
         assert_eq!(second.local_addr().expect("local addr").port(), port);
+    }
+}
+
+/// Tests for the ADR-0046 capability retry as wired into the production bind entry points.
+#[cfg(test)]
+mod bind_capability_tests {
+    use super::{bind_configured_tcp, bind_configured_udp};
+    use caddy_rs_core::listen::ListenAddr;
+
+    /// ADR-0046 §1 through the PRODUCTION entry points: a successful bind makes no capability call.
+    ///
+    /// Testing [`crate::bindcap::with_bind_capability`] alone would not establish this — the
+    /// criterion is about the bind path the server actually runs, including the case where the
+    /// retry is never reached because the first attempt worked. These binds use an ephemeral port
+    /// (port 0), which is unprivileged and succeeds here, so the seam must not be entered at all.
+    #[tokio::test]
+    async fn the_production_bind_paths_make_no_capability_call_when_the_bind_succeeds() {
+        let before = crate::bindcap::capability_operations();
+        let before_entries = crate::bindcap::seam_entries();
+
+        let tcp_configured = "127.0.0.1:0";
+        let tcp_address = ListenAddr::parse(tcp_configured).expect("tcp address parses");
+        let listener = bind_configured_tcp(tcp_configured, &tcp_address, None)
+            .await
+            .expect("an ephemeral TCP bind succeeds");
+        assert!(listener.local_addr().expect("local addr").port() > 0);
+        drop(listener);
+
+        let udp_configured = "127.0.0.1:0";
+        let udp_address = ListenAddr::parse(udp_configured).expect("udp address parses");
+        let socket = bind_configured_udp(udp_configured, &udp_address)
+            .await
+            .expect("an ephemeral UDP bind succeeds");
+        assert!(socket.local_addr().expect("local addr").port() > 0);
+        drop(socket);
+
+        assert_eq!(
+            crate::bindcap::capability_operations(),
+            before,
+            "a successful bind must never raise or lower CAP_NET_BIND_SERVICE"
+        );
+        // Stronger than the operations check, and the one that actually pins "attempt first": the
+        // successful path must not even *enter* the capability seam. Checking only operations would pass
+        // in an environment where the capability is already effective, because the seam would return
+        // before raising anything -- which is exactly how the first version of this test let a mutant
+        // that consulted the capability on every bind survive.
+        assert_eq!(
+            crate::bindcap::seam_entries(),
+            before_entries,
+            "a successful bind must not consult the capability seam at all"
+        );
     }
 }
