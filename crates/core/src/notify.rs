@@ -17,6 +17,8 @@
 
 use std::ffi::OsStr;
 use std::io;
+#[cfg(target_os = "linux")]
+use std::os::unix::io::RawFd;
 
 /// Environment variable used by systemd to name the notification socket.
 pub const NOTIFY_SOCKET_ENV: &str = "NOTIFY_SOCKET";
@@ -148,6 +150,53 @@ fn sanitize_status(message: &str) -> String {
     }
     // Truncation above happens at a character boundary because we append whole `char`s.
     value.trim().to_string()
+}
+
+/// The systemd fd-store upload protocol message (ADR-0047 §2).
+///
+/// `FDSTORE=1` tells the service manager to keep the attached descriptor in its fd store, and
+/// `FDNAME=<name>` gives it the deterministic identity `run` later looks it up by.
+pub fn fdstore_upload_payload(fd_name: &str) -> String {
+    format!("FDSTORE=1\nFDNAME={fd_name}")
+}
+
+/// The systemd fd-store removal protocol message (ADR-0047 §5).
+pub fn fdstore_remove_payload(fd_name: &str) -> String {
+    format!("FDSTOREREMOVE=1\nFDNAME={fd_name}")
+}
+
+/// Why an fd-store upload failed, distinguishing the cases the helper must report differently.
+#[derive(Debug)]
+pub enum FdStoreError {
+    /// `NOTIFY_SOCKET` is unset or empty: there is no fd store to upload to.
+    ///
+    /// ADR-0047 §6 requires this to be a clear error with **no partial state**, so callers must
+    /// treat it as fatal before binding anything.
+    NotifySocketUnset,
+    /// The notification socket could not be used.
+    Socket(io::Error),
+}
+
+impl std::fmt::Display for FdStoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotifySocketUnset => write!(
+                f,
+                "NOTIFY_SOCKET is not set, so there is no systemd fd store to upload to; \
+                 fdstore mode requires systemd socket/notify support (ADR-0047)"
+            ),
+            Self::Socket(error) => write!(f, "cannot upload to the systemd fd store: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for FdStoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::NotifySocketUnset => None,
+            Self::Socket(error) => Some(error),
+        }
+    }
 }
 
 #[cfg(test)]
