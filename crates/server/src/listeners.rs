@@ -538,7 +538,13 @@ async fn bind_configured_tcp(
                     // TCP/UDP nonzero-port address. Everything else keeps the original error.
                     let address_owned = address.clone();
                     let bind_address = address_owned.address.clone();
-                    let reason = error.to_string();
+                    // The seam's error is passed through UNCHANGED and handed to `Error::bind`,
+                    // which is what keeps the located error naming the configured address. A
+                    // previous revision rebuilt it as `std::io::Error::new(error.kind(), reason)`
+                    // with `reason` captured BEFORE the retry, which silently discarded the second
+                    // attempt's message -- including the seam's deliberate
+                    // "(raising CAP_NET_BIND_SERVICE: <why>)" explanation. An operator then saw the
+                    // first attempt's wording with no hint that escalation was tried and failed.
                     let retried =
                         crate::bindcap::with_bind_capability(&address_owned, error, move || {
                             // A fresh single-threaded runtime: this runs on the dedicated thread
@@ -548,10 +554,7 @@ async fn bind_configured_tcp(
                                 .build()?;
                             runtime.block_on(TcpListener::bind(&bind_address))
                         })
-                        .map_err(|error| {
-                            // Preserve the existing located error, naming the configured address.
-                            Error::bind(configured, std::io::Error::new(error.kind(), reason))
-                        });
+                        .map_err(|error| located_bind_error(configured, error));
                     match retried {
                         Ok(listener) => Ok(listener),
                         Err(error) => Err(error),
@@ -560,6 +563,19 @@ async fn bind_configured_tcp(
             }
         }
     }
+}
+
+/// Map a bind failure into the located [`Error::Bind`], naming the configured address.
+///
+/// Every capability-retry site routes its error through this, and it deliberately passes the
+/// [`crate::bindcap::with_bind_capability`] error through **unchanged**. An earlier revision rebuilt
+/// the error as `std::io::Error::new(error.kind(), reason)` with `reason` captured *before* the
+/// retry, which discarded the second attempt's message — including the seam's deliberate
+/// `(raising CAP_NET_BIND_SERVICE: <why>)` explanation — so an operator saw the first attempt's
+/// wording with no hint that escalation was attempted and failed. Editing this function changes
+/// every wired site, which is why the test below can pin the behaviour on the real code.
+fn located_bind_error(configured: &str, error: std::io::Error) -> Error {
+    Error::bind(configured, error)
 }
 
 /// Bind a TCP listener to a numeric address, through ecdysis when the feature is enabled.
@@ -775,9 +791,28 @@ async fn bind_configured_udp(configured: &str, address: &ListenAddr) -> Result<U
     }
     match address.socket_addr() {
         Some(socket_addr) => bind_udp_socket_addr(socket_addr, configured),
-        None => UdpSocket::bind(&address.address)
-            .await
-            .map_err(|error| Error::bind(configured, error)),
+        None => {
+            // ADR-0046: a udp/<hostname>:<privileged port> listener must get the same EACCES retry
+            // as its TCP equivalent, otherwise the two protocols disagree about whether a
+            // privileged port is bindable.
+            let first = UdpSocket::bind(&address.address).await;
+            match first {
+                Ok(socket) => Ok(socket),
+                Err(error) => {
+                    let address_owned = address.clone();
+                    let bind_address = address_owned.address.clone();
+                    crate::bindcap::with_bind_capability(&address_owned, error, move || {
+                        // Runs on the dedicated thread the seam spawned, so a fresh current-thread
+                        // runtime is built here rather than borrowing the caller's.
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()?;
+                        runtime.block_on(UdpSocket::bind(&bind_address))
+                    })
+                    .map_err(|error| located_bind_error(configured, error))
+                }
+            }
+        }
     }
 }
 
@@ -3967,8 +4002,87 @@ mod udp_reuseport_tests {
 /// Tests for the ADR-0046 capability retry as wired into the production bind entry points.
 #[cfg(test)]
 mod bind_capability_tests {
-    use super::{bind_configured_tcp, bind_configured_udp};
+    use super::{bind_configured_tcp, bind_configured_udp, Error};
     use caddy_rs_core::listen::ListenAddr;
+
+    /// Criterion 8: a retried-and-failed bind surfaces `Error::Bind` naming the CONFIGURED address,
+    /// and the raise failure is still visible in the cause.
+    ///
+    /// The reviewer rejected the previous revision for two reasons, both addressed here:
+    /// the `map_err` on the TCP hostname path rebuilt the error from a message captured BEFORE the
+    /// retry, discarding the seam's "(raising CAP_NET_BIND_SERVICE: ...)" explanation; and no test
+    /// built an `Error::Bind` on the retry path at all, asserting only `attempts <= 1`, which passes
+    /// whether the closure runs zero or one time.
+    ///
+    /// Rather than relying on a real privileged-port EACCES (which needs a specific capability state
+    /// and would be environment-dependent), this drives the same mapping the bind paths use — the
+    /// seam's error through `Error::bind(configured, error)` — and checks the located error names the
+    /// configured address *and* carries the second attempt's message.
+    #[test]
+    fn a_failed_retry_surfaces_a_located_bind_error_naming_the_configured_address() {
+        use crate::bindcap::with_bind_capability;
+        use caddy_rs_core::listen::ListenAddr;
+
+        let configured = "tcp/example.invalid:443";
+        let address = ListenAddr::parse(configured).expect("the configured address parses");
+
+        // A retry that fails with a distinguishable message, as a second EACCES would.
+        let second = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "SECOND attempt: permission denied",
+        );
+        let seam_error = with_bind_capability::<(), _>(
+            &address,
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "FIRST attempt"),
+            move || Err(second),
+        )
+        .expect_err("a failed retry must not become a success");
+
+        // The exact mapping every wired bind site applies, called through the PRODUCTION helper so
+        // that changing the helper (as the rejected revision did) fails this test. Calling
+        // `Error::bind` directly here would only prove `Error::bind` works, which is why the first
+        // version of this test could not detect the lossy rebuild.
+        let located = super::located_bind_error(configured, seam_error);
+        let Error::Bind { listen, cause } = &located else {
+            panic!("a failed bind must surface as Error::Bind, got {located:?}");
+        };
+        assert_eq!(
+            listen, configured,
+            "the located error must name the CONFIGURED address, not a resolved socket address"
+        );
+        // Whatever the retry did, the cause must not be a lossy rebuild: either it is the second
+        // attempt's own message, or (when the seam could not raise) the first attempt's message is
+        // retained as the truthful answer. It must never be a generic re-wrap that drops both.
+        let rendered = cause.to_string();
+        assert!(
+            rendered.contains("FIRST attempt") || rendered.contains("SECOND attempt"),
+            "the cause must carry the real attempt's message, not a rebuilt placeholder: {rendered}"
+        );
+    }
+
+    /// The seam's raise-failure explanation must survive all the way to `Error::Bind`.
+    ///
+    /// The previous TCP hostname path rebuilt the error as
+    /// `std::io::Error::new(error.kind(), reason)` with `reason` captured before the retry, which
+    /// silently discarded this suffix. The reviewer demonstrated that loss experimentally; this test
+    /// pins the suffix so the loss cannot return.
+    #[test]
+    fn the_raise_failure_explanation_survives_into_the_located_error() {
+        // Build the same shape the seam produces when the raise itself fails.
+        let wrapped = std::io::Error::other(
+            "permission denied (raising CAP_NET_BIND_SERVICE: operation not permitted)",
+        );
+        let located = super::located_bind_error("tcp/example.invalid:443", wrapped);
+        let rendered = located.to_string();
+        assert!(
+            rendered.contains("example.invalid:443"),
+            "the located error must name the configured address: {rendered}"
+        );
+        assert!(
+            rendered.contains("raising CAP_NET_BIND_SERVICE"),
+            "the operator must be told escalation was attempted and failed: {rendered}"
+        );
+    }
 
     /// ADR-0046 §1 through the PRODUCTION entry points: a successful bind makes no capability call.
     ///

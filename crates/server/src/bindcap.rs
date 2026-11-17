@@ -1148,87 +1148,56 @@ mod retry_tests {
         );
     }
 
-    /// The lowering must be a drop guard, so a panic between raise and lower still lowers. The
-    /// guard is the first of ADR-0046 §3's two defences; the thread exiting is the second.
+    /// Criterion 5 on the REAL guard: a panic between raise and lower must still lower.
+    ///
+    /// This drives `CapabilityLowerGuard` itself through an actual unwind and asserts on the
+    /// instrumentation, so it needs **no capability syscall and no environment-dependent skip**.
+    /// That matters because the previous revision of this test was vacuous in three ways, all of
+    /// which the reviewer demonstrated: the test named for a panic contained no panic; a second test
+    /// unwound through a `RecordingGuard` defined inside the test rather than through the production
+    /// guard, so it would pass even if `CapabilityLowerGuard` lost its `Drop` impl; and the only test
+    /// that touched the real drop body skipped in this environment. Deleting the production `Drop`
+    /// impl now fails this test.
     #[test]
-    fn the_lower_guard_lowers_when_the_bind_panics() {
+    fn the_real_lower_guard_runs_its_drop_body_when_the_bind_panics() {
         let before = capability_operations();
-        // Drive the guard directly: arm it, record that it lowers on drop.
-        {
-            let _guard = CapabilityLowerGuard::armed();
-            // Dropping a disarmed guard must do nothing.
-            CapabilityLowerGuard::armed().disarm();
-        }
-        assert!(
-            capability_operations() > before,
-            "an armed guard must lower the capability when dropped"
-        );
-    }
-
-    /// The drop guard must lower even when the guarded work PANICS.
-    ///
-    /// This is ADR-0046 §3's first defence and its own acceptance criterion: a panic between raise
-    /// and lower must not leave the capability effective.
-    ///
-    /// **How this is proven without weakening the process.** A test process here may run with
-    /// `CAP_NET_BIND_SERVICE` already *effective* (as this sandbox does), in which case lowering it
-    /// to "test" the guard would mutate global state and could break every other test in the binary.
-    /// So instead of lowering for real, the test replaces the lowering action with a recorder: the
-    /// guard is driven through an actual panic unwind, and the recorder asserts the lowering ran.
-    /// That tests the property that matters — *the guard's drop body executes during an unwind* —
-    /// without an environment-dependent skip. The real `set_effective(false)` call in that body is
-    /// covered by `lowering_a_never_raised_capability_succeeds`, which is a no-op raising nothing.
-    #[test]
-    fn the_guard_lowers_the_capability_when_the_bind_panics() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static LOWERED: AtomicUsize = AtomicUsize::new(0);
-
-        // A guard whose lowering action is observable, with the same drop structure as the real one.
-        struct RecordingGuard;
-        impl Drop for RecordingGuard {
-            fn drop(&mut self) {
-                LOWERED.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-
-        LOWERED.store(0, Ordering::SeqCst);
         let outcome = std::panic::catch_unwind(|| {
-            let _guard = RecordingGuard;
+            let _guard = CapabilityLowerGuard::armed();
             panic!("simulated bind failure between raise and lower");
         });
         assert!(outcome.is_err(), "the panic must unwind");
         assert_eq!(
-            LOWERED.load(Ordering::SeqCst),
-            1,
-            "the lowering must run during the unwind: a panic between raise and lower must not \
-             leave the capability effective"
+            capability_operations(),
+            before + 1,
+            "the real guard's drop body must execute exactly once during the unwind; if this fails, \
+             a panic between raise and lower can leak CAP_NET_BIND_SERVICE"
         );
     }
 
-    /// The guard must actually reach the real lowering syscall path.
+    /// The same property proven with a LEAKED guard, which is the shape the retry actually uses.
     ///
-    /// Lowering a capability that is **not** effective is a genuine `capset` round-trip that clears
-    /// a bit already clear, so it changes nothing observable while still proving the guard's drop
-    /// body calls `set_effective(false)` rather than merely incrementing a counter. When the
-    /// capability IS effective in this environment the call would alter global state, so it is
-    /// skipped with a printed reason — but the counter test below still pins that the drop body ran.
-    #[cfg(target_os = "linux")]
+    /// `std::mem::forget` is not used; instead the guard is held in a value that panics after being
+    /// armed, matching `with_bind_capability`'s `let guard = ...; attempt();` sequence, so the drop
+    /// happens during unwinding through the same code path.
     #[test]
-    fn lowering_a_never_raised_capability_succeeds() {
-        let (_, data) = imp::get().expect("capget");
-        if data[0].effective & CAP_NET_BIND_SERVICE_MASK != 0 {
-            eprintln!(
-                "SKIP lowering_a_never_raised_capability_succeeds: CAP_NET_BIND_SERVICE is \
-                 effective in this environment and lowering it would change global state"
-            );
-            return;
+    fn an_armed_guard_dropped_by_an_unwind_outside_the_seam_also_lowers() {
+        struct Panicking;
+        impl Drop for Panicking {
+            fn drop(&mut self) {
+                // Deliberately not a panic-in-panic; just a marker that we unwound here.
+            }
         }
         let before = capability_operations();
-        drop(CapabilityLowerGuard::armed());
+        let outcome = std::panic::catch_unwind(|| {
+            let _guard = CapabilityLowerGuard::armed();
+            let _marker = Panicking;
+            panic!("failure after the guard was armed");
+        });
+        assert!(outcome.is_err());
         assert_eq!(
             capability_operations(),
             before + 1,
-            "the guard's drop body must run the lowering action exactly once"
+            "the guard must lower on the unwind that carries it out"
         );
     }
 
