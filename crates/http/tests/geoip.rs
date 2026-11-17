@@ -202,3 +202,148 @@ fn products_are_the_two_documented_words() {
     assert_eq!(GeoIpProduct::DbIp.as_str(), "dbip");
     assert_eq!(GeoIpProduct::MaxMind.as_str(), "maxmind");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Provider selection: turning the adapted `geoip` option into the trait object the matcher takes.
+// ---------------------------------------------------------------------------------------------
+
+use caddy_rs_http::geoip::{select_provider, GeoIpConfigEntry};
+
+#[test]
+fn no_configured_entries_selects_noop_without_warning() {
+    // Nothing configured is the default and is not a mistake, so it must not warn.
+    let selected = select_provider(&[]);
+    assert!(
+        selected.mmdb.is_none(),
+        "no database means no concrete provider"
+    );
+    assert!(
+        selected.warnings.is_empty(),
+        "an unconfigured geoip option must be silent: {:?}",
+        selected.warnings
+    );
+    assert_eq!(selected.provider.lookup(ip("89.160.20.112")), None);
+}
+
+#[test]
+fn configured_entries_select_a_real_provider_that_resolves() {
+    // The wiring criterion: given the adapted config, selection produces a provider that actually
+    // resolves, so the matcher would get a working lookup rather than NoopGeoIp.
+    let asn = fixture("GeoIP2-ISP-Test.mmdb");
+    let country = fixture("GeoIP2-Country-Test.mmdb");
+    let entries = [
+        GeoIpConfigEntry {
+            provider: GeoIpProduct::MaxMind,
+            path: asn.to_str().unwrap(),
+        },
+        GeoIpConfigEntry {
+            provider: GeoIpProduct::MaxMind,
+            path: country.to_str().unwrap(),
+        },
+    ];
+    let selected = select_provider(&entries);
+    assert!(selected.mmdb.is_some(), "a real provider must be selected");
+    assert!(selected.warnings.is_empty(), "{:?}", selected.warnings);
+
+    let location = selected
+        .provider
+        .lookup(ip("89.160.20.112"))
+        .expect("the selected provider resolves the fixture address");
+    assert_eq!(location.asn, Some(29518));
+    assert_eq!(location.country.as_deref(), Some("SE"));
+}
+
+#[test]
+fn selection_classifies_asn_and_country_paths_by_name() {
+    // One entry per database: the ASN path supplies ASN, the country path supplies country. If
+    // classification were wrong the wrong reader would be asked and one attribute would be lost.
+    let asn = fixture("GeoIP2-ISP-Test.mmdb");
+    let country = fixture("GeoIP2-Country-Test.mmdb");
+    let entries = [
+        GeoIpConfigEntry {
+            provider: GeoIpProduct::MaxMind,
+            path: asn.to_str().unwrap(),
+        },
+        GeoIpConfigEntry {
+            provider: GeoIpProduct::MaxMind,
+            path: country.to_str().unwrap(),
+        },
+    ];
+    let selected = select_provider(&entries);
+    let mmdb = selected.mmdb.as_ref().expect("a provider was selected");
+
+    // ASN comes from the ISP database, country from the country database.
+    let location = mmdb.lookup(ip("89.160.20.112")).expect("known address");
+    assert_eq!(
+        location.asn,
+        Some(29518),
+        "ASN must come from the ASN database"
+    );
+    assert_eq!(
+        location.country.as_deref(),
+        Some("SE"),
+        "country must come from the country database"
+    );
+}
+
+#[test]
+fn a_single_asn_entry_selects_a_provider_that_resolves_asn_only() {
+    let asn = fixture("GeoIP2-ISP-Test.mmdb");
+    let entries = [GeoIpConfigEntry {
+        provider: GeoIpProduct::DbIp,
+        path: asn.to_str().unwrap(),
+    }];
+    let selected = select_provider(&entries);
+    let location = selected
+        .provider
+        .lookup(ip("1.128.0.1"))
+        .expect("ASN known");
+    assert_eq!(location.asn, Some(1221));
+    assert_eq!(location.country, None, "no country database was configured");
+}
+
+#[test]
+fn entries_that_cannot_open_fall_back_to_noop_and_explain_why() {
+    // Fail open: the server keeps serving, but the operator is told. Silence here would leave ASN
+    // predicates permanently unmatchable with no clue why.
+    let entries = [GeoIpConfigEntry {
+        provider: GeoIpProduct::DbIp,
+        path: "/nonexistent/dbip-asn-lite.mmdb",
+    }];
+    let selected = select_provider(&entries);
+    assert!(selected.mmdb.is_none(), "no database opened");
+    assert!(
+        !selected.warnings.is_empty(),
+        "a failed selection must explain itself"
+    );
+    assert!(
+        selected
+            .warnings
+            .iter()
+            .any(|w| w.contains("/nonexistent/dbip-asn-lite.mmdb")),
+        "the warning must name the path: {:?}",
+        selected.warnings
+    );
+    assert_eq!(selected.provider.lookup(ip("89.160.20.112")), None);
+}
+
+#[test]
+fn selection_exposes_counters_through_the_concrete_provider() {
+    let asn = fixture("GeoIP2-ISP-Test.mmdb");
+    let entries = [GeoIpConfigEntry {
+        provider: GeoIpProduct::MaxMind,
+        path: asn.to_str().unwrap(),
+    }];
+    let selected = select_provider(&entries);
+    let mmdb = selected.mmdb.as_ref().expect("provider selected");
+
+    assert_eq!(mmdb.stats().lookups, 0);
+    let _ = selected.provider.lookup(ip("1.128.0.1"));
+    let _ = selected.provider.lookup(ip("10.0.0.1"));
+    let stats = mmdb.stats();
+    assert_eq!(
+        stats.lookups, 2,
+        "counters must observe lookups made through the trait object"
+    );
+    assert_eq!(stats.hits + stats.misses, 2);
+}

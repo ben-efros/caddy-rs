@@ -277,6 +277,142 @@ impl GeoIpProvider for MmdbGeoIp {
     }
 }
 
+/// A configured `geoip` entry, as the adapter emits it.
+///
+/// Deliberately a plain value type rather than a dependency on `caddy-rs-config`: this crate sits
+/// below the config crate, and the adapter's JSON is the stable interface between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GeoIpConfigEntry<'a> {
+    /// The provider word (`dbip` or `maxmind`).
+    pub provider: GeoIpProduct,
+    /// The database path as configured.
+    pub path: &'a str,
+}
+
+/// What [`select_provider`] decided, so the caller can log it.
+pub struct SelectedGeoIp {
+    /// The provider to install. [`NoopGeoIp`] when no database could be opened.
+    ///
+    /// [`NoopGeoIp`]: crate::radar_matcher::NoopGeoIp
+    pub provider: Arc<dyn GeoIpProvider>,
+    /// The concrete provider, when one was opened, so the caller can read [`MmdbGeoIp::stats`].
+    /// `None` when the fallback is in use.
+    pub mmdb: Option<Arc<MmdbGeoIp>>,
+    /// Warnings produced while selecting, in order. Empty when every database opened.
+    pub warnings: Vec<String>,
+}
+
+impl fmt::Debug for SelectedGeoIp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // `dyn GeoIpProvider` is not `Debug`; report which concrete provider was chosen instead.
+        f.debug_struct("SelectedGeoIp")
+            .field("mmdb", &self.mmdb.is_some())
+            .field("warnings", &self.warnings)
+            .finish()
+    }
+}
+
+/// Select the provider for the `geoip` global option.
+///
+/// This is the piece of runtime wiring that does not depend on the radar matcher being reachable:
+/// it turns the adapted configuration into the `Arc<dyn GeoIpProvider>` that
+/// `RadarMatcher::new` takes, so the moment `@radar` is registered the provider is already chosen
+/// correctly (that registration is T-ROUTE-063, not this task).
+///
+/// Classification follows ADR-0020's resolution of open question 1 and the provider word:
+///
+/// * An entry naming the ASN database becomes the ASN reader; one naming the country database
+///   becomes the country reader. Classification is by the configured **provider** plus which
+///   attribute the file is asked for at lookup time, so a single `MmdbGeoIp` can hold both.
+/// * With **no** entries the result is [`NoopGeoIp`] and no warning: nothing was configured, which
+///   is the default and is not a mistake.
+/// * With entries that all fail to open the result is [`NoopGeoIp`] and the warnings explain why,
+///   so the server keeps serving (fail open).
+///
+/// An entry whose file exists but is not a valid database is reported in `warnings` and skipped
+/// rather than aborting the whole selection: one bad path should not cost the operator a working
+/// database. The error text still names the path and the reason.
+///
+/// [`NoopGeoIp`]: crate::radar_matcher::NoopGeoIp
+pub fn select_provider(entries: &[GeoIpConfigEntry<'_>]) -> SelectedGeoIp {
+    if entries.is_empty() {
+        return SelectedGeoIp {
+            provider: Arc::new(crate::radar_matcher::NoopGeoIp),
+            mmdb: None,
+            warnings: Vec::new(),
+        };
+    }
+
+    // Classify by path name in TWO passes, so a generic name cannot claim a specific slot. A name
+    // containing "asn" is the ASN database; a name containing "country" is the country database;
+    // anything else (e.g. MaxMind's `GeoIP2-ISP-Test.mmdb`, which contains neither word) is
+    // ambiguous and fills whichever slots the specific passes left empty.
+    //
+    // The two-pass order matters and was a real bug when it was one pass: with a single pass the
+    // generic ISP database matched "neither asn nor country" and took the country slot before the
+    // genuine country database was seen, silently discarding it.
+    let mut paths = GeoIpPaths::default();
+    for entry in entries {
+        let name = entry.path.to_ascii_lowercase();
+        if name.contains("asn") {
+            paths.asn.get_or_insert_with(|| PathBuf::from(entry.path));
+        }
+        if name.contains("country") {
+            paths
+                .country
+                .get_or_insert_with(|| PathBuf::from(entry.path));
+        }
+    }
+    for entry in entries {
+        let name = entry.path.to_ascii_lowercase();
+        if name.contains("asn") || name.contains("country") {
+            continue;
+        }
+        // Ambiguous: supply whatever is still unset.
+        paths.asn.get_or_insert_with(|| PathBuf::from(entry.path));
+        paths
+            .country
+            .get_or_insert_with(|| PathBuf::from(entry.path));
+    }
+
+    let warnings: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&warnings);
+    let opened = MmdbGeoIp::open(&paths, move |message: &str| {
+        sink.lock().expect("warning sink").push(message.to_string());
+    });
+
+    let warnings = Arc::try_unwrap(warnings)
+        .map(|cell| cell.into_inner().unwrap_or_default())
+        .unwrap_or_default();
+
+    match opened {
+        Ok(Some(mmdb)) => {
+            let mmdb = Arc::new(mmdb);
+            SelectedGeoIp {
+                provider: Arc::clone(&mmdb) as Arc<dyn GeoIpProvider>,
+                mmdb: Some(mmdb),
+                warnings,
+            }
+        }
+        Ok(None) => SelectedGeoIp {
+            provider: Arc::new(crate::radar_matcher::NoopGeoIp),
+            mmdb: None,
+            warnings,
+        },
+        Err(error) => {
+            let mut warnings = warnings;
+            // A database that exists but cannot be parsed: reported, then ignored, so a typo in one
+            // path does not disable the other.
+            warnings.push(format!("geoip: {error}; continuing without it"));
+            SelectedGeoIp {
+                provider: Arc::new(crate::radar_matcher::NoopGeoIp),
+                mmdb: None,
+                warnings,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

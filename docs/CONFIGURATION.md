@@ -155,6 +155,81 @@ integer nanoseconds. Modules are named by their short JSON key in a `handler` fi
 of a module map; the qualified module ID (for example `http.handlers.reverse_proxy`) is not the
 JSON spelling. Full per-area details are in [FEATURES.md](FEATURES.md).
 
+## Radar and GeoIP
+
+`radar` and `geoip` are caddy-rs extensions (ADR-0020, ADR-013). Neither exists in stock Caddy
+v2.11.9, so both are rejected under `stock_compat true` (see [Compatibility
+modes](#compatibility-modes)). The adapter carries the configuration only; polling Radar, the
+`@radar` matcher and the handlers are runtime work.
+
+| Option | Caddyfile | JSON | Notes |
+|---|---|---|---|
+| `geoip` | `geoip <provider> <path>` | top-level `geoip`: array of `{"provider": "dbip"\|"maxmind", "path": "<file>"}` | The IP → ASN/country database behind the `@radar` ASN and country predicates (`crates/http/src/geoip.rs`). Repeatable, in source order. |
+| `radar` | `radar { ... }` | top-level `radar`: object | Radar API client, cache storage, endpoints, filters and protection mode. |
+
+`geoip` details:
+
+- **Provider.** `dbip` is the default product: DB-IP's free tier needs no license key.
+  `maxmind` is opt-in because MaxMind requires a license key for downloads even though the file
+  format is identical. The provider word selects which product a path names; both are read by the
+  same MaxMind DB parser.
+- **Two databases, not one.** ASN and country records live in separate files
+  (`dbip-asn-lite.mmdb` and `dbip-country-lite.mmdb`; `GeoLite2-ASN.mmdb` and
+  `GeoLite2-Country.mmdb`), so both are configured with two `geoip` lines. Supplying only one is
+  valid: the other attribute is unknown (`None`) for every address, which is not an error.
+- **Fail open.** A configured path that does not exist is skipped with a warning naming the full
+  path; if no database can be opened at all, the server installs the no-op provider and keeps
+  serving, so `@radar` ASN and country predicates never match. A path that exists but is not a
+  valid MaxMind DB is a real misconfiguration and is reported as an error naming the path.
+- **Updates.** A database file is read when the configuration is provisioned, so replacing it
+  takes effect on the next reload. Update on the publisher's schedule — DB-IP ships monthly,
+  MaxMind GeoLite2 twice weekly — and reload rather than restart to pick the new file up.
+
+The same configuration in Caddyfile and JSON form:
+
+```caddyfile
+{
+	geoip dbip /var/lib/caddy-rs/geoip/dbip-asn-lite.mmdb
+	geoip dbip /var/lib/caddy-rs/geoip/dbip-country-lite.mmdb
+}
+
+example.com {
+	root * /srv/www
+	file_server
+}
+```
+
+```json
+{
+  "geoip": [
+    { "provider": "dbip", "path": "/var/lib/caddy-rs/geoip/dbip-asn-lite.mmdb" },
+    { "provider": "dbip", "path": "/var/lib/caddy-rs/geoip/dbip-country-lite.mmdb" }
+  ],
+  "apps": {
+    "http": {
+      "servers": {
+        "srv0": {
+          "listen": [":443"],
+          "routes": [
+            {
+              "match": [{ "host": ["example.com"] }],
+              "handle": [
+                { "handler": "file_server", "root": "/srv/www" }
+              ],
+              "terminal": true
+            }
+          ]
+        }
+      }
+    }
+  }
+}
+```
+
+Paths are emitted verbatim: they are not resolved against the Caddyfile's directory, so a
+relative path means the process working directory. Runnable pairs live in
+`crates/config/tests/fixtures/local/geoip_*.caddyfile` and `.json`.
+
 ## Compatibility modes
 
 Three independent switches tune how closely this build reproduces stock Caddy v2.11.9.
