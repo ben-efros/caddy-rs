@@ -15,6 +15,10 @@ members = [
     "crates/authn",
     "crates/config-tx",
     "crates/test-support",
+    # Vendored ecdysis 1.1.1 (T-OPS-106 API-compat shim). A workspace member so its
+    # golden-bytes wire test runs under `cargo test --workspace` and the audit gate's
+    # `cargo audit --file Cargo.lock` sees it in the same lockfile.
+    "vendor/ecdysis",
 ]
 
 [workspace.package]
@@ -86,6 +90,13 @@ urlencoding = "2.1"
 # `httpdate` (a hyper dependency). The vendored crate implements exactly the surface hyper uses.
 # Delete this patch when building online; the vendored crate is version-compatible with 1.0.3.
 httpdate = { path = "vendor/httpdate" }
+# T-OPS-017: ecdysis 1.1.1 declares `nix = "0.26"` with default features ON. nix's default
+# `aio` feature is the ONLY thing that pulls the unmaintained `pin-utils` 0.1.1
+# (RUSTSEC-2026-0441) into Cargo.lock. ecdysis never uses nix::aio; it needs only fcntl,
+# signal, process and net. This vendored copy changes ONE manifest line-group (nix default
+# features off + the four modules ecdysis uses); src/ is byte-identical to crates.io 1.1.1.
+# Delete this patch when upstream ecdysis drops its nix default features.
+ecdysis = { path = "vendor/ecdysis" }
 
 [profile.release]
 lto = "thin"
