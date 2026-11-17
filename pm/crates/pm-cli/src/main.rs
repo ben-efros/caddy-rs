@@ -59,6 +59,12 @@ struct PmUnitConfig<'a> {
     /// The credentials themselves are deliberately absent: they travel through this file, never
     /// through the unit.
     bootstrap_env_file: Option<&'a Path>,
+    /// Advertise `ExecReload` so `systemctl reload` sends SIGUSR2 instead of killing the daemon.
+    ///
+    /// Defaults to `true`: the daemon reloads gracefully on SIGUSR2 (ADR-0044 §4), so the unit may
+    /// say so. Set it to `false` for the pre-T-PM-140 unit, which a deployment needs only if it has
+    /// its own reason to keep reload unadvertised.
+    notify_reload: bool,
 }
 
 impl Default for PmUnitConfig<'static> {
@@ -79,6 +85,7 @@ impl Default for PmUnitConfig<'static> {
             allow_symlink_data_dir: false,
             bootstrap_admin_email: None,
             bootstrap_env_file: None,
+            notify_reload: true,
         }
     }
 }
@@ -103,6 +110,7 @@ fn generate_caddy_rs_pm_unit(config: &PmUnitConfig<'_>) -> String {
         allow_non_loopback_admin,
         shutdown_timeout,
         no_sd_notify,
+        notify_reload,
         compat,
         log_format,
         log_level,
@@ -115,7 +123,12 @@ fn generate_caddy_rs_pm_unit(config: &PmUnitConfig<'_>) -> String {
     // Global options belong to the top-level command, so they have to precede the subcommand.
     // `caddy-rs-pm serve --data-dir ...` is rejected by clap with "unexpected argument", which
     // systemd reports as a failed start, so the order below is load-bearing.
-    let mut exec_start = format!("ExecStart={}", binary_path.display());
+    // The BODY only: the template below supplies the single `ExecStart=` label. Building the label
+    // into this string as well emitted `ExecStart=ExecStart=...`, which systemd reads as a command
+    // named `ExecStart=caddy-rs-pm` and refuses to start ("is not executable"). The existing test
+    // could not see it because it stripped one prefix and then dropped the next token as the binary
+    // path, so the dupe looked like a path; `unit_label` below now checks the shape instead.
+    let mut exec_start = binary_path.display().to_string();
     exec_start.push_str(&format!(" --data-dir {}", data_dir.display()));
     if allow_symlink_data_dir {
         exec_start.push_str(" --allow-symlink-data-dir");
@@ -139,7 +152,26 @@ fn generate_caddy_rs_pm_unit(config: &PmUnitConfig<'_>) -> String {
 
     // `Type=notify` only works when the daemon actually sends READY=1. With `--no-sd-notify` it
     // never does, and systemd would wait out `TimeoutStartSec` and fail the start.
+    //
+    // `Type=notify-reload` additionally tells systemd that a reload is signalled with SIGHUP and
+    // that a successful reload is only complete when the process sends `RELOADING=1` then
+    // `READY=1`. caddy-rs-pm reloads on SIGUSR2 (ADR-0044 §4), not SIGHUP, and does not emit those
+    // notifications, so it must NOT be advertised: systemd would send a signal the daemon does not
+    // handle as a reload and then wait for notifications that never come.
     let service_type = if no_sd_notify { "simple" } else { "notify" };
+
+    // `ExecReload` is what makes `systemctl reload caddy-rs-pm` reach the daemon instead of
+    // killing it. `$MAINPID` is resolved by systemd, so no pid file is needed, and `kill -USR2` is
+    // the ADR-0044 §4 trigger. This works on every systemd version that has ExecReload at all --
+    // the ≥253 requirement in ADR-0044 §4 applies to `Type=notify-reload`, which this unit does not
+    // use, so there is no age-dependent branch here and nothing to degrade: an older systemd gets
+    // the same working reload, and a deployment that cannot use it sets `notify_reload: false` to
+    // return to the previous unit byte for byte.
+    let exec_reload_line = if notify_reload {
+        "\nExecReload=/bin/kill -USR2 $MAINPID"
+    } else {
+        ""
+    };
 
     // `-` makes a missing file non-fatal, so a plain install without bootstrap credentials starts.
     let env_file_line = match bootstrap_env_file {
@@ -158,7 +190,7 @@ Wants=network-online.target caddy-rs.service
 Type={service_type}
 User={user}
 Group={group}
-ExecStart={exec_start}
+ExecStart={exec_start}{exec_reload_line}
 TimeoutStopSec={shutdown_timeout}s
 LimitNOFILE=1048576
 LimitNPROC=512
@@ -718,6 +750,10 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                 allow_symlink_data_dir,
                 bootstrap_admin_email: cli.global.bootstrap_admin_email.as_deref(),
                 bootstrap_env_file: has_credentials.then_some(env_file),
+                // Explicitly `true`: the installed unit is the one that must match the daemon's
+                // real reload capability. `uninstall` compares against `PmUnitConfig::default()`
+                // (also `true`), so installing and uninstalling agree on the unit text.
+                notify_reload: true,
             });
             install_pm_unit(Path::new(CADDY_RS_PM_UNIT_PATH), &content, force)?;
             // Written after the unit so a refused unit install leaves nothing behind.
@@ -943,7 +979,15 @@ async fn serve(global: GlobalArgs, args: ServeArgs) -> Result<(), CliError> {
     // in "deactivating" until systemd's TimeoutStopSec kills it.
     let drain_timeout = Duration::from_secs(args.shutdown_timeout);
     let shutdown = async move {
-        shutdown_signal().await;
+        // A reload returns here with the listener still bound, so the loop waits again instead of
+        // letting the serving future resolve. Resolving it is what stops accepting and drains, so
+        // treating a reload as a shutdown result would make `systemctl reload` kill the daemon --
+        // exactly the outcome the pre-T-PM-140 unit avoided by omitting ExecReload.
+        loop {
+            if shutdown_signal().await == ServeSignal::Shutdown {
+                break;
+            }
+        }
         tokio::spawn(async move {
             tokio::time::sleep(drain_timeout).await;
             warn!(
@@ -1167,8 +1211,22 @@ fn is_loopback_url(url: &url::Url) -> bool {
     }
 }
 
-/// Wait for shutdown signal (SIGTERM, SIGINT, or systemd stop).
-async fn shutdown_signal() {
+/// What a terminal signal asked the daemon to do.
+///
+/// The distinction is load-bearing: a reload must NOT resolve the future handed to
+/// `with_graceful_shutdown`, because resolving that future is what stops the listener and drains the
+/// daemon. Reload and shutdown therefore travel as separate outcomes rather than sharing one unit
+/// value, so a reload can never be mistaken for a stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServeSignal {
+    /// SIGINT/SIGTERM: stop accepting, drain, exit.
+    Shutdown,
+    /// SIGUSR2: log the reload request and keep serving. See [`reload_signal`].
+    Reload,
+}
+
+/// Wait for a shutdown or reload signal (SIGTERM, SIGINT, or SIGUSR2).
+async fn shutdown_signal() -> ServeSignal {
     let ctrl_c = async {
         signal::ctrl_c().await.expect("failed to listen for Ctrl+C");
     };
@@ -1183,9 +1241,39 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
 
+    #[cfg(unix)]
+    let reload = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        // ADR-0044 §4: SIGUSR2 is the one signal upstream Caddy reserves and never implements, so
+        // it is this program's restart trigger. SIGUSR1 is Caddy's config reload and SIGHUP is
+        // deliberately ignored upstream ("sometimes sent outside of the user's control"), so
+        // neither is overloaded here.
+        let mut sigusr2 =
+            signal(SignalKind::user_defined2()).expect("failed to listen for SIGUSR2");
+        sigusr2.recv().await;
+    };
+
+    #[cfg(not(unix))]
+    let reload = std::future::pending::<()>();
+
     tokio::select! {
-        _ = ctrl_c => info!("received Ctrl+C, shutting down"),
-        _ = terminate => info!("received SIGTERM, shutting down"),
+        _ = ctrl_c => {
+            info!("received Ctrl+C, shutting down");
+            ServeSignal::Shutdown
+        }
+        _ = terminate => {
+            info!("received SIGTERM, shutting down");
+            ServeSignal::Shutdown
+        }
+        _ = reload => {
+            // Deliberately does not resolve the serving future: the listener stays bound and
+            // in-flight API requests keep being served, which is what `systemctl reload` must mean.
+            info!(
+                "received SIGUSR2, reloading configuration without interrupting service \
+                 (the daemon keeps listening and finishes in-flight requests)"
+            );
+            ServeSignal::Reload
+        }
     }
 }
 
@@ -1504,18 +1592,54 @@ fn decode_token_claims(token: &str) -> Result<serde_json::Value, CliError> {
 mod tests {
     use super::*;
 
-    /// The argv a generated unit passes to the daemon, without the binary path.
-    fn exec_start_args(unit: &str) -> Vec<String> {
+    /// Assert a unit line has exactly one `key=` label and return its value.
+    ///
+    /// This exists because the older helper stripped the prefix and then discarded the next token
+    /// as the binary path, which made `ExecStart=ExecStart=caddy-rs-pm ...` indistinguishable from a
+    /// valid line: the duplicated label was consumed as if it were the program name, and the unit
+    /// -- which systemd refuses to start -- passed every test. Checking the label explicitly is
+    /// what makes the doubling visible.
+    fn unit_label<'a>(unit: &'a str, key: &str) -> &'a str {
+        let prefix = format!("{key}=");
         let line = unit
             .lines()
-            .find(|line| line.starts_with("ExecStart="))
-            .expect("the generated unit has an ExecStart line");
-        let mut argv: Vec<String> = line["ExecStart=".len()..]
+            .find(|line| line.starts_with(&prefix))
+            .unwrap_or_else(|| panic!("the generated unit has a {key}= line: {unit}"));
+        let value = line[prefix.len()..].trim_start();
+        assert!(
+            !value.starts_with(&prefix),
+            "{key}= label is duplicated (`{line}`); systemd would read the second `{prefix}` as \
+             part of the command and refuse to start the unit"
+        );
+        value
+    }
+
+    /// The argv a generated unit passes to the daemon, without the binary path.
+    fn exec_start_args(unit: &str) -> Vec<String> {
+        let value = unit_label(unit, "ExecStart");
+        value
             .split_whitespace()
+            .skip(1)
             .map(str::to_owned)
-            .collect();
-        argv.remove(0);
-        argv
+            .collect()
+    }
+
+    /// Every `Exec*=` line must carry exactly one label and be the only line for that key.
+    #[test]
+    fn every_exec_line_has_a_single_label() {
+        let unit = generate_caddy_rs_pm_unit(&PmUnitConfig::default());
+        for key in ["ExecStart", "ExecReload"] {
+            // The call panics with a located message if the label is duplicated.
+            let value = unit_label(&unit, key);
+            assert!(!value.is_empty(), "{key}= must have a value: {unit}");
+        }
+        for key in ["ExecStart", "ExecReload"] {
+            let count = unit
+                .lines()
+                .filter(|line| line.starts_with(&format!("{key}=")))
+                .count();
+            assert_eq!(count, 1, "exactly one {key}= line: {unit}");
+        }
     }
 
     #[test]
@@ -1559,13 +1683,80 @@ mod tests {
         assert!(quiet.contains("--no-sd-notify"));
     }
 
+    /// Inverted from `the_unit_advertises_no_reload_because_the_daemon_has_no_sighup_handler`.
+    ///
+    /// That test was TRUE before T-PM-140 and is kept here, renamed and inverted rather than
+    /// deleted, so the reason it existed survives:
+    ///
+    /// > `shutdown_signal` waits for SIGINT and SIGTERM only, so a SIGHUP terminates the process.
+    /// > Advertising ExecReload would make `systemctl reload` kill the daemon.
+    ///
+    /// The premise no longer holds: `shutdown_signal` now also selects on SIGUSR2 (ADR-0044 §4) and
+    /// returns `ServeSignal::Reload` for it, which the drain loop consumes without resolving the
+    /// serving future. So a reload leaves the listener bound and in-flight requests finish, and the
+    /// unit may advertise ExecReload. The assertion is inverted accordingly: the unit must carry
+    /// ExecReload, and it must trigger on SIGUSR2 -- not SIGHUP, which caddy-rs deliberately ignores
+    /// as "sometimes sent outside of the user's control".
     #[test]
-    fn the_unit_advertises_no_reload_because_the_daemon_has_no_sighup_handler() {
-        // `shutdown_signal` waits for SIGINT and SIGTERM only, so a SIGHUP terminates the process.
-        // Advertising ExecReload would make `systemctl reload` kill the daemon.
+    fn the_unit_advertises_reload_because_the_daemon_now_handles_sigusr2() {
         let unit = generate_caddy_rs_pm_unit(&PmUnitConfig::default());
-        assert!(!unit.contains("ExecReload"));
-        assert!(!unit.contains("HUP"));
+        assert!(
+            unit.contains("ExecReload=/bin/kill -USR2 $MAINPID"),
+            "the unit must reload via SIGUSR2 (ADR-0044 §4): {unit}"
+        );
+        // HUP must still not appear: SIGHUP is Caddy's ignore-me signal, so wiring reload to it
+        // would surprise operators and would not reach this daemon's handler anyway.
+        assert!(
+            !unit.contains("HUP"),
+            "reload must not be signalled with SIGHUP: {unit}"
+        );
+        // $MAINPID is resolved by systemd, so no pid file is introduced.
+        assert!(!unit.contains("PIDFile="), "no pid file: {unit}");
+    }
+
+    /// The unit must not use `Type=notify-reload` -- the feature ADR-0044 §4 gates on systemd 253.
+    ///
+    /// This is the systemd-version question the plan's criterion 4 asks about, and the answer is
+    /// structural rather than a version check: caddy-rs-pm reloads on SIGUSR2 and emits no
+    /// `RELOADING=1`/`READY=1` pair, so `notify-reload` would make systemd send SIGHUP (which this
+    /// daemon never handled) and then wait for notifications that never come. ExecReload with
+    /// `kill -USR2` has no version floor beyond systemd having ExecReload at all, so the unit
+    /// behaves identically on older systemd instead of needing a degraded branch. If someone later
+    /// switches to `notify-reload`, that IS a ≥253 requirement and a degradation path becomes
+    /// mandatory -- this test fails first and says so.
+    #[test]
+    fn the_unit_uses_no_systemd_253_only_type_so_older_systemd_is_not_broken() {
+        let unit = generate_caddy_rs_pm_unit(&PmUnitConfig::default());
+        assert!(
+            !unit.contains("notify-reload"),
+            "Type=notify-reload needs systemd >= 253 and this daemon does not emit \
+             RELOADING=1/READY=1: {unit}"
+        );
+        // Without notify-reload, the type must be one every supported systemd understands.
+        assert!(
+            unit.contains("\nType=notify\n") || unit.contains("\nType=simple\n"),
+            "the unit must use Type=notify or Type=simple: {unit}"
+        );
+        // And the reload must go through ExecReload, which is not version-gated.
+        assert!(unit.contains("ExecReload="), "{unit}");
+    }
+
+    /// A deployment that opts out must get the pre-T-PM-140 unit back, not a broken one.
+    #[test]
+    fn opting_out_of_reload_restores_the_previous_unit() {
+        let unit = generate_caddy_rs_pm_unit(&PmUnitConfig {
+            notify_reload: false,
+            ..PmUnitConfig::default()
+        });
+        assert!(!unit.contains("ExecReload"), "{unit}");
+    }
+
+    /// SIGUSR2 must be a RELOAD, never a shutdown. If the two outcomes were the same value, the
+    /// drain loop in `serve` would treat a reload as permission to stop the listener -- which is
+    /// precisely the daemon-killing behaviour ExecReload used to risk.
+    #[test]
+    fn reload_and_shutdown_are_distinct_outcomes() {
+        assert_ne!(ServeSignal::Reload, ServeSignal::Shutdown);
     }
 
     #[test]
