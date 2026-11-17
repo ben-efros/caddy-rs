@@ -869,14 +869,27 @@ async fn run(command: Command) -> anyhow::Result<()> {
             // signal then fired on a channel nobody was watching, so the second SIGINT/SIGTERM
             // could not shorten the grace period.
             let channels = crate::signals::shutdown_channels()?;
-            activation::serve_with(
+            // The generation-scoped caddy-pm-rs service (T-SETUP-004, ADR-006) is started BEFORE
+            // the activation layer serves: the enrollment handler lives in that service, so a
+            // missing binary must be a located error rather than a boot that comes up serving 503.
+            // It is stopped on handoff, when the activation layer returns, so a normal run never
+            // inherits it and a failed serve does not leak it.
+            let pm =
+                setup::SetupService::new(setup::ProcessService::default(), setup::SETUP_GENERATION);
+            pm.start().map_err(|error| anyhow!("{error}"))?;
+            let served = activation::serve_with(
                 &config.activation_listen,
                 service,
                 builtin_module_registry(),
                 channels.shutdown,
                 channels.force,
             )
-            .await?;
+            .await;
+            // Stop regardless of how the serve ended; report the serve error in preference, since
+            // that is what the operator needs to see.
+            let stopped = pm.stop();
+            served?;
+            stopped.map_err(|error| anyhow!("{error}"))?;
         }
         Command::Version { json } => {
             if json {
