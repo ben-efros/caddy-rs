@@ -62,6 +62,42 @@ listener set on each generation change and reuses listeners whose address did no
 (`crates/server/src/runtime.rs`). That means a reload never creates a listening gap for unchanged
 addresses, and an unchanged address is not rebound (avoiding `EADDRINUSE` races).
 
+### UDP socket generations (`udpgrm`)
+
+The UDP graceful-restart path (ADR-0045, opt-in via the `udpgrm` Cargo feature) has a **second**
+generation concept, and the two are deliberately not the same number. ADR-0045 §2 makes the mapping
+an acceptance criterion because conflating them would promote the wrong sockets.
+
+| | config generation | udpgrm socket generation |
+|---|---|---|
+| Identified by | `Generation::id()`, a `u64` from 1 | `udp_grm_socket_gen.socket_gen`, a `u32` |
+| Counts | one per **loaded configuration** | one per **set of UDP sockets per runtime instance** |
+| Advanced by | a config load/reload | a socket registering into a new generation |
+| Scope | process-wide: config, routers, TLS, listeners | one `SO_REUSEPORT` group (one UDP listen address) |
+
+The mapping is **not numeric**: the config generation is not an input to the socket generation.
+A socket generation belongs to one runtime instance and is assigned by udpgrm as
+`working_gen + 1`, where `working_gen` is whatever the *previous* process promoted. The two
+vocabularies diverge in both directions, which is why they cannot be keyed off each other:
+
+- a reload that keeps the same UDP sockets must **not** create a new socket generation — the
+  sockets are the same kernel sockets, and re-registering them would churn the flow table;
+- a process restart creates a new socket generation **without** any config generation changing,
+  because the successor starts its own `GenerationStore` at generation 1 exactly as its
+  predecessor did. Keying sockets off the config generation would make the old and new socket sets
+  indistinguishable to the eBPF program.
+
+`working_gen` is `(uint32_t)-1` when the group does not exist yet — that sentinel also *is* the
+default working generation — so the first process to bind a group registers into generation 0. The
+`wrapping_add(1)` in `crates/server/src/udpgrm.rs` is deliberate and pinned by a test.
+
+**Registration and promotion are separate steps**, which is the UDP form of the `ready()` ordering
+ADR-0044 §2 fixes for TCP. A bound socket joins its new generation immediately
+(`register_listener`) but is held in a deferred set; the runtime drains and promotes that set only
+when the instance is fully initialised (`ServerRuntime::mark_ready`, which promotes whether or not a
+listener binder exists, since `udpgrm` is independent of `graceful-restart`). Promoting at bind time
+— which the first cut of this code did — sends new flows to a process that is not yet serving.
+
 ## Module registry
 
 Handlers and matchers are looked up by both their dotted Caddy module id

@@ -27,6 +27,11 @@ minimal = []
 # any other non-Unix target the feature fails to compile with a named error instead of silently
 # falling back to stop-then-start (ADR-0044 section 5).
 graceful-restart = ["caddy-rs-server/graceful-restart"]
+# UDP graceful restart via SO_REUSEPORT + udpgrm (ADR-0045). Default-OFF and independent of
+# `graceful-restart`: a deployment can keep QUIC flows across a restart without adopting the TCP
+# binary-upgrade path. Requires `http3`, because the only UDP listeners caddy-rs creates are the
+# QUIC ones.
+udpgrm = ["caddy-rs-server/udpgrm"]
 
 [dependencies]
 anyhow = { workspace = true }
