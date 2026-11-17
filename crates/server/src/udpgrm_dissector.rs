@@ -354,53 +354,6 @@ impl FlowMetrics {
     }
 }
 
-/// The exported eviction observable ADR-0045 §4 requires of this task.
-///
-/// **This is an approximation, and it is named as one.** The flow table is a `BPF_MAP_TYPE_LRU_HASH`
-/// inside udpgrm's eBPF program, so the kernel evicts entries where caddy-rs cannot see it: there is
-/// no `getsockopt` that reports eviction, and the daemon raises no error when the table is full
-/// (ADR-0045 §4: "the kernel silently evicts the least-recently-used flow"). Any counter claiming to
-/// be exact would be inventing kernel truth caddy-rs does not have.
-///
-/// What caddy-rs *can* observe is the **at-risk condition**: a listener whose concurrent flows are at
-/// or above the published bound. Recording that as a counter makes the condition visible rather than
-/// leaving it to be inferred from lost stickiness, which is exactly what ADR-0045 §4 asks for. The
-/// metric name carries `approximate` so no operator or dashboard mistakes it for a kernel counter.
-///
-/// A genuinely exact eviction count needs either a counter in udpgrm's state map (an upstream
-/// change, tracked by the DIV-0156/T-CORE-114 verdict work) or eBPF inspection the server must never
-/// do itself (ADR-0045 §5). That is why this is documented as an approximation rather than presented
-/// as the finished observable.
-pub const FLOW_TABLE_EVICTION_APPROXIMATE_TOTAL: &str =
-    "caddy_udp_grm_flow_table_eviction_approximate_total";
-
-/// Record that `flows` concurrent flows were observed against the published bound.
-///
-/// Increments [`FLOW_TABLE_EVICTION_APPROXIMATE_TOTAL`] by one whenever `flows` reaches or exceeds
-/// [`DISSECTOR_FLOW_MAX_CONCURRENT_FLOWS`], because that is the first observation at which the LRU can
-/// have evicted anything. Below the bound this records nothing: no eviction is possible there, and a
-/// counter that moved below the bound would be noise an operator learns to ignore.
-///
-/// Returns whether the at-risk condition was recorded, so a caller can log or test it.
-pub fn record_flow_pressure(
-    registry: &caddy_rs_admin::MetricsRegistry,
-    flows: usize,
-) -> Result<bool, caddy_rs_admin::MetricsError> {
-    if flows < DISSECTOR_FLOW_MAX_CONCURRENT_FLOWS {
-        return Ok(false);
-    }
-    registry
-        .counter(
-            FLOW_TABLE_EVICTION_APPROXIMATE_TOTAL,
-            "Approximate count of observations at or above the published 8192 concurrent-flow \
-             bound, where the udpgrm LRU may have evicted a flow. Not a kernel eviction count: the \
-             table lives in udpgrm's eBPF map and raises no error.",
-            &[],
-        )?
-        .inc()?;
-    Ok(true)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,6 +486,33 @@ mod tests {
     }
 
     #[test]
+    fn the_runtime_registers_the_flow_metrics_so_they_reach_the_admin_endpoint() {
+        // The reviewer's blocking point was that `register` had no production caller: a series that
+        // nothing registers never appears on a live /metrics, so the operator still inferred. This
+        // drives the runtime entry point, which is the function the server calls, rather than
+        // calling `register` by hand - so it fails if the wiring is removed even though `register`
+        // itself still works.
+        let runtime = crate::runtime::ServerRuntime::new(std::sync::Arc::new(
+            caddy_rs_core::GenerationStore::with_builtin_registry(),
+        ));
+        let published = runtime
+            .publish_udpgrm_flow_metrics(FlowMetrics {
+                rx_flow_rg_conflict: 4,
+                tx_flow_update_conflict: 2,
+                rx_flow_new_bad_cookie: 1,
+            })
+            .expect("publish");
+        assert_eq!(published, 3);
+
+        // The runtime's registry is the one the admin endpoint renders, so this is the same surface
+        // an operator scrapes.
+        let rendered = runtime.metrics().render();
+        assert!(rendered.contains("rx_flow_rg_conflict"), "{rendered}");
+        assert!(rendered.contains("tx_flow_update_conflict"), "{rendered}");
+        assert!(rendered.contains("rx_flow_new_bad_cookie"), "{rendered}");
+    }
+
+    #[test]
     fn the_flow_metrics_are_registered_in_the_registry_metrics_renders() {
         // The criterion is that the counters are EXPORTED, not that a constant names them. So this
         // drives the real MetricsRegistry and asserts the rendered output carries the values -
@@ -557,63 +537,6 @@ mod tests {
                 "value {value} for {name} missing from:\n{rendered}"
             );
         }
-    }
-
-    #[test]
-    fn eviction_pressure_is_recorded_only_at_or_above_the_published_bound() {
-        // The eviction observable ADR-0045 section 4 requires of this task. Below the bound no
-        // eviction is possible, so nothing is recorded; at and above it, the at-risk condition is.
-        let registry = caddy_rs_admin::MetricsRegistry::new();
-        assert!(
-            !record_flow_pressure(&registry, DISSECTOR_FLOW_MAX_CONCURRENT_FLOWS - 1)
-                .expect("record")
-        );
-        assert!(
-            !registry
-                .render()
-                .contains(FLOW_TABLE_EVICTION_APPROXIMATE_TOTAL),
-            "nothing may be exported below the bound:\n{}",
-            registry.render()
-        );
-
-        assert!(
-            record_flow_pressure(&registry, DISSECTOR_FLOW_MAX_CONCURRENT_FLOWS).expect("record")
-        );
-        assert!(
-            registry
-                .render()
-                .contains(FLOW_TABLE_EVICTION_APPROXIMATE_TOTAL),
-            "the at-risk condition must be exported:\n{}",
-            registry.render()
-        );
-
-        // Above the bound also records, and the counter accumulates rather than resetting.
-        assert!(
-            record_flow_pressure(&registry, DISSECTOR_FLOW_MAX_CONCURRENT_FLOWS * 2)
-                .expect("record")
-        );
-        let rendered = registry.render();
-        let line = rendered
-            .lines()
-            .find(|line| {
-                line.starts_with(FLOW_TABLE_EVICTION_APPROXIMATE_TOTAL) && !line.starts_with('#')
-            })
-            .expect("a sample line");
-        assert!(
-            line.trim_end().ends_with(" 2"),
-            "expected 2 observations, got {line:?}"
-        );
-    }
-
-    #[test]
-    fn the_eviction_metric_name_says_it_is_approximate() {
-        // Honesty requirement: the LRU lives in udpgrm's eBPF map and raises no error, so caddy-rs
-        // cannot count kernel evictions. The name must not read like a kernel counter.
-        assert!(
-            FLOW_TABLE_EVICTION_APPROXIMATE_TOTAL.contains("approximate"),
-            "the metric name must disclose that it is an approximation: \
-             {FLOW_TABLE_EVICTION_APPROXIMATE_TOTAL}"
-        );
     }
 
     #[test]
