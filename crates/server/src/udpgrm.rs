@@ -329,7 +329,7 @@ impl PendingRegistry {
         let drained: Vec<_> = std::mem::take(&mut *self.lock());
         let mut promoted = 0;
         for (listen, socket, pending_generation) in drained {
-            if promote(&socket, pending_generation, &listen) {
+            if promote(self, &socket, pending_generation, &listen) {
                 promoted += 1;
             }
         }
@@ -490,8 +490,19 @@ pub fn register_listener(socket: &UdpSocket, listen: &str) -> Option<PendingGene
 ///
 /// Call this only when the instance is **fully initialised** — the same point at which the TCP path
 /// signals `ready()` (ADR-0044 §2). Returns `true` when the promotion succeeded.
-pub fn promote(socket: &UdpSocket, pending: PendingGeneration, listen: &str) -> bool {
-    registry().attempts.fetch_add(1, Ordering::SeqCst);
+///
+/// The registry is a parameter rather than the process global so the attempt is counted against the
+/// registry the caller actually used. Counting against `registry()` here would mean a test holding
+/// its own `PendingRegistry` reads a counter this function never writes, and that a concurrently
+/// running test could move the number inside another test's assertion window - which is the exact
+/// cross-test coupling the owned registry exists to remove.
+fn promote(
+    registry: &PendingRegistry,
+    socket: &UdpSocket,
+    pending: PendingGeneration,
+    listen: &str,
+) -> bool {
+    registry.attempts.fetch_add(1, Ordering::SeqCst);
     match promote_generation(socket, pending.generation) {
         Ok(()) => {
             tracing::debug!(
@@ -629,10 +640,10 @@ mod tests {
         };
         let owned = duplicate_for_promotion(&listener).expect("duplicate the listener");
 
-        let before = registry().attempts();
+        let before = queue.attempts();
         queue.defer("udp/127.0.0.1:0", owned, pending);
         assert_eq!(
-            registry().attempts(),
+            queue.attempts(),
             before,
             "deferring a registration must not attempt a promotion - promoting at bind time is \
              exactly the ordering defect ADR-0045 §2 forbids"
@@ -641,8 +652,9 @@ mod tests {
 
         // Promotion drains the set and attempts the promotion once.
         let promoted = queue.promote_all();
-        assert!(
-            registry().attempts() > before,
+        assert_eq!(
+            queue.attempts(),
+            before + 1,
             "promotion must actually attempt to promote the deferred generation"
         );
         assert_eq!(queue.len(), 0, "promotion drains the deferred set");
