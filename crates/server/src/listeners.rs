@@ -813,15 +813,31 @@ fn select_udpgrm_dissector(socket: &std::net::UdpSocket, configured: &str) {
     use crate::udpgrm_dissector::{select_dissector, Dissector, DissectorError};
 
     // DISSECTOR_FLOW is the initial choice (ADR-0045 §4). Its concurrent-flow cap is published in
-    // the operator docs; DISSECTOR_NOOP remains available for stateless UDP use but is not selected
-    // by default because it gives up flow stickiness entirely.
-    match select_dissector(socket, Dissector::Flow) {
+    // the operator docs; DISSECTOR_NOOP is available through the documented environment variable
+    // for stateless UDP use, where flow identity is meaningless.
+    let dissector = match crate::udpgrm_dissector::dissector_from_env() {
+        Ok(dissector) => dissector,
+        Err(error) => {
+            // A misconfigured name must not silently become the default: the operator asked for a
+            // specific dissector, and serving with a different one hides the mistake until it shows
+            // up as unexplained restart behaviour.
+            tracing::warn!(
+                listen = configured,
+                %error,
+                "udpgrm flow dissector selection is invalid; falling back to the default"
+            );
+            Dissector::default()
+        }
+    };
+    match select_dissector(socket, dissector) {
         Ok(()) => {}
         Err(DissectorError::Conflict { .. }) => tracing::warn!(
             listen = configured,
-            dissector = Dissector::Flow.as_str(),
-            max_concurrent_flows = Dissector::Flow.max_concurrent_flows().unwrap_or(0),
-            "udpgrm already has a different flow dissector for this reuseport group; the              configured dissector was not applied and new flows may not stay sticky across a              restart. The dissector is fixed for the lifetime of the group"
+            dissector = dissector.as_str(),
+            max_concurrent_flows = dissector.max_concurrent_flows().unwrap_or(0),
+            "udpgrm already has a different flow dissector for this reuseport group; the \
+             configured dissector was not applied and new flows may not stay sticky across a \
+             restart. The dissector is fixed for the lifetime of the group"
         ),
         Err(DissectorError::Io(error)) if error.raw_os_error() == Some(libc::ENOPROTOOPT) => {
             // No daemon: identical to the presence probe's outcome. Already reported once, loudly,
@@ -830,7 +846,8 @@ fn select_udpgrm_dissector(socket: &std::net::UdpSocket, configured: &str) {
         Err(DissectorError::Io(error)) => tracing::warn!(
             listen = configured,
             %error,
-            "udpgrm flow dissector could not be selected; flow stickiness across a restart is not              guaranteed for this listener"
+            "udpgrm flow dissector could not be selected; flow stickiness across a restart is not \
+             guaranteed for this listener"
         ),
     }
 }

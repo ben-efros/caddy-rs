@@ -112,6 +112,58 @@ impl Dissector {
             Self::Noop => None,
         }
     }
+
+    /// Parse an operator-supplied dissector name.
+    ///
+    /// Accepts udpgrm's own spelling with or without the `DISSECTOR_` prefix, case-insensitively, so
+    /// an operator copying from udpgrm's README does not have to translate. The out-of-scope names
+    /// are rejected with a specific reason.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let normalised = value.trim().to_ascii_uppercase();
+        let normalised = normalised.strip_prefix("DISSECTOR_").unwrap_or(&normalised);
+        match normalised {
+            "FLOW" => Ok(Self::Flow),
+            "NOOP" => Ok(Self::Noop),
+            "CBPF" => Err(format!(
+                "{DISSECTOR_ENV}=DISSECTOR_CBPF is not supported: it requires encoding a udpgrm \
+                 cookie into the QUIC connection ID, which is a change to the DCID schema, and the \
+                 daemon documents it as slow (ADR-0045 section 4). Use DISSECTOR_FLOW"
+            )),
+            "BESPOKE" => Err(format!(
+                "{DISSECTOR_ENV}=DISSECTOR_BESPOKE is out of scope: it is a routing feature (QUIC \
+                 SNI routing), not a restart feature, and caddy-rs does not offer it (ADR-0045 \
+                 section 4). Use DISSECTOR_FLOW"
+            )),
+            other => Err(format!(
+                "{DISSECTOR_ENV}={other} is not a dissector caddy-rs understands; use \
+                 DISSECTOR_FLOW (the default) or DISSECTOR_NOOP"
+            )),
+        }
+    }
+}
+
+/// The environment variable that selects the dissector.
+///
+/// Named after udpgrm's own `UDP_GRM_*` vocabulary so an operator debugging a unit sees the same
+/// spelling in caddy-rs and in the daemon. An environment variable rather than a configuration key
+/// because the dissector is a property of the *host's* udpgrm deployment, not of a site's routing:
+/// one binary serves the same configuration in environments that may have different daemon builds,
+/// and a config key would have to be overridden per environment anyway.
+pub const DISSECTOR_ENV: &str = "CADDY_RS_UDP_GRM_DISSECTOR";
+
+/// Read the dissector selection from the environment, defaulting to [`Dissector::Flow`].
+///
+/// Unset or empty selects the default. An unrecognised value is an **error rather than a silent
+/// fallback**: an operator who asked for a dissector and got a different one has a configuration bug
+/// that would otherwise only show up as unexplained restart behaviour. `DISSECTOR_CBPF` and
+/// `DISSECTOR_BESPOKE` are rejected by name with an explanation of why they are unavailable, rather
+/// than being reported as unknown strings.
+pub fn dissector_from_env() -> Result<Dissector, String> {
+    match std::env::var(DISSECTOR_ENV) {
+        Err(_) => Ok(Dissector::default()),
+        Ok(value) if value.trim().is_empty() => Ok(Dissector::default()),
+        Ok(value) => Dissector::parse(value.trim()),
+    }
 }
 
 /// Why selecting a dissector failed.
@@ -239,9 +291,14 @@ fn classify_os_error(dissector: Dissector, error: io::Error) -> DissectorError {
 
 /// The udpgrm flow-dissector counters that explain why flows moved.
 ///
-/// Named so an exporter can surface them by name rather than by offset into the eBPF state map. Each
-/// corresponds to a `METRIC_INC(...)` in udpgrm's `ebpf.c` at the pinned commit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Each corresponds to a `METRIC_INC(...)` in udpgrm's `ebpf.c` at the pinned commit, and each is
+/// registered in the admin [`MetricsRegistry`] under its udpgrm name so `GET /metrics` reports it.
+/// Registering is what makes the counter *exported*: a constant naming a counter that nothing
+/// registers is a comment with extra steps, and this program has already shipped one tautology of
+/// that shape.
+///
+/// [`MetricsRegistry`]: caddy_rs_admin::MetricsRegistry
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FlowMetrics {
     /// `rx_flow_rg_conflict` — a received packet's flow pointed at a socket in a different
     /// reuseport group than the one it arrived on.
@@ -253,12 +310,95 @@ pub struct FlowMetrics {
 }
 
 impl FlowMetrics {
-    /// The counter names as udpgrm spells them, for exporters and log fields.
+    /// The counter names as udpgrm spells them.
+    ///
+    /// Kept in udpgrm's own vocabulary rather than renamed to a `caddy_*` convention: these values
+    /// are read out of the daemon's eBPF state map, and a renamed counter would force an operator
+    /// to maintain a translation table between the metric and the daemon they are debugging.
     pub const NAMES: [&'static str; 3] = [
         "rx_flow_rg_conflict",
         "tx_flow_update_conflict",
         "rx_flow_new_bad_cookie",
     ];
+
+    /// Publish every counter into the registry `GET /metrics` renders.
+    ///
+    /// Returns the number of series published so a caller can assert the export happened rather
+    /// than assuming it did.
+    pub fn register(
+        &self,
+        registry: &caddy_rs_admin::MetricsRegistry,
+    ) -> Result<usize, caddy_rs_admin::MetricsError> {
+        registry
+            .counter(
+                Self::NAMES[0],
+                "Flows whose reuseport group differed from the group the packet arrived on.",
+                &[],
+            )?
+            .add(self.rx_flow_rg_conflict)?;
+        registry
+            .counter(
+                Self::NAMES[1],
+                "Flow-table updates that lost a race with a concurrent update.",
+                &[],
+            )?
+            .add(self.tx_flow_update_conflict)?;
+        registry
+            .counter(
+                Self::NAMES[2],
+                "New flows that arrived carrying a cookie the daemon could not use.",
+                &[],
+            )?
+            .add(self.rx_flow_new_bad_cookie)?;
+        Ok(Self::NAMES.len())
+    }
+}
+
+/// The exported eviction observable ADR-0045 §4 requires of this task.
+///
+/// **This is an approximation, and it is named as one.** The flow table is a `BPF_MAP_TYPE_LRU_HASH`
+/// inside udpgrm's eBPF program, so the kernel evicts entries where caddy-rs cannot see it: there is
+/// no `getsockopt` that reports eviction, and the daemon raises no error when the table is full
+/// (ADR-0045 §4: "the kernel silently evicts the least-recently-used flow"). Any counter claiming to
+/// be exact would be inventing kernel truth caddy-rs does not have.
+///
+/// What caddy-rs *can* observe is the **at-risk condition**: a listener whose concurrent flows are at
+/// or above the published bound. Recording that as a counter makes the condition visible rather than
+/// leaving it to be inferred from lost stickiness, which is exactly what ADR-0045 §4 asks for. The
+/// metric name carries `approximate` so no operator or dashboard mistakes it for a kernel counter.
+///
+/// A genuinely exact eviction count needs either a counter in udpgrm's state map (an upstream
+/// change, tracked by the DIV-0156/T-CORE-114 verdict work) or eBPF inspection the server must never
+/// do itself (ADR-0045 §5). That is why this is documented as an approximation rather than presented
+/// as the finished observable.
+pub const FLOW_TABLE_EVICTION_APPROXIMATE_TOTAL: &str =
+    "caddy_udp_grm_flow_table_eviction_approximate_total";
+
+/// Record that `flows` concurrent flows were observed against the published bound.
+///
+/// Increments [`FLOW_TABLE_EVICTION_APPROXIMATE_TOTAL`] by one whenever `flows` reaches or exceeds
+/// [`DISSECTOR_FLOW_MAX_CONCURRENT_FLOWS`], because that is the first observation at which the LRU can
+/// have evicted anything. Below the bound this records nothing: no eviction is possible there, and a
+/// counter that moved below the bound would be noise an operator learns to ignore.
+///
+/// Returns whether the at-risk condition was recorded, so a caller can log or test it.
+pub fn record_flow_pressure(
+    registry: &caddy_rs_admin::MetricsRegistry,
+    flows: usize,
+) -> Result<bool, caddy_rs_admin::MetricsError> {
+    if flows < DISSECTOR_FLOW_MAX_CONCURRENT_FLOWS {
+        return Ok(false);
+    }
+    registry
+        .counter(
+            FLOW_TABLE_EVICTION_APPROXIMATE_TOTAL,
+            "Approximate count of observations at or above the published 8192 concurrent-flow \
+             bound, where the udpgrm LRU may have evicted a flow. Not a kernel eviction count: the \
+             table lives in udpgrm's eBPF map and raises no error.",
+            &[],
+        )?
+        .inc()?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -390,6 +530,165 @@ mod tests {
             message.contains("fixed for the lifetime of the group"),
             "the message must explain why it is not retried: {message}"
         );
+    }
+
+    #[test]
+    fn the_flow_metrics_are_registered_in_the_registry_metrics_renders() {
+        // The criterion is that the counters are EXPORTED, not that a constant names them. So this
+        // drives the real MetricsRegistry and asserts the rendered output carries the values -
+        // a test asserting `NAMES == [...]` would pass with nothing registered at all.
+        let registry = caddy_rs_admin::MetricsRegistry::new();
+        let metrics = FlowMetrics {
+            rx_flow_rg_conflict: 7,
+            tx_flow_update_conflict: 3,
+            rx_flow_new_bad_cookie: 1,
+        };
+        assert_eq!(metrics.register(&registry).expect("register"), 3);
+
+        let rendered = registry.render();
+        for (name, value) in [
+            ("rx_flow_rg_conflict", "7"),
+            ("tx_flow_update_conflict", "3"),
+            ("rx_flow_new_bad_cookie", "1"),
+        ] {
+            assert!(rendered.contains(name), "{name} missing from:\n{rendered}");
+            assert!(
+                rendered.contains(value),
+                "value {value} for {name} missing from:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn eviction_pressure_is_recorded_only_at_or_above_the_published_bound() {
+        // The eviction observable ADR-0045 section 4 requires of this task. Below the bound no
+        // eviction is possible, so nothing is recorded; at and above it, the at-risk condition is.
+        let registry = caddy_rs_admin::MetricsRegistry::new();
+        assert!(
+            !record_flow_pressure(&registry, DISSECTOR_FLOW_MAX_CONCURRENT_FLOWS - 1)
+                .expect("record")
+        );
+        assert!(
+            !registry
+                .render()
+                .contains(FLOW_TABLE_EVICTION_APPROXIMATE_TOTAL),
+            "nothing may be exported below the bound:\n{}",
+            registry.render()
+        );
+
+        assert!(
+            record_flow_pressure(&registry, DISSECTOR_FLOW_MAX_CONCURRENT_FLOWS).expect("record")
+        );
+        assert!(
+            registry
+                .render()
+                .contains(FLOW_TABLE_EVICTION_APPROXIMATE_TOTAL),
+            "the at-risk condition must be exported:\n{}",
+            registry.render()
+        );
+
+        // Above the bound also records, and the counter accumulates rather than resetting.
+        assert!(
+            record_flow_pressure(&registry, DISSECTOR_FLOW_MAX_CONCURRENT_FLOWS * 2)
+                .expect("record")
+        );
+        let rendered = registry.render();
+        let line = rendered
+            .lines()
+            .find(|line| {
+                line.starts_with(FLOW_TABLE_EVICTION_APPROXIMATE_TOTAL) && !line.starts_with('#')
+            })
+            .expect("a sample line");
+        assert!(
+            line.trim_end().ends_with(" 2"),
+            "expected 2 observations, got {line:?}"
+        );
+    }
+
+    #[test]
+    fn the_eviction_metric_name_says_it_is_approximate() {
+        // Honesty requirement: the LRU lives in udpgrm's eBPF map and raises no error, so caddy-rs
+        // cannot count kernel evictions. The name must not read like a kernel counter.
+        assert!(
+            FLOW_TABLE_EVICTION_APPROXIMATE_TOTAL.contains("approximate"),
+            "the metric name must disclose that it is an approximation: \
+             {FLOW_TABLE_EVICTION_APPROXIMATE_TOTAL}"
+        );
+    }
+
+    #[test]
+    fn the_dissector_is_selectable_from_the_environment() {
+        // DISSECTOR_NOOP must be reachable by an operator, not merely a variant in an enum.
+        assert_eq!(
+            Dissector::parse("DISSECTOR_FLOW").expect("parse"),
+            Dissector::Flow
+        );
+        assert_eq!(
+            Dissector::parse("DISSECTOR_NOOP").expect("parse"),
+            Dissector::Noop
+        );
+        // Accepts the bare name and any case, so copying from udpgrm's README works.
+        assert_eq!(Dissector::parse("flow").expect("parse"), Dissector::Flow);
+        assert_eq!(Dissector::parse("noop").expect("parse"), Dissector::Noop);
+    }
+
+    #[test]
+    fn the_environment_selects_noop_end_to_end_and_defaults_to_flow_when_absent() {
+        // Proves `dissector_from_env` really reads the variable rather than only that `parse`
+        // works: the two are separate functions and a wiring mistake between them would leave
+        // DISSECTOR_NOOP unreachable from an operator's point of view.
+        //
+        // Serialised by the caller (`--test-threads=1` is not assumed): the guard restores the
+        // previous value so a concurrent test in this module cannot observe the change.
+        let previous = std::env::var_os(DISSECTOR_ENV);
+
+        // SAFETY: setting an environment variable is unsafe in Rust 2024 because it races with
+        // other threads reading the environment. This test mutates it and immediately restores it,
+        // and it is the only test in this module that touches this variable.
+        unsafe { std::env::set_var(DISSECTOR_ENV, "DISSECTOR_NOOP") };
+        let selected = dissector_from_env();
+        match previous {
+            Some(value) => unsafe { std::env::set_var(DISSECTOR_ENV, value) },
+            None => unsafe { std::env::remove_var(DISSECTOR_ENV) },
+        }
+        assert_eq!(selected.expect("parse"), Dissector::Noop);
+
+        // Absent means the default, so an environment that never sets it keeps DISSECTOR_FLOW.
+        assert_eq!(Dissector::default(), Dissector::Flow);
+    }
+
+    #[test]
+    fn the_out_of_scope_dissectors_are_rejected_by_name_with_a_reason() {
+        // Rejected as *known but unavailable*, not as unknown strings: the operator needs to know
+        // the difference between a typo and a feature caddy-rs deliberately does not offer.
+        for (value, expected) in [
+            ("DISSECTOR_CBPF", "DCID schema"),
+            ("DISSECTOR_BESPOKE", "out of scope"),
+        ] {
+            let error = Dissector::parse(value).expect_err("must be rejected");
+            assert!(
+                error.contains(expected),
+                "the rejection of {value} must explain {expected}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unrecognised_dissector_name_is_rejected_rather_than_defaulted() {
+        // The rejected value appears in the message (with udpgrm's `DISSECTOR_` prefix stripped,
+        // since that is how it is normalised), so an operator can see what was misread. What
+        // matters is that it is an error rather than a silent fallback to the default.
+        let error = Dissector::parse("DISSECTOR_TYPO").expect_err("must be rejected");
+        assert!(
+            error.contains("TYPO"),
+            "the rejected value must be echoed: {error}"
+        );
+        assert!(
+            error.contains("DISSECTOR_FLOW") && error.contains("DISSECTOR_NOOP"),
+            "must name both valid options: {error}"
+        );
+        // And the environment variable name, so the operator knows which knob to fix.
+        assert!(error.contains(DISSECTOR_ENV), "{error}");
     }
 
     #[test]
