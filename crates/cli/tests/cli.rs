@@ -6249,3 +6249,83 @@ fn stop_orders_the_process_exit_after_the_shutdown() {
         "/stop must land with the admin listener up, so the runtime tears it down itself:\n{contents}"
     );
 }
+
+/// `bind-fds --dry-run` prints the plan and the FD names it would create, then exits without
+/// binding or uploading (ADR-0047 section 2; T-CORE-132 acceptance criterion 1).
+#[test]
+fn bind_fds_dry_run_prints_the_plan_and_exits() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let config = directory.path().join("caddy.json");
+    std::fs::write(
+        &config,
+        r#"{"apps":{"http":{"servers":{"s0":{"listen":[":443"]}}}}}"#,
+    )
+    .expect("write config");
+
+    let (code, stdout, stderr) = run(&[
+        "bind-fds",
+        "--config",
+        config.to_str().expect("utf-8 path"),
+        "--dry-run",
+    ]);
+    assert_eq!(code, 0, "dry run must succeed; stderr: {stderr}");
+    assert!(
+        stdout.contains("caddy-tcp--443"),
+        "the dry run must name the FD it would create: {stdout}"
+    );
+    // Enough detail to paste into a bug report: protocol, address, port and FD name.
+    for field in ["PROTO", "ADDRESS", "PORT", "FD NAME"] {
+        assert!(stdout.contains(field), "missing {field} in: {stdout}");
+    }
+    assert!(stdout.contains("no sockets were bound"), "{stdout}");
+}
+
+/// Without `--dry-run` the upload stage does not exist yet, so it must refuse loudly rather than
+/// print a plan and exit 0 as though descriptors had been stored (T-CORE-133 owns the upload).
+#[test]
+fn bind_fds_without_dry_run_refuses_loudly() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let config = directory.path().join("caddy.json");
+    std::fs::write(
+        &config,
+        r#"{"apps":{"http":{"servers":{"s0":{"listen":[":443"]}}}}}"#,
+    )
+    .expect("write config");
+
+    let (code, _stdout, stderr) =
+        run(&["bind-fds", "--config", config.to_str().expect("utf-8 path")]);
+    assert_ne!(code, 0, "a missing upload stage must not report success");
+    assert!(
+        stderr.contains("not implemented") && stderr.contains("T-CORE-133"),
+        "the refusal must name the missing stage: {stderr}"
+    );
+}
+
+/// Distinct wildcard forms are distinct listeners and must get distinct FD names, so three
+/// configured listeners cannot collapse into one stored descriptor (ADR-0047 section 3).
+#[test]
+fn bind_fds_dry_run_keeps_distinct_wildcards_apart() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let config = directory.path().join("caddy.json");
+    std::fs::write(
+        &config,
+        r#"{"apps":{"http":{"servers":{"s0":{"listen":[":443","0.0.0.0:443","[::]:443"]}}}}}"#,
+    )
+    .expect("write config");
+
+    let (code, stdout, stderr) = run(&[
+        "bind-fds",
+        "--config",
+        config.to_str().expect("utf-8 path"),
+        "--dry-run",
+    ]);
+    assert_eq!(code, 0, "dry run must succeed; stderr: {stderr}");
+    for name in [
+        "caddy-tcp--443",
+        "caddy-tcp-0.0.0.0-443",
+        "caddy-tcp-[%3A%3A]-443",
+    ] {
+        assert!(stdout.contains(name), "missing {name} in: {stdout}");
+    }
+    assert!(stdout.contains("listeners: 3"), "{stdout}");
+}
