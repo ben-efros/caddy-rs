@@ -1,0 +1,28 @@
+{
+	layer4 {
+		0.0.0.0:51820/udp {
+			@wg_peer asn 12345 67890
+			route @wg_peer {
+				proxy 10.0.0.10:51820
+			}
+			route {
+				close
+			}
+		}
+		udp/0.0.0.0:53 {
+			route {
+				proxy 10.0.0.53:53
+			}
+		}
+		udp:0.0.0.0:853 {
+			route {
+				close
+			}
+		}
+		0.0.0.0:443 {
+			route {
+				close
+			}
+		}
+	}
+}
