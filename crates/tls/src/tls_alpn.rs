@@ -34,6 +34,7 @@
 //! Challenge certificates are keyed by the authorization identifier (a wildcard authorization is
 //! validated as its base domain); lookups normalise case and trailing dots.
 
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
@@ -83,9 +84,10 @@ impl TlsAlpn01Challenge {
                     issuer_error(format!("loading generated challenge key: {error}"))
                 })?;
         let public_key = key_pair.public_key().as_ref().to_vec();
-        let digest = ring::digest::digest(&ring::digest::SHA256, key_authorization.as_bytes());
-        let certificate_der =
-            challenge_certificate(&domain, digest.as_ref(), &public_key, &key_pair)?;
+        // Byte-identical to the previous `ring::digest::digest(&SHA256, ..)` call; the ACME
+        // identifier extension the CA validates is unchanged.
+        let digest = Sha256::digest(key_authorization.as_bytes());
+        let certificate_der = challenge_certificate(&domain, &digest, &public_key, &key_pair)?;
         Ok(Self {
             domain,
             key_authorization: key_authorization.to_string(),

@@ -100,7 +100,6 @@ use http_body_util::{BodyExt, Full};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
-use ring::rand::SecureRandom;
 use serde_json::{json, Map, Value};
 
 use caddy_rs_tls::acme::csr::{parse_csr, MAX_CSR_DER_BYTES};
@@ -3481,8 +3480,8 @@ fn constant_time_equals(left: &[u8], right: &[u8]) -> bool {
 
 fn random_bytes(length: usize) -> std::result::Result<Vec<u8>, Problem> {
     let mut bytes = vec![0u8; length];
-    ring::rand::SystemRandom::new()
-        .fill(&mut bytes)
+    // OS-sourced randomness with no fallback and no seed, exactly as `SystemRandom::fill` was.
+    getrandom::getrandom(&mut bytes)
         .map_err(|_| Problem::server_internal("random number generation failed"))?;
     Ok(bytes)
 }

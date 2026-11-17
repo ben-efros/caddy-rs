@@ -52,8 +52,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
-use ring::digest::{digest, SHA1_FOR_LEGACY_USE_ONLY};
-use ring::rand::{SecureRandom, SystemRandom};
+use ring::rand::SystemRandom;
 use ring::signature::{
     EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING, ECDSA_P384_SHA384_ASN1_SIGNING,
 };
@@ -1147,9 +1146,9 @@ fn load_ecdsa_key(pem: &str) -> Result<EcdsaKeyPair> {
 
 /// Generate a positive 16-byte serial number.
 fn random_serial() -> Result<Vec<u8>> {
-    let rng = SystemRandom::new();
     let mut serial = [0u8; 16];
-    rng.fill(&mut serial)
+    // OS-sourced randomness with no fallback and no seed, exactly as `SystemRandom::fill` was.
+    getrandom::getrandom(&mut serial)
         .map_err(|_| Error::Issuer("internal CA random serial generation failed".to_string()))?;
     serial[0] = (serial[0] & 0x7f) | 0x01;
     Ok(serial.to_vec())
@@ -1179,9 +1178,11 @@ struct CertSpec<'a> {
 /// RFC 5280 (4.2.1.2) method 1 subject key identifier: SHA-1 over the contents of the
 /// subjectPublicKey BIT STRING (the uncompressed EC point, excluding tag/length/unused-bits).
 fn key_identifier(public_key: &[u8]) -> Vec<u8> {
-    digest(&SHA1_FOR_LEGACY_USE_ONLY, public_key)
-        .as_ref()
-        .to_vec()
+    use sha1::{Digest, Sha1};
+
+    // RFC 5280 4.2.1.2 method 1 fixes the algorithm as SHA-1, so this is a provider swap only and
+    // the identifier bytes are unchanged.
+    Sha1::digest(public_key).to_vec()
 }
 
 /// The key identifier an issuer certificate advertises: its own SKI, or the RFC 5280 method 1

@@ -25,6 +25,8 @@ ring = "0.17.14"
 # dependencies.
 rsa = { version = "0.9.10", default-features = false, features = ["std", "pem", "u64_digit"] }
 sha2 = { version = "0.10.9", features = ["oid"] }
+sha1 = "0.10.7"
+getrandom = { workspace = true }
 rand = { workspace = true }
 
 # PKCS#11 token-held TLS keys (T-TLS-097). Dynamic loading is built in: no features,

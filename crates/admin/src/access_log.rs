@@ -89,7 +89,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use http::{HeaderMap, HeaderName};
-use ring::rand::{SecureRandom, SystemRandom};
 use serde::de::{MapAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -1804,8 +1803,12 @@ fn filter_set_cookie(value: &str, actions: &[FilterAction]) -> String {
 
 /// Caddy's `hash` filter: first 4 bytes of SHA-256, lower-case hex (8 characters).
 fn short_sha256(value: &str) -> String {
-    let digest = ring::digest::digest(&ring::digest::SHA256, value.as_bytes());
-    digest.as_ref()[..4]
+    use sha2::{Digest, Sha256};
+
+    // Byte-identical to the previous `ring::digest::digest(&SHA256, ..)` call: SHA-256 is a fixed
+    // algorithm, so only the first 4 bytes are taken exactly as before.
+    let digest = Sha256::digest(value.as_bytes());
+    digest[..4]
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
@@ -2161,7 +2164,8 @@ impl RequestUuid {
 /// `NewRandom` layout used by Caddy's `{http.request.uuid}`.
 pub fn generate_uuid_v4() -> Option<String> {
     let mut bytes = [0u8; 16];
-    SystemRandom::new().fill(&mut bytes).ok()?;
+    // OS-sourced randomness with no fallback and no seed, as `SystemRandom::fill` was.
+    getrandom::getrandom(&mut bytes).ok()?;
     // RFC 4122 version 4 / variant 10xx, matching google/uuid's random UUID.
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
@@ -2632,6 +2636,21 @@ fn deserialize_duration<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Du
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn short_sha256_keeps_the_exact_digest_bytes_after_the_sha2_migration() {
+        // T-DEPS-014 phase 1 replaced `ring::digest::digest(&SHA256, ..)` with `sha2::Sha256`. The
+        // acceptance criterion is byte-equivalence, and nothing else in this file pinned the
+        // output, so a silent change here would have gone unnoticed. The expected values come from
+        // an INDEPENDENT implementation (coreutils `sha256sum`), not from the code under test:
+        //   printf 'hello' | sha256sum    -> 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
+        //   printf 'caddy-rs' | sha256sum -> 69716a857e0ac8f82bf99658bcea9ddd1d7e717b7bff4d16af6cb9099ad3376d
+        // The filter keeps Caddy's layout: the FIRST FOUR bytes, lower-case hex.
+        assert_eq!(short_sha256("hello"), "2cf24dba");
+        assert_eq!(short_sha256("caddy-rs"), "69716a85");
+        // Empty input is the degenerate case that would expose a length or offset slip.
+        assert_eq!(short_sha256(""), "e3b0c442");
+    }
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut headers = HeaderMap::new();

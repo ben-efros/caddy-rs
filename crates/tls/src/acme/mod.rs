@@ -29,6 +29,8 @@ pub mod csr;
 pub mod order;
 pub mod transport;
 
+use hmac::{Hmac, Mac};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -822,8 +824,10 @@ impl Jwk {
                 )
             }
         };
-        let digest = ring::digest::digest(&ring::digest::SHA256, canonical.as_bytes());
-        Ok(URL_SAFE_NO_PAD.encode(digest.as_ref()))
+        // Byte-identical to the previous `ring::digest::digest(&SHA256, ..)` call; the thumbprint a
+        // CA validates against is unchanged.
+        let digest = Sha256::digest(canonical.as_bytes());
+        Ok(URL_SAFE_NO_PAD.encode(digest))
     }
 
     /// Canonical JSON encoding used for signatures and external account binding payloads.
@@ -1662,12 +1666,16 @@ impl ExternalAccount {
             .map_err(|error| {
                 AcmeError::ExternalAccount(format!("EAB hmac_key is not valid base64url: {error}"))
             })?;
-        let hmac_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &mac_key);
-        let tag = ring::hmac::sign(&hmac_key, signing_input.as_bytes());
+        // HMAC-SHA256 with the same key bytes and message: byte-identical tag to the previous
+        // `ring::hmac::Key::new`/`sign` pair, so an external account binding stays valid.
+        let mut mac =
+            HmacSha256::new_from_slice(&mac_key).expect("HMAC accepts keys of any length");
+        mac.update(signing_input.as_bytes());
+        let tag: [u8; 32] = mac.finalize().into_bytes().into();
         Ok(serde_json::json!({
             "protected": protected,
             "payload": payload,
-            "signature": URL_SAFE_NO_PAD.encode(tag.as_ref()),
+            "signature": URL_SAFE_NO_PAD.encode(tag),
         }))
     }
 }
@@ -3434,3 +3442,5 @@ EVdZ8IcAQzAPk1jBxj0YDC0rR5d09Q==
         assert_eq!(value, serde_json::json!({"onlyReturnExisting": true}));
     }
 }
+
+type HmacSha256 = Hmac<Sha256>;
