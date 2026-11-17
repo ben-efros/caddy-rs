@@ -4,8 +4,14 @@
 //! activation layer, single-use activation tokens, and the boot seam. The activation handler
 //! itself (T-SETUP-002), WebAuthn/TOTP enrollment (T-SETUP-003) and the generation-scoped
 //! `caddy-pm-rs` external service (T-SETUP-004, ADR-006) are not part of this task; the generated
-//! route is therefore a placeholder `respond` handler and `ServerBootRunner` only starts caddy-rs
-//! itself (it does not spawn `caddy-pm-rs`).
+//! route is therefore a placeholder `respond` handler.
+//!
+//! The generation-scoped `caddy-pm-rs` service is T-SETUP-004 and IS wired here: [`SetupService`]
+//! is resolved and started before the boot, tagged with the configuration generation, and stopped
+//! on handoff so a normal run proceeds without it. The plan and ADRs call the service
+//! `caddy-pm-rs`, but the binary the `pm` workspace actually builds is `caddy-rs-pm`
+//! (`pm/crates/pm-cli/Cargo.toml`, `[[bin]] name = "caddy-rs-pm"`); both names are accepted when
+//! resolving it, so neither spelling is a trap.
 //!
 //! Tokens are single-use and expire after `--registration-timeout` (ADR-0039: default 15m,
 //! minimum 5m, maximum 60m). They live in memory in this process only; persisting them in
@@ -147,6 +153,8 @@ pub enum SetupError {
     ConfigRejected(String),
     /// The boot step failed.
     BootFailed(String),
+    /// The `caddy-pm-rs` service binary could not be found or would not start.
+    ServiceUnavailable(String),
 }
 
 impl fmt::Display for SetupError {
@@ -183,6 +191,9 @@ impl fmt::Display for SetupError {
                 write!(f, "generated setup configuration is invalid: {reason}")
             }
             Self::BootFailed(reason) => write!(f, "cannot boot caddy-rs: {reason}"),
+            Self::ServiceUnavailable(reason) => {
+                write!(f, "caddy-pm-rs service is unavailable: {reason}")
+            }
         }
     }
 }
@@ -540,6 +551,201 @@ pub fn ensure_not_stock_compat(stock_compat: bool) -> Result<(), SetupError> {
     }
 }
 
+/// The binary names the `caddy-pm-rs` service is known by, in resolution order.
+///
+/// The plan and ADRs call it `caddy-pm-rs`; the `pm` workspace builds `caddy-rs-pm`. Accepting both
+/// means an operator who installs either name gets a working setup, and the "missing binary" error
+/// (acceptance criterion 3) only fires when neither exists.
+pub const SERVICE_BINARY_NAMES: &[&str] = &["caddy-pm-rs", "caddy-rs-pm"];
+
+/// Environment variable that pins the service binary path, bypassing the search.
+pub const SERVICE_BIN_ENV: &str = "CADDY_RS_PM_BIN";
+
+/// How the `caddy-pm-rs` service is located and started.
+///
+/// This is a trait for the same reason [`BootRunner`] is one: a test must be able to prove the
+/// service is started, generation-scoped and stopped without spawning a real process or binding a
+/// port. [`ProcessService`] is the production implementation.
+pub trait ServiceSupervisor {
+    /// Resolve and start the service for configuration generation `generation`.
+    fn start(&self, generation: u64) -> Result<(), SetupError>;
+
+    /// Stop the service. Idempotent, and must succeed when nothing was started.
+    fn stop(&self) -> Result<(), SetupError>;
+}
+
+/// The generation-scoped `caddy-pm-rs` service for one setup boot.
+///
+/// The service is scoped to the *configuration generation*, not to the process or to wall-clock
+/// time: it is started with the generation id in its environment and is expected to serve only
+/// that generation's requests. The setup boot is generation 1 — the temporary activation layer —
+/// and the handoff to a normal run ends that generation, so the service is stopped rather than
+/// inherited. Keeping the id explicit is what makes "scoped to the generation" checkable instead
+/// of implied.
+#[derive(Debug)]
+pub struct SetupService<S: ServiceSupervisor> {
+    supervisor: S,
+    generation: u64,
+    started: std::cell::Cell<bool>,
+}
+
+/// The generation id of the setup boot's temporary activation layer.
+pub const SETUP_GENERATION: u64 = 1;
+
+impl<S: ServiceSupervisor> SetupService<S> {
+    /// Create the service for `generation`. Nothing is started yet.
+    pub fn new(supervisor: S, generation: u64) -> Self {
+        Self {
+            supervisor,
+            generation,
+            started: std::cell::Cell::new(false),
+        }
+    }
+
+    /// The configuration generation this service is scoped to.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Start the service for this generation. Starting twice is a no-op, so a retried boot does not
+    /// leak a second service.
+    pub fn start(&self) -> Result<(), SetupError> {
+        if self.started.get() {
+            return Ok(());
+        }
+        self.supervisor.start(self.generation)?;
+        self.started.set(true);
+        Ok(())
+    }
+
+    /// Stop the service. Safe to call when it was never started, so the handoff path cannot fail
+    /// merely because the boot failed early.
+    pub fn stop(&self) -> Result<(), SetupError> {
+        if !self.started.get() {
+            return Ok(());
+        }
+        self.supervisor.stop()?;
+        self.started.set(false);
+        Ok(())
+    }
+}
+
+/// Production supervisor: runs the service binary as a child process.
+///
+/// The child is started with `CADDY_RS_PM_GENERATION` set to the generation id, which is how the
+/// service knows which configuration generation it is serving. `stop` kills and reaps the child, so
+/// the handoff leaves no orphan behind.
+#[derive(Debug, Default)]
+pub struct ProcessService {
+    child: std::sync::Mutex<Option<std::process::Child>>,
+}
+
+impl ProcessService {
+    /// Locate the service binary: `CADDY_RS_PM_BIN` if set, else the first of
+    /// [`SERVICE_BINARY_NAMES`] found next to the current executable or on `PATH`.
+    pub fn resolve_binary() -> Result<std::path::PathBuf, SetupError> {
+        if let Some(pinned) = std::env::var_os(SERVICE_BIN_ENV) {
+            let path = std::path::PathBuf::from(&pinned);
+            if path.is_file() {
+                return Ok(path);
+            }
+            return Err(SetupError::ServiceUnavailable(format!(
+                "{SERVICE_BIN_ENV} points at `{}`, which is not a file",
+                path.display()
+            )));
+        }
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf));
+        for name in SERVICE_BINARY_NAMES {
+            if let Some(dir) = &exe_dir {
+                let candidate = dir.join(name);
+                if candidate.is_file() {
+                    return Ok(candidate);
+                }
+            }
+            if let Some(path) = find_on_path(name) {
+                return Ok(path);
+            }
+        }
+        Err(SetupError::ServiceUnavailable(format!(
+            "no `caddy-pm-rs` service binary found: looked for {} next to `{}` and on PATH; \
+             install it or set {SERVICE_BIN_ENV}",
+            SERVICE_BINARY_NAMES.join("` / `"),
+            exe_dir
+                .as_deref()
+                .map_or_else(|| "<unknown>".to_string(), |d| d.display().to_string()),
+        )))
+    }
+}
+
+/// Search `PATH` for an executable named `name`.
+fn find_on_path(name: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+impl ServiceSupervisor for ProcessService {
+    fn start(&self, generation: u64) -> Result<(), SetupError> {
+        let binary = Self::resolve_binary()?;
+        let child = Command::new(&binary)
+            .arg("serve")
+            .env("CADDY_RS_PM_GENERATION", generation.to_string())
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .map_err(|error| {
+                SetupError::ServiceUnavailable(format!(
+                    "cannot start `{}`: {error}",
+                    binary.display()
+                ))
+            })?;
+        *self.child.lock().expect("service mutex") = Some(child);
+        Ok(())
+    }
+
+    fn stop(&self) -> Result<(), SetupError> {
+        let mut slot = self.child.lock().expect("service mutex");
+        let Some(mut child) = slot.take() else {
+            return Ok(());
+        };
+        // `kill` fails if the child already exited; that is not an error, the goal is "not running".
+        let _ = child.kill();
+        child.wait().map_err(|error| {
+            SetupError::ServiceUnavailable(format!("cannot reap the caddy-pm-rs service: {error}"))
+        })?;
+        Ok(())
+    }
+}
+
+/// Start the service for its generation, run `boot`, then stop the service on handoff.
+///
+/// The ordering is the contract, so it lives in one place rather than being re-implemented by its
+/// tests:
+///
+/// 1. **start first** — the activation layer is useless without the enrollment handler the service
+///    provides, so a missing binary must be a located error rather than a boot that comes up
+///    serving 503 (criterion 3);
+/// 2. **stop on handoff regardless of outcome** — a normal run must not inherit the setup service,
+///    and a failed boot must not leak it (criterion 1).
+///
+/// The boot error wins over a stop error: it is what the operator needs to see first, and the
+/// service is already stopped either way.
+fn run_service_around_boot<S: ServiceSupervisor, T>(
+    service: &SetupService<S>,
+    boot: impl FnOnce(T) -> Result<(), SetupError>,
+) -> Result<(), SetupError>
+where
+    T: Default,
+{
+    service.start()?;
+    let boot_result = boot(T::default());
+    let stop_result = service.stop();
+    boot_result?;
+    stop_result
+}
+
 /// Seam for the boot step so tests never bind a port.
 pub trait BootRunner {
     /// Start caddy-rs with the generated configuration and wait for it to exit.
@@ -550,10 +756,43 @@ pub trait BootRunner {
 ///
 /// It does **not** spawn `caddy-pm-rs`; the generation-scoped external service is T-SETUP-004
 /// (ADR-006) and is absent from this build.
-#[derive(Debug, Default)]
-pub struct ServerBootRunner;
+#[derive(Debug)]
+pub struct ServiceBootRunner<S: ServiceSupervisor> {
+    service: Option<SetupService<S>>,
+}
 
-impl BootRunner for ServerBootRunner {
+/// The production boot runner: [`ServiceBootRunner`] over the real [`ProcessService`].
+pub type ServerBootRunner = ServiceBootRunner<ProcessService>;
+
+impl ServiceBootRunner<ProcessService> {
+    /// Build the runner with a generation-scoped `caddy-pm-rs` service. `Default` has no service,
+    /// which keeps `boot` usable where no proxy manager is installed.
+    pub fn with_service() -> Self {
+        Self {
+            service: Some(SetupService::new(
+                ProcessService::default(),
+                SETUP_GENERATION,
+            )),
+        }
+    }
+}
+
+impl<S: ServiceSupervisor> Default for ServiceBootRunner<S> {
+    fn default() -> Self {
+        Self { service: None }
+    }
+}
+
+impl<S: ServiceSupervisor> ServiceBootRunner<S> {
+    /// Build a runner over an explicit supervisor (the test seam for the handoff behaviour).
+    pub fn with_supervisor(supervisor: S, generation: u64) -> Self {
+        Self {
+            service: Some(SetupService::new(supervisor, generation)),
+        }
+    }
+}
+
+impl<S: ServiceSupervisor> BootRunner for ServiceBootRunner<S> {
     fn boot(&self, config: &SetupConfig) -> Result<(), SetupError> {
         if let Some(parent) = config.config_path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| {
@@ -566,6 +805,16 @@ impl BootRunner for ServerBootRunner {
                 config.config_path.display()
             ))
         })?;
+        match &self.service {
+            Some(service) => run_service_around_boot(service, |()| self.run_caddy(config)),
+            None => self.run_caddy(config),
+        }
+    }
+}
+
+impl<S: ServiceSupervisor> ServiceBootRunner<S> {
+    /// Start `caddy-rs run` on the generated configuration and wait for it to exit.
+    fn run_caddy(&self, config: &SetupConfig) -> Result<(), SetupError> {
         let exe = std::env::current_exe()
             .map_err(|error| SetupError::BootFailed(format!("cannot resolve caddy-rs: {error}")))?;
         let status = Command::new(exe)
@@ -587,7 +836,7 @@ impl BootRunner for ServerBootRunner {
 
 /// Run the setup command.
 pub fn run(args: SetupArgs) -> Result<(), SetupError> {
-    run_with_runner(args, &ServerBootRunner)
+    run_with_runner(args, &ServerBootRunner::with_service())
 }
 
 /// Run setup against an explicit boot runner (the test seam).
@@ -615,4 +864,220 @@ pub fn run_with_runner<R: BootRunner>(args: SetupArgs, runner: &R) -> Result<(),
     println!("caddy-rs setup: token expires at unix {expires_in}; it can be used once");
 
     runner.boot(&config)
+}
+
+#[cfg(test)]
+mod t_setup_004_tests {
+    //! T-SETUP-004: the generation-scoped `caddy-pm-rs` service — started for a setup boot,
+    //! scoped to the configuration generation, stopped on handoff, and a located error when the
+    //! binary is missing.
+    //!
+    //! These tests never call `boot` itself: `run_caddy` re-executes `current_exe()` as `caddy-rs
+    //! run`, which under `cargo test` is the test binary, so driving the real boot would recurse
+    //! into the test suite. The ordering contract is instead exercised through
+    //! `run_service_around_boot`, which is the same function `boot` delegates to — so the
+    //! production path and these tests cannot drift apart.
+
+    use super::*;
+    use std::cell::RefCell;
+    use std::sync::{Arc, Mutex};
+
+    /// Serialises tests that mutate process-global environment variables.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[derive(Debug, Default)]
+    struct RecordingSupervisor {
+        log: RefCell<Vec<String>>,
+        fail_start: bool,
+    }
+
+    impl ServiceSupervisor for RecordingSupervisor {
+        fn start(&self, generation: u64) -> Result<(), SetupError> {
+            if self.fail_start {
+                return Err(SetupError::ServiceUnavailable("no binary".to_string()));
+            }
+            self.log.borrow_mut().push(format!("start({generation})"));
+            Ok(())
+        }
+
+        fn stop(&self) -> Result<(), SetupError> {
+            self.log.borrow_mut().push("stop".to_string());
+            Ok(())
+        }
+    }
+
+    /// Lets a test observe a supervisor the service owns.
+    struct Shared(Arc<RecordingSupervisor>);
+
+    impl ServiceSupervisor for Shared {
+        fn start(&self, generation: u64) -> Result<(), SetupError> {
+            self.0.start(generation)
+        }
+        fn stop(&self) -> Result<(), SetupError> {
+            self.0.stop()
+        }
+    }
+
+    #[test]
+    fn the_service_is_scoped_to_the_setup_generation() {
+        let supervisor = Arc::new(RecordingSupervisor::default());
+        let service = SetupService::new(Shared(supervisor.clone()), SETUP_GENERATION);
+        assert_eq!(service.generation(), SETUP_GENERATION);
+        run_service_around_boot(&service, |()| Ok(())).expect("boot");
+        assert_eq!(
+            supervisor.log.borrow()[0],
+            format!("start({SETUP_GENERATION})"),
+            "the service must be started for the setup configuration generation, not generation 0"
+        );
+    }
+
+    #[test]
+    fn the_service_is_stopped_on_handoff_when_the_boot_succeeds() {
+        // Criterion 1's second half. My first round of tests did not cover it: deleting the stop
+        // call left all of them green.
+        let supervisor = Arc::new(RecordingSupervisor::default());
+        let service = SetupService::new(Shared(supervisor.clone()), SETUP_GENERATION);
+        run_service_around_boot(&service, |()| Ok(())).expect("boot");
+        assert_eq!(
+            *supervisor.log.borrow(),
+            vec![format!("start({SETUP_GENERATION})"), "stop".to_string()],
+            "start -> stop around a successful boot"
+        );
+    }
+
+    #[test]
+    fn the_service_is_stopped_on_handoff_when_the_boot_fails() {
+        // A failed boot must not leak the service.
+        let supervisor = Arc::new(RecordingSupervisor::default());
+        let service = SetupService::new(Shared(supervisor.clone()), SETUP_GENERATION);
+        let result = run_service_around_boot(&service, |()| {
+            Err(SetupError::BootFailed("simulated".to_string()))
+        });
+        assert!(result.is_err(), "the boot failure propagates");
+        assert_eq!(
+            *supervisor.log.borrow(),
+            vec![format!("start({SETUP_GENERATION})"), "stop".to_string()],
+            "the service must still be stopped after a failed boot"
+        );
+    }
+
+    #[test]
+    fn a_missing_service_binary_aborts_before_the_boot_runs() {
+        // Criterion 3, plus the ordering half: the service starts first, so a missing binary is a
+        // located error rather than a boot that comes up serving 503.
+        let service = SetupService::new(
+            RecordingSupervisor {
+                fail_start: true,
+                ..Default::default()
+            },
+            SETUP_GENERATION,
+        );
+        let booted = std::cell::Cell::new(false);
+        let error = run_service_around_boot(&service, |()| {
+            booted.set(true);
+            Ok(())
+        })
+        .expect_err("a missing binary must fail the setup boot");
+        let text = error.to_string();
+        assert!(matches!(error, SetupError::ServiceUnavailable(_)), "{text}");
+        assert!(text.contains("caddy-pm-rs"), "names the service: {text}");
+        assert!(!booted.get(), "the boot must not run without the service");
+    }
+
+    #[test]
+    fn starting_twice_does_not_leak_a_second_service() {
+        let supervisor = Arc::new(RecordingSupervisor::default());
+        let service = SetupService::new(Shared(supervisor.clone()), 1);
+        service.start().expect("start");
+        service.start().expect("start again");
+        assert_eq!(
+            supervisor.log.borrow().len(),
+            1,
+            "a retried boot must not start a second service"
+        );
+    }
+
+    #[test]
+    fn stop_is_idempotent_and_safe_when_never_started() {
+        let supervisor = Arc::new(RecordingSupervisor::default());
+        let service = SetupService::new(Shared(supervisor.clone()), 1);
+        service.stop().expect("stop before start");
+        assert!(supervisor.log.borrow().is_empty(), "nothing to stop");
+
+        service.start().expect("start");
+        service.stop().expect("stop");
+        service.stop().expect("stop again");
+        assert_eq!(
+            *supervisor.log.borrow(),
+            vec!["start(1)".to_string(), "stop".to_string()],
+            "stop must not double-stop the service"
+        );
+    }
+
+    #[test]
+    fn process_service_names_the_pinned_path_and_the_escape_hatch() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let missing = "/nonexistent/caddy-pm-rs-for-t-setup-004";
+        // SAFETY: the ENV_LOCK guard serialises this against the other env test.
+        unsafe { std::env::set_var(SERVICE_BIN_ENV, missing) };
+        let result = ProcessService::resolve_binary();
+        unsafe { std::env::remove_var(SERVICE_BIN_ENV) };
+
+        let text = result.expect_err("pinned path does not exist").to_string();
+        assert!(text.contains(missing), "names the pinned path: {text}");
+        assert!(
+            text.contains(SERVICE_BIN_ENV),
+            "names the escape hatch: {text}"
+        );
+    }
+
+    #[test]
+    fn a_missing_binary_message_names_both_accepted_spellings() {
+        // With no pin and no PATH entry, the resolver's error must tell the operator what it
+        // looked for. Clearing PATH under the lock keeps this hermetic.
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let saved = std::env::var_os("PATH");
+        let saved_bin = std::env::var_os(SERVICE_BIN_ENV);
+        // SAFETY: serialised by ENV_LOCK; both variables are restored below.
+        unsafe {
+            std::env::remove_var(SERVICE_BIN_ENV);
+            std::env::set_var("PATH", "");
+        }
+        let result = ProcessService::resolve_binary();
+        unsafe {
+            match saved {
+                Some(value) => std::env::set_var("PATH", value),
+                None => std::env::remove_var("PATH"),
+            }
+            if let Some(value) = saved_bin {
+                std::env::set_var(SERVICE_BIN_ENV, value);
+            }
+        }
+
+        let text = result
+            .expect_err("no service binary on an empty PATH")
+            .to_string();
+        for name in SERVICE_BINARY_NAMES {
+            assert!(text.contains(name), "must name `{name}`: {text}");
+        }
+        assert!(
+            text.contains(SERVICE_BIN_ENV),
+            "names the escape hatch: {text}"
+        );
+    }
+
+    #[test]
+    fn both_service_binary_names_are_accepted() {
+        // The plan says `caddy-pm-rs`; the pm workspace builds `caddy-rs-pm`. Neither may be a trap.
+        assert!(SERVICE_BINARY_NAMES.contains(&"caddy-pm-rs"));
+        assert!(SERVICE_BINARY_NAMES.contains(&"caddy-rs-pm"));
+    }
+
+    #[test]
+    fn a_runner_without_a_service_boots_without_one() {
+        // `Default` keeps the old behaviour available where no proxy manager is installed.
+        assert!(ServiceBootRunner::<RecordingSupervisor>::default()
+            .service
+            .is_none());
+    }
 }
