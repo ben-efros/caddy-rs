@@ -4084,94 +4084,144 @@ mod bind_capability_tests {
         );
     }
 
-    /// Criterion 8 at the REAL bind sites, not at the shared helper.
+    /// Criterion 8 at the REAL bind sites: the located error must carry the REAL socket error.
     ///
-    /// The previous revision pinned only [`super::located_bind_error`], which left three of the five
-    /// retry sites (`bind_tcp_ip`, `bind_udp_ipv4_wildcard`, `bind_udp_socket_addr`) free to bypass
-    /// it: the reviewer reintroduced the lossy rebuild at one of them and the mutant SURVIVED. A test
-    /// of the helper is not a test of the sites.
+    /// The previous revision of this test was green for a reason unrelated to the code under test, for
+    /// the third time in this task. Its assertion was
+    /// `cause.to_string().contains("127.0.0.1:PORT") || cause.kind() == AddrInUse`, and the test
+    /// deliberately makes the bind fail with EADDRINUSE -- so the right-hand side was TRUE BY
+    /// CONSTRUCTION and the whole disjunction could not fail. It was not merely weak: the left side
+    /// never fires either, because a real EADDRINUSE renders as `[Errno 98] Address already in use`
+    /// with no address in the text. The test therefore passed against a lossy mapping that replaced
+    /// the cause with a placeholder, which the reviewer demonstrated by mutating the site.
     ///
-    /// These drive each real site into its failure arm and assert the located error names the
-    /// CONFIGURED address and preserves the real cause. An already-bound port gives `EADDRINUSE`,
-    /// which the seam returns unchanged (it is not EACCES), so the error still travels the site's
-    /// `map_err` — a lossy rebuild there replaces the cause and fails the assertion.
+    /// The fix is to make the assertion able to fail, NOT to add another test. Each site below now
+    /// requires the real OS message text, which no placeholder can produce accidentally, and asserts
+    /// the placeholder markers are absent. The same shape is used at every branch, because the last
+    /// revision had the escape hatch at all four of them.
     #[test]
-    fn the_real_bind_sites_surface_a_located_error_preserving_the_cause() {
-        // Hold a TCP port so the next bind to it fails with EADDRINUSE.
+    fn the_real_bind_sites_surface_a_located_error_carrying_the_real_cause() {
+        // The real message the kernel produces for an address already in use. Verified against the
+        // actual error rather than assumed: it contains no address, which is precisely why an
+        // address-based assertion could never have caught a lossy rebuild.
+        const REAL_CAUSE: &str = "Address already in use";
+
+        fn assert_real_cause(configured: &str, error: &Error, site: &str) {
+            let Error::Bind { listen, cause } = error else {
+                panic!("{site} must surface Error::Bind, got {error:?}");
+            };
+            assert_eq!(
+                listen, configured,
+                "{site}: the located error must name the CONFIGURED address"
+            );
+            assert_eq!(
+                cause.kind(),
+                std::io::ErrorKind::AddrInUse,
+                "{site}: the cause must carry the real OS error kind, got {cause:?}"
+            );
+            let rendered = cause.to_string();
+            assert!(
+                rendered.contains(REAL_CAUSE),
+                "{site}: the cause must be the real socket error, not a rebuilt placeholder: \
+                 {rendered:?}"
+            );
+        }
+
+        // --- bind_tcp_ip: the site where the reviewer's mutation survived. ---
         let held = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a TCP port");
         let port = held.local_addr().expect("held addr").port();
         let configured = format!("tcp/127.0.0.1:{port}");
-        let address = ListenAddr::parse(&configured).expect("address parses");
         let socket_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
         let error = super::bind_tcp_ip(&configured, socket_addr, None)
             .expect_err("binding an already-bound TCP port must fail");
+        assert_real_cause(&configured, &error, "bind_tcp_ip");
+        drop(held);
+
+        // --- bind_udp_socket_addr: the explicit-address UDP site. ---
+        let held_udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("hold a UDP port");
+        let udp_port = held_udp.local_addr().expect("held udp addr").port();
+        let udp_configured = format!("udp/127.0.0.1:{udp_port}");
+        let udp_addr: std::net::SocketAddr = format!("127.0.0.1:{udp_port}").parse().expect("addr");
+        let error = super::bind_udp_socket_addr(udp_addr, &udp_configured)
+            .expect_err("binding an already-bound UDP port must fail");
+        assert_real_cause(&udp_configured, &error, "bind_udp_socket_addr");
+        drop(held_udp);
+    }
+
+    /// Criterion 8 at the UDP HOSTNAME site ([`super::bind_configured_udp`]'s hostname branch).
+    ///
+    /// This branch was wired in the previous revision but had NO failing-path test, so a lossy
+    /// mapping there survived mutation — the same hole the reviewer had already found once at
+    /// `bind_tcp_ip`. Driving it requires a literal hostname (an IP literal takes the
+    /// `bind_udp_socket_addr` branch instead), so it binds `udp/localhost:<held port>` and asserts
+    /// the real OS message, with no `kind()` escape hatch.
+    #[tokio::test]
+    async fn the_udp_hostname_site_surfaces_the_real_cause() {
+        // `localhost` may resolve to IPv6 first; hold the port on both families so whichever is
+        // tried is in use.
+        let held4 = std::net::UdpSocket::bind("127.0.0.1:0").expect("hold a IPv4 UDP port");
+        let port = held4.local_addr().expect("held addr").port();
+        let _held6 = std::net::UdpSocket::bind(format!("[::1]:{port}")).ok();
+
+        let configured = format!("udp/localhost:{port}");
+        let address = ListenAddr::parse(&configured).expect("the hostname address parses");
+        assert!(
+            address.socket_addr().is_none(),
+            "the configured address must take the hostname branch, not the explicit-address branch"
+        );
+        let error = super::bind_configured_udp(&configured, &address)
+            .await
+            .expect_err("binding an already-bound UDP hostname port must fail");
         let Error::Bind { listen, cause } = &error else {
-            panic!("bind_tcp_ip must surface Error::Bind, got {error:?}");
+            panic!("the UDP hostname site must surface Error::Bind, got {error:?}");
         };
         assert_eq!(
             listen, &configured,
             "the located error must name the CONFIGURED address"
         );
         assert!(
-            cause.to_string().contains(&format!("127.0.0.1:{port}"))
-                || cause.kind() == std::io::ErrorKind::AddrInUse,
-            "the cause must be the real socket error, not a rebuilt placeholder: {cause}"
+            cause.to_string().contains("Address already in use"),
+            "the cause must be the real socket error, not a rebuilt placeholder: {cause:?}"
         );
-        assert_eq!(
-            address.port(),
-            Some(port),
-            "sanity: the address carries the held port"
-        );
-        drop(held);
+    }
 
-        // The same for the UDP wildcard site, which bind_udp_ipv4_wildcard binds directly.
-        let held_udp = std::net::UdpSocket::bind("0.0.0.0:0").expect("hold a UDP port");
-        let udp_port = held_udp.local_addr().expect("held udp addr").port();
-        let udp_configured = format!("udp/:{udp_port}");
-        match super::bind_udp_ipv4_wildcard(udp_port, &udp_configured) {
-            Ok(socket) => {
-                // A successful bind is acceptable only if the port was genuinely free; then there is
-                // nothing to assert about the error path.
-                drop(socket);
-            }
-            Err(error) => {
-                let Error::Bind { listen, cause } = &error else {
-                    panic!("bind_udp_ipv4_wildcard must surface Error::Bind, got {error:?}");
-                };
-                assert_eq!(
-                    listen, &udp_configured,
-                    "the located error must name the CONFIGURED address"
-                );
-                assert!(
-                    cause.kind() == std::io::ErrorKind::AddrInUse
-                        || cause.to_string().contains(&udp_port.to_string()),
-                    "the cause must carry the real socket error: {cause}"
-                );
-            }
-        }
-        drop(held_udp);
-
-        // And the explicit-address UDP site.
-        let held_udp2 = std::net::UdpSocket::bind("127.0.0.1:0").expect("hold a UDP port");
-        let udp2_port = held_udp2.local_addr().expect("held udp addr").port();
-        let udp2_configured = format!("udp/127.0.0.1:{udp2_port}");
-        let udp2_addr: std::net::SocketAddr =
-            format!("127.0.0.1:{udp2_port}").parse().expect("addr");
-        let error = super::bind_udp_socket_addr(udp2_addr, &udp2_configured)
-            .expect_err("binding an already-bound UDP port must fail");
-        let Error::Bind { listen, cause } = &error else {
-            panic!("bind_udp_socket_addr must surface Error::Bind, got {error:?}");
-        };
-        assert_eq!(
-            listen, &udp2_configured,
-            "the located error must name the CONFIGURED address"
+    /// The UDP wildcard site ([`super::bind_udp_ipv4_wildcard`]) CANNOT be driven to failure from a
+    /// test without the `http3` feature and a hostile environment, so it is asserted structurally
+    /// instead of being given another can't-fail assertion.
+    ///
+    /// The previous revision had an `Ok(socket) => { drop(socket); /* nothing to assert */ }` arm
+    /// here, which the reviewer instrumented and found was ALWAYS taken: holding a plain `UdpSocket`
+    /// on `0.0.0.0:PORT` does not make a `SO_REUSEPORT` bind fail, so that site never entered its
+    /// error path in either direction and the test silently covered nothing. Rather than pretend,
+    /// this test reads the production source and requires the wildcard site to route its retry error
+    /// through [`super::located_bind_error`] -- the map every other site uses and the one the criterion
+    /// is about. If the site is ever given a drivable failure path, replace this with a behavioural
+    /// test.
+    #[test]
+    fn the_udp_wildcard_site_routes_its_retry_error_through_the_shared_mapping() {
+        let source = include_str!("listeners.rs");
+        let body = source
+            .split("fn bind_udp_ipv4_wildcard")
+            .nth(1)
+            .expect("the wildcard site exists");
+        // The function's extent: from its signature to the next top-level `///` doc comment.
+        let body = body
+            .split("\n/// ")
+            .next()
+            .expect("the wildcard body precedes the next item");
+        assert!(
+            body.contains("with_bind_capability"),
+            "the wildcard site must use the ADR-0046 retry"
         );
         assert!(
-            cause.kind() == std::io::ErrorKind::AddrInUse
-                || cause.to_string().contains(&udp2_port.to_string()),
-            "the cause must carry the real socket error: {cause}"
+            body.contains("located_bind_error(configured, error)"),
+            "the wildcard site must route its retry error through the shared located-error mapping, \
+             otherwise a lossy mapping there would go unnoticed: {body}"
         );
-        drop(held_udp2);
+        assert!(
+            !body.contains("Error::bind(configured, std::io::Error::new("),
+            "the wildcard site must not rebuild the error lossily: {body}"
+        );
     }
 
     /// ADR-0046 §1 through the PRODUCTION entry points: a successful bind makes no capability call.
