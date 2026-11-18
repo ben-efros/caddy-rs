@@ -6422,17 +6422,18 @@ fn bind_fds_uploads_a_bound_descriptor_named_after_the_plan() {
     // The store must have received the message, carrying the descriptor.
     let mut buffer = [0u8; 64];
     let mut cmsg = vec![0u8; 128];
+    let mut iov = libc::iovec {
+        iov_base: buffer.as_mut_ptr().cast(),
+        iov_len: buffer.len(),
+    };
+    // `msg` outlives this block because the control-message walk below re-reads it.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg.as_mut_ptr().cast();
+    msg.msg_controllen = cmsg.len();
     let received = {
         use std::os::unix::io::AsRawFd;
-        let mut iov = libc::iovec {
-            iov_base: buffer.as_mut_ptr().cast(),
-            iov_len: buffer.len(),
-        };
-        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-        msg.msg_iov = &mut iov;
-        msg.msg_iovlen = 1;
-        msg.msg_control = cmsg.as_mut_ptr().cast();
-        msg.msg_controllen = cmsg.len();
         unsafe { libc::recvmsg(store.as_raw_fd(), &mut msg, 0) }
     };
     assert!(received > 0, "the store must receive the upload notice");
@@ -6445,6 +6446,74 @@ fn bind_fds_uploads_a_bound_descriptor_named_after_the_plan() {
         text.contains(&format!("FDNAME=caddy-tcp-127.0.0.1-{port}")),
         "the payload must carry the plan's FD name: {text}"
     );
+
+    // A payload that says FDSTORE=1 without an attached descriptor would be accepted by systemd and
+    // store nothing, so the descriptor itself must be walked out of the control message. Asserting
+    // only on the text passed even with zero descriptors attached (the payload is unchanged); the
+    // CMSG_FIRSTHDR walk below is what makes this test's name true.
+    let mut fds: Vec<libc::c_int> = Vec::new();
+    unsafe {
+        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+        while !cmsg.is_null() {
+            let header = &*cmsg;
+            if header.cmsg_level == libc::SOL_SOCKET && header.cmsg_type == libc::SCM_RIGHTS {
+                let data = libc::CMSG_DATA(cmsg);
+                // cmsg_len covers the header plus the descriptors actually attached.
+                let payload_bytes = header.cmsg_len as usize - libc::CMSG_LEN(0) as usize;
+                let count = payload_bytes / std::mem::size_of::<libc::c_int>();
+                for index in 0..count {
+                    let mut fd: libc::c_int = 0;
+                    std::ptr::copy_nonoverlapping(
+                        data.add(index * std::mem::size_of::<libc::c_int>()),
+                        (&mut fd as *mut libc::c_int).cast::<u8>(),
+                        std::mem::size_of::<libc::c_int>(),
+                    );
+                    fds.push(fd);
+                }
+            }
+            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+        }
+    }
+    assert_eq!(
+        fds.len(),
+        1,
+        "exactly one descriptor must arrive over SCM_RIGHTS; a payload alone stores nothing: {fds:?}"
+    );
+    // The descriptor must be a real socket listening on the port the plan named, not just any fd.
+    let local = {
+        let mut address: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let mut length = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        let result = unsafe {
+            libc::getsockname(
+                fds[0],
+                (&mut address as *mut libc::sockaddr_storage).cast(),
+                &mut length,
+            )
+        };
+        assert_eq!(
+            result, 0,
+            "the uploaded descriptor must be a socket: getsockname failed"
+        );
+        match address.ss_family as libc::c_int {
+            libc::AF_INET => {
+                let address =
+                    unsafe { &*(std::ptr::addr_of!(address) as *const libc::sockaddr_in) };
+                (
+                    u32::from_be(address.sin_addr.s_addr),
+                    u16::from_be(address.sin_port),
+                )
+            }
+            other => panic!("the uploaded descriptor is not an IPv4 socket (family {other})"),
+        }
+    };
+    assert_eq!(
+        local.1, port,
+        "the uploaded descriptor must be listening on the planned port {port}, got {}",
+        local.1
+    );
+    for fd in fds {
+        unsafe { libc::close(fd) };
+    }
 }
 
 /// Distinct wildcard forms are distinct listeners and must get distinct FD names, so three
