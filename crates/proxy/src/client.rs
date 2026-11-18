@@ -1690,6 +1690,325 @@ mod tests {
         );
     }
 
+    /// The behavioural proof of ADR-0043 §1 case (b): with the option set, `bind(local, 0)` does
+    /// **not** reserve a source port, so the kernel chooses it at `connect()` and the 2-tuple is
+    /// not held by a socket that has not yet connected.
+    ///
+    /// This asserts the observable the ADR actually claims (DIV-0153: "`bind()` must reserve a
+    /// unique 2-tuple ... each concurrent outbound connection from that source address holds its
+    /// own ephemeral port") and not a stronger claim the kernel does not make. It is deliberately
+    /// NOT written as "several connections must end up on one source port": on this kernel the
+    /// port choice at `connect()` is still made per socket, so that assertion fails on correct
+    /// code (measured: with and without the option alike, six concurrent outbound connections from
+    /// a port-0 pinned source took six distinct ports). The pre-change behaviour it discriminates
+    /// is real and is the defect: without the option every `bind()` immediately consumes a port
+    /// from `net.ipv4.ip_local_port_range`, whether or not the connection succeeds.
+    ///
+    /// Fails against the pre-change code, where the port is chosen at `bind()` and is therefore
+    /// already non-zero before `connect()`.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn port_zero_local_address_leaves_the_source_port_unreserved_until_connect() {
+        let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let socket = TcpSocket::new_v4().unwrap();
+        bind_before_connect(&socket, local).unwrap();
+
+        let bound = socket.local_addr().unwrap();
+        assert_eq!(
+            bound.port(),
+            0,
+            "with IP_BIND_ADDRESS_NO_PORT the kernel must defer the source-port choice to \
+             connect(), so bind() leaves port 0; a non-zero port here means the option did not \
+             take effect and the 2-tuple is already reserved (DIV-0153)"
+        );
+        assert_eq!(
+            bound.ip().to_string(),
+            "127.0.0.1",
+            "the local ADDRESS must still be bound even though the port is deferred"
+        );
+    }
+
+    /// The same construction, then connected: the deferred port is chosen at `connect()` and the
+    /// connection completes, so deferring did not break the dial.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_deferred_source_port_is_chosen_by_connect_and_the_dial_completes() {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) => {
+                eprintln!("SKIP: the sandbox cannot bind a loopback listener ({error})");
+                return;
+            }
+        };
+        let destination = listener.local_addr().unwrap();
+        let accept =
+            tokio::spawn(async move { listener.accept().await.ok().map(|(_, peer)| peer) });
+
+        let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let stream = connect_address(destination, Some(local))
+            .await
+            .expect("a port-0 pinned source must connect");
+        let chosen = stream.local_addr().unwrap();
+        assert_ne!(
+            chosen.port(),
+            0,
+            "connect() must have chosen a concrete source port"
+        );
+        assert_eq!(
+            chosen.ip().to_string(),
+            "127.0.0.1",
+            "the connection must originate from the pinned source address"
+        );
+        let peer = accept.await.unwrap().expect("the listener accepted");
+        assert_eq!(
+            peer.port(),
+            chosen.port(),
+            "the peer must observe the source port that connect() chose"
+        );
+    }
+
+    /// ADR-0043 §1 says one helper owns server egress TCP creation. This enforces it by parsing the
+    /// source, because the alternative (a `grep` in CI) cannot tell a `#[cfg(test)]` harness from a
+    /// production dial and would either false-pass or force meaningless conversions.
+    ///
+    /// Every `TcpStream::connect` / `TcpSocket::new_v4` / `TcpSocket::new_v6` in the proxy and http
+    /// crates must be either inside [`connect_address`]'s body or named in
+    /// `crates/proxy/EGRESS-CONNECT-SITES.md`. A new connect site that is not named fails here, which
+    /// is the point: the exemption list is checked against the code rather than trusted.
+    ///
+    /// Comments are stripped before scanning, because several doc comments in this very file quote
+    /// the pattern when explaining it and would otherwise match themselves.
+    #[test]
+    /// ADR-0043 §1 says one helper owns server egress TCP creation. This enforces it by parsing the
+    /// source, because a `grep` in CI cannot tell a `#[cfg(test)]` harness from a production dial.
+    ///
+    /// Every `TcpStream::connect` / `TcpSocket::new_v4` / `TcpSocket::new_v6` in the proxy and http
+    /// crates must be either inside [`connect_address`], inside a `#[cfg(test)]` module, or carrying
+    /// the `ADR-0043 egress helper` marker that `crates/proxy/EGRESS-CONNECT-SITES.md` requires.
+    ///
+    /// Two defects found while writing this, both fixed and both the reason the checks look the way
+    /// they do:
+    ///
+    /// * An exemption keyed on the FILE alone exempted every dial in that file: a smuggled
+    ///   `TcpStream::connect` added to `dns.rs` survived the first version. The exemption now needs
+    ///   the marker at the site as well, so a new dial in an already-exempt file is reported.
+    /// * The marker is a comment, so it cannot be found in comment-blanked text. Offsets must also
+    ///   survive blanking, so comments are replaced with spaces rather than deleted, and the marker
+    ///   is matched in the raw source at the same byte offset.
+    #[test]
+    fn every_egress_connect_is_the_helper_or_a_named_exemption() {
+        use std::path::{Path, PathBuf};
+
+        const MARKER: &str = "ADR-0043 egress helper";
+
+        /// Blank out comments, replacing every byte with a space so offsets are preserved.
+        fn strip_comments(source: &str) -> String {
+            let bytes = source.as_bytes();
+            let mut out = bytes.to_vec();
+            let mut i = 0usize;
+            let mut in_str = false;
+            while i < bytes.len() {
+                let c = bytes[i];
+                if in_str {
+                    if c == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if c == b'"' {
+                        in_str = false;
+                    }
+                    i += 1;
+                    continue;
+                }
+                if c == b'"' {
+                    in_str = true;
+                    i += 1;
+                    continue;
+                }
+                if c == b'/' && bytes.get(i + 1) == Some(&b'/') {
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        out[i] = b' ';
+                        i += 1;
+                    }
+                    continue;
+                }
+                if c == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                    let mut depth = 0usize;
+                    while i < bytes.len() {
+                        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                            depth += 1;
+                            out[i] = b' ';
+                            out[i + 1] = b' ';
+                            i += 2;
+                            continue;
+                        }
+                        if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                            depth -= 1;
+                            out[i] = b' ';
+                            out[i + 1] = b' ';
+                            i += 2;
+                            if depth == 0 {
+                                break;
+                            }
+                            continue;
+                        }
+                        if bytes[i] != b'\n' {
+                            out[i] = b' ';
+                        }
+                        i += 1;
+                    }
+                    continue;
+                }
+                i += 1;
+            }
+            String::from_utf8(out).expect("blanking preserves valid UTF-8")
+        }
+
+        /// Byte range of `connect_address`'s body, or `None` if this file does not define it.
+        fn helper_body_range(source: &str) -> Option<(usize, usize)> {
+            let start = source.find("async fn connect_address(")?;
+            let rest = &source[start..];
+            let end = rest
+                .find("\n}\n")
+                .map(|offset| offset + 2)
+                .unwrap_or(rest.len());
+            Some((start, start + end))
+        }
+
+        /// Whether byte offset `at` sits inside a `#[cfg(test)] mod ... { ... }` block.
+        fn is_in_test_module(source: &str, at: usize) -> bool {
+            let marker = "#[cfg(test)]";
+            let mut search = 0usize;
+            while let Some(found) = source[search..].find(marker) {
+                let marker_at = search + found;
+                if marker_at > at {
+                    return false;
+                }
+                let after = marker_at + marker.len();
+                // `#[cfg(test)]` is not always a module: it also attributes a `use` block or a
+                // single test fn. Only a following `mod` opens a test module whose body exempts
+                // its contents. Treating every `#[cfg(test)]` as a module (the first version) made
+                // the scan look at the wrong block entirely and exempt nothing.
+                let after_ws = after + source[after..].len() - source[after..].trim_start().len();
+                if !source[after_ws..].starts_with("mod ") {
+                    search = after;
+                    continue;
+                }
+                if let Some(brace) = source[after..].find('{') {
+                    let open = after + brace;
+                    let mut depth = 0usize;
+                    // Byte offsets throughout: the file contains non-ASCII, and every other offset
+                    // in this scan is a byte offset.
+                    for (offset, byte) in source.as_bytes()[open..].iter().enumerate() {
+                        match byte {
+                            b'{' => depth += 1,
+                            b'}' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    return at > open && at < open + offset;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                search = after;
+            }
+            false
+        }
+
+        /// Whether the exemption marker appears in the raw source just above `at`.
+        fn site_is_marked(raw: &str, at: usize) -> bool {
+            let bytes = raw.as_bytes();
+            let mut position = at;
+            let mut lines = 0;
+            while position > 0 && lines < 4 {
+                position -= 1;
+                if bytes[position] == b'\n' {
+                    lines += 1;
+                }
+            }
+            raw.get(position..at)
+                .is_some_and(|window| window.contains(MARKER))
+        }
+
+        fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir)
+                .unwrap_or_else(|error| panic!("cannot read {}: {error}", dir.display()))
+            {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    rs_files(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let crates_dir = manifest.parent().expect("crates dir").to_path_buf();
+        let workspace = crates_dir.parent().expect("workspace root").to_path_buf();
+        let mut files = Vec::new();
+        for crate_name in ["proxy", "http"] {
+            rs_files(&crates_dir.join(crate_name), &mut files);
+        }
+        assert!(
+            !files.is_empty(),
+            "the scan must find source files to be meaningful"
+        );
+        let exemption_doc = std::fs::read_to_string(manifest.join("EGRESS-CONNECT-SITES.md"))
+            .expect("crates/proxy/EGRESS-CONNECT-SITES.md must exist");
+
+        let patterns = [
+            "TcpStream::connect(",
+            "TcpSocket::new_v4(",
+            "TcpSocket::new_v6(",
+        ];
+        let mut unnamed = Vec::new();
+        let mut scanned = 0usize;
+        for file in &files {
+            let raw = std::fs::read_to_string(file).expect("read source");
+            let stripped = strip_comments(&raw);
+            let helper_range = helper_body_range(&stripped);
+            let relative = file
+                .strip_prefix(&workspace)
+                .unwrap_or(file)
+                .display()
+                .to_string();
+            let file_named = exemption_doc.contains(&relative);
+            for pattern in patterns {
+                let mut from = 0usize;
+                while let Some(found) = stripped[from..].find(pattern) {
+                    let at = from + found;
+                    from = at + pattern.len();
+                    scanned += 1;
+                    if let Some((start, end)) = helper_range {
+                        if at >= start && at < end {
+                            continue;
+                        }
+                    }
+                    if is_in_test_module(&stripped, at) {
+                        continue;
+                    }
+                    if file_named && site_is_marked(&raw, at) {
+                        continue;
+                    }
+                    unnamed.push(format!("{relative}: `{pattern}`"));
+                }
+            }
+        }
+
+        assert!(
+            scanned > 0,
+            "the scan found no connect calls at all, so it is not scanning the right files"
+        );
+        assert!(
+            unnamed.is_empty(),
+            "these server-egress connect sites are neither the ADR-0043 helper, a #[cfg(test)] \
+             module, nor marked and named in crates/proxy/EGRESS-CONNECT-SITES.md: {unnamed:#?}"
+        );
+    }
+
     /// Case (c): an explicit source port must take `SO_REUSEADDR` and must *not* take
     /// `IP_BIND_ADDRESS_NO_PORT`, which the kernel rejects for a non-zero port (ADR-0043 §1).
     #[cfg(target_os = "linux")]

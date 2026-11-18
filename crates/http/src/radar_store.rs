@@ -457,6 +457,8 @@ impl RedisStorage {
     }
 
     async fn connect(&self) -> Result<BufReader<TcpStream>, StorageError> {
+        // Exempt from the ADR-0043 egress helper: no local-address option, defect unreachable.
+        // See caddy-rs/crates/proxy/EGRESS-CONNECT-SITES.md.
         let connect = TcpStream::connect((self.host.as_str(), self.port));
         let stream = tokio::time::timeout(REDIS_TIMEOUT, connect)
             .await
