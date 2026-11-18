@@ -41,7 +41,7 @@ use argon2::{
 use async_trait::async_trait;
 use base32::Alphabet;
 use bcrypt::{hash as bcrypt_hash, verify as bcrypt_verify, DEFAULT_COST};
-use chrono::{DateTime, Utc};
+use caddy_rs_core::Timestamp;
 use jsonwebtoken::{
     decode, encode, Algorithm as JwtAlgorithm, DecodingKey, EncodingKey, Header, Validation,
 };
@@ -372,9 +372,9 @@ pub struct User {
     /// explicit revocation increment it, which invalidates every previously issued access token.
     pub auth_epoch: u64,
     /// Account creation timestamp.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// Last update timestamp.
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
 }
 
 impl User {
@@ -430,9 +430,9 @@ pub struct UserRecord {
     /// Monotonically increasing authentication epoch.
     pub auth_epoch: u64,
     /// Account creation timestamp.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// Last update timestamp.
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
 }
 
 impl User {
@@ -495,9 +495,9 @@ pub struct PublicUser {
     /// Authentication epoch the user is currently on.
     pub auth_epoch: u64,
     /// Account creation timestamp.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// Last update timestamp.
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
 }
 
 /// Increment a user's authentication epoch, failing closed on exhaustion.
@@ -1387,7 +1387,7 @@ impl UserStore for MemoryUserStore {
         }
 
         user.totp_last_step = Some(step);
-        user.updated_at = Utc::now();
+        user.updated_at = Timestamp::now();
         Ok(true)
     }
 }
@@ -1682,7 +1682,7 @@ impl<S: UserStore> AuthnService<S> {
         }
 
         let password_hash = hash_password(password, &self.config.argon2_params)?;
-        let now = Utc::now();
+        let now = Timestamp::now();
         let user = User {
             id: UserId::new(),
             username,
@@ -1711,7 +1711,7 @@ impl<S: UserStore> AuthnService<S> {
     ) -> AuthResult<(User, TokenPair)> {
         let username = username.into();
         let password_hash = hash_password(password, &self.config.argon2_params)?;
-        let now = Utc::now();
+        let now = Timestamp::now();
         let user = User {
             id: UserId::new(),
             username,
@@ -1752,7 +1752,7 @@ impl<S: UserStore> AuthnService<S> {
 
         user.password_hash = hash_password(new_password, &self.config.argon2_params)?;
         bump_epoch(&mut user)?;
-        user.updated_at = Utc::now();
+        user.updated_at = Timestamp::now();
         self.store.update_user(user).await?;
         self.store
             .revoke_all_refresh_tokens_for_user(user_id, now_ts()?)
@@ -1773,7 +1773,7 @@ impl<S: UserStore> AuthnService<S> {
 
         user.password_hash = hash_password(new_password, &self.config.argon2_params)?;
         bump_epoch(&mut user)?;
-        user.updated_at = Utc::now();
+        user.updated_at = Timestamp::now();
         self.store.update_user(user).await?;
         self.store
             .revoke_all_refresh_tokens_for_user(user_id, now_ts()?)
@@ -1794,7 +1794,7 @@ impl<S: UserStore> AuthnService<S> {
 
         user.role = role;
         bump_epoch(&mut user)?;
-        user.updated_at = Utc::now();
+        user.updated_at = Timestamp::now();
         self.store.update_user(user.clone()).await?;
         Ok(user)
     }
@@ -1825,7 +1825,7 @@ impl<S: UserStore> AuthnService<S> {
         user.totp_secret = Some(secret.clone());
         user.totp_pending = true;
         user.totp_last_step = None;
-        user.updated_at = Utc::now();
+        user.updated_at = Timestamp::now();
         self.store.update_user(user).await?;
 
         Ok((secret, uri))
@@ -1871,7 +1871,7 @@ impl<S: UserStore> AuthnService<S> {
             .ok_or(AuthError::UserNotFound)?;
         user.totp_pending = false;
         bump_epoch(&mut user)?;
-        user.updated_at = Utc::now();
+        user.updated_at = Timestamp::now();
         let user_id = user.id;
         self.store.update_user(user).await?;
         self.store
@@ -1975,7 +1975,7 @@ impl<S: UserStore> AuthnService<S> {
         // Removing a factor weakens the account, so tokens minted while it was enabled are
         // retired rather than allowed to outlive the downgrade.
         bump_epoch(&mut user)?;
-        user.updated_at = Utc::now();
+        user.updated_at = Timestamp::now();
         let user_id = user.id;
         self.store.update_user(user).await?;
         self.store
@@ -2066,7 +2066,7 @@ impl<S: UserStore> AuthnService<S> {
             .ok_or(AuthError::UserNotFound)?;
 
         bump_epoch(&mut user)?;
-        user.updated_at = Utc::now();
+        user.updated_at = Timestamp::now();
         self.store.update_user(user).await?;
         self.store
             .revoke_all_refresh_tokens_for_user(user_id, now_ts()?)

@@ -1470,9 +1470,7 @@ async fn create_first_admin(
         // Decode token to show expiration (if available)
         if let Ok(claims) = decode_token_claims(&result.access_token) {
             if let Some(exp) = claims.get("exp").and_then(|v| v.as_i64()) {
-                let exp_time = chrono::DateTime::from_timestamp(exp, 0)
-                    .map(|dt| dt.to_rfc3339())
-                    .unwrap_or_else(|| "unknown".to_string());
+                let exp_time = caddy_rs_core::Timestamp::from_secs_and_nanos(exp, 0).to_rfc3339();
                 println!("  Token expires: {}", exp_time);
             }
         }
@@ -1557,9 +1555,7 @@ async fn login(
             // Decode token to show expiration (if available)
             if let Ok(claims) = decode_token_claims(&result.access_token) {
                 if let Some(exp) = claims.get("exp").and_then(|v| v.as_i64()) {
-                    let exp_time = chrono::DateTime::from_timestamp(exp, 0)
-                        .map(|dt| dt.to_rfc3339())
-                        .unwrap_or_else(|| "unknown".to_string());
+                    let exp_time = caddy_rs_core::Timestamp::from_secs_and_nanos(exp, 0).to_rfc3339();
                     println!("Token expires: {}", exp_time);
                 }
             }

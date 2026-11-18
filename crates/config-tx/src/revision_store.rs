@@ -14,7 +14,7 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use chrono::{DateTime, Utc};
+use caddy_rs_core::Timestamp;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -44,7 +44,7 @@ pub struct RevisionRecord {
     /// Hash of the configuration.
     pub hash: String,
     /// Timestamp of the revision.
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
     /// Status of the revision.
     pub status: RevisionStatus,
     /// Error message if failed.
@@ -291,7 +291,7 @@ mod tests {
         RevisionRecord {
             revision,
             hash: format!("hash{revision}"),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             status: RevisionStatus::Applied,
             error: None,
         }
@@ -316,7 +316,7 @@ mod tests {
                     config: serde_json::json!({}),
                     hash: "hash2".to_string(),
                     revision: 2,
-                    timestamp: Utc::now(),
+                    timestamp: Timestamp::now(),
                 },
             )
             .expect("record_generation after poisoning");
@@ -390,7 +390,7 @@ mod tests {
                 RevisionRecord {
                     revision: 2,
                     hash: failed.hash.clone(),
-                    timestamp: Utc::now(),
+                    timestamp: Timestamp::now(),
                     status: RevisionStatus::Failed,
                     error: Some("stale precondition".to_owned()),
                 },

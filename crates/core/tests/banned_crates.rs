@@ -17,7 +17,52 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const BANNED: [&str; 2] = ["bincode", "pin-utils"];
+/// Directories whose lockfile is required to be free of every [`BANNED`] crate.
+///
+/// `pm/` is a SEPARATE workspace with its own lockfile and is out of this scope: it reaches
+/// `chrono` only through `axum-test` -> `expect-json` (a dev-dependency, and every published
+/// `expect-json` depends on chrono), and CI's advisory gate runs `cargo audit --file Cargo.lock`
+/// from the `caddy-rs` submodule root, so `pm/Cargo.lock` is never audited. The audited surface is
+/// the root lockfile (plus the plug template, which ships to plugin authors).
+/// A crate that must not appear in an audited lockfile.
+struct Banned {
+    /// Package name as it appears in a `[[package]]` stanza.
+    name: &'static str,
+    /// The advisory that forces removal rather than upgrade.
+    advisory: &'static str,
+    /// Why no version can ever satisfy the gate.
+    why: &'static str,
+    /// Whether the ban also covers the auxiliary `pm/` workspace.
+    ///
+    /// `pm/` is a separate workspace whose lockfile CI never audits (the gate runs
+    /// `cargo audit --file Cargo.lock` from the `caddy-rs` submodule root). It reaches `chrono`
+    /// only via the dev-dependency `axum-test` -> `expect-json`, and every published
+    /// `expect-json` depends on chrono, so there is no version to move to. Keeping chrono out of
+    /// `pm/` would mean dropping `axum-test`, which is a test-harness rewrite, not a dependency
+    /// edge. `bincode`/`pin-utils` are absent from `pm/` and stay banned everywhere.
+    audited_in_pm: bool,
+}
+
+const BANNED: [Banned; 3] = [
+    Banned {
+        name: "bincode",
+        advisory: "RUSTSEC-2025-0141",
+        why: "patched = [] matches every published version",
+        audited_in_pm: true,
+    },
+    Banned {
+        name: "pin-utils",
+        advisory: "RUSTSEC-2026-0441",
+        why: "unmaintained; reached only via nix's default `aio` feature",
+        audited_in_pm: true,
+    },
+    Banned {
+        name: "chrono",
+        advisory: "RUSTSEC-2026-0543",
+        why: "unmaintained, patched = []; replaced by caddy_rs_core::Timestamp",
+        audited_in_pm: false,
+    },
+];
 
 /// Directories containing a `Cargo.lock` that is committed and gates a build or an audit.
 fn lockfile_dirs() -> Vec<PathBuf> {
@@ -69,13 +114,18 @@ fn workspace_lockfiles_contain_no_banned_crates() {
         };
         checked += 1;
         let names = locked_package_names(&contents);
-        for banned in BANNED {
-            if let Some(hit) = names.iter().find(|n| n.as_str() == banned) {
+        let is_pm = dir.file_name().map(|n| n == "pm").unwrap_or(false);
+        for banned in &BANNED {
+            if is_pm && !banned.audited_in_pm {
+                continue;
+            }
+            if let Some(hit) = names.iter().find(|n| n.as_str() == banned.name) {
                 failures.push(format!(
-                    "{} locks `{hit}` (banned; RUSTSEC-2025-0141 for bincode has patched = [], \
-                     RUSTSEC-2026-0441 for pin-utils). Remove the dependency -- do not add an \
+                    "{} locks `{hit}` (banned; {}: {}). Remove the dependency -- do not add an \
                      ignore to .cargo/audit.toml.",
-                    path.display()
+                    path.display(),
+                    banned.advisory,
+                    banned.why,
                 ));
             }
         }
@@ -101,10 +151,14 @@ fn audit_policy_does_not_ignore_the_banned_advisories() {
         return;
     };
     // The ban is delete-don't-ignore: an ignore entry would re-admit the crate silently.
-    for id in ["RUSTSEC-2025-0141", "RUSTSEC-2026-0441"] {
+    for id in [
+        "RUSTSEC-2025-0141",
+        "RUSTSEC-2026-0441",
+        "RUSTSEC-2026-0543",
+    ] {
         assert!(
             !contents.contains(id),
-            "{} must not ignore {id}; bincode and pin-utils are banned outright",
+            "{} must not ignore {id}; the banned crates are banned outright",
             audit_toml.display()
         );
     }

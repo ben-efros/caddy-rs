@@ -50,7 +50,7 @@ fn claims_for(user_id: UserId, role: &Role, epoch: u64) -> Claims {
 }
 
 fn test_user(username: &str) -> User {
-    let now = Utc::now();
+    let now = Timestamp::now();
     User {
         id: UserId::new(),
         username: username.to_string(),
@@ -839,10 +839,9 @@ fn debug_redacts_secrets() {
 
 #[test]
 fn user_record_serde_roundtrip() {
-    use chrono::Utc;
     use serde_json;
 
-    let now = Utc::now();
+    let now = Timestamp::now();
 
     let user_id = UserId::new();
     let username = "testuser".to_string();
@@ -876,10 +875,9 @@ fn user_record_serde_roundtrip() {
 
 #[test]
 fn refresh_token_record_serde_roundtrip() {
-    use chrono::{Duration, Utc};
     use serde_json;
 
-    let now = Utc::now();
+    let now = Timestamp::now();
     let user_id = UserId::new();
     let token_id = "refresh-token-123".to_string();
 
@@ -887,7 +885,7 @@ fn refresh_token_record_serde_roundtrip() {
         token_hash: "token-hash".to_string(),
         user_id: user_id.clone(),
         iat: now.timestamp(),
-        expires_at: (now + Duration::hours(1)).timestamp(),
+        expires_at: now.timestamp() + 3_600, // one hour
         revoked_at: Some(now.timestamp()),
         token_id: token_id.clone(),
     };
@@ -908,10 +906,9 @@ fn refresh_token_record_serde_roundtrip() {
 
 #[test]
 fn user_public_view_no_secrets() {
-    use chrono::Utc;
     use serde_json;
 
-    let now = Utc::now();
+    let now = Timestamp::now();
 
     let user = User {
         id: UserId::new(),

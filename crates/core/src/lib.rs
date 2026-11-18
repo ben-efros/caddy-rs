@@ -30,6 +30,7 @@ pub mod listen;
 pub mod module;
 pub mod notify;
 pub mod regex;
+pub mod timestamp;
 pub mod validate;
 
 pub use adapter::{AdaptedConfig, ConfigAdapter};
@@ -55,6 +56,7 @@ pub use lifecycle::{
 };
 pub use listen::{ListenAddr, Network};
 pub use module::{Module, ModuleKind, ModuleRegistry, ModuleRegistryBuilder, SharedModuleRegistry};
+pub use timestamp::{Timestamp, TimestampParseError};
 pub use validate::{validate_config, ValidationReport};
 
 /// Version reported by `caddy-rs version`.
