@@ -486,12 +486,42 @@ mod tests {
     }
 
     #[test]
-    fn the_runtime_registers_the_flow_metrics_so_they_reach_the_admin_endpoint() {
-        // The reviewer's blocking point was that `register` had no production caller: a series that
-        // nothing registers never appears on a live /metrics, so the operator still inferred. This
-        // drives the runtime entry point, which is the function the server calls, rather than
-        // calling `register` by hand - so it fails if the wiring is removed even though `register`
-        // itself still works.
+    fn the_flow_counters_are_absent_from_a_default_builds_admin_endpoint() {
+        // This pins the state an operator actually observes, which is the opposite of what the
+        // previous version of this test claimed. Nothing in the server calls
+        // `publish_udpgrm_flow_metrics`: its only caller is this test module, and reading the
+        // daemon's eBPF maps is refused — ADR-0045 §5 denies the server `CAP_BPF` and any eBPF
+        // control plane, and the ADR's answer on map occupancy states that route is "not available
+        // at any effort level" — so there is no production value to publish. Because
+        // `MetricsRegistry::render` iterates only registered families and never zero-fills, the
+        // three counters are ABSENT from `GET /metrics`, not present at zero.
+        //
+        // A test named "...so_they_reach_the_admin_endpoint" that reached nothing was worse than
+        // no test: it asserted the opposite of the shipped behaviour and would have led an operator
+        // to build an alert on series that never appear.
+        let runtime = crate::runtime::ServerRuntime::new(std::sync::Arc::new(
+            caddy_rs_core::GenerationStore::with_builtin_registry(),
+        ));
+        let rendered = runtime.metrics().render();
+        for name in FlowMetrics::NAMES {
+            assert!(
+                !rendered.contains(name),
+                "the flow counters are unwired and must not appear in a real build's /metrics; \
+                 found {name} in:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn publishing_the_flow_counters_would_make_them_render() {
+        // The other half of the honest position: the plumbing works, so the counters are not
+        // absent because publishing is broken. They are absent because nothing calls it. The test
+        // above stays true only while that remains so; if a measurement source ever appears and
+        // this is called from the serving path, THIS test is the one that keeps working and the
+        // absence test must be replaced by one asserting the values.
+        //
+        // This drives the runtime entry point rather than `register` directly, so it fails if the
+        // Runtime -> MetricsRegistry wiring is removed.
         let runtime = crate::runtime::ServerRuntime::new(std::sync::Arc::new(
             caddy_rs_core::GenerationStore::with_builtin_registry(),
         ));
@@ -504,12 +534,12 @@ mod tests {
             .expect("publish");
         assert_eq!(published, 3);
 
-        // The runtime's registry is the one the admin endpoint renders, so this is the same surface
-        // an operator scrapes.
+        // The runtime's registry is the one the admin endpoint renders, so this is the same
+        // surface an operator scrapes.
         let rendered = runtime.metrics().render();
-        assert!(rendered.contains("rx_flow_rg_conflict"), "{rendered}");
-        assert!(rendered.contains("tx_flow_update_conflict"), "{rendered}");
-        assert!(rendered.contains("rx_flow_new_bad_cookie"), "{rendered}");
+        for name in FlowMetrics::NAMES {
+            assert!(rendered.contains(name), "missing {name} in:\n{rendered}");
+        }
     }
 
     #[test]
