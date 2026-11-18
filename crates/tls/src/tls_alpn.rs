@@ -421,13 +421,14 @@ fn challenge_certificate(
     ]);
     let mut serial = [0_u8; 16];
     // OS-sourced randomness with no fallback and no seed, exactly as `SystemRandom::fill` was.
-    // Same operation as internal_ca::random_serial.
+    // `shape_serial` is the same SIGN mask as `internal_ca::random_serial`, but not the same
+    // non-zero guarantee: that function writes `(serial[0] & 0x7f) | 0x01`, which is non-zero by
+    // construction with no branch, while this one masks and then repairs the all-zero case. Both
+    // are correct; they are not interchangeable, so do not "unify" them without deciding which
+    // guarantee is wanted.
     getrandom::getrandom(&mut serial)
         .map_err(|error| issuer_error(format!("generating challenge serial: {error}")))?;
-    serial[0] &= 0x7f;
-    if serial.iter().all(|byte| *byte == 0) {
-        serial[15] = 1;
-    }
+    shape_serial(&mut serial);
     let tbs = der_sequence(&[
         der_tlv(0xA0, &der_integer(2)), // v3
         der_integer_from_bytes(&serial),
@@ -447,6 +448,24 @@ fn challenge_certificate(
         signature_algorithm,
         der_bit_string(signature.as_ref()),
     ]))
+}
+
+/// Force a raw random serial into the shape RFC 5280 requires for `serialNumber`.
+///
+/// Two properties, both required and both easy to lose in a refactor:
+/// - the high bit of the first byte is cleared, because DER INTEGERs are signed and a set top bit
+///   would make the serial negative;
+/// - an all-zero serial is forced non-zero, because RFC 5280 requires a positive serial and zero
+///   is not positive.
+///
+/// Split out from `challenge_certificate` so both properties are reachable from a test. Inline,
+/// the all-zero branch is only hit with probability 2^-128, so no test could exercise it and a
+/// mutation that deleted the guard would pass the whole suite.
+fn shape_serial(serial: &mut [u8; 16]) {
+    serial[0] &= 0x7f;
+    if serial.iter().all(|byte| *byte == 0) {
+        serial[15] = 1;
+    }
 }
 
 // ---- minimal DER encoding helpers -----------------------------------------------------------
@@ -740,6 +759,92 @@ mod tests {
             (length, 2 + count)
         };
         (tag, &input[header..header + length], header + length)
+    }
+
+    /// The serial INTEGER exactly as it appears in the DER, so tests assert the bytes on the
+    /// wire rather than the pre-encoding `serial` array. Those differ: `der_integer_from_bytes`
+    /// strips leading zero bytes and re-adds one `0x00` when the top bit is set, so an assertion
+    /// on `serial[0]` would not catch a change in the encoded INTEGER.
+    fn serial_integer(der: &[u8]) -> Vec<u8> {
+        let (tag, certificate, _) = read_tlv(der);
+        assert_eq!(tag, 0x30, "Certificate is a SEQUENCE");
+        let (tbs_tag, tbs, _) = read_tlv(certificate);
+        assert_eq!(tbs_tag, 0x30, "tbsCertificate is a SEQUENCE");
+        let mut rest = tbs;
+        let (version_tag, _, total) = read_tlv(rest);
+        assert_eq!(
+            version_tag, 0xA0,
+            "v3 certificate starts with explicit version"
+        );
+        rest = &rest[total..];
+        let (serial_tag, serial, _) = read_tlv(rest);
+        assert_eq!(serial_tag, 0x02, "serial is an INTEGER");
+        serial.to_vec()
+    }
+
+    #[test]
+    fn shape_serial_clears_the_sign_bit() {
+        // DER INTEGERs are signed, so a set top bit makes the serial negative, which RFC 5280
+        // forbids. Mutating the mask to `|= 0x80` or deleting it must fail here.
+        let mut serial = [0xff_u8; 16];
+        shape_serial(&mut serial);
+        assert_eq!(
+            serial[0] & 0x80,
+            0,
+            "the high bit of the first byte must be cleared"
+        );
+        assert_eq!(
+            serial[0], 0x7f,
+            "the other seven bits must survive the mask"
+        );
+
+        // A value already below 0x80 is untouched.
+        let mut low = [0x01_u8; 16];
+        shape_serial(&mut low);
+        assert_eq!(low[0], 0x01);
+    }
+
+    #[test]
+    fn shape_serial_forces_an_all_zero_serial_non_zero() {
+        // Reachable only through the helper: the 2^-128 branch cannot be hit by drawing random
+        // serials, so this is the only way the guard is covered at all. Deleting the guard from
+        // `shape_serial` must fail here.
+        let mut serial = [0_u8; 16];
+        shape_serial(&mut serial);
+        assert!(
+            serial.iter().any(|byte| *byte != 0),
+            "an all-zero serial must be forced non-zero, got {serial:02x?}"
+        );
+        assert_eq!(serial[15], 1, "the guard sets the last byte");
+
+        // A serial that is non-zero only in its high byte is still non-zero after masking.
+        let mut edge = [0_u8; 16];
+        edge[0] = 0x80;
+        shape_serial(&mut edge);
+        assert!(
+            edge.iter().any(|byte| *byte != 0),
+            "masking 0x80 must not produce a zero serial"
+        );
+    }
+
+    #[test]
+    fn generated_serial_is_a_positive_der_integer() {
+        // The end-to-end property: whatever `shape_serial` does, the INTEGER that actually lands
+        // in the certificate must be positive and non-zero. Run many times, because the mask only
+        // matters when the random first byte has its top bit set.
+        for _ in 0..64 {
+            let serial = serial_integer(challenge().certificate_der());
+            assert!(!serial.is_empty(), "serial INTEGER must not be empty");
+            assert_eq!(
+                serial[0] & 0x80,
+                0,
+                "serial must be a positive DER INTEGER (RFC 5280), got {serial:02x?}"
+            );
+            assert!(
+                serial.iter().any(|byte| *byte != 0),
+                "a generated serial must never be zero"
+            );
+        }
     }
 
     #[test]
