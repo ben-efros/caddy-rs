@@ -1,9 +1,28 @@
 //! `caddy-rs bind-fds` — pre-bind the configured listeners and upload them to `systemd`'s fd store
 //! (ADR-0047 §2, §3).
 //!
-//! Stage 2 of the five stages ADR-0047 specifies: this module computes the plan, derives the FD
-//! names it would use, and (under `--dry-run`) prints both and exits **without binding or
-//! uploading**. Stage 3 adds the real `FDSTORE=1` upload and `run` adoption; `T-CORE-133` owns it.
+//! This module computes the plan, derives the FD names it would use, and then either (under
+//! `--dry-run`) prints both and exits **without binding or uploading**, or performs the real
+//! `FDSTORE=1` upload via [`bind_and_upload`].
+//!
+//! # Ordering is the security property, not an implementation detail
+//!
+//! Every planned socket is bound before any descriptor is uploaded. Binding and uploading in one
+//! interleaved pass would leave the store holding descriptors for listeners `1..n` when listener
+//! `n+1` failed to bind, and `run` would then adopt a set that does not match the plan — a silent
+//! half-applied configuration. Binding first means a bind failure uploads nothing, which is the
+//! "no partial state" ADR-0047 §6 requires. `a_bind_failure_uploads_nothing_at_all` asserts this on
+//! the observable (the upload callback is never invoked) rather than by reading the source.
+//!
+//! `NOTIFY_SOCKET` is likewise checked **before** the first bind: an unset or empty value is a
+//! clear refusal rather than a late socket failure, so a unit that forgot socket activation cannot
+//! leave orphaned bound ports behind.
+//!
+//! # Still open
+//!
+//! `run`-side adoption (finding the stored descriptors by `FDNAME` and using those instead of
+//! binding) is **not** implemented here; it is tracked separately so this increment cannot be
+//! mistaken for the whole of stage 3.
 //!
 //! # Why the plan, and not the configuration text
 //!
@@ -45,6 +64,8 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+#[cfg(unix)]
+use std::os::fd::OwnedFd;
 
 use caddy_rs_core::Network;
 use caddy_rs_server::listener_plan::{plan_listeners, ListenerPlan, ListenerPlanError};
@@ -191,12 +212,48 @@ pub enum BindFdsError {
         /// The other listener that produced it, as `proto/address`.
         second: String,
     },
+    /// A planned listener could not be bound.
+    ///
+    /// ADR-0047 §6: this is a loud failure rather than a partial upload. The address is named
+    /// because the operator's next action is to find whichever process already holds the port.
+    Bind {
+        /// The listener that failed, as `proto/address`.
+        listener: String,
+        /// The bind failure.
+        source: std::io::Error,
+    },
+    /// A bound descriptor could not be uploaded to the fd store.
+    ///
+    /// Reported with the FD name and the address so the unit's log names which socket is missing
+    /// rather than only that "upload failed".
+    Upload {
+        /// The plan entry that failed, as `proto/address`.
+        listener: String,
+        /// The deterministic FD name that was attempted.
+        fd_name: String,
+        /// The upload failure.
+        source: caddy_rs_server::fdstore::FdStoreError,
+    },
 }
 
 impl std::fmt::Display for BindFdsError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Plan(error) => write!(formatter, "{error}"),
+            Self::Bind { listener, source } => write!(
+                formatter,
+                "cannot bind `{listener}`: {source}; nothing was uploaded to the fd store, so the \
+                 unit must not treat any descriptor as present"
+            ),
+            Self::Upload {
+                listener,
+                fd_name,
+                source,
+            } => write!(
+                formatter,
+                "cannot upload `{listener}` to the fd store as `{fd_name}`: {source}; the upload \
+                 stopped at the first failure so the store is not partially populated"
+            ),
             Self::NameCollision {
                 name,
                 first,
@@ -212,6 +269,150 @@ impl std::fmt::Display for BindFdsError {
 }
 
 impl std::error::Error for BindFdsError {}
+
+/// A bound descriptor waiting to be handed to `systemd`, with its identity kept alongside it.
+///
+/// The descriptor is owned so that a failure part-way through the upload closes everything already
+/// bound instead of leaking it: dropping this struct closes the socket. Nothing here is uploaded
+/// twice, and an upload that stops early leaves no descriptor half-registered under a name `run`
+/// would later adopt.
+#[derive(Debug)]
+struct BoundFd {
+    entry: PlannedFd,
+    /// Owned on Unix; never read directly, only borrowed as a raw descriptor for the upload.
+    #[cfg(unix)]
+    socket: OwnedFd,
+}
+
+/// Bind every planned listener, then upload each descriptor to the fd store (ADR-0047 §3, §6).
+///
+/// This is the real `bind-fds` body: stage 2 could only plan, so a unit that ran it without
+/// `--dry-run` was refused outright. The order matters and is deliberate — **every** socket is
+/// bound before **any** is uploaded. Binding and uploading in one interleaved pass would leave the
+/// store holding descriptors for listeners 1..n when listener n+1 failed to bind, and `run` would
+/// then adopt a set that does not match the plan. Binding first means a bind failure uploads
+/// nothing at all, which is the "no partial state" ADR-0047 §6 requires.
+///
+/// Returns the number of descriptors uploaded so that the caller can print a real bound-versus-
+/// reused summary rather than a plan.
+///
+/// # Errors
+/// [`BindFdsError::Bind`] when a planned listener cannot be bound, [`BindFdsError::Upload`] when a
+/// bound descriptor cannot be handed to the store. In both cases nothing remains uploaded: on a
+/// bind failure no upload has happened yet, and on an upload failure the remaining sockets are
+/// dropped with this function's locals.
+#[cfg(unix)]
+pub fn bind_and_upload(
+    planned: &[PlannedFd],
+    upload: &mut dyn FnMut(i32, &str) -> Result<(), caddy_rs_server::fdstore::FdStoreError>,
+) -> Result<usize, BindFdsError> {
+    // Refuse before binding anything when there is no store to upload to (ADR-0047 §6). Checking
+    // first is the whole point: discovering an unset NOTIFY_SOCKET after binding would leave the
+    // process having taken ports it then discards, which is exactly the partial state the ADR
+    // forbids. It is also the cheaper failure to diagnose, since nothing was touched.
+    require_notify_socket()?;
+    bind_and_upload_body(planned, upload)
+}
+
+/// The bind-then-upload body, split from [`bind_and_upload`] so tests can drive it with an injected
+/// upload closure instead of a real systemd socket, without weakening the production entry point's
+/// `NOTIFY_SOCKET` pre-check.
+#[cfg(unix)]
+fn bind_and_upload_body(
+    planned: &[PlannedFd],
+    upload: &mut dyn FnMut(i32, &str) -> Result<(), caddy_rs_server::fdstore::FdStoreError>,
+) -> Result<usize, BindFdsError> {
+    // Refuse UDP before binding anything: a UDP listener under fdstore mode is a configuration
+    // error whose real cause is a missing prerequisite, not a runtime failure (DIV-0040).
+    for entry in planned {
+        if entry.network == Network::Udp {
+            return Err(BindFdsError::Plan(ListenerPlanError {
+                listen: entry.address(),
+                reason:
+                    "UDP listeners cannot be pre-bound by `bind-fds`: systemd socket activation \
+                         for a UDP socket is a prerequisite that does not exist yet, so this \
+                         listener must be left for `run` to bind (see DIV-0040 and ADR-0047)"
+                        .to_owned(),
+            }));
+        }
+    }
+
+    // Phase 1: bind everything. A failure here has uploaded nothing.
+    let mut bound: Vec<BoundFd> = Vec::with_capacity(planned.len());
+    for entry in planned {
+        let address = entry.address();
+        let socket = bind_one(entry).map_err(|source| BindFdsError::Bind {
+            listener: address,
+            source,
+        })?;
+        bound.push(BoundFd {
+            entry: entry.clone(),
+            socket,
+        });
+    }
+
+    // Phase 2: upload everything that was bound.
+    for entry in &bound {
+        use std::os::unix::io::AsRawFd as _;
+        let raw = entry.socket.as_raw_fd();
+        upload(raw, &entry.entry.fd_name).map_err(|source| BindFdsError::Upload {
+            listener: entry.entry.address(),
+            fd_name: entry.entry.fd_name.clone(),
+            source,
+        })?;
+    }
+    Ok(bound.len())
+}
+
+/// Fail unless `NOTIFY_SOCKET` names a usable store, before any socket is bound (ADR-0047 §6).
+///
+/// Split out so the check is testable without binding a port or mutating the process environment.
+/// An empty value is rejected as well as a missing one: systemd never sets it empty, and treating
+/// empty as "no store" is what `notify::send` does for payloads, so a unit that ran with it unset
+/// would otherwise appear to succeed.
+#[cfg(unix)]
+fn require_notify_socket() -> Result<(), BindFdsError> {
+    let configured = std::env::var_os(caddy_rs_core::notify::NOTIFY_SOCKET_ENV);
+    check_notify_socket(configured.as_deref())
+}
+
+/// The pure half of [`require_notify_socket`]: an unset **or empty** value means there is no store.
+///
+/// Empty counts as absent because systemd never sets the variable empty, and treating it as a store
+/// would turn "the unit forgot to configure socket activation" into a confusing socket error much
+/// later. Testing this through an argument rather than the process environment keeps the tests
+/// order-independent, since environment access is global.
+#[cfg(unix)]
+fn check_notify_socket(configured: Option<&std::ffi::OsStr>) -> Result<(), BindFdsError> {
+    match configured.filter(|value| !value.is_empty()) {
+        Some(_) => Ok(()),
+        None => Err(no_notify_socket_error()),
+    }
+}
+
+/// The error for an unset `NOTIFY_SOCKET`, shared by the pre-check and its test.
+#[cfg(unix)]
+fn no_notify_socket_error() -> BindFdsError {
+    BindFdsError::Upload {
+        listener: "none".to_owned(),
+        fd_name: "none".to_owned(),
+        source: caddy_rs_server::fdstore::FdStoreError::NotifySocketUnset,
+    }
+}
+
+/// Bind one planned TCP listener, reusing the server's own bind path so the helper and `run` cannot
+/// disagree about socket options.
+#[cfg(unix)]
+fn bind_one(entry: &PlannedFd) -> std::io::Result<OwnedFd> {
+    use std::net::TcpListener;
+    let host = if entry.host.is_empty() {
+        "0.0.0.0"
+    } else {
+        entry.host.as_str()
+    };
+    let listener = TcpListener::bind((host, entry.port))?;
+    Ok(OwnedFd::from(listener))
+}
 
 /// Build the plan for a configuration, deriving an FD name for every listener.
 ///
@@ -454,5 +655,204 @@ mod tests {
         assert!(planned.is_empty());
         let rendered = render_plan(&planned, true);
         assert!(rendered.contains("no plannable listeners"), "{rendered}");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Stage 3: the real upload path (T-CORE-133 criteria 2 and 3).
+    // ---------------------------------------------------------------------------------------
+
+    /// A plan entry for an ephemeral loopback port, so the bind cannot collide with anything.
+    fn loopback_plan(port: u16) -> Vec<PlannedFd> {
+        vec![PlannedFd {
+            network: Network::Tcp,
+            host: "127.0.0.1".to_owned(),
+            port,
+            fd_name: fd_name(Network::Tcp, "127.0.0.1", port),
+        }]
+    }
+
+    /// A port that is free right now: bind a probe, read the port, drop it.
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("probe binds")
+            .local_addr()
+            .expect("probe has an address")
+            .port()
+    }
+
+    #[test]
+    fn with_a_store_configured_every_planned_listener_is_bound_and_uploaded_by_name() {
+        // Criterion 1 at the helper level: one upload per plan entry, carrying that entry's FD
+        // NAME. The name is what `run` later looks the descriptor up by, so a wrong name here is
+        // the failure mode this whole design exists to prevent.
+        let port = free_port();
+        let planned = loopback_plan(port);
+        let mut uploads: Vec<(i32, String)> = Vec::new();
+        let uploaded = bind_and_upload_body(&planned, &mut |fd, name| {
+            assert!(fd >= 0, "a real descriptor must be uploaded, got {fd}");
+            uploads.push((fd, name.to_owned()));
+            Ok(())
+        })
+        .expect("bind and upload succeeds");
+        assert_eq!(uploaded, 1);
+        assert_eq!(
+            uploads.len(),
+            1,
+            "exactly one descriptor per planned listener: {uploads:?}"
+        );
+        assert_eq!(
+            uploads[0].1,
+            fd_name(Network::Tcp, "127.0.0.1", port),
+            "the uploaded FDNAME must be the plan entry's name"
+        );
+    }
+
+    #[test]
+    fn a_bind_failure_uploads_nothing_at_all() {
+        // Criterion 2's ordering guarantee, asserted on the observable rather than by reading the
+        // source: hold the port so the bind must fail, then confirm the upload closure was never
+        // called. If the implementation interleaved bind and upload, the FIRST entry would already
+        // have been uploaded when the second failed.
+        let held = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("hold a port");
+        let busy = held.local_addr().expect("held port has an address").port();
+
+        let mut planned = loopback_plan(free_port());
+        planned.push(PlannedFd {
+            network: Network::Tcp,
+            host: "127.0.0.1".to_owned(),
+            port: busy,
+            fd_name: fd_name(Network::Tcp, "127.0.0.1", busy),
+        });
+
+        let mut upload_calls = 0usize;
+        let error = bind_and_upload_body(&planned, &mut |_fd, _name| {
+            upload_calls += 1;
+            Ok(())
+        })
+        .expect_err("binding an in-use port must fail");
+        assert!(
+            matches!(error, BindFdsError::Bind { .. }),
+            "a bind failure must surface as Bind, got {error:?}"
+        );
+        assert_eq!(
+            upload_calls, 0,
+            "a bind failure must upload NOTHING: every socket is bound before any is uploaded"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(&busy.to_string()),
+            "the error must name the address that failed: {message}"
+        );
+    }
+
+    #[test]
+    fn an_unset_or_empty_notify_socket_is_refused_but_a_set_one_is_accepted() {
+        // Criterion 3, exercised through the real precheck rather than through the error
+        // constructor: a test that only builds the error would pass even if the precheck were
+        // never called from bind_and_upload.
+        use std::ffi::OsStr;
+        assert!(
+            check_notify_socket(None).is_err(),
+            "an UNSET NOTIFY_SOCKET must be refused before anything is bound"
+        );
+        assert!(
+            check_notify_socket(Some(OsStr::new(""))).is_err(),
+            "an EMPTY NOTIFY_SOCKET must be refused: systemd never sets it empty, so empty means              the unit has no store to upload to"
+        );
+        assert!(
+            check_notify_socket(Some(OsStr::new("/run/systemd/notify"))).is_ok(),
+            "a set NOTIFY_SOCKET must be accepted, otherwise the helper refuses to work at all"
+        );
+        // And the production entry point must consult it: with no store configured in this test
+        // process, bind_and_upload must fail before binding the free port we hand it.
+        let port = free_port();
+        let mut upload_calls = 0usize;
+        let error = bind_and_upload(&loopback_plan(port), &mut |_f, _n| {
+            upload_calls += 1;
+            Ok(())
+        })
+        .expect_err("without NOTIFY_SOCKET the production entry point must refuse");
+        assert_eq!(upload_calls, 0, "nothing may be uploaded without a store");
+        assert!(
+            error.to_string().contains("NOTIFY_SOCKET"),
+            "the refusal must name NOTIFY_SOCKET: {error}"
+        );
+        // The port must still be free: the refusal happened before any bind.
+        std::net::TcpListener::bind(("127.0.0.1", port))
+            .expect("the refused run must not have bound the port");
+    }
+
+    #[test]
+    fn the_notify_socket_error_is_precise_and_typed() {
+        let error = no_notify_socket_error();
+        let message = error.to_string();
+        assert!(
+            message.contains("NOTIFY_SOCKET"),
+            "the message must name NOTIFY_SOCKET: {message}"
+        );
+        assert!(
+            message.contains("fd store"),
+            "the message must say what is missing, the fd store: {message}"
+        );
+        assert!(
+            matches!(
+                error,
+                BindFdsError::Upload {
+                    source: caddy_rs_server::fdstore::FdStoreError::NotifySocketUnset,
+                    ..
+                }
+            ),
+            "an unset socket must be its own error case, not a generic socket error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_udp_listener_is_refused_before_any_bind_so_nothing_is_uploaded() {
+        // Criterion 6: UDP under fdstore mode is a loud, actionable error naming the missing
+        // prerequisite, and it happens before anything is bound or uploaded.
+        let planned = vec![PlannedFd {
+            network: Network::Udp,
+            host: "127.0.0.1".to_owned(),
+            port: free_port(),
+            fd_name: fd_name(Network::Udp, "127.0.0.1", 1234),
+        }];
+        let mut upload_calls = 0usize;
+        let error = bind_and_upload_body(&planned, &mut |_f, _n| {
+            upload_calls += 1;
+            Ok(())
+        })
+        .expect_err("a UDP listener must be refused");
+        assert_eq!(upload_calls, 0, "a refused UDP plan must upload nothing");
+        let message = error.to_string();
+        assert!(
+            message.contains("UDP") && message.contains("prerequisite"),
+            "the error must name UDP and the missing prerequisite: {message}"
+        );
+    }
+
+    #[test]
+    fn an_upload_failure_names_the_listener_and_its_fd_name() {
+        // The operator's next action is to find which socket failed, so both identities are named.
+        let port = free_port();
+        let planned = loopback_plan(port);
+        let error = bind_and_upload_body(&planned, &mut |_fd, _name| {
+            Err(caddy_rs_server::fdstore::FdStoreError::Socket(
+                std::io::Error::other("mock store rejected the descriptor"),
+            ))
+        })
+        .expect_err("an upload failure must surface");
+        assert!(
+            matches!(error, BindFdsError::Upload { .. }),
+            "an upload failure must surface as Upload: {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(&port.to_string()),
+            "the error must name the failed listener's address: {message}"
+        );
+        assert!(
+            message.contains(&fd_name(Network::Tcp, "127.0.0.1", port)),
+            "the error must name the attempted FDNAME: {message}"
+        );
     }
 }

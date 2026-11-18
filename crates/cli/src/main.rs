@@ -1006,18 +1006,39 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 .map_err(|error| anyhow::anyhow!("cannot plan fd-store listeners: {error}"))?;
             if dry_run {
                 print!("{}", bind_fds::render_plan(&planned, true));
-                // Stage 2 stops here: no socket is bound and nothing is uploaded (T-CORE-133 owns
-                // the real upload). Exiting successfully is what makes the dry run usable in a
-                // unit's `ExecStartPre` for diagnosis without side effects.
+                // A dry run stops here: no socket is bound and nothing is uploaded. Exiting
+                // successfully is what makes it usable in a unit's `ExecStartPre` for diagnosis
+                // without side effects.
                 return Ok(());
             }
-            // Stage 3 adds the FDSTORE=1 upload. Until it exists, refusing loudly is correct:
-            // printing a plan and exiting 0 without uploading would let a unit believe the
-            // descriptors exist when they do not.
-            anyhow::bail!(
-                "bind-fds without --dry-run is not implemented yet: the fd-store upload is stage 3 \
-                 (T-CORE-133). Re-run with --dry-run to inspect the plan"
-            );
+            // Stage 3: bind every planned listener, then upload each descriptor (ADR-0047 §3, §6).
+            // `http3` is irrelevant here: UDP listeners are refused before any bind happens, so the
+            // helper never claims to pre-bind a socket whose activation prerequisite is missing.
+            #[cfg(unix)]
+            {
+                let uploaded = bind_fds::bind_and_upload(&planned, &mut |fd, name| {
+                    caddy_rs_server::fdstore::send_fd_to_store(fd as i32, name)
+                })
+                .map_err(|error| {
+                    anyhow::anyhow!("cannot bind and upload fd-store listeners: {error}")
+                })?;
+                print!("{}", bind_fds::render_plan(&planned, false));
+                println!(
+                    "bound {uploaded} listener(s) and uploaded {uploaded} descriptor(s) to the fd \
+                     store; `run` adopts them by FD name"
+                );
+                // Exiting here is correct: `FDSTORE=1` makes systemd take its own reference to each
+                // descriptor at sendmsg time, so the store keeps the sockets alive after this
+                // process is gone. This is the point of pre-binding.
+                return Ok(());
+            }
+            #[cfg(not(unix))]
+            {
+                anyhow::bail!(
+                    "bind-fds requires a Unix platform: the fd store is a Unix-domain socket \
+                     protocol (ADR-0047)"
+                );
+            }
         }
         Command::Run {
             config,

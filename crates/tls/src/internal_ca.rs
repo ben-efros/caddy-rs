@@ -1142,7 +1142,7 @@ fn generate_leaf_key(key_type: crate::acme::csr::CertificateKeyType) -> Result<G
 
 fn load_ecdsa_key(pem: &str) -> Result<EcdsaKeyPair> {
     let der = pem_first_der(pem, "PRIVATE KEY")?;
-    let rng = SystemRandom::new();
+    // No rng binding: aws-lc-rs `from_pkcs8` does not take one (T-DEPS-015 phase 2).
     EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &der)
         .map_err(|error| Error::Issuer(format!("not an ECDSA P-256 PKCS#8 key: {error}")))
 }
