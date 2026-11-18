@@ -50,8 +50,11 @@ use crate::acme::ari::RenewalInfo;
 use crate::storage::FileStorage;
 use crate::{Error, Result};
 
-use ring::rand::SystemRandom;
-use ring::signature::{
+use aws_lc_rs::rand::SystemRandom;
+// T-DEPS-015 phase 2: same pinned algorithm set as the ring import this replaces
+// (`ECDSA_P256_SHA256_FIXED{,_SIGNING}`, `ECDSA_P384_SHA384_FIXED{,_SIGNING}`); aws-lc-rs exports
+// these names with identical meanings, so no algorithm was dropped or added.
+use aws_lc_rs::signature::{
     EcdsaKeyPair, KeyPair, UnparsedPublicKey, ECDSA_P256_SHA256_FIXED,
     ECDSA_P256_SHA256_FIXED_SIGNING, ECDSA_P384_SHA384_FIXED, ECDSA_P384_SHA384_FIXED_SIGNING,
 };
@@ -1254,20 +1257,14 @@ impl AccountKey {
     fn from_ec_pkcs8(der: &[u8], key_type: AccountKeyType) -> Result<Self> {
         let rng = SystemRandom::new();
         let key_pair = match key_type {
-            AccountKeyType::P256 => {
-                EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, der, &rng).map_err(
-                    |error| {
-                        AcmeError::AccountKey(format!("invalid ECDSA P-256 account key: {error}"))
-                    },
-                )?
-            }
-            AccountKeyType::P384 => {
-                EcdsaKeyPair::from_pkcs8(&ECDSA_P384_SHA384_FIXED_SIGNING, der, &rng).map_err(
-                    |error| {
-                        AcmeError::AccountKey(format!("invalid ECDSA P-384 account key: {error}"))
-                    },
-                )?
-            }
+            AccountKeyType::P256 => EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, der)
+                .map_err(|error| {
+                    AcmeError::AccountKey(format!("invalid ECDSA P-256 account key: {error}"))
+                })?,
+            AccountKeyType::P384 => EcdsaKeyPair::from_pkcs8(&ECDSA_P384_SHA384_FIXED_SIGNING, der)
+                .map_err(|error| {
+                    AcmeError::AccountKey(format!("invalid ECDSA P-384 account key: {error}"))
+                })?,
             AccountKeyType::Rsa2048 | AccountKeyType::Rsa4096 => {
                 return Err(AcmeError::AccountKey(
                     "internal error: non-EC key passed to EC loader".to_string(),
@@ -2622,7 +2619,7 @@ mod tests {
 
     #[test]
     fn account_key_rejects_ed25519_pkcs8_with_a_located_error() {
-        use ring::signature::Ed25519KeyPair;
+        use aws_lc_rs::signature::Ed25519KeyPair;
         let rng = SystemRandom::new();
         let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
         let pem = pem_encode("PRIVATE KEY", pkcs8.as_ref());

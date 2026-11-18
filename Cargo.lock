@@ -354,6 +354,7 @@ version = "0.1.0-trial.7"
 dependencies = [
  "argon2",
  "async-trait",
+ "aws-lc-rs",
  "base64 0.23.1",
  "bcrypt",
  "bytes",
@@ -437,6 +438,7 @@ name = "caddy-rs-server"
 version = "0.1.0-trial.7"
 dependencies = [
  "async-trait",
+ "aws-lc-rs",
  "base64 0.23.1",
  "bytes",
  "caddy-rs-admin",
@@ -477,6 +479,7 @@ name = "caddy-rs-tls"
 version = "0.1.0-trial.7"
 dependencies = [
  "async-trait",
+ "aws-lc-rs",
  "base64 0.23.1",
  "bytes",
  "caddy-rs-core",

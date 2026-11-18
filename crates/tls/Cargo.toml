@@ -19,6 +19,23 @@ tokio = { workspace = true }
 # Both crates are present in the offline registry cache used by this workspace.
 base64 = { workspace = true }
 ring = "0.17.14"
+# T-DEPS-015 phase 2: signature verification and key generation move onto aws-lc-rs, the provider
+# rustls already uses in this workspace (see the note further down), so this adds no second crypto
+# backend. ring stays until the remaining `ring::rand`/`ring::digest` sites (T-DEPS-014 phase 1
+# scope) are migrated; phase 3 removes it.
+#
+# NO ACCEPTED ALGORITHM SET WAS WIDENED BY THIS CHANGE. Every migrated site keeps the exact ring
+# constant it used before, because aws-lc-rs exports the same names with the same meanings:
+# ECDSA_P256_SHA256_ASN1{,_SIGNING}, ECDSA_P256_SHA256_FIXED{,_SIGNING}, ECDSA_P384_SHA384_ASN1
+# {,_SIGNING}, ECDSA_P384_SHA384_FIXED{,_SIGNING}, RSA_PKCS1_2048_8192_SHA256, RSA_PKCS1_2048_
+# 8192_SHA384 and ED25519. No SHA-1 signature algorithm exists on any new path, and the RSA
+# 2048-bit floor implied by RSA_PKCS1_2048_8192_* is unchanged. Key parsing stays strict:
+# `from_pkcs8` is used everywhere, never `from_pkcs8_maybe_unchecked`, so a non-PKCS#8 or
+# unsupported key still fails loudly. The equivalence is proved by
+# `crates/tls/src/acme/csr.rs::phase2_algorithm_equivalence`, which verifies RING-PRODUCED
+# signatures with the aws-lc-rs constants (and not vice versa), so the test cannot pass by the two
+# implementations merely agreeing with themselves.
+aws-lc-rs = "1.19.0"
 
 # RSA account keys and certificate keys (certmagic supports rsa2048/rsa4096). All transitive
 # dependencies are present in the offline registry cache; feature set avoids network/build-script

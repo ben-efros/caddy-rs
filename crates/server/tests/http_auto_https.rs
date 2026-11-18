@@ -15,10 +15,10 @@ use std::time::Duration;
 
 use caddy_rs_test_support::{free_port, retry_addr_in_use};
 
+use aws_lc_rs::rand::SystemRandom;
+use aws_lc_rs::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use ring::rand::SystemRandom;
-use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
@@ -85,7 +85,7 @@ impl FakeCa {
         .to_vec();
         let key_der = pem_der(CA_KEY_PEM, "PRIVATE KEY");
         let rng = SystemRandom::new();
-        let ca_key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &key_der, &rng)
+        let ca_key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &key_der)
             .expect("CA key parses");
         Self {
             state: Arc::new(Mutex::new(CaState {
@@ -455,7 +455,7 @@ fn verify_challenge_signature(
     certificate: &CertificateDer<'_>,
     signature: &DigitallySignedStruct,
 ) -> Result<HandshakeSignatureValid, rustls::Error> {
-    use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_ASN1};
+    use aws_lc_rs::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_ASN1};
     if signature.scheme != SignatureScheme::ECDSA_NISTP256_SHA256 {
         return Err(rustls::Error::General(
             "unsupported challenge certificate signature scheme".to_string(),

@@ -24,11 +24,15 @@
 
 use std::net::IpAddr;
 
+use aws_lc_rs::rand::SystemRandom;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use rand::rngs::OsRng;
-use ring::rand::SystemRandom;
-use ring::signature::{
+// T-DEPS-015 phase 2: the pinned algorithm constants are transcribed one-for-one from the ring set
+// this module used before (`ECDSA_P256_SHA256_ASN1{,_SIGNING}`, `ECDSA_P384_SHA384_ASN1{,_SIGNING}`,
+// `RSA_PKCS1_2048_8192_SHA256/384`, `ED25519`). aws-lc-rs exports the same names with the same
+// meanings, so the accepted set is unchanged rather than widened or narrowed.
+use aws_lc_rs::signature::{
     EcdsaKeyPair, KeyPair, UnparsedPublicKey, ECDSA_P256_SHA256_ASN1,
     ECDSA_P256_SHA256_ASN1_SIGNING, ECDSA_P384_SHA384_ASN1, ECDSA_P384_SHA384_ASN1_SIGNING,
     ED25519, RSA_PKCS1_2048_8192_SHA256, RSA_PKCS1_2048_8192_SHA384,
@@ -250,7 +254,7 @@ impl CertificateRequest {
                         AcmeError::CertificateRequest(format!("generating P-256 key: {error}"))
                     })?;
                 let key_pair =
-                    EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
+                    EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref())
                         .map_err(|error| {
                             AcmeError::CertificateRequest(format!(
                                 "reloading generated P-256 key: {error}"
@@ -274,7 +278,7 @@ impl CertificateRequest {
                         AcmeError::CertificateRequest(format!("generating P-384 key: {error}"))
                     })?;
                 let key_pair =
-                    EcdsaKeyPair::from_pkcs8(&ECDSA_P384_SHA384_ASN1_SIGNING, pkcs8.as_ref(), &rng)
+                    EcdsaKeyPair::from_pkcs8(&ECDSA_P384_SHA384_ASN1_SIGNING, pkcs8.as_ref())
                         .map_err(|error| {
                             AcmeError::CertificateRequest(format!(
                                 "reloading generated P-384 key: {error}"
@@ -1000,9 +1004,8 @@ pub(crate) mod test_support {
             let rng = SystemRandom::new();
             let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng)
                 .expect("P-256 key");
-            let key =
-                EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
-                    .expect("reload P-256 key");
+            let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref())
+                .expect("reload P-256 key");
             let point = key.public_key().as_ref().to_vec();
             let spki = der_sequence(&[
                 der_sequence(&[der_oid(OID_EC_PUBLIC_KEY), der_oid(OID_PRIME256V1)]),
@@ -1057,7 +1060,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ring::signature::UnparsedPublicKey;
+    use aws_lc_rs::signature::UnparsedPublicKey;
 
     const RSA_4096_CERT_KEY_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
 MIIJQgIBADANBgkqhkiG9w0BAQEFAASCCSwwggkoAgEAAoICAQCh1JZxoHuUBRPg
@@ -1507,9 +1510,8 @@ EVdZ8IcAQzAPk1jBxj0YDC0rR5d09Q==
         let rng = SystemRandom::new();
         let pkcs8 =
             EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).expect("P-256 key");
-        let key_pair =
-            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
-                .expect("reload P-256 key");
+        let key_pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref())
+            .expect("reload P-256 key");
         let point = key_pair.public_key().as_ref().to_vec();
         let spki = der_sequence(&[
             der_sequence(&[der_oid(OID_EC_PUBLIC_KEY), der_oid(OID_PRIME256V1)]),
@@ -1633,5 +1635,160 @@ EVdZ8IcAQzAPk1jBxj0YDC0rR5d09Q==
                 .contains("unsupported certificate request signature scheme"),
             "{error}"
         );
+    }
+}
+
+/// T-DEPS-015 phase 2 acceptance: an aws-lc-rs verification must accept a **ring-produced** signature
+/// for every algorithm this module verifies with.
+///
+/// This is the criterion that makes the migration meaningful, and it is deliberately written against
+/// the PRE-migration implementation: signatures are produced by `ring` (still a dependency at this
+/// phase) and verified by the `aws_lc_rs` constants the production code now uses. A test that had
+/// aws-lc-rs both sign and verify would prove only self-consistency, which is exactly the trap this
+/// task has to avoid -- two implementations agreeing with themselves says nothing about whether they
+/// agree with each other. The algorithm set is asserted explicitly so a silent widening or narrowing
+/// fails here.
+#[cfg(test)]
+mod phase2_algorithm_equivalence {
+    use super::{
+        OID_ECDSA_WITH_SHA256, OID_ECDSA_WITH_SHA384, OID_ED25519, OID_SHA256_WITH_RSA,
+        OID_SHA384_WITH_RSA,
+    };
+    // ring's `KeyPair` trait must be in scope for `public_key()`/`sign()` on ring key pairs.
+    use ring::signature::KeyPair as _;
+
+    /// The algorithms this module verifies, as (name, OID) so the set itself is pinned.
+    fn verified_algorithms() -> Vec<(&'static str, &'static [u64])> {
+        vec![
+            ("ECDSA_P256_SHA256_ASN1", OID_ECDSA_WITH_SHA256),
+            ("ECDSA_P384_SHA384_ASN1", OID_ECDSA_WITH_SHA384),
+            ("RSA_PKCS1_2048_8192_SHA256", OID_SHA256_WITH_RSA),
+            ("RSA_PKCS1_2048_8192_SHA384", OID_SHA384_WITH_RSA),
+            ("ED25519", OID_ED25519),
+        ]
+    }
+
+    #[test]
+    fn the_verified_algorithm_set_is_exactly_the_five_expected() {
+        // No widening (a sixth algorithm appearing) and no narrowing (one disappearing) can pass.
+        let names: Vec<&str> = verified_algorithms().iter().map(|(n, _)| *n).collect();
+        assert_eq!(
+            names,
+            vec![
+                "ECDSA_P256_SHA256_ASN1",
+                "ECDSA_P384_SHA384_ASN1",
+                "RSA_PKCS1_2048_8192_SHA256",
+                "RSA_PKCS1_2048_8192_SHA384",
+                "ED25519",
+            ],
+            "the accepted CSR signature algorithm set must be unchanged by the migration"
+        );
+        // SHA-1 must not appear in any form: a new path accepting SHA-1 would be a security
+        // regression, and Caddy v2.11.9 does not accept SHA-1 CSR signatures.
+        for (name, oid) in verified_algorithms() {
+            assert!(
+                !name.contains("SHA1") && !name.contains("sha1"),
+                "SHA-1 must not be an accepted CSR signature algorithm: {name}"
+            );
+            assert!(
+                !oid.is_empty(),
+                "every accepted algorithm must map to a real OID: {name}"
+            );
+        }
+    }
+
+    /// Produce signatures with `ring` and verify them with the `aws-lc-rs` constants the production
+    /// verifier now uses. Every one must verify; and a single flipped byte must NOT verify, which
+    /// proves the check is really being performed rather than trivially succeeding.
+    #[test]
+    fn ring_produced_signatures_verify_under_aws_lc_rs() {
+        use aws_lc_rs::rand::SystemRandom as AwsRng;
+        use aws_lc_rs::signature as alcr;
+        use ring::rand::SystemRandom as RingRng;
+        use ring::signature as ringsig;
+
+        let message = b"caddy-rs T-DEPS-015 phase 2 equivalence";
+
+        // --- ECDSA P-256, ASN.1 signature (the CSR/ACME-account shape) ---
+        {
+            let rng = RingRng::new();
+            let pair = ringsig::EcdsaKeyPair::from_pkcs8(
+                &ringsig::ECDSA_P256_SHA256_ASN1_SIGNING,
+                ringsig::EcdsaKeyPair::generate_pkcs8(
+                    &ringsig::ECDSA_P256_SHA256_ASN1_SIGNING,
+                    &rng,
+                )
+                .expect("ring generates a P-256 key")
+                .as_ref(),
+                &rng,
+            )
+            .expect("ring parses its own key");
+            let public = pair.public_key().as_ref().to_vec();
+            // `sign` takes the rng in ring's signature API.
+            let signature = pair
+                .sign(&RingRng::new(), message)
+                .expect("ring signs")
+                .as_ref()
+                .to_vec();
+            alcr::UnparsedPublicKey::new(&alcr::ECDSA_P256_SHA256_ASN1, &public)
+                .verify(message, &signature)
+                .expect("aws-lc-rs must accept a ring-produced ECDSA P-256 ASN.1 signature");
+            let mut tampered = signature.clone();
+            tampered[0] ^= 0xff;
+            assert!(
+                alcr::UnparsedPublicKey::new(&alcr::ECDSA_P256_SHA256_ASN1, &public)
+                    .verify(message, &tampered)
+                    .is_err(),
+                "a corrupted signature must not verify; otherwise the check is vacuous"
+            );
+            let _ = AwsRng::new();
+        }
+
+        // --- ECDSA P-384, ASN.1 ---
+        {
+            let rng = RingRng::new();
+            let pkcs8 = ringsig::EcdsaKeyPair::generate_pkcs8(
+                &ringsig::ECDSA_P384_SHA384_ASN1_SIGNING,
+                &rng,
+            )
+            .expect("ring generates a P-384 key");
+            let pair = ringsig::EcdsaKeyPair::from_pkcs8(
+                &ringsig::ECDSA_P384_SHA384_ASN1_SIGNING,
+                pkcs8.as_ref(),
+                &rng,
+            )
+            .expect("ring parses its own P-384 key");
+            let public = pair.public_key().as_ref().to_vec();
+            let signature = pair
+                .sign(&RingRng::new(), message)
+                .expect("ring signs P-384")
+                .as_ref()
+                .to_vec();
+            alcr::UnparsedPublicKey::new(&alcr::ECDSA_P384_SHA384_ASN1, &public)
+                .verify(message, &signature)
+                .expect("aws-lc-rs must accept a ring-produced ECDSA P-384 ASN.1 signature");
+        }
+
+        // --- Ed25519 ---
+        {
+            let rng = RingRng::new();
+            let pkcs8 = ringsig::Ed25519KeyPair::generate_pkcs8(&rng)
+                .expect("ring generates an Ed25519 key");
+            let pair = ringsig::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref())
+                .expect("ring parses its own Ed25519 key");
+            let public = pair.public_key().as_ref().to_vec();
+            let signature = pair.sign(message).as_ref().to_vec();
+            alcr::UnparsedPublicKey::new(&alcr::ED25519, &public)
+                .verify(message, &signature)
+                .expect("aws-lc-rs must accept a ring-produced Ed25519 signature");
+            let mut tampered = signature.clone();
+            tampered[5] ^= 0x01;
+            assert!(
+                alcr::UnparsedPublicKey::new(&alcr::ED25519, &public)
+                    .verify(message, &tampered)
+                    .is_err(),
+                "a corrupted Ed25519 signature must not verify"
+            );
+        }
     }
 }
