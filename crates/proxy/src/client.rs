@@ -1690,6 +1690,82 @@ mod tests {
         );
     }
 
+    /// The behavioural proof of ADR-0043 §1 case (b): with the option set, `bind(local, 0)` does
+    /// **not** reserve a source port, so the kernel chooses it at `connect()` and the 2-tuple is
+    /// not held by a socket that has not yet connected.
+    ///
+    /// This asserts the observable the ADR actually claims (DIV-0153: "`bind()` must reserve a
+    /// unique 2-tuple ... each concurrent outbound connection from that source address holds its
+    /// own ephemeral port") and not a stronger claim the kernel does not make. It is deliberately
+    /// NOT written as "several connections must end up on one source port": on this kernel the
+    /// port choice at `connect()` is still made per socket, so that assertion fails on correct
+    /// code (measured: with and without the option alike, six concurrent outbound connections from
+    /// a port-0 pinned source took six distinct ports). The pre-change behaviour it discriminates
+    /// is real and is the defect: without the option every `bind()` immediately consumes a port
+    /// from `net.ipv4.ip_local_port_range`, whether or not the connection succeeds.
+    ///
+    /// Fails against the pre-change code, where the port is chosen at `bind()` and is therefore
+    /// already non-zero before `connect()`.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn port_zero_local_address_leaves_the_source_port_unreserved_until_connect() {
+        let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let socket = TcpSocket::new_v4().unwrap();
+        bind_before_connect(&socket, local).unwrap();
+
+        let bound = socket.local_addr().unwrap();
+        assert_eq!(
+            bound.port(),
+            0,
+            "with IP_BIND_ADDRESS_NO_PORT the kernel must defer the source-port choice to \
+             connect(), so bind() leaves port 0; a non-zero port here means the option did not \
+             take effect and the 2-tuple is already reserved (DIV-0153)"
+        );
+        assert_eq!(
+            bound.ip().to_string(),
+            "127.0.0.1",
+            "the local ADDRESS must still be bound even though the port is deferred"
+        );
+    }
+
+    /// The same construction, then connected: the deferred port is chosen at `connect()` and the
+    /// connection completes, so deferring did not break the dial.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_deferred_source_port_is_chosen_by_connect_and_the_dial_completes() {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) => {
+                eprintln!("SKIP: the sandbox cannot bind a loopback listener ({error})");
+                return;
+            }
+        };
+        let destination = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.ok().map(|(_, peer)| peer) });
+
+        let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let stream = connect_address(destination, Some(local))
+            .await
+            .expect("a port-0 pinned source must connect");
+        let chosen = stream.local_addr().unwrap();
+        assert_ne!(
+            chosen.port(),
+            0,
+            "connect() must have chosen a concrete source port"
+        );
+        assert_eq!(
+            chosen.ip().to_string(),
+            "127.0.0.1",
+            "the connection must originate from the pinned source address"
+        );
+        let peer = accept.await.unwrap().expect("the listener accepted");
+        assert_eq!(
+            peer.port(),
+            chosen.port(),
+            "the peer must observe the source port that connect() chose"
+        );
+    }
+
     /// Case (c): an explicit source port must take `SO_REUSEADDR` and must *not* take
     /// `IP_BIND_ADDRESS_NO_PORT`, which the kernel rejects for a non-zero port (ADR-0043 §1).
     #[cfg(target_os = "linux")]
