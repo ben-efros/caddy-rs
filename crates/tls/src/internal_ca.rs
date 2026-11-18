@@ -52,8 +52,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
-use ring::rand::SystemRandom;
-use ring::signature::{
+// T-DEPS-015 phase 2: the same two pinned signing algorithms as the ring import this replaces
+// (`ECDSA_P256_SHA256_ASN1_SIGNING`, `ECDSA_P384_SHA384_ASN1_SIGNING`). No algorithm was added: the
+// internal CA still issues P-256 roots and P-256/P-384 intermediates exactly as before.
+use aws_lc_rs::rand::SystemRandom;
+use aws_lc_rs::signature::{
     EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING, ECDSA_P384_SHA384_ASN1_SIGNING,
 };
 use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey};
@@ -1043,7 +1046,7 @@ fn generate_key() -> Result<GeneratedKey> {
         .map_err(|error| Error::Issuer(format!("internal CA key generation failed: {error}")))?
         .as_ref()
         .to_vec();
-    let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &pkcs8_der, &rng)
+    let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &pkcs8_der)
         .map_err(|error| Error::Issuer(format!("internal CA key load failed: {error}")))?;
     let public_key = pair.public_key().as_ref().to_vec();
     Ok(GeneratedKey {
@@ -1083,7 +1086,7 @@ fn generate_leaf_key(key_type: crate::acme::csr::CertificateKeyType) -> Result<G
                 })?
                 .as_ref()
                 .to_vec();
-            let pair = EcdsaKeyPair::from_pkcs8(algorithm, &pkcs8_der, &rng).map_err(|error| {
+            let pair = EcdsaKeyPair::from_pkcs8(algorithm, &pkcs8_der).map_err(|error| {
                 Error::Issuer(format!("internal CA leaf key load failed: {error}"))
             })?;
             let public_key = pair.public_key().as_ref().to_vec();
@@ -1140,7 +1143,7 @@ fn generate_leaf_key(key_type: crate::acme::csr::CertificateKeyType) -> Result<G
 fn load_ecdsa_key(pem: &str) -> Result<EcdsaKeyPair> {
     let der = pem_first_der(pem, "PRIVATE KEY")?;
     let rng = SystemRandom::new();
-    EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &der, &rng)
+    EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &der)
         .map_err(|error| Error::Issuer(format!("not an ECDSA P-256 PKCS#8 key: {error}")))
 }
 

@@ -95,5 +95,8 @@ h2 = "0.4.19"
 caddy-rs-config = { workspace = true }
 base64 = { workspace = true }
 ring = "0.17.14"
+# T-DEPS-015 phase 2: integration tests sign and verify with aws-lc-rs, the workspace's rustls
+# provider, matching the production code that no longer uses ring for signatures.
+aws-lc-rs = "1.19.0"
 tempfile = "3.27.0"
 tracing = { workspace = true }

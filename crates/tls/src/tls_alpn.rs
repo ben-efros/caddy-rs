@@ -41,8 +41,10 @@ use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use ring::rand::SystemRandom;
-use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+// T-DEPS-015 phase 2: identical pinned set (`ECDSA_P256_SHA256_ASN1_SIGNING` for signing,
+// `ECDSA_P256_SHA256_ASN1` for TLS-ALPN-01 challenge verification). No algorithm widened.
+use aws_lc_rs::rand::SystemRandom;
+use aws_lc_rs::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
@@ -78,11 +80,8 @@ impl TlsAlpn01Challenge {
         let rng = SystemRandom::new();
         let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng)
             .map_err(|error| issuer_error(format!("generating challenge key: {error}")))?;
-        let key_pair =
-            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
-                .map_err(|error| {
-                    issuer_error(format!("loading generated challenge key: {error}"))
-                })?;
+        let key_pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref())
+            .map_err(|error| issuer_error(format!("loading generated challenge key: {error}")))?;
         let public_key = key_pair.public_key().as_ref().to_vec();
         // Byte-identical to the previous `ring::digest::digest(&SHA256, ..)` call; the ACME
         // identifier extension the CA validates is unchanged.
@@ -637,7 +636,7 @@ fn verify_challenge_signature(
     certificate: &CertificateDer<'_>,
     dss: &rustls::DigitallySignedStruct,
 ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-    use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_ASN1};
+    use aws_lc_rs::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_ASN1};
     if dss.scheme != rustls::SignatureScheme::ECDSA_NISTP256_SHA256 {
         return Err(rustls::Error::General(
             "unsupported challenge certificate signature scheme".to_string(),
@@ -705,7 +704,7 @@ fn certificate_public_key(der: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_ASN1};
+    use aws_lc_rs::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_ASN1};
 
     fn challenge() -> TlsAlpn01Challenge {
         TlsAlpn01Challenge::generate("Example.COM.", "token-1.thumbprint").expect("challenge")

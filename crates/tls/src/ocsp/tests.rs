@@ -455,9 +455,9 @@ async fn no_responder_is_loud_and_never_stapled() {
 async fn resolver_selects_certificate_with_staple() {
     // A real P-256 key so rustls can build the signing key; the certificate chain bytes are not
     // parsed by `certified_key`.
-    let rng = ring::rand::SystemRandom::new();
-    let pkcs8 = ring::signature::EcdsaKeyPair::generate_pkcs8(
-        &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+    let rng = aws_lc_rs::rand::SystemRandom::new();
+    let pkcs8 = aws_lc_rs::signature::EcdsaKeyPair::generate_pkcs8(
+        &aws_lc_rs::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
         &rng,
     )
     .unwrap();

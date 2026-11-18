@@ -3370,8 +3370,8 @@ fn verify_jws_signature(
             point.push(0x04);
             point.extend_from_slice(&x);
             point.extend_from_slice(&y);
-            ring::signature::UnparsedPublicKey::new(
-                &ring::signature::ECDSA_P256_SHA256_FIXED,
+            aws_lc_rs::signature::UnparsedPublicKey::new(
+                &aws_lc_rs::signature::ECDSA_P256_SHA256_FIXED,
                 point,
             )
             .verify(message, signature)
@@ -3396,8 +3396,8 @@ fn verify_jws_signature(
                 ));
             }
             let public_key = rsa_public_key_der(&modulus, &exponent);
-            ring::signature::UnparsedPublicKey::new(
-                &ring::signature::RSA_PKCS1_2048_8192_SHA256,
+            aws_lc_rs::signature::UnparsedPublicKey::new(
+                &aws_lc_rs::signature::RSA_PKCS1_2048_8192_SHA256,
                 public_key,
             )
             .verify(message, signature)

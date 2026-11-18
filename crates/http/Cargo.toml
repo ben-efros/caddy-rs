@@ -36,6 +36,9 @@ http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 ring = "0.17.14"
+# T-DEPS-015 phase 2: ACME server JWS signature verification moves onto aws-lc-rs, the same provider
+# rustls uses in this workspace. ring stays until phase 3 removes the remaining sites.
+aws-lc-rs = "1.19.0"
 # Radar client: hyper HTTP/1 over rustls for https://, platform trust store for the API host.
 rustls = { version = "0.23.45", default-features = false, features = [
     "std", "aws_lc_rs", "tls12", "logging",
