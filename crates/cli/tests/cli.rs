@@ -18,6 +18,35 @@ fn run(args: &[&str]) -> (i32, String, String) {
     )
 }
 
+/// Run the binary with `NOTIFY_SOCKET` pointing at a mock fd store (T-CORE-133).
+fn run_with_notify_socket(args: &[&str], socket: &std::path::Path) -> (i32, String, String) {
+    let output = Command::new(binary())
+        .args(args)
+        .env("NOTIFY_SOCKET", socket)
+        .output()
+        .expect("run caddy-rs");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
+/// Run the binary with `NOTIFY_SOCKET` explicitly removed, so the "no fd store" path is exercised
+/// regardless of the ambient environment the test runner happened to have.
+fn run_without_notify_socket(args: &[&str]) -> (i32, String, String) {
+    let output = Command::new(binary())
+        .args(args)
+        .env_remove("NOTIFY_SOCKET")
+        .output()
+        .expect("run caddy-rs");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
 /// Run the binary in `directory` with the given arguments.
 fn run_in(directory: &std::path::Path, args: &[&str]) -> (i32, String, String) {
     let output = Command::new(binary())
@@ -6280,10 +6309,15 @@ fn bind_fds_dry_run_prints_the_plan_and_exits() {
     assert!(stdout.contains("no sockets were bound"), "{stdout}");
 }
 
-/// Without `--dry-run` the upload stage does not exist yet, so it must refuse loudly rather than
-/// print a plan and exit 0 as though descriptors had been stored (T-CORE-133 owns the upload).
+/// Without `--dry-run` the helper performs the real upload, so with **no** `NOTIFY_SOCKET` it must
+/// refuse loudly and leave no partial state: nothing bound, nothing uploaded (ADR-0047 §6).
+///
+/// This replaces a Stage-2 test that asserted the refusal said "not implemented". That message is
+/// gone because the upload now exists, and the property worth keeping is the one below: a missing
+/// store is caught *before* any socket is taken, so a unit that forgot socket activation cannot
+/// leave orphaned bound ports behind.
 #[test]
-fn bind_fds_without_dry_run_refuses_loudly() {
+fn bind_fds_without_notify_socket_refuses_before_binding_anything() {
     let directory = tempfile::tempdir().expect("temp dir");
     let config = directory.path().join("caddy.json");
     std::fs::write(
@@ -6293,11 +6327,123 @@ fn bind_fds_without_dry_run_refuses_loudly() {
     .expect("write config");
 
     let (code, _stdout, stderr) =
-        run(&["bind-fds", "--config", config.to_str().expect("utf-8 path")]);
-    assert_ne!(code, 0, "a missing upload stage must not report success");
+        run_without_notify_socket(&["bind-fds", "--config", config.to_str().expect("utf-8 path")]);
+    assert_ne!(code, 0, "a missing fd store must not report success");
     assert!(
-        stderr.contains("not implemented") && stderr.contains("T-CORE-133"),
-        "the refusal must name the missing stage: {stderr}"
+        stderr.contains("NOTIFY_SOCKET"),
+        "the refusal must name NOTIFY_SOCKET so the operator knows what to configure: {stderr}"
+    );
+    assert!(
+        !stderr.contains("not implemented"),
+        "the upload is implemented now, so that message must be gone: {stderr}"
+    );
+}
+
+/// A UDP listener cannot be pre-bound, and the helper must say so naming the missing prerequisite
+/// rather than silently binding (DIV-0040, ADR-0047).
+#[test]
+fn bind_fds_refuses_a_udp_listener_naming_the_missing_prerequisite() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let config = directory.path().join("caddy.json");
+    std::fs::write(
+        &config,
+        r#"{"apps":{"http":{"servers":{"s0":{"listen":["udp/:443"]}}}}}"#,
+    )
+    .expect("write config");
+
+    // Even WITH a store configured, UDP must be refused: the socket must not be bound.
+    let socket_dir = tempfile::tempdir().expect("socket dir");
+    let socket_path = socket_dir.path().join("notify.sock");
+    let _listener = std::os::unix::net::UnixDatagram::bind(&socket_path).expect("bind mock store");
+
+    let (code, _stdout, stderr) = run_with_notify_socket(
+        &["bind-fds", "--config", config.to_str().expect("utf-8 path")],
+        &socket_path,
+    );
+    assert_ne!(code, 0, "a UDP listener must not report success");
+    assert!(
+        stderr.contains("UDP") && stderr.contains("prerequisite"),
+        "the refusal must name UDP and the missing prerequisite: {stderr}"
+    );
+}
+
+/// The real upload path: with a mock store on a Unix datagram socket, the helper must bind the
+/// planned listener and deliver one descriptor carrying the plan's FD name.
+///
+/// This is the executable proof of T-CORE-133 criterion 1 at the process level rather than only at
+/// the unit level.
+#[test]
+fn bind_fds_uploads_a_bound_descriptor_named_after_the_plan() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let config = directory.path().join("caddy.json");
+    std::fs::write(
+        &config,
+        r#"{"apps":{"http":{"servers":{"s0":{"listen":["127.0.0.1:0"]}}}}}"#,
+    )
+    .expect("write config");
+    // Port 0 is not plannable (the plan requires a concrete port), so pick a free one.
+    let port = {
+        let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("probe");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        port
+    };
+    std::fs::write(
+        &config,
+        format!(
+            r#"{{"apps":{{"http":{{"servers":{{"s0":{{"listen":["127.0.0.1:{port}"]}}}}}}}}}}"#
+        ),
+    )
+    .expect("write config");
+
+    let socket_dir = tempfile::tempdir().expect("socket dir");
+    let socket_path = socket_dir.path().join("notify.sock");
+    let store = std::os::unix::net::UnixDatagram::bind(&socket_path).expect("bind mock store");
+    store
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .expect("set timeout");
+    // The helper sends to the daemon's socket; this bound datagram socket plays the daemon and
+    // reads from the same path the helper writes to.
+
+    let (code, stdout, stderr) = run_with_notify_socket(
+        &["bind-fds", "--config", config.to_str().expect("utf-8 path")],
+        &socket_path,
+    );
+    assert_eq!(code, 0, "the real upload must succeed; stderr: {stderr}");
+    assert!(
+        stdout.contains(&format!("127.0.0.1:{port}")),
+        "the report must name the bound listener: {stdout}"
+    );
+    assert!(
+        stdout.contains("uploaded 1 descriptor"),
+        "the report must state how many descriptors were uploaded: {stdout}"
+    );
+
+    // The store must have received the message, carrying the descriptor.
+    let mut buffer = [0u8; 64];
+    let mut cmsg = vec![0u8; 128];
+    let received = {
+        use std::os::unix::io::AsRawFd;
+        let mut iov = libc::iovec {
+            iov_base: buffer.as_mut_ptr().cast(),
+            iov_len: buffer.len(),
+        };
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cmsg.as_mut_ptr().cast();
+        msg.msg_controllen = cmsg.len();
+        unsafe { libc::recvmsg(store.as_raw_fd(), &mut msg, 0) }
+    };
+    assert!(received > 0, "the store must receive the upload notice");
+    let text = String::from_utf8_lossy(&buffer[..received as usize]).to_string();
+    assert!(
+        text.contains("FDSTORE=1"),
+        "the payload must set FDSTORE=1 to keep the descriptor: {text}"
+    );
+    assert!(
+        text.contains(&format!("FDNAME=caddy-tcp-127.0.0.1-{port}")),
+        "the payload must carry the plan's FD name: {text}"
     );
 }
 

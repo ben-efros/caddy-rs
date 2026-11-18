@@ -1255,7 +1255,7 @@ impl AccountKey {
     }
 
     fn from_ec_pkcs8(der: &[u8], key_type: AccountKeyType) -> Result<Self> {
-        let rng = SystemRandom::new();
+        // No rng binding: aws-lc-rs `from_pkcs8` does not take one (T-DEPS-015 phase 2).
         let key_pair = match key_type {
             AccountKeyType::P256 => EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, der)
                 .map_err(|error| {
