@@ -6437,6 +6437,14 @@ fn bind_fds_uploads_a_bound_descriptor_named_after_the_plan() {
         unsafe { libc::recvmsg(store.as_raw_fd(), &mut msg, 0) }
     };
     assert!(received > 0, "the store must receive the upload notice");
+    // With 128 control bytes and a 24-byte CMSG_SPACE(4) payload this cannot truncate today, but a
+    // truncated message would carry a descriptor the walk below never sees, so fail loudly rather
+    // than under-report.
+    assert_eq!(
+        msg.msg_flags & libc::MSG_CTRUNC,
+        0,
+        "the control message was truncated, so a descriptor may have been dropped"
+    );
     let text = String::from_utf8_lossy(&buffer[..received as usize]).to_string();
     assert!(
         text.contains("FDSTORE=1"),
@@ -6459,7 +6467,12 @@ fn bind_fds_uploads_a_bound_descriptor_named_after_the_plan() {
             if header.cmsg_level == libc::SOL_SOCKET && header.cmsg_type == libc::SCM_RIGHTS {
                 let data = libc::CMSG_DATA(cmsg);
                 // cmsg_len covers the header plus the descriptors actually attached.
-                let payload_bytes = header.cmsg_len as usize - libc::CMSG_LEN(0) as usize;
+                // `cmsg_len` is sender-controlled, so a malformed sender would underflow this
+                // subtraction and `count` would become enormous, reading far past the buffer.
+                // Saturating to 0 treats an impossible length as "no descriptors" and lets the
+                // assertion below report it, rather than walking memory.
+                let payload_bytes =
+                    (header.cmsg_len as usize).saturating_sub(libc::CMSG_LEN(0) as usize);
                 let count = payload_bytes / std::mem::size_of::<libc::c_int>();
                 for index in 0..count {
                     let mut fd: libc::c_int = 0;
