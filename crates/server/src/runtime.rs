@@ -673,14 +673,24 @@ impl ServerRuntime {
     /// Publish the udpgrm flow counters into the registry `/metrics` renders.
     ///
     /// The counters live in udpgrm's eBPF state map, which caddy-rs cannot read (see
-    /// [`crate::udpgrm_dissector::FlowMetrics`]): the daemon's client API is five `setsockopt`
-    /// optnames and none of them reports metrics or flow occupancy. So the series are registered
-    /// here, at the point where the admin endpoint becomes reachable, so they exist in the exported
-    /// output with a known value instead of being a constant naming counters that never appear.
+    /// [`crate::udpgrm_dissector::FlowMetrics`]), and ADR-0045 §5 forbids caddy-rs reading eBPF maps
+    /// itself, so no correct value exists to publish.
     ///
-    /// The values are supplied by the caller because only a caller that has read them from the
-    /// daemon can supply non-zero ones; `FlowMetrics::default()` registers the series at zero, which
-    /// is the honest state for a build that cannot observe the daemon at all.
+    /// **This function has no production caller and the series are therefore absent from
+    /// `GET /metrics` in every build.** `MetricsRegistry::render` iterates only the families that
+    /// were registered and does not zero-fill, so the counters are missing from the endpoint rather
+    /// than present at zero — an operator who expects them must not build an alert on them.
+    ///
+    /// It is kept, and not deleted, because the plumbing is the piece that would be needed if a
+    /// measurement source ever appears: an upstream optname exposing the daemon's `metrics_map`
+    /// occupancy would make a real value available without the server gaining an eBPF control
+    /// plane. If that happens, call this from the serving path and add a test that reaches it
+    /// through that path. Until then the honest position is that the counters are a *defined set*
+    /// for a future exporter, which is what the module header of [`crate::udpgrm_dissector`] says.
+    ///
+    /// Do not call this with `FlowMetrics::default()` to make the series appear at zero. Publishing
+    /// a zero that is not a measurement is the silent-falsehood class ADR-0045 §5 rules out: an
+    /// operator who sees `0` reads it as "no conflicts", not as "not measured".
     ///
     /// Returns the number of series published.
     #[cfg(feature = "udpgrm")]
