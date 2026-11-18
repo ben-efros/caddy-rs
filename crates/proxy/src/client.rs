@@ -1741,7 +1741,8 @@ mod tests {
             }
         };
         let destination = listener.local_addr().unwrap();
-        let accept = tokio::spawn(async move { listener.accept().await.ok().map(|(_, peer)| peer) });
+        let accept =
+            tokio::spawn(async move { listener.accept().await.ok().map(|(_, peer)| peer) });
 
         let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let stream = connect_address(destination, Some(local))
@@ -1951,11 +1952,18 @@ mod tests {
         for crate_name in ["proxy", "http"] {
             rs_files(&crates_dir.join(crate_name), &mut files);
         }
-        assert!(!files.is_empty(), "the scan must find source files to be meaningful");
+        assert!(
+            !files.is_empty(),
+            "the scan must find source files to be meaningful"
+        );
         let exemption_doc = std::fs::read_to_string(manifest.join("EGRESS-CONNECT-SITES.md"))
             .expect("crates/proxy/EGRESS-CONNECT-SITES.md must exist");
 
-        let patterns = ["TcpStream::connect(", "TcpSocket::new_v4(", "TcpSocket::new_v6("];
+        let patterns = [
+            "TcpStream::connect(",
+            "TcpSocket::new_v4(",
+            "TcpSocket::new_v6(",
+        ];
         let mut unnamed = Vec::new();
         let mut scanned = 0usize;
         for file in &files {
@@ -1985,12 +1993,15 @@ mod tests {
                     if file_named && site_is_marked(&raw, at) {
                         continue;
                     }
-                    unnamed.push(format!("{relative}:{at}: `{pattern}`"));
+                    unnamed.push(format!("{relative}: `{pattern}`"));
                 }
             }
         }
 
-        assert!(scanned > 0, "the scan found no connect calls at all, so it is not scanning the right files");
+        assert!(
+            scanned > 0,
+            "the scan found no connect calls at all, so it is not scanning the right files"
+        );
         assert!(
             unnamed.is_empty(),
             "these server-egress connect sites are neither the ADR-0043 helper, a #[cfg(test)] \

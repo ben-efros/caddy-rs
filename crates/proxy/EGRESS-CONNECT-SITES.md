@@ -16,9 +16,15 @@ with `IP_BIND_ADDRESS_NO_PORT`; explicit-port local address with `SO_REUSEADDR`)
 
 ## Exemptions
 
+Each exempt site carries the marker `ADR-0043 egress helper` in a comment directly above the dial,
+and the test requires **both** that marker and a row here. Requiring only the file name was the
+first version of the test and it was wrong: it exempted *every* dial in an already-exempt file, so a
+new `TcpStream::connect` added to `dns.rs` passed. That is measured, not assumed — the file-only
+variant was run against a smuggled dial and it passed.
+
 | Site | Why it is not the helper |
 |---|---|
-| `crates/proxy/src/client.rs` — the helper's own body | This *is* the helper. |
+| `crates/proxy/src/client.rs` — the helper's own body | This *is* the helper. Recognised by byte range, not by an exemption. |
 | `crates/proxy/src/websocket.rs:290` | Inside `#[cfg(test)] mod tests` (`tcp_pair()`): a test harness connecting two ends of a loopback pair. Not server egress. |
 | `crates/http/src/radar_client.rs:642` | Radar polling. `RadarClient` carries no local-address configuration at all, so the ADR-0043 defect (a *pinned* source address forcing `bind()` to reserve a unique 2-tuple) is **unreachable** here. Routing it through the helper would produce `connect_address(dest, None)`, whose first branch is literally `TcpStream::connect(dest).await` — a byte-identical call that changes no behaviour and no test could distinguish. Per ADR-0043 §5 ("no silent degradation ... a located error or a documented divergence with a test"), a no-op conversion that only satisfies a textual grep is worse than a named exemption. |
 | `crates/http/src/radar_store.rs:460` | Same reasoning as `radar_client.rs`: no local-address configuration, defect unreachable. Named in ADR-0043's inventory as "healthy (vanilla)". |
