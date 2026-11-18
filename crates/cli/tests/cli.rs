@@ -6381,13 +6381,11 @@ fn bind_fds_uploads_a_bound_descriptor_named_after_the_plan() {
         r#"{"apps":{"http":{"servers":{"s0":{"listen":["127.0.0.1:0"]}}}}}"#,
     )
     .expect("write config");
-    // Port 0 is not plannable (the plan requires a concrete port), so pick a free one.
-    let port = {
-        let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("probe");
-        let port = probe.local_addr().expect("addr").port();
-        drop(probe);
-        port
-    };
+    // Port 0 is not plannable (the plan requires a concrete port), so take one from the shared
+    // registry rather than probe-bind-drop: the local probe returns the SAME number to a parallel
+    // test in this binary, and this very test was seen to fail with EADDRINUSE under a parallel
+    // workspace run because of it. `free_port` remembers what it issued process-wide.
+    let port = caddy_rs_test_support::free_port();
     std::fs::write(
         &config,
         format!(
