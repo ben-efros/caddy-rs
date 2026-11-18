@@ -673,8 +673,12 @@ impl ServerRuntime {
     /// Publish the udpgrm flow counters into the registry `/metrics` renders.
     ///
     /// The counters live in udpgrm's eBPF state map, which caddy-rs cannot read (see
-    /// [`crate::udpgrm_dissector::FlowMetrics`]), and ADR-0045 §5 forbids caddy-rs reading eBPF maps
-    /// itself, so no correct value exists to publish.
+    /// [`crate::udpgrm_dissector::FlowMetrics`]), so no correct value exists to publish. Reading
+    /// the map is refused deliberately: ADR-0045 §5 forbids the server gaining `CAP_BPF` or any
+    /// eBPF control plane, and the ADR's answer to the open question about map occupancy states
+    /// that route "is not available at any effort level" (the same section notes that no
+    /// `setsockopt` optname returns the maps to a socket peer, so there is no client-API path
+    /// either).
     ///
     /// **This function has no production caller and the series are therefore absent from
     /// `GET /metrics` in every build.** `MetricsRegistry::render` iterates only the families that
@@ -684,13 +688,17 @@ impl ServerRuntime {
     /// It is kept, and not deleted, because the plumbing is the piece that would be needed if a
     /// measurement source ever appears: an upstream optname exposing the daemon's `metrics_map`
     /// occupancy would make a real value available without the server gaining an eBPF control
-    /// plane. If that happens, call this from the serving path and add a test that reaches it
-    /// through that path. Until then the honest position is that the counters are a *defined set*
+    /// plane. If that happens, wire it at the SERVING PATH, not from [`Self::metrics`]: this
+    /// function calls `self.metrics()` to obtain the registry, so wiring it into that accessor is
+    /// mutual recursion and aborts the process with a stack overflow (reproduced) rather than
+    /// failing an assertion. Add a test that reaches it through the serving path too. Until then
+    /// the honest position is that the counters are a *defined set*
     /// for a future exporter, which is what the module header of [`crate::udpgrm_dissector`] says.
     ///
     /// Do not call this with `FlowMetrics::default()` to make the series appear at zero. Publishing
-    /// a zero that is not a measurement is the silent-falsehood class ADR-0045 §5 rules out: an
-    /// operator who sees `0` reads it as "no conflicts", not as "not measured".
+    /// a zero that is not a measurement is the silent-falsehood class the ADR's standing rule for
+    /// implementers rules out: an operator who sees `0` reads it as "no conflicts", not as "not
+    /// measured".
     ///
     /// Returns the number of series published.
     #[cfg(feature = "udpgrm")]

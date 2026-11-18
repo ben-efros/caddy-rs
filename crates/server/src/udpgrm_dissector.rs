@@ -489,10 +489,12 @@ mod tests {
     fn the_flow_counters_are_absent_from_a_default_builds_admin_endpoint() {
         // This pins the state an operator actually observes, which is the opposite of what the
         // previous version of this test claimed. Nothing in the server calls
-        // `publish_udpgrm_flow_metrics`: its only caller is this test module, and ADR-0045 §5
-        // forbids caddy-rs reading the daemon's eBPF maps, so there is no production value to
-        // publish. Because `MetricsRegistry::render` iterates only registered families and never
-        // zero-fills, the three counters are ABSENT from `GET /metrics`, not present at zero.
+        // `publish_udpgrm_flow_metrics`: its only caller is this test module, and reading the
+        // daemon's eBPF maps is refused — ADR-0045 §5 denies the server `CAP_BPF` and any eBPF
+        // control plane, and the ADR's answer on map occupancy states that route is "not available
+        // at any effort level" — so there is no production value to publish. Because
+        // `MetricsRegistry::render` iterates only registered families and never zero-fills, the
+        // three counters are ABSENT from `GET /metrics`, not present at zero.
         //
         // A test named "...so_they_reach_the_admin_endpoint" that reached nothing was worse than
         // no test: it asserted the opposite of the shipped behaviour and would have led an operator
