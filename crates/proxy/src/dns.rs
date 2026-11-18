@@ -417,6 +417,8 @@ async fn send_tcp_query(
     timeout: Duration,
 ) -> Result<Vec<u8>, String> {
     let exchange = async {
+        // Exempt from the ADR-0043 egress helper: the resolver binds no source address, so the
+        // pinned-source defect (DIV-0153) is unreachable here. See crates/proxy/EGRESS-CONNECT-SITES.md.
         let mut stream = TcpStream::connect(address)
             .await
             .map_err(|error| format!("connecting DNS TCP socket: {error}"))?;

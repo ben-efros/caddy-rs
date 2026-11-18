@@ -620,6 +620,9 @@ impl FastCgiTransport {
         };
         match transport {
             Transport::Tcp { address } => {
+                // Exempt from the ADR-0043 egress helper: FastCgiTransport carries no local_address,
+                // so the pinned-source defect (DIV-0153) is unreachable here. See
+                // crates/proxy/EGRESS-CONNECT-SITES.md.
                 let connect = tokio::net::TcpStream::connect(address);
                 match tokio::time::timeout(self.dial_timeout, connect).await {
                     Ok(Ok(stream)) => Ok(FastCgiStream::Tcp(stream)),

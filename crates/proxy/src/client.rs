@@ -1766,6 +1766,223 @@ mod tests {
         );
     }
 
+    /// ADR-0043 §1 says one helper owns server egress TCP creation. This enforces it by parsing the
+    /// source, because the alternative (a `grep` in CI) cannot tell a `#[cfg(test)]` harness from a
+    /// production dial and would either false-pass or force meaningless conversions.
+    ///
+    /// Every `TcpStream::connect` / `TcpSocket::new_v4` / `TcpSocket::new_v6` in the proxy and http
+    /// crates must be either inside [`connect_address`]'s body or named in
+    /// `crates/proxy/EGRESS-CONNECT-SITES.md`. A new connect site that is not named fails here, which
+    /// is the point: the exemption list is checked against the code rather than trusted.
+    ///
+    /// Comments are stripped before scanning, because several doc comments in this very file quote
+    /// the pattern when explaining it and would otherwise match themselves.
+    #[test]
+    fn every_egress_connect_is_the_helper_or_a_named_exemption() {
+        use std::path::{Path, PathBuf};
+
+        /// Strip `//` line comments and `/* */` blocks so prose cannot match the scan.
+        fn strip_comments(source: &str) -> String {
+            let mut out = String::with_capacity(source.len());
+            let bytes: Vec<char> = source.chars().collect();
+            let mut i = 0;
+            let mut in_line = false;
+            let mut in_block = 0usize;
+            let mut in_str: Option<char> = None;
+            while i < bytes.len() {
+                let c = bytes[i];
+                let next = bytes.get(i + 1).copied();
+                if in_line {
+                    if c == '\n' {
+                        in_line = false;
+                        out.push(c);
+                    }
+                    i += 1;
+                    continue;
+                }
+                if in_block > 0 {
+                    if c == '/' && next == Some('*') {
+                        in_block += 1;
+                        i += 2;
+                        continue;
+                    }
+                    if c == '*' && next == Some('/') {
+                        in_block -= 1;
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    continue;
+                }
+                if let Some(quote) = in_str {
+                    out.push(c);
+                    if c == '\\' {
+                        if let Some(escaped) = bytes.get(i + 1).copied() {
+                            out.push(escaped);
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    if c == quote {
+                        in_str = None;
+                    }
+                    i += 1;
+                    continue;
+                }
+                if c == '/' && next == Some('/') {
+                    in_line = true;
+                    i += 2;
+                    continue;
+                }
+                if c == '/' && next == Some('*') {
+                    in_block = 1;
+                    i += 2;
+                    continue;
+                }
+                if c == '"' {
+                    in_str = Some('"');
+                }
+                out.push(c);
+                i += 1;
+            }
+            out
+        }
+
+        /// Whether `at` sits inside a `#[cfg(test)] mod ... { ... }` block.
+        ///
+        /// Counts braces from the module that follows a `#[cfg(test)]` attribute to see whether the
+        /// block is still open at `at`. A production dial that happens to come *after* a test
+        /// module is therefore still reported, because the block is closed by then.
+        fn is_in_test_module(source: &str, at: usize) -> bool {
+            let marker = "#[cfg(test)]";
+            let mut search = 0usize;
+            while let Some(found) = source[search..].find(marker) {
+                let marker_at = search + found;
+                if marker_at > at {
+                    return false;
+                }
+                // Find the module's opening brace, then walk to its matching close.
+                let after = marker_at + marker.len();
+                if let Some(brace) = source[after..].find('{') {
+                    let open = after + brace;
+                    let mut depth = 0usize;
+                    for (offset, ch) in source[open..].char_indices() {
+                        match ch {
+                            '{' => depth += 1,
+                            '}' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    // Block closes at `open + offset`; if `at` is inside, exempt.
+                                    return at > open && at < open + offset;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                search = after;
+            }
+            false
+        }
+
+        /// The body of `connect_address`, so its own dial is not reported as an exemption.
+        ///
+        /// Returns `None` for a file that does not define the helper -- the scan covers several
+        /// files and only one of them owns it, so absence is the normal case and not an error.
+        fn helper_body(source: &str) -> Option<&str> {
+            let start = source.find("async fn connect_address(")?;
+            let rest = &source[start..];
+            // The helper ends at the next top-level `fn` at the same indentation.
+            let end = rest[1..]
+                .find("\n}")
+                .map(|offset| offset + 1)
+                .unwrap_or(rest.len());
+            Some(&rest[..end])
+        }
+
+        fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+            let entries = std::fs::read_dir(dir).unwrap_or_else(|error| {
+                panic!("cannot read {}: {error}", dir.display())
+            });
+            for entry in entries {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    rs_files(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        // `crates/proxy` and `crates/http` are siblings of this crate.
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let workspace = manifest.parent().expect("crates dir").to_path_buf();
+        let mut files = Vec::new();
+        for crate_name in ["proxy", "http"] {
+            rs_files(&workspace.join(crate_name), &mut files);
+        }
+        assert!(!files.is_empty(), "the scan must find source files to be meaningful");
+
+        let exemption_doc = std::fs::read_to_string(
+            manifest.join("EGRESS-CONNECT-SITES.md"),
+        )
+        .expect("crates/proxy/EGRESS-CONNECT-SITES.md must exist");
+
+        let patterns = ["TcpStream::connect(", "TcpSocket::new_v4(", "TcpSocket::new_v6("];
+        let mut unnamed = Vec::new();
+        let mut scanned = 0usize;
+        for file in &files {
+            let source = std::fs::read_to_string(file).expect("read source");
+            let stripped = strip_comments(&source);
+            let helper = helper_body(&stripped);
+            for pattern in patterns {
+                let mut from = 0usize;
+                while let Some(found) = stripped[from..].find(pattern) {
+                    let at = from + found;
+                    from = at + pattern.len();
+                    scanned += 1;
+                    // Inside the helper itself: that is the owner, not an exemption.
+                    if let Some(helper) = helper {
+                        if let Some(helper_at) = stripped.find(helper) {
+                            if at >= helper_at && at < helper_at + helper.len() {
+                                continue;
+                            }
+                        }
+                    }
+                    // A `#[cfg(test)]` module is a harness, not server egress. Detected from the
+                    // stripped text so a production dial placed after a test module cannot hide
+                    // behind it: the marker must open a module and that module must still be open
+                    // at the call site.
+                    if is_in_test_module(&stripped, at) {
+                        continue;
+                    }
+                    let relative = file
+                        .strip_prefix(&workspace)
+                        .unwrap_or(file)
+                        .display()
+                        .to_string();
+                    let named = exemption_doc.contains(&relative)
+                        || exemption_doc.contains(
+                            &file.file_name().unwrap().to_string_lossy().to_string(),
+                        );
+                    if !named {
+                        unnamed.push(format!("{relative}: `{pattern}`"));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            scanned > 0,
+            "the scan found no connect calls at all, which means it is not scanning the right files"
+        );
+        assert!(
+            unnamed.is_empty(),
+            "these server-egress connect sites are neither the ADR-0043 helper nor named in \
+             crates/proxy/EGRESS-CONNECT-SITES.md: {unnamed:#?}"
+        );
+    }
+
     /// Case (c): an explicit source port must take `SO_REUSEADDR` and must *not* take
     /// `IP_BIND_ADDRESS_NO_PORT`, which the kernel rejects for a non-zero port (ADR-0043 §1).
     #[cfg(target_os = "linux")]

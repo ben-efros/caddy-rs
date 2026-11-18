@@ -639,6 +639,8 @@ impl RadarTransport for HyperRadarTransport {
         let default_port = if scheme == "https" { 443 } else { 80 };
         let port = uri.port_u16().unwrap_or(default_port);
         let authority = format!("{host}:{port}");
+        // Exempt from the ADR-0043 egress helper: RadarClient has no local-address option, so the
+        // pinned-source defect (DIV-0153) is unreachable. See caddy-rs/crates/proxy/EGRESS-CONNECT-SITES.md.
         let tcp = tokio::time::timeout(HTTP_TIMEOUT, TcpStream::connect(&authority))
             .await
             .map_err(|_| format!("radar: connect to {authority} timed out"))?
