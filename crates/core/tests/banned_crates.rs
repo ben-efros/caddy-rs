@@ -74,6 +74,13 @@ fn lockfile_dirs() -> Vec<PathBuf> {
         .to_path_buf();
     // The workspace lockfile is what `cargo audit --file` and every offline build use. `pm/`
     // and `crates/plug/template/` ship their own committed lockfiles to users of those crates.
+    //
+    // NOTE for anyone adding a crate here: the program-level SBOM
+    // (`docs/operations/SBOM.json`) is generated from these same lockfiles, so a ban that
+    // changes them also changes the SBOM. That regeneration is owned by `scripts/merge-task.sh`
+    // in the program repository, which runs it *after* staging the submodule gitlink bump; it is
+    // deliberately not done on the branch, because until the gitlink moves the program-root
+    // SBOM and the branch lockfiles are by definition inconsistent.
     vec![
         root.clone(),
         root.join("pm"),
