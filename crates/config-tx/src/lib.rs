@@ -8,7 +8,7 @@
 
 use std::sync::{Arc, Mutex, RwLock};
 
-use chrono::{DateTime, Utc};
+use caddy_rs_core::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -80,14 +80,14 @@ pub struct Generation {
     /// Monotonically increasing revision number.
     pub revision: u64,
     /// Timestamp when this generation was created.
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
 }
 
 impl Generation {
     /// Create a new generation from a config value.
     pub fn new(config: Value, revision: u64) -> Self {
         let hash = compute_hash(&config);
-        let timestamp = Utc::now();
+        let timestamp = Timestamp::now();
         Self {
             config,
             hash,
@@ -110,14 +110,14 @@ pub struct StagedConfig {
     /// The xxHash64 hash of the configuration.
     pub hash: String,
     /// Timestamp when this config was staged.
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
 }
 
 impl StagedConfig {
     /// Create a new staged config from a config value.
     pub fn new(config: Value) -> Self {
         let hash = compute_hash(&config);
-        let timestamp = Utc::now();
+        let timestamp = Timestamp::now();
         Self {
             config,
             hash,
@@ -417,7 +417,7 @@ impl<S: RevisionStore + RevisionStoreExt> ConfigTx<S> {
 
         // Recompute hash after modification
         staged.hash = compute_hash(&staged.config);
-        staged.timestamp = Utc::now();
+        staged.timestamp = Timestamp::now();
 
         Ok(())
     }
@@ -454,7 +454,7 @@ impl<S: RevisionStore + RevisionStoreExt> ConfigTx<S> {
         let new_revision = self.next_revision(active_guard.as_ref());
         let mut new_generation = generation.clone();
         new_generation.revision = new_revision;
-        new_generation.timestamp = Utc::now();
+        new_generation.timestamp = Timestamp::now();
         new_generation.hash = compute_hash(&new_generation.config);
 
         // Record rollback in revision store

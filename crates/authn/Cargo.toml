@@ -8,6 +8,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# Workspace
+# `Timestamp` (RFC 3339 wire-compatible UTC instant) lives here now that `chrono` is banned.
+caddy-rs-core = { path = "../core", default-features = false }
 # External dependencies
 serde = { workspace = true }
 thiserror = { workspace = true }
@@ -20,7 +23,6 @@ jsonwebtoken = { version = "10.3", features = ["aws_lc_rs"] }
 rand = { workspace = true }
 base32 = "0.5"
 totp-lite = "2.0"
-chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.11", features = ["v4", "serde", "fast-rng"] }
 urlencoding = "2.1"
 sha2 = { workspace = true }

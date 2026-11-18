@@ -15,7 +15,6 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
-chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.0", features = ["v4", "serde"] }
 
 [dev-dependencies]
