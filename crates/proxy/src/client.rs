@@ -1778,81 +1778,103 @@ mod tests {
     /// Comments are stripped before scanning, because several doc comments in this very file quote
     /// the pattern when explaining it and would otherwise match themselves.
     #[test]
+    /// ADR-0043 §1 says one helper owns server egress TCP creation. This enforces it by parsing the
+    /// source, because a `grep` in CI cannot tell a `#[cfg(test)]` harness from a production dial.
+    ///
+    /// Every `TcpStream::connect` / `TcpSocket::new_v4` / `TcpSocket::new_v6` in the proxy and http
+    /// crates must be either inside [`connect_address`], inside a `#[cfg(test)]` module, or carrying
+    /// the `ADR-0043 egress helper` marker that `crates/proxy/EGRESS-CONNECT-SITES.md` requires.
+    ///
+    /// Two defects found while writing this, both fixed and both the reason the checks look the way
+    /// they do:
+    ///
+    /// * An exemption keyed on the FILE alone exempted every dial in that file: a smuggled
+    ///   `TcpStream::connect` added to `dns.rs` survived the first version. The exemption now needs
+    ///   the marker at the site as well, so a new dial in an already-exempt file is reported.
+    /// * The marker is a comment, so it cannot be found in comment-blanked text. Offsets must also
+    ///   survive blanking, so comments are replaced with spaces rather than deleted, and the marker
+    ///   is matched in the raw source at the same byte offset.
+    #[test]
     fn every_egress_connect_is_the_helper_or_a_named_exemption() {
         use std::path::{Path, PathBuf};
 
-        /// Strip `//` line comments and `/* */` blocks so prose cannot match the scan.
+        const MARKER: &str = "ADR-0043 egress helper";
+
+        /// Blank out comments, replacing every byte with a space so offsets are preserved.
         fn strip_comments(source: &str) -> String {
-            let mut out = String::with_capacity(source.len());
-            let bytes: Vec<char> = source.chars().collect();
-            let mut i = 0;
-            let mut in_line = false;
-            let mut in_block = 0usize;
-            let mut in_str: Option<char> = None;
+            let bytes = source.as_bytes();
+            let mut out = bytes.to_vec();
+            let mut i = 0usize;
+            let mut in_str = false;
             while i < bytes.len() {
                 let c = bytes[i];
-                let next = bytes.get(i + 1).copied();
-                if in_line {
-                    if c == '\n' {
-                        in_line = false;
-                        out.push(c);
+                if in_str {
+                    if c == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if c == b'"' {
+                        in_str = false;
                     }
                     i += 1;
                     continue;
                 }
-                if in_block > 0 {
-                    if c == '/' && next == Some('*') {
-                        in_block += 1;
-                        i += 2;
-                        continue;
-                    }
-                    if c == '*' && next == Some('/') {
-                        in_block -= 1;
-                        i += 2;
-                        continue;
-                    }
+                if c == b'"' {
+                    in_str = true;
                     i += 1;
                     continue;
                 }
-                if let Some(quote) = in_str {
-                    out.push(c);
-                    if c == '\\' {
-                        if let Some(escaped) = bytes.get(i + 1).copied() {
-                            out.push(escaped);
+                if c == b'/' && bytes.get(i + 1) == Some(&b'/') {
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        out[i] = b' ';
+                        i += 1;
+                    }
+                    continue;
+                }
+                if c == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                    let mut depth = 0usize;
+                    while i < bytes.len() {
+                        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                            depth += 1;
+                            out[i] = b' ';
+                            out[i + 1] = b' ';
+                            i += 2;
+                            continue;
                         }
-                        i += 2;
-                        continue;
+                        if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                            depth -= 1;
+                            out[i] = b' ';
+                            out[i + 1] = b' ';
+                            i += 2;
+                            if depth == 0 {
+                                break;
+                            }
+                            continue;
+                        }
+                        if bytes[i] != b'\n' {
+                            out[i] = b' ';
+                        }
+                        i += 1;
                     }
-                    if c == quote {
-                        in_str = None;
-                    }
-                    i += 1;
                     continue;
                 }
-                if c == '/' && next == Some('/') {
-                    in_line = true;
-                    i += 2;
-                    continue;
-                }
-                if c == '/' && next == Some('*') {
-                    in_block = 1;
-                    i += 2;
-                    continue;
-                }
-                if c == '"' {
-                    in_str = Some('"');
-                }
-                out.push(c);
                 i += 1;
             }
-            out
+            String::from_utf8(out).expect("blanking preserves valid UTF-8")
         }
 
-        /// Whether `at` sits inside a `#[cfg(test)] mod ... { ... }` block.
-        ///
-        /// Counts braces from the module that follows a `#[cfg(test)]` attribute to see whether the
-        /// block is still open at `at`. A production dial that happens to come *after* a test
-        /// module is therefore still reported, because the block is closed by then.
+        /// Byte range of `connect_address`'s body, or `None` if this file does not define it.
+        fn helper_body_range(source: &str) -> Option<(usize, usize)> {
+            let start = source.find("async fn connect_address(")?;
+            let rest = &source[start..];
+            let end = rest
+                .find("\n}\n")
+                .map(|offset| offset + 2)
+                .unwrap_or(rest.len());
+            Some((start, start + end))
+        }
+
+        /// Whether byte offset `at` sits inside a `#[cfg(test)] mod ... { ... }` block.
         fn is_in_test_module(source: &str, at: usize) -> bool {
             let marker = "#[cfg(test)]";
             let mut search = 0usize;
@@ -1861,18 +1883,27 @@ mod tests {
                 if marker_at > at {
                     return false;
                 }
-                // Find the module's opening brace, then walk to its matching close.
                 let after = marker_at + marker.len();
+                // `#[cfg(test)]` is not always a module: it also attributes a `use` block or a
+                // single test fn. Only a following `mod` opens a test module whose body exempts
+                // its contents. Treating every `#[cfg(test)]` as a module (the first version) made
+                // the scan look at the wrong block entirely and exempt nothing.
+                let after_ws = after + source[after..].len() - source[after..].trim_start().len();
+                if !source[after_ws..].starts_with("mod ") {
+                    search = after;
+                    continue;
+                }
                 if let Some(brace) = source[after..].find('{') {
                     let open = after + brace;
                     let mut depth = 0usize;
-                    for (offset, ch) in source[open..].char_indices() {
-                        match ch {
-                            '{' => depth += 1,
-                            '}' => {
+                    // Byte offsets throughout: the file contains non-ASCII, and every other offset
+                    // in this scan is a byte offset.
+                    for (offset, byte) in source.as_bytes()[open..].iter().enumerate() {
+                        match byte {
+                            b'{' => depth += 1,
+                            b'}' => {
                                 depth -= 1;
                                 if depth == 0 {
-                                    // Block closes at `open + offset`; if `at` is inside, exempt.
                                     return at > open && at < open + offset;
                                 }
                             }
@@ -1885,26 +1916,25 @@ mod tests {
             false
         }
 
-        /// The body of `connect_address`, so its own dial is not reported as an exemption.
-        ///
-        /// Returns `None` for a file that does not define the helper -- the scan covers several
-        /// files and only one of them owns it, so absence is the normal case and not an error.
-        fn helper_body(source: &str) -> Option<&str> {
-            let start = source.find("async fn connect_address(")?;
-            let rest = &source[start..];
-            // The helper ends at the next top-level `fn` at the same indentation.
-            let end = rest[1..]
-                .find("\n}")
-                .map(|offset| offset + 1)
-                .unwrap_or(rest.len());
-            Some(&rest[..end])
+        /// Whether the exemption marker appears in the raw source just above `at`.
+        fn site_is_marked(raw: &str, at: usize) -> bool {
+            let bytes = raw.as_bytes();
+            let mut position = at;
+            let mut lines = 0;
+            while position > 0 && lines < 4 {
+                position -= 1;
+                if bytes[position] == b'\n' {
+                    lines += 1;
+                }
+            }
+            raw.get(position..at)
+                .is_some_and(|window| window.contains(MARKER))
         }
 
         fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
-            let entries = std::fs::read_dir(dir).unwrap_or_else(|error| {
-                panic!("cannot read {}: {error}", dir.display())
-            });
-            for entry in entries {
+            for entry in std::fs::read_dir(dir)
+                .unwrap_or_else(|error| panic!("cannot read {}: {error}", dir.display()))
+            {
                 let path = entry.expect("dir entry").path();
                 if path.is_dir() {
                     rs_files(&path, out);
@@ -1914,72 +1944,57 @@ mod tests {
             }
         }
 
-        // `crates/proxy` and `crates/http` are siblings of this crate.
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let workspace = manifest.parent().expect("crates dir").to_path_buf();
+        let crates_dir = manifest.parent().expect("crates dir").to_path_buf();
+        let workspace = crates_dir.parent().expect("workspace root").to_path_buf();
         let mut files = Vec::new();
         for crate_name in ["proxy", "http"] {
-            rs_files(&workspace.join(crate_name), &mut files);
+            rs_files(&crates_dir.join(crate_name), &mut files);
         }
         assert!(!files.is_empty(), "the scan must find source files to be meaningful");
-
-        let exemption_doc = std::fs::read_to_string(
-            manifest.join("EGRESS-CONNECT-SITES.md"),
-        )
-        .expect("crates/proxy/EGRESS-CONNECT-SITES.md must exist");
+        let exemption_doc = std::fs::read_to_string(manifest.join("EGRESS-CONNECT-SITES.md"))
+            .expect("crates/proxy/EGRESS-CONNECT-SITES.md must exist");
 
         let patterns = ["TcpStream::connect(", "TcpSocket::new_v4(", "TcpSocket::new_v6("];
         let mut unnamed = Vec::new();
         let mut scanned = 0usize;
         for file in &files {
-            let source = std::fs::read_to_string(file).expect("read source");
-            let stripped = strip_comments(&source);
-            let helper = helper_body(&stripped);
+            let raw = std::fs::read_to_string(file).expect("read source");
+            let stripped = strip_comments(&raw);
+            let helper_range = helper_body_range(&stripped);
+            let relative = file
+                .strip_prefix(&workspace)
+                .unwrap_or(file)
+                .display()
+                .to_string();
+            let file_named = exemption_doc.contains(&relative);
             for pattern in patterns {
                 let mut from = 0usize;
                 while let Some(found) = stripped[from..].find(pattern) {
                     let at = from + found;
                     from = at + pattern.len();
                     scanned += 1;
-                    // Inside the helper itself: that is the owner, not an exemption.
-                    if let Some(helper) = helper {
-                        if let Some(helper_at) = stripped.find(helper) {
-                            if at >= helper_at && at < helper_at + helper.len() {
-                                continue;
-                            }
+                    if let Some((start, end)) = helper_range {
+                        if at >= start && at < end {
+                            continue;
                         }
                     }
-                    // A `#[cfg(test)]` module is a harness, not server egress. Detected from the
-                    // stripped text so a production dial placed after a test module cannot hide
-                    // behind it: the marker must open a module and that module must still be open
-                    // at the call site.
                     if is_in_test_module(&stripped, at) {
                         continue;
                     }
-                    let relative = file
-                        .strip_prefix(&workspace)
-                        .unwrap_or(file)
-                        .display()
-                        .to_string();
-                    let named = exemption_doc.contains(&relative)
-                        || exemption_doc.contains(
-                            &file.file_name().unwrap().to_string_lossy().to_string(),
-                        );
-                    if !named {
-                        unnamed.push(format!("{relative}: `{pattern}`"));
+                    if file_named && site_is_marked(&raw, at) {
+                        continue;
                     }
+                    unnamed.push(format!("{relative}:{at}: `{pattern}`"));
                 }
             }
         }
 
-        assert!(
-            scanned > 0,
-            "the scan found no connect calls at all, which means it is not scanning the right files"
-        );
+        assert!(scanned > 0, "the scan found no connect calls at all, so it is not scanning the right files");
         assert!(
             unnamed.is_empty(),
-            "these server-egress connect sites are neither the ADR-0043 helper nor named in \
-             crates/proxy/EGRESS-CONNECT-SITES.md: {unnamed:#?}"
+            "these server-egress connect sites are neither the ADR-0043 helper, a #[cfg(test)] \
+             module, nor marked and named in crates/proxy/EGRESS-CONNECT-SITES.md: {unnamed:#?}"
         );
     }
 
