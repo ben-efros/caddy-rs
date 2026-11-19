@@ -152,8 +152,6 @@ pub struct MmdbGeoIp {
     asn: Option<Reader<Vec<u8>>>,
     country: Option<Reader<Vec<u8>>>,
     counters: Counters,
-    /// Startup and selection warnings only. Lookups never call this — see the module docs.
-    warn: Arc<dyn Fn(&str) + Send + Sync>,
 }
 
 impl fmt::Debug for MmdbGeoIp {
@@ -214,7 +212,6 @@ impl MmdbGeoIp {
             asn,
             country,
             counters: Counters::default(),
-            warn,
         }))
     }
 
