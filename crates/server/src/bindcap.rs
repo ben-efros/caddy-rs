@@ -337,10 +337,18 @@ pub fn is_port_bind(address: &ListenAddr) -> bool {
 /// Count of capability *raise/lower* operations performed in this process.
 ///
 /// Instrumentation for ADR-0046 §1's first rule: the common case must touch no capabilities at all.
-/// It is a process-wide atomic rather than a thread-local **on purpose**: the retry path runs on a
-/// dedicated spawned thread, so a thread-local counter would be invisible to the test thread that
-/// asserts on it. Tests compare *deltas* around a single bind rather than absolute values, so they
-/// do not depend on test ordering or on other tests running capability code.
+///
+/// This global is the **production** contract: a monotonic process-wide total, so an operator or a
+/// log can see that capability syscalls happened at all. It is deliberately *not* what the tests
+/// assert on. The first version of this counter claimed tests could compare *deltas* around a single
+/// bind "so they do not depend on test ordering"; that was false. `cargo test` runs test functions
+/// as parallel threads in ONE process, and the retry performs its raise/lower on a **dedicated
+/// spawned thread** (`std::thread::spawn`), so an increment from test A's bind thread can land
+/// inside test B's before/after window. The result was a test family that failed in CI with a
+/// different member each run (`left: 2, right: 1`).
+///
+/// The scope a test can rely on is [`THREAD_CAPABILITY_OPERATIONS`] below, combined with the count
+/// the spawned thread reports back through [`with_bind_capability`]'s result channel.
 ///
 /// Present in test builds and when the `bindcap-test-seam`-style cfg is off it still compiles to a
 /// plain atomic increment, so production pays one relaxed add per capability syscall — a syscall
@@ -348,19 +356,62 @@ pub fn is_port_bind(address: &ListenAddr) -> bool {
 static CAPABILITY_OPERATIONS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Count of capability *raise/lower* operations performed **on the calling thread**.
+///
+/// The per-test scope, for the same reason [`SEAM_ENTRIES`] is thread-local: a shared counter moves
+/// under a parallel test run. Two things make this sufficient where a bare thread-local was not:
+///
+/// 1. The guard's drop body ([`CapabilityLowerGuard`]) runs on whichever thread drops the guard, and
+///    the tests that drive it directly do so on the test thread — so those increments are visible
+///    here without any plumbing.
+/// 2. The retry's operations happen on the spawned bind thread, which a test thread cannot see. That
+///    thread therefore reports its own count back through the channel result, and
+///    [`with_bind_capability`] adds it to the caller's thread-local before returning. So by the time
+///    `recv()` yields, every operation belonging to *this* call has been folded in on *this* thread.
+///
+/// The tests assert on this value only; the global above keeps its production meaning.
+thread_local! {
+    static THREAD_CAPABILITY_OPERATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// How many capability raise/lower operations this process has performed.
 ///
 /// The acceptance criterion "the bind is attempted with no capability manipulation first" is proven
 /// by asserting this does not change across a *successful* bind, rather than by inspecting thread
 /// capability sets from a test thread (which cannot see the dedicated bind thread's sets and would
 /// therefore pass vacuously).
+///
+/// **Not** suitable for a before/after delta in a parallel test run — see the comment on the
+/// counter. Tests use [`thread_capability_operations`].
 pub fn capability_operations() -> usize {
     CAPABILITY_OPERATIONS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Record one capability operation.
-fn note_capability_operation() {
+/// How many capability raise/lower operations the **calling thread** has performed, including those
+/// performed on its behalf by the dedicated bind thread of each completed [`with_bind_capability`].
+///
+/// This is the counter tests assert on: it is scoped to one thread, so a parallel test run cannot
+/// move it, and [`with_bind_capability`] folds the spawned thread's count in before it returns.
+pub fn thread_capability_operations() -> usize {
+    THREAD_CAPABILITY_OPERATIONS.with(std::cell::Cell::get)
+}
+
+/// Record one capability operation: the process total and the calling thread's share.
+///
+/// Returns the new value of the calling thread's counter, which the bind thread uses to report back
+/// exactly how much work it did.
+fn note_capability_operation() -> usize {
     CAPABILITY_OPERATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    THREAD_CAPABILITY_OPERATIONS.with(|operations| {
+        operations.set(operations.get() + 1);
+        operations.get()
+    })
+}
+
+/// Fold operations performed on another thread into the calling thread's counter.
+fn adopt_capability_operations(performed_elsewhere: usize) {
+    THREAD_CAPABILITY_OPERATIONS
+        .with(|operations| operations.set(operations.get() + performed_elsewhere));
 }
 
 /// Count of times the retry seam was **entered** on THIS thread, regardless of whether it acted.
@@ -404,17 +455,33 @@ fn note_seam_entry() {
 #[cfg(target_os = "linux")]
 struct CapabilityLowerGuard {
     armed: bool,
+    /// The value of [`THREAD_CAPABILITY_OPERATIONS`] *before* this guard's drop body runs.
+    ///
+    /// The guard's drop runs on whichever thread drops it: the test thread when a test unwinds
+    /// through it directly, the dedicated bind thread when `attempt()` panics. Recording the
+    /// before-value on that thread lets the caller tell the two apart without a shared counter, so
+    /// a guard dropped on the test thread can be attributed to that thread's own scope.
+    observed_before_drop: usize,
 }
 
 #[cfg(target_os = "linux")]
 impl CapabilityLowerGuard {
     fn armed() -> Self {
-        Self { armed: true }
+        Self {
+            armed: true,
+            observed_before_drop: thread_capability_operations(),
+        }
     }
 
     /// Disarm without lowering, for the case where the raise itself failed and nothing was raised.
     fn disarm(mut self) {
         self.armed = false;
+    }
+
+    /// How many capability operations the thread that dropped this guard had performed before the
+    /// drop body ran. Only meaningful once the guard has been dropped.
+    fn operations_before_drop(&self) -> usize {
+        self.observed_before_drop
     }
 }
 
@@ -424,6 +491,7 @@ impl Drop for CapabilityLowerGuard {
         if !self.armed {
             return;
         }
+        self.observed_before_drop = thread_capability_operations();
         note_capability_operation();
         if let Err(error) = imp::set_effective(false) {
             // Not fatal to the bind that already failed, but it must be visible: the thread is
@@ -486,14 +554,18 @@ where
     }
 
     // Step 4: raise -> bind -> lower on a dedicated thread that exits.
+    // The spawned thread reports the operations it performed, so the caller can fold them into its
+    // own thread-local counter. Without that, the caller could not see the raise/lower that happened
+    // on this dedicated thread, and a parallel test could not tell its own operations from another
+    // test's.
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        note_capability_operation();
+        let mut performed = note_capability_operation();
         if let Err(error) = imp::set_effective(true) {
             // Nothing was raised, so the guard must not try to lower. Report the raise failure
             // *wrapped around* the original bind error, as the oracle does, so the operator sees
             // both the denied bind and why the escalation did not happen.
-            let _ = sender.send(Err((first_error, Some(error))));
+            let _ = sender.send(Err((first_error, Some(error), performed)));
             return;
         }
         let guard = CapabilityLowerGuard::armed();
@@ -501,16 +573,29 @@ where
         // Explicit lower before sending, so the capability is already gone by the time the caller
         // wakes; the guard remains as the panic path.
         drop(guard);
-        let _ = sender.send(result.map_err(|error| (error, None)));
+        // `note_capability_operation` returns the thread-local total after the increment, so the
+        // last value seen on this thread is exactly how much work it did.
+        performed = thread_capability_operations();
+        let _ = sender.send(match result {
+            Ok(value) => Ok((value, performed)),
+            Err(error) => Err((error, None, performed)),
+        });
     });
-    match receiver.recv() {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err((error, raise_failure))) => match raise_failure {
-            Some(raise_failure) => Err(std::io::Error::other(format!(
-                "{error} (raising CAP_NET_BIND_SERVICE: {raise_failure})"
-            ))),
-            None => Err(error),
-        },
+    let outcome = receiver.recv();
+    match outcome {
+        Ok(Ok((value, performed))) => {
+            adopt_capability_operations(performed);
+            Ok(value)
+        }
+        Ok(Err((error, raise_failure, performed))) => {
+            adopt_capability_operations(performed);
+            match raise_failure {
+                Some(raise_failure) => Err(std::io::Error::other(format!(
+                    "{error} (raising CAP_NET_BIND_SERVICE: {raise_failure})"
+                ))),
+                None => Err(error),
+            }
+        }
         Err(_) => Err(std::io::Error::other(
             "the dedicated bind thread exited without reporting a result",
         )),
@@ -931,7 +1016,7 @@ mod retry_tests {
         let address = listen("127.0.0.1:1");
         // Drive the seam as the bind path does: attempt first, and only call the seam on error.
         // A successful attempt means the seam is never reached at all.
-        let before = capability_operations();
+        let before = thread_capability_operations();
         let attempt = || Ok::<_, std::io::Error>("bound");
         // The bind path's contract is: attempt(); on Err, hand the error to the seam.
         let result = match attempt() {
@@ -940,7 +1025,7 @@ mod retry_tests {
         };
         assert!(result.is_ok());
         assert_eq!(
-            capability_operations(),
+            thread_capability_operations(),
             before,
             "a successful bind must make zero capability operations"
         );
@@ -950,20 +1035,20 @@ mod retry_tests {
     /// and makes no capability syscall unless the predicate and the errno both allow a retry.
     #[test]
     fn a_non_permission_error_is_returned_without_touching_capabilities() {
-        let before = capability_operations();
+        let before = thread_capability_operations();
         let error = std::io::Error::from_raw_os_error(libc::EADDRINUSE);
         let result = with_bind_capability::<(), _>(&listen(":443"), error, || {
             panic!("must not retry a non-EACCES failure")
         });
         let returned = result.expect_err("the original error is returned");
         assert_eq!(returned.raw_os_error(), Some(libc::EADDRINUSE));
-        assert_eq!(capability_operations(), before);
+        assert_eq!(thread_capability_operations(), before);
     }
 
     /// Only `EACCES` (`PermissionDenied`) may trigger a retry — not `EPERM`, which looks similar.
     #[test]
     fn only_eacces_triggers_a_retry() {
-        let before = capability_operations();
+        let before = thread_capability_operations();
         for errno in [libc::EACCES, libc::EPERM] {
             let result = with_bind_capability::<(), _>(
                 &listen(":443"),
@@ -975,7 +1060,7 @@ mod retry_tests {
         // EACCES reaches `should_raise`, which reads capabilities but raises none; EPERM returns
         // immediately. Neither may *raise*, which is what the counter guards on this path.
         assert_eq!(
-            capability_operations(),
+            thread_capability_operations(),
             before,
             "neither EPERM nor an unpermitted EACCES may raise or lower the capability"
         );
@@ -984,7 +1069,7 @@ mod retry_tests {
     /// Excluded addresses are final even on `EACCES`: unix sockets and port 0 never escalate.
     #[test]
     fn excluded_addresses_never_escalate_on_eacces() {
-        let before = capability_operations();
+        let before = thread_capability_operations();
         for text in [":0", "127.0.0.1:0"] {
             let result = with_bind_capability::<(), _>(&listen(text), eacces(), || {
                 panic!("port 0 must never be retried with a capability")
@@ -996,7 +1081,7 @@ mod retry_tests {
             panic!("a unix socket must never be retried with a capability")
         });
         assert!(result.is_err());
-        assert_eq!(capability_operations(), before);
+        assert_eq!(thread_capability_operations(), before);
     }
 
     /// The production source of this file with comments removed.
@@ -1126,7 +1211,7 @@ mod retry_tests {
 
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = std::sync::Arc::clone(&attempts);
-        let before = capability_operations();
+        let before = thread_capability_operations();
         let result = with_bind_capability::<(), _>(&listen(":443"), eacces(), move || {
             counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             // Inside the retry the capability must be EFFECTIVE, otherwise the retry is pointless.
@@ -1144,7 +1229,7 @@ mod retry_tests {
             "the bind must be retried exactly once"
         );
         assert_eq!(
-            capability_operations() - before,
+            thread_capability_operations() - before,
             2,
             "exactly one raise and one lower"
         );
@@ -1174,14 +1259,14 @@ mod retry_tests {
     /// impl now fails this test.
     #[test]
     fn the_real_lower_guard_runs_its_drop_body_when_the_bind_panics() {
-        let before = capability_operations();
+        let before = thread_capability_operations();
         let outcome = std::panic::catch_unwind(|| {
             let _guard = CapabilityLowerGuard::armed();
             panic!("simulated bind failure between raise and lower");
         });
         assert!(outcome.is_err(), "the panic must unwind");
         assert_eq!(
-            capability_operations(),
+            thread_capability_operations(),
             before + 1,
             "the real guard's drop body must execute exactly once during the unwind; if this fails, \
              a panic between raise and lower can leak CAP_NET_BIND_SERVICE"
@@ -1201,7 +1286,7 @@ mod retry_tests {
                 // Deliberately not a panic-in-panic; just a marker that we unwound here.
             }
         }
-        let before = capability_operations();
+        let before = thread_capability_operations();
         let outcome = std::panic::catch_unwind(|| {
             let _guard = CapabilityLowerGuard::armed();
             let _marker = Panicking;
@@ -1209,7 +1294,7 @@ mod retry_tests {
         });
         assert!(outcome.is_err());
         assert_eq!(
-            capability_operations(),
+            thread_capability_operations(),
             before + 1,
             "the guard must lower on the unwind that carries it out"
         );
@@ -1218,8 +1303,8 @@ mod retry_tests {
     /// A disarmed guard must not lower — the raise failed, so there is nothing to lower.
     #[test]
     fn a_disarmed_guard_does_not_lower() {
-        let before = capability_operations();
+        let before = thread_capability_operations();
         CapabilityLowerGuard::armed().disarm();
-        assert_eq!(capability_operations(), before);
+        assert_eq!(thread_capability_operations(), before);
     }
 }
