@@ -25,7 +25,7 @@ use caddy_rs_server::limits::ServerLimits;
 
 /// Records the SNI every dispatched request carried, and answers `200 OK`.
 struct Recorder {
-    seen: Arc<Mutex<Vec<Option<String>>>>,
+    seen: Arc<Mutex<Vec<(Option<String>, Option<std::net::SocketAddr>)>>>,
 }
 
 #[async_trait::async_trait]
@@ -35,7 +35,10 @@ impl Handler for Recorder {
     }
 
     async fn handle(&self, request: Request) -> HttpResult<Outcome> {
-        self.seen.lock().expect("lock").push(request.sni.clone());
+        self.seen
+            .lock()
+            .expect("lock")
+            .push((request.sni.clone(), request.remote_addr));
         Ok(Outcome::Respond(Response::text(
             http::StatusCode::OK,
             "handoff-ok",
@@ -45,7 +48,9 @@ impl Handler for Recorder {
 
 /// A router whose single route is served by `Recorder`, installed through the same custom-handler
 /// hook the server mounts extension handlers with.
-fn router_recording(seen: Arc<Mutex<Vec<Option<String>>>>) -> Arc<caddy_rs_http::Router> {
+fn router_recording(
+    seen: Arc<Mutex<Vec<(Option<String>, Option<std::net::SocketAddr>)>>>,
+) -> Arc<caddy_rs_http::Router> {
     let routes = serde_json::json!([
         { "match": [{ "path": ["/"] }], "handle": [{ "handler": "test_recorder" }] }
     ]);
@@ -62,9 +67,20 @@ fn router_recording(seen: Arc<Mutex<Vec<Option<String>>>>) -> Arc<caddy_rs_http:
 
 fn context(sni: Option<&str>, h2c: bool) -> HandoffContext {
     HandoffContext {
+        peer: None,
         sni: sni.map(str::to_owned),
         tls: false,
         h2c,
+    }
+}
+
+/// A context that also carries the client address, as the real acceptor supplies it.
+fn context_with_peer(sni: Option<&str>, peer: std::net::SocketAddr) -> HandoffContext {
+    HandoffContext {
+        peer: Some(peer),
+        sni: sni.map(str::to_owned),
+        tls: false,
+        h2c: false,
     }
 }
 
@@ -140,8 +156,8 @@ async fn the_sni_survives_the_handoff_and_is_visible_to_the_l7_request() {
     connection.abort();
     serving.await.expect("join").expect("serve");
     assert_eq!(
-        seen.lock().expect("lock").as_slice(),
-        &[Some("api.example.com".to_owned())],
+        seen.lock().expect("lock")[0].0.as_deref(),
+        Some("api.example.com"),
         "the SNI comes from the L4 handoff, not the Host header"
     );
 }
@@ -182,6 +198,86 @@ async fn http2_requests_are_served_through_the_handoff() {
     drop(send_request);
     serving.await.expect("join").expect("serve");
     assert_eq!(seen.lock().expect("lock").len(), 1);
+}
+
+/// The client address must survive the handoff: `remote_ip`/`client_ip` matchers and every
+/// `{http.request.remote.*}` placeholder read it, and an in-memory handoff has no socket for the
+/// HTTP layer to ask. Without this, an L4-routed connection silently looks address-less.
+#[tokio::test]
+async fn the_peer_address_survives_the_handoff_and_is_visible_to_the_l7_request() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let router = router_recording(Arc::clone(&seen));
+    let (client, server) = tokio::io::duplex(8192);
+    let peer: std::net::SocketAddr = "203.0.113.7:54321".parse().expect("peer");
+
+    let serving = tokio::spawn(async move {
+        caddy_rs_server::l7_handoff::serve(
+            server,
+            router,
+            ServerLimits::default(),
+            context_with_peer(Some("web.example.com"), peer),
+        )
+        .await
+    });
+
+    let io = hyper_util::rt::TokioIo::new(client);
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(io)
+        .await
+        .expect("handshake");
+    let connection = tokio::spawn(connection);
+    let request = hyper::Request::builder()
+        .uri("http://web.example.com/")
+        .header("host", "web.example.com")
+        .body(caddy_rs_http::Body::from_bytes(bytes::Bytes::new()))
+        .expect("request");
+    let _ = sender.send_request(request).await.expect("response");
+
+    drop(sender);
+    connection.abort();
+    serving.await.expect("join").expect("serve");
+    assert_eq!(
+        seen.lock().expect("lock")[0].1,
+        Some(peer),
+        "the peer comes from the L4 handoff, not a loopback stand-in"
+    );
+}
+
+/// A failed handoff must actually close the stream, not merely report an error: the acceptance is
+/// "closes the stream ... without leaking the stream", so the far end has to see EOF.
+#[tokio::test]
+async fn a_failed_handoff_closes_the_stream_for_the_far_end() {
+    use tokio::io::AsyncReadExt;
+
+    struct Failing;
+    #[async_trait::async_trait]
+    impl HttpDispatcher for Failing {
+        async fn dispatch(
+            &self,
+            _stream: caddy_rs_l4::handler::BoxedStream,
+            _context: HandoffContext,
+        ) -> Result<(), HandoffError> {
+            // Returning drops the boxed stream, which closes the connection.
+            Err(HandoffError::new("refused"))
+        }
+    }
+
+    let (client, server) = tokio::io::duplex(64);
+    let mut client = client;
+    let error = Failing
+        .dispatch(Box::new(server), HandoffContext::default())
+        .await
+        .expect_err("must fail");
+    assert_eq!(error.reason(), "refused");
+    // The far end must observe EOF rather than block forever on a leaked stream.
+    let mut buffer = [0u8; 8];
+    let read = tokio::time::timeout(std::time::Duration::from_secs(5), client.read(&mut buffer))
+        .await
+        .expect("the far end must not hang: the stream was leaked")
+        .expect("read");
+    assert_eq!(
+        read, 0,
+        "the far end sees EOF because the stream was closed"
+    );
 }
 
 /// A dispatcher that always fails must still drop the stream: the caller gets an error and no live

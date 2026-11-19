@@ -17,10 +17,15 @@
 //!
 //! ## What the handoff carries
 //!
-//! [`HandoffContext`] is the state the HTTP layer cannot recover from the bytes: the SNI the route
-//! matched on, and whether TLS was terminated here. The client address is *not* carried: it is a
-//! property of the accepted socket, which the L4 layer is given separately from the route, so
-//! inventing it from the route would be fabrication.
+//! [`HandoffContext`] is the state the HTTP layer cannot recover from the bytes: the client's
+//! address, the SNI the route matched on, and whether TLS was terminated here.
+//!
+//! The peer address is a property of the accepted socket rather than of the route, so it is a
+//! parameter of [`http_route`] and must come from whoever accepted the connection. It is
+//! deliberately not derived from the route, and `None` is reserved for streams that genuinely have
+//! no address (an in-memory duplex in a test) — the L7 side reads it for
+//! `{http.request.remote.*}` and for the `remote_ip`/`client_ip` matchers, so dropping it on an
+//! L4-routed connection would make every one of those silently see nothing.
 //!
 //! ## Failure behaviour
 //!
@@ -36,6 +41,13 @@ use crate::router::Route;
 /// The connection state an L4 route carries into the L7 request.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HandoffContext {
+    /// The client's address as accepted by the listener.
+    ///
+    /// Carried because the L7 request's `{http.request.remote.*}` placeholders and the
+    /// `remote_ip`/`client_ip` matchers read it, and an in-memory handoff has no socket for the
+    /// HTTP layer to ask. `None` only when the acceptor genuinely had no address (a `duplex`
+    /// stream in a test), never as a substitute for looking it up.
+    pub peer: Option<std::net::SocketAddr>,
     /// The SNI the route matched on, when the connection presented one.
     ///
     /// Taken from the `Route` the connection was matched against, which is the name the route was
@@ -102,6 +114,7 @@ pub trait HttpDispatcher: Send + Sync {
 /// name and the h2c decision.
 pub async fn http_route<S>(
     client: S,
+    peer: Option<std::net::SocketAddr>,
     route: &Route,
     dispatcher: &dyn HttpDispatcher,
 ) -> Result<(), HandoffError>
@@ -116,6 +129,7 @@ where
         )));
     };
     let context = HandoffContext {
+        peer,
         // The config's server name is the one the adapter validated for this route; fall back to
         // the route's own host so a wildcard route still records what it matched.
         sni: config
@@ -196,6 +210,7 @@ mod tests {
         let (client, _server) = tokio::io::duplex(64);
         http_route(
             client,
+            None,
             &http_route_for("web.example.com", Some("web.example.com")),
             &recorder,
         )
@@ -210,9 +225,14 @@ mod tests {
     async fn a_route_without_a_configured_name_falls_back_to_its_host() {
         let recorder = Recorder::new(false);
         let (client, _server) = tokio::io::duplex(64);
-        http_route(client, &http_route_for("*.example.com", None), &recorder)
-            .await
-            .expect("handoff");
+        http_route(
+            client,
+            None,
+            &http_route_for("*.example.com", None),
+            &recorder,
+        )
+        .await
+        .expect("handoff");
         let seen = recorder.seen.lock().expect("lock");
         assert_eq!(seen[0].sni.as_deref(), Some("*.example.com"));
     }
@@ -223,6 +243,7 @@ mod tests {
         let (client, _server) = tokio::io::duplex(64);
         let error = http_route(
             client,
+            None,
             &http_route_for("web.example.com", Some("web.example.com")),
             &recorder,
         )
@@ -241,7 +262,7 @@ mod tests {
             "ssh.example.com",
             SniAction::Fallback(FallbackConfig::new(FallbackReason::NoRoute)),
         );
-        let error = http_route(client, &route, &recorder)
+        let error = http_route(client, None, &route, &recorder)
             .await
             .expect_err("must be refused");
         assert!(
@@ -264,7 +285,7 @@ mod tests {
                     .with_h2c(true),
             ),
         );
-        http_route(client, &route, &recorder)
+        http_route(client, None, &route, &recorder)
             .await
             .expect("handoff");
         assert!(recorder.seen.lock().expect("lock")[0].h2c);
