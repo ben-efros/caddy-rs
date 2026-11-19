@@ -133,7 +133,6 @@ pub struct SecurityHeadersDocs {
 }
 
 /// The JSON field names of the documented DTO, in documentation order.
-/// The field names this module documents, in documentation order.
 ///
 /// Consumed only by `tests_security_headers_docs`, and the module that holds it is private, so it
 /// is compiled only for tests: as an unconditional `pub` item in a private module it is dead code
