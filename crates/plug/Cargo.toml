@@ -10,9 +10,10 @@ repository.workspace = true
 [features]
 # The in-process WASM host runtime (T-PLUG-011). Off by default: the secure baseline and `minimal`
 # profiles compile no guest runtime; enabling it is an explicit opt-in for trusted plugins. The
-# pinned Wasmtime 50.0.1 has no open sandbox advisories (the previous 34.0.2 pin did, tracked by
-# T-PLUG-030), but the feature still raises the effective MSRV to 1.97 (Wasmtime 50.0.1 declares
-# rust-version 1.97.0), so build it with rustc >= 1.97.
+# pinned Wasmtime 50.0.2 is the first 50.x patch outside the RUSTSEC-2026-0566..0573 range (the
+# earlier 34.0.2 pin carried a separate set, tracked by T-PLUG-030), but the feature still raises
+# the effective MSRV to 1.97 (Wasmtime 50.0.2 declares rust-version 1.97.0), so build it with
+# rustc >= 1.97.
 default = []
 wasm-runtime = ["dep:wasmtime"]
 
