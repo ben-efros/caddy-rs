@@ -291,6 +291,13 @@ pub struct Request {
     /// Presented client certificate, when the TLS listener requested one (Caddy's
     /// `r.TLS.PeerCertificates[0]`). `None` when no certificate was presented or TLS is off.
     pub client_certificate: Option<ClientCertificate>,
+    /// The server name (SNI) the connection was accepted under, when known.
+    ///
+    /// This is recorded from the TLS handshake, or from the L4 route that matched the ClientHello
+    /// before handing the decrypted stream to the HTTP pipeline. It is deliberately **not**
+    /// re-derived from the `Host` header: a client can send a `Host` that disagrees with the SNI it
+    /// connected under, and Caddy's `{http.request.tls.server_name}` reports the handshake value.
+    pub sni: Option<String>,
     /// The request's effective HTTP version, propagated by the server from the hyper connection.
     ///
     /// This is what the `protocol` matcher keys off (Caddy's `r.Proto`): HTTP/1.1 for plain
@@ -345,6 +352,7 @@ impl Request {
             tls: false,
             tls_connection: None,
             client_certificate: None,
+            sni: None,
             version: Version::HTTP_11,
             vars: BTreeMap::new(),
             pending_response_headers: HeaderMap::new(),
@@ -740,6 +748,7 @@ impl Clone for Request {
             tls: self.tls,
             tls_connection: self.tls_connection.clone(),
             client_certificate: self.client_certificate.clone(),
+            sni: self.sni.clone(),
             version: self.version,
             vars: self.vars.clone(),
             pending_response_headers: self.pending_response_headers.clone(),

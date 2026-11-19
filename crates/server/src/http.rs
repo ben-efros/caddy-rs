@@ -122,7 +122,17 @@ pub async fn serve_request_with_limits_and_alpn(
     tls: bool,
     tls_alpn: Option<&str>,
 ) -> hyper::Response<Body> {
-    serve_request_with_automatic(limits, router, request, remote_addr, tls, tls_alpn, None).await
+    serve_request_with_automatic(
+        limits,
+        router,
+        request,
+        remote_addr,
+        tls,
+        tls_alpn,
+        None,
+        None,
+    )
+    .await
 }
 
 /// Like [`serve_request_with_limits_and_alpn`], with automatic-HTTPS pre-routing: ACME HTTP-01
@@ -140,6 +150,7 @@ pub(crate) async fn serve_request_with_automatic(
     tls: bool,
     tls_alpn: Option<&str>,
     automatic: Option<Arc<AutomaticHttpsServing>>,
+    sni: Option<String>,
 ) -> hyper::Response<Body> {
     match serve_request_with_automatic_upgradable(
         limits,
@@ -154,6 +165,7 @@ pub(crate) async fn serve_request_with_automatic(
         Arc::new(ServerTrustedProxies::default()),
         None,
         None,
+        sni,
         &[],
         None,
     )
@@ -195,6 +207,7 @@ pub(crate) async fn serve_internal_buffered(
     trusted_proxies: Arc<ServerTrustedProxies>,
     client_certificate: Option<HttpClientCertificate>,
     tls_connection: Option<caddy_rs_http::TlsConnection>,
+    sni: Option<String>,
     access_log: Option<Arc<AccessLogContext>>,
 ) -> ServedResponse {
     let limit = limits.max_request_body_size;
@@ -235,6 +248,7 @@ pub(crate) async fn serve_internal_buffered(
     internal.tls = tls;
     internal.tls_connection = tls_connection;
     internal.client_certificate = client_certificate;
+    internal.sni = sni;
     if let Some(access_log) = access_log {
         internal = internal.with_access_log(access_log);
     }
@@ -312,6 +326,7 @@ pub(crate) async fn serve_request_with_automatic_upgradable(
     trusted_proxies: Arc<ServerTrustedProxies>,
     client_certificate: Option<HttpClientCertificate>,
     tls_connection: Option<caddy_rs_http::TlsConnection>,
+    sni: Option<String>,
     proxy_vars: &[(String, String)],
     access_log: Option<Arc<AccessLogContext>>,
 ) -> ServedResponse {
@@ -441,6 +456,7 @@ pub(crate) async fn serve_request_with_automatic_upgradable(
     internal.tls = tls;
     internal.tls_connection = tls_connection;
     internal.client_certificate = client_certificate;
+    internal.sni = sni;
     if let Some(access_log) = &access_log {
         internal = internal.with_access_log(Arc::clone(access_log));
     }

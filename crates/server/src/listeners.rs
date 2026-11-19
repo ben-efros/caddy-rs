@@ -1341,6 +1341,8 @@ async fn serve_h3_connection(
                             Arc::clone(&context.trusted_proxies),
                             h3_client_certificate(&connection, context.client_auth_verified),
                             request_tls_connection(Some(&tls_info)),
+                            (!tls_info.server_name.is_empty())
+                                .then(|| tls_info.server_name.clone()),
                             access_log_context.clone(),
                         )
                         .await;
@@ -2211,6 +2213,11 @@ async fn serve_one_request(
         Arc::clone(&context.trusted_proxies),
         context.client_certificate.clone(),
         request_tls_connection(context.tls_info.as_ref()),
+        context
+            .tls_info
+            .as_ref()
+            .filter(|info| !info.server_name.is_empty())
+            .map(|info| info.server_name.clone()),
         &context.proxy_vars,
         access_log_context.clone(),
     )
@@ -2435,7 +2442,7 @@ fn spawn_upgraded_tunnel(
 
 /// Caddy applies a 16 KiB default `MaxHeaderBytes` when the server field is absent or <= 0
 /// (`external/caddy/modules/caddyhttp/app.go`, `Server.Start`).
-const CADDY_DEFAULT_MAX_HEADER_BYTES: usize = 16 * 1024;
+pub(crate) const CADDY_DEFAULT_MAX_HEADER_BYTES: usize = 16 * 1024;
 
 /// Go's `http2adjustHTTP1MaxHeaderSize`: HTTP/2 counts 32 bytes of per-field overhead per pair and
 /// assumes 10 typical headers, so the advertised `SETTINGS_MAX_HEADER_LIST_SIZE` is the HTTP/1
@@ -2495,7 +2502,7 @@ fn configure_h2_raw_server(
 
 /// The same tuning applied through hyper-util's auto-builder `Http2Builder` wrapper (used for
 /// connections served by the automatic HTTP/1-or-HTTP/2 detector).
-fn configure_h2_auto_server(
+pub(crate) fn configure_h2_auto_server(
     builder: &mut hyper_util::server::conn::auto::Http2Builder<'_, TokioExecutor>,
     limits: &ServerLimits,
 ) {
