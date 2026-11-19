@@ -801,7 +801,7 @@ trait AccountCommands {
     fn create_user(&self, user: &str, group: &str, home: &Path) -> anyhow::Result<()>;
     /// Give a path to the service account with the given mode.
     fn set_owner_mode(&self, path: &Path, user: &str, group: &str, mode: u32)
-    -> anyhow::Result<()>;
+        -> anyhow::Result<()>;
 }
 
 /// The real implementation, shelling out to `getent`/`groupadd`/`useradd`.
@@ -826,12 +826,7 @@ impl SystemAccountCommands {
             .with_context(|| format!("failed to run {program}"))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!(
-                "{} failed ({}): {}",
-                program,
-                output.status,
-                stderr.trim()
-            );
+            bail!("{} failed ({}): {}", program, output.status, stderr.trim());
         }
         Ok(())
     }
@@ -1807,14 +1802,15 @@ mod tests {
             Ok(self.group_exists)
         }
         fn create_group(&self, group: &str) -> anyhow::Result<()> {
-            self.calls.borrow_mut().push(format!("create_group {group}"));
+            self.calls
+                .borrow_mut()
+                .push(format!("create_group {group}"));
             Ok(())
         }
         fn create_user(&self, user: &str, group: &str, home: &Path) -> anyhow::Result<()> {
-            self.calls.borrow_mut().push(format!(
-                "create_user {user} {group} {}",
-                home.display()
-            ));
+            self.calls
+                .borrow_mut()
+                .push(format!("create_user {user} {group} {}", home.display()));
             Ok(())
         }
         fn set_owner_mode(
@@ -1858,7 +1854,9 @@ mod tests {
             "the group the unit names must be created: {calls:?}"
         );
         assert!(
-            calls.iter().any(|c| c.starts_with("create_user caddy-rs caddy-rs")),
+            calls
+                .iter()
+                .any(|c| c.starts_with("create_user caddy-rs caddy-rs")),
             "the account the unit names must be created: {calls:?}"
         );
         assert!(
