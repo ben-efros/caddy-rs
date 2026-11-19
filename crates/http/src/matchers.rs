@@ -20,7 +20,7 @@ use crate::types::{Error, Matcher, MatcherError, Request, Result, SharedMatcher}
 /// supplied here. Omitting them (see [`build_matcher_set`]) leaves a `radar` matcher
 /// unconstructible, which is deliberate: a `radar` matcher with no state would silently never
 /// match, and a configuration that cannot work should fail loudly instead.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct MatcherDeps {
     /// The generation's radar snapshot state.
     pub radar: Option<Arc<crate::radar_matcher::RadarState>>,
@@ -28,16 +28,6 @@ pub struct MatcherDeps {
     pub geoip: Option<Arc<dyn crate::radar_matcher::GeoIpProvider>>,
     /// The CDN-trust resolver used to recover a client IP behind a proxy.
     pub trust_cdn: Option<Arc<dyn crate::radar_matcher::TrustCdnResolver>>,
-}
-
-impl Default for MatcherDeps {
-    fn default() -> Self {
-        Self {
-            radar: None,
-            geoip: None,
-            trust_cdn: None,
-        }
-    }
 }
 
 impl MatcherDeps {

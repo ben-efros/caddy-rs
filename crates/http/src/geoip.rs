@@ -325,9 +325,10 @@ impl fmt::Debug for SelectedGeoIp {
 /// Select the provider for the `geoip` global option.
 ///
 /// This is the piece of runtime wiring that does not depend on the radar matcher being reachable:
-/// it turns the adapted configuration into the `Arc<dyn GeoIpProvider>` that
-/// `RadarMatcher::new` takes, so the moment `@radar` is registered the provider is already chosen
-/// correctly (that registration is T-ROUTE-063, not this task).
+/// it turns the adapted configuration into the `Arc<dyn GeoIpProvider>` that `RadarMatcher::new`
+/// takes. `@radar` is registered now (DIV-0149, queue task `T-ROUTE-065`) and the server calls this
+/// function from `ServerRuntime::geoip_provider`, so the provider reaching the matcher is the one
+/// selected here.
 ///
 /// Classification follows ADR-0020's resolution of open question 1 and the provider word:
 ///

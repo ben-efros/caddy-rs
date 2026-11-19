@@ -378,6 +378,19 @@ fn extension_handler_factory(
     )
 }
 
+/// Runtime handles `build_router` needs beyond the configuration document.
+///
+/// Grouped into a struct rather than passed positionally: `build_router` already sat at the
+/// `clippy::too_many_arguments` threshold before the `radar` wiring, and adding a ninth positional
+/// argument would have raised the lint count for a reason unrelated to this change.
+struct ExtensionHandles<'a> {
+    /// ACME `local` authorities from the PKI app, keyed by name.
+    acme_server_authorities:
+        &'a std::collections::BTreeMap<String, caddy_rs_http::router::AcmeServerAuthority>,
+    /// Handles the `radar` matcher evaluates through (DIV-0149).
+    matcher_deps: caddy_rs_http::matchers::MatcherDeps,
+}
+
 impl ServerRuntime {
     /// Release a [`caddy_rs_admin::ShutdownLatch`] exactly once, from whichever path ends this
     /// runtime's loop. `POST /stop` exits the process as soon as it is released, so every path that
@@ -820,8 +833,10 @@ impl ServerRuntime {
                 generation.config().stock_compat(),
                 has_reverse_proxy,
                 acme_server_data_root.as_deref(),
-                &acme_server_authorities,
-                matcher_deps.clone(),
+                &ExtensionHandles {
+                    acme_server_authorities: &acme_server_authorities,
+                    matcher_deps: matcher_deps.clone(),
+                },
             )?;
             for listen in &server.listen {
                 let parsed = match caddy_rs_core::ListenAddr::parse(listen) {
@@ -2128,11 +2143,7 @@ impl ServerRuntime {
         stock_compat: bool,
         has_reverse_proxy: bool,
         acme_server_data_root: Option<&std::path::Path>,
-        acme_server_authorities: &std::collections::BTreeMap<
-            String,
-            caddy_rs_http::router::AcmeServerAuthority,
-        >,
-        matcher_deps: caddy_rs_http::matchers::MatcherDeps,
+        extension_handles: &ExtensionHandles<'_>,
     ) -> Result<Arc<caddy_rs_http::Router>> {
         // Server identity (caddy-rs extension, T-CONF-060; ADR-0010 §3): malformed values are
         // located errors, and the FastCGI `SERVER_SOFTWARE` parameter follows the resolved matrix
@@ -2175,8 +2186,8 @@ impl ServerRuntime {
             .with_optional_acme_server_data_root(
                 acme_server_data_root.map(std::path::Path::to_path_buf),
             )
-            .with_acme_server_authorities(acme_server_authorities.clone())
-            .with_matcher_deps(matcher_deps.clone());
+            .with_acme_server_authorities(extension_handles.acme_server_authorities.clone())
+            .with_matcher_deps(extension_handles.matcher_deps.clone());
         let router_builder = router_builder
             .with_error_routes(
                 errors_value.as_ref(),
@@ -2297,8 +2308,10 @@ impl ServerRuntime {
                 generation.config().stock_compat(),
                 has_reverse_proxy,
                 acme_server_data_root.as_deref(),
-                &acme_server_authorities,
-                matcher_deps.clone(),
+                &ExtensionHandles {
+                    acme_server_authorities: &acme_server_authorities,
+                    matcher_deps: matcher_deps.clone(),
+                },
             )?;
             // HTTP/3 Alt-Svc advertisement (h1/h2 responses only), when this server offers h3 on a
             // concrete UDP port. During the automatic-HTTPS bootstrap phase there is no final
@@ -3588,6 +3601,38 @@ mod matcher_deps_tests {
         let location = provider
             .lookup("89.160.20.112".parse().expect("address"))
             .expect("the configured fixture database resolves this address");
+        assert_eq!(location.asn, Some(29518), "ASN from the ISP fixture");
+        assert_eq!(
+            location.country.as_deref(),
+            Some("SE"),
+            "country from the country fixture"
+        );
+    }
+
+    #[test]
+    fn the_provider_matcher_deps_hands_on_is_the_one_selected_from_the_option() {
+        // Identity, not existence. `deps.geoip.is_some()` is satisfied by `NoopGeoIp` too, so a
+        // `matcher_deps` that selected the configured provider and then dropped it on the way to
+        // `MatcherDeps::radar` would pass an existence check while making every ASN/country
+        // predicate silently false in production — `RadarMatcher` evaluates through
+        // `self.geoip.lookup(ip)`, so the provider must survive that seam. This resolves the
+        // address through `deps.geoip`, the value the router actually receives.
+        let config = Config::from_value(serde_json::json!({
+            "radar": {"mode": "on"},
+            "geoip": [
+                {"provider": "maxmind", "path": fixture("GeoIP2-ISP-Test.mmdb")},
+                {"provider": "maxmind", "path": fixture("GeoIP2-Country-Test.mmdb")}
+            ],
+            "apps": {"http": {"servers": {}}}
+        }))
+        .expect("configuration decodes");
+        let deps = ServerRuntime::matcher_deps(&config).expect("radar deps build");
+        let provider = deps.geoip.expect("the radar option supplies a provider");
+        let location = provider
+            .lookup("89.160.20.112".parse().expect("address"))
+            .expect(
+                "the provider handed to the matcher must resolve through the configured database",
+            );
         assert_eq!(location.asn, Some(29518), "ASN from the ISP fixture");
         assert_eq!(
             location.country.as_deref(),
