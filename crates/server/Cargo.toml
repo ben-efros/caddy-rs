@@ -60,11 +60,15 @@ ecdysis = { version = "1.1.1", optional = true }
 # the graph (see the KNOWN COST note above), so this is an alias to the version ecdysis
 # actually uses, not a third copy. Without it the closure signature cannot name the type.
 socket2-v05 = { package = "socket2", version = "0.5.10", optional = true }
+async-trait = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
 caddy-rs-admin = { workspace = true, default-features = false }
 caddy-rs-core = { workspace = true, default-features = false }
 caddy-rs-http = { workspace = true, default-features = false }
+# The L4 `http` handler hands its matched stream to this crate's L7 dispatcher in memory
+# (ADR-030); the handoff types live here, so `server` sits above `l4`.
+caddy-rs-l4 = { workspace = true, default-features = false }
 caddy-rs-proxy = { workspace = true, default-features = false }
 caddy-rs-tls = { workspace = true, default-features = false }
 h3 = { version = "0.0.8", optional = true }

@@ -435,6 +435,7 @@ dependencies = [
  "caddy-rs-config",
  "caddy-rs-core",
  "caddy-rs-http",
+ "caddy-rs-l4",
  "caddy-rs-proxy",
  "caddy-rs-test-support",
  "caddy-rs-tls",

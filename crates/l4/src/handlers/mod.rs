@@ -5,11 +5,13 @@
 //! [`crate::handler::HandlerPipeline`] executes the stages in the validated order. See
 //! [`tls::validate_stage_order`] for the ordering contract.
 
+pub mod http;
 pub mod proxy;
 pub mod proxy_protocol;
 pub mod throttle;
 pub mod tls;
 
+pub use http::{http_route, HandoffContext, HandoffError, HttpDispatcher};
 pub use proxy::{proxy_connection, proxy_route, ProxyError, ProxyOptions, DEFAULT_IDLE_TIMEOUT};
 pub use proxy_protocol::{
     render_proxy_header, ProxyHeaderAddresses, ProxyHeaderError, ProxyProtocolVersion, V2_SIGNATURE,

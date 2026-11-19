@@ -22,6 +22,8 @@ pub mod fdstore;
 pub mod graceful_restart;
 pub mod http;
 mod inventory;
+/// In-memory L4 -> L7 handoff (ADR-030).
+pub mod l7_handoff;
 pub mod limits;
 pub mod listener_plan;
 pub mod listener_source;
