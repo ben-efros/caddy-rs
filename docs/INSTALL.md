@@ -101,19 +101,26 @@ caddy-rs-pm 0.1.0-trial.7 (caddy-rs 0.1.0-trial.7)
 
 ### Install as a systemd service
 
-`caddy-rs-pm install` writes `/etc/systemd/system/caddy-rs-pm.service`. It must run as root, and the
-service account named in the unit (default `caddy-rs:caddy-rs`) and its data directory (default
-`/var/lib/caddy-rs`, writable by that account) must already exist — the installer creates neither:
+`caddy-rs-pm install` writes `/etc/systemd/system/caddy-rs-pm.service`. It must run as root, because
+creating the service account and the data directory are privileged operations.
+
+The unit names a service account (default `caddy-rs:caddy-rs`) and a data directory (default
+`/var/lib/caddy-rs`) that it makes writable. `install` creates both when they are absent, so a clean
+host needs no manual setup — systemd otherwise fails the start with a generic `217/USER` or
+`226/NAMESPACE` that never mentions the missing prerequisite:
 
 ```sh
-sudo useradd --system --home /var/lib/caddy-rs --shell /usr/sbin/nologin caddy-rs
-sudo install -d -o caddy-rs -g caddy-rs -m 0750 /var/lib/caddy-rs
 sudo install -m 0755 caddy-rs /usr/local/bin/caddy-rs
 sudo install -m 0755 caddy-rs-pm /usr/local/bin/caddy-rs-pm
-sudo caddy-rs-pm install
+sudo caddy-rs-pm install          # creates the account and data directory if absent
 sudo systemctl daemon-reload
 sudo systemctl enable --now caddy-rs-pm
 ```
+
+Every step is idempotent, so re-running `install` is safe: an existing group or user is left
+untouched, and an existing data directory keeps its own owner and mode (re-install never changes the
+mode of a directory you tightened). If your distribution has no `getent`/`groupadd`/`useradd`
+(shadow-utils), create the account first and `install` will find it.
 
 `install` defaults:
 
