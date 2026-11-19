@@ -19,15 +19,19 @@ ignore = [
   # here performs RSA decryption with an attacker-influenced ciphertext.
   "RUSTSEC-2023-0071",
 
-  # --- wasmtime 34: the in-process WASM host. The `wasm-runtime` feature is OFF by default
+  # --- wasmtime: the in-process WASM host. The `wasm-runtime` feature is OFF by default
   # (see crates/plug/Cargo.toml), so a default or `minimal` build contains no guest runtime.
-  # Upgrading to the fixed releases (>=48) is a major API change tracked by T-PLUG-030; until
-  # then enabling the feature is documented as experimental and not for untrusted plugins.
+  # The pin is now Wasmtime 50.0.2 (13 wasmtime + 2 pulley crates at 50.0.2, cranelift 0.137.2).
+  # 50.0.2 is the first 50.x patch outside the RUSTSEC-2026-0566..0573 range, so those eight are
+  # deliberately NOT ignored here: they are fixed by the upgrade and must gate if they reappear.
+  # The entries below are the residue of the older 34.0.2 pin (T-PLUG-030). They are kept rather
+  # than pruned because cargo-audit is unavailable in this environment, so none of them has been
+  # confirmed dead against a current advisory database; pruning an ignore still in use would turn
+  # the `security` job red. Re-derive this list from a real `cargo audit` run when it is available.
   "RUSTSEC-2025-0118",
-  # --- fxhash 0.2.1 (RUSTSEC-2025-0057, unmaintained): transitive through
-  # fxprof-processed-profile via Wasmtime 34, so it is unreachable exactly like the advisories
-  # above (the `wasm-runtime` feature is off by default). The crate has no maintained or patched
-  # release; it disappears with the Wasmtime upgrade tracked by T-PLUG-030.
+  # --- fxhash 0.2.1 (RUSTSEC-2025-0057, unmaintained): reached through
+  # fxprof-processed-profile. As of the Wasmtime 50.0.2 pin the crate is no longer in Cargo.lock,
+  # so this entry is believed dead but is left in place for the reason given above.
   "RUSTSEC-2025-0057",
   "RUSTSEC-2026-0006",
   "RUSTSEC-2026-0020",
