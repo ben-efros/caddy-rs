@@ -17,8 +17,6 @@
 
 use std::ffi::OsStr;
 use std::io;
-#[cfg(target_os = "linux")]
-use std::os::unix::io::RawFd;
 
 /// Environment variable used by systemd to name the notification socket.
 pub const NOTIFY_SOCKET_ENV: &str = "NOTIFY_SOCKET";
