@@ -15,7 +15,6 @@
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, put};
 use axum::Json;
 use caddy_rs_pm_core::{SecurityHeadersConfig, SecurityHeadersHstsConfig};
 use caddy_rs_pm_service::HostDraft;

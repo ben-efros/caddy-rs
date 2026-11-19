@@ -46,7 +46,7 @@ pub async fn list_handler(
         .authn
         .list_users()
         .await
-        .map_err(|error| crate::auth::internal_error(error))?;
+        .map_err(crate::auth::internal_error)?;
     users.sort_by(|left, right| left.username.cmp(&right.username));
     let total = users.len() as u64;
     let items = users
@@ -123,7 +123,7 @@ pub async fn delete_handler(
         .authn
         .list_users()
         .await
-        .map_err(|error| crate::auth::internal_error(error))?;
+        .map_err(crate::auth::internal_error)?;
     let target = users
         .iter()
         .find(|user| user.id == user_id)

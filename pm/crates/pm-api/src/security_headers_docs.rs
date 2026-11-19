@@ -133,6 +133,11 @@ pub struct SecurityHeadersDocs {
 }
 
 /// The JSON field names of the documented DTO, in documentation order.
+///
+/// Consumed only by `tests_security_headers_docs`, and the module that holds it is private, so it
+/// is compiled only for tests: as an unconditional `pub` item in a private module it is dead code
+/// in the library build, which is what clippy reported.
+#[cfg(test)]
 pub const DOCUMENTED_FIELDS: &[&str] = &[
     "content_security_policy",
     "strict_transport_security",
@@ -663,11 +668,11 @@ pub fn render_page(docs: &SecurityHeadersDocs) -> String {
     let mut body = String::new();
     body.push_str(&format!("<h1>{}</h1>", escape(docs.title)));
     body.push_str(&paragraph(docs.summary));
-    body.push_str(&format!(
+    body.push_str(
         "<p class=\"api-link\">Same content as JSON: \
          <a href=\"/api/v1/security-headers/docs\">/api/v1/security-headers/docs</a> · \
-         <a href=\"/\">back to the proxy manager</a></p>"
-    ));
+         <a href=\"/\">back to the proxy manager</a></p>",
+    );
     body.push_str("<h2>Defaults and stricter-than-Caddy behavior</h2>");
     body.push_str(&paragraph(docs.defaults_note));
     body.push_str("<h2>Routes</h2>");
@@ -807,7 +812,7 @@ mod tests {
 
     #[test]
     fn the_rendered_page_contains_every_option_and_warning() {
-        let page = render_page(&docs());
+        let page = render_page(docs());
         for option in DOCS.options {
             assert!(page.contains(option.field), "page misses {}", option.field);
             assert!(page.contains(&escape(&option.default[..20])));
@@ -821,6 +826,6 @@ mod tests {
     #[test]
     fn html_is_escaped() {
         assert_eq!(escape("a<b&c'd\"e"), "a&lt;b&amp;c&#39;d&quot;e");
-        assert!(!render_page(&docs()).contains("<script"));
+        assert!(!render_page(docs()).contains("<script"));
     }
 }
