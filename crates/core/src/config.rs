@@ -48,6 +48,21 @@ pub struct Config {
     )]
     pub stock_compat: Option<bool>,
 
+    /// caddy-rs extension (`radar`, ADR-0020, DIV-0148): the Radar threat-intelligence global
+    /// option. Kept as raw JSON because the option's schema is owned by the Radar subsystem and
+    /// nothing in the core model interprets it; the server reads it to decide whether the `@radar`
+    /// matcher is constructible. A typed field (rather than an `extra` entry) is what keeps the
+    /// strict loader from rejecting a configuration that sets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radar: Option<Value>,
+
+    /// caddy-rs extension (`geoip`, ADR-0020, DIV-0161): the configured GeoIP databases as an
+    /// array of `{provider, path}` objects. Shape is validated by the server when it selects a
+    /// provider (`geoip::select_provider`), which is the single authority on which provider words
+    /// exist and what a usable path is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geoip: Option<Value>,
+
     /// Unknown top-level keys, preserved for round-tripping and rejected by validation.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,

@@ -786,6 +786,13 @@ pub const BUILTIN_MODULES: &[Module] = &[
         ModuleKind::HttpMatcher,
         "CEL expression matcher (documented subset: boolean/comparisons/in over strings, ints and bools; Caddy placeholders and request aliases)",
     ),
+    // caddy-rs extension (ADR-0020, DIV-0149): no Caddy v2.11.9 equivalent.
+    Module::new(
+        "http.matchers.radar",
+        "radar",
+        ModuleKind::HttpMatcher,
+        "Radar threat-intelligence matcher: predicates over the cached Radar snapshot (attacking/hijacking/leaking/anomalous ASNs and countries), resolved through the configured GeoIP provider",
+    ),
     // Storage
     Module::new(
         "caddy.storage.file_system",

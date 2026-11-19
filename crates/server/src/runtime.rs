@@ -378,6 +378,19 @@ fn extension_handler_factory(
     )
 }
 
+/// Runtime handles `build_router` needs beyond the configuration document.
+///
+/// Grouped into a struct rather than passed positionally: `build_router` already sat at the
+/// `clippy::too_many_arguments` threshold before the `radar` wiring, and adding a ninth positional
+/// argument would have raised the lint count for a reason unrelated to this change.
+struct ExtensionHandles<'a> {
+    /// ACME `local` authorities from the PKI app, keyed by name.
+    acme_server_authorities:
+        &'a std::collections::BTreeMap<String, caddy_rs_http::router::AcmeServerAuthority>,
+    /// Handles the `radar` matcher evaluates through (DIV-0149).
+    matcher_deps: caddy_rs_http::matchers::MatcherDeps,
+}
+
 impl ServerRuntime {
     /// Release a [`caddy_rs_admin::ShutdownLatch`] exactly once, from whichever path ends this
     /// runtime's loop. `POST /stop` exits the process as soon as it is released, so every path that
@@ -799,6 +812,7 @@ impl ServerRuntime {
                 has_reverse_proxy,
             )?;
             let _trusted_proxies = parse_server_trusted_proxies(server, server_name)?;
+            let matcher_deps = Self::matcher_deps(generation.config())?;
             let policies = server.tls_connection_policies.as_deref();
             let has_connection_policies = policies.is_some_and(|policies| !policies.is_empty());
             if strict_sni_host_enabled(server.strict_sni_host.as_ref()) {
@@ -819,7 +833,10 @@ impl ServerRuntime {
                 generation.config().stock_compat(),
                 has_reverse_proxy,
                 acme_server_data_root.as_deref(),
-                &acme_server_authorities,
+                &ExtensionHandles {
+                    acme_server_authorities: &acme_server_authorities,
+                    matcher_deps: matcher_deps.clone(),
+                },
             )?;
             for listen in &server.listen {
                 let parsed = match caddy_rs_core::ListenAddr::parse(listen) {
@@ -2038,6 +2055,86 @@ impl ServerRuntime {
     /// the handler/matcher objects verbatim, so re-serializing is lossless. Used by both
     /// [`Self::build_listener_states`] and [`Self::validate_provisioning`] so `validate` and `run`
     /// construct exactly the same router.
+    /// Build the runtime handles the `radar` matcher needs from the configuration root.
+    ///
+    /// The `radar`, `trust_cdn` and `geoip` global options are caddy-rs extensions
+    /// (ADR-0020/DIV-0149, DIV-0161) that the adapter emits at the top level. They are not part of
+    /// the typed core model, so they arrive in `Config::extra`; nothing else in the runtime reads
+    /// them, which is precisely why `@radar` could never match before T-ROUTE-065.
+    ///
+    /// A `radar` matcher is only constructible when a `radar` option is configured. Without one
+    /// the matcher is rejected by name at router build time rather than installed dead: a matcher
+    /// that can never match is worse than a configuration error, because it looks like it works.
+    fn matcher_deps(
+        config: &caddy_rs_core::Config,
+    ) -> Result<caddy_rs_http::matchers::MatcherDeps> {
+        if config.radar.is_none() {
+            return Ok(caddy_rs_http::matchers::MatcherDeps::default());
+        }
+        let state = std::sync::Arc::new(caddy_rs_http::radar_matcher::RadarState::new());
+        let geoip = Self::geoip_provider(config)?;
+        let trust_cdn: std::sync::Arc<dyn caddy_rs_http::radar_matcher::TrustCdnResolver> =
+            std::sync::Arc::new(caddy_rs_http::radar_matcher::NoopTrustCdn);
+        Ok(caddy_rs_http::matchers::MatcherDeps::radar(
+            state, geoip, trust_cdn,
+        ))
+    }
+
+    /// Resolve the configured `geoip` global option into a provider.
+    ///
+    /// `select_provider` (T-ROUTE-062) does the work and reports warnings for entries it had to
+    /// skip; they are printed here because a silently ignored GeoIP path would make every
+    /// ASN/country predicate quietly match nothing. Absent configuration yields `NoopGeoIp`,
+    /// which is the documented behaviour: nothing configured means nothing matches.
+    fn geoip_provider(
+        config: &caddy_rs_core::Config,
+    ) -> Result<std::sync::Arc<dyn caddy_rs_http::radar_matcher::GeoIpProvider>> {
+        use caddy_rs_http::geoip::{select_provider, GeoIpConfigEntry, GeoIpProduct};
+        let Some(entries) = config.geoip.as_ref() else {
+            return Ok(std::sync::Arc::new(caddy_rs_http::radar_matcher::NoopGeoIp));
+        };
+        let array = entries.as_array().ok_or_else(|| {
+            Error::Config(caddy_rs_core::Error::invalid(
+                "geoip".to_string(),
+                "`geoip` must be an array of {provider, path} objects".to_string(),
+            ))
+        })?;
+        let mut parsed = Vec::with_capacity(array.len());
+        for (index, entry) in array.iter().enumerate() {
+            let object = entry.as_object().ok_or_else(|| {
+                Error::Config(caddy_rs_core::Error::invalid(
+                    format!("geoip[{index}]"),
+                    "each `geoip` entry must be an object with `provider` and `path`".to_string(),
+                ))
+            })?;
+            let provider = object
+                .get("provider")
+                .and_then(|value| value.as_str())
+                .and_then(GeoIpProduct::parse)
+                .ok_or_else(|| {
+                    Error::Config(caddy_rs_core::Error::invalid(
+                        format!("geoip[{index}].provider"),
+                        "expected `dbip` or `maxmind`".to_string(),
+                    ))
+                })?;
+            let path = object
+                .get("path")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| {
+                    Error::Config(caddy_rs_core::Error::invalid(
+                        format!("geoip[{index}].path"),
+                        "expected a database path".to_string(),
+                    ))
+                })?;
+            parsed.push(GeoIpConfigEntry { provider, path });
+        }
+        let selected = select_provider(&parsed);
+        for warning in &selected.warnings {
+            eprintln!("caddy-rs: {warning}");
+        }
+        Ok(selected.provider)
+    }
+
     fn build_router(
         server_name: &str,
         server: &caddy_rs_core::HttpServer,
@@ -2046,10 +2143,7 @@ impl ServerRuntime {
         stock_compat: bool,
         has_reverse_proxy: bool,
         acme_server_data_root: Option<&std::path::Path>,
-        acme_server_authorities: &std::collections::BTreeMap<
-            String,
-            caddy_rs_http::router::AcmeServerAuthority,
-        >,
+        extension_handles: &ExtensionHandles<'_>,
     ) -> Result<Arc<caddy_rs_http::Router>> {
         // Server identity (caddy-rs extension, T-CONF-060; ADR-0010 §3): malformed values are
         // located errors, and the FastCGI `SERVER_SOFTWARE` parameter follows the resolved matrix
@@ -2092,7 +2186,8 @@ impl ServerRuntime {
             .with_optional_acme_server_data_root(
                 acme_server_data_root.map(std::path::Path::to_path_buf),
             )
-            .with_acme_server_authorities(acme_server_authorities.clone());
+            .with_acme_server_authorities(extension_handles.acme_server_authorities.clone())
+            .with_matcher_deps(extension_handles.matcher_deps.clone());
         let router_builder = router_builder
             .with_error_routes(
                 errors_value.as_ref(),
@@ -2192,6 +2287,7 @@ impl ServerRuntime {
             )?);
             let trusted_proxies = parse_server_trusted_proxies(server, server_name)?;
             let allow_0rtt = allow_0rtt_enabled(server, server_name)?;
+            let matcher_deps = Self::matcher_deps(generation.config())?;
             let policies = server.tls_connection_policies.as_deref();
             let has_connection_policies = policies.is_some_and(|policies| !policies.is_empty());
             if strict_sni_host_enabled(server.strict_sni_host.as_ref()) {
@@ -2212,7 +2308,10 @@ impl ServerRuntime {
                 generation.config().stock_compat(),
                 has_reverse_proxy,
                 acme_server_data_root.as_deref(),
-                &acme_server_authorities,
+                &ExtensionHandles {
+                    acme_server_authorities: &acme_server_authorities,
+                    matcher_deps: matcher_deps.clone(),
+                },
             )?;
             // HTTP/3 Alt-Svc advertisement (h1/h2 responses only), when this server offers h3 on a
             // concrete UDP port. During the automatic-HTTPS bootstrap phase there is no final
@@ -3463,6 +3562,137 @@ mod automatic_identity_warning_tests {
         assert_eq!(
             automatic_identity_conflict_warning(&entries, &ResolvedIdentity::default()),
             None
+        );
+    }
+}
+
+#[cfg(test)]
+mod matcher_deps_tests {
+    //! The `radar`/`geoip` global options reach the matcher's runtime handles (DIV-0149,
+    //! DIV-0161, T-ROUTE-065). These call the private helpers directly because the selected
+    //! provider is not otherwise observable from outside the runtime: the matcher publishes no
+    //! client-ASN variable, so an integration test cannot tell a real provider from `NoopGeoIp`
+    //! by looking at a response.
+    use super::ServerRuntime;
+    use caddy_rs_core::Config;
+    use caddy_rs_http::GeoIpProvider;
+
+    fn fixture(name: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("http")
+            .join("tests")
+            .join("fixtures")
+            .join(name)
+    }
+
+    #[test]
+    fn a_configured_geoip_database_becomes_the_provider_radar_resolves_through() {
+        let config = Config::from_value(serde_json::json!({
+            "geoip": [
+                {"provider": "maxmind", "path": fixture("GeoIP2-ISP-Test.mmdb")},
+                {"provider": "maxmind", "path": fixture("GeoIP2-Country-Test.mmdb")}
+            ],
+            "apps": {"http": {"servers": {}}}
+        }))
+        .expect("configuration decodes");
+        let provider = ServerRuntime::geoip_provider(&config).expect("provider selection succeeds");
+        // If the option were ignored this would be NoopGeoIp and both would be None.
+        let location = provider
+            .lookup("89.160.20.112".parse().expect("address"))
+            .expect("the configured fixture database resolves this address");
+        assert_eq!(location.asn, Some(29518), "ASN from the ISP fixture");
+        assert_eq!(
+            location.country.as_deref(),
+            Some("SE"),
+            "country from the country fixture"
+        );
+    }
+
+    #[test]
+    fn the_provider_matcher_deps_hands_on_is_the_one_selected_from_the_option() {
+        // Identity, not existence. `deps.geoip.is_some()` is satisfied by `NoopGeoIp` too, so a
+        // `matcher_deps` that selected the configured provider and then dropped it on the way to
+        // `MatcherDeps::radar` would pass an existence check while making every ASN/country
+        // predicate silently false in production — `RadarMatcher` evaluates through
+        // `self.geoip.lookup(ip)`, so the provider must survive that seam. This resolves the
+        // address through `deps.geoip`, the value the router actually receives.
+        let config = Config::from_value(serde_json::json!({
+            "radar": {"mode": "on"},
+            "geoip": [
+                {"provider": "maxmind", "path": fixture("GeoIP2-ISP-Test.mmdb")},
+                {"provider": "maxmind", "path": fixture("GeoIP2-Country-Test.mmdb")}
+            ],
+            "apps": {"http": {"servers": {}}}
+        }))
+        .expect("configuration decodes");
+        let deps = ServerRuntime::matcher_deps(&config).expect("radar deps build");
+        let provider = deps.geoip.expect("the radar option supplies a provider");
+        let location = provider
+            .lookup("89.160.20.112".parse().expect("address"))
+            .expect(
+                "the provider handed to the matcher must resolve through the configured database",
+            );
+        assert_eq!(location.asn, Some(29518), "ASN from the ISP fixture");
+        assert_eq!(
+            location.country.as_deref(),
+            Some("SE"),
+            "country from the country fixture"
+        );
+    }
+
+    #[test]
+    fn no_geoip_option_means_no_provider_and_no_radar_state() {
+        // Nothing configured is the documented default, not a mistake: no radar state, so a
+        // `radar` matcher is refused at router build time rather than installed dead.
+        let config = Config::from_value(serde_json::json!({
+            "apps": {"http": {"servers": {}}}
+        }))
+        .expect("configuration decodes");
+        let deps = ServerRuntime::matcher_deps(&config).expect("no deps is not an error");
+        assert!(
+            deps.radar.is_none(),
+            "no `radar` option means no radar state"
+        );
+        assert!(deps.geoip.is_none(), "no `geoip` option means no provider");
+    }
+
+    #[test]
+    fn the_radar_option_is_what_makes_a_radar_matcher_constructible() {
+        let config = Config::from_value(serde_json::json!({
+            "radar": {"mode": "on"},
+            "apps": {"http": {"servers": {}}}
+        }))
+        .expect("configuration decodes");
+        let deps = ServerRuntime::matcher_deps(&config).expect("radar deps build");
+        assert!(
+            deps.radar.is_some(),
+            "the `radar` option supplies the state"
+        );
+        assert!(
+            deps.geoip.is_some(),
+            "the radar option also supplies a provider (NoopGeoIp when no database is configured)"
+        );
+        assert!(
+            deps.trust_cdn.is_some(),
+            "the trusted-CDN resolver is always supplied"
+        );
+    }
+
+    #[test]
+    fn a_malformed_geoip_entry_is_a_located_error() {
+        let config = Config::from_value(serde_json::json!({
+            "geoip": [{"provider": "not-a-provider", "path": "/x.mmdb"}],
+            "apps": {"http": {"servers": {}}}
+        }))
+        .expect("configuration decodes");
+        let error = ServerRuntime::geoip_provider(&config)
+            .err()
+            .expect("an unknown provider word is an error");
+        let message = format!("{error}");
+        assert!(
+            message.contains("geoip[0].provider"),
+            "the error must name the offending entry: {message}"
         );
     }
 }
