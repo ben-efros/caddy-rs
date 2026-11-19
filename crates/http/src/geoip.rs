@@ -17,20 +17,30 @@
 //! rather than failing: a partially configured lookup is useful, and refusing it would push
 //! operators toward the no-database case where *nothing* matches.
 //!
-//! # Fail open, warn once, never panic
+//! # Fail open at startup, silently miss at request time, never panic
 //!
 //! `GeoIpProvider::lookup` returns `Option` and is called on the request path, so a database
-//! problem must never turn into a 5xx. Two distinct failures are handled differently:
+//! problem must never turn into a 5xx.
 //!
-//! * **A missing or unreadable database at startup** is a configuration problem, not a request
-//!   problem. [`MmdbGeoIp::open`] returns `Ok(None)` with a warning when the file does not exist,
-//!   so the server starts with a [`NoopGeoIp`]-equivalent provider and continues serving. It
-//!   returns `Err` only when a file exists but cannot be opened or is not a valid database —
-//!   that is a real mistake and silently degrading would hide it.
-//! * **A per-request lookup error** (an address outside the database's coverage, a corrupt
-//!   record) is logged once per provider and then reported as `None`. The warning is emitted
-//!   through [`MmdbGeoIp::set_warn`] rather than `eprintln!` so tests can capture it and the
-//!   server can route it through its own logging.
+//! **A missing or unreadable database at startup** is a configuration problem, not a request
+//! problem. [`MmdbGeoIp::open`] returns `Ok(None)` with a warning when the file does not exist,
+//! so the server starts with a [`NoopGeoIp`]-equivalent provider and continues serving. It
+//! returns `Err` only when a file exists but cannot be opened or is not a valid database —
+//! that is a real mistake and silently degrading would hide it.
+//!
+//! **A lookup that finds no record is not an error and is not logged.** An address outside the
+//! database's coverage is the ordinary case — every public address missing from a country
+//! database takes this path on every request that consults it — so logging it would flood the
+//! log, and warning "once per provider" would be worse still: it would name the first uncovered
+//! address and then stay silent about every genuine corruption for the rest of the process. The
+//! lookups therefore return `None` without emitting anything.
+//!
+//! **A lookup that fails outright** (a corrupt record, an address family the database cannot
+//! represent) also returns `None` and also does not warn. This is a deliberate limitation rather
+//! than a policy: the two cases are indistinguishable at the `Option` boundary, and no test in
+//! this crate can reach the failure branch without hand-crafting a malformed `.mmdb`. Reporting
+//! `None` is the fail-open behaviour the request path needs; the startup warning is what catches
+//! a misconfigured path. See the `lookup_asn` implementation for the per-call comment.
 //!
 //! # Why not `crates/route`
 //!
@@ -142,8 +152,6 @@ pub struct MmdbGeoIp {
     asn: Option<Reader<Vec<u8>>>,
     country: Option<Reader<Vec<u8>>>,
     counters: Counters,
-    /// Emitted at most once, on the first per-request lookup failure.
-    warn: Arc<dyn Fn(&str) + Send + Sync>,
 }
 
 impl fmt::Debug for MmdbGeoIp {
@@ -204,7 +212,6 @@ impl MmdbGeoIp {
             asn,
             country,
             counters: Counters::default(),
-            warn,
         }))
     }
 
@@ -245,10 +252,13 @@ impl MmdbGeoIp {
 
     fn lookup_asn(&self, ip: IpAddr) -> Option<u64> {
         let reader = self.asn.as_ref()?;
-        // A lookup failure here means "not in this database", which is not worth a warning:
-        // ordinary uncovered addresses take this path constantly.
-        // `decode` returns Ok(None) when the address has no record, which is the ordinary
-        // "not covered by this database" case.
+        // `decode` returns Ok(None) when the address has no record: that is the ordinary "not
+        // covered by this database" case, and it must never warn — ordinary uncovered addresses
+        // take this path constantly. `lookup` itself can also return Err (an address family the
+        // database cannot represent, a corrupt record); `.ok()?` collapses that to the same
+        // `None` rather than warning. The two cases are indistinguishable at this boundary, and
+        // no test here can reach the Err branch without a hand-crafted malformed database, so
+        // failing open without a warning is the documented behaviour rather than an oversight.
         let record: maxminddb::geoip2::Asn = reader.lookup(ip).ok()?.decode().ok()??;
         record.autonomous_system_number.map(u64::from)
     }
