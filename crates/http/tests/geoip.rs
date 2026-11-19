@@ -347,3 +347,76 @@ fn selection_exposes_counters_through_the_concrete_provider() {
     );
     assert_eq!(stats.hits + stats.misses, 2);
 }
+
+#[test]
+fn uncovered_addresses_never_warn_on_the_request_path() {
+    // The module docs previously claimed a per-request lookup error "is logged once per provider"
+    // through a warning-setter method that never existed. The truth is that lookups never emit
+    // anything: an uncovered address is the ordinary case, so warning once would a name a single
+    // unremarkable address and then stay silent. This test pins the real contract so the doc
+    // cannot drift back into promising a warning that no code produces.
+    use std::sync::Mutex;
+
+    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&seen);
+    let opened = MmdbGeoIp::open(&both_databases(), move |message: &str| {
+        recorder.lock().unwrap().push(message.to_string());
+    })
+    .expect("both fixture databases are valid");
+    let provider = opened.expect("both fixture databases are present");
+
+    // Startup must be silent: nothing is missing, so there is nothing to warn about. Any message
+    // recorded from here on would therefore belong to the lookups below.
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "opening two valid databases must not warn: {:?}",
+        seen.lock().unwrap()
+    );
+
+    // Many uncovered addresses, through both the concrete type and the trait object, because the
+    // request path holds the trait object.
+    let boxed: &dyn GeoIpProvider = &provider;
+    for _ in 0..10 {
+        for addr in [
+            "10.0.0.1",
+            "203.0.113.5",
+            "192.0.2.7",
+            "198.51.100.9",
+            "::1",
+        ] {
+            assert_eq!(provider.lookup(ip(addr)), None, "{addr} has no record");
+            assert_eq!(boxed.lookup(ip(addr)), None, "{addr} has no record");
+        }
+    }
+
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "lookups must never warn, got: {:?}",
+        seen.lock().unwrap()
+    );
+}
+
+#[test]
+fn the_counters_still_record_every_uncovered_lookup_it_did_not_warn_about() {
+    // Failing open silently must not mean failing open invisibly: the counters are how an operator
+    // learns that the database is not covering their traffic. This is the observable substitute for
+    // the warning the docs used to promise.
+    let provider = caddy_rs_http::geoip::MmdbGeoIp::open(&both_databases(), |_| {})
+        .expect("both fixture databases are valid")
+        .expect("both fixture databases are present");
+
+    let before = provider.stats();
+    assert_eq!(
+        before.lookups, 0,
+        "a fresh provider has not looked up anything"
+    );
+
+    for _ in 0..5 {
+        assert_eq!(provider.lookup(ip("203.0.113.5")), None);
+    }
+
+    let after = provider.stats();
+    assert_eq!(after.lookups, 5, "every lookup is counted");
+    assert_eq!(after.misses, 5, "uncovered addresses count as misses");
+    assert_eq!(after.hits, 0, "an uncovered address is never a hit");
+}
