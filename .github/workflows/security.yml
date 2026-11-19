@@ -35,5 +35,21 @@ jobs:
       # noise. This replaced rustsec/audit-check, which failed with
       # "Not Found ... checks/runs#update-a-check-run" after a clean audit because it tries to update
       # a check run it did not create in this run.
-      - name: RustSec advisory check
-        run: cargo audit --file Cargo.lock --deny warnings
+      #
+      # The advisory database is vendored at a pinned commit (.cargo/advisory-db, provenance in
+      # .cargo/advisory-db/SNAPSHOT) and `--no-fetch` stops cargo-audit from reaching for the
+      # network, so the verdict depends only on the committed lockfile, the committed policy and
+      # the committed database. Before T-CI-002 the job cloned RustSec at run time, which meant an
+      # upstream advisory added overnight could fail (or clear) this gate with no change here.
+      # Refreshing the database is a reviewed commit, not an ambient CI side effect.
+      - name: RustSec advisory check (vendored database, no network)
+        run: cargo audit --file Cargo.lock --deny warnings --db .cargo/advisory-db --no-fetch
+      # A snapshot that silently stopped being loaded would make the gate vacuous, so prove it was
+      # read: cargo-audit reports the advisory count from the --db path, and it must be non-zero.
+      - name: Vendored advisory database was actually loaded
+        run: |
+          set -Eeuo pipefail
+          out="$(cargo audit --file Cargo.lock --db .cargo/advisory-db --no-fetch 2>&1)"
+          echo "$out"
+          grep -q 'Loaded [1-9][0-9]* security advisories (from .*\.cargo/advisory-db)' <<<"$out" \
+            || { echo "::error::the vendored advisory database was not loaded"; exit 1; }
