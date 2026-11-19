@@ -734,6 +734,11 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             let env_file = Path::new(CADDY_RS_PM_ENV_PATH);
             let has_credentials = cli.global.bootstrap_admin_password.is_some()
                 || cli.global.bootstrap_admin_totp.is_some();
+            // Before the unit is written: a unit that names an account or a writable directory
+            // which does not exist fails to start with a generic 217/USER or 226/NAMESPACE that
+            // does not mention the missing prerequisite. Creating them here is what makes
+            // `install` + `systemctl enable --now` reach `active` on a clean host.
+            ensure_service_prerequisites(&SystemAccountCommands, &user, &group, &data_dir)?;
             let content = generate_caddy_rs_pm_unit(&PmUnitConfig {
                 binary_path: &binary,
                 user: &user,
@@ -779,6 +784,166 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             Ok(())
         }
     }
+}
+
+/// Runs the account-management commands the installer needs.
+///
+/// Abstracted so the decision logic is testable without root and without touching the real service
+/// account: a test supplies a fake and asserts on the exact argv that would have run.
+trait AccountCommands {
+    /// Whether the named system user already exists.
+    fn user_exists(&self, user: &str) -> anyhow::Result<bool>;
+    /// Whether the named group already exists.
+    fn group_exists(&self, group: &str) -> anyhow::Result<bool>;
+    /// Create a system group with no login shell and no password.
+    fn create_group(&self, group: &str) -> anyhow::Result<()>;
+    /// Create a system user with no login shell, whose home is the data directory.
+    fn create_user(&self, user: &str, group: &str, home: &Path) -> anyhow::Result<()>;
+    /// Give a path to the service account with the given mode.
+    fn set_owner_mode(&self, path: &Path, user: &str, group: &str, mode: u32)
+    -> anyhow::Result<()>;
+}
+
+/// The real implementation, shelling out to `getent`/`groupadd`/`useradd`.
+///
+/// These are the shadow-utils tools present on every systemd distribution this unit targets, and
+/// shelling out keeps the installer free of an extra crate for four commands.
+struct SystemAccountCommands;
+
+impl SystemAccountCommands {
+    fn status_is_success(program: &str, args: &[&str]) -> anyhow::Result<bool> {
+        let output = std::process::Command::new(program)
+            .args(args)
+            .output()
+            .with_context(|| format!("failed to run {program}"))?;
+        Ok(output.status.success())
+    }
+
+    fn must_succeed(program: &str, args: &[&str]) -> anyhow::Result<()> {
+        let output = std::process::Command::new(program)
+            .args(args)
+            .output()
+            .with_context(|| format!("failed to run {program}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "{} failed ({}): {}",
+                program,
+                output.status,
+                stderr.trim()
+            );
+        }
+        Ok(())
+    }
+}
+
+impl AccountCommands for SystemAccountCommands {
+    fn user_exists(&self, user: &str) -> anyhow::Result<bool> {
+        Self::status_is_success("getent", &["passwd", user])
+    }
+
+    fn group_exists(&self, group: &str) -> anyhow::Result<bool> {
+        Self::status_is_success("getent", &["group", group])
+    }
+
+    fn create_group(&self, group: &str) -> anyhow::Result<()> {
+        Self::must_succeed("groupadd", &["--system", group])
+    }
+
+    fn create_user(&self, user: &str, group: &str, home: &Path) -> anyhow::Result<()> {
+        let home = home.display().to_string();
+        Self::must_succeed(
+            "useradd",
+            &[
+                "--system",
+                "--gid",
+                group,
+                "--home-dir",
+                &home,
+                "--shell",
+                "/usr/sbin/nologin",
+                "--no-create-home",
+                user,
+            ],
+        )
+    }
+
+    fn set_owner_mode(
+        &self,
+        path: &Path,
+        user: &str,
+        group: &str,
+        mode: u32,
+    ) -> anyhow::Result<()> {
+        let path = path.display().to_string();
+        let owner = format!("{user}:{group}");
+        let permissions = format!("{mode:o}");
+        let output = std::process::Command::new("install")
+            .args(["-d", "-o", user, "-g", group, "-m"])
+            .args([&permissions, &path])
+            .output()
+            .context("failed to run install")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "install -d -o {owner} -m {permissions} {path} failed ({}): {}",
+                output.status,
+                stderr.trim()
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Create the service account and data directory a unit refers to, if they are absent.
+///
+/// A unit that names `User=`/`Group=` and `ReadWritePaths=` blocks the service from starting when
+/// those do not exist, and systemd reports it as a generic 217/USER or 226/NAMESPACE failure that
+/// says nothing about the missing prerequisite. The installer therefore creates them itself, which
+/// is what makes `install` + `systemctl enable --now` reach `active` on a clean host without the
+/// operator copying commands out of the documentation.
+///
+/// Every step is idempotent: an existing group or user is left untouched (re-install must not
+/// reset an account an operator has since customised), and the data directory is created without
+/// modifying the mode of one that already exists.
+fn ensure_service_prerequisites(
+    commands: &dyn AccountCommands,
+    user: &str,
+    group: &str,
+    data_dir: &Path,
+) -> anyhow::Result<()> {
+    if !commands.group_exists(group)? {
+        commands.create_group(group)?;
+        println!("Created system group: {group}");
+    }
+    if !commands.user_exists(user)? {
+        // `--no-create-home` plus the explicit `install -d` below keeps ownership and mode in one
+        // place: useradd's own home creation cannot express the 0750 the unit's ReadWritePaths
+        // expects, and a half-created home is worse than none.
+        commands.create_user(user, group, data_dir)?;
+        println!("Created system user: {user}");
+    }
+    let created = match std::fs::metadata(data_dir) {
+        Ok(meta) if meta.is_dir() => false,
+        Ok(_) => bail!(
+            "data directory {} exists but is not a directory",
+            data_dir.display()
+        ),
+        Err(_) => {
+            std::fs::create_dir_all(data_dir).with_context(|| {
+                format!("failed to create data directory {}", data_dir.display())
+            })?;
+            true
+        }
+    };
+    if created {
+        // Ownership and mode are set only for a directory this run created. An existing directory
+        // keeps whatever an operator chose: re-install must not silently widen a mode they
+        // tightened, and it must not fail because the account cannot chown something it owns.
+        commands.set_owner_mode(data_dir, user, group, 0o750)?;
+        println!("Created data directory: {}", data_dir.display());
+    }
+    Ok(())
 }
 
 /// Create the initial administrator from `PM_BOOTSTRAP_ADMIN_*`.
@@ -1622,6 +1787,162 @@ mod tests {
     }
 
     /// Every `Exec*=` line must carry exactly one label and be the only line for that key.
+    /// Records what the installer asked for, without touching the real system.
+    #[derive(Default)]
+    struct FakeAccounts {
+        user_exists: bool,
+        group_exists: bool,
+        calls: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl AccountCommands for FakeAccounts {
+        fn user_exists(&self, user: &str) -> anyhow::Result<bool> {
+            self.calls.borrow_mut().push(format!("user_exists {user}"));
+            Ok(self.user_exists)
+        }
+        fn group_exists(&self, group: &str) -> anyhow::Result<bool> {
+            self.calls
+                .borrow_mut()
+                .push(format!("group_exists {group}"));
+            Ok(self.group_exists)
+        }
+        fn create_group(&self, group: &str) -> anyhow::Result<()> {
+            self.calls.borrow_mut().push(format!("create_group {group}"));
+            Ok(())
+        }
+        fn create_user(&self, user: &str, group: &str, home: &Path) -> anyhow::Result<()> {
+            self.calls.borrow_mut().push(format!(
+                "create_user {user} {group} {}",
+                home.display()
+            ));
+            Ok(())
+        }
+        fn set_owner_mode(
+            &self,
+            path: &Path,
+            user: &str,
+            group: &str,
+            mode: u32,
+        ) -> anyhow::Result<()> {
+            self.calls.borrow_mut().push(format!(
+                "set_owner_mode {} {user} {group} {mode:o}",
+                path.display()
+            ));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_clean_host_gets_the_account_and_directory_the_unit_names() {
+        // The defect this covers: the unit names `User=caddy-rs`, `Group=caddy-rs` and
+        // `ReadWritePaths=/var/lib/caddy-rs`, so installing without creating them leaves a service
+        // that cannot start. Every prerequisite has to be created on a host that has none.
+        let dir = std::env::temp_dir().join(format!(
+            "pm-prereq-clean-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        let fake = FakeAccounts {
+            user_exists: false,
+            group_exists: false,
+            ..FakeAccounts::default()
+        };
+        ensure_service_prerequisites(&fake, "caddy-rs", "caddy-rs", &dir).expect("prerequisites");
+        // Assert before cleaning up: the directory's existence is part of what is checked.
+        let exists_on_disk = dir.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let calls = fake.calls.borrow();
+        assert!(
+            calls.iter().any(|c| c == "create_group caddy-rs"),
+            "the group the unit names must be created: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.starts_with("create_user caddy-rs caddy-rs")),
+            "the account the unit names must be created: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.starts_with("set_owner_mode") && c.contains("750")),
+            "the data directory must be given to the service account 0750: {calls:?}"
+        );
+        assert!(exists_on_disk, "the data directory must exist on disk");
+    }
+
+    #[test]
+    fn reinstalling_over_an_existing_account_changes_nothing() {
+        // Re-install must be idempotent: an operator may have customised the account, so an
+        // existing user and group are left alone and only the unit is rewritten.
+        let dir = std::env::temp_dir().join(format!(
+            "pm-prereq-existing-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let fake = FakeAccounts {
+            user_exists: true,
+            group_exists: true,
+            ..FakeAccounts::default()
+        };
+        ensure_service_prerequisites(&fake, "caddy-rs", "caddy-rs", &dir).expect("prerequisites");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let calls = fake.calls.borrow();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("create_group")),
+            "an existing group must not be recreated: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.starts_with("create_user")),
+            "an existing user must not be recreated: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.starts_with("set_owner_mode")),
+            "an existing directory must keep its own owner and mode: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn a_failing_account_command_names_the_command_and_its_stderr() {
+        // The real implementation runs the shadow-utils helpers. If one fails, the operator needs
+        // to know which command failed and why: a bare "install failed" leaves them guessing.
+        // `/etc` is read-only in this sandbox, so creating a user genuinely fails here, which
+        // exercises the real error path instead of a fake's.
+        let error = SystemAccountCommands
+            .create_group("caddy-rs-prereq-impossible")
+            .expect_err("creating a group on a read-only /etc must fail");
+        let text = error.to_string();
+        assert!(
+            text.contains("groupadd"),
+            "the error must name the failing command: {text}"
+        );
+    }
+
+    #[test]
+    fn a_data_directory_that_is_a_file_is_refused_by_name() {
+        // A file at the data path would leave the service unable to write its store; failing with
+        // the path named beats letting systemd report a bare 226/NAMESPACE later.
+        let path = std::env::temp_dir().join(format!(
+            "pm-prereq-file-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        std::fs::write(&path, b"not a directory").expect("file");
+        let fake = FakeAccounts {
+            user_exists: true,
+            group_exists: true,
+            ..FakeAccounts::default()
+        };
+        let error = ensure_service_prerequisites(&fake, "caddy-rs", "caddy-rs", &path)
+            .expect_err("must refuse");
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            error.to_string().contains(&path.display().to_string()),
+            "the error must name the path: {error}"
+        );
+    }
+
     #[test]
     fn every_exec_line_has_a_single_label() {
         let unit = generate_caddy_rs_pm_unit(&PmUnitConfig::default());
