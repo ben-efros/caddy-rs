@@ -4884,6 +4884,7 @@ fn matcher_from_inline_args(args: &[String], position: Position) -> caddy_rs_cor
         "vars",
         "vars_regexp",
         "file",
+        "radar",
     ];
     if args.len() == 1 && !KNOWN_MATCHERS.contains(&name.as_str()) {
         // Caddy treats a lone quoted argument that is not a known matcher name as an inline
@@ -4985,6 +4986,66 @@ fn matcher_from_directive(
             }
             object.insert("pattern".to_string(), Value::String(pattern.clone()));
             Ok(json!({"path_regexp": Value::Object(object)}))
+        }
+        // caddy-rs extension (ADR-0020, DIV-0149): the threat-intel matcher. `radar` is a matcher
+        // directive, so the Caddyfile spelling is `@attacked { radar source_asn_attacking true }`
+        // — the block of a named matcher holds matchers, and this is one of them. Its predicates
+        // are block options of *this* directive, emitted as the JSON object that
+        // RadarPredicate::from_json consumes. Registering it here makes `@radar` reachable from a
+        // Caddyfile; the server still supplies the runtime state it evaluates against.
+        "radar" => {
+            // Predicates are `name value` pairs on the directive line. A block form is accepted
+            // too, one predicate per line, because a matcher with several predicates reads badly
+            // on one line; both produce the same object.
+            let mut object = Map::new();
+            let mut pairs: Vec<(&str, &str)> = Vec::new();
+            let mut index = 0;
+            while index < args.len() {
+                let Some(key) = args.get(index) else { break };
+                let Some(value) = args.get(index + 1) else {
+                    return Err(adapter_error(
+                        position,
+                        format!("matcher `radar`: `{key}` requires a value"),
+                    ));
+                };
+                pairs.push((key.as_str(), value.as_str()));
+                index += 2;
+            }
+            for directive in block {
+                let Some((key, rest)) = directive.args.split_first() else {
+                    return Err(adapter_error(
+                        directive.position.clone(),
+                        format!("matcher `radar`: `{}` requires a value", directive.name),
+                    ));
+                };
+                if rest.len() > 1 {
+                    return Err(adapter_error(
+                        directive.position.clone(),
+                        format!("matcher `radar`: `{}` takes exactly one value", directive.name),
+                    ));
+                }
+                pairs.push((directive.name.as_str(), key.as_str()));
+            }
+            for (key, value) in pairs {
+                // Predicate values are typed by RadarPredicate::from_json, which is the single
+                // authority on which keys exist and what they accept; the adapter only has to emit
+                // a boolean as a boolean and everything else as a string. A bare `true`/`false` is
+                // the common case, and emitting it as the string "true" would be rejected
+                // downstream for a reason the operator cannot see.
+                let parsed = match value {
+                    "true" => Value::Bool(true),
+                    "false" => Value::Bool(false),
+                    other => Value::String(other.to_string()),
+                };
+                object.insert(key.to_string(), parsed);
+            }
+            if object.is_empty() {
+                return Err(adapter_error(
+                    position,
+                    "matcher `radar` requires at least one predicate",
+                ));
+            }
+            Ok(json!({"radar": Value::Object(object)}))
         }
         "query" => {
             if args.is_empty() {

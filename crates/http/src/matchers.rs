@@ -12,8 +12,59 @@ use serde_json::Value;
 use crate::regex_lite::Regex;
 use crate::types::{Error, Matcher, MatcherError, Request, Result, SharedMatcher};
 
-/// Build a matcher set from one JSON object.
+/// Runtime handles a matcher may need at construction time.
+///
+/// Most matchers are pure configuration, which is why [`build_matcher_set`] has no such argument.
+/// `radar` is the exception: it evaluates against a snapshot the server publishes into a
+/// [`RadarState`] and resolves ASN/country through the configured [`GeoIpProvider`], so both are
+/// supplied here. Omitting them (see [`build_matcher_set`]) leaves a `radar` matcher
+/// unconstructible, which is deliberate: a `radar` matcher with no state would silently never
+/// match, and a configuration that cannot work should fail loudly instead.
+#[derive(Clone)]
+pub struct MatcherDeps {
+    /// The generation's radar snapshot state.
+    pub radar: Option<Arc<crate::radar_matcher::RadarState>>,
+    /// The provider used to resolve ASN and country for radar predicates.
+    pub geoip: Option<Arc<dyn crate::radar_matcher::GeoIpProvider>>,
+    /// The CDN-trust resolver used to recover a client IP behind a proxy.
+    pub trust_cdn: Option<Arc<dyn crate::radar_matcher::TrustCdnResolver>>,
+}
+
+impl Default for MatcherDeps {
+    fn default() -> Self {
+        Self {
+            radar: None,
+            geoip: None,
+            trust_cdn: None,
+        }
+    }
+}
+
+impl MatcherDeps {
+    /// Dependencies that make `radar` constructible.
+    pub fn radar(
+        state: Arc<crate::radar_matcher::RadarState>,
+        geoip: Arc<dyn crate::radar_matcher::GeoIpProvider>,
+        trust_cdn: Arc<dyn crate::radar_matcher::TrustCdnResolver>,
+    ) -> Self {
+        Self {
+            radar: Some(state),
+            geoip: Some(geoip),
+            trust_cdn: Some(trust_cdn),
+        }
+    }
+}
+
+/// Build a matcher set from one JSON object, with no runtime dependencies.
+///
+/// Equivalent to [`build_matcher_set_with`] and an empty [`MatcherDeps`]. Matcher sets that
+/// contain `radar` need the server's runtime handles; see [`build_matcher_set_with`].
 pub fn build_matcher_set(value: &Value) -> Result<Vec<SharedMatcher>> {
+    build_matcher_set_with(value, &MatcherDeps::default())
+}
+
+/// Build a matcher set from one JSON object, resolving runtime-backed matchers from `deps`.
+pub fn build_matcher_set_with(value: &Value, deps: &MatcherDeps) -> Result<Vec<SharedMatcher>> {
     let object = value.as_object().ok_or_else(|| Error::InvalidConfig {
         path: "match".to_string(),
         message: "matcher set must be a JSON object".to_string(),
@@ -27,7 +78,7 @@ pub fn build_matcher_set(value: &Value) -> Result<Vec<SharedMatcher>> {
             })?;
             let mut inner = Vec::new();
             for (index, set) in sets.iter().enumerate() {
-                for matcher in build_matcher_set(set).map_err(|error| {
+                for matcher in build_matcher_set_with(set, deps).map_err(|error| {
                     if let Error::InvalidConfig { path, message } = error {
                         Error::InvalidConfig {
                             path: format!("match.not[{index}].{path}"),
@@ -43,7 +94,7 @@ pub fn build_matcher_set(value: &Value) -> Result<Vec<SharedMatcher>> {
             matchers.push(Arc::new(NotMatcher { inner }));
             continue;
         }
-        let matcher = build_single_matcher(key, value)?;
+        let matcher = build_single_matcher(key, value, deps)?;
         matchers.push(matcher);
     }
     Ok(matchers)
@@ -71,7 +122,7 @@ fn strings(value: &Value, path: &str) -> Result<Vec<String>> {
     }
 }
 
-fn build_single_matcher(name: &str, value: &Value) -> Result<SharedMatcher> {
+fn build_single_matcher(name: &str, value: &Value, deps: &MatcherDeps) -> Result<SharedMatcher> {
     let path = format!("match.{name}");
     match name {
         "host" => Ok(Arc::new(HostMatcher {
@@ -118,6 +169,38 @@ fn build_single_matcher(name: &str, value: &Value) -> Result<SharedMatcher> {
         "protocol" => Ok(Arc::new(ProtocolMatcher::from_json(value, &path)?)),
         "tls" => Ok(Arc::new(TlsMatcher::from_json(value, &path)?)),
         "expression" => Ok(Arc::new(ExpressionMatcher::from_json(value, &path)?)),
+        // `radar` is the one matcher that cannot be built from configuration alone: it needs the
+        // snapshot state the server publishes and the configured GeoIP provider. Both arrive
+        // through `MatcherDeps`; without them the matcher would silently never match, so this
+        // fails loudly instead of building a matcher that cannot work.
+        "radar" => {
+            let (Some(state), Some(geoip), Some(trust_cdn)) =
+                (&deps.radar, &deps.geoip, &deps.trust_cdn)
+            else {
+                return Err(Error::InvalidConfig {
+                    path,
+                    message: "matcher `radar` requires the server runtime (radar state, a geoip \
+                              provider and a trusted-CDN resolver); it cannot be built from a \
+                              bare configuration"
+                        .to_string(),
+                });
+            };
+            // `RadarPredicate::from_json` reports a bad predicate as a `MatcherError`, which
+            // carries an HTTP status for match-time failures. At build time this is a
+            // configuration mistake, so it is re-reported as `InvalidConfig` to keep the located
+            // `match.radar.*` path that every other matcher produces.
+            let matcher = crate::radar_matcher::RadarMatcher::from_json(
+                value,
+                Arc::clone(state),
+                Arc::clone(geoip),
+                Arc::clone(trust_cdn),
+            )
+            .map_err(|error| Error::InvalidConfig {
+                path: "match.radar".to_string(),
+                message: error.message,
+            })?;
+            Ok(Arc::new(matcher))
+        }
         other => Err(Error::InvalidConfig {
             path,
             message: format!("matcher `{other}` is not implemented by the HTTP engine"),
@@ -3055,7 +3138,7 @@ mod matcher_network_tls_tests {
     }
 
     fn build(name: &str, value: serde_json::Value) -> Result<TestMatcher> {
-        build_single_matcher(name, &value).map(TestMatcher)
+        build_single_matcher(name, &value, &MatcherDeps::default()).map(TestMatcher)
     }
 
     #[test]

@@ -21,7 +21,7 @@ use crate::handlers::{
     ErrorHandler, HeadersHandler, MapHandler, RequestBodyHandler, RewriteHandler,
     StaticResponseHandler, SubrouteHandler, VarsHandler,
 };
-use crate::matchers::build_matcher_set;
+use crate::matchers::{build_matcher_set_with, MatcherDeps};
 use crate::rate_limit::RateLimitHandler;
 use crate::security_headers::{SecurityHeaders, SecurityHeadersConfig, SecurityHeadersMode};
 #[cfg(feature = "templates")]
@@ -575,6 +575,9 @@ pub struct RouterBuilder {
     /// provisioned `local` authority. `None` means the caller did not supply the PKI app, so
     /// the lookup is not enforced (unit tests and embedders); the server always supplies it.
     acme_server_authorities: Option<std::collections::BTreeMap<String, AcmeServerAuthority>>,
+    /// Runtime handles for matchers that cannot be built from configuration alone (`radar`).
+    /// Empty means such a matcher is a configuration error rather than a silently dead match.
+    matcher_deps: crate::matchers::MatcherDeps,
 }
 
 impl Default for RouterBuilder {
@@ -592,6 +595,7 @@ impl RouterBuilder {
             stock_compat: false,
             acme_server_data_root: None,
             acme_server_authorities: None,
+            matcher_deps: crate::matchers::MatcherDeps::default(),
         }
     }
 
@@ -636,6 +640,17 @@ impl RouterBuilder {
     /// decides whether to apply the implicit security profile.
     pub fn with_stock_compat(mut self, stock_compat: bool) -> Self {
         self.stock_compat = stock_compat;
+        self
+    }
+
+    /// Supply the runtime handles the `radar` matcher needs (DIV-0149).
+    ///
+    /// `radar` is the only matcher that cannot be built from configuration: it evaluates against
+    /// the snapshot the server publishes and resolves ASN/country through the configured GeoIP
+    /// provider. The server passes both here; a router built without them rejects a `radar`
+    /// matcher with a located error rather than installing one that can never match.
+    pub fn with_matcher_deps(mut self, deps: MatcherDeps) -> Self {
+        self.matcher_deps = deps;
         self
     }
 
@@ -727,16 +742,18 @@ impl RouterBuilder {
                 message: "`match` must be an array of matcher sets".to_string(),
             })?;
             for (index, set) in matchers.iter().enumerate() {
-                matcher_sets.push(build_matcher_set(set).map_err(|error| match error {
-                    Error::InvalidConfig {
-                        path: inner_path,
-                        message,
-                    } => Error::InvalidConfig {
-                        path: format!("{path}.match[{index}].{inner_path}"),
-                        message,
+                matcher_sets.push(build_matcher_set_with(set, &self.matcher_deps).map_err(
+                    |error| match error {
+                        Error::InvalidConfig {
+                            path: inner_path,
+                            message,
+                        } => Error::InvalidConfig {
+                            path: format!("{path}.match[{index}].{inner_path}"),
+                            message,
+                        },
+                        other => other,
                     },
-                    other => other,
-                })?);
+                )?);
             }
         }
         let handler_values = object
