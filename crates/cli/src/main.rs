@@ -205,6 +205,18 @@ enum Command {
         /// Print the plan and the FD names it would create, then exit without binding or uploading.
         #[arg(long)]
         dry_run: bool,
+        /// The configuration the service last ran with, used to find listeners that were removed.
+        ///
+        /// systemd offers no interface for enumerating the fd store, so a listener dropped from the
+        /// configuration cannot be discovered by asking the store. Passing the previous
+        /// configuration lets `bind-fds` remove the descriptors it no longer owns, which is what
+        /// makes a removed site actually stop listening and free its port (ADR-0047 §5).
+        ///
+        /// Without it, stale descriptors are left in place and the ports they hold stay bound. That
+        /// is a documented limitation, not a silent success: the run reports how many stale names
+        /// it removed, so a zero there on a configuration that lost a listener is visible.
+        #[arg(long = "previous-config", value_name = "PATH")]
+        previous_config: Option<PathBuf>,
         /// Environment file(s) in KEY=VALUE form, loaded before adaptation.
         #[arg(long = "envfile", value_name = "PATH")]
         envfile: Vec<PathBuf>,
@@ -992,6 +1004,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
             adapter,
             adapt_mode,
             dry_run,
+            previous_config,
             envfile,
         } => {
             load_env_files(&envfile)?;
@@ -1016,17 +1029,59 @@ async fn run(command: Command) -> anyhow::Result<()> {
             // helper never claims to pre-bind a socket whose activation prerequisite is missing.
             #[cfg(unix)]
             {
-                let uploaded = bind_fds::bind_and_upload(&planned, &mut |fd, name| {
-                    caddy_rs_server::fdstore::send_fd_to_store(fd as i32, name)
-                })
+                let report = bind_fds::bind_and_upload(
+                    &planned,
+                    &mut |fd, name| caddy_rs_server::fdstore::send_fd_to_store(fd as i32, name),
+                    &mut |name| caddy_rs_server::fdstore::remove_fd_from_store(name),
+                )
                 .map_err(|error| {
                     anyhow::anyhow!("cannot bind and upload fd-store listeners: {error}")
                 })?;
                 print!("{}", bind_fds::render_plan(&planned, false));
                 println!(
-                    "bound {uploaded} listener(s) and uploaded {uploaded} descriptor(s) to the fd \
-                     store; `run` adopts them by FD name"
+                    "bound {} listener(s) and uploaded {} descriptor(s) to the fd store \
+                     ({} already-stored name(s) were removed and re-uploaded, so exactly one \
+                     descriptor per listener is now stored); `run` adopts them by FD name",
+                    report.stored(),
+                    report.stored(),
+                    report.replaced
                 );
+                // Remove descriptors for listeners that are no longer configured (ADR-0047 §5).
+                // The store cannot be enumerated, so the previous plan has to be supplied; without
+                // it a dropped listener would keep its descriptor and therefore its port.
+                let stale = match &previous_config {
+                    Some(path) => {
+                        let previous_loaded = load_validated(path, adapter.as_deref(), options)?;
+                        let previous =
+                            bind_fds::plan_bind_fds(&previous_loaded.model).map_err(|error| {
+                                anyhow::anyhow!(
+                                    "cannot plan the previous configuration's fd-store listeners: \
+                                     {error}"
+                                )
+                            })?;
+                        bind_fds::stale_names(&previous, &planned)
+                    }
+                    None => Vec::new(),
+                };
+                let removed = bind_fds::remove_stale(&stale, &mut |name| {
+                    caddy_rs_server::fdstore::remove_fd_from_store(name)
+                })
+                .map_err(|error| {
+                    anyhow::anyhow!("cannot remove stale fd-store listeners: {error}")
+                })?;
+                if removed > 0 {
+                    println!(
+                        "removed {removed} stale descriptor(s) for listeners no longer in the \
+                         configuration: {}",
+                        stale.join(", ")
+                    );
+                } else if previous_config.is_none() {
+                    println!(
+                        "no --previous-config was given, so listeners removed since the last run \
+                         keep their descriptors and ports; pass the previous configuration to \
+                         release them (see docs/INSTALL.md)"
+                    );
+                }
                 // Exiting here is correct: `FDSTORE=1` makes systemd take its own reference to each
                 // descriptor at sendmsg time, so the store keeps the sockets alive after this
                 // process is gone. This is the point of pre-binding.

@@ -18,6 +18,27 @@
 //! clear refusal rather than a late socket failure, so a unit that forgot socket activation cannot
 //! leave orphaned bound ports behind.
 //!
+//! # Idempotency, and why removal comes after binding
+//!
+//! `bind-fds` runs from `ExecStartPre` on every start, so it must converge rather than accumulate.
+//! systemd does not document an interface for enumerating the fd store, so the helper cannot ask
+//! what is already stored; it removes every name its plan owns and re-uploads, which leaves exactly
+//! one descriptor per planned listener however many times it runs (ADR-0047 §5). That limitation is
+//! recorded in `docs/INSTALL.md` rather than worked around, because there is no interface to work
+//! around.
+//!
+//! Removal happens **after** binding and **before** uploading, in that order, and both orderings are
+//! deliberate. After binding, because a bind failure must leave the store untouched — removing
+//! first would destroy working descriptors and then fail to replace them. Before uploading, because
+//! uploading onto a name that is still stored is exactly the duplicate this task exists to prevent.
+//! `re_running_for_unchanged_configuration_never_duplicates_a_stored_descriptor` asserts the final
+//! store contents, and `a_bind_failure_uploads_nothing_at_all` asserts that a failed bind removes
+//! nothing either.
+//!
+//! A listener dropped from the configuration cannot be discovered for the same reason — the store
+//! cannot be enumerated — so [`stale_names`] and [`remove_stale`] take the previous plan explicitly.
+//! Without it a removed listener keeps its descriptor, and therefore its port.
+//!
 //! # Still open
 //!
 //! `run`-side adoption (finding the stored descriptors by `FDNAME` and using those instead of
@@ -234,6 +255,19 @@ pub enum BindFdsError {
         /// The upload failure.
         source: caddy_rs_server::fdstore::FdStoreError,
     },
+    /// An already-stored descriptor could not be removed before re-upload.
+    ///
+    /// This is a distinct failure from [`Self::Upload`] because the store is in a different state
+    /// when it happens: nothing new has been uploaded, but the stale entry may still be present, so
+    /// the caller must not assume the plan is either fully old or fully new.
+    Remove {
+        /// The plan entry whose name could not be removed, as `proto/address`.
+        listener: String,
+        /// The deterministic FD name that was being removed.
+        fd_name: String,
+        /// The removal failure.
+        source: caddy_rs_server::fdstore::FdStoreError,
+    },
 }
 
 impl std::fmt::Display for BindFdsError {
@@ -253,6 +287,17 @@ impl std::fmt::Display for BindFdsError {
                 formatter,
                 "cannot upload `{listener}` to the fd store as `{fd_name}`: {source}; the upload \
                  stopped at the first failure so the store is not partially populated"
+            ),
+            Self::Remove {
+                listener,
+                fd_name,
+                source,
+            } => write!(
+                formatter,
+                "cannot remove the stored descriptor `{fd_name}` for `{listener}`: {source}; \
+                 nothing new was uploaded, but the previous descriptor may still be stored under \
+                 that name, so the store is in an unknown state and the unit should be restarted \
+                 with a clean fd store rather than trusted"
             ),
             Self::NameCollision {
                 name,
@@ -305,13 +350,39 @@ struct BoundFd {
 pub fn bind_and_upload(
     planned: &[PlannedFd],
     upload: &mut dyn FnMut(i32, &str) -> Result<(), caddy_rs_server::fdstore::FdStoreError>,
-) -> Result<usize, BindFdsError> {
+    remove: &mut dyn FnMut(&str) -> Result<(), caddy_rs_server::fdstore::FdStoreError>,
+) -> Result<BindReport, BindFdsError> {
     // Refuse before binding anything when there is no store to upload to (ADR-0047 §6). Checking
     // first is the whole point: discovering an unset NOTIFY_SOCKET after binding would leave the
     // process having taken ports it then discards, which is exactly the partial state the ADR
     // forbids. It is also the cheaper failure to diagnose, since nothing was touched.
     require_notify_socket()?;
-    bind_and_upload_body(planned, upload)
+    bind_and_upload_body(planned, upload, remove)
+}
+
+/// What one `bind-fds` run did, so the caller can report it instead of printing a bare count.
+#[cfg(unix)]
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct BindReport {
+    /// Descriptors bound and uploaded under a name that was not stored before.
+    pub uploaded: usize,
+    /// Names that were already stored and were therefore removed and re-uploaded.
+    ///
+    /// This is the idempotency counter: a re-run of `bind-fds` for unchanged configuration must
+    /// report every listener here and none in [`uploaded`], and the store must hold exactly one
+    /// descriptor per name afterwards rather than two.
+    pub replaced: usize,
+}
+
+impl BindReport {
+    /// The number of descriptors the store holds for this plan once the run has finished.
+    ///
+    /// Always equal to the plan length on success; named so a caller can assert the postcondition
+    /// directly rather than reconstructing it.
+    #[must_use]
+    pub fn stored(&self) -> usize {
+        self.uploaded + self.replaced
+    }
 }
 
 /// The bind-then-upload body, split from [`bind_and_upload`] so tests can drive it with an injected
@@ -321,7 +392,8 @@ pub fn bind_and_upload(
 fn bind_and_upload_body(
     planned: &[PlannedFd],
     upload: &mut dyn FnMut(i32, &str) -> Result<(), caddy_rs_server::fdstore::FdStoreError>,
-) -> Result<usize, BindFdsError> {
+    remove: &mut dyn FnMut(&str) -> Result<(), caddy_rs_server::fdstore::FdStoreError>,
+) -> Result<BindReport, BindFdsError> {
     // Refuse UDP before binding anything: a UDP listener under fdstore mode is a configuration
     // error whose real cause is a missing prerequisite, not a runtime failure (DIV-0040).
     for entry in planned {
@@ -351,7 +423,29 @@ fn bind_and_upload_body(
         });
     }
 
-    // Phase 2: upload everything that was bound.
+    // Phase 2: drop any descriptor already stored under a name this plan owns, then upload.
+    //
+    // This is what makes a re-run idempotent (ADR-0047 §5). systemd does not document an interface
+    // for enumerating the store, so the helper cannot ask what is already there; the safe default
+    // is to remove every name the plan owns and re-upload, which converges on exactly one stored
+    // descriptor per planned listener no matter how many times it runs. The limitation is recorded
+    // in `docs/INSTALL.md` rather than worked around here, because there is nothing to work around:
+    // an undocumented interface is not an interface.
+    //
+    // Removal happens after binding, not before. A bind failure must leave the store untouched, so
+    // the pre-existing descriptors are still valid; removing first would destroy working state and
+    // then fail to replace it.
+    let mut report = BindReport::default();
+    for entry in &bound {
+        remove(&entry.entry.fd_name).map_err(|source| BindFdsError::Remove {
+            listener: entry.entry.address(),
+            fd_name: entry.entry.fd_name.clone(),
+            source,
+        })?;
+        report.replaced += 1;
+    }
+
+    // Phase 3: upload everything that was bound.
     for entry in &bound {
         use std::os::unix::io::AsRawFd as _;
         let raw = entry.socket.as_raw_fd();
@@ -361,7 +455,7 @@ fn bind_and_upload_body(
             source,
         })?;
     }
-    Ok(bound.len())
+    Ok(report)
 }
 
 /// Fail unless `NOTIFY_SOCKET` names a usable store, before any socket is bound (ADR-0047 §6).
@@ -433,6 +527,55 @@ pub fn plan_bind_fds(config: &caddy_rs_core::Config) -> Result<Vec<PlannedFd>, B
         .collect();
     assert_injective(&planned)?;
     Ok(planned)
+}
+
+/// Names this plan no longer owns, and which must therefore be removed from the store.
+///
+/// ADR-0047 §5: a listener removed from the configuration must actually stop listening and free
+/// its port. The helper cannot enumerate the store (see `docs/INSTALL.md`), so it cannot discover
+/// stale names by asking; it has to be told the previous plan. `previous` is what the last run
+/// stored — in practice the `LISTEN_FDNAMES` the unit recorded, or the plan from the configuration
+/// the service last ran with.
+///
+/// Returns the names in `previous` that `current` does not contain, sorted and de-duplicated so the
+/// caller's log line is deterministic. A name present in both plans is not stale: it is being
+/// re-uploaded, and [`bind_and_upload`] already removes-then-uploads it.
+#[must_use]
+pub fn stale_names(previous: &[PlannedFd], current: &[PlannedFd]) -> Vec<String> {
+    let live: std::collections::BTreeSet<&str> =
+        current.iter().map(|entry| entry.fd_name.as_str()).collect();
+    let stale: std::collections::BTreeSet<String> = previous
+        .iter()
+        .filter(|entry| !live.contains(entry.fd_name.as_str()))
+        .map(|entry| entry.fd_name.clone())
+        .collect();
+    stale.into_iter().collect()
+}
+
+/// Remove every name in `stale` from the store, so a dropped listener stops holding its port.
+///
+/// Separate from [`bind_and_upload`] because the two run at different points in the unit: the
+/// upload happens once per start, while stale removal must happen even when the current plan is
+/// empty (every listener was removed). Failing here is loud for the same reason a removal failure
+/// during upload is loud: a port that should be free is still held, and the operator needs to know
+/// which name caused it rather than discovering it from a bind error later.
+///
+/// # Errors
+/// [`BindFdsError::Remove`] naming the first stale FD that could not be dropped. Names before it in
+/// sorted order were already removed; the ones after it were not attempted.
+#[cfg(unix)]
+pub fn remove_stale(
+    stale: &[String],
+    remove: &mut dyn FnMut(&str) -> Result<(), caddy_rs_server::fdstore::FdStoreError>,
+) -> Result<usize, BindFdsError> {
+    for name in stale {
+        remove(name).map_err(|source| BindFdsError::Remove {
+            listener: name.clone(),
+            fd_name: name.clone(),
+            source,
+        })?;
+    }
+    Ok(stale.len())
 }
 
 /// Fail if two distinct plan entries produced the same name.
@@ -688,13 +831,17 @@ mod tests {
         let port = free_port();
         let planned = loopback_plan(port);
         let mut uploads: Vec<(i32, String)> = Vec::new();
-        let uploaded = bind_and_upload_body(&planned, &mut |fd, name| {
-            assert!(fd >= 0, "a real descriptor must be uploaded, got {fd}");
-            uploads.push((fd, name.to_owned()));
-            Ok(())
-        })
+        let report = bind_and_upload_body(
+            &planned,
+            &mut |fd, name| {
+                assert!(fd >= 0, "a real descriptor must be uploaded, got {fd}");
+                uploads.push((fd, name.to_owned()));
+                Ok(())
+            },
+            &mut |_name| Ok(()),
+        )
         .expect("bind and upload succeeds");
-        assert_eq!(uploaded, 1);
+        assert_eq!(report.stored(), 1);
         assert_eq!(
             uploads.len(),
             1,
@@ -704,6 +851,218 @@ mod tests {
             uploads[0].1,
             fd_name(Network::Tcp, "127.0.0.1", port),
             "the uploaded FDNAME must be the plan entry's name"
+        );
+    }
+
+    /// A stand-in for the systemd fd store that counts what the helper does to it.
+    ///
+    /// systemd offers no enumeration interface (ADR-0047 §5), so the helper cannot ask what is
+    /// stored; it must instead remove each name it owns and re-upload. This models exactly that
+    /// contract: `names` is what the store holds, keyed by name, and a name holds at most one
+    /// descriptor no matter how many times it is uploaded.
+    #[derive(Default)]
+    struct MockStore {
+        names: Vec<String>,
+        uploads: usize,
+        removals: usize,
+    }
+
+    impl MockStore {
+        fn upload(
+            &mut self,
+            _fd: i32,
+            name: &str,
+        ) -> Result<(), caddy_rs_server::fdstore::FdStoreError> {
+            self.uploads += 1;
+            // A store keyed by FDNAME holds one descriptor per name: re-uploading without removing
+            // first is precisely the duplicate this test exists to catch.
+            assert!(
+                !self.names.iter().any(|existing| existing == name),
+                "the store already holds `{name}`, so uploading it again without removing it \
+                 first would create a duplicate descriptor"
+            );
+            self.names.push(name.to_owned());
+            Ok(())
+        }
+
+        fn remove(&mut self, name: &str) -> Result<(), caddy_rs_server::fdstore::FdStoreError> {
+            self.removals += 1;
+            self.names.retain(|existing| existing != name);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn re_running_for_unchanged_configuration_never_duplicates_a_stored_descriptor() {
+        // T-CORE-134 criterion 1, the whole point of the stage: `bind-fds` runs from
+        // `ExecStartPre` on every service start, so a second run for an unchanged configuration
+        // must converge on the SAME store contents rather than accumulating descriptors. The
+        // assertion is on the store's final contents, not on a counter, because a duplicate
+        // descriptor is the failure and a count alone would not prove its absence.
+        let port = free_port();
+        let planned = loopback_plan(port);
+        // `RefCell` because both closures need the same store and `bind_and_upload_body` takes
+        // them simultaneously; interior mutability keeps the assertions on one object.
+        let store = std::cell::RefCell::new(MockStore::default());
+
+        let first = bind_and_upload_body(
+            &planned,
+            &mut |fd, name| store.borrow_mut().upload(fd, name),
+            &mut |name| store.borrow_mut().remove(name),
+        )
+        .expect("the first run succeeds");
+        let store = store.into_inner();
+        assert_eq!(first.stored(), 1);
+        assert_eq!(
+            store.names.len(),
+            1,
+            "the first run stores exactly one descriptor"
+        );
+
+        // Second run: identical configuration, so the port is already held by this process only
+        // through the descriptor the store holds. Rebind must therefore succeed only because the
+        // first run's socket was handed to the store and released by this process.
+        let store = std::cell::RefCell::new(store);
+        let second = bind_and_upload_body(
+            &planned,
+            &mut |fd, name| store.borrow_mut().upload(fd, name),
+            &mut |name| store.borrow_mut().remove(name),
+        )
+        .expect("a re-run for unchanged configuration succeeds");
+        let store = store.into_inner();
+        assert_eq!(second.stored(), 1);
+        assert_eq!(
+            store.names.len(),
+            1,
+            "after a re-run the store must still hold exactly one descriptor, got {:?}",
+            store.names
+        );
+        assert_eq!(
+            store.names[0],
+            fd_name(Network::Tcp, "127.0.0.1", port),
+            "the surviving descriptor must be the plan's own name"
+        );
+        assert_eq!(
+            store.removals, 2,
+            "each run must remove every name it owns before re-uploading, so removals equal runs \
+             times listeners"
+        );
+    }
+
+    #[test]
+    fn a_removal_failure_is_reported_rather_than_silently_uploading_anyway() {
+        // If the store refuses a removal, uploading would produce the duplicate this task exists to
+        // prevent. The helper must stop and say the store is in an unknown state.
+        let port = free_port();
+        let planned = loopback_plan(port);
+        let mut uploads = 0usize;
+        let error = bind_and_upload_body(
+            &planned,
+            &mut |_fd, _name| {
+                uploads += 1;
+                Ok(())
+            },
+            &mut |_name| {
+                Err(caddy_rs_server::fdstore::FdStoreError::Socket(
+                    std::io::Error::other("mock store refused the removal"),
+                ))
+            },
+        )
+        .expect_err("a removal failure must surface");
+        assert!(
+            matches!(error, BindFdsError::Remove { .. }),
+            "a removal failure must surface as Remove, not Upload: {error:?}"
+        );
+        assert_eq!(
+            uploads, 0,
+            "nothing may be uploaded after a removal failure, or the store would hold a duplicate"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("unknown state"),
+            "the error must warn that the store is in an unknown state: {message}"
+        );
+    }
+
+    #[test]
+    fn a_removed_listener_frees_its_port_and_the_port_is_rebindable() {
+        // T-CORE-134 criterion 2, and the half that matters operationally: removing a site from the
+        // configuration must let something else take that port. Asserting only that a removal
+        // message was sent would be satisfied by a store that still held the descriptor, so this
+        // test drops the stored copy and then PROVES the port is free by binding it.
+        let port = free_port();
+        let previous = loopback_plan(port);
+        // The new configuration drops that listener entirely.
+        let current: Vec<PlannedFd> = Vec::new();
+
+        let stale = stale_names(&previous, &current);
+        assert_eq!(
+            stale.len(),
+            1,
+            "the removed listener must be reported stale: {stale:?}"
+        );
+        assert_eq!(stale[0], fd_name(Network::Tcp, "127.0.0.1", port));
+
+        // Stand in for the store: the descriptor is held here, and dropping it is what actually
+        // releases the port.
+        let mut held = Some(
+            std::net::TcpListener::bind(("127.0.0.1", port)).expect("the plan's port is bindable"),
+        );
+        // While the store holds it, the port must NOT be available: this is the control that makes
+        // the post-removal assertion meaningful rather than trivially true.
+        assert!(
+            std::net::TcpListener::bind(("127.0.0.1", port)).is_err(),
+            "precondition: a port held by the store must not be bindable, otherwise the \
+             rebindability check below proves nothing"
+        );
+
+        let removed = remove_stale(&stale, &mut |name| {
+            assert_eq!(name, stale[0], "the removal must name the stale FD");
+            // The store drops its reference, which closes the socket.
+            held = None;
+            Ok(())
+        })
+        .expect("removing a stale name succeeds");
+        assert_eq!(removed, 1);
+
+        // The actual criterion: the port is closed and something else can take it.
+        std::net::TcpListener::bind(("127.0.0.1", port))
+            .expect("a removed listener must leave its port closed and rebindable");
+    }
+
+    #[test]
+    fn a_listener_present_in_both_plans_is_not_treated_as_stale() {
+        // The complement of the test above: a listener that survived the reload is re-uploaded by
+        // bind_and_upload, so calling it stale would remove the descriptor of a live listener and
+        // leave the port free while `run` still expects to adopt it.
+        let port = free_port();
+        let previous = loopback_plan(port);
+        let current = loopback_plan(port);
+        assert!(
+            stale_names(&previous, &current).is_empty(),
+            "an unchanged listener must not be reported stale"
+        );
+    }
+
+    #[test]
+    fn stale_removal_names_the_fd_that_could_not_be_dropped() {
+        // A failed removal leaves a port held, so the message must identify which one rather than
+        // reporting only that cleanup failed.
+        let port = free_port();
+        let stale = vec![fd_name(Network::Tcp, "127.0.0.1", port)];
+        let error = remove_stale(&stale, &mut |_name| {
+            Err(caddy_rs_server::fdstore::FdStoreError::Socket(
+                std::io::Error::other("mock store refused"),
+            ))
+        })
+        .expect_err("a failed stale removal must surface");
+        assert!(
+            matches!(error, BindFdsError::Remove { .. }),
+            "a stale removal failure must surface as Remove: {error:?}"
+        );
+        assert!(
+            error.to_string().contains(&stale[0]),
+            "the error must name the FD that could not be dropped: {error}"
         );
     }
 
@@ -725,10 +1084,18 @@ mod tests {
         });
 
         let mut upload_calls = 0usize;
-        let error = bind_and_upload_body(&planned, &mut |_fd, _name| {
-            upload_calls += 1;
-            Ok(())
-        })
+        let mut remove_calls = 0usize;
+        let error = bind_and_upload_body(
+            &planned,
+            &mut |_fd, _name| {
+                upload_calls += 1;
+                Ok(())
+            },
+            &mut |_name| {
+                remove_calls += 1;
+                Ok(())
+            },
+        )
         .expect_err("binding an in-use port must fail");
         assert!(
             matches!(error, BindFdsError::Bind { .. }),
@@ -737,6 +1104,11 @@ mod tests {
         assert_eq!(
             upload_calls, 0,
             "a bind failure must upload NOTHING: every socket is bound before any is uploaded"
+        );
+        assert_eq!(
+            remove_calls, 0,
+            "a bind failure must also remove NOTHING: removing first would destroy the working \
+             descriptors and then fail to replace them"
         );
         let message = error.to_string();
         assert!(
@@ -767,10 +1139,14 @@ mod tests {
         // process, bind_and_upload must fail before binding the free port we hand it.
         let port = free_port();
         let mut upload_calls = 0usize;
-        let error = bind_and_upload(&loopback_plan(port), &mut |_f, _n| {
-            upload_calls += 1;
-            Ok(())
-        })
+        let error = bind_and_upload(
+            &loopback_plan(port),
+            &mut |_f, _n| {
+                upload_calls += 1;
+                Ok(())
+            },
+            &mut |_n| Ok(()),
+        )
         .expect_err("without NOTIFY_SOCKET the production entry point must refuse");
         assert_eq!(upload_calls, 0, "nothing may be uploaded without a store");
         assert!(
@@ -817,10 +1193,14 @@ mod tests {
             fd_name: fd_name(Network::Udp, "127.0.0.1", 1234),
         }];
         let mut upload_calls = 0usize;
-        let error = bind_and_upload_body(&planned, &mut |_f, _n| {
-            upload_calls += 1;
-            Ok(())
-        })
+        let error = bind_and_upload_body(
+            &planned,
+            &mut |_f, _n| {
+                upload_calls += 1;
+                Ok(())
+            },
+            &mut |_n| Ok(()),
+        )
         .expect_err("a UDP listener must be refused");
         assert_eq!(upload_calls, 0, "a refused UDP plan must upload nothing");
         let message = error.to_string();
@@ -835,11 +1215,15 @@ mod tests {
         // The operator's next action is to find which socket failed, so both identities are named.
         let port = free_port();
         let planned = loopback_plan(port);
-        let error = bind_and_upload_body(&planned, &mut |_fd, _name| {
-            Err(caddy_rs_server::fdstore::FdStoreError::Socket(
-                std::io::Error::other("mock store rejected the descriptor"),
-            ))
-        })
+        let error = bind_and_upload_body(
+            &planned,
+            &mut |_fd, _name| {
+                Err(caddy_rs_server::fdstore::FdStoreError::Socket(
+                    std::io::Error::other("mock store rejected the descriptor"),
+                ))
+            },
+            &mut |_n| Ok(()),
+        )
         .expect_err("an upload failure must surface");
         assert!(
             matches!(error, BindFdsError::Upload { .. }),

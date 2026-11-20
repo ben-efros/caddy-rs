@@ -6367,6 +6367,52 @@ fn bind_fds_refuses_a_udp_listener_naming_the_missing_prerequisite() {
     );
 }
 
+/// Read exactly one datagram from the mock fd store, returning its payload and any descriptors.
+///
+/// The helper now sends two messages per listener (remove, then upload), so a test that read one
+/// datagram would assert against whichever arrived first rather than against the sequence.
+fn receive_one_datagram(store: &std::os::unix::net::UnixDatagram) -> (Vec<u8>, Vec<i32>) {
+    let mut buffer = [0u8; 128];
+    let mut cmsg = vec![0u8; 128];
+    let mut iov = libc::iovec {
+        iov_base: buffer.as_mut_ptr().cast(),
+        iov_len: buffer.len(),
+    };
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg.as_mut_ptr().cast();
+    msg.msg_controllen = cmsg.len();
+    let received = {
+        use std::os::unix::io::AsRawFd;
+        unsafe { libc::recvmsg(store.as_raw_fd(), &mut msg, 0) }
+    };
+    assert!(received > 0, "the store must receive a message");
+    assert_eq!(
+        msg.msg_flags & libc::MSG_CTRUNC,
+        0,
+        "the control message was truncated, so a descriptor may have been dropped"
+    );
+    let payload = buffer[..received as usize].to_vec();
+    let mut descriptors = Vec::new();
+    // SAFETY: `msg` was filled by a successful `recvmsg` and `cmsg` is still live.
+    unsafe {
+        let mut header = libc::CMSG_FIRSTHDR(&msg);
+        while !header.is_null() {
+            if (*header).cmsg_level == libc::SOL_SOCKET && (*header).cmsg_type == libc::SCM_RIGHTS {
+                let count =
+                    ((*header).cmsg_len - libc::CMSG_LEN(0) as usize) / std::mem::size_of::<i32>();
+                let data = libc::CMSG_DATA(header).cast::<i32>();
+                for index in 0..count {
+                    descriptors.push(*data.add(index));
+                }
+            }
+            header = libc::CMSG_NXTHDR(&msg, header);
+        }
+    }
+    (payload, descriptors)
+}
+
 /// The real upload path: with a mock store on a Unix datagram socket, the helper must bind the
 /// planned listener and deliver one descriptor carrying the plan's FD name.
 ///
@@ -6415,6 +6461,22 @@ fn bind_fds_uploads_a_bound_descriptor_named_after_the_plan() {
     assert!(
         stdout.contains("uploaded 1 descriptor"),
         "the report must state how many descriptors were uploaded: {stdout}"
+    );
+
+    // The store must have received the REMOVAL first, then the upload carrying the descriptor.
+    // The removal comes first because uploading onto a name that is still stored would leave two
+    // descriptors for one listener (ADR-0047 §5); a first run has nothing stored, so the removal is
+    // a no-op in systemd but the helper still sends it to converge rather than accumulate.
+    let (removal_payload, removal_fds) = receive_one_datagram(&store);
+    assert_eq!(
+        String::from_utf8_lossy(&removal_payload),
+        format!("FDSTOREREMOVE=1\nFDNAME=caddy-tcp-127.0.0.1-{port}"),
+        "the helper must remove the plan's name before re-uploading it"
+    );
+    assert!(
+        removal_fds.is_empty(),
+        "a removal carries no descriptor, got {}",
+        removal_fds.len()
     );
 
     // The store must have received the message, carrying the descriptor.

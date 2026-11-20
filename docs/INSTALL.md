@@ -294,3 +294,60 @@ and shuts down cleanly on the first SIGTERM or SIGINT; a second signal closes co
 immediately. To run `caddy-rs` itself as a service, install it under `/usr/local/bin` and point a
 unit's `ExecStart` at `caddy-rs run --config /etc/caddy/Caddyfile --adapter caddyfile`; the proxy
 manager's generated unit (above) already expects a `caddy-rs` service on the default admin API.
+
+### Pre-binding privileged ports with the systemd fd store
+
+`bind-fds` lets a privileged helper bind the configured listeners and hand them to `run` through the
+systemd fd store, so `run` itself never needs `CAP_NET_BIND_SERVICE`. The helper is idempotent: it
+may run from `ExecStartPre` on every start.
+
+#### The fd store cannot be enumerated, and that is a real limitation
+
+systemd does **not** document an interface for listing what the fd store contains. There is no
+supported call that answers "which descriptors are stored under which names". This is a limitation
+of the systemd interface, not a gap in `caddy-rs`, and the helper does not work around it.
+
+What `bind-fds` does instead, and what you must therefore expect:
+
+- For every name in the current plan it sends `FDSTOREREMOVE=1` followed by `FDSTORE=1`. Removing a
+  name that is not stored is a no-op in systemd, so this is safe on a first run.
+- Consequently the store converges on **exactly one descriptor per planned listener**, no matter how
+  many times the helper runs. It does not accumulate duplicates, but it also cannot tell you whether
+  a descriptor it just replaced was previously in use.
+- A listener **removed from the configuration** cannot be discovered by the helper, because it
+  cannot ask the store what is there. Stale descriptors must be named explicitly; the helper
+  provides this as `stale_names(previous, current)` and `remove_stale`, and the unit is responsible
+  for supplying the previous plan (for example from the `LISTEN_FDNAMES` it recorded last time).
+  **If the previous plan is not supplied, a listener removed from the configuration keeps its
+  descriptor and therefore keeps its port** until the unit is fully stopped and the store cleared.
+
+Because there is no enumeration, do not assume `bind-fds` can clean up after a configuration change
+it was not told about. Treat the previous plan as required input for that case, and treat the fd
+store as a cache keyed by FD name rather than as a queryable registry.
+
+#### Verifying what the store holds
+
+Since the helper cannot list the store, verify from the unit side rather than from the store:
+
+- `bind-fds --dry-run` prints the plan and the FD names it would create, without binding or
+  uploading. This is the supported way to check what the next start will do.
+- `bind-fds` prints how many descriptors it stored and how many already-stored names it removed and
+  re-uploaded, so a re-run for unchanged configuration shows every listener as re-uploaded rather
+  than newly uploaded.
+- To prove a port was actually released, bind it: a descriptor still held by the store keeps the
+  port open, so `bind` failing is the evidence that cleanup did not happen.
+
+#### Reload and restart precedence, and the note to re-check it
+
+Today `caddy-rs` reloads **in process**: a configuration reload keeps the listeners it already has
+and does not re-adopt from the fd store. That is the rule this version implements, and it does not
+depend on the cross-process handoff design in ADR-0044.
+
+ADR-0044 records a **forward** precedence rule for once that cross-process handoff exists: on reload,
+take the handed-off listener first, the fd store second, and bind fresh never. That rule is **not
+implemented here** and must not be assumed.
+
+> **Re-check this note when ADR-0044 lands.** When the cross-process handoff is implemented, the
+> three-way precedence above supersedes the in-process rule described in this section, and this
+> section (and the test that pins the current behaviour) must be updated deliberately rather than
+> left to drift. The task that split this work is recorded in the program plan.
