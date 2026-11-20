@@ -40,7 +40,7 @@ use std::ffi::OsStr;
 use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 
-use caddy_rs_core::notify::{fdstore_upload_payload, NOTIFY_SOCKET_ENV};
+use caddy_rs_core::notify::{fdstore_remove_payload, fdstore_upload_payload, NOTIFY_SOCKET_ENV};
 
 /// Why an fd-store upload failed, distinguishing the cases the helper reports differently.
 #[derive(Debug)]
@@ -85,6 +85,70 @@ pub fn send_fd_to_store(fd: RawFd, fd_name: &str) -> Result<(), FdStoreError> {
         .filter(|value| !value.is_empty())
         .ok_or(FdStoreError::NotifySocketUnset)?;
     send_fd_to_store_at(&socket, fd, fd_name).map_err(FdStoreError::Socket)
+}
+
+/// Ask the service manager to drop the stored descriptor called `fd_name` (ADR-0047 §5).
+///
+/// This is the counterpart to [`send_fd_to_store`] and it carries **no descriptor**: the message
+/// body is `FDSTOREREMOVE=1\nFDNAME=<name>`, and systemd identifies the stored entry by name alone.
+/// Removing by name is the only supported mechanism, because systemd does not expose an interface
+/// for enumerating the store — see the limitation documented in `docs/INSTALL.md`.
+///
+/// Returns `Ok(())` whether or not a descriptor under that name existed: systemd treats a removal
+/// for an unknown name as a no-op, and the caller's intent ("this name must not be stored
+/// afterwards") is satisfied either way. A caller that needs to distinguish the two cannot, and
+/// must not pretend to.
+pub fn remove_fd_from_store(fd_name: &str) -> Result<(), FdStoreError> {
+    let socket = std::env::var_os(NOTIFY_SOCKET_ENV)
+        .filter(|value| !value.is_empty())
+        .ok_or(FdStoreError::NotifySocketUnset)?;
+    remove_fd_from_store_at(&socket, fd_name).map_err(FdStoreError::Socket)
+}
+
+/// Ask the store reachable at an explicit `NOTIFY_SOCKET`-style address to drop `fd_name`.
+///
+/// Split from [`remove_fd_from_store`] for the same reason as [`send_fd_to_store_at`]: tests need
+/// to point at a mock socket without mutating the process environment, which is global.
+pub fn remove_fd_from_store_at(socket_name: &OsStr, fd_name: &str) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let bytes = socket_name.as_bytes();
+    if bytes.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "empty NOTIFY_SOCKET",
+        ));
+    }
+    let (address, address_len) = encode_socket_address(bytes)?;
+    let payload = fdstore_remove_payload(fd_name);
+
+    // No control message at all: `FDSTOREREMOVE` names the entry, so attaching a descriptor would
+    // be meaningless and systemd would ignore it.
+    let sender = std::os::unix::net::UnixDatagram::unbound()?;
+    let mut iov = libc::iovec {
+        iov_base: payload.as_ptr() as *mut libc::c_void,
+        iov_len: payload.len(),
+    };
+    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+    message.msg_name = address.as_ptr() as *mut libc::c_void;
+    message.msg_namelen = address_len;
+    message.msg_iov = &mut iov;
+    message.msg_iovlen = 1;
+
+    // SAFETY: `sender` is live, and `message` refers only to `iov` and `address`, both of which are
+    // live locals outliving the call. `msg_control` is left null with a zero length, which is the
+    // correct encoding for a message that carries no descriptors.
+    let sent = unsafe { libc::sendmsg(sender.as_raw_fd(), &message, 0) };
+    if sent < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if (sent as usize) != payload.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            format!("sent {sent} of {} fd-store removal bytes", payload.len()),
+        ));
+    }
+    Ok(())
 }
 
 /// Upload `fd` to the fd store reachable at an explicit `NOTIFY_SOCKET`-style address.
@@ -333,6 +397,43 @@ mod tests {
             "FDSTORE=1\nFDNAME=caddy-tcp-::1-8443"
         );
         assert_eq!(descriptors.len(), 1);
+    }
+
+    #[test]
+    fn removes_a_stored_descriptor_by_name_over_a_pathname_socket() {
+        // T-CORE-134 criterion 2 at the protocol level: the removal message must name the FD and
+        // must carry NO descriptor. Attaching one would be meaningless to systemd, and a test that
+        // only checked the payload text would not notice the difference.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("notify.sock");
+        let receiver = std::os::unix::net::UnixDatagram::bind(&path).unwrap();
+        receiver
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+
+        remove_fd_from_store_at(path.as_os_str(), "caddy-tcp-0.0.0.0-443").unwrap();
+
+        let (payload, descriptors) = receive_one(&receiver);
+        assert_eq!(
+            String::from_utf8_lossy(&payload),
+            "FDSTOREREMOVE=1\nFDNAME=caddy-tcp-0.0.0.0-443",
+            "the removal must use the FDSTOREREMOVE protocol message for the plan's own name"
+        );
+        assert!(
+            descriptors.is_empty(),
+            "a removal must carry no descriptor: FDSTOREREMOVE identifies the entry by name alone, \
+             got {} descriptor(s)",
+            descriptors.len()
+        );
+    }
+
+    #[test]
+    fn a_removal_without_a_store_is_the_same_distinct_error_as_an_upload() {
+        // The helper must not treat "no store" as "nothing to remove": a unit that forgot socket
+        // activation would otherwise silently keep every stale descriptor and its port.
+        let error = remove_fd_from_store_at(OsStr::new(""), "caddy-tcp-0.0.0.0-443")
+            .expect_err("an empty NOTIFY_SOCKET must be refused");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
