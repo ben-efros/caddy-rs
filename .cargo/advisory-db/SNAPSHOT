@@ -1,0 +1,30 @@
+RustSec advisory-db snapshot
+============================
+
+This directory is a verbatim export of the RustSec advisory database at a pinned commit, vendored
+so that the `security` workflow's cargo-audit gate needs no network access (T-CI-002).
+
+  repository: https://github.com/RustSec/advisory-db.git
+  commit:     074ea9a7ed619f511b5b7374c7a97e98d1e98be4
+  commit date: 2026-11-19 17:35:07 +0100
+  subject:    wasmtime: mark versions before the affected ranges as unaffected
+  exported:   git archive <commit>  (no .git directory: a plain tree is what cargo-audit --db reads)
+  files:      1569
+  advisories: 1550
+
+Do NOT edit files here by hand. Refresh with:
+
+  git -C ~/.cargo/advisory-db fetch
+  git -C ~/.cargo/advisory-db checkout <new-commit>
+  rm -rf caddy-rs/.cargo/advisory-db
+  git -C ~/.cargo/advisory-db archive HEAD | tar -x -C caddy-rs/.cargo/advisory-db
+  # then update commit/date/subject/files/advisories above, and re-run the gate below
+
+Why vendored rather than cloned at run time: a run-time `git clone` makes the verdict depend on
+whatever the upstream repository holds that day, so a RustSec change can turn the gate red (or
+green) without any change in this repository. Pinning the database makes the audit reproducible
+and reviewable: bumping it is a commit, and the diff shows which advisories arrived.
+
+Refresh cadence: at least every release (see docs/operations/RELEASE-READINESS.md in the program
+repository). A stale database is a known, recorded limitation, not a silent one -- the commit
+above names exactly how stale the snapshot is.
