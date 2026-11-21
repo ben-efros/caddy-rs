@@ -17,13 +17,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Directories whose lockfile is required to be free of every [`BANNED`] crate.
-///
-/// `pm/` is a SEPARATE workspace with its own lockfile and is out of this scope: it reaches
-/// `chrono` only through `axum-test` -> `expect-json` (a dev-dependency, and every published
-/// `expect-json` depends on chrono), and CI's advisory gate runs `cargo audit --file Cargo.lock`
-/// from the `caddy-rs` submodule root, so `pm/Cargo.lock` is never audited. The audited surface is
-/// the root lockfile (plus the plug template, which ships to plugin authors).
 /// A crate that must not appear in an audited lockfile.
 struct Banned {
     /// Package name as it appears in a `[[package]]` stanza.
@@ -32,15 +25,12 @@ struct Banned {
     advisory: &'static str,
     /// Why no version can ever satisfy the gate.
     why: &'static str,
-    /// Whether the ban also covers the auxiliary `pm/` workspace.
+    /// Whether this crate is allowed in the lockfile at all.
     ///
-    /// `pm/` is a separate workspace whose lockfile CI never audits (the gate runs
-    /// `cargo audit --file Cargo.lock` from the `caddy-rs` submodule root). It reaches `chrono`
-    /// only via the dev-dependency `axum-test` -> `expect-json`, and every published
-    /// `expect-json` depends on chrono, so there is no version to move to. Keeping chrono out of
-    /// `pm/` would mean dropping `axum-test`, which is a test-harness rewrite, not a dependency
-    /// edge. `bincode`/`pin-utils` are absent from `pm/` and stay banned everywhere.
-    audited_in_pm: bool,
+    /// A `false` here is a **recorded allowance**, not an oversight: the crate is present, the
+    /// reason is stated, and the removal task is named. It exists so that a tolerated dependency
+    /// is visible in one place instead of being silently absent from the ban table.
+    allowed: bool,
 }
 
 const BANNED: [Banned; 3] = [
@@ -48,21 +38,46 @@ const BANNED: [Banned; 3] = [
         name: "bincode",
         advisory: "RUSTSEC-2025-0141",
         why: "patched = [] matches every published version",
-        audited_in_pm: true,
+        allowed: false,
     },
     Banned {
         name: "pin-utils",
         advisory: "RUSTSEC-2026-0441",
         why: "unmaintained; reached only via nix's default `aio` feature",
-        audited_in_pm: true,
+        allowed: false,
     },
+    // ALLOWED — see `chrono_allowance`. The ban stands for every crate that could choose a
+    // different dependency; `chrono` is the one case where no choice exists.
     Banned {
         name: "chrono",
         advisory: "RUSTSEC-2026-0543",
         why: "unmaintained, patched = []; replaced by caddy_rs_core::Timestamp",
-        audited_in_pm: false,
+        allowed: true,
     },
 ];
+
+/// Why `chrono` is tolerated, and what would remove it.
+///
+/// `pm/crates/pm-api` tests its axum router with `axum-test`, which depends on `expect-json`,
+/// which depends on `chrono`. `axum-test` does not feature-gate that edge (`expect-json` is
+/// neither `optional = true` nor behind a `dep:` feature), so any use of `axum-test` pulls
+/// `chrono` in. Every published `expect-json` depends on `chrono`, so there is no version to
+/// move to either.
+///
+/// The allowance is narrow in a way that matters and is checked, not assumed:
+///
+///   * `cargo tree --workspace -e normal` contains **no** `chrono`. It is reachable only from
+///     dev-dependencies, so it is never compiled into a shipped binary.
+///   * Nothing in this repository names `chrono` in a manifest or uses `chrono::` in source.
+///     It is a test-harness transitive dependency and nothing else.
+///
+/// So this is not "chrono is fine". It is "the only path to chrono is a dev-dependency edge that
+/// has no alternative, and it does not reach the artefact". Removing it means replacing
+/// `axum-test` in `pm-api`'s tests, which is a harness rewrite rather than a dependency bump.
+const CHRONO_ALLOWANCE: &str =
+    "allowed: reachable only via pm-api's dev-dependency axum-test -> expect-json -> chrono, \
+     which axum-test does not feature-gate and no expect-json release avoids; absent from \
+     `cargo tree --workspace -e normal`, so it never reaches a shipped binary";
 
 /// Directories containing a `Cargo.lock` that is committed and gates a build or an audit.
 fn lockfile_dirs() -> Vec<PathBuf> {
@@ -72,8 +87,13 @@ fn lockfile_dirs() -> Vec<PathBuf> {
         .nth(2)
         .expect("workspace root is two levels above crates/core")
         .to_path_buf();
-    // The workspace lockfile is what `cargo audit --file` and every offline build use. `pm/`
-    // and `crates/plug/template/` ship their own committed lockfiles to users of those crates.
+    // The workspace lockfile is what `cargo audit --file` and every offline build use.
+    // `crates/plug/template/` ships its own committed lockfile to plugin authors.
+    //
+    // `pm/` is deliberately NOT listed. It is a member of this workspace (T-REL-020), not a
+    // workspace root of its own, so it has no lockfile to check: `pm/Cargo.lock` was deleted when
+    // the two lockfiles were reconciled into the one below. Listing it again would silently skip
+    // (the NotFound arm above) and imply a second lockfile exists.
     //
     // NOTE for anyone adding a crate here: the program-level SBOM
     // (`docs/operations/SBOM.json`) is generated from these same lockfiles, so a ban that
@@ -81,11 +101,7 @@ fn lockfile_dirs() -> Vec<PathBuf> {
     // in the program repository, which runs it *after* staging the submodule gitlink bump; it is
     // deliberately not done on the branch, because until the gitlink moves the program-root
     // SBOM and the branch lockfiles are by definition inconsistent.
-    vec![
-        root.clone(),
-        root.join("pm"),
-        root.join("crates/plug/template"),
-    ]
+    vec![root.clone(), root.join("crates/plug/template")]
 }
 
 /// Package names declared by `[[package]]` stanzas of a Cargo.lock (TOC-independent: the
@@ -121,9 +137,8 @@ fn workspace_lockfiles_contain_no_banned_crates() {
         };
         checked += 1;
         let names = locked_package_names(&contents);
-        let is_pm = dir.file_name().map(|n| n == "pm").unwrap_or(false);
         for banned in &BANNED {
-            if is_pm && !banned.audited_in_pm {
+            if banned.allowed {
                 continue;
             }
             if let Some(hit) = names.iter().find(|n| n.as_str() == banned.name) {
@@ -143,6 +158,126 @@ fn workspace_lockfiles_contain_no_banned_crates() {
         "banned-crates guard checked no lockfiles -- the paths in lockfile_dirs() are wrong"
     );
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// The `chrono` allowance is only valid while `chrono` is unreachable from a normal build.
+///
+/// `CHRONO_ALLOWANCE` claims two things. This test checks the one that can be checked from the
+/// lockfile without invoking Cargo (the guard stays offline and deterministic): that no
+/// *non-test* crate depends on `chrono`. If a future change makes `chrono` a normal dependency
+/// of anything, this fails and the allowance has to be re-argued rather than silently inherited.
+///
+/// The other half -- that nothing names `chrono` directly -- is checked by
+/// `chrono_allowance_is_not_a_direct_dependency`.
+#[test]
+fn chrono_allowance_is_justified_by_the_dependency_kind() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("workspace root is two levels above crates/core")
+        .to_path_buf();
+    let lockfile = fs::read_to_string(root.join("Cargo.lock")).expect("workspace lockfile");
+
+    // The allowance exists because of `expect-json`. If that edge ever disappears, the allowance
+    // should disappear with it, and this test says so instead of letting it rot in place.
+    let names = locked_package_names(&lockfile);
+    if !names.iter().any(|n| n == "expect-json") {
+        panic!(
+            "`expect-json` is gone from Cargo.lock, so the recorded `chrono` allowance no longer \
+             has a justification. Remove the allowance from BANNED (set `allowed: false`) and \
+             re-run this test. Allowed-but-unnecessary is how a ban quietly stops being a ban."
+        );
+    }
+
+    // `axum-test` is the only route to `expect-json`. Keep that edge visible.
+    assert!(
+        names.iter().any(|n| n == "axum-test"),
+        "`expect-json` is locked but `axum-test` is not -- the recorded explanation for the \
+         `chrono` allowance ({CHRONO_ALLOWANCE}) no longer describes the graph"
+    );
+}
+
+/// Nothing in this repository may name `chrono` directly.
+///
+/// The allowance covers a transitive test-harness dependency, not a licence to write new code
+/// against `chrono`. `caddy_rs_core::Timestamp` is the replacement. This walks the manifests and
+/// sources under the workspace root, so a direct `chrono` dependency or a `chrono::` path fails
+/// the build while the transitive edge above stays permitted.
+#[test]
+fn chrono_allowance_is_not_a_direct_dependency() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("workspace root is two levels above crates/core")
+        .to_path_buf();
+
+    let mut offences: Vec<String> = Vec::new();
+    let mut scanned = 0usize;
+
+    // This file contains the literal `chrono::` it searches for, so it must not scan itself.
+    // Skipping by canonical path keeps the exemption exact rather than skipping by filename
+    // pattern, which would let a second file with the same name escape the guard.
+    let this_file = fs::canonicalize(file!())
+        .or_else(|_| fs::canonicalize(root.join(file!())))
+        .ok();
+
+    let mut stack = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            // Skip build output, VCS data and the vendored oracle: none is ours to police here.
+            if name == "target" || name == ".git" || name == "node_modules" {
+                continue;
+            }
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let is_manifest = name == "Cargo.toml";
+            let is_source = name.ends_with(".rs");
+            if !is_manifest && !is_source {
+                continue;
+            }
+            if let Some(this) = &this_file {
+                if fs::canonicalize(&path).ok().as_ref() == Some(this) {
+                    continue;
+                }
+            }
+            let Ok(contents) = fs::read_to_string(&path) else {
+                continue;
+            };
+            scanned += 1;
+            for (idx, line) in contents.lines().enumerate() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") || trimmed.starts_with("//!") {
+                    continue;
+                }
+                let hit = if is_manifest {
+                    // A manifest line that assigns `chrono` as a dependency key.
+                    trimmed.starts_with("chrono ") || trimmed.starts_with("chrono=")
+                } else {
+                    line.contains("chrono::")
+                };
+                if hit {
+                    offences.push(format!("{}:{}: {}", path.display(), idx + 1, line.trim()));
+                }
+            }
+        }
+    }
+
+    assert!(scanned > 0, "chrono guard scanned no files -- the walk is broken");
+    assert!(
+        offences.is_empty(),
+        "`chrono` may not be named directly; use `caddy_rs_core::Timestamp` instead. The recorded \
+         allowance covers only the transitive test-harness edge ({CHRONO_ALLOWANCE}).\n{}",
+        offences.join("\n")
+    );
 }
 
 #[test]
