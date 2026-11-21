@@ -339,8 +339,9 @@ fn serial_encoding_cost_is_linear_not_quadratic() {
     let small = build_with_serial(&vec![0u8; SMALL]);
     let large = build_with_serial(&vec![0u8; LARGE]);
 
-    // Linear work would give a 4x ratio; quadratic gives 16x. Allow generous headroom for timer
-    // noise and allocator behaviour, but fail well below the quadratic expectation.
+    // Linear work would give an 8x ratio; quadratic gives 64x. The threshold of 10 sits between
+    // them, with headroom for timer noise and allocator behaviour while staying far below the
+    // quadratic expectation.
     let small_ns = small.as_nanos().max(1);
     let ratio = large.as_nanos() as f64 / small_ns as f64;
     assert!(
@@ -348,6 +349,39 @@ fn serial_encoding_cost_is_linear_not_quadratic() {
         "build_ocsp_request cost grew {ratio:.1}x for a {LARGE}-byte vs {SMALL}-byte serial \
          (linear would be ~{:.0}x): the serial re-encoder is super-linear — {small:?} -> {large:?}",
         LARGE as f64 / SMALL as f64
+    );
+}
+
+/// Guards the corpus itself, not the product code.
+///
+/// The linearity test and the non-minimal corpus entries only exercise `der_integer_from_bytes`'
+/// strip loop because they encode the serial with [`der_integer_raw`]. If someone "tidies" those
+/// call sites back to the normalising [`der_integer`], every one of them still compiles and still
+/// passes, but the suite silently loses the only coverage that reaches the loop — the original
+/// vacuity bug returning green. This test fails in that case.
+#[test]
+fn corpus_still_reaches_the_serial_strip_loop() {
+    // A serial the normalising helper would rewrite, and one it would not.
+    let non_minimal = der_integer_raw(&[0x00, 0x01]);
+    assert_eq!(
+        non_minimal,
+        vec![0x02, 0x02, 0x00, 0x01],
+        "der_integer_raw must emit the content verbatim; if this changes, the non-minimal corpus \
+         entries stop reaching the strip loop"
+    );
+    assert_ne!(
+        der_integer(&[0x00, 0x01]),
+        non_minimal,
+        "der_integer is expected to normalise this serial away — that is exactly why the corpus \
+         uses der_integer_raw, and why this guard exists"
+    );
+    // The loop body is entered only when content starts with 0x00 and the next byte's high bit is
+    // clear. Assert the corpus actually contains such a serial by checking the encoded TLV.
+    let leaf = certificate_with_serial_encoded(&non_minimal, 0x11);
+    assert!(
+        leaf.windows(4)
+            .any(|window| window == [0x02, 0x02, 0x00, 0x01]),
+        "the non-minimal serial must appear in the built certificate"
     );
 }
 
