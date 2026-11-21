@@ -338,7 +338,21 @@ fn mutated_valid_responses_never_panic() {
         // Known defect (see PRE_EPOCH_* below): any time before 1970-01-01 makes the civil-date
         // arithmetic wrap and the parser panic. Inputs that reach it are skipped here so this
         // corpus stays green until the fix lands; `pre_epoch_*` tests pin the exact inputs.
-        if std::panic::catch_unwind(|| parse_ocsp_response(&input)).is_err() {
+        //
+        // The skip is only sound while it cannot hide a *different* panic, so the payload is
+        // checked: anything other than the known overflow fails the test. Without this, a future
+        // regression could be silently absorbed by the skip that exists for today's defect.
+        if let Err(payload) = std::panic::catch_unwind(|| parse_ocsp_response(&input)) {
+            let msg = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default();
+            assert!(
+                msg.contains("multiply with overflow"),
+                "mutation case {case}: unexpected panic kind {msg:?} (input {})",
+                hex(&input)
+            );
             skipped += 1;
             continue;
         }
