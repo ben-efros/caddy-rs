@@ -271,7 +271,10 @@ fn chrono_allowance_is_not_a_direct_dependency() {
         }
     }
 
-    assert!(scanned > 0, "chrono guard scanned no files -- the walk is broken");
+    assert!(
+        scanned > 0,
+        "chrono guard scanned no files -- the walk is broken"
+    );
     assert!(
         offences.is_empty(),
         "`chrono` may not be named directly; use `caddy_rs_core::Timestamp` instead. The recorded \
