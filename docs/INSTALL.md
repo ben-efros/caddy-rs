@@ -14,9 +14,11 @@ command reference is in [CLI.md](CLI.md).
 | External services | None. Building and serving a local configuration need no database, container runtime or other service. |
 
 The workspace crates use Rust edition 2021 and declare `rust-version = "1.88"`; a dependency
-(`jsonwebtoken` 10.3) itself requires 1.88. The nested `pm/` workspace also uses edition 2021 but
-declares `rust-version = "1.85"`. The pinned 1.98.1 toolchain satisfies both. The optional
-`wasm-runtime` feature of the plug crate pulls in `wasmtime`; build it with the pinned toolchain.
+(`jsonwebtoken` 10.3) itself requires 1.88. The proxy-manager crates (`pm/`) are packages in the
+same workspace and inherit that same `rust-version` of 1.88; they previously declared 1.85 in their
+own workspace, so building them now needs 1.88. The pinned 1.98.1 toolchain satisfies this. The
+optional `wasm-runtime` feature of the plug crate pulls in `wasmtime`; build it with the pinned
+toolchain.
 
 ## Build from source
 
@@ -80,12 +82,11 @@ Setting `CARGO_TARGET_DIR` moves build artifacts out of `target/`; with
 
 ## Proxy manager sidecar
 
-`caddy-rs-pm` is the proxy-manager daemon. It is a separate nested workspace (`pm/`) with its own
-lockfile, and it is built from source in the same tree:
+`caddy-rs-pm` is the proxy-manager daemon. It is a package in the same workspace, built from source
+in the same tree:
 
 ```sh
-cd pm
-cargo build --release
+cargo build --release -p caddy-rs-pm-cli
 ./target/release/caddy-rs-pm version
 ```
 

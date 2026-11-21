@@ -1,7 +1,8 @@
-# caddy-rs proxy manager — foundation workspace
+# caddy-rs proxy manager — crates
 
-This is the proxy-manager foundation workspace. It is deliberately independent of the
-`caddy-rs` workspace and of the NPM compatibility adapter.
+The proxy-manager crates live here. They are packages in the parent `caddy-rs` workspace (listed in
+the root `members`), not a workspace of their own, so there is no `pm/Cargo.lock`. They stay
+independent of the NPM compatibility adapter, and the data plane does not depend on them.
 
 | Crate | Role |
 |---|---|
@@ -17,12 +18,16 @@ This is the proxy-manager foundation workspace. It is deliberately independent o
 | `caddy-rs-pm-certificates` | Manual certificate validation and secret store: strict PEM chain/key parsing, key-match proof, expiry/SAN checks, `0600` key files in a `0700` directory, monotonic ids/tombstones, metadata-only state and no key bytes in responses. |
 | `caddy-rs-pm-api` | Native REST API with axum: `/api/v1` router, host CRUD/enable/disable with strong per-host ETags and `If-Match` CAS, certificate intents with inventory-derived status, manual certificate upload/list/delete, config apply/revision history, list filters/pagination, health/setup/version/config, typed error envelope, loopback-only mutation guard, bearer-authenticated user administration (`GET/PATCH/DELETE /users` with the `users` capability), request ID and logging middleware. |
 
-## Why a nested workspace
+## Why these crates are kept apart
 
 `caddy-rs` core must remain database-free and must not depend on a management product. The PM will
 grow its own API/UI/certificate service; keeping its crates in `pm/` prevents accidental imports
-from `crates/http`, `crates/proxy` or `crates/tls`. The data plane cannot compile against this
-workspace.
+from `crates/http`, `crates/proxy` or `crates/tls`. The data plane cannot compile against these
+crates.
+
+The directory is not a workspace root. It is a set of members of the parent workspace, which is
+what keeps the sidecar's bytes identical wherever the tree is checked out (see the header of
+`pm/Cargo.toml` and T-REL-020).
 
 ## `pm-state`
 
@@ -474,19 +479,23 @@ The importer never invents a certificate origin and never drops an unsupported s
 
 ## Commands
 
+Run these **from the repository root**, not from inside `pm/`: `pm/Cargo.toml` is a virtual
+manifest, so `cargo` invoked from `pm/` fails with `manifest is missing either a [package] or a
+[workspace]`. `cargo test --workspace` at the root runs every crate including these; the `-p` flags
+scope it to the sidecar.
+
 ```sh
-cd pm
 cargo fmt --all --check
 CARGO_HOME=/root/caddy-rs/.scratch/cargo-home \
   CARGO_TARGET_DIR=/root/caddy-rs/.scratch/rust-target-pm \
-  cargo test --offline --workspace
+  cargo test --offline -p caddy-rs-pm-api -p caddy-rs-pm-core
 ```
 
 ## Release packaging
 
 `caddy-rs-pm` is released with the data plane: every archive from a `v*` tag contains both
-`caddy-rs` and `caddy-rs-pm`, built from the same commit and target. The nested workspace version is
-kept equal to the `caddy-rs` workspace version at every cut, and `caddy-rs-pm version` prints both
+`caddy-rs` and `caddy-rs-pm`, built from the same commit and target. The sidecar version is
+kept equal to the `caddy-rs` version at every cut, and `caddy-rs-pm version` prints both
 versions. The sidecar has no `release-minimal` profile; it is built with `--release` for every
 target in the release matrix. See [`../docs/RELEASING.md`](../docs/RELEASING.md) for the packaging and verification steps.
 
