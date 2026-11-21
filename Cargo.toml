@@ -19,6 +19,20 @@ members = [
     # golden-bytes wire test runs under `cargo test --workspace` and the audit gate's
     # `cargo audit --file Cargo.lock` sees it in the same lockfile.
     "vendor/ecdysis",
+    # Proxy-manager crates (T-REL-020). Listed here rather than in pm/Cargo.toml because a
+    # workspace member cannot declare its own members or workspace tables.
+    "pm/crates/pm-state",
+    "pm/crates/pm-core",
+    "pm/crates/pm-compiler",
+    "pm/crates/pm-config",
+    "pm/crates/pm-hosts",
+    "pm/crates/pm-service",
+    "pm/crates/pm-policies",
+    "pm/crates/pm-certificates",
+    "pm/crates/pm-import",
+    "pm/crates/pm-runtime",
+    "pm/crates/pm-api",
+    "pm/crates/pm-cli",
 ]
 
 [workspace.package]
@@ -30,6 +44,13 @@ repository = "https://github.com/example/caddy-rs"
 authors = ["caddy-rs contributors"]
 
 [workspace.dependencies]
+# Declared here because pm crates inherit them via `workspace = true` and a workspace
+# member cannot declare its own [workspace.dependencies] (T-REL-020).
+reqwest = { version = "0.12.28", default-features = false, features = ["json"] }
+ring = "0.17.14"
+sd-notify = "0.2.0"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+url = "2.5.8"
 # Internal crates (path dependencies declared once). Default features are declared off here so a
 # dependent crate can opt in explicitly (required for `caddy-rs`'s `--no-default-features` to
 # really disable the optional modules; without this, Cargo ignores member-level
@@ -50,8 +71,11 @@ anyhow = "1.0.104"
 arc-swap = "1.7.1"
 async-trait = "0.1.92"
 bytes = "1.12.1"
+# "env" is required by pm-cli's #[arg(env = ...)] attributes. It was declared by pm's own
+# workspace before pm became a member; a member cannot add features to a dependency inherited
+# via `workspace = true`, so the union of both feature sets has to live here (T-REL-020).
 clap = { version = "4.6.7", default-features = false, features = [
-    "std", "derive", "help", "usage", "error-context", "suggestions",
+    "std", "derive", "help", "usage", "error-context", "suggestions", "env",
 ] }
 http = "1.5.0"
 http-body-util = "0.1.5"

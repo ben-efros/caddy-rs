@@ -67,11 +67,12 @@ cargo test --offline --workspace
 Re-run `cargo fetch --locked` whenever `Cargo.lock` changes. The cache is a normal directory and can
 be deleted at any time.
 
-The proxy manager is a nested workspace with its own `pm/Cargo.lock`, so an offline build of it
-needs its own fetch, with the same `CARGO_HOME`:
+The proxy manager is a member of the same workspace and shares the root `Cargo.lock`, so a single
+`cargo fetch --locked` at the repository root primes an offline build of both binaries. Build the
+sidecar by name:
 
 ```sh
-(cd pm && cargo fetch --locked)
+cargo build --release -p caddy-rs-pm
 ```
 
 Setting `CARGO_TARGET_DIR` moves build artifacts out of `target/`; with

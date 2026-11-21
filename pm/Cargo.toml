@@ -1,42 +1,17 @@
-[workspace]
-resolver = "2"
-members = [
-    "crates/pm-state",
-    "crates/pm-core",
-    "crates/pm-compiler",
-    "crates/pm-config",
-    "crates/pm-hosts",
-    "crates/pm-service",
-    "crates/pm-policies",
-    "crates/pm-certificates",
-    "crates/pm-import",
-    "crates/pm-runtime",
-    "crates/pm-api",
-    "crates/pm-cli",
-]
-
-[workspace.package]
-version = "0.1.0-trial.7"
-edition = "2021"
-rust-version = "1.85"
-license = "Apache-2.0"
-repository = "https://github.com/ben-efros/caddy-rs"
-
-[workspace.dependencies]
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
-thiserror = "2.0.21"
-anyhow = "1.0.104"
-async-trait = "0.1.92"
-base64 = "0.23.1"
-reqwest = { version = "0.12.28", default-features = false, features = ["json"] }
-ring = "0.17.14"
-tempfile = "3.27.0"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "fs"] }
-tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
-clap = { version = "4.6.7", default-features = false, features = [
-    "std", "derive", "help", "usage", "error-context", "suggestions", "env",
-] }
-sd-notify = "0.2.0"
-url = "2.5.8"
+# This directory is a member of the parent caddy-rs workspace (see ../Cargo.toml), not a
+# workspace root of its own.
+#
+# That is deliberate. As a separate workspace root, pm's upward path dependencies
+# (crates/authn, crates/core, crates/config-tx) resolved to paths OUTSIDE the workspace root.
+# Cargo hashes package identity with PackageId::stable_hash(ws_root), stripping the
+# workspace-root prefix so the hash covers a workspace-relative path; when the prefix does not
+# match it falls back to hashing the ABSOLUTE path. That absolute path reached -C metadata and
+# therefore rustc's StableCrateId, so caddy-rs-pm differed byte-for-byte depending on where it
+# was built (T-REL-020).
+#
+# With pm as a member, every crate it depends on lives inside the workspace root, strip_prefix
+# succeeds, and the hashes are identical on every machine.
+#
+# The pm crates are listed in the parent's `members` list. The workspace-wide tables
+# ([workspace.package], [workspace.dependencies]) live in the parent manifest, because a
+# workspace member cannot declare them.
