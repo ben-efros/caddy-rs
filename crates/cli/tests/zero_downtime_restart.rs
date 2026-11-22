@@ -256,10 +256,15 @@ fn measure(signal: i32, holders: usize) -> (u64, u64, u64) {
     let opened = counters.opened.load(Ordering::Relaxed);
     let reset = counters.reset.load(Ordering::Relaxed);
     let refused = counters.refused.load(Ordering::Relaxed);
+    // The harness must have observed *something* after the transition, or it measured nothing and
+    // its zero cannot be believed. Note what counts as activity: under SIGUSR2 the hammer keeps
+    // opening connections, so `opened` grows; under SIGKILL every attempt is refused, so `opened`
+    // correctly stops growing and only `refused` moves. Requiring `opened` to grow would therefore
+    // fail the negative control precisely when the kill worked -- which it did, 1 run in 5.
     assert!(
-        opened > opened_before,
-        "the harness opened no connection after the transition began ({opened} total, \
-         {opened_before} before); it measured nothing and cannot be believed"
+        opened > opened_before || refused > 0,
+        "the harness observed no connection activity after the transition began ({opened} opened, \
+         {opened_before} before, {refused} refused); it measured nothing and cannot be believed"
     );
     let _ = std::fs::remove_dir_all(&dir);
     (opened, reset, refused)
@@ -392,24 +397,29 @@ fn a_long_lived_streaming_response_survives_the_restart() {
     let backend = TcpListener::bind("127.0.0.1:0").expect("bind the backend");
     let backend_port = backend.local_addr().expect("backend addr").port();
     let backend_thread = thread::spawn(move || {
-        let (mut socket, _) = backend.accept().expect("accept the proxied connection");
-        let mut request = [0u8; 4096];
-        let _ = socket.read(&mut request);
-        let head =
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n";
-        if socket.write_all(head.as_bytes()).is_err() {
-            return;
-        }
-        for tick in 0..TICKS {
-            let body = format!("tick{tick}\n");
-            let frame = format!("{:x}\r\n{body}\r\n", body.len());
-            if socket.write_all(frame.as_bytes()).is_err() {
+        // Serve connections in a loop rather than accepting exactly one. The readiness probe below
+        // opens a connection and drops it, and the proxy forwards that to the backend; a
+        // single-accept backend would serve the dead probe connection and leave the real request
+        // waiting forever. That is a race, and it hung this test until it was found.
+        let mut served = 0usize;
+        while served < 4 {
+            let Ok((mut socket, _)) = backend.accept() else {
                 return;
+            };
+            // Bounded, because a probe connection that the proxy keeps open would otherwise block
+            // here instead of being skipped.
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set the backend read timeout");
+            let mut request = [0u8; 4096];
+            if socket.read(&mut request).unwrap_or(0) == 0 {
+                // A connection that closed (or stayed silent) before sending a request is the
+                // readiness probe, not the stream under test.
+                continue;
             }
-            let _ = socket.flush();
-            thread::sleep(Duration::from_millis(100));
+            served += 1;
+            serve_stream(&mut socket);
         }
-        let _ = socket.write_all(b"0\r\n\r\n");
     });
 
     let port = free_port();
@@ -464,7 +474,10 @@ fn a_long_lived_streaming_response_survives_the_restart() {
     let _ = stream.read_to_end(&mut body);
     let _ = child.kill();
     let _ = child.wait();
-    let _ = backend_thread.join();
+    // Not joined: the backend may still be parked in `accept()` waiting for a connection that will
+    // never come, and a join would hang the test instead of failing it. The listener and its thread
+    // die with the process.
+    drop(backend_thread);
 
     let text = String::from_utf8_lossy(&body);
     let ticks: Vec<&str> = text
@@ -487,4 +500,23 @@ fn a_long_lived_streaming_response_survives_the_restart() {
         text.contains("0\r\n\r\n"),
         "the terminating chunk was lost, so the stream was cut rather than completed"
     );
+}
+
+/// Write the chunked body: 40 ticks at 100ms, then the terminating chunk.
+fn serve_stream(socket: &mut TcpStream) {
+    const TICKS: usize = 40;
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n";
+    if socket.write_all(head.as_bytes()).is_err() {
+        return;
+    }
+    for tick in 0..TICKS {
+        let body = format!("tick{tick}\n");
+        let frame = format!("{:x}\r\n{body}\r\n", body.len());
+        if socket.write_all(frame.as_bytes()).is_err() {
+            return;
+        }
+        let _ = socket.flush();
+        thread::sleep(Duration::from_millis(100));
+    }
+    let _ = socket.write_all(b"0\r\n\r\n");
 }
