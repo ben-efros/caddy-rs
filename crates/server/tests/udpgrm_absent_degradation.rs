@@ -105,11 +105,13 @@ fn udpgrm_is_absent() -> bool {
     )
 }
 
-/// A configuration with two UDP (HTTP/3) listeners and one TCP listener, all on fresh ports.
+/// A configuration with three UDP (HTTP/3) sockets: two explicit `udp/` listeners plus the
+/// `https_port` socket, which binds UDP as well as TCP for HTTP/3. Measured, not assumed --
+/// instrumenting `defer_udpgrm_promotion` shows three calls.
 ///
-/// Two UDP listeners matter: the "report once" property is about one warning per *process*, so a
-/// single listener cannot distinguish "reported once" from "reported per listener".
-fn config_with_two_udp_listeners() -> (Config, u16, u16, u16) {
+/// More than one UDP socket matters: the "report once" property is about one warning per
+/// *process*, so a single socket cannot distinguish "reported once" from "reported per listener".
+fn config_with_udp_listeners() -> (Config, u16, u16, u16) {
     let tcp_port = free_port();
     let udp_a = free_port();
     let udp_b = free_port();
@@ -217,7 +219,7 @@ async fn h3_get(port: u16) -> Result<(u16, String), String> {
 }
 
 /// With udpgrm absent, a udpgrm-enabled build still serves HTTP/3 over UDP, and the absence is
-/// reported **exactly once** across two UDP listeners in a single apply.
+/// reported **exactly once** across three UDP sockets in a single apply.
 #[tokio::test]
 async fn udp_keeps_serving_and_the_absence_is_reported_once() {
     assert!(
@@ -226,7 +228,7 @@ async fn udp_keeps_serving_and_the_absence_is_reported_once() {
          the degradation cannot be exercised here, so a pass would mean nothing"
     );
 
-    let (config, _tcp_port, udp_a, udp_b) = config_with_two_udp_listeners();
+    let (config, _tcp_port, udp_a, udp_b) = config_with_udp_listeners();
     let store = Arc::new(GenerationStore::with_builtin_registry());
     store.load(config).expect("config loads");
 
@@ -250,13 +252,13 @@ async fn udp_keeps_serving_and_the_absence_is_reported_once() {
     }
 
     // 2. The absence was reported exactly once. Two listeners in one apply is what makes this a
-    //    measurement: a per-listener report would give two, and a silent degradation would give
+    //    measurement: a per-listener report would give three, and a silent degradation would give
     //    zero. Both are non-zero-or-zero answers this assertion can actually distinguish.
     let absence = events.udpgrm_events();
     assert_eq!(
         absence.len(),
         1,
-        "expected exactly one udpgrm warning for two UDP listeners, got {}: {absence:#?}",
+        "expected exactly one udpgrm warning across three UDP sockets, got {}: {absence:#?}",
         absence.len()
     );
 
