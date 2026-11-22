@@ -814,6 +814,19 @@ mod tests {
             for _ in 0..len {
                 message.push((xorshift(&mut state) & 0xff) as u8);
             }
+            // Half the cases get a well-formed 12-byte header so the random phase is not purely a
+            // header-rejection smoke test: it must also drive the answer loop and the name decoder
+            // with unconstrained bodies. The reviewer of T-FUZZ-DNS measured 0% answer-loop
+            // coverage before this bias was added.
+            if case % 2 == 0 && message.len() >= 12 {
+                message[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+                let qdcount = (xorshift(&mut state) % 3) as u16;
+                let ancount = (xorshift(&mut state) % 4) as u16;
+                message[4..6].copy_from_slice(&qdcount.to_be_bytes());
+                message[6..8].copy_from_slice(&ancount.to_be_bytes());
+                message[8..10].copy_from_slice(&0_u16.to_be_bytes());
+                message[10..12].copy_from_slice(&0_u16.to_be_bytes());
+            }
             assert_typed(&message, QTYPE_A, &format!("random case {case}"));
         }
     }
@@ -980,21 +993,64 @@ mod tests {
         }
     }
 
-    /// Guards against the corpus going vacuous: the generator must keep producing messages that
-    /// actually parse, not only garbage that fails at the header check.
+    /// Guards against the corpus going vacuous by measuring the *generated* corpus, not the static
+    /// builder. A generator that only emits messages failing at the 12-byte header check would make
+    /// every "never panics" assertion above pass without exercising the parser body at all.
     #[test]
     fn dns_fuzz_generator_reaches_the_answer_loop() {
-        let mut accepted = 0;
+        // The mutation phase must mostly get past the header and reach the answer loop, because
+        // that is the code the fuzz assertions are supposed to cover.
+        let base = response(
+            &[("example.com.", QTYPE_A)],
+            &[(QTYPE_A, vec![192, 0, 2, 10])],
+        );
+        let mut state = 0x5EED_D15_0000_0002_u64;
+        let mut reached_answers = 0_usize;
+        let cases = 2_000_usize;
+        for case in 0..cases {
+            let mut message = base.clone();
+            let mutations = 1 + (xorshift(&mut state) % 3) as usize;
+            for _ in 0..mutations {
+                match xorshift(&mut state) % 3 {
+                    0 => {
+                        let index = (xorshift(&mut state) as usize) % message.len();
+                        message[index] ^= 1 << (xorshift(&mut state) % 8);
+                    }
+                    1 => {
+                        let keep = (xorshift(&mut state) as usize) % (message.len() + 1);
+                        message.truncate(keep);
+                        if message.is_empty() {
+                            message.push(0);
+                        }
+                    }
+                    _ => {
+                        let index = (xorshift(&mut state) as usize) % message.len();
+                        message[index] =
+                            [0x00, 0xff, 0xc0, 0x3f][(xorshift(&mut state) % 4) as usize];
+                    }
+                }
+            }
+            // "Reached the answer loop" means the header parsed; `answers()` is the next stage.
+            if DnsParser::new(&message).is_ok() {
+                reached_answers += 1;
+            }
+            let _ = case;
+        }
+        assert!(
+            reached_answers > cases / 2,
+            "only {reached_answers} of {cases} generated mutations got past the DNS header; the \
+             mutation generator has regressed and the fuzz phases are no longer reaching the \
+             answer loop"
+        );
+
+        // The hand-written builder must also still produce fully-parseable messages.
         for qtype in [QTYPE_A, QTYPE_AAAA, QTYPE_SRV] {
             let message = response(&[("example.com.", qtype)], &[(qtype, rdata_for(qtype))]);
-            if parse_ip_response(&message, qtype).is_ok() {
-                accepted += 1;
-            }
+            assert!(
+                parse_ip_response(&message, qtype).is_ok(),
+                "the response builder must produce a message that parses for qtype {qtype}"
+            );
         }
-        assert_eq!(
-            accepted, 3,
-            "the response builder must produce messages that reach the answer loop"
-        );
     }
 
     fn srv_rdata(priority: u16, weight: u16, port: u16, target: &str) -> Vec<u8> {
