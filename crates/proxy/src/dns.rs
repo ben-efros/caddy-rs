@@ -759,6 +759,265 @@ mod tests {
         message
     }
 
+    // --- Fuzz coverage for the response parsers -------------------------------------------------
+    //
+    // `parse_ip_response`, `parse_srv_response` and `decode_name_at` consume bytes chosen by an
+    // upstream DNS resolver (or by whoever can spoof a UDP reply), so they are a request-time
+    // attack surface. `decode_name_at` is the dangerous one: DNS compression pointers are
+    // message-relative and a malicious message can point backwards to itself. The implementation
+    // bounds the jump count and checks every slice, but nothing exercised that with adversarial
+    // input until these tests.
+    //
+    // House style: a seeded xorshift64 PRNG in this file (no cargo-fuzz/libFuzzer/proptest/rand),
+    // `catch_unwind` so a panic is reported with the input that caused it, and an always-executed
+    // regression corpus so the exact bytes that once mattered keep being tried.
+
+    fn xorshift(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    /// The outcome of parsing must always be a typed `Result`, never a panic and never a hang.
+    fn assert_typed(message: &[u8], qtype: u16, context: &str) {
+        let outcome = std::panic::catch_unwind(|| parse_ip_response(message, qtype));
+        match outcome {
+            Ok(Ok(_)) | Ok(Err(_)) => {}
+            Err(_) => panic!(
+                "{context}: parse_ip_response panicked on {} bytes: {:02x?}",
+                message.len(),
+                message
+            ),
+        }
+        let outcome = std::panic::catch_unwind(|| parse_srv_response(message));
+        match outcome {
+            Ok(Ok(_)) | Ok(Err(_)) => {}
+            Err(_) => panic!(
+                "{context}: parse_srv_response panicked on {} bytes: {:02x?}",
+                message.len(),
+                message
+            ),
+        }
+    }
+
+    #[test]
+    fn random_dns_messages_never_panic() {
+        const CASES: usize = 20_000;
+        let mut state = 0x0D15_EA5E_0000_0001_u64;
+        for case in 0..CASES {
+            // Lengths straddle the 12-byte header so both the early return and the parser body run.
+            let len = (xorshift(&mut state) % 96) as usize;
+            let mut message = Vec::with_capacity(len);
+            for _ in 0..len {
+                message.push((xorshift(&mut state) & 0xff) as u8);
+            }
+            assert_typed(&message, QTYPE_A, &format!("random case {case}"));
+        }
+    }
+
+    /// Mutations of a *valid* message reach much deeper than random bytes: the header stays sane,
+    /// so the parser gets into the answer loop and the name decoder.
+    #[test]
+    fn mutated_valid_dns_messages_never_panic() {
+        const CASES: usize = 20_000;
+        let base_a = response(
+            &[("example.com.", QTYPE_A)],
+            &[(QTYPE_A, vec![192, 0, 2, 10])],
+        );
+        let base_srv = response(
+            &[("_https._tcp.example.com.", QTYPE_SRV)],
+            &[(QTYPE_SRV, srv_rdata(10, 20, 443, "backend.example.com."))],
+        );
+        let mut state = 0x5EED_D15_0000_0002_u64;
+        for case in 0..CASES {
+            let base = if case % 2 == 0 { &base_a } else { &base_srv };
+            let mut message = base.clone();
+            // 1..=3 mutations: byte flip, truncate, or splice in an extreme byte.
+            let mutations = 1 + (xorshift(&mut state) % 3) as usize;
+            for _ in 0..mutations {
+                match xorshift(&mut state) % 3 {
+                    0 => {
+                        let index = (xorshift(&mut state) as usize) % message.len();
+                        message[index] ^= 1 << (xorshift(&mut state) % 8);
+                    }
+                    1 => {
+                        let keep = (xorshift(&mut state) as usize) % (message.len() + 1);
+                        message.truncate(keep);
+                        if message.is_empty() {
+                            message.push(0);
+                        }
+                    }
+                    _ => {
+                        let index = (xorshift(&mut state) as usize) % message.len();
+                        message[index] =
+                            [0x00, 0xff, 0xc0, 0x3f][(xorshift(&mut state) % 4) as usize];
+                    }
+                }
+            }
+            assert_typed(&message, QTYPE_A, &format!("mutation case {case}"));
+        }
+    }
+
+    /// Compression pointers are the classic DNS attack: a pointer chain that loops, or one that
+    /// jumps past the end. `decode_name_at` bounds jumps at 64 and rejects out-of-range pointers;
+    /// this drives both limits directly rather than hoping the random corpus finds them.
+    #[test]
+    fn compression_pointer_abuse_is_rejected_not_panicking() {
+        // A self-referential pointer at offset 12: reading it must terminate with an error.
+        let mut looping = vec![0_u8; 12];
+        looping.extend_from_slice(&[0xc0, 12]);
+        assert!(
+            decode_name_at(&looping, 12).is_err(),
+            "a self-referential compression pointer must be rejected"
+        );
+
+        // A pointer chain: each offset points at the next, ending in a loop.
+        let mut chain = vec![0_u8; 12];
+        for offset in 12..300_u16 {
+            chain.extend_from_slice(&(0xc000 | (offset + 2)).to_be_bytes());
+        }
+        assert!(
+            decode_name_at(&chain, 12).is_err(),
+            "a long compression pointer chain must be rejected by the jump bound"
+        );
+
+        // A pointer past the end of the message.
+        let mut past_end = vec![0_u8; 12];
+        past_end.extend_from_slice(&[0xc0, 0xff]);
+        assert!(
+            decode_name_at(&past_end, 12).is_err(),
+            "a compression pointer past the end must be rejected"
+        );
+
+        // A single-byte 0xc0 with no low byte: the pointer itself is truncated.
+        let mut truncated = vec![0_u8; 12];
+        truncated.push(0xc0);
+        assert!(
+            decode_name_at(&truncated, 12).is_err(),
+            "a truncated compression pointer must be rejected"
+        );
+
+        // Every start offset of a valid message must be a typed outcome, including offsets at and
+        // beyond the end.
+        let valid = response(
+            &[("example.com.", QTYPE_A)],
+            &[(QTYPE_A, vec![192, 0, 2, 10])],
+        );
+        for start in 0..=valid.len() + 1 {
+            let outcome = std::panic::catch_unwind(|| decode_name_at(&valid, start));
+            assert!(
+                matches!(outcome, Ok(Ok(_)) | Ok(Err(_))),
+                "decode_name_at panicked at start offset {start}"
+            );
+        }
+    }
+
+    /// `qdcount`/`ancount` are attacker-controlled u16s. A message claiming 65535 questions in 12
+    /// bytes must fail cleanly rather than loop or over-read.
+    #[test]
+    fn absurd_section_counts_are_rejected() {
+        for (qdcount, ancount) in [
+            (0xffff_u16, 0_u16),
+            (0, 0xffff),
+            (0xffff, 0xffff),
+            (1, 0xffff),
+        ] {
+            let mut message = vec![0_u8; 12];
+            message[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+            message[4..6].copy_from_slice(&qdcount.to_be_bytes());
+            message[6..8].copy_from_slice(&ancount.to_be_bytes());
+            assert_typed(
+                &message,
+                QTYPE_A,
+                &format!("qdcount {qdcount} ancount {ancount} with an empty body"),
+            );
+        }
+    }
+
+    /// The exact inputs a previous run found interesting, kept so they are always tried even if
+    /// the random phase is tuned down.
+    #[test]
+    fn dns_regression_corpus_never_panics() {
+        let corpus: Vec<Vec<u8>> = vec![
+            vec![],
+            vec![0],
+            vec![0; 11],
+            vec![0; 12],
+            {
+                let mut m = vec![0_u8; 12];
+                m.extend_from_slice(&[0xc0, 12]);
+                m
+            },
+            {
+                let mut m = vec![0_u8; 12];
+                m[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+                m[4..6].copy_from_slice(&0xffff_u16.to_be_bytes());
+                m
+            },
+            {
+                let mut m = vec![0_u8; 12];
+                m.extend_from_slice(&[0x3f]);
+                m.extend_from_slice(&[b'a'; 0x3f]);
+                m
+            },
+            response(&[("example.com.", QTYPE_SRV)], &[(QTYPE_SRV, vec![0; 6])]),
+            response(&[("example.com.", QTYPE_SRV)], &[(QTYPE_SRV, vec![0; 5])]),
+            response(&[("example.com.", QTYPE_A)], &[(QTYPE_A, vec![0; 3])]),
+            response(
+                &[("example.com.", QTYPE_AAAA)],
+                &[(QTYPE_AAAA, vec![0; 16])],
+            ),
+            response(
+                &[("example.com.", QTYPE_CNAME)],
+                &[(QTYPE_CNAME, vec![0xc0, 12])],
+            ),
+        ];
+        for (index, message) in corpus.iter().enumerate() {
+            assert_typed(message, QTYPE_A, &format!("corpus entry {index}"));
+        }
+    }
+
+    /// Guards against the corpus going vacuous: the generator must keep producing messages that
+    /// actually parse, not only garbage that fails at the header check.
+    #[test]
+    fn dns_fuzz_generator_reaches_the_answer_loop() {
+        let mut accepted = 0;
+        for qtype in [QTYPE_A, QTYPE_AAAA, QTYPE_SRV] {
+            let message = response(&[("example.com.", qtype)], &[(qtype, rdata_for(qtype))]);
+            if parse_ip_response(&message, qtype).is_ok() {
+                accepted += 1;
+            }
+        }
+        assert_eq!(
+            accepted, 3,
+            "the response builder must produce messages that reach the answer loop"
+        );
+    }
+
+    fn srv_rdata(priority: u16, weight: u16, port: u16, target: &str) -> Vec<u8> {
+        let mut rdata = Vec::new();
+        rdata.extend_from_slice(&priority.to_be_bytes());
+        rdata.extend_from_slice(&weight.to_be_bytes());
+        rdata.extend_from_slice(&port.to_be_bytes());
+        for label in target.trim_end_matches('.').split('.') {
+            rdata.push(label.len() as u8);
+            rdata.extend_from_slice(label.as_bytes());
+        }
+        rdata.push(0);
+        rdata
+    }
+
+    fn rdata_for(qtype: u16) -> Vec<u8> {
+        match qtype {
+            QTYPE_A => vec![192, 0, 2, 10],
+            QTYPE_AAAA => vec![0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            _ => srv_rdata(10, 20, 443, "backend.example.com."),
+        }
+    }
+
     #[test]
     fn parses_a_aaaa_and_srv_answers_with_compression() {
         let a = response(
