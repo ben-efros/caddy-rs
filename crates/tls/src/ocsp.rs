@@ -1117,15 +1117,40 @@ fn parse_asn1_time(tag: u8, value: &[u8]) -> Result<u64, OcspError> {
     let hour = parse(&rest[4..6])?;
     let minute = parse(&rest[6..8])?;
     let second = parse(&rest[8..10])?;
-    Ok(unix_seconds_from_civil(
-        year, month, day, hour, minute, second,
-    ))
+    unix_seconds_from_civil(year, month, day, hour, minute, second).ok_or_else(|| {
+        OcspError::Malformed(format!(
+            "ASN.1 time `{text}` is before the Unix epoch and cannot be represented"
+        ))
+    })
 }
 
 fn time_from_unix(seconds: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(seconds)
 }
 
+/// Seconds since the Unix epoch for a civil UTC date-time, or `None` when the instant is before
+/// 1970-01-01 and therefore has no representation as a `u64`.
+///
+/// The return type is deliberately fallible. An earlier version cast the day count to `u64` before
+/// scaling it to seconds:
+///
+/// ```text
+/// let days = (era * 146097 + doe as i64 - 719468) as u64;   // wraps to ~1.8e19 for pre-1970
+/// days * 86_400 + ...                                        // overflows
+/// ```
+///
+/// For any date before the epoch the day count is negative, the cast wrapped it, and the
+/// multiplication overflowed — a panic in debug builds and a silent wrap to a nonsense timestamp in
+/// release. It was reachable from `parse_ocsp_response` with ordinary DER: a UTCTime with `YY >= 50`
+/// denotes year `19YY`, so a plain 1950-1969 date in a responder's `thisUpdate`/`nextUpdate` was
+/// enough, with no malformed encoding required (T-FUZZ-DEFECT-OCSP-PRE-EPOCH).
+///
+/// Rejecting is the right outcome rather than clamping to zero: the result feeds
+/// [`time_from_unix`], which builds a `SystemTime` from a `u64`, and the freshness check in
+/// `staple_for_certificate` compares `next_update` against `this_update`. Clamping would turn
+/// "unrepresentable" into "1970", silently changing what the freshness comparison means. Go's
+/// `encoding/asn1` (what Caddy uses) represents these instants fine because `time.Time` is signed;
+/// caddy-rs cannot, so it reports a typed error instead of guessing.
 fn unix_seconds_from_civil(
     year: i64,
     month: u64,
@@ -1133,7 +1158,7 @@ fn unix_seconds_from_civil(
     hour: u64,
     minute: u64,
     second: u64,
-) -> u64 {
+) -> Option<u64> {
     // Howard Hinnant's days-from-civil algorithm.
     let y = if month <= 2 { year - 1 } else { year };
     let era = if y >= 0 { y } else { y - 399 } / 400;
@@ -1141,8 +1166,15 @@ fn unix_seconds_from_civil(
     let month = month as i64;
     let doy = ((153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5) as u64 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = (era as i64 * 146097 + doe as i64 - 719468) as u64;
-    days * 86_400 + hour * 3_600 + minute * 60 + second
+    // Keep the day count signed all the way through the epoch conversion: it is negative for
+    // every date before 1970-01-01, and that is exactly the case the cast used to break.
+    let days = era * 146097 + doe as i64 - 719468;
+    if days < 0 {
+        return None;
+    }
+    let days = days as u64;
+    days.checked_mul(86_400)?
+        .checked_add(hour * 3_600 + minute * 60 + second)
 }
 
 #[cfg(test)]

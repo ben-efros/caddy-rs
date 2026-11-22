@@ -247,64 +247,6 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
-// Records where a caught panic came from, so a `catch_unwind` skip can prove it is skipping the
-// *known* defect rather than absorbing an unknown one.
-//
-// The panic payload cannot be used: an arithmetic-overflow panic carries a payload that is neither
-// `String` nor `&str` once it crosses a `#[test]` boundary, so `downcast_ref` returns `None` and the
-// message is empty. The source location is reliable, and `unix_seconds_from_civil` is where the
-// pre-epoch defect overflows — any other site means a *new* defect, which must fail the test rather
-// than be skipped.
-//
-// The hook is installed once per process and writes to a thread-local, because tests run on
-// separate threads and a global `Mutex` slot would race between them.
-thread_local! {
-    static PANIC_LOCATION: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
-}
-
-static HOOK_INSTALLED: std::sync::Once = std::sync::Once::new();
-
-fn record_panic_location() {
-    HOOK_INSTALLED.call_once(|| {
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            if let Some(location) = info.location() {
-                let text = format!("{}:{}", location.file(), location.line());
-                PANIC_LOCATION.with(|slot| *slot.borrow_mut() = Some(text));
-            }
-            previous(info);
-        }));
-    });
-}
-
-/// The file:line of the known defect. If the fix moves or removes this arithmetic, update this
-/// constant *and* delete the skips that use it.
-const KNOWN_OVERFLOW_LOCATION: &str = "crates/tls/src/ocsp.rs:1145";
-
-/// Runs `body`, expecting it to panic at [`KNOWN_OVERFLOW_LOCATION`]. Returns `true` if it did.
-/// A panic anywhere else is a *new* defect and panics the test, so it cannot be skipped silently.
-fn panicked_at_known_overflow<F, R>(body: F, context: &str) -> bool
-where
-    F: FnOnce() -> R + std::panic::UnwindSafe,
-{
-    record_panic_location();
-    PANIC_LOCATION.with(|slot| *slot.borrow_mut() = None);
-    let outcome = std::panic::catch_unwind(body);
-    let location = PANIC_LOCATION.with(|slot| slot.borrow().clone());
-    match (outcome, location) {
-        (Ok(_), _) => false,
-        (Err(_), Some(where_)) => {
-            assert!(
-                where_ == KNOWN_OVERFLOW_LOCATION,
-                "{context}: panicked at {where_}, but only the known pre-epoch overflow at \
-                 {KNOWN_OVERFLOW_LOCATION} may be skipped (T-FUZZ-DEFECT-OCSP-PRE-EPOCH)"
-            );
-            true
-        }
-        (Err(_), None) => panic!("{context}: panicked but the location was not recorded"),
-    }
-}
-
 // --- Corpus ---------------------------------------------------------------------------------
 
 #[test]
@@ -365,7 +307,6 @@ fn every_prefix_of_a_valid_response_is_rejected_or_accepted_consistently() {
 fn mutated_valid_responses_never_panic() {
     let mut state = 0x5EED_0000_0000_0003_u64;
     let base = valid_response(&[7], 1_700_000_000, Some(1_700_003_600));
-    let mut skipped = 0usize;
     for case in 0..MUTATION_CASES {
         let mut input = base.clone();
         // Apply 1..=4 mutations: flip a byte, truncate, splice in a random byte, or duplicate.
@@ -393,25 +334,9 @@ fn mutated_valid_responses_never_panic() {
                 }
             }
         }
-        // Known defect (see PRE_EPOCH_* below): any time before 1970-01-01 makes the civil-date
-        // arithmetic wrap and the parser panic. Inputs that reach it are skipped here so this
-        // corpus stays green until the fix lands; `pre_epoch_*` tests pin the exact inputs.
-        //
-        // The skip is only sound while it cannot hide a *different* panic, so the panic location
-        // is checked: anything other than the known overflow fails the test. Without this, a future
-        // regression could be silently absorbed by the skip that exists for today's defect.
-        if panicked_at_known_overflow(
-            || parse_ocsp_response(&input),
-            &format!("mutation case {case}"),
-        ) {
-            skipped += 1;
-            continue;
-        }
         assert_typed_outcome(&input, &format!("mutation case {case}"));
     }
-    println!(
-        "mutated_valid_responses_never_panic: {skipped} input(s) skipped (known pre-epoch defect)"
-    );
+    println!("mutated_valid_responses_never_panic: {MUTATION_CASES} input(s) asserted");
 }
 
 #[test]
@@ -477,16 +402,8 @@ fn asn1_time_fields_are_bounded_not_trusted() {
                 continue;
             }
 
-            // At or above the guard the body decodes. It may legitimately land before 1970, which
-            // is the separately tracked overflow defect, so only those inputs are skipped — and the
-            // skip is narrow: it applies only to bodies the guard accepts, and it checks the panic
-            // location, so any *other* panic still fails the test.
-            if panicked_at_known_overflow(
-                || parse_ocsp_response(&input),
-                &format!("tag {tag:#04x} body len {len}"),
-            ) {
-                continue;
-            }
+            // At or above the guard the body decodes. A pre-1970 time is now a typed error rather
+            // than a panic, so it is accepted by `assert_typed_outcome` like any other rejection.
             assert_typed_outcome(&input, &format!("nextUpdate tag {tag:#04x} body len {len}"));
         }
     }
@@ -561,9 +478,9 @@ fn regression_corpus_never_panics() {
 // through 1969 is both ordinary-looking and a crash: `500101000000Z` is a 13-byte, well-formed
 // UTCTime. No malformed DER is required, only an unremarkable early date.
 //
-// These tests pin the exact inputs. They are `#[ignore]`d so CI stays green until the fix lands;
-// the fix removes `#[ignore]` in the same change. If the fix normalises pre-epoch times instead of
-// rejecting them, change the assertion to the accepted behaviour — but a panic must never remain.
+// These tests pin the exact inputs. They are active regression tests for T-FUZZ-DEFECT-OCSP-PRE-EPOCH:
+// `unix_seconds_from_civil` now returns `Option<u64>` and `parse_asn1_time` reports a typed
+// `Malformed` error for instants before the epoch, so these must stay typed errors, never panics.
 const PRE_EPOCH_UTC_TIMES: &[&str] = &[
     "500101000000Z", // 1950-01-01, the earliest UTCTime year (YY>=50 -> 19YY)
     "690101000000Z", // 1969-01-01
@@ -579,7 +496,6 @@ fn response_with_next_update_utctime(body: &str) -> Vec<u8> {
 }
 
 #[test]
-#[ignore = "known defect: pre-1970 ASN.1 time overflows unix_seconds_from_civil (crates/tls/src/ocsp.rs:1145)"]
 fn pre_epoch_next_update_is_rejected_not_panicking() {
     for body in PRE_EPOCH_UTC_TIMES {
         let input = response_with_next_update_utctime(body);
@@ -588,7 +504,6 @@ fn pre_epoch_next_update_is_rejected_not_panicking() {
 }
 
 #[test]
-#[ignore = "known defect: pre-1970 ASN.1 time overflows unix_seconds_from_civil (crates/tls/src/ocsp.rs:1145)"]
 fn pre_epoch_this_update_is_rejected_not_panicking() {
     // `thisUpdate` goes through the same parser, so the crash is reachable from either field.
     let mut utc = Vec::new();
