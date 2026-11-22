@@ -46,38 +46,33 @@ const BANNED: [Banned; 3] = [
         why: "unmaintained; reached only via nix's default `aio` feature",
         allowed: false,
     },
-    // ALLOWED — see `chrono_allowance`. The ban stands for every crate that could choose a
-    // different dependency; `chrono` is the one case where no choice exists.
+    // Now banned outright, not allowed. T-SEC-141 replaced `axum-test` with an in-process
+    // harness (`pm/crates/pm-api/src/test_harness.rs`), which removed the only path to chrono,
+    // so there is no longer an edge that has no alternative.
     Banned {
         name: "chrono",
         advisory: "RUSTSEC-2026-0543",
         why: "unmaintained, patched = []; replaced by caddy_rs_core::Timestamp",
-        allowed: true,
+        allowed: false,
     },
 ];
 
-/// Why `chrono` is tolerated, and what would remove it.
+/// Why `chrono` was once tolerated, and how it left.
 ///
-/// `pm/crates/pm-api` tests its axum router with `axum-test`, which depends on `expect-json`,
-/// which depends on `chrono`. `axum-test` does not feature-gate that edge (`expect-json` is
-/// neither `optional = true` nor behind a `dep:` feature), so any use of `axum-test` pulls
-/// `chrono` in. Every published `expect-json` depends on `chrono`, so there is no version to
-/// move to either.
+/// Kept as a record because the reasoning explains the shape of the ban. `pm/crates/pm-api` used
+/// to test its axum router with `axum-test`, which depends on `expect-json`, which depends on
+/// `chrono`. `axum-test` does not feature-gate that edge, and every published `expect-json`
+/// depends on `chrono`, so no version bump could remove it.
 ///
-/// The allowance is narrow in a way that matters and is checked, not assumed:
+/// T-SEC-141 took the route this comment used to name as the only remaining one: replacing
+/// `axum-test` in `pm-api`'s tests with a harness rewrite. `pm/crates/pm-api/src/test_harness.rs`
+/// drives the router through `tower::ServiceExt::oneshot` and covers the API surface the suite
+/// actually calls. With `axum-test` gone, `expect-json` and `chrono` left the lockfile, and
+/// `chrono` moved from `allowed: true` to `allowed: false` above.
 ///
-///   * `cargo tree --workspace -e normal` contains **no** `chrono`. It is reachable only from
-///     dev-dependencies, so it is never compiled into a shipped binary.
-///   * Nothing in this repository names `chrono` in a manifest or uses `chrono::` in source.
-///     It is a test-harness transitive dependency and nothing else.
-///
-/// So this is not "chrono is fine". It is "the only path to chrono is a dev-dependency edge that
-/// has no alternative, and it does not reach the artefact". Removing it means replacing
-/// `axum-test` in `pm-api`'s tests, which is a harness rewrite rather than a dependency bump.
-const CHRONO_ALLOWANCE: &str =
-    "allowed: reachable only via pm-api's dev-dependency axum-test -> expect-json -> chrono, \
-     which axum-test does not feature-gate and no expect-json release avoids; absent from \
-     `cargo tree --workspace -e normal`, so it never reaches a shipped binary";
+/// The narrow claims that justified the old allowance are still checked, and now hold for a
+/// stronger reason: there is no `chrono` in the graph at all, so it is trivially absent from
+/// `cargo tree --workspace -e normal` and nothing can name it in a manifest.
 
 /// Directories containing a `Cargo.lock` that is committed and gates a build or an audit.
 fn lockfile_dirs() -> Vec<PathBuf> {
@@ -160,51 +155,50 @@ fn workspace_lockfiles_contain_no_banned_crates() {
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
 
-/// The `chrono` allowance is only valid while `chrono` is unreachable from a normal build.
+/// `chrono` is out of the graph, and this test fails if it comes back.
 ///
-/// `CHRONO_ALLOWANCE` claims two things. This test checks the one that can be checked from the
-/// lockfile without invoking Cargo (the guard stays offline and deterministic): that no
-/// *non-test* crate depends on `chrono`. If a future change makes `chrono` a normal dependency
-/// of anything, this fails and the allowance has to be re-argued rather than silently inherited.
+/// The old `CHRONO_ALLOWANCE` was guarded by a test that fired once `expect-json` disappeared,
+/// telling the next agent to drop the allowance. T-SEC-141 removed `axum-test` (the only route to
+/// `expect-json`), so that is now done: `chrono` is banned outright in `BANNED` above.
 ///
-/// The other half -- that nothing names `chrono` directly -- is checked by
-/// `chrono_allowance_is_not_a_direct_dependency`.
+/// This test is the reverse ratchet. It asserts the graph really is free of `chrono`, so a
+/// dependency change that drags it back in fails here rather than silently re-opening
+/// RUSTSEC-2026-0543. The lockfile is read directly, keeping the guard offline and deterministic.
 #[test]
-fn chrono_allowance_is_justified_by_the_dependency_kind() {
+fn chrono_is_absent_from_the_lockfile() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(2)
         .expect("workspace root is two levels above crates/core")
         .to_path_buf();
     let lockfile = fs::read_to_string(root.join("Cargo.lock")).expect("workspace lockfile");
-
-    // The allowance exists because of `expect-json`. If that edge ever disappears, the allowance
-    // should disappear with it, and this test says so instead of letting it rot in place.
     let names = locked_package_names(&lockfile);
-    if !names.iter().any(|n| n == "expect-json") {
-        panic!(
-            "`expect-json` is gone from Cargo.lock, so the recorded `chrono` allowance no longer \
-             has a justification. Remove the allowance from BANNED (set `allowed: false`) and \
-             re-run this test. Allowed-but-unnecessary is how a ban quietly stops being a ban."
+
+    assert!(
+        !names.iter().any(|n| n == "chrono"),
+        "`chrono` is back in Cargo.lock and RUSTSEC-2026-0543 is live again. The ban in `BANNED` \
+         is `allowed: false`, so this must be removed rather than re-allowlisted. The previous \
+         route was pm-api's dev-dependency on `axum-test`; it now uses the in-process harness in \
+         pm/crates/pm-api/src/test_harness.rs, which needs no chrono."
+    );
+
+    // Name the edges that used to carry it, so a reintroduction points at the cause.
+    for crate_name in ["axum-test", "expect-json"] {
+        assert!(
+            !names.iter().any(|n| n == crate_name),
+            "`{crate_name}` is back in Cargo.lock; it is the edge that used to pull `chrono` in. \
+             If a test needs an HTTP harness, extend pm/crates/pm-api/src/test_harness.rs."
         );
     }
-
-    // `axum-test` is the only route to `expect-json`. Keep that edge visible.
-    assert!(
-        names.iter().any(|n| n == "axum-test"),
-        "`expect-json` is locked but `axum-test` is not -- the recorded explanation for the \
-         `chrono` allowance ({CHRONO_ALLOWANCE}) no longer describes the graph"
-    );
 }
 
-/// Nothing in this repository may name `chrono` directly.
+/// Nothing in this repository may name `chrono` at all.
 ///
-/// The allowance covers a transitive test-harness dependency, not a licence to write new code
-/// against `chrono`. `caddy_rs_core::Timestamp` is the replacement. This walks the manifests and
-/// sources under the workspace root, so a direct `chrono` dependency or a `chrono::` path fails
-/// the build while the transitive edge above stays permitted.
+/// `caddy_rs_core::Timestamp` is the replacement. This walks the manifests and sources under the
+/// workspace root, so a direct `chrono` dependency or a `chrono::` path fails the build. It used
+/// to permit the transitive `axum-test` edge; that edge is gone, so there is no exemption left.
 #[test]
-fn chrono_allowance_is_not_a_direct_dependency() {
+fn chrono_is_not_a_direct_dependency() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(2)
@@ -277,8 +271,8 @@ fn chrono_allowance_is_not_a_direct_dependency() {
     );
     assert!(
         offences.is_empty(),
-        "`chrono` may not be named directly; use `caddy_rs_core::Timestamp` instead. The recorded \
-         allowance covers only the transitive test-harness edge ({CHRONO_ALLOWANCE}).\n{}",
+        "`chrono` may not be named; use `caddy_rs_core::Timestamp` instead. There is no allowance: \
+         T-SEC-141 removed the axum-test edge that justified one.\n{}",
         offences.join("\n")
     );
 }

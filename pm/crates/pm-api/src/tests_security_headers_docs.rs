@@ -3,8 +3,8 @@
 //! The registry tests live next to the data (`security_headers_docs::tests`); these tests only
 //! assert that both public surfaces serve it and that its defaults agree with the stored config.
 
+use crate::test_harness::TestServer;
 use axum::http::{header, StatusCode};
-use axum_test::TestServer;
 use caddy_rs_authn::{Argon2Config, AuthnConfig, AuthnService, JwtSecretSource, MemoryUserStore};
 use caddy_rs_pm_core::SecurityHeadersConfig;
 use caddy_rs_pm_runtime::{PmRuntime, RuntimeConfig};
