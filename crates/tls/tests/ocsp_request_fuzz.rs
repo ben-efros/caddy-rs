@@ -310,16 +310,16 @@ fn empty_and_tiny_inputs_are_typed_errors() {
 }
 
 /// A serial number is attacker-chosen and its length is not bounded by the parser, so the cost of
-/// re-encoding it must stay linear. `der_integer_from_bytes` strips leading zeros one `remove(0)` at
-/// a time, which is O(n) per byte and therefore O(n^2) overall — a CPU-amplification vector.
+/// re-encoding it must stay linear. `der_integer_from_bytes` used to strip leading zeros one
+/// `remove(0)` at a time, which is O(n) per byte and therefore O(n^2) overall — a CPU-amplification
+/// vector. It now scans to the first byte that must be kept and slices, which is linear.
 ///
 /// This test measures the ratio rather than an absolute time so it does not depend on machine speed.
 ///
-/// KNOWN DEFECT (T-FUZZ-DEFECT-OCSP-REQUEST-QUADRATIC): this test currently FAILS. Run it with
-/// `cargo test --offline -p caddy-rs-tls --test ocsp_request_fuzz -- --ignored` to see it. It is
-/// `#[ignore]`d so the suite stays green until the fix lands; the fix should remove the attribute.
+/// Regression guard for T-FUZZ-DEFECT-OCSP-REQUEST-QUADRATIC: it failed against the `remove(0)`
+/// implementation (8x the serial cost 20.9x, where linear is 8x and quadratic 64x) and passes
+/// against the scan.
 #[test]
-#[ignore = "known defect T-FUZZ-DEFECT-OCSP-REQUEST-QUADRATIC: der_integer_from_bytes is O(n^2)"]
 fn serial_encoding_cost_is_linear_not_quadratic() {
     fn build_with_serial(serial: &[u8]) -> std::time::Duration {
         // Raw encoding: the serial must reach the builder unnormalised, or the test is vacuous.

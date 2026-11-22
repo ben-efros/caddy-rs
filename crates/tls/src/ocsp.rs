@@ -983,18 +983,35 @@ fn der_null() -> Vec<u8> {
     vec![0x05, 0x00]
 }
 
+/// Encode `bytes` as a DER INTEGER, stripping redundant leading zeros.
+///
+/// The strip is a single scan to the first byte that must be kept, not a `remove(0)` loop. The loop
+/// shifted the whole `Vec` once per stripped byte, so it cost O(n^2) in the length of the leading
+/// zero run; the serial comes from the certificate's INTEGER content and `parse_certificate` puts no
+/// length bound on it, so a certificate could choose an arbitrarily long run and make
+/// `build_ocsp_request` quadratic. Found by fuzzing (`T-FUZZ-DEFECT-OCSP-REQUEST-QUADRATIC`).
+///
+/// Redundant leading zeros are those where the value would still be a valid DER INTEGER without
+/// them: a zero byte is kept when it is the last byte, or when the next byte has its high bit set
+/// (dropping it would flip the sign).
 fn der_integer_from_bytes(bytes: &[u8]) -> Vec<u8> {
-    let mut content = bytes.to_vec();
-    while content.len() > 1 && content[0] == 0 && content[1] & 0x80 == 0 {
-        content.remove(0);
+    let mut start = 0;
+    while start + 1 < bytes.len() && bytes[start] == 0 && bytes[start + 1] & 0x80 == 0 {
+        start += 1;
     }
+    let content = &bytes[start..];
     if content.is_empty() {
-        content.push(0);
+        // Only reachable for an empty input; DER INTEGER content is never empty.
+        return der_tlv(0x02, &[0]);
     }
     if content[0] & 0x80 != 0 {
-        content.insert(0, 0);
+        // A positive value whose top bit is set needs a leading zero so it stays positive.
+        let mut prefixed = Vec::with_capacity(content.len() + 1);
+        prefixed.push(0);
+        prefixed.extend_from_slice(content);
+        return der_tlv(0x02, &prefixed);
     }
-    der_tlv(0x02, &content)
+    der_tlv(0x02, content)
 }
 
 fn der_octet_string(content: &[u8]) -> Vec<u8> {
