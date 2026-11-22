@@ -1446,6 +1446,40 @@ mod tests {
         }
     }
 
+    /// The CRC32C verification slices `buffer[..16 + payload_len]` and then indexes
+    /// `value_position..value_position + 4` inside it. That is only sound because
+    /// `read_exact_more` never appends *more* than the count it was asked for: `read_some` caps each
+    /// read at `min(limit, chunk.len())` and `read_exact_more` loops on the remaining count. Pin the
+    /// invariant, so a future "just read a bit more for safety" change to the reader fails here
+    /// rather than producing a silently wrong checksum.
+    #[tokio::test]
+    async fn read_exact_more_never_reads_past_the_requested_count() {
+        for available in [0_usize, 1, 3, 4, 7, 16, 17, 1023, 1024, 1025, 4096] {
+            let data = vec![0xA5_u8; available];
+            let mut stream: &[u8] = &data;
+            let mut buffer = V2_SIGNATURE.to_vec(); // 12 bytes already consumed
+            let before = buffer.len();
+            let outcome = read_exact_more(&mut stream, 4, None, &mut buffer).await;
+            if available >= 4 {
+                outcome.expect("four bytes are available");
+                assert_eq!(
+                    buffer.len(),
+                    before + 4,
+                    "read_exact_more appended more than the 4 bytes requested (available {available})"
+                );
+            } else {
+                assert!(
+                    outcome.is_err(),
+                    "read_exact_more must report EOF with only {available} of 4 bytes available"
+                );
+                assert!(
+                    buffer.len() <= before + available,
+                    "read_exact_more over-read with only {available} bytes available"
+                );
+            }
+        }
+    }
+
     /// A v1 header longer than 107 bytes must be rejected rather than buffered without bound.
     #[tokio::test]
     async fn oversized_v1_headers_are_rejected() {
@@ -1537,14 +1571,28 @@ mod tests {
                     }
                 }
             }
-            if bytes.starts_with(V2_SIGNATURE) || bytes.starts_with(b"PROXY ") {
+            // Count cases that reach the *body* of a parser, not merely a signature match: a
+            // generator emitting 13-byte "PROXY \r\n" stubs would otherwise satisfy a
+            // signature-only check while never exercising the address or TLV code.
+            let entered_parser = if bytes.starts_with(V2_SIGNATURE) {
+                bytes.len() > 16 && bytes[12] >> 4 == 2 && bytes[13] >> 4 <= 3
+            } else if bytes.starts_with(b"PROXY ") {
+                bytes.windows(2).any(|window| window == b"\r\n")
+            } else {
+                false
+            };
+            if entered_parser {
                 entered += 1;
             }
         }
+        // Measured 312/1000 reach a parser body today. The floor is set well below that so ordinary
+        // churn in the mutation mix does not trip it, while a real regression (generator emitting
+        // non-header garbage, or a signature-only stub) fails clearly.
         assert!(
-            entered > cases / 2,
-            "only {entered} of {cases} generated mutations still start with a PROXY signature; \
-             the mutation generator has regressed and the fuzz phases no longer reach the parsers"
+            entered > cases / 10,
+            "only {entered} of {cases} generated mutations reach a PROXY protocol parser body \
+             (12-byte v2 signature with a v2 version nibble, or a v1 line terminated by CRLF); the \
+             mutation generator has regressed and the fuzz phases no longer exercise the parsers"
         );
     }
 }
