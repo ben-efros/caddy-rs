@@ -1,0 +1,45 @@
+# Zero-downtime restart evidence (T-CORE-104) — re-run to verify
+# generated: 2026-11-22T19:15:13Z
+# rustc: 1.98.1 (48a229cea 2026-09-01), binary built with feature graceful-restart
+# ADR-0044 §2 states the gap-free upgrade as a design constraint, not a demonstrated result.
+# graceful_restart_inherit.rs names T-CORE-104 as the missing measurement. This is it.
+
+# Both probe scripts below take the binary from $CADDY_RS_BIN (default: `caddy-rs` on PATH), so
+# point it at the cargo build before re-running:
+#   export CADDY_RS_BIN=$(cargo build -p caddy-rs --features graceful-restart \
+#       --message-format=json 2>/dev/null | jq -r 'select(.reason=="compiler-artifact") \
+#       | select(.target.name=="caddy-rs") | .executable')
+#
+# The measurement is crates/cli/tests/zero_downtime_restart.rs. It runs the real binary, holds
+# connections open across a live SIGUSR2 restart, hammers new connections throughout, and records
+# counts — resets and refusals — rather than a pass flag.
+
+$ cargo test --offline --locked -p caddy-rs --features caddy-rs/graceful-restart \
+    --test zero_downtime_restart
+test killing_the_process_is_measured_as_refusals_and_resets ... ok
+test zero_downtime ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.57s
+
+# Direction 1: graceful restart (SIGUSR2). 5 connections held open across the transition, a
+# connection hammer running throughout. The zero is the claim.
+$ python3 docs/operations/evidence/2026-11-zero-downtime-probe.py
+    pre-restart opens: 199
+    SIGUSR2 sent
+{"opened": 1561, "reset": 0, "refused": 0, "errors": []}
+
+# Direction 2: the negative control. The SAME measurement against SIGKILL, where the answer must be
+# bad. Without this, a harness that could only ever print 0 would print 0 here too, and the zero in
+# direction 1 would prove nothing.
+$ python3 docs/operations/evidence/2026-11-zero-downtime-negative-control.py
+{"opened": 291, "reset": 1, "refused": 681, "errors": []}
+
+# Mutation checks, so the assertions are known to be load-bearing rather than decorative:
+#   - asserting reset == 1 in zero_downtime        -> FAILED (the counter is read, not ignored)
+#   - sending SIGKILL on the graceful path         -> FAILED with
+#       "5 connection(s) established before the restart were reset; 104 were opened in total,
+#        so the old generation did not drain them"
+#   - both measurements sharing one scratch dir    -> "did not begin serving": the two overwrote
+#       each other's Caddyfile, because std::process::id() is identical across test threads
+
+# What this does not prove: in-flight requests are not timed. The assertion is that connections
+# survive the transition, not that a request issued during the drain completes within a bound.
