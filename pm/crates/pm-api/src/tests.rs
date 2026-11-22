@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::*;
 use crate::dto::{HostResponse, HostSpecDto, HostTlsDto, HostWriteRequest};
-use axum_test::TestServer;
+use crate::test_harness::TestServer;
 use caddy_rs_authn::{
     Argon2Config, AuthnConfig, AuthnService, JwtSecretSource, MemoryUserStore, PublicUser,
 };
@@ -2658,7 +2658,7 @@ async fn login(server: &TestServer, username: &str, password: &str) -> SessionTo
     response.json()
 }
 
-fn error_envelope(response: &axum_test::TestResponse) -> ApiErrorResponse {
+fn error_envelope(response: &crate::test_harness::TestResponse) -> ApiErrorResponse {
     response.json()
 }
 
@@ -3361,7 +3361,7 @@ async fn confirm_enrollment(
     server: &TestServer,
     token: &str,
     code: &str,
-) -> axum_test::TestResponse {
+) -> crate::test_harness::TestResponse {
     server
         .post("/api/v1/auth/totp/confirm")
         .add_header("Authorization", bearer(token))

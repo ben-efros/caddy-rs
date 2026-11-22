@@ -27,6 +27,13 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
-axum-test = "22.0.0-rc.1"
+# `axum-test` was removed rather than kept: it depends on `expect-json`, which depends on
+# `chrono` unconditionally, and `chrono` is unmaintained (RUSTSEC-2026-0543). The replacement
+# is `src/test_harness.rs`, which drives the router through `tower::ServiceExt::oneshot` --
+# the same mechanism `axum-test` used -- and covers exactly the API surface the suite calls.
+# Adding it back reintroduces the advisory.
+http-body-util = { workspace = true }
 tempfile = { workspace = true }
+# `ServiceExt::oneshot`, used by the harness to drive the router in-process.
+tower = { version = "0.5", features = ["util"] }
 tokio = { workspace = true, features = ["full"] }
