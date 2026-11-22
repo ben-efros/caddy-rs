@@ -300,3 +300,191 @@ fn killing_the_process_is_measured_as_refusals_and_resets() {
          connection and `zero_downtime`'s zero is not evidence"
     );
 }
+
+/// The failed-child case (T-CORE-103, ADR-0044 §2.4): a restart whose child cannot initialise must
+/// leave the *parent* serving.
+///
+/// `graceful_restart.rs` already has a test named for this property, but it asserts that the error
+/// string contains "still serving" -- it never starts a parent, fails a child, and shows the parent
+/// answering. This is that proof: the parent is running and serving, the configuration on disk is
+/// replaced with one that cannot be adapted, `SIGUSR2` asks for a restart, and the parent must still
+/// answer on the same port afterwards.
+///
+/// This is the case that decides whether the §2 ordering is real. If the parent stopped accepting
+/// while it waited for the child, a bad configuration would be an outage -- which is the whole reason
+/// the readiness handshake exists.
+#[test]
+fn a_failed_child_leaves_the_parent_serving() {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "caddy-rs-failed-child-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(&dir).expect("create the scratch directory");
+    let port = free_port();
+    let server = Server::start(&dir, port);
+    assert_eq!(
+        serve_status(port),
+        200,
+        "the parent must be serving before the restart"
+    );
+
+    // Replace the configuration with one that cannot adapt. The child re-reads the same path, so it
+    // exits before becoming ready; the parent must survive that.
+    std::fs::write(
+        dir.join("Caddyfile"),
+        format!(":{port} {{\n\tnonexistent_directive_xyz\n}}\n"),
+    )
+    .expect("write the bad Caddyfile");
+
+    server.signal(libc::SIGUSR2);
+    // Give the child time to start, fail, and be reported. This is not a race against a timeout: the
+    // parent blocks on the readiness pipe, so once the child has exited the outcome is decided.
+    thread::sleep(Duration::from_secs(3));
+
+    assert_eq!(
+        serve_status(port),
+        200,
+        "a restart whose child failed to initialise took the parent down; ADR-0044 §2.4 requires the \
+         old generation to keep serving"
+    );
+}
+
+/// One request to `port`, returning the status code, or 0 if nothing answered.
+fn serve_status(port: u16) -> u16 {
+    use std::io::Write as _;
+    let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) else {
+        return 0;
+    };
+    let _ = stream.write_all(b"GET / HTTP/1.1\r\nHost: probe\r\nConnection: close\r\n\r\n");
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    let text = String::from_utf8_lossy(&response);
+    text.split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0)
+}
+
+/// A long-lived streaming connection survives the restart (the second case the row names).
+///
+/// A plain held-open TCP connection proves the socket was not torn down, but not that a stream
+/// *mid-conversation* keeps flowing: a server that drains by finishing the current response would
+/// pass the socket test and still truncate a stream. So this test streams: a backend writes a
+/// chunked body slowly, caddy-rs reverse-proxies it, and the client must receive **every** chunk --
+/// including the ones written after the restart -- and the terminating zero-length chunk.
+///
+/// The backend is a real HTTP server on a thread, not a mock, because the property under test is
+/// that the proxy does not buffer the body before the restart.
+#[test]
+fn a_long_lived_streaming_response_survives_the_restart() {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "caddy-rs-streaming-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(&dir).expect("create the scratch directory");
+
+    // A chunked backend: 40 ticks at 100ms, so the restart lands mid-stream.
+    const TICKS: usize = 40;
+    let backend = TcpListener::bind("127.0.0.1:0").expect("bind the backend");
+    let backend_port = backend.local_addr().expect("backend addr").port();
+    let backend_thread = thread::spawn(move || {
+        let (mut socket, _) = backend.accept().expect("accept the proxied connection");
+        let mut request = [0u8; 4096];
+        let _ = socket.read(&mut request);
+        let head =
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n";
+        if socket.write_all(head.as_bytes()).is_err() {
+            return;
+        }
+        for tick in 0..TICKS {
+            let body = format!("tick{tick}\n");
+            let frame = format!("{:x}\r\n{body}\r\n", body.len());
+            if socket.write_all(frame.as_bytes()).is_err() {
+                return;
+            }
+            let _ = socket.flush();
+            thread::sleep(Duration::from_millis(100));
+        }
+        let _ = socket.write_all(b"0\r\n\r\n");
+    });
+
+    let port = free_port();
+    let config = dir.join("Caddyfile");
+    std::fs::write(
+        &config,
+        format!("{{\n\tadmin off\n}}\n:{port} {{\n\treverse_proxy 127.0.0.1:{backend_port}\n}}\n"),
+    )
+    .expect("write the Caddyfile");
+    let mut child = Command::new(binary())
+        .args([
+            "run",
+            "--config",
+            config.to_str().expect("utf-8 path"),
+            "--adapter",
+            "caddyfile",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            std::fs::File::create(dir.join("caddy-rs.stderr")).expect("create the log file"),
+        ))
+        .spawn()
+        .expect("spawn caddy-rs");
+
+    // Wait for the proxy to accept, then read the stream on this thread while the restart happens.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "the proxy never began listening on {port}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the proxy");
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: probe\r\n\r\n")
+        .expect("send the request");
+
+    // Let the stream get going, then restart while it is mid-body.
+    thread::sleep(Duration::from_millis(500));
+    let status = Command::new("kill")
+        .arg("-USR2")
+        .arg(child.id().to_string())
+        .status()
+        .expect("run kill");
+    assert!(status.success(), "kill -USR2 failed");
+
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("set the read timeout");
+    let mut body = Vec::new();
+    let _ = stream.read_to_end(&mut body);
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = backend_thread.join();
+
+    let text = String::from_utf8_lossy(&body);
+    let ticks: Vec<&str> = text
+        .lines()
+        .filter(|line| line.starts_with("tick"))
+        .collect();
+    assert_eq!(
+        ticks.len(),
+        TICKS,
+        "the stream was truncated across the restart: received {} of {TICKS} chunks (last: {:?})",
+        ticks.len(),
+        ticks.last()
+    );
+    assert_eq!(
+        ticks.last().copied(),
+        Some("tick39"),
+        "the stream did not continue to its final chunk across the restart"
+    );
+    assert!(
+        text.contains("0\r\n\r\n"),
+        "the terminating chunk was lost, so the stream was cut rather than completed"
+    );
+}

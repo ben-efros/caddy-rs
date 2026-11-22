@@ -18,7 +18,9 @@ $ cargo test --offline --locked -p caddy-rs --features caddy-rs/graceful-restart
     --test zero_downtime_restart
 test killing_the_process_is_measured_as_refusals_and_resets ... ok
 test zero_downtime ... ok
-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.57s
+test a_failed_child_leaves_the_parent_serving ... ok
+test a_long_lived_streaming_response_survives_the_restart ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 34.29s
 
 # Direction 1: graceful restart (SIGUSR2). 5 connections held open across the transition, a
 # connection hammer running throughout. The zero is the claim.
@@ -40,6 +42,24 @@ $ python3 docs/operations/evidence/2026-11-zero-downtime-negative-control.py
 #        so the old generation did not drain them"
 #   - both measurements sharing one scratch dir    -> "did not begin serving": the two overwrote
 #       each other's Caddyfile, because std::process::id() is identical across test threads
+
+# Case 2: a failed child leaves the parent serving (T-CORE-103, ADR-0044 §2.4). The configuration
+# on disk is replaced with one that cannot adapt, SIGUSR2 asks for a restart, and the parent must
+# still answer 200 on the same port afterwards. Verified by hand before it was written as a test:
+#   $ curl -o /dev/null -w '%{http_code}' http://127.0.0.1:18897/     -> 200 before
+#   $ kill -USR2 <parent>            # child re-reads the bad config and exits
+#   $ curl -o /dev/null -w '%{http_code}' http://127.0.0.1:18897/     -> 200 after
+#   stderr: graceful restart FAILED, still serving: ... the new process did not become ready
+#           (child exited unexpectedly); the current process is still serving
+# This supplies the proof graceful_restart.rs:427 only asserted as an error STRING.
+# Mutation: expecting 500 instead of 200 FAILS with "left: 200, right: 500", so the assertion reads
+# a real status rather than passing vacuously.
+
+# Case 3: a long-lived streaming response survives. A chunked backend writes 40 ticks at 100ms,
+# caddy-rs reverse-proxies it, and SIGUSR2 lands mid-body. Every chunk must arrive, including those
+# written after the restart, plus the terminating zero-length chunk.
+# Mutation: sending SIGKILL instead of SIGUSR2 FAILS with
+#   "the stream was truncated across the restart: received 5 of 40 chunks (last: Some("tick4"))"
 
 # What this does not prove: in-flight requests are not timed. The assertion is that connections
 # survive the transition, not that a request issued during the drain completes within a bound.
