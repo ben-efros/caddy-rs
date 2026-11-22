@@ -752,7 +752,7 @@ mod tests {
     /// Determinism: inputs come from a seeded xorshift64 PRNG implemented in this function. No
     /// external fuzzing crate and no ambient randomness, so a failure reproduces from the seed.
     #[test]
-    fn format_never_panics_and_matches_oracle_quirks() {
+    fn format_is_total_and_preserves_output_invariants() {
         // xorshift64 — deterministic, dependency-free PRNG.
         fn xorshift(state: &mut u64) -> u64 {
             let mut x = *state;
@@ -795,9 +795,24 @@ mod tests {
 
             // Property 2b: the output always ends with exactly one newline (a documented contract:
             // "the Caddyfile must end with a newline because newlines are significant").
+            //
+            // `format` pushes that newline unconditionally, so `ends_with('\n')` alone would only
+            // detect the push being deleted. These two assertions test the *trimming* instead,
+            // which is the part that can actually regress: the output must be non-empty (every
+            // input yields at least the newline), and the text before the final newline must carry
+            // no trailing whitespace, because `formatter.out` is trimmed.
             assert!(
-                once_text.ends_with('\n'),
-                "format output must end with a newline, case {case}: {once_text:?}"
+                !once_text.is_empty(),
+                "format output must never be empty, case {case}"
+            );
+            let before_newline = once_text
+                .strip_suffix('\n')
+                .expect("output ends with a newline");
+            assert_eq!(
+                before_newline.trim_end(),
+                before_newline,
+                "format output must have no trailing whitespace before its final newline, \
+                 case {case}: {once_text:?}"
             );
 
             // Property 2c: formatting is total on its own output too — it must not panic when fed
@@ -806,11 +821,22 @@ mod tests {
             let twice = std::panic::catch_unwind(|| format(&once)).unwrap_or_else(|_| {
                 panic!("format panicked re-formatting its own output, case {case}: {once_text:?}")
             });
+            // Re-formatting must be total; its result is not asserted equal to `once`, because the
+            // formatter is not idempotent (see the doc comment and the oracle fixture below).
             let _ = twice;
 
-            checked += 1;
+            // Track that the corpus actually exercises the formatter's interesting paths. If the
+            // alphabet or the generator regressed, every output would be a bare newline and the
+            // assertions above would pass vacuously.
+            if once_text.trim() != once_text.trim_end_matches('\n') || once_text.contains('{') {
+                checked += 1;
+            }
         }
-        assert_eq!(checked, CASES, "every generated case must be exercised");
+        assert!(
+            checked > CASES / 2,
+            "only {checked} of {CASES} cases produced brace-bearing or multi-line output; the \
+             generator is no longer exercising the formatter"
+        );
     }
 
     /// Oracle parity for the formatter's non-idempotent quirk, with the exact bytes the pinned
@@ -835,8 +861,12 @@ mod tests {
 
     /// The corpus a previous fuzz run found to be non-idempotent, kept so a change to the
     /// formatter's quote/escape handling is visible even if the random corpus misses it.
+    ///
+    /// This asserts *totality* only (re-formatting must not panic and must still end with a
+    /// newline). It deliberately does not assert that re-formatting is stable, because the oracle
+    /// is not stable either — see [`matches_oracle_non_idempotent_quirk`].
     #[test]
-    fn oracle_corpus_round_trips_without_panicking() {
+    fn oracle_corpus_is_total_on_reformatting() {
         let corpus: Vec<&[u8]> = vec![
             b"c{\\",
             b"\\{",
