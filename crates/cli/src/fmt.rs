@@ -732,6 +732,168 @@ mod tests {
         assert!(formatting_difference("Caddyfile", b"a b\r\n").is_none());
     }
 
+    /// Deterministic fuzz test for [`format`].
+    ///
+    /// The formatter is the one place in the CLI that rewrites arbitrary operator bytes into
+    /// different arbitrary bytes, and it is stateful: ~20 fields track quoting, heredocs, escaping,
+    /// brace nesting and blank-line policy. Its two properties are:
+    ///
+    ///   1. **Totality.** It never panics, for any input. It slices `&bytes[offset..]` and calls
+    ///      `decode_rune`, so a width bug would panic or loop forever.
+    ///   2. **Oracle parity, including non-idempotence.** caddy-rs must reproduce upstream Caddy's
+    ///      formatter byte for byte — *including its bugs*. Upstream's own `formatter_fuzz.go`
+    ///      treats `Format(x) == Format(Format(x))` as the success property, and that property
+    ///      does **not** hold upstream: `Format("c{\\")` is `"c\\ {\n"` but formatting *that* gives
+    ///      `"c\\  {\n"`. A trailing backslash before `{` grows a space on the second pass. This was
+    ///      confirmed against the pinned oracle (external/caddy v2.11.9), which returns the same
+    ///      two outputs. So non-idempotence here is a *compatibility requirement*, not a defect:
+    ///      "fixing" it would make caddy-rs diverge from Caddy. The oracle fixtures below pin that.
+    ///
+    /// Determinism: inputs come from a seeded xorshift64 PRNG implemented in this function. No
+    /// external fuzzing crate and no ambient randomness, so a failure reproduces from the seed.
+    #[test]
+    fn format_is_total_and_preserves_output_invariants() {
+        // xorshift64 — deterministic, dependency-free PRNG.
+        fn xorshift(state: &mut u64) -> u64 {
+            let mut x = *state;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *state = x;
+            x
+        }
+
+        // The bytes that drive the formatter's state machine: braces, quotes, backslashes,
+        // whitespace, comment markers, heredoc markers and multi-byte UTF-8.
+        const ALPHABET: &[u8] = b"ab{}[]()\"`#\\ \t\r\n,<>=*\xc3\xa9\xe2\x82\xac";
+        const CASES: usize = 8_000;
+
+        let mut state = 0x0F0F_0000_0000_0042_u64;
+        let mut checked = 0_usize;
+        for case in 0..CASES {
+            let len = (xorshift(&mut state) % 48) as usize;
+            let mut input = Vec::with_capacity(len);
+            for _ in 0..len {
+                let index = (xorshift(&mut state) as usize) % ALPHABET.len();
+                input.push(ALPHABET[index]);
+            }
+
+            // Property 1: totality. A panic here fails the test with the input named.
+            let once = std::panic::catch_unwind(|| format(&input)).unwrap_or_else(|_| {
+                panic!(
+                    "format panicked on case {case} ({} bytes): {:?}",
+                    input.len(),
+                    String::from_utf8_lossy(&input)
+                )
+            });
+
+            // Property 2a: the output is always valid UTF-8. `format` builds from `char`s, so this
+            // is a cheap invariant that would catch a byte-level regression.
+            let once_text = String::from_utf8(once.clone()).unwrap_or_else(|error| {
+                panic!("format produced non-UTF-8 output on case {case}: {error}")
+            });
+
+            // Property 2b: the output always ends with exactly one newline (a documented contract:
+            // "the Caddyfile must end with a newline because newlines are significant").
+            //
+            // `format` pushes that newline unconditionally, so `ends_with('\n')` alone would only
+            // detect the push being deleted. These two assertions test the *trimming* instead,
+            // which is the part that can actually regress: the output must be non-empty (every
+            // input yields at least the newline), and the text before the final newline must carry
+            // no trailing whitespace, because `formatter.out` is trimmed.
+            assert!(
+                !once_text.is_empty(),
+                "format output must never be empty, case {case}"
+            );
+            let before_newline = once_text
+                .strip_suffix('\n')
+                .expect("output ends with a newline");
+            assert_eq!(
+                before_newline.trim_end(),
+                before_newline,
+                "format output must have no trailing whitespace before its final newline, \
+                 case {case}: {once_text:?}"
+            );
+
+            // Property 2c: formatting is total on its own output too — it must not panic when fed
+            // back in. Note this deliberately does NOT assert idempotence: upstream is not
+            // idempotent (see the doc comment), so neither is caddy-rs.
+            let twice = std::panic::catch_unwind(|| format(&once)).unwrap_or_else(|_| {
+                panic!("format panicked re-formatting its own output, case {case}: {once_text:?}")
+            });
+            // Re-formatting must be total; its result is not asserted equal to `once`, because the
+            // formatter is not idempotent (see the doc comment and the oracle fixture below).
+            let _ = twice;
+
+            // Track that the corpus actually exercises the formatter's interesting paths. If the
+            // alphabet or the generator regressed, every output would be a bare newline and the
+            // assertions above would pass vacuously.
+            if once_text.trim() != once_text.trim_end_matches('\n') || once_text.contains('{') {
+                checked += 1;
+            }
+        }
+        assert!(
+            checked > CASES / 2,
+            "only {checked} of {CASES} cases produced brace-bearing or multi-line output; the \
+             generator is no longer exercising the formatter"
+        );
+    }
+
+    /// Oracle parity for the formatter's non-idempotent quirk, with the exact bytes the pinned
+    /// oracle (external/caddy v2.11.9) returns.
+    ///
+    /// These are regression fixtures: if someone "fixes" the double space, caddy-rs stops matching
+    /// Caddy and this test fails. The correct fix, if upstream ever changes, is to update this
+    /// fixture together with the oracle pin.
+    #[test]
+    fn matches_oracle_non_idempotent_quirk() {
+        // Upstream: Format("c{\\") == "c\\ {\n"; Format("c\\ {\n") == "c\\  {\n".
+        let first = format(b"c{\\");
+        assert_eq!(String::from_utf8(first.clone()).unwrap(), "c\\ {\n");
+        let second = format(&first);
+        assert_eq!(String::from_utf8(second.clone()).unwrap(), "c\\  {\n");
+        assert_ne!(
+            first, second,
+            "this fixture exists because the oracle is NOT idempotent here; if this now passes, \
+             re-check upstream Caddy v2.11.9 before deleting the fixture"
+        );
+    }
+
+    /// The corpus a previous fuzz run found to be non-idempotent, kept so a change to the
+    /// formatter's quote/escape handling is visible even if the random corpus misses it.
+    ///
+    /// This asserts *totality* only (re-formatting must not panic and must still end with a
+    /// newline). It deliberately does not assert that re-formatting is stable, because the oracle
+    /// is not stable either — see [`matches_oracle_non_idempotent_quirk`].
+    #[test]
+    fn oracle_corpus_is_total_on_reformatting() {
+        let corpus: Vec<&[u8]> = vec![
+            b"c{\\",
+            b"\\{",
+            b"a\\{b",
+            b"{\\",
+            b"x{\\y",
+            b"c{\\\\\\",
+            b"q{\\ {",
+            b"c{\\ {",
+            b"c{\\  {",
+            b"a{\\b",
+            b"{\\}",
+            b"\tc\t{\t``\r`bb\\{}",
+            b"b\r\na\"\t\"cb\" }\n\r\r\t\n{\"\rc#\nb\\\" \"\"\\b{\r\\",
+        ];
+        for input in corpus {
+            let once = format(input);
+            // Total on its own output: must not panic, and must still end with a newline.
+            let twice = format(&once);
+            assert!(
+                twice.ends_with(b"\n"),
+                "output must end with a newline for input {:?}",
+                String::from_utf8_lossy(input)
+            );
+        }
+    }
+
     fn upstream_corpus() -> Vec<(&'static str, &'static str, &'static str)> {
         vec![
             (
