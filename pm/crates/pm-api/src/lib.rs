@@ -945,6 +945,9 @@ pub use certificates::{
 pub use security_headers::{SecurityHeadersDto, SecurityHeadersHstsDto};
 
 #[cfg(test)]
+mod test_harness;
+
+#[cfg(test)]
 mod tests;
 
 #[cfg(test)]
