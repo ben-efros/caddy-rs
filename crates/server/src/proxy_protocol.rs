@@ -1204,4 +1204,395 @@ mod tests {
             .expect_err("truncated v2");
         assert!(matches!(error, ProxyProtocolError::Malformed(_)), "{error}");
     }
+
+    // --- Fuzz coverage for the header parsers ---------------------------------------------------
+    //
+    // The PROXY protocol header is read from the raw TCP socket *before* TLS, so every byte of it is
+    // chosen by whoever can open a connection. It is the earliest attacker-controlled input the
+    // server sees, and until these tests it had only six hand-written cases.
+    //
+    // House style: a seeded xorshift64 PRNG in this file (no cargo-fuzz/libFuzzer/proptest/rand),
+    // `catch_unwind` so a panic names the input that caused it, and an always-executed regression
+    // corpus. The parsers are async and take a stream, so each case is driven with an in-memory
+    // reader over the exact bytes.
+
+    fn xorshift(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    /// Drive both parsers over `bytes` and assert the outcome is a typed result, never a panic.
+    ///
+    /// The buffer is fed as the already-read prefix (as `read_header` does after seeing the
+    /// signature) with an empty stream behind it, which is the state the parsers see on a
+    /// connection that sends a header and then stops.
+    ///
+    /// A panic in an async fn propagates through the `.await` inside the test's task, which fails
+    /// the test with the panic message, so no `catch_unwind` is needed here: any panic is already a
+    /// test failure. The assertions below therefore only need to check the *typed* outcome shape.
+    async fn assert_typed_proxy_header(bytes: &[u8], context: &str) {
+        if bytes.starts_with(V2_SIGNATURE) {
+            let mut empty: &[u8] = &[];
+            let result = parse_v2(&mut empty, bytes.to_vec(), None).await;
+            assert_typed_outcome(result, context);
+        } else if bytes.starts_with(b"PROXY ") {
+            let mut empty: &[u8] = &[];
+            let result = parse_v1(&mut empty, bytes.to_vec(), None).await;
+            assert_typed_outcome(result, context);
+        } else {
+            // Not a header: `read_header` must report "no header" and replay what it consumed.
+            //
+            // It reads exactly `V2_SIGNATURE.len()` bytes to decide, so the prefix it returns is
+            // that leading window; anything after it stays in the stream for the consumer to read
+            // normally. Asserting the prefix equals the whole input would be wrong.
+            let mut stream = bytes;
+            let (parsed, prefix) = read_header(&mut stream, None)
+                .await
+                .expect("a non-header prefix must not be an error");
+            assert!(
+                parsed.is_none(),
+                "{context}: parsed a header from a non-header prefix"
+            );
+            let window = V2_SIGNATURE.len().min(bytes.len());
+            assert_eq!(
+                prefix,
+                &bytes[..window],
+                "{context}: the consumed prefix must be replayed verbatim"
+            );
+            // The rest of the input is still in the stream, so nothing was dropped.
+            assert_eq!(
+                stream.len() + prefix.len(),
+                bytes.len(),
+                "{context}: bytes were lost between the prefix and the stream"
+            );
+        }
+    }
+
+    /// Every parser outcome must be one of the two shapes the bytes can justify: an accepted header,
+    /// or an error that describes the header itself (`Malformed`, `Io`, `Timeout`). The policy
+    /// variants (`Missing`, `Rejected`) are decided by configuration, not by these bytes, so seeing
+    /// one here would mean the parser returned a decision it cannot have made from its input.
+    fn assert_typed_outcome(
+        result: Result<(Option<ProxyAddresses>, Vec<u8>), ProxyProtocolError>,
+        context: &str,
+    ) {
+        match result {
+            Ok((parsed, _rest)) => {
+                // A returned header must be self-consistent: if it claims addresses, both source
+                // and destination are present.
+                if let Some(addresses) = parsed {
+                    assert!(
+                        addresses.source.is_some() == addresses.destination.is_some(),
+                        "{context}: header reported only one of source/destination"
+                    );
+                }
+            }
+            Err(ProxyProtocolError::Malformed(reason)) => assert!(
+                !reason.is_empty(),
+                "{context}: Malformed error with an empty reason"
+            ),
+            Err(ProxyProtocolError::Io(_)) | Err(ProxyProtocolError::Timeout(_)) => {}
+            Err(other) => panic!("{context}: parser returned a policy error {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn random_proxy_headers_never_panic() {
+        const CASES: usize = 6_000;
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        for case in 0..CASES {
+            // Half the cases start with a real signature so the parsers are actually entered;
+            // the rest are free-form and must be classified as "no header".
+            let len = (xorshift(&mut state) % 64) as usize;
+            let mut bytes = Vec::with_capacity(len + 12);
+            if case % 2 == 0 {
+                bytes.extend_from_slice(if case % 4 == 0 {
+                    V2_SIGNATURE
+                } else {
+                    b"PROXY "
+                });
+            }
+            for _ in 0..len {
+                bytes.push((xorshift(&mut state) & 0xff) as u8);
+            }
+            assert_typed_proxy_header(&bytes, &format!("random case {case}")).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn mutated_valid_headers_never_panic() {
+        const CASES: usize = 6_000;
+        let mut v1 = b"PROXY TCP4 192.0.2.1 198.51.100.2 56324 443\r\n".to_vec();
+        v1.extend_from_slice(b"GET / HTTP/1.1\r\n");
+        let mut v2_payload = ipv4_payload();
+        push_tlv(&mut v2_payload, 0x01, b"h2");
+        push_tlv(&mut v2_payload, 0x30, b"netns");
+        let mut v2 = header_v2(0x11, &v2_payload);
+        v2.extend_from_slice(b"payload-after-header");
+
+        let mut state = 0xC0FF_EE00_0000_0003_u64;
+        for case in 0..CASES {
+            let base = if case % 2 == 0 { &v1 } else { &v2 };
+            let mut bytes = base.clone();
+            let mutations = 1 + (xorshift(&mut state) % 3) as usize;
+            for _ in 0..mutations {
+                // A previous truncation can leave the buffer empty. Both byte-editing arms index
+                // into it, so stop mutating rather than dividing by zero — that would be a bug in
+                // the test, not in the parser under test.
+                if bytes.is_empty() {
+                    break;
+                }
+                match xorshift(&mut state) % 3 {
+                    0 => {
+                        let index = (xorshift(&mut state) as usize) % bytes.len();
+                        bytes[index] ^= 1 << (xorshift(&mut state) % 8);
+                    }
+                    1 => {
+                        let keep = (xorshift(&mut state) as usize) % (bytes.len() + 1);
+                        bytes.truncate(keep);
+                    }
+                    _ => {
+                        let index = (xorshift(&mut state) as usize) % bytes.len();
+                        bytes[index] =
+                            [0x00, 0xff, 0x0d, 0x0a][(xorshift(&mut state) % 4) as usize];
+                    }
+                }
+            }
+            assert_typed_proxy_header(&bytes, &format!("mutation case {case}")).await;
+        }
+    }
+
+    /// Length fields in the v2 header are the classic over-read: `payload_len` and each TLV length
+    /// are attacker-chosen u16s. Drive the extremes directly.
+    #[tokio::test]
+    async fn absurd_v2_lengths_are_rejected_not_panicking() {
+        // payload_len claims far more than is present.
+        for claimed in [1_u16, 216, 4096, 4097, u16::MAX] {
+            let mut bytes = V2_SIGNATURE.to_vec();
+            bytes.push(0x21); // v2, PROXY
+            bytes.push(0x11); // AF_INET, STREAM
+            bytes.extend_from_slice(&claimed.to_be_bytes());
+            bytes.extend_from_slice(&[0_u8; 4]); // only 4 bytes of the claimed payload
+            assert_typed_proxy_header(&bytes, &format!("payload_len {claimed} truncated")).await;
+        }
+
+        // The truncated cases above are rejected by `read_exact_more` hitting EOF, so they would
+        // still pass if the `MAX_V2_HEADER_SIZE` bound were removed entirely. To exercise the
+        // bound, *supply* the claimed bytes: an oversized header that is fully present must be
+        // rejected on its declared length rather than read into the buffer first.
+        for claimed in [MAX_V2_HEADER_SIZE as u16 + 1, u16::MAX] {
+            let mut bytes = V2_SIGNATURE.to_vec();
+            bytes.push(0x21); // v2, PROXY
+            bytes.push(0x11); // AF_INET, STREAM
+            bytes.extend_from_slice(&claimed.to_be_bytes());
+            // A complete payload of the claimed size, so nothing is truncated.
+            bytes.resize(16 + claimed as usize, 0);
+            let mut stream = &bytes[16..];
+            let mut buffer = bytes[..16].to_vec();
+            let result = parse_v2(&mut stream, std::mem::take(&mut buffer), None).await;
+            assert!(
+                matches!(result, Err(ProxyProtocolError::Malformed(ref reason))
+                    if reason.contains("exceeds")),
+                "a fully-present {claimed}-byte payload must be rejected on its declared length, \
+                 not accepted or read into memory; got {result:?}"
+            );
+        }
+
+        // A TLV whose length runs past the payload.
+        // A TLV whose declared length overruns the payload. `header_v2` derives `payload_len` from
+        // the bytes it is given, so a TLV built through it is always self-consistent and the parser
+        // legitimately accepts it. To make the TLV length lie while `payload_len` stays honest the
+        // header has to be assembled by hand: 12 address bytes, then one TLV header claiming more
+        // bytes than the payload contains.
+        // A declared length of 1 is deliberately absent: with exactly one byte present it is an
+        // honest TLV and the parser correctly accepts it, so asserting a rejection there would be
+        // asserting a bug.
+        for tlv_len in [2_u16, 4, 4096, u16::MAX] {
+            let mut payload = ipv4_payload();
+            payload.push(0x30); // NETNS
+            payload.extend_from_slice(&tlv_len.to_be_bytes());
+            payload.push(b'x'); // exactly one byte of the claimed value
+            let mut bytes = V2_SIGNATURE.to_vec();
+            bytes.push(0x21); // v2, PROXY
+            bytes.push(0x11); // AF_INET, STREAM
+                              // Declare the *actual* payload length, so framing is honest and only the TLV lies.
+            bytes.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+            bytes.extend_from_slice(&payload);
+            let (signature, rest) = bytes.split_at(12);
+            let mut stream = rest;
+            let result = parse_v2(&mut stream, signature.to_vec(), None).await;
+            // The payload is fully present and framed correctly, so `read_exact_more` succeeds and
+            // the TLV loop is what must reject this. Without the bounds check it slices past the
+            // end of the payload and panics.
+            assert!(
+                matches!(result, Err(ProxyProtocolError::Malformed(ref reason))
+                    if reason.contains("TLV")),
+                "a TLV declaring {tlv_len} bytes with 1 present must be rejected by the TLV \
+                 bounds check; got {result:?}"
+            );
+        }
+
+        // Every address-block length from 0 up to the required size must be typed, not a panic.
+        for len in 0..40_usize {
+            for family in [0x11_u8, 0x21, 0x31] {
+                let payload = vec![0xAB_u8; len];
+                let bytes = header_v2(family, &payload);
+                assert_typed_proxy_header(&bytes, &format!("family {family:#04x} len {len}")).await;
+            }
+        }
+    }
+
+    /// The CRC32C verification slices `buffer[..16 + payload_len]` and then indexes
+    /// `value_position..value_position + 4` inside it. That is only sound because
+    /// `read_exact_more` never appends *more* than the count it was asked for: `read_some` caps each
+    /// read at `min(limit, chunk.len())` and `read_exact_more` loops on the remaining count. Pin the
+    /// invariant, so a future "just read a bit more for safety" change to the reader fails here
+    /// rather than producing a silently wrong checksum.
+    #[tokio::test]
+    async fn read_exact_more_never_reads_past_the_requested_count() {
+        for available in [0_usize, 1, 3, 4, 7, 16, 17, 1023, 1024, 1025, 4096] {
+            let data = vec![0xA5_u8; available];
+            let mut stream: &[u8] = &data;
+            let mut buffer = V2_SIGNATURE.to_vec(); // 12 bytes already consumed
+            let before = buffer.len();
+            let outcome = read_exact_more(&mut stream, 4, None, &mut buffer).await;
+            if available >= 4 {
+                outcome.expect("four bytes are available");
+                assert_eq!(
+                    buffer.len(),
+                    before + 4,
+                    "read_exact_more appended more than the 4 bytes requested (available {available})"
+                );
+            } else {
+                assert!(
+                    outcome.is_err(),
+                    "read_exact_more must report EOF with only {available} of 4 bytes available"
+                );
+                assert!(
+                    buffer.len() <= before + available,
+                    "read_exact_more over-read with only {available} bytes available"
+                );
+            }
+        }
+    }
+
+    /// A v1 header longer than 107 bytes must be rejected rather than buffered without bound.
+    #[tokio::test]
+    async fn oversized_v1_headers_are_rejected() {
+        let mut bytes = b"PROXY TCP4 192.0.2.1 198.51.100.2 56324 443".to_vec();
+        while bytes.len() < V1_MAX_LEN + 64 {
+            bytes.push(b'x');
+        }
+        // No CRLF anywhere, so the parser keeps reading until it hits the length bound.
+        assert_typed_proxy_header(&bytes, "oversized v1").await;
+    }
+
+    #[tokio::test]
+    async fn proxy_header_regression_corpus_never_panics() {
+        let corpus: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            b"PROXY".to_vec(),
+            b"PROXY ".to_vec(),
+            b"PROXY\r\n".to_vec(),
+            b"PROXY UNKNOWN\r\n".to_vec(),
+            b"PROXY TCP4\r\n".to_vec(),
+            b"PROXY TCP4 192.0.2.1 198.51.100.2 0 0\r\n".to_vec(),
+            b"PROXY TCP4 192.0.2.1 198.51.100.2 65535 65535\r\n".to_vec(),
+            b"PROXY TCP6 ::1 ::2 1 2\r\n".to_vec(),
+            b"PROXY TCP4 ::1 ::2 1 2\r\n".to_vec(),
+            b"PROXY  TCP4 192.0.2.1 198.51.100.2 1 2\r\n".to_vec(),
+            V2_SIGNATURE.to_vec(),
+            {
+                let mut b = V2_SIGNATURE.to_vec();
+                b.extend_from_slice(&[0x20, 0x00, 0x00, 0x00]); // LOCAL, no addresses
+                b
+            },
+            {
+                let mut b = V2_SIGNATURE.to_vec();
+                b.extend_from_slice(&[0x2f, 0x11, 0x00, 0x00]); // command 15: unsupported
+                b
+            },
+            header_v2(0x11, &[]),
+            header_v2(0x21, &[]),
+            header_v2(0x31, &[]),
+            {
+                let mut payload = ipv4_payload();
+                push_tlv(&mut payload, 0x03, &[0, 0, 0, 0]); // CRC32C, 4 bytes
+                header_v2(0x11, &payload)
+            },
+            {
+                let mut payload = ipv4_payload();
+                push_tlv(&mut payload, 0x20, &ssl_tlv());
+                header_v2(0x11, &payload)
+            },
+        ];
+        for (index, bytes) in corpus.iter().enumerate() {
+            assert_typed_proxy_header(bytes, &format!("corpus entry {index}")).await;
+        }
+    }
+
+    /// Guards against the corpus going vacuous: the generated mutations must keep producing headers
+    /// the parser actually enters, not only inputs that fail the signature check.
+    #[tokio::test]
+    async fn proxy_fuzz_generator_reaches_the_parser() {
+        let v1 = b"PROXY TCP4 192.0.2.1 198.51.100.2 56324 443\r\n".to_vec();
+        let v2 = header_v2(0x11, &ipv4_payload());
+        let mut state = 0xC0FF_EE00_0000_0003_u64;
+        let mut entered = 0_usize;
+        let cases = 1_000_usize;
+        for case in 0..cases {
+            let base = if case % 2 == 0 { &v1 } else { &v2 };
+            let mut bytes = base.clone();
+            let mutations = 1 + (xorshift(&mut state) % 3) as usize;
+            for _ in 0..mutations {
+                // A previous truncation can leave the buffer empty. Both byte-editing arms index
+                // into it, so stop mutating rather than dividing by zero — that would be a bug in
+                // the test, not in the parser under test.
+                if bytes.is_empty() {
+                    break;
+                }
+                match xorshift(&mut state) % 3 {
+                    0 => {
+                        let index = (xorshift(&mut state) as usize) % bytes.len();
+                        bytes[index] ^= 1 << (xorshift(&mut state) % 8);
+                    }
+                    1 => {
+                        let keep = (xorshift(&mut state) as usize) % (bytes.len() + 1);
+                        bytes.truncate(keep);
+                    }
+                    _ => {
+                        let index = (xorshift(&mut state) as usize) % bytes.len();
+                        bytes[index] =
+                            [0x00, 0xff, 0x0d, 0x0a][(xorshift(&mut state) % 4) as usize];
+                    }
+                }
+            }
+            // Count cases that reach the *body* of a parser, not merely a signature match: a
+            // generator emitting 13-byte "PROXY \r\n" stubs would otherwise satisfy a
+            // signature-only check while never exercising the address or TLV code.
+            let entered_parser = if bytes.starts_with(V2_SIGNATURE) {
+                bytes.len() > 16 && bytes[12] >> 4 == 2 && bytes[13] >> 4 <= 3
+            } else if bytes.starts_with(b"PROXY ") {
+                bytes.windows(2).any(|window| window == b"\r\n")
+            } else {
+                false
+            };
+            if entered_parser {
+                entered += 1;
+            }
+        }
+        // Measured 312/1000 reach a parser body today. The floor is set well below that so ordinary
+        // churn in the mutation mix does not trip it, while a real regression (generator emitting
+        // non-header garbage, or a signature-only stub) fails clearly.
+        assert!(
+            entered > cases / 10,
+            "only {entered} of {cases} generated mutations reach a PROXY protocol parser body \
+             (12-byte v2 signature with a v2 version nibble, or a v1 line terminated by CRLF); the \
+             mutation generator has regressed and the fuzz phases no longer exercise the parsers"
+        );
+    }
 }
