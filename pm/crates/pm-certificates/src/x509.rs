@@ -453,6 +453,194 @@ mod tests {
         der.push(0);
         assert!(parse_certificate(&der).is_err());
     }
+
+    // --- Fuzz coverage for the X.509 certificate parser ----------------------------------------
+    //
+    // This parser accepts user-supplied certificate DER (manual uploads), so every byte is
+    // chosen by the uploader. House style: seeded xorshift64 PRNG in this file (no
+    // cargo-fuzz/libFuzzer/proptest/rand), `catch_unwind` so a panic names the input, and an
+    // always-executed regression corpus.
+
+    fn xorshift(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    fn assert_typed_x509_outcome(bytes: &[u8], context: &str) {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = parse_certificate(bytes);
+        }));
+        if let Err(_panic) = outcome {
+            panic!(
+                "{context}: parse_certificate panicked on {} bytes: {:02x?}",
+                bytes.len(),
+                bytes
+            );
+        }
+    }
+
+    #[test]
+    fn random_x509_certs_never_panic() {
+        const CASES: usize = 4_000;
+        let mut state = 0xC0FF_EE00_0000_0001_u64;
+        for case in 0..CASES {
+            let len = (xorshift(&mut state) % 1024) as usize;
+            let mut bytes = Vec::with_capacity(len);
+            for _ in 0..len {
+                bytes.push((xorshift(&mut state) & 0xff) as u8);
+            }
+            if case % 2 == 0 && bytes.len() >= 2 {
+                bytes[0] = 0x30;
+                bytes[1] = if bytes.len() > 2 {
+                    (bytes.len() - 2) as u8
+                } else {
+                    0
+                };
+            }
+            assert_typed_x509_outcome(&bytes, &format!("random case {case}"));
+        }
+    }
+
+    #[test]
+    fn mutated_valid_x509_certs_never_panic() {
+        const CASES: usize = 4_000;
+        let base = pem_der(VALID);
+        let mut state = 0xC0FF_EE00_0000_0002_u64;
+        for case in 0..CASES {
+            let mut bytes = base.clone();
+            let mutations = 1 + (xorshift(&mut state) % 4) as usize;
+            for _ in 0..mutations {
+                match xorshift(&mut state) % 4 {
+                    0 => {
+                        if !bytes.is_empty() {
+                            let index = (xorshift(&mut state) as usize) % bytes.len();
+                            bytes[index] ^= 1 << (xorshift(&mut state) % 8);
+                        }
+                    }
+                    1 => {
+                        if !bytes.is_empty() {
+                            let keep = (xorshift(&mut state) as usize) % (bytes.len() + 1);
+                            bytes.truncate(keep);
+                        }
+                    }
+                    2 => {
+                        if !bytes.is_empty() {
+                            let index = (xorshift(&mut state) as usize) % bytes.len();
+                            bytes[index] = [0x00, 0xff, 0x30][(xorshift(&mut state) % 3) as usize];
+                        }
+                    }
+                    _ => {
+                        let index = (xorshift(&mut state) as usize) % (bytes.len() + 1);
+                        bytes.insert(index, (xorshift(&mut state) & 0xff) as u8);
+                    }
+                }
+            }
+            assert_typed_x509_outcome(&bytes, &format!("mutation case {case}"));
+        }
+    }
+
+    #[test]
+    fn absurd_x509_structures_are_rejected_not_panicking() {
+        assert_typed_x509_outcome(&[0x30], "truncated SEQUENCE");
+        assert_typed_x509_outcome(&[0x30, 0xff, 0xff, 0xff, 0xff], "oversized length");
+        assert_typed_x509_outcome(&[0x02, 0x01, 0x00], "INTEGER instead of SEQUENCE");
+        assert_typed_x509_outcome(
+            &[0x30, 0x05, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00],
+            "missing fields",
+        );
+        assert_typed_x509_outcome(
+            &[
+                0x30, 0x0a, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00,
+            ],
+            "invalid version tag",
+        );
+        assert_typed_x509_outcome(
+            &[0x30, 0x0a, 0xa0, 0x03, 0x02, 0x01, 0x02, 0x02, 0x01, 0x00],
+            "serial not INTEGER",
+        );
+        let mut utc = [
+            0x30, 0x12, 0xa0, 0x03, 0x02, 0x01, 0x02, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x17,
+            0x0d, 0x32, 0x34, 0x30, 0x31, 0x30, 0x31, 0x30, 0x31, 0x30, 0x30, 0x30, 0x30, 0x5a,
+        ];
+        utc[1] = 0x12;
+        assert_typed_x509_outcome(&utc, "invalid time tag");
+    }
+
+    #[test]
+    fn x509_regression_corpus_never_panics() {
+        let corpus: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            vec![0x30],
+            vec![0x30, 0x00],
+            vec![0x30, 0x03, 0x02, 0x01, 0x00],
+            pem_der(VALID),
+            {
+                let mut d = pem_der(VALID);
+                d.push(0);
+                d
+            },
+            [
+                vec![0x30, 0x0a],
+                vec![
+                    0x18, 0x0d, 0x32, 0x30, 0x32, 0x34, 0x30, 0x31, 0x30, 0x31, 0x30, 0x31, 0x30,
+                    0x30, 0x30, 0x30, 0x5a,
+                ],
+            ]
+            .concat(),
+        ];
+        for (index, bytes) in corpus.iter().enumerate() {
+            assert_typed_x509_outcome(bytes, &format!("corpus entry {index}"));
+        }
+    }
+
+    #[test]
+    fn x509_fuzz_generator_reaches_the_parser() {
+        let base = pem_der(VALID);
+        let mut state = 0xC0FF_EE00_0000_0002_u64;
+        let mut entered = 0_usize;
+        const CASES: usize = 1_000;
+        for case in 0..CASES {
+            let mut bytes = base.clone();
+            let mutations = 1 + (xorshift(&mut state) % 4) as usize;
+            for _ in 0..mutations {
+                match xorshift(&mut state) % 4 {
+                    0 => {
+                        if !bytes.is_empty() {
+                            let index = (xorshift(&mut state) as usize) % bytes.len();
+                            bytes[index] ^= 1 << (xorshift(&mut state) % 8);
+                        }
+                    }
+                    1 => {
+                        if !bytes.is_empty() {
+                            let keep = (xorshift(&mut state) as usize) % (bytes.len() + 1);
+                            bytes.truncate(keep);
+                        }
+                    }
+                    2 => {
+                        if !bytes.is_empty() {
+                            let index = (xorshift(&mut state) as usize) % bytes.len();
+                            bytes[index] = [0x00, 0xff, 0x30][(xorshift(&mut state) % 3) as usize];
+                        }
+                    }
+                    _ => {
+                        let index = (xorshift(&mut state) as usize) % (bytes.len() + 1);
+                        bytes.insert(index, (xorshift(&mut state) & 0xff) as u8);
+                    }
+                }
+            }
+            if bytes.first() == Some(&0x30) {
+                entered += 1;
+            }
+        }
+        assert!(
+            entered > CASES / 2,
+            "only {entered} of {CASES} generated mutations start with SEQUENCE tag; the mutation generator has regressed"
+        );
+    }
 }
 
 #[cfg(test)]
