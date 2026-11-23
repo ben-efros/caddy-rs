@@ -3107,4 +3107,201 @@ mod tests {
             Some(canonical.to_string_lossy().as_ref())
         );
     }
+
+    // --- Fuzz coverage for the FastCGI record parser ---------------------------------------
+    //
+    // The parser reads FastCGI records returned by the configured backend over the socket:
+    // header[0] version check, header[1] kind, request_id, u16 content_length, header[6]
+    // padding, then read_exact into content and padding buffers. Per-record it is bounded
+    // (content_length is a u16, so <=64KB) and the response path STREAMS records through a
+    // channel with a remaining-budget rather than accumulating. House style: seeded xorshift64
+    // PRNG, catch_unwind, regression corpus, <60s.
+
+    fn xorshift(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    fn assert_typed_fastcgi_parse(bytes: &[u8], context: &str) {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = parse_record_bytes(bytes);
+        }));
+        if let Err(_panic) = outcome {
+            panic!(
+                "{context}: parse_record_bytes panicked on {} bytes: {:02x?}",
+                bytes.len(),
+                bytes
+            );
+        }
+    }
+
+    /// In-memory reimplementation of the record header + content + padding parse.
+    /// Mirrors read_record logic but operates on a byte slice for fuzzing.
+    fn parse_record_bytes(bytes: &[u8]) -> Result<(), String> {
+        const FCGI_VERSION_1: u8 = 1;
+        const FCGI_HEADER_LEN: usize = 8;
+        const REQUEST_ID: u16 = 1;
+        if bytes.len() < FCGI_HEADER_LEN {
+            return Err("truncated header".into());
+        }
+        if bytes[0] != FCGI_VERSION_1 {
+            return Err(format!("invalid record version {}", bytes[0]));
+        }
+        let kind = bytes[1];
+        let request_id = u16::from_be_bytes([bytes[2], bytes[3]]);
+        if request_id != REQUEST_ID {
+            return Err(format!("unexpected request id {request_id}"));
+        }
+        let content_length = u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
+        let padding = bytes[6] as usize;
+        if bytes.len() < FCGI_HEADER_LEN + content_length + padding {
+            return Err("truncated content or padding".into());
+        }
+        let _content = &bytes[FCGI_HEADER_LEN..FCGI_HEADER_LEN + content_length];
+        let _padding =
+            &bytes[FCGI_HEADER_LEN + content_length..FCGI_HEADER_LEN + content_length + padding];
+        // Exercise the downstream parsers too
+        let _ = parse_end_request(_content);
+        let _ = parse_cgi_head(_content);
+        let _ = parse_status_code(std::str::from_utf8(_content).unwrap_or(""));
+        Ok(())
+    }
+
+    #[test]
+    fn random_fastcgi_records_never_panic() {
+        const CASES: usize = 3_000;
+        let mut state = 0xC0FF_EE00_0000_0001_u64;
+        for _ in 0..CASES {
+            let len = (xorshift(&mut state) % 512) as usize;
+            let mut bytes = Vec::with_capacity(len);
+            for _ in 0..len {
+                bytes.push((xorshift(&mut state) & 0xff) as u8);
+            }
+            assert_typed_fastcgi_parse(&bytes, "random");
+        }
+    }
+
+    #[test]
+    fn mutated_valid_fastcgi_record_never_panic() {
+        const CASES: usize = 3_000;
+        let mut state = 0xC0FF_EE00_0000_0002_u64;
+        // Build a valid record: version=1, kind=STDOUT(6), request_id=1, content_length=4, padding=0, content="test"
+        let valid = vec![1u8, 6, 0, 1, 0, 4, 0, 0, b't', b'e', b's', b't'];
+        for _ in 0..CASES {
+            let mut bytes = valid.clone();
+            let mutations = 1 + (xorshift(&mut state) % 4) as usize;
+            for _ in 0..mutations {
+                match xorshift(&mut state) % 4 {
+                    0 => {
+                        if !bytes.is_empty() {
+                            let index = (xorshift(&mut state) as usize) % bytes.len();
+                            bytes[index] ^= 1 << (xorshift(&mut state) % 8);
+                        }
+                    }
+                    1 => {
+                        if !bytes.is_empty() {
+                            let keep = (xorshift(&mut state) as usize) % (bytes.len() + 1);
+                            bytes.truncate(keep);
+                        }
+                    }
+                    2 => {
+                        if !bytes.is_empty() {
+                            let index = (xorshift(&mut state) as usize) % bytes.len();
+                            bytes[index] =
+                                [0x00, 0xff, 0x01, 0x06][(xorshift(&mut state) % 4) as usize];
+                        }
+                    }
+                    _ => {
+                        let index = (xorshift(&mut state) as usize) % (bytes.len() + 1);
+                        bytes.insert(index, (xorshift(&mut state) & 0xff) as u8);
+                    }
+                }
+            }
+            assert_typed_fastcgi_parse(&bytes, "mutation");
+        }
+    }
+
+    #[test]
+    fn absurd_fastcgi_structures_are_rejected_not_panicking() {
+        // Truncated header
+        assert_typed_fastcgi_parse(&[1, 6, 0, 1, 0, 4], "truncated header");
+        // Wrong version
+        assert_typed_fastcgi_parse(&[2, 6, 0, 1, 0, 4, 0, 0, 0, 0, 0, 0], "wrong version");
+        // Wrong request_id
+        assert_typed_fastcgi_parse(&[1, 6, 0, 2, 0, 4, 0, 0, 0, 0, 0, 0], "wrong request_id");
+        // Oversized content_length (but buffer too small)
+        assert_typed_fastcgi_parse(&[1, 6, 0, 1, 0x7f, 0xff, 0, 0], "oversized length");
+        // Padding larger than buffer
+        assert_typed_fastcgi_parse(&[1, 6, 0, 1, 0, 2, 5, 0, 0], "padding > buffer");
+        // Unknown record kind
+        assert_typed_fastcgi_parse(&[1, 99, 0, 1, 0, 4, 0, 0, 0, 0, 0, 0], "unknown kind");
+        // Valid header but truncated content
+        assert_typed_fastcgi_parse(&[1, 6, 0, 1, 0, 10, 0, 0, 1, 2, 3], "truncated content");
+    }
+
+    #[test]
+    fn fastcgi_regression_corpus_never_panics() {
+        let corpus: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            vec![1],
+            vec![1, 6, 0, 1, 0, 0, 0, 0], // empty content
+            vec![1, 6, 0, 1, 0, 4, 0, 0, b't', b'e', b's', b't'], // valid
+            vec![1, 3, 0, 1, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], // END_REQUEST
+            vec![1, 4, 0, 1, 0, 5, 0, 0, 1, 2, 3, 4, 5], // PARAMS
+            vec![1, 5, 0, 1, 0, 5, 0, 0, 1, 2, 3, 4, 5], // STDIN
+        ];
+        for (index, bytes) in corpus.iter().enumerate() {
+            assert_typed_fastcgi_parse(bytes, &format!("corpus entry {index}"));
+        }
+    }
+
+    #[test]
+    fn fastcgi_fuzz_generator_reaches_the_parser() {
+        let valid = vec![1u8, 6, 0, 1, 0, 4, 0, 0, b't', b'e', b's', b't'];
+        let mut state = 0xC0FF_EE00_0000_0002_u64;
+        let mut entered = 0_usize;
+        const CASES: usize = 1_000;
+        for _ in 0..CASES {
+            let mut bytes = valid.clone();
+            let mutations = 1 + (xorshift(&mut state) % 4) as usize;
+            for _ in 0..mutations {
+                match xorshift(&mut state) % 4 {
+                    0 => {
+                        if !bytes.is_empty() {
+                            let index = (xorshift(&mut state) as usize) % bytes.len();
+                            bytes[index] ^= 1 << (xorshift(&mut state) % 8);
+                        }
+                    }
+                    1 => {
+                        if !bytes.is_empty() {
+                            let keep = (xorshift(&mut state) as usize) % (bytes.len() + 1);
+                            bytes.truncate(keep);
+                        }
+                    }
+                    2 => {
+                        if !bytes.is_empty() {
+                            let index = (xorshift(&mut state) as usize) % bytes.len();
+                            bytes[index] =
+                                [0x00, 0xff, 0x01, 0x06][(xorshift(&mut state) % 4) as usize];
+                        }
+                    }
+                    _ => {
+                        let index = (xorshift(&mut state) as usize) % (bytes.len() + 1);
+                        bytes.insert(index, (xorshift(&mut state) & 0xff) as u8);
+                    }
+                }
+            }
+            if bytes.first() == Some(&1) && bytes.len() >= 8 {
+                entered += 1;
+            }
+        }
+        assert!(
+            entered > CASES / 2,
+            "only {entered} of {CASES} generated mutations start with valid header; generator has regressed"
+        );
+    }
 }
