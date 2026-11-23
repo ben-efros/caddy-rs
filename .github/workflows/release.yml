@@ -102,10 +102,12 @@ jobs:
       - name: Build
         run: |
           cargo build --locked --profile ${{ matrix.profile }} --target ${{ matrix.target }} ${{ matrix.features }} -p caddy-rs
-          # The proxy manager is a separate nested workspace with its own lockfile; build it with
-          # the same target so both binaries in an archive are built for the same platform. pm has
-          # no release-minimal profile, so it always uses `--release`.
-          ( cd pm && cargo build --locked --release --target ${{ matrix.target }} )
+          # The proxy manager sidecar is a package in the single root workspace (member
+          # `pm/crates/pm-cli`), so it builds from the repository root like everything else, against
+          # the same lockfile. It is built with the same target so both binaries in an archive are
+          # built for the same platform. The sidecar has no release-minimal profile, so it always
+          # uses `--release` while caddy-rs honours `matrix.profile`.
+          cargo build --locked --release --target ${{ matrix.target }} -p caddy-rs-pm-cli
 
       - name: Package
         shell: bash
@@ -118,7 +120,7 @@ jobs:
           bin="target/${{ matrix.target }}/${{ matrix.profile }}/caddy-rs"
           strip "$bin" 2>/dev/null || true
           cp "$bin" "$dir/caddy-rs"
-          pm_bin="pm/target/${{ matrix.target }}/release/caddy-rs-pm"
+          pm_bin="target/${{ matrix.target }}/release/caddy-rs-pm"
           strip "$pm_bin" 2>/dev/null || true
           cp "$pm_bin" "$dir/caddy-rs-pm"
           cp LICENSE NOTICE.md README.md "$dir/"
