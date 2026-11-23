@@ -882,6 +882,7 @@ mod tests {
     }
 
     #[test]
+    #[test]
     fn absurd_cose_structures_are_rejected_not_panicking() {
         // Truncated CBOR map
         assert_typed_cose_outcome(&[0xa1], "truncated map");
@@ -891,16 +892,23 @@ mod tests {
         bytes.extend_from_slice(&cbor_int(2));
         assert_typed_cose_outcome(&bytes, "text label");
 
-        // Deeply nested CBOR (exceeds depth limit 16)
-        let mut deep = vec![0x81]; // array(1)
+        // Deeply nested CBOR MAP (exceeds depth limit 16)
+        // Use map(1) chains so from_cbor enters the decoder (it requires a top-level map)
+        let mut deep = vec![0xa1]; // map(1)
         for _ in 0..20 {
-            deep = [vec![0x81], deep].concat();
+            deep = [vec![0xa1], deep].concat(); // nest maps
         }
         assert_typed_cose_outcome(&deep, "deep nesting");
 
-        // Oversized CBOR arrays/maps (limits 4096)
-        let huge_array = [vec![0x9f], vec![0x01; 5000]].concat(); // indefinite array (rejected earlier)
-        assert_typed_cose_outcome(&huge_array, "huge array");
+        // Oversized CBOR definite-length arrays (limit 4096)
+        // 0x98 13 88 = array(5000) in 2-byte length form
+        let huge_array = [vec![0x98, 0x13, 0x88], vec![0x01; 5000]].concat();
+        assert_typed_cose_outcome(&huge_array, "huge definite array");
+
+        // Oversized CBOR definite-length maps (limit 4096)
+        // 0xb8 13 88 = map(5000) in 2-byte length form
+        let huge_map = [vec![0xb8, 0x13, 0x88], vec![0x01; 10000]].concat(); // key+value pairs
+        assert_typed_cose_outcome(&huge_map, "huge definite map");
 
         // PEM with missing END marker
         assert_typed_cose_outcome(
@@ -926,13 +934,6 @@ AAAA
 ",
             "PEM with header",
         );
-
-        // Depth limit: 17 levels of nesting should be rejected (limit is 16)
-        let mut deep17 = vec![0x81];
-        for _ in 0..17 {
-            deep17 = [vec![0x81], deep17].concat();
-        }
-        assert_typed_cose_outcome(&deep17, "depth 17 nesting");
     }
 
     #[test]
