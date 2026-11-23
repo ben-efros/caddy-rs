@@ -753,4 +753,281 @@ mod tests {
         let key = CosePublicKey::parse(&encoded).expect("base64url COSE parses");
         assert_eq!(key.x, vec![0x09; 32]);
     }
+
+    // --- Fuzz coverage for the WebAuthn COSE/PEM parsers ----------------------------------------
+    //
+    // These parsers accept credentials from clients (base64url COSE_Key or PEM SPKI), so every
+    // byte is chosen by the caller. House style: seeded xorshift64 PRNG in this file (no
+    // cargo-fuzz/libFuzzer/proptest/rand), `catch_unwind` so a panic names the input, and an
+    // always-executed regression corpus.
+
+    fn xorshift(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    /// Drive both `from_cbor` and `from_pem` over `bytes` and assert the outcome is a typed
+    /// result, never a panic.
+    fn assert_typed_cose_outcome(bytes: &[u8], context: &str) {
+        // Try CBOR first (handles both COSE_Key map and bare byte strings).
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = CosePublicKey::from_cbor(bytes);
+        }));
+        if let Err(panic) = outcome {
+            panic!(
+                "{context}: from_cbor panicked on {} bytes: {:02x?}",
+                bytes.len(),
+                bytes
+            );
+        }
+
+        // Try PEM if it looks like one.
+        if let Ok(text) = std::str::from_utf8(bytes) {
+            if text.trim().starts_with("-----BEGIN") {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = CosePublicKey::from_pem(text);
+                }));
+                if let Err(panic) = outcome {
+                    panic!(
+                        "{context}: from_pem panicked on {} bytes: {:02x?}",
+                        bytes.len(),
+                        bytes
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn random_cose_inputs_never_panic() {
+        const CASES: usize = 5_000;
+        let mut state = 0xC0FF_EE00_0000_0001_u64;
+        for case in 0..CASES {
+            let len = (xorshift(&mut state) % 256) as usize;
+            let mut bytes = Vec::with_capacity(len);
+            for _ in 0..len {
+                bytes.push((xorshift(&mut state) & 0xff) as u8);
+            }
+            // Half the cases get a minimal CBOR map header so the CBOR parser is entered.
+            if case % 2 == 0 && bytes.len() >= 2 {
+                bytes[0] = 0xa2; // map(2)
+                bytes[1] = 0x01; // key label 1 (kty)
+            }
+            assert_typed_cose_outcome(&bytes, &format!("random case {case}"));
+        }
+    }
+
+    #[test]
+    fn mutated_valid_cose_keys_never_panic() {
+        const CASES: usize = 5_000;
+        // Valid ES256 COSE_Key
+        let mut es256 = cose_map(-7, 2, 1, &[0x11; 32], Some(&[0x22; 32]));
+        // Valid EdDSA COSE_Key
+        let mut eddsa = cose_map(-8, 1, 6, &[0x33; 32], None);
+        // Valid Ed25519 PEM
+        let ed_pem = pem(&spki_der(&ED25519_OID, &[0x44; 32]));
+        // Valid P-256 PEM
+        let p256_pem = pem(&p256_spki());
+
+        let mut state = 0xC0FF_EE00_0000_0002_u64;
+        for case in 0..CASES {
+            // Pre-compute all bases to avoid lifetime issues
+            let mut ed_pem_bytes = ed_pem.as_bytes().to_vec();
+            let mut p256_pem_bytes = p256_pem.as_bytes().to_vec();
+            let base = match case % 4 {
+                0 => &mut es256,
+                1 => &mut eddsa,
+                2 => &mut ed_pem_bytes,
+                _ => &mut p256_pem_bytes,
+            };
+            let mut bytes = base.clone();
+            let mutations = 1 + (xorshift(&mut state) % 4) as usize;
+            for _ in 0..mutations {
+                match xorshift(&mut state) % 4 {
+                    0 => {
+                        // Bit flip
+                        if !bytes.is_empty() {
+                            let index = (xorshift(&mut state) as usize) % bytes.len();
+                            bytes[index] ^= 1 << (xorshift(&mut state) % 8);
+                        }
+                    }
+                    1 => {
+                        // Truncation
+                        if !bytes.is_empty() {
+                            let keep = (xorshift(&mut state) as usize) % (bytes.len() + 1);
+                            bytes.truncate(keep);
+                        }
+                    }
+                    2 => {
+                        // Splice in CRLF/NUL/0xFF
+                        if !bytes.is_empty() {
+                            let index = (xorshift(&mut state) as usize) % bytes.len();
+                            bytes[index] =
+                                [0x00, 0xff, 0x0d, 0x0a][(xorshift(&mut state) % 4) as usize];
+                        }
+                    }
+                    _ => {
+                        // Insert random byte
+                        let index = (xorshift(&mut state) as usize) % (bytes.len() + 1);
+                        bytes.insert(index, (xorshift(&mut state) & 0xff) as u8);
+                    }
+                }
+            }
+            assert_typed_cose_outcome(&bytes, &format!("mutation case {case}"));
+        }
+    }
+
+    #[test]
+    #[test]
+    fn absurd_cose_structures_are_rejected_not_panicking() {
+        // Truncated CBOR map
+        assert_typed_cose_outcome(&[0xa1], "truncated map");
+        // Map with invalid label type (text instead of int)
+        let mut bytes = vec![0xa1]; // map(1)
+        bytes.extend_from_slice(&[0x63, 0x6b, 0x74, 0x79]); // text "kty"
+        bytes.extend_from_slice(&cbor_int(2));
+        assert_typed_cose_outcome(&bytes, "text label");
+
+        // Deeply nested CBOR MAP (exceeds depth limit 16)
+        // Use map(1) chains so from_cbor enters the decoder (it requires a top-level map)
+        let mut deep = vec![0xa1]; // map(1)
+        for _ in 0..20 {
+            deep = [vec![0xa1], deep].concat(); // nest maps
+        }
+        assert_typed_cose_outcome(&deep, "deep nesting");
+
+        // Oversized CBOR definite-length arrays (limit 4096)
+        // 0x98 13 88 = array(5000) in 2-byte length form
+        let huge_array = [vec![0x98, 0x13, 0x88], vec![0x01; 5000]].concat();
+        assert_typed_cose_outcome(&huge_array, "huge definite array");
+
+        // Oversized CBOR definite-length maps (limit 4096)
+        // 0xb8 13 88 = map(5000) in 2-byte length form
+        let huge_map = [vec![0xb8, 0x13, 0x88], vec![0x01; 10000]].concat(); // key+value pairs
+        assert_typed_cose_outcome(&huge_map, "huge definite map");
+
+        // PEM with missing END marker
+        assert_typed_cose_outcome(
+            b"-----BEGIN PUBLIC KEY-----
+AAAA",
+            "truncated PEM",
+        );
+        // PEM with mismatched labels
+        assert_typed_cose_outcome(
+            b"-----BEGIN PUBLIC KEY-----
+AAAA
+-----END PRIVATE KEY-----
+",
+            "mismatched PEM labels",
+        );
+        // PEM with header (encrypted)
+        assert_typed_cose_outcome(
+            b"-----BEGIN PUBLIC KEY-----
+Proc-Type: 4,ENCRYPTED
+
+AAAA
+-----END PUBLIC KEY-----
+",
+            "PEM with header",
+        );
+    }
+
+    #[test]
+    fn cose_regression_corpus_never_panics() {
+        let corpus: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            b"not a key".to_vec(),
+            b"-----BEGIN PUBLIC KEY-----
+"
+            .to_vec(),
+            b"-----BEGIN PUBLIC KEY-----
+AAAA
+-----END PUBLIC KEY-----
+"
+            .to_vec(),
+            // Valid COSE keys (CBOR)
+            cose_map(-7, 2, 1, &[0x00; 32], Some(&[0x00; 32])),
+            cose_map(-8, 1, 6, &[0x00; 32], None),
+            cose_map(-7, 2, 1, &[0xff; 32], Some(&[0xff; 32])),
+            cose_map(-8, 1, 6, &[0xff; 32], None),
+            // Valid PEM (base64 of minimal SPKI)
+            pem(&spki_der(&ED25519_OID, &[0x00; 32])).into_bytes(),
+            pem(&p256_spki()).into_bytes(),
+            // Base64 variants
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(cose_map(-8, 1, 6, &[0x01; 32], None))
+                .into_bytes(),
+            base64::engine::general_purpose::STANDARD
+                .encode(cose_map(-7, 2, 1, &[0x02; 32], Some(&[0x03; 32])))
+                .into_bytes(),
+            // Invalid: wrong coordinate lengths
+            cose_map(-7, 2, 1, &[0x01; 31], Some(&[0x02; 32])),
+            cose_map(-7, 2, 1, &[0x01; 32], Some(&[0x02; 31])),
+            cose_map(-8, 1, 6, &[0x01; 31], None),
+            // Invalid: inconsistent kty/alg/crv
+            cose_map(-7, 1, 6, &[0x01; 32], None), // OKP with ES256
+            cose_map(-8, 2, 1, &[0x01; 32], Some(&[0x02; 32])), // EC2 with EdDSA
+            cose_map(-9, 2, 1, &[0x01; 32], Some(&[0x02; 32])), // unknown alg
+        ];
+        for (index, bytes) in corpus.iter().enumerate() {
+            assert_typed_cose_outcome(bytes, &format!("corpus entry {index}"));
+        }
+    }
+
+    /// Guards against the corpus going vacuous: the generated mutations must keep producing inputs
+    /// the parsers actually enter, not only inputs that fail at the first byte check.
+    #[test]
+    fn cose_fuzz_generator_reaches_the_parsers() {
+        let es256 = cose_map(-7, 2, 1, &[0x11; 32], Some(&[0x22; 32]));
+        let eddsa = cose_map(-8, 1, 6, &[0x33; 32], None);
+        let mut state = 0xC0FF_EE00_0000_0002_u64;
+        let mut entered = 0_usize;
+        let cases = 1_000_usize;
+        for case in 0..cases {
+            let base = if case % 2 == 0 { &es256 } else { &eddsa };
+            let mut bytes = base.clone();
+            let mutations = 1 + (xorshift(&mut state) % 4) as usize;
+            for _ in 0..mutations {
+                match xorshift(&mut state) % 4 {
+                    0 => {
+                        if !bytes.is_empty() {
+                            let index = (xorshift(&mut state) as usize) % bytes.len();
+                            bytes[index] ^= 1 << (xorshift(&mut state) % 8);
+                        }
+                    }
+                    1 => {
+                        if !bytes.is_empty() {
+                            let keep = (xorshift(&mut state) as usize) % (bytes.len() + 1);
+                            bytes.truncate(keep);
+                        }
+                    }
+                    2 => {
+                        if !bytes.is_empty() {
+                            let index = (xorshift(&mut state) as usize) % bytes.len();
+                            bytes[index] =
+                                [0x00, 0xff, 0x0d, 0x0a][(xorshift(&mut state) % 4) as usize];
+                        }
+                    }
+                    _ => {
+                        let index = (xorshift(&mut state) as usize) % (bytes.len() + 1);
+                        bytes.insert(index, (xorshift(&mut state) & 0xff) as u8);
+                    }
+                }
+            }
+            // "Reached the parser" means the CBOR started with a map header, or the PEM has BEGIN.
+            if matches!(bytes.first(), Some(0xa0..=0xbf)) || // CBOR map
+               bytes.starts_with(b"-----BEGIN")
+            {
+                entered += 1;
+            }
+        }
+        assert!(
+            entered > cases / 2,
+            "only {entered} of {cases} generated mutations reached a parser; the mutation generator has regressed"
+        );
+    }
 }
