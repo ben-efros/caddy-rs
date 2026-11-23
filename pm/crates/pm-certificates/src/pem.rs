@@ -132,5 +132,210 @@ mod tests {
         let error = parse_blocks("-----BEGIN CERTIFICATE-----\nAAAA\n-----END PRIVATE KEY-----\n")
             .expect_err("mismatch");
         assert!(error.contains("does not match"), "{error}");
+
+        // --- Fuzz coverage for the PEM block decoder ---------------------------------------------
+        //
+        // This decoder accepts PEM blocks from user input (certificate/key uploads), so every
+        // byte is chosen by the uploader. It enforces strict structure: no text outside blocks,
+        // no nested blocks, matched BEGIN/END labels, base64-only body, no headers, no empty
+        // blocks. House style: seeded xorshift64 PRNG, catch_unwind, regression corpus.
+
+        fn xorshift(state: &mut u64) -> u64 {
+            let mut x = *state;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *state = x;
+            x
+        }
+
+        fn assert_typed_pem_outcome(text: &str, context: &str) {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = parse_blocks(text);
+            }));
+            if let Err(_panic) = outcome {
+                panic!(
+                    "{context}: parse_blocks panicked on {} bytes: {:?}",
+                    text.len(),
+                    text
+                );
+            }
+        }
+
+        #[test]
+        fn random_pem_inputs_never_panic() {
+            const CASES: usize = 3_000;
+            let mut state = 0xC0FF_EE00_0000_0001_u64;
+            for _ in 0..CASES {
+                let len = (xorshift(&mut state) % 512) as usize;
+                let mut bytes = Vec::with_capacity(len);
+                for _ in 0..len {
+                    bytes.push((xorshift(&mut state) & 0xff) as u8);
+                }
+                if let Ok(text) = std::str::from_utf8(&bytes) {
+                    assert_typed_pem_outcome(text, "random");
+                }
+            }
+        }
+
+        #[test]
+        fn mutated_valid_pem_never_panic() {
+            const CASES: usize = 3_000;
+            let valid_cert = include_str!("../../../tests/fixtures/manual-valid.crt.pem");
+            let mut state = 0xC0FF_EE00_0000_0002_u64;
+            for _ in 0..CASES {
+                let mut bytes = valid_cert.as_bytes().to_vec();
+                let mutations = 1 + (xorshift(&mut state) % 4) as usize;
+                for _ in 0..mutations {
+                    match xorshift(&mut state) % 4 {
+                        0 => {
+                            if !bytes.is_empty() {
+                                let index = (xorshift(&mut state) as usize) % bytes.len();
+                                bytes[index] ^= 1 << (xorshift(&mut state) % 8);
+                            }
+                        }
+                        1 => {
+                            if !bytes.is_empty() {
+                                let keep = (xorshift(&mut state) as usize) % (bytes.len() + 1);
+                                bytes.truncate(keep);
+                            }
+                        }
+                        2 => {
+                            if !bytes.is_empty() {
+                                let index = (xorshift(&mut state) as usize) % bytes.len();
+                                bytes[index] =
+                                    [0x00, 0xff, 0x0a, 0x2d][(xorshift(&mut state) % 4) as usize];
+                            }
+                        }
+                        _ => {
+                            let index = (xorshift(&mut state) as usize) % (bytes.len() + 1);
+                            bytes.insert(index, (xorshift(&mut state) & 0xff) as u8);
+                        }
+                    }
+                }
+                if let Ok(text) = std::str::from_utf8(&bytes) {
+                    assert_typed_pem_outcome(text, "mutation");
+                }
+            }
+        }
+
+        #[test]
+        fn absurd_pem_structures_are_rejected_not_panicking() {
+            // Truncated PEM (missing END)
+            assert_typed_pem_outcome(
+                "-----BEGIN CERTIFICATE-----
+AAAA",
+                "truncated PEM",
+            );
+            // Missing BEGIN
+            assert_typed_pem_outcome(
+                "AAAA
+-----END CERTIFICATE-----",
+                "missing BEGIN",
+            );
+            // Mismatched labels
+            assert_typed_pem_outcome(
+                "-----BEGIN CERTIFICATE-----
+AAAA
+-----END PRIVATE KEY-----",
+                "mismatched labels",
+            );
+            // Nested blocks
+            assert_typed_pem_outcome(
+                "-----BEGIN CERTIFICATE-----
+-----BEGIN PRIVATE KEY-----
+AAAA
+-----END PRIVATE KEY-----
+-----END CERTIFICATE-----",
+                "nested",
+            );
+            // Empty block
+            assert_typed_pem_outcome(
+                "-----BEGIN CERTIFICATE-----
+
+-----END CERTIFICATE-----",
+                "empty block",
+            );
+            // Header-bearing (encrypted)
+            assert_typed_pem_outcome(
+                "-----BEGIN PRIVATE KEY-----
+Proc-Type: 4,ENCRYPTED
+
+AAAA
+-----END PRIVATE KEY-----",
+                "encrypted",
+            );
+            // Non-base64 character
+            assert_typed_pem_outcome(
+                "-----BEGIN CERTIFICATE-----
+AAAA!
+-----END CERTIFICATE-----",
+                "non-base64",
+            );
+        }
+
+        #[test]
+        fn pem_regression_corpus_never_panics() {
+            let corpus: Vec<&str> = vec![
+                "",
+                "garbage",
+                "-----BEGIN CERTIFICATE-----
+",
+                "-----BEGIN CERTIFICATE-----
+AAAA
+-----END CERTIFICATE-----
+",
+                include_str!("../../../tests/fixtures/manual-valid.crt.pem"),
+            ];
+            for (index, text) in corpus.iter().enumerate() {
+                assert_typed_pem_outcome(text, &format!("corpus entry {index}"));
+            }
+        }
+
+        #[test]
+        fn pem_fuzz_generator_reaches_the_parser() {
+            let valid = include_str!("../../../tests/fixtures/manual-valid.crt.pem");
+            let mut state = 0xC0FF_EE00_0000_0002_u64;
+            let mut entered = 0_usize;
+            const CASES: usize = 1_000;
+            for _ in 0..CASES {
+                let mut bytes = valid.as_bytes().to_vec();
+                let mutations = 1 + (xorshift(&mut state) % 4) as usize;
+                for _ in 0..mutations {
+                    match xorshift(&mut state) % 4 {
+                        0 => {
+                            if !bytes.is_empty() {
+                                let index = (xorshift(&mut state) as usize) % bytes.len();
+                                bytes[index] ^= 1 << (xorshift(&mut state) % 8);
+                            }
+                        }
+                        1 => {
+                            if !bytes.is_empty() {
+                                let keep = (xorshift(&mut state) as usize) % (bytes.len() + 1);
+                                bytes.truncate(keep);
+                            }
+                        }
+                        2 => {
+                            if !bytes.is_empty() {
+                                let index = (xorshift(&mut state) as usize) % bytes.len();
+                                bytes[index] =
+                                    [0x00, 0xff, 0x0a, 0x2d][(xorshift(&mut state) % 4) as usize];
+                            }
+                        }
+                        _ => {
+                            let index = (xorshift(&mut state) as usize) % (bytes.len() + 1);
+                            bytes.insert(index, (xorshift(&mut state) & 0xff) as u8);
+                        }
+                    }
+                }
+                if bytes.starts_with(b"-----BEGIN") {
+                    entered += 1;
+                }
+            }
+            assert!(
+            entered > CASES / 2,
+            "only {entered} of {CASES} generated mutations start with PEM BEGIN; generator has regressed"
+        );
+        }
     }
 }
