@@ -21,20 +21,18 @@ jobs:
       - name: Build release
         run: cargo build --workspace --release
 
-  pm:
-    name: proxy manager sidecar
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: pm
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - name: Format
-        run: cargo fmt --all --check
-      - name: Test
-        run: cargo test --workspace --locked
-      - name: Build release
-        run: cargo build --workspace --release --locked
+  # The `pm` job that used to live here is deliberately gone (T-PMW-061).
+  #
+  # It set its cargo commands to run inside pm/, but pm/ is not a workspace root: pm/Cargo.toml
+  # is a comment-only virtual manifest by design, and pm's crates are members of the
+  # ROOT workspace (see ../Cargo.toml, entries "pm/crates/pm-*"). Since T-REL-020 (4b412047bd97)
+  # made that true, every command with cwd=pm fails before compiling anything:
+  #
+  #   error: failed to parse manifest at `pm/Cargo.toml`
+  #   Caused by: manifest is missing either a `[package]` or a `[workspace]`
+  #
+  # The job was also redundant: the workspace-root `test` job above runs `cargo test --workspace`,
+  # and `cargo metadata` from the root resolves all 12 caddy-rs-pm-* crates, so their tests, format
+  # and release build already run there. Re-adding a pm-directory job would restore only the
+  # failure. If pm ever needs its own job, give it a real [workspace] manifest first.
+
