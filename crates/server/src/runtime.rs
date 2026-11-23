@@ -1759,11 +1759,18 @@ impl ServerRuntime {
     }
 
     async fn stop_all(&mut self) {
-        // Force-close remaining connections, then give their tasks a bounded moment to observe the
-        // force signal and drop their tracker guards. Go's Shutdown only returns once its
-        // connections are done; without this wait, connection tasks outlive the runtime and leak.
+        // Force-close connections on the HTTP listeners so idle keep-alive connections don't
+        // delay shutdown. The admin endpoint is deliberately NOT force-closed here: an in-flight
+        // `POST /stop` response (200 OK) must be written to the client before the process exits,
+        // and `std::process::exit` skips async-I/O flushing, so aborting the admin connection
+        // would drop the reply and make a client observe no response. `wait_for_trackers_closed`
+        // below waits for admin connections to drain their responses first (bounded by the
+        // timeout), so the `/stop` reply is delivered before `release_shutdown_latch` and the
+        // subsequent `process::exit`.
         let trackers = self.trackers();
-        self.force_all();
+        for handle in self.listeners.values() {
+            handle.begin_force();
+        }
         let remaining = wait_for_trackers_closed(&trackers, Duration::from_secs(2)).await;
         if remaining > 0 {
             tracing::warn!(
