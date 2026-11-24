@@ -42,6 +42,19 @@ jobs:
       # the committed database. Before T-CI-002 the job cloned RustSec at run time, which meant an
       # upstream advisory added overnight could fail (or clear) this gate with no change here.
       # Refreshing the database is a reviewed commit, not an ambient CI side effect.
+      #
+      # `--no-fetch` has one visible side effect that is NOT a failure: cargo-audit still tries to
+      # answer "is this version yanked?" by reading the crates.io index, and with no network that
+      # lookup fails once per dependency, so the log fills with
+      #   error: couldn't check if the package is yanked: not found: No such crate in crates.io
+      # index: <crate>
+      # Those lines are diagnostics, not findings: they do not affect the exit status, and the
+      # advisory verdict below them is computed entirely from the vendored database. They are left
+      # in place rather than silenced, because silencing them (`2>/dev/null`, or dropping
+      # `--deny warnings`) would also hide the real verdict. Read the tail of the log -- the
+      # authoritative output is the RUSTSEC block, and the job fails on the exit status, not on the
+      # yank lines. If a yank check ever becomes load-bearing, the fix is to run this job without
+      # `--no-fetch` in a network-enabled step, not to filter the log.
       - name: RustSec advisory check (vendored database, no network)
         run: cargo audit --file Cargo.lock --deny warnings --db .cargo/advisory-db --no-fetch
       # A snapshot that silently stopped being loaded would make the gate vacuous, so prove it was
