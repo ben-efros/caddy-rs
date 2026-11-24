@@ -99,6 +99,9 @@ jobs:
           target="${{ matrix.target }}"
           echo "CC_${target//-/_}=musl-gcc" >> "$GITHUB_ENV"
 
+      - name: Fetch dependencies (populate crates.io index)
+        run: cargo fetch --locked
+
       - name: Build
         run: |
           cargo build --locked --profile ${{ matrix.profile }} --target ${{ matrix.target }} ${{ matrix.features }} -p caddy-rs
