@@ -24,4 +24,14 @@ ignore = [
   # CSR generation). The advisory concerns RSA *decryption* padding oracles, and no code path
   # here performs RSA decryption with an attacker-influenced ciphertext.
   "RUSTSEC-2023-0071",
+
+  # --- chrono: unmaintained (RUSTSEC-2026-0543, 2026-09-14). Not our dependency and not in the
+  # shipped binary. The only path to it is
+  #   pm/crates/pm-api [dev-dependencies] axum-test -> expect-json -> chrono
+  # so it is absent from every release artefact: `cargo tree -e normal` does not reach it, and the
+  # advisory is "unmaintained", not a vulnerability. We cannot pin it away either -- the version is
+  # chosen by axum-test, and axum-test is our only harness for exercising the pm HTTP surface.
+  # Re-check when axum-test stops depending on expect-json, or when expect-json drops chrono
+  # (tracked as T-CI-002). Deliberately narrow: this ignores one advisory, not a crate name.
+  "RUSTSEC-2026-0543",
 ]
