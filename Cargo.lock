@@ -317,7 +317,7 @@ checksum = "7354288c522e7e980fafd2075d63d1285794c3a6a16cdd492f189ea406e5f18b"
 
 [[package]]
 name = "caddy-rs"
-version = "0.1.0-trial.7"
+version = "0.1.0-trial.8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -344,7 +344,7 @@ dependencies = [
 
 [[package]]
 name = "caddy-rs-admin"
-version = "0.1.0-trial.7"
+version = "0.1.0-trial.8"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -365,7 +365,7 @@ dependencies = [
 
 [[package]]
 name = "caddy-rs-auth"
-version = "0.1.0-trial.7"
+version = "0.1.0-trial.8"
 dependencies = [
  "base64 0.23.1",
  "serde_json",
@@ -375,7 +375,7 @@ dependencies = [
 
 [[package]]
 name = "caddy-rs-authn"
-version = "0.1.0-trial.7"
+version = "0.1.0-trial.8"
 dependencies = [
  "argon2",
  "async-trait",
@@ -398,7 +398,7 @@ dependencies = [
 
 [[package]]
 name = "caddy-rs-config"
-version = "0.1.0-trial.7"
+version = "0.1.0-trial.8"
 dependencies = [
  "caddy-rs-core",
  "libc",
@@ -408,7 +408,7 @@ dependencies = [
 
 [[package]]
 name = "caddy-rs-config-tx"
-version = "0.1.0-trial.7"
+version = "0.1.0-trial.8"
 dependencies = [
  "async-trait",
  "caddy-rs-core",
@@ -423,7 +423,7 @@ dependencies = [
 
 [[package]]
 name = "caddy-rs-core"
-version = "0.1.0-trial.7"
+version = "0.1.0-trial.8"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -436,7 +436,7 @@ dependencies = [
 
 [[package]]
 name = "caddy-rs-http"
-version = "0.1.0-trial.7"
+version = "0.1.0-trial.8"
 dependencies = [
  "argon2",
  "async-trait",
@@ -471,7 +471,7 @@ dependencies = [
 
 [[package]]
 name = "caddy-rs-l4"
-version = "0.1.0-trial.7"
+version = "0.1.0-trial.8"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -487,7 +487,7 @@ dependencies = [
 
 [[package]]
 name = "caddy-rs-plug"
-version = "0.1.0-trial.7"
+version = "0.1.0-trial.8"
 dependencies = [
  "async-trait",
  "caddy-rs-core",
@@ -497,7 +497,7 @@ dependencies = [
 
 [[package]]
 name = "caddy-rs-pm-api"
-version = "0.1.0-trial.7"
+version = "0.1.0-trial.8"
 dependencies = [
  "async-trait",
  "axum",
@@ -522,7 +522,7 @@ dependencies = [
 
 [[package]]
 name = "caddy-rs-pm-certificates"
-version = "0.1.0-trial.7"
+version = "0.1.0-trial.8"
 dependencies = [
  "base64 0.23.1",
  "caddy-rs-pm-core",
@@ -536,7 +536,7 @@ dependencies = [
 
 [[package]]
 name = "caddy-rs-pm-cli"
-version = "0.1.0-trial.7"
+version = "0.1.0-trial.8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -562,7 +562,7 @@ dependencies = [
 
 [[package]]
 name = "caddy-rs-pm-compiler"
-version = "0.1.0-trial.7"
+version = "0.1.0-trial.8"
 dependencies = [
  "caddy-rs-pm-core",
  "serde_json",
@@ -571,7 +571,7 @@ dependencies = [
 
 [[package]]
 name = "caddy-rs-pm-config"
-version = "0.1.0-trial.7"
+version = "0.1.0-trial.8"
 dependencies = [
  "caddy-rs-pm-compiler",
  "caddy-rs-pm-core",
@@ -582,7 +582,7 @@ dependencies = [
 
 [[package]]
 name = "caddy-rs-pm-core"
-version = "0.1.0-trial.7"
+version = "0.1.0-trial.8"
 dependencies = [
  "serde",
  "serde_json",
@@ -591,7 +591,7 @@ dependencies = [
 
 [[package]]
 name = "caddy-rs-pm-hosts"
-version = "0.1.0-trial.7"
+version = "0.1.0-trial.8"
 dependencies = [
  "caddy-rs-pm-core",
  "caddy-rs-pm-state",
@@ -602,7 +602,7 @@ dependencies = [
 
 [[package]]
 name = "caddy-rs-pm-import"
-version = "0.1.0-trial.7"
+version = "0.1.0-trial.8"
 dependencies = [
  "caddy-rs-pm-core",
  "serde",
@@ -612,7 +612,7 @@ dependencies = [
 
 [[package]]
 name = "caddy-rs-pm-policies"
-version = "0.1.0-trial.7"
+version = "0.1.0-trial.8"
 dependencies = [
  "caddy-rs-pm-core",
  "caddy-rs-pm-state",
@@ -623,7 +623,7 @@ dependencies = [
 
 [[package]]
 name = "caddy-rs-pm-runtime"
-version = "0.1.0-trial.7"
+version = "0.1.0-trial.8"
 dependencies = [
  "async-trait",
  "axum",
@@ -646,7 +646,7 @@ dependencies = [
 
 [[package]]
 name = "caddy-rs-pm-service"
-version = "0.1.0-trial.7"
+version = "0.1.0-trial.8"
 dependencies = [
  "caddy-rs-pm-certificates",
  "caddy-rs-pm-compiler",
@@ -661,7 +661,7 @@ dependencies = [
 
 [[package]]
 name = "caddy-rs-pm-state"
-version = "0.1.0-trial.7"
+version = "0.1.0-trial.8"
 dependencies = [
  "serde",
  "serde_json",
@@ -671,7 +671,7 @@ dependencies = [
 
 [[package]]
 name = "caddy-rs-proxy"
-version = "0.1.0-trial.7"
+version = "0.1.0-trial.8"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -695,7 +695,7 @@ dependencies = [
 
 [[package]]
 name = "caddy-rs-server"
-version = "0.1.0-trial.7"
+version = "0.1.0-trial.8"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
@@ -733,11 +733,11 @@ dependencies = [
 
 [[package]]
 name = "caddy-rs-test-support"
-version = "0.1.0-trial.7"
+version = "0.1.0-trial.8"
 
 [[package]]
 name = "caddy-rs-tls"
-version = "0.1.0-trial.7"
+version = "0.1.0-trial.8"
 dependencies = [
  "async-trait",
  "aws-lc-rs",

@@ -295,16 +295,38 @@ fn audit_policy_does_not_ignore_the_banned_advisories() {
         eprintln!("banned-crates guard: no {}", audit_toml.display());
         return;
     };
-    // The ban is delete-don't-ignore: an ignore entry would re-admit the crate silently.
-    for id in [
-        "RUSTSEC-2025-0141",
-        "RUSTSEC-2026-0441",
-        "RUSTSEC-2026-0543",
-    ] {
+    // The ban is delete-don't-ignore for a crate banned OUTRIGHT: an ignore entry would re-admit
+    // it silently, so those advisories may never appear in the policy.
+    //
+    // A crate carrying `allowed: true` is the opposite case, and the distinction is load-bearing:
+    // it is permitted to stay in the lockfile precisely because no version can ever satisfy the
+    // audit gate, which means the ONLY way to pass that gate is an explicit, reasoned ignore.
+    // Forbidding the ignore for an allowed crate would not remove the dependency -- it would just
+    // make the gate unpassable, and the pressure would move to weakening the gate itself. So the
+    // rule is derived from the same table that decides the lockfile ban, rather than from a
+    // second hardcoded list that can drift out of agreement with it. Each allowed ignore is still
+    // checked: it must be an advisory this table knows about, and the audit policy must state a
+    // reason for it rather than listing a bare id.
+    for banned in &BANNED {
+        let id = banned.advisory;
+        if banned.allowed {
+            if let Some(line) = contents.lines().find(|l| l.contains(id)) {
+                assert!(
+                    !line.trim_start().starts_with(&format!("\"{id}\"")),
+                    "{} ignores {id} ({}) with no reason on the line. An allowance is permitted \
+                     only with its justification, so a reviewer sees why: {}",
+                    audit_toml.display(),
+                    banned.name,
+                    CHRONO_ALLOWANCE
+                );
+            }
+            continue;
+        }
         assert!(
             !contents.contains(id),
-            "{} must not ignore {id}; the banned crates are banned outright",
-            audit_toml.display()
+            "{} must not ignore {id} ({}); the banned crates are banned outright",
+            audit_toml.display(),
+            banned.name
         );
     }
 }
