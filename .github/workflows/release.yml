@@ -90,7 +90,12 @@ jobs:
       - name: Install Rust
         run: |
           rustup toolchain install --profile minimal
-          rustup target add ${{ matrix.target }}
+
+      - name: Populate crates.io index (prevents --locked failures)
+        run: cargo fetch
+
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
 
       - name: Install musl toolchain
         if: matrix.musl
@@ -100,8 +105,8 @@ jobs:
           target="${{ matrix.target }}"
           echo "CC_${target//-/_}=musl-gcc" >> "$GITHUB_ENV"
 
-      - name: Fetch dependencies for target (populate crates.io index)
-        run: cargo fetch --target ${{ matrix.target }}
+      - name: Fetch for target (locked, no network)
+        run: cargo fetch --locked --target ${{ matrix.target }}
 
       - name: Build
         run: |
