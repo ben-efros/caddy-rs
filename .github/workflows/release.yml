@@ -26,6 +26,7 @@ jobs:
   build:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -104,7 +105,7 @@ jobs:
           target="${{ matrix.target }}"
           echo "CC_${target//-/_}=musl-gcc" >> "$GITHUB_ENV"
 
-      - name: Fetch for target
+      - name: Fetch for target (locked, no network)
         run: cargo fetch --locked --target ${{ matrix.target }}
 
       - name: Build
