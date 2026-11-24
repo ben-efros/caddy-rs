@@ -6154,14 +6154,27 @@ fn reload_and_stop_reach_a_unix_socket_admin_endpoint() {
 /// draining, so it could run first. `process::exit` runs no destructors, so exiting first cut the
 /// graceful drain short and left everything the shutdown path tears down behind.
 ///
-/// The configuration below makes the runtime loop's shutdown *slow and observable*: a 1 s
+/// The configuration below makes the runtime loop's shutdown *slow and observable*: a 300 ms
 /// `shutdown_delay` inside `graceful_stop` (Caddy's `/stop` handler never waits for it) plus a
-/// 500 ms grace period on a server with one request in flight. TMPDIR points at a directory that
-/// is deliberately removed, so the runtime's own shutdown notice ("removing socket file ...") is a
-/// syscall that fails and prints to stderr exactly when the listeners are torn down - after the
-/// grace period. Waiting on the shutdown latch makes the exit follow that notice; exiting on a
-/// fixed timer lands during the shutdown delay and the notice never appears, because
-/// `process::exit` skips the listener teardown. Nothing here depends on a 100 ms/200 ms race.
+/// 500 ms grace period on a server with one request held open. `graceful_stop` runs those two waits
+/// **in sequence**, so the designed shutdown takes ~800 ms, which must finish inside the
+/// `STOP_EXIT_WAIT` budget (`crates/admin/src/lib.rs`, 2 s) that bounds the `/stop` exit path.
+///
+/// The delay was 1 s until `T-CLI-STOP-EXIT-FLAKY`: 1000 + 500 = 1500 ms of designed wait inside a
+/// 2000 ms budget left only ~500 ms for the `/stop` round trip, listener teardown and process exit,
+/// and the test failed on roughly half of all runs -- a coin flip, not a verdict. Measured, isolated,
+/// one run per sample: 1 s delay -> 4 passed / 4 failed of 8; 2.5 s delay (deliberately past the
+/// budget) -> 0 passed / 6 failed; 300 ms delay -> 28 passed / 0 failed of 28. So the test does
+/// discriminate on shutdown duration -- it was the margin that was too small, not the assertion.
+///
+/// TMPDIR points at a directory that is deliberately removed, so the runtime's listener teardown
+/// fails when it runs; that failure is not what this test reads. What it reads is the exit path's own
+/// two mutually exclusive notices on stderr, both emitted from `crates/admin/src/lib.rs` after the
+/// `/stop` handler returns: "runtime shutdown finished; exiting on /stop" when the shutdown latch is
+/// observed, and "shutdown did not complete within Ns" when the handler times out instead. Asserting
+/// the first AND the absence of the second is what makes the ordering observable: an exit that fires
+/// on a fixed timer lands inside the shutdown delay and prints the timeout line, because
+/// `process::exit` skips the listener teardown.
 #[cfg(unix)]
 #[test]
 fn stop_orders_the_process_exit_after_the_shutdown() {
@@ -6183,7 +6196,7 @@ fn stop_orders_the_process_exit_after_the_shutdown() {
         serde_json::json!({
             "admin": {"listen": listen},
             "apps": {"http": {
-                "shutdown_delay": 1_000_000_000_u64,
+                "shutdown_delay": 300_000_000_u64,
                 "grace_period": GRACE_PERIOD.as_nanos() as u64,
                 "servers": {
                     "srv0": {
@@ -6241,8 +6254,9 @@ fn stop_orders_the_process_exit_after_the_shutdown() {
         .expect("write in-flight request");
     std::thread::sleep(Duration::from_millis(250));
 
-    // From here on the runtime cannot report its teardown: the directory it removes the sockets in
-    // is gone, so that step prints "caddy-rs: removing socket file ..." to stderr.
+    // From here on the runtime's listener teardown fails: the directory it removes the sockets in is
+    // gone. That failure is deliberately not asserted on -- what the assertions below read is the
+    // `/stop` handler's own exit-path notices, which is what makes the ordering observable.
     std::fs::remove_dir_all(&tmpdir).expect("remove TMPDIR");
 
     let (code, stdout, stderr) = run(&["stop", "--address", &listen]);
