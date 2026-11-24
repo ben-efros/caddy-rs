@@ -1615,18 +1615,40 @@ async fn browse_html(
     root: &Path,
     uri: Uri,
     relative: &str,
-    _options: &BrowseOptions,
+    options: &BrowseOptions,
 ) -> Result<Vec<u8>> {
     let mut entries = fs::read_dir(root).await?;
     let mut names = Vec::new();
     while let Some(entry) = entries.next_entry().await? {
         let name = entry.file_name().to_string_lossy().to_string();
-        let is_dir = entry
-            .file_type()
-            .await
+        let path = entry.path();
+        let file_type = entry.file_type().await.ok();
+        let is_dir = file_type
             .map(|file_type| file_type.is_dir())
             .unwrap_or(false);
-        names.push((name, is_dir));
+        let is_symlink = file_type
+            .map(|file_type| file_type.is_symlink())
+            .unwrap_or(false);
+        // `reveal_symlinks` shows where a symlink points. The link is only read when the option
+        // asks for it: without it the target is not part of the listing at all.
+        let symlink_target = if is_symlink && options.reveal_symlinks {
+            fs::read_link(&path)
+                .await
+                .ok()
+                .map(|target| target.to_string_lossy().to_string())
+        } else {
+            None
+        };
+        // `plain_time_format` is a literal suffix appended to the entry's modification time.
+        let modified = if options.plain_time_format.is_some() {
+            fs::metadata(&path)
+                .await
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+        } else {
+            None
+        };
+        names.push((name, is_dir, symlink_target, modified));
     }
     names.sort_by(|a, b| a.0.cmp(&b.0));
     let mut html = String::new();
@@ -1636,7 +1658,7 @@ async fn browse_html(
     if !relative.is_empty() {
         html.push_str("<li><a href=\"../\">../</a></li>");
     }
-    for (name, is_dir) in names {
+    for (name, is_dir, symlink_target, modified) in names {
         let suffix = if is_dir { "/" } else { "" };
         html.push_str("<li><a href=\"");
         html.push_str(&percent_encode_path_segment(&name));
@@ -1644,7 +1666,25 @@ async fn browse_html(
         html.push_str("\">");
         html.push_str(&html_escape(&name));
         html.push_str(suffix);
-        html.push_str("</a></li>");
+        html.push_str("</a>");
+        if let Some(target) = symlink_target {
+            html.push_str(" -&gt; ");
+            html.push_str(&html_escape(&target));
+        }
+        if let Some(modified) = modified {
+            // Seconds since the Unix epoch, then the caller's literal suffix. Caddy renders a Go
+            // time layout; caddy-rs does not implement that syntax, which is why only the literal
+            // suffix is honoured here (see `BrowseOptions`).
+            if let Ok(since_epoch) = modified.duration_since(std::time::UNIX_EPOCH) {
+                html.push_str(" <span class=\"time\">");
+                html.push_str(&since_epoch.as_secs().to_string());
+                if let Some(format) = &options.plain_time_format {
+                    html.push_str(&html_escape(format));
+                }
+                html.push_str("</span>");
+            }
+        }
+        html.push_str("</li>");
     }
     html.push_str("</ul></body></html>");
     Ok(html.into_bytes())
@@ -3046,6 +3086,62 @@ mod tests {
         assert!(plan.headers.get(header::CONTENT_RANGE).is_none());
         assert_eq!(plan.send_size, plan.body.len() as u64);
         assert!(plan.ranged);
+    }
+
+    // --- the two honoured options change what is SERVED (T-BROWSE-OPTIONS-SILENTLY-DROPPED) ------
+
+    fn browse_fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("real.txt"), "x").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("real.txt", dir.path().join("alias.txt")).unwrap();
+        dir
+    }
+
+    async fn browse_body(dir: &Path, browse: serde_json::Value) -> String {
+        let handler = configured_handler(dir, serde_json::json!({"browse": browse}));
+        let response = respond(&handler, make_request(Method::GET, "/")).await;
+        assert_eq!(response.status, StatusCode::OK);
+        String::from_utf8(response.body.to_vec()).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reveal_symlinks_shows_the_target_and_default_hides_it() {
+        // The option must change the listing. If `reveal_symlinks` were parsed and then ignored --
+        // the defect this task removed -- both bodies would be identical.
+        let dir = browse_fixture();
+        let hidden = browse_body(dir.path(), serde_json::json!({})).await;
+        let revealed = browse_body(dir.path(), serde_json::json!({"reveal_symlinks": true})).await;
+        assert!(
+            !hidden.contains("real.txt</a> -&gt;"),
+            "the default listing must not reveal symlink targets: {hidden}"
+        );
+        assert!(
+            revealed.contains("alias.txt</a> -&gt; real.txt"),
+            "reveal_symlinks must show the symlink target: {revealed}"
+        );
+        assert_ne!(hidden, revealed, "reveal_symlinks must change the listing");
+    }
+
+    #[tokio::test]
+    async fn plain_time_format_appends_its_literal_and_default_omits_times() {
+        let dir = browse_fixture();
+        let plain = browse_body(dir.path(), serde_json::json!({})).await;
+        let formatted =
+            browse_body(dir.path(), serde_json::json!({"plain_time_format": " Z"})).await;
+        assert!(
+            !plain.contains("class=\"time\""),
+            "the default listing must not render times: {plain}"
+        );
+        assert!(
+            formatted.contains("class=\"time\""),
+            "plain_time_format must render a time: {formatted}"
+        );
+        assert!(
+            formatted.contains(" Z</span>"),
+            "plain_time_format must append its literal suffix: {formatted}"
+        );
     }
 }
 
