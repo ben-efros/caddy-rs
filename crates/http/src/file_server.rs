@@ -105,12 +105,94 @@ fn auto_hide_entries(env: &AutoHideEnv) -> Vec<String> {
 /// `http.precompressed.{gzip,brotli,zstd}` modules).
 const PRECOMPRESSED_SUFFIXES: &[(&str, &str)] = &[("gzip", ".gz"), ("br", ".br"), ("zstd", ".zst")];
 
+/// Upstream's `Browse` object (`modules/caddyhttp/fileserver/browse.go`).
+///
+/// `browse` used to be parsed as `as_bool().unwrap_or(is_object())`, so an OBJECT enabled browsing
+/// and every key in it was discarded: an operator writing `{"browse": {"reveal_symlinks": true}}`
+/// got neither the behaviour nor an error. AGENTS.md is explicit that silent approximation is a
+/// defect.
+///
+/// `sort`, `file_limit` and `template_file` are upstream options caddy-rs does not implement. They
+/// are a located error rather than a silent ignore. Unknown keys are refused too, so a future
+/// upstream option cannot be dropped in silence the way these were -- default-ALLOW is what made the
+/// original defect possible.
+#[derive(Default, Clone, Debug)]
+struct BrowseOptions {
+    /// `reveal_symlinks`: show the symlink target path in the listing (T-BROWSE-OPTIONS-*).
+    reveal_symlinks: bool,
+    /// `plain_time_format`: a literal suffix appended to each entry's modification time.
+    plain_time_format: Option<String>,
+}
+
+impl BrowseOptions {
+    const KNOWN: &'static [&'static str] = &[
+        "reveal_symlinks",
+        "plain_time_format",
+        "sort",
+        "file_limit",
+        "template_file",
+    ];
+    /// Upstream options caddy-rs does not implement.
+    const UNIMPLEMENTED: &'static [&'static str] = &["sort", "file_limit", "template_file"];
+
+    fn parse(value: &serde_json::Value, path: &str) -> Result<Option<Self>> {
+        match value {
+            serde_json::Value::Bool(true) => Ok(Some(Self::default())),
+            serde_json::Value::Bool(false) => Ok(None),
+            serde_json::Value::Object(map) => {
+                if let Some(unknown) = map.keys().find(|key| !Self::KNOWN.contains(&key.as_str())) {
+                    return Err(invalid(
+                        path,
+                        &format!(
+                            "`browse` has no option `{unknown}`; the options are {}",
+                            Self::KNOWN.join(", ")
+                        ),
+                    ));
+                }
+                for unsupported in Self::UNIMPLEMENTED {
+                    if map.contains_key(*unsupported) {
+                        return Err(invalid(
+                            path,
+                            &format!(
+                                "`browse.{unsupported}` is not implemented by caddy-rs; remove it \
+                                 rather than leaving it silently ignored"
+                            ),
+                        ));
+                    }
+                }
+                let reveal_symlinks = match map.get("reveal_symlinks") {
+                    None => false,
+                    Some(flag) => flag.as_bool().ok_or_else(|| {
+                        invalid(path, "`browse.reveal_symlinks` must be a boolean")
+                    })?,
+                };
+                let plain_time_format = match map.get("plain_time_format") {
+                    None => None,
+                    Some(value) => Some(
+                        value
+                            .as_str()
+                            .ok_or_else(|| {
+                                invalid(path, "`browse.plain_time_format` must be a string")
+                            })?
+                            .to_string(),
+                    ),
+                };
+                Ok(Some(Self {
+                    reveal_symlinks,
+                    plain_time_format,
+                }))
+            }
+            _ => Err(invalid(path, "`browse` must be a boolean or an object")),
+        }
+    }
+}
+
 /// Serve files from a root directory.
 pub struct FileServerHandler {
     root: String,
     hide: Vec<String>,
     index_names: Vec<String>,
-    browse: bool,
+    browse: Option<BrowseOptions>,
     pass_thru: bool,
     status_code: Option<StatusOverride>,
     canonical_uris: bool,
@@ -194,10 +276,10 @@ impl FileServerHandler {
             })
             .transpose()?
             .unwrap_or_else(|| vec!["index.html".to_string(), "index.txt".to_string()]);
-        let browse = object
-            .get("browse")
-            .map(|browse| browse.as_bool().unwrap_or(browse.is_object()))
-            .unwrap_or(false);
+        let browse = match object.get("browse") {
+            None => None,
+            Some(value) => BrowseOptions::parse(value, path)?,
+        };
         let pass_thru = object
             .get("pass_thru")
             .and_then(serde_json::Value::as_bool)
@@ -687,8 +769,8 @@ impl Handler for FileServerHandler {
                     request.method == http::Method::HEAD,
                 )));
             }
-            if self.browse {
-                let body = browse_html(&filename, request.uri.clone(), relative).await?;
+            if let Some(browse) = &self.browse {
+                let body = browse_html(&filename, request.uri.clone(), relative, browse).await?;
                 return Ok(Outcome::Respond(Response::bytes(
                     StatusCode::OK,
                     "text/html; charset=utf-8",
@@ -1529,7 +1611,12 @@ fn multipart_body(
     Some(body)
 }
 
-async fn browse_html(root: &Path, uri: Uri, relative: &str) -> Result<Vec<u8>> {
+async fn browse_html(
+    root: &Path,
+    uri: Uri,
+    relative: &str,
+    _options: &BrowseOptions,
+) -> Result<Vec<u8>> {
     let mut entries = fs::read_dir(root).await?;
     let mut names = Vec::new();
     while let Some(entry) = entries.next_entry().await? {
@@ -2960,4 +3047,106 @@ mod tests {
         assert_eq!(plan.send_size, plan.body.len() as u64);
         assert!(plan.ranged);
     }
+}
+
+// --- `browse` options (T-BROWSE-OPTIONS-SILENTLY-DROPPED) ------------------------------------
+//
+// Before these, `browse` was parsed as `as_bool().unwrap_or(is_object())`: an object enabled
+// browsing and every key in it was discarded, so an operator writing
+// `{"browse": {"reveal_symlinks": true}}` got neither the behaviour nor an error.
+
+/// Parse `browse` the way an operator's JSON does: through `from_json`, not by calling the
+/// options parser directly. Calling `BrowseOptions::parse` in isolation would keep these tests
+/// green even if `from_json` reverted to the old silent `as_bool().unwrap_or(is_object())`
+/// parse -- which is exactly the defect being removed, so the tests must cross that call site.
+fn parse_browse(value: serde_json::Value) -> Result<FileServerHandler> {
+    FileServerHandler::from_json(
+        &serde_json::json!({"handler": "file_server", "root": "/tmp", "browse": value}),
+        "handler",
+    )
+}
+
+fn browse_options(value: serde_json::Value) -> Result<Option<BrowseOptions>> {
+    parse_browse(value).map(|handler| handler.browse)
+}
+
+#[test]
+fn a_boolean_browse_still_works() {
+    assert!(browse_options(serde_json::json!(true)).unwrap().is_some());
+    assert!(browse_options(serde_json::json!(false)).unwrap().is_none());
+}
+
+#[test]
+fn browse_options_are_read_rather_than_discarded() {
+    let options = browse_options(serde_json::json!({
+        "reveal_symlinks": true,
+        "plain_time_format": " UTC"
+    }))
+    .unwrap()
+    .expect("an object enables browsing");
+    // These assertions are the whole point: the values must survive parsing. Under the old
+    // implementation the object became `true` and both fields were lost.
+    assert!(options.reveal_symlinks);
+    assert_eq!(options.plain_time_format.as_deref(), Some(" UTC"));
+}
+
+#[test]
+fn browse_defaults_are_off() {
+    let options = browse_options(serde_json::json!({})).unwrap().unwrap();
+    assert!(!options.reveal_symlinks);
+    assert!(options.plain_time_format.is_none());
+}
+
+#[test]
+fn an_unimplemented_browse_option_is_a_located_error() {
+    // Accepting these and ignoring them is the defect; refusing them is the advertised outcome.
+    for option in ["sort", "file_limit", "template_file"] {
+        let error = browse_options(serde_json::json!({ option: [] }))
+            .expect_err(&format!("`browse.{option}` must be refused, not ignored"));
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("browse.{option}")),
+            "the error must name the field `browse.{option}`: {message}"
+        );
+        assert!(
+            message.contains("not implemented"),
+            "the error must say the option is unimplemented: {message}"
+        );
+    }
+}
+
+#[test]
+fn an_unknown_browse_option_is_a_located_error() {
+    // Default-ALLOW is what let the original defect exist: a key nobody parsed was dropped in
+    // silence. A future upstream option must not inherit that.
+    let error = browse_options(serde_json::json!({"reveal_symlinks": true, "no_such_option": 1}))
+        .expect_err("an unknown key must be refused");
+    let message = error.to_string();
+    assert!(
+        message.contains("no_such_option"),
+        "the error must name the key: {message}"
+    );
+    assert!(
+        message.contains("reveal_symlinks"),
+        "the error must list the real options: {message}"
+    );
+}
+
+#[test]
+fn browse_option_types_are_checked() {
+    let error = browse_options(serde_json::json!({"reveal_symlinks": "yes"}))
+        .expect_err("a non-boolean reveal_symlinks must be refused");
+    assert!(error.to_string().contains("reveal_symlinks"), "{error}");
+    let error = browse_options(serde_json::json!({"plain_time_format": 7}))
+        .expect_err("a non-string plain_time_format must be refused");
+    assert!(error.to_string().contains("plain_time_format"), "{error}");
+}
+
+#[test]
+fn a_non_boolean_non_object_browse_is_refused() {
+    let error = browse_options(serde_json::json!("yes")).expect_err("a string is not valid");
+    assert!(
+        error.to_string().contains("boolean or an object"),
+        "{error}"
+    );
 }
