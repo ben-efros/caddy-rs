@@ -2499,3 +2499,110 @@ fn walkdir(root: &std::path::Path) -> Vec<String> {
     }
     out
 }
+
+/// `T-TLS-108`: the reachable fixture for the certificates-gap error.
+///
+/// The error reported in `T-TLS-104` came with a config that does **not** produce it, so this
+/// fixture establishes the shape that actually does: a TLS listener under
+/// `automatic_https.disable` with no certificate. That is the *manual* arm of
+/// `missing_certificates_error`.
+///
+/// The text it pins is the defect: the operator disabled automatic HTTPS deliberately, and the
+/// message tells them to "enable automatic HTTPS with `apps.tls.automation`" — advice they have
+/// already declined. A fix for `T-TLS-104` must make this assertion fail.
+#[tokio::test]
+async fn manual_arm_without_certificates_reproduces_the_reported_error() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().to_string_lossy().to_string();
+    let store = Arc::new(GenerationStore::with_builtin_registry());
+    store
+        .load(config("127.0.0.1:0", Some(0), false, true, &root))
+        .expect("config validates");
+    let mut runtime = ServerRuntime::new(store)
+        .with_acme_transport(Arc::new(FakeCa::new(false)))
+        .with_data_root(directory.path());
+    let error = runtime
+        .apply()
+        .await
+        .expect_err("AUTO_HTTPS disabled + TLS listener without certs must fail");
+    let message = error.to_string();
+
+    // The located path and the condition, both as reported.
+    assert!(
+        message.contains("invalid configuration at `apps.tls.certificates`"),
+        "the reported error names apps.tls.certificates: {message}"
+    );
+    assert!(
+        message.contains("terminates TLS"),
+        "the reported error states the condition: {message}"
+    );
+    // The defect, pinned deliberately: this advice is wrong for this operator.
+    assert!(
+        message.contains("enable automatic HTTPS with `apps.tls.automation`"),
+        "T-TLS-104: the manual arm advises enabling automation the operator disabled: {message}"
+    );
+}
+
+/// `T-TLS-108`: a TLS-terminating server whose host the plan does not manage still starts.
+///
+/// This is the measurement behind the finding that the automatic arm of
+/// `missing_certificates_error` is unreachable: every configuration tried — a mixed
+/// managed/unmanaged server pair, `skip_certs` on the server, and a policy-forced skip — either
+/// starts or fails inside the issuer. None reaches the certificates-gap error from the automatic
+/// arm.
+#[tokio::test]
+async fn a_tls_server_with_no_managed_subject_does_not_reach_the_certificates_gap_error() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().to_string_lossy().to_string();
+    let store = Arc::new(GenerationStore::with_builtin_registry());
+    store
+        .load(
+            Config::from_value(serde_json::json!({
+                "admin": {"disabled": true},
+                "storage": {"module": "file_system", "root": root},
+                "apps": {
+                    "http": {"servers": {
+                        // Terminates TLS, but its only host is not a managed subject.
+                        "srv0": {
+                            "listen": ["127.0.0.1:0"],
+                            "tls_connection_policies": [{}],
+                            "routes": [{
+                                "match": [{"host": ["unmanaged.internal"]}],
+                                "handle": [{"handler": "static_response", "body": "x"}]
+                            }]
+                        },
+                        // Owns the managed subject.
+                        "srv1": {
+                            "listen": ["127.0.0.2:0"],
+                            "routes": [{
+                                "match": [{"host": ["managed.internal"]}],
+                                "handle": [{"handler": "static_response", "body": "y"}]
+                            }]
+                        }
+                    }},
+                    "tls": {"automation": {"policies": [{
+                        "subjects": ["managed.internal"],
+                        "issuers": [{"module": "internal"}]
+                    }]}}
+                }
+            }))
+            .unwrap(),
+        )
+        .expect("config validates");
+    let mut runtime = ServerRuntime::new(store)
+        .with_acme_transport(Arc::new(FakeCa::new(false)))
+        .with_data_root(directory.path());
+    let outcome = runtime.apply().await;
+    match outcome {
+        Ok(_status) => {}
+        Err(error) => {
+            let message = error.to_string();
+            assert!(
+                !message.contains("apps.tls.certificates"),
+                "T-TLS-108: the automatic arm is claimed unreachable, but this config reached \
+                 the certificates-gap error: {message}"
+            );
+        }
+    }
+    runtime.shutdown().await;
+}
