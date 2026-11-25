@@ -15,6 +15,7 @@ members = [
     "crates/authn",
     "crates/config-tx",
     "crates/test-support",
+    "crates/fsperm",
     # Vendored ecdysis 1.1.1 (T-OPS-106 API-compat shim). A workspace member so its
     # golden-bytes wire test runs under `cargo test --workspace` and the audit gate's
     # `cargo audit --file Cargo.lock` sees it in the same lockfile.
