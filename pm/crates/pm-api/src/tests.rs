@@ -32,6 +32,7 @@ fn authn() -> AuthnService<MemoryUserStore> {
             time_cost: 1,
             parallelism: 1,
         },
+        allow_weak_argon2_params: true,
         ..AuthnConfig::default()
     };
     AuthnService::new(MemoryUserStore::new(), authn_config).expect("create authn service")
@@ -55,6 +56,7 @@ fn server_with_totp_window() -> (TempDir, TestServer, AuthnService<MemoryUserSto
             parallelism: 1,
         },
         totp_window: caddy_rs_authn::TotpWindow::PlusMinusOne,
+        allow_weak_argon2_params: true,
         ..AuthnConfig::default()
     };
     let authn =
@@ -189,6 +191,47 @@ async fn setup_reports_configured_after_the_first_administrator() {
         body.setup,
         "health and setup agree that the server is configured"
     );
+}
+
+#[tokio::test]
+async fn setup_enforces_the_password_policy_server_side() {
+    let (_dir, server, _authn) = server_with_authn();
+    for (password, field) in [
+        ("", "password"),
+        ("short", "password"),
+        ("1234567", "password"),
+    ] {
+        let response = server
+            .post("/api/v1/auth/setup")
+            .json(&serde_json::json!({"username": "admin", "password": password}))
+            .await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::BAD_REQUEST,
+            "{password:?}: {}",
+            response.text()
+        );
+        let body: ApiErrorResponse = response.json();
+        assert_eq!(body.error.code, ErrorCode::Validation);
+        assert_eq!(body.error.location.as_deref(), Some(field));
+        assert!(
+            body.error.message.contains("at least 8"),
+            "{}",
+            body.error.message
+        );
+    }
+    let too_long = server
+        .post("/api/v1/auth/setup")
+        .json(&serde_json::json!({"username": "admin", "password": "x".repeat(2000)}))
+        .await;
+    assert_eq!(too_long.status_code(), StatusCode::BAD_REQUEST);
+
+    // The rejections created nothing: setup is still open and an 8-character password works.
+    let ok = server
+        .post("/api/v1/auth/setup")
+        .json(&serde_json::json!({"username": "admin", "password": "12345678"}))
+        .await;
+    assert_eq!(ok.status_code(), StatusCode::CREATED, "{}", ok.text());
 }
 
 #[tokio::test]
@@ -2873,6 +2916,7 @@ async fn me_reports_an_expired_access_token_as_401() {
             time_cost: 1,
             parallelism: 1,
         },
+        allow_weak_argon2_params: true,
         ..AuthnConfig::default()
     };
     let authn =

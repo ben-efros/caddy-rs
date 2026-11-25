@@ -29,7 +29,8 @@ containing `AuthnConfig` does not. `Debug` redacts the signing-key source.
 | `jwt_secret_source` | `JwtSecretSource::Ephemeral` | A random key per start; sessions do not survive a restart. Set `Master` or `File` in production. |
 | `access_ttl` | 15 minutes (`Duration::from_secs(15 * 60)`) | JWT `exp` is computed from the configured TTL. |
 | `refresh_ttl` | 7 days (`Duration::from_secs(7 * 24 * 60 * 60)`) | Stored as an expiry timestamp on the refresh-token record. |
-| `argon2_params` | memory 19 456 KiB, time cost 2, parallelism 1 | OWASP-recommended Argon2id defaults (2024). |
+| `argon2_params` | memory 19 456 KiB, time cost 2, parallelism 1 | OWASP-recommended Argon2id defaults (2024), and also the **minimum**: weaker values make `AuthnService::new` fail unless `allow_weak_argon2_params` is set. |
+| `allow_weak_argon2_params` | `false` | Opt-in escape hatch for tests/constrained hardware; logs a warning when weak parameters are used. |
 | `issuer` / `audience` | `None` | Optional JWT issuer/audience claims. |
 | `totp_window` | `TotpWindow::Current` | See [TOTP.md](TOTP.md). |
 | `login_throttle` | 5 failures, 30 s doubling to 15 min, 10 000 tracked keys | See [Login throttling](#login-throttling). Invalid values (zero failures, zero or inverted lockouts, zero tracked keys) make `AuthnService::new` fail with `AuthError::InvalidConfig`. |
@@ -65,10 +66,26 @@ invalidate every session without telling anyone. The rules for `path`:
 
 ## Passwords
 
-`hash_password` produces an Argon2id hash using the configured `argon2_params`; if Argon2 cannot
-run it falls back to bcrypt (`DEFAULT_COST`). `verify_password` detects the stored format from the
-prefix: `$argon2…` hashes are verified with Argon2, `$2…` (legacy bcrypt) with bcrypt; any other
-format is a `PasswordHash` error, not a silent failure.
+`hash_password` produces an Argon2id hash using the configured `argon2_params`. There is **no
+fallback** to another algorithm: if Argon2 cannot run, the error is returned (the old silent bcrypt
+fallback stored a hash of different strength and truncated at 72 bytes). `verify_password` detects
+the stored format from the prefix: `$argon2…` hashes are verified with Argon2, `$2…` (legacy bcrypt)
+with bcrypt; any other format is a `PasswordHash` error, not a silent failure.
+
+Limits enforced by the service:
+
+- **Argon2 minimum.** `AuthnService::new` rejects `argon2_params` below the OWASP minimum
+  (`memory_cost >= 19456` KiB, `time_cost >= 2`, `parallelism >= 1`; the defaults) with
+  `AuthError::InvalidConfig` naming the field. Tests and constrained hardware can opt in with
+  `AuthnConfig::allow_weak_argon2_params = true`, which logs a warning.
+- **Maximum length.** Passwords over `MAX_PASSWORD_BYTES` (1024 bytes) are refused by
+  `hash_password` with `AuthError::PasswordTooLong`, and `verify_password`/`login` treat them as a
+  non-match without hashing, so an unauthenticated caller cannot make the server hash megabytes.
+- **Minimum length for the first administrator.** `create_first_admin` rejects passwords shorter
+  than `MIN_PASSWORD_CHARS` (8 characters; counted as characters) with
+  `AuthError::PasswordTooShort`; `POST /auth/setup` answers `400` with `location: "password"`.
+  Other password-setting paths (`create_user`, `set_password`, `update_password`) apply only the
+  maximum.
 
 `login` spends the same password-verification work (a dummy hash) when the username does not exist,
 so response time does not reveal whether an account exists.

@@ -144,6 +144,41 @@ upstream (SSRF) and `{env.X}` leaked the variable through DNS or the `Host` head
 `an_editor_cannot_store_placeholder_text_in_host_security_headers`,
 `host_creation_rejects_a_placeholder_upstream`.
 
+## E4 — password hashing parameters and length limits (`crates/authn`, `pm-api`)
+
+### Vulnerability (low)
+
+`AuthnConfig::argon2_params` accepted any values, so a deployment could run with trivially weak
+hashing without noticing; `hash_password` silently fell back to bcrypt when Argon2 failed (a hash of
+different strength, truncating at 72 bytes); there was no cap on password length before hashing (an
+unauthenticated login could make the server hash an arbitrarily large body); and
+`create_first_admin` accepted an empty password (the UI said "at least 8 characters" but nothing
+enforced it server-side).
+
+### Behaviour
+
+- `AuthnService::new` validates `argon2_params` against the OWASP minimum (`m >= 19456 KiB`,
+  `t >= 2`, `p >= 1`) and returns `AuthError::InvalidConfig` naming the field. The new
+  `AuthnConfig::allow_weak_argon2_params` (default `false`) is the explicit, logged opt-in; the
+  in-tree tests that use cheap parameters set it.
+- `hash_password` no longer falls back to bcrypt: it returns the Argon2 error. bcrypt hashes
+  created earlier still verify.
+- Passwords over `MAX_PASSWORD_BYTES` = 1024 are `AuthError::PasswordTooLong` in `hash_password`
+  and a plain non-match in `verify_password`/`login` (no hashing work, no account oracle).
+- `create_first_admin` requires `MIN_PASSWORD_CHARS` = 8 characters (`AuthError::PasswordTooShort`);
+  `POST /auth/setup` maps both errors to `400` with `location: "password"`.
+
+### Tests
+
+`crates/authn/src/tests_security.rs`:
+`argon2_parameters_below_the_owasp_minimum_are_rejected_one_by_one`,
+`stronger_than_minimum_parameters_are_accepted_and_weak_ones_need_an_explicit_opt_in`,
+`passwords_over_the_cap_are_refused_before_hashing_and_the_boundary_is_exact`,
+`login_with_an_oversized_password_is_a_plain_credential_failure`,
+`the_first_administrator_needs_a_password_of_at_least_eight_characters`. `pm-api`:
+`setup_enforces_the_password_policy_server_side`. Not covered: the removed bcrypt fallback has no
+test because Argon2 cannot be made to fail on demand with valid parameters.
+
 ## Exact program-repository text to merge
 
 `docs/compatibility/BEHAVIOR-DIVERGENCES.md`, new entry (`caddy-rs extension`, no stock Caddy
@@ -159,3 +194,6 @@ equivalent; `stock_compat` does not apply):
 > manager rejects `{`/`}` and control characters in the operator-supplied security-header strings and
 > upstream hosts it would otherwise emit into placeholder-expanding Caddy JSON fields (stock Caddy
 > expands `{env.*}` there; hand-written JSON keeps that behaviour, only the proxy-manager forms refuse).
+> The authentication service refuses Argon2 parameters below the OWASP minimum (unless explicitly
+> allowed), never falls back to bcrypt, caps passwords at 1024 bytes and requires 8 characters for
+> the first administrator.

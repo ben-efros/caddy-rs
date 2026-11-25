@@ -1,4 +1,5 @@
 use super::*;
+use bcrypt::{hash as bcrypt_hash, DEFAULT_COST};
 
 /// Fixed TOTP time step for tests: the window and replay assertions must not depend on where the
 /// wall clock happens to be inside a 30-second step.
@@ -32,6 +33,8 @@ fn test_config() -> AuthnConfig {
         audience: None,
         totp_window: TotpWindow::Current,
         login_throttle: LoginThrottleConfig::default(),
+        // Cheap hashing keeps the suite fast; the minimum itself is tested in `tests_security`.
+        allow_weak_argon2_params: true,
     }
 }
 

@@ -815,6 +815,11 @@ async fn auth_setup_handler(
             caddy_rs_authn::AuthError::UsernameExists => {
                 ApiError::Conflict("first-run setup is already complete".to_owned())
             }
+            // The password policy is enforced by the service, not just the UI.
+            policy @ (caddy_rs_authn::AuthError::PasswordTooShort { .. }
+            | caddy_rs_authn::AuthError::PasswordTooLong { .. }) => {
+                ApiError::validation(policy.to_string(), "password")
+            }
             other => auth::internal_error(other),
         })?;
 

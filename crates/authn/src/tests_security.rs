@@ -17,6 +17,7 @@ fn fast_config() -> AuthnConfig {
             time_cost: 1,
             parallelism: 1,
         },
+        allow_weak_argon2_params: true,
         ..AuthnConfig::default()
     }
 }
@@ -726,4 +727,182 @@ async fn the_pending_secret_never_reaches_debug_output() {
         .unwrap();
     let user = store.get_user(id).await.unwrap().unwrap();
     assert!(!format!("{user:?}").contains(&pending));
+}
+
+// ---------------------------------------------------------------------------------------------
+// E4: password hashing parameters, length limits
+// ---------------------------------------------------------------------------------------------
+
+fn owasp_minimum() -> Argon2Config {
+    Argon2Config {
+        memory_cost: 19456,
+        time_cost: 2,
+        parallelism: 1,
+    }
+}
+
+fn strong_config(argon2_params: Argon2Config) -> AuthnConfig {
+    AuthnConfig {
+        jwt_secret_source: JwtSecretSource::Master("test-secret".to_string()),
+        argon2_params,
+        ..AuthnConfig::default()
+    }
+}
+
+#[test]
+fn argon2_parameters_below_the_owasp_minimum_are_rejected_one_by_one() {
+    assert!(
+        owasp_minimum().validate().is_ok(),
+        "the minimum itself is accepted"
+    );
+    assert!(Argon2Config::default().validate().is_ok());
+
+    let weak = [
+        Argon2Config {
+            memory_cost: 19455,
+            ..owasp_minimum()
+        },
+        Argon2Config {
+            time_cost: 1,
+            ..owasp_minimum()
+        },
+        Argon2Config {
+            time_cost: 0,
+            ..owasp_minimum()
+        },
+        Argon2Config {
+            parallelism: 0,
+            ..owasp_minimum()
+        },
+        Argon2Config {
+            memory_cost: 8,
+            time_cost: 1,
+            parallelism: 1,
+        },
+    ];
+    for params in weak {
+        let service = AuthnService::new(MemoryUserStore::new(), strong_config(params.clone()));
+        match service {
+            Err(AuthError::InvalidConfig(message)) => {
+                assert!(message.contains("argon2_params"), "{message}");
+            }
+            Err(other) => panic!("{params:?}: wrong error {other:?}"),
+            Ok(_) => panic!("{params:?} must be rejected"),
+        }
+    }
+}
+
+#[test]
+fn stronger_than_minimum_parameters_are_accepted_and_weak_ones_need_an_explicit_opt_in() {
+    AuthnService::new(
+        MemoryUserStore::new(),
+        strong_config(Argon2Config {
+            memory_cost: 32 * 1024,
+            time_cost: 3,
+            parallelism: 2,
+        }),
+    )
+    .expect("stronger parameters are fine");
+
+    let weak = Argon2Config {
+        memory_cost: 4096,
+        time_cost: 1,
+        parallelism: 1,
+    };
+    assert!(AuthnService::new(MemoryUserStore::new(), strong_config(weak.clone())).is_err());
+    AuthnService::new(
+        MemoryUserStore::new(),
+        AuthnConfig {
+            allow_weak_argon2_params: true,
+            ..strong_config(weak)
+        },
+    )
+    .expect("an explicit opt-in allows weak parameters");
+}
+
+#[test]
+fn passwords_over_the_cap_are_refused_before_hashing_and_the_boundary_is_exact() {
+    let params = Argon2Config {
+        memory_cost: 4096,
+        time_cost: 1,
+        parallelism: 1,
+    };
+    let at_cap = "a".repeat(MAX_PASSWORD_BYTES);
+    let over = "a".repeat(MAX_PASSWORD_BYTES + 1);
+
+    let hash = hash_password(&at_cap, &params).expect("exactly the cap is hashed");
+    assert!(
+        hash.starts_with("$argon2id$"),
+        "never a bcrypt fallback: {hash}"
+    );
+    assert!(verify_password(&at_cap, &hash).unwrap());
+
+    assert!(matches!(
+        hash_password(&over, &params),
+        Err(AuthError::PasswordTooLong {
+            max: MAX_PASSWORD_BYTES
+        })
+    ));
+    // A multi-byte password is measured in bytes, not characters.
+    let wide = "é".repeat(MAX_PASSWORD_BYTES / 2 + 1);
+    assert!(matches!(
+        hash_password(&wide, &params),
+        Err(AuthError::PasswordTooLong { .. })
+    ));
+    // Verification never hashes an over-long password: it simply cannot match.
+    assert!(!verify_password(&over, &hash).unwrap());
+    let legacy = bcrypt::hash("short", bcrypt::DEFAULT_COST).unwrap();
+    assert!(!verify_password(&over, &legacy).unwrap());
+    assert!(
+        verify_password("short", &legacy).unwrap(),
+        "legacy bcrypt still verifies"
+    );
+}
+
+#[tokio::test]
+async fn login_with_an_oversized_password_is_a_plain_credential_failure() {
+    let (service, _clock) = clocked_service(fast_config());
+    service
+        .create_user("alice", "correct horse", Role::viewer())
+        .await
+        .unwrap();
+    let huge = "x".repeat(10 * 1024 * 1024);
+    for username in ["alice", "ghost"] {
+        assert!(matches!(
+            service.login(username, &huge, None).await,
+            Err(AuthError::InvalidCredentials)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn the_first_administrator_needs_a_password_of_at_least_eight_characters() {
+    let service = AuthnService::new(MemoryUserStore::new(), fast_config()).expect("build service");
+    for short in ["", "a", "1234567", "ééééééé"] {
+        assert!(
+            matches!(
+                service.create_first_admin("root", short).await,
+                Err(AuthError::PasswordTooShort { min: 8 })
+            ),
+            "{short:?} must be rejected"
+        );
+    }
+    assert!(matches!(
+        service
+            .create_first_admin("root", &"a".repeat(MAX_PASSWORD_BYTES + 1))
+            .await,
+        Err(AuthError::PasswordTooLong { .. })
+    ));
+    // Rejections created nothing: the setup window is still open, and 8 characters (counted as
+    // characters, not bytes) is the accepted boundary.
+    let (user, tokens) = service
+        .create_first_admin("root", "pässwörd")
+        .await
+        .expect("8 multi-byte characters are accepted");
+    assert_eq!(user.username, "root");
+    assert!(!tokens.access_token.is_empty());
+    assert!(matches!(
+        service.create_first_admin("second", "long enough pw").await,
+        Err(AuthError::UsernameExists)
+    ));
 }

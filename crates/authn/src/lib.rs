@@ -2,7 +2,7 @@
 //!
 //! This crate provides a reusable authentication and authorization system with:
 //! - User management with roles, capabilities, and row-level visibility
-//! - Password hashing (argon2id preferred, bcrypt fallback) with constant-time verification
+//! - Password hashing (argon2id; legacy bcrypt hashes still verify) with constant-time verification
 //! - JWT access tokens and rotating opaque refresh tokens
 //! - TOTP two-factor authentication with a configurable window and monotonic replay protection;
 //!   see `docs/TOTP.md` for the configuration and the required handling of replay rejections
@@ -40,7 +40,7 @@ use argon2::{
 };
 use async_trait::async_trait;
 use base32::Alphabet;
-use bcrypt::{hash as bcrypt_hash, verify as bcrypt_verify, DEFAULT_COST};
+use bcrypt::verify as bcrypt_verify;
 use caddy_rs_core::Timestamp;
 use jsonwebtoken::{
     decode, encode, Algorithm as JwtAlgorithm, DecodingKey, EncodingKey, Header, Validation,
@@ -597,6 +597,18 @@ pub enum AuthError {
     /// The service configuration is unusable (weak or inconsistent parameters).
     #[error("invalid authentication configuration: {0}")]
     InvalidConfig(String),
+    /// A new password is shorter than [`MIN_PASSWORD_CHARS`].
+    #[error("password must be at least {min} characters")]
+    PasswordTooShort {
+        /// The minimum length, in characters.
+        min: usize,
+    },
+    /// A password is longer than [`MAX_PASSWORD_BYTES`].
+    #[error("password must be at most {max} bytes")]
+    PasswordTooLong {
+        /// The maximum length, in bytes.
+        max: usize,
+    },
     /// A password hash is malformed or uses an unsupported format.
     #[error("password hash error: {0}")]
     PasswordHash(String),
@@ -715,10 +727,58 @@ impl Default for Argon2Config {
     fn default() -> Self {
         // OWASP recommended defaults for Argon2id (2024).
         Self {
-            memory_cost: 19456,
-            time_cost: 2,
-            parallelism: 1,
+            memory_cost: MIN_ARGON2_MEMORY_KIB,
+            time_cost: MIN_ARGON2_TIME_COST,
+            parallelism: MIN_ARGON2_PARALLELISM,
         }
+    }
+}
+
+/// Smallest Argon2id memory cost (KiB) accepted by [`AuthnService::new`]: the OWASP minimum
+/// configuration `m=19456 (19 MiB), t=2, p=1`.
+pub const MIN_ARGON2_MEMORY_KIB: u32 = 19456;
+/// Smallest Argon2id time cost (iterations) accepted by [`AuthnService::new`].
+pub const MIN_ARGON2_TIME_COST: u32 = 2;
+/// Smallest Argon2id parallelism accepted by [`AuthnService::new`].
+pub const MIN_ARGON2_PARALLELISM: u32 = 1;
+
+/// Longest password (in bytes) that is hashed or verified.
+///
+/// Anything longer is refused before any hashing work: an unbounded password is a CPU and memory
+/// lever for an unauthenticated caller (login accepts a password from anyone), and bcrypt, which
+/// legacy hashes may use, silently truncates at 72 bytes. 1024 bytes is far above any passphrase.
+pub const MAX_PASSWORD_BYTES: usize = 1024;
+
+/// Shortest password (in characters) accepted when creating the first administrator.
+pub const MIN_PASSWORD_CHARS: usize = 8;
+
+impl Argon2Config {
+    /// Reject parameters weaker than the OWASP minimum, or unusable by Argon2 at all.
+    ///
+    /// Weak parameters are not an error in `hash_password` itself (it hashes with whatever it is
+    /// given); [`AuthnService::new`] calls this so a service cannot be built with them by accident.
+    pub fn validate(&self) -> AuthResult<()> {
+        if self.memory_cost < MIN_ARGON2_MEMORY_KIB {
+            return Err(AuthError::InvalidConfig(format!(
+                "argon2_params.memory_cost {} KiB is below the minimum of {MIN_ARGON2_MEMORY_KIB} KiB",
+                self.memory_cost
+            )));
+        }
+        if self.time_cost < MIN_ARGON2_TIME_COST {
+            return Err(AuthError::InvalidConfig(format!(
+                "argon2_params.time_cost {} is below the minimum of {MIN_ARGON2_TIME_COST}",
+                self.time_cost
+            )));
+        }
+        if self.parallelism < MIN_ARGON2_PARALLELISM {
+            return Err(AuthError::InvalidConfig(format!(
+                "argon2_params.parallelism {} is below the minimum of {MIN_ARGON2_PARALLELISM}",
+                self.parallelism
+            )));
+        }
+        Argon2Params::new(self.memory_cost, self.time_cost, self.parallelism, None)
+            .map_err(|error| AuthError::InvalidConfig(format!("argon2_params: {error}")))?;
+        Ok(())
     }
 }
 
@@ -1146,6 +1206,11 @@ pub struct AuthnConfig {
     pub totp_window: TotpWindow,
     /// Failed-attempt throttling for [`AuthnService::login`] and [`AuthnService::totp_verify`].
     pub login_throttle: LoginThrottleConfig,
+    /// Accept [`argon2_params`](Self::argon2_params) below the OWASP minimum (`m >= 19456 KiB`,
+    /// `t >= 2`, `p >= 1`). Default `false`: [`AuthnService::new`] fails with
+    /// [`AuthError::InvalidConfig`] instead of silently running with weak hashing. Opt in only for
+    /// tests or very constrained hardware; a warning is logged when the weak values are used.
+    pub allow_weak_argon2_params: bool,
 }
 
 impl Default for AuthnConfig {
@@ -1159,6 +1224,7 @@ impl Default for AuthnConfig {
             audience: None,
             totp_window: TotpWindow::Current,
             login_throttle: LoginThrottleConfig::default(),
+            allow_weak_argon2_params: false,
         }
     }
 }
@@ -1367,6 +1433,7 @@ impl std::fmt::Debug for AuthnConfig {
             .field("audience", &self.audience)
             .field("totp_window", &self.totp_window)
             .field("login_throttle", &self.login_throttle)
+            .field("allow_weak_argon2_params", &self.allow_weak_argon2_params)
             .finish()
     }
 }
@@ -1613,8 +1680,19 @@ impl UserStore for MemoryUserStore {
     }
 }
 
-/// Hash a password using Argon2id, falling back to bcrypt if Argon2 cannot run.
+/// Hash a password using Argon2id.
+///
+/// There is deliberately no fallback to a weaker algorithm: if Argon2 cannot run, the error is
+/// returned (a silent switch to bcrypt would store a hash of a different strength, and bcrypt
+/// truncates at 72 bytes). Passwords longer than [`MAX_PASSWORD_BYTES`] are refused with
+/// [`AuthError::PasswordTooLong`] before any hashing work. The parameters are used as given;
+/// [`AuthnService::new`] is what enforces the OWASP minimum on the configured ones.
 pub fn hash_password(password: &str, argon2_config: &Argon2Config) -> AuthResult<String> {
+    if password.len() > MAX_PASSWORD_BYTES {
+        return Err(AuthError::PasswordTooLong {
+            max: MAX_PASSWORD_BYTES,
+        });
+    }
     let params = Argon2Params::new(
         argon2_config.memory_cost,
         argon2_config.time_cost,
@@ -1628,19 +1706,20 @@ pub fn hash_password(password: &str, argon2_config: &Argon2Config) -> AuthResult
     let mut salt = [0u8; 16];
     OsRng.fill_bytes(&mut salt);
 
-    if let Ok(hash) = argon2.hash_password_with_salt(password.as_bytes(), &salt) {
-        return Ok(hash.to_string());
-    }
-
-    let hash = bcrypt_hash(password, DEFAULT_COST)?;
-    Ok(hash)
+    let hash = argon2.hash_password_with_salt(password.as_bytes(), &salt)?;
+    Ok(hash.to_string())
 }
 
 /// Verify a password against a stored Argon2id or bcrypt hash.
 ///
 /// A wrong password returns `Ok(false)`; only a malformed or unsupported hash is an error.
-/// Argon2's `PasswordVerifier` performs the comparison in constant time.
+/// Argon2's `PasswordVerifier` performs the comparison in constant time. A password longer than
+/// [`MAX_PASSWORD_BYTES`] can never match (it could not have been hashed) and returns `Ok(false)`
+/// without doing any hashing work.
 pub fn verify_password(password: &str, hash: &str) -> AuthResult<bool> {
+    if password.len() > MAX_PASSWORD_BYTES {
+        return Ok(false);
+    }
     let hash_bytes = hash.as_bytes();
     let is_argon2 = hash_bytes
         .get(..7)
@@ -1852,6 +1931,12 @@ impl<S: UserStore> AuthnService<S> {
     /// silently starting with a different (ephemeral) key that would invalidate every session.
     pub fn new(store: S, config: AuthnConfig) -> AuthResult<Self> {
         config.login_throttle.validate()?;
+        if let Err(error) = config.argon2_params.validate() {
+            if !config.allow_weak_argon2_params {
+                return Err(error);
+            }
+            tracing::warn!(%error, "running with Argon2 parameters below the OWASP minimum");
+        }
         let secret = config.jwt_secret_source.resolve()?;
         let encoding_key = EncodingKey::from_secret(&secret);
         let decoding_key = DecodingKey::from_secret(&secret);
@@ -1987,6 +2072,14 @@ impl<S: UserStore> AuthnService<S> {
         password: &str,
     ) -> AuthResult<(User, TokenPair)> {
         let username = username.into();
+        // Enforced here, not only in the UI: the first administrator is created by an
+        // unauthenticated call, and an empty or one-character password would make the whole
+        // deployment trivially guessable. Rejected before any hashing work.
+        if password.chars().count() < MIN_PASSWORD_CHARS {
+            return Err(AuthError::PasswordTooShort {
+                min: MIN_PASSWORD_CHARS,
+            });
+        }
         let password_hash = hash_password(password, &self.config.argon2_params)?;
         let now = Timestamp::now();
         let user = User {
