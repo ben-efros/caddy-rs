@@ -453,7 +453,13 @@ impl IpRange {
         }
     }
 
+    /// Whether `address` is in the range, also trying the IPv4-canonical form of an IPv4-mapped
+    /// IPv6 address (SEC-MEDIUM-PROXY review).
     fn contains(&self, address: IpAddr) -> bool {
+        self.contains_exact(address) || self.contains_exact(address.to_canonical())
+    }
+
+    fn contains_exact(&self, address: IpAddr) -> bool {
         match (self.network, address) {
             (IpAddr::V4(network), IpAddr::V4(address)) => {
                 let mask = if self.prefix == 0 {
@@ -3534,6 +3540,16 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SEC-MEDIUM-PROXY (review): an IP identifier `::ffff:10.0.0.1` must be judged as 10.0.0.1 by
+    /// IPv4 allow/deny ranges.
+    #[test]
+    fn acme_ip_ranges_match_ipv4_mapped_identifiers() {
+        let range = IpRange::parse("10.0.0.0/8").unwrap();
+        assert!(range.contains("10.0.0.1".parse().unwrap()));
+        assert!(range.contains("::ffff:10.0.0.1".parse().unwrap()));
+        assert!(!range.contains("::ffff:11.0.0.1".parse().unwrap()));
+    }
 
     #[test]
     fn rfc3339_formats_epoch_and_known_instants() {

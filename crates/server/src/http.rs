@@ -77,6 +77,21 @@ pub(crate) enum ServedResponse {
     },
 }
 
+/// The accepted peer address with an IPv4-mapped IPv6 address turned into plain IPv4.
+///
+/// Listeners bind `[::]` with `IPV6_V6ONLY` off, so IPv4 clients are reported as
+/// `::ffff:a.b.c.d`; Go's `net` reports them as IPv4. Canonicalising where the peer enters the
+/// request keeps `remote_ip`/`client_ip` ranges, trusted proxies and `{http.request.remote.host}`
+/// consistent.
+fn canonical_peer(remote_addr: Option<SocketAddr>) -> Option<SocketAddr> {
+    remote_addr.map(|address| match address {
+        SocketAddr::V6(v6) if v6.ip().to_ipv4_mapped().is_some() => {
+            SocketAddr::new(address.ip().to_canonical(), address.port())
+        }
+        other => other,
+    })
+}
+
 /// Serve one hyper request through a router with the server's default limits.
 pub async fn serve_request(
     router: Arc<Router>,
@@ -244,7 +259,7 @@ pub(crate) async fn serve_internal_buffered(
     let mut internal = Request::new(parts.method, parts.uri);
     internal.version = parts.version;
     internal.headers = parts.headers;
-    internal.remote_addr = remote_addr;
+    internal.remote_addr = canonical_peer(remote_addr);
     internal.tls = tls;
     internal.tls_connection = tls_connection;
     internal.client_certificate = client_certificate;
@@ -452,7 +467,7 @@ pub(crate) async fn serve_request_with_automatic_upgradable(
     // `http.matchers.protocol` matcher keys off (Caddy's `r.Proto`).
     internal.version = parts.version;
     internal.headers = parts.headers;
-    internal.remote_addr = remote_addr;
+    internal.remote_addr = canonical_peer(remote_addr);
     internal.tls = tls;
     internal.tls_connection = tls_connection;
     internal.client_certificate = client_certificate;
@@ -798,6 +813,21 @@ pub type ServiceResult = Result<hyper::Response<Body>, Infallible>;
 mod tests {
     use super::*;
     use http::HeaderValue;
+
+    /// The default listener binds `[::]` dual-stack, so an IPv4 client's address arrives
+    /// IPv4-mapped. Go reports such peers as plain IPv4, and every matcher/placeholder expects
+    /// that form (SEC-MEDIUM-PROXY review).
+    #[test]
+    fn mapped_peers_enter_the_request_as_plain_ipv4() {
+        let mapped: SocketAddr = "[::ffff:203.0.113.5]:4242".parse().unwrap();
+        assert_eq!(
+            canonical_peer(Some(mapped)),
+            Some("203.0.113.5:4242".parse().unwrap())
+        );
+        let v6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        assert_eq!(canonical_peer(Some(v6)), Some(v6));
+        assert_eq!(canonical_peer(None), None);
+    }
 
     #[test]
     fn declared_content_length_parses_valid_headers_only() {
