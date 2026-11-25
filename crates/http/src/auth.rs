@@ -705,7 +705,15 @@ const HASH_CACHE_CAPACITY: usize = 1000;
 /// contents cannot be used to test password guesses offline.
 struct HashCache {
     key: ring::hmac::Key,
-    entries: std::sync::Mutex<std::collections::HashMap<[u8; 32], bool>>,
+    entries: std::sync::Mutex<CacheState>,
+}
+
+/// Remembered successes: key -> "hit since last considered for eviction", plus insertion order
+/// for the clock hand.
+#[derive(Default)]
+struct CacheState {
+    referenced: std::collections::HashMap<[u8; 32], bool>,
+    queue: std::collections::VecDeque<[u8; 32]>,
 }
 
 impl std::fmt::Debug for HashCache {
@@ -720,7 +728,7 @@ impl HashCache {
         Self {
             key: ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &rng)
                 .expect("the system random source is available"),
-            entries: std::sync::Mutex::new(std::collections::HashMap::new()),
+            entries: std::sync::Mutex::new(CacheState::default()),
         }
     }
 
@@ -735,25 +743,53 @@ impl HashCache {
         key
     }
 
-    fn get(&self, key: &[u8; 32]) -> Option<bool> {
-        self.entries.lock().ok()?.get(key).copied()
+    /// Whether `key` is a remembered success; a hit marks the entry as recently used.
+    fn hit(&self, key: &[u8; 32]) -> bool {
+        let Ok(mut state) = self.entries.lock() else {
+            return false;
+        };
+        match state.referenced.get_mut(key) {
+            Some(referenced) => {
+                *referenced = true;
+                true
+            }
+            None => false,
+        }
     }
 
-    fn insert(&self, key: [u8; 32], matched: bool) {
-        let Ok(mut entries) = self.entries.lock() else {
+    /// Remember a success. When full, second-chance (clock) eviction removes the oldest entry
+    /// that was not hit since it was last considered, so entries in active use survive a flood.
+    fn insert(&self, key: [u8; 32]) {
+        let Ok(mut state) = self.entries.lock() else {
             return;
         };
-        if entries.len() >= HASH_CACHE_CAPACITY && !entries.contains_key(&key) {
-            if let Some(victim) = entries.keys().next().copied() {
-                entries.remove(&victim);
+        if let Some(referenced) = state.referenced.get_mut(&key) {
+            *referenced = true;
+            return;
+        }
+        while state.referenced.len() >= HASH_CACHE_CAPACITY {
+            let Some(candidate) = state.queue.pop_front() else {
+                break;
+            };
+            match state.referenced.get_mut(&candidate) {
+                Some(referenced) if *referenced => {
+                    *referenced = false;
+                    state.queue.push_back(candidate);
+                }
+                _ => {
+                    state.referenced.remove(&candidate);
+                }
             }
         }
-        entries.insert(key, matched);
+        state.queue.push_back(key);
+        state.referenced.insert(key, false);
     }
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.entries.lock().map_or(0, |entries| entries.len())
+        self.entries
+            .lock()
+            .map_or(0, |state| state.referenced.len())
     }
 }
 
@@ -1346,15 +1382,15 @@ impl BasicAuthHandler {
             identity.extend_from_slice(&hash.cache_identity());
             self.cache.key(&identity, &password)
         });
-        if let Some(matched) = key.as_ref().and_then(|key| self.cache.get(key)) {
-            return Some(matched);
+        if key.as_ref().is_some_and(|key| self.cache.hit(key)) {
+            return Some(true);
         }
         let cache = std::sync::Arc::clone(&self.cache);
         run_limited_within(&self.limiter, self.max_wait, move || {
             let matched = verify_password(&hash, &password);
             // Cached from inside the job so a hash whose request was cancelled still pays off.
-            if let Some(key) = key {
-                cache.insert(key, matched);
+            if let Some(key) = key.filter(|_| matched) {
+                cache.insert(key);
             }
             matched
         })
@@ -2539,10 +2575,10 @@ mod tests {
         }
     }
 
-    /// B1 review: like Caddy's `hash_cache`, a repeated credential pair (success or failure) is
-    /// answered from the cache without computing a hash, so legitimate clients are unaffected by a
-    /// saturated hash pool. Proven by exhausting the pool: cached pairs still answer, uncached
-    /// pairs time out with 503.
+    /// B1 review: like Caddy's `hash_cache`, a repeated successful credential pair is answered
+    /// from the cache without computing a hash, so legitimate clients are unaffected by a
+    /// saturated hash pool. Proven by exhausting the pool: a cached success still answers, an
+    /// uncached pair times out with 503.
     #[tokio::test]
     async fn hash_cache_answers_repeat_credentials_while_the_pool_is_exhausted() {
         let limiter = Arc::new(tokio::sync::Semaphore::new(1));
@@ -2562,15 +2598,46 @@ mod tests {
             "a cached success must not need a hash permit"
         );
         assert_eq!(
-            status_of(&attempt(&handler, "alice", "wrong").await),
-            Some(StatusCode::UNAUTHORIZED),
-            "a cached failure must not need a hash permit"
-        );
-        assert_eq!(
             status_of(&attempt(&handler, "alice", "never-seen").await),
             Some(StatusCode::SERVICE_UNAVAILABLE),
             "an uncached pair needs a permit and must not queue forever"
         );
+    }
+
+    /// B1 round 2: only successes are cached. A failure gains no availability (the legitimate
+    /// client is the one that succeeds) and every junk password would otherwise insert an entry,
+    /// the flood vector that flushes legitimate entries.
+    #[tokio::test]
+    async fn failed_verdicts_are_not_cached() {
+        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let handler = cached_handler(false, &limiter);
+        assert_eq!(
+            status_of(&attempt(&handler, "alice", "wrong").await),
+            Some(StatusCode::UNAUTHORIZED)
+        );
+        let _held = Arc::clone(&limiter).acquire_owned().await.unwrap();
+        assert_eq!(
+            status_of(&attempt(&handler, "alice", "wrong").await),
+            Some(StatusCode::SERVICE_UNAVAILABLE),
+            "a failed pair must be recomputed, not served from the cache"
+        );
+    }
+
+    /// A hot (recently hit) success survives a flood of new entries: second-chance eviction, not
+    /// arbitrary eviction.
+    #[test]
+    fn hot_cache_entries_survive_a_flood_of_new_entries() {
+        let cache = HashCache::new();
+        let hot = cache.key(b"user", b"hot-password");
+        cache.insert(hot);
+        for index in 0..(HASH_CACHE_CAPACITY * 3) {
+            assert!(
+                cache.hit(&hot),
+                "the hot entry was evicted after {index} inserts"
+            );
+            cache.insert(cache.key(b"user", format!("junk-{index}").as_bytes()));
+        }
+        assert!(cache.len() <= HASH_CACHE_CAPACITY);
     }
 
     /// B1 round 2: the cache must not turn into a user-existence oracle. A verdict for an unknown
@@ -2642,7 +2709,7 @@ mod tests {
         // Unambiguous framing: moving a byte between hash and password changes the key.
         assert_ne!(first.key(b"ab", b"c"), first.key(b"a", b"bc"));
         for index in 0..(HASH_CACHE_CAPACITY * 2) {
-            first.insert(first.key(b"hash", index.to_string().as_bytes()), true);
+            first.insert(first.key(b"hash", index.to_string().as_bytes()));
         }
         assert!(first.len() <= HASH_CACHE_CAPACITY);
     }
