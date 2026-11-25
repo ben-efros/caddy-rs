@@ -25,6 +25,7 @@ fn authn() -> AuthnService<MemoryUserStore> {
             time_cost: 1,
             parallelism: 1,
         },
+        allow_weak_argon2_params: true,
         ..AuthnConfig::default()
     };
     AuthnService::new(MemoryUserStore::new(), authn_config).expect("create authn service")

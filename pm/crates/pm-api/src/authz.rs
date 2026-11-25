@@ -54,6 +54,16 @@ pub(crate) fn required_capability(method: &Method, path: &str) -> Option<(Sectio
     ) {
         return None;
     }
+    // A user manages their OWN second factor, whatever their role: the handlers authenticate the
+    // caller (`require_claims`) and act only on the token's subject, so no section capability
+    // applies. Without this exemption the default-deny fallback below demanded `settings:admin`,
+    // which locked every non-admin out of TOTP enrolment. Exact paths, not a prefix.
+    if matches!(
+        path,
+        "/auth/totp/setup" | "/auth/totp/confirm" | "/auth/totp/disable"
+    ) {
+        return None;
+    }
     if path.starts_with("/users") {
         // The handlers also check; doing it here too means a future `/users/...` mutation cannot
         // skip the gate by forgetting its handler check. Both paths use `require_capability`, so
@@ -198,6 +208,30 @@ mod tests {
             required_capability(&Method::POST, "/auth/password"),
             Some((Section::Settings, Action::Admin)),
             "only the four session routes are exempt; a future /auth mutation is gated"
+        );
+    }
+
+    #[test]
+    fn a_user_manages_their_own_totp_factor_without_a_section_capability() {
+        for path in [
+            "/auth/totp/setup",
+            "/auth/totp/confirm",
+            "/auth/totp/disable",
+        ] {
+            assert_eq!(
+                required_capability(&Method::POST, path),
+                None,
+                "{path} authenticates in its handler and acts on the token's subject"
+            );
+        }
+        // Exact paths only: anything else under the namespace stays default-deny.
+        assert_eq!(
+            required_capability(&Method::POST, "/auth/totp/other"),
+            Some((Section::Settings, Action::Admin))
+        );
+        assert_eq!(
+            required_capability(&Method::POST, "/auth/totp"),
+            Some((Section::Settings, Action::Admin))
         );
     }
 

@@ -79,19 +79,41 @@ export function clearSession(): void {
   setSession({});
 }
 
-async function refreshSession(): Promise<boolean> {
-  if (!refreshToken) return false;
-  const response = await fetch(`${BASE}/auth/refresh`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ refresh_token: refreshToken }),
+/**
+ * The refresh currently in flight, shared by every request that needs one.
+ *
+ * Rotating a refresh token consumes it, and the daemon treats a *second* use of an already
+ * consumed token as evidence of theft: it revokes the whole token family, which signs the account
+ * out everywhere. The dashboard loads several authenticated resources at once, so on an expired
+ * access token every one of them fails and — without this — each starts its own refresh with the
+ * same token. The first wins, the rest are read as replay, and the winner's fresh tokens are
+ * revoked along with every other session. One shared promise means the whole burst rotates once.
+ */
+let inFlightRefresh: Promise<boolean> | null = null;
+
+function refreshSession(): Promise<boolean> {
+  if (inFlightRefresh) return inFlightRefresh;
+  if (!refreshToken) return Promise.resolve(false);
+  inFlightRefresh = (async (): Promise<boolean> => {
+    // Read the token at call time: a previous rotation may have replaced it since this request
+    // captured its own (expired) access token.
+    const token = refreshToken;
+    if (!token) return false;
+    const response = await fetch(`${BASE}/auth/refresh`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ refresh_token: token }),
+    });
+    if (!response.ok) {
+      clearSession();
+      return false;
+    }
+    setSession((await response.json()) as Session);
+    return true;
+  })().finally(() => {
+    inFlightRefresh = null;
   });
-  if (!response.ok) {
-    clearSession();
-    return false;
-  }
-  setSession((await response.json()) as Session);
-  return true;
+  return inFlightRefresh;
 }
 
 export interface RequestOptions {

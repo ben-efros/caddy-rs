@@ -492,3 +492,90 @@ const logout = calls.find((call) => call.path === '/api/v1/auth/logout');
 assert.deepEqual(logout.body, { refreshToken: 'refresh-2' }, 'logout revokes the refresh token by body');
 
 console.log('ui smoke test passed:', calls.length, 'API calls');
+
+// --- concurrent refresh collapses to one rotation ------------------------------------------
+//
+// The daemon treats a second use of an already-rotated refresh token as replay and revokes the
+// whole token family, signing the account out everywhere. The dashboard loads several
+// authenticated resources at once, so one expired access token makes every one of them fail
+// together. They must share a single rotation, not race each other.
+
+{
+  const concurrentCalls = [];
+  let refreshes = 0;
+  let session = { access_token: 'access-c1', refresh_token: 'refresh-c1' };
+
+  const fakeFetchConcurrent = async (input, init = {}) => {
+    const url = new URL(String(input), 'http://127.0.0.1:81');
+    const body = init.body ? JSON.parse(init.body) : undefined;
+    concurrentCalls.push({ path: url.pathname, body, headers: init.headers || {} });
+    if (url.pathname === '/api/v1/auth/refresh') {
+      refreshes += 1;
+      // Yield so every caller that is going to start a refresh does so before this one rotates.
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      assert.equal(body.refresh_token, 'refresh-c1', 'refresh uses the stored token');
+      session = { access_token: 'access-c2', refresh_token: 'refresh-c2' };
+      return json(200, session);
+    }
+    if (url.pathname.startsWith('/api/v1/auth/')) {
+      return json(200, session);
+    }
+    if (session.access_token === 'access-c1') {
+      return json(
+        403,
+        { error: { code: 'INVALID_TOKEN', message: 'access token expired' } },
+        { 'www-authenticate': 'Bearer error="invalid_token"' },
+      );
+    }
+    return json(200, { items: [], total: 0, limit: 50, offset: 0 });
+  };
+
+  // `api.ts` reads localStorage at import time, so it needs a DOM before it is bundled and run.
+  const dom = new JSDOM('<!doctype html><html><body></body></html>', { url: 'http://127.0.0.1:81/' });
+  globalThis.window = dom.window;
+  globalThis.document = dom.window.document;
+  // The data-URL module resolves bare `localStorage` against this global, not `dom.window`.
+  globalThis.localStorage = dom.window.localStorage;
+  globalThis.localStorage.setItem('pm.access_token', 'access-c1');
+  globalThis.localStorage.setItem('pm.refresh_token', 'refresh-c1');
+
+  const bundledApi = await build({
+    entryPoints: [path.join(root, 'src/api.ts')],
+    bundle: true,
+    format: 'esm',
+    write: false,
+    platform: 'neutral',
+    loader: { '.css': 'empty' },
+  });
+  const moduleUrl =
+    'data:text/javascript;base64,' +
+    Buffer.from(bundledApi.outputFiles[0].text).toString('base64');
+
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = fakeFetchConcurrent;
+  try {
+    const api = await import(moduleUrl);
+    // Three authenticated resources the dashboard loads together.
+    const results = await Promise.all([
+      api.hosts.list(),
+      api.securityHeaders.getGlobal(),
+      api.certificates.list(),
+    ]);
+    assert.equal(
+      refreshes,
+      1,
+      'the three concurrent failures must share one refresh, not race for the same token',
+    );
+    assert.ok(
+      results.every((r) => r.status !== 403),
+      'every request is retried with the rotated token',
+    );
+    assert.equal(
+      dom.window.localStorage.getItem('pm.refresh_token'),
+      'refresh-c2',
+      'the rotated token is stored once',
+    );
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+}

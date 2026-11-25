@@ -8,6 +8,10 @@
 //! message is only reachable after the password matched, so it does not become an account oracle.
 //! Login failures are rate limited per username: five failures inside a minute answer `429` with
 //! `Retry-After`, which also bounds online TOTP guessing (every TOTP failure is a login failure).
+//! This sliding window is the outer limiter. The authentication service enforces its own
+//! per-account lockout with exponential backoff (30 s doubling to 15 min, shared by password and
+//! TOTP failures, see `caddy-rs-authn`'s `LoginThrottleConfig`), also for `totp_verify`, so the
+//! TOTP confirm/disable endpoints are throttled too; its refusals map to the same `429`.
 //!
 //! Every handler takes [`LocalPeer`] first, like the rest of the management API: a non-loopback
 //! peer is refused before the body is parsed. `Cache-Control: no-store` keeps token pairs and the
@@ -88,10 +92,11 @@ impl LoginLimiter {
     }
 }
 
-/// Usernames are matched case-sensitively by the store, but a limiter keyed case-insensitively
-/// cannot be dodged by changing the spelling of the same account.
+/// Usernames are matched case-sensitively by the store (`Bob` and `bob` are two accounts), so the
+/// limiter keys on the exact name, like the authentication service: a folded key would let failures
+/// as `bob` lock out `Bob`.
 fn normalize(username: &str) -> String {
-    username.to_ascii_lowercase()
+    username.to_owned()
 }
 
 /// Request body for `POST /api/v1/auth/login`.
@@ -205,6 +210,17 @@ pub struct TotpConfirmRequest {
     pub totp_code: String,
 }
 
+/// Optional body of `POST /api/v1/auth/totp/setup`.
+///
+/// Only needed to replace an *active* factor: the caller's current code proves they hold it.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TotpSetupRequest {
+    /// The code currently shown by the authenticator for the active factor.
+    #[serde(default)]
+    pub totp_code: Option<String>,
+}
+
 /// Body of `POST /api/v1/auth/totp/disable`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -280,8 +296,20 @@ fn login_error(error: AuthError) -> ApiError {
             ApiError::Unauthorized("invalid username or password".to_owned())
         }
         AuthError::InvalidTotpCode => ApiError::Unauthorized("invalid TOTP code".to_owned()),
-        AuthError::TotpReplay => ApiError::Unauthorized("TOTP code already used".to_owned()),
+        // The service already reports a replayed code as `InvalidTotpCode` at the login boundary;
+        // this arm only keeps a direct `TotpReplay` from distinguishing itself if that changes.
+        AuthError::TotpReplay => ApiError::Unauthorized("invalid TOTP code".to_owned()),
+        AuthError::TooManyAttempts { retry_after } => rate_limited(retry_after),
         other => internal_error(other),
+    }
+}
+
+/// The service-level lockout (per-account failure budget with exponential backoff) as `429` with
+/// `Retry-After`. The same mapping serves login and the TOTP endpoints, so every caller of the
+/// authentication service gets one consistent refusal.
+fn rate_limited(retry_after: Duration) -> ApiError {
+    ApiError::RateLimited {
+        retry_after_seconds: retry_after.as_secs().max(1),
     }
 }
 
@@ -386,20 +414,41 @@ pub(crate) fn internal_error(error: impl std::fmt::Display) -> ApiError {
 /// The secret is stored on the user but is not yet *activated* for login purposes in the sense the
 /// caller cares about: `confirm` must succeed before the operator trusts the account to be
 /// protected. Calling setup twice is allowed and simply replaces the pending secret.
+///
+/// An account whose factor is already active is **not** silently re-keyed: that would let a stolen
+/// access token turn the account password-only and enrol the thief's authenticator. Without a
+/// body the call is `409`; with `{"totpCode": "<current code>"}` it proves possession of the live
+/// factor, and the new secret is stored *beside* the old one, which keeps gating login until
+/// `confirm` is called with a code from the new secret.
 pub(crate) async fn totp_setup_handler(
     State(state): State<ApiState>,
     _peer: LocalPeer,
     headers: HeaderMap,
+    body: Option<Json<TotpSetupRequest>>,
 ) -> Result<impl IntoResponse, ApiError> {
     let Claims { sub, .. } = require_claims(&state, &headers).await?;
-    let (secret, otpauth_uri) = state
-        .authn
-        .totp_setup(sub)
-        .await
-        .map_err(|error| match error {
-            AuthError::UserNotFound => ApiError::Unauthorized("invalid access token".to_owned()),
-            other => internal_error(other),
-        })?;
+    let current_code = body
+        .and_then(|Json(body)| body.totp_code)
+        .filter(|code| !code.is_empty());
+    let enrolment = match current_code {
+        Some(code) => state.authn.totp_reenroll(sub, &code).await,
+        None => state.authn.totp_setup(sub).await,
+    };
+    let (secret, otpauth_uri) = enrolment.map_err(|error| match error {
+        AuthError::TotpAlreadyEnabled => ApiError::Conflict(
+            "TOTP is already enabled; to replace the factor send the current code as \
+             {\"totpCode\": \"...\"}"
+                .to_owned(),
+        ),
+        AuthError::InvalidTotpCode => ApiError::Unauthorized("invalid TOTP code".to_owned()),
+        AuthError::TotpReplay => {
+            tracing::warn!(user = %sub.0, "TOTP replay refused at re-enrolment");
+            ApiError::Unauthorized("invalid TOTP code".to_owned())
+        }
+        AuthError::TooManyAttempts { retry_after } => rate_limited(retry_after),
+        AuthError::UserNotFound => ApiError::Unauthorized("invalid access token".to_owned()),
+        other => internal_error(other),
+    })?;
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
         Json(TotpSetupResponse {
@@ -435,6 +484,7 @@ pub(crate) async fn totp_confirm_handler(
                 tracing::warn!(user = %sub.0, "TOTP replay refused at confirm");
                 ApiError::Unauthorized("invalid TOTP code".to_owned())
             }
+            AuthError::TooManyAttempts { retry_after } => rate_limited(retry_after),
             AuthError::UserNotFound => ApiError::Unauthorized("invalid access token".to_owned()),
             other => internal_error(other),
         })?;
@@ -494,6 +544,7 @@ async fn verify_totp(state: &ApiState, user_id: UserId, code: &str) -> Result<()
             tracing::warn!(user = %user_id.0, "TOTP replay refused");
             Err(ApiError::Unauthorized("invalid TOTP code".to_owned()))
         }
+        Err(AuthError::TooManyAttempts { retry_after }) => Err(rate_limited(retry_after)),
         Err(AuthError::UserNotFound) => {
             Err(ApiError::Unauthorized("invalid access token".to_owned()))
         }
@@ -594,6 +645,25 @@ mod tests {
     }
 
     #[test]
+    fn service_lockouts_map_to_429_with_retry_after_and_replays_stay_masked() {
+        let response = login_error(AuthError::TooManyAttempts {
+            retry_after: Duration::from_secs(90),
+        })
+        .into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "90");
+
+        // A zero wait would invite an immediate refused retry.
+        let response = rate_limited(Duration::ZERO).into_response();
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+
+        // A replayed code carries the same message as a wrong one.
+        let replay = login_error(AuthError::TotpReplay);
+        let wrong = login_error(AuthError::InvalidTotpCode);
+        assert_eq!(replay.to_string(), wrong.to_string());
+    }
+
+    #[test]
     fn the_login_limiter_blocks_one_username_and_spares_another() {
         let limiter = LoginLimiter::new();
         for _ in 0..MAX_LOGIN_FAILURES {
@@ -604,8 +674,8 @@ mod tests {
             "five attempts exhaust the window"
         );
         assert!(
-            limiter.reserve_attempt("ALICE").is_err(),
-            "spelling changes must not dodge the limiter"
+            limiter.reserve_attempt("ALICE").is_ok(),
+            "a differently-cased name is a different account (the store is case-sensitive)"
         );
         assert!(
             limiter.reserve_attempt("bob").is_ok(),
