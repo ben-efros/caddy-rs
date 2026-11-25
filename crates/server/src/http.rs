@@ -272,9 +272,10 @@ pub(crate) async fn serve_internal_buffered(
             .insert("tls.alpn".to_string(), alpn.to_string());
     }
     trusted_proxies.apply(&mut internal);
+    let is_head = internal.method == http::Method::HEAD;
     match router.handle_upgradable(internal).await {
         Ok(ResponseOutcome::Response(response)) => ServedResponse::Response(
-            to_hyper_streaming_with_identity(response, &limits.server_identity),
+            to_hyper_streaming_with_identity(response, is_head, &limits.server_identity),
         ),
         Ok(ResponseOutcome::Upgrade(_)) => served_response_with_identity(
             limits,
@@ -546,9 +547,10 @@ pub(crate) async fn serve_request_with_automatic_upgradable(
     // the whole handler chain, before any handler runs.
     trusted_proxies.apply(&mut internal);
 
+    let is_head = internal.method == http::Method::HEAD;
     match router.handle_upgradable(internal).await {
         Ok(ResponseOutcome::Response(response)) => ServedResponse::Response(
-            to_hyper_streaming_with_identity(response, &limits.server_identity),
+            to_hyper_streaming_with_identity(response, is_head, &limits.server_identity),
         ),
         Ok(ResponseOutcome::Upgrade(upgraded)) => {
             let Some(on_upgrade) = on_upgrade else {
@@ -731,9 +733,10 @@ fn served_response_with_identity(
 /// Convert an internal response and stamp the server identity onto it.
 fn to_hyper_streaming_with_identity(
     response: StreamingResponse,
+    head: bool,
     identity: &caddy_rs_core::ResolvedIdentity,
 ) -> hyper::Response<Body> {
-    let mut response = to_hyper_streaming(response);
+    let mut response = to_hyper_streaming_for(response, head);
     apply_server_identity(&mut response, identity);
     response
 }
@@ -741,6 +744,13 @@ fn to_hyper_streaming_with_identity(
 /// Convert an internal (possibly streaming) response to a hyper response, applying the framing
 /// policy documented at the top of this module.
 pub fn to_hyper_streaming(response: StreamingResponse) -> hyper::Response<Body> {
+    to_hyper_streaming_for(response, false)
+}
+
+/// [`to_hyper_streaming`] aware of the request method. A `HEAD` response carries no body by
+/// definition, so its declared `Content-Length` (the length a GET would send, as Go's
+/// `ServeContent` reports it) is kept even though the body is empty.
+pub fn to_hyper_streaming_for(response: StreamingResponse, head: bool) -> hyper::Response<Body> {
     let StreamingResponse {
         status,
         mut headers,
@@ -753,6 +763,7 @@ pub fn to_hyper_streaming(response: StreamingResponse) -> hyper::Response<Body> 
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.trim().parse::<u64>().ok());
     let keep_content_length = match (declared, exact_size) {
+        (Some(_), Some(0)) if head => true,
         (Some(declared), Some(exact)) => declared == exact,
         _ => false,
     };
@@ -821,6 +832,62 @@ mod tests {
             HeaderValue::from_static("not-a-number"),
         );
         assert_eq!(declared_content_length(&headers), None);
+    }
+
+    /// B2 round 2: a HEAD response has an empty body but must keep the declared `Content-Length`
+    /// (Go sends the length GET would), while a 304 (no length staged) and GET keep their rules.
+    #[tokio::test]
+    async fn head_keeps_the_declared_content_length() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("big.bin"), vec![7u8; 700_000]).unwrap();
+        let routes = serde_json::json!([{ "handle": [{
+            "handler": "file_server", "root": dir.path().to_string_lossy(), "hide": []
+        }]}]);
+        let router = caddy_rs_http::RouterBuilder::new()
+            .build(routes.as_array().unwrap())
+            .unwrap();
+        let send = |method: http::Method, etag: Option<HeaderValue>| {
+            let router = &router;
+            async move {
+                let mut request = caddy_rs_http::Request::new(method, "/big.bin".parse().unwrap());
+                if let Some(etag) = etag {
+                    request.headers.insert(http::header::IF_NONE_MATCH, etag);
+                }
+                let Ok(ResponseOutcome::Response(response)) =
+                    router.handle_upgradable(request).await
+                else {
+                    panic!("expected a response");
+                };
+                response
+            }
+        };
+        let head = send(http::Method::HEAD, None).await;
+        let etag = head.headers.get(http::header::ETAG).unwrap().clone();
+        let converted = to_hyper_streaming_for(head, true);
+        assert_eq!(
+            converted.headers().get(http::header::CONTENT_LENGTH),
+            Some(&HeaderValue::from_static("700000")),
+            "HEAD must keep the length GET would send"
+        );
+        let not_modified = send(http::Method::GET, Some(etag)).await;
+        assert_eq!(not_modified.status, StatusCode::NOT_MODIFIED);
+        let converted = to_hyper_streaming_for(not_modified, false);
+        assert!(!converted
+            .headers()
+            .contains_key(http::header::CONTENT_LENGTH));
+        // A GET whose declared length disagrees with its (empty) body still loses the header.
+        let mut mismatched = StreamingResponse::from_buffered(caddy_rs_http::Response::bytes(
+            StatusCode::OK,
+            "text/plain",
+            Vec::<u8>::new(),
+        ));
+        mismatched
+            .headers
+            .insert(http::header::CONTENT_LENGTH, HeaderValue::from_static("5"));
+        let converted = to_hyper_streaming_for(mismatched, false);
+        assert!(!converted
+            .headers()
+            .contains_key(http::header::CONTENT_LENGTH));
     }
 
     /// SEC-MEDIUM-HTTP B2 review: a streamed static file (over the 256 KiB threshold) must keep
