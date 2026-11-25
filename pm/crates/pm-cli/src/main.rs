@@ -637,8 +637,21 @@ async fn main() {
     // Initialize logging.
     init_logging(&cli.global);
 
+    for flag in secret_flags_on_command_line(std::env::args()) {
+        warn!(
+            flag,
+            "a credential was passed on the command line, where other local users can read it in \
+             the process listing; use the environment variable or the owner-only environment \
+             file written by `install` instead"
+        );
+    }
+
     if let Err(err) = run(cli).await {
-        error!(%err, "fatal error");
+        // The error text can carry a TOTP enrolment URI (a rejected bootstrap code hands the
+        // operator the URI to retry with), and the URI embeds the secret. The structured log gets
+        // the redacted text; the full text, URI included, goes only to the operator's stderr.
+        error!(err = %redact_totp_secrets(&err.to_string()), "fatal error");
+        eprintln!("error: {err}");
         std::process::exit(1);
     }
 }
@@ -988,6 +1001,66 @@ async fn enrol_and_confirm_bootstrap_totp(
     Ok(uri)
 }
 
+/// Tell the operator the bootstrap TOTP enrolment URI, once.
+///
+/// The URI embeds the TOTP secret, so it must not travel through the structured log: log lines are
+/// shipped to aggregators, retained, and readable by far more people than the operator who has to
+/// scan the code. It is written to `out` (the process's stderr, i.e. the operator's terminal or
+/// the service manager's capture of it) and only a non-secret line is logged. Under systemd stderr
+/// still reaches the journal, so a deployment that cannot allow that should enrol TOTP through
+/// `POST /auth/totp/setup` instead of `PM_BOOTSTRAP_ADMIN_TOTP`.
+fn announce_bootstrap_totp(out: &mut impl std::io::Write, totp_uri: &str) {
+    warn!("bootstrap admin TOTP enrolled; the enrolment URI was printed to stderr (not logged)");
+    // A failed write to stderr is not worth failing startup over; the factor is already confirmed.
+    let _ = writeln!(
+        out,
+        "bootstrap admin TOTP enrolled; scan this enrolment URI to keep receiving codes:\n{totp_uri}"
+    );
+}
+
+/// Replace the value of every `secret=` query parameter (as in an `otpauth://` URI) with
+/// `[redacted]`, so text that may embed an enrolment URI can be logged safely.
+fn redact_totp_secrets(text: &str) -> String {
+    const KEY: &str = "secret=";
+    let mut redacted = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(position) = rest.find(KEY) {
+        let value_start = position + KEY.len();
+        redacted.push_str(&rest[..value_start]);
+        redacted.push_str("[redacted]");
+        let value = &rest[value_start..];
+        let value_len = value
+            .find(|c: char| c == '&' || c.is_whitespace() || c == '"' || c == '\'')
+            .unwrap_or(value.len());
+        rest = &value[value_len..];
+    }
+    redacted.push_str(rest);
+    redacted
+}
+
+/// The bootstrap-credential flags present in `args` (flag names only, never values).
+///
+/// A command-line argument is visible to every local user in the process listing (`ps`,
+/// `/proc/<pid>/cmdline`) and lands in shell history, unlike `PM_BOOTSTRAP_ADMIN_PASSWORD` in the
+/// owner-only environment file that `install` writes. The flags still work (removing them would
+/// break existing invocations); `main` warns when one is used.
+fn secret_flags_on_command_line(args: impl IntoIterator<Item = String>) -> Vec<&'static str> {
+    const SECRET_FLAGS: [&str; 2] = ["--bootstrap-admin-password", "--bootstrap-admin-totp"];
+    let mut found = Vec::new();
+    for arg in args {
+        for flag in SECRET_FLAGS {
+            let is_flag = arg == flag
+                || arg
+                    .strip_prefix(flag)
+                    .is_some_and(|rest| rest.starts_with('='));
+            if is_flag && !found.contains(&flag) {
+                found.push(flag);
+            }
+        }
+    }
+    found
+}
+
 async fn bootstrap_admin(
     authn: &AuthnService<MemoryUserStore>,
     store: &MemoryUserStore,
@@ -1091,12 +1164,7 @@ async fn serve(global: GlobalArgs, args: ServeArgs) -> Result<(), CliError> {
     )
     .await?
     {
-        // The URI carries the secret, so it is logged only here, once, and only because the
-        // operator must scan it to keep using the factor they just proved possession of.
-        warn!(
-            totp_uri = %totp_uri,
-            "bootstrap admin TOTP enrolled; scan this enrolment URI to keep receiving codes"
-        );
+        announce_bootstrap_totp(&mut std::io::stderr(), &totp_uri);
     }
 
     info!(
@@ -2494,5 +2562,123 @@ mod tests {
             !body.contains(&base64),
             "the base64 form of the signing key must not appear in /api/v1/config"
         );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // E6: secrets must not reach the structured log or hide on the command line unannounced
+    // ---------------------------------------------------------------------------------------
+
+    /// A `MakeWriter` target that collects everything the subscriber writes.
+    #[derive(Clone, Default)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log buffer").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = CapturedLog;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl CapturedLog {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("log buffer")).into_owned()
+        }
+    }
+
+    const SECRET_URI: &str =
+        "otpauth://totp/caddy-rs:admin?secret=JBSWY3DPEHPK3PXP&issuer=caddy-rs";
+
+    #[test]
+    fn the_bootstrap_totp_uri_goes_to_stderr_and_never_to_the_structured_log() {
+        let log = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .finish();
+        let mut stderr = Vec::new();
+        tracing::subscriber::with_default(subscriber, || {
+            announce_bootstrap_totp(&mut stderr, SECRET_URI);
+        });
+
+        let printed = String::from_utf8(stderr).expect("utf-8 output");
+        assert!(
+            printed.contains(SECRET_URI),
+            "the operator must be shown the URI to scan: {printed}"
+        );
+        let logged = log.text();
+        assert!(
+            logged.contains("bootstrap admin TOTP enrolled"),
+            "the enrolment is still logged: {logged}"
+        );
+        assert!(
+            !logged.contains("JBSWY3DPEHPK3PXP") && !logged.contains("otpauth://"),
+            "the secret must not reach the log: {logged}"
+        );
+    }
+
+    #[test]
+    fn totp_secrets_are_redacted_from_text_that_may_be_logged() {
+        let error = format!("bootstrap TOTP code rejected: x; retry with this URI: {SECRET_URI}");
+        let redacted = redact_totp_secrets(&error);
+        assert!(!redacted.contains("JBSWY3DPEHPK3PXP"), "{redacted}");
+        assert!(
+            redacted.contains("secret=[redacted]&issuer=caddy-rs"),
+            "{redacted}"
+        );
+
+        // Several occurrences, a value at the end of the text, and text without a secret.
+        assert_eq!(
+            redact_totp_secrets("a secret=ONE b secret=TWO"),
+            "a secret=[redacted] b secret=[redacted]"
+        );
+        assert_eq!(redact_totp_secrets("secret=END"), "secret=[redacted]");
+        assert_eq!(redact_totp_secrets("nothing to hide"), "nothing to hide");
+        assert_eq!(redact_totp_secrets(""), "");
+    }
+
+    #[test]
+    fn credential_flags_on_the_command_line_are_detected_by_name_only() {
+        fn args(list: &[&str]) -> Vec<String> {
+            list.iter().map(|arg| (*arg).to_string()).collect()
+        }
+
+        assert!(secret_flags_on_command_line(args(&["caddy-rs-pm", "serve"])).is_empty());
+        assert_eq!(
+            secret_flags_on_command_line(args(&[
+                "caddy-rs-pm",
+                "--bootstrap-admin-password",
+                "hunter22",
+                "serve"
+            ])),
+            vec!["--bootstrap-admin-password"]
+        );
+        assert_eq!(
+            secret_flags_on_command_line(args(&[
+                "caddy-rs-pm",
+                "--bootstrap-admin-password=hunter22",
+                "--bootstrap-admin-totp=123456",
+                "--bootstrap-admin-password",
+                "x",
+            ])),
+            vec!["--bootstrap-admin-password", "--bootstrap-admin-totp"],
+            "each flag is reported once"
+        );
+        // The email is not a secret, and a longer flag that merely shares a prefix is not a match.
+        assert!(secret_flags_on_command_line(args(&[
+            "--bootstrap-admin-email=a@b.c",
+            "--bootstrap-admin-password-file=/x",
+            "--bootstrap-admin-totpx",
+        ]))
+        .is_empty());
     }
 }

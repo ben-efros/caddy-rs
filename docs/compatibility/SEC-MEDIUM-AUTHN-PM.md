@@ -207,6 +207,38 @@ adjusted because they encoded the old behaviour (`login_and_refresh_rotation`,
 `revoke_all_for_user_invalidates_access_and_refresh`,
 `revoke_refresh_token_ends_one_session_and_is_replay_safe`).
 
+## E6 — secrets in logs and arguments in `pm-cli`
+
+### Vulnerability (low)
+
+`serve` logged the bootstrap TOTP enrolment URI (which embeds the secret) as a structured `warn!`
+field, and a rejected bootstrap code put the same URI in the fatal error that `main` logged with
+`error!`; log lines are retained and shipped far beyond the operator who must scan the code.
+`--bootstrap-admin-password` / `--bootstrap-admin-totp` are ordinary clap arguments and therefore
+visible in process listings and shell history (they already accept the `PM_BOOTSTRAP_ADMIN_*`
+environment variables through clap's `env`).
+
+### Behaviour
+
+- The URI is printed to stderr once (`announce_bootstrap_totp`); the structured log only says it was
+  printed. The fatal-error path logs the error with every `secret=` value replaced by `[redacted]`
+  and prints the full text, URI included, to stderr only. Under systemd stderr still reaches the
+  journal, which is documented in `docs/INSTALL.md` together with the alternative (`POST
+  /auth/totp/setup`).
+- The credential flags keep working (removing them would break existing invocations); `main` logs a
+  warning naming the flag (never the value) when either is present on the command line, steering
+  operators to the environment variables / the 0600 environment file. Not changed: the bootstrap
+  admin is created with `create_user`, so the 8-character minimum of E4 does not apply to
+  `PM_BOOTSTRAP_ADMIN_PASSWORD`.
+
+### Tests
+
+`pm-cli`: `the_bootstrap_totp_uri_goes_to_stderr_and_never_to_the_structured_log` (captures the
+tracing output; with the old `warn!(totp_uri = ...)` it fails with the secret in the log),
+`totp_secrets_are_redacted_from_text_that_may_be_logged`,
+`credential_flags_on_the_command_line_are_detected_by_name_only`. The wiring in `main`
+(`error!`/`eprintln!` and the flag warning) is not unit-tested.
+
 ## Exact program-repository text to merge
 
 `docs/compatibility/BEHAVIOR-DIVERGENCES.md`, new entry (`caddy-rs extension`, no stock Caddy
@@ -225,4 +257,6 @@ equivalent; `stock_compat` does not apply):
 > The authentication service refuses Argon2 parameters below the OWASP minimum (unless explicitly
 > allowed), never falls back to bcrypt, caps passwords at 1024 bytes and requires 8 characters for
 > the first administrator. Replaying a consumed refresh token revokes all of that user's refresh
-> tokens and bumps the authentication epoch.
+> tokens and bumps the authentication epoch. The proxy-manager daemon prints the bootstrap TOTP
+> enrolment URI to stderr instead of the structured log and warns when a bootstrap credential is
+> passed as a command-line argument.
