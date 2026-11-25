@@ -421,8 +421,12 @@ pub fn handler_factory(service: Arc<ActivationService>) -> CustomHandlerFactory 
     )
 }
 
-/// The HTTP app that serves the activation endpoint on `listen`.
-pub fn activation_config(listen: &str) -> Config {
+/// The HTTP app that serves the activation endpoint on `listen` over TLS.
+///
+/// `tls_app` carries the internal-CA certificate the listener terminates TLS with; the listener
+/// declares a TLS connection policy, so the endpoint serves the `https://` scheme its activation
+/// URL advertises instead of cleartext (T-SETUP-008).
+pub fn activation_config(listen: &str, tls_app: caddy_rs_core::TlsApp) -> Config {
     let mut handler = Map::new();
     handler.insert("handler".into(), Value::String(ACTIVATION_HANDLER.into()));
     let route = Route {
@@ -437,6 +441,10 @@ pub fn activation_config(listen: &str) -> Config {
             ..Default::default()
         }),
         idle_timeout: Some(Value::String(IDLE_TIMEOUT.to_string())),
+        // T-SETUP-008: the activation endpoint is TLS. A connection policy is what makes the
+        // listener terminate TLS regardless of which port it was given, so `--listen-address`
+        // can name any port and the printed `https://` URL is still served over TLS.
+        tls_connection_policies: Some(vec![serde_json::json!({})]),
         ..Default::default()
     };
     server.extra.insert(
@@ -464,15 +472,18 @@ pub fn activation_config(listen: &str) -> Config {
         apps: Some(Apps {
             http: Some(HttpApp {
                 servers,
-                // The activation layer is cleartext HTTP for now (DIV-0151). Port 443 is the
-                // HTTPS port, so a listener there would be treated as a TLS listener with no
-                // certificate; `https_port: 0` is Caddy's "no HTTPS port" spelling (automatic
-                // HTTPS is off for this app anyway) and keeps the temporary endpoint serving
-                // plain HTTP on whichever port the activation URL names.
-                https_port: Some(0),
+                // Left at its default: the listener is TLS because it carries a connection
+                // policy, not because its port equals the HTTPS port, so nothing here depends on
+                // `https_port`. Setting it to 0 (the earlier "no HTTPS port" spelling used while
+                // the endpoint was cleartext, DIV-0151) would now be misleading rather than
+                // load-bearing.
+                https_port: None,
                 ..Default::default()
             }),
-            tls: None,
+            // The internal-CA leaf that terminates TLS for this endpoint (T-SETUP-008). Built
+            // from `load_pem`, so the runtime resolves it through the same
+            // `resolver_from_config` path a normal deployment uses; there is no side channel.
+            tls: Some(tls_app),
             pki: None,
             extra: BTreeMap::new(),
         }),
@@ -482,21 +493,21 @@ pub fn activation_config(listen: &str) -> Config {
 
 /// Boot the activation listener on `listen` with an explicit module registry and signal source.
 ///
-/// `listen` is a cleartext `host:port`. The printed activation URLs use `https://`; terminating TLS
-/// for the temporary layer belongs to the generation-scoped `caddy-pm-rs` service (T-SETUP-004,
-/// ADR-006), which this build does not have. Binding plain HTTP keeps the endpoint reachable for
-/// the boot check instead of pretending TLS exists; DIV-0151 records the difference.
+/// `listen` is a `host:port` bound exactly as given (T-SETUP-007), and `tls_app` holds the
+/// internal-CA leaf the listener terminates TLS with (T-SETUP-008), so the `https://` scheme the
+/// activation URLs print is the scheme actually served.
 ///
 /// The registry and the shutdown channels are parameters so the integration test can boot the real
 /// listener without the binary's own module table, which is private to `main.rs`.
 pub async fn serve_with(
     listen: &str,
     service: Arc<ActivationService>,
+    tls_app: caddy_rs_core::TlsApp,
     registry: caddy_rs_core::ModuleRegistry,
     shutdown: tokio::sync::watch::Receiver<bool>,
     force: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
-    let config = activation_config(listen);
+    let config = activation_config(listen, tls_app);
     let store = Arc::new(GenerationStore::new(Arc::new(registry_with_activation(
         registry,
     )?)));
@@ -515,7 +526,7 @@ pub async fn serve_with(
     })?;
     // The bound address is printed so the boot check can reach the endpoint; the token itself is
     // never printed here (the caller prints it once, on the activation URL).
-    eprintln!("caddy-rs setup: activation endpoint listening on http://{bound}{ACTIVATION_PATH}");
+    eprintln!("caddy-rs setup: activation endpoint listening on https://{bound}{ACTIVATION_PATH}");
 
     runtime
         .run_with_force(shutdown, force)

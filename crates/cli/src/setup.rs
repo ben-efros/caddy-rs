@@ -132,6 +132,28 @@ pub struct SetupArgs {
     pub cf_api_token: Option<String>,
 }
 
+impl Default for SetupArgs {
+    /// Every flag at its documented default, with an empty `--domain`.
+    ///
+    /// `--domain` is required on the command line, so there is no "valid" default for it; this
+    /// exists so a caller or test that only cares about one or two flags does not have to spell
+    /// out the rest. `generate_config` still rejects the empty domain with a located error.
+    fn default() -> Self {
+        Self {
+            domain: String::new(),
+            auth_method: AuthMethod::Webauthn,
+            storage: "file_system".to_string(),
+            registration_timeout: "15m".to_string(),
+            data_dir: None,
+            host: Vec::new(),
+            listen_address: None,
+            acme: false,
+            cloudflare: false,
+            cf_api_token: None,
+        }
+    }
+}
+
 /// Errors of the setup command. Kept free of `anyhow` so the pure pieces are testable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SetupError {
@@ -155,6 +177,8 @@ pub enum SetupError {
     BootFailed(String),
     /// The `caddy-pm-rs` service binary could not be found or would not start.
     ServiceUnavailable(String),
+    /// The activation endpoint's certificate could not be issued or loaded (T-SETUP-008).
+    TlsUnavailable(String),
 }
 
 impl fmt::Display for SetupError {
@@ -194,6 +218,9 @@ impl fmt::Display for SetupError {
             Self::ServiceUnavailable(reason) => {
                 write!(f, "caddy-pm-rs service is unavailable: {reason}")
             }
+            Self::TlsUnavailable(reason) => {
+                write!(f, "cannot serve the activation endpoint over TLS: {reason}")
+            }
         }
     }
 }
@@ -214,7 +241,7 @@ pub struct SetupConfig {
     pub activation_urls: Vec<String>,
     /// Effective TTL for the activation token.
     pub registration_timeout: Duration,
-    /// Listener the activation endpoint binds (`host:port`; cleartext, see DIV-0151).
+    /// Listener the activation endpoint binds (`host:port`, TLS with the internal CA cert).
     pub activation_listen: String,
     /// Enrollment method.
     pub auth_method: AuthMethod,
@@ -222,6 +249,12 @@ pub struct SetupConfig {
     pub storage: String,
     /// Primary domain.
     pub domain: String,
+    /// Every site host, `--domain` first and duplicates dropped: the names the activation
+    /// certificate must cover and the names the activation URLs are printed for.
+    pub hosts: Vec<String>,
+    /// Data directory for this boot (T-SETUP-006). Passed to `caddy-rs run` and to the
+    /// `caddy-rs-pm` service so neither falls back to `/var/lib/caddy-rs`.
+    pub data_dir: PathBuf,
 }
 
 /// Parse an ADR-0039 duration such as `15m`, `900s` or `1h`.
@@ -284,81 +317,124 @@ fn is_valid_host(host: &str) -> bool {
         && !host.ends_with('.')
 }
 
-/// Extract the port from an ADR-0039 listen address, defaulting to 443.
-fn listen_port(addr: Option<&str>) -> Result<u16, SetupError> {
-    let Some(addr) = addr else {
-        return Ok(443);
-    };
-    if !is_valid_listen_address(addr) {
-        return Err(SetupError::InvalidListenAddress(addr.to_string()));
-    }
-    let port = if let Some(rest) = addr.strip_prefix('[') {
-        // `[IPv6]` or `[IPv6]:port`
-        rest.split_once("]:").map(|(_, port)| port)
-    } else if let Some(port) = addr.strip_prefix(':') {
-        Some(port)
-    } else {
-        addr.rsplit_once(':').map(|(_, port)| port)
-    };
-    match port {
-        Some(port) => port
-            .parse()
-            .map_err(|_| SetupError::InvalidListenAddress(addr.to_string())),
-        None => Ok(443),
-    }
-}
+/// The default port an ADR-0039 listen address uses when it names none.
+pub const DEFAULT_LISTEN_PORT: u16 = 443;
 
-/// The concrete `host:port` the activation endpoint binds.
+/// A parsed ADR-0039 `--listen-address`.
 ///
-/// ADR-0039 listen addresses are `IP`, `IP:port`, `[IPv6]`, `[IPv6]:port` or `:port`; a bare address
-/// means port 443 (the default the activation URLs use), and a host-less `:port` binds the
-/// wildcard. The endpoint is served over cleartext HTTP for now (DIV-0151), so the default host is
-/// the loopback interface rather than `0.0.0.0`: a temporary activation endpoint with no TLS must
-/// not be reachable from the network.
-pub fn activation_listen(addr: Option<&str>, port: u16) -> String {
-    match addr {
-        None => format!("127.0.0.1:{port}"),
-        Some(addr) if addr.starts_with(':') => format!("127.0.0.1:{port}"),
-        Some(addr) if addr.starts_with('[') => {
-            // `[IPv6]` or `[IPv6]:port`: keep the bracketed literal and append the resolved port.
-            let end = addr.find(']').map(|index| index + 1).unwrap_or(addr.len());
-            format!("{}:{port}", &addr[..end])
-        }
-        Some(addr) => {
-            let host = addr.rsplit_once(':').map(|(host, _)| host).unwrap_or(addr);
-            format!("{host}:{port}")
+/// The flag accepts `IP`, `IP:port`, `[IPv6]`, `[IPv6]:port` or `:port` (ADR-0039). The address and
+/// the port are kept *separately*: keeping only the port was the T-SETUP-007 defect, which made
+/// `--listen-address 127.0.0.1:18443` bind every interface. `None` means "no address given", which
+/// resolves to loopback (see [`SetupListen::default`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetupListen {
+    /// The literal address to bind, or `None` for a host-less `:port` (all interfaces).
+    pub ip: Option<std::net::IpAddr>,
+    /// The port to bind.
+    pub port: u16,
+}
+
+impl Default for SetupListen {
+    /// No `--listen-address`: loopback, port 443.
+    ///
+    /// Loopback rather than the wildcard because the activation endpoint carries a live
+    /// single-use credential and is reachable over TLS only after the operator has the fingerprint
+    /// to compare it against; binding it everywhere by default would publish the claim window
+    /// before anyone has verified what they are talking to.
+    fn default() -> Self {
+        Self {
+            ip: Some(std::net::IpAddr::from([127, 0, 0, 1])),
+            port: DEFAULT_LISTEN_PORT,
         }
     }
 }
 
-fn is_valid_listen_address(addr: &str) -> bool {
-    if addr.is_empty() || addr.contains(char::is_whitespace) {
-        return false;
-    }
-    if let Some(port) = addr.strip_prefix(':') {
-        return !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit());
-    }
-    if addr.starts_with('[') {
-        return addr
-            .find(']')
-            .map(|end| {
-                let rest = &addr[end + 1..];
-                rest.is_empty()
-                    || rest.strip_prefix(':').is_some_and(|port| {
-                        !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit())
-                    })
-            })
-            .unwrap_or(false);
-    }
-    match addr.rsplit_once(':') {
-        Some((host, port)) => {
-            !host.is_empty()
-                && !port.is_empty()
-                && port.bytes().all(|b| b.is_ascii_digit())
-                && !host.contains(':')
+impl SetupListen {
+    /// Parse `--listen-address`, or return the loopback default when the flag is absent.
+    ///
+    /// An address that names an IP is bound to exactly that IP. A host-less `:port` is the one
+    /// documented spelling that means every interface (ADR-0039), and it is the only way to get
+    /// that: no explicit IP is ever widened to the wildcard.
+    pub fn parse(addr: Option<&str>) -> Result<Self, SetupError> {
+        let Some(addr) = addr else {
+            return Ok(Self::default());
+        };
+        let invalid = || SetupError::InvalidListenAddress(addr.to_string());
+        if addr.is_empty() || addr.contains(char::is_whitespace) {
+            return Err(invalid());
         }
-        None => !addr.contains(':'),
+        // Host-less `:port`: all interfaces, the ADR-0039 spelling for it.
+        if let Some(port) = addr.strip_prefix(':') {
+            return Ok(Self {
+                ip: None,
+                port: parse_port(port).ok_or_else(invalid)?,
+            });
+        }
+        // Bracketed IPv6: `[IPv6]` or `[IPv6]:port`. Unbracketed IPv6 is rejected rather than
+        // guessed at, because `2001:db8::1:8443` cannot be split into address and port unambiguously.
+        if let Some(rest) = addr.strip_prefix('[') {
+            let (literal, after) = rest.split_once(']').ok_or_else(invalid)?;
+            let ip: std::net::IpAddr = literal.parse().map_err(|_| invalid())?;
+            if !ip.is_ipv6() {
+                return Err(invalid());
+            }
+            let port = match after {
+                "" => DEFAULT_LISTEN_PORT,
+                after => {
+                    parse_port(after.strip_prefix(':').ok_or_else(invalid)?).ok_or_else(invalid)?
+                }
+            };
+            return Ok(Self { ip: Some(ip), port });
+        }
+        // `IP` or `IP:port`. A bare IPv4 literal has no port; anything else must split cleanly.
+        if let Ok(ip) = addr.parse::<std::net::IpAddr>() {
+            return Ok(Self {
+                ip: Some(ip),
+                port: DEFAULT_LISTEN_PORT,
+            });
+        }
+        let (host, port) = addr.rsplit_once(':').ok_or_else(invalid)?;
+        let ip: std::net::IpAddr = host.parse().map_err(|_| invalid())?;
+        Ok(Self {
+            ip: Some(ip),
+            port: parse_port(port).ok_or_else(invalid)?,
+        })
     }
+
+    /// The port only, for the generated site address and the activation URL.
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// The concrete `host:port` the activation listener binds.
+    ///
+    /// A host-less `:port` binds `0.0.0.0` — every interface — because that is what the spelling
+    /// means; every form that names an address binds exactly that address.
+    pub fn bind_address(&self) -> String {
+        match self.ip {
+            Some(ip) => std::net::SocketAddr::new(ip, self.port).to_string(),
+            None => std::net::SocketAddr::from(([0, 0, 0, 0], self.port)).to_string(),
+        }
+    }
+}
+
+/// Parse a decimal port, rejecting empty strings and values above `u16::MAX`.
+fn parse_port(port: &str) -> Option<u16> {
+    if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    port.parse().ok()
+}
+
+/// The concrete `host:port` the activation endpoint binds (T-SETUP-007).
+///
+/// `port` is the port resolved from the same address by [`SetupListen::parse`]; it is accepted so a
+/// caller holding both halves cannot pass a mismatched pair, and it must agree with the address's
+/// own port (the parser never produces a different one).
+pub fn activation_listen(addr: Option<&str>, port: u16) -> String {
+    let listen = SetupListen::parse(addr).unwrap_or_default();
+    let listen = SetupListen { port, ..listen };
+    listen.bind_address()
 }
 
 /// Pure config generation: builds the activation-layer Caddyfile and validates it with the
@@ -377,7 +453,8 @@ pub fn generate_config(args: &SetupArgs) -> Result<SetupConfig, SetupError> {
         other => return Err(SetupError::InvalidStorage(other.to_string())),
     }
     let timeout = registration_timeout(args)?;
-    let port = listen_port(args.listen_address.as_deref())?;
+    let listen = SetupListen::parse(args.listen_address.as_deref())?;
+    let port = listen.port();
     if args.cloudflare && args.cf_api_token.is_none() && std::env::var("CF_API_TOKEN").is_err() {
         return Err(SetupError::MissingCloudflareToken);
     }
@@ -435,11 +512,7 @@ pub fn generate_config(args: &SetupArgs) -> Result<SetupConfig, SetupError> {
         })
         .collect();
 
-    let data_dir = args
-        .data_dir
-        .clone()
-        .or_else(|| std::env::var_os("CADDY_RS_DATA_DIR").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from(".caddy-rs"));
+    let data_dir = resolve_data_dir(args);
     let config_path = data_dir.join("setup").join("Caddyfile");
 
     Ok(SetupConfig {
@@ -447,12 +520,27 @@ pub fn generate_config(args: &SetupArgs) -> Result<SetupConfig, SetupError> {
         json: adapted.config,
         config_path,
         activation_urls,
-        activation_listen: activation_listen(args.listen_address.as_deref(), port),
+        activation_listen: listen.bind_address(),
         registration_timeout: timeout,
         auth_method: args.auth_method,
         storage: args.storage.clone(),
         domain: args.domain.clone(),
+        hosts,
+        data_dir,
     })
+}
+
+/// The data directory a setup boot uses: `--data-dir`, else `$CADDY_RS_DATA_DIR`, else
+/// `./.caddy-rs`.
+///
+/// Resolved in one place because three consumers need the same answer (the generated Caddyfile's
+/// path, the `caddy-rs run` child and the `caddy-rs-pm` service); resolving it separately in each
+/// is how `--data-dir` came to reach the first and not the other two (T-SETUP-006).
+pub fn resolve_data_dir(args: &SetupArgs) -> PathBuf {
+    args.data_dir
+        .clone()
+        .or_else(|| std::env::var_os("CADDY_RS_DATA_DIR").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from(".caddy-rs"))
 }
 
 /// Single-use activation token.
@@ -567,8 +655,13 @@ pub const SERVICE_BIN_ENV: &str = "CADDY_RS_PM_BIN";
 /// service is started, generation-scoped and stopped without spawning a real process or binding a
 /// port. [`ProcessService`] is the production implementation.
 pub trait ServiceSupervisor {
-    /// Resolve and start the service for configuration generation `generation`.
-    fn start(&self, generation: u64) -> Result<(), SetupError>;
+    /// Resolve and start the service for configuration generation `generation`, with its data
+    /// directory at `data_dir`.
+    ///
+    /// `data_dir` is a parameter rather than ambient state because it is the one thing the
+    /// service cannot infer: its own default is `/var/lib/caddy-rs`, which is read-only on a
+    /// hardened host and is not where `setup` was told to write (T-SETUP-006).
+    fn start(&self, generation: u64, data_dir: &std::path::Path) -> Result<(), SetupError>;
 
     /// Stop the service. Idempotent, and must succeed when nothing was started.
     fn stop(&self) -> Result<(), SetupError>;
@@ -586,6 +679,7 @@ pub trait ServiceSupervisor {
 pub struct SetupService<S: ServiceSupervisor> {
     supervisor: S,
     generation: u64,
+    data_dir: PathBuf,
     started: std::cell::Cell<bool>,
 }
 
@@ -593,13 +687,19 @@ pub struct SetupService<S: ServiceSupervisor> {
 pub const SETUP_GENERATION: u64 = 1;
 
 impl<S: ServiceSupervisor> SetupService<S> {
-    /// Create the service for `generation`. Nothing is started yet.
-    pub fn new(supervisor: S, generation: u64) -> Self {
+    /// Create the service for `generation`, writing under `data_dir`. Nothing is started yet.
+    pub fn new(supervisor: S, generation: u64, data_dir: impl Into<PathBuf>) -> Self {
         Self {
             supervisor,
             generation,
+            data_dir: data_dir.into(),
             started: std::cell::Cell::new(false),
         }
+    }
+
+    /// The data directory the service is started with.
+    pub fn data_dir(&self) -> &std::path::Path {
+        &self.data_dir
     }
 
     /// The configuration generation this service is scoped to.
@@ -613,7 +713,7 @@ impl<S: ServiceSupervisor> SetupService<S> {
         if self.started.get() {
             return Ok(());
         }
-        self.supervisor.start(self.generation)?;
+        self.supervisor.start(self.generation, &self.data_dir)?;
         self.started.set(true);
         Ok(())
     }
@@ -688,10 +788,24 @@ fn find_on_path(name: &str) -> Option<std::path::PathBuf> {
 }
 
 impl ServiceSupervisor for ProcessService {
-    fn start(&self, generation: u64) -> Result<(), SetupError> {
+    fn start(&self, generation: u64, data_dir: &std::path::Path) -> Result<(), SetupError> {
         let binary = Self::resolve_binary()?;
+        // `caddy-rs-pm`'s data directory is the global `--data-dir` option, which also reads
+        // `PM_DATA_DIR`. Both are set, and deliberately so:
+        //
+        // * the flag is the contract — `pm/crates/pm-cli` parses `--data-dir` as a *global* option
+        //   (it must precede `serve`; `serve --data-dir` is a clap error, which systemd reports as
+        //   a failed start), so passing it here matches what the generated systemd unit does;
+        // * the environment variable covers a future `caddy-rs-pm` build whose argument order
+        //   differs, and is what an operator would set by hand.
+        //
+        // Without this the service ignores `caddy-rs setup --data-dir` and defaults to
+        // `/var/lib/caddy-rs`, which fails on a read-only filesystem (T-SETUP-006).
         let child = Command::new(&binary)
+            .arg("--data-dir")
+            .arg(data_dir)
             .arg("serve")
+            .env("PM_DATA_DIR", data_dir)
             .env("CADDY_RS_PM_GENERATION", generation.to_string())
             .stdin(std::process::Stdio::null())
             .spawn()
@@ -767,11 +881,12 @@ pub type ServerBootRunner = ServiceBootRunner<ProcessService>;
 impl ServiceBootRunner<ProcessService> {
     /// Build the runner with a generation-scoped `caddy-pm-rs` service. `Default` has no service,
     /// which keeps `boot` usable where no proxy manager is installed.
-    pub fn with_service() -> Self {
+    pub fn with_service(data_dir: impl Into<PathBuf>) -> Self {
         Self {
             service: Some(SetupService::new(
                 ProcessService::default(),
                 SETUP_GENERATION,
+                data_dir,
             )),
         }
     }
@@ -785,9 +900,9 @@ impl<S: ServiceSupervisor> Default for ServiceBootRunner<S> {
 
 impl<S: ServiceSupervisor> ServiceBootRunner<S> {
     /// Build a runner over an explicit supervisor (the test seam for the handoff behaviour).
-    pub fn with_supervisor(supervisor: S, generation: u64) -> Self {
+    pub fn with_supervisor(supervisor: S, generation: u64, data_dir: impl Into<PathBuf>) -> Self {
         Self {
-            service: Some(SetupService::new(supervisor, generation)),
+            service: Some(SetupService::new(supervisor, generation, data_dir)),
         }
     }
 }
@@ -823,6 +938,9 @@ impl<S: ServiceSupervisor> ServiceBootRunner<S> {
             .arg(&config.config_path)
             .arg("--adapter")
             .arg("caddyfile")
+            // T-SETUP-006: the child must write where `setup --data-dir` said, not to the default.
+            .arg("--data-dir")
+            .arg(&config.data_dir)
             .status()
             .map_err(|error| SetupError::BootFailed(error.to_string()))?;
         if !status.success() {
@@ -836,7 +954,8 @@ impl<S: ServiceSupervisor> ServiceBootRunner<S> {
 
 /// Run the setup command.
 pub fn run(args: SetupArgs) -> Result<(), SetupError> {
-    run_with_runner(args, &ServerBootRunner::with_service())
+    let data_dir = resolve_data_dir(&args);
+    run_with_runner(args, &ServerBootRunner::with_service(data_dir))
 }
 
 /// Run setup against an explicit boot runner (the test seam).
@@ -885,6 +1004,9 @@ mod t_setup_004_tests {
     /// Serialises tests that mutate process-global environment variables.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    /// The data directory the recording-supervisor tests are started with.
+    const DATA_DIR: &str = "/nonexistent/t-setup-data";
+
     #[derive(Debug, Default)]
     struct RecordingSupervisor {
         log: RefCell<Vec<String>>,
@@ -892,11 +1014,13 @@ mod t_setup_004_tests {
     }
 
     impl ServiceSupervisor for RecordingSupervisor {
-        fn start(&self, generation: u64) -> Result<(), SetupError> {
+        fn start(&self, generation: u64, data_dir: &std::path::Path) -> Result<(), SetupError> {
             if self.fail_start {
                 return Err(SetupError::ServiceUnavailable("no binary".to_string()));
             }
-            self.log.borrow_mut().push(format!("start({generation})"));
+            self.log
+                .borrow_mut()
+                .push(format!("start({generation},{})", data_dir.display()));
             Ok(())
         }
 
@@ -910,8 +1034,8 @@ mod t_setup_004_tests {
     struct Shared(Arc<RecordingSupervisor>);
 
     impl ServiceSupervisor for Shared {
-        fn start(&self, generation: u64) -> Result<(), SetupError> {
-            self.0.start(generation)
+        fn start(&self, generation: u64, data_dir: &std::path::Path) -> Result<(), SetupError> {
+            self.0.start(generation, data_dir)
         }
         fn stop(&self) -> Result<(), SetupError> {
             self.0.stop()
@@ -921,12 +1045,12 @@ mod t_setup_004_tests {
     #[test]
     fn the_service_is_scoped_to_the_setup_generation() {
         let supervisor = Arc::new(RecordingSupervisor::default());
-        let service = SetupService::new(Shared(supervisor.clone()), SETUP_GENERATION);
+        let service = SetupService::new(Shared(supervisor.clone()), SETUP_GENERATION, DATA_DIR);
         assert_eq!(service.generation(), SETUP_GENERATION);
         run_service_around_boot(&service, |()| Ok(())).expect("boot");
         assert_eq!(
             supervisor.log.borrow()[0],
-            format!("start({SETUP_GENERATION})"),
+            format!("start({SETUP_GENERATION},{DATA_DIR})"),
             "the service must be started for the setup configuration generation, not generation 0"
         );
     }
@@ -936,11 +1060,14 @@ mod t_setup_004_tests {
         // Criterion 1's second half. My first round of tests did not cover it: deleting the stop
         // call left all of them green.
         let supervisor = Arc::new(RecordingSupervisor::default());
-        let service = SetupService::new(Shared(supervisor.clone()), SETUP_GENERATION);
+        let service = SetupService::new(Shared(supervisor.clone()), SETUP_GENERATION, DATA_DIR);
         run_service_around_boot(&service, |()| Ok(())).expect("boot");
         assert_eq!(
             *supervisor.log.borrow(),
-            vec![format!("start({SETUP_GENERATION})"), "stop".to_string()],
+            vec![
+                format!("start({SETUP_GENERATION},{DATA_DIR})"),
+                "stop".to_string()
+            ],
             "start -> stop around a successful boot"
         );
     }
@@ -949,14 +1076,17 @@ mod t_setup_004_tests {
     fn the_service_is_stopped_on_handoff_when_the_boot_fails() {
         // A failed boot must not leak the service.
         let supervisor = Arc::new(RecordingSupervisor::default());
-        let service = SetupService::new(Shared(supervisor.clone()), SETUP_GENERATION);
+        let service = SetupService::new(Shared(supervisor.clone()), SETUP_GENERATION, DATA_DIR);
         let result = run_service_around_boot(&service, |()| {
             Err(SetupError::BootFailed("simulated".to_string()))
         });
         assert!(result.is_err(), "the boot failure propagates");
         assert_eq!(
             *supervisor.log.borrow(),
-            vec![format!("start({SETUP_GENERATION})"), "stop".to_string()],
+            vec![
+                format!("start({SETUP_GENERATION},{DATA_DIR})"),
+                "stop".to_string()
+            ],
             "the service must still be stopped after a failed boot"
         );
     }
@@ -971,6 +1101,7 @@ mod t_setup_004_tests {
                 ..Default::default()
             },
             SETUP_GENERATION,
+            DATA_DIR,
         );
         let booted = std::cell::Cell::new(false);
         let error = run_service_around_boot(&service, |()| {
@@ -987,7 +1118,7 @@ mod t_setup_004_tests {
     #[test]
     fn starting_twice_does_not_leak_a_second_service() {
         let supervisor = Arc::new(RecordingSupervisor::default());
-        let service = SetupService::new(Shared(supervisor.clone()), 1);
+        let service = SetupService::new(Shared(supervisor.clone()), 1, DATA_DIR);
         service.start().expect("start");
         service.start().expect("start again");
         assert_eq!(
@@ -1000,7 +1131,7 @@ mod t_setup_004_tests {
     #[test]
     fn stop_is_idempotent_and_safe_when_never_started() {
         let supervisor = Arc::new(RecordingSupervisor::default());
-        let service = SetupService::new(Shared(supervisor.clone()), 1);
+        let service = SetupService::new(Shared(supervisor.clone()), 1, DATA_DIR);
         service.stop().expect("stop before start");
         assert!(supervisor.log.borrow().is_empty(), "nothing to stop");
 
@@ -1009,7 +1140,7 @@ mod t_setup_004_tests {
         service.stop().expect("stop again");
         assert_eq!(
             *supervisor.log.borrow(),
-            vec!["start(1)".to_string(), "stop".to_string()],
+            vec![format!("start(1,{DATA_DIR})"), "stop".to_string()],
             "stop must not double-stop the service"
         );
     }
