@@ -872,8 +872,35 @@ fn request_path_escapes_root(decoded_path: &str, windows: bool) -> bool {
     // Win32 path normalisation drops trailing dots and spaces *after* `hide` and the matchers have
     // looked at the name: `secret.env.` and `secret.env ` open `secret.env` while `*.env` does not
     // match them. Refuse any component that would be altered that way (`.` itself is a no-op).
+    // Device names (`NUL`, `COM1`, ...) open a device, not a file; Go's `filepath.IsLocal`, which
+    // stock Caddy's `SanitizedPathJoin` relies on, refuses them too.
     decoded_path.split(['/', '\\']).any(|component| {
-        component != "." && component.trim_end_matches(['.', ' ']) != component
+        (component != "." && component.trim_end_matches(['.', ' ']) != component)
+            || is_windows_reserved_name(component)
+    })
+}
+
+/// Whether a path component names a Windows device (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`,
+/// `LPT1`-`LPT9` with the superscript digits, `CONIN$`, `CONOUT$`), with any extension or stream
+/// suffix. Mirrors Go's `isReservedName` (`internal/filepathlite`), but refuses a device name with
+/// an extension unconditionally: Go consults `RtlIsDosDeviceName_U` for that case because Windows
+/// 11 no longer treats `CON.txt` as a device, and this check cannot call it from a portable test.
+fn is_windows_reserved_name(component: &str) -> bool {
+    // Device names can have arbitrary trailing characters after a dot or colon; trailing spaces in
+    // the base are ignored.
+    let base = component.split(['.', ':']).next().unwrap_or("");
+    let upper = base.trim_end_matches(' ').to_ascii_uppercase();
+    if matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) {
+        return true;
+    }
+    ["COM", "LPT"].iter().any(|prefix| {
+        upper.strip_prefix(prefix).is_some_and(|digit| {
+            matches!(digit, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+                || matches!(digit, "\u{b2}" | "\u{b3}" | "\u{b9}")
+        })
     })
 }
 
@@ -1921,6 +1948,14 @@ mod tests {
             "/secret.env ",
             "/secret.env. .",
             "/dir/secret.env./x",
+            "/NUL",
+            "/nul.txt",
+            "/dir/COM1",
+            "/LPT9.log",
+            "/CONIN$",
+            "/conout$",
+            "/aux ",
+            "/COM\u{b9}",
         ] {
             assert!(
                 request_path_escapes_root(path, true),
@@ -1943,6 +1978,12 @@ mod tests {
             "/trailing.dot.txt",
             "/./x",
             "/name with spaces.txt",
+            "/CONSOLE",
+            "/COM10",
+            "/COM0",
+            "/nullable.txt",
+            "/auxiliary",
+            "/connect/lpt",
         ] {
             assert!(
                 !request_path_escapes_root(path, true),
