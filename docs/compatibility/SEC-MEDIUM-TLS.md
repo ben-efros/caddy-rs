@@ -129,6 +129,42 @@ loses stapling, and a Must-Staple certificate behind such a responder fails clos
 a security regression the operator should opt into with a dedicated knob (follow-up). Test:
 `sha1_and_pss_response_signatures_are_rejected_with_a_typed_error`.
 
+### Review round 3 additions (D1)
+
+* **Refresh schedule.** A staple is refreshed at the half-life of its response
+  (`thisUpdate + (nextUpdate - thisUpdate)/2`, as certmagic does). The old rule refreshed `check
+  interval` (1 h) before `nextUpdate` on an hourly scan, i.e. about one attempt per lifetime, so one
+  responder blip let the staple expire (Must-Staple certificates then failed hard). Failed fetches
+  retry with the stapler's 30 s doubling backoff, and the server scan now ticks at
+  `min(ocsp_interval, 60 s)` (a tick with nothing due makes no request). The previous good staple is
+  kept until it actually expires.
+* **Handshake-time expiry.** The resolver stores each staple's `nextUpdate` and hands rustls the
+  certificate without the staple from that instant, with no scan needed
+  (`CertificateResolver::select` / `select_with_tags`). `OcspStapler::staple()` applies the same rule.
+* **Replayed revocations.** A verified `revoked` response evicts the cached staple only if its
+  `thisUpdate` is not older than the cached one; otherwise it is `SupersededRevocation` and ignored. A
+  `revoked (certificateHold)` statement replayed after reinstatement can therefore no longer evict a
+  newer `good` staple. A genuinely newer `certificateHold` still evicts: while the hold lasts the
+  certificate is revoked, and the next good response (after reinstatement) restores the staple.
+* **Times.** `GeneralizedTime` fractions (`.d+`) and numeric zones (`+hhmm`/`-hhmm`, applied to
+  UTC) are accepted like Go's `encoding/asn1`; a value without a zone designator is rejected; UTCTime
+  without seconds is accepted. ASCII-only validation and range checks stay (no panics).
+* **Refresh race.** `CertificateResolver::replace_if_current` re-installs a re-stapled certificate
+  only if the resolver still serves that leaf for every name, so a renewal that landed during the
+  network fetch is not undone by the stale snapshot.
+* Supply chain note: no secret scanner (for example gitleaks) runs in `.github/workflows`. The
+  committed OCSP fixtures contain only public material (certificates, OCSP responses); the
+  generator deletes every private key with its scratch directory and none is committed.
+
+### Known pre-existing issues (recorded, not fixed here)
+
+* `caddy_issuer_key("http://localhost:14000/dir")` yields `localhost:14000-dir`
+  (`crates/tls/src/storage.rs`); `:` is invalid in Windows file names. This is why two
+  `automatic_https` tests fail natively on Windows with os error 123
+  (`provisioner_honors_configured_trusted_roots_over_real_tls`,
+  `renewal_uses_configured_trusted_roots_over_real_tls`); it predates this branch. certmagic's
+  `Safe()` maps `:` to `-`.
+
 ### Exact program-repository text to merge
 
 `docs/compatibility/BEHAVIOR-DIVERGENCES.md`, DIV-0087 (OCSP response signature): change the status
@@ -296,8 +332,11 @@ argon2 key) and the CLI `TokenStore` (live activation tokens; only the count is 
 Reviewed and left as is: `TlsCertificate.private_key` (rustls's `PrivateKeyDer` redacts itself),
 `RefreshTokenRecord` (stores only a hash), ACME-server `Account.key` (a public JWK), HTTP-01/ALPN
 challenge tokens (public by protocol), `CertKeyFilePair.key` and `AdminIdentity.key` (paths).
-**Still deriving `Debug` over secret-ish data, not fixed:** `crates/cli/src/enrollment.rs::State`
-(`issued_uri`, the enrolment secret URI) and `authn::MemoryUserStore` (refresh-token hashes only).
+Round 3 also redacted `cli::enrollment::State` and `EnrollmentOutcome::SecretIssued` (the TOTP
+`otpauth://` URI and session token) and the `extra` maps of `ModuleRef`, `NamedModuleRef`,
+`ProviderModuleRef` and `StorageConfig` (values under token/secret/password/key/credential/api/auth
+keys, nested too; keys stay visible). `authn::MemoryUserStore` already goes through redacting
+impls (`User`, `RefreshTokenRecord`) and needed nothing.
 
 ### Exact program-repository text to merge
 

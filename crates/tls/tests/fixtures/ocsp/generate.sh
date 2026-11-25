@@ -1,7 +1,8 @@
 #!/bin/bash
 # Generates independent OCSP fixtures with the OpenSSL CLI (see the README next to the output).
 set -euo pipefail
-OUT="$1"
+mkdir -p "$1"
+OUT=$(realpath "$1")   # resolve BEFORE the cd into the scratch directory
 WORK=$(mktemp -d)
 cd "$WORK"
 SERIAL_HEX=8F2A6C41D9B37E5510A4C3D2E1F00B97   # high bit set: DER INTEGER carries a 00 prefix
@@ -60,7 +61,7 @@ EOF
   openssl x509 -in ca.pem -outform DER -out "$d/issuer.der"
   cp resp.der "$d/response.der"
   rm -f resp.pem resp.key resp.csr resp.ext
-  echo "$name: $(stat -c %s "$d/response.der") bytes"
+  echo "$name: $(wc -c < "$d/response.der" | tr -d " ") bytes"
 }
 
 make_case rsa2048-direct-byname-good-nonce  rsa2048 good           direct    byname nonce

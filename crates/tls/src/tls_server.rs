@@ -752,6 +752,8 @@ pub struct TlsCertificate {
     external: Option<ExternalKey>,
     /// DER-encoded OCSP response to staple with this certificate (T-TLS-051).
     ocsp_staple: Option<Vec<u8>>,
+    /// `nextUpdate` of the staple: the resolver stops handing the staple to rustls from then on.
+    ocsp_expiry: Option<std::time::SystemTime>,
     /// Configured source of this certificate, used to locate key errors when several
     /// certificates are configured (`apps.tls.certificates.load_files[i]`, a storage key, ...).
     source: Option<String>,
@@ -791,6 +793,7 @@ impl Clone for TlsCertificate {
                 signer: Arc::clone(&external.signer),
             }),
             ocsp_staple: self.ocsp_staple.clone(),
+            ocsp_expiry: self.ocsp_expiry,
             source: self.source.clone(),
         }
     }
@@ -831,6 +834,7 @@ impl TlsCertificate {
             private_key: Some(private_key),
             external: None,
             ocsp_staple: None,
+            ocsp_expiry: None,
             source,
         })
     }
@@ -902,6 +906,7 @@ impl TlsCertificate {
             private_key: Some(private_key),
             external: None,
             ocsp_staple: None,
+            ocsp_expiry: None,
             source,
         })
     }
@@ -935,6 +940,7 @@ impl TlsCertificate {
             private_key: Some(private_key),
             external: None,
             ocsp_staple: None,
+            ocsp_expiry: None,
             source,
         })
     }
@@ -998,6 +1004,13 @@ impl TlsCertificate {
     /// the resolver-inserted certificate with the returned staple. `None` clears it.
     pub fn with_ocsp_staple(mut self, staple: Option<Vec<u8>>) -> Self {
         self.ocsp_staple = staple;
+        self
+    }
+
+    /// Record when the attached OCSP staple expires (`nextUpdate`); from that instant the
+    /// resolver serves the certificate without it, even if no refresh ran since.
+    pub fn with_ocsp_expiry(mut self, expiry: Option<std::time::SystemTime>) -> Self {
+        self.ocsp_expiry = expiry;
         self
     }
 
@@ -1089,6 +1102,31 @@ struct ResolverState {
     tagged: Vec<TaggedCertificate>,
     /// Source certificates (with keys) so the server can rebuild entries with OCSP staples.
     sources: Vec<TlsCertificate>,
+    /// Stapled entries with the instant their OCSP response expires (`nextUpdate`).
+    expiries: Vec<(Arc<CertifiedKey>, std::time::SystemTime)>,
+}
+
+impl ResolverState {
+    /// The key to hand to rustls: `certified` itself, or a copy without the OCSP staple once the
+    /// staple's `nextUpdate` has passed (no scan has to run for that to take effect).
+    fn serve(&self, certified: Arc<CertifiedKey>) -> Arc<CertifiedKey> {
+        if certified.ocsp.is_none() {
+            return certified;
+        }
+        let expired = self
+            .expiries
+            .iter()
+            .find(|(candidate, _)| Arc::ptr_eq(candidate, &certified))
+            .is_some_and(|(_, expiry)| std::time::SystemTime::now() >= *expiry);
+        if expired {
+            return Arc::new(CertifiedKey {
+                cert: certified.cert.clone(),
+                key: Arc::clone(&certified.key),
+                ocsp: None,
+            });
+        }
+        certified
+    }
 }
 
 #[derive(Debug)]
@@ -1103,6 +1141,12 @@ struct TaggedCertificate {
 impl ResolverState {
     fn insert(&mut self, certificate: TlsCertificate) -> Result<()> {
         let certified = Arc::new(certificate.certified_key()?);
+        // Entries that are no longer referenced by any name map are dropped from the expiry list.
+        self.expiries
+            .retain(|(candidate, _)| Arc::strong_count(candidate) > 1);
+        if let (Some(_), Some(expiry)) = (&certificate.ocsp_staple, certificate.ocsp_expiry) {
+            self.expiries.push((Arc::clone(&certified), expiry));
+        }
         // Keep the source for OCSP re-stapling; replace entries covering the same leaf rather than
         // growing on each refresh.
         let leaf = certificate.chain()[0].as_ref().to_vec();
@@ -1301,20 +1345,46 @@ impl CertificateResolver {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some(server_name) = server_name else {
-            return state.default.clone();
+            return state.default.clone().map(|key| state.serve(key));
         };
         let name = normalize_server_name(server_name);
         if let Some(certified) = state.certificates.get(&name) {
-            return Some(Arc::clone(certified));
+            return Some(state.serve(Arc::clone(certified)));
         }
         if let Some((_, rest)) = name.split_once('.') {
             if !rest.is_empty() && rest.contains('.') {
                 if let Some(certified) = state.certificates.get(&format!("*.{rest}")) {
-                    return Some(Arc::clone(certified));
+                    return Some(state.serve(Arc::clone(certified)));
                 }
             }
         }
-        state.default.clone()
+        state.default.clone().map(|key| state.serve(key))
+    }
+
+    /// Re-insert `certificate` (typically the same certificate with a fresh OCSP staple) only if
+    /// it is still what this resolver serves for every one of its names: a compare-and-swap on
+    /// the leaf. The OCSP refresh snapshots an entry, awaits a network fetch and then re-inserts;
+    /// a renewal that landed in between must not be undone by the stale snapshot. Returns whether
+    /// the certificate was installed.
+    pub fn replace_if_current(&self, certificate: TlsCertificate) -> Result<bool> {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(leaf) = certificate.chain().first() else {
+            return Ok(false);
+        };
+        let current = certificate.names().iter().all(|name| {
+            state
+                .certificates
+                .get(&normalize_server_name(name))
+                .is_some_and(|served| served.cert.first() == Some(leaf))
+        });
+        if !current {
+            return Ok(false);
+        }
+        state.insert(certificate)?;
+        Ok(true)
     }
 }
 
@@ -1360,14 +1430,14 @@ impl TaggedCertificateSelector for CertificateResolver {
             .collect();
         let first = candidates.first()?;
         let Some(server_name) = server_name else {
-            return Some(Arc::clone(&first.certified));
+            return Some(state.serve(Arc::clone(&first.certified)));
         };
         let name = normalize_server_name(server_name);
         if let Some(candidate) = candidates
             .iter()
             .find(|candidate| candidate.names.iter().any(|candidate| candidate == &name))
         {
-            return Some(Arc::clone(&candidate.certified));
+            return Some(state.serve(Arc::clone(&candidate.certified)));
         }
         if let Some((_, rest)) = name.split_once('.') {
             if !rest.is_empty() && rest.contains('.') {
@@ -1376,12 +1446,12 @@ impl TaggedCertificateSelector for CertificateResolver {
                     .iter()
                     .find(|candidate| candidate.names.iter().any(|name| name == &wildcard))
                 {
-                    return Some(Arc::clone(&candidate.certified));
+                    return Some(state.serve(Arc::clone(&candidate.certified)));
                 }
             }
         }
         // Caddy's certmagic default selector falls back to the first viable candidate.
-        Some(Arc::clone(&first.certified))
+        Some(state.serve(Arc::clone(&first.certified)))
     }
 }
 
@@ -1859,6 +1929,7 @@ fn load_pkcs11_pair(
         private_key: None,
         external: Some(ExternalKey { pool, signer }),
         ocsp_staple: None,
+        ocsp_expiry: None,
         source: Some(path.to_string()),
     })
 }

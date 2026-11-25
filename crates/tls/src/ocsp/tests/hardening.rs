@@ -53,7 +53,11 @@ fn asn1_time_field_ranges_are_validated() {
         "20231114221360Z", // second 60
         "2023111422132Z",  // too short
         "202311142213200Z",
-        "20231114221320X", // not a Z
+        "20231114221320X",     // not a Z
+        "20231114221320.Z",    // empty fraction
+        "20231114221320+24",   // short offset
+        "20231114221320+2460", // minute 60 in the offset
+        "20231114221320Zz",
     ] {
         assert!(parse_asn1_time(0x18, bad.as_bytes()).is_err(), "{bad}");
     }
@@ -62,10 +66,9 @@ fn asn1_time_field_ranges_are_validated() {
         "leap day"
     );
     assert!(parse_asn1_time(0x17, b"231114221320Z").is_ok());
-    assert!(
-        parse_asn1_time(0x17, b"231114221320").is_ok(),
-        "Z is optional"
-    );
+    // A value without a zone designator is ambiguous (local time) and rejected, as in Go.
+    assert!(parse_asn1_time(0x17, b"231114221320").is_err());
+    assert!(parse_asn1_time(0x18, b"20231114221320").is_err());
 }
 
 #[test]
@@ -549,4 +552,252 @@ fn oversized_responses_are_rejected_before_they_can_be_stapled() {
     ];
     let error = parse_ocsp_response(&spec.build()).expect_err("100 KiB response");
     assert!(error.to_string().contains("exceeds"), "{error}");
+}
+
+#[test]
+fn asn1_time_accepts_fractions_and_numeric_offsets_like_go() {
+    let utc = parse_asn1_time(0x18, b"20261124120000Z").unwrap();
+    // Fractional seconds (Go's encoding/asn1 accepts them; real responders emit them).
+    assert_eq!(parse_asn1_time(0x18, b"20261124120000.123Z").unwrap(), utc);
+    assert_eq!(parse_asn1_time(0x18, b"20261124120000.5Z").unwrap(), utc);
+    // Numeric offsets are applied: 14:00 at +0200 is 12:00 UTC.
+    assert_eq!(parse_asn1_time(0x18, b"20261124140000+0200").unwrap(), utc);
+    assert_eq!(parse_asn1_time(0x18, b"20261124103000-0130").unwrap(), utc);
+    assert_eq!(parse_asn1_time(0x17, b"261124120000Z").unwrap(), utc);
+    assert_eq!(parse_asn1_time(0x17, b"261124140000+0200").unwrap(), utc);
+    // UTCTime without seconds.
+    assert_eq!(parse_asn1_time(0x17, b"2611241200Z").unwrap(), utc);
+    // The multi-byte panic inputs stay plain errors, also after a fraction or offset.
+    for bad in [
+        "201\u{e9}0101000000Z",
+        "20261124120000.\u{e9}Z",
+        "20261124120000+02\u{e9}",
+    ] {
+        assert!(parse_asn1_time(0x18, bad.as_bytes()).is_err(), "{bad}");
+    }
+}
+
+// --- Refresh schedule, handshake-time expiry, replay of older revocations --------------------
+
+#[tokio::test]
+async fn staple_is_refreshed_at_half_life_and_retried_soon_after_a_failure() {
+    let clock = Arc::new(ManualClock::new(now_at(Duration::ZERO)));
+    let transport = Arc::new(MockTransport::with(ocsp_response(
+        &[7],
+        START.as_secs(),
+        Some(START.as_secs() + 4 * HOUR),
+    )));
+    let stapler = make_stapler(
+        Arc::clone(&transport) as Arc<dyn OcspTransport>,
+        OcspPolicy::default(),
+        clock.clone(),
+    );
+    let leaf = leaf_certificate(&[7], Some("http://ocsp.example.test"), false);
+    let issuer = issuer_certificate();
+    assert_eq!(
+        stapler.ensure_staple(&leaf, &issuer).await.unwrap(),
+        StapleOutcome::Fetched
+    );
+    // One second before half of the validity window: nothing to do.
+    clock.advance(Duration::from_secs(2 * HOUR - 1));
+    assert_eq!(
+        stapler.ensure_staple(&leaf, &issuer).await.unwrap(),
+        StapleOutcome::Cached
+    );
+    assert_eq!(transport.call_count(), 1);
+    // At half-life the refresh is attempted (certmagic: thisUpdate + (nextUpdate - thisUpdate)/2)
+    // and fails because the responder has nothing scripted.
+    clock.advance(Duration::from_secs(1));
+    assert!(stapler.ensure_staple(&leaf, &issuer).await.is_err());
+    assert_eq!(transport.call_count(), 2);
+    // The previous good staple is kept while refreshes fail.
+    assert!(stapler.staple(&leaf).is_some());
+    // The retry does not wait for the next hourly scan: after the 30 s backoff it tries again
+    // and succeeds.
+    clock.advance(Duration::from_secs(29));
+    assert_eq!(
+        stapler.ensure_staple(&leaf, &issuer).await.unwrap_err(),
+        OcspError::Backoff
+    );
+    transport.push(ocsp_response(
+        &[7],
+        START.as_secs() + 2 * HOUR,
+        Some(START.as_secs() + 6 * HOUR),
+    ));
+    clock.advance(Duration::from_secs(1));
+    assert_eq!(
+        stapler.ensure_staple(&leaf, &issuer).await.unwrap(),
+        StapleOutcome::Fetched
+    );
+    assert_eq!(transport.call_count(), 3);
+}
+
+#[tokio::test]
+async fn failed_refreshes_keep_the_staple_until_it_actually_expires() {
+    let clock = Arc::new(ManualClock::new(now_at(Duration::ZERO)));
+    let transport = Arc::new(MockTransport::with(ocsp_response(
+        &[7],
+        START.as_secs(),
+        Some(START.as_secs() + 4 * HOUR),
+    )));
+    let stapler = make_stapler(
+        Arc::clone(&transport) as Arc<dyn OcspTransport>,
+        OcspPolicy::default(),
+        clock.clone(),
+    );
+    let leaf = leaf_certificate(&[7], Some("http://ocsp.example.test"), false);
+    let issuer = issuer_certificate();
+    stapler.ensure_staple(&leaf, &issuer).await.unwrap();
+    clock.advance(Duration::from_secs(2 * HOUR));
+    assert!(stapler.ensure_staple(&leaf, &issuer).await.is_err());
+    clock.advance(Duration::from_secs(2 * HOUR - 1));
+    assert!(
+        stapler.staple(&leaf).is_some(),
+        "still valid one second early"
+    );
+    clock.advance(Duration::from_secs(1));
+    assert!(stapler.staple(&leaf).is_none(), "expired at nextUpdate");
+}
+
+fn p256_certificate(serial: u8) -> TlsCertificate {
+    let rng = aws_lc_rs::rand::SystemRandom::new();
+    let pkcs8 = aws_lc_rs::signature::EcdsaKeyPair::generate_pkcs8(
+        &aws_lc_rs::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+        &rng,
+    )
+    .unwrap();
+    TlsCertificate::from_der(
+        vec![leaf_certificate(
+            &[serial],
+            Some("http://ocsp.example.test"),
+            false,
+        )],
+        pkcs8.as_ref().to_vec(),
+        vec!["example.test".to_string()],
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn handshake_does_not_serve_a_staple_past_next_update_even_without_a_scan() {
+    let wall = SystemTime::now();
+    let wall_secs = wall.duration_since(UNIX_EPOCH).unwrap().as_secs();
+    // Fresh against the real clock: served.
+    let clock = Arc::new(ManualClock::new(wall));
+    let stapler = make_stapler(
+        Arc::new(MockTransport::with(ocsp_response(
+            &[7],
+            wall_secs - 60,
+            Some(wall_secs + HOUR),
+        ))) as Arc<dyn OcspTransport>,
+        OcspPolicy::default(),
+        clock,
+    );
+    let certificate = p256_certificate(7);
+    let leaf = certificate.chain()[0].as_ref().to_vec();
+    stapler
+        .ensure_staple(&leaf, &issuer_certificate())
+        .await
+        .unwrap();
+    let resolver = crate::tls_server::CertificateResolver::new();
+    resolver
+        .insert(staple_for_certificate(&stapler, certificate))
+        .unwrap();
+    assert!(resolver
+        .select(Some("example.test"))
+        .unwrap()
+        .ocsp
+        .is_some());
+
+    // Valid for the stapler's (injected, 2023) clock but long past `nextUpdate` for the wall
+    // clock the handshake runs on: no scan ran since, and the staple must not be served.
+    let clock = Arc::new(ManualClock::new(now_at(Duration::ZERO)));
+    let stapler = make_stapler(
+        Arc::new(MockTransport::with(ocsp_response(
+            &[8],
+            START.as_secs(),
+            Some(START.as_secs() + HOUR),
+        ))) as Arc<dyn OcspTransport>,
+        OcspPolicy::default(),
+        clock,
+    );
+    let certificate = p256_certificate(8);
+    let leaf = certificate.chain()[0].as_ref().to_vec();
+    stapler
+        .ensure_staple(&leaf, &issuer_certificate())
+        .await
+        .unwrap();
+    let stapled = staple_for_certificate(&stapler, certificate);
+    assert!(stapled.ocsp_staple().is_some());
+    let resolver = crate::tls_server::CertificateResolver::new();
+    resolver.insert(stapled).unwrap();
+    assert!(
+        resolver
+            .select(Some("example.test"))
+            .unwrap()
+            .ocsp
+            .is_none(),
+        "an expired staple must not be handed to rustls"
+    );
+}
+
+#[tokio::test]
+async fn replayed_older_revoked_response_does_not_evict_a_newer_good_staple() {
+    let clock = Arc::new(ManualClock::new(now_at(Duration::ZERO)));
+    let transport = Arc::new(MockTransport::with(ocsp_response(
+        &[7],
+        START.as_secs() + 1_000,
+        Some(START.as_secs() + 1_000 + 4 * HOUR),
+    )));
+    let stapler = make_stapler(
+        Arc::clone(&transport) as Arc<dyn OcspTransport>,
+        OcspPolicy::default(),
+        clock.clone(),
+    );
+    let leaf = leaf_certificate(&[7], Some("http://ocsp.example.test"), false);
+    let issuer = issuer_certificate();
+    clock.advance(Duration::from_secs(1_000));
+    stapler.ensure_staple(&leaf, &issuer).await.unwrap();
+    // Half-life of the cached staple.
+    clock.advance(Duration::from_secs(2 * HOUR));
+    // An attacker replays a genuine `revoked (certificateHold)` response that predates the
+    // cached `good` one and has not expired yet.
+    let mut replay = ResponseSpec::good(&[7], START.as_secs(), Some(START.as_secs() + 3 * HOUR));
+    replay.status_tag = 0xA1;
+    transport.push(replay.build());
+    let error = stapler
+        .ensure_staple(&leaf, &issuer)
+        .await
+        .expect_err("not stapled");
+    assert!(error.to_string().contains("older"), "{error}");
+    assert!(
+        stapler.staple(&leaf).is_some(),
+        "an older revocation must not evict the newer good staple"
+    );
+}
+
+#[test]
+fn a_stale_snapshot_does_not_undo_a_renewal_that_landed_during_the_fetch() {
+    let old = p256_certificate(7);
+    let renewed = p256_certificate(8);
+    let resolver = crate::tls_server::CertificateResolver::new();
+    resolver.insert(old.clone()).unwrap();
+    // The OCSP refresh snapshotted `old` and is awaiting the responder; a renewal replaces it.
+    resolver.insert(renewed.clone()).unwrap();
+    let installed = resolver
+        .replace_if_current(old.clone().with_ocsp_staple(Some(vec![0x30, 0x00])))
+        .unwrap();
+    assert!(!installed, "the stale snapshot must be dropped");
+    let served = resolver.select(Some("example.test")).unwrap();
+    assert_eq!(served.cert[0].as_ref(), renewed.chain()[0].as_ref());
+    assert!(served.ocsp.is_none());
+    // The renewed certificate itself can be re-stapled.
+    assert!(resolver
+        .replace_if_current(renewed.with_ocsp_staple(Some(vec![0x30, 0x00])))
+        .unwrap());
+    assert!(resolver
+        .select(Some("example.test"))
+        .unwrap()
+        .ocsp
+        .is_some());
 }

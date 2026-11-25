@@ -3086,8 +3086,15 @@ async fn apply_ocsp_staples(
         }
         match stapler.ensure_staple(leaf.as_ref(), issuer.as_ref()).await {
             Ok(outcome) if outcome.has_staple() => {
-                match resolver.insert(staple_for_certificate(stapler, certificate.clone())) {
-                    Ok(()) => {}
+                match resolver
+                    .replace_if_current(staple_for_certificate(stapler, certificate.clone()))
+                {
+                    Ok(true) => {}
+                    Ok(false) => tracing::debug!(
+                        subject,
+                        "certificate was replaced while its OCSP staple was being fetched; \
+                         keeping the new certificate"
+                    ),
                     Err(error) => tracing::warn!(
                         subject,
                         %error,
@@ -3100,11 +3107,9 @@ async fn apply_ocsp_staples(
                 // The stapler withdraws a staple on a verified revocation and never serves one
                 // past its `nextUpdate`; mirror that into the resolver so the handshake stops
                 // stapling the old response (a still-fresh previous staple is kept).
-                let current = stapler.staple(leaf.as_ref());
-                if certificate.ocsp_staple() != current.as_deref() {
-                    if let Err(insert_error) =
-                        resolver.insert(certificate.clone().with_ocsp_staple(current))
-                    {
+                let refreshed = staple_for_certificate(stapler, certificate.clone());
+                if certificate.ocsp_staple() != refreshed.ocsp_staple() {
+                    if let Err(insert_error) = resolver.replace_if_current(refreshed) {
                         tracing::warn!(
                             subject,
                             %insert_error,
@@ -3115,7 +3120,9 @@ async fn apply_ocsp_staples(
                 if matches!(error, OcspError::Revoked) {
                     tracing::error!(
                         subject,
-                        "OCSP responder reports this certificate as REVOKED; the staple was                          withdrawn. Automatic re-issuance of revoked certificates is not                          implemented: replace the certificate"
+                        "OCSP responder reports this certificate as REVOKED; the staple was \
+                         withdrawn. Automatic re-issuance of revoked certificates is not \
+                         implemented: replace the certificate"
                     );
                 } else {
                     tracing::warn!(
@@ -3129,14 +3136,22 @@ async fn apply_ocsp_staples(
     }
 }
 
+/// Upper bound for the OCSP scan tick (see [`spawn_ocsp_refresh`]).
+const OCSP_SCAN_TICK: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Spawn the periodic OCSP freshness scan for one generation.
 fn spawn_ocsp_refresh(
     resolver: Arc<CertificateResolver>,
     plan: AutomaticHttpsPlan,
     stapler: SharedOcspStapler,
 ) -> OcspRefresh {
+    // Staples are refreshed at half of their validity and a failed refresh is retried with the
+    // stapler's own backoff (30 s doubling), so the scan must tick well inside one hour: with an
+    // hourly tick a single responder blip would let a staple expire. A tick with nothing due
+    // costs no network request.
     let period = plan
         .ocsp_check_interval
+        .min(OCSP_SCAN_TICK)
         .max(std::time::Duration::from_secs(1));
     let handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(period);

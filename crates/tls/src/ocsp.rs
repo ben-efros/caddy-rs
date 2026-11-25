@@ -79,6 +79,11 @@ pub enum OcspError {
     /// A verified (authentic, fresh, matching) response says the certificate is revoked.
     #[error("OCSP responder reports the certificate as revoked; the staple was withdrawn")]
     Revoked,
+    /// A verified `revoked` response is OLDER (`thisUpdate`) than the cached `good` staple: a
+    /// replay of a superseded statement (for example `certificateHold` before reinstatement). It
+    /// is ignored and the newer staple stays.
+    #[error("OCSP revoked response is older than the cached staple and was ignored")]
+    SupersededRevocation,
     /// A verified response says the responder does not know the certificate.
     #[error("OCSP responder reports the certificate status as unknown")]
     UnknownStatus,
@@ -444,6 +449,14 @@ impl OcspStapler {
             .map(|staple| staple.response.der)
     }
 
+    /// `nextUpdate` of the cached staple for `leaf_der`, when it has one. The server stores it
+    /// next to the staple bytes so the handshake path can stop serving the staple at that instant
+    /// without waiting for the next scan.
+    pub fn staple_expiry(&self, leaf_der: &[u8]) -> Option<SystemTime> {
+        self.cached(leaf_der)
+            .and_then(|staple| staple.response.next_update)
+    }
+
     /// The cached staple for `leaf_der` (regardless of freshness).
     pub fn cached(&self, leaf_der: &[u8]) -> Option<Staple> {
         self.staples
@@ -467,18 +480,14 @@ impl OcspStapler {
             None => true,
             Some(staple) => match staple.response.next_update {
                 Some(next_update) => {
-                    // certmagic scans every check interval and refreshes when the response is
-                    // about to go stale. Clamp the margin so short-lived responses are not
-                    // re-fetched on every scan.
-                    let freshness = next_update
+                    // certmagic refreshes at the half-life of the response:
+                    // thisUpdate + (nextUpdate - thisUpdate) / 2. A fixed margin before
+                    // nextUpdate (it used to be the hourly scan interval) left roughly one
+                    // attempt per staple lifetime, so one responder blip let the staple expire.
+                    let validity = next_update
                         .duration_since(staple.response.this_update)
                         .unwrap_or_default();
-                    let margin = self
-                        .policy
-                        .check_interval
-                        .min(freshness / 2)
-                        .max(Duration::from_secs(1));
-                    now + margin >= next_update
+                    now >= staple.response.this_update + validity / 2
                 }
                 None => now >= staple.fetched_at + self.policy.check_interval,
             },
@@ -529,13 +538,6 @@ impl OcspStapler {
                 Ok(StapleOutcome::Fetched)
             }
             Err(error) => {
-                if matches!(error, OcspError::Revoked) {
-                    // A verified revocation: never keep serving the earlier "good" staple.
-                    self.staples
-                        .write()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .remove(leaf_der);
-                }
                 let attempts = {
                     let mut retries = self
                         .retries
@@ -586,7 +588,24 @@ impl OcspStapler {
         verify_ocsp_response(&response, &leaf, &issuer, now)?;
         match response.status {
             OcspCertStatus::Good => {}
-            OcspCertStatus::Revoked => return Err(OcspError::Revoked),
+            OcspCertStatus::Revoked => {
+                // A verified revocation withdraws the cached staple - but only when it is not
+                // OLDER than that staple. An on-path attacker can replay a genuine, still-valid
+                // `revoked (certificateHold)` response issued before the certificate was
+                // reinstated; honouring it would evict the newer `good` staple.
+                let mut staples = self
+                    .staples
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let newer_good_staple = staples
+                    .get(leaf_der)
+                    .is_some_and(|cached| response.this_update < cached.response.this_update);
+                if newer_good_staple {
+                    return Err(OcspError::SupersededRevocation);
+                }
+                staples.remove(leaf_der);
+                return Err(OcspError::Revoked);
+            }
             OcspCertStatus::Unknown => return Err(OcspError::UnknownStatus),
         }
         Ok(Staple {
@@ -615,8 +634,12 @@ pub fn staple_for_certificate(
     stapler: &OcspStapler,
     certificate: TlsCertificate,
 ) -> TlsCertificate {
-    let staple = stapler.staple(certificate.chain()[0].as_ref());
-    certificate.with_ocsp_staple(staple)
+    let leaf = certificate.chain()[0].as_ref();
+    let staple = stapler.staple(leaf);
+    let expiry = staple.as_ref().and(stapler.staple_expiry(leaf));
+    certificate
+        .with_ocsp_staple(staple)
+        .with_ocsp_expiry(expiry)
 }
 
 /// Parse the OCSP responder URL and Must-Staple flag from a leaf certificate.
@@ -1416,9 +1439,9 @@ impl<'a> DerReader<'a> {
 }
 
 fn parse_asn1_time(tag: u8, value: &[u8]) -> Result<u64, OcspError> {
-    let (name, digits, generalized) = match tag {
-        0x17 => ("UTCTime", 12usize, false),
-        0x18 => ("GeneralizedTime", 14usize, true),
+    let (name, generalized) = match tag {
+        0x17 => ("UTCTime", false),
+        0x18 => ("GeneralizedTime", true),
         other => {
             return Err(OcspError::Malformed(format!(
                 "unsupported ASN.1 time tag 0x{other:02x}"
@@ -1428,8 +1451,43 @@ fn parse_asn1_time(tag: u8, value: &[u8]) -> Result<u64, OcspError> {
     let bad = || OcspError::Malformed(format!("invalid {name}"));
     // The value comes straight off the network: validate it as ASCII digits BEFORE any indexing so
     // a multi-byte character can never land on a non-boundary slice (a panic).
-    let body = value.strip_suffix(b"Z").unwrap_or(value);
-    if body.len() != digits || !body.iter().all(u8::is_ascii_digit) {
+    //
+    // Zone designator, like Go's encoding/asn1 (`Z0700`): `Z` or a numeric `+hhmm`/`-hhmm`
+    // offset; a value without one is local time and rejected.
+    let (body, offset_seconds): (&[u8], i64) = if let Some(body) = value.strip_suffix(b"Z") {
+        (body, 0)
+    } else if value.len() > 5 && matches!(value[value.len() - 5], b'+' | b'-') {
+        let (body, zone) = value.split_at(value.len() - 5);
+        if !zone[1..].iter().all(u8::is_ascii_digit) {
+            return Err(bad());
+        }
+        let digit = |index: usize| i64::from(zone[index] - b'0');
+        let hours = digit(1) * 10 + digit(2);
+        let minutes = digit(3) * 10 + digit(4);
+        if hours > 23 || minutes > 59 {
+            return Err(bad());
+        }
+        let seconds = hours * 3_600 + minutes * 60;
+        (body, if zone[0] == b'-' { -seconds } else { seconds })
+    } else {
+        return Err(bad());
+    };
+    // GeneralizedTime may carry fractional seconds (`.d+`), which are dropped.
+    let body = if generalized && body.len() > 14 {
+        if body[14] != b'.' || body.len() == 15 || !body[15..].iter().all(u8::is_ascii_digit) {
+            return Err(bad());
+        }
+        &body[..14]
+    } else {
+        body
+    };
+    // UTCTime is YYMMDDHHMM[SS], GeneralizedTime YYYYMMDDHHMMSS.
+    let valid_length = if generalized {
+        body.len() == 14
+    } else {
+        body.len() == 10 || body.len() == 12
+    };
+    if !valid_length || !body.iter().all(u8::is_ascii_digit) {
         return Err(bad());
     }
     let number = |from: usize, to: usize| -> u64 {
@@ -1447,7 +1505,11 @@ fn parse_asn1_time(tag: u8, value: &[u8]) -> Result<u64, OcspError> {
     let day = number(rest + 2, rest + 4);
     let hour = number(rest + 4, rest + 6);
     let minute = number(rest + 6, rest + 8);
-    let second = number(rest + 8, rest + 10);
+    let second = if body.len() >= rest + 10 {
+        number(rest + 8, rest + 10)
+    } else {
+        0
+    };
     if !(1..=12).contains(&month)
         || day == 0
         || day > days_in_month(year, month)
@@ -1457,11 +1519,17 @@ fn parse_asn1_time(tag: u8, value: &[u8]) -> Result<u64, OcspError> {
     {
         return Err(bad());
     }
-    unix_seconds_from_civil(year, month, day, hour, minute, second).ok_or_else(|| {
-        OcspError::Malformed(format!(
-            "{name} is before the Unix epoch and cannot be represented"
-        ))
-    })
+    let local = unix_seconds_from_civil(year, month, day, hour, minute, second);
+    // UTC = local time - offset.
+    local
+        .and_then(|local| i64::try_from(local).ok())
+        .and_then(|local| local.checked_sub(offset_seconds))
+        .and_then(|utc| u64::try_from(utc).ok())
+        .ok_or_else(|| {
+            OcspError::Malformed(format!(
+                "{name} is before the Unix epoch and cannot be represented"
+            ))
+        })
 }
 
 fn days_in_month(year: i64, month: u64) -> u64 {
