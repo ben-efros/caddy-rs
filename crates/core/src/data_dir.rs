@@ -792,7 +792,9 @@ fn check_ancestor_acl(ancestor: &Path, root: &Path) -> Result<(), DataDirError> 
         process_uid: None,
         hint: None,
     })?;
-    if exposure.writable_by_others {
+    // `owned_by_others`: an owner keeps WRITE_DAC whatever the list says, so a directory another
+    // user owns can be reopened to them (or swapped) after this check.
+    if exposure.writable_by_others || exposure.owned_by_others {
         return Err(DataDirError {
             path: root.to_path_buf(),
             operation: "reject data-directory ancestor that other users can modify",

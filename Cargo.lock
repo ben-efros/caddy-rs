@@ -326,6 +326,7 @@ dependencies = [
  "caddy-rs-authn",
  "caddy-rs-config",
  "caddy-rs-core",
+ "caddy-rs-fsperm",
  "caddy-rs-http",
  "caddy-rs-server",
  "caddy-rs-test-support",

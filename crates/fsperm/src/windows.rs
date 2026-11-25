@@ -20,9 +20,9 @@ use windows_sys::Win32::Security::Authorization::{
     GetNamedSecurityInfoW, SetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    GetAce, GetSecurityDescriptorDacl, GetTokenInformation, TokenUser, ACCESS_ALLOWED_ACE,
-    ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
-    PROTECTED_DACL_SECURITY_INFORMATION, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
+    GetAce, GetSecurityDescriptorDacl, GetTokenInformation, TokenUser, ACE_HEADER, ACL,
+    DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, GetFinalPathNameByHandleW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL,
@@ -34,9 +34,6 @@ use crate::Exposure;
 
 /// `GENERIC_READ | GENERIC_WRITE` (declared here to avoid enabling another windows-sys feature).
 const GENERIC_READ_WRITE: u32 = 0x8000_0000 | 0x4000_0000;
-
-/// `ACCESS_ALLOWED_ACE_TYPE`.
-const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 
 /// Access-mask bits that let a principal read file data or list a directory.
 const READ_MASK: u32 = 0x0000_0001 // FILE_READ_DATA / FILE_LIST_DIRECTORY
@@ -62,6 +59,27 @@ const DATA_WRITE_MASK: u32 = 0x0000_0002 | 0x0000_0004;
 /// (`C:\` carries several such entries for `Authenticated Users`).
 const INHERIT_ONLY_ACE: u8 = 0x08;
 
+const ACE_TYPE_ALLOWED: u8 = 0;
+const ACE_TYPE_DENIED: u8 = 1;
+const ACE_TYPE_AUDIT: u8 = 2;
+const ACE_TYPE_ALARM: u8 = 3;
+const ACE_TYPE_ALLOWED_OBJECT: u8 = 5;
+const ACE_TYPE_DENIED_OBJECT: u8 = 6;
+const ACE_TYPE_AUDIT_OBJECT: u8 = 7;
+const ACE_TYPE_ALARM_OBJECT: u8 = 8;
+const ACE_TYPE_ALLOWED_CALLBACK: u8 = 9;
+const ACE_TYPE_DENIED_CALLBACK: u8 = 10;
+const ACE_TYPE_ALLOWED_CALLBACK_OBJECT: u8 = 11;
+const ACE_TYPE_DENIED_CALLBACK_OBJECT: u8 = 12;
+const ACE_TYPE_AUDIT_CALLBACK: u8 = 13;
+const ACE_TYPE_ALARM_CALLBACK: u8 = 14;
+const ACE_TYPE_AUDIT_CALLBACK_OBJECT: u8 = 15;
+const ACE_TYPE_ALARM_CALLBACK_OBJECT: u8 = 16;
+const ACE_TYPE_MANDATORY_LABEL: u8 = 17;
+const ACE_TYPE_RESOURCE_ATTRIBUTE: u8 = 18;
+const ACE_TYPE_SCOPED_POLICY_ID: u8 = 19;
+const ACE_TYPE_ACCESS_FILTER: u8 = 21;
+
 /// Principals that are not "others": SYSTEM, Administrators, CREATOR OWNER, OWNER RIGHTS and
 /// TrustedInstaller. The current user's own SID is added at run time.
 const TRUSTED_SIDS: &[&str] = &[
@@ -75,6 +93,18 @@ const TRUSTED_SIDS: &[&str] = &[
 /// UTF-16, NUL-terminated copy of `value` for a wide Win32 call.
 fn wide(value: &OsStr) -> Vec<u16> {
     value.encode_wide().chain(std::iter::once(0)).collect()
+}
+
+/// Fail closed on a path with an interior NUL: the wide Win32 calls would silently stop at it and
+/// act on a shorter path than the one `std::fs` is later given.
+fn check_path(path: &Path) -> io::Result<()> {
+    if path.as_os_str().encode_wide().any(|unit| unit == 0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path contains an interior NUL",
+        ));
+    }
+    Ok(())
 }
 
 fn last_error() -> io::Error {
@@ -188,6 +218,7 @@ fn descriptor_from_sddl(sddl: &str) -> io::Result<OwnedDescriptor> {
 }
 
 pub(crate) fn create_dir_all_private(path: &Path) -> io::Result<()> {
+    check_path(path)?;
     if path.is_dir() {
         return Ok(());
     }
@@ -223,6 +254,7 @@ pub(crate) fn create_dir_all_private(path: &Path) -> io::Result<()> {
 }
 
 pub(crate) fn create_new_file_private(path: &Path) -> io::Result<File> {
+    check_path(path)?;
     let descriptor = descriptor_from_sddl(&private_sddl(false)?)?;
     let attributes = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -252,6 +284,7 @@ pub(crate) fn create_new_file_private(path: &Path) -> io::Result<File> {
 }
 
 pub(crate) fn restrict(path: &Path, directory: bool) -> io::Result<()> {
+    check_path(path)?;
     let descriptor = descriptor_from_sddl(&private_sddl(directory)?)?;
     let mut present = 0i32;
     let mut defaulted = 0i32;
@@ -285,6 +318,7 @@ pub(crate) fn restrict(path: &Path, directory: bool) -> io::Result<()> {
 }
 
 pub(crate) fn owned_by_current_user(path: &Path) -> io::Result<bool> {
+    check_path(path)?;
     let user = current_user_sid()?;
     let wide_path = wide(path.as_os_str());
     let mut owner: *mut core::ffi::c_void = null_mut();
@@ -315,6 +349,7 @@ pub(crate) fn owned_by_current_user(path: &Path) -> io::Result<bool> {
 }
 
 pub(crate) fn exposure(path: &Path) -> io::Result<Exposure> {
+    check_path(path)?;
     let user = current_user_sid()?;
     let wide_path = wide(path.as_os_str());
     let mut dacl: *mut ACL = null_mut();
@@ -343,6 +378,7 @@ pub(crate) fn exposure(path: &Path) -> io::Result<Exposure> {
             readable_by_others: true,
             writable_by_others: true,
             creatable_by_others: true,
+            owned_by_others: false,
         });
     }
     let is_directory = path.is_dir();
@@ -357,19 +393,57 @@ pub(crate) fn exposure(path: &Path) -> io::Result<Exposure> {
         }
         // SAFETY: every ACE starts with an `ACE_HEADER`.
         let header = unsafe { &*ace.cast::<ACE_HEADER>() };
-        if header.AceType != ACCESS_ALLOWED_ACE_TYPE {
-            continue; // deny and audit entries do not grant access
+        match header.AceType {
+            // Deny, audit, alarm and label entries never grant access (ignoring a deny is the
+            // conservative direction: it can only over-report exposure).
+            ACE_TYPE_DENIED
+            | ACE_TYPE_AUDIT
+            | ACE_TYPE_ALARM
+            | ACE_TYPE_DENIED_OBJECT
+            | ACE_TYPE_AUDIT_OBJECT
+            | ACE_TYPE_ALARM_OBJECT
+            | ACE_TYPE_DENIED_CALLBACK
+            | ACE_TYPE_DENIED_CALLBACK_OBJECT
+            | ACE_TYPE_AUDIT_CALLBACK
+            | ACE_TYPE_ALARM_CALLBACK
+            | ACE_TYPE_AUDIT_CALLBACK_OBJECT
+            | ACE_TYPE_ALARM_CALLBACK_OBJECT
+            | ACE_TYPE_MANDATORY_LABEL
+            | ACE_TYPE_RESOURCE_ATTRIBUTE
+            | ACE_TYPE_SCOPED_POLICY_ID
+            | ACE_TYPE_ACCESS_FILTER => continue,
+            _ => {}
         }
         if header.AceFlags & INHERIT_ONLY_ACE != 0 {
             continue; // applies to children only, not to this object
         }
-        // SAFETY: the type check above established this is an `ACCESS_ALLOWED_ACE`; its SID starts
-        // at `SidStart`, which is the SID's first DWORD, so its address is the SID pointer.
+        // Every remaining type can grant access. Plain and callback allow entries share one
+        // layout (header, mask, SID). An object entry carries optional GUIDs before the SID.
+        // Anything else (compound, a type this code does not know) cannot be attributed to a
+        // principal, so it is treated as exposing the path rather than skipped.
+        let sid_offset = match header.AceType {
+            ACE_TYPE_ALLOWED | ACE_TYPE_ALLOWED_CALLBACK => Some(8usize),
+            ACE_TYPE_ALLOWED_OBJECT | ACE_TYPE_ALLOWED_CALLBACK_OBJECT => {
+                // SAFETY: an object ACE is header (4), mask (4), flags (4), then optional GUIDs.
+                let flags = unsafe { ace.cast::<u8>().add(8).cast::<u32>().read_unaligned() };
+                Some(12 + if flags & 1 != 0 { 16 } else { 0 } + if flags & 2 != 0 { 16 } else { 0 })
+            }
+            _ => None,
+        };
+        let Some(sid_offset) = sid_offset else {
+            exposure.readable_by_others = true;
+            exposure.writable_by_others = true;
+            exposure.creatable_by_others = true;
+            continue;
+        };
+        // SAFETY: the mask is the DWORD after the 4-byte header in every allow layout, and the
+        // SID starts `sid_offset` bytes into the ACE. The pointer is derived from the ACE pointer
+        // itself, not from a reference to a fixed-size struct that is shorter than the SID.
         let (mask, sid) = unsafe {
-            let allowed = &*ace.cast::<ACCESS_ALLOWED_ACE>();
+            let base = ace.cast::<u8>();
             (
-                allowed.Mask,
-                std::ptr::addr_of!(allowed.SidStart).cast_mut().cast(),
+                base.add(4).cast::<u32>().read_unaligned(),
+                base.add(sid_offset).cast::<core::ffi::c_void>(),
             )
         };
         let sid_text = sid_to_string(sid)?;
@@ -386,6 +460,8 @@ pub(crate) fn exposure(path: &Path) -> io::Result<Exposure> {
             }
         }
     }
+    // The owner keeps READ_CONTROL and WRITE_DAC whatever the list says.
+    exposure.owned_by_others = !owned_by_current_user(path)?;
     Ok(exposure)
 }
 
@@ -416,6 +492,7 @@ pub(crate) fn final_path(file: &File) -> io::Result<PathBuf> {
 /// Create exactly one directory with a protected owner-only DACL, failing if it exists. See
 /// [`crate::create_dir_private`].
 pub(crate) fn create_dir_private(path: &Path) -> io::Result<()> {
+    check_path(path)?;
     let descriptor = descriptor_from_sddl(&private_sddl(true)?)?;
     let attributes = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,

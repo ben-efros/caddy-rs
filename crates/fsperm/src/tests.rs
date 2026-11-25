@@ -323,3 +323,26 @@ fn the_inode_fallback_refuses_a_path_that_names_a_different_file() {
     assert!(a.dev() == same.dev() && a.ino() == same.ino());
     assert!(!(a.dev() == different.dev() && a.ino() == different.ino()));
 }
+
+/// A path with an interior NUL must be refused rather than silently truncated by the wide Win32
+/// calls (which would act on a shorter path than `std::fs` later opens).
+#[cfg(windows)]
+#[test]
+fn an_interior_nul_in_a_path_is_refused() {
+    use std::os::windows::ffi::OsStringExt;
+    let mut units: Vec<u16> = "C:\nul-test".encode_utf16().collect();
+    units.insert(4, 0);
+    let path = std::path::PathBuf::from(std::ffi::OsString::from_wide(&units));
+    assert_eq!(
+        create_new_file_private(&path).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    assert_eq!(
+        exposure(&path).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    assert_eq!(
+        create_dir_private(&path).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+}

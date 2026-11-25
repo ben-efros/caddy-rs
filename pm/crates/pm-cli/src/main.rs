@@ -1308,6 +1308,20 @@ fn create_owner_only_dir(dir: &Path) -> Result<(), CliError> {
     // Mode 0700 on Unix; a protected owner/SYSTEM/Administrators DACL on Windows, where a plain
     // `create_dir_all` under `%ProgramData%` would inherit read access for `BUILTIN\Users`.
     caddy_rs_fsperm::create_dir_all_private(dir)?;
+    // An existing directory is accepted by the call above as it is. On Windows it must not be
+    // owned by, or open to, another principal (an owner can always rewrite the access list), so
+    // tighten one of ours and refuse anyone else's.
+    #[cfg(windows)]
+    if !caddy_rs_fsperm::exposure(dir)?.is_private() {
+        if caddy_rs_fsperm::owned_by_current_user(dir)? {
+            caddy_rs_fsperm::restrict_dir(dir)?;
+        } else {
+            return Err(CliError::InvalidArg(format!(
+                "{} is owned by another user; choose a data directory you own",
+                dir.display()
+            )));
+        }
+    }
     Ok(())
 }
 

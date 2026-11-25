@@ -38,6 +38,7 @@ pub(crate) fn exposure(path: &Path) -> io::Result<Exposure> {
         readable_by_others: mode & 0o044 != 0,
         writable_by_others: others_can_write && !sticky,
         creatable_by_others: others_can_write && metadata.is_dir(),
+        owned_by_others: false,
     })
 }
 

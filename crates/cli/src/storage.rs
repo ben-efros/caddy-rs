@@ -301,29 +301,62 @@ fn stored_key(path: &Path) -> anyhow::Result<String> {
 }
 
 /// Write one archive element below `root`, like certmagic's file storage `Store`.
+#[cfg(unix)]
 fn store_key(root: &Path, key: &str, value: &[u8]) -> io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let target = root.join(key);
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
     }
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
+    options.mode(0o600);
     let mut file = options.open(&target)?;
     file.write_all(value)?;
     drop(file);
     // certmagic replaces the target through a 0600 temporary file, so an existing key always ends up
     // owner-read/write whatever its previous mode was.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
-    }
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
     Ok(())
+}
+
+/// Windows: imported keys are private from their first byte. New directories get a protected
+/// owner/SYSTEM/Administrators DACL (a plain `create_dir_all` under the program-data folder would
+/// inherit read access for the Users group), and the file is written to a private temporary file
+/// that is renamed over the target, so an existing key ends up private whatever its old access
+/// list was.
+#[cfg(not(unix))]
+fn store_key(root: &Path, key: &str, value: &[u8]) -> io::Result<()> {
+    let target = root.join(key);
+    let Some(parent) = target.parent() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "key has no parent",
+        ));
+    };
+    caddy_rs_fsperm::create_dir_all_private(parent)?;
+    let name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut counter = 0u32;
+    let (temporary, mut file) = loop {
+        let temporary = parent.join(format!(".{name}.import-{}-{counter}", std::process::id()));
+        match caddy_rs_fsperm::create_new_file_private(&temporary) {
+            Ok(file) => break (temporary, file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists && counter < 64 => {
+                counter += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    let written = file.write_all(value).and_then(|()| file.sync_all());
+    drop(file);
+    let finished = written.and_then(|()| fs::rename(&temporary, &target));
+    if finished.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    finished
 }
 
 /// The file's modification time in whole seconds since the Unix epoch, or 0 when unavailable.
@@ -343,4 +376,49 @@ fn failed_quit(message: String) -> anyhow::Error {
         message,
     }
     .into()
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    /// An imported key must be private whether it is new or replaces a file that was readable by
+    /// everyone, and the directories made for it must be private too.
+    #[test]
+    fn imported_keys_are_private_on_windows() {
+        let directory = tempfile::tempdir().unwrap();
+        caddy_rs_test_support::make_private(directory.path());
+        let root = directory.path().join("storage");
+        caddy_rs_fsperm::create_dir_all_private(&root).unwrap();
+
+        store_key(
+            &root,
+            "certificates/local/example.com/example.com.key",
+            b"KEY-1",
+        )
+        .unwrap();
+        let target = root.join("certificates/local/example.com/example.com.key");
+        assert_eq!(fs::read(&target).unwrap(), b"KEY-1");
+        assert!(caddy_rs_fsperm::exposure(&target).unwrap().is_private());
+        assert!(caddy_rs_fsperm::exposure(target.parent().unwrap())
+            .unwrap()
+            .is_private());
+
+        // Loosen it as an earlier version (or another tool) could have left it, then re-import.
+        let status = std::process::Command::new("icacls")
+            .arg(&target)
+            .args(["/grant", "Everyone:R"])
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        assert!(!caddy_rs_fsperm::exposure(&target).unwrap().is_private());
+        store_key(
+            &root,
+            "certificates/local/example.com/example.com.key",
+            b"KEY-2",
+        )
+        .unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"KEY-2");
+        assert!(caddy_rs_fsperm::exposure(&target).unwrap().is_private());
+    }
 }

@@ -59,20 +59,28 @@ pub struct Exposure {
     /// does a sticky `/tmp`; it is harmless for an ancestor but not for a directory that holds
     /// secrets. Always `false` for a file.
     pub creatable_by_others: bool,
+    /// Windows only: the path is owned by a principal other than the current user, SYSTEM or
+    /// Administrators. An owner keeps the implicit right to read and rewrite the access list, so
+    /// the list alone cannot show that such a path is safe. Always `false` on Unix, where callers
+    /// compare the owning uid themselves.
+    pub owned_by_others: bool,
 }
 
 impl Exposure {
     /// Whether the path is private: nobody else can read it, write it or add entries to it.
     #[must_use]
     pub fn is_private(self) -> bool {
-        !self.readable_by_others && !self.writable_by_others && !self.creatable_by_others
+        !self.readable_by_others
+            && !self.writable_by_others
+            && !self.creatable_by_others
+            && !self.owned_by_others
     }
 
     /// Whether another principal can change what the path contains or means: modify or replace it
     /// or add entries to it. This is the test for a directory that will hold secrets.
     #[must_use]
     pub fn tamperable_by_others(self) -> bool {
-        self.writable_by_others || self.creatable_by_others
+        self.writable_by_others || self.creatable_by_others || self.owned_by_others
     }
 }
 
