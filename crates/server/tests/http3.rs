@@ -1357,7 +1357,13 @@ fn memory_bytes() -> (u64, u64) {
         status
             .lines()
             .find_map(|line| line.strip_prefix(name))
-            .and_then(|rest| rest.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+            .and_then(|rest| {
+                rest.trim()
+                    .trim_end_matches("kB")
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+            })
             .expect("memory field")
             * 1024
     };
@@ -1384,7 +1390,10 @@ fn record_panics() {
 }
 
 fn assert_no_task_panics() {
-    let panics = PANICS.lock().map(|panics| panics.clone()).unwrap_or_default();
+    let panics = PANICS
+        .lock()
+        .map(|panics| panics.clone())
+        .unwrap_or_default();
     assert!(panics.is_empty(), "a server task panicked: {panics:?}");
 }
 
@@ -1576,10 +1585,9 @@ async fn http3_stalled_upload_is_cut_off_and_frees_the_connection() {
 
     let endpoint = quic_endpoint(client_config(vec![b"h3".to_vec()]));
     let connection = connect(&endpoint, address).await.expect("QUIC connect");
-    let (driver, mut send_request) =
-        h3::client::new(h3_quinn::Connection::new(connection.clone()))
-            .await
-            .expect("HTTP/3 client");
+    let (driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(connection.clone()))
+        .await
+        .expect("HTTP/3 client");
     let request = http::Request::builder()
         .method("POST")
         .uri("https://example.com/stall")
@@ -1697,12 +1705,14 @@ async fn http3_early_answer_with_the_upload_still_open_does_not_panic() {
 
     let endpoint = quic_endpoint(client_config(vec![b"h3".to_vec()]));
     let connection = connect(&endpoint, address).await.expect("QUIC connect");
-    let (driver, mut send_request) =
-        h3::client::new(h3_quinn::Connection::new(connection.clone()))
-            .await
-            .expect("HTTP/3 client");
+    let (driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(connection.clone()))
+        .await
+        .expect("HTTP/3 client");
 
-    for (path, headers) in [("/early", vec![]), ("/proxied", vec![("content-length", "4")])] {
+    for (path, headers) in [
+        ("/early", vec![]),
+        ("/proxied", vec![("content-length", "4")]),
+    ] {
         let mut builder = http::Request::builder()
             .method("POST")
             .uri(format!("https://example.com{path}"));

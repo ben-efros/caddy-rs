@@ -1626,7 +1626,9 @@ async fn pump_h3_request_body<S>(
             Ok(Err(error)) => {
                 failure_status.store(400, Ordering::SeqCst);
                 let _ = chunks
-                    .send(Err(caddy_rs_http::body::BodyError::Upstream(Box::new(error))))
+                    .send(Err(caddy_rs_http::body::BodyError::Upstream(Box::new(
+                        error,
+                    ))))
                     .await;
                 return;
             }
@@ -4562,8 +4564,16 @@ mod h3_declared_length_tests {
         assert_eq!(lengths(&[]), Ok(None));
         assert_eq!(lengths(&["0"]), Ok(Some(0)));
         assert_eq!(lengths(&["10"]), Ok(Some(10)));
-        assert_eq!(lengths(&["10", "10"]), Ok(Some(10)), "equal repeats are one value");
-        assert_eq!(lengths(&["10, 10"]), Ok(Some(10)), "an equal list is one value");
+        assert_eq!(
+            lengths(&["10", "10"]),
+            Ok(Some(10)),
+            "equal repeats are one value"
+        );
+        assert_eq!(
+            lengths(&["10, 10"]),
+            Ok(Some(10)),
+            "an equal list is one value"
+        );
         for bad in [
             &["10", "20"][..],
             &["10, 20"],
