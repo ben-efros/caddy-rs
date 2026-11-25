@@ -15,9 +15,10 @@ use bytes::Bytes;
 use http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use tokio::fs;
 
+use crate::body::StreamingResponse;
 use crate::handlers::clean_path;
 use crate::matchers::{glob_match, percent_decode};
-use crate::types::{Error, Handler, Outcome, Request, Response, Result};
+use crate::types::{Error, Handler, Outcome, Request, Response, Result, StreamingOutcome};
 
 fn invalid(path: &str, message: impl Into<String>) -> Error {
     Error::InvalidConfig {
@@ -560,7 +561,10 @@ impl FileServerHandler {
             }
         }
 
-        let body = Bytes::from(fs::read(&representation).await.map_err(Error::Io)?);
+        // SEC-MEDIUM-HTTP B2: nothing is read from disk yet. Preconditions (304/412), HEAD and
+        // Range responses are decided from `stat` alone, and only the bytes a response actually
+        // carries are read afterwards, so a 1-byte range, a HEAD or a 304 of a multi-GiB file
+        // costs no memory.
         let size = representation_metadata.len();
 
         // Conditional requests, following Go's `checkPreconditions` (RFC 7232 section 6).
@@ -599,20 +603,23 @@ impl FileServerHandler {
             .get(header::RANGE)
             .and_then(|value| value.to_str().ok());
         let if_range_ok = check_if_range(&request, &etag, modtime, useful_modtime);
+        let head = request.method == http::Method::HEAD;
+        // A HEAD never opens the file. A GET opens it (no read yet) so the length the ranges are
+        // checked against is the one of the handle the bytes will come from, not a stale `stat`.
+        let (file, available) = if head {
+            (None, size)
+        } else {
+            let file = fs::File::open(&representation).await.map_err(Error::Io)?;
+            let available = file.metadata().await.map_err(Error::Io)?.len();
+            (Some(file), available)
+        };
         let RangePlan {
             status,
             mut headers,
-            body,
+            segments,
             send_size,
             ranged,
-        } = match apply_ranges(
-            request.method == http::Method::HEAD,
-            headers,
-            range_header,
-            if_range_ok,
-            size,
-            body,
-        ) {
+        } = match apply_ranges(head, headers, range_header, if_range_ok, size, available) {
             RangeOutcome::Serve(plan) => plan,
             RangeOutcome::Reject(response) => return Ok(Outcome::Respond(response)),
         };
@@ -628,6 +635,18 @@ impl FileServerHandler {
             );
         }
 
+        // Materialise the body: nothing for HEAD; a large body is handed to the streaming path
+        // (when the caller runs one) instead of being read into memory.
+        let mut body = Bytes::new();
+        if let Some(mut file) = file {
+            if streaming_requested() && file_bytes(&segments) > STREAM_THRESHOLD {
+                stash_streamed_file(StreamedFile { file, segments });
+            } else {
+                body = read_segments(&mut file, &segments)
+                    .await
+                    .map_err(Error::Io)?;
+            }
+        }
         let mut response = Response {
             status,
             headers,
@@ -635,9 +654,6 @@ impl FileServerHandler {
         };
         if let Some(override_status) = self.status_override(&request)? {
             response.status = override_status;
-        }
-        if request.method == http::Method::HEAD {
-            response.body = Bytes::new();
         }
         Ok(Outcome::Respond(response))
     }
@@ -817,6 +833,30 @@ impl Handler for FileServerHandler {
         let original_name = filename.to_string_lossy().to_string();
         self.serve_file(request, &filename, &original_name, &root)
             .await
+    }
+
+    /// The streaming path runs the same request logic as [`Handler::handle`] (so every header,
+    /// precondition and range rule is shared) but lets `serve_file` hand a large body over as an
+    /// open file to stream in chunks instead of reading it into memory (SEC-MEDIUM-HTTP B2).
+    async fn handle_streaming(&self, request: Request) -> Result<StreamingOutcome> {
+        let (outcome, streamed) = STREAMED_FILE
+            .scope(std::cell::RefCell::new(None), async {
+                let outcome = self.handle(request).await;
+                let streamed = STREAMED_FILE.with(|slot| slot.borrow_mut().take());
+                (outcome, streamed)
+            })
+            .await;
+        Ok(match outcome? {
+            Outcome::Continue(request) => StreamingOutcome::Continue(request),
+            Outcome::Respond(response) => match streamed {
+                Some(streamed) => StreamingOutcome::Respond(StreamingResponse::new(
+                    response.status,
+                    response.headers,
+                    stream_file(streamed),
+                )),
+                None => StreamingOutcome::Respond(StreamingResponse::from_buffered(response)),
+            },
+        })
     }
 }
 
@@ -1363,25 +1403,56 @@ enum RangeOutcome {
     Reject(Response),
 }
 
+/// One piece of a response body, described without reading the file: either literal bytes
+/// (multipart framing) or a byte span of the representation read from disk when it is sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BodySegment {
+    Literal(Bytes),
+    File { start: u64, length: u64 },
+}
+
+/// Bytes of the representation the segments will read from disk.
+fn file_bytes(segments: &[BodySegment]) -> u64 {
+    segments
+        .iter()
+        .map(|segment| match segment {
+            BodySegment::File { length, .. } => *length,
+            BodySegment::Literal(_) => 0,
+        })
+        .sum()
+}
+
+/// Total length of the response body the segments describe.
+fn segments_len(segments: &[BodySegment]) -> u64 {
+    segments
+        .iter()
+        .map(|segment| match segment {
+            BodySegment::File { length, .. } => *length,
+            BodySegment::Literal(bytes) => bytes.len() as u64,
+        })
+        .sum()
+}
+
 /// The representation slice a successful `Range` request resolved to.
 struct RangePlan {
     status: StatusCode,
     headers: HeaderMap,
-    body: Bytes,
+    segments: Vec<BodySegment>,
     send_size: u64,
     /// Whether a byte range was applied (Go always sets `Content-Length` for range responses).
     ranged: bool,
 }
 
 /// Apply the request's `Range` header to a representation whose `size` was staged from `stat` and
-/// whose contents were read into `body`, following Go's `parseRange`/`serveContent`.
+/// of which `available` bytes exist on the open handle, following Go's `parseRange`/`serveContent`.
+/// No file content is read here: the plan only describes which spans to read.
 fn apply_ranges(
     head: bool,
     mut headers: HeaderMap,
     range_header: Option<&str>,
     if_range_ok: bool,
     size: u64,
-    body: Bytes,
+    available: u64,
 ) -> RangeOutcome {
     let mut ranges = match range_header {
         Some(header) if if_range_ok => parse_range(header, size as i64),
@@ -1393,7 +1464,10 @@ fn apply_ranges(
         .unwrap_or("")
         .to_string();
     let mut status = StatusCode::OK;
-    let mut body = body;
+    let mut segments = vec![BodySegment::File {
+        start: 0,
+        length: size,
+    }];
     let mut send_size = size;
     match ranges {
         Err(RangeError::NoOverlap) if size == 0 => {
@@ -1436,7 +1510,7 @@ fn apply_ranges(
                 .expect("content range is a valid header value"),
         );
         send_size = range.length as u64;
-        let Some((range_start, range_end)) = range_bounds(&range, body.len()) else {
+        let Some((range_start, range_end)) = range_bounds(&range, available) else {
             // The file shrank between `stat` and `read`: the `Content-Range` staged above is
             // stale, so replace it with RFC 7233's unsatisfied form (`bytes */<complete-length>`)
             // rather than advertising a range the representation no longer has.
@@ -1447,11 +1521,15 @@ fn apply_ranges(
                 "invalid range: the file changed while it was being served",
             ));
         };
-        body = Bytes::copy_from_slice(&body[range_start..range_end]);
+        segments = vec![BodySegment::File {
+            start: range_start,
+            length: range_end - range_start,
+        }];
     } else if ranges.len() > 1 {
         status = StatusCode::PARTIAL_CONTENT;
         let boundary = multipart_boundary();
-        let Some(multipart) = multipart_body(&ranges, &content_type, size as i64, &boundary, &body)
+        let Some(multipart) =
+            multipart_segments(&ranges, &content_type, size as i64, &boundary, available)
         else {
             // Same stale-range condition as the single-range arm above: answer 416 with the
             // unsatisfied `Content-Range` instead of failing the request with a 500.
@@ -1467,8 +1545,8 @@ fn apply_ranges(
             HeaderValue::from_str(&format!("multipart/byteranges; boundary={boundary}"))
                 .expect("multipart content type is a valid header value"),
         );
-        send_size = multipart.len() as u64;
-        body = Bytes::from(multipart);
+        send_size = segments_len(&multipart);
+        segments = multipart;
         if !content_encoding_present(&headers) {
             headers.remove(header::CONTENT_RANGE);
         }
@@ -1476,7 +1554,7 @@ fn apply_ranges(
     RangeOutcome::Serve(RangePlan {
         status,
         headers,
-        body,
+        segments,
         send_size,
         ranged: !ranges.is_empty(),
     })
@@ -1573,42 +1651,143 @@ fn multipart_boundary() -> String {
     output
 }
 
-/// Clamp a parsed byte range to the bytes actually read from disk. Returns `None` when the range
-/// does not fit, which happens when the file changed between `stat` and `read`; callers must turn
-/// that into a rejection instead of slicing out of bounds.
-fn range_bounds(range: &ByteRange, available: usize) -> Option<(usize, usize)> {
-    let start = usize::try_from(range.start).ok()?;
-    let length = usize::try_from(range.length).ok()?;
+/// Clamp a parsed byte range to the bytes that exist on the open handle. Returns `None` when the
+/// range does not fit, which happens when the file changed between `stat` and `open`; callers must
+/// turn that into a rejection instead of reading past the end.
+fn range_bounds(range: &ByteRange, available: u64) -> Option<(u64, u64)> {
+    let start = u64::try_from(range.start).ok()?;
+    let length = u64::try_from(range.length).ok()?;
     let end = start.checked_add(length)?;
     (end <= available).then_some((start, end))
 }
 
-/// Build a `multipart/byteranges` body, or `None` when a range no longer fits the bytes actually
-/// read from disk (the file shrank between `stat` and `read`).
-fn multipart_body(
+/// Describe a `multipart/byteranges` body, or `None` when a range no longer fits the bytes that
+/// exist on the open handle (the file shrank between `stat` and `open`). Only the framing is
+/// materialised; each part's content stays a [`BodySegment::File`] span read when sent.
+fn multipart_segments(
     ranges: &[ByteRange],
     content_type: &str,
     size: i64,
     boundary: &str,
-    representation: &[u8],
-) -> Option<Vec<u8>> {
-    let mut body = Vec::new();
+    available: u64,
+) -> Option<Vec<BodySegment>> {
+    let mut segments = Vec::with_capacity(ranges.len() * 2 + 1);
     for range in ranges {
-        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
-        body.extend_from_slice(
+        let mut framing = Vec::new();
+        framing.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        framing.extend_from_slice(
             format!("Content-Range: {}\r\n", range.content_range(size)).as_bytes(),
         );
-        body.extend_from_slice(format!("Content-Type: {content_type}\r\n").as_bytes());
-        body.extend_from_slice(b"\r\n");
-        let Some((start, end)) = range_bounds(range, representation.len()) else {
-            return None;
-        };
-        // INFEASIBLE: `range_bounds` proved `start..end` lies inside `representation`.
-        body.extend_from_slice(&representation[start..end]);
-        body.extend_from_slice(b"\r\n");
+        framing.extend_from_slice(format!("Content-Type: {content_type}\r\n").as_bytes());
+        framing.extend_from_slice(b"\r\n");
+        segments.push(BodySegment::Literal(Bytes::from(framing)));
+        let (start, end) = range_bounds(range, available)?;
+        segments.push(BodySegment::File {
+            start,
+            length: end - start,
+        });
+        segments.push(BodySegment::Literal(Bytes::from_static(b"\r\n")));
     }
-    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
-    Some(body)
+    segments.push(BodySegment::Literal(Bytes::from(format!(
+        "--{boundary}--\r\n"
+    ))));
+    Some(segments)
+}
+
+/// Bodies whose file content exceeds this are streamed from the file handle instead of read into
+/// memory first (when the caller runs the streaming path). Smaller bodies are read inline, which
+/// keeps small-file latency and framing exactly as before.
+const STREAM_THRESHOLD: u64 = 256 * 1024;
+
+/// Chunk size of a streamed file body.
+const STREAM_CHUNK: usize = 64 * 1024;
+
+/// Read the file spans of `segments` (and splice the literals) into one buffer. Only used for
+/// bodies at or below [`STREAM_THRESHOLD`] and by the buffered compatibility path.
+async fn read_segments(file: &mut fs::File, segments: &[BodySegment]) -> std::io::Result<Bytes> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let mut body = Vec::with_capacity(usize::try_from(segments_len(segments)).unwrap_or(0));
+    for segment in segments {
+        match segment {
+            BodySegment::Literal(bytes) => body.extend_from_slice(bytes),
+            BodySegment::File { start, length } => {
+                file.seek(std::io::SeekFrom::Start(*start)).await?;
+                let read = file.take(*length).read_to_end(&mut body).await?;
+                if (read as u64) < *length {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "the file changed while it was being served",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(Bytes::from(body))
+}
+
+/// A response body to stream from an open file.
+struct StreamedFile {
+    file: fs::File,
+    segments: Vec<BodySegment>,
+}
+
+tokio::task_local! {
+    /// Set by [`FileServerHandler::handle_streaming`] around the shared request logic. When it is
+    /// present, `serve_file` parks large bodies here instead of buffering them.
+    static STREAMED_FILE: std::cell::RefCell<Option<StreamedFile>>;
+}
+
+/// Whether the current request is being served on the streaming path.
+fn streaming_requested() -> bool {
+    STREAMED_FILE.try_with(|_| ()).is_ok()
+}
+
+fn stash_streamed_file(streamed: StreamedFile) {
+    // INFEASIBLE: only called when `streaming_requested()` held in the same task.
+    let _ = STREAMED_FILE.try_with(|slot| *slot.borrow_mut() = Some(streamed));
+}
+
+/// Turn a parked file into a chunked body. The producer task stops as soon as the client goes away
+/// (the receiver is dropped), and a file that shrinks mid-transfer ends the body with an I/O error
+/// so the connection is aborted instead of delivering a silently truncated representation.
+fn stream_file(streamed: StreamedFile) -> crate::body::Body {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let (sender, receiver) = tokio::sync::mpsc::channel(2);
+    tokio::spawn(async move {
+        let StreamedFile { mut file, segments } = streamed;
+        for segment in segments {
+            match segment {
+                BodySegment::Literal(bytes) => {
+                    if sender.send(Ok(bytes)).await.is_err() {
+                        return;
+                    }
+                }
+                BodySegment::File { start, length } => {
+                    if let Err(error) = file.seek(std::io::SeekFrom::Start(start)).await {
+                        let _ = sender.send(Err(error.into())).await;
+                        return;
+                    }
+                    let mut remaining = length;
+                    while remaining > 0 {
+                        let want = remaining.min(STREAM_CHUNK as u64) as usize;
+                        let mut chunk = vec![0u8; want];
+                        match file.read_exact(&mut chunk).await {
+                            Ok(_) => {}
+                            Err(error) => {
+                                let _ = sender.send(Err(error.into())).await;
+                                return;
+                            }
+                        }
+                        remaining -= want as u64;
+                        if sender.send(Ok(Bytes::from(chunk))).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    });
+    crate::body::Body::from_stream(crate::body::StreamingBody::from_chunks(receiver))
 }
 
 async fn browse_html(
@@ -1994,6 +2173,353 @@ mod tests {
             header(&response, header::CONTENT_LENGTH),
             response.body.len().to_string()
         );
+    }
+
+    // --- SEC-MEDIUM-HTTP B2: the file is not read into memory per request ----------------------
+
+    /// Peak resident set size of this process in KiB, after resetting the high-water mark so
+    /// earlier tests in the same binary do not hide an allocation (Linux only).
+    #[cfg(target_os = "linux")]
+    fn reset_peak_rss() {
+        std::fs::write("/proc/self/clear_refs", "5").expect("reset VmHWM");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn peak_rss_kib() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("VmHWM:"))
+            .and_then(|rest| rest.trim().trim_end_matches("kB").trim().parse().ok())
+            .expect("VmHWM")
+    }
+
+    /// 1 GiB sparse file: cheap to create, but `fs::read` would allocate and zero-fill all of it.
+    #[cfg(target_os = "linux")]
+    fn sparse_file(dir: &Path, name: &str, len: u64) {
+        let file = std::fs::File::create(dir.join(name)).unwrap();
+        file.set_len(len).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn range_head_and_not_modified_of_a_huge_file_do_not_load_it() {
+        const GIB: u64 = 1 << 30;
+        const BUDGET_KIB: u64 = 192 * 1024; // concurrent tests (argon2id) add process-wide noise
+        let dir = tempfile::tempdir().unwrap();
+        sparse_file(dir.path(), "huge.bin", GIB);
+        set_mtime(&dir.path().join("huge.bin"), 1_700_000_000);
+        let handler = handler(dir.path()).await;
+
+        // A 1-byte range.
+        reset_peak_rss();
+        let before = peak_rss_kib();
+        let mut request = make_request(Method::GET, "/huge.bin");
+        request.headers.insert(
+            header::RANGE,
+            "bytes=1073741823-1073741823".parse().unwrap(),
+        );
+        let response = respond(&handler, request).await;
+        assert_eq!(response.status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.body.len(), 1);
+        assert_eq!(
+            header(&response, header::CONTENT_RANGE),
+            "bytes 1073741823-1073741823/1073741824"
+        );
+        let range_growth = peak_rss_kib().saturating_sub(before);
+
+        // HEAD reports the full length without a body.
+        reset_peak_rss();
+        let before = peak_rss_kib();
+        let response = respond(&handler, make_request(Method::HEAD, "/huge.bin")).await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert!(response.body.is_empty());
+        assert_eq!(header(&response, header::CONTENT_LENGTH), GIB.to_string());
+        let head_growth = peak_rss_kib().saturating_sub(before);
+
+        // A satisfied conditional request is a bodyless 304.
+        let etag = header(&response, header::ETAG);
+        assert!(!etag.is_empty());
+        reset_peak_rss();
+        let before = peak_rss_kib();
+        let mut request = make_request(Method::GET, "/huge.bin");
+        request
+            .headers
+            .insert(header::IF_NONE_MATCH, etag.parse().unwrap());
+        let response = respond(&handler, request).await;
+        assert_eq!(response.status, StatusCode::NOT_MODIFIED);
+        let not_modified_growth = peak_rss_kib().saturating_sub(before);
+
+        assert!(
+            range_growth < BUDGET_KIB
+                && head_growth < BUDGET_KIB
+                && not_modified_growth < BUDGET_KIB,
+            "the file was read into memory: peak RSS grew by range={range_growth} KiB, \
+             head={head_growth} KiB, not_modified={not_modified_growth} KiB"
+        );
+    }
+
+    /// A full GET of a large file on the streaming path is delivered in chunks, never buffered.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn large_full_get_is_streamed_not_buffered() {
+        use http_body_util::BodyExt;
+        const LEN: u64 = 512 << 20;
+        const BUDGET_KIB: u64 = 192 * 1024; // concurrent tests (argon2id) add process-wide noise
+        let dir = tempfile::tempdir().unwrap();
+        sparse_file(dir.path(), "big.bin", LEN);
+        let handler = handler(dir.path()).await;
+
+        reset_peak_rss();
+        let before = peak_rss_kib();
+        let outcome = handler
+            .handle_streaming(make_request(Method::GET, "/big.bin"))
+            .await
+            .unwrap();
+        let StreamingOutcome::Respond(response) = outcome else {
+            panic!("expected a response");
+        };
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            response
+                .headers
+                .get(header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok()),
+            Some(LEN.to_string().as_str())
+        );
+        let mut body = Box::pin(response.body);
+        let mut received = 0u64;
+        while let Some(frame) = body.frame().await {
+            let frame = frame.expect("body frame");
+            if let Some(data) = frame.data_ref() {
+                received += data.len() as u64;
+            }
+        }
+        assert_eq!(received, LEN);
+        let growth = peak_rss_kib().saturating_sub(before);
+        assert!(
+            growth < BUDGET_KIB,
+            "a {LEN}-byte file was buffered: peak RSS grew by {growth} KiB"
+        );
+    }
+
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|index| (index % 251) as u8).collect()
+    }
+
+    async fn streamed(handler: &FileServerHandler, request: Request) -> (Response, bool) {
+        let StreamingOutcome::Respond(response) = handler.handle_streaming(request).await.unwrap()
+        else {
+            panic!("expected a response");
+        };
+        let was_stream = matches!(response.body, crate::body::Body::Stream(_));
+        let body = response.body.into_bytes().await.unwrap();
+        (
+            Response {
+                status: response.status,
+                headers: response.headers,
+                body,
+            },
+            was_stream,
+        )
+    }
+
+    /// Streamed bodies (above the threshold) are byte-identical to the buffered path, for full,
+    /// single-range and multipart responses.
+    #[tokio::test]
+    async fn streamed_bodies_match_the_content_and_buffered_framing() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = pattern(1_000_000);
+        std::fs::write(dir.path().join("big.txt"), &content).unwrap();
+        let handler = handler(dir.path()).await;
+
+        let (response, was_stream) =
+            streamed(&handler, make_request(Method::GET, "/big.txt")).await;
+        assert!(was_stream, "a large body must be streamed");
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, content);
+        assert_eq!(header(&response, header::CONTENT_LENGTH), "1000000");
+
+        let mut request = make_request(Method::GET, "/big.txt");
+        request
+            .headers
+            .insert(header::RANGE, "bytes=100-599999".parse().unwrap());
+        let (response, was_stream) = streamed(&handler, request).await;
+        assert!(was_stream);
+        assert_eq!(response.status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.body, content[100..600_000]);
+        assert_eq!(
+            header(&response, header::CONTENT_RANGE),
+            "bytes 100-599999/1000000"
+        );
+
+        let mut request = make_request(Method::GET, "/big.txt");
+        request.headers.insert(
+            header::RANGE,
+            "bytes=0-299999,400000-699999".parse().unwrap(),
+        );
+        let (response, was_stream) = streamed(&handler, request).await;
+        assert!(was_stream);
+        assert_eq!(response.status, StatusCode::PARTIAL_CONTENT);
+        let boundary = header(&response, header::CONTENT_TYPE)
+            .strip_prefix("multipart/byteranges; boundary=")
+            .expect("multipart")
+            .to_string();
+        let mut expected = Vec::new();
+        for (start, end) in [(0usize, 299_999usize), (400_000, 699_999)] {
+            expected.extend_from_slice(
+                format!(
+                    "--{boundary}\r\nContent-Range: bytes {start}-{end}/1000000\r\n\
+                     Content-Type: text/plain; charset=utf-8\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            expected.extend_from_slice(&content[start..=end]);
+            expected.extend_from_slice(b"\r\n");
+        }
+        expected.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        assert_eq!(response.body.len(), expected.len());
+        assert!(response.body == expected, "multipart body differs");
+        assert_eq!(
+            header(&response, header::CONTENT_LENGTH),
+            expected.len().to_string()
+        );
+    }
+
+    /// Small bodies keep the inline read (no producer task, same framing as before).
+    #[tokio::test]
+    async fn small_bodies_are_not_streamed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("small.txt"), pattern(1000)).unwrap();
+        let handler = handler(dir.path()).await;
+        let (response, was_stream) =
+            streamed(&handler, make_request(Method::GET, "/small.txt")).await;
+        assert!(!was_stream);
+        assert_eq!(response.body, pattern(1000));
+    }
+
+    /// Range correctness at the start, middle and end, suffix and open-ended ranges, multiple
+    /// ranges, and `If-Range` (validator match serves the range; mismatch serves the full file).
+    #[tokio::test]
+    async fn range_variants_read_exactly_the_requested_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = pattern(100);
+        std::fs::write(dir.path().join("f.bin"), &content).unwrap();
+        set_mtime(&dir.path().join("f.bin"), 1_700_000_000);
+        let handler = handler(dir.path()).await;
+
+        let cases: [(&str, usize, usize); 6] = [
+            ("bytes=0-0", 0, 1),
+            ("bytes=50-59", 50, 60),
+            ("bytes=99-99", 99, 100),
+            ("bytes=-10", 90, 100),
+            ("bytes=90-", 90, 100),
+            ("bytes=95-1000", 95, 100),
+        ];
+        for (spec, start, end) in cases {
+            let mut request = make_request(Method::GET, "/f.bin");
+            request.headers.insert(header::RANGE, spec.parse().unwrap());
+            let response = respond(&handler, request).await;
+            assert_eq!(response.status, StatusCode::PARTIAL_CONTENT, "{spec}");
+            assert_eq!(response.body, content[start..end], "{spec}");
+            assert_eq!(
+                header(&response, header::CONTENT_RANGE),
+                format!("bytes {}-{}/100", start, end - 1),
+                "{spec}"
+            );
+            assert_eq!(
+                header(&response, header::CONTENT_LENGTH),
+                (end - start).to_string(),
+                "{spec}"
+            );
+        }
+
+        let mut request = make_request(Method::GET, "/f.bin");
+        request
+            .headers
+            .insert(header::RANGE, "bytes=0-9,20-29".parse().unwrap());
+        let response = respond(&handler, request).await;
+        assert_eq!(response.status, StatusCode::PARTIAL_CONTENT);
+        let text = response.body.to_vec();
+        for window in [&content[0..10], &content[20..30]] {
+            assert!(text.windows(10).any(|candidate| candidate == window));
+        }
+
+        // If-Range with the current ETag keeps the range; a stale one serves everything.
+        let head = respond(&handler, make_request(Method::HEAD, "/f.bin")).await;
+        let etag = header(&head, header::ETAG);
+        let mut request = make_request(Method::GET, "/f.bin");
+        request
+            .headers
+            .insert(header::RANGE, "bytes=10-19".parse().unwrap());
+        request
+            .headers
+            .insert(header::IF_RANGE, etag.parse().unwrap());
+        let response = respond(&handler, request).await;
+        assert_eq!(response.status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.body, content[10..20]);
+
+        let mut request = make_request(Method::GET, "/f.bin");
+        request
+            .headers
+            .insert(header::RANGE, "bytes=10-19".parse().unwrap());
+        request
+            .headers
+            .insert(header::IF_RANGE, "\"stale\"".parse().unwrap());
+        let response = respond(&handler, request).await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, content);
+
+        // Past the end is still a 416 and a HEAD with a range reports the range without a body.
+        let mut request = make_request(Method::GET, "/f.bin");
+        request
+            .headers
+            .insert(header::RANGE, "bytes=100-".parse().unwrap());
+        assert_eq!(
+            respond(&handler, request).await.status,
+            StatusCode::RANGE_NOT_SATISFIABLE
+        );
+        let mut request = make_request(Method::HEAD, "/f.bin");
+        request
+            .headers
+            .insert(header::RANGE, "bytes=10-19".parse().unwrap());
+        let response = respond(&handler, request).await;
+        assert_eq!(response.status, StatusCode::PARTIAL_CONTENT);
+        assert!(response.body.is_empty());
+        assert_eq!(header(&response, header::CONTENT_LENGTH), "10");
+    }
+
+    /// A file that shrinks between `stat` and the read must not deliver a truncated 200 or panic:
+    /// the buffered read reports it as an I/O error.
+    #[tokio::test]
+    async fn read_segments_reports_a_file_shorter_than_planned() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("short.bin"), b"abc").unwrap();
+        let mut file = fs::File::open(dir.path().join("short.bin")).await.unwrap();
+        let error = read_segments(
+            &mut file,
+            &[BodySegment::File {
+                start: 0,
+                length: 10,
+            }],
+        )
+        .await
+        .expect_err("short file");
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        let body = read_segments(
+            &mut file,
+            &[
+                BodySegment::Literal(Bytes::from_static(b"[")),
+                BodySegment::File {
+                    start: 1,
+                    length: 2,
+                },
+                BodySegment::Literal(Bytes::from_static(b"]")),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(body, Bytes::from_static(b"[bc]"));
     }
 
     #[tokio::test]
@@ -2968,7 +3494,7 @@ mod tests {
             length: 10,
         }];
         assert!(
-            multipart_body(&ranges, "text/plain", 100, "boundary", b"short").is_none(),
+            multipart_segments(&ranges, "text/plain", 100, "boundary", 5).is_none(),
             "range beyond the read bytes must be rejected"
         );
     }
@@ -2978,14 +3504,7 @@ mod tests {
     /// `Content-Range: bytes */<complete-length>`, not the stale `bytes <start>-<end>/<size>`.
     #[test]
     fn stale_single_range_is_416_with_unsatisfied_content_range() {
-        let outcome = apply_ranges(
-            false,
-            HeaderMap::new(),
-            Some("bytes=5-9"),
-            true,
-            10,
-            Bytes::from_static(b"short"),
-        );
+        let outcome = apply_ranges(false, HeaderMap::new(), Some("bytes=5-9"), true, 10, 5);
         let RangeOutcome::Reject(response) = outcome else {
             panic!("a stale single range must be rejected");
         };
@@ -3007,14 +3526,7 @@ mod tests {
     /// arm: 416 with `Content-Range: bytes */<complete-length>`, never a 500.
     #[test]
     fn stale_multipart_range_is_416_with_unsatisfied_content_range() {
-        let outcome = apply_ranges(
-            false,
-            HeaderMap::new(),
-            Some("bytes=0-1,4-5"),
-            true,
-            10,
-            Bytes::from_static(b"short"),
-        );
+        let outcome = apply_ranges(false, HeaderMap::new(), Some("bytes=0-1,4-5"), true, 10, 5);
         let RangeOutcome::Reject(response) = outcome else {
             panic!("a stale multipart range must be rejected");
         };
@@ -3039,14 +3551,7 @@ mod tests {
     /// `Content-Range`.
     #[test]
     fn valid_single_range_still_returns_206_with_its_content_range() {
-        let outcome = apply_ranges(
-            false,
-            HeaderMap::new(),
-            Some("bytes=0-1"),
-            true,
-            10,
-            Bytes::from_static(b"0123456789"),
-        );
+        let outcome = apply_ranges(false, HeaderMap::new(), Some("bytes=0-1"), true, 10, 10);
         let RangeOutcome::Serve(plan) = outcome else {
             panic!("a valid range must be served");
         };
@@ -3058,7 +3563,13 @@ mod tests {
             Some("bytes 0-1/10")
         );
         assert_eq!(plan.send_size, 2);
-        assert_eq!(plan.body, Bytes::from_static(b"01"));
+        assert_eq!(
+            plan.segments,
+            vec![BodySegment::File {
+                start: 0,
+                length: 2
+            }]
+        );
         assert!(plan.ranged);
     }
 
@@ -3066,14 +3577,7 @@ mod tests {
     /// top-level `Content-Range`.
     #[test]
     fn valid_multipart_range_still_returns_206() {
-        let outcome = apply_ranges(
-            false,
-            HeaderMap::new(),
-            Some("bytes=0-1,4-5"),
-            true,
-            10,
-            Bytes::from_static(b"0123456789"),
-        );
+        let outcome = apply_ranges(false, HeaderMap::new(), Some("bytes=0-1,4-5"), true, 10, 10);
         let RangeOutcome::Serve(plan) = outcome else {
             panic!("a valid multipart range must be served");
         };
@@ -3084,7 +3588,8 @@ mod tests {
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.starts_with("multipart/byteranges; boundary=")));
         assert!(plan.headers.get(header::CONTENT_RANGE).is_none());
-        assert_eq!(plan.send_size, plan.body.len() as u64);
+        assert_eq!(plan.send_size, segments_len(&plan.segments));
+        assert_eq!(file_bytes(&plan.segments), 4);
         assert!(plan.ranged);
     }
 
