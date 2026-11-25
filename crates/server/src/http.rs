@@ -524,10 +524,7 @@ pub(crate) async fn serve_request_with_automatic_upgradable(
                 );
                 return served_response_with_identity(
                     limits,
-                    status_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "503 Service Unavailable",
-                    ),
+                    status_response(StatusCode::SERVICE_UNAVAILABLE, "503 Service Unavailable"),
                 );
             }
             Err(BodyReadError::TooLarge { limit }) => {

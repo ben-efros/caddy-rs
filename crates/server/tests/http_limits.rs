@@ -735,7 +735,10 @@ async fn declared_length_over_the_buffering_ceiling_is_refused_up_front() {
 
     let mut stream = TcpStream::connect(address).await.expect("connect");
     let request = "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 10737418240\r\n\r\n";
-    stream.write_all(request.as_bytes()).await.expect("send head");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("send head");
     // No body is sent: the 413 must come from the declared length alone.
     let response = read_until_close(&mut stream, Duration::from_secs(5)).await;
     let response = String::from_utf8_lossy(&response);
@@ -746,4 +749,3 @@ async fn declared_length_over_the_buffering_ceiling_is_refused_up_front() {
 
     runtime.shutdown().await;
 }
-
