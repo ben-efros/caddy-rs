@@ -2809,6 +2809,7 @@ fn admin_body_limit(api: &AdminApi) -> Option<usize> {
 /// An over-cap body (declared by `Content-Length` or streamed) is `413`; a transport failure
 /// mid-body is `400` rather than the empty body the listeners used to substitute, which ran
 /// `/load` and friends against a silently truncated request.
+#[allow(clippy::result_large_err)] // the error is the ready-to-send admin response
 async fn read_admin_body<B>(
     headers: &http::HeaderMap,
     body: B,
