@@ -43,8 +43,7 @@ use crate::error::{Error, Result};
 use crate::limits::ServerLimits;
 use crate::listeners::{
     bind, bind_admin_remote, bind_admin_with, remote_admin_tls_config, AdminBindOptions,
-    ListenerHandle, ListenerState,
-    SharedListeners,
+    ListenerHandle, ListenerState, SharedListeners,
 };
 use crate::observability::{record_certificate_metrics, AccessLogRuntime, ServerAccessLogPolicy};
 use crate::proxy_protocol::ListenerWrappers;
@@ -1419,13 +1418,9 @@ impl ServerRuntime {
             // listener, so `AddrInUse` falls back to stop-then-bind.
             let mut new_handle = None;
             if let Some(listen) = &desired_admin {
-                let first = bind_admin_with(
-                    listen,
-                    self.admin_api.clone(),
-                    self.binder_ref(),
-                    options,
-                )
-                .await;
+                let first =
+                    bind_admin_with(listen, self.admin_api.clone(), self.binder_ref(), options)
+                        .await;
                 match first {
                     Ok(handle) => new_handle = Some(handle),
                     Err(Error::Bind { cause, .. })
@@ -1448,13 +1443,8 @@ impl ServerRuntime {
                 let handle = match new_handle {
                     Some(handle) => handle,
                     None => {
-                        bind_admin_with(
-                            listen,
-                            self.admin_api.clone(),
-                            self.binder_ref(),
-                            options,
-                        )
-                        .await?
+                        bind_admin_with(listen, self.admin_api.clone(), self.binder_ref(), options)
+                            .await?
                     }
                 };
                 tracing::info!(listen, bound = %handle.bound, "admin API listening");
@@ -3383,7 +3373,9 @@ mod shutdown_latch_tests {
         };
         let store = Arc::new(GenerationStore::with_builtin_registry());
         let mut runtime = ServerRuntime::new(Arc::clone(&store));
-        store.load(config(format!("127.0.0.1:{port}"))).expect("load");
+        store
+            .load(config(format!("127.0.0.1:{port}")))
+            .expect("load");
         runtime.apply().await.expect("initial apply");
         assert_eq!(runtime.admin_address().map(|a| a.port()), Some(port));
 
@@ -3412,8 +3404,10 @@ mod shutdown_latch_tests {
             .expect("the old admin address still accepts");
         stream
             .write_all(
-                format!("GET /config/ HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
-                    .as_bytes(),
+                format!(
+                    "GET /config/ HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
             )
             .await
             .unwrap();

@@ -5340,7 +5340,10 @@ mod admin_limits_tests {
     #[test]
     fn the_listener_wide_cap_applies_across_peers() {
         let slots = super::AdminBodySlots::with_limits(3, 2);
-        let _a = [slots.try_acquire("a").unwrap(), slots.try_acquire("a").unwrap()];
+        let _a = [
+            slots.try_acquire("a").unwrap(),
+            slots.try_acquire("a").unwrap(),
+        ];
         let _b = slots.try_acquire("b").unwrap();
         assert!(slots.try_acquire("c").is_none(), "listener-wide cap");
         assert!(slots.try_acquire("a").is_none(), "per-peer cap");
@@ -5957,12 +5960,24 @@ mod admin_unix_tests {
         let refused = Error::from(ErrorKind::ConnectionRefused);
         let denied = Error::from(ErrorKind::PermissionDenied);
         let other = Error::other("boom");
-        assert_eq!(classify_probe(Ok(()), false, 1000, Some(1000)), SocketProbe::Live);
-        assert_eq!(classify_probe(Err(&refused), false, 1000, Some(1000)), SocketProbe::Stale);
+        assert_eq!(
+            classify_probe(Ok(()), false, 1000, Some(1000)),
+            SocketProbe::Live
+        );
+        assert_eq!(
+            classify_probe(Err(&refused), false, 1000, Some(1000)),
+            SocketProbe::Stale
+        );
         // A wedged peer that never accepts within the budget counts as live (safe error).
-        assert_eq!(classify_probe(Ok(()), true, 1000, Some(1000)), SocketProbe::Live);
+        assert_eq!(
+            classify_probe(Ok(()), true, 1000, Some(1000)),
+            SocketProbe::Live
+        );
         // EACCES on a socket another user owns (a crashed `sudo caddy-rs run`): stale.
-        assert_eq!(classify_probe(Err(&denied), false, 0, Some(1000)), SocketProbe::Stale);
+        assert_eq!(
+            classify_probe(Err(&denied), false, 0, Some(1000)),
+            SocketProbe::Stale
+        );
         // EACCES on our own socket, or when we cannot tell who we are: report, do not guess.
         assert!(matches!(
             classify_probe(Err(&denied), false, 1000, Some(1000)),

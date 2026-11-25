@@ -381,8 +381,8 @@ fn admin_status(socket: &std::path::Path) -> u16 {
     stream
         .set_read_timeout(Some(Duration::from_secs(3)))
         .expect("set read timeout");
-    let _ = stream
-        .write_all(b"GET /config/ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    let _ =
+        stream.write_all(b"GET /config/ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
     let mut response = Vec::new();
     let _ = stream.read_to_end(&mut response);
     String::from_utf8_lossy(&response)
@@ -410,11 +410,7 @@ fn an_upgrade_hands_the_unix_admin_socket_to_the_new_process() {
     let port = free_port();
     let socket = dir.join("admin.sock");
     let config = dir.join("config.json");
-    std::fs::write(
-        &config,
-        serde_json_config(port, &socket),
-    )
-    .expect("write the config");
+    std::fs::write(&config, serde_json_config(port, &socket)).expect("write the config");
     let log_path = dir.join("caddy-rs.stderr");
     let mut parent = Command::new(binary())
         .args([
@@ -493,7 +489,11 @@ fn an_upgrade_hands_the_unix_admin_socket_to_the_new_process() {
         }
         thread::sleep(Duration::from_millis(100));
     };
-    assert!(exit.success(), "the old process exited with {exit}:\n{}", log());
+    assert!(
+        exit.success(),
+        "the old process exited with {exit}:\n{}",
+        log()
+    );
 
     // The new process owns the admin socket: it answers, and the old process's exit did not
     // unlink the replaced path.

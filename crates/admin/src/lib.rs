@@ -2137,7 +2137,10 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         let theirs = UnixListener::bind(&path).expect("bind another");
         latch.remove_owned_socket_paths();
-        assert!(std::fs::symlink_metadata(&path).is_ok(), "foreign socket survives");
+        assert!(
+            std::fs::symlink_metadata(&path).is_ok(),
+            "foreign socket survives"
+        );
         // The path moved on: a disowned path is never touched either.
         latch.disown_socket_path(&path);
         latch.remove_owned_socket_paths();
@@ -2150,7 +2153,10 @@ mod tests {
         let metadata = std::fs::symlink_metadata(&path).unwrap();
         latch.own_socket_path(&path, metadata.dev(), metadata.ino());
         latch.remove_owned_socket_paths();
-        assert!(std::fs::symlink_metadata(&path).is_err(), "our own socket is removed");
+        assert!(
+            std::fs::symlink_metadata(&path).is_err(),
+            "our own socket is removed"
+        );
         drop(again);
     }
 
