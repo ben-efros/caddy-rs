@@ -8,8 +8,11 @@
 //!
 //! * **platform store** — Linux: copy the root into
 //!   `<prefix>/usr/local/share/ca-certificates/caddy-rs-<ca-id>.crt` and run
-//!   `update-ca-certificates`; macOS: `security add-trusted-cert`; Windows and other operating
-//!   systems are explicitly unsupported with a located limitation (no silent success).
+//!   `update-ca-certificates`; macOS: `security add-trusted-cert`; Windows: `certutil -user
+//!   -addstore -f Root` into the current user's Trusted Root store (what Caddy's truststore does),
+//!   probed by the certificate's SHA-1 thumbprint so a second run reports "already installed";
+//!   other operating systems are explicitly unsupported with a located limitation (no silent
+//!   success).
 //! * **NSS/Firefox** — every discovered NSS database (`$HOME/.pki/nssdb` and Firefox profiles
 //!   containing `cert9.db`, plus legacy `cert8.db` databases) is updated with
 //!   `certutil -d sql:<db> -A -t C,, -n <alias> -i <root.crt>`. Requires `certutil` (nss-tools).
@@ -58,7 +61,7 @@ pub enum TrustPlatform {
     Linux,
     /// macOS: `security add-trusted-cert` on the system keychain.
     MacOs,
-    /// Windows: no automatic installation in this build (documented limitation).
+    /// Windows: `certutil -user -addstore -f Root` into the current user's Trusted Root store.
     Windows,
     /// Any other target: no automatic installation.
     Unsupported,
@@ -315,16 +318,19 @@ impl TrustEnvironment {
 
     fn find_program(&self, name: &str) -> Option<PathBuf> {
         for directory in &self.path {
+            // An empty `PATH` entry means "the working directory" to some shells; never resolve a
+            // program there.
+            if directory.as_os_str().is_empty() {
+                continue;
+            }
+            // Windows runs a program by its `.exe` file; an extension-less file with the same name
+            // is not one and is never offered.
+            #[cfg(target_os = "windows")]
+            let candidate = directory.join(format!("{name}.exe"));
+            #[cfg(not(target_os = "windows"))]
             let candidate = directory.join(name);
             if is_executable(&candidate) {
                 return Some(candidate);
-            }
-            #[cfg(target_os = "windows")]
-            {
-                let candidate = directory.join(format!("{name}.exe"));
-                if is_executable(&candidate) {
-                    return Some(candidate);
-                }
             }
         }
         None
@@ -361,7 +367,15 @@ impl TrustPlan {
             &environment.platform_prefix,
             environment,
         )];
-        for (database, format) in discover_nss_databases(environment.home.as_deref()) {
+        // On Windows a `certutil` on PATH is the Windows tool, not NSS's, and Firefox there reads the
+        // Windows store (enterprise roots) or keeps its profile under %APPDATA%: NSS databases are
+        // not discovered, so the NSS command line is never run against the wrong program.
+        let nss_databases = if environment.platform == TrustPlatform::Windows {
+            Vec::new()
+        } else {
+            discover_nss_databases(environment.home.as_deref())
+        };
+        for (database, format) in nss_databases {
             targets.push(nss_target(
                 &database,
                 format,
@@ -615,21 +629,74 @@ fn platform_target(
                 steps,
             }
         }
-        TrustPlatform::Windows => TrustTarget {
-            kind: platform_store,
-            status: TrustStatus::Unsupported {
-                limitation: "automatic trust-store installation on Windows is not implemented; \
-                             run `certutil -addstore -user Root <root.crt>` manually (this build \
-                             never modifies the Windows certificate store silently)"
-                    .to_string(),
-            },
-            probe: None,
-            steps: Vec::new(),
-            commands: vec![format!(
-                "certutil -addstore -user Root \"{}\"",
-                root_path.display()
-            )],
-        },
+        TrustPlatform::Windows => {
+            // The current user's Trusted Root store needs no elevation (Caddy's truststore opens
+            // the same store); Windows asks for confirmation in a dialog when a root is added to it,
+            // so an unattended or service context cannot complete the install. A machine-wide
+            // install is the same command without `-user`, from an elevated prompt.
+            let thumbprint = certificate_thumbprint(root_path);
+            let display = |args: &[String]| format!("certutil {}", args.join(" "));
+            let install_args = vec![
+                "-user".to_string(),
+                "-addstore".to_string(),
+                "-f".to_string(),
+                "Root".to_string(),
+                format!("\"{}\"", root_path.display()),
+            ];
+            let commands = vec![display(&install_args)];
+            let Some(certutil) =
+                windows_system_certutil().or_else(|| environment.find_program("certutil"))
+            else {
+                return TrustTarget {
+                    kind: platform_store,
+                    status: TrustStatus::MissingTool {
+                        tool: "certutil",
+                        limitation: "the Windows certificate store was not updated because \
+                                      `certutil` was not found on PATH (it ships in \
+                                      %SystemRoot%\\System32); the root certificate is not \
+                                      trusted by Windows clients"
+                            .to_string(),
+                    },
+                    probe: None,
+                    steps: Vec::new(),
+                    commands,
+                };
+            };
+            // `certutil` takes the path as one argument; quoting is the shell's job in the printed
+            // command only.
+            let steps = vec![TrustStep::Run {
+                program: certutil.clone(),
+                args: vec![
+                    "-user".to_string(),
+                    "-addstore".to_string(),
+                    "-f".to_string(),
+                    "Root".to_string(),
+                    // Absolute, so a relative data directory starting with `-` cannot be read as an
+                    // option.
+                    std::path::absolute(root_path)
+                        .unwrap_or_else(|_| root_path.to_path_buf())
+                        .display()
+                        .to_string(),
+                ],
+            }];
+            // `-store Root <sha1>` exits non-zero when no certificate with that thumbprint exists.
+            let probe = thumbprint.map(|thumbprint| TrustStep::Run {
+                program: certutil,
+                args: vec![
+                    "-user".to_string(),
+                    "-store".to_string(),
+                    "Root".to_string(),
+                    thumbprint,
+                ],
+            });
+            TrustTarget {
+                kind: platform_store,
+                status: TrustStatus::Ready,
+                probe,
+                steps,
+                commands,
+            }
+        }
         TrustPlatform::Unsupported => TrustTarget {
             kind: platform_store,
             status: TrustStatus::Unsupported {
@@ -644,6 +711,40 @@ fn platform_target(
             commands: Vec::new(),
         },
     }
+}
+
+/// The Windows `certutil` from the system directory, when this is a Windows build and it exists.
+///
+/// Installing a trusted root is a high-impact operation, so the system copy is preferred over the
+/// first `certutil` on `PATH`, which can be a user-writable directory (or the working directory)
+/// holding a look-alike. `PATH` is only the fallback (and what tests use with stand-in tools).
+fn windows_system_certutil() -> Option<PathBuf> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let root = std::env::var_os("SystemRoot").or_else(|| std::env::var_os("windir"))?;
+    let candidate = PathBuf::from(root).join("System32").join("certutil.exe");
+    candidate.is_file().then_some(candidate)
+}
+
+/// Upper-case hex SHA-1 thumbprint of the first certificate in a PEM file: the identifier Windows
+/// tools (`certutil -store`) use. SHA-1 here only *names* a certificate for a lookup; nothing is
+/// authenticated with it. `None` when the file cannot be read or holds no certificate (the install
+/// still runs, only the "already installed" probe is unavailable).
+fn certificate_thumbprint(root_path: &Path) -> Option<String> {
+    let pem = std::fs::read(root_path).ok()?;
+    let der = crate::pki::parse_pem_certificates(&pem, root_path)
+        .ok()?
+        .into_iter()
+        .next()?;
+    let digest = ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, &der);
+    Some(
+        digest
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect(),
+    )
 }
 
 fn nss_target(
@@ -1092,17 +1193,251 @@ mod tests {
     }
 
     #[test]
-    fn windows_and_unsupported_platforms_are_loudly_unsupported() {
-        for platform in [TrustPlatform::Windows, TrustPlatform::Unsupported] {
-            let directory = temp_dir("unsupported");
-            let root = root_certificate(&directory);
-            let environment = TrustEnvironment::new(platform, None, Vec::new());
-            let plan = TrustPlan::detect("local", &root, &environment);
-            let limitation = plan.targets[0].status.limitation().unwrap();
-            assert!(!limitation.is_empty(), "{platform:?}");
-            let report = execute(&plan).unwrap();
-            assert_eq!(report.skipped.len(), 1);
-            assert!(!report.any_trusted());
+    fn unsupported_platforms_are_loudly_unsupported() {
+        let directory = temp_dir("unsupported");
+        let root = root_certificate(&directory);
+        let environment = TrustEnvironment::new(TrustPlatform::Unsupported, None, Vec::new());
+        let plan = TrustPlan::detect("local", &root, &environment);
+        let limitation = plan.targets[0].status.limitation().unwrap();
+        assert!(!limitation.is_empty());
+        let report = execute(&plan).unwrap();
+        assert_eq!(report.skipped.len(), 1);
+        assert!(!report.any_trusted());
+    }
+
+    /// The fixture CA root, copied next to the test so the plan sees a real certificate.
+    fn real_root_certificate(directory: &Path) -> PathBuf {
+        let path = directory.join("root.crt");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/pki/authorities/local/root.crt");
+        std::fs::copy(fixture, &path).unwrap();
+        path
+    }
+
+    #[test]
+    fn windows_platform_installs_into_the_user_root_store_and_is_idempotent() {
+        let directory = temp_dir("windows");
+        let root = real_root_certificate(&directory);
+        let bin = directory.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let log = directory.join("certutil.log");
+        let marker = directory.join("installed");
+        // A stand-in `certutil`: `-store` succeeds only once `-addstore` ran.
+        write_executable(
+            &bin.join("certutil"),
+            &format!(
+                "#!/bin/sh\necho $* >> '{}'\ncase $* in\n  *-addstore*) touch '{}'; exit 0;;\n  *-store*) [ -f '{}' ] && exit 0 || exit 1;;\nesac\nexit 2\n",
+                log.display(),
+                marker.display(),
+                marker.display()
+            ),
+        );
+        let environment = TrustEnvironment::new(TrustPlatform::Windows, None, vec![bin]);
+        let plan = TrustPlan::detect("local", &root, &environment);
+        assert_eq!(plan.targets.len(), 1);
+        let target = &plan.targets[0];
+        assert!(target.status.is_ready());
+        assert!(
+            target.probe.is_some(),
+            "a real certificate has a thumbprint"
+        );
+        assert_eq!(
+            target.commands,
+            vec![format!(
+                "certutil -user -addstore -f Root \"{}\"",
+                root.display()
+            )]
+        );
+
+        let first = execute(&plan).unwrap();
+        assert_eq!(first.installed, vec![TrustStoreKind::Platform]);
+        assert!(first.already_installed.is_empty());
+        let second = execute(&plan).unwrap();
+        assert_eq!(second.already_installed, vec![TrustStoreKind::Platform]);
+        assert!(second.installed.is_empty());
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        let lines: Vec<&str> = calls.lines().collect();
+        // probe (absent), install, probe (present).
+        assert_eq!(lines.len(), 3, "{calls}");
+        assert_eq!(
+            lines[0],
+            "-user -store Root A3ACA63A4F5492EF6C92436716852DCE87DD582D"
+        );
+        assert_eq!(
+            lines[1],
+            format!("-user -addstore -f Root {}", root.display())
+        );
+        assert_eq!(lines[2], lines[0]);
+    }
+
+    #[test]
+    fn windows_without_certutil_is_a_loud_limitation_naming_the_tool() {
+        let directory = temp_dir("windows-missing");
+        let root = real_root_certificate(&directory);
+        let empty = directory.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let environment = TrustEnvironment::new(TrustPlatform::Windows, None, vec![empty]);
+        let plan = TrustPlan::detect("local", &root, &environment);
+        assert!(matches!(
+            plan.targets[0].status,
+            TrustStatus::MissingTool {
+                tool: "certutil",
+                ..
+            }
+        ));
+        let report = execute(&plan).unwrap();
+        assert_eq!(report.skipped.len(), 1);
+        assert!(report.skipped[0].1.contains("certutil"));
+        assert!(!report.any_trusted());
+    }
+
+    #[test]
+    fn windows_never_runs_the_nss_command_line_against_its_own_certutil() {
+        let directory = temp_dir("windows-nss");
+        let root = real_root_certificate(&directory);
+        // A home directory with an NSS database that Linux would discover.
+        let home = directory.join("home");
+        std::fs::create_dir_all(home.join(".pki/nssdb")).unwrap();
+        std::fs::write(home.join(".pki/nssdb/cert9.db"), b"").unwrap();
+        let environment = TrustEnvironment::new(TrustPlatform::Windows, Some(home), Vec::new());
+        let plan = TrustPlan::detect("local", &root, &environment);
+        assert_eq!(plan.targets.len(), 1, "only the platform target: {plan:?}");
+    }
+}
+
+#[cfg(test)]
+mod thumbprint_tests {
+    use super::*;
+
+    /// SHA-1 of the fixture root's DER, computed independently of this code (Python's hashlib).
+    #[test]
+    fn thumbprint_matches_an_independent_computation() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/pki/authorities/local/root.crt");
+        assert_eq!(
+            certificate_thumbprint(&fixture).as_deref(),
+            Some("A3ACA63A4F5492EF6C92436716852DCE87DD582D")
+        );
+    }
+
+    #[test]
+    fn thumbprint_of_a_missing_or_certificate_free_file_is_none() {
+        let directory = tempfile::tempdir().unwrap();
+        assert_eq!(
+            certificate_thumbprint(&directory.path().join("nope.crt")),
+            None
+        );
+        let garbage = directory.path().join("garbage.crt");
+        std::fs::write(&garbage, "not a certificate").unwrap();
+        assert_eq!(certificate_thumbprint(&garbage), None);
+    }
+
+    /// The Windows plan is built from the environment alone, so it can be checked on any host
+    /// (nothing is executed): the install and probe command lines are what `certutil` expects.
+    #[test]
+    fn windows_plan_uses_the_current_user_root_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let bin = directory.path().to_path_buf();
+        let program = if cfg!(windows) {
+            "certutil.exe"
+        } else {
+            "certutil"
+        };
+        std::fs::write(bin.join(program), b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(bin.join(program), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
         }
+        let root = directory.path().join("root.crt");
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/pki/authorities/local/root.crt"),
+            &root,
+        )
+        .unwrap();
+        let environment = TrustEnvironment::new(TrustPlatform::Windows, None, vec![bin]);
+        let plan = TrustPlan::detect("local", &root, &environment);
+        let target = &plan.targets[0];
+        assert!(target.status.is_ready(), "{:?}", target.status);
+        let Some(TrustStep::Run { args, .. }) = target.steps.first() else {
+            panic!("an install step");
+        };
+        assert_eq!(
+            args,
+            &[
+                "-user",
+                "-addstore",
+                "-f",
+                "Root",
+                &root.display().to_string()
+            ]
+        );
+        let Some(TrustStep::Run { args, .. }) = &target.probe else {
+            panic!("a probe step");
+        };
+        assert_eq!(
+            args,
+            &[
+                "-user",
+                "-store",
+                "Root",
+                "A3ACA63A4F5492EF6C92436716852DCE87DD582D"
+            ]
+        );
+    }
+    /// On a Windows host the system `certutil` wins over one earlier on `PATH`: a look-alike in a
+    /// user-writable directory must not be what installs a trusted root.
+    #[cfg(windows)]
+    #[test]
+    fn the_system_certutil_beats_a_look_alike_earlier_on_path() {
+        let system = windows_system_certutil().expect("certutil ships in System32");
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("certutil.exe"), b"not the real tool").unwrap();
+        let root = directory.path().join("root.crt");
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/pki/authorities/local/root.crt"),
+            &root,
+        )
+        .unwrap();
+        let environment = TrustEnvironment::new(
+            TrustPlatform::Windows,
+            None,
+            vec![directory.path().to_path_buf()],
+        );
+        let plan = TrustPlan::detect("local", &root, &environment);
+        for step in plan.targets[0]
+            .steps
+            .iter()
+            .chain(plan.targets[0].probe.iter())
+        {
+            let TrustStep::Run { program, .. } = step else {
+                panic!("a command step");
+            };
+            assert_eq!(program, &system);
+        }
+    }
+
+    /// Windows only runs `.exe` files, so an extension-less file on `PATH` is never offered, and an
+    /// empty `PATH` entry is never searched.
+    #[cfg(windows)]
+    #[test]
+    fn find_program_offers_only_exe_files_and_skips_empty_path_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("plain"), b"x").unwrap();
+        std::fs::write(directory.path().join("tool.exe"), b"x").unwrap();
+        let environment = TrustEnvironment::new(
+            TrustPlatform::Windows,
+            None,
+            vec![PathBuf::new(), directory.path().to_path_buf()],
+        );
+        assert_eq!(environment.find_program("plain"), None);
+        assert_eq!(
+            environment.find_program("tool"),
+            Some(directory.path().join("tool.exe"))
+        );
     }
 }

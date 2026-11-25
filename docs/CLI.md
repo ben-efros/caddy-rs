@@ -689,8 +689,9 @@ platform install target contains this exact root certificate and, on Linux, the 
 `/etc/ssl/certs/ca-certificates.crt` bundle does not contradict it), `missing` (the target does not
 contain it, or the bundle is stale), `disabled` (the supplied configuration has
 `apps.pki.certificate_authorities.<id>.install_trust: false`) or `unknown` (the platform store
-cannot be inspected without installing, as on macOS and Windows, or the platform tool is
-unavailable). On Linux the checked install target is
+cannot be inspected without installing, as on macOS, or the platform tool is
+unavailable). On Windows the state comes from a read-only `certutil -user -store Root <thumbprint>`
+lookup of the root's SHA-1 thumbprint in the current user's Trusted Root store. On Linux the checked install target is
 `/usr/local/share/ca-certificates/caddy-rs-<id>.crt`. NSS/Firefox and Java stores are not queried by
 `list`; use `caddy-rs trust --dry-run` to see every target.
 
@@ -912,6 +913,18 @@ privileges of the printed commands. Stores whose tool is missing are reported wi
 limitation. With `--config`, a CA configured with
 `apps.pki.certificate_authorities.<id>.install_trust: false` is a no-op with a message, and the
 configured `storage.root` is used as the data directory.
+
+On Windows the platform target is the current user's Trusted Root store, installed with
+`certutil -user -addstore -f Root <root.crt>` (no elevation needed; this is the store Caddy's
+`truststore` also uses). Windows shows a confirmation dialog when a root is added to that store, so
+the install must run in an interactive session and cannot complete from a service or a scheduled
+task. An already-installed root is detected by its SHA-1 thumbprint and reported as installed
+without a second prompt; only the current user's store is probed, so a root an administrator added
+to the machine store still shows as `missing` and `trust` adds a user-store copy, and a root file
+whose thumbprint cannot be computed (not PEM) is installed on every run. For a machine-wide store run the same command from an elevated prompt
+without `-user`. NSS/Firefox databases are not discovered on Windows (Firefox there can use the
+Windows store through its enterprise-roots setting); Java keystores are handled as on other
+systems when `keytool` is available.
 
 Exit status is 0 on success, including `--dry-run` and the `install_trust: false` no-op, and 1 when
 no trust store could be updated or the CA does not exist.

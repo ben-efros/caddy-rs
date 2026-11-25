@@ -15,7 +15,7 @@ supported, how to build and run it, how secrets are protected without POSIX perm
 | Admin API (TCP loopback) | Supported (see *Admin API exposure*) |
 | `caddy-rs-pm serve` and its web UI | Supported |
 | Running as a Windows service (`install`/`uninstall`) | **Not yet**: those commands generate systemd units. Use a service wrapper such as NSSM or WinSW meanwhile. |
-| `caddy-rs trust` / `untrust` (system trust store) | **Not yet** on Windows (use `certutil -addstore` with the exported root). |
+| `caddy-rs trust` (system trust store) | Supported: installs the root into the current user's Trusted Root store with `certutil` (Windows shows a confirmation dialog, so it needs an interactive session); `pki list` shows the real trust state. |
 | `unix//path` listeners, Unix-domain admin socket, systemd socket activation, `bind-fds`, graceful binary upgrade (`ecdysis`) | Not applicable on Windows; refused with a clear error or ignored (see `docs/compatibility/PATHS-SYMLINKS-WINDOWS.md`). |
 
 ## Building
@@ -112,7 +112,7 @@ junctions (`mklink /J`) need neither.
 ## Known limitations
 
 * No native Windows service installation yet (use NSSM/WinSW).
-* No system trust-store installation for the internal CA yet.
+* `trust` installs into the current user's store only; use an elevated `certutil -addstore -f Root <root.crt>` for a machine-wide root, and run it interactively (the confirmation dialog).
 * The proxy manager's `install` writes a systemd unit and is not meaningful on Windows.
 * `unix//` listeners are rejected; use a TCP address.
 * When the server refuses a large upload early (413/503) and closes, Windows may reset the connection so the client sees a reset instead of the status code.

@@ -122,6 +122,7 @@ Tests: `crates/http/tests/file_server_path_validation.rs` (the corpus, run as GE
 | Data directory, autosave and Caddyfile `import` safety rules | Enforced from the file's DACL and owner instead of mode bits and uid. |
 | JWT signing key (proxy manager) | Refused when another principal can read or write it, created private. |
 | Entry-point stack | The program runs on a 16 MiB thread (Tokio workers 8 MiB); Windows gives the main thread 1 MiB. |
+| `caddy-rs trust` | Installs into the current user's Trusted Root store through `certutil -user -addstore -f Root` (Caddy's truststore uses the same store through the CryptoAPI). Idempotent via a SHA-1 thumbprint probe; the thumbprint only names the certificate for the lookup. NSS databases are not discovered on Windows. See DIV-0073 for the alias difference on other stores. |
 | Upstream TLS and ACME trust roots | No PEM bundle exists on Windows; the operating-system certificate store is used when `SSL_CERT_FILE`/the Linux bundle paths yield nothing (`rustls-native-certs`). |
 | ACME CA directory with a port (`https://localhost:14000/dir`) | The on-disk issuer directory drops the `:` on Windows (`localhost14000-dir`), as CertMagic's key sanitiser does everywhere; a `:` is not a valid directory name there. Linux keeps `localhost:14000-dir` (existing data stays valid). |
 | `respond` with a body on stdin | Only a real pipe (`GetFileType == FILE_TYPE_PIPE`) supplies the body, matching Caddy's named-pipe test; a redirected file or `NUL` does not. |
