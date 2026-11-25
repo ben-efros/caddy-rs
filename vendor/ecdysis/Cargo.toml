@@ -77,7 +77,7 @@ optional = true
 version = "0.4"
 
 [dependencies.nix]
-version = "=0.31.3"
+version = "=0.32.0"
 default-features = false
 features = [
     "fs",
