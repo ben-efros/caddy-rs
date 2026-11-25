@@ -1645,7 +1645,7 @@ pub fn build_server_config_with_cert_resolver(
             } else {
                 // Caddy's `request`/`require` modes ask for a certificate but do not verify its
                 // chain; an optional exact-leaf allowlist is still enforced.
-                if trusted_leaves.is_empty() {
+                if trusted_leaves.is_empty() && first_accept_any_warning(mode) {
                     tracing::warn!(
                         mode = ?mode,
                         "TLS client authentication mode accepts ANY client certificate without \
@@ -2262,7 +2262,28 @@ fn attach_certificate_identity(error: Error, source: Option<&str>, names: &[Stri
     }
 }
 
+/// Whether the "accepts ANY client certificate" warning for `mode` has not been logged yet in this
+/// process. The server config is rebuilt for every config load and reload; repeating an identical
+/// warning each time is noise, so each unverified mode warns once per process.
+fn first_accept_any_warning(mode: ClientAuthMode) -> bool {
+    static WARNED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    first_time_bit(&WARNED, mode)
+}
+
+/// Set the bit for `mode` in `flags`; true when it was not set before.
+fn first_time_bit(flags: &std::sync::atomic::AtomicU8, mode: ClientAuthMode) -> bool {
+    let bit = match mode {
+        ClientAuthMode::Request => 1,
+        ClientAuthMode::Require => 2,
+        _ => 4,
+    };
+    flags.fetch_or(bit, std::sync::atomic::Ordering::Relaxed) & bit == 0
+}
+
 /// Located path for client-authentication configuration errors.
+///
+/// Only `tls_connection_policies[0]` supplies listener-wide client authentication (see
+/// `from_connection_policies_with_stock_compat`), so the index is always 0.
 const CLIENT_AUTH_PATH: &str = "tls_connection_policies[0].client_authentication";
 
 /// caddy-rs extension field acknowledging that `request`/`require` accept any client certificate.
@@ -4191,6 +4212,15 @@ mod tests {
             vec![b"h2".to_vec(), b"http/1.1".to_vec()]
         );
         assert!(Arc::strong_count(&resolver) >= 1);
+    }
+
+    #[test]
+    fn accept_any_warning_fires_once_per_mode() {
+        let flags = std::sync::atomic::AtomicU8::new(0);
+        assert!(first_time_bit(&flags, ClientAuthMode::Request));
+        assert!(!first_time_bit(&flags, ClientAuthMode::Request));
+        assert!(first_time_bit(&flags, ClientAuthMode::Require));
+        assert!(!first_time_bit(&flags, ClientAuthMode::Require));
     }
 
     #[test]
