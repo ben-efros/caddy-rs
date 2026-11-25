@@ -497,9 +497,18 @@ impl FileServerHandler {
                 "403 Forbidden",
             )));
         }
-        let original_metadata = fs::metadata(filename)
-            .await
-            .map_err(|error| Error::Io(error))?;
+        // Open once. Every validator below (ETag, Last-Modified, size, is_file) comes from this
+        // handle's `fstat`, and the bytes are read from the same handle, so a file swapped after
+        // the path checks cannot be served under another file's validators, and a final symlink
+        // swapped in is refused by the open itself (`O_NOFOLLOW`).
+        let (original_file, original_metadata) = match open_regular(filename).await {
+            Ok(opened) => opened,
+            Err(error) if is_symlink_refusal(&error) => return Ok(forbidden()),
+            Err(error) => return Err(Error::Io(error)),
+        };
+        if !original_metadata.is_file() {
+            return self.not_found(request);
+        }
         let modtime = mod_time(&original_metadata);
         let useful_modtime = modtime.is_some_and(|time| time.unix != 0 && time.unix != 1);
 
@@ -511,6 +520,7 @@ impl FileServerHandler {
         // Precompressed sidecar selection (Caddy's `AcceptedEncodings` loop).
         let mut representation = filename.to_path_buf();
         let mut representation_metadata = original_metadata;
+        let mut representation_file = original_file;
         let mut content_encoding: Option<&str> = None;
         for encoding in accepted_encodings(&request, &self.precompressed_order) {
             if !self.precompressed.iter().any(|format| format == &encoding) {
@@ -529,14 +539,17 @@ impl FileServerHandler {
                     "403 Forbidden",
                 )));
             }
-            let Ok(info) = fs::metadata(&sidecar).await else {
-                continue;
+            let (sidecar_file, info) = match open_regular(&sidecar).await {
+                Ok(opened) => opened,
+                Err(error) if is_symlink_refusal(&error) => return Ok(forbidden()),
+                Err(_) => continue,
             };
-            if info.is_dir() {
+            if !info.is_file() {
                 continue;
             }
             representation = sidecar;
             representation_metadata = info;
+            representation_file = sidecar_file;
             content_encoding = Some(match encoding.as_str() {
                 "gzip" => "gzip",
                 "br" => "br",
@@ -662,15 +675,10 @@ impl FileServerHandler {
             .and_then(|value| value.to_str().ok());
         let if_range_ok = check_if_range(&request, &etag, modtime, useful_modtime);
         let head = request.method == http::Method::HEAD;
-        // A HEAD never opens the file. A GET opens it (no read yet) so the length the ranges are
-        // checked against is the one of the handle the bytes will come from, not a stale `stat`.
-        let (file, available) = if head {
-            (None, size)
-        } else {
-            let file = fs::File::open(&representation).await.map_err(Error::Io)?;
-            let available = file.metadata().await.map_err(Error::Io)?.len();
-            (Some(file), available)
-        };
+        // `size` is the open handle's length (see above); the handle is also what the bytes are
+        // read from. A HEAD drops it without reading (it still proved the file is readable).
+        let available = size;
+        let file = (!head).then_some(representation_file);
         let RangePlan {
             status,
             mut headers,
@@ -1858,6 +1866,64 @@ async fn read_segments(file: &mut fs::File, segments: &[BodySegment]) -> std::io
     Ok(Bytes::from(body))
 }
 
+fn forbidden() -> Outcome {
+    Outcome::Respond(Response::text(StatusCode::FORBIDDEN, "403 Forbidden"))
+}
+
+/// Open `path` for reading and return the handle with its own `fstat` metadata. On unix the final
+/// component is opened with `O_NOFOLLOW` (the crate's symlink policy is "refuse", so a symlink
+/// swapped in after [`path_contains_symlink`] fails with `ELOOP` instead of being followed) and
+/// `O_NONBLOCK` (so a FIFO swapped in cannot hang the open; it is rejected as not-a-file).
+///
+/// Residual: `O_NOFOLLOW` covers only the last component; an intermediate directory swapped for a
+/// symlink inside the same window is not caught by the open. Closing that needs `openat2`
+/// (`RESOLVE_NO_SYMLINKS`) or a per-component `openat` walk, which this crate does not do.
+async fn open_regular(path: &Path) -> std::io::Result<(fs::File, std::fs::Metadata)> {
+    #[cfg(test)]
+    run_before_open_hook(path);
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = options.open(path).await?;
+    let metadata = file.metadata().await?;
+    Ok((file, metadata))
+}
+
+/// Whether an open failed because the final component is a symlink (`O_NOFOLLOW` reports `ELOOP`).
+fn is_symlink_refusal(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(libc::ELOOP)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = error;
+        false
+    }
+}
+
+/// Test seam: runs between the path-based checks and the single `open`, so a test can swap the
+/// file deterministically (the window a real attacker races).
+#[cfg(test)]
+type OpenHook = std::sync::Arc<dyn Fn() + Send + Sync>;
+#[cfg(test)]
+static BEFORE_OPEN_HOOKS: std::sync::Mutex<Vec<(PathBuf, OpenHook)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn run_before_open_hook(path: &Path) {
+    let hook = BEFORE_OPEN_HOOKS
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(hooked, _)| hooked == path)
+        .map(|(_, hook)| hook.clone());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// A response body to stream from an open file.
 struct StreamedFile {
     file: fs::File,
@@ -2321,6 +2387,104 @@ mod tests {
         assert_eq!(
             header(&response, header::ETAG),
             calculate_etag(&std::fs::metadata(&file).unwrap())
+        );
+    }
+
+    fn install_open_hook(path: PathBuf, hook: impl Fn() + Send + Sync + 'static) {
+        BEFORE_OPEN_HOOKS
+            .lock()
+            .unwrap()
+            .push((path, std::sync::Arc::new(hook)));
+    }
+
+    /// SEC-MEDIUM-HTTP B2 review: the symlink policy is checked on the path, so a regular file
+    /// swapped for a symlink between that check and the `open` must still be refused (the open
+    /// itself must not follow a final symlink), not served from outside the root.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_swapped_in_after_the_path_check_is_refused() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), b"TOP SECRET").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let served = dir.path().join("file.txt");
+        std::fs::write(&served, b"public").unwrap();
+        let secret = outside.path().join("secret.txt");
+        let target = served.clone();
+        install_open_hook(served.clone(), move || {
+            std::fs::remove_file(&target).unwrap();
+            std::os::unix::fs::symlink(&secret, &target).unwrap();
+        });
+        let handler = handler(dir.path()).await;
+        let outcome = handler.handle(make_request(Method::GET, "/file.txt")).await;
+        let leaked = matches!(
+            &outcome,
+            Ok(Outcome::Respond(response)) if response.body.starts_with(b"TOP")
+        );
+        assert!(!leaked, "a symlink swapped in after the check was followed");
+        let Ok(Outcome::Respond(response)) = outcome else {
+            panic!("expected a response");
+        };
+        assert_eq!(response.status, StatusCode::FORBIDDEN);
+    }
+
+    /// The validators (ETag, Content-Length) must describe the file that is actually served, taken
+    /// from the open handle, not from a `stat` of the path that a swap can invalidate.
+    #[tokio::test]
+    async fn validators_come_from_the_opened_file_not_a_stale_stat() {
+        let dir = tempfile::tempdir().unwrap();
+        let served = dir.path().join("swap.txt");
+        std::fs::write(&served, b"old").unwrap();
+        let replacement = dir.path().join("replacement.tmp");
+        std::fs::write(&replacement, b"a much longer replacement body").unwrap();
+        set_mtime(&replacement, 1_700_000_123);
+        let (target, source) = (served.clone(), replacement.clone());
+        install_open_hook(served.clone(), move || {
+            std::fs::rename(&source, &target).unwrap();
+        });
+        let handler = handler(dir.path()).await;
+        let response = respond(&handler, make_request(Method::GET, "/swap.txt")).await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            response.body,
+            Bytes::from_static(b"a much longer replacement body")
+        );
+        assert_eq!(
+            header(&response, header::ETAG),
+            calculate_etag(&std::fs::metadata(&served).unwrap()),
+            "the ETag must describe the served (swapped-in) file"
+        );
+        assert_eq!(
+            header(&response, header::CONTENT_LENGTH),
+            "30",
+            "Content-Length must be the served file's size"
+        );
+    }
+
+    /// HEAD must behave like GET for a file the process cannot read: Caddy opens the file first,
+    /// so it never answers 200 headers for something GET would fail on.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn head_of_an_unreadable_file_fails_like_get() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("locked.txt");
+        std::fs::write(&file, b"secret").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&file).is_ok() {
+            eprintln!("skipping: running with privileges that bypass file permissions");
+            return;
+        }
+        let handler = handler(dir.path()).await;
+        let get = handler
+            .handle(make_request(Method::GET, "/locked.txt"))
+            .await;
+        let head = handler
+            .handle(make_request(Method::HEAD, "/locked.txt"))
+            .await;
+        assert!(get.is_err(), "GET of an unreadable file must fail");
+        assert!(
+            head.is_err(),
+            "HEAD of an unreadable file must fail like GET, not return 200 headers"
         );
     }
 
