@@ -2854,12 +2854,42 @@ fn error_response() -> hyper::Response<Body> {
 /// connection task, and an anonymous `service_fn` type cannot express that bound.
 struct AdminService {
     api: AdminApi,
+    /// Shared by every connection of one listener: bounds the admin requests reading a body.
+    body_slots: Arc<tokio::sync::Semaphore>,
+}
+
+/// Wait up to `budget` for the first byte of a connection and hand it back unconsumed.
+///
+/// Go's `ReadHeaderTimeout` runs from accept, but hyper's protocol sniffing (and with it the
+/// header-read timer) starts only once a byte arrives, so a connection that never sends one would
+/// otherwise live until the much longer read/idle timeouts. `None` when the budget expires or the
+/// peer closed or failed before sending anything.
+async fn await_first_byte<I>(mut stream: I, budget: Duration) -> Option<PrefixedStream<I>>
+where
+    I: AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut first = [0_u8; 1];
+    match tokio::time::timeout(budget, stream.read(&mut first)).await {
+        Ok(Ok(read)) if read > 0 => Some(PrefixedStream::new(stream, first[..read].to_vec())),
+        _ => None,
+    }
+}
+
+/// A fresh per-listener in-flight body budget ([`ADMIN_MAX_CONCURRENT_BODIES`]).
+fn new_admin_body_slots() -> Arc<tokio::sync::Semaphore> {
+    Arc::new(tokio::sync::Semaphore::new(ADMIN_MAX_CONCURRENT_BODIES))
 }
 
 /// Largest admin request body accepted (SEC-MEDIUM-ADMIN-SERVER A2). Stock Caddy reads `/load`
 /// and `/adapt` bodies with an unbounded `io.Copy`; 64 MiB is far above any real configuration
 /// while stopping a multi-gigabyte POST from exhausting memory. `stock_compat true` lifts it.
 pub(crate) const ADMIN_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+/// Admin requests that may be reading a body at once on one listener. With the 64 MiB per-request
+/// cap this bounds the memory a flood of trickling uploads can pin to 256 MiB; further requests
+/// with a body get `503` until one finishes (`stock_compat true` lifts the bound, like the cap).
+pub(crate) const ADMIN_MAX_CONCURRENT_BODIES: usize = 4;
 
 /// The body cap for the next admin request: [`ADMIN_MAX_BODY_BYTES`], or none when the active
 /// generation sets `stock_compat true`.
@@ -2869,6 +2899,58 @@ fn admin_body_limit(api: &AdminApi) -> Option<usize> {
         .current()
         .is_some_and(|generation| generation.config().stock_compat());
     (!stock_compat).then_some(ADMIN_MAX_BODY_BYTES)
+}
+
+/// Total time one admin request body may take to arrive: stock Caddy's admin `ReadTimeout`, which
+/// Go enforces as one deadline over the whole request. caddy-rs's per-read `read_timeout` alone
+/// lets a client that sends a byte every few seconds hold a body slot (and up to 64 MiB) forever.
+const ADMIN_BODY_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Read one admin request's body: claim an in-flight body slot (when the request announces a body
+/// and `stock_compat` is off), then read under the size cap and [`ADMIN_BODY_DEADLINE`].
+///
+/// `503` when every slot is busy, `408` when the body does not arrive in time, otherwise as
+/// [`read_admin_body`].
+#[allow(clippy::result_large_err)] // the error is the ready-to-send admin response
+async fn read_admin_request_body<B>(
+    api: &AdminApi,
+    slots: &Arc<tokio::sync::Semaphore>,
+    headers: &http::HeaderMap,
+    body: B,
+) -> Result<Bytes, caddy_rs_admin::AdminResponse>
+where
+    B: hyper::body::Body<Data = Bytes>,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    use caddy_rs_admin::AdminResponse;
+    use http::StatusCode;
+    let limit = admin_body_limit(api);
+    let announces_body = headers.contains_key(http::header::TRANSFER_ENCODING)
+        || headers
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .is_some_and(|value| value != "0");
+    let _slot = if limit.is_some() && announces_body {
+        match Arc::clone(slots).try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                return Err(AdminResponse::api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "too many admin requests are uploading a body; retry shortly",
+                ));
+            }
+        }
+    } else {
+        None
+    };
+    match tokio::time::timeout(ADMIN_BODY_DEADLINE, read_admin_body(headers, body, limit)).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(AdminResponse::api_error(
+            StatusCode::REQUEST_TIMEOUT,
+            "timed out reading the request body",
+        )),
+    }
 }
 
 /// Read an admin request body under `limit` (`None` = unbounded).
@@ -2944,6 +3026,7 @@ impl Clone for AdminService {
     fn clone(&self) -> Self {
         Self {
             api: self.api.clone(),
+            body_slots: Arc::clone(&self.body_slots),
         }
     }
 }
@@ -2957,9 +3040,11 @@ impl hyper::service::Service<hyper::Request<Incoming>> for AdminService {
 
     fn call(&self, request: hyper::Request<Incoming>) -> Self::Future {
         let api = self.api.clone();
+        let body_slots = Arc::clone(&self.body_slots);
         Box::pin(async move {
             let (parts, body) = request.into_parts();
-            let body = match read_admin_body(&parts.headers, body, admin_body_limit(&api)).await {
+            let body = match read_admin_request_body(&api, &body_slots, &parts.headers, body).await
+            {
                 Ok(body) => body,
                 Err(rejection) => {
                     return Ok::<_, std::convert::Infallible>(admin_hyper_response(rejection))
@@ -3087,6 +3172,7 @@ async fn bind_admin_unix(
     let tracker = Arc::new(ConnectionTracker::default());
     let loop_tracker = Arc::clone(&tracker);
     let cleanup = AdminSocketPath(socket_path.to_path_buf());
+    let body_slots = new_admin_body_slots();
     let task = tokio::spawn(async move {
         let _cleanup = cleanup;
         loop {
@@ -3106,10 +3192,20 @@ async fn bind_admin_unix(
                     let connection_shutdown = receiver.clone();
                     let connection_force = force_receiver.clone();
                     let tracked = loop_tracker.guard();
-                    let service = AdminService { api: api.clone() };
+                    let service = AdminService {
+                        api: api.clone(),
+                        body_slots: Arc::clone(&body_slots),
+                    };
                     tokio::spawn(async move {
                         let _tracked = tracked;
-                        let limits = Arc::new(ServerLimits::default());
+                        let limits = Arc::new(ServerLimits::admin());
+                        // Go's ReadHeaderTimeout runs from accept; hyper's protocol sniffing does
+                        // not start it until the first byte, so bound a silent connection here.
+                        let Some(stream) =
+                            await_first_byte(stream, limits.read_header_timeout).await
+                        else {
+                            return;
+                        };
                         let activity = Arc::new(ConnectionActivity::default());
                         serve_connection(
                             stream,
@@ -3166,6 +3262,7 @@ pub(crate) async fn bind_admin(
     let (force, mut force_receiver) = watch::channel(false);
     let tracker = Arc::new(ConnectionTracker::default());
     let loop_tracker = Arc::clone(&tracker);
+    let body_slots = new_admin_body_slots();
     let task = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -3185,10 +3282,19 @@ pub(crate) async fn bind_admin(
                     let connection_shutdown = receiver.clone();
                     let connection_force = force_receiver.clone();
                     let tracked = loop_tracker.guard();
-                    let service = AdminService { api };
+                    let service = AdminService {
+                        api,
+                        body_slots: Arc::clone(&body_slots),
+                    };
                     tokio::spawn(async move {
                         let _tracked = tracked;
-                        let limits = Arc::new(ServerLimits::default());
+                        let limits = Arc::new(ServerLimits::admin());
+                        // See the Unix listener: bound a connection that never sends a byte.
+                        let Some(stream) =
+                            await_first_byte(stream, limits.read_header_timeout).await
+                        else {
+                            return;
+                        };
                         let activity = Arc::new(ConnectionActivity::default());
                         serve_connection(
                             stream,
@@ -3348,6 +3454,7 @@ pub(crate) async fn bind_admin_remote(
     let (force, mut force_receiver) = watch::channel(false);
     let tracker = Arc::new(ConnectionTracker::default());
     let loop_tracker = Arc::clone(&tracker);
+    let body_slots = new_admin_body_slots();
     let task = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -3365,16 +3472,22 @@ pub(crate) async fn bind_admin_remote(
                     let Ok((stream, _peer)) = accepted else { continue };
                     let api = api.clone();
                     let acceptor = acceptor.clone();
-                    let connection_shutdown = receiver.clone();
-                    let connection_force = force_receiver.clone();
+                    let mut connection_shutdown = receiver.clone();
+                    let mut connection_force = force_receiver.clone();
                     let tracked = loop_tracker.guard();
+                    let body_slots = Arc::clone(&body_slots);
                     tokio::spawn(async move {
                         let _tracked = tracked;
+                        let limits = Arc::new(ServerLimits::admin());
                         // Mandatory mutual TLS: a missing or untrusted client certificate fails
                         // here and the connection is dropped before any admin request is parsed.
-                        let tls = match tokio::time::timeout(
-                            crate::limits::DEFAULT_READ_HEADER_TIMEOUT,
+                        // The budget is the admin server's own (stock: ReadHeaderTimeout 5 s, the
+                        // smallest of its three timeouts), not the public servers' 1 minute.
+                        let tls = match bounded_handshake(
                             acceptor.accept(stream),
+                            limits.tls_handshake_timeout(),
+                            &mut connection_shutdown,
+                            &mut connection_force,
                         )
                         .await
                         {
@@ -3383,8 +3496,8 @@ pub(crate) async fn bind_admin_remote(
                                 tracing::debug!(%error, "remote admin TLS handshake failed");
                                 return;
                             }
-                            Err(_elapsed) => {
-                                tracing::debug!("remote admin TLS handshake timed out");
+                            Err(abort) => {
+                                tracing::debug!(?abort, "remote admin TLS handshake abandoned");
                                 return;
                             }
                         };
@@ -3394,12 +3507,14 @@ pub(crate) async fn bind_admin_remote(
                         let service = service_fn(move |request: hyper::Request<Incoming>| {
                             let api = api.clone();
                             let identity = identity.clone();
+                            let body_slots = Arc::clone(&body_slots);
                             async move {
                                 let (parts, body) = request.into_parts();
-                                let body = match read_admin_body(
+                                let body = match read_admin_request_body(
+                                    &api,
+                                    &body_slots,
                                     &parts.headers,
                                     body,
-                                    admin_body_limit(&api),
                                 )
                                 .await
                                 {
@@ -3435,7 +3550,6 @@ pub(crate) async fn bind_admin_remote(
                                 )
                             }
                         });
-                        let limits = Arc::new(ServerLimits::default());
                         let activity = Arc::new(ConnectionActivity::default());
                         serve_connection(
                             tls,
@@ -4291,6 +4405,122 @@ mod admin_body_tests {
                 "stock_compat {stock_compat}"
             );
         }
+    }
+}
+
+/// Connection-level limits of the plaintext TCP admin listener: stock Caddy's admin `http.Server`
+/// runs with `ReadTimeout` 10 s, `ReadHeaderTimeout` 5 s and `IdleTimeout` 60 s, and the body
+/// cap alone left many trickling connections each free to hold up to 64 MiB.
+#[cfg(test)]
+mod admin_limits_tests {
+    use super::bind_admin;
+    use caddy_rs_admin::AdminApi;
+    use caddy_rs_core::GenerationStore;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    fn api() -> AdminApi {
+        AdminApi::new(Arc::new(GenerationStore::with_builtin_registry()))
+    }
+
+    async fn listener() -> (super::ListenerHandle, SocketAddr) {
+        let handle = bind_admin("127.0.0.1:0", api(), None)
+            .await
+            .expect("bind admin listener");
+        let address = handle.socket_addr.expect("bound address");
+        (handle, address)
+    }
+
+    #[tokio::test]
+    async fn a_silent_admin_connection_is_dropped_after_the_header_timeout() {
+        let (handle, address) = listener().await;
+        let mut stream = TcpStream::connect(address).await.expect("connect");
+        let started = Instant::now();
+        let mut buffer = [0_u8; 256];
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(8), stream.read(&mut buffer)).await;
+        assert!(
+            outcome.is_ok(),
+            "a connection that never sends a request must be closed (stock ReadHeaderTimeout 5 s)"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_secs(4),
+            "not closed early: {:?}",
+            started.elapsed()
+        );
+        handle.stop().await;
+    }
+
+    /// A body that never produces a frame, like a client trickling nothing.
+    struct Stalled;
+
+    impl hyper::body::Body for Stalled {
+        type Data = bytes::Bytes;
+        type Error = std::io::Error;
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<bytes::Bytes>, Self::Error>>>
+        {
+            std::task::Poll::Pending
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_admin_body_times_out_with_408_and_frees_its_slot() {
+        let api = api();
+        let slots = super::new_admin_body_slots();
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::CONTENT_LENGTH, "10".parse().unwrap());
+        let rejected = super::read_admin_request_body(&api, &slots, &headers, Stalled)
+            .await
+            .expect_err("a body that never arrives is rejected");
+        assert_eq!(rejected.status, http::StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(
+            slots.available_permits(),
+            super::ADMIN_MAX_CONCURRENT_BODIES,
+            "the slot is released"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_requests_beyond_the_in_flight_body_budget_get_503() {
+        let (handle, address) = listener().await;
+        // Fill every body slot with a request that announced a body and then stalls.
+        let mut holders = Vec::new();
+        for _ in 0..super::ADMIN_MAX_CONCURRENT_BODIES {
+            let mut stream = TcpStream::connect(address).await.expect("connect");
+            stream
+                .write_all(
+                    b"POST /load HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+                      Content-Length: 1000\r\n\r\n{",
+                )
+                .await
+                .expect("write partial request");
+            holders.push(stream);
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut extra = TcpStream::connect(address).await.expect("connect");
+        extra
+            .write_all(
+                b"POST /load HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
+                  Content-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+            )
+            .await
+            .expect("write request");
+        let mut response = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(3), extra.read_to_end(&mut response))
+            .await;
+        let response = String::from_utf8_lossy(&response);
+        assert!(
+            response.starts_with("HTTP/1.1 503"),
+            "a request past the in-flight body budget must be refused: {response}"
+        );
+        drop(holders);
+        handle.stop().await;
     }
 }
 

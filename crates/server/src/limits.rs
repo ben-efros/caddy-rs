@@ -123,6 +123,22 @@ impl Default for ServerLimits {
 }
 
 impl ServerLimits {
+    /// Limits of Caddy's admin `http.Server` (both the local and the remote listener in
+    /// `admin.go`): `ReadTimeout` 10 s, `ReadHeaderTimeout` 5 s, `IdleTimeout` 60 s,
+    /// `MaxHeaderBytes` 64 KiB, no `WriteTimeout`. Previously the admin listeners ran with the
+    /// public-server defaults (no read timeout, 1 minute header timeout, 5 minute idle timeout),
+    /// so idle and trickling connections lingered far longer than under stock Caddy.
+    pub fn admin() -> Self {
+        Self {
+            read_timeout: Some(Duration::from_secs(10)),
+            write_timeout: None,
+            idle_timeout: Duration::from_secs(60),
+            read_header_timeout: Duration::from_secs(5),
+            max_header_bytes: Some(64 * 1024),
+            ..Self::default()
+        }
+    }
+
     /// The longest a TLS handshake may take before the connection is dropped.
     ///
     /// Go's `net/http` (`Server.tlsHandshakeTimeout`) sets a read/write deadline before the
@@ -446,6 +462,18 @@ mod tests {
         limits.read_header_timeout = DEFAULT_READ_HEADER_TIMEOUT;
         limits.write_timeout = Some(Duration::from_secs(7));
         assert_eq!(limits.tls_handshake_timeout(), Duration::from_secs(7));
+    }
+
+    #[test]
+    fn admin_limits_match_stock_caddy_admin_server() {
+        let limits = ServerLimits::admin();
+        assert_eq!(limits.read_timeout, Some(Duration::from_secs(10)));
+        assert_eq!(limits.read_header_timeout, Duration::from_secs(5));
+        assert_eq!(limits.idle_timeout, Duration::from_secs(60));
+        assert_eq!(limits.write_timeout, None);
+        assert_eq!(limits.max_header_bytes, Some(64 * 1024));
+        // The remote admin handshake budget follows from them (Go: min of the three).
+        assert_eq!(limits.tls_handshake_timeout(), Duration::from_secs(5));
     }
 
     #[test]
