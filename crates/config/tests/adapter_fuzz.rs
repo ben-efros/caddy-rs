@@ -128,7 +128,7 @@ impl Knobs {
         }
     }
 
-    /// Case count, scaled to this generator's share of the default budget.
+    /// Case count for a generator that runs its `tier0` count once per generated case.
     ///
     /// `FUZZ_CASES`, when set, is the total across the suite and is divided by the tier-0 total, so
     /// `FUZZ_CASES=50` runs a few cases per generator rather than 50 per generator. The tier-0
@@ -144,7 +144,26 @@ impl Knobs {
         }
     }
 
+    /// Case count for a generator that runs its count once per seed, so the cases it actually
+    /// executes are `result * seeds`. Dividing the scaled budget by `seeds` keeps the generator's
+    /// contribution to the suite total equal to its share, instead of multiplying it by the seed
+    /// count.
+    fn cases_per_seed(&self, tier0: usize, seeds: usize) -> usize {
+        match self.cases {
+            None => tier0,
+            Some(_) => {
+                let scaled = self.cases(tier0);
+                // At least one case per seed, so a tiny FUZZ_CASES still exercises every seed.
+                (scaled / seeds.max(1)).max(1)
+            }
+        }
+    }
+
     /// Print the resolved seed and case count once per run so the corpus is identifiable.
+    ///
+    /// The count is `cases_total()`, which mirrors the actual loops — including the mutated
+    /// generator running once per seed — so the announcement never overstates or understates what
+    /// ran.
     fn announce(&self) {
         match (self.seed, self.cases) {
             (None, None) => println!(
@@ -155,20 +174,34 @@ impl Knobs {
                     SEED_MUTATED,
                     SEED_RANDOM_BYTES
                 ],
-                tier0_total()
+                self.cases_total()
             ),
             (seed, cases) => println!(
-                "adapter_fuzz: tier 1 — resolved FUZZ_SEED={:?}, FUZZ_CASES={:?} ({} cases total, tier-0 budget {})",
+                "adapter_fuzz: tier 1 — resolved FUZZ_SEED={:?}, FUZZ_CASES={:?} ({} cases total)",
                 seed,
                 cases,
-                cases.unwrap_or_else(tier0_total),
-                tier0_total()
+                self.cases_total()
             ),
         }
     }
+
+    /// Cases this run actually executes. Mirrors the four test loops exactly, so the announced
+    /// figure is the executed figure.
+    fn cases_total(&self) -> usize {
+        let mutated_seeds = seeds().len();
+        self.cases(CASES_TOKEN_SOUP)
+            + self.cases(CASES_STRUCTURED)
+            + self.cases_per_seed(CASES_MUTATED_PER_SEED, mutated_seeds) * mutated_seeds
+            + self.cases(CASES_RANDOM_BYTES)
+    }
 }
 
-/// Sum of the tier-0 case counts, used to scale `FUZZ_CASES` across the generators.
+/// Sum of the four tier-0 case *constants*, used only as the ratio denominator when scaling
+/// `FUZZ_CASES` across the generators.
+///
+/// This is deliberately NOT the number of cases a tier-0 run executes: the mutated generator runs
+/// `CASES_MUTATED_PER_SEED` once per seed, so it contributes `CASES_MUTATED_PER_SEED * seeds.len()`
+/// and the executed total is larger. Use [`Knobs::cases_total`] for the executed figure.
 fn tier0_total() -> usize {
     CASES_TOKEN_SOUP + CASES_STRUCTURED + CASES_MUTATED_PER_SEED + CASES_RANDOM_BYTES
 }
@@ -745,42 +778,67 @@ fn knobs_or_fail() -> Knobs {
 
 #[test]
 fn token_soup_returns_json_or_located_error() {
-    let knobs = knobs_or_fail();
+    run_token_soup(&knobs_or_fail());
+}
+
+/// Runs the token-soup loop and returns how many cases it executed.
+fn run_token_soup(knobs: &Knobs) -> usize {
+    let cases = knobs.cases(CASES_TOKEN_SOUP);
     let mut rng = Lcg::new(knobs.seed(SEED_TOKEN_SOUP));
-    for _ in 0..knobs.cases(CASES_TOKEN_SOUP) {
+    for _ in 0..cases {
         check_str(&token_soup(&mut rng));
     }
+    cases
 }
 
 #[test]
 fn structured_caddyfiles_return_json_or_located_error() {
-    let knobs = knobs_or_fail();
+    run_structured(&knobs_or_fail());
+}
+
+/// Runs the structured-Caddyfile loop and returns how many cases it executed.
+fn run_structured(knobs: &Knobs) -> usize {
+    let cases = knobs.cases(CASES_STRUCTURED);
     let mut rng = Lcg::new(knobs.seed(SEED_STRUCTURED));
-    for _ in 0..knobs.cases(CASES_STRUCTURED) {
+    for _ in 0..cases {
         check_str(&structured_caddyfile(&mut rng));
     }
+    cases
 }
 
 #[test]
 fn mutated_corpus_returns_json_or_located_error() {
-    let knobs = knobs_or_fail();
-    let mut rng = Lcg::new(knobs.seed(SEED_MUTATED));
+    run_mutated(&knobs_or_fail());
+}
+
+/// Runs the mutation loop and returns how many cases it executed - the per-seed count times the
+/// number of seeds, which is where an announcement most easily drifts from the loop.
+fn run_mutated(knobs: &Knobs) -> usize {
     let seeds = seeds();
     assert!(!seeds.is_empty(), "seed corpus must not be empty");
+    let per_seed = knobs.cases_per_seed(CASES_MUTATED_PER_SEED, seeds.len());
+    let mut rng = Lcg::new(knobs.seed(SEED_MUTATED));
     for seed in &seeds {
-        for _ in 0..knobs.cases(CASES_MUTATED_PER_SEED) {
+        for _ in 0..per_seed {
             check_str(&mutate(&mut rng, seed));
         }
     }
+    per_seed * seeds.len()
 }
 
 #[test]
 fn random_bytes_are_rejected_cleanly_or_adapted() {
-    let knobs = knobs_or_fail();
+    run_random_bytes(&knobs_or_fail());
+}
+
+/// Runs the raw-bytes loop and returns how many cases it executed.
+fn run_random_bytes(knobs: &Knobs) -> usize {
+    let cases = knobs.cases(CASES_RANDOM_BYTES);
     let mut rng = Lcg::new(knobs.seed(SEED_RANDOM_BYTES));
-    for _ in 0..knobs.cases(CASES_RANDOM_BYTES) {
+    for _ in 0..cases {
         check_bytes(&random_bytes(&mut rng));
     }
+    cases
 }
 
 #[test]
@@ -919,6 +977,65 @@ fn different_resolved_seeds_produce_different_case_streams() {
         knobs.seed(tier0)
     };
     assert_ne!(offset_seed(SEED_TOKEN_SOUP), offset_seed(SEED_STRUCTURED));
+}
+
+/// The announced total must equal the number of cases the real loops execute, and a tier-1 sweep
+/// must stay inside the documented cap.
+///
+/// The sum comes from the same `run_*` functions the four `#[test]`s call, each of which returns
+/// its own executed count. So this compares the announcement against real executions rather than
+/// re-deriving the loops' shape: if a loop's per-seed division or floor diverges from
+/// `cases_total`, the sums disagree here.
+#[test]
+fn announced_case_total_matches_the_executed_loops() {
+    let n = seeds().len();
+    assert!(n > 1, "expected several seed fixtures");
+
+    let tier0 = Knobs {
+        seed: None,
+        cases: None,
+    };
+    // Tier 0 counts the mutated generator once per seed - it is not the sum of the four constants.
+    assert_eq!(
+        tier0.cases_total(),
+        CASES_TOKEN_SOUP + CASES_STRUCTURED + CASES_MUTATED_PER_SEED * n + CASES_RANDOM_BYTES,
+        "tier-0 announcement must count the mutated generator once per seed"
+    );
+    assert_ne!(
+        tier0.cases_total(),
+        tier0_total(),
+        "the executed total must not be the sum of the four constants; the mutated generator \
+         runs once per seed"
+    );
+
+    for total in [
+        None,
+        Some(1usize),
+        Some(50),
+        Some(1000),
+        Some(3040),
+        Some(MAX_CASES),
+    ] {
+        let knobs = Knobs {
+            seed: Some(1),
+            cases: total,
+        };
+        let executed = run_token_soup(&knobs)
+            + run_structured(&knobs)
+            + run_mutated(&knobs)
+            + run_random_bytes(&knobs);
+        assert_eq!(
+            knobs.cases_total(),
+            executed,
+            "announcement must equal the executed total for FUZZ_CASES={total:?}"
+        );
+        if total.is_some() {
+            assert!(
+                executed <= MAX_CASES,
+                "FUZZ_CASES={total:?} must stay within the {MAX_CASES}-case cap, got {executed}"
+            );
+        }
+    }
 }
 
 #[test]
