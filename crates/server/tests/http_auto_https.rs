@@ -1530,6 +1530,128 @@ async fn auto_https_off_fails_loudly_without_certificates() {
     assert!(message.contains("terminates TLS"), "{message}");
 }
 
+/// The reported config from T-TLS-105, in the shape that exposes the guard: `srv0` listens on the
+/// HTTPS port with a route whose match is null and carries no `tls_connection_policies`, so it
+/// contributes no certificate subject of its own.
+///
+/// `srv1`'s host matcher is omitted and the ports are ephemeral so the test does not contend for
+/// `:443`/`:80` with the rest of this binary under the parallel harness; neither affects the guard,
+/// which depends only on srv0's listener being the HTTPS port with no policies and no subject.
+///
+/// Measured upstream behaviour for this config (`external/caddy` @ 0d98caea,
+/// `modules/caddyhttp/autohttps.go`): `:142-146` installs an implicit TLS connection policy for a
+/// server whose listeners are all on the HTTPS port, so srv0 does not take the `continue` at `:185`
+/// and `app.go:568`'s `useTLS` is true — the listener terminates TLS with no certificate selected
+/// for that server, and Caddy emits no error and no warning.
+fn reported_config(storage_root: &str, stock_compat: bool) -> Config {
+    let mut config = serde_json::json!({
+        "admin": {"disabled": true},
+        "apps": {
+            "http": {
+                "https_port": 0,
+                "servers": {
+                    "srv0": {
+                        "listen": ["127.0.0.1:0"],
+                        "routes": [{"handle": [{"handler": "static_response", "body": "srv0"}]}]
+                    }
+                }
+            },
+            "tls": {
+                "automation": {"policies": [{"subjects": ["rankmynuts.com"]}]},
+                "certificates": {"load_files": []}
+            }
+        },
+        "storage": {"module": "file_system", "root": storage_root}
+    });
+    if stock_compat {
+        config["stock_compat"] = serde_json::Value::Bool(true);
+    }
+    Config::from_value(config).expect("test config decodes")
+}
+
+/// Secure default: a TLS listener that resolves no certificate of its own fails the apply, loudly,
+/// naming the server and the listener so the operator can act on it.
+///
+/// This is the half of T-TLS-105 that must survive option (A): compat mode accepts, but the secure
+/// default keeps refusing.
+#[tokio::test]
+async fn default_mode_refuses_a_tls_listener_without_its_own_certificate() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().to_string_lossy().to_string();
+    let store = Arc::new(GenerationStore::with_builtin_registry());
+    store
+        .load(reported_config(&root, false))
+        .expect("config validates");
+    let mut runtime = ServerRuntime::new(store)
+        .with_acme_transport(Arc::new(FakeCa::new(false)))
+        .with_data_root(directory.path());
+    let error = runtime
+        .apply()
+        .await
+        .err()
+        .expect("secure default must refuse a TLS listener with no certificate of its own");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("apps.tls.certificates"),
+        "error must be located at apps.tls.certificates: {message}"
+    );
+    assert!(
+        message.contains("srv0"),
+        "error must name the server: {message}"
+    );
+    // The TCP listener must be the one refused, not only the HTTP/3 one. Upstream terminates TLS on
+    // the TCP HTTPS listener for this config, and this test must exercise that path: a guard that
+    // fired only on `udp/...` would leave TCP cleartext where upstream serves TLS while satisfying
+    // every other assertion here. The `udp/` prefix is what distinguishes them in the message.
+    assert!(
+        !message.contains("listener `udp/"),
+        "error must name the TCP listener, not only the HTTP/3 one: {message}"
+    );
+}
+
+/// `stock_compat`: the same config is accepted, as upstream Caddy accepts it (DIV-0165).
+///
+/// Upstream installs an implicit TLS connection policy for a server that listens only on the HTTPS
+/// port (`autohttps.go:142-146`), so it does not take the `continue` at `:185`, and `app.go:568`
+/// enables TLS on the listener even though `:224` added no subject for it. The listener terminates
+/// TLS with no certificate selected for that server, and no error or warning is emitted.
+///
+/// This test asserts what the listener actually does — not merely that the apply returned `Ok`.
+#[tokio::test]
+async fn stock_compat_accepts_a_tls_listener_without_its_own_certificate() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().to_string_lossy().to_string();
+    let store = Arc::new(GenerationStore::with_builtin_registry());
+    store
+        .load(reported_config(&root, true))
+        .expect("config validates");
+    let mut runtime = ServerRuntime::new(store)
+        .with_acme_transport(Arc::new(FakeCa::new(false)))
+        .with_data_root(directory.path());
+    runtime
+        .apply()
+        .await
+        .expect("stock_compat must accept the config, as upstream does");
+
+    // The listener terminates TLS. With no certificate selected for this server the handshake
+    // cannot complete, which is upstream's behaviour for the same config.
+    let address = runtime
+        .listener_address("127.0.0.1:0")
+        .expect("the HTTPS listener is bound");
+    let handshake = tls_connect_result(address, "rankmynuts.com", client_config()).await;
+    let failure = handshake
+        .expect_err("with no certificate selected for srv0 the handshake must not succeed");
+    // The failure must be a TLS-layer one, proving the listener speaks TLS rather than cleartext.
+    // A cleartext listener would surface as an unexpected plaintext/garbage record instead, which
+    // is exactly the defect this row fixes (TCP `:443` previously derived no TLS at all).
+    assert!(
+        failure.contains("TLS handshake failed"),
+        "the listener must terminate TLS and fail in the handshake, got: {failure}"
+    );
+    runtime.shutdown().await;
+}
+
 #[tokio::test]
 async fn failed_issuance_keeps_the_old_generation_serving() {
     let directory = tempfile::tempdir().unwrap();

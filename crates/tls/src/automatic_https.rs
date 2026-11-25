@@ -373,6 +373,14 @@ pub fn plan(config: &Config) -> Result<Option<AutomaticHttpsPlan>> {
             .tls_connection_policies
             .as_ref()
             .is_some_and(|policies| !policies.is_empty());
+        // Upstream (`modules/caddyhttp/autohttps.go:142-146`) installs an implicit TLS connection
+        // policy when a server has no explicit policies and every listener is on the HTTPS port:
+        // "it should be obvious that they want to use TLS without needing to specify one empty
+        // policy to enable it". The effect here is that such a server still terminates TLS even
+        // though it contributes no certificate subject, which is what makes `tls_ports` below
+        // include the HTTPS port for a catch-all server (DIV-0165).
+        let only_on_https_port = !ports.is_empty() && ports.iter().all(|port| *port == https_port);
+        let implicit_tls_policy = !policies_present && only_on_https_port;
         let non_http_ports: Vec<u16> = ports
             .iter()
             .copied()
@@ -415,6 +423,13 @@ pub fn plan(config: &Config) -> Result<Option<AutomaticHttpsPlan>> {
             // Caddy still enables HTTP->HTTPS redirects for a TLS server with no host matchers
             // (for example a catch-all HTTPS server with explicit TLS policies). The listener
             // port recorded for the catch-all route is the one HTTP redirects target.
+            // The listener still terminates TLS under an implicit policy even though it
+            // contributes no subject (autohttps.go:142-146, DIV-0165). This is independent of
+            // whether a redirect is planned: a catch-all server with no explicit policies gets
+            // TLS derivation but no redirect, so it does not by itself make a plan exist.
+            if implicit_tls_policy && !tls_ports.contains(&https_port) {
+                tls_ports.push(https_port);
+            }
             if policies_present {
                 tls_ports.extend(non_http_ports.iter().copied());
                 if !auto.disable_redirects {
@@ -425,7 +440,7 @@ pub fn plan(config: &Config) -> Result<Option<AutomaticHttpsPlan>> {
             continue;
         }
 
-        let uses_tls = policies_present || !non_http_ports.is_empty();
+        let uses_tls = policies_present || implicit_tls_policy || !non_http_ports.is_empty();
         if !uses_tls {
             continue;
         }
@@ -435,6 +450,12 @@ pub fn plan(config: &Config) -> Result<Option<AutomaticHttpsPlan>> {
         // HTTP/HTTPS listeners and multiple non-standard HTTPS ports derive deterministically.
         // (Caddy also uses listener ports with explicit policies; adopting that is a server/hook
         // follow-up because it changes observable Location values in existing tests.)
+        // A server with an implicit TLS policy listens only on the HTTPS port, which
+        // `non_http_ports` deliberately excludes; record it so its listeners terminate TLS
+        // (autohttps.go:142-146, DIV-0165).
+        if implicit_tls_policy && !tls_ports.contains(&https_port) {
+            tls_ports.push(https_port);
+        }
         let (redirects_for_server, redirect_ports_for_server) = if policies_present {
             tls_ports.extend(non_http_ports.iter().copied());
             // Explicit TLS policies still get Caddy's redirects. Use the declared listener ports
@@ -2146,6 +2167,33 @@ mod tests {
             stream.get_ref().1.peer_certificates().unwrap().len(),
             2,
             "served chain is leaf + intermediate"
+        );
+    }
+
+    #[test]
+    fn plan_derives_tls_for_a_catchall_server_on_the_https_port() {
+        // Upstream autohttps.go:142-146 installs an implicit TLS policy for a server whose
+        // listeners are all on the HTTPS port, so the listener terminates TLS even though the
+        // server contributes no certificate subject (DIV-0165).
+        let catchall = config(json!({
+            "apps": {
+                "http": {"servers": {"srv0": {
+                    "listen": [":443"],
+                    "routes": [{"handle": [{"handler": "static_response", "body": "x"}]}]
+                }}},
+                "tls": {"automation": {"policies": [{"subjects": ["rankmynuts.com"]}]}}
+            }
+        }));
+        let plan = plan(&catchall).unwrap().expect("a plan exists");
+        assert!(
+            plan.tls_ports.contains(&443),
+            "the HTTPS port must be derived as TLS for a catch-all server: {:?}",
+            plan.tls_ports
+        );
+        assert!(
+            plan.subjects.is_empty(),
+            "the catch-all server contributes no certificate subject: {:?}",
+            plan.subjects
         );
     }
 
