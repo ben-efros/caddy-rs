@@ -1795,41 +1795,39 @@ async fn serve_wrapped<I>(
 ) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (stream, remote_override, local_override, proxy_vars) = match context
-        .wrappers
-        .proxy_protocol()
-    {
-        Some(settings) => match bounded_handshake(
-            crate::proxy_protocol::wrap(stream, peer, local, settings),
-            // The wrapper enforces its own (default 10 s) header deadline; this only adds the
-            // shutdown signals.
-            Duration::from_secs(86_400),
-            &mut shutdown,
-            &mut force,
-        )
-        .await
-        .unwrap_or_else(|abort| {
-            Err(crate::proxy_protocol::ProxyProtocolError::Io(io::Error::other(
-                format!("connection abandoned during shutdown: {abort:?}"),
-            )))
-        }) {
-            Ok(wrapped) => wrapped,
-            Err(error) => {
-                tracing::warn!(
-                    peer = ?peer,
-                    %error,
-                    "rejecting connection: PROXY protocol wrapper failed"
-                );
-                return;
-            }
-        },
-        None => (
-            PrefixedStream::new(stream, Vec::new()),
-            None,
-            None,
-            Vec::new(),
-        ),
-    };
+    let (stream, remote_override, local_override, proxy_vars) =
+        match context.wrappers.proxy_protocol() {
+            Some(settings) => match bounded_handshake(
+                crate::proxy_protocol::wrap(stream, peer, local, settings),
+                // The wrapper enforces its own (default 10 s) header deadline; this only adds the
+                // shutdown signals.
+                Duration::from_secs(86_400),
+                &mut shutdown,
+                &mut force,
+            )
+            .await
+            .unwrap_or_else(|abort| {
+                Err(crate::proxy_protocol::ProxyProtocolError::Io(
+                    io::Error::other(format!("connection abandoned during shutdown: {abort:?}")),
+                ))
+            }) {
+                Ok(wrapped) => wrapped,
+                Err(error) => {
+                    tracing::warn!(
+                        peer = ?peer,
+                        %error,
+                        "rejecting connection: PROXY protocol wrapper failed"
+                    );
+                    return;
+                }
+            },
+            None => (
+                PrefixedStream::new(stream, Vec::new()),
+                None,
+                None,
+                Vec::new(),
+            ),
+        };
     serve_accepted(
         stream,
         remote_override.or(peer),
@@ -3317,7 +3315,8 @@ fn install_staged_socket(
         },
         Some(expected) => match std::fs::symlink_metadata(final_path) {
             Ok(metadata)
-                if metadata.file_type().is_socket() && SocketIdentity::of(&metadata) == expected =>
+                if metadata.file_type().is_socket()
+                    && SocketIdentity::of(&metadata) == expected =>
             {
                 std::fs::rename(staged, final_path)
             }
@@ -4440,7 +4439,10 @@ mod bounded_handshake_tests {
         tokio::time::sleep(Duration::from_secs(2)).await;
         shutdown_tx.send(true).unwrap();
         assert_eq!(task.await.unwrap(), Err(PhaseAbort::ShutdownGrace));
-        assert_eq!(started.elapsed(), Duration::from_secs(2) + HANDSHAKE_SHUTDOWN_GRACE);
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(2) + HANDSHAKE_SHUTDOWN_GRACE
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -4624,8 +4626,7 @@ mod admin_limits_tests {
         let mut stream = TcpStream::connect(address).await.expect("connect");
         let started = Instant::now();
         let mut buffer = [0_u8; 256];
-        let outcome =
-            tokio::time::timeout(Duration::from_secs(8), stream.read(&mut buffer)).await;
+        let outcome = tokio::time::timeout(Duration::from_secs(8), stream.read(&mut buffer)).await;
         assert!(
             outcome.is_ok(),
             "a connection that never sends a request must be closed (stock ReadHeaderTimeout 5 s)"
@@ -4696,8 +4697,8 @@ mod admin_limits_tests {
             .await
             .expect("write request");
         let mut response = Vec::new();
-        let _ = tokio::time::timeout(Duration::from_secs(3), extra.read_to_end(&mut response))
-            .await;
+        let _ =
+            tokio::time::timeout(Duration::from_secs(3), extra.read_to_end(&mut response)).await;
         let response = String::from_utf8_lossy(&response);
         assert!(
             response.starts_with("HTTP/1.1 503"),
@@ -4776,7 +4777,10 @@ mod admin_host_check_tests {
         for (extra, label) in [
             (vec![], "no Origin or Sec-Fetch-Mode"),
             (vec![origin.clone()], "Origin"),
-            (vec![origin.clone(), cross_site.clone()], "Origin + Sec-Fetch-Mode"),
+            (
+                vec![origin.clone(), cross_site.clone()],
+                "Origin + Sec-Fetch-Mode",
+            ),
             (vec![cross_site.clone()], "Sec-Fetch-Mode alone"),
         ] {
             let mut with_own = vec![own.clone()];
@@ -4784,7 +4788,11 @@ mod admin_host_check_tests {
             let status = status_of(address, &get("/config/", &with_own)).await;
             // `Sec-Fetch-Mode` alone has no Origin to validate, which Caddy rejects with 403
             // after the Host passed; every other combination with the own Host is served.
-            let expected = if label == "Sec-Fetch-Mode alone" { 403 } else { 200 };
+            let expected = if label == "Sec-Fetch-Mode alone" {
+                403
+            } else {
+                200
+            };
             assert_eq!(status, expected, "own Host, {label}");
 
             let mut with_foreign = vec![foreign.clone()];
@@ -4867,11 +4875,12 @@ mod admin_host_check_tests {
         assert_eq!(resolved.get(http::header::HOST).unwrap(), "a.example");
         // An authority (absolute-form / :authority) replaces it; userinfo is not part of the host.
         let resolved =
-            admin_request_headers(with_host("a.example"), &uri("http://u:p@b.example:1/x")).unwrap();
+            admin_request_headers(with_host("a.example"), &uri("http://u:p@b.example:1/x"))
+                .unwrap();
         assert_eq!(resolved.get(http::header::HOST).unwrap(), "b.example:1");
         // And supplies it when the header is absent (HTTP/2).
-        let resolved = admin_request_headers(http::HeaderMap::new(), &uri("http://c.example/x"))
-            .unwrap();
+        let resolved =
+            admin_request_headers(http::HeaderMap::new(), &uri("http://c.example/x")).unwrap();
         assert_eq!(resolved.get(http::header::HOST).unwrap(), "c.example");
         // Neither: still absent.
         let resolved = admin_request_headers(http::HeaderMap::new(), &uri("/x")).unwrap();
@@ -5075,7 +5084,10 @@ mod admin_unix_tests {
         }
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         let (observed, worst) = watcher.join().expect("watcher thread");
-        assert_eq!(worst, 0, "saw the socket with group/other bits ({observed} samples)");
+        assert_eq!(
+            worst, 0,
+            "saw the socket with group/other bits ({observed} samples)"
+        );
     }
 
     #[tokio::test]
@@ -5187,7 +5199,10 @@ mod admin_unix_tests {
     async fn an_over_long_staging_path_is_reported_with_the_configured_path_and_limit() {
         let (_base, directory) = directory_of_length(100);
         let path = directory.join("a.sock");
-        assert!(path.as_os_str().len() <= 107, "the final path itself would fit");
+        assert!(
+            path.as_os_str().len() <= 107,
+            "the final path itself would fit"
+        );
         let configured = format!("unix/{}", path.display());
         let error = bind_admin(&configured, api(), None)
             .await
