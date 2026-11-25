@@ -8,6 +8,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# Owner-only files and directories (mode bits on Unix, protected ACLs on Windows).
+caddy-rs-fsperm = { path = "../../../crates/fsperm" }
 async-trait.workspace = true
 caddy-rs-config-tx = { path = "../../../crates/config-tx" }
 caddy-rs-pm-certificates = { path = "../pm-certificates" }

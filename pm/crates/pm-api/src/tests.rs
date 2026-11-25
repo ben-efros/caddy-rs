@@ -1772,9 +1772,22 @@ async fn create_manual_certificate_returns_metadata_without_key_material() {
     let dir_meta = std::fs::metadata(&secrets).expect("secrets dir");
     let key_path = secrets.join("manual-1.key.pem");
     let key_meta = std::fs::metadata(&key_path).expect("key file");
-    use std::os::unix::fs::PermissionsExt;
-    assert_eq!(dir_meta.permissions().mode() & 0o777, 0o700);
-    assert_eq!(key_meta.permissions().mode() & 0o777, 0o600);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(dir_meta.permissions().mode() & 0o777, 0o700);
+        assert_eq!(key_meta.permissions().mode() & 0o777, 0o600);
+    }
+    // Windows has no mode bits: the secrets directory and the private key must carry a private
+    // DACL (only this user, SYSTEM and Administrators).
+    #[cfg(windows)]
+    {
+        let _ = (&dir_meta, &key_meta);
+        for path in [&secrets, &key_path] {
+            let exposure = caddy_rs_fsperm::exposure(path).expect("read the DACL");
+            assert!(exposure.is_private(), "{}: {exposure:?}", path.display());
+        }
+    }
 }
 
 #[tokio::test]
@@ -2092,7 +2105,10 @@ async fn successful_apply_marks_the_uploaded_certificate_issued() {
         config["apps"]["tls"]["certificates"]["load_files"][0]["certificate"],
         serde_json::json!(_dir
             .path()
-            .join("data/pm/secrets/manual-1.crt.pem")
+            .join("data")
+            .join("pm")
+            .join("secrets")
+            .join("manual-1.crt.pem")
             .display()
             .to_string())
     );

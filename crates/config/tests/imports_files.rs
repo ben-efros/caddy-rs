@@ -21,6 +21,9 @@ impl TempTree {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&root).expect("create temp dir");
+        // The safe-mode import rule refuses files other users can write; on Windows `%TEMP%` can
+        // grant other principals access, so make the fixture private like a real config directory.
+        caddy_rs_test_support::make_private(&root);
         Self { root }
     }
 

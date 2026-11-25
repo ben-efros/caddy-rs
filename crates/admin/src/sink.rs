@@ -738,6 +738,20 @@ fn open_append(path: &Path, options: &FileWriterOptions) -> io::Result<File> {
             open.mode(mode);
         }
     }
+    // Windows has no mode bits. Caddy's log files default to 0600; the equivalent is a private
+    // DACL (this user, SYSTEM and Administrators), applied when the file is created so the log is
+    // never readable by other users, even briefly. An existing log is left as the operator has it.
+    #[cfg(windows)]
+    {
+        let _ = options;
+        if !path.exists() {
+            match caddy_rs_fsperm::create_new_file_private(path) {
+                Ok(file) => drop(file),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
     open.open(path)
 }
 
@@ -748,6 +762,11 @@ fn create_parent_directories(path: &Path, options: &FileWriterOptions) -> io::Re
     if parent.as_os_str().is_empty() || parent.exists() {
         return Ok(());
     }
+    // Windows: new log directories are private (Caddy's default directory mode is 0700); elsewhere
+    // the default umask applies until `dir_mode` is applied below.
+    #[cfg(windows)]
+    caddy_rs_fsperm::create_dir_all_private(parent)?;
+    #[cfg(not(windows))]
     std::fs::create_dir_all(parent)?;
     #[cfg(unix)]
     if let Some(dir_mode) = options.dir_mode {
@@ -1982,6 +2001,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn unix_net_writer_streams_lines_to_a_unix_listener() {
         use std::io::BufRead;
         let directory = tempfile::tempdir().expect("tempdir");

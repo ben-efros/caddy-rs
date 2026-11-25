@@ -5,6 +5,9 @@
 //! reload and stop work through the socket, TCP<->Unix transitions clean up socket files, and
 //! concurrent requests are served.
 
+// These tests drive Unix-domain sockets or inherited file descriptors, which Windows does not have.
+#![cfg(unix)]
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;

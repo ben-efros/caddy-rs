@@ -174,17 +174,12 @@ impl CaStorage for FileStorage {
     }
 }
 
-/// Best-effort `0600` permissions for key files on Unix.
+/// Best-effort owner-only permissions for key files (mode 0600 on Unix, a protected DACL on
+/// Windows). The write above already creates the file private; this also covers a key that an
+/// earlier version left open.
 async fn restrict_key_permissions(path: &std::path::Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
+    let path = path.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || caddy_rs_fsperm::restrict_file(&path)).await;
 }
 
 /// Certificate/key storage keys for one CA, matching Caddy's layout.

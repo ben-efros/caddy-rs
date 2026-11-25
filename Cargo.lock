@@ -326,6 +326,7 @@ dependencies = [
  "caddy-rs-authn",
  "caddy-rs-config",
  "caddy-rs-core",
+ "caddy-rs-fsperm",
  "caddy-rs-http",
  "caddy-rs-server",
  "caddy-rs-test-support",
@@ -340,6 +341,7 @@ dependencies = [
  "tar",
  "tempfile",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -350,6 +352,7 @@ dependencies = [
  "bytes",
  "caddy-rs-config",
  "caddy-rs-core",
+ "caddy-rs-fsperm",
  "caddy-rs-tls",
  "flate2",
  "getrandom 0.2.17",
@@ -382,6 +385,7 @@ dependencies = [
  "base32",
  "bcrypt",
  "caddy-rs-core",
+ "caddy-rs-fsperm",
  "jsonwebtoken",
  "rand 0.8.8",
  "serde",
@@ -402,6 +406,8 @@ name = "caddy-rs-config"
 version = "0.1.0-trial.8"
 dependencies = [
  "caddy-rs-core",
+ "caddy-rs-fsperm",
+ "caddy-rs-test-support",
  "libc",
  "serde_json",
  "thiserror 2.0.21",
@@ -428,11 +434,21 @@ version = "0.1.0-trial.8"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
+ "caddy-rs-fsperm",
  "regex",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
+]
+
+[[package]]
+name = "caddy-rs-fsperm"
+version = "0.1.0-trial.8"
+dependencies = [
+ "libc",
+ "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -448,6 +464,7 @@ dependencies = [
  "caddy-rs-admin",
  "caddy-rs-config",
  "caddy-rs-core",
+ "caddy-rs-fsperm",
  "caddy-rs-tls",
  "flate2",
  "getrandom 0.2.17",
@@ -507,6 +524,7 @@ dependencies = [
  "axum-test",
  "caddy-rs-authn",
  "caddy-rs-core",
+ "caddy-rs-fsperm",
  "caddy-rs-pm-certificates",
  "caddy-rs-pm-config",
  "caddy-rs-pm-core",
@@ -528,6 +546,7 @@ name = "caddy-rs-pm-certificates"
 version = "0.1.0-trial.8"
 dependencies = [
  "base64 0.23.1",
+ "caddy-rs-fsperm",
  "caddy-rs-pm-core",
  "caddy-rs-pm-state",
  "ring",
@@ -547,6 +566,7 @@ dependencies = [
  "base64 0.23.1",
  "caddy-rs-authn",
  "caddy-rs-core",
+ "caddy-rs-fsperm",
  "caddy-rs-pm-api",
  "caddy-rs-pm-runtime",
  "clap",
@@ -631,6 +651,7 @@ dependencies = [
  "async-trait",
  "axum",
  "caddy-rs-config-tx",
+ "caddy-rs-fsperm",
  "caddy-rs-pm-certificates",
  "caddy-rs-pm-compiler",
  "caddy-rs-pm-config",
@@ -666,6 +687,7 @@ dependencies = [
 name = "caddy-rs-pm-state"
 version = "0.1.0-trial.8"
 dependencies = [
+ "caddy-rs-fsperm",
  "serde",
  "serde_json",
  "tempfile",
@@ -688,6 +710,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "rustls",
+ "rustls-native-certs",
  "serde_json",
  "socket2 0.6.5",
  "tempfile",
@@ -740,6 +763,9 @@ dependencies = [
 [[package]]
 name = "caddy-rs-test-support"
 version = "0.1.0-trial.8"
+dependencies = [
+ "caddy-rs-fsperm",
+]
 
 [[package]]
 name = "caddy-rs-tls"
@@ -750,6 +776,7 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "caddy-rs-core",
+ "caddy-rs-fsperm",
  "cryptoki",
  "getrandom 0.2.17",
  "hex",
@@ -765,6 +792,7 @@ dependencies = [
  "ring",
  "rsa",
  "rustls",
+ "rustls-native-certs",
  "rustls-webpki",
  "secrecy",
  "serde",

@@ -3300,6 +3300,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
+    #[cfg(unix)]
     #[test]
     fn accepts_admin_unix_socket_path_in_writable_directory() {
         let dir = admin_socket_temp_dir("accept");

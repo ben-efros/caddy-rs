@@ -289,14 +289,26 @@ fn fd_is_fifo(fd: libc::c_int) -> bool {
     stat.st_mode & libc::S_IFMT == libc::S_IFIFO
 }
 
-/// Whether stdin is a pipe, as closely as this platform can tell.
+/// Whether stdin is a pipe.
 ///
-/// Non-unix targets expose no `fstat`/`S_IFIFO` equivalent, so `!is_terminal()` is the closest
-/// available approximation (unlike unix, it also accepts a regular-file redirect).
-#[cfg(not(unix))]
+/// Windows reports the kind of a handle through `GetFileType`: `FILE_TYPE_PIPE` is what Go maps to
+/// `os.ModeNamedPipe` (anonymous pipes included), while a redirected regular file is
+/// `FILE_TYPE_DISK`, a console is `FILE_TYPE_CHAR` and `NUL` is `FILE_TYPE_CHAR` too, so, as on
+/// Unix and in Caddy, only a real pipe supplies the response body.
+#[cfg(windows)]
 fn stdin_is_pipe() -> bool {
-    use std::io::IsTerminal;
-    !std::io::stdin().is_terminal()
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{GetFileType, FILE_TYPE_PIPE};
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE};
+    // SAFETY: `GetStdHandle` only reads the process's standard handle slot; `GetFileType` accepts
+    // any handle value and reports `FILE_TYPE_UNKNOWN` for an invalid one, and neither retains it.
+    unsafe {
+        let handle = GetStdHandle(STD_INPUT_HANDLE);
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return false;
+        }
+        GetFileType(handle) == FILE_TYPE_PIPE
+    }
 }
 
 /// Validate the status code Caddy's `respond` can actually serve.

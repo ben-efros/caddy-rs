@@ -4,6 +4,9 @@
 //! file is removed when the listener moves to another transport, changes path, or the runtime
 //! shuts down.
 
+// These tests drive Unix-domain sockets or inherited file descriptors, which Windows does not have.
+#![cfg(unix)]
+
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

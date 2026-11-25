@@ -204,6 +204,7 @@ fn file_imports_resolve_through_the_adapter_source_path() {
             .as_nanos()
     ));
     std::fs::create_dir_all(&directory).expect("create temp dir");
+    caddy_rs_test_support::make_private(&directory);
     std::fs::write(
         directory.join("respond.conf"),
         "respond \"imported {args[0]}\"\n",

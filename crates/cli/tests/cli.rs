@@ -1321,10 +1321,10 @@ fn pki_list_reports_provisioned_cas_and_json_shape() {
         authorities[0]["intermediate_common_name"],
         "caddy-rs test intermediate"
     );
-    assert!(authorities[0]["directory"]
-        .as_str()
-        .unwrap()
-        .ends_with("authorities/local"));
+    assert!(
+        std::path::Path::new(authorities[0]["directory"].as_str().unwrap())
+            .ends_with(std::path::Path::new("authorities").join("local"))
+    );
     assert!(authorities[0]["root_not_after"].is_string());
     assert!(authorities[0]["has_intermediate"].as_bool().unwrap());
     assert_eq!(authorities[0]["trust"]["install_trust"], "default");
@@ -1892,7 +1892,9 @@ fn trust_dry_run_prints_instructions_and_changes_nothing() {
     assert!(stdout.contains("CA id: local"), "{stdout}");
     assert!(stdout.contains("root certificate:"), "{stdout}");
     assert!(
-        stdout.contains("pki/authorities/local/root.crt"),
+        stdout
+            .replace(std::path::MAIN_SEPARATOR, "/")
+            .contains("pki/authorities/local/root.crt"),
         "{stdout}"
     );
     assert!(stdout.contains("caddy-rs test root"), "{stdout}");
@@ -3353,6 +3355,25 @@ fn manpage_requires_an_output_directory_with_caddys_exit_code() {
 use std::io::{BufRead, BufReader};
 use std::sync::mpsc;
 
+/// Ask a spawned server to stop the way a service manager would.
+///
+/// Unix: `SIGTERM`, which the server turns into a graceful shutdown (buffered logs are flushed).
+/// Windows has no signal that can be sent to one console child from a test (`Ctrl+C`/`Ctrl+Break`
+/// events go to a whole console), so the process is terminated; tests that assert on graceful
+/// behaviour (flushed buffers, the shutdown message) are Unix-only, and the Windows graceful stop is
+/// covered through the admin API's `/stop` instead.
+fn request_graceful_stop(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        // SAFETY: `child.id()` is this live child's pid; SIGTERM is a valid signal.
+        unsafe { libc::kill(child.id() as libc::c_int, libc::SIGTERM) };
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+    }
+}
+
 /// A spawned `caddy-rs respond` process plus a line reader for its stdout.
 struct RespondProcess {
     child: Child,
@@ -3368,8 +3389,7 @@ impl RespondProcess {
 
     /// Send SIGTERM and wait for a graceful exit, returning the captured stderr.
     fn terminate(&mut self) -> String {
-        // SAFETY: `child.id()` is this live child's pid; SIGTERM is a valid signal.
-        unsafe { libc::kill(self.child.id() as libc::c_int, libc::SIGTERM) };
+        request_graceful_stop(&mut self.child);
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             if self.child.try_wait().expect("poll respond child").is_some() {
@@ -3748,6 +3768,7 @@ fn respond_expands_a_port_range_with_template_variables() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn respond_writes_the_access_log_when_requested() {
     let directory = tempfile::tempdir().expect("tempdir");
@@ -4065,9 +4086,10 @@ fn storage_config(directory: &Path, name: &str, root: &Path) -> std::path::PathB
     let config = directory.join(name);
     std::fs::write(
         &config,
+        // Built with serde_json: a Windows root contains backslashes that must be escaped.
         format!(
-            "{{\"storage\":{{\"module\":\"file_system\",\"root\":\"{}\"}}}}\n",
-            root.display()
+            "{}\n",
+            serde_json::json!({"storage": {"module": "file_system", "root": root.to_str().unwrap()}})
         ),
     )
     .expect("write config");
@@ -4713,6 +4735,7 @@ fn start_pid(stdout: &str) -> i32 {
         .expect("numeric pid")
 }
 
+#[cfg(unix)]
 /// Liveness via `kill(pid, 0)`, ignoring a zombie that a non-reaping PID 1 has not collected.
 fn process_alive(pid: i32) -> bool {
     if unsafe { libc::kill(pid, 0) } != 0 {
@@ -4729,6 +4752,7 @@ fn process_alive(pid: i32) -> bool {
     }
 }
 
+#[cfg(unix)]
 fn wait_for_process_exit(pid: i32, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -4740,6 +4764,7 @@ fn wait_for_process_exit(pid: i32, timeout: Duration) -> bool {
     !process_alive(pid)
 }
 
+#[cfg(unix)]
 #[test]
 fn start_reports_success_and_runs_in_the_background() {
     let directory = tempfile::tempdir().unwrap();
@@ -4798,6 +4823,7 @@ fn start_reports_success_and_runs_in_the_background() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn start_without_config_loads_caddyfile_in_the_working_directory() {
     let directory = tempfile::tempdir().unwrap();
@@ -4893,6 +4919,7 @@ fn start_rejects_watch_and_pidfile_before_spawning() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn run_pingback_handshake_echoes_the_parent_token() {
     let directory = tempfile::tempdir().unwrap();
@@ -4982,8 +5009,7 @@ impl FileServerProcess {
     ///
     /// A graceful shutdown flushes the buffered access-log sink; SIGKILL would not.
     fn terminate(&mut self) -> String {
-        // SAFETY: `child.id()` is this live child's pid; SIGTERM is a valid signal.
-        unsafe { libc::kill(self.child.id() as libc::c_int, libc::SIGTERM) };
+        request_graceful_stop(&mut self.child);
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             if self
@@ -5194,6 +5220,7 @@ fn file_server_browse_lists_a_directory() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn file_server_access_log_is_written_to_stderr() {
     let directory = tempfile::tempdir().expect("tempdir");
@@ -5348,8 +5375,7 @@ impl ProxyProcess {
     ///
     /// A graceful shutdown flushes the buffered access-log sink; SIGKILL would not.
     fn terminate(&mut self) -> String {
-        // SAFETY: `child.id()` is this live child's pid; SIGTERM is a valid signal.
-        unsafe { libc::kill(self.child.id() as libc::c_int, libc::SIGTERM) };
+        request_graceful_stop(&mut self.child);
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             if self
@@ -5690,6 +5716,7 @@ fn reverse_proxy_sets_request_and_response_headers() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn reverse_proxy_access_log_is_written_to_stderr() {
     let directory = tempfile::tempdir().expect("tempdir");
@@ -6330,6 +6357,7 @@ fn bind_fds_dry_run_prints_the_plan_and_exits() {
 /// gone because the upload now exists, and the property worth keeping is the one below: a missing
 /// store is caught *before* any socket is taken, so a unit that forgot socket activation cannot
 /// leave orphaned bound ports behind.
+#[cfg(unix)]
 #[test]
 fn bind_fds_without_notify_socket_refuses_before_binding_anything() {
     let directory = tempfile::tempdir().expect("temp dir");
@@ -6353,6 +6381,7 @@ fn bind_fds_without_notify_socket_refuses_before_binding_anything() {
     );
 }
 
+#[cfg(unix)]
 /// A UDP listener cannot be pre-bound, and the helper must say so naming the missing prerequisite
 /// rather than silently binding (DIV-0040, ADR-0047).
 #[test]
@@ -6381,6 +6410,7 @@ fn bind_fds_refuses_a_udp_listener_naming_the_missing_prerequisite() {
     );
 }
 
+#[cfg(unix)]
 /// Read exactly one datagram from the mock fd store, returning its payload and any descriptors.
 ///
 /// The helper now sends two messages per listener (remove, then upload), so a test that read one
@@ -6427,6 +6457,7 @@ fn receive_one_datagram(store: &std::os::unix::net::UnixDatagram) -> (Vec<u8>, V
     (payload, descriptors)
 }
 
+#[cfg(unix)]
 /// The real upload path: with a mock store on a Unix datagram socket, the helper must bind the
 /// planned listener and deliver one descriptor carrying the plan's FD name.
 ///

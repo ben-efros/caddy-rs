@@ -173,6 +173,7 @@ fn is_addr_in_use(error: &str) -> bool {
     lower.contains("address already in use")
         || lower.contains("addrinuse")
         || lower.contains("address in use")
+        || lower.contains("only one usage of each socket address")
 }
 
 async fn start(config: Config) -> (ServerRuntime, caddy_rs_server::RuntimeStatus) {
@@ -1357,7 +1358,13 @@ fn memory_bytes() -> (u64, u64) {
         status
             .lines()
             .find_map(|line| line.strip_prefix(name))
-            .and_then(|rest| rest.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+            .and_then(|rest| {
+                rest.trim()
+                    .trim_end_matches("kB")
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+            })
             .expect("memory field")
             * 1024
     };
@@ -1391,7 +1398,10 @@ fn record_panics() {
 }
 
 fn assert_no_task_panics() {
-    let panics = PANICS.lock().map(|panics| panics.clone()).unwrap_or_default();
+    let panics = PANICS
+        .lock()
+        .map(|panics| panics.clone())
+        .unwrap_or_default();
     assert!(panics.is_empty(), "a server task panicked: {panics:?}");
 }
 
@@ -1583,10 +1593,9 @@ async fn http3_stalled_upload_is_cut_off_and_frees_the_connection() {
 
     let endpoint = quic_endpoint(client_config(vec![b"h3".to_vec()]));
     let connection = connect(&endpoint, address).await.expect("QUIC connect");
-    let (driver, mut send_request) =
-        h3::client::new(h3_quinn::Connection::new(connection.clone()))
-            .await
-            .expect("HTTP/3 client");
+    let (driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(connection.clone()))
+        .await
+        .expect("HTTP/3 client");
     let request = http::Request::builder()
         .method("POST")
         .uri("https://example.com/stall")
@@ -1704,12 +1713,14 @@ async fn http3_early_answer_with_the_upload_still_open_does_not_panic() {
 
     let endpoint = quic_endpoint(client_config(vec![b"h3".to_vec()]));
     let connection = connect(&endpoint, address).await.expect("QUIC connect");
-    let (driver, mut send_request) =
-        h3::client::new(h3_quinn::Connection::new(connection.clone()))
-            .await
-            .expect("HTTP/3 client");
+    let (driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(connection.clone()))
+        .await
+        .expect("HTTP/3 client");
 
-    for (path, headers) in [("/early", vec![]), ("/proxied", vec![("content-length", "4")])] {
+    for (path, headers) in [
+        ("/early", vec![]),
+        ("/proxied", vec![("content-length", "4")]),
+    ] {
         let mut builder = http::Request::builder()
             .method("POST")
             .uri(format!("https://example.com{path}"));
@@ -1954,7 +1965,10 @@ async fn http3_forced_shutdown_aborts_an_in_flight_upload() {
 
     shutdown_tx.send(true).expect("first signal");
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(!running.is_finished(), "the stalled request is still draining");
+    assert!(
+        !running.is_finished(),
+        "the stalled request is still draining"
+    );
     force_tx.send(true).expect("second signal");
     let finished = tokio::time::timeout(Duration::from_secs(5), running)
         .await
@@ -2063,9 +2077,14 @@ async fn http3_draining_listener_refuses_new_streams_and_connections() {
         .expect("send a few bytes");
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    shutdown_tx.send(true).expect("first signal: graceful shutdown");
+    shutdown_tx
+        .send(true)
+        .expect("first signal: graceful shutdown");
     tokio::time::sleep(Duration::from_millis(400)).await;
-    assert!(!running.is_finished(), "the stalled request is still draining");
+    assert!(
+        !running.is_finished(),
+        "the stalled request is still draining"
+    );
 
     // A new request on the draining connection must fail fast, not hang.
     let started = std::time::Instant::now();
@@ -2093,7 +2112,10 @@ async fn http3_draining_listener_refuses_new_streams_and_connections() {
     let started = std::time::Instant::now();
     let endpoint = quic_endpoint(client_config(vec![b"h3".to_vec()]));
     let refused = connect(&endpoint, address).await;
-    assert!(refused.is_err(), "a draining listener must refuse new connections");
+    assert!(
+        refused.is_err(),
+        "a draining listener must refuse new connections"
+    );
     assert!(
         started.elapsed() < Duration::from_secs(3),
         "the refusal took {:?}; it must be immediate, not a handshake timeout",

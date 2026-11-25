@@ -197,7 +197,7 @@ impl std::error::Error for FdStoreError {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};

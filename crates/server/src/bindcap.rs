@@ -602,6 +602,23 @@ where
     }
 }
 
+/// Platforms without Linux capabilities (Windows) never escalate: a failed bind returns its original
+/// error unchanged. Binding a port below 1024 needs no privilege on Windows, so there is nothing to
+/// raise, mirroring the oracle's `bindcap_other.go` stub.
+#[cfg(not(target_os = "linux"))]
+pub fn with_bind_capability<T, F>(
+    _address: &ListenAddr,
+    first_error: std::io::Error,
+    _attempt: F,
+) -> std::result::Result<T, std::io::Error>
+where
+    T: Send + 'static,
+    F: FnOnce() -> std::result::Result<T, std::io::Error> + Send + 'static,
+{
+    note_seam_entry();
+    Err(first_error)
+}
+
 #[cfg(test)]
 #[allow(unsafe_code)] // one test calls prctl directly to construct the ambient-true case.
 mod tests {
@@ -1148,6 +1165,7 @@ mod retry_tests {
     /// always fails with `EACCES` is invoked at most once, and the error is propagated unchanged when
     /// the capability cannot be raised (which is the case whenever it is already effective or not
     /// permitted — so no capability syscall is made and no global state is touched).
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_second_eacces_is_returned_and_the_retry_happens_at_most_once() {
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1257,6 +1275,7 @@ mod retry_tests {
     /// guard, so it would pass even if `CapabilityLowerGuard` lost its `Drop` impl; and the only test
     /// that touched the real drop body skipped in this environment. Deleting the production `Drop`
     /// impl now fails this test.
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_real_lower_guard_runs_its_drop_body_when_the_bind_panics() {
         let before = thread_capability_operations();
@@ -1278,6 +1297,7 @@ mod retry_tests {
     /// `std::mem::forget` is not used; instead the guard is held in a value that panics after being
     /// armed, matching `with_bind_capability`'s `let guard = ...; attempt();` sequence, so the drop
     /// happens during unwinding through the same code path.
+    #[cfg(target_os = "linux")]
     #[test]
     fn an_armed_guard_dropped_by_an_unwind_outside_the_seam_also_lowers() {
         struct Panicking;
@@ -1301,6 +1321,7 @@ mod retry_tests {
     }
 
     /// A disarmed guard must not lower — the raise failed, so there is nothing to lower.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_disarmed_guard_does_not_lower() {
         let before = thread_capability_operations();

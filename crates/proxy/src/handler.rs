@@ -808,14 +808,18 @@ impl ReverseProxyHandler {
                 tracking_id: "PROXY-DYNAMIC-UPSTREAM-HEALTH",
             });
         }
-        if transport.proxy_protocol.is_some()
-            && upstreams.iter().any(|upstream| {
-                matches!(
-                    upstream.transport(),
-                    Some(crate::upstream::Transport::Unix { .. })
-                )
-            })
-        {
+        // Unix-socket upstreams exist only on Unix targets; on other platforms the variant is not
+        // compiled and a `unix/` dial is rejected when the upstream is parsed.
+        #[cfg(unix)]
+        let has_unix_upstream = upstreams.iter().any(|upstream| {
+            matches!(
+                upstream.transport(),
+                Some(crate::upstream::Transport::Unix { .. })
+            )
+        });
+        #[cfg(not(unix))]
+        let has_unix_upstream = false;
+        if transport.proxy_protocol.is_some() && has_unix_upstream {
             return Err(invalid(
                 &format!("{path}.transport.proxy_protocol"),
                 "PROXY protocol is not supported for Unix-socket upstreams (Caddy writes the \
@@ -5081,6 +5085,7 @@ mod tests {
         assert!(declined.is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn accepts_unix_dial_in_configuration() {
         let handler = build_handler(serde_json::json!({
@@ -5425,6 +5430,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn unix_socket_tls_upstream_requires_server_name() {
         let directory = tempfile::tempdir().unwrap();

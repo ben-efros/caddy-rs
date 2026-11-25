@@ -69,6 +69,13 @@ pub const LEGACY_FALLBACK_CONFIG_DIR: &str = ".caddy-rs";
 /// `$HOME/.config/caddy` otherwise, and `./caddy` when `HOME` is also unavailable. This is Caddy's
 /// `AppConfigDir()` layout.
 pub fn config_dir() -> PathBuf {
+    // Windows has no `HOME`: use Caddy's `%AppData%/Caddy` rather than `./caddy` in the working
+    // directory (see `data_dir::app_data_dir`).
+    if cfg!(windows) && std::env::var_os(XDG_CONFIG_HOME_ENV).is_none_or(|value| value.is_empty()) {
+        if let Some(directory) = crate::data_dir::windows_app_dir() {
+            return directory;
+        }
+    }
     config_dir_with(
         std::env::var_os(XDG_CONFIG_HOME_ENV),
         std::env::var_os(HOME_ENV),
@@ -108,7 +115,8 @@ pub fn default_autosave_path() -> PathBuf {
 
 /// Resolve the default autosave path and report whether a legacy path was used.
 pub fn resolve_autosave_path() -> AutosavePath {
-    resolve_autosave_path_with(
+    resolve_autosave_path_in(
+        config_dir(),
         std::env::var_os(XDG_CONFIG_HOME_ENV),
         std::env::var_os(HOME_ENV),
     )
@@ -119,7 +127,18 @@ pub fn resolve_autosave_path_with(
     xdg_config_home: Option<std::ffi::OsString>,
     home: Option<std::ffi::OsString>,
 ) -> AutosavePath {
-    let caddy = config_dir_with(xdg_config_home.clone(), home.clone()).join(AUTOSAVE_FILE_NAME);
+    let caddy_dir = config_dir_with(xdg_config_home.clone(), home.clone());
+    resolve_autosave_path_in(caddy_dir, xdg_config_home, home)
+}
+
+/// [`resolve_autosave_path_with`] with the Caddy config directory already decided (so the Windows
+/// `%AppData%/Caddy` location can be passed in).
+fn resolve_autosave_path_in(
+    caddy_dir: PathBuf,
+    xdg_config_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> AutosavePath {
+    let caddy = caddy_dir.join(AUTOSAVE_FILE_NAME);
     if caddy.exists() {
         return AutosavePath {
             path: caddy,
@@ -225,13 +244,21 @@ pub fn load_autosave(path: &Path) -> io::Result<Option<Vec<u8>>> {
             ));
         }
     }
+    // Windows has no mode bits: the equivalent is a DACL that lets another principal write.
+    #[cfg(not(unix))]
+    if caddy_rs_fsperm::exposure(path)?.writable_by_others {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "autosave file can be modified by other users; refusing to load it",
+        ));
+    }
     if metadata.len() > MAX_AUTOSAVE_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("autosave file is larger than {MAX_AUTOSAVE_BYTES} bytes"),
         ));
     }
-    check_owner(&metadata, "autosave file")?;
+    check_owner(&metadata, "autosave file", path)?;
     // A file in a group/world-writable directory can be replaced by another local user between
     // runs even when the file itself is 0600, so refuse to load from such a directory.
     check_private_directory(&parent_directory(path))?;
@@ -285,21 +312,11 @@ fn parent_directory(path: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// Create a directory chain with mode `0700`; directories that already exist are left untouched
-/// (`MkdirAll` semantics — an existing config dir keeps its mode). Std-only implementation of
-/// `os.MkdirAll(dir, 0o700)`.
+/// Create a directory chain that only its owner can use (mode `0700` on Unix, a protected
+/// owner/SYSTEM/Administrators DACL on Windows); directories that already exist are left untouched
+/// (`MkdirAll` semantics — an existing config dir keeps its permissions).
 fn create_dir_private(directory: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        let mut builder = std::fs::DirBuilder::new();
-        builder.mode(0o700);
-        builder.recursive(true).create(directory)
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::create_dir_all(directory)
-    }
+    caddy_rs_fsperm::create_dir_all_private(directory)
 }
 
 /// Refuse to write secrets into a directory that another local user can replace entries in.
@@ -331,7 +348,14 @@ fn check_private_directory(directory: &Path) -> io::Result<()> {
             ));
         }
     }
-    check_owner(&metadata, "autosave directory")?;
+    #[cfg(not(unix))]
+    if caddy_rs_fsperm::exposure(directory)?.writable_by_others {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "autosave directory can be modified by other users; refusing to write secrets into it",
+        ));
+    }
+    check_owner(&metadata, "autosave directory", directory)?;
     Ok(())
 }
 
@@ -352,7 +376,7 @@ fn sync_directory(_directory: &Path) -> io::Result<()> {
 /// without a libc dependency. On platforms without that probe the ownership check is skipped
 /// rather than guessed; the symlink/regular-file/mode checks still apply.
 #[cfg(target_os = "linux")]
-fn check_owner(metadata: &std::fs::Metadata, what: &str) -> io::Result<()> {
+fn check_owner(metadata: &std::fs::Metadata, what: &str, _path: &Path) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     if let Ok(process) = std::fs::metadata("/proc/self") {
         if metadata.uid() != process.uid() {
@@ -365,8 +389,20 @@ fn check_owner(metadata: &std::fs::Metadata, what: &str) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
-fn check_owner(_metadata: &std::fs::Metadata, _what: &str) -> io::Result<()> {
+/// Windows: the owner must be this user, SYSTEM or the Administrators group.
+#[cfg(windows)]
+fn check_owner(_metadata: &std::fs::Metadata, what: &str, path: &Path) -> io::Result<()> {
+    if !caddy_rs_fsperm::owned_by_current_user(path)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{what} is owned by another user; refusing to use it"),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn check_owner(_metadata: &std::fs::Metadata, _what: &str, _path: &Path) -> io::Result<()> {
     Ok(())
 }
 
@@ -389,15 +425,18 @@ fn temporary_path(path: &Path) -> PathBuf {
 
 /// Write `bytes` to a fresh file at `temp_path` with mode `0600` and `fsync` it.
 fn write_temp(temp_path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
     #[cfg(unix)]
-    {
+    let mut file = {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
         options.custom_flags(OPEN_NOFOLLOW_CLOEXEC);
-    }
-    let mut file = options.open(temp_path)?;
+        options.open(temp_path)?
+    };
+    // Windows: created exclusively with a protected owner-only DACL by the create call itself.
+    #[cfg(not(unix))]
+    let mut file = caddy_rs_fsperm::create_new_file_private(temp_path)?;
     let metadata = file.metadata()?;
     if !metadata.file_type().is_file() {
         return Err(io::Error::new(
@@ -434,6 +473,11 @@ mod tests {
                 COUNTER.fetch_add(1, Ordering::Relaxed)
             ));
             std::fs::create_dir_all(&path).expect("create test dir");
+            // `%TEMP%` can grant other principals access (this machine's does), and the autosave
+            // loader rightly refuses a directory others can modify. Fixtures are made private
+            // the way a real config directory is.
+            #[cfg(windows)]
+            caddy_rs_fsperm::restrict_dir(&path).expect("make the test dir private");
             Self { path }
         }
 

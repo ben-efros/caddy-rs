@@ -37,9 +37,11 @@ use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::TcpListener;
 #[cfg(feature = "http3")]
 use tokio::net::UdpSocket;
-use tokio::net::{TcpListener, UnixListener};
+#[cfg(unix)]
+use tokio::net::UnixListener;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
@@ -50,7 +52,9 @@ use caddy_rs_core::{Generation, GenerationStore, ListenAddr, Network};
 use caddy_rs_http::{Body, Router, StreamingBody};
 use caddy_rs_proxy::trusted_proxies::ServerTrustedProxies;
 
-use crate::activation::{adopt_tcp, adopt_unix, InheritedSocket, LocalSocket};
+#[cfg(unix)]
+use crate::activation::adopt_unix;
+use crate::activation::{adopt_tcp, InheritedSocket, LocalSocket};
 use crate::auto_https::AutomaticHttpsServing;
 use crate::error::Error;
 use crate::http::{serve_request_with_automatic_upgradable, ServedResponse};
@@ -383,6 +387,14 @@ pub(crate) async fn bind(
                 unix_socket: None,
             })
         }
+        // Windows has AF_UNIX at the OS level but tokio exposes Unix-domain listeners only on
+        // Unix, so a `unix//path` listener is refused loudly there instead of being ignored.
+        #[cfg(not(unix))]
+        Network::Unix => Err(Error::Listen {
+            listen: configured.to_string(),
+            reason: "Unix-domain socket listeners are not supported on Windows; listen on a TCP address such as `127.0.0.1:8080` instead".to_string(),
+        }),
+        #[cfg(unix)]
         Network::Unix => {
             let path = address.address.clone();
             let listener = match inherited {
@@ -759,6 +771,13 @@ fn tcp_socket_options(socket: &impl TcpSocketOptions) -> io::Result<()> {
 }
 
 /// A dual-stack (`IPv6` wildcard with `IPV6_V6ONLY=0`) listening socket for a hostless address.
+/// Backlog for wildcard listeners: the system maximum. Windows' `SOMAXCONN` is a sentinel (`0x7fffffff`)
+/// that asks the stack to pick a reasonable maximum.
+#[cfg(unix)]
+const LISTEN_BACKLOG: i32 = libc::SOMAXCONN;
+#[cfg(not(unix))]
+const LISTEN_BACKLOG: i32 = 0x7fff_ffff;
+
 fn wildcard_dual_stack_listener(port: u16) -> io::Result<TcpListener> {
     let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
     // Caddy (Go) forces IPV6_V6ONLY=0 for `:port`; do not depend on the host's bindv6only default.
@@ -766,7 +785,7 @@ fn wildcard_dual_stack_listener(port: u16) -> io::Result<TcpListener> {
     socket.set_reuse_address(true)?;
     socket.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)).into())?;
     // Caddy (Go) uses the system `somaxconn` backlog for `:port` wildcard listeners.
-    socket.listen(libc::SOMAXCONN)?;
+    socket.listen(LISTEN_BACKLOG)?;
     socket.set_nonblocking(true)?;
     TcpListener::from_std(socket.into())
 }
@@ -1305,7 +1324,9 @@ async fn serve_h3_request(
     let mut resolver = Some(resolver);
     for _ in 0..1 {
         // The body runs exactly once; `take` satisfies the borrow checker for the one-shot loop.
-        let Some(resolver) = resolver.take() else { break };
+        let Some(resolver) = resolver.take() else {
+            break;
+        };
         let (mut request, mut stream) = match resolver.resolve_request().await {
             Ok(pair) => pair,
             Err(error) => {
@@ -1325,13 +1346,10 @@ async fn serve_h3_request(
             request.uri(),
             request.headers(),
         );
-        let mut snapshot = context.access_log.is_enabled().then(|| {
-            RequestSnapshot::capture_http3(
-                &request,
-                Some(remote_addr),
-                Some(&tls_info),
-            )
-        });
+        let mut snapshot = context
+            .access_log
+            .is_enabled()
+            .then(|| RequestSnapshot::capture_http3(&request, Some(remote_addr), Some(&tls_info)));
         if let Some(snapshot) = snapshot.as_mut() {
             snapshot.resolve_client_ip(&context.trusted_proxies);
         }
@@ -1343,12 +1361,8 @@ async fn serve_h3_request(
             access_log.start(started);
             access_log
         });
-        let _request_guard = request_started(
-            &context.recorder,
-            &context.server_name,
-            &host,
-            is_https,
-        );
+        let _request_guard =
+            request_started(&context.recorder, &context.server_name, &host, is_https);
         // RFC 9114 has no HTTP/1.1-style `Upgrade`, and caddy-rs has no HTTP/3
         // request-stream tunnel for RFC 8441 extended CONNECT. Reject every
         // upgrade-style request before routing so a WebSocket/extended-CONNECT
@@ -1364,10 +1378,7 @@ async fn serve_h3_request(
             );
             let response = http::Response::builder()
                 .status(http::StatusCode::NOT_IMPLEMENTED)
-                .header(
-                    http::header::CONTENT_TYPE,
-                    "text/plain; charset=utf-8",
-                )
+                .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
                 .body(())
                 .unwrap_or_else(|_| http::Response::new(()));
             let _ = stream.send_response(response).await;
@@ -1408,8 +1419,7 @@ async fn serve_h3_request(
         let can_stream = !header_invalid
             && context.router.as_ref().is_some_and(|router| {
                 !router.requires_buffered_request_body()
-                    && (declared_length.is_some()
-                        || context.limits.max_request_body_size.is_none())
+                    && (declared_length.is_some() || context.limits.max_request_body_size.is_none())
             });
         // Send and receive halves are independent: the handler can answer (and
         // stream a response) while the request body is still arriving.
@@ -1460,9 +1470,7 @@ async fn serve_h3_request(
             let Some(reader) = recv_stream.as_mut() else {
                 break;
             };
-            let next = match tokio::time::timeout(body_idle_timeout, reader.recv_data())
-                .await
-            {
+            let next = match tokio::time::timeout(body_idle_timeout, reader.recv_data()).await {
                 Ok(next) => next,
                 Err(_elapsed) => {
                     tracing::debug!("HTTP/3 request body read timed out");
@@ -1508,30 +1516,27 @@ async fn serve_h3_request(
             access_log_context.request_bytes().set(body.len() as u64);
         }
         if too_large || overloaded || malformed.is_some() {
-            let (refusal_status, refusal_body): (http::StatusCode, &'static [u8]) =
-                if overloaded {
-                    (
-                        http::StatusCode::SERVICE_UNAVAILABLE,
-                        b"503 Service Unavailable",
-                    )
-                } else if too_large {
-                    (
-                        http::StatusCode::PAYLOAD_TOO_LARGE,
-                        b"413 Request Entity Too Large",
-                    )
-                } else if malformed == Some(http::StatusCode::REQUEST_TIMEOUT) {
-                    (http::StatusCode::REQUEST_TIMEOUT, b"408 Request Timeout")
-                } else {
-                    (http::StatusCode::BAD_REQUEST, b"400 Bad Request")
-                };
+            let (refusal_status, refusal_body): (http::StatusCode, &'static [u8]) = if overloaded {
+                (
+                    http::StatusCode::SERVICE_UNAVAILABLE,
+                    b"503 Service Unavailable",
+                )
+            } else if too_large {
+                (
+                    http::StatusCode::PAYLOAD_TOO_LARGE,
+                    b"413 Request Entity Too Large",
+                )
+            } else if malformed == Some(http::StatusCode::REQUEST_TIMEOUT) {
+                (http::StatusCode::REQUEST_TIMEOUT, b"408 Request Timeout")
+            } else {
+                (http::StatusCode::BAD_REQUEST, b"400 Bad Request")
+            };
             let response = http::Response::builder()
                 .status(refusal_status)
                 .body(())
                 .unwrap_or_else(|_| http::Response::new(()));
             let _ = stream.send_response(response).await;
-            let _ = stream
-                .send_data(Bytes::from_static(refusal_body))
-                .await;
+            let _ = stream.send_data(Bytes::from_static(refusal_body)).await;
             let _ = stream.finish().await;
             observe_request(
                 &context.recorder,
@@ -1558,9 +1563,7 @@ async fn serve_h3_request(
         if !request.headers().contains_key(http::header::HOST) {
             if let Some(authority) = request.uri().authority() {
                 if let Ok(value) = http::HeaderValue::from_str(authority.as_str()) {
-                    request
-                        .headers_mut()
-                        .insert(http::header::HOST, value);
+                    request.headers_mut().insert(http::header::HOST, value);
                 }
             }
         }
@@ -1595,10 +1598,9 @@ async fn serve_h3_request(
             continue;
         };
         let request_body = match streamed_body.take() {
-            Some(streaming) => crate::http::H3RequestBody::Streaming(
-                streaming,
-                Arc::clone(&body_failure),
-            ),
+            Some(streaming) => {
+                crate::http::H3RequestBody::Streaming(streaming, Arc::clone(&body_failure))
+            }
             None => crate::http::H3RequestBody::Buffered(body.freeze()),
         };
         let served = crate::http::serve_internal_h3(
@@ -1613,8 +1615,7 @@ async fn serve_h3_request(
             Arc::clone(&context.trusted_proxies),
             h3_client_certificate(&connection, context.client_auth_verified),
             request_tls_connection(Some(&tls_info)),
-            (!tls_info.server_name.is_empty())
-                .then(|| tls_info.server_name.clone()),
+            (!tls_info.server_name.is_empty()).then(|| tls_info.server_name.clone()),
             access_log_context.clone(),
         )
         .await;
@@ -1673,8 +1674,7 @@ async fn serve_h3_request(
             }
         }
         let _ = stream.finish().await;
-        let write_error = failed
-            .then(|| format!("response body write failed after {sent} bytes"));
+        let write_error = failed.then(|| format!("response body write failed after {sent} bytes"));
         observe_request(
             &context.recorder,
             &context.access_log,
@@ -2115,6 +2115,7 @@ fn spawn_tcp_accept_loop(
     })
 }
 
+#[cfg(unix)]
 fn spawn_unix_accept_loop(
     listener: UnixListener,
     listen_key: String,
@@ -3770,6 +3771,7 @@ pub(crate) struct SocketIdentity {
     pub(crate) inode: u64,
 }
 
+#[cfg(unix)]
 impl SocketIdentity {
     fn of(metadata: &std::fs::Metadata) -> Self {
         use std::os::unix::fs::MetadataExt;
@@ -3788,11 +3790,13 @@ impl SocketIdentity {
 /// regular file, a symlink, or another process's socket (different inode), it is left alone
 /// (SEC-MEDIUM-ADMIN-SERVER A3). The `lstat` and `unlink` are two calls, so a swap in the
 /// microseconds between them is narrowed, not eliminated: there is no unlink-if-inode primitive.
+#[cfg(unix)]
 struct AdminSocketPath {
     path: std::path::PathBuf,
     identity: SocketIdentity,
 }
 
+#[cfg(unix)]
 impl Drop for AdminSocketPath {
     fn drop(&mut self) {
         use std::os::unix::fs::FileTypeExt;
@@ -3825,6 +3829,7 @@ impl Drop for AdminSocketPath {
 /// Clients only need write permission to `connect(2)`, but an owner-only socket keeps the admin
 /// API unreachable for other users of the host, which is the reason to use a Unix socket instead
 /// of a loopback TCP port.
+#[cfg(unix)]
 fn set_admin_socket_permissions(path: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
@@ -3843,6 +3848,7 @@ fn set_admin_socket_permissions(path: &std::path::Path) -> std::io::Result<()> {
 /// `chmod`ed `0600`, and then installed under the final name by [`install_staged_socket`]. The
 /// staging directory is always removed. Returns the listener and the identity of the socket file
 /// now at `socket_path`, so cleanup removes only that file.
+#[cfg(unix)]
 fn bind_admin_unix_private(
     socket_path: &std::path::Path,
 ) -> std::io::Result<(UnixListener, SocketIdentity)> {
@@ -3942,12 +3948,14 @@ fn bind_admin_unix_private(
 }
 
 /// `sun_path` capacity including the trailing NUL (108 on Linux, 104 on the BSDs and macOS).
+#[cfg(unix)]
 const SUN_PATH_CAPACITY: usize = if cfg!(target_os = "linux") { 108 } else { 104 };
 
 /// Whether a failed `link(2)` means "this filesystem cannot hard-link" (so the re-checked
 /// `rename` fallback applies) rather than a real failure: `EPERM` (for example FUSE and
 /// `fs.protected_hardlinks`), `EOPNOTSUPP`/`ENOTSUP` and `ENOSYS`. `EACCES`, `EMLINK`, `ENOSPC`,
 /// `EDQUOT`, `EROFS`, `EIO` and the like are surfaced to the operator.
+#[cfg(unix)]
 fn hard_link_unsupported(error: &std::io::Error) -> bool {
     matches!(
         error.raw_os_error(),
@@ -3969,6 +3977,7 @@ fn hard_link_unsupported(error: &std::io::Error) -> bool {
 ///   is no portable no-replace-unless-inode primitive (and this crate denies `unsafe`, which rules
 ///   out calling `renameat2` directly), so a swap in the microseconds between that check and the
 ///   `rename` is narrowed, not eliminated.
+#[cfg(unix)]
 fn install_staged_socket(
     staged: &std::path::Path,
     final_path: &std::path::Path,
@@ -4019,6 +4028,7 @@ fn install_staged_socket(
 }
 
 /// What probing an existing admin socket found.
+#[cfg(unix)]
 #[derive(Debug, PartialEq, Eq)]
 enum SocketProbe {
     /// Something accepts on it (or did not answer within the budget): a running process owns it.
@@ -4036,6 +4046,7 @@ enum SocketProbe {
 /// user (for example a crashed `sudo caddy-rs run`) that this process could never have been
 /// talking to: it counts as stale, and the later replace fails clearly if the directory does not
 /// let us unlink it. A timeout counts as live: wrongly refusing is the safe error.
+#[cfg(unix)]
 fn classify_probe(
     outcome: Result<(), &std::io::Error>,
     timed_out: bool,
@@ -4060,6 +4071,7 @@ fn classify_probe(
 
 /// This process's effective uid without `unsafe` (Linux; `None` elsewhere): the owner of
 /// `/proc/self`.
+#[cfg(unix)]
 fn current_uid() -> Option<u32> {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata("/proc/self").ok().map(|m| m.uid())
@@ -4070,6 +4082,7 @@ fn current_uid() -> Option<u32> {
 /// stealing it would silently redirect that instance's admin clients. Does nothing when the path
 /// is absent or is not a socket (the bind reports non-sockets itself). Async with a 1 s budget so
 /// a wedged peer cannot block the runtime.
+#[cfg(unix)]
 async fn probe_existing_admin_socket(socket_path: &std::path::Path) -> std::io::Result<()> {
     use std::io::{Error, ErrorKind};
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
@@ -4110,6 +4123,7 @@ async fn probe_existing_admin_socket(socket_path: &std::path::Path) -> std::io::
 }
 
 /// Bind the admin API to a Unix domain socket.
+#[cfg(unix)]
 async fn bind_admin_unix(
     configured: &str,
     path: &str,
@@ -4235,7 +4249,15 @@ pub(crate) async fn bind_admin_with(
         reason,
     })?;
     if address.network == Network::Unix {
+        #[cfg(unix)]
         return bind_admin_unix(configured, &address.address, api, options).await;
+        // Windows: no tokio Unix-domain listener, and no owner-only socket file to protect the
+        // admin API with. Refuse rather than fall back to something weaker.
+        #[cfg(not(unix))]
+        return Err(Error::Listen {
+            listen: configured.to_string(),
+            reason: "Unix-domain admin sockets are not supported on Windows; use a loopback TCP admin address (the default `localhost:2019`)".to_string(),
+        });
     }
     if address.network != Network::Tcp {
         return Err(Error::NotImplemented {
@@ -6086,7 +6108,7 @@ mod admin_host_check_tests {
 }
 
 /// Tests for the Unix-domain-socket admin listener (`admin.listen: "unix/<path>"`).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod admin_unix_tests {
     use super::bind_admin;
     use caddy_rs_admin::AdminApi;
@@ -6754,6 +6776,7 @@ mod bind_capability_tests {
     /// requires the real OS message text, which no placeholder can produce accidentally, and asserts
     /// the placeholder markers are absent. The same shape is used at every branch, because the last
     /// revision had the escape hatch at all four of them.
+    #[cfg(unix)]
     #[test]
     fn the_real_bind_sites_surface_a_located_error_carrying_the_real_cause() {
         // The real message the kernel produces for an address already in use. Verified against the
@@ -6810,6 +6833,7 @@ mod bind_capability_tests {
     /// `bind_tcp_ip`. Driving it requires a literal hostname (an IP literal takes the
     /// `bind_udp_socket_addr` branch instead), so it binds `udp/localhost:<held port>` and asserts
     /// the real OS message, with no `kind()` escape hatch.
+    #[cfg(unix)]
     #[tokio::test]
     async fn the_udp_hostname_site_surfaces_the_real_cause() {
         // `localhost` may resolve to IPv6 first; hold the port on both families so whichever is
@@ -6969,8 +6993,16 @@ mod h3_declared_length_tests {
         assert_eq!(lengths(&[]), Ok(None));
         assert_eq!(lengths(&["0"]), Ok(Some(0)));
         assert_eq!(lengths(&["10"]), Ok(Some(10)));
-        assert_eq!(lengths(&["10", "10"]), Ok(Some(10)), "equal repeats are one value");
-        assert_eq!(lengths(&["10, 10"]), Ok(Some(10)), "an equal list is one value");
+        assert_eq!(
+            lengths(&["10", "10"]),
+            Ok(Some(10)),
+            "equal repeats are one value"
+        );
+        assert_eq!(
+            lengths(&["10, 10"]),
+            Ok(Some(10)),
+            "an equal list is one value"
+        );
         for bad in [
             &["10", "20"][..],
             &["10, 20"],

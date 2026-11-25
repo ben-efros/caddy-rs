@@ -8571,6 +8571,27 @@ fn file_server_handler(directive: &Directive) -> caddy_rs_core::Result<Value> {
             "disable_canonical_uris" => {
                 object.insert("canonical_uris".to_string(), json!(false));
             }
+            // caddy-rs extension (not in Caddy): what to do with a symlink on the requested path.
+            // `deny` refuses every link, `within_root` (the default) follows links that resolve
+            // inside the served root, `follow` follows every link like Caddy does.
+            "symlinks" => {
+                if values.len() != 1 {
+                    return Err(adapter_error(
+                        directive.position.clone(),
+                        "`file_server symlinks` takes exactly one of: deny, within_root, follow",
+                    ));
+                }
+                let policy = &values[0];
+                if !matches!(policy.as_ref(), "deny" | "within_root" | "follow") {
+                    return Err(adapter_error(
+                        directive.position.clone(),
+                        format!(
+                            "`file_server symlinks` must be deny, within_root or follow, not `{policy}`"
+                        ),
+                    ));
+                }
+                object.insert("symlinks".to_string(), json!(policy));
+            }
             "precompressed" => {
                 // Caddy defaults an empty format list to br, zstd, gzip and emits a module map
                 // plus the preference order.
@@ -8682,6 +8703,7 @@ fn is_file_server_option(value: &str) -> bool {
             | "status"
             | "precompressed"
             | "disable_canonical_uris"
+            | "symlinks"
     )
 }
 

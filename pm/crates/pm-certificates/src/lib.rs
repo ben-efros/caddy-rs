@@ -37,7 +37,7 @@ mod key;
 mod pem;
 mod x509;
 
-use std::fs::{self, DirBuilder, OpenOptions};
+use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -808,21 +808,34 @@ impl CertificateRepository {
                         });
                     }
                 }
+                // Windows has no mode bits: the same rule is read from the directory's DACL.
+                #[cfg(not(unix))]
+                {
+                    let exposure =
+                        caddy_rs_fsperm::exposure(&self.secrets_dir).map_err(|source| {
+                            CertificateError::SecretFile {
+                                path: self.secrets_dir.clone(),
+                                source,
+                            }
+                        })?;
+                    if !exposure.is_private() {
+                        return Err(CertificateError::UnsafeSecretPath {
+                            path: self.secrets_dir.clone(),
+                            reason: "secrets directory is accessible by other users",
+                        });
+                    }
+                }
                 Ok(())
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let mut builder = DirBuilder::new();
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::DirBuilderExt;
-                    builder.mode(0o700);
-                }
-                builder
-                    .create(&self.secrets_dir)
-                    .map_err(|source| CertificateError::SecretFile {
+                // Owner-only at creation (mode 0700, or a protected owner/SYSTEM/Administrators
+                // DACL on Windows).
+                caddy_rs_fsperm::create_dir_private(&self.secrets_dir).map_err(|source| {
+                    CertificateError::SecretFile {
                         path: self.secrets_dir.clone(),
                         source,
-                    })
+                    }
+                })
             }
             Err(source) => Err(CertificateError::SecretFile {
                 path: self.secrets_dir.clone(),
@@ -843,19 +856,14 @@ fn write_secret_file(
             reason: "secret file is outside the secrets directory",
         });
     }
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(path)
-        .map_err(|source| CertificateError::SecretFile {
+    // Created exclusively and owner-only by the create call itself, so a private key is never
+    // readable by another user, even briefly.
+    let mut file = caddy_rs_fsperm::create_new_file_private(path).map_err(|source| {
+        CertificateError::SecretFile {
             path: path.to_path_buf(),
             source,
-        })?;
+        }
+    })?;
     if let Err(source) = file.write_all(bytes).and_then(|()| file.sync_all()) {
         drop(file);
         let _ = fs::remove_file(path);

@@ -14,6 +14,7 @@ mod glob;
 pub mod layer4;
 pub mod lexer;
 pub mod parser;
+#[cfg(unix)]
 mod uid;
 
 pub use adapter::{

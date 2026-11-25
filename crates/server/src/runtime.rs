@@ -3378,6 +3378,7 @@ mod shutdown_latch_tests {
     /// A Unix admin socket must be registered on the latch, so the `/stop` exit path can remove
     /// it when the exit budget expires before the listener task's `Drop` guard runs
     /// (`std::process::exit` skips destructors).
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_unix_admin_socket_is_registered_for_the_exit_path() {
         let directory = tempfile::tempdir().expect("temporary directory");
@@ -3407,6 +3408,7 @@ mod shutdown_latch_tests {
 
     /// A reload that moves `admin.listen` onto a path the new bind refuses must leave the old
     /// admin API serving (it used to be stopped first, leaving no API to repair the config with).
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_refused_admin_rebind_keeps_the_old_admin_api_serving() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

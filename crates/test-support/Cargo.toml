@@ -8,3 +8,6 @@ license.workspace = true
 publish = false
 
 [dependencies]
+
+[target.'cfg(windows)'.dependencies]
+caddy-rs-fsperm = { path = "../fsperm" }

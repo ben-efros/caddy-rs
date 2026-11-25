@@ -47,7 +47,13 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io;
 use std::net::{IpAddr, SocketAddr, SocketAddrV6, ToSocketAddrs};
+#[cfg(unix)]
 use std::os::fd::{FromRawFd, RawFd};
+/// Stand-in for the descriptor type on platforms without file descriptors (Windows): systemd socket
+/// activation does not exist there, so no descriptor is ever created, but the portable parsing and
+/// matching code keeps its signatures.
+#[cfg(not(unix))]
+pub type RawFd = i32;
 use std::path::{Path, PathBuf};
 
 use caddy_rs_core::{ListenAddr, Network};
@@ -179,6 +185,7 @@ impl InheritedSocket {
     }
 }
 
+#[cfg(unix)]
 impl Drop for InheritedSocket {
     fn drop(&mut self) {
         // SAFETY: `fd` is owned by this value (see `into_raw_fd`), so closing it here is correct
@@ -205,15 +212,25 @@ impl SocketActivation {
     /// Returns `Ok(None)` when the environment does not describe activation for this process,
     /// which is the normal non-systemd case. Malformed values are located errors.
     pub fn from_env() -> Result<Option<Self>, ActivationError> {
-        let listen_pid = optional_env("LISTEN_PID")?;
-        let listen_fds = optional_env("LISTEN_FDS")?;
-        let listen_fdnames = optional_env("LISTEN_FDNAMES")?;
-        Self::from_env_values(
-            listen_pid.as_deref(),
-            listen_fds.as_deref(),
-            listen_fdnames.as_deref(),
-            std::process::id(),
-        )
+        // `LISTEN_FDS` is the systemd `sd_listen_fds(3)` protocol; there is no equivalent on
+        // Windows, where every configured listener is simply bound. A stray variable must not
+        // fail start-up there.
+        #[cfg(not(unix))]
+        {
+            Ok(None)
+        }
+        #[cfg(unix)]
+        {
+            let listen_pid = optional_env("LISTEN_PID")?;
+            let listen_fds = optional_env("LISTEN_FDS")?;
+            let listen_fdnames = optional_env("LISTEN_FDNAMES")?;
+            Self::from_env_values(
+                listen_pid.as_deref(),
+                listen_fds.as_deref(),
+                listen_fdnames.as_deref(),
+                std::process::id(),
+            )
+        }
     }
 
     /// Parse activation from explicit environment values.
@@ -266,6 +283,7 @@ impl SocketActivation {
                 Err(error) => {
                     // The caller handed ownership to us; close the descriptors we have not taken
                     // ownership of yet so an invalid set does not leak file descriptors.
+                    #[cfg(unix)]
                     for (remaining_fd, _) in &descriptors[index..] {
                         // SAFETY: these descriptors are owned by this function and are not part of
                         // any `InheritedSocket` yet, so closing them exactly once is correct.
@@ -384,6 +402,16 @@ fn parse_environment(
 }
 
 /// Validate that `fd` is an open listening socket and return its local address.
+#[cfg(not(unix))]
+fn inspect_descriptor(_fd: RawFd, _name: &str, path: &str) -> Result<LocalSocket, ActivationError> {
+    Err(ActivationError::new(
+        path,
+        "inherited listening sockets are not supported on this platform",
+    ))
+}
+
+/// Validate that `fd` is an open listening socket and return its local address.
+#[cfg(unix)]
 fn inspect_descriptor(fd: RawFd, name: &str, path: &str) -> Result<LocalSocket, ActivationError> {
     if fd < 0 {
         return Err(ActivationError::new(
@@ -443,6 +471,7 @@ fn inspect_descriptor(fd: RawFd, name: &str, path: &str) -> Result<LocalSocket, 
 }
 
 /// Read the local address of an open socket descriptor.
+#[cfg(unix)]
 fn socket_local_address(fd: RawFd) -> io::Result<LocalSocket> {
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     let mut length = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
@@ -694,6 +723,21 @@ fn normalize_ip(ip: IpAddr) -> IpAddr {
 }
 
 /// Adopt an inherited TCP listening socket.
+#[cfg(not(unix))]
+pub(crate) fn adopt_tcp(
+    _socket: InheritedSocket,
+    listen: &str,
+) -> Result<tokio::net::TcpListener, Error> {
+    Err(Error::SocketActivation {
+        path: "LISTEN_FDS".to_string(),
+        message: format!(
+            "inherited sockets are not supported on this platform (listener `{listen}`)"
+        ),
+    })
+}
+
+/// Adopt an inherited TCP listening socket.
+#[cfg(unix)]
 pub(crate) fn adopt_tcp(
     socket: InheritedSocket,
     listen: &str,
@@ -717,6 +761,7 @@ pub(crate) fn adopt_tcp(
 }
 
 /// Adopt an inherited Unix-domain listening socket.
+#[cfg(unix)]
 pub(crate) fn adopt_unix(
     socket: InheritedSocket,
     listen: &str,
@@ -739,6 +784,7 @@ pub(crate) fn adopt_unix(
     })
 }
 
+#[cfg(unix)]
 fn activation_io_error(index: usize, listen: &str, action: &str, error: std::io::Error) -> Error {
     Error::SocketActivation {
         path: format!("LISTEN_FDS[{index}]"),
@@ -747,12 +793,12 @@ fn activation_io_error(index: usize, listen: &str, action: &str, error: std::io:
 }
 
 /// Descriptor inspection helper exposed for tests that need fd metadata without adopting the fd.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn inspect_for_test(fd: RawFd, index: usize) -> Result<LocalSocket, ActivationError> {
     inspect_descriptor(fd, "test", &format!("test_fd[{index}]"))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::fd::AsRawFd;

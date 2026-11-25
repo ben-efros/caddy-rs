@@ -25,6 +25,7 @@ static SIGNAL_COUNT: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "graceful-restart")]
 static RESTART_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(unix)]
 extern "C" fn handle_signal(_signal: libc::c_int) {
     SIGNAL_COUNT.fetch_add(1, Ordering::SeqCst);
 }
@@ -53,22 +54,7 @@ pub struct SignalChannels {
 
 /// Install handlers and return shutdown/force channels for SIGINT/SIGTERM.
 pub fn shutdown_channels() -> anyhow::Result<SignalChannels> {
-    // SAFETY: the handler only performs an atomic increment, which is async-signal-safe. The
-    // signal numbers and `sighandler_t` ABI are the standard Linux/POSIX ones provided by
-    // `libc`.
-    unsafe {
-        let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = handle_signal as usize;
-        libc::sigemptyset(&mut sa.sa_mask);
-        sa.sa_flags = libc::SA_RESTART;
-        if libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut()) == -1 {
-            return Err(anyhow::anyhow!("failed to install SIGINT handler"));
-        }
-        if libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut()) == -1 {
-            return Err(anyhow::anyhow!("failed to install SIGTERM handler"));
-        }
-    }
-
+    install_shutdown_handlers()?;
     let (shutdown_sender, shutdown) = watch::channel(false);
     let (force_sender, force) = watch::channel(false);
     let shutdown_sender = Arc::new(shutdown_sender);
@@ -96,6 +82,51 @@ pub fn shutdown_channels() -> anyhow::Result<SignalChannels> {
         force,
         restart,
     })
+}
+
+/// Windows: Ctrl+C, Ctrl+Break, console close and system shutdown all request a graceful stop and
+/// feed the same counter as SIGINT/SIGTERM, so the "second signal forces" rule is identical.
+#[cfg(not(unix))]
+fn install_shutdown_handlers() -> anyhow::Result<()> {
+    use tokio::signal::windows;
+    let mut ctrl_c = windows::ctrl_c()?;
+    let mut ctrl_break = windows::ctrl_break()?;
+    let mut ctrl_close = windows::ctrl_close()?;
+    let mut ctrl_shutdown = windows::ctrl_shutdown()?;
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = ctrl_c.recv() => {}
+                _ = ctrl_break.recv() => {}
+                _ = ctrl_close.recv() => {}
+                _ = ctrl_shutdown.recv() => {}
+            }
+            SIGNAL_COUNT.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    Ok(())
+}
+
+/// Install handlers for SIGINT/SIGTERM that bump the shutdown counter.
+#[cfg(unix)]
+fn install_shutdown_handlers() -> anyhow::Result<()> {
+    // SAFETY: the handler only performs an atomic increment, which is async-signal-safe. The
+    // signal numbers and `sighandler_t` ABI are the standard Linux/POSIX ones provided by
+    // `libc`.
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = handle_signal as usize;
+        libc::sigemptyset(&mut sa.sa_mask);
+        sa.sa_flags = libc::SA_RESTART;
+        if libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut()) == -1 {
+            return Err(anyhow::anyhow!("failed to install SIGINT handler"));
+        }
+        if libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut()) == -1 {
+            return Err(anyhow::anyhow!("failed to install SIGTERM handler"));
+        }
+    }
+
+    Ok(())
 }
 
 /// Install the `SIGUSR2` restart trigger when the feature is compiled in.
@@ -145,7 +176,7 @@ fn install_restart_trigger() -> anyhow::Result<Option<watch::Receiver<bool>>> {
     Ok(None)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

@@ -374,6 +374,7 @@ pub struct BindReport {
     pub replaced: usize,
 }
 
+#[cfg(unix)]
 impl BindReport {
     /// The number of descriptors the store holds for this plan once the run has finished.
     ///
@@ -655,7 +656,7 @@ pub fn render_plan(planned: &[PlannedFd], dry_run: bool) -> String {
     output
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
