@@ -61,14 +61,34 @@ stopped answering until they finished.
    `503 Service Unavailable` with `Retry-After: 5` (no challenge, no hash). `stock_compat: true`
    waits indefinitely, as stock Caddy effectively does. Cached credentials are never affected.
    The cap is a wait time, not a queue depth: queue length is bounded by request rate times 5 s.
-5. **Per-client fairness.** Under the secure default one client may have at most 4 uncached
-   verifications in flight (waiting or hashing); the next gets `429 Too Many Requests` with
+5. **Per-client fairness and single flight.** Under the secure default one client may have at
+   most 8 uncached verifications in flight; the next gets `429 Too Many Requests` with
    `Retry-After: 5` immediately, so a single source cannot fill the wait queue and push everyone
-   else into the 503. A client is the resolved `client_ip` variable (the server derives it from
-   `trusted_proxies`, as the `client_ip` matcher does) or else the peer address; IPv6 is bucketed
-   by /64. The counter map holds an entry only while that client has a verification in flight, so
-   it is bounded by the number of concurrent requests. Caveat: many users behind one NAT or an
-   untrusted proxy share a bucket; only their first (uncached) login is affected.
+   else into the 503. Details:
+   - The slot is taken before waiting for a pool permit and moved into the blocking job next to
+     the permit, so a request cancelled mid-hash (HTTP/2 `RST_STREAM`) keeps counting against its
+     client until that hash really finishes; resetting and resending cannot accumulate detached
+     hashes.
+   - Identical concurrent `(username, password)` checks are single-flighted: the first request
+     (the leader) hashes and takes the slot, concurrent identical requests (followers) wait for
+     its result and take no slot of their own. A shared failure is returned to the followers but
+     not cached; a leader that is cancelled before hashing or refused abandons the flight and the
+     followers retry. This is what keeps a burst of parallel requests carrying the same new
+     credentials (after a configuration reload, which starts with an empty cache, or after
+     eviction) from tripping the cap. Followers are not themselves capped; they hold no CPU.
+   - The table is process-wide, like the hash pool, so several `basic_auth` handlers do not give
+     a client several caps. It holds an entry only while that client has a verification in
+     flight (bounded by concurrent requests) and tolerates a poisoned lock.
+   - A client is the resolved `client_ip` variable (the server derives it from `trusted_proxies`,
+     as the `client_ip` matcher does) or else the peer address; IPv6 is bucketed by /64. A request
+     with no client identity at all (for example a unix-socket peer without a resolved IP) is not
+     capped.
+   - Honest limits: behind a reverse proxy that is not in `trusted_proxies`, or many users behind
+     one NAT, everyone shares a bucket, so at most 8 DIFFERENT uncached credential pairs can be
+     verifying at once for that bucket (the first login of each user; cached successes and
+     single-flighted duplicates are unaffected). Operators behind a proxy should configure
+     `trusted_proxies`. The default is 8 rather than 4 because the cap bounds one source's share
+     of a pool of about `cores` hashes while tolerating a login burst from a shared address.
 
 ### stock_compat
 
@@ -95,6 +115,9 @@ per-client cap.
   `queue_wait_is_capped_with_503_and_retry_after_by_default`,
   `stock_compat_waits_for_a_permit_without_a_cap`, `one_client_cannot_fill_the_hash_wait_queue`,
   `client_buckets_group_ipv6_by_64_and_keep_ipv4_exact`,
+  `per_client_slots_stay_taken_until_a_cancelled_hash_finishes`,
+  `identical_concurrent_credentials_are_verified_once`, `client_waiters_are_shared_by_every_handler`,
+  `a_poisoned_client_table_still_admits_clients` (the first four failed before their fixes),
   `hash_cache_keys_are_secret_keyed_and_the_cache_is_bounded`;
 - `hash_verification_limiter_caps_concurrency_without_rejecting`,
   `hash_verification_limit_is_a_small_multiple_of_parallelism`,
@@ -109,7 +132,7 @@ Register: divergence for items 4 and 5 (item 3 is a timing-only difference). Pro
 - Caddy behaviour: `basic_auth` verification has no concurrency limit and no wait limit.
 - caddy-rs behaviour: hash computations run on a bounded pool (max(2, cores)); under the secure
   default a request waiting more than 5 s for a slot gets 503 + `Retry-After: 5`, and a client
-  with 4 uncached verifications already in flight gets 429 + `Retry-After: 5`;
+  with 8 uncached verifications already in flight gets 429 + `Retry-After: 5`;
   `stock_compat: true` waits without limit and has no per-client cap.
 - Rationale: stops a bad-credential flood from growing an unbounded queue that delays every login.
 - Status: intentional hardening (stock_compat restores stock behaviour)
@@ -160,7 +183,9 @@ re-checked afterwards. `O_NOFOLLOW` reports `ELOOP` on Linux/macOS/OpenBSD, `EML
 and `EFTYPE` on NetBSD; all are mapped to the 403 (the BSD arms are compiled only on those
 targets and were not built here). The `etag_file_extensions` sidecar is opened the same way (a
 symlinked or special sidecar is ignored, never followed) and read up to 1 KiB; a longer sidecar is
-ignored, so the computed ETag is used.
+ignored, so the computed ETag is used. CR and surrounding whitespace are stripped from the sidecar
+(CRLF files); a value that is still not a valid header value (control characters) is ignored too,
+so the computed ETag is used rather than failing the request with a 500.
 
 Residual: `O_NOFOLLOW` covers only the last component, so an intermediate directory swapped for a
 symlink inside that window is still followed. Closing it needs
@@ -205,7 +230,7 @@ must see a deliberate 300 MiB allocation, otherwise the other two would pass vac
 with "Content-Length was dropped").
 
 `crates/server/src/http.rs`: `head_keeps_the_declared_content_length`.
-`crates/http/src/file_server.rs`: `etag_sidecar_symlink_is_not_followed`,
+`crates/http/src/file_server.rs`: `etag_sidecar_symlink_is_not_followed`, `etag_sidecar_crlf_is_stripped_and_invalid_values_fall_back`,
 `oversized_etag_sidecar_is_ignored`, `special_files_are_rejected_before_they_are_opened` (a FIFO
 must not reach `open()`; skipped without `mkfifo`); all three failed before.
 
