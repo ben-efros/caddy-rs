@@ -681,12 +681,13 @@ pub struct BasicAuthHandler {
     realm: String,
     /// Caddy's fixed fake hashes, verified for unknown usernames to avoid a user-existence timing
     /// side channel (see `BcryptHash.FakeHash`/`Argon2idHash.FakeHash` upstream).
-    fake_hash: PasswordHash,
+    fake_hash: std::sync::Arc<PasswordHash>,
 }
 
 #[derive(Debug, Clone)]
 struct Account {
-    hash: PasswordHash,
+    /// `Arc` so the hash can move into the blocking pool without a deep copy per request.
+    hash: std::sync::Arc<PasswordHash>,
 }
 
 /// A validated account password: the modular-crypt/PHC hash is parsed at configuration load, so
@@ -750,7 +751,7 @@ impl BasicAuthHandler {
                 return Ok(Self {
                     accounts: BTreeMap::new(),
                     realm: "restricted".to_string(),
-                    fake_hash: fake_hash(PasswordAlgorithm::Bcrypt),
+                    fake_hash: std::sync::Arc::new(fake_hash(PasswordAlgorithm::Bcrypt)),
                 });
             }
             Some(provider) => provider.as_object().ok_or_else(|| {
@@ -851,13 +852,18 @@ impl BasicAuthHandler {
                 &password_bytes,
                 &format!("{account_path}.password"),
             )?;
-            accounts.insert(username, Account { hash });
+            accounts.insert(
+                username,
+                Account {
+                    hash: std::sync::Arc::new(hash),
+                },
+            );
         }
 
         Ok(Self {
             accounts,
             realm,
-            fake_hash: fake_hash(algorithm),
+            fake_hash: std::sync::Arc::new(fake_hash(algorithm)),
         })
     }
 }
@@ -1120,6 +1126,48 @@ fn verify_password(hash: &PasswordHash, password: &[u8]) -> bool {
     }
 }
 
+/// Upper bound on simultaneous password-hash computations: the machine's parallelism (at least
+/// 2). Hashing is pure CPU (and, for argon2id, memory) work, so more concurrency than cores only
+/// adds memory pressure without adding throughput.
+fn hash_verification_limit() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .max(2)
+}
+
+/// Process-wide limiter shared by every `basic_auth` handler instance, so the bound holds for
+/// the whole server rather than per route.
+fn hash_verification_limiter() -> &'static tokio::sync::Semaphore {
+    static LIMITER: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    LIMITER.get_or_init(|| tokio::sync::Semaphore::new(hash_verification_limit()))
+}
+
+/// Run blocking `work` on the blocking pool once a permit is free. Callers beyond the limit wait
+/// asynchronously (they never occupy a worker thread and are never rejected, so response codes
+/// stay exactly Caddy's). A cancelled/panicked job counts as a failed verification.
+async fn run_limited<F>(limiter: &tokio::sync::Semaphore, work: F) -> bool
+where
+    F: FnOnce() -> bool + Send + 'static,
+{
+    let Ok(_permit) = limiter.acquire().await else {
+        return false;
+    };
+    tokio::task::spawn_blocking(work).await.unwrap_or(false)
+}
+
+/// Verify `password` against `hash` without blocking an async worker. bcrypt (cost 14 for the
+/// unknown-user fake hash) and argon2id take 100 ms to seconds of CPU; the constant-time
+/// plaintext extension is trivially cheap and stays inline.
+async fn verify_password_offloaded(hash: std::sync::Arc<PasswordHash>, password: Vec<u8>) -> bool {
+    if matches!(*hash, PasswordHash::Plaintext(_)) {
+        return verify_password(&hash, &password);
+    }
+    run_limited(hash_verification_limiter(), move || {
+        verify_password(&hash, &password)
+    })
+    .await
+}
+
 /// Expand `{env.NAME}` placeholders the way Caddy's global replacer does at provision time.
 /// Unknown placeholders are left literal (ReplaceKnown semantics); unset environment variables
 /// expand to the empty string (env lookups are always known to Caddy).
@@ -1231,10 +1279,15 @@ impl Handler for BasicAuthHandler {
         };
 
         // Verify even for unknown usernames, against Caddy's fixed fake hash for the configured
-        // algorithm, so response timing does not reveal whether the account exists.
+        // algorithm, so response timing does not reveal whether the account exists. The hash runs
+        // on the blocking pool behind a concurrency limiter (SEC-MEDIUM-HTTP B1) so bad
+        // credentials cannot starve the async workers; unknown users take the same path.
         let account = self.accounts.get(&username);
-        let hash = account.map_or(&self.fake_hash, |account| &account.hash);
-        let matches = verify_password(hash, password.as_bytes());
+        let hash = account.map_or_else(
+            || std::sync::Arc::clone(&self.fake_hash),
+            |account| std::sync::Arc::clone(&account.hash),
+        );
+        let matches = verify_password_offloaded(hash, password.into_bytes()).await;
         if !matches || account.is_none() {
             return Ok(challenge(&self.realm));
         }
@@ -2106,5 +2159,114 @@ mod tests {
             .contains("2001:db8::1".parse().unwrap()));
         assert!(Cidr::parse("not-an-ip").is_none());
         assert!(Cidr::parse("10.0.0.0/33").is_none());
+    }
+
+    /// B1 (SEC-MEDIUM-HTTP): password hashing is CPU-heavy (the unknown-user fake bcrypt hash is
+    /// cost 14, about a second). It must run off the async workers, otherwise a few concurrent
+    /// bad-credential requests starve every tokio worker and the whole server stops answering.
+    /// With two workers and eight in-flight bad-credential requests, an unrelated timer task must
+    /// still be serviced promptly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn bad_credentials_do_not_starve_the_async_workers() {
+        let handler = std::sync::Arc::new(basic_auth_handler(serde_json::json!({
+            "handler": "basic_auth",
+            "hash": {"algorithm": "bcrypt"},
+            "accounts": [{
+                "username": "alice",
+                "password": "$2a$04$XziKIb5ayw0suaNwlK.1vOqOj9gEveGnkq.anOrdVrnkN5z1bA2A."
+            }]
+        })));
+
+        let started = std::time::Instant::now();
+        let mut attackers = Vec::new();
+        for index in 0..8 {
+            let handler = std::sync::Arc::clone(&handler);
+            attackers.push(tokio::spawn(async move {
+                let mut request = base_request();
+                // Unknown user => the cost-14 fake hash is verified.
+                request.headers.insert(
+                    header::AUTHORIZATION,
+                    authorization(&format!("nobody{index}"), "x"),
+                );
+                handler.handle(request).await
+            }));
+        }
+        // An unrelated task on the same runtime must still make progress while the attackers
+        // are in flight (each hash takes seconds in a debug build, so a starved runtime would
+        // not answer for many seconds).
+        let probe = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        });
+        let probed = tokio::time::timeout(Duration::from_millis(1500), probe).await;
+        let elapsed = started.elapsed();
+        assert!(
+            probed.is_ok() && elapsed < Duration::from_millis(1500),
+            "an unrelated task was starved by password hashing on the async workers \
+             (took {elapsed:?})"
+        );
+        probed.unwrap().expect("probe task");
+
+        for attacker in attackers {
+            let Outcome::Respond(response) = attacker.await.unwrap().unwrap() else {
+                panic!("expected challenge");
+            };
+            assert_eq!(response.status, StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    /// The concurrency limiter caps simultaneous hash computations but never rejects: callers
+    /// beyond the limit wait and still get a correct answer (no divergence from Caddy's status
+    /// codes, so there is no `stock_compat` switch for it).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hash_verification_limiter_caps_concurrency_without_rejecting() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let limiter = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+        let running = std::sync::Arc::new(AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let (limiter, running, peak) = (limiter.clone(), running.clone(), peak.clone());
+            tasks.push(tokio::spawn(async move {
+                run_limited(&limiter, move || {
+                    let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(30));
+                    running.fetch_sub(1, Ordering::SeqCst);
+                    true
+                })
+                .await
+            }));
+        }
+        for task in tasks {
+            assert!(task.await.unwrap(), "waiting callers must still succeed");
+        }
+        assert!(peak.load(Ordering::SeqCst) <= 2, "limit exceeded");
+        assert!(peak.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn hash_verification_limit_is_a_small_multiple_of_parallelism() {
+        let limit = hash_verification_limit();
+        assert!(limit >= 2);
+        let parallelism = std::thread::available_parallelism().map_or(1, usize::from);
+        assert!(limit <= parallelism.max(2) * 2);
+    }
+
+    #[tokio::test]
+    async fn offloaded_verification_still_accepts_and_rejects_each_algorithm() {
+        let bcrypt = std::sync::Arc::new(
+            parse_password_hash(
+                PasswordAlgorithm::Bcrypt,
+                bcrypt::hash("pw", 4).unwrap().as_bytes(),
+                "t",
+            )
+            .unwrap(),
+        );
+        assert!(verify_password_offloaded(bcrypt.clone(), b"pw".to_vec()).await);
+        assert!(!verify_password_offloaded(bcrypt, b"nope".to_vec()).await);
+
+        let plain = std::sync::Arc::new(PasswordHash::Plaintext(b"pw".to_vec()));
+        assert!(verify_password_offloaded(plain.clone(), b"pw".to_vec()).await);
+        assert!(!verify_password_offloaded(plain, b"px".to_vec()).await);
     }
 }
