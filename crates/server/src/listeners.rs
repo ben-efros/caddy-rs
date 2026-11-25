@@ -47,7 +47,7 @@ use tokio_rustls::TlsAcceptor;
 use caddy_rs_admin::access_log::AccessLogContext;
 use caddy_rs_admin::{common_name_from_subject, AdminApi, AdminRequest, SharedRequestRecorder};
 use caddy_rs_core::{Generation, GenerationStore, ListenAddr, Network};
-use caddy_rs_http::{Body, Router};
+use caddy_rs_http::{Body, Router, StreamingBody};
 use caddy_rs_proxy::trusted_proxies::ServerTrustedProxies;
 
 use crate::activation::{adopt_tcp, adopt_unix, InheritedSocket, LocalSocket};
@@ -1231,7 +1231,54 @@ async fn serve_h3_connection(
                             );
                             continue;
                         }
-                        // HTTP/3 always buffers the body, so it is always bounded.
+                        // Same rule as HTTP/1.1 and HTTP/2: the body streams to the handlers unless
+                        // one of them needs it buffered (`reverse_proxy` retries, FastCGI,
+                        // `handle_response`/`forward_auth`) or a body limit is configured for a body
+                        // of unknown length (so the 413 can still precede the handler).
+                        // A malformed `Content-Length` (several values, a sign, a list that disagrees)
+                        // is refused with 400 (RFC 9114 section 4.1.2) before any body is read.
+                        let declared = h3_declared_length(request.headers());
+                        let header_invalid = declared.is_err();
+                        let declared_length = declared.unwrap_or(None);
+                        let can_stream = !header_invalid
+                            && context.router.as_ref().is_some_and(|router| {
+                                !router.requires_buffered_request_body()
+                                    && (declared_length.is_some()
+                                        || context.limits.max_request_body_size.is_none())
+                            });
+                        // Send and receive halves are independent: the handler can answer (and
+                        // stream a response) while the request body is still arriving.
+                        let (mut stream, recv_stream) = stream.split();
+                        let mut recv_stream = Some(recv_stream);
+                        let mut streamed_body = None;
+                        // Longest silence tolerated between body reads. HTTP/1 enforces
+                        // `read_timeout` per read at the socket; QUIC has no such wrapper, and its
+                        // idle timeout is defeated by keep-alive PINGs, so without this a client
+                        // that stalls mid-upload holds the handler (and its upstream) forever.
+                        let body_idle_timeout = h3_body_idle_timeout(&context.limits);
+                        // Cancels the body reader when this request is done (dropping the guard
+                        // resolves the reader's `cancelled` receiver), even if the handler
+                        // answered without consuming the whole upload.
+                        let mut _body_reader = None;
+                        // Status the reader records when the streamed upload fails, so the client
+                        // is never told success for an upload that did not complete.
+                        let body_failure = Arc::new(std::sync::atomic::AtomicU16::new(0));
+                        if can_stream {
+                            let reader = recv_stream.take().expect("receive half is present");
+                            let (chunks, receiver) = tokio::sync::mpsc::channel(H3_BODY_CHANNEL_DEPTH);
+                            let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
+                            _body_reader = Some(cancel);
+                            tokio::spawn(pump_h3_request_body(
+                                reader,
+                                chunks,
+                                cancelled,
+                                body_idle_timeout,
+                                declared_length,
+                                Arc::clone(&body_failure),
+                            ));
+                            streamed_body = Some(StreamingBody::from_chunks(receiver));
+                        }
+                        // The buffered path is always bounded.
                         let limit = Some(context.limits.buffered_body_limit());
                         let mut body = BytesMut::new();
                         let mut too_large = false;
@@ -1239,8 +1286,26 @@ async fn serve_h3_connection(
                         // this request's response has been produced.
                         let mut reservation = crate::limits::BufferedBodyReservation::default();
                         let mut overloaded = false;
-                        loop {
-                            match stream.recv_data().await {
+                        // Set when the body could not be read to the end, or does not match the
+                        // declared length: the request is refused instead of being routed with a
+                        // truncated body.
+                        let mut malformed: Option<http::StatusCode> =
+                            header_invalid.then_some(http::StatusCode::BAD_REQUEST);
+                        while !can_stream && malformed.is_none() {
+                            let Some(reader) = recv_stream.as_mut() else {
+                                break;
+                            };
+                            let next = match tokio::time::timeout(body_idle_timeout, reader.recv_data())
+                                .await
+                            {
+                                Ok(next) => next,
+                                Err(_elapsed) => {
+                                    tracing::debug!("HTTP/3 request body read timed out");
+                                    malformed = Some(http::StatusCode::REQUEST_TIMEOUT);
+                                    break;
+                                }
+                            };
+                            match next {
                                 Ok(Some(mut chunk)) => {
                                     let chunk = chunk.copy_to_bytes(chunk.remaining());
                                     if let Some(limit) = limit {
@@ -1258,27 +1323,41 @@ async fn serve_h3_connection(
                                 Ok(None) => break,
                                 Err(error) => {
                                     tracing::debug!(%error, "HTTP/3 request body read failed");
+                                    malformed = Some(http::StatusCode::BAD_REQUEST);
                                     break;
                                 }
                             }
                         }
-                        if let Some(access_log_context) = &access_log_context {
-                            // The HTTP/3 path buffers the request body here; report the bytes
-                            // actually read from the transport (Caddy's `bytes_read`).
+                        if !can_stream
+                            && malformed.is_none()
+                            && !too_large
+                            && !overloaded
+                            && declared_length.is_some_and(|declared| declared != body.len() as u64)
+                        {
+                            malformed = Some(http::StatusCode::BAD_REQUEST);
+                        }
+                        if let (false, Some(access_log_context)) = (can_stream, &access_log_context) {
+                            // A buffered request body was read in full here; report the bytes
+                            // actually read from the transport (Caddy's `bytes_read`). A streamed
+                            // body is counted as the handlers consume it.
                             access_log_context.request_bytes().set(body.len() as u64);
                         }
-                        if too_large || overloaded {
+                        if too_large || overloaded || malformed.is_some() {
                             let (refusal_status, refusal_body): (http::StatusCode, &'static [u8]) =
                                 if overloaded {
                                     (
                                         http::StatusCode::SERVICE_UNAVAILABLE,
                                         b"503 Service Unavailable",
                                     )
-                                } else {
+                                } else if too_large {
                                     (
                                         http::StatusCode::PAYLOAD_TOO_LARGE,
                                         b"413 Request Entity Too Large",
                                     )
+                                } else if malformed == Some(http::StatusCode::REQUEST_TIMEOUT) {
+                                    (http::StatusCode::REQUEST_TIMEOUT, b"408 Request Timeout")
+                                } else {
+                                    (http::StatusCode::BAD_REQUEST, b"400 Bad Request")
                                 };
                             let response = http::Response::builder()
                                 .status(refusal_status)
@@ -1350,11 +1429,18 @@ async fn serve_h3_connection(
                             let _ = stream.finish().await;
                             continue;
                         };
-                        let served = crate::http::serve_internal_buffered(
+                        let request_body = match streamed_body.take() {
+                            Some(streaming) => crate::http::H3RequestBody::Streaming(
+                                streaming,
+                                Arc::clone(&body_failure),
+                            ),
+                            None => crate::http::H3RequestBody::Buffered(body.freeze()),
+                        };
+                        let served = crate::http::serve_internal_h3(
                             &context.limits,
                             router,
                             parts,
-                            body.freeze(),
+                            request_body,
                             Some(remote_addr),
                             Some(local_addr),
                             true,
@@ -1458,6 +1544,140 @@ async fn serve_h3_connection(
     }
 }
 
+/// How many request-body chunks may sit between the QUIC stream and the handler. Small on purpose:
+/// it is the whole read-ahead, so memory per upload is a few chunks regardless of file size.
+#[cfg(feature = "http3")]
+const H3_BODY_CHANNEL_DEPTH: usize = 4;
+
+/// Stand-in for "no timeout" (a negative `read_idle_timeout` and no `read_timeout`): far enough in
+/// the future that it never fires.
+#[cfg(feature = "http3")]
+const H3_BODY_NO_TIMEOUT: Duration = Duration::from_secs(60 * 60 * 24 * 365);
+
+/// The longest silence tolerated between reads of one HTTP/3 request body: the shorter of the
+/// server's `read_timeout` and `read_idle_timeout` (Caddy default 1 minute, negative disables).
+/// A stalled upload otherwise holds its handler and any upstream connection forever, because QUIC
+/// keep-alive PINGs keep the connection itself alive.
+#[cfg(feature = "http3")]
+fn h3_body_idle_timeout(limits: &crate::limits::ServerLimits) -> Duration {
+    [limits.read_timeout, limits.read_idle_timeout]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(H3_BODY_NO_TIMEOUT)
+}
+
+/// Feed one HTTP/3 request body from the QUIC receive half into `chunks`, which the handler reads
+/// as a streaming body.
+///
+/// * The bounded channel is the whole read-ahead: a slow handler stops this task pulling from QUIC,
+///   which closes the stream's flow-control window and slows the client.
+/// * `cancelled` resolves when the request ends (its sender is dropped). If the handler dropped the
+///   body while this task was blocked handing it a chunk, the client is told to stop sending with
+///   `H3_NO_ERROR` (RFC 9114 section 4.1). If the request ended while a read was pending, the
+///   stream is just dropped: quinn then sends STOP_SENDING with code 0, because h3-quinn panics on
+///   `stop_sending` while a read is in flight (see the comment in the loop).
+/// * `idle` bounds the silence between reads; on expiry the body fails (the client gets `408`).
+/// * `declared` is the request's `Content-Length`: more data than declared, or a stream that ends
+///   short of it, fails the body and resets the stream with `H3_MESSAGE_ERROR` (RFC 9114 section
+///   4.1.2). Without this a lying length is silently truncated by the HTTP/1 upstream framing. It
+///   only sees data that arrives while the handler is still reading: if the handler finishes
+///   after exactly `declared` bytes, later surplus data is never observed.
+#[cfg(feature = "http3")]
+async fn pump_h3_request_body<S>(
+    mut reader: h3::server::RequestStream<S, Bytes>,
+    chunks: tokio::sync::mpsc::Sender<Result<Bytes, caddy_rs_http::body::BodyError>>,
+    mut cancelled: tokio::sync::oneshot::Receiver<()>,
+    idle: Duration,
+    declared: Option<u64>,
+    failure_status: Arc<std::sync::atomic::AtomicU16>,
+) where
+    S: h3::quic::RecvStream,
+{
+    use h3::error::Code;
+    use std::sync::atomic::Ordering;
+    let mut received: u64 = 0;
+    loop {
+        // h3-quinn moves the QUIC stream into the pending read future, so `stop_sending` (and
+        // `recv_id`) unwrap a `None` and PANIC while a read is in flight, which is exactly the state
+        // left behind by abandoning `recv_data()` below. With the `release-minimal` profile
+        // (`panic = "abort"`) that would let any client kill the process. Therefore: after a
+        // cancelled or timed-out read the stream is only dropped (quinn then sends STOP_SENDING
+        // with code 0); `stop_sending` is called only where the previous read has completed and
+        // the stream is back in place.
+        let next = tokio::select! {
+            _ = &mut cancelled => return,
+            next = tokio::time::timeout(idle, reader.recv_data()) => next,
+        };
+        let failure: (&'static str, Option<Code>) = match next {
+            Err(_elapsed) => {
+                // Do not touch the stream: its read is still pending (see above).
+                failure_status.store(408, Ordering::SeqCst);
+                let _ = chunks
+                    .send(Err(caddy_rs_http::body::BodyError::Upstream(Box::new(
+                        std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "request body read timed out",
+                        ),
+                    ))))
+                    .await;
+                return;
+            }
+            Ok(Err(error)) => {
+                failure_status.store(400, Ordering::SeqCst);
+                let _ = chunks
+                    .send(Err(caddy_rs_http::body::BodyError::Upstream(Box::new(error))))
+                    .await;
+                return;
+            }
+            Ok(Ok(None)) => match declared {
+                Some(declared) if declared != received => (
+                    "request body ended before the declared Content-Length",
+                    Some(Code::H3_MESSAGE_ERROR),
+                ),
+                _ => return,
+            },
+            Ok(Ok(Some(mut chunk))) => {
+                let chunk = chunk.copy_to_bytes(chunk.remaining());
+                received += chunk.len() as u64;
+                if declared.is_some_and(|declared| received > declared) {
+                    (
+                        "request body is longer than the declared Content-Length",
+                        Some(Code::H3_MESSAGE_ERROR),
+                    )
+                } else {
+                    tokio::select! {
+                        _ = &mut cancelled => {
+                            reader.stop_sending(Code::H3_NO_ERROR);
+                            return;
+                        }
+                        sent = chunks.send(Ok(chunk)) => {
+                            if sent.is_err() {
+                                // The handler dropped the body; stop the upload.
+                                reader.stop_sending(Code::H3_NO_ERROR);
+                                return;
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+        };
+        let (message, code) = failure;
+        failure_status.store(400, Ordering::SeqCst);
+        if let Some(code) = code {
+            // Safe: the read that produced this chunk completed, so the stream is in place.
+            reader.stop_sending(code);
+        }
+        let _ = chunks
+            .send(Err(caddy_rs_http::body::BodyError::Upstream(Box::new(
+                std::io::Error::new(std::io::ErrorKind::InvalidData, message),
+            ))))
+            .await;
+        return;
+    }
+}
+
 /// Body returned for an HTTP/3 protocol-upgrade attempt.
 ///
 /// Shared with the buffered router path so a handler that reports an upgrade (for example a
@@ -1471,7 +1691,7 @@ pub(crate) const H3_UPGRADE_UNSUPPORTED_BODY: &str =
 /// HTTP/3 (RFC 9114) has no HTTP/1.1 `Upgrade` mechanism: a request that carries `Upgrade` is a
 /// WebSocket/other-upgrade attempt that quic-go would reject as malformed. RFC 8441 extended
 /// CONNECT is a `CONNECT` request with a `:protocol` pseudo-header, which `h3` surfaces as an
-/// extension. caddy-rs buffers HTTP/3 requests and has no request-stream tunnel, so both forms are
+/// extension. caddy-rs has no HTTP/3 request-stream tunnel, so both forms are
 /// rejected loudly instead of being handed to the router as ordinary requests. A plain `CONNECT`
 /// without `:protocol` is not an upgrade and keeps the existing routing behaviour.
 #[cfg(feature = "http3")]
@@ -4294,5 +4514,68 @@ mod bind_capability_tests {
             before_entries,
             "a successful bind must not consult the capability seam at all"
         );
+    }
+}
+
+/// The declared request length of an HTTP/3 request, validated the way RFC 9110 section 8.6 and
+/// RFC 9114 section 4.1.2 require: every `Content-Length` value (several headers, or a comma list)
+/// must be plain decimal digits and all must be equal. `Err` means the request is malformed.
+/// quic-go's HTTP/3 body enforces the declared length itself; the h3 crate does not, and Rust's
+/// `str::parse::<u64>` would also accept a leading `+`.
+#[cfg(feature = "http3")]
+fn h3_declared_length(headers: &http::HeaderMap) -> Result<Option<u64>, ()> {
+    let mut found: Option<u64> = None;
+    for value in headers.get_all(http::header::CONTENT_LENGTH) {
+        let text = value.to_str().map_err(|_| ())?;
+        for part in text.split(',') {
+            let part = part.trim();
+            if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(());
+            }
+            let length: u64 = part.parse().map_err(|_| ())?;
+            match found {
+                Some(previous) if previous != length => return Err(()),
+                _ => found = Some(length),
+            }
+        }
+    }
+    Ok(found)
+}
+
+#[cfg(all(test, feature = "http3"))]
+mod h3_declared_length_tests {
+    use super::h3_declared_length;
+
+    fn lengths(values: &[&str]) -> Result<Option<u64>, ()> {
+        let mut headers = http::HeaderMap::new();
+        for value in values {
+            headers.append(
+                http::header::CONTENT_LENGTH,
+                http::HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        h3_declared_length(&headers)
+    }
+
+    #[test]
+    fn content_length_is_validated_strictly() {
+        assert_eq!(lengths(&[]), Ok(None));
+        assert_eq!(lengths(&["0"]), Ok(Some(0)));
+        assert_eq!(lengths(&["10"]), Ok(Some(10)));
+        assert_eq!(lengths(&["10", "10"]), Ok(Some(10)), "equal repeats are one value");
+        assert_eq!(lengths(&["10, 10"]), Ok(Some(10)), "an equal list is one value");
+        for bad in [
+            &["10", "20"][..],
+            &["10, 20"],
+            &["+10"],
+            &["-1"],
+            &["1e3"],
+            &[""],
+            &["ten"],
+            &["10,"],
+            &["99999999999999999999999"],
+        ] {
+            assert_eq!(lengths(bad), Err(()), "{bad:?} must be malformed");
+        }
     }
 }
