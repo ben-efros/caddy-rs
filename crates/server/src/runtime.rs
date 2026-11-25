@@ -108,10 +108,25 @@ impl ShutdownTiming {
     }
 }
 
-/// A TLS listener without any certificate must fail the apply rather than serve cleartext or
-/// complete no handshakes.
-fn missing_certificates_error(listen: &str, server_name: &str, https_port: u16) -> Error {
-    Error::Config(caddy_rs_core::Error::invalid(
+/// A TLS listener without any certificate fails the apply rather than serve cleartext or complete
+/// no handshakes — except in `stock_compat`, where upstream's behaviour is matched instead.
+///
+/// The mode is passed in rather than inferred here: `T-TLS-105` requires the caller to thread
+/// `stock_compat` to the guard, so that every fail-closed guard is visibly conditioned on the mode
+/// at its call site instead of each one rediscovering it (and one of them forgetting).
+fn missing_certificates_error(
+    listen: &str,
+    server_name: &str,
+    https_port: u16,
+    stock_compat: bool,
+) -> Option<Error> {
+    if stock_compat {
+        // Upstream `autohttps.go:185` simply continues: the server produces no subjects and its TLS
+        // listener has no certificate of its own. Stock compatibility matches that instead of
+        // refusing to start. The secure default (below) is unchanged.
+        return None;
+    }
+    Some(Error::Config(caddy_rs_core::Error::invalid(
         "apps.tls.certificates",
         format!(
             "listener `{listen}` for server `{server_name}` terminates TLS (HTTPS port \
@@ -119,7 +134,7 @@ fn missing_certificates_error(listen: &str, server_name: &str, https_port: u16) 
              `apps.tls.certificates.load_pem`/`load_files` or enable automatic HTTPS with \
              `apps.tls.automation`"
         ),
-    ))
+    )))
 }
 
 /// Whether a server's `strict_sni_host` setting asks for strict SNI enforcement.
@@ -2228,6 +2243,9 @@ impl ServerRuntime {
         status_sink: &Arc<UpstreamStatusSink>,
     ) -> Result<std::collections::HashMap<String, Arc<ListenerState>>> {
         let mut states = std::collections::HashMap::new();
+        // Threaded to every fail-closed guard in this function (T-TLS-105): read once, here, so a
+        // guard can never disagree with the mode the rest of the apply used.
+        let stock_compat = generation.config().stock_compat();
         let Some(http) = generation.config().http() else {
             return Ok(states);
         };
@@ -2391,13 +2409,18 @@ impl ServerRuntime {
                             let fallback: Arc<CertificateResolver> = match &context.resolver {
                                 Some(resolver) if !resolver.is_empty() => Arc::clone(resolver),
                                 _ if context.bootstrap => Arc::new(CertificateResolver::default()),
-                                _ => {
-                                    return Err(missing_certificates_error(
-                                        listen,
-                                        server_name,
-                                        https_port,
-                                    ))
-                                }
+                                _ => match missing_certificates_error(
+                                    listen,
+                                    server_name,
+                                    https_port,
+                                    stock_compat,
+                                ) {
+                                    Some(error) => return Err(error),
+                                    // `stock_compat`: no subjects were derived and nothing is
+                                    // loaded, so this listener carries an empty resolver, exactly
+                                    // as upstream leaves it. Handshakes fail; the apply does not.
+                                    None => Arc::new(CertificateResolver::default()),
+                                },
                             };
                             // Token-held key pools travel with the resolver so the listener can
                             // bound handshakes with the PKCS#11 budget (T-TLS-097).
@@ -2427,12 +2450,30 @@ impl ServerRuntime {
                             }
                         }
                         None => {
-                            let resolver = manual_resolver
+                            // Owned so the `stock_compat` fallback has somewhere to live.
+                            let stock_compat_resolver;
+                            let resolver = match manual_resolver
                                 .as_ref()
                                 .filter(|resolver| !resolver.is_empty())
-                                .ok_or_else(|| {
-                                    missing_certificates_error(listen, server_name, https_port)
-                                })?;
+                            {
+                                Some(resolver) => resolver,
+                                None => match missing_certificates_error(
+                                    listen,
+                                    server_name,
+                                    https_port,
+                                    stock_compat,
+                                ) {
+                                    Some(error) => return Err(error),
+                                    // `stock_compat`: upstream `autohttps.go:185` continues with no
+                                    // subjects, so this listener serves nothing rather than failing
+                                    // the apply. Handshakes fail; the process starts.
+                                    None => {
+                                        stock_compat_resolver =
+                                            Arc::new(CertificateResolver::default());
+                                        &stock_compat_resolver
+                                    }
+                                },
+                            };
                             (
                                 Some(build_server_config(Arc::clone(resolver), &tls_options)?),
                                 TlsResolver::external_key_pool(&**resolver),

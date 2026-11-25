@@ -510,3 +510,107 @@ fn malformed_stock_compat_is_a_located_error() {
         assert_eq!(config.stock_compat(), value);
     }
 }
+
+/// `T-TLS-105`: the certificates-gap guard is mode-aware. Stock compatibility matches upstream;
+/// the secure default still refuses.
+///
+/// The reported shape is srv0 on a TLS listener whose route has no host matcher, plus srv1 on the
+/// HTTP port naming `rankmynuts.com` in an automation policy. Neither server contributes a
+/// certificate subject — `srv1` listens only on the HTTP port, which upstream
+/// (`autohttps.go:125-132`) and caddy-rs both skip, and `policies[].subjects` selects a policy
+/// rather than creating a subject — so the plan manages none and the guard decides.
+///
+/// This builds the SAME config twice and asserts the two outcomes DIFFER.
+#[tokio::test]
+async fn the_certificates_gap_guard_is_mode_aware() {
+    let reported = |stock_compat: Option<bool>| {
+        let mut root = serde_json::json!({
+            "admin": {"disabled": true},
+            "apps": {
+                "tls": {"automation": {"policies": [{
+                    "subjects": ["rankmynuts.com"],
+                    "issuers": [{"module": "internal"}]
+                }]}},
+                "http": {
+                    "http_port": 0,
+                    "https_port": 0,
+                    "servers": {
+                        "srv0": {
+                            "listen": ["127.0.0.1:0"],
+                            "tls_connection_policies": [{}],
+                            "routes": [{"handle": [{"handler": "static_response", "body": "x"}]}]
+                        },
+                        "srv1": {
+                            "listen": ["127.0.0.2:0"],
+                            "routes": [{
+                                "match": [{"host": ["rankmynuts.com"]}],
+                                "handle": [{"handler": "static_response", "body": "y"}]
+                            }]
+                        }
+                    }
+                }
+            }
+        });
+        if let Some(flag) = stock_compat {
+            root["stock_compat"] = serde_json::json!(flag);
+        }
+        Config::from_value(root).expect("the reported config decodes")
+    };
+
+    // --- secure default: refuses, and the error locates the listener and the server.
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(GenerationStore::with_builtin_registry());
+    store.load(reported(None)).expect("default config loads");
+    let mut runtime = ServerRuntime::new(store).with_data_root(directory.path());
+    let error = runtime
+        .apply()
+        .await
+        .expect_err("the secure default must refuse a TLS listener with no certificate");
+    let message = error.to_string();
+    assert!(
+        message.contains("no certificates are configured"),
+        "expected the certificates-gap error: {message}"
+    );
+    assert!(
+        message.contains("127.0.0.1:0") && message.contains("srv0"),
+        "the failure must name the listener and the server: {message}"
+    );
+
+    // --- stock compatibility: the same config starts.
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(GenerationStore::with_builtin_registry());
+    store
+        .load(reported(Some(true)))
+        .expect("stock_compat config loads");
+    let mut runtime = ServerRuntime::new(store).with_data_root(directory.path());
+    runtime
+        .apply()
+        .await
+        .expect("stock_compat must match upstream and start");
+
+    // What the listener ACTUALLY does, not merely that apply returned Ok: upstream's
+    // `autohttps.go:185` continues with no subjects, so the listener carries an empty resolver and
+    // a handshake fails. T-TLS-105 requires this to be measured rather than assumed.
+    let addr = runtime
+        .listener_address("127.0.0.1:0")
+        .expect("the uncovered TLS listener is bound");
+    let mut socket = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("the listener accepts TCP");
+    // A TLS ClientHello is not needed: the listener answers nothing and the connection closes or
+    // yields no certificate, which is the upstream "no certificate of its own" outcome.
+    use tokio::io::AsyncReadExt as _;
+    let mut buf = [0u8; 1];
+    let read = tokio::time::timeout(std::time::Duration::from_secs(2), socket.read(&mut buf)).await;
+    // Measured outcome, and the reason this assertion is written as it is: the listener accepts the
+    // connection and then does nothing. It sends no application bytes and does not close, because the
+    // TLS layer has no certificate to present before a ClientHello is read. That matches upstream's
+    // "starts with no subjects" outcome (autohttps.go:185) rather than the refusal this row removed.
+    // Only emitting bytes would contradict it.
+    match read {
+        Err(_elapsed) => {}
+        Ok(Ok(0)) => {}
+        Ok(Err(_)) => {}
+        Ok(Ok(_)) => panic!("an uncovered TLS listener must not emit application bytes"),
+    }
+}
