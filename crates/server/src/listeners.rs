@@ -3077,22 +3077,59 @@ impl hyper::service::Service<hyper::Request<Incoming>> for AdminService {
     }
 }
 
-/// Removes an admin Unix socket file when its accept loop ends.
+/// The `(device, inode)` of the socket file this process created at the admin path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SocketIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl SocketIdentity {
+    fn of(metadata: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+}
+
+/// Removes the admin Unix socket file we created when its accept loop ends.
 ///
 /// The guard lives inside the listener task, so it runs after the reload/shutdown signal stops the
 /// loop and before `ListenerHandle::stop` returns - the next bind on the same path never sees a
-/// stale socket. A path another process has already recreated is removed too: Caddy owns its
-/// configured admin socket path for the lifetime of the listener.
-struct AdminSocketPath(std::path::PathBuf);
+/// stale socket. Only the very socket this listener created is removed: if the path now holds a
+/// regular file, a symlink, or another process's socket (different inode), it is left alone
+/// (SEC-MEDIUM-ADMIN-SERVER A3). The `lstat` and `unlink` are two calls, so a swap in the
+/// microseconds between them is narrowed, not eliminated: there is no unlink-if-inode primitive.
+struct AdminSocketPath {
+    path: std::path::PathBuf,
+    identity: SocketIdentity,
+}
 
 impl Drop for AdminSocketPath {
     fn drop(&mut self) {
-        match std::fs::remove_file(&self.0) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                tracing::warn!(path = %self.0.display(), %error, "cannot remove admin Unix socket");
+        use std::os::unix::fs::FileTypeExt;
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(metadata)
+                if metadata.file_type().is_socket()
+                    && SocketIdentity::of(&metadata) == self.identity =>
+            {
+                if let Err(error) = std::fs::remove_file(&self.path) {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(
+                            path = %self.path.display(),
+                            %error,
+                            "cannot remove admin Unix socket"
+                        );
+                    }
+                }
             }
+            Ok(_) => tracing::debug!(
+                path = %self.path.display(),
+                "admin Unix socket path no longer holds our socket; leaving it in place"
+            ),
+            Err(_) => {}
         }
     }
 }
@@ -3115,47 +3152,147 @@ fn set_admin_socket_permissions(path: &std::path::Path) -> std::io::Result<()> {
 /// by `chmod` left the socket connectable per the umask for a moment. Here the type of whatever
 /// sits at the path is checked with `symlink_metadata` (never following links): only a socket is
 /// replaced; a regular file, directory or symlink is a bind error and is left untouched. The
-/// socket is bound inside a freshly created `0700` staging directory next to the final path,
-/// `chmod`ed `0600`, and atomically `rename`d into place (`rename` replaces a stale socket, or a
-/// symlink raced in afterwards, without following it). The staging directory is always removed.
-fn bind_admin_unix_private(socket_path: &std::path::Path) -> std::io::Result<UnixListener> {
+/// socket is bound inside a freshly created `0700` staging directory next to the final path (its
+/// name is 8 random hex digits from the OS RNG, retried on collision, so it cannot be squatted),
+/// `chmod`ed `0600`, and then installed under the final name by [`install_staged_socket`]. The
+/// staging directory is always removed. Returns the listener and the identity of the socket file
+/// now at `socket_path`, so cleanup removes only that file.
+fn bind_admin_unix_private(
+    socket_path: &std::path::Path,
+) -> std::io::Result<(UnixListener, SocketIdentity)> {
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{DirBuilderExt, FileTypeExt};
-    static STAGING_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-    match std::fs::symlink_metadata(socket_path) {
-        Ok(metadata) if metadata.file_type().is_socket() => {}
+    let existing = match std::fs::symlink_metadata(socket_path) {
+        Ok(metadata) if metadata.file_type().is_socket() => Some(SocketIdentity::of(&metadata)),
         Ok(_) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
+            return Err(Error::new(
+                ErrorKind::AlreadyExists,
                 format!(
                     "refusing to replace {}: it exists and is not a socket",
                     socket_path.display()
                 ),
             ));
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => None,
         Err(error) => return Err(error),
-    }
+    };
     let parent = match socket_path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => std::path::Path::new("."),
     };
-    let staging = parent.join(format!(
-        ".caddy-rs-admin-{}-{}",
-        std::process::id(),
-        STAGING_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::DirBuilder::new().mode(0o700).create(&staging)?;
+    let mut staging = None;
+    for _ in 0..16 {
+        let mut random = [0_u8; 4];
+        getrandom::getrandom(&mut random).map_err(Error::other)?;
+        let candidate = parent.join(format!(
+            ".{:02x}{:02x}{:02x}{:02x}",
+            random[0], random[1], random[2], random[3]
+        ));
+        // `sun_path` limits the path the socket is *bound* at, which is the staged one.
+        let bound_length = candidate.join("s").as_os_str().as_bytes().len();
+        if bound_length >= SUN_PATH_CAPACITY
+            || socket_path.as_os_str().as_bytes().len() >= SUN_PATH_CAPACITY
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "admin socket path {} is too long: binding needs {bound_length} bytes \
+                     (the path of a short staging directory next to it plus a socket name), \
+                     but a Unix socket path may hold at most {} bytes plus the trailing NUL \
+                     ({SUN_PATH_CAPACITY}-byte sun_path); use a shorter path",
+                    socket_path.display(),
+                    SUN_PATH_CAPACITY - 1,
+                ),
+            ));
+        }
+        match std::fs::DirBuilder::new().mode(0o700).create(&candidate) {
+            Ok(()) => {
+                staging = Some(candidate);
+                break;
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    let staging = staging.ok_or_else(|| {
+        Error::new(
+            ErrorKind::AlreadyExists,
+            format!(
+                "cannot create a unique staging directory next to {}",
+                socket_path.display()
+            ),
+        )
+    })?;
     let staged_socket = staging.join("s");
     let result = (|| {
         let listener = UnixListener::bind(&staged_socket)?;
         set_admin_socket_permissions(&staged_socket)?;
-        std::fs::rename(&staged_socket, socket_path)?;
-        Ok(listener)
+        let identity = SocketIdentity::of(&std::fs::symlink_metadata(&staged_socket)?);
+        install_staged_socket(&staged_socket, socket_path, existing)?;
+        Ok((listener, identity))
     })();
     let _ = std::fs::remove_file(&staged_socket);
     let _ = std::fs::remove_dir(&staging);
     result
+}
+
+/// `sun_path` capacity including the trailing NUL (108 on Linux, 104 on the BSDs and macOS).
+const SUN_PATH_CAPACITY: usize = if cfg!(target_os = "linux") { 108 } else { 104 };
+
+/// Move the already-bound, already-`0600` staged socket to its final path without clobbering
+/// anything that is not the stale socket we saw earlier.
+///
+/// * Nothing there: `link(2)` the staged socket in. `link` fails with `EEXIST` instead of
+///   replacing, so a file or symlink created in the meantime is never overwritten (atomic
+///   no-replace; filesystems without hard links fall back to a re-checked `rename`).
+/// * A stale socket there: re-`lstat` immediately before and `rename` over it only if it is still
+///   a socket with the inode seen at the start. `rename` replaces without following links. There
+///   is no portable no-replace-unless-inode primitive (and this crate denies `unsafe`, which rules
+///   out calling `renameat2` directly), so a swap in the microseconds between that check and the
+///   `rename` is narrowed, not eliminated.
+fn install_staged_socket(
+    staged: &std::path::Path,
+    final_path: &std::path::Path,
+    existing: Option<SocketIdentity>,
+) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::fs::FileTypeExt;
+    let changed = || {
+        Error::new(
+            ErrorKind::AlreadyExists,
+            format!(
+                "{} changed while the admin socket was being bound; not replacing it",
+                final_path.display()
+            ),
+        )
+    };
+    match existing {
+        None => match std::fs::hard_link(staged, final_path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => Err(changed()),
+            Err(_no_hard_links) => match std::fs::symlink_metadata(final_path) {
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    std::fs::rename(staged, final_path)
+                }
+                Ok(_) => Err(changed()),
+                Err(error) => Err(error),
+            },
+        },
+        Some(expected) => match std::fs::symlink_metadata(final_path) {
+            Ok(metadata)
+                if metadata.file_type().is_socket() && SocketIdentity::of(&metadata) == expected =>
+            {
+                std::fs::rename(staged, final_path)
+            }
+            Ok(_) => Err(changed()),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                install_staged_socket(staged, final_path, None)
+            }
+            Err(error) => Err(error),
+        },
+    }
 }
 
 /// Bind the admin API to a Unix domain socket.
@@ -3165,13 +3302,16 @@ async fn bind_admin_unix(
     api: AdminApi,
 ) -> Result<ListenerHandle, Error> {
     let socket_path = std::path::Path::new(path);
-    let listener =
+    let (listener, identity) =
         bind_admin_unix_private(socket_path).map_err(|error| Error::bind(configured, error))?;
     let (shutdown, mut receiver) = watch::channel(false);
     let (force, mut force_receiver) = watch::channel(false);
     let tracker = Arc::new(ConnectionTracker::default());
     let loop_tracker = Arc::clone(&tracker);
-    let cleanup = AdminSocketPath(socket_path.to_path_buf());
+    let cleanup = AdminSocketPath {
+        path: socket_path.to_path_buf(),
+        identity,
+    };
     let body_slots = new_admin_body_slots();
     let task = tokio::spawn(async move {
         let _cleanup = cleanup;
@@ -4682,9 +4822,45 @@ mod admin_unix_tests {
         assert!(path.is_dir());
     }
 
+    /// Best-effort probe for the creation window (SEC-MEDIUM-ADMIN-SERVER A3): a watcher thread
+    /// polls the parent directory while the listener is bound and re-bound many times, and every
+    /// time it sees the final socket path it checks the mode. It is probabilistic, not
+    /// deterministic: the pre-fix `bind`-then-`chmod` window is a few microseconds wide, so this
+    /// can pass on old code by missing it. The deterministic guarantees (staging directory is gone,
+    /// only the final socket remains, mode 0600, failed binds leave nothing behind) are asserted
+    /// in `staging_leaves_only_the_socket_behind`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watcher_never_observes_the_socket_with_wider_than_owner_permissions() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (configured, path) = unix_listen(directory.path());
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher = {
+            let stop = Arc::clone(&stop);
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let mut observed = 0_usize;
+                let mut worst = 0_u32;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+                        observed += 1;
+                        worst = worst.max(metadata.permissions().mode() & 0o077);
+                    }
+                }
+                (observed, worst)
+            })
+        };
+        for _ in 0..200 {
+            let handle = bind_admin(&configured, api(), None).await.expect("bind");
+            handle.stop().await;
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (observed, worst) = watcher.join().expect("watcher thread");
+        assert_eq!(worst, 0, "saw the socket with group/other bits ({observed} samples)");
+    }
+
     #[tokio::test]
-    async fn socket_is_never_visible_with_wider_than_owner_permissions() {
-        // The socket is bound inside a private 0700 staging directory and renamed into place, so
+    async fn staging_leaves_only_the_socket_behind() {
+        // The socket is bound inside a private 0700 staging directory and moved into place, so
         // no path under the configured name ever has umask-derived permissions. After bind the
         // staging directory is gone and only the socket remains.
         let directory = tempfile::tempdir().expect("temporary directory");
@@ -4716,6 +4892,90 @@ mod admin_unix_tests {
             vec![std::ffi::OsString::from("admin.sock")],
             "{names:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn stopping_does_not_delete_a_file_or_foreign_socket_that_replaced_ours() {
+        // The cleanup used to `remove_file` whatever sat at the path, including a regular file or
+        // another process's socket put there after we bound (SEC-MEDIUM-ADMIN-SERVER A3).
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (configured, path) = unix_listen(directory.path());
+        let handle = bind_admin(&configured, api(), None).await.expect("bind");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"precious").unwrap();
+        handle.stop().await;
+        assert_eq!(
+            std::fs::read(&path).expect("the replacement file survives the stop"),
+            b"precious"
+        );
+        std::fs::remove_file(&path).unwrap();
+
+        let handle = bind_admin(&configured, api(), None).await.expect("bind");
+        std::fs::remove_file(&path).unwrap();
+        let foreign = std::os::unix::net::UnixListener::bind(&path).expect("foreign socket");
+        handle.stop().await;
+        assert!(
+            std::fs::symlink_metadata(&path).is_ok(),
+            "another process's socket at the path is not ours to delete"
+        );
+        drop(foreign);
+    }
+
+    #[tokio::test]
+    async fn a_predictable_staging_name_cannot_block_the_bind() {
+        // The staging directory used to be `.caddy-rs-admin-<pid>-<counter>`: in a world-writable
+        // parent anyone could pre-create those names and make every bind fail.
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (configured, path) = unix_listen(directory.path());
+        for counter in 0..256 {
+            let name = format!(".caddy-rs-admin-{}-{counter}", std::process::id());
+            std::fs::create_dir(directory.path().join(name)).unwrap();
+        }
+        let handle = bind_admin(&configured, api(), None)
+            .await
+            .expect("a pre-created guessable name must not block the bind");
+        assert!(path.exists());
+        handle.stop().await;
+    }
+
+    /// A temporary directory whose path is exactly `length` bytes long.
+    fn directory_of_length(length: usize) -> (tempfile::TempDir, PathBuf) {
+        let base = tempfile::tempdir().expect("temporary directory");
+        let used = base.path().as_os_str().len();
+        let filler = "d".repeat(length - used - 1);
+        let nested = base.path().join(filler);
+        std::fs::create_dir(&nested).expect("nested directory");
+        assert_eq!(nested.as_os_str().len(), length);
+        (base, nested)
+    }
+
+    #[tokio::test]
+    async fn staging_does_not_cost_much_of_the_108_byte_socket_path_budget() {
+        // `sun_path` holds 107 bytes plus the NUL. The staging name used to add ~28 bytes, so a
+        // socket path that fits could fail to bind; it now adds a short random name.
+        let (_base, directory) = directory_of_length(92);
+        let path = directory.join("a.sock");
+        assert!(path.as_os_str().len() <= 107);
+        let configured = format!("unix/{}", path.display());
+        let handle = bind_admin(&configured, api(), None)
+            .await
+            .expect("a path well within the limit binds");
+        handle.stop().await;
+    }
+
+    #[tokio::test]
+    async fn an_over_long_staging_path_is_reported_with_the_configured_path_and_limit() {
+        let (_base, directory) = directory_of_length(100);
+        let path = directory.join("a.sock");
+        assert!(path.as_os_str().len() <= 107, "the final path itself would fit");
+        let configured = format!("unix/{}", path.display());
+        let error = bind_admin(&configured, api(), None)
+            .await
+            .err()
+            .expect("the staged path is too long to bind");
+        let message = error.to_string();
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(message.contains("108"), "{message}");
     }
 }
 

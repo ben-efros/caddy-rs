@@ -71,6 +71,7 @@ caddy-rs-http = { workspace = true, default-features = false }
 caddy-rs-l4 = { workspace = true, default-features = false }
 caddy-rs-proxy = { workspace = true, default-features = false }
 caddy-rs-tls = { workspace = true, default-features = false }
+getrandom = { workspace = true }
 h3 = { version = "0.0.8", optional = true }
 h3-quinn = { version = "0.0.10", optional = true }
 http = { workspace = true }

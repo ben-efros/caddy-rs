@@ -710,6 +710,7 @@ dependencies = [
  "caddy-rs-test-support",
  "caddy-rs-tls",
  "ecdysis",
+ "getrandom 0.2.17",
  "h2",
  "h3",
  "h3-quinn",
