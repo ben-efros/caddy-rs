@@ -1814,3 +1814,28 @@ async fn get_user_returns_the_public_view_without_credentials() {
         Err(AuthError::UserNotFound)
     ));
 }
+
+#[test]
+fn setup_tokens_are_long_random_and_distinct() {
+    let first = generate_setup_token();
+    let second = generate_setup_token();
+    assert_ne!(first, second, "tokens come from the CSPRNG, never repeat");
+    // 32 random bytes in unpadded base32 is 52 characters (256 bits of entropy).
+    assert_eq!(first.len(), 52);
+    assert!(first
+        .chars()
+        .all(|character| character.is_ascii_uppercase() || ('2'..='7').contains(&character)));
+}
+
+#[test]
+fn secrets_match_requires_exact_equality() {
+    let token = generate_setup_token();
+    assert!(secrets_match(&token, &token.clone()));
+    assert!(!secrets_match(&token, ""), "an absent header never matches");
+    assert!(!secrets_match(&token, &token[..token.len() - 1]));
+    assert!(!secrets_match(&token, &format!("{token}A")));
+    let mut flipped = token.clone().into_bytes();
+    flipped[0] = if flipped[0] == b'A' { b'B' } else { b'A' };
+    assert!(!secrets_match(&token, &String::from_utf8(flipped).unwrap()));
+    assert!(!secrets_match("", "x"));
+}

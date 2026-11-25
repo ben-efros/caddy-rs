@@ -41,7 +41,12 @@ export function Login(): JSX.Element {
     try {
       const response = configured
         ? await auth.login(username, password, totp || null)
-        : await auth.setup(username, password, totp || null);
+        : await auth.setup(
+            username,
+            password,
+            totp || null,
+            String(data.get('setupToken') || '').trim() || null,
+          );
       setSession(response.data);
       navigate('/', { replace: true });
     } catch (failure) {
@@ -111,6 +116,15 @@ export function Login(): JSX.Element {
               <span className="form-hint">At least 8 characters. This account is created once.</span>
             )}
           </div>
+          {configured ? null : (
+            <div className="form-group">
+              <label htmlFor="setupToken">Setup token</label>
+              <input id="setupToken" name="setupToken" autoComplete="off" required />
+              <span className="form-hint">
+                Printed in the daemon log at start-up (look for “setup_token”).
+              </span>
+            </div>
+          )}
           {configured ? (
             <div className="form-group">
               <label htmlFor="totp">

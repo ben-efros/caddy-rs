@@ -119,6 +119,10 @@ pub struct ApiState {
     /// the loopback-only `POST /auth/setup` route.
     bootstrap_window: bool,
     login_limiter: Arc<crate::auth::LoginLimiter>,
+    /// One-time token `POST /auth/setup` must present in `X-Setup-Token`. `None` (the library
+    /// default, used by tests) keeps the loopback-only guard as the sole check; the daemon always
+    /// sets one when no administrator exists, so a restart cannot be raced by a local caller.
+    setup_token: Option<Arc<str>>,
 }
 
 impl ApiState {
@@ -132,7 +136,15 @@ impl ApiState {
             applier: None,
             bootstrap_window: false,
             login_limiter: Arc::new(crate::auth::LoginLimiter::new()),
+            setup_token: None,
         }
+    }
+
+    /// Require `token` in the `X-Setup-Token` header of `POST /auth/setup`.
+    #[must_use]
+    pub fn with_setup_token(mut self, token: String) -> Self {
+        self.setup_token = Some(Arc::from(token));
+        self
     }
 
     /// Re-open the pre-setup mutation window. Test-only: the production constructor leaves it
@@ -805,8 +817,21 @@ impl std::fmt::Debug for CreateUserResponse {
 async fn auth_setup_handler(
     State(state): State<ApiState>,
     _peer: hosts::LocalPeer,
+    headers: HeaderMap,
     Json(request): Json<SetupRequest>,
 ) -> Result<(StatusCode, Json<CreateUserResponse>), ApiError> {
+    if let Some(expected) = &state.setup_token {
+        let presented = headers
+            .get("x-setup-token")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        // An empty configured token must never match (a missing header reads as empty).
+        if expected.is_empty() || !caddy_rs_authn::secrets_match(expected, presented) {
+            return Err(ApiError::Unauthorized(
+                "first-run setup requires the setup token printed at daemon start-up".to_owned(),
+            ));
+        }
+    }
     let (user, token_pair) = state
         .authn
         .create_first_admin(&request.username, &request.password)

@@ -137,6 +137,69 @@ async fn setup_is_not_configured_before_the_first_administrator() {
 }
 
 #[tokio::test]
+async fn setup_with_a_token_configured_rejects_a_missing_or_wrong_token() {
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let runtime =
+        PmRuntime::open(RuntimeConfig::new(temp_dir.path().join("data"))).expect("open runtime");
+    let authn = authn();
+    let state = ApiState::new(runtime, authn.clone()).with_setup_token("s3cret-token".to_owned());
+    let server = TestServer::new(
+        create_router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    );
+
+    let missing = server
+        .post("/api/v1/auth/setup")
+        .json(&setup_request("admin"))
+        .await;
+    assert_eq!(missing.status_code(), StatusCode::UNAUTHORIZED);
+
+    let wrong = server
+        .post("/api/v1/auth/setup")
+        .add_header("x-setup-token", "not-the-token")
+        .json(&setup_request("admin"))
+        .await;
+    assert_eq!(wrong.status_code(), StatusCode::UNAUTHORIZED);
+    assert!(
+        authn.list_users().await.expect("list users").is_empty(),
+        "a rejected setup creates no administrator"
+    );
+
+    let accepted = server
+        .post("/api/v1/auth/setup")
+        .add_header("x-setup-token", "s3cret-token")
+        .json(&setup_request("admin"))
+        .await;
+    assert_eq!(accepted.status_code(), StatusCode::CREATED);
+
+    // Replaying the token after the administrator exists is a conflict, not a second admin.
+    let replay = server
+        .post("/api/v1/auth/setup")
+        .add_header("x-setup-token", "s3cret-token")
+        .json(&setup_request("second"))
+        .await;
+    assert_eq!(replay.status_code(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn an_empty_setup_token_never_matches_a_missing_header() {
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let runtime =
+        PmRuntime::open(RuntimeConfig::new(temp_dir.path().join("data"))).expect("open runtime");
+    let authn = authn();
+    let state = ApiState::new(runtime, authn.clone()).with_setup_token(String::new());
+    let server = TestServer::new(
+        create_router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    );
+
+    let response = server
+        .post("/api/v1/auth/setup")
+        .json(&setup_request("admin"))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::UNAUTHORIZED);
+    assert!(authn.list_users().await.expect("list users").is_empty());
+}
+
+#[tokio::test]
 async fn setup_creates_the_first_administrator_with_201() {
     let (_dir, server, authn) = server_with_authn();
 

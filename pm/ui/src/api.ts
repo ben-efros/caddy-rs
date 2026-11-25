@@ -187,10 +187,17 @@ export interface CurrentUser {
 
 export const auth = {
   setupStatus: () => request<SetupStatus>('/setup', { auth: false }),
-  setup: (username: string, password: string, totpCode?: string | null) =>
+  setup: (
+    username: string,
+    password: string,
+    totpCode?: string | null,
+    setupToken?: string | null,
+  ) =>
     request<Session>('/auth/setup', {
       method: 'POST',
       auth: false,
+      // The daemon prints a one-time setup token at start-up while no administrator exists.
+      headers: setupToken ? { 'x-setup-token': setupToken } : {},
       body: { username, password, totp_code: totpCode || null },
     }),
   login: (username: string, password: string, totpCode?: string | null) =>
