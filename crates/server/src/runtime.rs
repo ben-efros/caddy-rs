@@ -1406,6 +1406,35 @@ impl ServerRuntime {
         };
         let current_admin = self.admin.as_ref().map(|handle| handle.bound.clone());
         if desired_admin != current_admin {
+            // Both inputs come from the generation being applied and this process's role, not
+            // from whichever generation the store currently holds.
+            let options = AdminBindOptions {
+                stock_compat: generation.config().stock_compat(),
+                replace_live: self.is_upgrade_child(),
+            };
+            // Bind the new listener BEFORE stopping the old one: a refused bind (a path in use, a
+            // permission error) then leaves the old admin API serving, so the operator can still
+            // repair the configuration through it. Addresses that differ as strings but resolve to
+            // the same socket (`localhost:2019` vs `127.0.0.1:2019`) collide with the old
+            // listener, so `AddrInUse` falls back to stop-then-bind.
+            let mut new_handle = None;
+            if let Some(listen) = &desired_admin {
+                let first = bind_admin_with(
+                    listen,
+                    self.admin_api.clone(),
+                    self.binder_ref(),
+                    options,
+                )
+                .await;
+                match first {
+                    Ok(handle) => new_handle = Some(handle),
+                    Err(Error::Bind { cause, .. })
+                        if cause.kind() == std::io::ErrorKind::AddrInUse
+                            && self.admin.is_some()
+                            && !listen.starts_with("unix/") => {}
+                    Err(error) => return Err(error),
+                }
+            }
             if let Some(handle) = self.admin.take() {
                 let moved_from = handle.unix_socket.as_ref().map(|(path, _)| path.clone());
                 handle.stop().await;
@@ -1416,19 +1445,18 @@ impl ServerRuntime {
                 }
             }
             if let Some(listen) = &desired_admin {
-                // Both inputs come from the generation being applied and this process's role,
-                // not from whichever generation the store currently holds.
-                let options = AdminBindOptions {
-                    stock_compat: generation.config().stock_compat(),
-                    replace_live: self.is_upgrade_child(),
+                let handle = match new_handle {
+                    Some(handle) => handle,
+                    None => {
+                        bind_admin_with(
+                            listen,
+                            self.admin_api.clone(),
+                            self.binder_ref(),
+                            options,
+                        )
+                        .await?
+                    }
                 };
-                let handle = bind_admin_with(
-                    listen,
-                    self.admin_api.clone(),
-                    self.binder_ref(),
-                    options,
-                )
-                .await?;
                 tracing::info!(listen, bound = %handle.bound, "admin API listening");
                 // The `/stop` exit path removes this file itself if the runtime has not finished
                 // shutting down within its budget: `process::exit` skips the listener task's
@@ -3331,6 +3359,70 @@ mod shutdown_latch_tests {
         assert!(
             !socket.exists(),
             "the /stop exit path removes the admin socket the process owns"
+        );
+        runtime.stop_all().await;
+    }
+
+    /// A reload that moves `admin.listen` onto a path the new bind refuses must leave the old
+    /// admin API serving (it used to be stopped first, leaving no API to repair the config with).
+    #[tokio::test]
+    async fn a_refused_admin_rebind_keeps_the_old_admin_api_serving() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let blocked = directory.path().join("blocked.sock");
+        std::fs::write(&blocked, b"not a socket").expect("plant a regular file");
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe port");
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let config = |admin: String| {
+            Config::from_value(serde_json::json!({
+                "admin": {"listen": admin},
+                "apps": {"http": {"servers": {"srv0": {"listen": ["127.0.0.1:0"]}}}}
+            }))
+            .expect("configuration decodes")
+        };
+        let store = Arc::new(GenerationStore::with_builtin_registry());
+        let mut runtime = ServerRuntime::new(Arc::clone(&store));
+        store.load(config(format!("127.0.0.1:{port}"))).expect("load");
+        runtime.apply().await.expect("initial apply");
+        assert_eq!(runtime.admin_address().map(|a| a.port()), Some(port));
+
+        store
+            .load(config(format!("unix/{}", blocked.display())))
+            .expect("load");
+        let error = runtime
+            .apply()
+            .await
+            .err()
+            .expect("the refused admin bind fails the apply");
+        assert!(error.to_string().contains("not a socket"), "{error}");
+        assert_eq!(
+            std::fs::read(&blocked).unwrap(),
+            b"not a socket",
+            "the planted file is untouched"
+        );
+
+        assert_eq!(
+            runtime.admin_address().map(|a| a.port()),
+            Some(port),
+            "the old admin listener must still be the runtime's"
+        );
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("the old admin address still accepts");
+        stream
+            .write_all(
+                format!("GET /config/ HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        let _ = stream.read_to_end(&mut response).await;
+        assert!(
+            String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"),
+            "{}",
+            String::from_utf8_lossy(&response)
         );
         runtime.stop_all().await;
     }
