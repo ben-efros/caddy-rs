@@ -1425,8 +1425,11 @@ mod tests {
             "[64:ff9b::a9fe:a9fe]:80",
             "[2002:a9fe:a9fe::]:80",
         ] {
-            let error = dial_tcp(target, &tuning)
+            // A timeout is a FAILURE: the guard must refuse before any socket is opened, and a
+            // broken guard must not hang the test or send traffic towards a real IMDS.
+            let error = tokio::time::timeout(Duration::from_millis(500), dial_tcp(target, &tuning))
                 .await
+                .unwrap_or_else(|_| panic!("{target}: the guard did not refuse promptly"))
                 .expect_err("restricted literal must be refused");
             assert_eq!(
                 error.kind(),

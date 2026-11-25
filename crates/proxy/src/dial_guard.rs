@@ -39,21 +39,24 @@ impl DialGuard {
         for entry in entries {
             let entry = entry.trim();
             if let Some(prefix) = entry.strip_prefix("unix/") {
-                let path = Path::new(prefix);
-                if !path.is_absolute() {
+                // Validated textually so a config that is valid on Linux also loads on Windows
+                // (`Path::is_absolute` is false for `/run/app` there). Unix-socket upstreams do
+                // not exist on non-Unix platforms, so such entries are accepted and ignored.
+                if !prefix.starts_with('/') {
                     return Err(format!(
                         "`{entry}`: a unix prefix must be an absolute path (`unix//run/app`)"
                     ));
                 }
-                if path.components().any(|part| part == Component::ParentDir) {
+                if prefix.split('/').any(|part| part == "..") {
                     return Err(format!("`{entry}`: a unix prefix must not contain `..`"));
                 }
-                if path.parent().is_none() {
+                if prefix.trim_matches('/').is_empty() {
                     return Err(format!(
                         "`{entry}`: refusing a unix prefix that allows the whole filesystem"
                     ));
                 }
-                guard.allowed_unix_prefixes.push(path.to_path_buf());
+                #[cfg(unix)]
+                guard.allowed_unix_prefixes.push(PathBuf::from(prefix));
             } else {
                 let net = IpNet::parse(entry).map_err(|message| {
                     format!("`{entry}` is neither an IP address/CIDR nor `unix/<path>`: {message}")
@@ -99,8 +102,8 @@ impl DialGuard {
 /// Whether a dial / name / port template can carry request-controlled text.
 ///
 /// Conservative: a template is operator-controlled only when every `{placeholder}` in it is in
-/// the `env.*`, `system.*`, `time.*` or `$VAR` namespaces (set by whoever wrote the config, not by
-/// the client); a literal with no placeholder is operator-controlled too. Any other placeholder
+/// the `env.*` namespace (the only one the replacer resolves itself, so request variables cannot shadow it;
+/// `system.*`, `time.*` and `$VAR` fall through to request variables); a literal with no placeholder is operator-controlled too. Any other placeholder
 /// (`http.request.*`, `http.vars.*`, `vars.*`, `http.regexp.*`, `http.matchers.*`, unknown names)
 /// and any unbalanced brace is treated as request-derived, so the guard applies.
 pub fn template_is_request_derived(template: &str) -> bool {
@@ -111,11 +114,12 @@ pub fn template_is_request_derived(template: &str) -> bool {
             return true;
         };
         let name = &after[..close];
-        let operator_controlled = name.starts_with('$')
-            || ["env.", "system.", "time."]
-                .iter()
-                .any(|prefix| name.starts_with(prefix));
-        if !operator_controlled {
+        // Only `env.*` is resolved by the replacer itself before request variables are
+        // consulted. `system.*`, `time.*` and `$VAR` are not implemented there: they fall through
+        // to request variables, and a `vars`/`map` handler can create a variable of any name from
+        // request data, so they must be guarded. (`{$VAR}` in a Caddyfile is substituted at config
+        // load and never reaches runtime.)
+        if !name.starts_with("env.") {
             return true;
         }
         rest = &after[close + 1..];
@@ -243,6 +247,7 @@ mod tests {
         assert!(guard.check_ip(ip("fe80::1")).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn unix_targets_are_denied_unless_below_an_allowed_prefix() {
         let none = DialGuard::default();
@@ -262,7 +267,7 @@ mod tests {
     }
 
     /// SEC-MEDIUM-PROXY C3 (review): only templates that can carry request data are guarded.
-    /// Literals and operator-controlled sources (`env.*`, `system.*`, `time.*`, `$VAR`) are not;
+    /// Literals and operator-controlled sources (`env.*` only) are not;
     /// everything else (request, vars, regexp, matchers, unknown) is.
     #[test]
     fn template_classification_is_conservative() {
@@ -275,9 +280,6 @@ mod tests {
             "{env.BACKEND_PORT}",
             "localhost:{env.PORT}",
             "{env.HOST}:{env.PORT}",
-            "{system.hostname}:80",
-            "{time.now.unix}",
-            "{$PORT}",
             "{env.HOST:localhost}:80",
         ] {
             assert!(
@@ -287,6 +289,9 @@ mod tests {
         }
         for request_derived in [
             "{http.request.header.X-Backend}",
+            "{system.hostname}:80",
+            "{time.now.unix}",
+            "{$PORT}",
             "{http.request.host}:80",
             "{http.request.uri.query.b}",
             "{http.vars.backend}",

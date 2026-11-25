@@ -10,4 +10,3 @@ core.*
 
 # Scratch cargo target dirs (never commit build output)
 target-*/
-C*UsersBE110810/

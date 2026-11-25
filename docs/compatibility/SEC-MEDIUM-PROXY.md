@@ -100,8 +100,17 @@ proxy was not trusted at the server level while the handler-level check trusted 
   identifier `::ffff:10.0.0.1` passed an IPv4 deny policy. Each `contains` now tries the raw and the
   canonical form, and `crates/server/src/http.rs` `canonical_peer` turns a mapped peer into plain IPv4
   where it enters the request (as Go's `net` reports it), which also makes
-  `{http.request.remote.host}` the dotted form. A shared helper in a common crate was not extracted
-  to keep the hunks small next to concurrent edits; the four copies are now identical in behaviour.
+  `{http.request.remote.host}` the dotted form.
+- **One shared helper (second review).** `caddy_rs_core::net::ip_in_net(base, prefix, ip)` is now
+  the single range test (raw-or-canonical, mapped-form ranges read as IPv4, `/0` of either family
+  matches). It backs l4 `IpRange` and the UDP `IpMatcher`, proxy `IpNet` (trusted proxies and the
+  handler's), http `IpRange`/`Cidr`/ACME `IpRange`, and the server's `proxy_protocol` `allow`/`deny`
+  `Cidr`. The last three were missed before: with `proxy_protocol { deny 203.0.113.0/24 }` an IPv4
+  client arriving as `::ffff:203.0.113.5` fell to the fallback policy (whose PROXY header may be
+  honoured: source-IP spoofing), and `allow 10.0.0.0/8` never matched the load balancer. Tests:
+  `net::tests`, `allow_and_deny_match_ipv4_mapped_peers`, `wrap_denies_a_mapped_peer_inside_a_deny_range`
+  (unit level; no real dual-stack listener test was added), `udp_ip_matcher_matches_ipv4_mapped_peers`,
+  `handler_ip_nets_match_mapped_spellings_both_ways`.
   Tests: `ip_ranges_match_ipv4_mapped_peers`, `trusted_proxy_cidrs_match_ipv4_mapped_peers`,
   `acme_ip_ranges_match_ipv4_mapped_identifiers`, `mapped_peers_enter_the_request_as_plain_ipv4`.
 - **Known deviation: `::ffff:0:0/96`.** `IpNet::parse`/`IpRange::parse` store `::ffff:0:0/96` as
@@ -159,9 +168,15 @@ were never evicted, so a client choosing the expansion could grow memory without
 - **Only request-derived dials are guarded (review fix).** `template_is_request_derived` classifies
   the `dial` template (and, for `dynamic_upstreams`, the `name`/`service`/`proto`/`port` templates of
   each source; `multi` is guarded if any member is). A template is operator-controlled, and so
-  unguarded, only if it is a literal or every placeholder is in `env.*`, `system.*`, `time.*` or
-  `$VAR`; any other placeholder (`http.request.*`, `http.vars.*`, `vars.*`, `http.regexp.*`,
-  `http.matchers.*`, unknown) or an unbalanced brace counts as request-derived. So
+  unguarded, only if it is a literal or every placeholder is in `env.*`; any other placeholder
+  (`http.request.*`, `http.vars.*`, `vars.*`, `http.regexp.*`, `http.matchers.*`, `system.*`,
+  `time.*`, `$VAR`, unknown) or an unbalanced brace counts as request-derived. `env.*` is the only
+  namespace the replacer resolves itself before consulting request variables (so it cannot be
+  shadowed); `system.*`, `time.*` and `$NAME` are not implemented there and fall through to request
+  variables, which a `vars` handler can create from request data (its keys are expanded from the
+  request), so `vars {http.request.header.K} {http.request.header.V}` plus `dial {system.hostname}:80`
+  would otherwise have let a client choose the dial. `{$VAR}` in a Caddyfile is substituted at load
+  and never reaches runtime. So
   `dynamic_upstreams { name localhost }`, Consul/Nomad SRV answering 127.0.0.1 and
   `dial localhost:{env.PORT}` keep working with the guard on. A `map` or `vars` handler that copies
   request data into `{vars.backend}` stays guarded (it is "unknown"); put its loopback targets in
@@ -180,6 +195,11 @@ were never evicted, so a client choosing the expansion could grow memory without
   `stock_compat`.
 - **NAT64 and 6to4 (review fix).** `64:ff9b::/96` and `2002::/16` addresses are classified by the
   embedded IPv4 address (`64:ff9b::a9fe:a9fe` and `2002:a9fe:a9fe::` are metadata).
+
+Notes: a symlink inside a directory allowed by `dial_allow unix//<prefix>` is trusted (paths are
+compared lexically, symlinks are not resolved). On non-Unix platforms `unix/` entries are validated
+textually and ignored. The FastCGI head terminator scan does not recognise the mixed `\n\r\n`
+spelling that Go's `textproto` accepts (pre-existing, unchanged).
 
 ### Design limit, stated bluntly
 
